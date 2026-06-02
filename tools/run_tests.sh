@@ -19,4 +19,5 @@ pytest -q \
   tests/test_outer.py \
   tests/test_bincount.py \
   tests/test_silu_and_mul.py \
+  tests/test_moe_align_block_size.py \
   --quick
