@@ -1,4 +1,5 @@
 # isort: off
+from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
@@ -26,6 +27,7 @@ from flaggems_vllm.ops.FLA import (
     fused_recurrent_gated_delta_rule_fwd,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
@@ -94,6 +96,7 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 # isort: on
 
 __all__ = [
+    "add_rms_norm",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "bincount",
@@ -113,6 +116,7 @@ __all__ = [
     "dswiglu",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "flash_mla_with_kvcache",
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
