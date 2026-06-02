@@ -17,6 +17,7 @@ jobs:
       CUDA_VISIBLE_DEVICES: "0"
       PYTHONPATH: ${{ github.workspace }}/src
       CMAKE_ARGS: -DFLAGGEMS_BUILD_C_EXTENSIONS=ON -DCMAKE_BUILD_TYPE=Release
+      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
 
     steps:
       - id: checkout-attempt-1
@@ -45,29 +46,16 @@ jobs:
         if: steps.checkout-attempt-2.outcome == 'failure'
         uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: pip
-
-      - name: Create virtual environment
-        shell: bash
-        run: |
-          python -m venv .venv
-          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
-
       - name: Show GPU
         shell: bash
         run: nvidia-smi
 
-      - name: Install package and test dependencies
+      - name: Use preconfigured Python environment
         shell: bash
         run: |
-          export PATH="/usr/local/cuda-12.8/bin:$PATH"
-          python -m pip install --upgrade pip
-          python -m pip install -v -e ".[test]" --no-build-isolation
+          test -x "${VIRTUAL_ENV}/bin/python"
+          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
 
       - name: Import smoke test
         shell: bash
