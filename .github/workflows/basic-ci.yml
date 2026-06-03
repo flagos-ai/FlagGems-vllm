@@ -8,10 +8,70 @@ on:
   workflow_dispatch:
 
 jobs:
-  smoke-tests:
-    name: NVIDIA smoke tests
+  pre-commit:
+    name: Pre-commit checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pre-commit
+        shell: bash
+        run: python -m pip install pre-commit
+
+      - name: Run pre-commit
+        shell: bash
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  code-style:
+    name: Code style
+    needs: pre-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install style tools
+        shell: bash
+        run: python -m pip install black==24.8.0 flake8==7.1.0 isort==5.12.0
+
+      - name: Check Black formatting
+        shell: bash
+        run: black --check .
+
+      - name: Check import order
+        shell: bash
+        run: isort --check-only --profile black .
+
+      - name: Run flake8
+        shell: bash
+        run: flake8 .
+
+  select-targets:
+    name: Select CI targets
+    needs: code-style
     runs-on: h20
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      tests: ${{ steps.select.outputs.tests }}
+      benchmarks: ${{ steps.select.outputs.benchmarks }}
     env:
       DNN_VENDOR: nvidia
       PYTHONPATH: ${{ github.workspace }}/src
@@ -61,11 +121,6 @@ jobs:
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
           echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
 
-      - name: Import smoke test
-        shell: bash
-        run: |
-          python -c "import torch, flaggems_vllm; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('vendor:', flaggems_vllm.vendor_name); print('device:', flaggems_vllm.device); assert torch.cuda.is_available()"
-
       - name: Collect CI selection inputs
         shell: bash
         env:
@@ -84,8 +139,101 @@ jobs:
           echo "Changed files:"
           cat changed_files.txt
 
+      - id: select
+        name: Select tests and benchmarks
+        shell: bash
+        run: |
+          selection="$(python tools/select_tests.py \
+            --changed-files changed_files.txt \
+            --format shell)"
+          eval "${selection}"
+
+          echo "Test selection mode: ${TEST_SELECTION_MODE}"
+          if [[ -n "${SELECTED_TESTS}" ]]; then
+            echo "Selected tests: ${SELECTED_TESTS}"
+          fi
+          if [[ -n "${SELECTED_BENCHMARKS}" ]]; then
+            echo "Selected benchmarks: ${SELECTED_BENCHMARKS}"
+          fi
+
+          echo "mode=${TEST_SELECTION_MODE}" >> "${GITHUB_OUTPUT}"
+          echo "tests=${SELECTED_TESTS}" >> "${GITHUB_OUTPUT}"
+          echo "benchmarks=${SELECTED_BENCHMARKS}" >> "${GITHUB_OUTPUT}"
+
+  unit-tests:
+    name: NVIDIA unit tests
+    needs: select-targets
+    if: needs.select-targets.outputs.tests != ''
+    runs-on: h20
+    timeout-minutes: 30
+    env:
+      DNN_VENDOR: nvidia
+      PYTHONPATH: ${{ github.workspace }}/src
+      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show GPU
+        shell: bash
+        run: nvidia-smi
+
+      - name: Use preconfigured Python environment
+        shell: bash
+        run: |
+          test -x "${VIRTUAL_ENV}/bin/python"
+          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+
+      - name: Import smoke test
+        shell: bash
+        run: |
+          python -c "import torch, flaggems_vllm; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('vendor:', flaggems_vllm.vendor_name); print('device:', flaggems_vllm.device); assert torch.cuda.is_available()"
+
       - name: Run selected unit tests
         shell: bash
         env:
-          CHANGED_FILES_FILE: changed_files.txt
-        run: bash tools/run_tests.sh nvidia
+          SELECTED_TESTS: ${{ needs.select-targets.outputs.tests }}
+        run: |
+          echo "Selected tests: ${SELECTED_TESTS}"
+          pytest -q ${SELECTED_TESTS} --quick
+
+  benchmark-tests:
+    name: NVIDIA benchmarks
+    needs: select-targets
+    if: needs.select-targets.outputs.benchmarks != ''
+    runs-on: h20
+    timeout-minutes: 30
+    env:
+      DNN_VENDOR: nvidia
+      PYTHONPATH: ${{ github.workspace }}/src
+      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show GPU
+        shell: bash
+        run: nvidia-smi
+
+      - name: Use preconfigured Python environment
+        shell: bash
+        run: |
+          test -x "${VIRTUAL_ENV}/bin/python"
+          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+
+      - name: Import smoke test
+        shell: bash
+        run: |
+          python -c "import torch, flaggems_vllm; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('vendor:', flaggems_vllm.vendor_name); print('device:', flaggems_vllm.device); assert torch.cuda.is_available()"
+
+      - name: Run selected benchmarks
+        shell: bash
+        env:
+          SELECTED_BENCHMARKS: ${{ needs.select-targets.outputs.benchmarks }}
+        run: |
+          echo "Selected benchmarks: ${SELECTED_BENCHMARKS}"
+          pytest -q ${SELECTED_BENCHMARKS} --level core
