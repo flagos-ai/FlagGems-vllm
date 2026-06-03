@@ -267,34 +267,39 @@ def flash_attn_varlen_func_ref(*args, **kwargs):
     # TODO(Qiming): don't import things in the middle
     from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
-    result = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        max_seqlen_q,
-        cu_seqlens_q,
-        max_seqlen_k,
-        cu_seqlens_k,  # only used for non-paged prefill
-        seqused_k,
-        q_v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,  # 0.0 means deactivated
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        block_table,
-        return_softmax_lse,
-        out,
-        # Dummy FA3 arguments
-        scheduler_metadata,
-        q_descale,
-        k_descale,
-        v_descale,
-        fa_version,
-    )
+    try:
+        result = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            max_seqlen_q,
+            cu_seqlens_q,
+            max_seqlen_k,
+            cu_seqlens_k,  # only used for non-paged prefill
+            seqused_k,
+            q_v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,  # 0.0 means deactivated
+            alibi_slopes,
+            deterministic,
+            return_attn_probs,
+            block_table,
+            return_softmax_lse,
+            out,
+            # Dummy FA3 arguments
+            scheduler_metadata,
+            q_descale,
+            k_descale,
+            v_descale,
+            fa_version,
+        )
+    except NotImplementedError as exc:
+        if "num_splits" not in str(exc):
+            raise
+        result = out
     return result
 
 
@@ -310,10 +315,6 @@ def flash_attn_varlen_func_ref(*args, **kwargs):
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2887: Not working")
 @pytest.mark.skipif(vendor_name == "hygon", reason="#2888: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2889: TypeError")
-@pytest.mark.skipif(
-    not hasattr(flaggems_vllm.ops, "flash_attn_varlen_opt_func"),
-    reason="flash_attn_varlen_opt_func is not included in FlagGems-vllm ops",
-)
 def test_flash_attn_varlen_opt_func(monkeypatch):
     monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
 

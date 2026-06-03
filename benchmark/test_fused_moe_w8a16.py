@@ -15,13 +15,6 @@ def is_cuda_available():
 
 
 CUDA_AVAILABLE = is_cuda_available()
-HAS_OPS_MOE_MXQ = False
-try:
-    import flaggems_vllm.ops_moe_mxq  # noqa: F401
-
-    HAS_OPS_MOE_MXQ = True
-except ImportError:
-    pass
 
 try:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
@@ -295,9 +288,6 @@ def _gems_fused_moe_mxq_w8a16_wrapper(
 
 @pytest.mark.fused_moe
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-@pytest.mark.skipif(
-    not HAS_OPS_MOE_MXQ, reason="ops_moe_mxq is not included in FlagGems-vllm"
-)
 def test_fused_moe_w8a16_mxq():
     """
     Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
@@ -314,9 +304,6 @@ def test_fused_moe_w8a16_mxq():
 @pytest.mark.fused_moe
 @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-@pytest.mark.skipif(
-    not HAS_OPS_MOE_MXQ, reason="ops_moe_mxq is not included in FlagGems-vllm"
-)
 def test_fused_moe_w8a16_mxq_gems_vs_vllm():
     """
     Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.

@@ -306,10 +306,6 @@ def flash_attention_forward_input_fn(config, dtype, device):
 @pytest.mark.skipif(utils.SkipVersion("torch", "<2.4"), reason="Low Pytorch Version.")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.skipif(flaggems_vllm.device == "cpu", reason="Unsupported in CPU mode")
-@pytest.mark.skipif(
-    not hasattr(flaggems_vllm.ops, "flash_attention_forward"),
-    reason="flash_attention_forward is not included in FlagGems-vllm ops",
-)
 @pytest.mark.flash_attention_forward
 def test_flash_attention_forward():
     bench = FlashAttentionForwardBenchmark(
