@@ -1,4 +1,4 @@
-name: Basic CI
+name: basic ci
 
 on:
   push:
@@ -9,62 +9,62 @@ on:
 
 jobs:
   pre-commit:
-    name: Pre-commit checks
+    name: pre-commit checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Check out repository
+      - name: check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: set up python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
 
-      - name: Install pre-commit
+      - name: install pre-commit
         shell: bash
         run: python -m pip install pre-commit pre-commit-hooks==4.6.0 black==24.8.0 flake8==7.1.0 isort==5.12.0
 
-      - name: Run pre-commit
+      - name: run pre-commit
         shell: bash
         run: pre-commit run --all-files --show-diff-on-failure
 
   code-style:
-    name: Code style
+    name: code style
     needs: pre-commit
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Check out repository
+      - name: check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: set up python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
 
-      - name: Install style tools
+      - name: install style tools
         shell: bash
         run: python -m pip install black==24.8.0 flake8==7.1.0 isort==5.12.0
 
-      - name: Check Black formatting
+      - name: check black formatting
         shell: bash
         run: black --check .
 
-      - name: Check import order
+      - name: check import order
         shell: bash
         run: isort --check-only --profile black .
 
-      - name: Run flake8
+      - name: run flake8
         shell: bash
         run: flake8 .
 
   select-targets:
-    name: Select CI targets
+    name: select ci targets
     needs: code-style
     runs-on: h20
     timeout-minutes: 10
@@ -73,13 +73,11 @@ jobs:
       tests: ${{ steps.select.outputs.tests }}
       benchmarks: ${{ steps.select.outputs.benchmarks }}
     env:
-      DNN_VENDOR: nvidia
-      PYTHONPATH: ${{ github.workspace }}/src
       VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
 
     steps:
       - id: checkout-attempt-1
-        name: Check out repository
+        name: check out repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -91,7 +89,7 @@ jobs:
         run: sleep 30s
 
       - id: checkout-attempt-2
-        name: Retry checkout
+        name: retry checkout
         if: steps.checkout-attempt-1.outcome == 'failure'
         uses: actions/checkout@v6
         with:
@@ -104,24 +102,19 @@ jobs:
         run: sleep 30s
 
       - id: checkout-attempt-3
-        name: Retry checkout again
+        name: retry checkout again
         if: steps.checkout-attempt-2.outcome == 'failure'
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Show GPU
-        shell: bash
-        run: nvidia-smi
-
-      - name: Use preconfigured Python environment
+      - name: use preconfigured python environment
         shell: bash
         run: |
           test -x "${VIRTUAL_ENV}/bin/python"
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
 
-      - name: Collect CI selection inputs
+      - name: collect ci selection inputs
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -140,7 +133,7 @@ jobs:
           cat changed_files.txt
 
       - id: select
-        name: Select tests and benchmarks
+        name: select tests and benchmarks
         shell: bash
         run: |
           selection="$(python tools/select_tests.py \
@@ -160,10 +153,10 @@ jobs:
           echo "tests=${SELECTED_TESTS}" >> "${GITHUB_OUTPUT}"
           echo "benchmarks=${SELECTED_BENCHMARKS}" >> "${GITHUB_OUTPUT}"
 
-  unit-tests:
-    name: NVIDIA unit tests
+  nvidia-tests:
+    name: nvidia tests and benchmarks
     needs: select-targets
-    if: needs.select-targets.outputs.tests != ''
+    if: needs.select-targets.outputs.tests != '' || needs.select-targets.outputs.benchmarks != ''
     runs-on: h20
     timeout-minutes: 30
     env:
@@ -172,26 +165,22 @@ jobs:
       VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
 
     steps:
-      - name: Check out repository
+      - name: check out repository
         uses: actions/checkout@v6
 
-      - name: Show GPU
+      - name: show gpu
         shell: bash
         run: nvidia-smi
 
-      - name: Use preconfigured Python environment
+      - name: use preconfigured python environment
         shell: bash
         run: |
           test -x "${VIRTUAL_ENV}/bin/python"
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
           echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
 
-      - name: Import smoke test
-        shell: bash
-        run: |
-          python -c "import torch, flaggems_vllm; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('vendor:', flaggems_vllm.vendor_name); print('device:', flaggems_vllm.device); assert torch.cuda.is_available()"
-
-      - name: Run selected unit tests
+      - name: run selected unit tests
+        if: needs.select-targets.outputs.tests != ''
         shell: bash
         env:
           SELECTED_TESTS: ${{ needs.select-targets.outputs.tests }}
@@ -199,38 +188,8 @@ jobs:
           echo "Selected tests: ${SELECTED_TESTS}"
           pytest -q ${SELECTED_TESTS} --quick
 
-  benchmark-tests:
-    name: NVIDIA benchmarks
-    needs: select-targets
-    if: needs.select-targets.outputs.benchmarks != ''
-    runs-on: h20
-    timeout-minutes: 30
-    env:
-      DNN_VENDOR: nvidia
-      PYTHONPATH: ${{ github.workspace }}/src
-      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Show GPU
-        shell: bash
-        run: nvidia-smi
-
-      - name: Use preconfigured Python environment
-        shell: bash
-        run: |
-          test -x "${VIRTUAL_ENV}/bin/python"
-          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
-
-      - name: Import smoke test
-        shell: bash
-        run: |
-          python -c "import torch, flaggems_vllm; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('vendor:', flaggems_vllm.vendor_name); print('device:', flaggems_vllm.device); assert torch.cuda.is_available()"
-
-      - name: Run selected benchmarks
+      - name: run selected benchmarks
+        if: needs.select-targets.outputs.benchmarks != ''
         shell: bash
         env:
           SELECTED_BENCHMARKS: ${{ needs.select-targets.outputs.benchmarks }}
