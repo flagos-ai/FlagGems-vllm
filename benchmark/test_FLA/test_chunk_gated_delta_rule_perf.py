@@ -99,7 +99,13 @@ def _recurrent_wrapper(
 
 class ChunkGatedDeltaRuleBenchmark(Benchmark):
     DEFAULT_DTYPES = [torch.bfloat16, torch.float16]
+    DEFAULT_SHAPES = [(1, 64, 8, 8, 128, 128)]
     DEFAULT_SHAPE_DESC = "B, T, Hg, H, K, V"
+
+    def init_user_config(self):
+        super().init_user_config()
+        if any(len(shape) != 6 for shape in self.shapes):
+            self.shapes = self.DEFAULT_SHAPES
 
     def get_input_iter(self, cur_dtype):
         for B, T, Hg, H, K, V in self.shapes:

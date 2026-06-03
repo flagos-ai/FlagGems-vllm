@@ -9,6 +9,10 @@ from . import accuracy_utils as utils
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
+HAS_FLASH_ATTN_VARLEN_FUNC = hasattr(flaggems_vllm.ops, "flash_attn_varlen_func")
+HAS_FLASH_ATTN_VARLEN_OPT_FUNC = hasattr(
+    flaggems_vllm.ops, "flash_attn_varlen_opt_func"
+)
 
 
 # Following varlen and paged attn tests are copied from
@@ -95,6 +99,10 @@ def ref_paged_attn(
 
 
 @pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(
+    not (HAS_FLASH_ATTN_VARLEN_FUNC and HAS_FLASH_ATTN_VARLEN_OPT_FUNC),
+    reason="flash_attn_varlen funcs are not included in FlagGems-vllm ops",
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
@@ -255,6 +263,10 @@ def test_flash_attn_varlen_func(
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not working")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
 @pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(
+    not HAS_FLASH_ATTN_VARLEN_FUNC,
+    reason="flash_attn_varlen_func is not included in FlagGems-vllm ops",
+)
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (1, 18), (1, 463)]])
 @pytest.mark.parametrize("num_heads", [(8, 2)])
 @pytest.mark.parametrize("head_size", [128])

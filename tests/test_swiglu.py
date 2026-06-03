@@ -5,13 +5,6 @@ import flaggems_vllm
 
 from . import accuracy_utils as utils
 
-try:
-    from transformer_engine.pytorch import cpp_extensions as tex
-
-    TE_AVAILABLE = True
-except ImportError:
-    TE_AVAILABLE = False
-
 
 def generate_input(
     shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
@@ -35,15 +28,14 @@ VALID_POINTWISE_SHAPES = filter_valid_shapes(utils.SWIGLU_SPECIAL_SHAPES)
 @pytest.mark.swiglu
 @pytest.mark.parametrize("shape", VALID_POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-@pytest.mark.skipif(not TE_AVAILABLE, reason="transformer engine is not available")
 def test_swiglu(shape: tuple[int, ...], dtype: torch.dtype):
     torch.manual_seed(42)
     device = flaggems_vllm.device
 
     input_tensor = generate_input(shape, dtype, device)
 
-    te_forward = tex.swiglu(input_tensor, quantizer=None).to(device)
-    te_forward = utils.to_reference(te_forward)
+    x1, x2 = input_tensor.float().chunk(2, dim=-1)
+    te_forward = utils.to_reference(torch.nn.functional.silu(x1) * x2)
 
     with flaggems_vllm.use_gems():
         fg_forward = flaggems_vllm.swiglu(input_tensor, quantizer=None)

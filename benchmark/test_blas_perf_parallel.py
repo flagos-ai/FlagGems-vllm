@@ -1314,6 +1314,8 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
 
 @pytest.mark.w8a8_block_fp8_matmul
 def test_perf_w8a8_block_fp8_matmul():
+    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
+        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
     if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
         pytest.skip("w8a8_block_fp8_matmul benchmark requires vLLM baseline operator")
     if len(consts.FP8_DTYPES) == 0:
@@ -1332,6 +1334,8 @@ def test_perf_w8a8_block_fp8_matmul():
 
 @pytest.mark.w8a8_block_fp8_matmul_deepgemm
 def test_perf_w8a8_block_fp8_matmul_deepgemm():
+    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
+        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
     if not DEEPGEMM_AVAILABLE:
         pytest.skip("DeepGEMM is not available on this platform")
     if len(consts.FP8_DTYPES) == 0:
@@ -1447,6 +1451,9 @@ def test_addr_benchmark():
 
 @pytest.mark.router_gemm
 def test_perf_router_gemm():
+    if not hasattr(flaggems_vllm, "router_gemm"):
+        pytest.skip("router_gemm is not included in FlagGems-vllm")
+
     def torch_router_gemm(x, weight):
         return torch.mm(x, weight.t()).to(torch.float32)
 

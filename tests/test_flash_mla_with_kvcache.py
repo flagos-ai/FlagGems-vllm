@@ -22,11 +22,11 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 # Triton implementation under test
-from flaggems_vllm.fused.flash_mla_with_kvcache import FlashMLASchedMeta
-from flaggems_vllm.fused.flash_mla_with_kvcache import (
+from flaggems_vllm.ops.flash_mla_with_kvcache import FlashMLASchedMeta
+from flaggems_vllm.ops.flash_mla_with_kvcache import (
     flash_mla_with_kvcache as triton_flash_mla,
 )
-from flaggems_vllm.fused.flash_mla_with_kvcache import (
+from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
 )
 

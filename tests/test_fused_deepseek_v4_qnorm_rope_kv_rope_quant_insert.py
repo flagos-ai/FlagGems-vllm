@@ -246,7 +246,7 @@ def ref_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
 
 
 def fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
-    flaggems_vllm.ops_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
     )
 

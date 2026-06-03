@@ -14,6 +14,7 @@ from . import conftest as cfg
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
+HAS_FLASH_ATTENTION_FORWARD = hasattr(flaggems_vllm.ops, "flash_attention_forward")
 
 
 def make_input(
@@ -199,6 +200,10 @@ def attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=False):
 
 
 @pytest.mark.flash_attention_forward
+@pytest.mark.skipif(
+    not HAS_FLASH_ATTENTION_FORWARD,
+    reason="flash_attention_forward is not included in FlagGems-vllm ops",
+)
 @pytest.mark.skip(
     reason="Issue #2809: The operator fails this test on Nvidia at least."
 )
@@ -395,6 +400,10 @@ def attention_ref(
 
 
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(
+    not HAS_FLASH_ATTENTION_FORWARD,
+    reason="flash_attention_forward is not included in FlagGems-vllm ops",
+)
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2810: RuntimeError")
 @pytest.mark.skipif(vendor_name == "mthreads", reason="Issue #2812: Not supported")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2814: Not supported")
@@ -477,6 +486,10 @@ def test_flash_attention_forward_gqa_alibi_softcap(
 
 
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(
+    not HAS_FLASH_ATTENTION_FORWARD,
+    reason="flash_attention_forward is not included in FlagGems-vllm ops",
+)
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2810: RuntimeError")
 @pytest.mark.skipif(vendor_name == "metax", reason="Issue #2811: Not working")
 @pytest.mark.skipif(vendor_name == "mthreads", reason="Issue #2812: Not working")
@@ -559,6 +572,10 @@ def test_flash_attention_foward_splitkv(
 
 
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(
+    not HAS_FLASH_ATTENTION_FORWARD,
+    reason="flash_attention_forward is not included in FlagGems-vllm ops",
+)
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2810: RuntimeError")
 @pytest.mark.skipif(vendor_name == "metax", reason="Issue #2811: Not working")
 @pytest.mark.skipif(vendor_name == "mthreads", reason="Issue #2812: Not working")
@@ -638,6 +655,10 @@ def test_flash_attention_foward_swa(
 
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(triton.__version__ < "3.1", reason="RequiresTriton >= 3.1")
+@pytest.mark.skipif(
+    not HAS_FLASH_ATTENTION_FORWARD,
+    reason="flash_attention_forward is not included in FlagGems-vllm ops",
+)
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2810: RuntimeError")
 @pytest.mark.skipif(vendor_name == "mthreads", reason="Issue #2812: Not supported")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2814: Not supported")

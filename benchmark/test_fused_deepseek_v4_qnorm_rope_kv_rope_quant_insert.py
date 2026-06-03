@@ -48,7 +48,9 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
             torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
             [torch.bfloat16],
         )
-        self.set_gems(flaggems_vllm.ops_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
+        self.set_gems(
+            flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+        )
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = []

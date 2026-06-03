@@ -19,6 +19,7 @@ build/
 dist/
 
 # An auxiliary product of unittests
+/*.json
 tests/*.json
 
 # Executables

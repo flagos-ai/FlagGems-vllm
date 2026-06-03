@@ -42,7 +42,7 @@ def test_fused_add_rms_norm(shape, dtype):
         eps=eps,
     )
 
-    res_out, res_new_residual = flaggems_vllm.ops_add_rms_norm(
+    res_out, res_new_residual = flaggems_vllm.ops.fused_add_rms_norm(
         inp, residual, list(layer_shape), weight=weight, eps=eps
     )
 

@@ -20,6 +20,17 @@ runtime.replace_customized_ops(globals())
 
 __version__ = "0.1.0"
 
+_COMPAT_OP_ALIASES = {
+    "ops_add_rms_norm": "fused_add_rms_norm",
+    "ops_deepseek_v4_qnorm_rope_kv_rope_quant_insert": "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+    "ops_experts_impl": "fused_experts_impl",
+    "ops_inv_rope_fp8_quant": "fused_inv_rope_fp8_quant",
+    "ops_recurrent_gated_delta_rule_fwd": "fused_recurrent_gated_delta_rule_fwd",
+}
+for _alias, _target in _COMPAT_OP_ALIASES.items():
+    if _target in globals():
+        globals()[_alias] = globals()[_target]
+
 _FULL_CONFIG = tuple(
     (op_name, globals()[op_name])
     for op_name in getattr(_ops_module, "__all__", [])

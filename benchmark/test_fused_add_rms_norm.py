@@ -27,7 +27,7 @@ def test_fused_add_rms_norm():
         input_fn=_input_fn,
         op_name="fused_add_rms_norm",
         torch_op=torch_op,
-        gems_op=flaggems_vllm.ops_add_rms_norm,
+        gems_op=flaggems_vllm.ops.fused_add_rms_norm,
         dtypes=consts.FLOAT_DTYPES,
     )
 
