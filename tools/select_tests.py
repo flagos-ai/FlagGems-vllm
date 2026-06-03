@@ -104,6 +104,39 @@ def add_target(targets: set[str], target: str, existing_targets: set[str]) -> No
         targets.add(normalized)
 
 
+def source_name_variants(stem: str) -> list[str]:
+    variants = [
+        stem,
+        stem.replace("layernorm", "layer_norm"),
+        stem.replace("weightnorm", "weight_norm"),
+    ]
+    return list(dict.fromkeys(variants))
+
+
+def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[str]:
+    variants = source_name_variants(stem)
+    exact_matches = []
+    prefix_matches = []
+
+    for variant in variants:
+        exact_name = f"{root}/test_{variant}.py"
+        if exact_name in targets:
+            exact_matches.append(exact_name)
+
+    if exact_matches:
+        return sorted(set(exact_matches))
+
+    for target in targets:
+        if not target.startswith(f"{root}/test_"):
+            continue
+
+        target_stem = Path(target).stem.removeprefix("test_")
+        if any(target_stem.startswith(f"{variant}_") for variant in variants):
+            prefix_matches.append(target)
+
+    return sorted(set(prefix_matches))
+
+
 def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
@@ -121,12 +154,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
         return []
 
     stem = Path(path).stem
-    candidates = [
-        f"tests/test_{stem}.py",
-        f"tests/test_{stem.replace('layernorm', 'layer_norm')}.py",
-        f"tests/test_{stem.replace('weightnorm', 'weight_norm')}.py",
-    ]
-    return [candidate for candidate in candidates if candidate in tests]
+    return matching_targets_for_stem(stem, tests, "tests")
 
 
 def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
@@ -156,12 +184,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
         return []
 
     stem = Path(path).stem
-    candidates = [
-        f"benchmark/test_{stem}.py",
-        f"benchmark/test_{stem.replace('layernorm', 'layer_norm')}.py",
-        f"benchmark/test_{stem.replace('weightnorm', 'weight_norm')}.py",
-    ]
-    return [candidate for candidate in candidates if candidate in benchmarks]
+    return matching_targets_for_stem(stem, benchmarks, "benchmark")
 
 
 def is_non_test_change(path: str) -> bool:
