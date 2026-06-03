@@ -7,7 +7,6 @@ import argparse
 import shlex
 from pathlib import Path
 
-
 SMOKE_TESTS = [
     "tests/test_outer.py",
     "tests/test_bincount.py",
@@ -34,9 +33,7 @@ BROAD_SOURCE_PREFIXES = (
     "src/flaggems_vllm/utils/",
 )
 
-NON_TEST_PREFIXES = (
-    "docs/",
-)
+NON_TEST_PREFIXES = ("docs/",)
 
 NON_TEST_FILES = {
     ".flake8",
@@ -79,6 +76,7 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_moe_align_block_size_triton.py",
     ],
 }
+
 
 def normalize_path(path: str) -> str:
     return path.strip().replace("\\", "/")
@@ -150,7 +148,9 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
         return []
 
     if path.startswith("src/flaggems_vllm/ops/mhc/"):
-        return ["benchmark/test_mhc.py"] if "benchmark/test_mhc.py" in benchmarks else []
+        return (
+            ["benchmark/test_mhc.py"] if "benchmark/test_mhc.py" in benchmarks else []
+        )
 
     if not path.startswith("src/flaggems_vllm/ops/") or not path.endswith(".py"):
         return []
@@ -193,10 +193,10 @@ def select_targets(
         }:
             broad_change = True
 
-        if (
-            path.startswith(("src/", "tests/", "benchmark/"))
-            or path in {"pyproject.toml", "pytest.ini"}
-        ):
+        if path.startswith(("src/", "tests/", "benchmark/")) or path in {
+            "pyproject.toml",
+            "pytest.ini",
+        }:
             code_change = True
 
         if path.startswith("tests/test_") and path.endswith(".py"):
@@ -221,7 +221,9 @@ def select_targets(
             [benchmark for benchmark in SMOKE_BENCHMARKS if benchmark in benchmarks],
         )
 
-    if changed_files and all(is_non_test_change(normalize_path(path)) for path in changed_files):
+    if changed_files and all(
+        is_non_test_change(normalize_path(path)) for path in changed_files
+    ):
         return "skip", [], []
 
     return (
