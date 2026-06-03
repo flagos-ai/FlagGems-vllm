@@ -310,6 +310,10 @@ def flash_attn_varlen_func_ref(*args, **kwargs):
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2887: Not working")
 @pytest.mark.skipif(vendor_name == "hygon", reason="#2888: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2889: TypeError")
+@pytest.mark.skipif(
+    not hasattr(flaggems_vllm.ops, "flash_attn_varlen_opt_func"),
+    reason="flash_attn_varlen_opt_func is not included in FlagGems-vllm ops",
+)
 def test_flash_attn_varlen_opt_func(monkeypatch):
     monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
 
