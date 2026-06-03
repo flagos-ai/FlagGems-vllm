@@ -21,6 +21,8 @@ jobs:
       - id: checkout-attempt-1
         name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
         continue-on-error: true
 
       - id: sleep-1
@@ -32,6 +34,8 @@ jobs:
         name: Retry checkout
         if: steps.checkout-attempt-1.outcome == 'failure'
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
         continue-on-error: true
 
       - id: sleep-2
@@ -43,6 +47,8 @@ jobs:
         name: Retry checkout again
         if: steps.checkout-attempt-2.outcome == 'failure'
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Show GPU
         shell: bash
@@ -60,6 +66,26 @@ jobs:
         run: |
           python -c "import torch, flaggems_vllm; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('vendor:', flaggems_vllm.vendor_name); print('device:', flaggems_vllm.device); assert torch.cuda.is_available()"
 
+      - name: Collect CI selection inputs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            git diff --name-only "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_files.txt
+          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_files.txt
+          else
+            git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" > changed_files.txt
+          fi
+
+          echo "Changed files:"
+          cat changed_files.txt
+
       - name: Run selected unit tests
         shell: bash
+        env:
+          CHANGED_FILES_FILE: changed_files.txt
         run: bash tools/run_tests.sh nvidia
