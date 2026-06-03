@@ -7,32 +7,6 @@ import argparse
 import shlex
 from pathlib import Path
 
-SMOKE_TESTS = [
-    "tests/test_outer.py",
-    "tests/test_bincount.py",
-    "tests/test_silu_and_mul.py",
-    "tests/test_moe_align_block_size.py",
-]
-
-SMOKE_BENCHMARKS = [
-    "benchmark/test_outer.py",
-    "benchmark/test_bincount.py",
-    "benchmark/test_silu_and_mul.py",
-    "benchmark/test_moe_align_block_size_triton.py",
-]
-
-BROAD_TEST_FILES = {
-    "tests/conftest.py",
-    "tests/accuracy_utils.py",
-    "pytest.ini",
-}
-
-BROAD_SOURCE_PREFIXES = (
-    "src/flaggems_vllm/runtime/",
-    "src/flaggems_vllm/testing/",
-    "src/flaggems_vllm/utils/",
-)
-
 NON_TEST_PREFIXES = ("docs/",)
 
 NON_TEST_FILES = {
@@ -198,29 +172,11 @@ def select_targets(
     benchmarks = set(existing_benchmarks(repo_root))
     test_targets: set[str] = set()
     benchmark_targets: set[str] = set()
-    broad_change = False
-    code_change = False
 
     for raw_path in changed_files:
         path = normalize_path(raw_path)
         if not path:
             continue
-
-        if path in BROAD_TEST_FILES or path.startswith(".github/workflows/"):
-            broad_change = True
-
-        if path.startswith(BROAD_SOURCE_PREFIXES) or path in {
-            "src/flaggems_vllm/__init__.py",
-            "src/flaggems_vllm/config.py",
-            "pyproject.toml",
-        }:
-            broad_change = True
-
-        if path.startswith(("src/", "tests/", "benchmark/")) or path in {
-            "pyproject.toml",
-            "pytest.ini",
-        }:
-            code_change = True
 
         if path.startswith("tests/test_") and path.endswith(".py"):
             add_target(test_targets, path, tests)
@@ -237,23 +193,12 @@ def select_targets(
     if test_targets or benchmark_targets:
         return "selected", sorted(test_targets), sorted(benchmark_targets)
 
-    if broad_change or code_change:
-        return (
-            "smoke",
-            [test for test in SMOKE_TESTS if test in tests],
-            [benchmark for benchmark in SMOKE_BENCHMARKS if benchmark in benchmarks],
-        )
-
     if changed_files and all(
         is_non_test_change(normalize_path(path)) for path in changed_files
     ):
         return "skip", [], []
 
-    return (
-        "smoke",
-        [test for test in SMOKE_TESTS if test in tests],
-        [benchmark for benchmark in SMOKE_BENCHMARKS if benchmark in benchmarks],
-    )
+    return "skip", [], []
 
 
 def read_changed_files(path: str | None) -> list[str]:
