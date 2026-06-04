@@ -2516,8 +2516,9 @@ def _flash_mla_auto_select_variant(batch_size: int, seqlen: int) -> str:
         return "none"  # use original triton (splitkv_lite) kernel
 
 
-def _flash_mla_tle_bh() -> int:
-    variant = _flash_mla_tle_variant()
+def _flash_mla_tle_bh(variant=None) -> int:
+    if variant is None:
+        variant = _flash_mla_tle_variant()
     if variant == "splitkv":
         return TLE_FLASH_MLA_SPLITKV_BH
     if variant == "2wg":
@@ -2604,13 +2605,22 @@ def _flash_mla_splitkv_lite_main_stages(batch_size: int, default_stages: int) ->
 
 
 def _can_use_tle_flash_mla(
-    q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
+    q,
+    blocked_k,
+    block_table,
+    cache_seqlens,
+    block_size,
+    h_q,
+    h_kv,
+    d,
+    dv,
+    variant=None,
 ):
     return (
         HAS_TLE_FLASH_MLA
         and _flash_mla_tle_enabled()
         and q.device.type == "cuda"
-        and h_q % _flash_mla_tle_bh() == 0
+        and h_q % _flash_mla_tle_bh(variant) == 0
         and h_kv == 1
         and d in (512, 576)
         and dv == 512
@@ -2691,11 +2701,32 @@ def flash_mla(
         _effective_variant == "persistent"
         and max_seqlen_pad >= 8192
         and _can_use_tle_flash_mla(
-            q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
+            q,
+            blocked_k,
+            block_table,
+            cache_seqlens,
+            block_size,
+            h_q,
+            h_kv,
+            d,
+            dv,
+            _effective_variant,
         )
     )
     if _effective_variant == "persistent" and not use_tle_persistent:
         _effective_variant = _flash_mla_auto_select_variant(batch_size, max_seqlen_pad)
+    can_use_tle = _can_use_tle_flash_mla(
+        q,
+        blocked_k,
+        block_table,
+        cache_seqlens,
+        block_size,
+        h_q,
+        h_kv,
+        d,
+        dv,
+        _effective_variant,
+    )
     use_splitkv_lite = use_tle_persistent or (
         (
             batch_size <= 16
@@ -2704,12 +2735,7 @@ def flash_mla(
         )
         and max_seqlen_pad >= 4096
         and not force_original_triton
-        and (
-            _effective_variant == "none"
-            or not _can_use_tle_flash_mla(
-                q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
-            )
-        )
+        and (_effective_variant == "none" or not can_use_tle)
     )
     if (
         not use_splitkv_lite
@@ -2818,16 +2844,10 @@ def flash_mla(
             )
         return o.view([b, s_q, h_q, dv])
 
-    if (
-        not force_original_triton
-        and _effective_variant != "none"
-        and _can_use_tle_flash_mla(
-            q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
-        )
-    ):
+    if not force_original_triton and _effective_variant != "none" and can_use_tle:
         from triton.tools.tensor_descriptor import TensorDescriptor
 
-        tle_bh = _flash_mla_tle_bh()
+        tle_bh = _flash_mla_tle_bh(_effective_variant)
         tle_grid = (
             triton.cdiv(head_num, tle_bh),
             batch_size,
