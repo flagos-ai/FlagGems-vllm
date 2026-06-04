@@ -146,7 +146,10 @@ def flash_mla_splitkv_kernel(
 
     # Handle remainder
     remainder_start = end_block * BLOCK_N
-    if remainder_start < cur_batch_seq_len and split_id == (cur_batch_seq_len // BLOCK_N) // SPLIT_SIZE:
+    if (
+        remainder_start < cur_batch_seq_len
+        and split_id == (cur_batch_seq_len // BLOCK_N) // SPLIT_SIZE
+    ):
         offs_n = remainder_start + tl.arange(0, BLOCK_N)
         mask_kvsplit = offs_n < cur_batch_seq_len
         kv_page_number = tl.load(
@@ -193,10 +196,14 @@ def flash_mla_splitkv_kernel(
     if EVEN_H:
         tl.store(O_partial + offs_o, acc.to(O_partial.dtype.element_ty))
     else:
-        tl.store(O_partial + offs_o, acc.to(O_partial.dtype.element_ty), mask=mask_head[:, None])
+        tl.store(
+            O_partial + offs_o,
+            acc.to(O_partial.dtype.element_ty),
+            mask=mask_head[:, None],
+        )
 
     # Store LSE (log-sum-exp)
-    lse = tl.where(valid, tl.log(e_sum) + e_max, float('-inf'))
+    lse = tl.where(valid, tl.log(e_sum) + e_max, float("-inf"))
     offs_lse = (
         split_id * stride_lse_split
         + cur_batch_id * stride_lse_b
@@ -305,10 +312,15 @@ def flash_mla_splitkv_persistent_tle_kernel(
             offs_n += BLOCK_N
 
         remainder_start = end_block * BLOCK_N
-        if remainder_start < cur_batch_seq_len and split_id == (cur_batch_seq_len // BLOCK_N) // SPLIT_SIZE:
+        if (
+            remainder_start < cur_batch_seq_len
+            and split_id == (cur_batch_seq_len // BLOCK_N) // SPLIT_SIZE
+        ):
             offs_n = remainder_start + tl.arange(0, BLOCK_N)
             mask_kvsplit = offs_n < cur_batch_seq_len
-            kv_page_number = tle.load(req_base + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0)
+            kv_page_number = tle.load(
+                req_base + offs_n // PAGE_SIZE, mask=mask_kvsplit, other=0
+            )
             kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
             offs_v_c = kv_loc[:, None] * stride_kv_bs + offs_d_ckv[None, :]
             v_c = tl.load(Kv_cache + offs_v_c, mask=mask_kvsplit[:, None], other=0.0)
@@ -383,7 +395,9 @@ def flash_mla_splitkv_combine_kernel(
     # Find max LSE across splits
     max_lse = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
     for s in tl.static_range(NUM_SPLITS):
-        offs_lse = s * stride_lse_split + cur_batch_id * stride_lse_b + cur_head * stride_lse_h
+        offs_lse = (
+            s * stride_lse_split + cur_batch_id * stride_lse_b + cur_head * stride_lse_h
+        )
         lse_s = tl.load(LSE_partial + offs_lse, mask=mask_head, other=float("-inf"))
         max_lse = tl.maximum(max_lse, lse_s)
 
@@ -391,7 +405,9 @@ def flash_mla_splitkv_combine_kernel(
     acc = tl.zeros([BLOCK_H, HEAD_DIM_V], dtype=tl.float32)
     sum_w = tl.zeros([BLOCK_H], dtype=tl.float32)
     for s in tl.static_range(NUM_SPLITS):
-        offs_lse = s * stride_lse_split + cur_batch_id * stride_lse_b + cur_head * stride_lse_h
+        offs_lse = (
+            s * stride_lse_split + cur_batch_id * stride_lse_b + cur_head * stride_lse_h
+        )
         lse_s = tl.load(LSE_partial + offs_lse, mask=mask_head, other=float("-inf"))
         w = tl.exp(lse_s - max_lse)
         sum_w += w
@@ -409,9 +425,7 @@ def flash_mla_splitkv_combine_kernel(
 
     # Store final output
     offs_out = (
-        cur_batch_id * stride_o_b
-        + cur_head[:, None] * stride_o_h
-        + offs_d[None, :]
+        cur_batch_id * stride_o_b + cur_head[:, None] * stride_o_h + offs_d[None, :]
     )
     tl.store(O + offs_out, acc.to(O.dtype.element_ty), mask=mask_head[:, None])
 
@@ -584,12 +598,12 @@ if HAS_TLE_FLASH_MLA:
 
             page0 = tl.load(req_to_tokens + t_offs0 // PAGE_SIZE, valid0, other=0)
             page1 = tl.load(req_to_tokens + t_offs1 // PAGE_SIZE, valid1, other=0)
-            kv_offsets0 = (
-                (page0 * PAGE_SIZE + t_offs0 % PAGE_SIZE).to(tl.int64) * stride_kv
-            )
-            kv_offsets1 = (
-                (page1 * PAGE_SIZE + t_offs1 % PAGE_SIZE).to(tl.int64) * stride_kv
-            )
+            kv_offsets0 = (page0 * PAGE_SIZE + t_offs0 % PAGE_SIZE).to(
+                tl.int64
+            ) * stride_kv
+            kv_offsets1 = (page1 * PAGE_SIZE + t_offs1 % PAGE_SIZE).to(
+                tl.int64
+            ) * stride_kv
 
             k0_l_slot = k0_l_writer.acquire(pair)
             for tile in tl.static_range(0, DPH, 64):
@@ -622,7 +636,10 @@ if HAS_TLE_FLASH_MLA:
                 k_tail_ptr = kv_base + kv_offsets1[:, None] + (D + offs_td)[None, :]
                 k_tail_msk = valid1[:, None] & (offs_td < TD)[None, :]
                 k_tail_blk = tl.load(
-                    k_tail_ptr, mask=k_tail_msk, other=0.0, eviction_policy="evict_first"
+                    k_tail_ptr,
+                    mask=k_tail_msk,
+                    other=0.0,
+                    eviction_policy="evict_first",
                 )
                 tl.store(
                     tle.gpu.local_ptr(k1_r_slot.sK_tail),
@@ -648,7 +665,10 @@ if HAS_TLE_FLASH_MLA:
                 k_tail_ptr = kv_base + kv_offsets0[:, None] + (D + offs_td)[None, :]
                 k_tail_msk = valid0[:, None] & (offs_td < TD)[None, :]
                 k_tail_blk = tl.load(
-                    k_tail_ptr, mask=k_tail_msk, other=0.0, eviction_policy="evict_first"
+                    k_tail_ptr,
+                    mask=k_tail_msk,
+                    other=0.0,
+                    eviction_policy="evict_first",
                 )
                 tl.store(
                     tle.gpu.local_ptr(k0_r_slot.sK_tail),
@@ -674,8 +694,14 @@ if HAS_TLE_FLASH_MLA:
             valid_slot = valid_writer.acquire(pair)
             row0 = tl.full([BK], 0, dtype=tl.int32)
             row1 = tl.full([BK], 1, dtype=tl.int32)
-            tl.store(tle.gpu.local_ptr(valid_slot.is_valid, (row0, offs_t)), valid0.to(tl.int8))
-            tl.store(tle.gpu.local_ptr(valid_slot.is_valid, (row1, offs_t)), valid1.to(tl.int8))
+            tl.store(
+                tle.gpu.local_ptr(valid_slot.is_valid, (row0, offs_t)),
+                valid0.to(tl.int8),
+            )
+            tl.store(
+                tle.gpu.local_ptr(valid_slot.is_valid, (row1, offs_t)),
+                valid1.to(tl.int8),
+            )
             valid_writer.commit(pair)
 
     @triton.jit
@@ -747,7 +773,14 @@ if HAS_TLE_FLASH_MLA:
 
             valid_wait = valid_reader.wait(pair)
             row0 = tl.full([BK], 0, dtype=tl.int32)
-            valid0 = tl.load(tle.gpu.local_ptr(valid_wait.slot.is_valid, (row0, tl.arange(0, BK)))) != 0
+            valid0 = (
+                tl.load(
+                    tle.gpu.local_ptr(
+                        valid_wait.slot.is_valid, (row0, tl.arange(0, BK))
+                    )
+                )
+                != 0
+            )
             qk0 = tl.where(valid0[None, :], qk0, float("-inf"))
             valid_reader.release(pair)
 
@@ -775,13 +808,18 @@ if HAS_TLE_FLASH_MLA:
             acc_l = acc_l * final_scale[:, None]
 
             sS0_slot = sS0_writer.acquire(pair)
-            tl.store(tle.gpu.local_ptr(sS0_slot.sS0), (prob0 * final_scale[:, None]).to(OUT_DTYPE))
+            tl.store(
+                tle.gpu.local_ptr(sS0_slot.sS0),
+                (prob0 * final_scale[:, None]).to(OUT_DTYPE),
+            )
             sS0_writer.commit(pair)
 
             sS1_wait = sS1_reader.wait(pair)
             prob1 = tl.load(tle.gpu.local_ptr(sS1_wait.slot.sS1))
             k1_l_wait = k1_l_remote_reader.wait(pair)
-            k1_l_blk = tl.load(tle.gpu.local_ptr(k1_l_wait.slot.sK, (kv_rows, kv_cols_l)))
+            k1_l_blk = tl.load(
+                tle.gpu.local_ptr(k1_l_wait.slot.sK, (kv_rows, kv_cols_l))
+            )
             acc_l = tl.dot(prob1, k1_l_blk, acc_l, out_dtype=tl.float32)
             sS1_reader.release(pair)
             k1_l_remote_reader.release(pair)
@@ -856,7 +894,14 @@ if HAS_TLE_FLASH_MLA:
 
             valid_wait = valid_reader.wait(pair)
             row1 = tl.full([BK], 1, dtype=tl.int32)
-            valid1 = tl.load(tle.gpu.local_ptr(valid_wait.slot.is_valid, (row1, tl.arange(0, BK)))) != 0
+            valid1 = (
+                tl.load(
+                    tle.gpu.local_ptr(
+                        valid_wait.slot.is_valid, (row1, tl.arange(0, BK))
+                    )
+                )
+                != 0
+            )
             qk1 = tl.where(valid1[None, :], qk1, float("-inf"))
             valid_reader.release(pair)
 
@@ -883,7 +928,9 @@ if HAS_TLE_FLASH_MLA:
             sS0_wait = sS0_reader.wait(pair)
             prob0 = tl.load(tle.gpu.local_ptr(sS0_wait.slot.sS0))
             k0_r_wait = k0_r_remote_reader.wait(pair)
-            k0_r_blk = tl.load(tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols_r)))
+            k0_r_blk = tl.load(
+                tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols_r))
+            )
             acc_r = tl.dot(prob0, k0_r_blk, acc_r, out_dtype=tl.float32)
             k1_r_reader.release(pair)
             k1_l_qk_reader.release(pair)
@@ -901,7 +948,6 @@ if HAS_TLE_FLASH_MLA:
         out_r_vals = acc_r * tl.fdiv(1.0, total_sum)[:, None]
         tl.store(q_r_smem_ptr, out_r_vals.to(OUT_DTYPE))
         tle.gpu.copy(q_slot.sQ_r, output_desc, [BH, DPH], [q_row, DPH])
-
 
     @triton.jit
     def _tle_flash_mla_dense_2wg_consumer0(
@@ -935,9 +981,6 @@ if HAS_TLE_FLASH_MLA:
     ):
         offs_t = tl.arange(0, BK)
         offs_dh = tl.arange(0, DPH)
-        kv_rows = tl.broadcast_to(offs_t[:, None], (BK, DPH))
-        kv_cols_l = tl.broadcast_to(offs_dh[None, :], (BK, DPH))
-        kv_cols_r = tl.broadcast_to((DPH + offs_dh)[None, :], (BK, DPH))
 
         q_write_slot = q_writer.acquire(0)
         tle.gpu.copy(q_desc, q_write_slot.sQ_l, [BH, DPH], [q_row, 0])
@@ -963,12 +1006,12 @@ if HAS_TLE_FLASH_MLA:
             valid1 = t_offs1 < seq_len
             page0 = tl.load(req_to_tokens + t_offs0 // PAGE_SIZE, valid0, other=0)
             page1 = tl.load(req_to_tokens + t_offs1 // PAGE_SIZE, valid1, other=0)
-            kv_offsets0 = (
-                (page0 * PAGE_SIZE + t_offs0 % PAGE_SIZE).to(tl.int64) * STRIDE_KV
-            )
-            kv_offsets1 = (
-                (page1 * PAGE_SIZE + t_offs1 % PAGE_SIZE).to(tl.int64) * STRIDE_KV
-            )
+            kv_offsets0 = (page0 * PAGE_SIZE + t_offs0 % PAGE_SIZE).to(
+                tl.int64
+            ) * STRIDE_KV
+            kv_offsets1 = (page1 * PAGE_SIZE + t_offs1 % PAGE_SIZE).to(
+                tl.int64
+            ) * STRIDE_KV
 
             q_l_blk = tl.load(q_l_smem_ptr)
             q_r_blk = tl.load(q_r_smem_ptr)
@@ -1101,12 +1144,12 @@ if HAS_TLE_FLASH_MLA:
             valid1 = t_offs1 < seq_len
             page0 = tl.load(req_to_tokens + t_offs0 // PAGE_SIZE, valid0, other=0)
             page1 = tl.load(req_to_tokens + t_offs1 // PAGE_SIZE, valid1, other=0)
-            kv_offsets0 = (
-                (page0 * PAGE_SIZE + t_offs0 % PAGE_SIZE).to(tl.int64) * STRIDE_KV
-            )
-            kv_offsets1 = (
-                (page1 * PAGE_SIZE + t_offs1 % PAGE_SIZE).to(tl.int64) * STRIDE_KV
-            )
+            kv_offsets0 = (page0 * PAGE_SIZE + t_offs0 % PAGE_SIZE).to(
+                tl.int64
+            ) * STRIDE_KV
+            kv_offsets1 = (page1 * PAGE_SIZE + t_offs1 % PAGE_SIZE).to(
+                tl.int64
+            ) * STRIDE_KV
 
             q_l_blk = tl.load(q_l_smem_ptr)
             q_r_blk = tl.load(q_r_smem_ptr)
@@ -1253,12 +1296,24 @@ if HAS_TLE_FLASH_MLA:
             scope=tle.gpu.smem,
             nv_mma_shared_layout=False,
         )
-        sM_wg0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_2wg_sM0", sM=sM_smem)
-        sM_wg1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_2wg_sM1", sM=sM_smem)
-        sS0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_2wg_sS0", sS0=sS0_smem)
-        sS1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_2wg_sS1", sS1=sS1_smem)
-        sL_wg0_pipe = tle.pipe(capacity=2, scope="cta", name="flash_mla_2wg_sL0", sL=sL_smem)
-        sL_wg1_pipe = tle.pipe(capacity=2, scope="cta", name="flash_mla_2wg_sL1", sL=sL_smem)
+        sM_wg0_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_2wg_sM0", sM=sM_smem
+        )
+        sM_wg1_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_2wg_sM1", sM=sM_smem
+        )
+        sS0_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_2wg_sS0", sS0=sS0_smem
+        )
+        sS1_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_2wg_sS1", sS1=sS1_smem
+        )
+        sL_wg0_pipe = tle.pipe(
+            capacity=2, scope="cta", name="flash_mla_2wg_sL0", sL=sL_smem
+        )
+        sL_wg1_pipe = tle.pipe(
+            capacity=2, scope="cta", name="flash_mla_2wg_sL1", sL=sL_smem
+        )
 
         log_scale: tl.constexpr = sm_scale * 1.4426950408889634
         tle.gpu.warp_specialize(
@@ -1328,7 +1383,6 @@ if HAS_TLE_FLASH_MLA:
             [4],
             [216],
         )
-
 
     @triton.jit
     def _tle_flash_mla_dense_fwd(
@@ -1444,7 +1498,9 @@ if HAS_TLE_FLASH_MLA:
             nv_mma_shared_layout=False,
         )
 
-        k0_l_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_sK0_l", sK=sK0_smem)
+        k0_l_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_sK0_l", sK=sK0_smem
+        )
         if TD > 0:
             k0_r_pipe = tle.pipe(
                 capacity=1,
@@ -1486,12 +1542,20 @@ if HAS_TLE_FLASH_MLA:
             readers=("wg0", "wg1"),
             is_valid=is_valid_smem,
         )
-        sM_wg0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_sM0", sM=sM_smem)
-        sM_wg1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_sM1", sM=sM_smem)
+        sM_wg0_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_sM0", sM=sM_smem
+        )
+        sM_wg1_pipe = tle.pipe(
+            capacity=1, scope="cta", name="flash_mla_sM1", sM=sM_smem
+        )
         sS0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_sS0", sS0=sS0_smem)
         sS1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_sS1", sS1=sS1_smem)
-        sL_wg0_pipe = tle.pipe(capacity=2, scope="cta", name="flash_mla_sL0", sL=sL_smem)
-        sL_wg1_pipe = tle.pipe(capacity=2, scope="cta", name="flash_mla_sL1", sL=sL_smem)
+        sL_wg0_pipe = tle.pipe(
+            capacity=2, scope="cta", name="flash_mla_sL0", sL=sL_smem
+        )
+        sL_wg1_pipe = tle.pipe(
+            capacity=2, scope="cta", name="flash_mla_sL1", sL=sL_smem
+        )
 
         log_scale: tl.constexpr = sm_scale * 1.4426950408889634
         tle.gpu.warp_specialize(
@@ -1578,7 +1642,6 @@ if HAS_TLE_FLASH_MLA:
             [216, 72],
         )
 
-
     @triton.jit
     def _splitkv_direct_kernel(
         Q_ptr,
@@ -1634,17 +1697,25 @@ if HAS_TLE_FLASH_MLA:
 
         q_l = tl.load(
             Q_ptr + q_batch_off + q_heads[:, None] * stride_qh + offs_dph[None, :],
-            mask=mask_h[:, None], other=0.0,
+            mask=mask_h[:, None],
+            other=0.0,
         )  # [BH, DPH]
         q_r = tl.load(
-            Q_ptr + q_batch_off + q_heads[:, None] * stride_qh + (DPH + offs_dph)[None, :],
-            mask=mask_h[:, None], other=0.0,
+            Q_ptr
+            + q_batch_off
+            + q_heads[:, None] * stride_qh
+            + (DPH + offs_dph)[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
         )  # [BH, DPH]
 
         if TD > 0:
             offs_td = tl.arange(0, TDP)
             q_tail = tl.load(
-                Q_ptr + q_batch_off + q_heads[:, None] * stride_qh + (DP + offs_td)[None, :],
+                Q_ptr
+                + q_batch_off
+                + q_heads[:, None] * stride_qh
+                + (DP + offs_td)[None, :],
                 mask=mask_h[:, None] & (offs_td < TD)[None, :],
                 other=0.0,
             )  # [BH, TDP]
@@ -1664,18 +1735,18 @@ if HAS_TLE_FLASH_MLA:
 
             # page-table lookup -> linear KV offset
             page = tl.load(req_base + t_offs // PAGE_SIZE, mask=valid, other=0)
-            kv_offs = (
-                (page * PAGE_SIZE + t_offs % PAGE_SIZE).to(tl.int64) * stride_kv
-            )
+            kv_offs = (page * PAGE_SIZE + t_offs % PAGE_SIZE).to(tl.int64) * stride_kv
 
             # load K halves directly from global memory
             k_l = tl.load(
                 kv_ptr + kv_offs[:, None] + offs_dph[None, :],
-                mask=valid[:, None], other=0.0,
+                mask=valid[:, None],
+                other=0.0,
             )  # [BK, DPH]
             k_r = tl.load(
                 kv_ptr + kv_offs[:, None] + (DPH + offs_dph)[None, :],
-                mask=valid[:, None], other=0.0,
+                mask=valid[:, None],
+                other=0.0,
             )  # [BK, DPH]
 
             # qk = sum over left/right/tail partitions
@@ -1734,7 +1805,6 @@ if HAS_TLE_FLASH_MLA:
         )
         tl.store(lse_base + offs_h, lse, mask=mask_h)
 
-
     @triton.jit
     def _tle_splitkv_producer(
         k_writer,
@@ -1761,7 +1831,9 @@ if HAS_TLE_FLASH_MLA:
             t_offs = ck * BK + offs_t
             valid = t_offs < seq_len
             page = tl.load(req_to_tokens + t_offs // PAGE_SIZE, valid, other=0)
-            kv_offsets = (page * PAGE_SIZE + t_offs % PAGE_SIZE).to(tl.int64) * stride_kv
+            kv_offsets = (page * PAGE_SIZE + t_offs % PAGE_SIZE).to(
+                tl.int64
+            ) * stride_kv
 
             k_slot = k_writer.acquire(ck - k_start)
             for tile in tl.static_range(0, DV, 64):
@@ -1777,10 +1849,11 @@ if HAS_TLE_FLASH_MLA:
                 )
             if TD > 0:
                 offs_td = tl.arange(0, TDP)
-                kv_tail_rows = tl.broadcast_to(offs_t[:, None], (BK, TDP))
                 k_tail_ptr = kv_base + kv_offsets[:, None] + (DV + offs_td)[None, :]
                 k_tail_msk = valid[:, None] & (offs_td < TD)[None, :]
-                k_tail_blk = tle.load(k_tail_ptr, mask=k_tail_msk, other=0.0, is_async=True)
+                k_tail_blk = tle.load(
+                    k_tail_ptr, mask=k_tail_msk, other=0.0, is_async=True
+                )
                 tl.store(tle.gpu.local_ptr(k_slot.sK_tail), k_tail_blk, mask=k_tail_msk)
 
             tl.store(tle.gpu.local_ptr(k_slot.is_valid), valid.to(tl.int8))
@@ -1881,8 +1954,12 @@ if HAS_TLE_FLASH_MLA:
         DV2: tl.constexpr = 2 * DPH
         o_base = o_partial + split_idx * stride_o_split + q_row * DV2
         lse_base = lse_partial + split_idx * stride_lse_split + q_row
-        tl.store(o_base + offs_h[:, None] * DV2 + offs_dv_l[None, :], acc_l.to(OUT_DTYPE))
-        tl.store(o_base + offs_h[:, None] * DV2 + offs_dv_r[None, :], acc_r.to(OUT_DTYPE))
+        tl.store(
+            o_base + offs_h[:, None] * DV2 + offs_dv_l[None, :], acc_l.to(OUT_DTYPE)
+        )
+        tl.store(
+            o_base + offs_h[:, None] * DV2 + offs_dv_r[None, :], acc_r.to(OUT_DTYPE)
+        )
         tl.store(lse_base + offs_h, lse)
 
     @triton.jit
@@ -1923,7 +2000,9 @@ if HAS_TLE_FLASH_MLA:
                 t_offs = (k_start + i) * BK + offs_t
                 valid = t_offs < seq_len
                 page = tl.load(req_base + t_offs // PAGE_SIZE, valid, other=0)
-                kv_offsets = (page * PAGE_SIZE + t_offs % PAGE_SIZE).to(tl.int64) * stride_kv
+                kv_offsets = (page * PAGE_SIZE + t_offs % PAGE_SIZE).to(
+                    tl.int64
+                ) * stride_kv
 
                 k_slot = k_writer.acquire(stage)
                 for tile in tl.static_range(0, DV, 64):
@@ -1941,8 +2020,12 @@ if HAS_TLE_FLASH_MLA:
                     offs_td = tl.arange(0, TDP)
                     k_tail_ptr = kv_base + kv_offsets[:, None] + (DV + offs_td)[None, :]
                     k_tail_msk = valid[:, None] & (offs_td < TD)[None, :]
-                    k_tail_blk = tle.load(k_tail_ptr, mask=k_tail_msk, other=0.0, is_async=True)
-                    tl.store(tle.gpu.local_ptr(k_slot.sK_tail), k_tail_blk, mask=k_tail_msk)
+                    k_tail_blk = tle.load(
+                        k_tail_ptr, mask=k_tail_msk, other=0.0, is_async=True
+                    )
+                    tl.store(
+                        tle.gpu.local_ptr(k_slot.sK_tail), k_tail_blk, mask=k_tail_msk
+                    )
                 k_writer.commit(stage)
 
                 valid_slot = valid_writer.acquire(stage)
@@ -2102,7 +2185,11 @@ if HAS_TLE_FLASH_MLA:
             [1, BK, DP], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         is_valid_smem = tle.gpu.alloc(
-            [1, BK], dtype=tl.int8, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            [1, BK],
+            dtype=tl.int8,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
         )
 
         if TD > 0:
@@ -2113,20 +2200,35 @@ if HAS_TLE_FLASH_MLA:
                 [1, BK, TDP], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
             )
             q_pipe = tle.pipe(
-                capacity=1, scope="cta", name="persist_sQ", readers=("wg0",),
-                sQ_l=sQ_l_smem, sQ_r=sQ_r_smem, sQ_tail=sQ_tail_smem,
+                capacity=1,
+                scope="cta",
+                name="persist_sQ",
+                readers=("wg0",),
+                sQ_l=sQ_l_smem,
+                sQ_r=sQ_r_smem,
+                sQ_tail=sQ_tail_smem,
             )
             k_pipe = tle.pipe(
-                capacity=1, scope="cta", name="persist_sK", sK=sK_smem, sK_tail=sK_tail_smem
+                capacity=1,
+                scope="cta",
+                name="persist_sK",
+                sK=sK_smem,
+                sK_tail=sK_tail_smem,
             )
         else:
             q_pipe = tle.pipe(
-                capacity=1, scope="cta", name="persist_sQ", readers=("wg0",),
-                sQ_l=sQ_l_smem, sQ_r=sQ_r_smem,
+                capacity=1,
+                scope="cta",
+                name="persist_sQ",
+                readers=("wg0",),
+                sQ_l=sQ_l_smem,
+                sQ_r=sQ_r_smem,
             )
             k_pipe = tle.pipe(capacity=1, scope="cta", name="persist_sK", sK=sK_smem)
 
-        valid_pipe = tle.pipe(capacity=1, scope="cta", name="persist_valid", is_valid=is_valid_smem)
+        valid_pipe = tle.pipe(
+            capacity=1, scope="cta", name="persist_valid", is_valid=is_valid_smem
+        )
         log_scale: tl.constexpr = sm_scale * 1.4426950408889634
         tle.gpu.warp_specialize(
             [
@@ -2242,7 +2344,11 @@ if HAS_TLE_FLASH_MLA:
             [1, BK, DP], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         is_valid_smem = tle.gpu.alloc(
-            [1, BK], dtype=tl.int8, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            [1, BK],
+            dtype=tl.int8,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
         )
 
         if TD > 0:
@@ -2253,20 +2359,40 @@ if HAS_TLE_FLASH_MLA:
                 [1, BK, TDP], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
             )
             q_pipe = tle.pipe(
-                capacity=1, scope="cta", name="splitkv_sQ",
-                readers=("wg0",), one_shot=True,
-                sQ_l=sQ_l_smem, sQ_r=sQ_r_smem, sQ_tail=sQ_tail_smem,
+                capacity=1,
+                scope="cta",
+                name="splitkv_sQ",
+                readers=("wg0",),
+                one_shot=True,
+                sQ_l=sQ_l_smem,
+                sQ_r=sQ_r_smem,
+                sQ_tail=sQ_tail_smem,
             )
-            k_pipe = tle.pipe(capacity=1, scope="cta", name="splitkv_sK",
-                              sK=sK_smem, sK_tail=sK_tail_smem, is_valid=is_valid_smem)
+            k_pipe = tle.pipe(
+                capacity=1,
+                scope="cta",
+                name="splitkv_sK",
+                sK=sK_smem,
+                sK_tail=sK_tail_smem,
+                is_valid=is_valid_smem,
+            )
         else:
             q_pipe = tle.pipe(
-                capacity=1, scope="cta", name="splitkv_sQ",
-                readers=("wg0",), one_shot=True,
-                sQ_l=sQ_l_smem, sQ_r=sQ_r_smem,
+                capacity=1,
+                scope="cta",
+                name="splitkv_sQ",
+                readers=("wg0",),
+                one_shot=True,
+                sQ_l=sQ_l_smem,
+                sQ_r=sQ_r_smem,
             )
-            k_pipe = tle.pipe(capacity=1, scope="cta", name="splitkv_sK",
-                              sK=sK_smem, is_valid=is_valid_smem)
+            k_pipe = tle.pipe(
+                capacity=1,
+                scope="cta",
+                name="splitkv_sK",
+                sK=sK_smem,
+                is_valid=is_valid_smem,
+            )
 
         log_scale: tl.constexpr = sm_scale * 1.4426950408889634
         tle.gpu.warp_specialize(
@@ -2570,25 +2696,25 @@ def flash_mla(
     )
     if _effective_variant == "persistent" and not use_tle_persistent:
         _effective_variant = _flash_mla_auto_select_variant(batch_size, max_seqlen_pad)
-    use_splitkv_lite = (
-        use_tle_persistent
-        or (
-            (
-                batch_size <= 16
-                or (batch_size >= 128 and max_seqlen_pad >= 4096)
-                or (batch_size >= 17 and max_seqlen_pad > 4352)
-            )
-            and max_seqlen_pad >= 4096
-            and not force_original_triton
-            and (
-                _effective_variant == "none"
-                or not _can_use_tle_flash_mla(
-                    q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
-                )
+    use_splitkv_lite = use_tle_persistent or (
+        (
+            batch_size <= 16
+            or (batch_size >= 128 and max_seqlen_pad >= 4096)
+            or (batch_size >= 17 and max_seqlen_pad > 4352)
+        )
+        and max_seqlen_pad >= 4096
+        and not force_original_triton
+        and (
+            _effective_variant == "none"
+            or not _can_use_tle_flash_mla(
+                q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
             )
         )
     )
-    if not use_splitkv_lite and os.environ.get("FLAGGEMS_VLLM_FLASH_MLA_SPLITKV_LITE", "0") == "1":
+    if (
+        not use_splitkv_lite
+        and os.environ.get("FLAGGEMS_VLLM_FLASH_MLA_SPLITKV_LITE", "0") == "1"
+    ):
         use_splitkv_lite = True
 
     if use_splitkv_lite:
@@ -2597,12 +2723,14 @@ def flash_mla(
         num_splits = triton.cdiv(max_nk, SPLIT_SIZE)
         o_partial = torch.empty(
             [num_splits, batch_size, head_num, dv],
-            dtype=q.dtype, device=q.device,
+            dtype=q.dtype,
+            device=q.device,
         )
         lse_partial = torch.full(
             [num_splits, batch_size, head_num],
             float("-inf"),
-            dtype=torch.float32, device=q.device,
+            dtype=torch.float32,
+            device=q.device,
         )
         splitkv_grid = (
             triton.cdiv(head_num, BLOCK_H),
@@ -2628,9 +2756,11 @@ def flash_mla(
                 o_partial,
                 lse_partial,
                 sm_scale,
-                *((
-                    triton.cdiv(head_num, BLOCK_H) * batch_size * num_splits,
-                ) if use_tle_persistent else ()),
+                *(
+                    (triton.cdiv(head_num, BLOCK_H) * batch_size * num_splits,)
+                    if use_tle_persistent
+                    else ()
+                ),
                 head_num,
                 *((batch_size,) if use_tle_persistent else ()),
                 q.stride(0),
@@ -2649,10 +2779,14 @@ def flash_mla(
                 HEAD_DIM_V=dv,
                 HEAD_DIM=d,
                 SPLIT_SIZE=SPLIT_SIZE,
-                **({
-                    "NUM_SPLITS": num_splits,
-                    "NUM_SMS": main_grid[0],
-                } if use_tle_persistent else {}),
+                **(
+                    {
+                        "NUM_SPLITS": num_splits,
+                        "NUM_SMS": main_grid[0],
+                    }
+                    if use_tle_persistent
+                    else {}
+                ),
                 num_warps=_flash_mla_splitkv_lite_main_warps(),
                 num_stages=_flash_mla_splitkv_lite_main_stages(batch_size, num_stages),
             )
@@ -2684,8 +2818,12 @@ def flash_mla(
             )
         return o.view([b, s_q, h_q, dv])
 
-    if not force_original_triton and _effective_variant != "none" and _can_use_tle_flash_mla(
-        q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
+    if (
+        not force_original_triton
+        and _effective_variant != "none"
+        and _can_use_tle_flash_mla(
+            q, blocked_k, block_table, cache_seqlens, block_size, h_q, h_kv, d, dv
+        )
     ):
         from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -2700,7 +2838,10 @@ def flash_mla(
 
         _set_triton_descriptor_allocator(q.device)
         q_desc = TensorDescriptor(
-            q, shape=[batch_size * head_num, d], strides=[d, 1], block_shape=[tle_bh, DP // 2]
+            q,
+            shape=[batch_size * head_num, d],
+            strides=[d, 1],
+            block_shape=[tle_bh, DP // 2],
         )
         if TD > 0:
             tq_desc = TensorDescriptor(
@@ -2712,14 +2853,16 @@ def flash_mla(
         else:
             tq_desc = q_desc
         output_desc = TensorDescriptor(
-            o, shape=[batch_size * head_num, dv], strides=[dv, 1], block_shape=[tle_bh, DP // 2]
+            o,
+            shape=[batch_size * head_num, dv],
+            strides=[dv, 1],
+            block_shape=[tle_bh, DP // 2],
         )
         with torch_device_fn.device(device):
             if _effective_variant in ("splitkv", "splitkv_direct"):
                 BK = TLE_FLASH_MLA_BK
                 splitkv_bh = TLE_FLASH_MLA_SPLITKV_BH
                 max_nk = triton.cdiv(max_seqlen_pad, BK)
-                num_head_groups = triton.cdiv(head_num, splitkv_bh)
                 if max_nk <= 128:
                     BLOCKS_PER_SPLIT = 8
                 elif max_nk <= 384:
@@ -2730,19 +2873,27 @@ def flash_mla(
                 total_rows = batch_size * head_num
                 o_partial = torch.empty(
                     [num_splits, total_rows, dv],
-                    dtype=q.dtype, device=q.device,
+                    dtype=q.dtype,
+                    device=q.device,
                 )
                 lse_partial = torch.full(
                     [num_splits, total_rows],
                     float("-inf"),
-                    dtype=torch.float32, device=q.device,
+                    dtype=torch.float32,
+                    device=q.device,
                 )
                 splitkv_q_desc = TensorDescriptor(
-                    q, shape=[batch_size * head_num, d], strides=[d, 1], block_shape=[splitkv_bh, DP // 2]
+                    q,
+                    shape=[batch_size * head_num, d],
+                    strides=[d, 1],
+                    block_shape=[splitkv_bh, DP // 2],
                 )
                 if TD > 0:
                     splitkv_tq_desc = TensorDescriptor(
-                        q, shape=[batch_size * head_num, d], strides=[d, 1], block_shape=[splitkv_bh, TDP]
+                        q,
+                        shape=[batch_size * head_num, d],
+                        strides=[d, 1],
+                        block_shape=[splitkv_bh, TDP],
                     )
                 else:
                     splitkv_tq_desc = splitkv_q_desc
@@ -2780,30 +2931,30 @@ def flash_mla(
                     )
                 else:
                     _tle_splitkv_fwd[splitkv_grid](
-                    splitkv_q_desc,
-                    splitkv_tq_desc,
-                    blocked_k,
-                    block_table,
-                    cache_seqlens,
-                    o_partial,
-                    lse_partial,
-                    sm_scale,
-                    batch_size,
-                    head_num,
-                    d,
-                    d,
-                    dv,
-                    TD,
-                    DP,
-                    TDP,
-                    block_size,
-                    max_seqlen_pad,
-                    BK,
-                    splitkv_bh,
-                    BLOCKS_PER_SPLIT,
-                    num_warps=TLE_FLASH_MLA_WORKER_NUM_WARPS,
-                    num_stages=1,
-                )
+                        splitkv_q_desc,
+                        splitkv_tq_desc,
+                        blocked_k,
+                        block_table,
+                        cache_seqlens,
+                        o_partial,
+                        lse_partial,
+                        sm_scale,
+                        batch_size,
+                        head_num,
+                        d,
+                        d,
+                        dv,
+                        TD,
+                        DP,
+                        TDP,
+                        block_size,
+                        max_seqlen_pad,
+                        BK,
+                        splitkv_bh,
+                        BLOCKS_PER_SPLIT,
+                        num_warps=TLE_FLASH_MLA_WORKER_NUM_WARPS,
+                        num_stages=1,
+                    )
                 combine_grid = (triton.cdiv(total_rows, splitkv_bh),)
                 _tle_splitkv_combine[combine_grid](
                     o_partial,
