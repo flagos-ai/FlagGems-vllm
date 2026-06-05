@@ -201,19 +201,316 @@ def flash_mla_sched_meta_kernel(
             tl.store(meta + 6, is_last_req_splitted.to(tl.int32))
             tl.store(meta + 7, 0)
 
+@triton.jit
+def _flash_mla_ws_kv_producer(
+    kv0_writer,
+    kv1_writer,
+    kv2_writer,
+    kv3_writer,
+    kv4_writer,
+    kv5_writer,
+    kv6_writer,
+    kv7_writer,
+    kv_tail_writer,
+    Kv_desc,
+    Block_table,
+    block_table_base,
+    start_block_idx,
+    end_block_idx,
+    seq_len,
+    BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+):
+    _ = seq_len
+    for block_idx in tl.range(start_block_idx, end_block_idx):
+        pipe_idx = block_idx - start_block_idx
+        page_id = tle.load(Block_table + block_table_base + block_idx)
+        kv_row = (page_id * PAGE_SIZE).to(tl.int32)
+
+        kv0_slot = kv0_writer.acquire(pipe_idx)
+        tle.gpu.copy(Kv_desc, kv0_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 0])
+        kv0_writer.commit(pipe_idx)
+        for chunk in tl.static_range(0, 8):
+            if chunk == 0:
+                pass
+            elif chunk == 1:
+                kv_slot = kv1_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 64])
+                kv1_writer.commit(pipe_idx)
+            elif chunk == 2:
+                kv_slot = kv2_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 128])
+                kv2_writer.commit(pipe_idx)
+            elif chunk == 3:
+                kv_slot = kv3_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 192])
+                kv3_writer.commit(pipe_idx)
+            elif chunk == 4:
+                kv_slot = kv4_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 256])
+                kv4_writer.commit(pipe_idx)
+            elif chunk == 5:
+                kv_slot = kv5_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 320])
+                kv5_writer.commit(pipe_idx)
+            elif chunk == 6:
+                kv_slot = kv6_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 384])
+                kv6_writer.commit(pipe_idx)
+            else:
+                kv_slot = kv7_writer.acquire(pipe_idx)
+                tle.gpu.copy(Kv_desc, kv_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, 448])
+                kv7_writer.commit(pipe_idx)
+
+        kv_tail_slot = kv_tail_writer.acquire(pipe_idx)
+        tle.gpu.copy(
+            Kv_desc, kv_tail_slot.sKV, [BLOCK_N, D_CHUNK], [kv_row, HEAD_DIM_V]
+        )
+        kv_tail_writer.commit(pipe_idx)
+
 
 @triton.jit
-def flash_mla_splitkv_tle_kernel(
+def _flash_mla_ws_consumer(
+    kv0_reader,
+    kv1_reader,
+    kv2_reader,
+    kv3_reader,
+    kv4_reader,
+    kv5_reader,
+    kv6_reader,
+    kv7_reader,
+    kv_tail_reader,
+    Q_desc,
+    Q_tail_desc,
+    Num_splits,
+    O,
+    O_accum,
+    LSE_accum,
+    sm_scale,
+    batch_idx,
+    split_idx,
+    is_no_split,
+    start_block_idx,
+    end_block_idx,
+    seq_len,
+    q_row,
+    out_row_base,
+    head_base,
+    head_num,
+    stride_o_b,
+    stride_o_h,
+    stride_oaccum_split,
+    stride_oaccum_h,
+    stride_lseaccum_split,
+    stride_lseaccum_h,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+):
+    offs_h = tl.arange(0, BLOCK_M)
+    head_offsets = head_base + offs_h
+    offs_dv = tl.arange(0, HEAD_DIM_V)
+    mask_h = head_offsets < head_num
+
+    kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, D_CHUNK))
+    kv_cols = tl.broadcast_to(tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK))
+
+    # Q 只在这里 load 一次；后面 QK 阶段 extract_tile(q_nope)，PV 阶段不再读 Q
+    q_nope = Q_desc.load([q_row, 0])
+
+    # 注意：如果 Q_tail_desc 已经是 tail view，这里应该是 [q_row, 0]
+    # 如果 Q_tail_desc 仍然是完整 Q descriptor，这里才是 [q_row, HEAD_DIM_V]
+    q_pe = Q_tail_desc.load([q_row, HEAD_DIM_V])
+
+    e_max = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
+    e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
+
+    for block_idx in tl.range(start_block_idx, end_block_idx):
+        pipe_idx = block_idx - start_block_idx
+
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+        # =========================
+        # QK phase
+        # =========================
+        wait0 = kv0_reader.wait(pipe_idx)
+        slot0 = wait0.slot
+        q_d0 = tle.extract_tile(q_nope, index=[0, 0], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d0 = tl.load(tle.gpu.local_ptr(slot0.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d0, tl.trans(k_d0), qk, out_dtype=tl.float32)
+
+        wait1 = kv1_reader.wait(pipe_idx)
+        slot1 = wait1.slot
+        q_d1 = tle.extract_tile(q_nope, index=[0, 1], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d1 = tl.load(tle.gpu.local_ptr(slot1.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d1, tl.trans(k_d1), qk, out_dtype=tl.float32)
+
+        wait2 = kv2_reader.wait(pipe_idx)
+        slot2 = wait2.slot
+        q_d2 = tle.extract_tile(q_nope, index=[0, 2], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d2 = tl.load(tle.gpu.local_ptr(slot2.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d2, tl.trans(k_d2), qk, out_dtype=tl.float32)
+
+        wait3 = kv3_reader.wait(pipe_idx)
+        slot3 = wait3.slot
+        q_d3 = tle.extract_tile(q_nope, index=[0, 3], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d3 = tl.load(tle.gpu.local_ptr(slot3.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d3, tl.trans(k_d3), qk, out_dtype=tl.float32)
+
+        wait4 = kv4_reader.wait(pipe_idx)
+        slot4 = wait4.slot
+        q_d4 = tle.extract_tile(q_nope, index=[0, 4], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d4 = tl.load(tle.gpu.local_ptr(slot4.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d4, tl.trans(k_d4), qk, out_dtype=tl.float32)
+
+        wait5 = kv5_reader.wait(pipe_idx)
+        slot5 = wait5.slot
+        q_d5 = tle.extract_tile(q_nope, index=[0, 5], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d5 = tl.load(tle.gpu.local_ptr(slot5.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d5, tl.trans(k_d5), qk, out_dtype=tl.float32)
+
+        wait6 = kv6_reader.wait(pipe_idx)
+        slot6 = wait6.slot
+        q_d6 = tle.extract_tile(q_nope, index=[0, 6], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d6 = tl.load(tle.gpu.local_ptr(slot6.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d6, tl.trans(k_d6), qk, out_dtype=tl.float32)
+
+        wait7 = kv7_reader.wait(pipe_idx)
+        slot7 = wait7.slot
+        q_d7 = tle.extract_tile(q_nope, index=[0, 7], tile_shape=(BLOCK_M, D_CHUNK))
+        k_d7 = tl.load(tle.gpu.local_ptr(slot7.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_d7, tl.trans(k_d7), qk, out_dtype=tl.float32)
+
+        tail_wait = kv_tail_reader.wait(pipe_idx)
+        tail_slot = tail_wait.slot
+        k_tail = tl.load(tle.gpu.local_ptr(tail_slot.sKV, (kv_rows, kv_cols)))
+        qk = tl.dot(q_pe, tl.trans(k_tail), qk, out_dtype=tl.float32)
+
+        # =========================
+        # Online softmax
+        # =========================
+        valid_n = block_idx * BLOCK_N + tl.arange(0, BLOCK_N) < seq_len
+        qk *= sm_scale * 1.4426950408889634
+        qk = tl.where(valid_n[None, :], qk, float("-inf"))
+
+        n_e_max = tl.maximum(tl.max(qk, axis=1), e_max)
+        re_scale = tl.exp2(e_max - n_e_max)
+        p = tl.exp2(qk - n_e_max[:, None])
+
+        # =========================
+        # PV phase: O += P @ V
+        # 这里不再读 Q，只读 p 和 slot*.sKV
+        # =========================
+        acc0 = tle.extract_tile(acc, index=[0, 0], tile_shape=(BLOCK_M, D_CHUNK))
+        acc0 *= re_scale[:, None]
+        v_d0 = tl.load(tle.gpu.local_ptr(slot0.sKV, (kv_rows, kv_cols)))
+        acc0 = tl.dot(p.to(v_d0.dtype), v_d0, acc0, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc0, index=[0, 0])
+
+        acc1 = tle.extract_tile(acc, index=[0, 1], tile_shape=(BLOCK_M, D_CHUNK))
+        acc1 *= re_scale[:, None]
+        v_d1 = tl.load(tle.gpu.local_ptr(slot1.sKV, (kv_rows, kv_cols)))
+        acc1 = tl.dot(p.to(v_d1.dtype), v_d1, acc1, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc1, index=[0, 1])
+
+        acc2 = tle.extract_tile(acc, index=[0, 2], tile_shape=(BLOCK_M, D_CHUNK))
+        acc2 *= re_scale[:, None]
+        v_d2 = tl.load(tle.gpu.local_ptr(slot2.sKV, (kv_rows, kv_cols)))
+        acc2 = tl.dot(p.to(v_d2.dtype), v_d2, acc2, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc2, index=[0, 2])
+
+        acc3 = tle.extract_tile(acc, index=[0, 3], tile_shape=(BLOCK_M, D_CHUNK))
+        acc3 *= re_scale[:, None]
+        v_d3 = tl.load(tle.gpu.local_ptr(slot3.sKV, (kv_rows, kv_cols)))
+        acc3 = tl.dot(p.to(v_d3.dtype), v_d3, acc3, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc3, index=[0, 3])
+
+        acc4 = tle.extract_tile(acc, index=[0, 4], tile_shape=(BLOCK_M, D_CHUNK))
+        acc4 *= re_scale[:, None]
+        v_d4 = tl.load(tle.gpu.local_ptr(slot4.sKV, (kv_rows, kv_cols)))
+        acc4 = tl.dot(p.to(v_d4.dtype), v_d4, acc4, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc4, index=[0, 4])
+
+        acc5 = tle.extract_tile(acc, index=[0, 5], tile_shape=(BLOCK_M, D_CHUNK))
+        acc5 *= re_scale[:, None]
+        v_d5 = tl.load(tle.gpu.local_ptr(slot5.sKV, (kv_rows, kv_cols)))
+        acc5 = tl.dot(p.to(v_d5.dtype), v_d5, acc5, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc5, index=[0, 5])
+
+        acc6 = tle.extract_tile(acc, index=[0, 6], tile_shape=(BLOCK_M, D_CHUNK))
+        acc6 *= re_scale[:, None]
+        v_d6 = tl.load(tle.gpu.local_ptr(slot6.sKV, (kv_rows, kv_cols)))
+        acc6 = tl.dot(p.to(v_d6.dtype), v_d6, acc6, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc6, index=[0, 6])
+
+        acc7 = tle.extract_tile(acc, index=[0, 7], tile_shape=(BLOCK_M, D_CHUNK))
+        acc7 *= re_scale[:, None]
+        v_d7 = tl.load(tle.gpu.local_ptr(slot7.sKV, (kv_rows, kv_cols)))
+        acc7 = tl.dot(p.to(v_d7.dtype), v_d7, acc7, out_dtype=tl.float32)
+        acc = tle.insert_tile(acc, acc7, index=[0, 7])
+
+        # 在 release 前，确保所有使用 slot*.sKV 的 WGMMA 已完成
+        # 这个 wait 的目的不是为了 qk/acc 数据依赖，而是为了防止 producer 覆盖 sKV
+
+        kv0_reader.release(pipe_idx)
+        kv1_reader.release(pipe_idx)
+        kv2_reader.release(pipe_idx)
+        kv3_reader.release(pipe_idx)
+        kv4_reader.release(pipe_idx)
+        kv5_reader.release(pipe_idx)
+        kv6_reader.release(pipe_idx)
+        kv7_reader.release(pipe_idx)
+        kv_tail_reader.release(pipe_idx)
+
+        e_sum = e_sum * re_scale + tl.sum(p, axis=1)
+        e_max = n_e_max
+
+    valid = e_sum > 0.0
+    out_vals = tl.where(valid[:, None], acc * tl.fdiv(1.0, e_sum)[:, None], 0.0)
+    lse_vals = tl.where(valid, tl.log(e_sum) + e_max, float("-inf"))
+
+    if is_no_split:
+        tl.store(
+            O
+            + batch_idx * stride_o_b
+            + head_offsets[:, None] * stride_o_h
+            + offs_dv[None, :],
+            out_vals.to(O.dtype.element_ty),
+            mask=mask_h[:, None],
+        )
+    else:
+        tl.store(
+            O_accum
+            + split_idx * stride_oaccum_split
+            + head_offsets[:, None] * stride_oaccum_h
+            + offs_dv[None, :],
+            out_vals,
+            mask=mask_h[:, None],
+        )
+        tl.store(
+            LSE_accum
+            + split_idx * stride_lseaccum_split
+            + head_offsets * stride_lseaccum_h,
+            lse_vals,
+            mask=mask_h,
+        )
+
+
+@triton.jit
+def flash_mla_splitkv_ws_tle_kernel(
     Q_desc,
     Q_tail_desc,
     Kv_desc,
-    Kv_tail_desc,
     Block_table,
     B_seq_len,
     Sched_meta,
     Num_splits,
-    O_desc,
-    O_accum_desc,
+    O,
+    O_accum,
     LSE_accum,
     sm_scale,
     head_num,
@@ -232,6 +529,181 @@ def flash_mla_splitkv_tle_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+    META_FIELDS: tl.constexpr,
+):
+    m_block_idx = tl.program_id(0)
+    partition_idx = tl.program_id(1)
+    meta_base = Sched_meta + partition_idx * META_FIELDS
+    begin_req_idx = tl.load(meta_base + 0)
+    end_req_idx = tl.load(meta_base + 1)
+    begin_block_idx_meta = tl.load(meta_base + 2)
+    end_block_idx_meta = tl.load(meta_base + 3)
+    begin_split_idx = tl.load(meta_base + 4)
+    is_first_req_splitted = tl.load(meta_base + 5) != 0
+    is_last_req_splitted = tl.load(meta_base + 6) != 0
+    head_base = m_block_idx * BLOCK_M
+
+    sKV0 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV1 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV2 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV3 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV4 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV5 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV6 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV7 = tle.gpu.alloc([1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV_tail = tle.gpu.alloc(
+        [1, BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem
+    )
+    kv0_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv0", sKV=sKV0
+    )
+    kv1_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv1", sKV=sKV1
+    )
+    kv2_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv2", sKV=sKV2
+    )
+    kv3_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv3", sKV=sKV3
+    )
+    kv4_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv4", sKV=sKV4
+    )
+    kv5_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv5", sKV=sKV5
+    )
+    kv6_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv6", sKV=sKV6
+    )
+    kv7_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv7", sKV=sKV7
+    )
+    kv_tail_pipe = tle.pipe(
+        capacity=1, scope="cta", name="flash_mla_ws_kv_tail", sKV=sKV_tail
+    )
+
+    for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
+        seq_len = tl.load(B_seq_len + batch_idx)
+        start_block_idx = tl.where(batch_idx == begin_req_idx, begin_block_idx_meta, 0)
+        full_end_block_idx = tl.cdiv(seq_len, BLOCK_N)
+        end_block_idx = tl.where(
+            batch_idx == end_req_idx, end_block_idx_meta, full_end_block_idx
+        )
+        n_split_idx = tl.where(batch_idx == begin_req_idx, begin_split_idx, 0)
+        no_split_middle = (batch_idx != begin_req_idx) & (batch_idx != end_req_idx)
+        no_split_first = (batch_idx == begin_req_idx) & (~is_first_req_splitted)
+        no_split_last = (batch_idx == end_req_idx) & (~is_last_req_splitted)
+        is_no_split = no_split_middle | no_split_first | no_split_last
+        if begin_req_idx == end_req_idx:
+            is_no_split = ~is_first_req_splitted
+        split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
+        q_row = batch_idx * head_num + head_base
+        out_row_base = batch_idx * stride_o_b
+        block_table_base = batch_idx * stride_block_table_b
+        tle.gpu.warp_specialize(
+            [
+                (
+                    _flash_mla_ws_kv_producer,
+                    (
+                        kv0_pipe.writer(),
+                        kv1_pipe.writer(),
+                        kv2_pipe.writer(),
+                        kv3_pipe.writer(),
+                        kv4_pipe.writer(),
+                        kv5_pipe.writer(),
+                        kv6_pipe.writer(),
+                        kv7_pipe.writer(),
+                        kv_tail_pipe.writer(),
+                        Kv_desc,
+                        Block_table,
+                        block_table_base,
+                        start_block_idx,
+                        end_block_idx,
+                        seq_len,
+                        BLOCK_N,
+                        PAGE_SIZE,
+                        HEAD_DIM_V,
+                        D_CHUNK,
+                    ),
+                ),
+                (
+                    _flash_mla_ws_consumer,
+                    (
+                        kv0_pipe.reader(),
+                        kv1_pipe.reader(),
+                        kv2_pipe.reader(),
+                        kv3_pipe.reader(),
+                        kv4_pipe.reader(),
+                        kv5_pipe.reader(),
+                        kv6_pipe.reader(),
+                        kv7_pipe.reader(),
+                        kv_tail_pipe.reader(),
+                        Q_desc,
+                        Q_tail_desc,
+                        Num_splits,
+                        O,
+                        O_accum,
+                        LSE_accum,
+                        sm_scale,
+                        batch_idx,
+                        split_idx,
+                        is_no_split,
+                        start_block_idx,
+                        end_block_idx,
+                        seq_len,
+                        q_row,
+                        out_row_base,
+                        head_base,
+                        head_num,
+                        stride_o_b,
+                        stride_o_h,
+                        stride_oaccum_split,
+                        stride_oaccum_h,
+                        stride_lseaccum_split,
+                        stride_lseaccum_h,
+                        BLOCK_M,
+                        BLOCK_N,
+                        HEAD_DIM_V,
+                        D_CHUNK,
+                    ),
+                ),
+            ],
+            [4],
+            [216],
+        )
+
+
+@triton.jit
+def flash_mla_splitkv_tle_kernel(
+    Q_desc,
+    Q_tail_desc,
+    Kv_desc,
+    Block_table,
+    B_seq_len,
+    Sched_meta,
+    Num_splits,
+    O,
+    O_accum,
+    LSE_accum,
+    sm_scale,
+    head_num,
+    stride_q_b,
+    stride_q_h,
+    stride_kv_token,
+    stride_block_table_b,
+    stride_o_b,
+    stride_o_h,
+    stride_oaccum_split,
+    stride_oaccum_h,
+    stride_lseaccum_split,
+    stride_lseaccum_h,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    D_CHUNK: tl.constexpr,
     META_FIELDS: tl.constexpr,
 ):
     m_block_idx = tl.program_id(0)
@@ -249,7 +721,21 @@ def flash_mla_splitkv_tle_kernel(
     offs_h = m_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_h = offs_h < head_num
     offs_dv = tl.arange(0, HEAD_DIM_V)
-    offs_dt = tl.arange(HEAD_DIM_V, HEAD_DIM)
+    kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, D_CHUNK))
+    kv_chunk_cols = tl.broadcast_to(tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK))
+    sKV0 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV1 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV2 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV3 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV4 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV5 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV6 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV7 = tle.gpu.alloc([BLOCK_N, D_CHUNK], dtype=Kv_desc.dtype, scope=tle.gpu.smem)
+    sKV_tail = tle.gpu.alloc(
+        [BLOCK_N, D_CHUNK],
+        dtype=Kv_desc.dtype,
+        scope=tle.gpu.smem,
+    )
 
     for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
         seq_len = tl.load(B_seq_len + batch_idx)
@@ -281,18 +767,81 @@ def flash_mla_splitkv_tle_kernel(
             token_pos = block_idx * BLOCK_N + offs_n
             valid_n = token_pos < seq_len
             kv_row = (page_id * PAGE_SIZE).to(tl.int32)
-            v_c = Kv_desc.load([kv_row, 0])
-            qk = tl.dot(q_nope, tl.trans(v_c), out_dtype=tl.float32)
-            k_pe = Kv_tail_desc.load([kv_row, HEAD_DIM_V])
-            qk = tl.dot(q_pe, tl.trans(k_pe), qk, out_dtype=tl.float32)
+
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            for chunk in tl.static_range(0, 8):
+                d_start = chunk * 64
+                q_d = tle.extract_tile(
+                    q_nope,
+                    index=[0, chunk],
+                    tile_shape=(BLOCK_M, D_CHUNK),
+                )
+                if chunk == 0:
+                    tle.gpu.copy(Kv_desc, sKV0, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV0, (kv_rows, kv_chunk_cols)))
+                elif chunk == 1:
+                    tle.gpu.copy(Kv_desc, sKV1, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV1, (kv_rows, kv_chunk_cols)))
+                elif chunk == 2:
+                    tle.gpu.copy(Kv_desc, sKV2, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV2, (kv_rows, kv_chunk_cols)))
+                elif chunk == 3:
+                    tle.gpu.copy(Kv_desc, sKV3, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV3, (kv_rows, kv_chunk_cols)))
+                elif chunk == 4:
+                    tle.gpu.copy(Kv_desc, sKV4, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV4, (kv_rows, kv_chunk_cols)))
+                elif chunk == 5:
+                    tle.gpu.copy(Kv_desc, sKV5, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV5, (kv_rows, kv_chunk_cols)))
+                elif chunk == 6:
+                    tle.gpu.copy(Kv_desc, sKV6, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV6, (kv_rows, kv_chunk_cols)))
+                else:
+                    tle.gpu.copy(Kv_desc, sKV7, [BLOCK_N, D_CHUNK], [kv_row, d_start])
+                    k_d = tl.load(tle.gpu.local_ptr(sKV7, (kv_rows, kv_chunk_cols)))
+                qk = tl.dot(q_d, tl.trans(k_d), qk, out_dtype=tl.float32)
+            tle.gpu.copy(
+                Kv_desc,
+                sKV_tail,
+                [BLOCK_N, D_CHUNK],
+                [kv_row, HEAD_DIM_V],
+            )
+            k_tail = tl.load(
+                tle.gpu.local_ptr(sKV_tail, (kv_rows, kv_chunk_cols))
+            )
+            qk = tl.dot(q_pe, tl.trans(k_tail), qk, out_dtype=tl.float32)
             qk *= sm_scale
             qk = tl.where(valid_n[None, :], qk, float("-inf"))
 
             n_e_max = tl.maximum(tl.max(qk, axis=1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            acc = tl.dot(p.to(v_c.dtype), v_c, acc, out_dtype=tl.float32)
+            for chunk in tl.static_range(0, 8):
+                if chunk == 0:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV0, (kv_rows, kv_chunk_cols)))
+                elif chunk == 1:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV1, (kv_rows, kv_chunk_cols)))
+                elif chunk == 2:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV2, (kv_rows, kv_chunk_cols)))
+                elif chunk == 3:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV3, (kv_rows, kv_chunk_cols)))
+                elif chunk == 4:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV4, (kv_rows, kv_chunk_cols)))
+                elif chunk == 5:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV5, (kv_rows, kv_chunk_cols)))
+                elif chunk == 6:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV6, (kv_rows, kv_chunk_cols)))
+                else:
+                    v_d = tl.load(tle.gpu.local_ptr(sKV7, (kv_rows, kv_chunk_cols)))
+                acc_d = tle.extract_tile(
+                    acc, index=[0, chunk], tile_shape=(BLOCK_M, D_CHUNK)
+                )
+                acc_d *= re_scale[:, None]
+                acc_d = tl.dot(p.to(v_d.dtype), v_d, acc_d, out_dtype=tl.float32)
+                acc = tle.insert_tile(
+                    acc, acc_d, index=[0, chunk]
+                )
             e_sum = e_sum * re_scale + tl.sum(p, axis=1)
             e_max = n_e_max
 
@@ -301,11 +850,25 @@ def flash_mla_splitkv_tle_kernel(
         lse_vals = tl.where(valid, tl.log(e_sum) + e_max, float("-inf"))
 
         if is_no_split:
-            O_desc.store([q_row, 0], out_vals.to(O_desc.dtype))
+            tl.store(
+                O
+                + batch_idx * stride_o_b
+                + offs_h[:, None] * stride_o_h
+                + offs_dv[None, :],
+                out_vals.to(O.dtype.element_ty),
+                mask=mask_h[:, None],
+            )
         else:
             split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
             accum_row = (split_idx * head_num + m_block_idx * BLOCK_M).to(tl.int32)
-            O_accum_desc.store([accum_row, 0], out_vals)
+            tl.store(
+                O_accum
+                + split_idx * stride_oaccum_split
+                + offs_h[:, None] * stride_oaccum_h
+                + offs_dv[None, :],
+                out_vals,
+                mask=mask_h[:, None],
+            )
             tl.store(
                 LSE_accum
                 + split_idx * stride_lseaccum_split
@@ -455,8 +1018,7 @@ def _try_flash_mla_tle(
     )
     out_flat = out.view(b * s_q * h_q, dv)
     out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
-    tail_dim = d - dv
-    tail_block = triton.next_power_of_2(tail_dim) if tail_dim > 0 else 1
+    d_chunk = 64
     q_desc = TensorDescriptor(
         q_flat,
         shape=[b * s_q * h_q, d],
@@ -467,44 +1029,25 @@ def _try_flash_mla_tle(
         q_flat,
         shape=[b * s_q * h_q, d],
         strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, tail_block],
+        block_shape=[FLASH_MLA_BLOCK_M, d_chunk],
     )
     kv_desc = TensorDescriptor(
         kv_flat,
         shape=[kv_flat.shape[0], d],
         strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_N, dv],
-    )
-    kv_tail_desc = TensorDescriptor(
-        kv_flat,
-        shape=[kv_flat.shape[0], d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_N, tail_block],
-    )
-    out_desc = TensorDescriptor(
-        out_flat,
-        shape=[b * s_q * h_q, dv],
-        strides=[dv, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, dv],
-    )
-    out_accum_desc = TensorDescriptor(
-        out_accum_flat,
-        shape=[total_num_splits * h_q, dv],
-        strides=[dv, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, dv],
+        block_shape=[FLASH_MLA_BLOCK_N, d_chunk],
     )
 
-    flash_mla_splitkv_tle_kernel[(num_m_blocks, num_sm_parts)](
+    flash_mla_splitkv_ws_tle_kernel[(num_m_blocks, num_sm_parts)](
         q_desc,
         q_tail_desc,
         kv_desc,
-        kv_tail_desc,
         block_table_tle,
         cache_seqlens_tle,
         sched_meta,
         num_splits,
-        out_desc,
-        out_accum_desc,
+        out,
+        out_accum,
         lse_accum,
         1 / math.sqrt(d),
         h_q,
@@ -523,8 +1066,9 @@ def _try_flash_mla_tle(
         PAGE_SIZE=block_size,
         HEAD_DIM_V=dv,
         HEAD_DIM=d,
+        D_CHUNK=d_chunk,
         META_FIELDS=FLASH_MLA_META_FIELDS,
-        num_warps=8,
+        num_warps=4,
         num_stages=1,
     )
 
