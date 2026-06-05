@@ -34,6 +34,15 @@ FLASH_MLA_FIXED_OVERHEAD_BLOCKS = 5
 FLASH_MLA_COMBINE_BLOCK_H = 16
 
 
+def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
+    def alloc_fn(size: int, align: int, stream):
+        _ = align
+        _ = stream
+        return torch.empty(size, dtype=torch.int8, device=cuda_device)
+
+    triton.set_allocator(alloc_fn)
+
+
 def _flash_mla_tle_variant() -> str:
     variant = os.environ.get("FLAGGEMS_VLLM_FLASH_MLA_TLE_VARIANT", "auto").lower()
     legacy = os.environ.get("FLAGGEMS_VLLM_FLASH_MLA_TLE")
@@ -195,14 +204,16 @@ def flash_mla_sched_meta_kernel(
 
 @triton.jit
 def flash_mla_splitkv_tle_kernel(
-    Q_ptr,
-    Kv_cache,
+    Q_desc,
+    Q_tail_desc,
+    Kv_desc,
+    Kv_tail_desc,
     Block_table,
     B_seq_len,
     Sched_meta,
     Num_splits,
-    O,
-    O_accum,
+    O_desc,
+    O_accum_desc,
     LSE_accum,
     sm_scale,
     head_num,
@@ -255,22 +266,9 @@ def flash_mla_splitkv_tle_kernel(
         if begin_req_idx == end_req_idx:
             is_no_split = ~is_first_req_splitted
 
-        q_nope = tl.load(
-            Q_ptr
-            + batch_idx * stride_q_b
-            + offs_h[:, None] * stride_q_h
-            + offs_dv[None, :],
-            mask=mask_h[:, None],
-            other=0.0,
-        )
-        q_pe = tl.load(
-            Q_ptr
-            + batch_idx * stride_q_b
-            + offs_h[:, None] * stride_q_h
-            + offs_dt[None, :],
-            mask=mask_h[:, None],
-            other=0.0,
-        )
+        q_row = (batch_idx * head_num + m_block_idx * BLOCK_M).to(tl.int32)
+        q_nope = Q_desc.load([q_row, 0])
+        q_pe = Q_tail_desc.load([q_row, HEAD_DIM_V])
 
         e_max = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
         e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -280,21 +278,13 @@ def flash_mla_splitkv_tle_kernel(
 
         for block_idx in tl.range(start_block_idx, end_block_idx):
             page_id = tle.load(block_table_base + block_idx)
-            token_idx = page_id * PAGE_SIZE + offs_n
             token_pos = block_idx * BLOCK_N + offs_n
             valid_n = token_pos < seq_len
-            v_c = tl.load(
-                Kv_cache + token_idx[:, None] * stride_kv_token + offs_dv[None, :],
-                mask=valid_n[:, None],
-                other=0.0,
-            )
+            kv_row = (page_id * PAGE_SIZE).to(tl.int32)
+            v_c = Kv_desc.load([kv_row, 0])
             qk = tl.dot(q_nope, tl.trans(v_c), out_dtype=tl.float32)
-            k_pe = tl.load(
-                Kv_cache + token_idx[None, :] * stride_kv_token + offs_dt[:, None],
-                mask=valid_n[None, :],
-                other=0.0,
-            )
-            qk = tl.dot(q_pe, k_pe, qk, out_dtype=tl.float32)
+            k_pe = Kv_tail_desc.load([kv_row, HEAD_DIM_V])
+            qk = tl.dot(q_pe, tl.trans(k_pe), qk, out_dtype=tl.float32)
             qk *= sm_scale
             qk = tl.where(valid_n[None, :], qk, float("-inf"))
 
@@ -311,24 +301,11 @@ def flash_mla_splitkv_tle_kernel(
         lse_vals = tl.where(valid, tl.log(e_sum) + e_max, float("-inf"))
 
         if is_no_split:
-            tl.store(
-                O
-                + batch_idx * stride_o_b
-                + offs_h[:, None] * stride_o_h
-                + offs_dv[None, :],
-                out_vals.to(O.dtype.element_ty),
-                mask=mask_h[:, None],
-            )
+            O_desc.store([q_row, 0], out_vals.to(O_desc.dtype))
         else:
             split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
-            tl.store(
-                O_accum
-                + split_idx * stride_oaccum_split
-                + offs_h[:, None] * stride_oaccum_h
-                + offs_dv[None, :],
-                out_vals,
-                mask=mask_h[:, None],
-            )
+            accum_row = (split_idx * head_num + m_block_idx * BLOCK_M).to(tl.int32)
+            O_accum_desc.store([accum_row, 0], out_vals)
             tl.store(
                 LSE_accum
                 + split_idx * stride_lseaccum_split
@@ -442,6 +419,10 @@ def _try_flash_mla_tle(
     kv_flat = blocked_k.contiguous().view(-1, d)
     block_table_tle = block_table.contiguous()
     cache_seqlens_tle = cache_seqlens.contiguous()
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _set_triton_descriptor_allocator(q.device)
+    q_flat = q_tle.view(b * s_q * h_q, d)
     num_m_blocks = triton.cdiv(s_q * h_q // h_kv, FLASH_MLA_BLOCK_M)
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     num_sm_parts = max(num_sms // h_kv // num_m_blocks, 1)
@@ -472,16 +453,58 @@ def _try_flash_mla_tle(
     lse_accum = torch.empty(
         (total_num_splits, h_q), dtype=torch.float32, device=q.device
     )
+    out_flat = out.view(b * s_q * h_q, dv)
+    out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
+    tail_dim = d - dv
+    tail_block = triton.next_power_of_2(tail_dim) if tail_dim > 0 else 1
+    q_desc = TensorDescriptor(
+        q_flat,
+        shape=[b * s_q * h_q, d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv],
+    )
+    q_tail_desc = TensorDescriptor(
+        q_flat,
+        shape=[b * s_q * h_q, d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, tail_block],
+    )
+    kv_desc = TensorDescriptor(
+        kv_flat,
+        shape=[kv_flat.shape[0], d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_N, dv],
+    )
+    kv_tail_desc = TensorDescriptor(
+        kv_flat,
+        shape=[kv_flat.shape[0], d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_N, tail_block],
+    )
+    out_desc = TensorDescriptor(
+        out_flat,
+        shape=[b * s_q * h_q, dv],
+        strides=[dv, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv],
+    )
+    out_accum_desc = TensorDescriptor(
+        out_accum_flat,
+        shape=[total_num_splits * h_q, dv],
+        strides=[dv, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv],
+    )
 
     flash_mla_splitkv_tle_kernel[(num_m_blocks, num_sm_parts)](
-        q_tle,
-        kv_flat,
+        q_desc,
+        q_tail_desc,
+        kv_desc,
+        kv_tail_desc,
         block_table_tle,
         cache_seqlens_tle,
         sched_meta,
         num_splits,
-        out,
-        out_accum,
+        out_desc,
+        out_accum_desc,
         lse_accum,
         1 / math.sqrt(d),
         h_q,
@@ -502,7 +525,7 @@ def _try_flash_mla_tle(
         HEAD_DIM=d,
         META_FIELDS=FLASH_MLA_META_FIELDS,
         num_warps=8,
-        num_stages=3,
+        num_stages=1,
     )
 
     flash_mla_combine_kernel[(b, triton.cdiv(h_q, FLASH_MLA_COMBINE_BLOCK_H))](
