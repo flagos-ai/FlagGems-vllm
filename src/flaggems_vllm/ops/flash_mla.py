@@ -66,19 +66,24 @@ _FLASH_MLA_TLE_PLAN_CACHE: OrderedDict[
 ] = OrderedDict()
 
 
-@dataclass(frozen=True)
-class FlashMLATLEDecodePlanKey:
-    device: int
-    dtype: torch.dtype
-    b: int
-    s_q: int
-    h_q: int
-    h_kv: int
-    d: int
-    dv: int
-    block_size: int
-    causal: bool
-    reuse_output: bool
+def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
+    def alloc_fn(size: int, align: int, stream):
+        _ = align
+        _ = stream
+        return torch.empty(size, dtype=torch.int8, device=cuda_device)
+
+    triton.set_allocator(alloc_fn)
+
+
+def _flash_mla_tle_variant() -> str:
+    variant = os.environ.get("FLAGGEMS_VLLM_FLASH_MLA_TLE_VARIANT", "auto").lower()
+    legacy = os.environ.get("FLAGGEMS_VLLM_FLASH_MLA_TLE")
+    if legacy is not None and legacy.lower() in {"0", "false", "off", "no"}:
+        return "triton"
+    if variant not in {"auto", "triton"}:
+        logger.warning("Unknown FLAGGEMS_VLLM_FLASH_MLA_TLE_VARIANT=%s", variant)
+        return "auto"
+    return variant
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -294,24 +299,19 @@ def flash_mla_sched_meta_kernel_v3(
 
 
 @triton.jit
-def _flash_mla_ws_kv_producer(
-    q_writer,
-    k0_l_writer,
-    k0_r_writer,
-    k1_l_writer,
-    k1_r_writer,
+def flash_mla_splitkv_tle_kernel(
     Q_desc,
     Q_tail_desc,
-    Kv,
     Kv_desc,
     Kv_tail_desc,
     Block_table,
     B_seq_len,
-    begin_req_idx,
-    end_req_idx,
-    begin_block_idx_meta,
-    end_block_idx_meta,
-    head_base,
+    Sched_meta,
+    Num_splits,
+    O_desc,
+    O_accum_desc,
+    LSE_accum,
+    sm_scale,
     head_num,
     stride_kv_token,
     stride_block_table_b,
@@ -503,43 +503,23 @@ def _flash_mla_ws_consumer0(
             is_no_split = ~is_first_req_splitted
         split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
 
-        q_wait = q_reader.wait(q_stage)
-        q_slot = q_wait.slot
+        q_row = (batch_idx * head_num + m_block_idx * BLOCK_M).to(tl.int32)
+        q_nope = Q_desc.load([q_row, 0])
+        q_pe = Q_tail_desc.load([q_row, HEAD_DIM_V])
 
         e_max = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
         e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, HALF_DIM_V], dtype=tl.float32)
 
-        n_blocks = end_block_idx - start_block_idx
-        n_full_pairs = n_blocks // 2
-        has_tail = (n_blocks - n_full_pairs * 2) > 0
-        n_pair_slots = n_full_pairs + has_tail.to(tl.int32)
-
-        for pair in tl.range(0, n_full_pairs):
-            pipe_idx = pipe_base + pair
-            k1_pipe_idx = k1_pipe_base + pair
-            block0 = start_block_idx + pair * 2
-            k0_l_wait = k0_l_reader.wait(pipe_idx)
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-            k0_l_slot = k0_l_wait.slot
-            k0_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
-            q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
-            qk = tl.dot(q_l, tl.trans(k0_l), qk, out_dtype=tl.float32)
-
-            k0_r_wait = k0_r_qk_reader.wait(pipe_idx)
-            k0_r_slot = k0_r_wait.slot
-            k0_r = tl.load(tle.gpu.local_ptr(k0_r_slot.sK, (kv_rows, kv_cols)))
-            q_r = tl.load(tle.gpu.local_ptr(q_slot.sQ_r))
-            qk = tl.dot(q_r, tl.trans(k0_r), qk, out_dtype=tl.float32)
-            if HAVE_TAIL:
-                k_tail = tl.load(
-                    tle.gpu.local_ptr(k0_r_slot.sK_tail, (kv_rows_tail, kv_cols_tail))
-                )
-                q_tail = tl.load(tle.gpu.local_ptr(q_slot.sQ_tail))
-                qk = tl.dot(q_tail, tl.trans(k_tail), qk, out_dtype=tl.float32)
-
-            valid_n = block0 * BLOCK_N + offs_n < seq_len
+        for block_idx in tl.range(start_block_idx, end_block_idx):
+            page_id = tle.load(block_table_base + block_idx)
+            token_pos = block_idx * BLOCK_N + offs_n
+            valid_n = token_pos < seq_len
+            kv_row = (page_id * PAGE_SIZE).to(tl.int32)
+            v_c = Kv_desc.load([kv_row, 0])
+            qk = tl.dot(q_nope, tl.trans(v_c), out_dtype=tl.float32)
+            k_pe = Kv_tail_desc.load([kv_row, HEAD_DIM_V])
+            qk = tl.dot(q_pe, tl.trans(k_pe), qk, out_dtype=tl.float32)
             qk *= sm_scale
             qk = tl.where(valid_n[None, :], qk, float("-inf"))
 
@@ -645,231 +625,11 @@ def _flash_mla_ws_consumer0(
 
         output_row = batch_idx * head_num + head_base
         if is_no_split:
-            out_vals = acc * inv_total_sum[:, None]
-            out_vals = tl.where(valid[:, None], out_vals, 0.0)
-            out_vals_bf16 = out_vals.to(O.dtype.element_ty)
-            tl.store(
-                tle.gpu.local_ptr(q_slot.sQ_l), out_vals_bf16, mask=mask_h[:, None]
-            )
-            tle.gpu.copy(
-                q_slot.sQ_l, Output_desc, [BLOCK_M, HALF_DIM_V], [output_row, 0]
-            )
+            O_desc.store([q_row, 0], out_vals.to(O_desc.dtype))
         else:
-            out_vals = acc * inv_total_sum[:, None]
-            out_vals = tl.where(valid[:, None], out_vals, 0.0)
-            out_vals_q = out_vals.to(O.dtype.element_ty)
-            tl.store(tle.gpu.local_ptr(q_slot.sQ_l), out_vals_q, mask=mask_h[:, None])
-            oaccum_row = split_idx * head_num + head_base
-            tle.gpu.copy(
-                q_slot.sQ_l, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, 0]
-            )
-
-        q_reader.release(q_stage)
-        pipe_base += n_pair_slots
-        k1_pipe_base += n_full_pairs
-
-
-@triton.jit
-def _flash_mla_ws_consumer1(
-    k1_l_qk_reader,
-    k1_r_reader,
-    k0_r_remote_reader,
-    sM_wg1_writer,
-    sM_wg0_reader,
-    sP1_writer,
-    sP0_reader,
-    sL1_writer,
-    sL0_reader,
-    q_reader,
-    sO_stage,
-    Output_desc,
-    OAccum_desc,
-    O,
-    LSE_accum,
-    sm_scale,
-    B_seq_len,
-    Num_splits,
-    begin_req_idx,
-    end_req_idx,
-    begin_block_idx_meta,
-    end_block_idx_meta,
-    begin_split_idx,
-    is_first_req_splitted,
-    is_last_req_splitted,
-    head_base,
-    head_num,
-    stride_lseaccum_split,
-    stride_lseaccum_h,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    HEAD_DIM_V: tl.constexpr,
-    D_CHUNK: tl.constexpr,
-    HAVE_TAIL: tl.constexpr,
-):
-    offs_h = tl.arange(0, BLOCK_M)
-    head_offsets = head_base + offs_h
-    HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
-    mask_h = head_offsets < head_num
-
-    offs_n = tl.arange(0, BLOCK_N)
-    kv_rows = tl.broadcast_to(offs_n[:, None], (BLOCK_N, HALF_DIM_V))
-    kv_cols = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
-    if HAVE_TAIL:
-        kv_rows_tail = tl.broadcast_to(offs_n[:, None], (BLOCK_N, D_CHUNK))
-        kv_cols_tail = tl.broadcast_to(
-            tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK)
-        )
-
-    pipe_base = 0
-    k1_pipe_base = 0
-    for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
-        q_stage = batch_idx - begin_req_idx
-        seq_len = tl.load(B_seq_len + batch_idx)
-        start_block_idx = tl.where(batch_idx == begin_req_idx, begin_block_idx_meta, 0)
-        full_end_block_idx = tl.cdiv(seq_len, BLOCK_N)
-        end_block_idx = tl.where(
-            batch_idx == end_req_idx, end_block_idx_meta, full_end_block_idx
-        )
-        n_split_idx = tl.where(batch_idx == begin_req_idx, begin_split_idx, 0)
-        no_split_middle = (batch_idx != begin_req_idx) & (batch_idx != end_req_idx)
-        no_split_first = (batch_idx == begin_req_idx) & (~is_first_req_splitted)
-        no_split_last = (batch_idx == end_req_idx) & (~is_last_req_splitted)
-        is_no_split = no_split_middle | no_split_first | no_split_last
-        if begin_req_idx == end_req_idx:
-            is_no_split = ~is_first_req_splitted
-        split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
-
-        q_wait = q_reader.wait(q_stage)
-        q_slot = q_wait.slot
-
-        e_max = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
-        e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc = tl.zeros([BLOCK_M, HALF_DIM_V], dtype=tl.float32)
-
-        n_blocks = end_block_idx - start_block_idx
-        n_full_pairs = n_blocks // 2
-        has_tail = (n_blocks - n_full_pairs * 2) > 0
-        n_pair_slots = n_full_pairs + has_tail.to(tl.int32)
-
-        for pair in tl.range(0, n_full_pairs):
-            pipe_idx = pipe_base + pair
-            k1_pipe_idx = k1_pipe_base + pair
-            block1 = start_block_idx + pair * 2 + 1
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-            k1_l_wait = k1_l_qk_reader.wait(k1_pipe_idx)
-            k1_l_slot = k1_l_wait.slot
-            k1_l = tl.load(tle.gpu.local_ptr(k1_l_slot.sK, (kv_rows, kv_cols)))
-            q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
-            qk = tl.dot(q_l, tl.trans(k1_l), qk, out_dtype=tl.float32)
-
-            k1_r_wait = k1_r_reader.wait(k1_pipe_idx)
-            k1_r_slot = k1_r_wait.slot
-            k1_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
-            q_r = tl.load(tle.gpu.local_ptr(q_slot.sQ_r))
-            qk = tl.dot(q_r, tl.trans(k1_r), qk, out_dtype=tl.float32)
-            if HAVE_TAIL:
-                k1_tail = tl.load(
-                    tle.gpu.local_ptr(k1_r_slot.sK_tail, (kv_rows_tail, kv_cols_tail))
-                )
-                q_tail = tl.load(tle.gpu.local_ptr(q_slot.sQ_tail))
-                qk = tl.dot(q_tail, tl.trans(k1_tail), qk, out_dtype=tl.float32)
-
-            valid_n = block1 * BLOCK_N + offs_n < seq_len
-            qk *= sm_scale
-            qk = tl.where(valid_n[None, :], qk, float("-inf"))
-
-            peer_wait = sM_wg0_reader.wait(pipe_idx)
-            peer_max = tl.load(tle.gpu.local_ptr(peer_wait.slot.sM))
-            sM_wg0_reader.release(pipe_idx)
-            local_max = tl.maximum(e_max, tl.max(qk, axis=1))
-            merged_max = tl.maximum(local_max, peer_max)
-            sM_slot = sM_wg1_writer.acquire(k1_pipe_idx)
-            tl.store(tle.gpu.local_ptr(sM_slot.sM), merged_max)
-            sM_wg1_writer.commit(k1_pipe_idx)
-
-            re_scale = tl.exp(e_max - merged_max)
-            p = tl.exp(qk - merged_max[:, None])
-            e_sum = e_sum * re_scale + tl.sum(p, axis=1)
-            acc = acc * re_scale[:, None]
-            p_b = p.to(k1_r.dtype)
-
-            k1_l_qk_reader.release(k1_pipe_idx)
-
-            v_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
-            acc = tl.dot(p_b, v_r, acc, out_dtype=tl.float32)
-
-            sP_slot = sP1_writer.acquire(k1_pipe_idx)
-            tl.store(tle.gpu.local_ptr(sP_slot.sP), p_b)
-            sP1_writer.commit(k1_pipe_idx)
-
-            sP0_wait = sP0_reader.wait(pipe_idx)
-            p0 = tl.load(tle.gpu.local_ptr(sP0_wait.slot.sP))
-            k0_r_wait = k0_r_remote_reader.wait(pipe_idx)
-            k0_r = tl.load(tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols)))
-            acc = tl.dot(p0, k0_r, acc, out_dtype=tl.float32)
-            sP0_reader.release(pipe_idx)
-            k0_r_remote_reader.release(pipe_idx)
-            k1_r_reader.release(k1_pipe_idx)
-            e_max = merged_max
-
-        if has_tail:
-            pipe_idx = pipe_base + n_full_pairs
-            peer_wait = sM_wg0_reader.wait(pipe_idx)
-            new_max = tl.load(tle.gpu.local_ptr(peer_wait.slot.sM))
-            sM_wg0_reader.release(pipe_idx)
-
-            re_scale = tl.exp(e_max - new_max)
-            e_sum = e_sum * re_scale
-            acc = acc * re_scale[:, None]
-            e_max = new_max
-
-            sP0_wait = sP0_reader.wait(pipe_idx)
-            p0 = tl.load(tle.gpu.local_ptr(sP0_wait.slot.sP))
-            k0_r_wait = k0_r_remote_reader.wait(pipe_idx)
-            k0_r = tl.load(tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols)))
-            acc = tl.dot(p0, k0_r, acc, out_dtype=tl.float32)
-            sP0_reader.release(pipe_idx)
-            k0_r_remote_reader.release(pipe_idx)
-
-        l_stage0 = q_stage * 2
-        l_stage1 = l_stage0 + 1
-        sL_slot = sL1_writer.acquire(l_stage1)
-        tl.store(tle.gpu.local_ptr(sL_slot.sL), e_sum)
-        sL1_writer.commit(l_stage1)
-        peer_l_wait = sL0_reader.wait(l_stage0)
-        total_sum = e_sum + tl.load(tle.gpu.local_ptr(peer_l_wait.slot.sL))
-        sL0_reader.release(l_stage0)
-        valid = total_sum > 0.0
-        safe_total_sum = tl.where(valid, total_sum, 1.0)
-        lse_vals = tl.where(valid, tl.log(safe_total_sum) + e_max, float("-inf"))
-        inv_total_sum = tl.fdiv(1.0, safe_total_sum)
-        output_row = batch_idx * head_num + head_base
-        if is_no_split:
-            out_vals = acc * inv_total_sum[:, None]
-            out_vals = tl.where(valid[:, None], out_vals, 0.0)
-            out_vals_bf16 = out_vals.to(O.dtype.element_ty)
-            tl.store(
-                tle.gpu.local_ptr(q_slot.sQ_r), out_vals_bf16, mask=mask_h[:, None]
-            )
-            tle.gpu.copy(
-                q_slot.sQ_r,
-                Output_desc,
-                [BLOCK_M, HALF_DIM_V],
-                [output_row, HALF_DIM_V],
-            )
-        else:
-            out_vals = acc * inv_total_sum[:, None]
-            out_vals = tl.where(valid[:, None], out_vals, 0.0)
-            out_vals_q = out_vals.to(O.dtype.element_ty)
-            tl.store(tle.gpu.local_ptr(q_slot.sQ_r), out_vals_q, mask=mask_h[:, None])
-            oaccum_row = split_idx * head_num + head_base
-            tle.gpu.copy(
-                q_slot.sQ_r,
-                OAccum_desc,
-                [BLOCK_M, HALF_DIM_V],
-                [oaccum_row, HALF_DIM_V],
-            )
+            split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
+            accum_row = (split_idx * head_num + m_block_idx * BLOCK_M).to(tl.int32)
+            O_accum_desc.store([accum_row, 0], out_vals)
             tl.store(
                 LSE_accum
                 + split_idx * stride_lseaccum_split
@@ -1828,15 +1588,20 @@ def _try_flash_mla_tle(
     if _force_triton_flash_mla() or not HAS_TLE_FLASH_MLA:
         return None
 
-    plan = _get_flash_mla_tle_decode_plan(
-        b=b,
-        s_q=s_q,
-        h_q=h_q,
-        h_kv=h_kv,
-        d=d,
-        dv=dv,
-        block_size=block_size,
-        dtype=q.dtype,
+    q_tle = q.contiguous()
+    kv_flat = blocked_k.contiguous().view(-1, d)
+    block_table_tle = block_table.contiguous()
+    cache_seqlens_tle = cache_seqlens.contiguous()
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _set_triton_descriptor_allocator(q.device)
+    q_flat = q_tle.view(b * s_q * h_q, d)
+    num_m_blocks = triton.cdiv(s_q * h_q // h_kv, FLASH_MLA_BLOCK_M)
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sm_parts = max(num_sms // h_kv // num_m_blocks, 1)
+    sched_meta = torch.empty(
+        (num_sm_parts, FLASH_MLA_META_FIELDS),
+        dtype=torch.int32,
         device=q.device,
         causal=causal,
         reuse_output=_reuse_tle_output(),
@@ -1848,6 +1613,108 @@ def _try_flash_mla_tle(
         cache_seqlens=cache_seqlens,
         update_metadata=True,
     )
+    total_num_splits = b + num_sm_parts
+    out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
+    out_accum = torch.empty(
+        (total_num_splits, h_q, dv), dtype=torch.float32, device=q.device
+    )
+    lse_accum = torch.empty(
+        (total_num_splits, h_q), dtype=torch.float32, device=q.device
+    )
+    out_flat = out.view(b * s_q * h_q, dv)
+    out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
+    tail_dim = d - dv
+    tail_block = triton.next_power_of_2(tail_dim) if tail_dim > 0 else 1
+    q_desc = TensorDescriptor(
+        q_flat,
+        shape=[b * s_q * h_q, d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv],
+    )
+    q_tail_desc = TensorDescriptor(
+        q_flat,
+        shape=[b * s_q * h_q, d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, tail_block],
+    )
+    kv_desc = TensorDescriptor(
+        kv_flat,
+        shape=[kv_flat.shape[0], d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_N, dv],
+    )
+    kv_tail_desc = TensorDescriptor(
+        kv_flat,
+        shape=[kv_flat.shape[0], d],
+        strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_N, tail_block],
+    )
+    out_desc = TensorDescriptor(
+        out_flat,
+        shape=[b * s_q * h_q, dv],
+        strides=[dv, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv],
+    )
+    out_accum_desc = TensorDescriptor(
+        out_accum_flat,
+        shape=[total_num_splits * h_q, dv],
+        strides=[dv, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv],
+    )
+
+    flash_mla_splitkv_tle_kernel[(num_m_blocks, num_sm_parts)](
+        q_desc,
+        q_tail_desc,
+        kv_desc,
+        kv_tail_desc,
+        block_table_tle,
+        cache_seqlens_tle,
+        sched_meta,
+        num_splits,
+        out_desc,
+        out_accum_desc,
+        lse_accum,
+        1 / math.sqrt(d),
+        h_q,
+        q_tle.stride(0),
+        q_tle.stride(2),
+        kv_flat.stride(0),
+        block_table_tle.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out_accum.stride(0),
+        out_accum.stride(1),
+        lse_accum.stride(0),
+        lse_accum.stride(1),
+        BLOCK_M=FLASH_MLA_BLOCK_M,
+        BLOCK_N=FLASH_MLA_BLOCK_N,
+        PAGE_SIZE=block_size,
+        HEAD_DIM_V=dv,
+        HEAD_DIM=d,
+        META_FIELDS=FLASH_MLA_META_FIELDS,
+        num_warps=8,
+        num_stages=1,
+    )
+
+    flash_mla_combine_kernel[(b, triton.cdiv(h_q, FLASH_MLA_COMBINE_BLOCK_H))](
+        out_accum,
+        lse_accum,
+        num_splits,
+        out,
+        h_q,
+        out_accum.stride(0),
+        out_accum.stride(1),
+        lse_accum.stride(0),
+        lse_accum.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_H=FLASH_MLA_COMBINE_BLOCK_H,
+        HEAD_DIM_V=dv,
+        MAX_SPLITS=num_sm_parts,
+        num_warps=FLASH_MLA_COMBINE_BLOCK_H,
+        num_stages=1,
+    )
+    return out.view([b, s_q, h_q, dv])
 
 
 # @triton.autotune(
