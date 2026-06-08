@@ -217,6 +217,7 @@ def _flash_mla_ws_kv_producer(
     block_table_base,
     start_block_idx,
     end_block_idx,
+    pipe_base,
     seq_len,
     BLOCK_N: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -225,7 +226,7 @@ def _flash_mla_ws_kv_producer(
 ):
     _ = seq_len
     for block_idx in tl.range(start_block_idx, end_block_idx):
-        pipe_idx = block_idx - start_block_idx
+        pipe_idx = pipe_base + block_idx - start_block_idx
         page_id = tle.load(Block_table + block_table_base + block_idx)
         kv_row = (page_id * PAGE_SIZE).to(tl.int32)
 
@@ -294,6 +295,7 @@ def _flash_mla_ws_consumer(
     is_no_split,
     start_block_idx,
     end_block_idx,
+    pipe_base,
     seq_len,
     q_row,
     out_row_base,
@@ -330,7 +332,7 @@ def _flash_mla_ws_consumer(
     acc = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
 
     for block_idx in tl.range(start_block_idx, end_block_idx):
-        pipe_idx = block_idx - start_block_idx
+        pipe_idx = pipe_base + block_idx - start_block_idx
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -394,12 +396,12 @@ def _flash_mla_ws_consumer(
         # Online softmax
         # =========================
         valid_n = block_idx * BLOCK_N + tl.arange(0, BLOCK_N) < seq_len
-        qk *= sm_scale * 1.4426950408889634
+        qk *= sm_scale
         qk = tl.where(valid_n[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, axis=1), e_max)
-        re_scale = tl.exp2(e_max - n_e_max)
-        p = tl.exp2(qk - n_e_max[:, None])
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
 
         # =========================
         # PV phase: O += P @ V
@@ -582,6 +584,7 @@ def flash_mla_splitkv_ws_tle_kernel(
     kv_tail_pipe = tle.pipe(
         capacity=1, scope="cta", name="flash_mla_ws_kv_tail", sKV=sKV_tail
     )
+    pipe_base = 0
 
     for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
         seq_len = tl.load(B_seq_len + batch_idx)
@@ -620,6 +623,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                         block_table_base,
                         start_block_idx,
                         end_block_idx,
+                        pipe_base,
                         seq_len,
                         BLOCK_N,
                         PAGE_SIZE,
@@ -651,6 +655,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                         is_no_split,
                         start_block_idx,
                         end_block_idx,
+                        pipe_base,
                         seq_len,
                         q_row,
                         out_row_base,
@@ -672,6 +677,7 @@ def flash_mla_splitkv_ws_tle_kernel(
             [4],
             [216],
         )
+        pipe_base += end_block_idx - start_block_idx
 
 
 @triton.jit
