@@ -6,7 +6,10 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
-from flaggems_vllm.ops import weight_norm_interface, weight_norm_interface_backward
+from flaggems_vllm.ops.weightnorm import (
+    weight_norm_interface,
+    weight_norm_interface_backward,
+)
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 from flaggems_vllm.utils import triton_lang_extension as ext

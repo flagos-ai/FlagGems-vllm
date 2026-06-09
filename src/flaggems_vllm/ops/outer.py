@@ -2,7 +2,8 @@ import logging
 
 import torch
 
-from flaggems_vllm.ops import mul, mv
+from flaggems_vllm.ops.mul import mul
+from flaggems_vllm.ops.mv import mv
 
 logger = logging.getLogger(__name__)
 
