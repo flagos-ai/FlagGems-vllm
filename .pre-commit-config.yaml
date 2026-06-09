@@ -1,45 +1,32 @@
 repos:
-  - repo: local
-    hooks:
-      - id: trailing-whitespace
-        name: trim trailing whitespace
-        entry: trailing-whitespace-fixer
-        language: system
-        types: [text]
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v2.3.0
+  hooks:
+  - id: check-yaml
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  - id: flake8
+    args: ["--ignore=F405,E731,W503,E203", --max-line-length=120]
+    # F405 : Name may be undefined, or defined from star imports: module
+    # E731 : Do not assign a lambda expression, use a def
+    # W503 : Line break before binary operator
+    # E203 : Whitespace before ':'
 
-      - id: end-of-file-fixer
-        name: fix end of files
-        entry: end-of-file-fixer
-        language: system
-        types: [text]
+- repo: https://github.com/pre-commit/mirrors-clang-format
+  rev: v13.0.0
+  hooks:
+    - id: clang-format
+      files: \.(cpp|h|cc|c|hpp)$
+      exclude: ^third_party/
 
-      - id: check-yaml
-        name: check yaml
-        entry: check-yaml
-        language: system
-        types: [yaml]
+- repo: https://github.com/pycqa/isort
+  rev: 5.12.0
+  hooks:
+    - id: isort
+      args: ["--profile", "black"]
 
-      - id: check-added-large-files
-        name: check for added large files
-        entry: check-added-large-files
-        language: system
-
-      - id: flake8
-        name: flake8
-        entry: flake8
-        language: system
-        types: [python]
-        args: ["--ignore=F405,E731,W503,E203,E704", --max-line-length=120]
-
-      - id: isort
-        name: isort
-        entry: isort
-        language: system
-        types: [python]
-        args: ["--profile", "black"]
-
-      - id: black
-        name: black
-        entry: black
-        language: system
-        types: [python]
+- repo: https://github.com/psf/black.git
+  rev: 23.7.0
+  hooks:
+    - id: black
+    - id: black-jupyter
