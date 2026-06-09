@@ -46,6 +46,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.utils" = ["configs/*.yaml"]
 
 [tool.scikit-build]
 build.verbose = true
