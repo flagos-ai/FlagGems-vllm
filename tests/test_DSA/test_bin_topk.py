@@ -8,9 +8,7 @@ import torch
 from flaggems_vllm.ops.DSA.bin_topk import (
     bucket_sort_topk,  # Replace with actual module name
 )
-from flaggems_vllm.ops.DSA.bin_topk import (
-    HAS_TLE,
-)
+from flaggems_vllm.ops.DSA.bin_topk import HAS_TLE
 
 
 def assert_set_similar(actual, expected, dtype, equal_nan=False):
