@@ -8,32 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  pre-commit:
-    name: pre-commit checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: check out repository
-        uses: actions/checkout@v6
-
-      - name: set up python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: install pre-commit
-        shell: bash
-        run: python -m pip install pre-commit pre-commit-hooks==4.6.0 black==24.8.0 flake8==7.1.0 isort==5.12.0
-
-      - name: run pre-commit
-        shell: bash
-        run: pre-commit run --all-files --show-diff-on-failure
-
   code-style:
     name: code style
-    needs: pre-commit
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -49,19 +25,11 @@ jobs:
 
       - name: install style tools
         shell: bash
-        run: python -m pip install black==24.8.0 flake8==7.1.0 isort==5.12.0
+        run: python -m pip install pre-commit pre-commit-hooks==4.6.0 black==24.8.0 flake8==7.1.0 isort==5.12.0
 
-      - name: check black formatting
+      - name: run pre-commit
         shell: bash
-        run: black --check .
-
-      - name: check import order
-        shell: bash
-        run: isort --check-only --profile black .
-
-      - name: run flake8
-        shell: bash
-        run: flake8 .
+        run: pre-commit run --all-files --show-diff-on-failure
 
   select-targets:
     name: select ci targets
