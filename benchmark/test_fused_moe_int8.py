@@ -87,10 +87,7 @@ class FusedMoEINT8Benchmark(base.Benchmark):
             )
             w2_int8[e] = to_int8(
                 torch.randn(
-                    hidden_size,
-                    intermediate_size,
-                    device=device,
-                    dtype=torch.float16,
+                    hidden_size, intermediate_size, device=device, dtype=torch.float16
                 )
                 * 50
             )
@@ -98,10 +95,7 @@ class FusedMoEINT8Benchmark(base.Benchmark):
         # Synthetic per-channel scales [E, output_dim]
         w1_scale = (
             torch.rand(
-                num_experts,
-                intermediate_size * 2,
-                device=device,
-                dtype=torch.float32,
+                num_experts, intermediate_size * 2, device=device, dtype=torch.float32
             )
             * 0.01
             + 0.001

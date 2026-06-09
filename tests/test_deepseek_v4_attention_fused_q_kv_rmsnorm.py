@@ -47,16 +47,10 @@ def test_fused_q_kv_rmsnorm_accuracy(tokens, qdim, kvdim):
     q_out, kv_out = fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)
 
     fg_testing.assert_close(
-        q_out,
-        _rmsnorm_ref(qr, q_weight, eps),
-        dtype=torch.bfloat16,
-        equal_nan=True,
+        q_out, _rmsnorm_ref(qr, q_weight, eps), dtype=torch.bfloat16, equal_nan=True
     )
     fg_testing.assert_close(
-        kv_out,
-        _rmsnorm_ref(kv, kv_weight, eps),
-        dtype=torch.bfloat16,
-        equal_nan=True,
+        kv_out, _rmsnorm_ref(kv, kv_weight, eps), dtype=torch.bfloat16, equal_nan=True
     )
 
 

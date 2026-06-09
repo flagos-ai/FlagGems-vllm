@@ -77,10 +77,7 @@ class CutlassScaledMMPerfKit:
         ]
         scale_shape_types = ["scalar", "vector", "matrix"]
         if_use_bias = [True, False]
-        dtypes = [
-            (torch.int8, torch.float16),
-            (torch.float8_e4m3fn, torch.bfloat16),
-        ]
+        dtypes = [(torch.int8, torch.float16), (torch.float8_e4m3fn, torch.bfloat16)]
 
         combinations = product(
             mnk, scale_shape_types, scale_shape_types, if_use_bias, dtypes
@@ -175,16 +172,9 @@ class CutlassScaledMMPerfKit:
 
 class CutlassScaledMMBenchmark(base.Benchmark):
     def __init__(self):
-        extended_dtypes = [
-            "scalar_only",
-            "vector_only",
-            "scalar_and_vector",
-            "block",
-        ]
+        extended_dtypes = ["scalar_only", "vector_only", "scalar_and_vector", "block"]
         super().__init__(
-            "cutlass_scaled_mm",
-            torch.ops._C.cutlass_scaled_mm,
-            extended_dtypes,
+            "cutlass_scaled_mm", torch.ops._C.cutlass_scaled_mm, extended_dtypes
         )
         self.set_gems(flaggems_vllm.cutlass_scaled_mm)
         self.kit = CutlassScaledMMPerfKit

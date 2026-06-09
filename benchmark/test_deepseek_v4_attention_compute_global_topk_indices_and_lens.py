@@ -40,13 +40,7 @@ class ComputeGlobalTopkIndicesAndLensBenchmark(base.Benchmark):
 
     def get_input_iter(self, dtype):
         _ = dtype
-        for (
-            num_tokens,
-            topk,
-            num_reqs,
-            blocks_per_req,
-            block_size,
-        ) in self.shapes:
+        for num_tokens, topk, num_reqs, blocks_per_req, block_size in self.shapes:
             topk_indices = torch.randint(
                 -1,
                 blocks_per_req * block_size,

@@ -63,12 +63,7 @@ def recompute_w_u_fwd_kernel(
     )
     p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
     p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT,
-        (T, BT),
-        (H * BT, 1),
-        (i_t * BT, 0),
-        (BT, BT),
-        (1, 0),
+        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
     b_beta = tl.load(p_beta, boundary_check=(0,))
     b_A = tl.load(p_A, boundary_check=(0, 1))

@@ -1,6 +1,10 @@
-# isort: off
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.attention import (
+    flash_attention_forward,
+    flash_attn_varlen_func,
+    flash_attn_varlen_opt_func,
+)
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
@@ -25,11 +29,6 @@ from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_fwd,
-)
-from flaggems_vllm.ops.attention import (
-    flash_attention_forward,
-    flash_attn_varlen_func,
-    flash_attn_varlen_opt_func,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
@@ -92,13 +91,11 @@ from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
 from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
 from flaggems_vllm.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.ops.weight_norm import weight_norm
 from flaggems_vllm.ops.weightnorm import (
     weight_norm_interface,
     weight_norm_interface_backward,
 )
-from flaggems_vllm.ops.weight_norm import weight_norm
-
-# isort: on
 
 __all__ = [
     "add_rms_norm",

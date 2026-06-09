@@ -84,10 +84,7 @@ class FlashmlaSparseBenchmark(base.Benchmark):
 
     @staticmethod
     def _randperm_batch(
-        batch_size: int,
-        perm_range: torch.Tensor,
-        perm_size: int,
-        paddings: List[int],
+        batch_size: int, perm_range: torch.Tensor, perm_size: int, paddings: List[int]
     ) -> torch.Tensor:
         """
         Generate random permutations in batch
@@ -112,8 +109,7 @@ class FlashmlaSparseBenchmark(base.Benchmark):
             res[res >= perm_range.view(batch_size, 1)] = paddings[0]
         else:
             fillers = torch.tensor(paddings, dtype=torch.int32).index_select(
-                0,
-                torch.randint(0, len(paddings), (res.numel(),), dtype=torch.int32),
+                0, torch.randint(0, len(paddings), (res.numel(),), dtype=torch.int32)
             )
             res.masked_scatter_(res >= perm_range.view(batch_size, 1), fillers)
         torch.use_deterministic_algorithms(False)

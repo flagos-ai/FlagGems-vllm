@@ -100,11 +100,7 @@ def test_cross_entropy_loss_probabilities(shape, dtype, reduction, label_smoothi
         label_smoothing=label_smoothing,
     )
     res_out = flaggems_vllm.cross_entropy_loss(
-        inp,
-        target,
-        weight=weight,
-        reduction=reduction,
-        label_smoothing=label_smoothing,
+        inp, target, weight=weight, reduction=reduction, label_smoothing=label_smoothing
     )
 
     utils.gems_assert_close(res_out, ref_out, dtype, reduce_dim=shape[dim])

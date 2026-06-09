@@ -91,10 +91,7 @@ class FusedMoEINT4W4A16Benchmark(base.Benchmark):
         # Per-channel scales [E, output_dim]
         w1_scale = (
             torch.rand(
-                num_experts,
-                intermediate_size * 2,
-                device=device,
-                dtype=torch.float32,
+                num_experts, intermediate_size * 2, device=device, dtype=torch.float32
             )
             * 0.01
             + 0.001

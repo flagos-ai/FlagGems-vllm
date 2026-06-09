@@ -5,6 +5,13 @@ import flaggems_vllm
 
 from . import accuracy_utils as utils
 
+try:
+    from transformer_engine.pytorch import cpp_extensions as tex
+
+    TE_AVAILABLE = True
+except ImportError:
+    TE_AVAILABLE = False
+
 
 def generate_input(
     shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
@@ -26,6 +33,7 @@ VALID_POINTWISE_SHAPES = filter_valid_shapes(utils.SWIGLU_SPECIAL_SHAPES)
 
 
 @pytest.mark.dswiglu
+@pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine is required")
 @pytest.mark.parametrize("shape", VALID_POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_dswiglu(shape: tuple[int, ...], dtype: torch.dtype):
@@ -38,14 +46,8 @@ def test_dswiglu(shape: tuple[int, ...], dtype: torch.dtype):
     grad_shape[-1] = grad_shape[-1] // 2
     grad_output = generate_input(tuple(grad_shape), dtype, device)
 
-    x1, x2 = input_tensor.float().chunk(2, dim=-1)
-    grad_output_fp32 = grad_output.float()
-    sigmoid_x1 = torch.sigmoid(x1)
-    silu_x1 = x1 * sigmoid_x1
-    grad_silu = sigmoid_x1 + x1 * sigmoid_x1 * (1 - sigmoid_x1)
-    grad_x1 = grad_output_fp32 * x2 * grad_silu
-    grad_x2 = grad_output_fp32 * silu_x1
-    te_grad_input = utils.to_reference(torch.cat((grad_x1, grad_x2), dim=-1))
+    te_grad_input = tex.dswiglu(grad_output, input_tensor, quantizer=None).to(device)
+    te_grad_input = utils.to_reference(te_grad_input)
 
     with flaggems_vllm.use_gems():
         fg_grad_input = flaggems_vllm.dswiglu(grad_output, input_tensor, quantizer=None)

@@ -30,13 +30,7 @@ def compute_correlation(a, b, label="tensor"):
 
 
 def assert_close_inf(
-    a,
-    b,
-    tolerance=1e-8,
-    tensor_name="tensor",
-    should_raise=True,
-    ks=None,
-    ke=None,
+    a, b, tolerance=1e-8, tensor_name="tensor", should_raise=True, ks=None, ke=None
 ):
     a_finite = torch.isfinite(a)
     b_finite = torch.isfinite(b)
@@ -134,11 +128,7 @@ def make_lighting_indexer_input(
     # p = (torch.randn(S, SKV, device="cuda", dtype=torch.float32) * 4).softmax(dim=-1)
 
     ks, ke = generate_random_cu_seqlens(
-        per_cp_seqlen=S,
-        cp_size=3,
-        cp_rank=4,
-        kv_stride=kv_stride,
-        average_q_len=2048,
+        per_cp_seqlen=S, cp_size=3, cp_rank=4, kv_stride=kv_stride, average_q_len=2048
     )
 
     return q, kv, weights, ks, ke
@@ -169,11 +159,7 @@ def reference_lighting_indexer_implementation(q, kv, weights, ks, ke):
 @pytest.mark.parametrize("qk_dim", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_lighting_indexer_forward(
-    seq_len_q: int,
-    seq_len_kv: int,
-    num_heads: int,
-    qk_dim: int,
-    dtype: torch.dtype,
+    seq_len_q: int, seq_len_kv: int, num_heads: int, qk_dim: int, dtype: torch.dtype
 ):
     # Create input
     q, kv, weights, ks, ke = make_lighting_indexer_input(

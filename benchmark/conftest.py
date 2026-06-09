@@ -13,7 +13,7 @@ from . import consts
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
-recordLogger = logging.getLogger("flag_gems_benchmark")
+recordLogger = logging.getLogger("flaggems_vllm_benchmark")
 recordLogger.propagate = False
 Config = None
 

@@ -101,10 +101,7 @@ class FusedMoEFP8Benchmark(base.Benchmark):
             )
             w2_fp8[e] = to_fp8(
                 torch.randn(
-                    hidden_size,
-                    intermediate_size,
-                    device=device,
-                    dtype=torch.float16,
+                    hidden_size, intermediate_size, device=device, dtype=torch.float16
                 )
             )
 

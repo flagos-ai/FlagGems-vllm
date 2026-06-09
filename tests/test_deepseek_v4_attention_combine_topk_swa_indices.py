@@ -133,17 +133,7 @@ def test_combine_topk_swa_indices_vllm_accuracy():
     query_start_loc = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
     seq_lens = torch.tensor([8, 10], device=device, dtype=torch.int32)
     gather_lens = torch.tensor([8, 10], device=device, dtype=torch.int32)
-    args = (
-        topk_indices,
-        query_start_loc,
-        seq_lens,
-        gather_lens,
-        4,
-        2,
-        4,
-        64,
-        16,
-    )
+    args = (topk_indices, query_start_loc, seq_lens, gather_lens, 4, 2, 4, 64, 16)
 
     actual, actual_lens = combine_topk_swa_indices(*args)
     expected, expected_lens = vllm_combine_topk_swa_indices(*args)

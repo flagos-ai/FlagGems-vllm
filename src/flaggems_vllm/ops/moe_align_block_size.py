@@ -155,11 +155,7 @@ def moe_align_block_size_tle_atomic_fused_coop(
         pid * BLOCK_TOKENS, numel_sorted_token_ids, NUM_BLOCKS * BLOCK_TOKENS
     ):
         offs = base + token_offsets
-        tl.store(
-            sorted_token_ids_ptr + offs,
-            numel,
-            mask=offs < numel_sorted_token_ids,
-        )
+        tl.store(sorted_token_ids_ptr + offs, numel, mask=offs < numel_sorted_token_ids)
     for base in range(pid * BLOCK_TOKENS, numel_expert_ids, NUM_BLOCKS * BLOCK_TOKENS):
         offs = base + token_offsets
         tl.store(expert_ids_ptr + offs, 0, mask=offs < numel_expert_ids)
@@ -246,9 +242,7 @@ def moe_align_block_size_tle_atomic_fused_coop(
             count_ptrs, 1, mask=mask, sem="relaxed", scope="cta"
         )
         rank_base = tl.load(
-            tle.gpu.local_ptr(expert_starts_local, (expert_id,)),
-            mask=mask,
-            other=0,
+            tle.gpu.local_ptr(expert_starts_local, (expert_id,)), mask=mask, other=0
         )
         rank_post_pad = rank_with_prefix + rank_base
         tl.store(sorted_token_ids_ptr + rank_post_pad, offs, mask=mask)
@@ -284,17 +278,13 @@ def moe_align_block_size_tle_cluster_fused(
 
     init_offsets = tl.arange(0, BLOCK_TOKENS)
     for base in range(
-        cluster_rank * BLOCK_TOKENS,
-        numel_sorted_token_ids,
-        CLUSTER_SIZE * BLOCK_TOKENS,
+        cluster_rank * BLOCK_TOKENS, numel_sorted_token_ids, CLUSTER_SIZE * BLOCK_TOKENS
     ):
         offs = base + init_offsets
         mask = offs < numel_sorted_token_ids
         tl.store(sorted_token_ids_ptr + offs, numel, mask=mask)
     for base in range(
-        cluster_rank * BLOCK_TOKENS,
-        numel_expert_ids,
-        CLUSTER_SIZE * BLOCK_TOKENS,
+        cluster_rank * BLOCK_TOKENS, numel_expert_ids, CLUSTER_SIZE * BLOCK_TOKENS
     ):
         offs = base + init_offsets
         mask = offs < numel_expert_ids
@@ -618,9 +608,7 @@ def moe_align_block_size_triton(
     # to prevent out-of-bounds address access.
     cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
     tokens_cnts = torch.zeros(
-        (num_experts + 1, num_experts),
-        dtype=torch.int32,
-        device=topk_ids.device,
+        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
     )
     num_experts_next_power_of_2 = triton.next_power_of_2(num_experts)
 

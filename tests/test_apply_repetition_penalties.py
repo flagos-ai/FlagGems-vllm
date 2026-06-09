@@ -23,9 +23,7 @@ def _init_vllm():
             for i in range(logits.shape[0]):
                 m = pm[i] | om[i]
                 logits[i][m] = torch.where(
-                    logits[i][m] > 0,
-                    logits[i][m] / pens[i],
-                    logits[i][m] * pens[i],
+                    logits[i][m] > 0, logits[i][m] / pens[i], logits[i][m] * pens[i]
                 )
 
         return fallback, True
@@ -72,12 +70,7 @@ def test_apply_repetition_penalty(shape, penalty, dtype, mask_mode):
     penalties = torch.full((shape[0],), penalty, dtype=dtype, device=device)
 
     logits_vllm = logits.clone()
-    _vllm_fn(
-        logits_vllm,
-        prompt_mask.clone(),
-        output_mask.clone(),
-        penalties.clone(),
-    )
+    _vllm_fn(logits_vllm, prompt_mask.clone(), output_mask.clone(), penalties.clone())
     ref = utils.to_reference(logits_vllm, True).to(dtype)
 
     with flaggems_vllm.use_gems():
@@ -92,8 +85,7 @@ def test_apply_repetition_penalty(shape, penalty, dtype, mask_mode):
     should_modify = has_mask and penalty != 1.0
     if should_modify:
         assert not torch.equal(
-            utils.to_reference(logits, True),
-            utils.to_reference(logits_ori, True),
+            utils.to_reference(logits, True), utils.to_reference(logits_ori, True)
         ), "In-place not working"
     elif mask_mode == "empty":
         utils.gems_assert_close(

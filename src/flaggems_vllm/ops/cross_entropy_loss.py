@@ -625,27 +625,11 @@ class CrossEntropyLoss(torch.autograd.Function):
         grid = lambda meta: (triton.cdiv(D, meta["BLOCK_D"]), N)
         if tgt.ndim == inp.ndim:
             celoss_probability_bwd[grid](
-                out_grad,
-                inp,
-                tgt,
-                weight,
-                inp_grad,
-                label_smoothing,
-                mean_num,
-                C,
-                D,
+                out_grad, inp, tgt, weight, inp_grad, label_smoothing, mean_num, C, D
             )
         elif label_smoothing == 0:
             celoss_indices_bwd[grid](
-                out_grad,
-                inp,
-                tgt,
-                weight,
-                inp_grad,
-                ignore_index,
-                mean_num,
-                C,
-                D,
+                out_grad, inp, tgt, weight, inp_grad, ignore_index, mean_num, C, D
             )
         else:
             celoss_indices_smooth_bwd[grid](
@@ -664,12 +648,7 @@ class CrossEntropyLoss(torch.autograd.Function):
 
 
 def cross_entropy_loss(
-    inp,
-    target,
-    weight=None,
-    reduction="mean",
-    ignore_index=-100,
-    label_smoothing=0.0,
+    inp, target, weight=None, reduction="mean", ignore_index=-100, label_smoothing=0.0
 ):
     return CrossEntropyLoss.apply(
         inp,

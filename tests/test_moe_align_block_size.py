@@ -187,19 +187,11 @@ def test_accuracy_moe_align_block_size(num_experts, block_size, topk_ids_shape):
         """
         # Group tokens by expert from the golden implementation
         golden_expert_tokens = _group_tokens_by_expert(
-            golden_sorted_ids,
-            expert_ids,
-            block_size,
-            valid_length,
-            total_tokens,
+            golden_sorted_ids, expert_ids, block_size, valid_length, total_tokens
         )
 
         actual_expert_tokens = _group_tokens_by_expert(
-            actual_sorted_ids,
-            expert_ids,
-            block_size,
-            valid_length,
-            total_tokens,
+            actual_sorted_ids, expert_ids, block_size, valid_length, total_tokens
         )
 
         assert set(golden_expert_tokens.keys()) == set(actual_expert_tokens.keys()), (
@@ -209,12 +201,10 @@ def test_accuracy_moe_align_block_size(num_experts, block_size, topk_ids_shape):
 
         for expert_id in golden_expert_tokens:
             golden_tokens = torch.tensor(
-                golden_expert_tokens[expert_id],
-                device=actual_sorted_ids.device,
+                golden_expert_tokens[expert_id], device=actual_sorted_ids.device
             )
             actual_tokens = torch.tensor(
-                actual_expert_tokens[expert_id],
-                device=actual_sorted_ids.device,
+                actual_expert_tokens[expert_id], device=actual_sorted_ids.device
             )
             assert torch.equal(
                 torch.sort(golden_tokens)[0], torch.sort(actual_tokens)[0]
@@ -241,7 +231,5 @@ def test_accuracy_moe_align_block_size(num_experts, block_size, topk_ids_shape):
         expert_ids, utils.to_reference(expert_ids_vllm), dtype=dtype
     )
     utils.gems_assert_close(
-        num_tokens_post_pad,
-        utils.to_reference(num_tokens_post_pad_vllm),
-        dtype=dtype,
+        num_tokens_post_pad, utils.to_reference(num_tokens_post_pad_vllm), dtype=dtype
     )

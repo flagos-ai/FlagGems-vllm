@@ -82,11 +82,7 @@ def convert_fp8(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize(
     "device",
-    (
-        [flaggems_vllm.device]
-        if flaggems_vllm.vendor_name == "mthreads"
-        else CUDA_DEVICES
-    ),
+    [flaggems_vllm.device] if flaggems_vllm.vendor_name == "mthreads" else CUDA_DEVICES,
 )
 @pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPE)
 @torch.inference_mode()
@@ -152,10 +148,7 @@ def test_concat_and_cache_mla(
                 torch.empty_like(ref_kv_cache, dtype=torch.uint8)
             )
             convert_fp8(
-                expected_temp,
-                ref_kv_cache,
-                scale.item(),
-                kv_dtype=kv_cache_dtype,
+                expected_temp, ref_kv_cache, scale.item(), kv_dtype=kv_cache_dtype
             )
             dtype = torch.float8_e4m3fn
             result_temp = to_reference(result_temp)

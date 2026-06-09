@@ -38,14 +38,7 @@ try:
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
     ):
         torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            seq_lens,
-            indices,
-            num_rows,
-            stride0,
-            stride1,
-            top_k,
+            logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
         )
 
     HAS_VLLM = True

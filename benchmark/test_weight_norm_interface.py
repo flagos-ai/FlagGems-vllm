@@ -3,7 +3,7 @@ import torch
 
 import flaggems_vllm
 
-from . import base
+from . import base, consts
 
 vendor_name = flaggems_vllm.vendor_name
 
@@ -52,7 +52,7 @@ def test_weight_norm_interface_backward():
         op_name="weight_norm_interface_backward",
         input_fn=weight_norm_interface_backward_input_fn,
         torch_op=torch.ops.aten._weight_norm_interface_backward,
-        dtypes=[torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.set_gems(flaggems_vllm.weight_norm_interface_backward)
 

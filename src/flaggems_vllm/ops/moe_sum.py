@@ -48,7 +48,7 @@ def moe_sum_kernel(
 
     tl.store(
         output_ptr_pos,
-        (acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc),
+        acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc,
         mask=hidden_mask,
     )
 
@@ -61,10 +61,7 @@ def moe_sum(
     num_tokens, topk, hidden_size = input.shape
     input_strides = input.stride()
     output_strides = output.stride()
-    grid = lambda meta: (
-        num_tokens,
-        triton.cdiv(hidden_size, meta["BLOCK_SIZE"]),
-    )
+    grid = lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_SIZE"]))
     moe_sum_kernel[grid](
         input,
         output,

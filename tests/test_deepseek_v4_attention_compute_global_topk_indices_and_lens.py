@@ -18,13 +18,7 @@ except Exception:
 
 
 @pytest.mark.parametrize(
-    (
-        "topk_values",
-        "req_values",
-        "block_table_values",
-        "valid_values",
-        "block_size",
-    ),
+    ("topk_values", "req_values", "block_table_values", "valid_values", "block_size"),
     [
         (
             [[0, 3, -1, 7], [2, -1, 4, 5], [1, 0, -1, -1]],
@@ -53,11 +47,7 @@ def test_compute_global_topk_indices_and_lens_accuracy(
     is_valid_token = torch.tensor(valid_values, device=device, dtype=torch.int32)
 
     actual_indices, actual_lens = compute_global_topk_indices_and_lens(
-        topk_indices,
-        token_to_req_indices,
-        block_table,
-        block_size,
-        is_valid_token,
+        topk_indices, token_to_req_indices, block_table, block_size, is_valid_token
     )
 
     expected = torch.full_like(topk_indices, -1)
@@ -99,13 +89,7 @@ def test_compute_global_topk_indices_and_lens_vllm_accuracy():
         [[11, 12, 13, 14], [21, 22, 23, 24]], device=device, dtype=torch.int32
     )
     is_valid_token = torch.tensor([1, 1, 0], device=device, dtype=torch.int32)
-    args = (
-        topk_indices,
-        token_to_req_indices,
-        block_table,
-        64,
-        is_valid_token,
-    )
+    args = (topk_indices, token_to_req_indices, block_table, 64, is_valid_token)
 
     actual_indices, actual_lens = compute_global_topk_indices_and_lens(*args)
     expected_indices, expected_lens = vllm_compute_global_topk_indices_and_lens(*args)

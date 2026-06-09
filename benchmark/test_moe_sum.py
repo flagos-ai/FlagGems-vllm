@@ -19,11 +19,7 @@ def _input_fn(shape, dtype, device):
     )
 
     output_tensor = torch.empty(
-        num_tokens,
-        hidden_size,
-        dtype=dtype,
-        device=device,
-        requires_grad=False,
+        num_tokens, hidden_size, dtype=dtype, device=device, requires_grad=False
     )
     yield input_tensor, output_tensor
 

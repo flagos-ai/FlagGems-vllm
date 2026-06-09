@@ -5,6 +5,14 @@ import flaggems_vllm
 
 from . import accuracy_utils as utils
 
+try:
+    from transformer_engine.pytorch import cpp_extensions as tex
+
+    TE_AVAILABLE = True
+except ImportError:
+    TE_AVAILABLE = False
+
+
 DREGLU_SHAPES = [
     (),
     (1,),
@@ -24,6 +32,7 @@ DREGLU_SHAPES = [
 @pytest.mark.dreglu
 @pytest.mark.parametrize("shape", DREGLU_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine is required")
 def test_dreglu(shape, dtype):
     if len(shape) == 0:
         # dreglu does not support 0-dim scalar tensors.
@@ -42,10 +51,7 @@ def test_dreglu(shape, dtype):
         tuple(grad_output_shape), dtype=dtype, device=flaggems_vllm.device
     )
 
-    x1, x2 = input_tensor.chunk(2, dim=-1)
-    grad_x1 = grad_output * (x1 > 0).to(x1.dtype) * x2
-    grad_x2 = grad_output * torch.relu(x1)
-    ref_out = torch.cat((grad_x1, grad_x2), dim=-1)
+    ref_out = tex.dreglu(grad_output, input_tensor, None)
     ref_out = utils.to_reference(ref_out)
     with flaggems_vllm.use_gems():
         res_out = flaggems_vllm.dreglu(grad_output, input_tensor, None)

@@ -29,7 +29,7 @@ else:
     TOPK_LIST = [1, 2]
     RENORMALIZE_LIST = [True, False]
     SCORING_FUNC_LIST = [0, 1]
-    DTYPE_LIST = [torch.float32]
+    DTYPE_LIST = [torch.bfloat16, torch.float32]
 
 try:
     from vllm._custom_ops import grouped_topk as vllm_grouped_topk
@@ -130,7 +130,7 @@ def test_grouped_topk(
 @pytest.mark.parametrize("topk_group", [2])
 @pytest.mark.parametrize("renormalize", [True, False])
 @pytest.mark.parametrize("scoring_func", [0, 1])
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_grouped_topk_large_scale(
     n_token,
     n_expert,
@@ -205,14 +205,7 @@ def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
 
     with flaggems_vllm.use_gems():
         res_weights, res_ids = flaggems_vllm.grouped_topk(
-            scores.clone(),
-            4,
-            2,
-            2,
-            renormalize,
-            routed_scaling_factor,
-            bias,
-            0,
+            scores.clone(), 4, 2, 2, renormalize, routed_scaling_factor, bias, 0
         )
 
     utils.gems_assert_equal(res_ids, ref_ids)

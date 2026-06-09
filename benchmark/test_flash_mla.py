@@ -32,9 +32,7 @@ def test_flash_mla(monkeypatch):
         causal = True
         block_size = 64
         cache_seqlens = torch.tensor(
-            [seqlen + 2 * i for i in range(b)],
-            dtype=torch.int32,
-            device=device,
+            [seqlen + 2 * i for i in range(b)], dtype=torch.int32, device=device
         )
         max_seqlen = cache_seqlens.max().item()
         max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
@@ -44,9 +42,7 @@ def test_flash_mla(monkeypatch):
             b * max_seqlen_pad // block_size, dtype=torch.int32, device=device
         ).view(b, max_seqlen_pad // block_size)
         blocked_k = torch.randn(
-            [block_table.numel(), block_size, h_kv, d],
-            dtype=dtype,
-            device=device,
+            [block_table.numel(), block_size, h_kv, d], dtype=dtype, device=device
         )
         yield q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal
 

@@ -97,9 +97,7 @@ class MHCPreBenchmark(base.Benchmark):
             )
             fn = (
                 torch.randn(
-                    (hc_mult3, hc_mult, hidden_size),
-                    dtype=torch.float,
-                    device=device,
+                    (hc_mult3, hc_mult, hidden_size), dtype=torch.float, device=device
                 )
                 * 1e-4
                 * (1 + torch.arange(hc_mult, device=device).mul(0.01).view(1, -1, 1))
@@ -248,9 +246,7 @@ class HCHeadFusedBenchmark(base.Benchmark):
             torch.manual_seed(42)
             hs_flat = torch.randn((n, hc_mult, hidden_size), dtype=dtype, device=device)
             fn = torch.randn(
-                (hc_mult, hc_mult * hidden_size),
-                dtype=torch.float32,
-                device=device,
+                (hc_mult, hc_mult * hidden_size), dtype=torch.float32, device=device
             )
             hc_scale = torch.randn((1,), dtype=torch.float32, device=device) * 0.1
             hc_base = torch.randn((hc_mult,), dtype=torch.float32, device=device) * 0.1
@@ -263,15 +259,7 @@ def _hc_head_fused_kernel_ref(
     hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
 ):
     _vllm_hc_head_fused(
-        hs_flat,
-        fn,
-        hc_scale,
-        hc_base,
-        out,
-        hidden_size,
-        rms_eps,
-        hc_eps,
-        hc_mult,
+        hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
     )
     return out
 

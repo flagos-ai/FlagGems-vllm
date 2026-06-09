@@ -82,16 +82,6 @@ def _gems_fused_inv_rope_fp8_quant(
     )
 
 
-class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = [(1, 8, 1, True), (16, 64, 8, True)]
-    DEFAULT_SHAPE_DESC = "num_tokens, num_heads, n_groups, tma_aligned_scales"
-
-    def init_user_config(self):
-        super().init_user_config()
-        if any(len(shape) != 4 for shape in self.shapes):
-            self.shapes = self.DEFAULT_SHAPES
-
-
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.skipif(
@@ -99,7 +89,7 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
     reason="vLLM fused_inv_rope_fp8_quant not installed",
 )
 def test_fused_inv_rope_fp8_quant():
-    bench = FusedInvRopeFP8QuantBenchmark(
+    bench = base.GenericBenchmark(
         op_name="fused_inv_rope_fp8_quant",
         input_fn=_input_fn,
         torch_op=vllm_fused_inv_rope_fp8_quant,

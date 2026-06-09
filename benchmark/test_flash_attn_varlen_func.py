@@ -177,10 +177,7 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
             if alibi:
                 alibi_slopes = (
                     torch.ones(
-                        num_seqs,
-                        num_query_heads,
-                        device=device,
-                        dtype=torch.float32,
+                        num_seqs, num_query_heads, device=device, dtype=torch.float32
                     )
                     * 0.3
                 )

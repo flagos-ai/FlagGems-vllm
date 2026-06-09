@@ -48,9 +48,7 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
             torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
             [torch.bfloat16],
         )
-        self.set_gems(
-            flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-        )
+        self.set_gems(flaggems_vllm.ops_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
@@ -151,31 +149,17 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
         num_blocks = (num_tokens + block_size - 1) // block_size + 1
         slot_mapping = torch.arange(num_tokens_insert, dtype=torch.int64, device=device)
         k_cache = torch.zeros(
-            num_blocks,
-            block_size * HEAD_BYTES,
-            dtype=torch.uint8,
-            device=device,
+            num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
         )
-        yield (
-            q,
-            kv,
-            k_cache,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            eps,
-            block_size,
-        )
+        yield (q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
 @pytest.mark.skipif(
-    not VLLM_REF_AVAILABLE,
-    reason="The referenced vLLM implementation is not installed",
+    not VLLM_REF_AVAILABLE, reason="The referenced vLLM implementation is not installed"
 )
 @pytest.mark.skipif(
-    not is_support_fp8e4nv(),
-    reason="Do not support fp8e4nv when capability < 89",
+    not is_support_fp8e4nv(), reason="Do not support fp8e4nv when capability < 89"
 )
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert():
     bench = FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark()

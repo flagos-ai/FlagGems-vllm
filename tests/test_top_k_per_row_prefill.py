@@ -102,14 +102,7 @@ def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
 
     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
     top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices_test,
-        num_rows,
-        stride0,
-        stride1,
-        top_k,
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
     )
 
     assert check_topk_values_match(
@@ -120,8 +113,7 @@ def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
 @pytest.mark.top_k_per_row_prefill
 @pytest.mark.parametrize("num_rows", [1, 32])
 @pytest.mark.parametrize(
-    "vocab_size",
-    [20000, 129280],  # 20000: smaller vocab for edge case coverage
+    "vocab_size", [20000, 129280]  # 20000: smaller vocab for edge case coverage
 )
 @pytest.mark.parametrize(
     "top_k", [1024, 2048]  # 2048: tests larger top_k (used in some configs)
@@ -148,14 +140,7 @@ def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
 
     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
     top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices_test,
-        num_rows,
-        stride0,
-        stride1,
-        top_k,
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
     )
 
     assert check_topk_values_match(
@@ -181,11 +166,7 @@ def test_top_k_per_row_prefill_nonzero_starts(num_rows):
     row_starts = torch.randint(0, 1000, (num_rows,), dtype=torch.int32, device=device)
     # row_ends in [top_k+1000, vocab_size]: ensures enough valid range after start
     row_ends = torch.randint(
-        top_k + 1000,
-        vocab_size + 1,
-        (num_rows,),
-        dtype=torch.int32,
-        device=device,
+        top_k + 1000, vocab_size + 1, (num_rows,), dtype=torch.int32, device=device
     )
     stride0 = logits.stride(0)
     stride1 = logits.stride(1)
@@ -194,14 +175,7 @@ def test_top_k_per_row_prefill_nonzero_starts(num_rows):
 
     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
     top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices_test,
-        num_rows,
-        stride0,
-        stride1,
-        top_k,
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
     )
 
     assert check_topk_values_match(

@@ -71,10 +71,7 @@ class CutlassScaledMMTestKit:
         ]
         scale_shape_types = ["scalar", "vector", "matrix"]
         if_use_bias = [True, False]
-        dtypes = [
-            (torch.int8, torch.float16),
-            (torch.float8_e4m3fn, torch.bfloat16),
-        ]
+        dtypes = [(torch.int8, torch.float16), (torch.float8_e4m3fn, torch.bfloat16)]
 
         combinations = product(
             mnk, scale_shape_types, scale_shape_types, if_use_bias, dtypes
@@ -154,11 +151,7 @@ class CutlassScaledMMTestKit:
                     assert s % t.shape[i] == 0
                     t = (
                         t.unsqueeze(i + 1)
-                        .expand(
-                            *t.shape[: i + 1],
-                            s // t.shape[i],
-                            *t.shape[i + 1 :],
-                        )
+                        .expand(*t.shape[: i + 1], s // t.shape[i], *t.shape[i + 1 :])
                         .flatten(i, i + 1)
                     )
             return t

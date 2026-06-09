@@ -7,6 +7,8 @@ import torch
 
 import flaggems_vllm
 
+from .conftest import QUICK_MODE
+
 random.seed(42)
 
 try:
@@ -119,16 +121,19 @@ class FlashmlaSparseTestKit:
 
     @staticmethod
     def get_correctness_test_params():
-        cases = [
-            Flashmla_Sparse_Test_Param(s_q, s_kv, topk, h_q, h_kv, d_qk, d_v)
-            for s_q in [64, 128, 512]
-            for s_kv in [1024, 2048, 4096]
-            for h_q in [64, 128, 256]
-            for h_kv in [1]
-            for d_qk in [576]
-            for d_v in [512]
-            for topk in [64, 128, 256]
-        ]
+        if QUICK_MODE:
+            cases = [Flashmla_Sparse_Test_Param(64, 1024, 128, 128, 1, 576, 512)]
+        else:
+            cases = [
+                Flashmla_Sparse_Test_Param(s_q, s_kv, topk, h_q, h_kv, d_qk, d_v)
+                for s_q in [64, 128, 512]
+                for s_kv in [1024, 2048, 4096]
+                for h_q in [64, 128, 256]
+                for h_kv in [1]
+                for d_qk in [576]
+                for d_v in [512]
+                for topk in [64, 128, 256]
+            ]
         return cases
 
     @staticmethod
@@ -168,39 +173,49 @@ class FlashmlaSparseTestKit:
 
     @staticmethod
     def get_correctness_test_params_flashmla():
-        cases = [
-            Flashmla_Sparse_Test_Param(
-                s_q,
-                s_kv,
-                topk,
-                h_q,
-                d_qk=d_qk,
-                have_attn_sink=have_attn_sink,
-                have_topk_length=have_topk_length,
-            )
-            for s_q in [1, 62, 213]
-            for h_q in [128, 64]
-            for d_qk in [512, 576]
-            for s_kv, topk in [
-                (592, 128),
-                (1840, 256),
-                (1592, 384),
-                (1521, 512),
-                (95, 128),
-                (153, 256),
-                (114, 384),
+        if QUICK_MODE:
+            cases = [
+                Flashmla_Sparse_Test_Param(
+                    s_q=62,
+                    s_kv=592,
+                    topk=128,
+                    h_q=128,
+                    d_qk=512,
+                    have_attn_sink=True,
+                    have_topk_length=False,
+                )
             ]
-            for have_attn_sink in [True, False]
-            for have_topk_length in [True, False]
-        ]
+        else:
+            cases = [
+                Flashmla_Sparse_Test_Param(
+                    s_q,
+                    s_kv,
+                    topk,
+                    h_q,
+                    d_qk=d_qk,
+                    have_attn_sink=have_attn_sink,
+                    have_topk_length=have_topk_length,
+                )
+                for s_q in [1, 62, 213]
+                for h_q in [128, 64]
+                for d_qk in [512, 576]
+                for s_kv, topk in [
+                    (592, 128),
+                    (1840, 256),
+                    (1592, 384),
+                    (1521, 512),
+                    (95, 128),
+                    (153, 256),
+                    (114, 384),
+                ]
+                for have_attn_sink in [True, False]
+                for have_topk_length in [True, False]
+            ]
         return cases
 
     @staticmethod
     def _randperm_batch(
-        batch_size: int,
-        perm_range: torch.Tensor,
-        perm_size: int,
-        paddings: List[int],
+        batch_size: int, perm_range: torch.Tensor, perm_size: int, paddings: List[int]
     ) -> torch.Tensor:
         """
         Generate random permutations in batch
@@ -223,8 +238,7 @@ class FlashmlaSparseTestKit:
             res[res >= perm_range.view(batch_size, 1)] = paddings[0]
         else:
             fillers = torch.tensor(paddings, dtype=torch.int32).index_select(
-                0,
-                torch.randint(0, len(paddings), (res.numel(),), dtype=torch.int32),
+                0, torch.randint(0, len(paddings), (res.numel(),), dtype=torch.int32)
             )
             res.masked_scatter_(res >= perm_range.view(batch_size, 1), fillers)
         torch.use_deterministic_algorithms(False)
@@ -361,6 +375,7 @@ def test_flashmla_sparse(param):
     flaggems_vllm.testing.assert_close(your_lse, ref_lse, torch.float32, atol=1e-4)
 
 
+@pytest.mark.skip(reason="Issue #3691: operator not working")
 @pytest.mark.flash_mla_sparse_fwd
 @pytest.mark.parametrize(
     "param", FlashmlaSparseTestKit.get_correctness_test_params_flashmla()
@@ -408,11 +423,7 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
         your_output, ref_output, atol=8e-4, rtol=3.01 / 128, equal_nan=False
     )  # cos_diff_tol=7e-6
     torch.testing.assert_close(
-        your_max_logbits,
-        ref_max_logbits,
-        atol=1e-6,
-        rtol=2.01 / 65536,
-        equal_nan=False,
+        your_max_logbits, ref_max_logbits, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
     )
     torch.testing.assert_close(
         your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False

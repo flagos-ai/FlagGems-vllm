@@ -52,13 +52,7 @@ def test_reshape_and_cache_flash():
         )
         _, key, value = qkv.unbind(dim=1)
 
-        key_value_cache_shape = (
-            num_blocks,
-            2,
-            block_size,
-            num_heads,
-            head_size,
-        )
+        key_value_cache_shape = (num_blocks, 2, block_size, num_heads, head_size)
         scale = head_size**-0.5
         key_caches: list[torch.Tensor] = []
         value_caches: list[torch.Tensor] = []

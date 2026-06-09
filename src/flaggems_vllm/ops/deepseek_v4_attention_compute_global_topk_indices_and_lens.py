@@ -31,9 +31,7 @@ def _compute_global_topk_indices_and_lens_kernel(
         offs = start + tl.arange(0, BLOCK)
         mask = offs < topk
         local_idx = tl.load(
-            local_indices_ptr + token_idx * local_stride + offs,
-            mask=mask,
-            other=-1,
+            local_indices_ptr + token_idx * local_stride + offs, mask=mask, other=-1
         )
         valid = local_idx >= 0
         block_idx = local_idx // block_size
@@ -45,11 +43,7 @@ def _compute_global_topk_indices_and_lens_kernel(
         )
         slot = block_no * block_size + block_off
         slot = tl.where(valid, slot, -1)
-        tl.store(
-            global_indices_ptr + token_idx * global_stride + offs,
-            slot,
-            mask=mask,
-        )
+        tl.store(global_indices_ptr + token_idx * global_stride + offs, slot, mask=mask)
         count += tl.sum(valid.to(tl.int32), axis=0)
 
     tl.store(lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
@@ -65,9 +59,7 @@ def compute_global_topk_indices_and_lens(
     assert topk_indices.ndim == 2
     if is_valid_token is None:
         is_valid_token = torch.ones(
-            (topk_indices.shape[0],),
-            device=topk_indices.device,
-            dtype=torch.int32,
+            (topk_indices.shape[0],), device=topk_indices.device, dtype=torch.int32
         )
     num_tokens, topk = topk_indices.shape
     global_indices = torch.empty_like(topk_indices, dtype=torch.int32)

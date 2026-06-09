@@ -16,13 +16,7 @@ except ImportError:  # pragma: no cover - optional dependency guard
 
 
 def rearrange_mixed_qkv(
-    mixed_qkv,
-    key_dim,
-    value_dim,
-    head_k_dim,
-    head_v_dim,
-    tp_size=1,
-    contiguous=True,
+    mixed_qkv, key_dim, value_dim, head_k_dim, head_v_dim, tp_size=1, contiguous=True
 ):
     query, key, value = torch.split(
         mixed_qkv,

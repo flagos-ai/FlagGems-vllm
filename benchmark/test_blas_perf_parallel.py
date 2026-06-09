@@ -350,9 +350,7 @@ def group_mm_input_fn(groups, N, K, cur_dtype, device):
     mat_a = torch.cat([x for x in group_A_list], dim=0)
     mat_b = torch.stack([x for x in group_B_list], dim=0)
     offs = torch.tensor(
-        [sum(M_list[: i + 1]) for i in range(groups)],
-        dtype=torch.int32,
-        device="cuda",
+        [sum(M_list[: i + 1]) for i in range(groups)], dtype=torch.int32, device="cuda"
     )
 
     yield mat_a, mat_b, offs
@@ -506,7 +504,7 @@ class ParallelBenchmarkMixin:
         for shape in self.shapes:
             group_size = max(1, int(self.get_parallel_metric_group_size(shape)))
             for _ in range(group_size):
-                yield (tuple(shape) if isinstance(shape, (list, tuple)) else shape)
+                yield tuple(shape) if isinstance(shape, (list, tuple)) else shape
 
     def _get_error_shape_output_path(self):
         return os.path.abspath("FlagTune/error_shape.yaml")
@@ -1314,8 +1312,6 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
 
 @pytest.mark.w8a8_block_fp8_matmul
 def test_perf_w8a8_block_fp8_matmul():
-    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
-        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
     if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
         pytest.skip("w8a8_block_fp8_matmul benchmark requires vLLM baseline operator")
     if len(consts.FP8_DTYPES) == 0:
@@ -1334,8 +1330,6 @@ def test_perf_w8a8_block_fp8_matmul():
 
 @pytest.mark.w8a8_block_fp8_matmul_deepgemm
 def test_perf_w8a8_block_fp8_matmul_deepgemm():
-    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
-        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
     if not DEEPGEMM_AVAILABLE:
         pytest.skip("DeepGEMM is not available on this platform")
     if len(consts.FP8_DTYPES) == 0:
@@ -1451,9 +1445,6 @@ def test_addr_benchmark():
 
 @pytest.mark.router_gemm
 def test_perf_router_gemm():
-    if not hasattr(flaggems_vllm, "router_gemm"):
-        pytest.skip("router_gemm is not included in FlagGems-vllm")
-
     def torch_router_gemm(x, weight):
         return torch.mm(x, weight.t()).to(torch.float32)
 

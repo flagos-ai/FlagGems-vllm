@@ -115,10 +115,7 @@ def test_concat_and_cache_mla(
                 torch.empty_like(ref_kv_cache, dtype=torch.uint8)
             )
             convert_fp8(
-                expected_temp,
-                ref_kv_cache,
-                scale.item(),
-                kv_dtype=kv_cache_dtype,
+                expected_temp, ref_kv_cache, scale.item(), kv_dtype=kv_cache_dtype
             )
             dtype = torch.float8_e4m3fn
             # TODO: RuntimeError: Comparing

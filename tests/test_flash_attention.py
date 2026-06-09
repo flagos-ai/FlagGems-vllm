@@ -43,14 +43,7 @@ def make_input(
 
 
 def torch_flash_fwd(
-    q,
-    k,
-    v,
-    scale,
-    is_causal,
-    dropout_p=0,
-    return_debug_mask=False,
-    **extra_kwargs,
+    q, k, v, scale, is_causal, dropout_p=0, return_debug_mask=False, **extra_kwargs
 ):
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -81,14 +74,7 @@ def torch_flash_fwd(
 
 
 def gems_flash_fwd(
-    q,
-    k,
-    v,
-    scale,
-    is_causal,
-    dropout_p=0,
-    return_debug_mask=False,
-    **extra_kwargs,
+    q, k, v, scale, is_causal, dropout_p=0, return_debug_mask=False, **extra_kwargs
 ):
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -218,14 +204,7 @@ def test_flash_attention_foward_nonsquare_qk(
 ):
     device = torch_device_fn.current_device()
     q, k, v = make_input(
-        batch,
-        num_head,
-        num_head,
-        q_seq_len,
-        kv_seq_len,
-        head_size,
-        dtype,
-        device,
+        batch, num_head, num_head, q_seq_len, kv_seq_len, head_size, dtype, device
     )
     ref_q = utils.to_reference(q, False)
     ref_k = utils.to_reference(k, False)
@@ -422,14 +401,7 @@ def test_flash_attention_forward_gqa_alibi_softcap(
 ):
     device = torch_device_fn.current_device()
     q, k, v = make_input(
-        batch,
-        num_head,
-        num_head_k,
-        q_seq_len,
-        kv_seq_len,
-        head_size,
-        dtype,
-        device,
+        batch, num_head, num_head_k, q_seq_len, kv_seq_len, head_size, dtype, device
     )
     ref_q = utils.to_reference(q, False)
     ref_k = utils.to_reference(k, False)
@@ -505,14 +477,7 @@ def test_flash_attention_foward_splitkv(
 ):
     device = torch_device_fn.current_device()
     q, k, v = make_input(
-        batch,
-        num_head,
-        num_head_k,
-        q_seq_len,
-        kv_seq_len,
-        head_size,
-        dtype,
-        device,
+        batch, num_head, num_head_k, q_seq_len, kv_seq_len, head_size, dtype, device
     )
     ref_q = utils.to_reference(q, False)
     ref_k = utils.to_reference(k, False)
@@ -566,12 +531,7 @@ def test_flash_attention_foward_splitkv(
 @pytest.mark.flash_attention_forward
 @pytest.mark.parametrize(
     ["batch", "num_head", "q_seq_len", "kv_seq_len"],
-    [
-        (1, 1, 128, 2048),
-        (8, 32, 1024, 1024),
-        (8, 32, 1024, 128),
-        (8, 32, 17, 1030),
-    ],
+    [(1, 1, 128, 2048), (8, 32, 1024, 1024), (8, 32, 1024, 128), (8, 32, 17, 1030)],
 )
 @pytest.mark.parametrize("head_size", [128, 192])
 @pytest.mark.parametrize(
@@ -592,14 +552,7 @@ def test_flash_attention_foward_swa(
 ):
     device = torch_device_fn.current_device()
     q, k, v = make_input(
-        batch,
-        num_head,
-        num_head,
-        q_seq_len,
-        kv_seq_len,
-        head_size,
-        dtype,
-        device,
+        batch, num_head, num_head, q_seq_len, kv_seq_len, head_size, dtype, device
     )
     ref_q = utils.to_reference(q, False)
     ref_k = utils.to_reference(k, False)
@@ -656,14 +609,7 @@ def test_flash_fwd_dropout(
 ):
     device = torch_device_fn.current_device()
     q, k, v = make_input(
-        batch,
-        num_head,
-        num_head,
-        q_seq_len,
-        kv_seq_len,
-        head_size,
-        dtype,
-        device,
+        batch, num_head, num_head, q_seq_len, kv_seq_len, head_size, dtype, device
     )
     scale = float(1.0 / np.sqrt(head_size))
     dropout_p = 0.2

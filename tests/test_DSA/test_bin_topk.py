@@ -8,7 +8,9 @@ import torch
 from flaggems_vllm.ops.DSA.bin_topk import (
     bucket_sort_topk,  # Replace with actual module name
 )
-from flaggems_vllm.ops.DSA.bin_topk import HAS_TLE
+from flaggems_vllm.ops.DSA.bin_topk import (
+    HAS_TLE,
+)
 
 
 def assert_set_similar(actual, expected, dtype, equal_nan=False):
@@ -194,10 +196,7 @@ def test_bucket_sort_topk_forward(
 
     # Debug output
     debug_topk_results(
-        your_indices,
-        ref_indices,
-        inputs,
-        f"forward_b{batch_size}_s{seq_len}_k{topk}",
+        your_indices, ref_indices, inputs, f"forward_b{batch_size}_s{seq_len}_k{topk}"
     )
 
     # Accuracy comparison - using custom topk comparison logic
@@ -213,11 +212,7 @@ def test_bucket_sort_topk_forward(
     [
         # Edge case tests
         {"batch_size": 1, "seq_len": 1, "topk": 1},
-        {
-            "batch_size": 1,
-            "seq_len": 10,
-            "topk": 10,
-        },  # topk equals sequence length
+        {"batch_size": 1, "seq_len": 10, "topk": 10},  # topk equals sequence length
         {"batch_size": 2, "seq_len": 100, "topk": 50},
         {"batch_size": 8, "seq_len": 17, "topk": 8},  # Small sequence
     ],
@@ -232,10 +227,7 @@ def test_bucket_sort_topk_edge_cases(config):
 
     # Reference implementation
     ref_indices = reference_topk_implementation(
-        to_reference(inputs),
-        to_reference(starts),
-        to_reference(ends),
-        config["topk"],
+        to_reference(inputs), to_reference(starts), to_reference(ends), config["topk"]
     )
 
     # Your operator implementation
@@ -273,10 +265,7 @@ def test_bucket_sort_topk_large_scale(config):
 
     # Reference implementation
     ref_indices = reference_topk_implementation(
-        to_reference(inputs),
-        to_reference(starts),
-        to_reference(ends),
-        config["topk"],
+        to_reference(inputs), to_reference(starts), to_reference(ends), config["topk"]
     )
 
     # Your operator implementation

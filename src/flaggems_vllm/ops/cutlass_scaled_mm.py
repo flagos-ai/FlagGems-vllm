@@ -52,12 +52,7 @@ def get_block_wise_smm_configs():
 
 @triton.jit
 def grouped_launch(
-    pid,
-    M,
-    N,
-    TILE_M: tl.constexpr,
-    TILE_N: tl.constexpr,
-    SWIZZLE_GROUP_M: tl.constexpr,
+    pid, M, N, TILE_M: tl.constexpr, TILE_N: tl.constexpr, SWIZZLE_GROUP_M: tl.constexpr
 ):
     grid_m = tl.cdiv(M, TILE_M)
     grid_n = tl.cdiv(N, TILE_N)

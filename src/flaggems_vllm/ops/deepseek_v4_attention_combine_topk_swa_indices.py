@@ -89,10 +89,7 @@ def combine_topk_swa_indices(
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
     combined = torch.full(
-        (num_tokens, combined_topk),
-        -1,
-        device=topk_indices.device,
-        dtype=torch.int32,
+        (num_tokens, combined_topk), -1, device=topk_indices.device, dtype=torch.int32
     )
     lens = torch.empty((num_tokens,), device=topk_indices.device, dtype=torch.int32)
     with torch_device_fn.device(topk_indices.device):

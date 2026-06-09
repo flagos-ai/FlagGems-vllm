@@ -83,14 +83,7 @@ def test_reshape_and_cache(
 
         # Create the KV caches.
         key_caches, value_caches = create_kv_caches_with_random(
-            num_blocks,
-            block_size,
-            1,
-            num_heads,
-            head_size,
-            kv_cache_dtype,
-            dtype,
-            seed,
+            num_blocks, block_size, 1, num_heads, head_size, kv_cache_dtype, dtype, seed
         )
         key_cache, value_cache = key_caches[0], value_caches[0]
 
