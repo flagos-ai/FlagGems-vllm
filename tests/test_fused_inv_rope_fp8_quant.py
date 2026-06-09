@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.modules.rotary_embedding import (
+from flaggems_vllm.ops.rotary_embedding import (
     yarn_find_correction_range,
     yarn_linear_ramp_mask,
 )

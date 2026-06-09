@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -10,6 +11,34 @@ from flaggems_vllm.utils import libentry
 from flaggems_vllm.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
+
+
+def yarn_find_correction_dim(
+    num_rotations, dim, base=10000, max_position_embeddings=2048
+):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+def yarn_find_correction_range(
+    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+):
+    low = math.floor(
+        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    )
+    high = math.ceil(
+        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    )
+    return max(low, 0), min(high, dim - 1)
+
+
+def yarn_linear_ramp_mask(min, max, dim):
+    if min == max:
+        max += 0.001
+
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    return torch.clamp(linear_func, 0, 1)
 
 
 @libentry()
