@@ -408,8 +408,10 @@ def _flash_mla_ws_consumer0(
     sL1_reader,
     q_writer,
     q_reader,
+    sO_stage,
     Q_desc,
     Q_tail_desc,
+    Output_desc,
     O,
     O_accum,
     LSE_accum,
@@ -446,6 +448,8 @@ def _flash_mla_ws_consumer0(
     kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, HALF_DIM_V))
     kv_cols_l = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
     kv_cols_r = tl.broadcast_to((HALF_DIM_V + tl.arange(0, HALF_DIM_V))[None, :], (BLOCK_N, HALF_DIM_V))
+    stage_rows = tl.broadcast_to(tl.arange(0, BLOCK_M)[:, None], (BLOCK_M, D_CHUNK))
+    stage_batch_idx = tl.full((BLOCK_M, D_CHUNK), 0, dtype=tl.int32)
     if HAVE_TAIL:
         kv_rows_tail = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, D_CHUNK))
         kv_cols_tail = tl.broadcast_to(tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK))
@@ -529,8 +533,9 @@ def _flash_mla_ws_consumer0(
 
             v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols_l)))
             acc = tl.dot(p.to(v_l.dtype), v_l, acc, out_dtype=tl.float32)
-            k0_l_reader.release(pipe_idx)
-            k0_r_qk_reader.release(pipe_idx)
+            if pair != n_pairs - 1:
+                k0_l_reader.release(pipe_idx)
+                k0_r_qk_reader.release(pipe_idx)
 
             p_save = p.to(v_l.dtype)
             sP_slot = sP0_writer.acquire(pipe_idx)
@@ -549,44 +554,87 @@ def _flash_mla_ws_consumer0(
 
         l_stage0 = q_stage * 2
         l_stage1 = l_stage0 + 1
+
         sL_slot = sL0_writer.acquire(l_stage0)
         tl.store(tle.gpu.local_ptr(sL_slot.sL), e_sum)
         sL0_writer.commit(l_stage0)
+
         peer_l_wait = sL1_reader.wait(l_stage1)
         total_sum = e_sum + tl.load(tle.gpu.local_ptr(peer_l_wait.slot.sL))
         sL1_reader.release(l_stage1)
+
         valid = total_sum > 0.0
         inv_total_sum = tl.fdiv(1.0, total_sum)
-        for tile in tl.static_range(0, HALF_DIM_V, D_CHUNK):
-            out_tile = tle.extract_tile(
-                acc,
-                index=[0, tile // D_CHUNK],
-                tile_shape=(BLOCK_M, D_CHUNK),
-            )
-            out_tile = tl.where(
-                valid[:, None], out_tile * inv_total_sum[:, None], 0.0
-            )
-            if is_no_split:
-                tl.store(
-                    O
-                    + batch_idx * stride_o_b
-                    + head_offsets[:, None] * stride_o_h
-                    + (tile + offs_chunk)[None, :],
-                    out_tile.to(O.dtype.element_ty),
-                    mask=mask_h[:, None],
+
+        output_row = batch_idx * head_num + head_base
+        if is_no_split:
+            out_vals = acc * inv_total_sum[:, None]
+            out_vals = tl.where(valid[:, None], out_vals, 0.0)
+            out_vals_bf16 = out_vals.to(O.dtype.element_ty)
+            tl.store(tle.gpu.local_ptr(q_slot.sQ_l), out_vals_bf16, mask=mask_h[:, None])
+            tle.gpu.copy(q_slot.sQ_l, Output_desc, [BLOCK_M, HALF_DIM_V], [output_row, 0])
+        else:
+            for tile in tl.static_range(0, HALF_DIM_V, D_CHUNK):
+                out_tile = tle.extract_tile(
+                    acc,
+                    index=[0, tile // D_CHUNK],
+                    tile_shape=(BLOCK_M, D_CHUNK),
                 )
-            else:
-                tl.store(
+                out_tile = tl.where(
+                    valid[:, None], out_tile * inv_total_sum[:, None], 0.0
+                )
+                stage_cols = tl.broadcast_to(((tile + offs_chunk) * 2)[None, :], (BLOCK_M, D_CHUNK))
+                stage_ptrs = tle.gpu.local_ptr(sO_stage, (stage_batch_idx, stage_rows, stage_cols))
+                oaccum_ptrs = (
                     O_accum
                     + split_idx * stride_oaccum_split
                     + head_offsets[:, None] * stride_oaccum_h
-                    + (tile + offs_chunk)[None, :],
-                    out_tile,
-                    mask=mask_h[:, None],
+                    + (tile + offs_chunk)[None, :]
                 )
+                store_mask = tl.broadcast_to(mask_h[:, None], (BLOCK_M, D_CHUNK)).to(tl.int32)
+                stage_addr = tl.inline_asm_elementwise(
+                    asm="mov.u64 $0, $1;",
+                    constraints="=l,l",
+                    args=[stage_ptrs],
+                    dtype=tl.uint64,
+                    is_pure=True,
+                    pack=1,
+                )
+                oaccum_addr = tl.inline_asm_elementwise(
+                    asm="mov.u64 $0, $1;",
+                    constraints="=l,l",
+                    args=[oaccum_ptrs],
+                    dtype=tl.uint64,
+                    is_pure=True,
+                    pack=1,
+                )
+                out_bits = out_tile.to(tl.uint32, bitcast=True)
+                dummy_store0 = tl.inline_asm_elementwise(
+                    asm="""
+                    {
+                        .reg .b32 tmp;
+                        .reg .pred p;
+                        setp.ne.u32 p, $4, 0;
+                        @p st.shared.b32 [$1], $3;
+                        @p ld.shared.b32 tmp, [$1];
+                        @p st.global.b32 [$2], tmp;
+                        mov.u32 $0, 0;
+                    }
+                    """,
+                    constraints="=r,l,l,r,r",
+                    args=[stage_addr, oaccum_addr, out_bits, store_mask],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                dummy_store0 += 0
+
+        if n_pairs > 0:
+            last_pipe_idx = pipe_base + n_pairs - 1
+            k0_l_reader.release(last_pipe_idx)
+            k0_r_qk_reader.release(last_pipe_idx)
         q_reader.release(q_stage)
         pipe_base += n_pairs
-
 
 @triton.jit
 def _flash_mla_ws_consumer1(
@@ -601,8 +649,10 @@ def _flash_mla_ws_consumer1(
     sL1_writer,
     sL0_reader,
     q_reader,
+    sO_stage,
     Q_desc,
     Q_tail_desc,
+    Output_desc,
     O,
     O_accum,
     LSE_accum,
@@ -630,8 +680,8 @@ def _flash_mla_ws_consumer1(
     D_CHUNK: tl.constexpr,
     HAVE_TAIL: tl.constexpr,
 ):
-    _ = Q_desc
-    _ = Q_tail_desc
+    unused_q_desc = Q_desc
+    unused_q_tail_desc = Q_tail_desc
     offs_h = tl.arange(0, BLOCK_M)
     head_offsets = head_base + offs_h
     HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
@@ -641,6 +691,8 @@ def _flash_mla_ws_consumer1(
     kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, HALF_DIM_V))
     kv_cols_l = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
     kv_cols_r = tl.broadcast_to((HALF_DIM_V + tl.arange(0, HALF_DIM_V))[None, :], (BLOCK_N, HALF_DIM_V))
+    stage_rows = tl.broadcast_to(tl.arange(0, BLOCK_M)[:, None], (BLOCK_M, D_CHUNK))
+    stage_batch_idx = tl.full((BLOCK_M, D_CHUNK), 0, dtype=tl.int32)
     if HAVE_TAIL:
         kv_rows_tail = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, D_CHUNK))
         kv_cols_tail = tl.broadcast_to(tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK))
@@ -718,7 +770,8 @@ def _flash_mla_ws_consumer1(
 
             v_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols_r)))
             acc = tl.dot(p_b, v_r, acc, out_dtype=tl.float32)
-            k1_l_qk_reader.release(pipe_idx)
+            if pair != n_pairs - 1:
+                k1_l_qk_reader.release(pipe_idx)
 
             sP_slot = sP1_writer.acquire(pipe_idx)
             tl.store(tle.gpu.local_ptr(sP_slot.sP), p_b)
@@ -731,7 +784,8 @@ def _flash_mla_ws_consumer1(
             acc = tl.dot(p0, k0_r, acc, out_dtype=tl.float32)
             sP0_reader.release(pipe_idx)
             k0_r_remote_reader.release(pipe_idx)
-            k1_r_reader.release(pipe_idx)
+            if pair != n_pairs - 1:
+                k1_r_reader.release(pipe_idx)
             e_max = merged_max
 
         l_stage0 = q_stage * 2
@@ -745,36 +799,74 @@ def _flash_mla_ws_consumer1(
         valid = total_sum > 0.0
         lse_vals = tl.where(valid, tl.log(total_sum) + e_max, float("-inf"))
         inv_total_sum = tl.fdiv(1.0, total_sum)
-        for tile in tl.static_range(0, HALF_DIM_V, D_CHUNK):
-            out_tile = tle.extract_tile(
-                acc,
-                index=[0, tile // D_CHUNK],
-                tile_shape=(BLOCK_M, D_CHUNK),
-            )
-            out_tile = tl.where(
-                valid[:, None], out_tile * inv_total_sum[:, None], 0.0
-            )
-            if is_no_split:
-                tl.store(
-                    O
-                    + batch_idx * stride_o_b
-                    + head_offsets[:, None] * stride_o_h
-                    + (HALF_DIM_V + tile + offs_chunk)[None, :],
-                    out_tile.to(O.dtype.element_ty),
-                    mask=mask_h[:, None],
+        output_row = batch_idx * head_num + head_base
+        if is_no_split:
+            out_vals = acc * inv_total_sum[:, None]
+            out_vals = tl.where(valid[:, None], out_vals, 0.0)
+            out_vals_bf16 = out_vals.to(O.dtype.element_ty)
+            tl.store(tle.gpu.local_ptr(q_slot.sQ_r), out_vals_bf16, mask=mask_h[:, None])
+            tle.gpu.copy(q_slot.sQ_r, Output_desc, [BLOCK_M, HALF_DIM_V], [output_row, HALF_DIM_V])
+        else:
+            for tile in tl.static_range(0, HALF_DIM_V, D_CHUNK):
+                out_tile = tle.extract_tile(
+                    acc,
+                    index=[0, tile // D_CHUNK],
+                    tile_shape=(BLOCK_M, D_CHUNK),
                 )
-            else:
-                tl.store(
+                out_tile = tl.where(
+                    valid[:, None], out_tile * inv_total_sum[:, None], 0.0
+                )
+                stage_cols = tl.broadcast_to(((tile + offs_chunk) * 2)[None, :], (BLOCK_M, D_CHUNK))
+                stage_ptrs = tle.gpu.local_ptr(sO_stage, (stage_batch_idx, stage_rows, stage_cols))
+                oaccum_ptrs = (
                     O_accum
                     + split_idx * stride_oaccum_split
                     + head_offsets[:, None] * stride_oaccum_h
-                    + (HALF_DIM_V + tile + offs_chunk)[None, :],
-                    out_tile,
-                    mask=mask_h[:, None],
+                    + (HALF_DIM_V + tile + offs_chunk)[None, :]
                 )
-        if not is_no_split:
+                store_mask = tl.broadcast_to(mask_h[:, None], (BLOCK_M, D_CHUNK)).to(tl.int32)
+                stage_addr = tl.inline_asm_elementwise(
+                    asm="mov.u64 $0, $1;",
+                    constraints="=l,l",
+                    args=[stage_ptrs],
+                    dtype=tl.uint64,
+                    is_pure=True,
+                    pack=1,
+                )
+                oaccum_addr = tl.inline_asm_elementwise(
+                    asm="mov.u64 $0, $1;",
+                    constraints="=l,l",
+                    args=[oaccum_ptrs],
+                    dtype=tl.uint64,
+                    is_pure=True,
+                    pack=1,
+                )
+                out_bits = out_tile.to(tl.uint32, bitcast=True)
+                dummy_store1 = tl.inline_asm_elementwise(
+                    asm="""
+                    {
+                        .reg .b32 tmp;
+                        .reg .pred p;
+                        setp.ne.u32 p, $4, 0;
+                        @p st.shared.b32 [$1], $3;
+                        @p ld.shared.b32 tmp, [$1];
+                        @p st.global.b32 [$2], tmp;
+                        mov.u32 $0, 0;
+                    }
+                    """,
+                    constraints="=r,l,l,r,r",
+                    args=[stage_addr, oaccum_addr, out_bits, store_mask],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                dummy_store1 += 0
             tl.store(LSE_accum + split_idx * stride_lseaccum_split + head_offsets * stride_lseaccum_h,
                 lse_vals, mask=mask_h)
+        if n_pairs > 0:
+            last_pipe_idx = pipe_base + n_pairs - 1
+            k1_l_qk_reader.release(last_pipe_idx)
+            k1_r_reader.release(last_pipe_idx)
         q_reader.release(q_stage)
         pipe_base += n_pairs
 
@@ -783,6 +875,7 @@ def _flash_mla_ws_consumer1(
 def flash_mla_splitkv_ws_tle_kernel(
     Q_desc,
     Q_tail_desc,
+    Output_desc,
     Kv_desc,
     Kv,
     Block_table,
@@ -988,8 +1081,10 @@ def flash_mla_splitkv_ws_tle_kernel(
                     sL1_pipe.reader(),
                     q_pipe.writer(),
                     q_pipe.reader("wg0"),
+                    sK0,
                     Q_desc,
                     Q_tail_desc,
+                    Output_desc,
                     O,
                     O_accum,
                     LSE_accum,
@@ -1032,8 +1127,10 @@ def flash_mla_splitkv_ws_tle_kernel(
                     sL1_pipe.writer(),
                     sL0_pipe.reader(),
                     q_pipe.reader("wg1"),
+                    sK1,
                     Q_desc,
                     Q_tail_desc,
+                    Output_desc,
                     O,
                     O_accum,
                     LSE_accum,
@@ -2073,7 +2170,6 @@ def _try_flash_mla_tle(
         (total_num_splits, h_q), dtype=torch.float32, device=q.device
     )
     out_flat = out.view(b * s_q * h_q, dv)
-    out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
     d_chunk = 64
     q_desc = TensorDescriptor(
         q_flat,
@@ -2087,6 +2183,12 @@ def _try_flash_mla_tle(
         strides=[d, 1],
         block_shape=[FLASH_MLA_BLOCK_M, d_chunk],
     )
+    output_desc = TensorDescriptor(
+        out_flat,
+        shape=[b * s_q * h_q, dv],
+        strides=[dv, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
+    )
     kv_desc = TensorDescriptor(
         kv_flat,
         shape=[kv_flat.shape[0], d],
@@ -2097,6 +2199,7 @@ def _try_flash_mla_tle(
     flash_mla_splitkv_ws_tle_kernel[(num_m_blocks, num_sm_parts)](
         q_desc,
         q_tail_desc,
+        output_desc,
         kv_desc,
         kv_flat,
         block_table_tle,
