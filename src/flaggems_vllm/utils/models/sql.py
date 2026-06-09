@@ -122,9 +122,9 @@ class SQLPersistantModel(PersistantModel):
     def get_config(
         self, name: str, keys: Sequence[Union[bool, int, float, str]]
     ) -> Optional[triton.Config]:
-        key_dict: Dict[str, Union[bool, int, float, str]] = (
-            SQLPersistantModel.get_key_dict(keys)
-        )
+        key_dict: Dict[
+            str, Union[bool, int, float, str]
+        ] = SQLPersistantModel.get_key_dict(keys)
         ConfigCls: Optional[Type[Base]] = self.get_sql_model(
             name, key_dict
         )  # type: ignore[assignment]
@@ -190,15 +190,15 @@ class SQLPersistantModel(PersistantModel):
             config: Dict[  # type: ignore[no-redef]
                 str, Union[bool, int, float, str]
             ] = SQLPersistantModel.get_config_dict(config)
-        key_dict: Dict[str, Union[bool, int, float, str]] = (
-            SQLPersistantModel.get_key_dict(keys)
-        )
-        ConfigCls: Optional[Type[Base]] = (
-            self.get_sql_model(  # type: ignore[assignment]
-                name,
-                {k: type(v) for k, v in key_dict.items()},
-                {k: type(v) for k, v in config.items()},
-            )
+        key_dict: Dict[
+            str, Union[bool, int, float, str]
+        ] = SQLPersistantModel.get_key_dict(keys)
+        ConfigCls: Optional[
+            Type[Base]
+        ] = self.get_sql_model(  # type: ignore[assignment]
+            name,
+            {k: type(v) for k, v in key_dict.items()},
+            {k: type(v) for k, v in config.items()},
         )
         if ConfigCls is not None:
             with RollbackSession(self.engine) as session:
@@ -213,9 +213,9 @@ class SQLPersistantModel(PersistantModel):
         config: Union[triton.Config, Dict[str, Union[bool, int, float, str]]],
         benchmark: Tuple[float, float, float],
     ) -> None:
-        key_dict: Dict[str, Union[bool, int, float, str]] = (
-            SQLPersistantModel.get_key_dict(keys)
-        )
+        key_dict: Dict[
+            str, Union[bool, int, float, str]
+        ] = SQLPersistantModel.get_key_dict(keys)
         if isinstance(config, triton.Config):
             config: Dict[  # type: ignore[no-redef]
                 str, Union[bool, int, float, str]
@@ -226,12 +226,12 @@ class SQLPersistantModel(PersistantModel):
             "p20": p20,
             "p80": p80,
         }
-        BenchmarkCls: Optional[Type[Base]] = (
-            self.get_sql_model(  # type: ignore[assignment]
-                name,
-                key_dict | config,  # type: ignore[operator]
-                benchmark,  # type: ignore[arg-type]
-            )
+        BenchmarkCls: Optional[
+            Type[Base]
+        ] = self.get_sql_model(  # type: ignore[assignment]
+            name,
+            key_dict | config,  # type: ignore[operator]
+            benchmark,  # type: ignore[arg-type]
         )
         if BenchmarkCls is not None:
             with RollbackSession(self.engine) as session:
