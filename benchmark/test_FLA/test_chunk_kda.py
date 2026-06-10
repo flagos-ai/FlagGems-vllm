@@ -144,7 +144,9 @@ def _chunk_kda_torch_reference_op(
 
         cu_seqlens_list = cu_seqlens.detach().cpu().tolist()
         outs, final_states = [], []
-        for i, (start, end) in enumerate(zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])):
+        for i, (start, end) in enumerate(
+            zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])
+        ):
             initial_state_i = (
                 initial_state[i : i + 1] if initial_state is not None else None
             )

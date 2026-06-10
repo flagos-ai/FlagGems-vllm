@@ -130,10 +130,10 @@ def _reference_chunk_kda(
 
     cu_seqlens_list = cu_seqlens.detach().cpu().tolist()
     outs, final_states = [], []
-    for i, (start, end) in enumerate(
-        zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])
-    ):
-        initial_state_i = initial_state[i : i + 1] if initial_state is not None else None
+    for i, (start, end) in enumerate(zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])):
+        initial_state_i = (
+            initial_state[i : i + 1] if initial_state is not None else None
+        )
         out_i, final_state_i = _naive_recurrent_kda(
             q=q[:, start:end],
             k=k[:, start:end],
@@ -231,8 +231,7 @@ def _assert_close(
     abs_err = _abs_err(expected, actual)
     err_ratio = _err_ratio(expected, actual)
     msg = (
-        f"{name} diff: {abs_err:.6f} ratio: {err_ratio:.6f} "
-        f"(limit {ASSERT_RATIO})"
+        f"{name} diff: {abs_err:.6f} ratio: {err_ratio:.6f} " f"(limit {ASSERT_RATIO})"
     )
     if abs_err <= 1e-6:
         return
