@@ -13,8 +13,7 @@ from flaggems_vllm.utils import triton_lang_extension as ext
 logger = logging.getLogger(__name__)
 
 
-
-
+# ci test
 @libentry()
 @triton.autotune(
     configs=runtime.get_tuned_config("cross_entropy_loss"),
