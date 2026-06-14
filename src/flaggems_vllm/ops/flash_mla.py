@@ -207,9 +207,9 @@ def _flash_mla_ws_kv_producer(
     k0_r_writer,
     k1_l_writer,
     k1_r_writer,
-    valid_writer,
     Kv,
     Kv_desc,
+    Kv_tail_desc,
     Block_table,
     B_seq_len,
     begin_req_idx,
@@ -224,11 +224,9 @@ def _flash_mla_ws_kv_producer(
     D_CHUNK: tl.constexpr,
     HAVE_TAIL: tl.constexpr,
 ):
-    _ = Kv_desc
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, D_CHUNK)
-    kv_rows = tl.broadcast_to(offs_n[:, None], (BLOCK_N, D_CHUNK))
     pipe_base = 0
+    k1_pipe_base = 0
     for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
         seq_len = tl.load(B_seq_len + batch_idx)
         start_block_idx = tl.where(batch_idx == begin_req_idx, begin_block_idx_meta, 0)
@@ -237,67 +235,59 @@ def _flash_mla_ws_kv_producer(
             batch_idx == end_req_idx, end_block_idx_meta, full_end_block_idx
         )
         block_table_base = batch_idx * stride_block_table_b
-        n_pairs = tl.cdiv(end_block_idx - start_block_idx, 2)
-        for pair in tl.range(0, n_pairs):
+        n_blocks = end_block_idx - start_block_idx
+        n_full_pairs = n_blocks // 2
+        has_tail = (n_blocks - n_full_pairs * 2) > 0
+        n_pair_slots = n_full_pairs + has_tail.to(tl.int32)
+
+        for pair in tl.range(0, n_full_pairs):
             pipe_idx = pipe_base + pair
+            k1_pipe_idx = k1_pipe_base + pair
             block0 = start_block_idx + pair * 2
             block1 = block0 + 1
-            has0 = block0 < end_block_idx
-            has1 = block1 < end_block_idx
-            page0 = tle.load(Block_table + block_table_base + block0, mask=has0, other=0)
-            page1 = tle.load(Block_table + block_table_base + block1, mask=has1, other=0)
-            kv_row0 = page0.to(tl.int64) * PAGE_SIZE
-            kv_row1 = page1.to(tl.int64) * PAGE_SIZE
-
-            valid0 = has0 & (block0 * BLOCK_N + offs_n < seq_len)
-            valid1 = has1 & (block1 * BLOCK_N + offs_n < seq_len)
-            valid_slot = valid_writer.acquire(pipe_idx)
-            row0 = tl.full([BLOCK_N], 0, dtype=tl.int32)
-            row1 = tl.full([BLOCK_N], 1, dtype=tl.int32)
-            tl.store(tle.gpu.local_ptr(valid_slot.valid, (row0, offs_n)), valid0.to(tl.int8))
-            tl.store(tle.gpu.local_ptr(valid_slot.valid, (row1, offs_n)), valid1.to(tl.int8))
-            valid_writer.commit(pipe_idx)
+            page0 = tle.load(Block_table + block_table_base + block0)
+            page1 = tle.load(Block_table + block_table_base + block1)
+            kv_row0 = page0 * PAGE_SIZE
+            kv_row1 = page1 * PAGE_SIZE
 
             k0_l_slot = k0_l_writer.acquire(pipe_idx)
-            for tile in tl.static_range(0, HEAD_DIM_V // 2, D_CHUNK):
-                kv_cols = tl.broadcast_to((tile + offs_d)[None, :], (BLOCK_N, D_CHUNK))
-                k = tl.load(Kv + (kv_row0 + kv_rows) * stride_kv_token + kv_cols)
-                tl.store(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)), k)
+            tle.gpu.copy(Kv_desc, k0_l_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row0, 0])
             k0_l_writer.commit(pipe_idx)
 
             k0_r_slot = k0_r_writer.acquire(pipe_idx)
-            for tile in tl.static_range(HEAD_DIM_V // 2, HEAD_DIM_V, D_CHUNK):
-                kv_cols = tl.broadcast_to((tile + offs_d)[None, :], (BLOCK_N, D_CHUNK))
-                k = tl.load(Kv + (kv_row0 + kv_rows) * stride_kv_token + kv_cols)
-                tl.store(tle.gpu.local_ptr(k0_r_slot.sK, (kv_rows, kv_cols)), k)
+            tle.gpu.copy(Kv_desc, k0_r_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row0, HEAD_DIM_V // 2])
             if HAVE_TAIL:
-                tail_cols = tl.broadcast_to(offs_d[None, :], (BLOCK_N, D_CHUNK))
-                k_tail = tl.load(
-                    Kv + (kv_row0 + kv_rows) * stride_kv_token + HEAD_DIM_V + tail_cols
-                )
-                tl.store(tle.gpu.local_ptr(k0_r_slot.sK_tail, (kv_rows, tail_cols)), k_tail)
+                tle.gpu.copy(Kv_tail_desc, k0_r_slot.sK_tail, [BLOCK_N, D_CHUNK], [kv_row0, HEAD_DIM_V])
             k0_r_writer.commit(pipe_idx)
 
-            k1_l_slot = k1_l_writer.acquire(pipe_idx)
-            for tile in tl.static_range(0, HEAD_DIM_V // 2, D_CHUNK):
-                kv_cols = tl.broadcast_to((tile + offs_d)[None, :], (BLOCK_N, D_CHUNK))
-                k = tl.load(Kv + (kv_row1 + kv_rows) * stride_kv_token + kv_cols)
-                tl.store(tle.gpu.local_ptr(k1_l_slot.sK, (kv_rows, kv_cols)), k)
-            k1_l_writer.commit(pipe_idx)
+            k1_l_slot = k1_l_writer.acquire(k1_pipe_idx)
+            tle.gpu.copy(Kv_desc, k1_l_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row1, 0])
+            k1_l_writer.commit(k1_pipe_idx)
 
-            k1_r_slot = k1_r_writer.acquire(pipe_idx)
-            for tile in tl.static_range(HEAD_DIM_V // 2, HEAD_DIM_V, D_CHUNK):
-                kv_cols = tl.broadcast_to((tile + offs_d)[None, :], (BLOCK_N, D_CHUNK))
-                k = tl.load(Kv + (kv_row1 + kv_rows) * stride_kv_token + kv_cols)
-                tl.store(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)), k)
+            k1_r_slot = k1_r_writer.acquire(k1_pipe_idx)
+            tle.gpu.copy(Kv_desc, k1_r_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row1, HEAD_DIM_V // 2])
             if HAVE_TAIL:
-                tail_cols = tl.broadcast_to(offs_d[None, :], (BLOCK_N, D_CHUNK))
-                k_tail = tl.load(
-                    Kv + (kv_row1 + kv_rows) * stride_kv_token + HEAD_DIM_V + tail_cols
-                )
-                tl.store(tle.gpu.local_ptr(k1_r_slot.sK_tail, (kv_rows, tail_cols)), k_tail)
-            k1_r_writer.commit(pipe_idx)
-        pipe_base += n_pairs
+                tle.gpu.copy(Kv_tail_desc, k1_r_slot.sK_tail, [BLOCK_N, D_CHUNK], [kv_row1, HEAD_DIM_V])
+            k1_r_writer.commit(k1_pipe_idx)
+
+        if has_tail:
+            pipe_idx = pipe_base + n_full_pairs
+            block0 = start_block_idx + n_full_pairs * 2
+            page0 = tle.load(Block_table + block_table_base + block0)
+            kv_row0 = page0 * PAGE_SIZE
+
+            k0_l_slot = k0_l_writer.acquire(pipe_idx)
+            tle.gpu.copy(Kv_desc, k0_l_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row0, 0])
+            k0_l_writer.commit(pipe_idx)
+
+            k0_r_slot = k0_r_writer.acquire(pipe_idx)
+            tle.gpu.copy(Kv_desc, k0_r_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row0, HEAD_DIM_V // 2])
+            if HAVE_TAIL:
+                tle.gpu.copy(Kv_tail_desc, k0_r_slot.sK_tail, [BLOCK_N, D_CHUNK], [kv_row0, HEAD_DIM_V])
+            k0_r_writer.commit(pipe_idx)
+
+        pipe_base += n_pair_slots
+        k1_pipe_base += n_full_pairs
 
 
 @triton.jit
@@ -305,7 +295,6 @@ def _flash_mla_ws_consumer0(
     k0_l_reader,
     k0_r_qk_reader,
     k1_l_remote_reader,
-    valid_reader,
     sM_wg0_writer,
     sM_wg1_reader,
     sP0_writer,
@@ -349,20 +338,17 @@ def _flash_mla_ws_consumer0(
     offs_h = tl.arange(0, BLOCK_M)
     head_offsets = head_base + offs_h
     HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
-    offs_dv = tl.arange(0, HALF_DIM_V)
     mask_h = head_offsets < head_num
 
-    kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, HALF_DIM_V))
-    kv_cols_l = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
-    kv_cols_r = tl.broadcast_to((HALF_DIM_V + tl.arange(0, HALF_DIM_V))[None, :], (BLOCK_N, HALF_DIM_V))
-    stage_rows = tl.broadcast_to(tl.arange(0, BLOCK_M)[:, None], (BLOCK_M, D_CHUNK))
-    stage_batch_idx = tl.full((BLOCK_M, D_CHUNK), 0, dtype=tl.int32)
+    offs_n = tl.arange(0, BLOCK_N)
+    kv_rows = tl.broadcast_to(offs_n[:, None], (BLOCK_N, HALF_DIM_V))
+    kv_cols = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
     if HAVE_TAIL:
-        kv_rows_tail = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, D_CHUNK))
+        kv_rows_tail = tl.broadcast_to(offs_n[:, None], (BLOCK_N, D_CHUNK))
         kv_cols_tail = tl.broadcast_to(tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK))
 
-    offs_chunk = tl.arange(0, D_CHUNK)
     pipe_base = 0
+    k1_pipe_base = 0
     for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
         q_stage = batch_idx - begin_req_idx
         seq_len = tl.load(B_seq_len + batch_idx)
@@ -395,20 +381,26 @@ def _flash_mla_ws_consumer0(
         e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, HALF_DIM_V], dtype=tl.float32)
 
-        n_pairs = tl.cdiv(end_block_idx - start_block_idx, 2)
-        for pair in tl.range(0, n_pairs):
+        n_blocks = end_block_idx - start_block_idx
+        n_full_pairs = n_blocks // 2
+        has_tail = (n_blocks - n_full_pairs * 2) > 0
+        n_pair_slots = n_full_pairs + has_tail.to(tl.int32)
+
+        for pair in tl.range(0, n_full_pairs):
             pipe_idx = pipe_base + pair
+            k1_pipe_idx = k1_pipe_base + pair
+            block0 = start_block_idx + pair * 2
             k0_l_wait = k0_l_reader.wait(pipe_idx)
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
             k0_l_slot = k0_l_wait.slot
-            k0_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols_l)))
+            k0_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
             q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
             qk = tl.dot(q_l, tl.trans(k0_l), qk, out_dtype=tl.float32)
 
             k0_r_wait = k0_r_qk_reader.wait(pipe_idx)
             k0_r_slot = k0_r_wait.slot
-            k0_r = tl.load(tle.gpu.local_ptr(k0_r_slot.sK, (kv_rows, kv_cols_r)))
+            k0_r = tl.load(tle.gpu.local_ptr(k0_r_slot.sK, (kv_rows, kv_cols)))
             q_r = tl.load(tle.gpu.local_ptr(q_slot.sQ_r))
             qk = tl.dot(q_r, tl.trans(k0_r), qk, out_dtype=tl.float32)
             if HAVE_TAIL:
@@ -416,11 +408,7 @@ def _flash_mla_ws_consumer0(
                 q_tail = tl.load(tle.gpu.local_ptr(q_slot.sQ_tail))
                 qk = tl.dot(q_tail, tl.trans(k_tail), qk, out_dtype=tl.float32)
 
-            valid_wait = valid_reader.wait(pipe_idx)
-            valid_row = tl.full([BLOCK_N], 0, dtype=tl.int32)
-            valid_n = (
-                tl.load(tle.gpu.local_ptr(valid_wait.slot.valid, (valid_row, tl.arange(0, BLOCK_N)))) != 0
-            )
+            valid_n = block0 * BLOCK_N + offs_n < seq_len
             qk *= sm_scale
             qk = tl.where(valid_n[None, :], qk, float("-inf"))
 
@@ -429,35 +417,80 @@ def _flash_mla_ws_consumer0(
             tl.store(tle.gpu.local_ptr(sM_slot.sM), local_max)
             sM_wg0_writer.commit(pipe_idx)
 
-            peer_wait = sM_wg1_reader.wait(pipe_idx)
+            peer_wait = sM_wg1_reader.wait(k1_pipe_idx)
             merged_max = tl.load(tle.gpu.local_ptr(peer_wait.slot.sM))
-            sM_wg1_reader.release(pipe_idx)
+            sM_wg1_reader.release(k1_pipe_idx)
 
             re_scale = tl.exp(e_max - merged_max)
             p = tl.exp(qk - merged_max[:, None])
             e_sum = e_sum * re_scale + tl.sum(p, axis=1)
             acc = acc * re_scale[:, None]
 
-            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols_l)))
+            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
             acc = tl.dot(p.to(v_l.dtype), v_l, acc, out_dtype=tl.float32)
-            if pair != n_pairs - 1:
-                k0_l_reader.release(pipe_idx)
-                k0_r_qk_reader.release(pipe_idx)
+            k0_l_reader.release(pipe_idx)
+            k0_r_qk_reader.release(pipe_idx)
 
             p_save = p.to(v_l.dtype)
             sP_slot = sP0_writer.acquire(pipe_idx)
             tl.store(tle.gpu.local_ptr(sP_slot.sP), p_save)
             sP0_writer.commit(pipe_idx)
 
-            peer_p_wait = sP1_reader.wait(pipe_idx)
+            peer_p_wait = sP1_reader.wait(k1_pipe_idx)
             peer_p = tl.load(tle.gpu.local_ptr(peer_p_wait.slot.sP))
-            k1_l_wait = k1_l_remote_reader.wait(pipe_idx)
-            k1_l = tl.load(tle.gpu.local_ptr(k1_l_wait.slot.sK, (kv_rows, kv_cols_l)))
+            k1_l_wait = k1_l_remote_reader.wait(k1_pipe_idx)
+            k1_l = tl.load(tle.gpu.local_ptr(k1_l_wait.slot.sK, (kv_rows, kv_cols)))
             acc = tl.dot(peer_p, k1_l, acc, out_dtype=tl.float32)
-            sP1_reader.release(pipe_idx)
-            k1_l_remote_reader.release(pipe_idx)
-            valid_reader.release(pipe_idx)
+            sP1_reader.release(k1_pipe_idx)
+            k1_l_remote_reader.release(k1_pipe_idx)
             e_max = merged_max
+
+        if has_tail:
+            pipe_idx = pipe_base + n_full_pairs
+            block0 = start_block_idx + n_full_pairs * 2
+            k0_l_wait = k0_l_reader.wait(pipe_idx)
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+            k0_l_slot = k0_l_wait.slot
+            k0_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
+            q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
+            qk = tl.dot(q_l, tl.trans(k0_l), qk, out_dtype=tl.float32)
+
+            k0_r_wait = k0_r_qk_reader.wait(pipe_idx)
+            k0_r_slot = k0_r_wait.slot
+            k0_r = tl.load(tle.gpu.local_ptr(k0_r_slot.sK, (kv_rows, kv_cols)))
+            q_r = tl.load(tle.gpu.local_ptr(q_slot.sQ_r))
+            qk = tl.dot(q_r, tl.trans(k0_r), qk, out_dtype=tl.float32)
+            if HAVE_TAIL:
+                k_tail = tl.load(tle.gpu.local_ptr(k0_r_slot.sK_tail, (kv_rows_tail, kv_cols_tail)))
+                q_tail = tl.load(tle.gpu.local_ptr(q_slot.sQ_tail))
+                qk = tl.dot(q_tail, tl.trans(k_tail), qk, out_dtype=tl.float32)
+
+            valid_n = block0 * BLOCK_N + offs_n < seq_len
+            qk *= sm_scale
+            qk = tl.where(valid_n[None, :], qk, float("-inf"))
+
+            new_max = tl.maximum(tl.max(qk, axis=1), e_max)
+            sM_slot = sM_wg0_writer.acquire(pipe_idx)
+            tl.store(tle.gpu.local_ptr(sM_slot.sM), new_max)
+            sM_wg0_writer.commit(pipe_idx)
+
+            re_scale = tl.exp(e_max - new_max)
+            p = tl.exp(qk - new_max[:, None])
+            e_sum = e_sum * re_scale + tl.sum(p, axis=1)
+            acc = acc * re_scale[:, None]
+
+            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
+            acc = tl.dot(p.to(v_l.dtype), v_l, acc, out_dtype=tl.float32)
+
+            p_save = p.to(v_l.dtype)
+            sP_slot = sP0_writer.acquire(pipe_idx)
+            tl.store(tle.gpu.local_ptr(sP_slot.sP), p_save)
+            sP0_writer.commit(pipe_idx)
+
+            e_max = new_max
+            k0_l_reader.release(pipe_idx)
+            k0_r_qk_reader.release(pipe_idx)
 
         l_stage0 = q_stage * 2
         l_stage1 = l_stage0 + 1
@@ -489,19 +522,15 @@ def _flash_mla_ws_consumer0(
             oaccum_row = split_idx * head_num + head_base
             tle.gpu.copy(q_slot.sQ_l, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, 0])
 
-        if n_pairs > 0:
-            last_pipe_idx = pipe_base + n_pairs - 1
-            k0_l_reader.release(last_pipe_idx)
-            k0_r_qk_reader.release(last_pipe_idx)
         q_reader.release(q_stage)
-        pipe_base += n_pairs
+        pipe_base += n_pair_slots
+        k1_pipe_base += n_full_pairs
 
 @triton.jit
 def _flash_mla_ws_consumer1(
     k1_l_qk_reader,
     k1_r_reader,
     k0_r_remote_reader,
-    valid_reader,
     sM_wg1_writer,
     sM_wg0_reader,
     sP1_writer,
@@ -546,20 +575,17 @@ def _flash_mla_ws_consumer1(
     offs_h = tl.arange(0, BLOCK_M)
     head_offsets = head_base + offs_h
     HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
-    offs_dv = tl.arange(0, HALF_DIM_V)
     mask_h = head_offsets < head_num
 
-    kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, HALF_DIM_V))
-    kv_cols_l = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
-    kv_cols_r = tl.broadcast_to((HALF_DIM_V + tl.arange(0, HALF_DIM_V))[None, :], (BLOCK_N, HALF_DIM_V))
-    stage_rows = tl.broadcast_to(tl.arange(0, BLOCK_M)[:, None], (BLOCK_M, D_CHUNK))
-    stage_batch_idx = tl.full((BLOCK_M, D_CHUNK), 0, dtype=tl.int32)
+    offs_n = tl.arange(0, BLOCK_N)
+    kv_rows = tl.broadcast_to(offs_n[:, None], (BLOCK_N, HALF_DIM_V))
+    kv_cols = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_N, HALF_DIM_V))
     if HAVE_TAIL:
-        kv_rows_tail = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, D_CHUNK))
+        kv_rows_tail = tl.broadcast_to(offs_n[:, None], (BLOCK_N, D_CHUNK))
         kv_cols_tail = tl.broadcast_to(tl.arange(0, D_CHUNK)[None, :], (BLOCK_N, D_CHUNK))
 
-    offs_chunk = tl.arange(0, D_CHUNK)
     pipe_base = 0
+    k1_pipe_base = 0
     for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
         q_stage = batch_idx - begin_req_idx
         seq_len = tl.load(B_seq_len + batch_idx)
@@ -584,14 +610,20 @@ def _flash_mla_ws_consumer1(
         e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, HALF_DIM_V], dtype=tl.float32)
 
-        n_pairs = tl.cdiv(end_block_idx - start_block_idx, 2)
-        for pair in tl.range(0, n_pairs):
+        n_blocks = end_block_idx - start_block_idx
+        n_full_pairs = n_blocks // 2
+        has_tail = (n_blocks - n_full_pairs * 2) > 0
+        n_pair_slots = n_full_pairs + has_tail.to(tl.int32)
+
+        for pair in tl.range(0, n_full_pairs):
             pipe_idx = pipe_base + pair
-            k1_r_wait = k1_r_reader.wait(pipe_idx)
+            k1_pipe_idx = k1_pipe_base + pair
+            block1 = start_block_idx + pair * 2 + 1
+            k1_r_wait = k1_r_reader.wait(k1_pipe_idx)
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
             k1_r_slot = k1_r_wait.slot
-            k1_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols_r)))
+            k1_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
             q_r = tl.load(tle.gpu.local_ptr(q_slot.sQ_r))
             qk = tl.dot(q_r, tl.trans(k1_r), qk, out_dtype=tl.float32)
             if HAVE_TAIL:
@@ -599,29 +631,24 @@ def _flash_mla_ws_consumer1(
                 q_tail = tl.load(tle.gpu.local_ptr(q_slot.sQ_tail))
                 qk = tl.dot(q_tail, tl.trans(k1_tail), qk, out_dtype=tl.float32)
 
-            k1_l_wait = k1_l_qk_reader.wait(pipe_idx)
+            k1_l_wait = k1_l_qk_reader.wait(k1_pipe_idx)
             k1_l_slot = k1_l_wait.slot
-            k1_l = tl.load(tle.gpu.local_ptr(k1_l_slot.sK, (kv_rows, kv_cols_l)))
+            k1_l = tl.load(tle.gpu.local_ptr(k1_l_slot.sK, (kv_rows, kv_cols)))
             q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
             qk = tl.dot(q_l, tl.trans(k1_l), qk, out_dtype=tl.float32)
 
-            valid_wait = valid_reader.wait(pipe_idx)
-            valid_row = tl.full([BLOCK_N], 1, dtype=tl.int32)
-            valid_n = (
-                tl.load(tle.gpu.local_ptr(valid_wait.slot.valid, (valid_row, tl.arange(0, BLOCK_N)))) != 0
-            )
+            valid_n = block1 * BLOCK_N + offs_n < seq_len
             qk *= sm_scale
             qk = tl.where(valid_n[None, :], qk, float("-inf"))
-            valid_reader.release(pipe_idx)
 
             peer_wait = sM_wg0_reader.wait(pipe_idx)
             peer_max = tl.load(tle.gpu.local_ptr(peer_wait.slot.sM))
             sM_wg0_reader.release(pipe_idx)
             local_max = tl.maximum(e_max, tl.max(qk, axis=1))
             merged_max = tl.maximum(local_max, peer_max)
-            sM_slot = sM_wg1_writer.acquire(pipe_idx)
+            sM_slot = sM_wg1_writer.acquire(k1_pipe_idx)
             tl.store(tle.gpu.local_ptr(sM_slot.sM), merged_max)
-            sM_wg1_writer.commit(pipe_idx)
+            sM_wg1_writer.commit(k1_pipe_idx)
 
             re_scale = tl.exp(e_max - merged_max)
             p = tl.exp(qk - merged_max[:, None])
@@ -629,25 +656,42 @@ def _flash_mla_ws_consumer1(
             acc = acc * re_scale[:, None]
             p_b = p.to(k1_r.dtype)
 
-            v_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols_r)))
+            v_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
             acc = tl.dot(p_b, v_r, acc, out_dtype=tl.float32)
-            if pair != n_pairs - 1:
-                k1_l_qk_reader.release(pipe_idx)
+            k1_l_qk_reader.release(k1_pipe_idx)
 
-            sP_slot = sP1_writer.acquire(pipe_idx)
+            sP_slot = sP1_writer.acquire(k1_pipe_idx)
             tl.store(tle.gpu.local_ptr(sP_slot.sP), p_b)
-            sP1_writer.commit(pipe_idx)
+            sP1_writer.commit(k1_pipe_idx)
 
             sP0_wait = sP0_reader.wait(pipe_idx)
             p0 = tl.load(tle.gpu.local_ptr(sP0_wait.slot.sP))
             k0_r_wait = k0_r_remote_reader.wait(pipe_idx)
-            k0_r = tl.load(tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols_r)))
+            k0_r = tl.load(tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols)))
             acc = tl.dot(p0, k0_r, acc, out_dtype=tl.float32)
             sP0_reader.release(pipe_idx)
             k0_r_remote_reader.release(pipe_idx)
-            if pair != n_pairs - 1:
-                k1_r_reader.release(pipe_idx)
+            k1_r_reader.release(k1_pipe_idx)
             e_max = merged_max
+
+        if has_tail:
+            pipe_idx = pipe_base + n_full_pairs
+            peer_wait = sM_wg0_reader.wait(pipe_idx)
+            new_max = tl.load(tle.gpu.local_ptr(peer_wait.slot.sM))
+            sM_wg0_reader.release(pipe_idx)
+
+            re_scale = tl.exp(e_max - new_max)
+            e_sum = e_sum * re_scale
+            acc = acc * re_scale[:, None]
+            e_max = new_max
+
+            sP0_wait = sP0_reader.wait(pipe_idx)
+            p0 = tl.load(tle.gpu.local_ptr(sP0_wait.slot.sP))
+            k0_r_wait = k0_r_remote_reader.wait(pipe_idx)
+            k0_r = tl.load(tle.gpu.local_ptr(k0_r_wait.slot.sK, (kv_rows, kv_cols)))
+            acc = tl.dot(p0, k0_r, acc, out_dtype=tl.float32)
+            sP0_reader.release(pipe_idx)
+            k0_r_remote_reader.release(pipe_idx)
 
         l_stage0 = q_stage * 2
         l_stage1 = l_stage0 + 1
@@ -677,12 +721,9 @@ def _flash_mla_ws_consumer1(
             tle.gpu.copy(q_slot.sQ_r, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, HALF_DIM_V])
             tl.store(LSE_accum + split_idx * stride_lseaccum_split + head_offsets * stride_lseaccum_h,
                 lse_vals, mask=mask_h)
-        if n_pairs > 0:
-            last_pipe_idx = pipe_base + n_pairs - 1
-            k1_l_qk_reader.release(last_pipe_idx)
-            k1_r_reader.release(last_pipe_idx)
         q_reader.release(q_stage)
-        pipe_base += n_pairs
+        pipe_base += n_pair_slots
+        k1_pipe_base += n_full_pairs
 
 
 @triton.jit
@@ -692,6 +733,7 @@ def flash_mla_splitkv_ws_tle_kernel(
     Output_desc,
     OAccum_desc,
     Kv_desc,
+    Kv_tail_desc,
     Kv,
     Block_table,
     B_seq_len,
@@ -771,14 +813,26 @@ def flash_mla_splitkv_ws_tle_kernel(
             sQ_l=sQ_l_smem,
             sQ_r=sQ_r_smem,
         )
-    sK0 = tle.gpu.alloc(
-        [1, BLOCK_N, HEAD_DIM_V],
+    sK0_l = tle.gpu.alloc(
+        [1, BLOCK_N, HALF_DIM_V],
         dtype=Kv.dtype.element_ty,
         layout=None,
         scope=tle.gpu.smem,
     )
-    sK1 = tle.gpu.alloc(
-        [1, BLOCK_N, HEAD_DIM_V],
+    sK0_r = tle.gpu.alloc(
+        [1, BLOCK_N, HALF_DIM_V],
+        dtype=Kv.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    sK1_l = tle.gpu.alloc(
+        [1, BLOCK_N, HALF_DIM_V],
+        dtype=Kv.dtype.element_ty,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    sK1_r = tle.gpu.alloc(
+        [1, BLOCK_N, HALF_DIM_V],
         dtype=Kv.dtype.element_ty,
         layout=None,
         scope=tle.gpu.smem,
@@ -813,13 +867,6 @@ def flash_mla_splitkv_ws_tle_kernel(
             scope=tle.gpu.smem,
             nv_mma_shared_layout=False,
         )
-    valid_smem = tle.gpu.alloc(
-        [1, 2, BLOCK_N],
-        dtype=tl.int8,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
     sM_smem = tle.gpu.alloc(
         [1, BLOCK_M],
         dtype=tl.float32,
@@ -838,7 +885,7 @@ def flash_mla_splitkv_ws_tle_kernel(
         capacity=1,
         scope="cta",
         name="flash_mla_ws_k0_l",
-        sK=sK0,
+        sK=sK0_l,
     )
     if HAVE_TAIL:
         k0_r_pipe = tle.pipe(
@@ -846,7 +893,7 @@ def flash_mla_splitkv_ws_tle_kernel(
             scope="cta",
             name="flash_mla_ws_k0_r",
             readers=("qk", "remote"),
-            sK=sK0,
+            sK=sK0_r,
             sK_tail=sK0_tail,
         )
     else:
@@ -855,21 +902,21 @@ def flash_mla_splitkv_ws_tle_kernel(
             scope="cta",
             name="flash_mla_ws_k0_r",
             readers=("qk", "remote"),
-            sK=sK0,
+            sK=sK0_r,
         )
     k1_l_pipe = tle.pipe(
         capacity=1,
         scope="cta",
         name="flash_mla_ws_k1_l",
         readers=("qk", "remote"),
-        sK=sK1,
+        sK=sK1_l,
     )
     if HAVE_TAIL:
         k1_r_pipe = tle.pipe(
             capacity=1,
             scope="cta",
             name="flash_mla_ws_k1_r",
-            sK=sK1,
+            sK=sK1_r,
             sK_tail=sK1_tail,
         )
     else:
@@ -877,9 +924,8 @@ def flash_mla_splitkv_ws_tle_kernel(
             capacity=1,
             scope="cta",
             name="flash_mla_ws_k1_r",
-            sK=sK1,
+            sK=sK1_r,
         )
-    valid_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_valid", readers=("wg0", "wg1"), valid=valid_smem)
     sM_wg0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_m0", sM=sM_smem)
     sM_wg1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_m1", sM=sM_smem)
     sP0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_p0", sP=sP0_smem)
@@ -895,7 +941,6 @@ def flash_mla_splitkv_ws_tle_kernel(
                     k0_l_pipe.reader(),
                     k0_r_pipe.reader("qk"),
                     k1_l_pipe.reader("remote", fields=("sK",)),
-                    valid_pipe.reader("wg0"),
                     sM_wg0_pipe.writer(),
                     sM_wg1_pipe.reader(),
                     sP0_pipe.writer(),
@@ -904,7 +949,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                     sL1_pipe.reader(),
                     q_pipe.writer(),
                     q_pipe.reader("wg0"),
-                    sK0,
+                    sK0_l,
                     Q_desc,
                     Q_tail_desc,
                     Output_desc,
@@ -943,7 +988,6 @@ def flash_mla_splitkv_ws_tle_kernel(
                     k1_l_pipe.reader("qk"),
                     k1_r_pipe.reader(),
                     k0_r_pipe.reader("remote", fields=("sK",)),
-                    valid_pipe.reader("wg1"),
                     sM_wg1_pipe.writer(),
                     sM_wg0_pipe.reader(),
                     sP1_pipe.writer(),
@@ -951,7 +995,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                     sL1_pipe.writer(),
                     sL0_pipe.reader(),
                     q_pipe.reader("wg1"),
-                    sK1,
+                    sK1_r,
                     Q_desc,
                     Q_tail_desc,
                     Output_desc,
@@ -991,9 +1035,9 @@ def flash_mla_splitkv_ws_tle_kernel(
                     k0_r_pipe.writer(),
                     k1_l_pipe.writer(),
                     k1_r_pipe.writer(),
-                    valid_pipe.writer(),
                     Kv,
                     Kv_desc,
+                    Kv_tail_desc,
                     Block_table,
                     B_seq_len,
                     begin_req_idx,
@@ -1184,6 +1228,12 @@ def _try_flash_mla_tle(
         kv_flat,
         shape=[kv_flat.shape[0], d],
         strides=[d, 1],
+        block_shape=[FLASH_MLA_BLOCK_N, dv // 2],
+    )
+    kv_tail_desc = TensorDescriptor(
+        kv_flat,
+        shape=[kv_flat.shape[0], d],
+        strides=[d, 1],
         block_shape=[FLASH_MLA_BLOCK_N, d_chunk],
     )
 
@@ -1193,6 +1243,7 @@ def _try_flash_mla_tle(
         output_desc,
         oaccum_desc,
         kv_desc,
+        kv_tail_desc,
         kv_flat,
         block_table_tle,
         cache_seqlens_tle,
