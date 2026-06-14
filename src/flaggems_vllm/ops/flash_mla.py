@@ -246,8 +246,8 @@ def _flash_mla_ws_kv_producer(
             has1 = block1 < end_block_idx
             page0 = tle.load(Block_table + block_table_base + block0, mask=has0, other=0)
             page1 = tle.load(Block_table + block_table_base + block1, mask=has1, other=0)
-            kv_row0 = (page0 * PAGE_SIZE).to(tl.int32)
-            kv_row1 = (page1 * PAGE_SIZE).to(tl.int32)
+            kv_row0 = page0.to(tl.int64) * PAGE_SIZE
+            kv_row1 = page1.to(tl.int64) * PAGE_SIZE
 
             valid0 = has0 & (block0 * BLOCK_N + offs_n < seq_len)
             valid1 = has1 & (block1 * BLOCK_N + offs_n < seq_len)
@@ -318,6 +318,7 @@ def _flash_mla_ws_consumer0(
     Q_desc,
     Q_tail_desc,
     Output_desc,
+    OAccum_desc,
     O,
     O_accum,
     LSE_accum,
@@ -470,7 +471,8 @@ def _flash_mla_ws_consumer0(
         sL1_reader.release(l_stage1)
 
         valid = total_sum > 0.0
-        inv_total_sum = tl.fdiv(1.0, total_sum)
+        safe_total_sum = tl.where(valid, total_sum, 1.0)
+        inv_total_sum = tl.fdiv(1.0, safe_total_sum)
 
         output_row = batch_idx * head_num + head_base
         if is_no_split:
@@ -480,60 +482,12 @@ def _flash_mla_ws_consumer0(
             tl.store(tle.gpu.local_ptr(q_slot.sQ_l), out_vals_bf16, mask=mask_h[:, None])
             tle.gpu.copy(q_slot.sQ_l, Output_desc, [BLOCK_M, HALF_DIM_V], [output_row, 0])
         else:
-            for tile in tl.static_range(0, HALF_DIM_V, D_CHUNK):
-                out_tile = tle.extract_tile(
-                    acc,
-                    index=[0, tile // D_CHUNK],
-                    tile_shape=(BLOCK_M, D_CHUNK),
-                )
-                out_tile = tl.where(
-                    valid[:, None], out_tile * inv_total_sum[:, None], 0.0
-                )
-                stage_cols = tl.broadcast_to(((tile + offs_chunk) * 2)[None, :], (BLOCK_M, D_CHUNK))
-                stage_ptrs = tle.gpu.local_ptr(sO_stage, (stage_batch_idx, stage_rows, stage_cols))
-                oaccum_ptrs = (
-                    O_accum
-                    + split_idx * stride_oaccum_split
-                    + head_offsets[:, None] * stride_oaccum_h
-                    + (tile + offs_chunk)[None, :]
-                )
-                store_mask = tl.broadcast_to(mask_h[:, None], (BLOCK_M, D_CHUNK)).to(tl.int32)
-                stage_addr = tl.inline_asm_elementwise(
-                    asm="mov.u64 $0, $1;",
-                    constraints="=l,l",
-                    args=[stage_ptrs],
-                    dtype=tl.uint64,
-                    is_pure=True,
-                    pack=1,
-                )
-                oaccum_addr = tl.inline_asm_elementwise(
-                    asm="mov.u64 $0, $1;",
-                    constraints="=l,l",
-                    args=[oaccum_ptrs],
-                    dtype=tl.uint64,
-                    is_pure=True,
-                    pack=1,
-                )
-                out_bits = out_tile.to(tl.uint32, bitcast=True)
-                dummy_store0 = tl.inline_asm_elementwise(
-                    asm="""
-                    {
-                        .reg .b32 tmp;
-                        .reg .pred p;
-                        setp.ne.u32 p, $4, 0;
-                        @p st.shared.b32 [$1], $3;
-                        @p ld.shared.b32 tmp, [$1];
-                        @p st.global.b32 [$2], tmp;
-                        mov.u32 $0, 0;
-                    }
-                    """,
-                    constraints="=r,l,l,r,r",
-                    args=[stage_addr, oaccum_addr, out_bits, store_mask],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
-                dummy_store0 += 0
+            out_vals = acc * inv_total_sum[:, None]
+            out_vals = tl.where(valid[:, None], out_vals, 0.0)
+            out_vals_q = out_vals.to(O.dtype.element_ty)
+            tl.store(tle.gpu.local_ptr(q_slot.sQ_l), out_vals_q, mask=mask_h[:, None])
+            oaccum_row = split_idx * head_num + head_base
+            tle.gpu.copy(q_slot.sQ_l, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, 0])
 
         if n_pairs > 0:
             last_pipe_idx = pipe_base + n_pairs - 1
@@ -559,6 +513,7 @@ def _flash_mla_ws_consumer1(
     Q_desc,
     Q_tail_desc,
     Output_desc,
+    OAccum_desc,
     O,
     O_accum,
     LSE_accum,
@@ -703,8 +658,9 @@ def _flash_mla_ws_consumer1(
         total_sum = e_sum + tl.load(tle.gpu.local_ptr(peer_l_wait.slot.sL))
         sL0_reader.release(l_stage0)
         valid = total_sum > 0.0
-        lse_vals = tl.where(valid, tl.log(total_sum) + e_max, float("-inf"))
-        inv_total_sum = tl.fdiv(1.0, total_sum)
+        safe_total_sum = tl.where(valid, total_sum, 1.0)
+        lse_vals = tl.where(valid, tl.log(safe_total_sum) + e_max, float("-inf"))
+        inv_total_sum = tl.fdiv(1.0, safe_total_sum)
         output_row = batch_idx * head_num + head_base
         if is_no_split:
             out_vals = acc * inv_total_sum[:, None]
@@ -713,60 +669,12 @@ def _flash_mla_ws_consumer1(
             tl.store(tle.gpu.local_ptr(q_slot.sQ_r), out_vals_bf16, mask=mask_h[:, None])
             tle.gpu.copy(q_slot.sQ_r, Output_desc, [BLOCK_M, HALF_DIM_V], [output_row, HALF_DIM_V])
         else:
-            for tile in tl.static_range(0, HALF_DIM_V, D_CHUNK):
-                out_tile = tle.extract_tile(
-                    acc,
-                    index=[0, tile // D_CHUNK],
-                    tile_shape=(BLOCK_M, D_CHUNK),
-                )
-                out_tile = tl.where(
-                    valid[:, None], out_tile * inv_total_sum[:, None], 0.0
-                )
-                stage_cols = tl.broadcast_to(((tile + offs_chunk) * 2)[None, :], (BLOCK_M, D_CHUNK))
-                stage_ptrs = tle.gpu.local_ptr(sO_stage, (stage_batch_idx, stage_rows, stage_cols))
-                oaccum_ptrs = (
-                    O_accum
-                    + split_idx * stride_oaccum_split
-                    + head_offsets[:, None] * stride_oaccum_h
-                    + (HALF_DIM_V + tile + offs_chunk)[None, :]
-                )
-                store_mask = tl.broadcast_to(mask_h[:, None], (BLOCK_M, D_CHUNK)).to(tl.int32)
-                stage_addr = tl.inline_asm_elementwise(
-                    asm="mov.u64 $0, $1;",
-                    constraints="=l,l",
-                    args=[stage_ptrs],
-                    dtype=tl.uint64,
-                    is_pure=True,
-                    pack=1,
-                )
-                oaccum_addr = tl.inline_asm_elementwise(
-                    asm="mov.u64 $0, $1;",
-                    constraints="=l,l",
-                    args=[oaccum_ptrs],
-                    dtype=tl.uint64,
-                    is_pure=True,
-                    pack=1,
-                )
-                out_bits = out_tile.to(tl.uint32, bitcast=True)
-                dummy_store1 = tl.inline_asm_elementwise(
-                    asm="""
-                    {
-                        .reg .b32 tmp;
-                        .reg .pred p;
-                        setp.ne.u32 p, $4, 0;
-                        @p st.shared.b32 [$1], $3;
-                        @p ld.shared.b32 tmp, [$1];
-                        @p st.global.b32 [$2], tmp;
-                        mov.u32 $0, 0;
-                    }
-                    """,
-                    constraints="=r,l,l,r,r",
-                    args=[stage_addr, oaccum_addr, out_bits, store_mask],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
-                dummy_store1 += 0
+            out_vals = acc * inv_total_sum[:, None]
+            out_vals = tl.where(valid[:, None], out_vals, 0.0)
+            out_vals_q = out_vals.to(O.dtype.element_ty)
+            tl.store(tle.gpu.local_ptr(q_slot.sQ_r), out_vals_q, mask=mask_h[:, None])
+            oaccum_row = split_idx * head_num + head_base
+            tle.gpu.copy(q_slot.sQ_r, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, HALF_DIM_V])
             tl.store(LSE_accum + split_idx * stride_lseaccum_split + head_offsets * stride_lseaccum_h,
                 lse_vals, mask=mask_h)
         if n_pairs > 0:
@@ -782,6 +690,7 @@ def flash_mla_splitkv_ws_tle_kernel(
     Q_desc,
     Q_tail_desc,
     Output_desc,
+    OAccum_desc,
     Kv_desc,
     Kv,
     Block_table,
@@ -999,6 +908,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                     Q_desc,
                     Q_tail_desc,
                     Output_desc,
+                    OAccum_desc,
                     O,
                     O_accum,
                     LSE_accum,
@@ -1045,6 +955,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                     Q_desc,
                     Q_tail_desc,
                     Output_desc,
+                    OAccum_desc,
                     O,
                     O_accum,
                     LSE_accum,
@@ -1163,7 +1074,7 @@ def flash_mla_combine_kernel(
                 + offs_d[None, :],
                 mask=active & mask_h[:, None],
                 other=0.0,
-            )
+            ).to(tl.float32)
             acc += w[:, None] * o_s
 
         acc = acc * tl.fdiv(1.0, sum_w)[:, None]
@@ -1237,12 +1148,13 @@ def _try_flash_mla_tle(
     total_num_splits = b + num_sm_parts
     out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
     out_accum = torch.empty(
-        (total_num_splits, h_q, dv), dtype=torch.float32, device=q.device
+        (total_num_splits, h_q, dv), dtype=q.dtype, device=q.device
     )
     lse_accum = torch.empty(
         (total_num_splits, h_q), dtype=torch.float32, device=q.device
     )
     out_flat = out.view(b * s_q * h_q, dv)
+    out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
     d_chunk = 64
     q_desc = TensorDescriptor(
         q_flat,
@@ -1262,6 +1174,12 @@ def _try_flash_mla_tle(
         strides=[dv, 1],
         block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
     )
+    oaccum_desc = TensorDescriptor(
+        out_accum_flat,
+        shape=[total_num_splits * h_q, dv],
+        strides=[dv, 1],
+        block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
+    )
     kv_desc = TensorDescriptor(
         kv_flat,
         shape=[kv_flat.shape[0], d],
@@ -1273,6 +1191,7 @@ def _try_flash_mla_tle(
         q_desc,
         q_tail_desc,
         output_desc,
+        oaccum_desc,
         kv_desc,
         kv_flat,
         block_table_tle,
@@ -1402,7 +1321,7 @@ def flash_mla_attn_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     for i in range(0, loop_time):
         kv_page_number = tl.load(Req_to_tokens + offs_n // PAGE_SIZE)
-        kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+        kv_loc = kv_page_number.to(tl.int64) * PAGE_SIZE + (offs_n % PAGE_SIZE).to(tl.int64)
         offs_v_c = kv_loc[:, None] * stride_kv_bs + offs_d_ckv[None, :]
         v_c = tl.load(Kv_cache + offs_v_c)
         k_c = tl.trans(v_c)
@@ -1432,7 +1351,7 @@ def flash_mla_attn_kernel(
             mask=mask_kvsplit,
             other=0,
         )
-        kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+        kv_loc = kv_page_number.to(tl.int64) * PAGE_SIZE + (offs_n % PAGE_SIZE).to(tl.int64)
         offs_v_c = kv_loc[:, None] * stride_kv_bs + offs_d_ckv[None, :]
         v_c = tl.load(Kv_cache + offs_v_c, mask=mask_kvsplit[:, None], other=0.0)
         k_c = tl.trans(v_c)
