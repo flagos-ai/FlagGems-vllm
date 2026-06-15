@@ -39,6 +39,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
+from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
     fused_experts_impl,
@@ -128,6 +129,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
+    "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
