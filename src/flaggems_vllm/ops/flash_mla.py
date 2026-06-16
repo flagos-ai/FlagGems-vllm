@@ -58,13 +58,6 @@ FLASH_MLA_FIXED_OVERHEAD_BLOCKS = 5
 FLASH_MLA_COMBINE_BLOCK_H = 8
 FLASH_MLA_COMBINE_BLOCK_D = 256
 
-_TENSOR_DESCRIPTOR_CLS = None
-_CURRENT_DESCRIPTOR_ALLOCATOR_DEVICE: int | None = None
-_NUM_SMS_CACHE: dict[int, int] = {}
-_FLASH_MLA_TLE_PLAN_CACHE: OrderedDict[
-    "FlashMLATLEDecodePlanKey", "FlashMLATLEDecodePlan"
-] = OrderedDict()
-
 
 def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
     def alloc_fn(size: int, align: int, stream):
@@ -294,6 +287,112 @@ def flash_mla_sched_meta_kernel_v3(
             tl.store(meta + 5, is_first_req_splitted.to(tl.int32))
             tl.store(meta + 6, is_last_req_splitted.to(tl.int32))
             tl.store(meta + 7, 0)
+
+
+@triton.jit
+def flash_mla_sched_meta_kernel_v3(
+    B_seq_len,
+    Sched_meta,
+    Num_splits,
+    CombineReqIds,
+    NumCombineReqs,
+    BLOCK_B: tl.constexpr,
+    BATCH_SIZE: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    FIXED_OVERHEAD_NUM_BLOCKS: tl.constexpr,
+    NUM_SM_PARTS: tl.constexpr,
+    META_FIELDS: tl.constexpr,
+):
+    offs_b = tl.arange(0, BLOCK_B)
+    mask_b = offs_b < BATCH_SIZE
+    seqlens = tl.load(B_seq_len + offs_b, mask=mask_b, other=0)
+    num_blocks_vec = tl.cdiv(tl.maximum(seqlens, 1), BLOCK_SIZE_N)
+    total_num_blocks = tl.sum(
+        tl.where(mask_b, num_blocks_vec + FIXED_OVERHEAD_NUM_BLOCKS, 0), axis=0
+    )
+    payload = tl.cdiv(total_num_blocks, NUM_SM_PARTS) + FIXED_OVERHEAD_NUM_BLOCKS
+
+    now_req_idx = 0
+    now_block = 0
+    now_n_split_idx = 0
+    cum_num_splits = 0
+    combine_req_count = 0
+    tl.store(Num_splits, 0)
+
+    for part in tl.range(0, NUM_SM_PARTS, 1):
+        begin_req_idx = now_req_idx
+        begin_block_idx = now_block
+        begin_split_idx = now_n_split_idx
+        is_first_req_splitted = now_block != 0
+        remain_payload = payload
+
+        while (now_req_idx < BATCH_SIZE) & (remain_payload > 0):
+            cur_seq_len = tl.load(B_seq_len + now_req_idx)
+            cur_num_blocks = tl.cdiv(tl.maximum(cur_seq_len, 1), BLOCK_SIZE_N)
+            now_remain_blocks = cur_num_blocks - now_block
+            if remain_payload >= now_remain_blocks + FIXED_OVERHEAD_NUM_BLOCKS:
+                req_num_splits = now_n_split_idx + 1
+                if req_num_splits != 1:
+                    tl.store(CombineReqIds + combine_req_count, now_req_idx)
+                    combine_req_count += 1
+                cum_num_splits += req_num_splits
+                tl.store(Num_splits + now_req_idx + 1, cum_num_splits)
+                remain_payload -= now_remain_blocks + FIXED_OVERHEAD_NUM_BLOCKS
+                now_req_idx += 1
+                now_block = 0
+                now_n_split_idx = 0
+            else:
+                if remain_payload - FIXED_OVERHEAD_NUM_BLOCKS > 0:
+                    now_block += remain_payload - FIXED_OVERHEAD_NUM_BLOCKS
+                    now_n_split_idx += 1
+                remain_payload = 0
+
+        if now_block > 0:
+            end_req_idx = now_req_idx
+            end_block_idx = now_block
+        else:
+            end_req_idx = now_req_idx - 1
+            if end_req_idx >= 0:
+                end_seq_len = tl.load(B_seq_len + end_req_idx)
+                end_block_idx = tl.where(
+                    end_seq_len == 0, 0, tl.cdiv(end_seq_len, BLOCK_SIZE_N)
+                )
+            else:
+                end_block_idx = 0
+
+        meta = Sched_meta + part * META_FIELDS
+        if begin_req_idx >= BATCH_SIZE:
+            tl.store(meta + 0, BATCH_SIZE)
+            tl.store(meta + 1, BATCH_SIZE - 1)
+            tl.store(meta + 2, 0)
+            tl.store(meta + 3, 0)
+            tl.store(meta + 4, 0)
+            tl.store(meta + 5, 0)
+            tl.store(meta + 6, 0)
+            tl.store(meta + 7, 0)
+        else:
+            end_seq_len = tl.load(B_seq_len + end_req_idx)
+            last_block_exclusive = tl.where(
+                end_seq_len == 0, 0, tl.cdiv(end_seq_len, BLOCK_SIZE_N)
+            )
+            is_last_req_splitted = (end_block_idx != last_block_exclusive) & (
+                end_seq_len != 0
+            )
+            if begin_req_idx == end_req_idx:
+                same_req_split = is_first_req_splitted | is_last_req_splitted
+                is_first_req_splitted = same_req_split
+                is_last_req_splitted = same_req_split
+
+            tl.store(meta + 0, begin_req_idx)
+            tl.store(meta + 1, end_req_idx)
+            tl.store(meta + 2, begin_block_idx)
+            tl.store(meta + 3, end_block_idx)
+            tl.store(meta + 4, begin_split_idx)
+            tl.store(meta + 5, is_first_req_splitted.to(tl.int32))
+            tl.store(meta + 6, is_last_req_splitted.to(tl.int32))
+            tl.store(meta + 7, 0)
+
+    tl.store(NumCombineReqs, combine_req_count)
 
 @triton.jit
 def _flash_mla_ws_kv_producer(
@@ -2075,6 +2174,170 @@ def get_flash_mla_tle_decode_plan(
     )
 
 
+@triton.jit
+def flash_mla_combine_kernel_v2(
+    O_accum,
+    LSE_accum,
+    Num_splits,
+    O,
+    head_num,
+    stride_oaccum_split,
+    stride_oaccum_h,
+    stride_lseaccum_split,
+    stride_lseaccum_h,
+    stride_o_b,
+    stride_o_h,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    h_block_idx = tl.program_id(1)
+    d_block_idx = tl.program_id(2)
+
+    offs_h = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_d = d_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_h = offs_h < head_num
+    mask_d = offs_d < HEAD_DIM_V
+
+    start_split = tl.load(Num_splits + batch_idx)
+    end_split = tl.load(Num_splits + batch_idx + 1)
+    my_num_splits = end_split - start_split
+
+    if my_num_splits > 1:
+        max_lse = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
+        for s in tl.range(0, my_num_splits):
+            lse_s = tl.load(
+                LSE_accum
+                + (start_split + s) * stride_lseaccum_split
+                + offs_h * stride_lseaccum_h,
+                mask=mask_h,
+                other=float("-inf"),
+            )
+            max_lse = tl.maximum(max_lse, lse_s)
+
+        acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        sum_w = tl.zeros([BLOCK_H], dtype=tl.float32)
+        valid_row = max_lse != float("-inf")
+        for s in tl.range(0, my_num_splits):
+            lse_s = tl.load(
+                LSE_accum
+                + (start_split + s) * stride_lseaccum_split
+                + offs_h * stride_lseaccum_h,
+                mask=mask_h,
+                other=float("-inf"),
+            )
+            w = tl.where(valid_row, tl.exp(lse_s - max_lse), 0.0)
+            sum_w += w
+
+            o_s = tl.load(
+                O_accum
+                + (start_split + s) * stride_oaccum_split
+                + offs_h[:, None] * stride_oaccum_h
+                + offs_d[None, :],
+                mask=mask_h[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            acc += w[:, None] * o_s
+
+        inv_sum = tl.where(sum_w > 0.0, tl.fdiv(1.0, sum_w), 0.0)
+        acc = acc * inv_sum[:, None]
+
+        tl.store(
+            O
+            + batch_idx * stride_o_b
+            + offs_h[:, None] * stride_o_h
+            + offs_d[None, :],
+            acc.to(O.dtype.element_ty),
+            mask=mask_h[:, None] & mask_d[None, :],
+        )
+
+
+@triton.jit
+def flash_mla_combine_kernel_compact(
+    O_accum,
+    LSE_accum,
+    Num_splits,
+    CombineReqIds,
+    NumCombineReqs,
+    O,
+    head_num,
+    stride_oaccum_split,
+    stride_oaccum_h,
+    stride_lseaccum_split,
+    stride_lseaccum_h,
+    stride_o_b,
+    stride_o_h,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+):
+    task_idx = tl.program_id(0)
+    h_block_idx = tl.program_id(1)
+    d_block_idx = tl.program_id(2)
+
+    num_tasks = tl.load(NumCombineReqs)
+    if task_idx < num_tasks:
+        batch_idx = tl.load(CombineReqIds + task_idx)
+
+        offs_h = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+        offs_d = d_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_h = offs_h < head_num
+        mask_d = offs_d < HEAD_DIM_V
+
+        start_split = tl.load(Num_splits + batch_idx)
+        end_split = tl.load(Num_splits + batch_idx + 1)
+        my_num_splits = end_split - start_split
+
+        if my_num_splits > 1:
+            max_lse = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
+            for s in tl.range(0, my_num_splits):
+                lse_s = tl.load(
+                    LSE_accum
+                    + (start_split + s) * stride_lseaccum_split
+                    + offs_h * stride_lseaccum_h,
+                    mask=mask_h,
+                    other=float("-inf"),
+                )
+                max_lse = tl.maximum(max_lse, lse_s)
+
+            acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+            sum_w = tl.zeros([BLOCK_H], dtype=tl.float32)
+            valid_row = max_lse != float("-inf")
+            for s in tl.range(0, my_num_splits):
+                lse_s = tl.load(
+                    LSE_accum
+                    + (start_split + s) * stride_lseaccum_split
+                    + offs_h * stride_lseaccum_h,
+                    mask=mask_h,
+                    other=float("-inf"),
+                )
+                w = tl.where(valid_row, tl.exp(lse_s - max_lse), 0.0)
+                sum_w += w
+
+                o_s = tl.load(
+                    O_accum
+                    + (start_split + s) * stride_oaccum_split
+                    + offs_h[:, None] * stride_oaccum_h
+                    + offs_d[None, :],
+                    mask=mask_h[:, None] & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                acc += w[:, None] * o_s
+
+            inv_sum = tl.where(sum_w > 0.0, tl.fdiv(1.0, sum_w), 0.0)
+            acc = acc * inv_sum[:, None]
+
+            tl.store(
+                O
+                + batch_idx * stride_o_b
+                + offs_h[:, None] * stride_o_h
+                + offs_d[None, :],
+                acc.to(O.dtype.element_ty),
+                mask=mask_h[:, None] & mask_d[None, :],
+            )
+
+
 def _try_flash_mla_tle(
     q: torch.Tensor,
     block_table: torch.Tensor,
@@ -2110,12 +2373,26 @@ def _try_flash_mla_tle(
         causal=causal,
         reuse_output=_reuse_tle_output(),
     )
-    return plan.run(
-        q=q,
-        blocked_k=blocked_k,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        update_metadata=True,
+    num_splits = torch.empty(b + 1, dtype=torch.int32, device=q.device)
+    max_combine_reqs = min(b, num_sm_parts)
+    combine_req_ids = torch.empty(
+        (max_combine_reqs,), dtype=torch.int32, device=q.device
+    )
+    num_combine_reqs = torch.empty((1,), dtype=torch.int32, device=q.device)
+    flash_mla_sched_meta_kernel_v3[(1,)](
+        cache_seqlens_tle,
+        sched_meta,
+        num_splits,
+        combine_req_ids,
+        num_combine_reqs,
+        BLOCK_B=triton.next_power_of_2(b),
+        BATCH_SIZE=b,
+        BLOCK_SIZE_N=FLASH_MLA_BLOCK_N,
+        FIXED_OVERHEAD_NUM_BLOCKS=FLASH_MLA_FIXED_OVERHEAD_BLOCKS,
+        NUM_SM_PARTS=num_sm_parts,
+        META_FIELDS=FLASH_MLA_META_FIELDS,
+        num_warps=1,
+        num_stages=1,
     )
     total_num_splits = b + num_sm_parts
     out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
@@ -2203,10 +2480,18 @@ def _try_flash_mla_tle(
         num_stages=1,
     )
 
-    flash_mla_combine_kernel[(b, triton.cdiv(h_q, FLASH_MLA_COMBINE_BLOCK_H))](
+    flash_mla_combine_kernel_compact[
+        (
+            max_combine_reqs,
+            triton.cdiv(h_q, FLASH_MLA_COMBINE_BLOCK_H),
+            triton.cdiv(dv, FLASH_MLA_COMBINE_BLOCK_D),
+        )
+    ](
         out_accum,
         lse_accum,
         num_splits,
+        combine_req_ids,
+        num_combine_reqs,
         out,
         h_q,
         out_accum.stride(0),
@@ -2216,9 +2501,9 @@ def _try_flash_mla_tle(
         out.stride(0),
         out.stride(1),
         BLOCK_H=FLASH_MLA_COMBINE_BLOCK_H,
+        BLOCK_D=FLASH_MLA_COMBINE_BLOCK_D,
         HEAD_DIM_V=dv,
-        MAX_SPLITS=num_sm_parts,
-        num_warps=FLASH_MLA_COMBINE_BLOCK_H,
+        num_warps=4,
         num_stages=1,
     )
     return out.view([b, s_q, h_q, dv])
