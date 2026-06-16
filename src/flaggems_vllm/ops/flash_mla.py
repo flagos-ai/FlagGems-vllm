@@ -1,3 +1,5 @@
+from collections import OrderedDict
+from dataclasses import dataclass
 import logging
 import math
 import os
@@ -33,6 +35,211 @@ FLASH_MLA_BLOCK_N = 64
 FLASH_MLA_FIXED_OVERHEAD_BLOCKS = 5
 FLASH_MLA_COMBINE_BLOCK_H = 8
 FLASH_MLA_COMBINE_BLOCK_D = 256
+
+_TENSOR_DESCRIPTOR_CLS = None
+_CURRENT_DESCRIPTOR_ALLOCATOR_DEVICE: int | None = None
+_NUM_SMS_CACHE: dict[int, int] = {}
+_FLASH_MLA_WORKSPACE_CACHE: dict["FlashMLAWorkspaceKey", "FlashMLAWorkspace"] = {}
+_DESCRIPTOR_CACHE: OrderedDict["TensorDescKey", object] = OrderedDict()
+_DESCRIPTOR_KEEPALIVE: OrderedDict["TensorDescKey", torch.Tensor] = OrderedDict()
+
+
+@dataclass(frozen=True)
+class FlashMLAWorkspaceKey:
+    device: int
+    dtype: torch.dtype
+    b: int
+    s_q: int
+    h_q: int
+    d: int
+    dv: int
+    block_size: int
+    num_sm_parts: int
+
+
+@dataclass
+class FlashMLAWorkspace:
+    sched_meta: torch.Tensor
+    num_splits: torch.Tensor
+    combine_req_ids: torch.Tensor
+    num_combine_reqs: torch.Tensor
+    out_accum: torch.Tensor
+    lse_accum: torch.Tensor
+    out: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class TensorDescKey:
+    device: int
+    dtype: torch.dtype
+    storage_ptr: int
+    storage_nbytes: int
+    data_ptr: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    block_shape: tuple[int, ...]
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
+def _contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
+    return x if x.is_contiguous() else x.contiguous()
+
+
+def _get_cuda_device_index(cuda_device: torch.device) -> int:
+    dev_idx = cuda_device.index
+    if dev_idx is None:
+        dev_idx = torch.cuda.current_device()
+    return int(dev_idx)
+
+
+def _get_tensor_descriptor_cls():
+    global _TENSOR_DESCRIPTOR_CLS
+    if _TENSOR_DESCRIPTOR_CLS is None:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        _TENSOR_DESCRIPTOR_CLS = TensorDescriptor
+    return _TENSOR_DESCRIPTOR_CLS
+
+
+def _ensure_triton_descriptor_allocator(cuda_device: torch.device) -> None:
+    global _CURRENT_DESCRIPTOR_ALLOCATOR_DEVICE
+    dev_idx = _get_cuda_device_index(cuda_device)
+    if _CURRENT_DESCRIPTOR_ALLOCATOR_DEVICE == dev_idx:
+        return
+    _set_triton_descriptor_allocator(cuda_device)
+    _CURRENT_DESCRIPTOR_ALLOCATOR_DEVICE = dev_idx
+
+
+def _get_num_sms(cuda_device: torch.device) -> int:
+    dev_idx = _get_cuda_device_index(cuda_device)
+    cached = _NUM_SMS_CACHE.get(dev_idx)
+    if cached is not None:
+        return cached
+    num_sms = torch.cuda.get_device_properties(cuda_device).multi_processor_count
+    _NUM_SMS_CACHE[dev_idx] = int(num_sms)
+    return int(num_sms)
+
+
+def _get_desc_cache_size() -> int:
+    try:
+        return max(
+            int(
+                os.environ.get(
+                    "FLAGGEMS_VLLM_FLASH_MLA_TLE_DESC_CACHE_SIZE", "128"
+                )
+            ),
+            0,
+        )
+    except ValueError:
+        logger.warning("Invalid FLAGGEMS_VLLM_FLASH_MLA_TLE_DESC_CACHE_SIZE")
+        return 128
+
+
+def _get_flash_mla_workspace(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    b: int,
+    s_q: int,
+    h_q: int,
+    d: int,
+    dv: int,
+    block_size: int,
+    num_sm_parts: int,
+    reuse_output: bool,
+) -> FlashMLAWorkspace:
+    dev_idx = _get_cuda_device_index(device)
+    key = FlashMLAWorkspaceKey(
+        device=dev_idx,
+        dtype=dtype,
+        b=b,
+        s_q=s_q,
+        h_q=h_q,
+        d=d,
+        dv=dv,
+        block_size=block_size,
+        num_sm_parts=num_sm_parts,
+    )
+    ws = _FLASH_MLA_WORKSPACE_CACHE.get(key)
+    if ws is not None:
+        if reuse_output and ws.out is None:
+            ws.out = torch.empty((b * s_q, h_q, dv), dtype=dtype, device=device)
+        return ws
+
+    total_num_splits = b + num_sm_parts
+    max_combine_reqs = min(b, num_sm_parts)
+    ws = FlashMLAWorkspace(
+        sched_meta=torch.empty(
+            (num_sm_parts, FLASH_MLA_META_FIELDS),
+            dtype=torch.int32,
+            device=device,
+        ),
+        num_splits=torch.empty((b + 1,), dtype=torch.int32, device=device),
+        combine_req_ids=torch.empty(
+            (max_combine_reqs,), dtype=torch.int32, device=device
+        ),
+        num_combine_reqs=torch.empty((1,), dtype=torch.int32, device=device),
+        out_accum=torch.empty(
+            (total_num_splits, h_q, dv), dtype=dtype, device=device
+        ),
+        lse_accum=torch.empty(
+            (total_num_splits, h_q), dtype=torch.float32, device=device
+        ),
+        out=(
+            torch.empty((b * s_q, h_q, dv), dtype=dtype, device=device)
+            if reuse_output
+            else None
+        ),
+    )
+    _FLASH_MLA_WORKSPACE_CACHE[key] = ws
+    return ws
+
+
+def _tensor_desc_key(t: torch.Tensor, block_shape: tuple[int, int]) -> TensorDescKey:
+    storage = t.untyped_storage()
+    return TensorDescKey(
+        device=_get_cuda_device_index(t.device),
+        dtype=t.dtype,
+        storage_ptr=int(storage.data_ptr()),
+        storage_nbytes=int(storage.nbytes()),
+        data_ptr=int(t.data_ptr()),
+        shape=tuple(int(x) for x in t.shape),
+        stride=tuple(int(x) for x in t.stride()),
+        block_shape=tuple(int(x) for x in block_shape),
+    )
+
+
+def _get_tensor_desc_cached(t: torch.Tensor, block_shape: tuple[int, int]):
+    TensorDescriptor = _get_tensor_descriptor_cls()
+    key = _tensor_desc_key(t, block_shape)
+    desc = _DESCRIPTOR_CACHE.get(key)
+    if desc is not None:
+        _DESCRIPTOR_CACHE.move_to_end(key)
+        _DESCRIPTOR_KEEPALIVE.move_to_end(key)
+        return desc
+
+    desc = TensorDescriptor(
+        t,
+        shape=list(t.shape),
+        strides=list(t.stride()),
+        block_shape=list(block_shape),
+    )
+    max_size = _get_desc_cache_size()
+    if max_size == 0:
+        return desc
+
+    _DESCRIPTOR_CACHE[key] = desc
+    _DESCRIPTOR_KEEPALIVE[key] = t
+    while len(_DESCRIPTOR_CACHE) > max_size:
+        old_key, _ = _DESCRIPTOR_CACHE.popitem(last=False)
+        _DESCRIPTOR_KEEPALIVE.pop(old_key, None)
+    return desc
 
 
 def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
@@ -1430,28 +1637,66 @@ def _try_flash_mla_tle(
     ):
         return None
 
-    q_tle = q.contiguous()
-    kv_flat = blocked_k.contiguous().view(-1, d)
-    block_table_tle = block_table.contiguous()
-    cache_seqlens_tle = cache_seqlens.contiguous()
-    from triton.tools.tensor_descriptor import TensorDescriptor
+    q_tle = _contiguous_if_needed(q)
+    blocked_k_tle = _contiguous_if_needed(blocked_k)
+    kv_flat = blocked_k_tle.view(-1, d)
+    block_table_tle = _contiguous_if_needed(block_table)
+    cache_seqlens_tle = _contiguous_if_needed(cache_seqlens)
+    TensorDescriptor = _get_tensor_descriptor_cls()
 
-    _set_triton_descriptor_allocator(q.device)
+    _ensure_triton_descriptor_allocator(q.device)
     q_flat = q_tle.view(b * s_q * h_q, d)
     num_m_blocks = triton.cdiv(s_q * h_q // h_kv, FLASH_MLA_BLOCK_M)
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = _get_num_sms(q.device)
     num_sm_parts = max(num_sms // h_kv // num_m_blocks, 1)
-    sched_meta = torch.empty(
-        (num_sm_parts, FLASH_MLA_META_FIELDS),
-        dtype=torch.int32,
-        device=q.device,
-    )
-    num_splits = torch.empty(b + 1, dtype=torch.int32, device=q.device)
     max_combine_reqs = min(b, num_sm_parts)
-    combine_req_ids = torch.empty(
-        (max_combine_reqs,), dtype=torch.int32, device=q.device
-    )
-    num_combine_reqs = torch.empty((1,), dtype=torch.int32, device=q.device)
+    total_num_splits = b + num_sm_parts
+    reuse_workspace = _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_REUSE_WORKSPACE", True)
+    reuse_output = _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_REUSE_OUTPUT", False)
+    if reuse_workspace:
+        ws = _get_flash_mla_workspace(
+            device=q.device,
+            dtype=q.dtype,
+            b=b,
+            s_q=s_q,
+            h_q=h_q,
+            d=d,
+            dv=dv,
+            block_size=block_size,
+            num_sm_parts=num_sm_parts,
+            reuse_output=reuse_output,
+        )
+        sched_meta = ws.sched_meta
+        num_splits = ws.num_splits
+        combine_req_ids = ws.combine_req_ids
+        num_combine_reqs = ws.num_combine_reqs
+        out_accum = ws.out_accum
+        lse_accum = ws.lse_accum
+        if reuse_output:
+            out = ws.out
+        else:
+            out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
+    else:
+        sched_meta = torch.empty(
+            (num_sm_parts, FLASH_MLA_META_FIELDS),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        num_splits = torch.empty(b + 1, dtype=torch.int32, device=q.device)
+        combine_req_ids = torch.empty(
+            (max_combine_reqs,), dtype=torch.int32, device=q.device
+        )
+        num_combine_reqs = torch.empty((1,), dtype=torch.int32, device=q.device)
+        out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
+        out_accum = torch.empty(
+            (total_num_splits, h_q, dv), dtype=q.dtype, device=q.device
+        )
+        lse_accum = torch.empty(
+            (total_num_splits, h_q), dtype=torch.float32, device=q.device
+        )
+    if out is None:
+        out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
+
     flash_mla_sched_meta_kernel_v3[(1,)](
         cache_seqlens_tle,
         sched_meta,
@@ -1467,53 +1712,58 @@ def _try_flash_mla_tle(
         num_warps=1,
         num_stages=1,
     )
-    total_num_splits = b + num_sm_parts
-    out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
-    out_accum = torch.empty(
-        (total_num_splits, h_q, dv), dtype=q.dtype, device=q.device
-    )
-    lse_accum = torch.empty(
-        (total_num_splits, h_q), dtype=torch.float32, device=q.device
-    )
     out_flat = out.view(b * s_q * h_q, dv)
     out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
     d_chunk = 64
-    q_desc = TensorDescriptor(
-        q_flat,
-        shape=[b * s_q * h_q, d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-    )
-    q_tail_desc = TensorDescriptor(
-        q_flat,
-        shape=[b * s_q * h_q, d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, d_chunk],
-    )
-    output_desc = TensorDescriptor(
-        out_flat,
-        shape=[b * s_q * h_q, dv],
-        strides=[dv, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-    )
-    oaccum_desc = TensorDescriptor(
-        out_accum_flat,
-        shape=[total_num_splits * h_q, dv],
-        strides=[dv, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-    )
-    kv_desc = TensorDescriptor(
-        kv_flat,
-        shape=[kv_flat.shape[0], d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_N, dv // 2],
-    )
-    kv_tail_desc = TensorDescriptor(
-        kv_flat,
-        shape=[kv_flat.shape[0], d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_N, d_chunk],
-    )
+    cache_desc = _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_CACHE_DESCRIPTORS", False)
+    if cache_desc:
+        q_desc = _get_tensor_desc_cached(q_flat, (FLASH_MLA_BLOCK_M, dv // 2))
+        q_tail_desc = _get_tensor_desc_cached(q_flat, (FLASH_MLA_BLOCK_M, d_chunk))
+        output_desc = _get_tensor_desc_cached(out_flat, (FLASH_MLA_BLOCK_M, dv // 2))
+        oaccum_desc = _get_tensor_desc_cached(
+            out_accum_flat, (FLASH_MLA_BLOCK_M, dv // 2)
+        )
+        kv_desc = _get_tensor_desc_cached(kv_flat, (FLASH_MLA_BLOCK_N, dv // 2))
+        kv_tail_desc = _get_tensor_desc_cached(
+            kv_flat, (FLASH_MLA_BLOCK_N, d_chunk)
+        )
+    else:
+        q_desc = TensorDescriptor(
+            q_flat,
+            shape=[b * s_q * h_q, d],
+            strides=[d, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
+        )
+        q_tail_desc = TensorDescriptor(
+            q_flat,
+            shape=[b * s_q * h_q, d],
+            strides=[d, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, d_chunk],
+        )
+        output_desc = TensorDescriptor(
+            out_flat,
+            shape=[b * s_q * h_q, dv],
+            strides=[dv, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
+        )
+        oaccum_desc = TensorDescriptor(
+            out_accum_flat,
+            shape=[total_num_splits * h_q, dv],
+            strides=[dv, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
+        )
+        kv_desc = TensorDescriptor(
+            kv_flat,
+            shape=[kv_flat.shape[0], d],
+            strides=[d, 1],
+            block_shape=[FLASH_MLA_BLOCK_N, dv // 2],
+        )
+        kv_tail_desc = TensorDescriptor(
+            kv_flat,
+            shape=[kv_flat.shape[0], d],
+            strides=[d, 1],
+            block_shape=[FLASH_MLA_BLOCK_N, d_chunk],
+        )
 
     flash_mla_splitkv_ws_tle_kernel[(num_m_blocks, num_sm_parts)](
         q_desc,
