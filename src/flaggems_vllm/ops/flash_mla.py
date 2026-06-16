@@ -63,45 +63,24 @@ FLASH_MLA_COMBINE_BLOCK_D = 256
 _TENSOR_DESCRIPTOR_CLS = None
 _CURRENT_DESCRIPTOR_ALLOCATOR_DEVICE: int | None = None
 _NUM_SMS_CACHE: dict[int, int] = {}
-_FLASH_MLA_WORKSPACE_CACHE: dict["FlashMLAWorkspaceKey", "FlashMLAWorkspace"] = {}
-_DESCRIPTOR_CACHE: OrderedDict["TensorDescKey", object] = OrderedDict()
-_DESCRIPTOR_KEEPALIVE: OrderedDict["TensorDescKey", torch.Tensor] = OrderedDict()
+_FLASH_MLA_TLE_PLAN_CACHE: OrderedDict[
+    "FlashMLATLEDecodePlanKey", "FlashMLATLEDecodePlan"
+] = OrderedDict()
 
 
 @dataclass(frozen=True)
-class FlashMLAWorkspaceKey:
+class FlashMLATLEDecodePlanKey:
     device: int
     dtype: torch.dtype
     b: int
     s_q: int
     h_q: int
+    h_kv: int
     d: int
     dv: int
     block_size: int
-    num_sm_parts: int
-
-
-@dataclass
-class FlashMLAWorkspace:
-    sched_meta: torch.Tensor
-    num_splits: torch.Tensor
-    combine_req_ids: torch.Tensor
-    num_combine_reqs: torch.Tensor
-    out_accum: torch.Tensor
-    lse_accum: torch.Tensor
-    out: torch.Tensor | None = None
-
-
-@dataclass(frozen=True)
-class TensorDescKey:
-    device: int
-    dtype: torch.dtype
-    storage_ptr: int
-    storage_nbytes: int
-    data_ptr: int
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
-    block_shape: tuple[int, ...]
+    causal: bool
+    reuse_output: bool
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -150,120 +129,29 @@ def _get_num_sms(cuda_device: torch.device) -> int:
     return int(num_sms)
 
 
-def _get_desc_cache_size() -> int:
+def _get_plan_cache_size() -> int:
     try:
         return max(
             int(
                 os.environ.get(
-                    "FLAGGEMS_VLLM_FLASH_MLA_TLE_DESC_CACHE_SIZE", "128"
+                    "FLAGGEMS_VLLM_FLASH_MLA_TLE_PLAN_CACHE_SIZE", "32"
                 )
             ),
             0,
         )
     except ValueError:
-        logger.warning("Invalid FLAGGEMS_VLLM_FLASH_MLA_TLE_DESC_CACHE_SIZE")
-        return 128
+        logger.warning("Invalid FLAGGEMS_VLLM_FLASH_MLA_TLE_PLAN_CACHE_SIZE")
+        return 32
 
 
-def _get_flash_mla_workspace(
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    b: int,
-    s_q: int,
-    h_q: int,
-    d: int,
-    dv: int,
-    block_size: int,
-    num_sm_parts: int,
-    reuse_output: bool,
-) -> FlashMLAWorkspace:
-    dev_idx = _get_cuda_device_index(device)
-    key = FlashMLAWorkspaceKey(
-        device=dev_idx,
-        dtype=dtype,
-        b=b,
-        s_q=s_q,
-        h_q=h_q,
-        d=d,
-        dv=dv,
-        block_size=block_size,
-        num_sm_parts=num_sm_parts,
-    )
-    ws = _FLASH_MLA_WORKSPACE_CACHE.get(key)
-    if ws is not None:
-        if reuse_output and ws.out is None:
-            ws.out = torch.empty((b * s_q, h_q, dv), dtype=dtype, device=device)
-        return ws
-
-    total_num_splits = b + num_sm_parts
-    max_combine_reqs = min(b, num_sm_parts)
-    ws = FlashMLAWorkspace(
-        sched_meta=torch.empty(
-            (num_sm_parts, FLASH_MLA_META_FIELDS),
-            dtype=torch.int32,
-            device=device,
-        ),
-        num_splits=torch.empty((b + 1,), dtype=torch.int32, device=device),
-        combine_req_ids=torch.empty(
-            (max_combine_reqs,), dtype=torch.int32, device=device
-        ),
-        num_combine_reqs=torch.empty((1,), dtype=torch.int32, device=device),
-        out_accum=torch.empty(
-            (total_num_splits, h_q, dv), dtype=dtype, device=device
-        ),
-        lse_accum=torch.empty(
-            (total_num_splits, h_q), dtype=torch.float32, device=device
-        ),
-        out=(
-            torch.empty((b * s_q, h_q, dv), dtype=dtype, device=device)
-            if reuse_output
-            else None
-        ),
-    )
-    _FLASH_MLA_WORKSPACE_CACHE[key] = ws
-    return ws
+def _reuse_tle_output() -> bool:
+    return _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_REUSE_OUTPUT", False)
 
 
-def _tensor_desc_key(t: torch.Tensor, block_shape: tuple[int, int]) -> TensorDescKey:
-    storage = t.untyped_storage()
-    return TensorDescKey(
-        device=_get_cuda_device_index(t.device),
-        dtype=t.dtype,
-        storage_ptr=int(storage.data_ptr()),
-        storage_nbytes=int(storage.nbytes()),
-        data_ptr=int(t.data_ptr()),
-        shape=tuple(int(x) for x in t.shape),
-        stride=tuple(int(x) for x in t.stride()),
-        block_shape=tuple(int(x) for x in block_shape),
-    )
-
-
-def _get_tensor_desc_cached(t: torch.Tensor, block_shape: tuple[int, int]):
-    TensorDescriptor = _get_tensor_descriptor_cls()
-    key = _tensor_desc_key(t, block_shape)
-    desc = _DESCRIPTOR_CACHE.get(key)
-    if desc is not None:
-        _DESCRIPTOR_CACHE.move_to_end(key)
-        _DESCRIPTOR_KEEPALIVE.move_to_end(key)
-        return desc
-
-    desc = TensorDescriptor(
-        t,
-        shape=list(t.shape),
-        strides=list(t.stride()),
-        block_shape=list(block_shape),
-    )
-    max_size = _get_desc_cache_size()
-    if max_size == 0:
-        return desc
-
-    _DESCRIPTOR_CACHE[key] = desc
-    _DESCRIPTOR_KEEPALIVE[key] = t
-    while len(_DESCRIPTOR_CACHE) > max_size:
-        old_key, _ = _DESCRIPTOR_CACHE.popitem(last=False)
-        _DESCRIPTOR_KEEPALIVE.pop(old_key, None)
-    return desc
+def _same_cuda_device(lhs: torch.device, rhs: torch.device) -> bool:
+    return lhs.type == rhs.type == "cuda" and _get_cuda_device_index(
+        lhs
+    ) == _get_cuda_device_index(rhs)
 
 
 def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
@@ -379,121 +267,6 @@ def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
         return torch.empty(size, dtype=torch.int8, device=cuda_device)
 
     triton.set_allocator(alloc_fn)
-
-
-@triton.jit
-def flash_mla_sched_meta_kernel_v3(
-    B_seq_len,
-    Sched_meta,
-    Num_splits,
-    CombineReqIds,
-    NumCombineReqs,
-    BLOCK_B: tl.constexpr,
-    BATCH_SIZE: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    FIXED_OVERHEAD_NUM_BLOCKS: tl.constexpr,
-    NUM_SM_PARTS: tl.constexpr,
-    META_FIELDS: tl.constexpr,
-):
-    offs_b = tl.arange(0, BLOCK_B)
-    mask_b = offs_b < BATCH_SIZE
-    seqlens = tl.load(B_seq_len + offs_b, mask=mask_b, other=0)
-    num_blocks_vec = tl.cdiv(tl.maximum(seqlens, 1), BLOCK_SIZE_N)
-    total_num_blocks = tl.sum(
-        tl.where(mask_b, num_blocks_vec + FIXED_OVERHEAD_NUM_BLOCKS, 0), axis=0
-    )
-    payload = tl.maximum(
-        tl.cdiv(total_num_blocks, NUM_SM_PARTS) + FIXED_OVERHEAD_NUM_BLOCKS,
-        FIXED_OVERHEAD_NUM_BLOCKS + 2,
-    )
-
-    now_req_idx = 0
-    now_block = 0
-    now_n_split_idx = 0
-    cum_num_splits = 0
-    combine_req_count = 0
-    tl.store(Num_splits, 0)
-
-    for part in tl.range(0, NUM_SM_PARTS, 1):
-        begin_req_idx = now_req_idx
-        begin_block_idx = now_block
-        begin_split_idx = now_n_split_idx
-        is_first_req_splitted = now_block != 0
-        remain_payload = payload
-
-        while (now_req_idx < BATCH_SIZE) & (remain_payload > 0):
-            cur_seq_len = tl.load(B_seq_len + now_req_idx)
-            cur_num_blocks = tl.cdiv(tl.maximum(cur_seq_len, 1), BLOCK_SIZE_N)
-            now_remain_blocks = cur_num_blocks - now_block
-            if remain_payload + 1 >= now_remain_blocks + FIXED_OVERHEAD_NUM_BLOCKS:
-                req_num_splits = now_n_split_idx + 1
-                if req_num_splits != 1:
-                    tl.store(CombineReqIds + combine_req_count, now_req_idx)
-                    combine_req_count += 1
-                cum_num_splits += req_num_splits
-                tl.store(Num_splits + now_req_idx + 1, cum_num_splits)
-                remain_payload -= now_remain_blocks + FIXED_OVERHEAD_NUM_BLOCKS
-                now_req_idx += 1
-                now_block = 0
-                now_n_split_idx = 0
-            else:
-                if remain_payload - FIXED_OVERHEAD_NUM_BLOCKS > 0:
-                    split_blocks = remain_payload - FIXED_OVERHEAD_NUM_BLOCKS
-                    # The WS TLE kernel cannot safely handle a one-block
-                    # partial split in this schedule.
-                    split_blocks = tl.where(
-                        (split_blocks > 1) & (now_remain_blocks - split_blocks == 1),
-                        split_blocks - 1,
-                        split_blocks,
-                    )
-                    now_block += split_blocks
-                    now_n_split_idx += 1
-                remain_payload = 0
-
-        if now_block > 0:
-            end_req_idx = now_req_idx
-            end_block_idx = now_block
-        else:
-            end_req_idx = now_req_idx - 1
-            if end_req_idx >= 0:
-                end_seq_len = tl.load(B_seq_len + end_req_idx)
-                end_block_idx = tl.where(
-                    end_seq_len == 0, 0, tl.cdiv(end_seq_len, BLOCK_SIZE_N)
-                )
-            else:
-                end_block_idx = 0
-
-        meta = Sched_meta + part * META_FIELDS
-        if begin_req_idx >= BATCH_SIZE:
-            tl.store(meta + 0, BATCH_SIZE)
-            tl.store(meta + 1, BATCH_SIZE - 1)
-            tl.store(meta + 2, 0)
-            tl.store(meta + 3, 0)
-            tl.store(meta + 4, 0)
-            tl.store(meta + 5, 0)
-            tl.store(meta + 6, 0)
-            tl.store(meta + 7, 0)
-        else:
-            end_seq_len = tl.load(B_seq_len + end_req_idx)
-            last_block_exclusive = tl.where(
-                end_seq_len == 0, 0, tl.cdiv(end_seq_len, BLOCK_SIZE_N)
-            )
-            is_last_req_splitted = (end_block_idx != last_block_exclusive) & (
-                end_seq_len != 0
-            )
-            if begin_req_idx == end_req_idx:
-                same_req_split = is_first_req_splitted | is_last_req_splitted
-                is_first_req_splitted = same_req_split
-                is_last_req_splitted = same_req_split
-
-            tl.store(meta + 0, begin_req_idx)
-            tl.store(meta + 1, end_req_idx)
-            tl.store(meta + 2, begin_block_idx)
-            tl.store(meta + 3, end_block_idx)
-            tl.store(meta + 4, begin_split_idx)
-            tl.store(meta + 5, is_first_req_splitted.to(tl.int32))
-            tl.store(meta + 6, is_last_req_splitted.to(tl.int32))
-            tl.store(meta + 7, 0)
 
 
 @triton.jit
@@ -1452,321 +1225,6 @@ def flash_mla_splitkv_ws_tle_kernel(
 
 
 @triton.jit
-def flash_mla_splitkv_ws_tle_kernel(
-    Q_desc,
-    Q_tail_desc,
-    Output_desc,
-    OAccum_desc,
-    Kv_desc,
-    Kv_tail_desc,
-    Kv,
-    Block_table,
-    B_seq_len,
-    Sched_meta,
-    Num_splits,
-    O,
-    O_accum,
-    LSE_accum,
-    sm_scale,
-    head_num,
-    stride_kv_token,
-    stride_block_table_b,
-    stride_lseaccum_split,
-    stride_lseaccum_h,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    HEAD_DIM_V: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    D_CHUNK: tl.constexpr,
-    META_FIELDS: tl.constexpr,
-):
-    m_block_idx = tl.program_id(0)
-    partition_idx = tl.program_id(1)
-    meta_base = Sched_meta + partition_idx * META_FIELDS
-    begin_req_idx = tl.load(meta_base + 0)
-    end_req_idx = tl.load(meta_base + 1)
-    begin_block_idx_meta = tl.load(meta_base + 2)
-    end_block_idx_meta = tl.load(meta_base + 3)
-    begin_split_idx = tl.load(meta_base + 4)
-    is_first_req_splitted = tl.load(meta_base + 5) != 0
-    is_last_req_splitted = tl.load(meta_base + 6) != 0
-    head_base = m_block_idx * BLOCK_M
-    HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
-    HAVE_TAIL: tl.constexpr = HEAD_DIM > HEAD_DIM_V
-
-    sQ_l_smem = tle.gpu.alloc(
-        [1, BLOCK_M, HALF_DIM_V],
-        dtype=Kv.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-    sQ_r_smem = tle.gpu.alloc(
-        [1, BLOCK_M, HALF_DIM_V],
-        dtype=Kv.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-    if HAVE_TAIL:
-        sQ_tail_smem = tle.gpu.alloc(
-            [1, BLOCK_M, D_CHUNK],
-            dtype=Kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
-        )
-        q_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flash_mla_ws_q",
-            readers=("wg0", "wg1"),
-            sQ_l=sQ_l_smem,
-            sQ_r=sQ_r_smem,
-            sQ_tail=sQ_tail_smem,
-        )
-    else:
-        q_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flash_mla_ws_q",
-            readers=("wg0", "wg1"),
-            sQ_l=sQ_l_smem,
-            sQ_r=sQ_r_smem,
-        )
-    sK0_l = tle.gpu.alloc(
-        [1, BLOCK_N, HALF_DIM_V],
-        dtype=Kv.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-    sK0_r = tle.gpu.alloc(
-        [1, BLOCK_N, HALF_DIM_V],
-        dtype=Kv.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-    sK1_l = tle.gpu.alloc(
-        [1, BLOCK_N, HALF_DIM_V],
-        dtype=Kv.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-    sK1_r = tle.gpu.alloc(
-        [1, BLOCK_N, HALF_DIM_V],
-        dtype=Kv.dtype.element_ty,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
-    if HAVE_TAIL:
-        sK0_tail = tle.gpu.alloc(
-            [1, BLOCK_N, D_CHUNK],
-            dtype=Kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
-        )
-        sK1_tail = tle.gpu.alloc(
-            [1, BLOCK_N, D_CHUNK],
-            dtype=Kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
-        )
-        sP0_smem = sK0_tail
-        sP1_smem = sK1_tail
-    else:
-        sP0_smem = tle.gpu.alloc(
-            [1, BLOCK_M, BLOCK_N],
-            dtype=Kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        sP1_smem = tle.gpu.alloc(
-            [1, BLOCK_M, BLOCK_N],
-            dtype=Kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-    sM_smem = tle.gpu.alloc(
-        [1, BLOCK_M],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    sL_smem = tle.gpu.alloc(
-        [2, BLOCK_M],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    k0_l_pipe = tle.pipe(
-        capacity=1,
-        scope="cta",
-        name="flash_mla_ws_k0_l",
-        sK=sK0_l,
-    )
-    if HAVE_TAIL:
-        k0_r_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flash_mla_ws_k0_r",
-            readers=("qk", "remote"),
-            sK=sK0_r,
-            sK_tail=sK0_tail,
-        )
-    else:
-        k0_r_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flash_mla_ws_k0_r",
-            readers=("qk", "remote"),
-            sK=sK0_r,
-        )
-    k1_l_pipe = tle.pipe(
-        capacity=1,
-        scope="cta",
-        name="flash_mla_ws_k1_l",
-        readers=("qk", "remote"),
-        sK=sK1_l,
-    )
-    if HAVE_TAIL:
-        k1_r_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flash_mla_ws_k1_r",
-            sK=sK1_r,
-            sK_tail=sK1_tail,
-        )
-    else:
-        k1_r_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flash_mla_ws_k1_r",
-            sK=sK1_r,
-        )
-    sM_wg0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_m0", sM=sM_smem)
-    sM_wg1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_m1", sM=sM_smem)
-    sP0_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_p0", sP=sP0_smem)
-    sP1_pipe = tle.pipe(capacity=1, scope="cta", name="flash_mla_ws_p1", sP=sP1_smem)
-    sL0_pipe = tle.pipe(capacity=2, scope="cta", name="flash_mla_ws_l0", sL=sL_smem)
-    sL1_pipe = tle.pipe(capacity=2, scope="cta", name="flash_mla_ws_l1", sL=sL_smem)
-
-    tle.gpu.warp_specialize(
-        [
-            (
-                _flash_mla_ws_consumer0,
-                (
-                    k0_l_pipe.reader(),
-                    k0_r_pipe.reader("qk"),
-                    k1_l_pipe.reader("remote", fields=("sK",)),
-                    sM_wg0_pipe.writer(),
-                    sM_wg1_pipe.reader(),
-                    sP0_pipe.writer(),
-                    sP1_pipe.reader(),
-                    sL0_pipe.writer(),
-                    sL1_pipe.reader(),
-                    q_pipe.reader("wg0"),
-                    sK0_l,
-                    Output_desc,
-                    OAccum_desc,
-                    O,
-                    sm_scale,
-                    B_seq_len,
-                    Num_splits,
-                    begin_req_idx,
-                    end_req_idx,
-                    begin_block_idx_meta,
-                    end_block_idx_meta,
-                    begin_split_idx,
-                    is_first_req_splitted,
-                    is_last_req_splitted,
-                    head_base,
-                    head_num,
-                    BLOCK_M,
-                    BLOCK_N,
-                    HEAD_DIM_V,
-                    D_CHUNK,
-                    HAVE_TAIL,
-                ),
-            ),
-            (
-                _flash_mla_ws_consumer1,
-                (
-                    k1_l_pipe.reader("qk"),
-                    k1_r_pipe.reader(),
-                    k0_r_pipe.reader("remote", fields=("sK",)),
-                    sM_wg1_pipe.writer(),
-                    sM_wg0_pipe.reader(),
-                    sP1_pipe.writer(),
-                    sP0_pipe.reader(),
-                    sL1_pipe.writer(),
-                    sL0_pipe.reader(),
-                    q_pipe.reader("wg1"),
-                    sK1_r,
-                    Output_desc,
-                    OAccum_desc,
-                    O,
-                    LSE_accum,
-                    sm_scale,
-                    B_seq_len,
-                    Num_splits,
-                    begin_req_idx,
-                    end_req_idx,
-                    begin_block_idx_meta,
-                    end_block_idx_meta,
-                    begin_split_idx,
-                    is_first_req_splitted,
-                    is_last_req_splitted,
-                    head_base,
-                    head_num,
-                    stride_lseaccum_split,
-                    stride_lseaccum_h,
-                    BLOCK_M,
-                    BLOCK_N,
-                    HEAD_DIM_V,
-                    D_CHUNK,
-                    HAVE_TAIL,
-                ),
-            ),
-            (
-                _flash_mla_ws_kv_producer,
-                (
-                    q_pipe.writer(),
-                    k0_l_pipe.writer(),
-                    k0_r_pipe.writer(),
-                    k1_l_pipe.writer(),
-                    k1_r_pipe.writer(),
-                    Q_desc,
-                    Q_tail_desc,
-                    Kv,
-                    Kv_desc,
-                    Kv_tail_desc,
-                    Block_table,
-                    B_seq_len,
-                    begin_req_idx,
-                    end_req_idx,
-                    begin_block_idx_meta,
-                    end_block_idx_meta,
-                    head_base,
-                    head_num,
-                    stride_kv_token,
-                    stride_block_table_b,
-                    BLOCK_M,
-                    BLOCK_N,
-                    PAGE_SIZE,
-                    HEAD_DIM_V,
-                    D_CHUNK,
-                    HAVE_TAIL,
-                ),
-            ),
-        ],
-        [4, 4],
-        [216, 72],
-    )
-
-
-@triton.jit
 def flash_mla_combine_kernel_compact(
     O_accum,
     LSE_accum,
@@ -1846,10 +1304,9 @@ def flash_mla_combine_kernel_compact(
                 + batch_idx * stride_o_b
                 + offs_h[:, None] * stride_o_h
                 + offs_d[None, :],
-                mask=active & mask_h[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            acc += w[:, None] * o_s
+                acc.to(O.dtype.element_ty),
+                mask=mask_h[:, None] & mask_d[None, :],
+            )
 
 
 class FlashMLATLEDecodePlan:
@@ -1879,12 +1336,6 @@ class FlashMLATLEDecodePlan:
         self.device = device
         self.causal = causal
         self.reuse_output = reuse_output
-        self._cache_run_desc = _env_flag(
-            "FLAGGEMS_VLLM_FLASH_MLA_TLE_CACHE_RUN_DESCRIPTORS", False
-        )
-        self._cache_q_desc = _env_flag(
-            "FLAGGEMS_VLLM_FLASH_MLA_TLE_CACHE_Q_DESC", False
-        )
 
         self.d_chunk = 64
         self.sm_scale = 1 / math.sqrt(d)
@@ -1920,176 +1371,10 @@ class FlashMLATLEDecodePlan:
         self.metadata_valid = False
         self._last_cache_seqlens_ref: torch.Tensor | None = None
         self._last_launch_refs = ()
-        self._out_accum_flat = None
-        self._oaccum_desc = None
-        self._oaccum_desc_refs = None
-        self._kv_desc_key = None
-        self._kv_desc = None
-        self._kv_tail_desc = None
-        self._kv_desc_refs = None
-        self._out_desc_key = None
-        self._output_desc = None
-        self._out_desc_refs = None
-        self._q_desc_key = None
-        self._q_desc = None
-        self._q_tail_desc = None
-        self._q_desc_refs = None
-        self._build_oaccum_desc()
 
     def invalidate_metadata(self) -> None:
         self.metadata_valid = False
         self._last_cache_seqlens_ref = None
-
-    def _build_oaccum_desc(self) -> None:
-        TensorDescriptor = _get_tensor_descriptor_cls()
-        _ensure_triton_descriptor_allocator(self.device)
-
-        self._out_accum_flat = self.out_accum.view(
-            self.total_num_splits * self.h_q,
-            self.dv,
-        )
-        self._oaccum_desc = TensorDescriptor(
-            self._out_accum_flat,
-            shape=[self.total_num_splits * self.h_q, self.dv],
-            strides=[self.dv, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
-        )
-        self._oaccum_desc_refs = (
-            self._out_accum_flat,
-            self._oaccum_desc,
-        )
-
-    def _get_oaccum_desc(self):
-        if self._oaccum_desc is None:
-            self._build_oaccum_desc()
-        return self._oaccum_desc
-
-    def clear_descriptor_cache(self) -> None:
-        self._kv_desc_key = None
-        self._kv_desc = None
-        self._kv_tail_desc = None
-        self._kv_desc_refs = None
-        self._out_desc_key = None
-        self._output_desc = None
-        self._out_desc_refs = None
-        self._q_desc_key = None
-        self._q_desc = None
-        self._q_tail_desc = None
-        self._q_desc_refs = None
-
-    def _get_kv_descs(self, TensorDescriptor, kv_flat, can_cache: bool):
-        kv_block = (FLASH_MLA_BLOCK_N, self.dv // 2)
-        kv_tail_block = (FLASH_MLA_BLOCK_N, self.d_chunk)
-
-        if not self._cache_run_desc or not can_cache:
-            kv_desc = TensorDescriptor(
-                kv_flat,
-                shape=[kv_flat.shape[0], self.d],
-                strides=[self.d, 1],
-                block_shape=list(kv_block),
-            )
-            kv_tail_desc = TensorDescriptor(
-                kv_flat,
-                shape=[kv_flat.shape[0], self.d],
-                strides=[self.d, 1],
-                block_shape=list(kv_tail_block),
-            )
-            return kv_desc, kv_tail_desc
-
-        key = (
-            _tensor_desc_light_key(kv_flat, kv_block),
-            _tensor_desc_light_key(kv_flat, kv_tail_block),
-        )
-        if key != self._kv_desc_key:
-            self._kv_desc = TensorDescriptor(
-                kv_flat,
-                shape=[kv_flat.shape[0], self.d],
-                strides=[self.d, 1],
-                block_shape=list(kv_block),
-            )
-            self._kv_tail_desc = TensorDescriptor(
-                kv_flat,
-                shape=[kv_flat.shape[0], self.d],
-                strides=[self.d, 1],
-                block_shape=list(kv_tail_block),
-            )
-            self._kv_desc_key = key
-            self._kv_desc_refs = (
-                kv_flat,
-                self._kv_desc,
-                self._kv_tail_desc,
-            )
-        return self._kv_desc, self._kv_tail_desc
-
-    def _get_output_desc(self, TensorDescriptor, out_flat, can_cache: bool):
-        block = (FLASH_MLA_BLOCK_M, self.dv // 2)
-
-        if not self._cache_run_desc or not can_cache:
-            return TensorDescriptor(
-                out_flat,
-                shape=[self.b * self.s_q * self.h_q, self.dv],
-                strides=[self.dv, 1],
-                block_shape=list(block),
-            )
-
-        key = _tensor_desc_light_key(out_flat, block)
-        if key != self._out_desc_key:
-            self._output_desc = TensorDescriptor(
-                out_flat,
-                shape=[self.b * self.s_q * self.h_q, self.dv],
-                strides=[self.dv, 1],
-                block_shape=list(block),
-            )
-            self._out_desc_key = key
-            self._out_desc_refs = (
-                out_flat,
-                self._output_desc,
-            )
-        return self._output_desc
-
-    def _get_q_descs(self, TensorDescriptor, q_flat, can_cache: bool):
-        q_block = (FLASH_MLA_BLOCK_M, self.dv // 2)
-        q_tail_block = (FLASH_MLA_BLOCK_M, self.d_chunk)
-
-        if not (self._cache_run_desc and self._cache_q_desc and can_cache):
-            q_desc = TensorDescriptor(
-                q_flat,
-                shape=[self.b * self.s_q * self.h_q, self.d],
-                strides=[self.d, 1],
-                block_shape=list(q_block),
-            )
-            q_tail_desc = TensorDescriptor(
-                q_flat,
-                shape=[self.b * self.s_q * self.h_q, self.d],
-                strides=[self.d, 1],
-                block_shape=list(q_tail_block),
-            )
-            return q_desc, q_tail_desc
-
-        key = (
-            _tensor_desc_light_key(q_flat, q_block),
-            _tensor_desc_light_key(q_flat, q_tail_block),
-        )
-        if key != self._q_desc_key:
-            self._q_desc = TensorDescriptor(
-                q_flat,
-                shape=[self.b * self.s_q * self.h_q, self.d],
-                strides=[self.d, 1],
-                block_shape=list(q_block),
-            )
-            self._q_tail_desc = TensorDescriptor(
-                q_flat,
-                shape=[self.b * self.s_q * self.h_q, self.d],
-                strides=[self.d, 1],
-                block_shape=list(q_tail_block),
-            )
-            self._q_desc_key = key
-            self._q_desc_refs = (
-                q_flat,
-                self._q_desc,
-                self._q_tail_desc,
-            )
-        return self._q_desc, self._q_tail_desc
 
     def plan(self, cache_seqlens: torch.Tensor) -> None:
         if cache_seqlens.dtype != torch.int32:
@@ -2203,22 +1488,45 @@ class FlashMLATLEDecodePlan:
         q_flat = q_tle.view(self.b * self.s_q * self.h_q, self.d)
         out_tle = self._get_out_tensor(out)
         out_flat = out_tle.view(self.b * self.s_q * self.h_q, self.dv)
-        oaccum_desc = self._get_oaccum_desc()
+        out_accum_flat = self.out_accum.view(
+            self.total_num_splits * self.h_q, self.dv
+        )
 
-        q_desc, q_tail_desc = self._get_q_descs(
-            TensorDescriptor,
+        q_desc = TensorDescriptor(
             q_flat,
-            can_cache=(q_tle is q),
+            shape=[self.b * self.s_q * self.h_q, self.d],
+            strides=[self.d, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
         )
-        output_desc = self._get_output_desc(
-            TensorDescriptor,
+        q_tail_desc = TensorDescriptor(
+            q_flat,
+            shape=[self.b * self.s_q * self.h_q, self.d],
+            strides=[self.d, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, self.d_chunk],
+        )
+        output_desc = TensorDescriptor(
             out_flat,
-            can_cache=(self.reuse_output and out is None),
+            shape=[self.b * self.s_q * self.h_q, self.dv],
+            strides=[self.dv, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
         )
-        kv_desc, kv_tail_desc = self._get_kv_descs(
-            TensorDescriptor,
+        oaccum_desc = TensorDescriptor(
+            out_accum_flat,
+            shape=[self.total_num_splits * self.h_q, self.dv],
+            strides=[self.dv, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
+        )
+        kv_desc = TensorDescriptor(
             kv_flat,
-            can_cache=(blocked_k_tle is blocked_k),
+            shape=[kv_flat.shape[0], self.d],
+            strides=[self.d, 1],
+            block_shape=[FLASH_MLA_BLOCK_N, self.dv // 2],
+        )
+        kv_tail_desc = TensorDescriptor(
+            kv_flat,
+            shape=[kv_flat.shape[0], self.d],
+            strides=[self.d, 1],
+            block_shape=[FLASH_MLA_BLOCK_N, self.d_chunk],
         )
 
         flash_mla_splitkv_ws_tle_kernel[(self.num_m_blocks, self.num_sm_parts)](
@@ -2238,8 +1546,14 @@ class FlashMLATLEDecodePlan:
             self.lse_accum,
             self.sm_scale,
             self.h_q,
+            q_tle.stride(0),
+            q_tle.stride(2),
             kv_flat.stride(0),
             block_table_tle.stride(0),
+            out_tle.stride(0),
+            out_tle.stride(1),
+            self.out_accum.stride(0),
+            self.out_accum.stride(1),
             self.lse_accum.stride(0),
             self.lse_accum.stride(1),
             BLOCK_M=FLASH_MLA_BLOCK_M,
@@ -2287,11 +1601,11 @@ class FlashMLATLEDecodePlan:
             block_table_tle,
             out_tle,
             out_flat,
-            self._out_accum_flat,
+            out_accum_flat,
             q_desc,
             q_tail_desc,
             output_desc,
-            self._oaccum_desc,
+            oaccum_desc,
             kv_desc,
             kv_tail_desc,
         )
@@ -2381,170 +1695,6 @@ def get_flash_mla_tle_decode_plan(
     )
 
 
-@triton.jit
-def flash_mla_combine_kernel_v2(
-    O_accum,
-    LSE_accum,
-    Num_splits,
-    O,
-    head_num,
-    stride_oaccum_split,
-    stride_oaccum_h,
-    stride_lseaccum_split,
-    stride_lseaccum_h,
-    stride_o_b,
-    stride_o_h,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    HEAD_DIM_V: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-    h_block_idx = tl.program_id(1)
-    d_block_idx = tl.program_id(2)
-
-    offs_h = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
-    offs_d = d_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_h = offs_h < head_num
-    mask_d = offs_d < HEAD_DIM_V
-
-    start_split = tl.load(Num_splits + batch_idx)
-    end_split = tl.load(Num_splits + batch_idx + 1)
-    my_num_splits = end_split - start_split
-
-    if my_num_splits > 1:
-        max_lse = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
-        for s in tl.range(0, my_num_splits):
-            lse_s = tl.load(
-                LSE_accum
-                + (start_split + s) * stride_lseaccum_split
-                + offs_h * stride_lseaccum_h,
-                mask=mask_h,
-                other=float("-inf"),
-            )
-            max_lse = tl.maximum(max_lse, lse_s)
-
-        acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-        sum_w = tl.zeros([BLOCK_H], dtype=tl.float32)
-        valid_row = max_lse != float("-inf")
-        for s in tl.range(0, my_num_splits):
-            lse_s = tl.load(
-                LSE_accum
-                + (start_split + s) * stride_lseaccum_split
-                + offs_h * stride_lseaccum_h,
-                mask=mask_h,
-                other=float("-inf"),
-            )
-            w = tl.where(valid_row, tl.exp(lse_s - max_lse), 0.0)
-            sum_w += w
-
-            o_s = tl.load(
-                O_accum
-                + (start_split + s) * stride_oaccum_split
-                + offs_h[:, None] * stride_oaccum_h
-                + offs_d[None, :],
-                mask=mask_h[:, None] & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            acc += w[:, None] * o_s
-
-        inv_sum = tl.where(sum_w > 0.0, tl.fdiv(1.0, sum_w), 0.0)
-        acc = acc * inv_sum[:, None]
-
-        tl.store(
-            O
-            + batch_idx * stride_o_b
-            + offs_h[:, None] * stride_o_h
-            + offs_d[None, :],
-            acc.to(O.dtype.element_ty),
-            mask=mask_h[:, None] & mask_d[None, :],
-        )
-
-
-@triton.jit
-def flash_mla_combine_kernel_compact(
-    O_accum,
-    LSE_accum,
-    Num_splits,
-    CombineReqIds,
-    NumCombineReqs,
-    O,
-    head_num,
-    stride_oaccum_split,
-    stride_oaccum_h,
-    stride_lseaccum_split,
-    stride_lseaccum_h,
-    stride_o_b,
-    stride_o_h,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    HEAD_DIM_V: tl.constexpr,
-):
-    task_idx = tl.program_id(0)
-    h_block_idx = tl.program_id(1)
-    d_block_idx = tl.program_id(2)
-
-    num_tasks = tl.load(NumCombineReqs)
-    if task_idx < num_tasks:
-        batch_idx = tl.load(CombineReqIds + task_idx)
-
-        offs_h = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
-        offs_d = d_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
-        mask_h = offs_h < head_num
-        mask_d = offs_d < HEAD_DIM_V
-
-        start_split = tl.load(Num_splits + batch_idx)
-        end_split = tl.load(Num_splits + batch_idx + 1)
-        my_num_splits = end_split - start_split
-
-        if my_num_splits > 1:
-            max_lse = tl.full([BLOCK_H], value=float("-inf"), dtype=tl.float32)
-            for s in tl.range(0, my_num_splits):
-                lse_s = tl.load(
-                    LSE_accum
-                    + (start_split + s) * stride_lseaccum_split
-                    + offs_h * stride_lseaccum_h,
-                    mask=mask_h,
-                    other=float("-inf"),
-                )
-                max_lse = tl.maximum(max_lse, lse_s)
-
-            acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-            sum_w = tl.zeros([BLOCK_H], dtype=tl.float32)
-            valid_row = max_lse != float("-inf")
-            for s in tl.range(0, my_num_splits):
-                lse_s = tl.load(
-                    LSE_accum
-                    + (start_split + s) * stride_lseaccum_split
-                    + offs_h * stride_lseaccum_h,
-                    mask=mask_h,
-                    other=float("-inf"),
-                )
-                w = tl.where(valid_row, tl.exp(lse_s - max_lse), 0.0)
-                sum_w += w
-
-                o_s = tl.load(
-                    O_accum
-                    + (start_split + s) * stride_oaccum_split
-                    + offs_h[:, None] * stride_oaccum_h
-                    + offs_d[None, :],
-                    mask=mask_h[:, None] & mask_d[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                acc += w[:, None] * o_s
-
-            inv_sum = tl.where(sum_w > 0.0, tl.fdiv(1.0, sum_w), 0.0)
-            acc = acc * inv_sum[:, None]
-
-            tl.store(
-                O
-                + batch_idx * stride_o_b
-                + offs_h[:, None] * stride_o_h
-                + offs_d[None, :],
-                acc.to(O.dtype.element_ty),
-                mask=mask_h[:, None] & mask_d[None, :],
-            )
-
-
 def _try_flash_mla_tle(
     q: torch.Tensor,
     block_table: torch.Tensor,
@@ -2562,199 +1712,26 @@ def _try_flash_mla_tle(
     if _force_triton_flash_mla() or not HAS_TLE_FLASH_MLA:
         return None
 
-    q_tle = _contiguous_if_needed(q)
-    blocked_k_tle = _contiguous_if_needed(blocked_k)
-    kv_flat = blocked_k_tle.view(-1, d)
-    block_table_tle = _contiguous_if_needed(block_table)
-    cache_seqlens_tle = _contiguous_if_needed(cache_seqlens)
-    TensorDescriptor = _get_tensor_descriptor_cls()
-
-    _ensure_triton_descriptor_allocator(q.device)
-    q_flat = q_tle.view(b * s_q * h_q, d)
-    num_m_blocks = triton.cdiv(s_q * h_q // h_kv, FLASH_MLA_BLOCK_M)
-    num_sms = _get_num_sms(q.device)
-    num_sm_parts = max(num_sms // h_kv // num_m_blocks, 1)
-    max_combine_reqs = min(b, num_sm_parts)
-    total_num_splits = b + num_sm_parts
-    reuse_workspace = _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_REUSE_WORKSPACE", True)
-    reuse_output = _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_REUSE_OUTPUT", False)
-    if reuse_workspace:
-        ws = _get_flash_mla_workspace(
-            device=q.device,
-            dtype=q.dtype,
-            b=b,
-            s_q=s_q,
-            h_q=h_q,
-            d=d,
-            dv=dv,
-            block_size=block_size,
-            num_sm_parts=num_sm_parts,
-            reuse_output=reuse_output,
-        )
-        sched_meta = ws.sched_meta
-        num_splits = ws.num_splits
-        combine_req_ids = ws.combine_req_ids
-        num_combine_reqs = ws.num_combine_reqs
-        out_accum = ws.out_accum
-        lse_accum = ws.lse_accum
-        if reuse_output:
-            out = ws.out
-        else:
-            out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
-    else:
-        sched_meta = torch.empty(
-            (num_sm_parts, FLASH_MLA_META_FIELDS),
-            dtype=torch.int32,
-            device=q.device,
-        )
-        num_splits = torch.empty(b + 1, dtype=torch.int32, device=q.device)
-        combine_req_ids = torch.empty(
-            (max_combine_reqs,), dtype=torch.int32, device=q.device
-        )
-        num_combine_reqs = torch.empty((1,), dtype=torch.int32, device=q.device)
-        out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
-        out_accum = torch.empty(
-            (total_num_splits, h_q, dv), dtype=q.dtype, device=q.device
-        )
-        lse_accum = torch.empty(
-            (total_num_splits, h_q), dtype=torch.float32, device=q.device
-        )
-    if out is None:
-        out = torch.empty((b * s_q, h_q, dv), dtype=q.dtype, device=q.device)
-
-    flash_mla_sched_meta_kernel_v3[(1,)](
-        cache_seqlens_tle,
-        sched_meta,
-        num_splits,
-        combine_req_ids,
-        num_combine_reqs,
-        BLOCK_B=triton.next_power_of_2(b),
-        BATCH_SIZE=b,
-        BLOCK_SIZE_N=FLASH_MLA_BLOCK_N,
-        FIXED_OVERHEAD_NUM_BLOCKS=FLASH_MLA_FIXED_OVERHEAD_BLOCKS,
-        NUM_SM_PARTS=num_sm_parts,
-        META_FIELDS=FLASH_MLA_META_FIELDS,
-        num_warps=1,
-        num_stages=1,
+    plan = _get_flash_mla_tle_decode_plan(
+        b=b,
+        s_q=s_q,
+        h_q=h_q,
+        h_kv=h_kv,
+        d=d,
+        dv=dv,
+        block_size=block_size,
+        dtype=q.dtype,
+        device=q.device,
+        causal=causal,
+        reuse_output=_reuse_tle_output(),
     )
-    out_flat = out.view(b * s_q * h_q, dv)
-    out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
-    d_chunk = 64
-    cache_desc = _env_flag("FLAGGEMS_VLLM_FLASH_MLA_TLE_CACHE_DESCRIPTORS", False)
-    if cache_desc:
-        q_desc = _get_tensor_desc_cached(q_flat, (FLASH_MLA_BLOCK_M, dv // 2))
-        q_tail_desc = _get_tensor_desc_cached(q_flat, (FLASH_MLA_BLOCK_M, d_chunk))
-        output_desc = _get_tensor_desc_cached(out_flat, (FLASH_MLA_BLOCK_M, dv // 2))
-        oaccum_desc = _get_tensor_desc_cached(
-            out_accum_flat, (FLASH_MLA_BLOCK_M, dv // 2)
-        )
-        kv_desc = _get_tensor_desc_cached(kv_flat, (FLASH_MLA_BLOCK_N, dv // 2))
-        kv_tail_desc = _get_tensor_desc_cached(
-            kv_flat, (FLASH_MLA_BLOCK_N, d_chunk)
-        )
-    else:
-        q_desc = TensorDescriptor(
-            q_flat,
-            shape=[b * s_q * h_q, d],
-            strides=[d, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-        )
-        q_tail_desc = TensorDescriptor(
-            q_flat,
-            shape=[b * s_q * h_q, d],
-            strides=[d, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, d_chunk],
-        )
-        output_desc = TensorDescriptor(
-            out_flat,
-            shape=[b * s_q * h_q, dv],
-            strides=[dv, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-        )
-        oaccum_desc = TensorDescriptor(
-            out_accum_flat,
-            shape=[total_num_splits * h_q, dv],
-            strides=[dv, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-        )
-        kv_desc = TensorDescriptor(
-            kv_flat,
-            shape=[kv_flat.shape[0], d],
-            strides=[d, 1],
-            block_shape=[FLASH_MLA_BLOCK_N, dv // 2],
-        )
-        kv_tail_desc = TensorDescriptor(
-            kv_flat,
-            shape=[kv_flat.shape[0], d],
-            strides=[d, 1],
-            block_shape=[FLASH_MLA_BLOCK_N, d_chunk],
-        )
-
-    flash_mla_splitkv_ws_tle_kernel[(num_m_blocks, num_sm_parts)](
-        q_desc,
-        q_tail_desc,
-        output_desc,
-        oaccum_desc,
-        kv_desc,
-        kv_tail_desc,
-        kv_flat,
-        block_table_tle,
-        cache_seqlens_tle,
-        sched_meta,
-        num_splits,
-        out,
-        out_accum,
-        lse_accum,
-        1 / math.sqrt(d),
-        h_q,
-        q_tle.stride(0),
-        q_tle.stride(2),
-        kv_flat.stride(0),
-        block_table_tle.stride(0),
-        out.stride(0),
-        out.stride(1),
-        out_accum.stride(0),
-        out_accum.stride(1),
-        lse_accum.stride(0),
-        lse_accum.stride(1),
-        BLOCK_M=FLASH_MLA_BLOCK_M,
-        BLOCK_N=FLASH_MLA_BLOCK_N,
-        PAGE_SIZE=block_size,
-        HEAD_DIM_V=dv,
-        HEAD_DIM=d,
-        D_CHUNK=d_chunk,
-        META_FIELDS=FLASH_MLA_META_FIELDS,
-        num_warps=4,
-        num_stages=1,
+    return plan.run(
+        q=q,
+        blocked_k=blocked_k,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        update_metadata=True,
     )
-
-    flash_mla_combine_kernel_compact[
-        (
-            max_combine_reqs,
-            triton.cdiv(h_q, FLASH_MLA_COMBINE_BLOCK_H),
-            triton.cdiv(dv, FLASH_MLA_COMBINE_BLOCK_D),
-        )
-    ](
-        out_accum,
-        lse_accum,
-        num_splits,
-        combine_req_ids,
-        num_combine_reqs,
-        out,
-        h_q,
-        out_accum.stride(0),
-        out_accum.stride(1),
-        lse_accum.stride(0),
-        lse_accum.stride(1),
-        out.stride(0),
-        out.stride(1),
-        BLOCK_H=FLASH_MLA_COMBINE_BLOCK_H,
-        BLOCK_D=FLASH_MLA_COMBINE_BLOCK_D,
-        HEAD_DIM_V=dv,
-        num_warps=4,
-        num_stages=1,
-    )
-    return out.view([b, s_q, h_q, dv])
 
 
 # @triton.autotune(
