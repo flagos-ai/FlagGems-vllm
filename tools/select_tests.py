@@ -19,14 +19,35 @@ NON_TEST_FILES = {
     "workflow.md",
 }
 
+# Some existing tests do not follow the source-stem naming convention, so keep
+# a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
+    "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
+        "tests/test_FLA/test_chunk_gated_delta_rule.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_fused_tail_vblock.py": [
+        "tests/test_FLA/test_chunk_gated_delta_rule.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_gated_delta_direct.py": [
+        "tests/test_FLA/test_chunk_gated_delta_rule.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_o.py": [
+        "tests/test_FLA/test_chunk_gated_delta_rule.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/fused_cumsum_kkt_solve_tril.py": [
+        "tests/test_FLA/test_chunk_gated_delta_rule.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/wy_fast.py": [
+        "tests/test_FLA/test_chunk_gated_delta_rule.py",
+    ],
 }
 
+# Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
@@ -48,6 +69,24 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/moe_align_block_size.py": [
         "benchmark/test_moe_align_block_size_triton.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
+        "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_fused_tail_vblock.py": [
+        "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_gated_delta_direct.py": [
+        "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/chunk_o.py": [
+        "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/fused_cumsum_kkt_solve_tril.py": [
+        "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/wy_fast.py": [
+        "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
     ],
 }
 
@@ -88,25 +127,26 @@ def source_name_variants(stem: str) -> list[str]:
 
 
 def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[str]:
-    variants = source_name_variants(stem)
-    exact_matches = []
-    prefix_matches = []
+    variants = set(source_name_variants(stem))
+    exact_matches: list[str] = []
+    prefix_matches: list[str] = []
 
-    for variant in variants:
-        exact_name = f"{root}/test_{variant}.py"
-        if exact_name in targets:
-            exact_matches.append(exact_name)
+    for target in targets:
+        if not target.startswith(f"{root}/"):
+            continue
+
+        target_stem = Path(target).stem
+        if not target_stem.startswith("test_"):
+            continue
+
+        target_name = target_stem.removeprefix("test_")
+        if target_name in variants:
+            exact_matches.append(target)
+        elif any(target_name.startswith(f"{variant}_") for variant in variants):
+            prefix_matches.append(target)
 
     if exact_matches:
         return sorted(set(exact_matches))
-
-    for target in targets:
-        if not target.startswith(f"{root}/test_"):
-            continue
-
-        target_stem = Path(target).stem.removeprefix("test_")
-        if any(target_stem.startswith(f"{variant}_") for variant in variants):
-            prefix_matches.append(target)
 
     return sorted(set(prefix_matches))
 
@@ -114,12 +154,6 @@ def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[s
 def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
-
-    if path.startswith("src/flaggems_vllm/ops/FLA/"):
-        return sorted(test for test in tests if test.startswith("tests/test_FLA/"))
-
-    if path.startswith("src/flaggems_vllm/ops/DSA/"):
-        return sorted(test for test in tests if test.startswith("tests/test_DSA/"))
 
     if path.startswith("src/flaggems_vllm/ops/mhc/"):
         return ["tests/test_mhc_ops.py"] if "tests/test_mhc_ops.py" in tests else []
@@ -138,13 +172,6 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
             for benchmark in EXPLICIT_SOURCE_TO_BENCHMARKS[path]
             if benchmark in benchmarks
         ]
-
-    if path.startswith("src/flaggems_vllm/ops/FLA/"):
-        return sorted(
-            benchmark
-            for benchmark in benchmarks
-            if benchmark.startswith("benchmark/test_FLA/")
-        )
 
     if path.startswith("src/flaggems_vllm/ops/DSA/"):
         return []
@@ -178,10 +205,10 @@ def select_targets(
         if not path:
             continue
 
-        if path.startswith("tests/test_") and path.endswith(".py"):
+        if path.startswith("tests/") and Path(path).name.startswith("test_"):
             add_target(test_targets, path, tests)
 
-        if path.startswith("benchmark/test_") and path.endswith(".py"):
+        if path.startswith("benchmark/") and Path(path).name.startswith("test_"):
             add_target(benchmark_targets, path, benchmarks)
 
         for target in tests_for_source(path, tests):
