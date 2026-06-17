@@ -1311,10 +1311,38 @@ class FlashMLATLEDecodePlan:
         self.metadata_valid = False
         self._last_cache_seqlens_ref: torch.Tensor | None = None
         self._last_launch_refs = ()
+        self._out_accum_flat = None
+        self._oaccum_desc = None
+        self._oaccum_desc_refs = None
+        self._build_oaccum_desc()
 
     def invalidate_metadata(self) -> None:
         self.metadata_valid = False
         self._last_cache_seqlens_ref = None
+
+    def _build_oaccum_desc(self) -> None:
+        TensorDescriptor = _get_tensor_descriptor_cls()
+        _ensure_triton_descriptor_allocator(self.device)
+
+        self._out_accum_flat = self.out_accum.view(
+            self.total_num_splits * self.h_q,
+            self.dv,
+        )
+        self._oaccum_desc = TensorDescriptor(
+            self._out_accum_flat,
+            shape=[self.total_num_splits * self.h_q, self.dv],
+            strides=[self.dv, 1],
+            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
+        )
+        self._oaccum_desc_refs = (
+            self._out_accum_flat,
+            self._oaccum_desc,
+        )
+
+    def _get_oaccum_desc(self):
+        if self._oaccum_desc is None:
+            self._build_oaccum_desc()
+        return self._oaccum_desc
 
     def plan(self, cache_seqlens: torch.Tensor) -> None:
         if cache_seqlens.dtype != torch.int32:
@@ -1428,9 +1456,7 @@ class FlashMLATLEDecodePlan:
         q_flat = q_tle.view(self.b * self.s_q * self.h_q, self.d)
         out_tle = self._get_out_tensor(out)
         out_flat = out_tle.view(self.b * self.s_q * self.h_q, self.dv)
-        out_accum_flat = self.out_accum.view(
-            self.total_num_splits * self.h_q, self.dv
-        )
+        oaccum_desc = self._get_oaccum_desc()
 
         q_desc = TensorDescriptor(
             q_flat,
@@ -1447,12 +1473,6 @@ class FlashMLATLEDecodePlan:
         output_desc = TensorDescriptor(
             out_flat,
             shape=[self.b * self.s_q * self.h_q, self.dv],
-            strides=[self.dv, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
-        )
-        oaccum_desc = TensorDescriptor(
-            out_accum_flat,
-            shape=[self.total_num_splits * self.h_q, self.dv],
             strides=[self.dv, 1],
             block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
         )
@@ -1541,11 +1561,11 @@ class FlashMLATLEDecodePlan:
             block_table_tle,
             out_tle,
             out_flat,
-            out_accum_flat,
+            self._out_accum_flat,
             q_desc,
             q_tail_desc,
             output_desc,
-            oaccum_desc,
+            self._oaccum_desc,
             kv_desc,
             kv_tail_desc,
         )
