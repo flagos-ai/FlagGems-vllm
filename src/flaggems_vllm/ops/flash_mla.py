@@ -376,10 +376,13 @@ def flash_mla_sched_meta_kernel_v3(
 
 @triton.jit
 def _flash_mla_ws_kv_producer(
+    q_writer,
     k0_l_writer,
     k0_r_writer,
     k1_l_writer,
     k1_r_writer,
+    Q_desc,
+    Q_tail_desc,
     Kv,
     Kv_desc,
     Kv_tail_desc,
@@ -389,8 +392,11 @@ def _flash_mla_ws_kv_producer(
     end_req_idx,
     begin_block_idx_meta,
     end_block_idx_meta,
+    head_base,
+    head_num,
     stride_kv_token,
     stride_block_table_b,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
@@ -401,6 +407,15 @@ def _flash_mla_ws_kv_producer(
     pipe_base = 0
     k1_pipe_base = 0
     for batch_idx in tl.range(begin_req_idx, end_req_idx + 1):
+        q_stage = batch_idx - begin_req_idx
+        q_row = batch_idx * head_num + head_base
+        q_slot = q_writer.acquire(q_stage)
+        tle.gpu.copy(Q_desc, q_slot.sQ_l, [BLOCK_M, HEAD_DIM_V // 2], [q_row, 0])
+        tle.gpu.copy(Q_desc, q_slot.sQ_r, [BLOCK_M, HEAD_DIM_V // 2], [q_row, HEAD_DIM_V // 2])
+        if HAVE_TAIL:
+            tle.gpu.copy(Q_tail_desc, q_slot.sQ_tail, [BLOCK_M, D_CHUNK], [q_row, HEAD_DIM_V])
+        q_writer.commit(q_stage)
+
         seq_len = tl.load(B_seq_len + batch_idx)
         start_block_idx = tl.where(batch_idx == begin_req_idx, begin_block_idx_meta, 0)
         full_end_block_idx = tl.cdiv(seq_len, BLOCK_N)
@@ -474,11 +489,8 @@ def _flash_mla_ws_consumer0(
     sP1_reader,
     sL0_writer,
     sL1_reader,
-    q_writer,
     q_reader,
     sO_stage,
-    Q_desc,
-    Q_tail_desc,
     Output_desc,
     OAccum_desc,
     O,
@@ -538,14 +550,6 @@ def _flash_mla_ws_consumer0(
         if begin_req_idx == end_req_idx:
             is_no_split = ~is_first_req_splitted
         split_idx = tl.load(Num_splits + batch_idx) + n_split_idx
-        q_row = batch_idx * head_num + head_base
-
-        q_write_slot = q_writer.acquire(q_stage)
-        tle.gpu.copy(Q_desc, q_write_slot.sQ_l, [BLOCK_M, HALF_DIM_V], [q_row, 0])
-        tle.gpu.copy(Q_desc, q_write_slot.sQ_r, [BLOCK_M, HALF_DIM_V], [q_row, HALF_DIM_V])
-        if HAVE_TAIL:
-            tle.gpu.copy(Q_tail_desc, q_write_slot.sQ_tail, [BLOCK_M, D_CHUNK], [q_row, HEAD_DIM_V])
-        q_writer.commit(q_stage)
 
         q_wait = q_reader.wait(q_stage)
         q_slot = q_wait.slot
@@ -712,8 +716,6 @@ def _flash_mla_ws_consumer1(
     sL0_reader,
     q_reader,
     sO_stage,
-    Q_desc,
-    Q_tail_desc,
     Output_desc,
     OAccum_desc,
     O,
@@ -743,8 +745,6 @@ def _flash_mla_ws_consumer1(
     D_CHUNK: tl.constexpr,
     HAVE_TAIL: tl.constexpr,
 ):
-    unused_q_desc = Q_desc
-    unused_q_tail_desc = Q_tail_desc
     offs_h = tl.arange(0, BLOCK_M)
     head_offsets = head_base + offs_h
     HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
@@ -1112,11 +1112,8 @@ def flash_mla_splitkv_ws_tle_kernel(
                     sP1_pipe.reader(),
                     sL0_pipe.writer(),
                     sL1_pipe.reader(),
-                    q_pipe.writer(),
                     q_pipe.reader("wg0"),
                     sK0_l,
-                    Q_desc,
-                    Q_tail_desc,
                     Output_desc,
                     OAccum_desc,
                     O,
@@ -1161,8 +1158,6 @@ def flash_mla_splitkv_ws_tle_kernel(
                     sL0_pipe.reader(),
                     q_pipe.reader("wg1"),
                     sK1_r,
-                    Q_desc,
-                    Q_tail_desc,
                     Output_desc,
                     OAccum_desc,
                     O,
@@ -1196,10 +1191,13 @@ def flash_mla_splitkv_ws_tle_kernel(
             (
                 _flash_mla_ws_kv_producer,
                 (
+                    q_pipe.writer(),
                     k0_l_pipe.writer(),
                     k0_r_pipe.writer(),
                     k1_l_pipe.writer(),
                     k1_r_pipe.writer(),
+                    Q_desc,
+                    Q_tail_desc,
                     Kv,
                     Kv_desc,
                     Kv_tail_desc,
@@ -1209,8 +1207,11 @@ def flash_mla_splitkv_ws_tle_kernel(
                     end_req_idx,
                     begin_block_idx_meta,
                     end_block_idx_meta,
+                    head_base,
+                    head_num,
                     stride_kv_token,
                     stride_block_table_b,
+                    BLOCK_M,
                     BLOCK_N,
                     PAGE_SIZE,
                     HEAD_DIM_V,
