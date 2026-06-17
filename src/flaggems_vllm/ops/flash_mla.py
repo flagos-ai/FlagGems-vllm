@@ -154,6 +154,21 @@ def _same_cuda_device(lhs: torch.device, rhs: torch.device) -> bool:
     ) == _get_cuda_device_index(rhs)
 
 
+def _tensor_desc_light_key(t: torch.Tensor, block_shape: tuple[int, int]) -> tuple:
+    if t.ndim != 2:
+        raise ValueError("TensorDescriptor cache key expects a 2D tensor/view")
+    return (
+        int(t.data_ptr()),
+        int(t.shape[0]),
+        int(t.shape[1]),
+        int(t.stride(0)),
+        int(t.stride(1)),
+        t.dtype,
+        _get_cuda_device_index(t.device),
+        tuple(block_shape),
+    )
+
+
 def _set_triton_descriptor_allocator(cuda_device: torch.device) -> None:
     def alloc_fn(size: int, align: int, stream):
         _ = align
@@ -1337,6 +1352,12 @@ class FlashMLATLEDecodePlan:
         self.device = device
         self.causal = causal
         self.reuse_output = reuse_output
+        self._cache_run_desc = _env_flag(
+            "FLAGGEMS_VLLM_FLASH_MLA_TLE_CACHE_RUN_DESCRIPTORS", False
+        )
+        self._cache_q_desc = _env_flag(
+            "FLAGGEMS_VLLM_FLASH_MLA_TLE_CACHE_Q_DESC", False
+        )
 
         self.d_chunk = 64
         self.sm_scale = 1 / math.sqrt(d)
@@ -1375,6 +1396,17 @@ class FlashMLATLEDecodePlan:
         self._out_accum_flat = None
         self._oaccum_desc = None
         self._oaccum_desc_refs = None
+        self._kv_desc_key = None
+        self._kv_desc = None
+        self._kv_tail_desc = None
+        self._kv_desc_refs = None
+        self._out_desc_key = None
+        self._output_desc = None
+        self._out_desc_refs = None
+        self._q_desc_key = None
+        self._q_desc = None
+        self._q_tail_desc = None
+        self._q_desc_refs = None
         self._build_oaccum_desc()
 
     def invalidate_metadata(self) -> None:
@@ -1404,6 +1436,133 @@ class FlashMLATLEDecodePlan:
         if self._oaccum_desc is None:
             self._build_oaccum_desc()
         return self._oaccum_desc
+
+    def clear_descriptor_cache(self) -> None:
+        self._kv_desc_key = None
+        self._kv_desc = None
+        self._kv_tail_desc = None
+        self._kv_desc_refs = None
+        self._out_desc_key = None
+        self._output_desc = None
+        self._out_desc_refs = None
+        self._q_desc_key = None
+        self._q_desc = None
+        self._q_tail_desc = None
+        self._q_desc_refs = None
+
+    def _get_kv_descs(self, TensorDescriptor, kv_flat, can_cache: bool):
+        kv_block = (FLASH_MLA_BLOCK_N, self.dv // 2)
+        kv_tail_block = (FLASH_MLA_BLOCK_N, self.d_chunk)
+
+        if not self._cache_run_desc or not can_cache:
+            kv_desc = TensorDescriptor(
+                kv_flat,
+                shape=[kv_flat.shape[0], self.d],
+                strides=[self.d, 1],
+                block_shape=list(kv_block),
+            )
+            kv_tail_desc = TensorDescriptor(
+                kv_flat,
+                shape=[kv_flat.shape[0], self.d],
+                strides=[self.d, 1],
+                block_shape=list(kv_tail_block),
+            )
+            return kv_desc, kv_tail_desc
+
+        key = (
+            _tensor_desc_light_key(kv_flat, kv_block),
+            _tensor_desc_light_key(kv_flat, kv_tail_block),
+        )
+        if key != self._kv_desc_key:
+            self._kv_desc = TensorDescriptor(
+                kv_flat,
+                shape=[kv_flat.shape[0], self.d],
+                strides=[self.d, 1],
+                block_shape=list(kv_block),
+            )
+            self._kv_tail_desc = TensorDescriptor(
+                kv_flat,
+                shape=[kv_flat.shape[0], self.d],
+                strides=[self.d, 1],
+                block_shape=list(kv_tail_block),
+            )
+            self._kv_desc_key = key
+            self._kv_desc_refs = (
+                kv_flat,
+                self._kv_desc,
+                self._kv_tail_desc,
+            )
+        return self._kv_desc, self._kv_tail_desc
+
+    def _get_output_desc(self, TensorDescriptor, out_flat, can_cache: bool):
+        block = (FLASH_MLA_BLOCK_M, self.dv // 2)
+
+        if not self._cache_run_desc or not can_cache:
+            return TensorDescriptor(
+                out_flat,
+                shape=[self.b * self.s_q * self.h_q, self.dv],
+                strides=[self.dv, 1],
+                block_shape=list(block),
+            )
+
+        key = _tensor_desc_light_key(out_flat, block)
+        if key != self._out_desc_key:
+            self._output_desc = TensorDescriptor(
+                out_flat,
+                shape=[self.b * self.s_q * self.h_q, self.dv],
+                strides=[self.dv, 1],
+                block_shape=list(block),
+            )
+            self._out_desc_key = key
+            self._out_desc_refs = (
+                out_flat,
+                self._output_desc,
+            )
+        return self._output_desc
+
+    def _get_q_descs(self, TensorDescriptor, q_flat, can_cache: bool):
+        q_block = (FLASH_MLA_BLOCK_M, self.dv // 2)
+        q_tail_block = (FLASH_MLA_BLOCK_M, self.d_chunk)
+
+        if not (self._cache_run_desc and self._cache_q_desc and can_cache):
+            q_desc = TensorDescriptor(
+                q_flat,
+                shape=[self.b * self.s_q * self.h_q, self.d],
+                strides=[self.d, 1],
+                block_shape=list(q_block),
+            )
+            q_tail_desc = TensorDescriptor(
+                q_flat,
+                shape=[self.b * self.s_q * self.h_q, self.d],
+                strides=[self.d, 1],
+                block_shape=list(q_tail_block),
+            )
+            return q_desc, q_tail_desc
+
+        key = (
+            _tensor_desc_light_key(q_flat, q_block),
+            _tensor_desc_light_key(q_flat, q_tail_block),
+        )
+        if key != self._q_desc_key:
+            self._q_desc = TensorDescriptor(
+                q_flat,
+                shape=[self.b * self.s_q * self.h_q, self.d],
+                strides=[self.d, 1],
+                block_shape=list(q_block),
+            )
+            self._q_tail_desc = TensorDescriptor(
+                q_flat,
+                shape=[self.b * self.s_q * self.h_q, self.d],
+                strides=[self.d, 1],
+                block_shape=list(q_tail_block),
+            )
+            self._q_desc_key = key
+            self._q_desc_refs = (
+                q_flat,
+                self._q_desc,
+                self._q_tail_desc,
+            )
+        return self._q_desc, self._q_tail_desc
 
     def plan(self, cache_seqlens: torch.Tensor) -> None:
         if cache_seqlens.dtype != torch.int32:
@@ -1519,35 +1678,20 @@ class FlashMLATLEDecodePlan:
         out_flat = out_tle.view(self.b * self.s_q * self.h_q, self.dv)
         oaccum_desc = self._get_oaccum_desc()
 
-        q_desc = TensorDescriptor(
+        q_desc, q_tail_desc = self._get_q_descs(
+            TensorDescriptor,
             q_flat,
-            shape=[self.b * self.s_q * self.h_q, self.d],
-            strides=[self.d, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
+            can_cache=(q_tle is q),
         )
-        q_tail_desc = TensorDescriptor(
-            q_flat,
-            shape=[self.b * self.s_q * self.h_q, self.d],
-            strides=[self.d, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, self.d_chunk],
-        )
-        output_desc = TensorDescriptor(
+        output_desc = self._get_output_desc(
+            TensorDescriptor,
             out_flat,
-            shape=[self.b * self.s_q * self.h_q, self.dv],
-            strides=[self.dv, 1],
-            block_shape=[FLASH_MLA_BLOCK_M, self.dv // 2],
+            can_cache=(self.reuse_output and out is None),
         )
-        kv_desc = TensorDescriptor(
+        kv_desc, kv_tail_desc = self._get_kv_descs(
+            TensorDescriptor,
             kv_flat,
-            shape=[kv_flat.shape[0], self.d],
-            strides=[self.d, 1],
-            block_shape=[FLASH_MLA_BLOCK_N, self.dv // 2],
-        )
-        kv_tail_desc = TensorDescriptor(
-            kv_flat,
-            shape=[kv_flat.shape[0], self.d],
-            strides=[self.d, 1],
-            block_shape=[FLASH_MLA_BLOCK_N, self.d_chunk],
+            can_cache=(blocked_k_tle is blocked_k),
         )
 
         flash_mla_splitkv_ws_tle_kernel[(self.num_m_blocks, self.num_sm_parts)](
