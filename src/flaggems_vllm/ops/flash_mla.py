@@ -618,15 +618,16 @@ def _flash_mla_ws_consumer0(
             e_sum = e_sum * re_scale + tl.sum(p, axis=1)
             acc = acc * re_scale[:, None]
 
-            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
-            acc = tl.dot(p.to(v_l.dtype), v_l, acc, out_dtype=tl.float32)
-            k0_l_reader.release(pipe_idx)
+            p_save = p.to(k0_l.dtype)
             k0_r_qk_reader.release(pipe_idx)
 
-            p_save = p.to(v_l.dtype)
             sP_slot = sP0_writer.acquire(pipe_idx)
             tl.store(tle.gpu.local_ptr(sP_slot.sP), p_save)
             sP0_writer.commit(pipe_idx)
+
+            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
+            acc = tl.dot(p_save, v_l, acc, out_dtype=tl.float32)
+            k0_l_reader.release(pipe_idx)
 
             peer_p_wait = sP1_reader.wait(k1_pipe_idx)
             peer_p = tl.load(tle.gpu.local_ptr(peer_p_wait.slot.sP))
@@ -672,17 +673,18 @@ def _flash_mla_ws_consumer0(
             e_sum = e_sum * re_scale + tl.sum(p, axis=1)
             acc = acc * re_scale[:, None]
 
-            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
-            acc = tl.dot(p.to(v_l.dtype), v_l, acc, out_dtype=tl.float32)
+            p_save = p.to(k0_l.dtype)
+            k0_r_qk_reader.release(pipe_idx)
 
-            p_save = p.to(v_l.dtype)
             sP_slot = sP0_writer.acquire(pipe_idx)
             tl.store(tle.gpu.local_ptr(sP_slot.sP), p_save)
             sP0_writer.commit(pipe_idx)
 
+            v_l = tl.load(tle.gpu.local_ptr(k0_l_slot.sK, (kv_rows, kv_cols)))
+            acc = tl.dot(p_save, v_l, acc, out_dtype=tl.float32)
+
             e_max = new_max
             k0_l_reader.release(pipe_idx)
-            k0_r_qk_reader.release(pipe_idx)
 
         l_stage0 = q_stage * 2
         l_stage1 = l_stage0 + 1
@@ -807,9 +809,15 @@ def _flash_mla_ws_consumer1(
             pipe_idx = pipe_base + pair
             k1_pipe_idx = k1_pipe_base + pair
             block1 = start_block_idx + pair * 2 + 1
-            k1_r_wait = k1_r_reader.wait(k1_pipe_idx)
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
+            k1_l_wait = k1_l_qk_reader.wait(k1_pipe_idx)
+            k1_l_slot = k1_l_wait.slot
+            k1_l = tl.load(tle.gpu.local_ptr(k1_l_slot.sK, (kv_rows, kv_cols)))
+            q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
+            qk = tl.dot(q_l, tl.trans(k1_l), qk, out_dtype=tl.float32)
+
+            k1_r_wait = k1_r_reader.wait(k1_pipe_idx)
             k1_r_slot = k1_r_wait.slot
             k1_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
             q_r = tl.load(tle.gpu.local_ptr(q_slot.sQ_r))
@@ -818,12 +826,6 @@ def _flash_mla_ws_consumer1(
                 k1_tail = tl.load(tle.gpu.local_ptr(k1_r_slot.sK_tail, (kv_rows_tail, kv_cols_tail)))
                 q_tail = tl.load(tle.gpu.local_ptr(q_slot.sQ_tail))
                 qk = tl.dot(q_tail, tl.trans(k1_tail), qk, out_dtype=tl.float32)
-
-            k1_l_wait = k1_l_qk_reader.wait(k1_pipe_idx)
-            k1_l_slot = k1_l_wait.slot
-            k1_l = tl.load(tle.gpu.local_ptr(k1_l_slot.sK, (kv_rows, kv_cols)))
-            q_l = tl.load(tle.gpu.local_ptr(q_slot.sQ_l))
-            qk = tl.dot(q_l, tl.trans(k1_l), qk, out_dtype=tl.float32)
 
             valid_n = block1 * BLOCK_N + offs_n < seq_len
             qk *= sm_scale
@@ -844,13 +846,14 @@ def _flash_mla_ws_consumer1(
             acc = acc * re_scale[:, None]
             p_b = p.to(k1_r.dtype)
 
-            v_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
-            acc = tl.dot(p_b, v_r, acc, out_dtype=tl.float32)
             k1_l_qk_reader.release(k1_pipe_idx)
 
             sP_slot = sP1_writer.acquire(k1_pipe_idx)
             tl.store(tle.gpu.local_ptr(sP_slot.sP), p_b)
             sP1_writer.commit(k1_pipe_idx)
+
+            v_r = tl.load(tle.gpu.local_ptr(k1_r_slot.sK, (kv_rows, kv_cols)))
+            acc = tl.dot(p_b, v_r, acc, out_dtype=tl.float32)
 
             sP0_wait = sP0_reader.wait(pipe_idx)
             p0 = tl.load(tle.gpu.local_ptr(sP0_wait.slot.sP))
