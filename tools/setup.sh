@@ -35,6 +35,33 @@ STRICT_TRITON_IMPORT="${STRICT_TRITON_IMPORT:-0}"
 # requirements such as "vllm requires triton".
 STRICT_PIP_CHECK="${STRICT_PIP_CHECK:-0}"
 
+CUDA_HOME="${CUDA_HOME:-}"
+
+setup_cuda_env() {
+  local candidate
+
+  if [ -z "${CUDA_HOME}" ]; then
+    for candidate in /usr/local/cuda /usr/local/cuda-*; do
+      if [ -x "${candidate}/bin/nvcc" ]; then
+        CUDA_HOME="${candidate}"
+        break
+      fi
+    done
+  fi
+
+  if [ -n "${CUDA_HOME}" ]; then
+    export CUDA_HOME
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+    if [ -d "${CUDA_HOME}/lib64" ]; then
+      if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+      else
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib64"
+      fi
+    fi
+  fi
+}
+
 # ── Check we're in the repo root ─────────────────────────────
 if [ ! -f "pyproject.toml" ] || [ ! -d "src/flaggems_vllm" ]; then
   echo "Error: run this script from the FlagGems-vllm repo root."
@@ -47,6 +74,8 @@ if [ ! -f "pyproject.toml" ] || [ ! -d "src/flaggems_vllm" ]; then
   ls -la
   exit 1
 fi
+
+setup_cuda_env
 
 # ── Basic system preflight ───────────────────────────────────
 printf "Checking basic commands ..."
@@ -73,9 +102,12 @@ printf "Checking nvcc ..."
 if command -v nvcc &>/dev/null; then
   NVCC_VERSION="$(nvcc --version | tail -1 || true)"
   printf " %s" "${NVCC_VERSION:-unknown}"
+  if [ -n "${CUDA_HOME}" ]; then
+    printf " (CUDA_HOME=%s)" "${CUDA_HOME}"
+  fi
   ok
 else
-  warn "nvcc not found; this is expected for nvidia/cuda:*base images. Source builds requiring CUDA compiler may fail"
+  warn "nvcc not found; set CUDA_HOME to your CUDA toolkit path if the compiler is installed. Source builds requiring CUDA compiler may fail"
 fi
 
 # ── Detect or install uv ─────────────────────────────────────

@@ -163,13 +163,18 @@ jobs:
       - name: install and activate python environment
         shell: bash
         run: |
-          export PATH="/usr/local/cuda-12.8/bin:${PATH}"
-          bash tools/setup.sh
+          source tools/setup.sh
           source "${VENV_DIR}/bin/activate"
           test -x "${VENV_DIR}/bin/python"
           echo "VIRTUAL_ENV=${VENV_DIR}" >> "$GITHUB_ENV"
           echo "${VENV_DIR}/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          if [[ -n "${CUDA_HOME:-}" ]]; then
+            echo "CUDA_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
+            echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+          fi
+          if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
           python --version
 
       - name: run selected unit tests
