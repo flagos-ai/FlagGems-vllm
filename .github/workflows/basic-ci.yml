@@ -12,10 +12,14 @@ jobs:
     name: code style
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
 
     steps:
       - name: check out repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref || github.ref }}
 
       - name: set up python
         uses: actions/setup-python@v6
@@ -25,23 +29,70 @@ jobs:
 
       - name: install style tools
         shell: bash
-        run: python -m pip install pre-commit pre-commit-hooks==4.6.0 black==24.8.0 flake8==7.1.0 isort==5.12.0
+        run: python -m pip install pre-commit
 
-      - name: run pre-commit
+      - id: pre_commit
+        name: run pre-commit
+        shell: bash
+        continue-on-error: true
+        run: pre-commit run --all-files --show-diff-on-failure
+
+      - id: pre_commit_changes
+        name: check pre-commit changes
+        if: steps.pre_commit.outcome == 'failure'
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: commit pre-commit fixes
+        if: >-
+          steps.pre_commit.outcome == 'failure' &&
+          steps.pre_commit_changes.outputs.has_changes == 'true' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          git commit -m "style: apply pre-commit fixes"
+          git push
+
+      - name: verify pre-commit after autofix
+        if: >-
+          steps.pre_commit.outcome == 'failure' &&
+          steps.pre_commit_changes.outputs.has_changes == 'true' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: pre-commit run --all-files --show-diff-on-failure
+
+      - name: fail when pre-commit needs manual fixes
+        if: >-
+          steps.pre_commit.outcome == 'failure' &&
+          (
+            steps.pre_commit_changes.outputs.has_changes != 'true' ||
+            github.event_name != 'pull_request' ||
+            github.event.pull_request.head.repo.full_name != github.repository
+          )
+        shell: bash
+        run: exit 1
 
   select-targets:
     name: select ci targets
     needs: code-style
-    runs-on: h20
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}
       tests: ${{ steps.select.outputs.tests }}
       benchmarks: ${{ steps.select.outputs.benchmarks }}
     env:
-      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv-select
 
     steps:
       - id: checkout-attempt-1
@@ -76,9 +127,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: use preconfigured python environment
+      - name: create selector python environment
         shell: bash
         run: |
+          python3 -m venv "${VIRTUAL_ENV}"
+          source "${VIRTUAL_ENV}/bin/activate"
+          python --version
           test -x "${VIRTUAL_ENV}/bin/python"
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
 
@@ -126,11 +180,12 @@ jobs:
     needs: select-targets
     if: needs.select-targets.outputs.tests != '' || needs.select-targets.outputs.benchmarks != ''
     runs-on: h20
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       DNN_VENDOR: nvidia
       PYTHONPATH: ${{ github.workspace }}/src
-      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
+      VENV_DIR: ${{ github.workspace }}/.venv
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv
 
     steps:
       - name: check out repository
@@ -140,12 +195,17 @@ jobs:
         shell: bash
         run: nvidia-smi
 
-      - name: use preconfigured python environment
+      - name: install and activate python environment
         shell: bash
         run: |
-          test -x "${VIRTUAL_ENV}/bin/python"
-          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/local/cuda-12.8/bin:${PATH}"
+          bash tools/setup.sh
+          source "${VENV_DIR}/bin/activate"
+          test -x "${VENV_DIR}/bin/python"
+          echo "VIRTUAL_ENV=${VENV_DIR}" >> "$GITHUB_ENV"
+          echo "${VENV_DIR}/bin" >> "$GITHUB_PATH"
           echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          python --version
 
       - name: run selected unit tests
         if: needs.select-targets.outputs.tests != ''
