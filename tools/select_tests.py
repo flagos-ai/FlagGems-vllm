@@ -19,6 +19,13 @@ NON_TEST_FILES = {
     "workflow.md",
 }
 
+FULL_UNIT_TEST_FILES = {
+    ".github/workflows/basic-ci.yml",
+    "pyproject.toml",
+    "pytest.ini",
+    "tools/setup.sh",
+}
+
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
@@ -192,6 +199,10 @@ def is_non_test_change(path: str) -> bool:
     return path in NON_TEST_FILES or path.startswith(NON_TEST_PREFIXES)
 
 
+def triggers_full_unit_tests(path: str) -> bool:
+    return path in FULL_UNIT_TEST_FILES
+
+
 def select_targets(
     repo_root: Path, changed_files: list[str]
 ) -> tuple[str, list[str], list[str]]:
@@ -200,11 +211,14 @@ def select_targets(
     test_targets: set[str] = set()
     benchmark_targets: set[str] = set()
 
-    for raw_path in changed_files:
-        path = normalize_path(raw_path)
-        if not path:
-            continue
+    normalized_changed_files = [
+        normalize_path(path) for path in changed_files if normalize_path(path)
+    ]
 
+    if any(triggers_full_unit_tests(path) for path in normalized_changed_files):
+        return "all", sorted(tests), []
+
+    for path in normalized_changed_files:
         if path.startswith("tests/") and Path(path).name.startswith("test_"):
             add_target(test_targets, path, tests)
 
@@ -220,8 +234,8 @@ def select_targets(
     if test_targets or benchmark_targets:
         return "selected", sorted(test_targets), sorted(benchmark_targets)
 
-    if changed_files and all(
-        is_non_test_change(normalize_path(path)) for path in changed_files
+    if normalized_changed_files and all(
+        is_non_test_change(path) for path in normalized_changed_files
     ):
         return "skip", [], []
 
