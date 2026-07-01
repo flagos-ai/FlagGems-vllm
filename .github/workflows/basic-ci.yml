@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      run_all:
+        description: "Run all unit tests on H20"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   code-style:
@@ -108,11 +114,19 @@ jobs:
       - id: select
         name: select tests and benchmarks
         shell: bash
+        env:
+          RUN_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all == true }}
         run: |
-          selection="$(python tools/select_tests.py \
-            --changed-files changed_files.txt \
-            --format shell)"
-          eval "${selection}"
+          if [[ "${RUN_ALL}" == "true" ]]; then
+            TEST_SELECTION_MODE="all"
+            SELECTED_TESTS="$(find tests -type f -name 'test_*.py' | sort | tr '\n' ' ')"
+            SELECTED_BENCHMARKS=""
+          else
+            selection="$(python tools/select_tests.py \
+              --changed-files changed_files.txt \
+              --format shell)"
+            eval "${selection}"
+          fi
 
           echo "Test selection mode: ${TEST_SELECTION_MODE}"
           if [[ -n "${SELECTED_TESTS}" ]]; then
