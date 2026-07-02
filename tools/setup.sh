@@ -18,7 +18,7 @@ VLLM_VERSION="${VLLM_VERSION:-0.20.2}"
 TORCH_BACKEND="${TORCH_BACKEND:-auto}"
 
 FLAGOS_PYPI="${FLAGOS_PYPI:-https://resource.flagos.net/repository/flagos-pypi-hosted/simple}"
-FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.0rc1}"
+FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.0}"
 
 # Whether to replace Triton with FlagTree.
 # For temporary container validation, you can run:
@@ -201,28 +201,40 @@ print(" vllm:", vllm.__version__)
 PY
 ok
 
+# ── Install FlagGems-vllm before Triton replacement ──────────
+printf "Installing FlagGems-vllm editable ..."
+uv pip install -q \
+  --no-build-isolation \
+  -e ".[test]" \
+  --constraint "${CONSTRAINTS_FILE}" \
+  --default-index "${MIRROR}" \
+  || fail
+ok
+
 # ── Remove Triton and install FlagTree ───────────────────────
 if [ "${USE_FLAGTREE}" = "1" ]; then
   printf "Removing Triton packages ..."
-  TRITON_PKGS="$(uv pip list 2>/dev/null | awk 'tolower($1) ~ /^triton/ {print $1}' || true)"
-
-  if [ -n "${TRITON_PKGS}" ]; then
-    echo "${TRITON_PKGS}" | xargs -r uv pip uninstall -q || true
-  fi
+  TRITON_UNINSTALL_ATTEMPTS=0
+  while python -m pip show triton >/dev/null 2>&1; do
+    python -m pip uninstall -y triton >/dev/null || fail
+    TRITON_UNINSTALL_ATTEMPTS=$((TRITON_UNINSTALL_ATTEMPTS + 1))
+    if [ "${TRITON_UNINSTALL_ATTEMPTS}" -ge 10 ]; then
+      fail
+    fi
+  done
   ok
 
   printf "Installing FlagTree==${FLAGTREE_VERSION} ..."
-  uv pip install -q \
+  python -m pip install -q \
     "flagtree===${FLAGTREE_VERSION}" \
-    --index "${FLAGOS_PYPI}" \
-    --default-index "${MIRROR}" \
+    --index-url "${FLAGOS_PYPI}" \
     || fail
   ok
 
   # Do not force `import triton` by default here.
   # Some FlagTree wheels may try to load vendor plugins during import.
   printf "Checking FlagTree package ..."
-  uv pip show flagtree >/tmp/flagtree_show.log || fail
+  python -m pip show flagtree >/tmp/flagtree_show.log || fail
   cat /tmp/flagtree_show.log
   ok
 
@@ -240,16 +252,6 @@ PY
 else
   warn "Skipping FlagTree installation; keeping Triton installed by vLLM/PyTorch"
 fi
-
-# ── Install FlagGems-vllm ────────────────────────────────────
-printf "Installing FlagGems-vllm editable ..."
-uv pip install -q \
-  --no-build-isolation \
-  -e ".[test]" \
-  --constraint "${CONSTRAINTS_FILE}" \
-  --default-index "${MIRROR}" \
-  || fail
-ok
 
 # ── Verify installation ──────────────────────────────────────
 printf "Verifying imports ..."

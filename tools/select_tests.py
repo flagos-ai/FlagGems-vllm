@@ -29,6 +29,7 @@ ENV_SMOKE_TRIGGER_FILES = {
 ENV_SMOKE_TESTS = [
     "tests/test_add_rms_norm.py",
     "tests/test_bincount.py",
+    "tests/test_flash_mla.py",
     "tests/test_silu_and_mul.py",
 ]
 
