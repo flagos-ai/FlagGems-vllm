@@ -76,8 +76,11 @@ def torch_act_quant(
 
 class ActQuantBenchmark(base.GenericBenchmark):
     # Only 2D shapes make sense for act_quant
-    def set_more_shapes(self):
+    def set_shapes(self, shape_file_path=None):
         self.shapes = SHAPES
+        self.shape_desc = "M, N"
+
+    def set_more_shapes(self):
         return []
 
 

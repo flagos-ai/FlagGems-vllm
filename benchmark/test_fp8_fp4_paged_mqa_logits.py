@@ -103,12 +103,24 @@ except ImportError:
     _HAS_VLLM = False
 
 
-def _baseline_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
+def _baseline_fn(q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta):
     """Baseline: vLLM DeepGEMM CUDA kernel."""
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
     q_input = (q_fp8, None)
     return _vllm_fp8_fp4_paged_mqa_logits(
+        q=q_input,
+        kv_cache=kv_fp8,
+        weights=weights,
+        context_lens=context_lens,
+        block_tables=block_table,
+        schedule_metadata=schedule_meta,
+        max_model_len=MAX_MODEL_LEN,
+        clean_logits=False,
+    )
+
+
+def _gems_fn(q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta):
+    q_input = (q_fp8, None)
+    return fp8_fp4_paged_mqa_logits(
         q=q_input,
         kv_cache=kv_fp8,
         weights=weights,
@@ -134,30 +146,7 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
             )
             num_sms = torch.cuda.get_device_properties(0).multi_processor_count
             schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
-            q_input = (q_fp8, None)
-
-            # Triton call signature
-            gems_args = dict(
-                q=q_input,
-                kv_cache=kv_fp8,
-                weights=weights,
-                context_lens=context_lens,
-                block_tables=block_table,
-                schedule_metadata=schedule_meta,
-                max_model_len=MAX_MODEL_LEN,
-                clean_logits=False,
-            )
-
-            # Baseline call uses same inputs
-            baseline_args = (
-                q_fp8,
-                kv_fp8,
-                weights,
-                context_lens,
-                block_table,
-            )
-
-            yield gems_args, baseline_args
+            yield q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta
 
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
@@ -166,7 +155,7 @@ def test_fp8_fp4_paged_mqa_logits():
     bench = Fp8Fp4PagedMqaLogitsBenchmark(
         op_name="fp8_fp4_paged_mqa_logits",
         torch_op=_baseline_fn,
-        gems_op=fp8_fp4_paged_mqa_logits,
+        gems_op=_gems_fn,
         dtypes=[torch.float32],
     )
     bench.run()
