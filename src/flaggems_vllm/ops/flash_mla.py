@@ -1,34 +1,12 @@
 import logging
 import math
 import os
-import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
-
-try:
-    import triton._C.libtriton as libtriton
-    from triton._C.libtriton import ir
-except Exception as e:
-    print(f"[ERROR] Failed to import Triton: {e}")
-    sys.exit(1)
-
-print("Triton information")
-print("===================")
-print("triton version :", getattr(triton, "__version__", "unknown"))
-print("triton path    :", triton.__file__)
-print("libtriton path :", libtriton.__file__)
-
-supported = hasattr(ir.builder, "make_nv_mma_shared_encoding_attr")
-print("has make_nv_mma_shared_encoding_attr :", supported)
-
-if not supported:
-    raise RuntimeError("This Triton/libtriton does not support nv_mma_shared_layout.")
-
-print("\nTLE-compatible Triton detected.")
 
 from flaggems_vllm.runtime import device, error, torch_device_fn  # noqa: E402
 from flaggems_vllm.utils import triton_lang_extension as ext  # noqa: E402
