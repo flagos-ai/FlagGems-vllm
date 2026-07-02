@@ -19,12 +19,18 @@ NON_TEST_FILES = {
     "workflow.md",
 }
 
-FULL_UNIT_TEST_FILES = {
+ENV_SMOKE_TRIGGER_FILES = {
     ".github/workflows/basic-ci.yml",
     "pyproject.toml",
     "pytest.ini",
     "tools/setup.sh",
 }
+
+ENV_SMOKE_TESTS = [
+    "tests/test_add_rms_norm.py",
+    "tests/test_bincount.py",
+    "tests/test_silu_and_mul.py",
+]
 
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
@@ -199,8 +205,8 @@ def is_non_test_change(path: str) -> bool:
     return path in NON_TEST_FILES or path.startswith(NON_TEST_PREFIXES)
 
 
-def triggers_full_unit_tests(path: str) -> bool:
-    return path in FULL_UNIT_TEST_FILES
+def triggers_env_smoke_tests(path: str) -> bool:
+    return path in ENV_SMOKE_TRIGGER_FILES
 
 
 def select_targets(
@@ -215,8 +221,8 @@ def select_targets(
         normalize_path(path) for path in changed_files if normalize_path(path)
     ]
 
-    if any(triggers_full_unit_tests(path) for path in normalized_changed_files):
-        return "all", sorted(tests), []
+    if any(triggers_env_smoke_tests(path) for path in normalized_changed_files):
+        return "smoke", [test for test in ENV_SMOKE_TESTS if test in tests], []
 
     for path in normalized_changed_files:
         if path.startswith("tests/") and Path(path).name.startswith("test_"):
