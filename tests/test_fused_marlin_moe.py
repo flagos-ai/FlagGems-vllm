@@ -224,7 +224,7 @@ def test_fused_marlin_moe_vs_ref(config, dtype):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    (hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s) = _make_inputs(
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs(
         num_tokens,
         num_experts,
         hidden_size,

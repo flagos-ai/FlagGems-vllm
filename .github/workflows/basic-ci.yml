@@ -6,36 +6,20 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      run_all:
+        description: "Run all unit tests on H20"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  pre-commit:
-    name: pre-commit checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: check out repository
-        uses: actions/checkout@v6
-
-      - name: set up python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: install pre-commit
-        shell: bash
-        run: python -m pip install pre-commit pre-commit-hooks==4.6.0 black==24.8.0 flake8==7.1.0 isort==5.12.0
-
-      - name: run pre-commit
-        shell: bash
-        run: pre-commit run --all-files --show-diff-on-failure
-
   code-style:
     name: code style
-    needs: pre-commit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
       - name: check out repository
@@ -49,31 +33,23 @@ jobs:
 
       - name: install style tools
         shell: bash
-        run: python -m pip install black==24.8.0 flake8==7.1.0 isort==5.12.0
+        run: python -m pip install pre-commit
 
-      - name: check black formatting
+      - name: run pre-commit
         shell: bash
-        run: black --check .
-
-      - name: check import order
-        shell: bash
-        run: isort --check-only --profile black .
-
-      - name: run flake8
-        shell: bash
-        run: flake8 .
+        run: pre-commit run --all-files --show-diff-on-failure
 
   select-targets:
     name: select ci targets
     needs: code-style
-    runs-on: h20
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}
       tests: ${{ steps.select.outputs.tests }}
       benchmarks: ${{ steps.select.outputs.benchmarks }}
     env:
-      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv-select
 
     steps:
       - id: checkout-attempt-1
@@ -108,9 +84,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: use preconfigured python environment
+      - name: create selector python environment
         shell: bash
         run: |
+          python3 -m venv "${VIRTUAL_ENV}"
+          source "${VIRTUAL_ENV}/bin/activate"
+          python --version
           test -x "${VIRTUAL_ENV}/bin/python"
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
 
@@ -135,11 +114,19 @@ jobs:
       - id: select
         name: select tests and benchmarks
         shell: bash
+        env:
+          RUN_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all == true }}
         run: |
-          selection="$(python tools/select_tests.py \
-            --changed-files changed_files.txt \
-            --format shell)"
-          eval "${selection}"
+          if [[ "${RUN_ALL}" == "true" ]]; then
+            TEST_SELECTION_MODE="all"
+            SELECTED_TESTS="$(find tests -type f -name 'test_*.py' | sort | tr '\n' ' ')"
+            SELECTED_BENCHMARKS=""
+          else
+            selection="$(python tools/select_tests.py \
+              --changed-files changed_files.txt \
+              --format shell)"
+            eval "${selection}"
+          fi
 
           echo "Test selection mode: ${TEST_SELECTION_MODE}"
           if [[ -n "${SELECTED_TESTS}" ]]; then
@@ -158,11 +145,12 @@ jobs:
     needs: select-targets
     if: needs.select-targets.outputs.tests != '' || needs.select-targets.outputs.benchmarks != ''
     runs-on: h20
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       DNN_VENDOR: nvidia
       PYTHONPATH: ${{ github.workspace }}/src
-      VIRTUAL_ENV: /home/secure/venvs/flaggems-vllm-ci
+      VENV_DIR: ${{ github.workspace }}/.venv
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv
 
     steps:
       - name: check out repository
@@ -172,12 +160,22 @@ jobs:
         shell: bash
         run: nvidia-smi
 
-      - name: use preconfigured python environment
+      - name: install and activate python environment
         shell: bash
         run: |
-          test -x "${VIRTUAL_ENV}/bin/python"
-          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          source tools/setup.sh
+          source "${VENV_DIR}/bin/activate"
+          test -x "${VENV_DIR}/bin/python"
+          echo "VIRTUAL_ENV=${VENV_DIR}" >> "$GITHUB_ENV"
+          echo "${VENV_DIR}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${CUDA_HOME:-}" ]]; then
+            echo "CUDA_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
+            echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+          fi
+          if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          python --version
 
       - name: run selected unit tests
         if: needs.select-targets.outputs.tests != ''

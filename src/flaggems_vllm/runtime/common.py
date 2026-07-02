@@ -21,3 +21,14 @@ class vendors(Enum):
         for member in cls:
             vendorDict[member.name.lower()] = member
         return vendorDict
+
+
+# Mapping from vendor name to torch attribute for quick detection
+_VENDOR_TORCH_ATTR = {
+    "ascend": "npu",
+    "cambricon": "mlu",
+    "hygon": "__hcu_version__",
+    "iluvatar": "corex",
+    "mthreads": "musa",
+    "sunrise": "ptpu",
+}

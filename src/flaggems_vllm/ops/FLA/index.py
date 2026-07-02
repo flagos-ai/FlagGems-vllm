@@ -39,3 +39,20 @@ def prepare_chunk_offsets(
             triton.cdiv(prepare_lens(cu_seqlens), chunk_size),
         ]
     ).cumsum(-1)
+
+
+@tensor_cache
+def prepare_token_indices(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+    """Return a 2-D tensor ``[total_tokens, 2]`` with ``[seq_id, intra_seq_pos]``."""
+    lens = prepare_lens(cu_seqlens)
+    total = lens.sum().item()
+    seq_ids = torch.arange(
+        lens.numel(), device=cu_seqlens.device, dtype=torch.long
+    ).repeat_interleave(lens)
+    offsets = torch.zeros(lens.numel(), device=cu_seqlens.device, dtype=torch.long)
+    offsets[1:] = lens.cumsum(0)[:-1]
+    intra = (
+        torch.arange(total, device=cu_seqlens.device, dtype=torch.long)
+        - offsets[seq_ids]
+    )
+    return torch.stack([seq_ids, intra], 1)

@@ -19,7 +19,7 @@ from flaggems_vllm.utils import libentry, libtuner
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_G": lambda args: True,
+        "USE_G": lambda args: args.get("USE_G", True),
     }
 )
 @libtuner(
@@ -415,6 +415,8 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype | None = None,
+    *,
+    use_g_in_kkt: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused kernel: cumsum(g) + KKT(L) + solve_tril(L -> inv). Returns (g_out, A_inv).
     w_u stays a separate kernel (e.g. recompute_w_u_fwd) for HGMMA."""
@@ -451,6 +453,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         K=K,
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
+        USE_G=use_g_in_kkt,
         USE_TMA=is_tma_supported and BT == 64,
         DOT_PRECISION=FLA_TRIL_PRECISION,
     )

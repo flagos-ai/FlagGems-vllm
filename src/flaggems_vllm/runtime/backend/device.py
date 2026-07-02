@@ -1,13 +1,12 @@
 import os
 import shlex
 import subprocess
-import threading
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch  # noqa: F401
 
 from .. import backend, error
-from ..common import vendors
+from ..common import _VENDOR_TORCH_ATTR, vendors
 
 UNSUPPORT_FP64 = [
     vendors.CAMBRICON,
@@ -37,6 +36,7 @@ class DeviceDetector(object):
     def __new__(cls, *args, **kargs):
         if cls._instance is None:
             cls._instance = super(DeviceDetector, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self, vendor_name=None):
@@ -69,11 +69,11 @@ class DeviceDetector(object):
         # Try to get the vendor name from a quick special
         # command like 'torch.mlu'.
         vendor_from_env = self._get_vendor_from_env()
-        if vendor_from_env is not None:
+        if vendor_from_env:
             return backend.get_vendor_info(vendor_from_env)
 
         vendor_name = self._get_vendor_from_quick_cmd()
-        if vendor_name is not None:
+        if vendor_name:
             return backend.get_vendor_info(vendor_name)
         try:
             # Obtaining a vendor_info from the methods provided
@@ -83,57 +83,66 @@ class DeviceDetector(object):
             return self._get_vendor_from_sys()
 
     def _get_vendor_from_quick_cmd(self):
-        cmd = {
-            "cambricon": "mlu",
-            "mthreads": "musa",
-            "iluvatar": "corex",
-            "ascend": "npu",
-            "sunrise": "ptpu",
-        }
-        for vendor_name, flag in cmd.items():
-            if hasattr(torch, flag):
-                return vendor_name
         try:
             import torch_npu
 
-            for vendor_name, flag in cmd.items():
-                if hasattr(torch_npu, flag):
-                    return vendor_name
-        except:  # noqa: E722
-            pass
-        return None
+            torch_module = torch_npu
+        except ImportError:
+            torch_module = torch
+
+        for vendor_name, attr in _VENDOR_TORCH_ATTR.items():
+            if hasattr(torch_module, attr):
+                return str(vendor_name)
+
+        if hasattr(torch_module, "cuda") and hasattr(
+            torch_module.cuda, "get_device_properties"
+        ):
+            try:
+                prop = torch_module.cuda.get_device_properties(0)
+                if "NVIDIA" in prop.name.upper():
+                    return "nvidia"
+            except Exception:
+                return False
+
+        return False
 
     def _get_vendor_from_env(self):
-        device_from_evn = os.environ.get("DNN_VENDOR")
-        return None if device_from_evn not in self.vendor_list else device_from_evn
+        if "PPU_SDK" in os.environ.keys():
+            return "thead"
+
+        env_keys = (
+            "GEMS_VENDOR",
+            "FLAGGEMS_VENDOR",
+            "GEMS_BACKEND",
+            "FLAGGEMS_BACKEND",
+        )
+        for key in env_keys:
+            if key in os.environ:
+                return str(os.environ.get(key).lower())
+
+        return False
 
     def _get_vendor_from_sys(self):
         vendor_infos = backend.get_vendor_infos()
-        result_single_info = Queue()
 
-        def runcmd(single_info):
-            device_query_cmd = single_info.device_query_cmd
+        def check_vendor(info):
             try:
-                cmd_args = shlex.split(device_query_cmd)
+                cmd_args = shlex.split(info.device_query_cmd)
                 result = subprocess.run(cmd_args, capture_output=True, text=True)
-                if result.returncode == 0:
-                    result_single_info.put(single_info)
-            except:  # noqa: E722
-                pass
+                return info if result.returncode == 0 else None
+            except Exception:
+                return None
 
-        threads = []
-        for single_info in vendor_infos:
-            # Get the vendor information by running system commands.
-            thread = threading.Thread(target=runcmd, args=(single_info,))
-            threads.append(thread)
-            thread.start()
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(check_vendor, info): info for info in vendor_infos
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    return result
 
-        for thread in threads:
-            thread.join()
-        if result_single_info.empty():
-            error.device_not_found()
-        else:
-            return result_single_info.get()
+        error.device_not_found()
 
     def get_vendor_name(self):
         return self.vendor_name

@@ -171,22 +171,10 @@ class LibCache(object):
     def __init__(self, db_url: Optional[str] = None):
         self.global_cache: Dict = {}
         self.volumn: Dict = {}
+        vendor_name = vendor_module.vendor_info.vendor_name
         if db_url is None:
-            try:
-                device_name: str = torch_device_fn.get_device_name().replace(" ", "_")
-            except AttributeError:
-                device_name: str = (  # type: ignore[no-redef]
-                    vendor_module.vendor_info.device_name
-                )
-            vname = vendor_module.vendor_info.vendor_name
             cache_file_name: str = (
-                f"TunedConfig_{device_name}"
-                f"_triton_{major_version}"
-                f"_{minor_version}.db"
-                if vname == "nvidia"
-                else f"TunedConfig_{vname}"
-                f"_triton_{major_version}"
-                f"_{minor_version}.db"
+                f"TunedConfig_{vendor_name}_triton_{major_version}_{minor_version}.db"
             )
             cache_path: Path = config_cache_dir() / cache_file_name
             self.db_url: str = f"sqlite:///{cache_path}"

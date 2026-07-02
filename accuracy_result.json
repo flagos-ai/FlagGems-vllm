@@ -29436,5 +29436,158 @@
       "flash_attn_varlen_func"
     ],
     "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel[B1-T63-H1-HQ16-D64-S16-block_size32-scale1.0-torch.float16]": {
+    "params": {
+      "B": 1,
+      "T": 63,
+      "H": 1,
+      "HQ": 16,
+      "D": 64,
+      "S": 16,
+      "block_size": 32,
+      "scale": 1.0,
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel[B3-T111-H1-HQ32-D100-S16-block_size32-scale1.0-torch.float16]": {
+    "params": {
+      "B": 3,
+      "T": 111,
+      "H": 1,
+      "HQ": 32,
+      "D": 100,
+      "S": 16,
+      "block_size": 32,
+      "scale": 1.0,
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel[B3-T1024-H2-HQ32-D60-S16-block_size32-scale0.1-torch.float16]": {
+    "params": {
+      "B": 3,
+      "T": 1024,
+      "H": 2,
+      "HQ": 32,
+      "D": 60,
+      "S": 16,
+      "block_size": 32,
+      "scale": 0.1,
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel[B3-T1024-H2-HQ32-D128-S16-block_size32-scale0.1-torch.float16]": {
+    "params": {
+      "B": 3,
+      "T": 1024,
+      "H": 2,
+      "HQ": 32,
+      "D": 128,
+      "S": 16,
+      "block_size": 32,
+      "scale": 0.1,
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel[B4-T2048-H2-HQ32-D64-S16-block_size32-scale0.1-torch.float16]": {
+    "params": {
+      "B": 4,
+      "T": 2048,
+      "H": 2,
+      "HQ": 32,
+      "D": 64,
+      "S": 16,
+      "block_size": 32,
+      "scale": 0.1,
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel_varlen[H1-HQ16-D64-S16-block_size32-cu_seqlens[0, 15]-torch.float16]": {
+    "params": {
+      "H": 1,
+      "HQ": 16,
+      "D": 64,
+      "S": 16,
+      "block_size": 32,
+      "cu_seqlens": [
+        0,
+        15
+      ],
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel_varlen[H2-HQ32-D64-S16-block_size32-cu_seqlens[0, 256, 500, 1000]-torch.float16]": {
+    "params": {
+      "H": 2,
+      "HQ": 32,
+      "D": 64,
+      "S": 16,
+      "block_size": 32,
+      "cu_seqlens": [
+        0,
+        256,
+        500,
+        1000
+      ],
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
+  },
+  "tests/test_parallel_nsa.py::test_parallel_varlen[H2-HQ32-D100-S16-block_size32-cu_seqlens[0, 15, 100, 300, 1200, 2000]-torch.float16]": {
+    "params": {
+      "H": 2,
+      "HQ": 32,
+      "D": 100,
+      "S": 16,
+      "block_size": 32,
+      "cu_seqlens": [
+        0,
+        15,
+        100,
+        300,
+        1200,
+        2000
+      ],
+      "dtype": "torch.float16"
+    },
+    "result": "passed",
+    "opname": [
+      "parallel_nsa"
+    ],
+    "reason": null
   }
 }

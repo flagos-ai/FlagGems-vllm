@@ -1,45 +1,35 @@
 repos:
-  - repo: local
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
     hooks:
       - id: trailing-whitespace
         name: trim trailing whitespace
-        entry: trailing-whitespace-fixer
-        language: system
         types: [text]
 
       - id: end-of-file-fixer
         name: fix end of files
-        entry: end-of-file-fixer
-        language: system
         types: [text]
 
       - id: check-yaml
         name: check yaml
-        entry: check-yaml
-        language: system
         types: [yaml]
 
       - id: check-added-large-files
         name: check for added large files
-        entry: check-added-large-files
-        language: system
 
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.0
+    hooks:
       - id: flake8
-        name: flake8
-        entry: flake8
-        language: system
-        types: [python]
         args: ["--ignore=F405,E731,W503,E203,E704", --max-line-length=120]
 
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.12.0
+    hooks:
       - id: isort
-        name: isort
-        entry: isort
-        language: system
-        types: [python]
         args: ["--profile", "black"]
 
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
       - id: black
-        name: black
-        entry: black
-        language: system
-        types: [python]

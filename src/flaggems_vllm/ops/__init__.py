@@ -39,6 +39,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
+from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
     fused_experts_impl,
@@ -69,6 +70,10 @@ from flaggems_vllm.ops.mul import mul, mul_
 from flaggems_vllm.ops.mv import mv
 from flaggems_vllm.ops.outer import outer
 from flaggems_vllm.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.ops.FLA import (
+    parallel_nsa,
+    parallel_nsa_compression,
+)
 from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -86,6 +91,9 @@ from flaggems_vllm.ops.silu_and_mul_with_clamp import (
 )
 from flaggems_vllm.ops.skip_layernorm import skip_layer_norm
 from flaggems_vllm.ops.sparse_attention import sparse_attn_triton
+from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
+    stage_deepseek_v4_mega_moe_inputs,
+)
 from flaggems_vllm.ops.swiglu import dswiglu, swiglu
 from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode
 from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
@@ -128,6 +136,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
+    "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -152,6 +161,8 @@ __all__ = [
     "mv",
     "outer",
     "outplace_fused_experts",
+    "parallel_nsa",
+    "parallel_nsa_compression",
     "pack_seq_triton",
     "per_token_group_quant_fp8",
     "reglu",
@@ -166,6 +177,7 @@ __all__ = [
     "sinkhorn_forward",
     "skip_layer_norm",
     "sparse_attn_triton",
+    "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
     "top_k_per_row_decode",
