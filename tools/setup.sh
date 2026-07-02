@@ -266,6 +266,30 @@ print(" flaggems_vllm device:", getattr(flaggems_vllm, "device", "unknown"))
 PY
 ok
 
+if [ "${USE_FLAGTREE}" = "1" ]; then
+  printf "Checking FlagTree TLE support ..."
+  python - <<'PY' || fail
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+if has_triton_tle(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle  # noqa: F401
+
+        HAS_TLE_FLASH_MLA = True
+    except ImportError:
+        tle = None
+        HAS_TLE_FLASH_MLA = False
+else:
+    tle = None
+    HAS_TLE_FLASH_MLA = False
+
+print(" HAS_TLE_FLASH_MLA:", HAS_TLE_FLASH_MLA)
+if not HAS_TLE_FLASH_MLA:
+    raise SystemExit("FlagTree TLE support is unavailable")
+PY
+  ok
+fi
+
 # ── Optional Triton import check ─────────────────────────────
 if [ "${STRICT_TRITON_IMPORT}" = "1" ]; then
   printf "Strictly verifying Triton import ..."
