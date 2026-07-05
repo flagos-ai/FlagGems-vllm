@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 import flaggems_vllm
 from benchmark.base import Benchmark
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 
 class ChunkGatedDeltaRuleFwdBenchmark(Benchmark):
@@ -56,6 +57,7 @@ class ChunkGatedDeltaRuleFwdBenchmark(Benchmark):
 
 @pytest.mark.chunk_gated_delta_rule_fwd
 @pytest.mark.xfail(
+    not has_triton_tle(3, 6, 0),
     reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue"
 )
 def test_perf_chunk_gated_delta_rule_fwd():

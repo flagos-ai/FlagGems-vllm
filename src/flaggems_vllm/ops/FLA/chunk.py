@@ -18,7 +18,10 @@ from flaggems_vllm.ops.FLA.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
 from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL
-from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd
+from flaggems_vllm.ops.FLA.wy_fast import (
+    maybe_set_tle_recompute_allocator,
+    recompute_w_u_fwd,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,7 @@ def chunk_gated_delta_rule_fwd(
             cu_seqlens = cu_seqlens.contiguous()
 
     chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
+    maybe_set_tle_recompute_allocator(q.device, cu_seqlens)
 
     g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         g=g,
@@ -82,6 +86,8 @@ def chunk_gated_delta_rule_fwd(
         chunk_size=chunk_size,
         output_dtype=k.dtype,
     )
+    block_v = 128 if v.shape[-1] == 128 else 64
+    pipe_stages = 5 if v.shape[-1] >= 256 else (3 if v.shape[-1] == 128 else 2)
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -89,6 +95,8 @@ def chunk_gated_delta_rule_fwd(
         A=A,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        block_v=block_v,
+        pipe_stages=pipe_stages,
     )
     if SUPPRESS_LEVEL < 3 and can_use_fused_tail_vblock(
         q=q,
