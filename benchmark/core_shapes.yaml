@@ -457,3 +457,10 @@ ReshapeAndCacheFlashBenchmark:
     - [21, 4, 80, 16, 10000]
     - [42, 8, 64, 8, 1024]
     - [42, 8, 80, 16, 10000]
+
+chunk_gated_delta_rule_fwd:
+  shapes:
+    - [2, 16384, 16, 128, 128]
+    - [4, 2048, 16, 128, 128]
+    - [4, 4096, 64, 128, 128]
+  shape_desc: "B, T, H, K, V"

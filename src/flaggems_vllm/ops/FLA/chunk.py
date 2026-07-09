@@ -78,6 +78,53 @@ def chunk_gated_delta_rule_fwd(
     chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
     maybe_set_tle_recompute_allocator(q.device, cu_seqlens)
 
+    if initial_state is None and output_final_state:
+        try:
+            from flaggems_vllm.ops.chunk_gated_delta_rule import (
+                _can_use_tle_chunk_gated_delta_rule,
+                _tle_chunk_gated_delta_rule_fwd,
+            )
+
+            if _can_use_tle_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                beta=beta,
+                g=g,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+            ):
+                g_tle, A_tle = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+                    g=g,
+                    k=k,
+                    beta=beta,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=chunk_size,
+                    output_dtype=k.dtype,
+                    use_g_in_kkt=False,
+                )
+                o, final_state = _tle_chunk_gated_delta_rule_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_cumsum=g_tle,
+                    beta=beta,
+                    a=A_tle,
+                    scale=float(scale),
+                )
+                g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+                    g=g,
+                    k=k,
+                    beta=beta,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=chunk_size,
+                    output_dtype=k.dtype,
+                )
+                return g, o, A, final_state, None, None, None
+        except ImportError:
+            pass
+
     g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         g=g,
         k=k,
