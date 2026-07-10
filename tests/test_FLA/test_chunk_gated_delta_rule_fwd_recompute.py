@@ -7,7 +7,6 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-
 ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAGGEMS_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAGGEMS_CHUNK_GATED_DELTA_RULE_TLE"
@@ -95,13 +94,14 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     assert not torch.isnan(expected).any(), f"{name}: NaN detected in baseline"
     ratio = _err_ratio(expected, actual)
     assert ratio < ASSERT_RATIO, (
-        f"{name} diff: abs={abs_err:.6f} ratio={ratio:.6f} "
-        f"limit={ASSERT_RATIO}"
+        f"{name} diff: abs={abs_err:.6f} ratio={ratio:.6f} " f"limit={ASSERT_RATIO}"
     )
 
 
 @pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE")
+@pytest.mark.skipif(
+    not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", GDN_RECOMPUTE_TEST_SHAPES)
 @torch.inference_mode()
@@ -119,7 +119,9 @@ def test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native(dtype, shape):
 
 
 @pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.skipif(not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE")
+@pytest.mark.skipif(
+    not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", GDN_FUSED_FWD_TEST_SHAPES)
 @torch.inference_mode()

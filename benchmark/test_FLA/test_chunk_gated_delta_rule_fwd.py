@@ -8,7 +8,6 @@ import flaggems_vllm
 from benchmark.base import Benchmark
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-
 RECOMPUTE_TLE_ENV = "FLAGGEMS_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAGGEMS_CHUNK_GATED_DELTA_RULE_TLE"
 
@@ -72,9 +71,7 @@ class ChunkGatedDeltaRuleFwdBenchmark(Benchmark):
         q = torch.randn(B, T, H, K, device=device, dtype=dtype) / (K**0.5)
         k = torch.randn(B, T, H, K, device=device, dtype=dtype) / (K**0.5)
         v = torch.randn(B, T, H, V, device=device, dtype=dtype)
-        g = (-torch.rand(B, T, H, device=device, dtype=torch.float32) * 0.1).to(
-            dtype
-        )
+        g = (-torch.rand(B, T, H, device=device, dtype=torch.float32) * 0.1).to(dtype)
         beta = torch.rand(B, T, H, device=device, dtype=dtype).sigmoid()
         scale = K**-0.5
 
@@ -94,7 +91,7 @@ class ChunkGatedDeltaRuleFwdBenchmark(Benchmark):
 @pytest.mark.chunk_gated_delta_rule_fwd
 @pytest.mark.xfail(
     not has_triton_tle(3, 6, 0),
-    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue"
+    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
 def test_perf_chunk_gated_delta_rule_fwd():
     bench = ChunkGatedDeltaRuleFwdBenchmark(

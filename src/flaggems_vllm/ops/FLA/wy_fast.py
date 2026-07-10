@@ -194,9 +194,7 @@ if HAS_TLE_RECOMPUTE_W_U:
         p_beta = tl.make_block_ptr(
             beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
         )
-        p_g = tl.make_block_ptr(
-            g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-        )
+        p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         p_A = tl.make_block_ptr(
             A + (bos * H + i_h) * BT,
             (T, BT),
