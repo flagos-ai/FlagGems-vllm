@@ -47,6 +47,7 @@ test = [
     "numpy>=1.26",
     "scipy>=1.14",
     "cupy-cuda12x",
+    "distro>=1.9.0",
 ]
 
 [project.urls]
