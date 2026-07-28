@@ -33,6 +33,7 @@ def _qwen_moe_sum_kernel(
     token_idx = tl.program_id(0)
     hidden_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     hidden_mask = hidden_offsets < hidden_size
+
     input_base = input_ptr + token_idx * TOPK * hidden_size + hidden_offsets
     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     for expert_idx in tl.static_range(0, TOPK):
@@ -49,6 +50,7 @@ def _qwen_moe_sum_kernel(
             )
             values = values.to(tl.float32) * router_weight.to(tl.float32)
         acc += values.to(tl.float32)
+
     output_offsets = token_idx * hidden_size + hidden_offsets
     tl.store(
         output_ptr + output_offsets,
@@ -80,7 +82,6 @@ def moe_sum(
     ):
         assert router_weights is None
         return generic_moe_sum(input, output)
-
     if router_weights is not None:
         assert router_weights.shape == input.shape[:2]
         router_weights_strides = router_weights.stride()
