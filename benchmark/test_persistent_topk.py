@@ -33,10 +33,11 @@ except (ImportError, AttributeError):
 STRIDE = 262144
 K = 512
 
-def _baseline_persistent_topk(logits, lengths, indices, workspace, max_seq_len, seq_lens):
-    torch.ops._C.persistent_topk(
-        logits, lengths, indices, workspace, K, max_seq_len
-    )
+
+def _baseline_persistent_topk(
+    logits, lengths, indices, workspace, max_seq_len, seq_lens
+):
+    torch.ops._C.persistent_topk(logits, lengths, indices, workspace, K, max_seq_len)
     return indices
 
 
@@ -83,14 +84,21 @@ class PersistentTopKBenchmark(base.Benchmark):
         for num_rows, seq_len, max_seq_len in self.shapes:
             torch.manual_seed(torch.randint(0, 2**31, (1,)).item())
             logits = torch.full(
-                (num_rows, STRIDE), float("-inf"), dtype=torch.float32, device=self.device
+                (num_rows, STRIDE),
+                float("-inf"),
+                dtype=torch.float32,
+                device=self.device,
             )
             logits[:, :seq_len] = torch.randn(num_rows, seq_len, device=self.device)
 
-            lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device=self.device)
+            lengths = torch.full(
+                (num_rows,), seq_len, dtype=torch.int32, device=self.device
+            )
             indices = torch.empty((num_rows, K), dtype=torch.int32, device=self.device)
             workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=self.device)
-            seq_lens = torch.full((num_rows,), seq_len, dtype=torch.int32, device=self.device)
+            seq_lens = torch.full(
+                (num_rows,), seq_len, dtype=torch.int32, device=self.device
+            )
 
             yield logits, lengths, indices, workspace, max_seq_len, seq_lens
 
@@ -98,11 +106,13 @@ class PersistentTopKBenchmark(base.Benchmark):
         for num_rows, max_len in self.hetero_shapes:
             torch.manual_seed(torch.randint(0, 2**31, (1,)).item())
             lengths_values = torch.linspace(
-                1, min(max_len, STRIDE), num_rows,
-                dtype=torch.int32, device=self.device
+                1, min(max_len, STRIDE), num_rows, dtype=torch.int32, device=self.device
             )
             logits = torch.full(
-                (num_rows, STRIDE), float("-inf"), dtype=torch.float32, device=self.device
+                (num_rows, STRIDE),
+                float("-inf"),
+                dtype=torch.float32,
+                device=self.device,
             )
             for i, sl in enumerate(lengths_values):
                 logits[i, :sl] = torch.randn(sl, device=self.device)

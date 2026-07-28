@@ -446,8 +446,9 @@ def _radix_topk(
 
     return barrier_phase
 
-
     # Medium path: 8K < seq_len <= 32K. Uses 2048-bin FP16-11bit histogram for
+
+
 # Phase 1 (finer granularity → fewer elements in threshold bin), then 4-pass
 # FP32 radix-256 refinement on the buffered threshold-bin elements.
 @triton.jit
@@ -521,7 +522,9 @@ def _histogram_256_topk(
             nps = ps + round_counts
             thr_mask = (ps <= cutoff) & (nps > cutoff)
             tl.store(medium_scalars + 1 + zeros, round_bins, mask=thr_mask)
-            tl.store(medium_scalars + 2 + zeros, (seq_len - nps).to(tl.int32), mask=thr_mask)
+            tl.store(
+                medium_scalars + 2 + zeros, (seq_len - nps).to(tl.int32), mask=thr_mask
+            )
             tl.store(medium_scalars + 0 + zeros, 0, mask=thr_mask)
             threshold_found = tl.reduce_or(thr_mask, axis=0)
             last_value = cum_total
@@ -541,23 +544,26 @@ def _histogram_256_topk(
             x = tl.load(row_input + offs)
             bin = _decode_bin(x)
             above = (bin > threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
-            out_pos = tl.atomic_add(medium_scalars + 0 + zeros_2d, 1, mask=above,
-                                     sem="relaxed", scope="cta")
+            out_pos = tl.atomic_add(
+                medium_scalars + 0 + zeros_2d, 1, mask=above, sem="relaxed", scope="cta"
+            )
             tl.store(row_output + out_pos, offs, mask=above)
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
             x = tl.load(row_input + offs)
             above = _decode_bin(x) > threshold_bin
-            out_pos = tl.atomic_add(medium_scalars + 0 + zeros, 1, mask=above,
-                                     sem="relaxed", scope="cta")
+            out_pos = tl.atomic_add(
+                medium_scalars + 0 + zeros, 1, mask=above, sem="relaxed", scope="cta"
+            )
             tl.store(row_output + out_pos, offs.to(tl.int32), mask=above)
         if rem_elems > 0:
             offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
             in_range = lane < rem_elems
             x = tl.load(row_input + offs, mask=in_range, other=float("-inf"))
             above = in_range & (_decode_bin(x) > threshold_bin)
-            out_pos = tl.atomic_add(medium_scalars + 0 + zeros, 1, mask=above,
-                                     sem="relaxed", scope="cta")
+            out_pos = tl.atomic_add(
+                medium_scalars + 0 + zeros, 1, mask=above, sem="relaxed", scope="cta"
+            )
             tl.store(row_output + out_pos, offs.to(tl.int32), mask=above)
         tl.debug_barrier()
         return
@@ -574,29 +580,37 @@ def _histogram_256_topk(
         bin = _decode_bin(x)
         above = (bin > threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
         equal = (bin == threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
-        out_pos = tl.atomic_add(medium_scalars + 0 + zeros_2d, 1, mask=above,
-                                 sem="relaxed", scope="cta")
+        out_pos = tl.atomic_add(
+            medium_scalars + 0 + zeros_2d, 1, mask=above, sem="relaxed", scope="cta"
+        )
         tl.store(row_output + out_pos, offs, mask=above)
-        buf_pos = tl.atomic_add(medium_scalars + 2 + zeros_2d, 1, mask=equal,
-                                 sem="relaxed", scope="cta")
+        buf_pos = tl.atomic_add(
+            medium_scalars + 2 + zeros_2d, 1, mask=equal, sem="relaxed", scope="cta"
+        )
         in_buf = equal & (buf_pos < MAX_BUFFERED_ITEMS)
         tl.store(buffered_indices + buf_pos, offs, mask=in_buf)
         fp32_bits = _convert_to_uint32_v2(x)
         next_bin_flat = ((fp32_bits >> 24) & 0xFF).reshape(BLOCK_SIZE * VEC_SIZE)
-        tl.atomic_add(hist0_ptr + next_bin_flat, 1,
-                       mask=in_buf.reshape(BLOCK_SIZE * VEC_SIZE),
-                       sem="relaxed", scope="cta")
+        tl.atomic_add(
+            hist0_ptr + next_bin_flat,
+            1,
+            mask=in_buf.reshape(BLOCK_SIZE * VEC_SIZE),
+            sem="relaxed",
+            scope="cta",
+        )
     for t in tl.range(0, rem_tiles):
         offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
         x = tl.load(row_input + offs)
         bin = _decode_bin(x)
         above = bin > threshold_bin
         equal = bin == threshold_bin
-        out_pos = tl.atomic_add(medium_scalars + 0 + zeros, 1, mask=above,
-                                 sem="relaxed", scope="cta")
+        out_pos = tl.atomic_add(
+            medium_scalars + 0 + zeros, 1, mask=above, sem="relaxed", scope="cta"
+        )
         tl.store(row_output + out_pos, offs.to(tl.int32), mask=above)
-        buf_pos = tl.atomic_add(medium_scalars + 2 + zeros, 1, mask=equal,
-                                 sem="relaxed", scope="cta")
+        buf_pos = tl.atomic_add(
+            medium_scalars + 2 + zeros, 1, mask=equal, sem="relaxed", scope="cta"
+        )
         in_buf = equal & (buf_pos < MAX_BUFFERED_ITEMS)
         tl.store(buffered_indices + buf_pos, offs.to(tl.int32), mask=in_buf)
         fp32_bits = _convert_to_uint32_v2(x)
@@ -609,11 +623,13 @@ def _histogram_256_topk(
         bin = _decode_bin(x)
         above = in_range & (bin > threshold_bin)
         equal = in_range & (bin == threshold_bin)
-        out_pos = tl.atomic_add(medium_scalars + 0 + zeros, 1, mask=above,
-                                 sem="relaxed", scope="cta")
+        out_pos = tl.atomic_add(
+            medium_scalars + 0 + zeros, 1, mask=above, sem="relaxed", scope="cta"
+        )
         tl.store(row_output + out_pos, offs.to(tl.int32), mask=above)
-        buf_pos = tl.atomic_add(medium_scalars + 2 + zeros, 1, mask=equal,
-                                 sem="relaxed", scope="cta")
+        buf_pos = tl.atomic_add(
+            medium_scalars + 2 + zeros, 1, mask=equal, sem="relaxed", scope="cta"
+        )
         in_buf = equal & (buf_pos < MAX_BUFFERED_ITEMS)
         tl.store(buffered_indices + buf_pos, offs.to(tl.int32), mask=in_buf)
         fp32_bits = _convert_to_uint32_v2(x)
@@ -652,9 +668,15 @@ def _histogram_256_topk(
                 tl.store(db + lane, val + tmp, mask=lane < RADIX)
                 tl.debug_barrier()
 
-            count_ge = tl.load(hist0_ptr + lane, mask=lane < RADIX, other=0).to(tl.int32)
-            count_gt = tl.load(hist0_ptr + lane + 1, mask=(lane + 1) < RADIX, other=0).to(tl.int32)
-            thr_mask = (count_ge > remaining_k) & (count_gt <= remaining_k) & (lane < RADIX)
+            count_ge = tl.load(hist0_ptr + lane, mask=lane < RADIX, other=0).to(
+                tl.int32
+            )
+            count_gt = tl.load(
+                hist0_ptr + lane + 1, mask=(lane + 1) < RADIX, other=0
+            ).to(tl.int32)
+            thr_mask = (
+                (count_ge > remaining_k) & (count_gt <= remaining_k) & (lane < RADIX)
+            )
             tl.store(medium_scalars + 1 + zeros, lane, mask=thr_mask)
             tl.store(medium_scalars + 2 + dst_buffer + zeros, 0, mask=thr_mask)
             tl.store(medium_scalars + 4 + zeros, remaining_k - count_gt, mask=thr_mask)
@@ -669,11 +691,23 @@ def _histogram_256_topk(
                 for b in tl.range(0, BUF_TILES):
                     offs_b = b * BLOCK_SIZE + lane
                     valid_b = offs_b < num_buffered
-                    buf_idx = tl.load(buffered_indices + src_buffer * MAX_BUFFERED_ITEMS + offs_b, mask=valid_b, other=0)
-                    logit_val = tl.load(row_input + buf_idx, mask=valid_b, other=float("-inf"))
+                    buf_idx = tl.load(
+                        buffered_indices + src_buffer * MAX_BUFFERED_ITEMS + offs_b,
+                        mask=valid_b,
+                        other=0,
+                    )
+                    logit_val = tl.load(
+                        row_input + buf_idx, mask=valid_b, other=float("-inf")
+                    )
                     bin = (_convert_to_uint32_v2(logit_val) >> bit_offset) & 0xFF
                     above = valid_b & (bin > threshold_bin)
-                    out_pos = tl.atomic_add(medium_scalars + 0 + zeros, 1, mask=above, sem="relaxed", scope="cta")
+                    out_pos = tl.atomic_add(
+                        medium_scalars + 0 + zeros,
+                        1,
+                        mask=above,
+                        sem="relaxed",
+                        scope="cta",
+                    )
                     tl.store(row_output + out_pos, buf_idx, mask=above)
                 tl.debug_barrier()
                 remaining_k = tl.full((), -1, dtype=tl.int32)
@@ -687,26 +721,54 @@ def _histogram_256_topk(
                     offs_b = b * BLOCK_SIZE + lane
                     valid_b = offs_b < num_buffered
                     buf_idx = tl.load(curent_buf + offs_b, mask=valid_b, other=0)
-                    logit_val = tl.load(row_input + buf_idx, mask=valid_b, other=float("-inf"))
+                    logit_val = tl.load(
+                        row_input + buf_idx, mask=valid_b, other=float("-inf")
+                    )
                     fp32_bits = _convert_to_uint32_v2(logit_val)
                     bin = (fp32_bits >> bit_offset) & 0xFF
                     above = valid_b & (bin > threshold_bin)
                     equal = valid_b & (bin == threshold_bin)
-                    out_pos = tl.atomic_add(medium_scalars + 0 + zeros, 1, mask=above, sem="relaxed", scope="cta")
+                    out_pos = tl.atomic_add(
+                        medium_scalars + 0 + zeros,
+                        1,
+                        mask=above,
+                        sem="relaxed",
+                        scope="cta",
+                    )
                     tl.store(row_output + out_pos, buf_idx, mask=above)
                     if pass_idx == 3:
-                        slot = tl.atomic_add(medium_scalars + 4 + zeros, -1, mask=equal, sem="relaxed", scope="cta").to(tl.int32)
+                        slot = tl.atomic_add(
+                            medium_scalars + 4 + zeros,
+                            -1,
+                            mask=equal,
+                            sem="relaxed",
+                            scope="cta",
+                        ).to(tl.int32)
                         take = equal & (slot > 0)
                         tl.store(row_output + (TOPK - slot), buf_idx, mask=take)
                     else:
-                        buffer_pos = tl.atomic_add(medium_scalars + 2 + dst_buffer + zeros, 1, mask=equal, sem="relaxed", scope="cta")
+                        buffer_pos = tl.atomic_add(
+                            medium_scalars + 2 + dst_buffer + zeros,
+                            1,
+                            mask=equal,
+                            sem="relaxed",
+                            scope="cta",
+                        )
                         in_buf = equal & (buffer_pos < MAX_BUFFERED_ITEMS)
                         tl.store(next_buf + buffer_pos, buf_idx, mask=in_buf)
                         next_bin = (fp32_bits >> (bit_offset - 8)) & 0xFF
-                        tl.atomic_add(hist0_ptr + next_bin, 1, mask=in_buf, sem="relaxed", scope="cta")
+                        tl.atomic_add(
+                            hist0_ptr + next_bin,
+                            1,
+                            mask=in_buf,
+                            sem="relaxed",
+                            scope="cta",
+                        )
                 tl.debug_barrier()
 
+
 # histogram_2048_topk — production xiao implementation
+
 
 @triton.jit
 def _histogram_2048_topk(
@@ -797,7 +859,7 @@ def _histogram_2048_topk(
             thr_mask = (ps <= cutoff) & (nps > cutoff)
             tl.store(scalars_ptr + 0 + zeros, round_bins, mask=thr_mask)
             tl.store(
-               scalars_ptr + 2 + zeros, (seq_len - nps).to(tl.int32), mask=thr_mask
+                scalars_ptr + 2 + zeros, (seq_len - nps).to(tl.int32), mask=thr_mask
             )
             threshold_found = tl.reduce_or(thr_mask, axis=0)
             last_value = cum_total
@@ -816,11 +878,11 @@ def _histogram_2048_topk(
         above = (bin_flat > threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
         equal = (bin_flat == threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
         out_pos = tl.atomic_add(
-           scalars_ptr + 1 + zeros_2d, 1, mask=above, sem="relaxed", scope="cta"
+            scalars_ptr + 1 + zeros_2d, 1, mask=above, sem="relaxed", scope="cta"
         )
         tl.store(row_output + out_pos, offs, mask=above)
         buf_pos = tl.atomic_add(
-           scalars_ptr + 4 + zeros_2d, 1, mask=equal, sem="relaxed", scope="cta"
+            scalars_ptr + 4 + zeros_2d, 1, mask=equal, sem="relaxed", scope="cta"
         )
         in_buf = equal & (buf_pos < DBUF_C)
         tl.store(buf0_ptr + buf_pos, offs, mask=in_buf)
@@ -831,11 +893,11 @@ def _histogram_2048_topk(
         above = bin > threshold_bin
         equal = bin == threshold_bin
         out_pos = tl.atomic_add(
-           scalars_ptr + 1 + zeros, 1, mask=above, sem="relaxed", scope="cta"
+            scalars_ptr + 1 + zeros, 1, mask=above, sem="relaxed", scope="cta"
         )
         tl.store(row_output + out_pos, offs, mask=above)
         buf_pos = tl.atomic_add(
-           scalars_ptr + 4 + zeros, 1, mask=equal, sem="relaxed", scope="cta"
+            scalars_ptr + 4 + zeros, 1, mask=equal, sem="relaxed", scope="cta"
         )
         in_buf = equal & (buf_pos < DBUF_C)
         tl.store(buf0_ptr + buf_pos, offs, mask=in_buf)
@@ -846,11 +908,11 @@ def _histogram_2048_topk(
         above = (bin > threshold_bin) & in_range
         equal = (bin == threshold_bin) & in_range
         out_pos = tl.atomic_add(
-           scalars_ptr + 1 + zeros, 1, mask=above, sem="relaxed", scope="cta"
+            scalars_ptr + 1 + zeros, 1, mask=above, sem="relaxed", scope="cta"
         )
         tl.store(row_output + out_pos, offs, mask=above)
         buf_pos = tl.atomic_add(
-           scalars_ptr + 4 + zeros, 1, mask=equal, sem="relaxed", scope="cta"
+            scalars_ptr + 4 + zeros, 1, mask=equal, sem="relaxed", scope="cta"
         )
         in_buf = equal & (buf_pos < DBUF_C)
         tl.store(buf0_ptr + buf_pos, offs, mask=in_buf)
@@ -919,7 +981,7 @@ def _histogram_2048_topk(
             tl.debug_barrier()
             tl.store(scalars_ptr + 2 + zeros, lane, mask=threshold_mask)
             tl.store(
-               scalars_ptr + 3 + zeros, remaining_k - count_gt, mask=threshold_mask
+                scalars_ptr + 3 + zeros, remaining_k - count_gt, mask=threshold_mask
             )  # sFIN
             tl.debug_barrier()
 
@@ -943,7 +1005,7 @@ def _histogram_2048_topk(
                     bin = (fp32_bits >> bit_offset) & 0xFF
                     above = valid & (bin > ref_thr)
                     out_pos = tl.atomic_add(
-                       scalars_ptr + 1 + zeros,
+                        scalars_ptr + 1 + zeros,
                         1,
                         mask=above,
                         sem="relaxed",
@@ -967,7 +1029,7 @@ def _histogram_2048_topk(
                     above = valid & (bin > ref_thr)
                     equal = valid & (bin == ref_thr)
                     out_pos = tl.atomic_add(
-                       scalars_ptr + 1 + zeros,
+                        scalars_ptr + 1 + zeros,
                         1,
                         mask=above,
                         sem="relaxed",
@@ -976,7 +1038,7 @@ def _histogram_2048_topk(
                     tl.store(row_output + out_pos, idx, mask=above)
                     if pass_idx == 3:
                         slot = tl.atomic_add(
-                           scalars_ptr + 3 + zeros,
+                            scalars_ptr + 3 + zeros,
                             -1,
                             mask=equal,
                             sem="relaxed",
@@ -986,7 +1048,7 @@ def _histogram_2048_topk(
                         tl.store(row_output + (TOPK - slot), idx, mask=take)
                     else:
                         buf_pos = tl.atomic_add(
-                           scalars_ptr + buf_count_dst_idx + zeros,
+                            scalars_ptr + buf_count_dst_idx + zeros,
                             1,
                             mask=equal,
                             sem="relaxed",
@@ -1263,38 +1325,93 @@ def _v1_process_bins(
         partial = in_range & (((key ^ logit_pattern) >> 10) == 0)
 
     take_lt = partial & (digit < threshold_bin_idx) & write_directly
-    out_pos_lt = tl.atomic_add(found_ptrs, ones, mask=take_lt, sem="relaxed", scope="cta")
+    out_pos_lt = tl.atomic_add(
+        found_ptrs, ones, mask=take_lt, sem="relaxed", scope="cta"
+    )
     if IS_MERGE_BLOCKS:
-        split_idx = tl.load(split_indices_ptr + offs, mask=take_lt & (out_pos_lt < TOPK))
-        tl.store(s_out_indices_ptr + out_pos_lt, split_idx, mask=take_lt & (out_pos_lt < TOPK))
+        split_idx = tl.load(
+            split_indices_ptr + offs, mask=take_lt & (out_pos_lt < TOPK)
+        )
+        tl.store(
+            s_out_indices_ptr + out_pos_lt,
+            split_idx,
+            mask=take_lt & (out_pos_lt < TOPK),
+        )
     elif USE_MULTI_BLOCKS:
-        tl.store(s_out_indices_ptr + out_pos_lt, (offs + row_start).to(tl.int32), mask=take_lt & (out_pos_lt < TOPK))
+        tl.store(
+            s_out_indices_ptr + out_pos_lt,
+            (offs + row_start).to(tl.int32),
+            mask=take_lt & (out_pos_lt < TOPK),
+        )
         tl.store(s_out_logits_ptr + out_pos_lt, x, mask=take_lt & (out_pos_lt < TOPK))
     else:
-        tl.store(s_out_indices_ptr + out_pos_lt, offs.to(tl.int32), mask=take_lt & (out_pos_lt < TOPK))
+        tl.store(
+            s_out_indices_ptr + out_pos_lt,
+            offs.to(tl.int32),
+            mask=take_lt & (out_pos_lt < TOPK),
+        )
 
     if step_idx == 3:
         take_eq = partial & (digit == threshold_bin_idx)
-        out_pos_eq = tl.atomic_add(hist_base_ptr + digit, ones, mask=take_eq, sem="relaxed", scope="cta")
+        out_pos_eq = tl.atomic_add(
+            hist_base_ptr + digit, ones, mask=take_eq, sem="relaxed", scope="cta"
+        )
         if IS_MERGE_BLOCKS:
-            split_idx = tl.load(split_indices_ptr + offs, mask=take_eq & (out_pos_eq < TOPK))
-            tl.store(s_out_indices_ptr + out_pos_eq, split_idx, mask=take_eq & (out_pos_eq < TOPK))
+            split_idx = tl.load(
+                split_indices_ptr + offs, mask=take_eq & (out_pos_eq < TOPK)
+            )
+            tl.store(
+                s_out_indices_ptr + out_pos_eq,
+                split_idx,
+                mask=take_eq & (out_pos_eq < TOPK),
+            )
         elif USE_MULTI_BLOCKS:
-            tl.store(s_out_indices_ptr + out_pos_eq, (offs + row_start).to(tl.int32), mask=take_eq & (out_pos_eq < TOPK))
-            tl.store(s_out_logits_ptr + out_pos_eq, x, mask=take_eq & (out_pos_eq < TOPK))
+            tl.store(
+                s_out_indices_ptr + out_pos_eq,
+                (offs + row_start).to(tl.int32),
+                mask=take_eq & (out_pos_eq < TOPK),
+            )
+            tl.store(
+                s_out_logits_ptr + out_pos_eq, x, mask=take_eq & (out_pos_eq < TOPK)
+            )
         else:
-            tl.store(s_out_indices_ptr + out_pos_eq, offs.to(tl.int32), mask=take_eq & (out_pos_eq < TOPK))
+            tl.store(
+                s_out_indices_ptr + out_pos_eq,
+                offs.to(tl.int32),
+                mask=take_eq & (out_pos_eq < TOPK),
+            )
     elif use_final:
         take_eq_final = partial & (digit == threshold_bin_idx)
-        final_pos = tl.atomic_add(final_cnt_ptrs, ones, mask=take_eq_final, sem="relaxed", scope="cta")
+        final_pos = tl.atomic_add(
+            final_cnt_ptrs, ones, mask=take_eq_final, sem="relaxed", scope="cta"
+        )
         if IS_MERGE_BLOCKS:
-            split_idx = tl.load(split_indices_ptr + offs, mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS))
-            tl.store(hist_base_ptr + final_pos, split_idx, mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS))
+            split_idx = tl.load(
+                split_indices_ptr + offs,
+                mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+            )
+            tl.store(
+                hist_base_ptr + final_pos,
+                split_idx,
+                mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+            )
         elif USE_MULTI_BLOCKS:
-            tl.store(hist_base_ptr + final_pos, (offs + row_start).to(tl.int32), mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS))
+            tl.store(
+                hist_base_ptr + final_pos,
+                (offs + row_start).to(tl.int32),
+                mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+            )
         else:
-            tl.store(hist_base_ptr + final_pos, offs.to(tl.int32), mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS))
-        tl.store(hist_base_ptr + (FINAL_SORT_ITEMS + final_pos), x.to(tl.int32, bitcast=True), mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS))
+            tl.store(
+                hist_base_ptr + final_pos,
+                offs.to(tl.int32),
+                mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+            )
+        tl.store(
+            hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+            x.to(tl.int32, bitcast=True),
+            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+        )
 
 
 @triton.jit
@@ -1333,7 +1450,9 @@ def _v1_processHistogramStep(
     zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     zeros_vec_2d = tl.zeros([BLOCK_SIZE, VEC], dtype=tl.int32)
 
-    threshold_rounds: tl.constexpr = RADIX10_SIZE // BLOCK_SIZE if step_idx == 3 else RADIX11_SIZE // BLOCK_SIZE
+    threshold_rounds: tl.constexpr = (
+        RADIX10_SIZE // BLOCK_SIZE if step_idx == 3 else RADIX11_SIZE // BLOCK_SIZE
+    )
     for clear_round in tl.static_range(0, threshold_rounds):
         clear_bins = clear_round * BLOCK_SIZE + lane
         tl.store(hist_base_ptr + clear_bins, 0)
@@ -1354,13 +1473,23 @@ def _v1_processHistogramStep(
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + offs)
             _v1_distribute_to_bins(
-                x_vec, True, ones_vec_2d, step_idx, logit_pattern, hist_base_ptr,
+                x_vec,
+                True,
+                ones_vec_2d,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + offs)
             _v1_distribute_to_bins(
-                x, True, ones, step_idx, logit_pattern, hist_base_ptr,
+                x,
+                True,
+                ones,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
     elif stride_xn == 1:
         aligned_row_start = (row_start + VEC - 1) // VEC * VEC
@@ -1374,27 +1503,49 @@ def _v1_processHistogramStep(
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + aligned_row_start + offs)
             _v1_distribute_to_bins(
-                x_vec, True, ones_vec_2d, step_idx, logit_pattern, hist_base_ptr,
+                x_vec,
+                True,
+                ones_vec_2d,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + aligned_row_start + offs)
             _v1_distribute_to_bins(
-                x, True, ones, step_idx, logit_pattern, hist_base_ptr,
+                x,
+                True,
+                ones,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
         if skip_elems > 0:
             offs = lane
             in_range = lane < skip_elems
             x = tl.load(row_ptr + row_start + offs, mask=in_range, other=float("-inf"))
             _v1_distribute_to_bins(
-                x, in_range, ones, step_idx, logit_pattern, hist_base_ptr,
+                x,
+                in_range,
+                ones,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
         if rem_elems > 0:
             offs = (n_vec_full * VEC + rem_tiles) * BLOCK_SIZE + lane
             in_range = lane < rem_elems
-            x = tl.load(row_ptr + aligned_row_start + offs, mask=in_range, other=float("-inf"))
+            x = tl.load(
+                row_ptr + aligned_row_start + offs, mask=in_range, other=float("-inf")
+            )
             _v1_distribute_to_bins(
-                x, in_range, ones, step_idx, logit_pattern, hist_base_ptr,
+                x,
+                in_range,
+                ones,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
     else:
         row_len = row_end - row_start
@@ -1404,10 +1555,16 @@ def _v1_processHistogramStep(
             in_range = offs < row_len
             x = tl.load(
                 row_ptr + row_start + offs * stride_xn,
-                mask=in_range, other=float("-inf"),
+                mask=in_range,
+                other=float("-inf"),
             )
             _v1_distribute_to_bins(
-                x, in_range, ones, step_idx, logit_pattern, hist_base_ptr,
+                x,
+                in_range,
+                ones,
+                step_idx,
+                logit_pattern,
+                hist_base_ptr,
             )
     last_value = tl.load(s_found_topk_values_ptr)
     tl.debug_barrier()
@@ -1455,19 +1612,39 @@ def _v1_processHistogramStep(
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + offs)
             _v1_process_bins(
-                x_vec, True, found_ptrs_vec_2d, ones_vec_2d, offs,
-                final_cnt_ptrs_vec_2d, step_idx, logit_pattern,
-                threshold_bin_idx, write_directly, s_out_indices_ptr,
-                hist_base_ptr, use_final, TOPK=TOPK,
+                x_vec,
+                True,
+                found_ptrs_vec_2d,
+                ones_vec_2d,
+                offs,
+                final_cnt_ptrs_vec_2d,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + offs)
             _v1_process_bins(
-                x, True, found_ptrs, ones, offs, final_cnt_ptrs,
-                step_idx, logit_pattern, threshold_bin_idx,
-                write_directly, s_out_indices_ptr, hist_base_ptr,
-                use_final, TOPK=TOPK,
+                x,
+                True,
+                found_ptrs,
+                ones,
+                offs,
+                final_cnt_ptrs,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
     elif stride_xn == 1:
         aligned_row_start = (row_start + VEC - 1) // VEC * VEC
@@ -1483,40 +1660,81 @@ def _v1_processHistogramStep(
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + aligned_row_start + offs)
             _v1_process_bins(
-                x_vec, True, found_ptrs_vec_2d, ones_vec_2d,
-                offs + skip_elems, final_cnt_ptrs_vec_2d,
-                step_idx, logit_pattern, threshold_bin_idx,
-                write_directly, s_out_indices_ptr, hist_base_ptr,
-                use_final, TOPK=TOPK,
+                x_vec,
+                True,
+                found_ptrs_vec_2d,
+                ones_vec_2d,
+                offs + skip_elems,
+                final_cnt_ptrs_vec_2d,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + aligned_row_start + offs)
             _v1_process_bins(
-                x, True, found_ptrs, ones, offs + skip_elems,
-                final_cnt_ptrs, step_idx, logit_pattern,
-                threshold_bin_idx, write_directly, s_out_indices_ptr,
-                hist_base_ptr, use_final, TOPK=TOPK,
+                x,
+                True,
+                found_ptrs,
+                ones,
+                offs + skip_elems,
+                final_cnt_ptrs,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
         if skip_elems > 0:
             offs = lane
             in_range = lane < skip_elems
             x = tl.load(row_ptr + row_start + offs, mask=in_range, other=float("-inf"))
             _v1_process_bins(
-                x, in_range, found_ptrs, ones, offs, final_cnt_ptrs,
-                step_idx, logit_pattern, threshold_bin_idx,
-                write_directly, s_out_indices_ptr, hist_base_ptr,
-                use_final, TOPK=TOPK,
+                x,
+                in_range,
+                found_ptrs,
+                ones,
+                offs,
+                final_cnt_ptrs,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
         if rem_elems > 0:
             offs = (n_vec_full * VEC + rem_tiles) * BLOCK_SIZE + lane
             in_range = lane < rem_elems
-            x = tl.load(row_ptr + aligned_row_start + offs, mask=in_range, other=float("-inf"))
+            x = tl.load(
+                row_ptr + aligned_row_start + offs, mask=in_range, other=float("-inf")
+            )
             _v1_process_bins(
-                x, in_range, found_ptrs, ones, offs + skip_elems,
-                final_cnt_ptrs, step_idx, logit_pattern,
-                threshold_bin_idx, write_directly, s_out_indices_ptr,
-                hist_base_ptr, use_final, TOPK=TOPK,
+                x,
+                in_range,
+                found_ptrs,
+                ones,
+                offs + skip_elems,
+                final_cnt_ptrs,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
     else:
         row_len = row_end - row_start
@@ -1526,16 +1744,31 @@ def _v1_processHistogramStep(
             in_range = offs < row_len
             x = tl.load(
                 row_ptr + row_start + offs * stride_xn,
-                mask=in_range, other=float("-inf"),
+                mask=in_range,
+                other=float("-inf"),
             )
             _v1_process_bins(
-                x, in_range, found_ptrs, ones, offs, final_cnt_ptrs,
-                step_idx, logit_pattern, threshold_bin_idx,
-                write_directly, s_out_indices_ptr, hist_base_ptr,
-                use_final, TOPK=TOPK,
+                x,
+                in_range,
+                found_ptrs,
+                ones,
+                offs,
+                final_cnt_ptrs,
+                step_idx,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                s_out_indices_ptr,
+                hist_base_ptr,
+                use_final,
+                TOPK=TOPK,
             )
     tl.debug_barrier()
-    return final_bin_size > FINAL_SORT_ITEMS, logit_pattern.to(tl.int32), threshold_bin_idx
+    return (
+        final_bin_size > FINAL_SORT_ITEMS,
+        logit_pattern.to(tl.int32),
+        threshold_bin_idx,
+    )
 
 
 @triton.jit
@@ -1581,7 +1814,8 @@ def _v1_final_select_radix(
                 valid = pos < final_cnt
                 x_bits_i32 = tl.load(
                     hist_base_ptr + (FINAL_SORT_ITEMS + pos),
-                    mask=valid, other=0,
+                    mask=valid,
+                    other=0,
                 )
                 x = x_bits_i32.to(tl.float32, bitcast=True)
                 key = _v1_convert_to_trt_uint32(x)
@@ -1589,8 +1823,11 @@ def _v1_final_select_radix(
                 digit = ((key >> digit_pos) & RADIX_MASK_FINAL).to(tl.int32)
                 take = valid & matches
                 tl.atomic_add(
-                    s_radix_count_ptr + digit, ones, mask=take,
-                    sem="relaxed", scope="cta",
+                    s_radix_count_ptr + digit,
+                    ones,
+                    mask=take,
+                    sem="relaxed",
+                    scope="cta",
                 )
 
             tl.debug_barrier()
@@ -1627,17 +1864,22 @@ def _v1_final_select_radix(
             idx = tl.load(hist_base_ptr + pos, mask=valid, other=0)
             x_bits_i32 = tl.load(
                 hist_base_ptr + (FINAL_SORT_ITEMS + pos),
-                mask=valid, other=0,
+                mask=valid,
+                other=0,
             )
             x = x_bits_i32.to(tl.float32, bitcast=True)
             key = _v1_convert_to_trt_uint32(x)
             take_lt = valid & (key < thr_key)
             out_pos_gt = tl.atomic_add(
-                found_ptrs, ones, mask=take_lt,
-                sem="relaxed", scope="cta",
+                found_ptrs,
+                ones,
+                mask=take_lt,
+                sem="relaxed",
+                scope="cta",
             )
             tl.store(
-                s_out_indices_ptr + out_pos_gt, idx,
+                s_out_indices_ptr + out_pos_gt,
+                idx,
                 mask=take_lt & (out_pos_gt < TOPK),
             )
 
@@ -1652,17 +1894,22 @@ def _v1_final_select_radix(
                     idx = tl.load(hist_base_ptr + pos, mask=valid, other=0)
                     x_bits_i32 = tl.load(
                         hist_base_ptr + (FINAL_SORT_ITEMS + pos),
-                        mask=valid, other=0,
+                        mask=valid,
+                        other=0,
                     )
                     x = x_bits_i32.to(tl.float32, bitcast=True)
                     key = _v1_convert_to_trt_uint32(x)
                     take_eq = valid & (key == thr_key)
                     out_pos_eq = tl.atomic_add(
-                        found_ptrs, ones, mask=take_eq,
-                        sem="relaxed", scope="cta",
+                        found_ptrs,
+                        ones,
+                        mask=take_eq,
+                        sem="relaxed",
+                        scope="cta",
                     )
                     tl.store(
-                        s_out_indices_ptr + out_pos_eq, idx,
+                        s_out_indices_ptr + out_pos_eq,
+                        idx,
                         mask=take_eq & (out_pos_eq < TOPK),
                     )
 
@@ -1730,23 +1977,43 @@ def _v1_top_k_per_row_selector(
     tl.debug_barrier()
     for step_idx in tl.static_range(0, 4):
         if continue_to_next_step:
-            continue_to_next_step, logit_pattern, threshold_bin_idx = _v1_processHistogramStep(
-                row_ptr, stride_xn, row_start, row_end, vocab_size,
-                step_idx, logit_pattern, threshold_bin_idx,
-                s_step_thresholds_ptr, 0, hist_base_ptr,
-                s_out_indices_ptr, s_final_cnt_ptr, s_found_topk_values_ptr,
-                s_threshold_bin_idx_ptr, s_final_bin_size_ptr,
-                assume_aligned=assume_aligned,
-                TOPK=TOPK, BLOCK_SIZE=BLOCK_SIZE, HAS_TLE=HAS_TLE,
+            continue_to_next_step, logit_pattern, threshold_bin_idx = (
+                _v1_processHistogramStep(
+                    row_ptr,
+                    stride_xn,
+                    row_start,
+                    row_end,
+                    vocab_size,
+                    step_idx,
+                    logit_pattern,
+                    threshold_bin_idx,
+                    s_step_thresholds_ptr,
+                    0,
+                    hist_base_ptr,
+                    s_out_indices_ptr,
+                    s_final_cnt_ptr,
+                    s_found_topk_values_ptr,
+                    s_threshold_bin_idx_ptr,
+                    s_final_bin_size_ptr,
+                    assume_aligned=assume_aligned,
+                    TOPK=TOPK,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    HAS_TLE=HAS_TLE,
+                )
             )
 
     if not continue_to_next_step:
         if USE_RADIX_FINAL:
             _v1_final_select_radix(
-                hist_base_ptr, s_out_indices_ptr, s_final_cnt_ptr,
-                s_found_topk_values_ptr, s_radix_count_ptr,
-                TOPK=TOPK, BLOCK_SIZE=BLOCK_SIZE,
-                FINAL_SORT_ITEMS=FINAL_SORT_ITEMS, HAS_TLE=HAS_TLE,
+                hist_base_ptr,
+                s_out_indices_ptr,
+                s_final_cnt_ptr,
+                s_found_topk_values_ptr,
+                s_radix_count_ptr,
+                TOPK=TOPK,
+                BLOCK_SIZE=BLOCK_SIZE,
+                FINAL_SORT_ITEMS=FINAL_SORT_ITEMS,
+                HAS_TLE=HAS_TLE,
             )
         else:
             base_idx = tl.load(s_found_topk_values_ptr)
@@ -1757,7 +2024,8 @@ def _v1_top_k_per_row_selector(
                 valid = pos < final_cnt
                 logit_i_bits = tl.load(
                     hist_base_ptr + FINAL_SORT_ITEMS + pos,
-                    mask=valid, other=0,
+                    mask=valid,
+                    other=0,
                 )
                 logit_i = logit_i_bits.to(tl.float32, bitcast=True)
                 out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
@@ -1811,32 +2079,53 @@ def _v1_tle_top_k_per_row_decode_wrapper2(
     out_ptr += pid * TOPK
 
     s_histogram = tle.gpu.alloc(
-        [HIST_SIZE], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [HIST_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     s_out_indices = tle.gpu.alloc(
-        [TOPKP], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [TOPKP],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     s_final_cnt = tle.gpu.alloc(
-        [1], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     s_threshold_bin_idx = tle.gpu.alloc(
-        [1], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     s_final_bin_size = tle.gpu.alloc(
-        [1], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     s_found_topk_values = tle.gpu.alloc(
-        [1], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     s_step_thresholds = tle.gpu.alloc(
-        [1], dtype=tl.int32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=False,
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     hist_base_ptr = tle.gpu.local_ptr(s_histogram, (0,))
     s_final_cnt_ptr = tle.gpu.local_ptr(s_final_cnt, (0,))
@@ -1847,20 +2136,35 @@ def _v1_tle_top_k_per_row_decode_wrapper2(
     s_out_indices_ptr = tle.gpu.local_ptr(s_out_indices, (0,))
     if USE_RADIX_FINAL:
         s_radix_counts = tle.gpu.alloc(
-            [RADIX_SIZE_FINAL], dtype=tl.int32, layout=None,
-            scope=tle.gpu.smem, nv_mma_shared_layout=False,
+            [RADIX_SIZE_FINAL],
+            dtype=tl.int32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
         )
         s_radix_count_ptr = tle.gpu.local_ptr(s_radix_counts, (0,))
     else:
         s_radix_count_ptr = None
 
     _v1_top_k_per_row_selector(
-        x_ptr, out_ptr, row_start, row_end, stride_xn, vocab_size,
-        hist_base_ptr, s_final_cnt_ptr, s_threshold_bin_idx_ptr,
-        s_final_bin_size_ptr, s_found_topk_values_ptr, s_step_thresholds_ptr,
-        s_out_indices_ptr, s_radix_count_ptr,
-        TOPK=TOPK, BLOCK_SIZE=BLOCK_SIZE,
-        USE_RADIX_FINAL=USE_RADIX_FINAL, HAS_TLE=True,
+        x_ptr,
+        out_ptr,
+        row_start,
+        row_end,
+        stride_xn,
+        vocab_size,
+        hist_base_ptr,
+        s_final_cnt_ptr,
+        s_threshold_bin_idx_ptr,
+        s_final_bin_size_ptr,
+        s_found_topk_values_ptr,
+        s_step_thresholds_ptr,
+        s_out_indices_ptr,
+        s_radix_count_ptr,
+        TOPK=TOPK,
+        BLOCK_SIZE=BLOCK_SIZE,
+        USE_RADIX_FINAL=USE_RADIX_FINAL,
+        HAS_TLE=True,
     )
 
 
@@ -1914,11 +2218,13 @@ def persistent_topk(
 
     if num_rows > 32:
         _v1_tle_top_k_per_row_decode_wrapper2[(num_rows,)](
-            logits, output, seq_lens,
-            1,         # next_n
-            stride,    # stride_xm
-            1,         # stride_xn
-            stride,    # vocab_size
+            logits,
+            output,
+            seq_lens,
+            1,  # next_n
+            stride,  # stride_xm
+            1,  # stride_xn
+            stride,  # vocab_size
             TOPK=k,
             TOPKP=max(k, 2048),
             BLOCK_SIZE=512,
