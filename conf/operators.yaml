@@ -902,7 +902,7 @@ ops:
     labels:
       - fused
       - vLLM
-      - KernelGen
+      - DeepSeekV4
     kind:
       - NeuralNetwork
     stages:
