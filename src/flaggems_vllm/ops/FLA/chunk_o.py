@@ -11,11 +11,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
 from flaggems_vllm.ops.FLA.triton_ops_helper import exp
-from flaggems_vllm.ops.FLA.utils import (
-    FLA_GDN_FIX_BT,
-    check_shared_mem,
-    is_nvidia_hopper,
-)
+from flaggems_vllm.ops.FLA.utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
 from flaggems_vllm.utils import libentry, libtuner
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -164,11 +160,7 @@ def chunk_fwd_o(
     def grid(meta):
         # In varlen mode chunk_indices owns the sequence mapping and the batch
         # id derived from i_bh is unused; use H programs to avoid duplicate work.
-        return (
-            triton.cdiv(V, meta["BV"]),
-            NT,
-            H if cu_seqlens is not None else B * H,
-        )
+        return (triton.cdiv(V, meta["BV"]), NT, H if cu_seqlens is not None else B * H)
 
     chunk_fwd_kernel_o[grid](
         q,

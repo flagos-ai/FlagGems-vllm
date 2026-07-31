@@ -214,16 +214,13 @@ def merge_16x16_to_32x32_inverse_kernel(
         )
     else:
         desc_o.store(
-            [i_t * BT + 0, 0],
-            b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 16, 0],
-            b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 16, 16],
-            b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
 
 
@@ -475,44 +472,34 @@ def merge_16x16_to_64x64_inverse_kernel(
         )
     else:
         desc_o.store(
-            [i_t * BT + 0, 0],
-            b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 16, 16],
-            b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 32, 32],
-            b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 32, 32], b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 48, 48],
-            b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 48, 48], b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 16, 0],
-            b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 32, 0],
-            b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 32, 0], b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 32, 16],
-            b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 32, 16], b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 48, 0],
-            b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 48, 0], b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 48, 16],
-            b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 48, 16], b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
         desc_o.store(
-            [i_t * BT + 48, 32],
-            b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"),
+            [i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
 
 

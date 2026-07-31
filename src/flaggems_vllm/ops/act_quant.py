@@ -56,12 +56,14 @@ def act_quant_triton_kernel(
     stride_xm,
     stride_ym,
     stride_sm,
+    n_blocks,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    pid_m = pid // n_blocks
+    pid_n = pid % n_blocks
 
     row_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     col_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -115,8 +117,7 @@ def act_quant_triton(
     Args:
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous and
                           its last dimension size must be divisible by `block_size`.
-        block_size (int, optional): The size of the blocks for quantization.
-            Default is 128.
+        block_size (int, optional): The size of the blocks for quantization. Default is 128.
         scale_fmt (Optional[str], optional): If not None, rounds scale to power of 2.
 
     Returns:
@@ -151,7 +152,7 @@ def act_quant_triton(
     y_view = y.view(-1, N)
     s_view = s.view(-1, n_blocks)
 
-    grid = (m_blocks, n_blocks)
+    grid = (m_blocks * n_blocks,)
     act_quant_triton_kernel[grid](
         x_2d,
         y_view,
@@ -161,6 +162,7 @@ def act_quant_triton(
         x_2d.stride(0),
         y_view.stride(0),
         s_view.stride(0),
+        n_blocks,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         ROUND_SCALE=(scale_fmt is not None),
@@ -170,3 +172,120 @@ def act_quant_triton(
     # s = s.view(*original_shape[:-1], n_blocks)
 
     return y, s
+
+
+if __name__ == "__main__":
+    from kernel import act_quant
+
+    torch.manual_seed(2026)
+
+    # test_shape = [
+    #     (16, 128, 128),
+    #     (32, 128, 512),
+    #     (64, 128, 2048),
+    #     (128, 128, 8192),
+    #     (256, 128, 32768),
+
+    #     # [1, 12, 4096],
+    #     # [1, 12, 1024],
+    #     # [1, 12, 448],
+    #     # [1, 12, 2048],
+    #     # [2, 4096],
+    #     # [1, 2048],
+    # ]
+    M = [1, 40, 164, 512, 3454, 12027, 38594]
+    # M = [1, 64, 128, 512, 4096, 4096*4, 4096*16]
+    N = [128, 448, 2048, 8192]
+    test_shape = [(m, n) for m in M for n in N]
+    fmt = [None, "ue8m0"]
+    block_sizes = [64, 128]
+
+    for scale_fmt in fmt:
+        for shape in test_shape:
+            for block_size in block_sizes:
+                # print(f"Testing shape {shape} with block_size {block_size} and scale_fmt {scale_fmt}")
+                if shape[-1] % block_size != 0:
+                    print(
+                        f"Skipping shape {shape} with block_size {block_size} due to incompatible dimensions."
+                    )
+                    continue
+                x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+
+                y_ref, s_ref = act_quant(x, block_size=block_size, scale_fmt=scale_fmt)
+                y_triton, s_triton = act_quant_triton(
+                    x, block_size=block_size, scale_fmt=scale_fmt
+                )
+                torch.testing.assert_close(
+                    y_ref.float(), y_triton.float(), rtol=1e-2, atol=1e-2
+                )
+                torch.testing.assert_close(s_ref, s_triton, rtol=1e-5, atol=1e-5)
+                print(
+                    f"Shape {str(shape):20s} | scale_fmt:{scale_fmt} | block_size:{block_size} | PASS"
+                )
+
+    print("=" * 60)
+
+    su = []
+    for scale_fmt in fmt:
+        for shape in test_shape:
+            for block_size in block_sizes:
+                if shape[-1] % block_size != 0:
+                    print(
+                        f"Skipping shape {shape} with block_size {block_size} due to incompatible dimensions."
+                    )
+                    continue
+                x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+                ref_time = triton.testing.do_bench(
+                    lambda: act_quant(x, block_size=block_size, scale_fmt=scale_fmt),
+                    warmup=50,
+                    rep=200,
+                )
+
+                triton_time = triton.testing.do_bench(
+                    lambda: act_quant_triton(
+                        x, block_size=block_size, scale_fmt=scale_fmt
+                    ),
+                    warmup=50,
+                    rep=200,
+                )
+                su.append(ref_time / triton_time)
+                print(
+                    f"Shape {str(shape):20s}, Scale format: {scale_fmt}, "
+                    f"block_size: {block_size} | "
+                    f"TileLang: {ref_time:.3f} ms | Triton: {triton_time:.3f} ms | "
+                    f"Speedup: {ref_time / triton_time:.2f}x"
+                )
+    print(
+        f"Average speedup: {sum(su) / len(su):.2f}x, max speedup: {max(su):.2f}x, min speedup: {min(su):.2f}x"
+    )
+
+    # x = torch.randn(4096*4, 40960, dtype=torch.bfloat16, device="cuda")
+
+    # # Warmup
+    # for _ in range(10):
+    #     _ = act_quant(x)
+    #     _ = act_quant_triton(x)
+
+    # torch.cuda.synchronize()
+
+    # import time
+
+    # # TileLang
+    # torch.cuda.synchronize()
+    # start = time.perf_counter()
+    # for _ in range(100):
+    #     _ = act_quant(x)
+    # torch.cuda.synchronize()
+    # tilelang_time = (time.perf_counter() - start) / 100 * 1000
+
+    # # Triton
+    # torch.cuda.synchronize()
+    # start = time.perf_counter()
+    # for _ in range(100):
+    #     _ = act_quant_triton(x)
+    # torch.cuda.synchronize()
+    # triton_time = (time.perf_counter() - start) / 100 * 1000
+
+    # print(f"TileLang: {tilelang_time:.3f} ms")
+    # print(f"Triton:   {triton_time:.3f} ms")
+    # print(f"Speedup:  {tilelang_time / triton_time:.2f}x")
