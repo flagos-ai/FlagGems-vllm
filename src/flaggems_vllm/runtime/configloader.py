@@ -471,6 +471,12 @@ class ConfigLoader(object):
                 "fused_marlin_moe_mxfp4",
                 expand_yaml_path=self._get_expand_config_path("fused_marlin_moe_mxfp4"),
             ),
+            "fused_marlin_moe_mxfp4_gemm_silu": self._build_single_expand_spec(
+                "fused_marlin_moe_mxfp4_gemm_silu",
+                expand_yaml_path=self._get_expand_config_path(
+                    "fused_marlin_moe_mxfp4_gemm_silu"
+                ),
+            ),
             "gemv": self._build_single_expand_spec("gemv"),
             "mm": self._build_single_expand_spec(
                 "mm", expand_yaml_path=self._get_expand_config_path("mm")

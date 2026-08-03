@@ -271,6 +271,10 @@ class LibTuner(triton.runtime.Autotuner):
         use_cuda_graph=False,
         do_bench=None,
         strategy=None,
+        flagtune_op_name=None,
+        flagtune_expand_op_name=None,
+        flagtune_yaml_path=None,
+        flagtune_pre_hook=None,
     ):
         # NOTE(zhengyang): See discussion in
         # https://github.com/triton-lang/triton/pull/4496
@@ -332,6 +336,76 @@ class LibTuner(triton.runtime.Autotuner):
         #     libcache[self.config_table_name]
         # )
         self.cache: ConfigCache = libcache[self.config_table_name]
+        self._flagtune_default_configs = self.configs
+        self._flagtune_default_strategy = strategy
+        self._flagtune_active = False
+        self._flagtune_warned = False
+        self._flagtune_op_name = flagtune_op_name
+        self._flagtune_expand_op_name = flagtune_expand_op_name or flagtune_op_name
+        self._flagtune_yaml_path = flagtune_yaml_path
+        self._flagtune_pre_hook = flagtune_pre_hook
+
+    def _normalize_strategy(self, strategy):
+        if isinstance(strategy, str):
+            strategy = LibTuner.get_strategy(strategy)
+        if not isinstance(strategy, (list, tuple)):
+            strategy = [strategy] * len(self.keys)
+        assert len(strategy) == len(self.keys), (
+            f"the length of strategy"
+            f" {len(strategy)} must match"
+            f" the length of keys"
+            f" {len(self.keys)}"
+        )
+        return [LibTuner.get_strategy(s) if isinstance(s, str) else s for s in strategy]
+
+    def _set_configs_and_strategy(self, configs, strategy):
+        self.configs = configs
+        self.strategy = self._normalize_strategy(strategy)
+        self.__dict__.pop("configs_hash", None)
+        self.__dict__.pop("kernel_hash", None)
+        self.config_table_name = f"{self.__name__}_{self.kernel_hash}"
+        self.benchmark_table_name = f"{self.__name__}_{self.cache_key}_benchmark"
+        self.cache = libcache[self.config_table_name]
+
+    def apply_flagtune(self):
+        if self._flagtune_op_name is None:
+            return False
+
+        from flaggems_vllm import runtime
+
+        enabled = runtime.flagtune_enabled(self._flagtune_op_name)
+        if enabled == self._flagtune_active:
+            return False
+
+        if not enabled:
+            self._set_configs_and_strategy(
+                self._flagtune_default_configs,
+                self._flagtune_default_strategy,
+            )
+            self._flagtune_active = False
+            return True
+
+        expand_config = runtime.get_expand_config(
+            self._flagtune_expand_op_name,
+            yaml_path=self._flagtune_yaml_path,
+        )
+        configs = runtime.ops_get_configs(
+            self._flagtune_expand_op_name,
+            yaml_path=self._flagtune_yaml_path,
+            pre_hook=self._flagtune_pre_hook,
+        )
+        if expand_config == -1 or not configs:
+            if not self._flagtune_warned:
+                logger.warning(
+                    "FlagTune expand config is unavailable for %s; using default configs.",
+                    self._flagtune_expand_op_name,
+                )
+                self._flagtune_warned = True
+            return False
+
+        self._set_configs_and_strategy(configs, expand_config["strategy"])
+        self._flagtune_active = True
+        return True
 
     @cached_property
     def cache_key(self) -> str:
@@ -646,6 +720,8 @@ def libtuner(
     policy: Union[str, Type[LibTuner]] = "default",
     flagtune_op_name=None,
     flagtune_expand_op_name=None,
+    flagtune_yaml_path=None,
+    flagtune_pre_hook=None,
 ):
     """Decorator for triton library autotuner.
 
@@ -687,6 +763,10 @@ def libtuner(
             use_cuda_graph=use_cuda_graph,
             do_bench=do_bench,
             strategy=strategy,
+            flagtune_op_name=flagtune_op_name,
+            flagtune_expand_op_name=flagtune_expand_op_name,
+            flagtune_yaml_path=flagtune_yaml_path,
+            flagtune_pre_hook=flagtune_pre_hook,
         )
 
     return decorator
