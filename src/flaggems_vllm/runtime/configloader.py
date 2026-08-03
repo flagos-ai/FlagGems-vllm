@@ -58,6 +58,7 @@ class ConfigLoader(object):
                 "num_stages": 2,
                 "num_warps": 4,
                 "num_ctas": 1,
+                "maxnreg": None,
             }
             if self.device.vendor_name == "hygon":
                 self.triton_config_default["num_ldmatrixes"] = 0
@@ -90,6 +91,7 @@ class ConfigLoader(object):
             "num_warps": current_config["num_warps"],
             "num_stages": current_config["num_stages"],
             "num_ctas": current_config["num_ctas"],
+            "maxnreg": current_config["maxnreg"],
         }
         if (
             self.device.vendor_name == "hygon"
@@ -262,7 +264,11 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "fused_marlin_moe_mxfp4":
+        if op_name in (
+            "fused_marlin_moe_mxfp4",
+            "fused_marlin_moe_mxfp4_gemm_silu",
+        ):
+            maxnreg_values = ranges.get("maxnreg", [None])
             return [
                 triton.Config(
                     {
@@ -271,12 +277,14 @@ class ConfigLoader(object):
                     },
                     num_stages=s,
                     num_warps=w,
+                    maxnreg=maxnreg,
                     pre_hook=pre_hook,
                 )
                 for block_size_n in ranges["BLOCK_SIZE_N"]
                 for group_size_m in ranges["GROUP_SIZE_M"]
                 for s in ranges["s"]
                 for w in ranges["w"]
+                for maxnreg in maxnreg_values
             ]
 
         if op_name == "w8a8_block_fp8_bmm":
@@ -565,6 +573,7 @@ class ConfigLoader(object):
                         num_warps=cur_config["num_warps"],
                         num_stages=cur_config["num_stages"],
                         num_ctas=cur_config["num_ctas"],
+                        maxnreg=cur_config["maxnreg"],
                     )
                 )
             else:
@@ -664,6 +673,8 @@ class ConfigLoader(object):
                 ranges[mapped_key.upper()] = gen_config[mapped_key]
             ranges["s"] = gen_config[param_map.get("num_stages")]
             ranges["w"] = gen_config[param_map.get("num_warps")]
+            if "maxnreg" in param_map:
+                ranges["maxnreg"] = gen_config[param_map["maxnreg"]]
 
             return {
                 "ranges": ranges,
