@@ -34,7 +34,15 @@ NUM_WARPS = [2, 4, 8, 16]
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
     ],
-    key=["H", "K", "V", "BT", "IS_VARLEN", "USE_INITIAL_STATE", "STORE_FINAL_STATE"],
+    key=[
+        "H",
+        "K",
+        "V",
+        "BT",
+        "IS_VARLEN",
+        "USE_INITIAL_STATE",
+        "STORE_FINAL_STATE",
+    ],
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -132,17 +140,32 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
             p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                h + i_t * stride_h,
+                (K, V),
+                (V, 1),
+                (64, i_v * BV),
+                (64, BV),
+                (1, 0),
             )
             tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
         if K > 128:
             p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                h + i_t * stride_h,
+                (K, V),
+                (V, 1),
+                (128, i_v * BV),
+                (64, BV),
+                (1, 0),
             )
             tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
         if K > 192:
             p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                h + i_t * stride_h,
+                (K, V),
+                (V, 1),
+                (192, i_v * BV),
+                (64, BV),
+                (1, 0),
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
@@ -176,7 +199,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         if SAVE_NEW_VALUE:
             p_v = tl.make_block_ptr(
-                v_new, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+                v_new,
+                (T, V),
+                (stride_v, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
             )
             tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
 
