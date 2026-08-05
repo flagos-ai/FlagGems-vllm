@@ -19,7 +19,7 @@ from flaggems_vllm.utils import libentry, libtuner
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_G": lambda args: True,
+        "USE_G": lambda args: args.get("USE_G", True),
     }
 )
 @libtuner(
@@ -104,7 +104,12 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     m_A_kkt = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A_kkt, b_A, 0)
     p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT, 0),
+        (BT, BT),
+        (1, 0),
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
@@ -238,31 +243,76 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
             A_inv_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
         )
         p_Ai_22 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 16, 16),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_33 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 32, 32),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_44 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 48, 48),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_21 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 16, 0),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_31 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 32, 0),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_32 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 32, 16),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_41 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 48, 0),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_42 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 48, 16),
+            (16, 16),
+            (1, 0),
         )
         p_Ai_43 = tl.make_block_ptr(
-            A_inv_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
+            A_inv_base,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + 48, 32),
+            (16, 16),
+            (1, 0),
         )
         tl.store(
             p_Ai_11,
@@ -317,34 +367,44 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     else:
         desc_o = make_tensor_descriptor(A_inv_base, [T, BT], [H * BT, 1], [16, 16])
         desc_o.store(
-            [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 0, 0],
+            b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 16, 16],
+            b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 32, 32], b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 32, 32],
+            b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 48, 48], b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 48, 48],
+            b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 16, 0],
+            b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 32, 0], b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 32, 0],
+            b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 32, 16], b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 32, 16],
+            b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 48, 0], b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 48, 0],
+            b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 48, 16], b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 48, 16],
+            b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
         desc_o.store(
-            [i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne")
+            [i_t * BT + 48, 32],
+            b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
 
 
@@ -355,6 +415,8 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype | None = None,
+    *,
+    use_g_in_kkt: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused kernel: cumsum(g) + KKT(L) + solve_tril(L -> inv). Returns (g_out, A_inv).
     w_u stays a separate kernel (e.g. recompute_w_u_fwd) for HGMMA."""
@@ -391,6 +453,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         K=K,
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
+        USE_G=use_g_in_kkt,
         USE_TMA=is_tma_supported and BT == 64,
         DOT_PRECISION=FLA_TRIL_PRECISION,
     )

@@ -164,7 +164,11 @@ def chunk_fwd_o(
     def grid(meta):
         # In varlen mode chunk_indices owns the sequence mapping and the batch
         # id derived from i_bh is unused; use H programs to avoid duplicate work.
-        return (triton.cdiv(V, meta["BV"]), NT, H if cu_seqlens is not None else B * H)
+        return (
+            triton.cdiv(V, meta["BV"]),
+            NT,
+            H if cu_seqlens is not None else B * H,
+        )
 
     chunk_fwd_kernel_o[grid](
         q,

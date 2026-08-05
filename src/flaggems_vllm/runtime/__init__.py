@@ -19,8 +19,6 @@ from .backend import SpecOpRegistrar
 from .backend.device_finder import DeviceDetector
 from .configloader import ConfigLoader
 
-# from .flagtune import flagtune, flagtune_enabled
-
 config_loader = ConfigLoader()
 device = DeviceDetector()
 
