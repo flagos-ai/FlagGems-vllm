@@ -119,6 +119,7 @@ from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode
 from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
 from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
+from flaggems_vllm.ops.triton_scaled_mm import triton_scaled_mm
 from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 from flaggems_vllm.ops.unpack_seq import unpack_seq_triton
 from flaggems_vllm.ops.weightnorm import (
@@ -212,6 +213,7 @@ __all__ = [
     "top_k_per_row_prefill",
     "topk_softmax",
     "topk_softplus_sqrt",
+    "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",
     "weight_norm",
