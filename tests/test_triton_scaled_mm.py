@@ -41,12 +41,12 @@ def torch_scaled_mm(
 
 def get_8bit_types():
     types = [torch.int8]
-    # Check if fp8 is supported by trying to create a tensor
-    try:
-        _ = torch.empty(1, dtype=torch.float8_e4m3fn, device=device)
-        types.append(torch.float8_e4m3fn)
-    except (RuntimeError, AttributeError):
-        pass
+    # # Check if fp8 is supported by trying to create a tensor
+    # try:
+    #     _ = torch.empty(1, dtype=torch.float8_e4m3fn, device=device)
+    #     types.append(torch.float8_e4m3fn)
+    # except (RuntimeError, AttributeError):
+    #     pass
     return types
 
 

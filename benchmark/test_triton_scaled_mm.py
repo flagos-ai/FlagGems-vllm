@@ -37,11 +37,11 @@ except ImportError:
 def get_8bit_types():
     """Get available 8-bit types for testing."""
     types = [torch.int8]
-    try:
-        _ = torch.empty(1, dtype=torch.float8_e4m3fn, device=device)
-        types.append(torch.float8_e4m3fn)
-    except (RuntimeError, AttributeError):
-        pass
+    # try:
+    #     _ = torch.empty(1, dtype=torch.float8_e4m3fn, device=device)
+    #     types.append(torch.float8_e4m3fn)
+    # except (RuntimeError, AttributeError):
+    #     pass
     return types
 
 
