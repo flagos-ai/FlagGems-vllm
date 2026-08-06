@@ -18,10 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.FLA.index import (
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-)
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flaggems_vllm.ops.FLA.triton_ops_helper import exp
 from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL
 from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd
@@ -39,10 +36,7 @@ def _prune_unsafe_kloop_configs(configs, named_args, *args, **kwargs):
     K = named_args.get("K", kwargs.get("K"))
     if K is None:
         return configs
-    pruned = [
-        c for c in configs
-        if not (c.num_warps > 2 and c.kwargs.get("BK", K) < K)
-    ]
+    pruned = [c for c in configs if not (c.num_warps > 2 and c.kwargs.get("BK", K) < K)]
     return pruned or configs[:1]
 
 
@@ -502,7 +496,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_kmajor(
     # main recurrence
     for i_t in range(NT):
         p_h1 = tl.make_block_ptr(
-            h + i_t.to(tl.int64) * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+            h + i_t.to(tl.int64) * stride_h,
+            (K, V),
+            (V, 1),
+            (0, i_v * BV),
+            (64, BV),
+            (1, 0),
         )
         tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:

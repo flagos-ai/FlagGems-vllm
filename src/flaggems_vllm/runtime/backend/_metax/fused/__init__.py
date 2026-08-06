@@ -5,6 +5,7 @@
 
 from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
 from .gdn_chunk import chunk_gated_delta_rule_fwd
+
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
