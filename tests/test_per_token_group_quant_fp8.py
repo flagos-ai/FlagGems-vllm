@@ -24,7 +24,9 @@ def native_per_token_group_quant_fp8(
     x, group_size, eps=1e-10, dtype=None, scale_ue8m0=False
 ):
     if dtype is None:
-        dtype = flaggems_vllm.SUPPORTED_FP8_DTYPE
+        dtype = flaggems_vllm.per_token_group_quant_fp8.__globals__[
+            "SUPPORTED_FP8_DTYPE"
+        ]
 
     assert (
         x.shape[-1] % group_size == 0
