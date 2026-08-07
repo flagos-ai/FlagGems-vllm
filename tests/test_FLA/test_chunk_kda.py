@@ -193,7 +193,7 @@ def _make_inputs(
     A_log = torch.log(
         torch.empty(HV, device=device, dtype=torch.float32).uniform_(1, 16)
     )
-    dt_bias = torch.randn(HV * D, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(HV, D, device=device, dtype=torch.float32)
 
     initial_state = None
     if use_initial_state:
@@ -271,6 +271,36 @@ def _assert_close(
                 "output_final_state": True,
             },
             id="dense",
+        ),
+        pytest.param(
+            {
+                "seq_lens": [32],
+                "H": 2,
+                "HV": 2,
+                "D": 128,
+                "scale": 1 / math.sqrt(128),
+                "dtype": torch.bfloat16,
+                "state_v_first": True,
+                "normal_inputs": True,
+                "use_initial_state": True,
+                "output_final_state": True,
+            },
+            id="strict_tle_compatible",
+        ),
+        pytest.param(
+            {
+                "seq_lens": [13, 19, 16],
+                "H": 2,
+                "HV": 2,
+                "D": 128,
+                "scale": 1 / math.sqrt(128),
+                "dtype": torch.bfloat16,
+                "state_v_first": True,
+                "normal_inputs": True,
+                "use_initial_state": True,
+                "output_final_state": True,
+            },
+            id="strict_tle_varlen_compatible",
         ),
         pytest.param(
             {

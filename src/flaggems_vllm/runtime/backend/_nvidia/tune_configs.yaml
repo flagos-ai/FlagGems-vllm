@@ -274,3 +274,81 @@ gated_activation:
       - 8
     block_n:
       - 1024
+scaled_int8_quant_static:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 256
+      - 512
+      - 1024
+    warps:
+      - 4
+      - 8
+      - 16
+    stages:
+      - 2
+      - 3
+      - 4
+
+scaled_int8_quant_dynamic:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    warps:
+      - 4
+      - 8
+      - 16
+    stages:
+      - 3
+      - 4
+      - 5
+
+scaled_int8_quant_dynamic_single:
+  - gen: true
+    param_map:
+      META:
+        PLACEHOLDER_UNUSED: placeholder
+      num_warps: warps
+      num_stages: stages
+    placeholder:
+      - 1
+    warps:
+      - 2
+      - 4
+      - 8
+      - 16
+    stages:
+      - 1
+      - 2
+      - 3
+
+scaled_int8_quant_dynamic_main_tail:
+  - gen: true
+    param_map:
+      META:
+        PLACEHOLDER_UNUSED: placeholder
+      num_warps: warps
+      num_stages: stages
+    placeholder:
+      - 1
+    warps:
+      - 4
+      - 8
+      - 16
+    stages:
+      - 1
+      - 2
+      - 3
