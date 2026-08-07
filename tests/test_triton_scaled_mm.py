@@ -66,7 +66,6 @@ MNK_FACTORS = [
 @pytest.mark.parametrize("use_scalar_scale_a", [True, False])
 @pytest.mark.parametrize("use_scalar_scale_b", [True, False])
 @pytest.mark.parametrize("use_bias", [True, False])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_scaled_mm(
     M, N, K, in_dtype, out_dtype, use_scalar_scale_a, use_scalar_scale_b, use_bias
 ):
@@ -124,7 +123,6 @@ def test_scaled_mm(
 @pytest.mark.parametrize("use_scalar_scale_a", [True, False])
 @pytest.mark.parametrize("use_scalar_scale_b", [True, False])
 @pytest.mark.parametrize("use_bias", [True, False])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAS_VLLM, reason="vLLM is not installed")
 def test_triton_scaled_mm_vs_vllm(
     M, N, K, in_dtype, out_dtype, use_scalar_scale_a, use_scalar_scale_b, use_bias

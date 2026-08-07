@@ -120,7 +120,6 @@ class TritonScaledMMBenchmark(base.Benchmark):
 
 
 @pytest.mark.triton_scaled_mm
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAS_VLLM, reason="vLLM is not installed")
 def test_triton_scaled_mm_benchmark():
     """Benchmark triton_scaled_mm with all configurations."""
