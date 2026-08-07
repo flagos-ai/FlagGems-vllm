@@ -91,68 +91,44 @@ def _hc_head_fused_kernel(
             sqr_acc += r2 * r2 + r3 * r3
 
             mix_acc0 += r2 * tl.load(
-                fn_ptr + 0 * fn_stride_m + 2 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 0 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
             )
             mix_acc0 += r3 * tl.load(
-                fn_ptr + 0 * fn_stride_m + 3 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 0 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
             )
 
             mix_acc1 += r2 * tl.load(
-                fn_ptr + 1 * fn_stride_m + 2 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 1 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
             )
             mix_acc1 += r3 * tl.load(
-                fn_ptr + 1 * fn_stride_m + 3 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 1 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
             )
 
             fn20 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 0 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 2 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0
             )
             fn21 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 1 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 2 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0
             )
             fn22 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 2 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 2 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
             )
             fn23 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 3 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 2 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
             )
             mix_acc2 += r0 * fn20 + r1 * fn21 + r2 * fn22 + r3 * fn23
 
             fn30 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 0 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 3 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0
             )
             fn31 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 1 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 3 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0
             )
             fn32 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 2 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 3 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
             )
             fn33 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 3 * H + h_off,
-                mask=h_mask,
-                other=0.0,
+                fn_ptr + 3 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
             )
             mix_acc3 += r0 * fn30 + r1 * fn31 + r2 * fn32 + r3 * fn33
 
@@ -256,15 +232,7 @@ def hc_head_fused_kernel(
 
     if hs_flat.device.type != "cuda":
         return hc_head_fused_kernel_ref(
-            hs_flat,
-            fn,
-            hc_scale,
-            hc_base,
-            out,
-            hidden_size,
-            rms_eps,
-            hc_eps,
-            hc_mult,
+            hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
         )
 
     H = hidden_size
