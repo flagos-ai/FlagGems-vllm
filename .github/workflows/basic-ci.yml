@@ -1,14 +1,42 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: basic ci
+
+permissions:
+  contents: read
 
 on:
   push:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
     inputs:
       run_all:
         description: "Run all unit tests on H20"
+        required: false
+        default: false
+        type: boolean
+      run_non_nvidia:
+        description: "Run every non-NVIDIA backend plus the H20 baseline"
+        required: false
+        default: false
+        type: boolean
+      run_benchmarks:
+        description: "Run selected core benchmarks"
         required: false
         default: false
         type: boolean
@@ -23,10 +51,10 @@ jobs:
 
     steps:
       - name: check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: set up python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: "3.11"
           cache: pip
@@ -39,6 +67,12 @@ jobs:
         shell: bash
         run: pre-commit run --all-files --show-diff-on-failure
 
+      - name: test ci selection helpers
+        shell: bash
+        run: |
+          python -m unittest discover -s tools -p 'test_ci_*.py'
+          python tools/check_ci_pins.py
+
   select-targets:
     name: select ci targets
     needs: code-style
@@ -46,15 +80,17 @@ jobs:
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}
-      tests: ${{ steps.select.outputs.tests }}
-      benchmarks: ${{ steps.select.outputs.benchmarks }}
+      targets: ${{ steps.select.outputs.targets }}
+      should_run: ${{ steps.select.outputs.should_run }}
+      non_nvidia_matrix: ${{ steps.select-backends.outputs.matrix }}
+      has_non_nvidia_backends: ${{ steps.select-backends.outputs.has_backends }}
     env:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv-select
 
     steps:
       - id: checkout-attempt-1
         name: check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
         continue-on-error: true
@@ -67,7 +103,7 @@ jobs:
       - id: checkout-attempt-2
         name: retry checkout
         if: steps.checkout-attempt-1.outcome == 'failure'
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
         continue-on-error: true
@@ -80,7 +116,7 @@ jobs:
       - id: checkout-attempt-3
         name: retry checkout again
         if: steps.checkout-attempt-2.outcome == 'failure'
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
 
@@ -101,60 +137,110 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            git diff --name-only "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_files.txt
+            git diff --name-only -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_files.bin
           elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
-            git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_files.txt
+            git diff --name-only -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_files.bin
           else
-            git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" > changed_files.txt
+            git diff-tree --no-commit-id --name-only -r -z "${GITHUB_SHA}" > changed_files.bin
           fi
 
           echo "Changed files:"
-          cat changed_files.txt
+          while IFS= read -r -d '' path; do
+            printf '  %q\n' "${path}"
+          done < changed_files.bin
 
       - id: select
         name: select tests and benchmarks
         shell: bash
         env:
           RUN_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all == true }}
+          FORCE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true }}
+          RUN_BENCHMARKS: >-
+            ${{ github.event_name == 'push' ||
+                (github.event_name == 'workflow_dispatch' && inputs.run_benchmarks == true) ||
+                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/benchmark')) }}
         run: |
+          set -euo pipefail
+          args=(
+            --changed-files changed_files.bin
+            --format github
+          )
           if [[ "${RUN_ALL}" == "true" ]]; then
-            TEST_SELECTION_MODE="all"
-            SELECTED_TESTS="$(find tests -type f -name 'test_*.py' | sort | tr '\n' ' ')"
-            SELECTED_BENCHMARKS=""
-          else
-            selection="$(python tools/select_tests.py \
-              --changed-files changed_files.txt \
-              --format shell)"
-            eval "${selection}"
+            args+=(--all-tests)
+          fi
+          if [[ "${FORCE_SMOKE}" == "true" ]]; then
+            args+=(--force-smoke)
+          fi
+          if [[ "${RUN_BENCHMARKS}" != "true" ]]; then
+            args+=(--no-benchmarks)
           fi
 
-          echo "Test selection mode: ${TEST_SELECTION_MODE}"
-          if [[ -n "${SELECTED_TESTS}" ]]; then
-            echo "Selected tests: ${SELECTED_TESTS}"
-          fi
-          if [[ -n "${SELECTED_BENCHMARKS}" ]]; then
-            echo "Selected benchmarks: ${SELECTED_BENCHMARKS}"
-          fi
+          python tools/select_tests.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
-          echo "mode=${TEST_SELECTION_MODE}" >> "${GITHUB_OUTPUT}"
-          echo "tests=${SELECTED_TESTS}" >> "${GITHUB_OUTPUT}"
-          echo "benchmarks=${SELECTED_BENCHMARKS}" >> "${GITHUB_OUTPUT}"
+      # Keep this ref aligned with the reusable workflow and setup action below.
+      # Reading FlagGems' registry avoids maintaining a second backend list here.
+      - name: check out FlagGems backend registry
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: flagos-ai/FlagGems
+          ref: b10f1d47401b2df7166ac0aff8958128338ed237
+          sparse-checkout: .github/backends.json
+          sparse-checkout-cone-mode: false
+          path: .ci/flaggems-registry
+          persist-credentials: false
+
+      - id: select-backends
+        name: select non-NVIDIA backends
+        shell: bash
+        env:
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # During backend bring-up, a main push must not fan out to every
+          # enabled accelerator. Use an explicit dispatch or PR label instead.
+          ALL_ENABLED: >-
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true) ||
+                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/all-vendors')) }}
+        run: |
+          set -euo pipefail
+          args=(
+            --registry .ci/flaggems-registry/.github/backends.json
+            --labels-json "${PR_LABELS_JSON:-null}"
+            --changed-files changed_files.bin
+            --format github
+          )
+          if [[ "${ALL_ENABLED}" == "true" ]]; then
+            args+=(--all-enabled)
+          fi
+          python tools/select_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
   nvidia-tests:
     name: nvidia tests and benchmarks
     needs: select-targets
-    if: needs.select-targets.outputs.tests != '' || needs.select-targets.outputs.benchmarks != ''
+    # Never execute fork-controlled code on the persistent H20 runner.
+    if: >-
+      needs.select-targets.outputs.should_run == 'true'
+      && (github.event_name != 'pull_request'
+          || (github.event.pull_request.head.repo.full_name == github.repository
+              && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: h20
     timeout-minutes: 60
     env:
-      DNN_VENDOR: nvidia
+      FLAGGEMS_VENDOR: nvidia
       PYTHONPATH: ${{ github.workspace }}/src
       VENV_DIR: ${{ github.workspace }}/.venv
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
 
     steps:
       - name: check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: clean generated state from persistent runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .venv build dist
+          find . -maxdepth 2 -type d -name '*.egg-info' -exec rm -rf -- {} +
 
       - name: show gpu
         shell: bash
@@ -177,20 +263,114 @@ jobs:
           fi
           python --version
 
-      - name: run selected unit tests
-        if: needs.select-targets.outputs.tests != ''
+      - name: run portable backend preflight
         shell: bash
-        env:
-          SELECTED_TESTS: ${{ needs.select-targets.outputs.tests }}
         run: |
-          echo "Selected tests: ${SELECTED_TESTS}"
-          pytest -q ${SELECTED_TESTS} --quick
+          source "${VENV_DIR}/bin/activate"
+          python tools/check_backend_env.py --expected-vendor nvidia
 
-      - name: run selected benchmarks
-        if: needs.select-targets.outputs.benchmarks != ''
+      - name: run selected tests and benchmarks
         shell: bash
         env:
-          SELECTED_BENCHMARKS: ${{ needs.select-targets.outputs.benchmarks }}
+          CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
         run: |
-          echo "Selected benchmarks: ${SELECTED_BENCHMARKS}"
-          pytest -q ${SELECTED_BENCHMARKS} --level core
+          source "${VENV_DIR}/bin/activate"
+          python tools/run_ci_targets.py \
+            --backend nvidia-cuda133 \
+            --capabilities .github/backend-capabilities.json
+
+  non-nvidia-tests:
+    name: ${{ matrix.backend }} tests and benchmarks
+    needs: select-targets
+    # Non-NVIDIA CI intentionally accepts fork pull requests. The checked-out
+    # setup and test code is therefore untrusted; these runner groups must be
+    # dedicated to public CI and contain no secrets or persistent sensitive
+    # state. NVIDIA/H20 keeps the stricter same-repository guard above.
+    if: >-
+      needs.select-targets.outputs.has_non_nvidia_backends == 'true'
+      && (needs.select-targets.outputs.should_run == 'true'
+          || github.event_name == 'pull_request')
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.user.login != 'dependabot[bot]')
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-targets.outputs.non_nvidia_matrix) }}
+    uses: flagos-ai/FlagGems/.github/workflows/backend-test.yaml@b10f1d47401b2df7166ac0aff8958128338ed237
+    with:
+      backend: ${{ matrix.backend }}
+      runner_label: ${{ matrix.runner_label }}
+      gpu_check_script: ${{ matrix.gpu_check }}
+      changed_files: ${{ needs.select-targets.outputs.targets }}
+      test_script: tools/run-multi-backend-tests.sh
+    # FlagGems currently declares this unused secret as required. Pass only the
+    # caller's read-only token instead of exposing a long-lived runner SSH key.
+    secrets:
+      RUNNER_SSH_KEY: ${{ secrets.GITHUB_TOKEN }}
+
+  multi-backend-summary:
+    name: multi-backend summary
+    if: always()
+    needs:
+      - code-style
+      - select-targets
+      - nvidia-tests
+      - non-nvidia-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check ci results
+        shell: bash
+        env:
+          CODE_STYLE_RESULT: ${{ needs.code-style.result }}
+          SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
+          NVIDIA_RESULT: ${{ needs.nvidia-tests.result }}
+          NON_NVIDIA_RESULT: ${{ needs.non-nvidia-tests.result }}
+          SHOULD_RUN: ${{ needs.select-targets.outputs.should_run }}
+          HAS_NON_NVIDIA_BACKENDS: >-
+            ${{ needs.select-targets.outputs.has_non_nvidia_backends }}
+          EVENT_NAME: ${{ github.event_name }}
+          NVIDIA_RUN_ALLOWED: >-
+            ${{ github.event_name != 'pull_request'
+                || (github.event.pull_request.head.repo.full_name == github.repository
+                    && github.event.pull_request.user.login != 'dependabot[bot]') }}
+          NON_NVIDIA_RUN_ALLOWED: >-
+            ${{ github.event_name != 'pull_request'
+                || github.event.pull_request.user.login != 'dependabot[bot]' }}
+        run: |
+          set -euo pipefail
+
+          for result in "${CODE_STYLE_RESULT}" "${SELECT_TARGETS_RESULT}"; do
+            if [[ "${result}" != "success" ]]; then
+              echo "Required CI preparation job ended with: ${result}" >&2
+              exit 1
+            fi
+          done
+
+          expect_nvidia=false
+          expect_non_nvidia=false
+          if [[ "${NVIDIA_RUN_ALLOWED}" == "true" && "${SHOULD_RUN}" == "true" ]]; then
+            expect_nvidia=true
+          fi
+          if [[ "${NON_NVIDIA_RUN_ALLOWED}" == "true" && "${HAS_NON_NVIDIA_BACKENDS}" == "true" ]]; then
+            if [[ "${SHOULD_RUN}" == "true" || "${EVENT_NAME}" == "pull_request" ]]; then
+              expect_non_nvidia=true
+            fi
+          fi
+
+          check_accelerator_result() {
+            local name="$1"
+            local expected="$2"
+            local result="$3"
+            if [[ "${expected}" == "true" && "${result}" != "success" ]]; then
+              echo "${name} was expected to succeed, got: ${result}" >&2
+              exit 1
+            fi
+            if [[ "${expected}" == "false" && "${result}" != "skipped" ]]; then
+              echo "${name} was expected to skip, got: ${result}" >&2
+              exit 1
+            fi
+          }
+
+          check_accelerator_result nvidia "${expect_nvidia}" "${NVIDIA_RESULT}"
+          check_accelerator_result \
+            non-nvidia "${expect_non_nvidia}" "${NON_NVIDIA_RESULT}"

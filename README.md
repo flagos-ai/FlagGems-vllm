@@ -146,7 +146,8 @@ print(topk_weights.shape, topk_ids.shape)
 
 The following commands can be used for quick validation after installation.
 
-Most tests and benchmarks require a CUDA-capable GPU runtime, PyTorch, Triton, and vLLM-compatible dependencies.
+Most tests and benchmarks require a supported accelerator runtime, its vendor
+PyTorch build, a compatible Triton implementation, and vLLM dependencies.
 
 ### Import smoke tests
 
@@ -155,10 +156,12 @@ cd /workspace/FlagGems-vllm
 PYTHONPATH=/workspace/FlagGems-vllm/src python - <<'PY'
 import torch
 import flaggems_vllm
+from flaggems_vllm import runtime
 
 print('torch:', torch.__version__)
-print('cuda available:', torch.cuda.is_available())
+print('vendor:', flaggems_vllm.vendor_name)
 print('flaggems_vllm device:', flaggems_vllm.device)
+print('device count:', runtime.device.device_count)
 print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
 PY
 ```

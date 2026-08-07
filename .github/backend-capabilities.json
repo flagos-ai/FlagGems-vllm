@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "allow_all_tests": false,
+    "tests_allow": [],
+    "benchmarks_enabled": false,
+    "allow_all_benchmarks": false,
+    "benchmarks_allow": []
+  },
+  "backends": {
+    "iluvatar": {
+      "tests_allow": [
+        "tests/test_mul.py"
+      ]
+    },
+    "nvidia-cuda133": {
+      "allow_all_tests": true,
+      "benchmarks_enabled": true,
+      "allow_all_benchmarks": true
+    }
+  }
+}

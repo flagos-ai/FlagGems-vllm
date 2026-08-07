@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 
 import pytest
@@ -179,7 +193,7 @@ def _make_inputs(
     A_log = torch.log(
         torch.empty(HV, device=device, dtype=torch.float32).uniform_(1, 16)
     )
-    dt_bias = torch.randn(HV * D, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(HV, D, device=device, dtype=torch.float32)
 
     initial_state = None
     if use_initial_state:
@@ -257,6 +271,36 @@ def _assert_close(
                 "output_final_state": True,
             },
             id="dense",
+        ),
+        pytest.param(
+            {
+                "seq_lens": [32],
+                "H": 2,
+                "HV": 2,
+                "D": 128,
+                "scale": 1 / math.sqrt(128),
+                "dtype": torch.bfloat16,
+                "state_v_first": True,
+                "normal_inputs": True,
+                "use_initial_state": True,
+                "output_final_state": True,
+            },
+            id="strict_tle_compatible",
+        ),
+        pytest.param(
+            {
+                "seq_lens": [13, 19, 16],
+                "H": 2,
+                "HV": 2,
+                "D": 128,
+                "scale": 1 / math.sqrt(128),
+                "dtype": torch.bfloat16,
+                "state_v_first": True,
+                "normal_inputs": True,
+                "use_initial_state": True,
+                "output_final_state": True,
+            },
+            id="strict_tle_varlen_compatible",
         ),
         pytest.param(
             {

@@ -12,6 +12,9 @@ __pycache__/
 # Python venv directory
 .venv
 
+# Repositories checked out by local CI compatibility actions
+/.ci/
+
 # Distribution files
 build/
 *.egg-info/
@@ -28,6 +31,7 @@ tests/*.json
 *.ipa
 *.apk
 
+.claude
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.

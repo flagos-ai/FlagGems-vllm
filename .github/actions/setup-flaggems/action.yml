@@ -1,0 +1,205 @@
+name: "Setup FlagGems-vllm backend"
+description: "Reuse FlagGems' vendor environment for FlagGems-vllm tests"
+
+inputs:
+  backend:
+    description: "FlagGems backend label"
+    required: true
+  gpu_check_script:
+    description: "GPU check script path inside the FlagGems repository"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: clean generated state from persistent runners
+      shell: bash
+      run: |
+        set -euo pipefail
+        trap 'status=$?; echo "::error title=Persistent runner cleanup failed::Exit ${status}"; exit "${status}"' ERR
+        cd "${GITHUB_WORKSPACE:?}"
+        rm -rf -- .venv .ci/flaggems build dist
+        find . -maxdepth 2 -type d -name '*.egg-info' -exec rm -rf -- {} +
+
+    # Keep this checkout pinned to the same FlagGems revision as basic-ci.yml.
+    - name: check out FlagGems CI support
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      with:
+        repository: flagos-ai/FlagGems
+        ref: b10f1d47401b2df7166ac0aff8958128338ed237
+        path: .ci/flaggems
+        persist-credentials: false
+
+    - name: prepare writable runner environment
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.backend }}
+      run: |
+        set -euo pipefail
+        trap 'status=$?; echo "::error title=Runner environment preparation failed::Exit ${status}"; exit "${status}"' ERR
+        bash "${GITHUB_WORKSPACE}/tools/prepare-flaggems-ci-env.sh" "${BACKEND}"
+
+    - name: create vendor environment with FlagGems
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.backend }}
+      run: |
+        # Vendor activation snippets may reference optional variables before
+        # defining them, so enable nounset only after activation.
+        set -eo pipefail
+        trap 'status=$?; echo "::error title=FlagGems vendor setup failed::Exit ${status}"; exit "${status}"' ERR
+        : "${FLAGGEMS_DIR:?}"
+        : "${FLAGGEMS_VENV:?}"
+
+        echo "Runner identity: $(id)"
+        echo "FlagGems checkout: ${FLAGGEMS_DIR}"
+        echo "FlagGems venv: ${FLAGGEMS_VENV}"
+        echo "HOME: ${HOME}"
+        echo "UV cache override: ${UV_CACHE_DIR:-<uv default>}"
+        echo "UV managed Python override: ${UV_PYTHON_INSTALL_DIR:-<uv default>}"
+
+        # Reuse the same runner-local uv and managed Python as FlagGems CI.
+        # These probes are diagnostic only: setup.sh installs uv/Python when
+        # they are absent, so a missing cache must not fail the job here.
+        export PATH="${HOME}/.local/bin:${PATH}"
+        backend_python="$(
+          awk "/^  ${BACKEND}:/{found=1} found && /python:/{print \$2; exit}" \
+            "${FLAGGEMS_DIR}/src/flag_gems/backends.yaml" | tr -d '"'
+        )"
+        echo "FlagGems Python: ${backend_python:-<unknown>}"
+        if command -v uv >/dev/null 2>&1; then
+          echo "Pre-setup uv: $(command -v uv)"
+          uv cache dir || echo "::warning::Unable to inspect the uv cache"
+          uv python dir || echo "::warning::Unable to inspect managed Python"
+          if [[ -n "${backend_python}" ]] && cached_python="$(
+            uv python find "${backend_python}" \
+              --managed-python --no-python-downloads 2>/dev/null
+          )"; then
+            echo "Cached managed Python ${backend_python}: ${cached_python}"
+          else
+            echo "No matching cached managed Python; setup.sh will install it"
+          fi
+        else
+          echo "uv is not cached; setup.sh will install it"
+        fi
+
+        cd "${FLAGGEMS_DIR}"
+        ./setup.sh "${BACKEND}"
+
+        test -x "${FLAGGEMS_VENV}/bin/python"
+        source "${FLAGGEMS_VENV}/bin/activate"
+        set -u
+        echo "uv: $(command -v uv)"
+        echo "uv cache: $(uv cache dir 2>/dev/null || echo '<unavailable>')"
+        echo "uv managed Python: $(
+          uv python dir 2>/dev/null || echo '<unavailable>'
+        )"
+        python - <<'PY'
+        import os
+        import sys
+        from pathlib import Path
+
+        print("python executable:", sys.executable)
+        print("python prefix:", sys.prefix)
+        expected = Path(os.environ["FLAGGEMS_VENV"]).resolve()
+        actual = Path(sys.prefix).resolve()
+        if actual != expected:
+            raise SystemExit(f"unexpected Python prefix: {actual} != {expected}")
+        PY
+
+    - name: install FlagGems-vllm without replacing vendor packages
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.backend }}
+      run: |
+        set -eo pipefail
+        trap 'status=$?; echo "::error title=FlagGems-vllm installation failed::Exit ${status}"; exit "${status}"' ERR
+        : "${FLAGGEMS_VENV:?}"
+        cd "${GITHUB_WORKSPACE:?}"
+
+        if [[ -e .venv || -L .venv ]]; then
+          echo "::error::.venv already exists before the multi-backend setup"
+          exit 1
+        fi
+        # Keep the root path expected by FlagGems' reusable workflow, while
+        # using the physical vendor venv path everywhere in this adapter.
+        ln -s "${FLAGGEMS_VENV}" .venv
+        # Vendor activation snippets may reference an unset LD_LIBRARY_PATH.
+        # Enable nounset only after the environment has been activated.
+        source "${FLAGGEMS_VENV}/bin/activate"
+        set -u
+
+        # FlagGems already installed the matching vendor torch, compiler and
+        # test dependencies. --no-deps prevents this project's generic torch
+        # and CUDA-only cupy requirements from replacing that environment.
+        uv pip install \
+          --python "${FLAGGEMS_VENV}/bin/python" \
+          --no-build-isolation \
+          --no-deps \
+          -e "${GITHUB_WORKSPACE}"
+        # This test-only pure Python dependency is not provided by FlagGems.
+        # Keep dependency resolution disabled so the vendor environment's
+        # pinned packages are not upgraded or replaced.
+        uv pip install \
+          --python "${FLAGGEMS_VENV}/bin/python" \
+          --no-deps \
+          "einops>=0.6" \
+          --default-index https://mirrors.aliyun.com/pypi/simple
+
+        vendor="${BACKEND%%-*}"
+        export FLAGGEMS_VENDOR="${vendor}"
+        export PYTHONPATH="${GITHUB_WORKSPACE}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+        echo "FLAGGEMS_VENDOR=${FLAGGEMS_VENDOR}" >> "${GITHUB_ENV}"
+        echo "PYTHONPATH=${PYTHONPATH}" >> "${GITHUB_ENV}"
+        echo "VIRTUAL_ENV=${FLAGGEMS_VENV}" >> "${GITHUB_ENV}"
+        echo "${FLAGGEMS_VENV}/bin" >> "${GITHUB_PATH}"
+        python --version
+
+    - name: check accelerator availability
+      if: inputs.gpu_check_script != ''
+      shell: bash
+      env:
+        GPU_CHECK_SCRIPT: ${{ inputs.gpu_check_script }}
+      run: |
+        set -eo pipefail
+        trap 'status=$?; echo "::error title=Accelerator availability check failed::Exit ${status}"; exit "${status}"' ERR
+        : "${FLAGGEMS_DIR:?}"
+        : "${FLAGGEMS_VENV:?}"
+        source "${FLAGGEMS_VENV}/bin/activate"
+        set -u
+
+        script="${FLAGGEMS_DIR}/${GPU_CHECK_SCRIPT}"
+        if [[ ! -f "${script}" ]]; then
+          echo "::error::FlagGems GPU check script not found: ${GPU_CHECK_SCRIPT}"
+          exit 1
+        fi
+
+        gpu_output="$(bash "${script}")"
+        echo "${gpu_output}"
+        available_gpus="$(
+          awk -F: '/^Available GPUs:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' \
+            <<< "${gpu_output}"
+        )"
+        if [[ -z "${available_gpus}" ]]; then
+          echo "::error::GPU check did not report any available accelerators"
+          exit 1
+        fi
+        echo "AVAILABLE_GPUS=${available_gpus}" >> "${GITHUB_ENV}"
+
+    - name: run portable backend preflight
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.backend }}
+      run: |
+        set -eo pipefail
+        trap 'status=$?; echo "::error title=Portable backend preflight failed::Exit ${status}"; exit "${status}"' ERR
+        : "${FLAGGEMS_VENV:?}"
+        source "${FLAGGEMS_VENV}/bin/activate"
+        set -u
+        vendor="${BACKEND%%-*}"
+        cd "${GITHUB_WORKSPACE:?}"
+        python tools/check_backend_env.py \
+          --expected-vendor "${vendor}" \
+          --require-flaggems

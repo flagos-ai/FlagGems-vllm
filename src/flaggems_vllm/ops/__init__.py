@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # isort: off
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
@@ -90,6 +104,7 @@ from flaggems_vllm.ops.rotary_embedding import apply_rotary_pos_emb
 from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
+from flaggems_vllm.ops.scaled_int8_quant import scaled_int8_quant
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
 from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
@@ -105,6 +120,7 @@ from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode
 from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
 from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
+from flaggems_vllm.ops.triton_scaled_mm import triton_scaled_mm
 from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 from flaggems_vllm.ops.unpack_seq import unpack_seq_triton
 from flaggems_vllm.ops.weightnorm import (
@@ -184,6 +200,7 @@ __all__ = [
     "router_gemm",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
+    "scaled_int8_quant",
     "silu_and_mul",
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
@@ -198,6 +215,7 @@ __all__ = [
     "top_k_per_row_prefill",
     "topk_softmax",
     "topk_softplus_sqrt",
+    "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",
     "weight_norm",
