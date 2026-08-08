@@ -13,6 +13,23 @@
 # limitations under the License.
 
 
+from .fused_moe import (  # noqa: F401
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
+from .scaled_int8_quant import scaled_int8_quant
+from .triton_scaled_mm import triton_scaled_mm
+
+__all__ = [
+    "fused_experts_impl",
+    "inplace_fused_experts",
+    "outplace_fused_experts",
+    "scaled_int8_quant",
+    "triton_scaled_mm",
+]
+
+
 from .scaled_int8_quant import scaled_int8_quant
 from .triton_scaled_mm import triton_scaled_mm
 
