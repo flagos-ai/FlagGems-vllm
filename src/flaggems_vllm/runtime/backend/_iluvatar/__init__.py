@@ -18,6 +18,7 @@ vendor_info = VendorDescriptor(
     vendor_name="iluvatar",
     device_name="cuda",
     device_query_cmd="ixsmi",
+    triton_extra_name="corex",
     fp64_enabled=False,
 )
 
