@@ -31,6 +31,12 @@ from flaggems_vllm.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
+# On devices without embedded MoE config tables, every fused_moe call
+# queries the default config; emit the "No embedded MoE configs" warning
+# only once (first call) to avoid spamming do_bench iterations (matches
+# upstream warning_once semantics).
+_WARNED_NO_EMBEDDED_CONFIG = False
+
 # OCP MX quantization helpers (requires amd-quark)
 
 OCP_MX_BLOCK_SIZE = 32
@@ -178,10 +184,13 @@ def get_moe_configs(
     embedded_configs, _ = get_embedded_moe_configs()
     device_table = embedded_configs.get(device_name)
     if device_table is None:
-        logger.warning(
-            "No embedded MoE configs for device %s. Will use default config.",
-            device_name,
-        )
+        global _WARNED_NO_EMBEDDED_CONFIG
+        if not _WARNED_NO_EMBEDDED_CONFIG:
+            _WARNED_NO_EMBEDDED_CONFIG = True
+            logger.warning(
+                "No embedded MoE configs for device %s. Will use default config.",
+                device_name,
+            )
         return None
 
     _block_n = block_n if block_n else 0
@@ -338,6 +347,42 @@ def get_moe_wna16_block_config(
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
 
+def _get_max_smem_bytes() -> int:
+    """Maximum dynamic shared memory per block for the current vendor."""
+    return device.info.max_smem_bytes
+
+
+def _clamp_num_stages_for_vendor(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_stages: int,
+    gemm_stage: str,
+    dtype: str | None,
+) -> int:
+    """Clamp the pipeline depth to vendor-specific MoE limits.
+
+    Driven by ``VendorDescriptor`` fields (see backend_utils.py); NVIDIA
+    defaults make this a no-op (same smem loop as the heuristic already runs,
+    NS floor of 2, no NS ceiling, fp16 B-tile factor of 1).
+    """
+    info = device.info
+    b_tile_factor = (
+        info.moe_fp16_gemm1_b_tile_factor
+        if (dtype == "fp16" and gemm_stage == "gemm1")
+        else 1
+    )
+    smem_per_stage = (block_m * block_k + b_tile_factor * block_k * block_n) * 2
+    while (
+        num_stages > info.moe_num_stages_min
+        and smem_per_stage * num_stages > info.max_smem_bytes
+    ):
+        num_stages -= 1
+    if info.moe_num_stages_max is not None:
+        num_stages = min(num_stages, info.moe_num_stages_max)
+    return num_stages
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -380,6 +425,14 @@ def get_default_config(
             "num_stages": 4 if M >= 1024 else 3,
             "SWAP_AB": False,
         }
+        config["num_stages"] = _clamp_num_stages_for_vendor(
+            block_m,
+            block_shape[0],
+            block_shape[1],
+            config["num_stages"],
+            gemm_stage,
+            dtype,
+        )
     elif dtype in _PLAIN_HALF_CONFIG_DTYPES:
         # Routed rows per expert drives block_m.  Each token contributes topk
         # rows to the expert-sorted GEMM input, so M * topk / E is the relevant
@@ -441,8 +494,11 @@ def get_default_config(
             num_stages = 4
 
         smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+        while num_stages > 2 and smem_per_stage * num_stages > _get_max_smem_bytes():
             num_stages -= 1
+        num_stages = _clamp_num_stages_for_vendor(
+            block_m, block_n, block_k, num_stages, gemm_stage, dtype
+        )
 
         config = {
             "BLOCK_SIZE_M": block_m,
@@ -495,6 +551,9 @@ def get_default_config(
         smem_per_stage = (block_m * block_k + block_k * block_n) * 2
         while num_stages > 2 and smem_per_stage * num_stages > 200_000:
             num_stages -= 1
+        num_stages = _clamp_num_stages_for_vendor(
+            block_m, block_n, block_k, num_stages, gemm_stage, dtype
+        )
 
         config = {
             "BLOCK_SIZE_M": block_m,
@@ -694,11 +753,25 @@ def _fp8_quantize(
             A_q = (A.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
             return A_q, A_scale
         else:
-            amax = A.abs().amax().clamp(min=eps).to(torch.float32)
-            scale = amax / fp8_max
-            iscale = 1.0 / scale
-            A_q = (A.float() * iscale).clamp(fp8_min, fp8_max).to(fp8_dtype)
-            return A_q, scale.view(1)
+            # Use the fused Triton kernel (single pass) instead of multiple
+            # torch passes: A.abs().amax() + A.float() + scale + clamp + cast
+            # cost ~5-6 torch kernels per call (~660us for small M); the
+            # Triton path is ~90us. group_size=K yields one scale per row
+            # (per-token), which the fused MoE kernel consumes via a_scale
+            # token-stride indexing.
+            from flaggems_vllm.ops.per_token_group_quant_fp8 import (
+                per_token_group_quant_fp8,
+            )
+
+            A_q, scale = per_token_group_quant_fp8(
+                A,
+                group_size=A.size(-1),
+                eps=eps,
+                dtype=fp8_dtype,
+                column_major_scales=False,
+                scale_ue8m0=False,
+            )
+            return A_q, scale
 
 
 def _int8_quantize(
@@ -1236,7 +1309,10 @@ def fused_moe_kernel(
                 a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
                 a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
             else:  # tensor-wise
-                a_scale = tl.load(a_scale_ptr)
+                # Per-token A scales: one scale per routed row (per-tensor
+                # scales use stride_asm=0 and reduce to the same scalar load).
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
                 b_scale_gate = tl.load(b_scale_ptr + off_experts)
                 b_scale_up = b_scale_gate
 
@@ -1403,7 +1479,10 @@ def fused_moe_kernel(
                 a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
                 a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
             else:  # tensor-wise
-                a_scale = tl.load(a_scale_ptr)
+                # Per-token A scales: one scale per routed row (per-tensor
+                # scales use stride_asm=0 and reduce to the same scalar load).
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
                 b_scale = tl.load(b_scale_ptr + off_experts)
 
         if HAS_BIAS:
@@ -2163,8 +2242,12 @@ def fused_experts_impl(
                 gemm_stage="gemm2",
                 enable_gemm_fast_path=True,
             )
+        # GEMM2 direct_sum (write-back accumulation into out_hidden_states)
+        # is slower on some vendors (measured -27% on large M); gate it via
+        # the vendor descriptor so other platforms keep the original path.
         use_direct_sum = (
-            not is_embedded_config
+            device.info.moe_direct_sum_enabled
+            and not is_embedded_config
             and direct_sum_supported
             and tokens_in_chunk >= MOE_DIRECT_SUM_MIN_TOKENS
             and expert_map is None
