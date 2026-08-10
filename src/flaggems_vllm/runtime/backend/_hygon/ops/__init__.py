@@ -29,8 +29,3 @@ __all__ = [
     "triton_scaled_mm",
 ]
 
-
-from .scaled_int8_quant import scaled_int8_quant
-from .triton_scaled_mm import triton_scaled_mm
-
-__all__ = ["scaled_int8_quant", "triton_scaled_mm"]
