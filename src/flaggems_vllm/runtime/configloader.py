@@ -591,9 +591,7 @@ class ConfigLoader(object):
                 }
                 if "maxnreg" in cur_config:
                     triton_kwargs["maxnreg"] = cur_config["maxnreg"]
-                all_configs.append(
-                    triton.Config(cur_config["META"], **triton_kwargs)
-                )
+                all_configs.append(triton.Config(cur_config["META"], **triton_kwargs))
             else:
                 cur_entry = iteration_plan[current_step]
                 cur_key = cur_entry["key"]
