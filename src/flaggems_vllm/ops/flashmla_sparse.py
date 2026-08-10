@@ -45,15 +45,7 @@ TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS = 4
         triton.Config({"BK": 64, "BH": 64}, num_warps=8, num_stages=2),
         triton.Config({"BK": 64, "BH": 64}, num_warps=8, num_stages=4),
     ],
-    key=[
-        "SQ",
-        "HQ",
-        "DQK",
-        "SKV",
-        "TOPK",
-        "HAVE_ATTN_SINK",
-        "HAVE_TOPK_LENGTH",
-    ],
+    key=["SQ", "HQ", "DQK", "SKV", "TOPK", "HAVE_ATTN_SINK", "HAVE_TOPK_LENGTH"],
 )
 @triton.jit
 def triton_flash_mla_sparse_fwd(
@@ -670,9 +662,7 @@ if HAS_TLE_FLASHMLA_SPARSE:
         tl.store(tle.gpu.local_ptr(final_max_logits_smem), final_max_logits, mask_h)
         tl.store(tle.gpu.local_ptr(final_lse_smem), fin_log, mask_h)
         final_max_logits = tl.load(
-            tle.gpu.local_ptr(final_max_logits_smem),
-            mask_h,
-            other=float("-inf"),
+            tle.gpu.local_ptr(final_max_logits_smem), mask_h, other=float("-inf")
         )
         fin_log = tl.load(tle.gpu.local_ptr(final_lse_smem), mask_h, other=float("inf"))
         tl.store(max_logits_base + offs_h, final_max_logits, mask_h)
@@ -741,16 +731,10 @@ if HAS_TLE_FLASHMLA_SPARSE:
         _ = DQK
 
         sQ_l_smem = tle.gpu.alloc(
-            [1, BH, DPH],
-            dtype=kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
+            [1, BH, DPH], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         sQ_r_smem = tle.gpu.alloc(
-            [1, BH, DPH],
-            dtype=kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
+            [1, BH, DPH], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         if HAVE_TAIL:
             sQ_tail_smem = tle.gpu.alloc(
@@ -781,16 +765,10 @@ if HAS_TLE_FLASHMLA_SPARSE:
             )
 
         sK0_smem = tle.gpu.alloc(
-            [1, BK, DP],
-            dtype=kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
+            [1, BK, DP], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         sK1_smem = tle.gpu.alloc(
-            [1, BK, DP],
-            dtype=kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
+            [1, BK, DP], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         if HAVE_TAIL:
             sK0_tail_smem = tle.gpu.alloc(
@@ -878,10 +856,7 @@ if HAS_TLE_FLASHMLA_SPARSE:
             nv_mma_shared_layout=False,
         )
         sS1_smem = tle.gpu.alloc(
-            [1, BH, BK],
-            dtype=kv.dtype.element_ty,
-            layout=None,
-            scope=tle.gpu.smem,
+            [1, BH, BK], dtype=kv.dtype.element_ty, layout=None, scope=tle.gpu.smem
         )
         sL_smem = tle.gpu.alloc(
             [2, BH],
@@ -905,16 +880,10 @@ if HAS_TLE_FLASHMLA_SPARSE:
             nv_mma_shared_layout=False,
         )
         sM_wg0_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flashmla_wg0_bunch_0_ready",
-            sM=sM_smem,
+            capacity=1, scope="cta", name="flashmla_wg0_bunch_0_ready", sM=sM_smem
         )
         sM_wg1_pipe = tle.pipe(
-            capacity=1,
-            scope="cta",
-            name="flashmla_wg1_bunch_0_ready",
-            sM=sM_smem,
+            capacity=1, scope="cta", name="flashmla_wg1_bunch_0_ready", sM=sM_smem
         )
         sS0_pipe = tle.pipe(capacity=1, scope="cta", name="flashmla_sS0", sS0=sS0_smem)
         sS1_pipe = tle.pipe(capacity=1, scope="cta", name="flashmla_sS1", sS1=sS1_smem)
@@ -1160,25 +1129,16 @@ def flash_mla_sparse_fwd(
 
         _set_triton_descriptor_allocator(q.device)
         q_desc = TensorDescriptor(
-            q,
-            shape=[SQ * HQ, DQK],
-            strides=[DQK, 1],
-            block_shape=[BH, DP // 2],
+            q, shape=[SQ * HQ, DQK], strides=[DQK, 1], block_shape=[BH, DP // 2]
         )
         if HAVE_TAIL:
             tq_desc = TensorDescriptor(
-                q,
-                shape=[SQ * HQ, DQK],
-                strides=[DQK, 1],
-                block_shape=[BH, TDP],
+                q, shape=[SQ * HQ, DQK], strides=[DQK, 1], block_shape=[BH, TDP]
             )
         else:
             tq_desc = q_desc
         output_desc = TensorDescriptor(
-            output,
-            shape=[SQ * HQ, D],
-            strides=[D, 1],
-            block_shape=[BH, DP // 2],
+            output, shape=[SQ * HQ, D], strides=[D, 1], block_shape=[BH, DP // 2]
         )
         _tle_flashmla_prefill_fwd[triton_grid](
             q_desc,

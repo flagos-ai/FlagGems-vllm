@@ -17,8 +17,8 @@ import logging
 import torch
 import triton
 import triton.language as tl
+from flag_gems.config import use_c_extension
 
-from flaggems_vllm.config import use_c_extension
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
@@ -84,7 +84,7 @@ def reshape_and_cache_flash(
 ):
     if use_c_extension:
         logger.debug("GEMS RESHAPE_AND_CACHE_FLASH(C EXTENSION)")
-        torch.ops.flaggems_vllm.reshape_and_cache_flash(
+        torch.ops.flag_gems.reshape_and_cache_flash(
             key,
             value,
             key_cache,

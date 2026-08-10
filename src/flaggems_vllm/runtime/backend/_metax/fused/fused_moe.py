@@ -44,6 +44,53 @@ def _is_qwen_moe_shape(
     return False
 
 
+_METAX_MAX_SHARED_MEMORY = 65536  # 64KB hardware limit for MetaX C550
+
+
+def _adjust_config_for_shared_memory(config: dict[str, Any]) -> dict[str, Any]:
+    """Adjust kernel config to fit within MetaX 64KB shared memory limit.
+
+    Strategy (preserving performance as much as possible):
+    1. First reduce num_stages to 2
+    2. Then reduce BLOCK_SIZE_K (less impact on parallelism)
+    3. Then reduce BLOCK_SIZE_N (affects output tile)
+    4. Finally reduce BLOCK_SIZE_M if still needed
+    """
+    block_m = config.get("BLOCK_SIZE_M", 128)
+    block_n = config.get("BLOCK_SIZE_N", 128)
+    block_k = config.get("BLOCK_SIZE_K", 64)
+    num_stages = config.get("num_stages", 3)
+
+    def calc_smem():
+        return (block_m * block_k + block_k * block_n) * 2 * num_stages
+
+    # Step 1: Reduce num_stages to 2
+    if calc_smem() > _METAX_MAX_SHARED_MEMORY:
+        num_stages = 2
+
+    # Step 2: Reduce BLOCK_SIZE_K (32 is minimum for good vectorization)
+    if calc_smem() > _METAX_MAX_SHARED_MEMORY and block_k > 32:
+        block_k = 32
+
+    # Step 3: Reduce BLOCK_SIZE_N
+    if calc_smem() > _METAX_MAX_SHARED_MEMORY and block_n > 128:
+        block_n = 128
+
+    # Step 4: Reduce BLOCK_SIZE_M if still over
+    if calc_smem() > _METAX_MAX_SHARED_MEMORY and block_m > 64:
+        block_m = 64
+
+    # Step 5: Further reduce BLOCK_SIZE_N if needed
+    if calc_smem() > _METAX_MAX_SHARED_MEMORY and block_n > 64:
+        block_n = 64
+
+    config["BLOCK_SIZE_M"] = block_m
+    config["BLOCK_SIZE_N"] = block_n
+    config["BLOCK_SIZE_K"] = block_k
+    config["num_stages"] = num_stages
+    return config
+
+
 def _metax_get_default_config(
     M: int,
     E: int,
@@ -56,7 +103,7 @@ def _metax_get_default_config(
     enable_gemm_fast_path: bool = False,
 ) -> dict[str, Any]:
     if not _is_qwen_moe_shape(E, N, K, topk, dtype, gemm_stage):
-        return _GENERIC_GET_DEFAULT_CONFIG(
+        config = _GENERIC_GET_DEFAULT_CONFIG(
             M,
             E,
             N,
@@ -67,6 +114,7 @@ def _metax_get_default_config(
             gemm_stage,
             enable_gemm_fast_path,
         )
+        return _adjust_config_for_shared_memory(config)
 
     if M <= 1024:
         block_m, block_n, block_k = 16, 128, 64

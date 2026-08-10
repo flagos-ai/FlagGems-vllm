@@ -85,7 +85,7 @@ FLAGGEMS_DB_URL = os.getenv("FLAGGEMS_DB_URL", None)
 class Cache(object):
     def __init__(
         self, table_name: str, model: PersistantModel, *args, **kwargs
-    ) -> None:  # type: ignore[override]
+    ) -> Cache:
         super().__init__(*args, **kwargs)
         self.table_name: Final[str] = table_name
         self.model: Final[PersistantModel] = model
@@ -93,13 +93,12 @@ class Cache(object):
 
 class ConfigCache(Cache):
     """
-    `ConfigCache` is used to store the relationship
-    between keys and their known best configurations.
+    `ConfigCache` is used to store the relationship between keys and their known best configurations.
     """
 
     def __init__(
         self, table_name: str, model: PersistantModel, *args, **kwargs
-    ) -> None:  # type: ignore[override]
+    ) -> ConfigCache:
         super().__init__(table_name, model, *args, **kwargs)
 
     def __contains__(self, key: Tuple[Union[int, float, str], ...]) -> bool:
@@ -133,39 +132,26 @@ class BenchmarkCache(Cache):
         key: Tuple[Union[int, float, str], ...],
         *args,
         **kwargs,
-    ) -> None:  # type: ignore[override]
+    ) -> BenchmarkCache:
         """
-        `BenchmarkCache` is used to store the
-        benchmark results for the pair of the
-        specific key and configuration.
+        `BenchmarkCache` is used to store the benchmark results for the pair of the specific key and configuration.
         """
         super().__init__(table_name, model, *args, **kwargs)
         self.key: Final[Tuple[Union[int, float, str], ...]] = key
 
-    def __contains__(self, config: triton.Config) -> bool:  # type: ignore[override]
-        return (
-            self.model.get_benchmark(  # type: ignore[call-arg]
-                self.key, config  # type: ignore[arg-type]
-            )
-            is not None
-        )
+    def __contains__(self, config: triton.Config) -> bool:
+        return self.model.get_benchmark(self.key, config) is not None
 
-    def __getitem__(  # type: ignore[override]
-        self, config: triton.Config
-    ) -> Tuple[float]:
+    def __getitem__(self, config: triton.Config) -> Tuple[float]:
         ret: Optional[Tuple[float, float, float]] = self.get(config)
         if ret is None:
             raise KeyError(
-                f"Config {config} not found"
-                f" in BenchmarkCache"
-                f" for key {self.key}."
+                f"Config {config} not found in BenchmarkCache for key {self.key}."
             )
-        return ret  # type: ignore[return-value]
+        return ret
 
-    def __setitem__(  # type: ignore[override]
-        self, config: triton.Config, benchmark: Tuple[float]
-    ) -> None:
-        return self.set(config, benchmark)  # type: ignore[arg-type]
+    def __setitem__(self, config: triton.Config, benchmark: Tuple[float]) -> None:
+        return self.set(config, benchmark)
 
     def get(self, config: triton.Config) -> Optional[Tuple[float, float, float]]:
         return self.model.get_benchmark(self.table_name, self.key, config)
@@ -193,7 +179,7 @@ class LibCache(object):
             cache_path: Path = config_cache_dir() / cache_file_name
             self.db_url: str = f"sqlite:///{cache_path}"
         else:
-            self.db_url: str = db_url  # type: ignore[no-redef]
+            self.db_url: str = db_url
         self.config_cache_pool: Dict[str, ConfigCache] = {}
         self.benchmark_cache_pool: Dict[
             Tuple[str, Tuple[Union[int, float, str], ...]], BenchmarkCache
@@ -212,7 +198,7 @@ class LibCache(object):
         if isinstance(key, str):
             return self.get_config(key)
         elif isinstance(key, tuple):
-            return self.get_benchmark(*key)  # type: ignore[arg-type]
+            return self.get_benchmark(*key)
         else:
             assert False, f"the type of key '{key.__class__.__name__}' is unacceptable"
 
@@ -239,21 +225,14 @@ libcache = LibCache(FLAGGEMS_DB_URL)
 class LibTuner(triton.runtime.Autotuner):
     """`LibTuner` is the base class for `FlagGems` library autotuner.
 
-    It could be extended in two ways, overriding
-    the `policy` or `run` method in a subclass.
-    For `policy` extension, `LibTuner` provides a
-    decorator `register_policy` to register a
-    policy function quickly. Please refer to the
-    implementation of `default_policy` for an
-    example.
+    It could be extended in two ways, overriding the `policy` or `run` method in a subclass.
+    For `policy` extension, `LibTuner` provides a decorator `register_policy` to register a policy function quickly.
+    Please refer to the implementation of `default_policy` for an example.
     """
 
-    # The dispatch table for `LibTuner` subclasses.
-    # It's shared across all instances.
+    # The dispatch table for `LibTuner` subclasses. It's shared across all instances.
     _dispatch_table: Dict[str, Type[LibTuner]] = {}
-    # wbj fix:
-    # _strategy_table: Dict[str, Callable[[Any], Any]] = {}
-    _strategy_table: Dict[Optional[str], Callable[[Any], Any]] = {}
+    _strategy_table: Dict[str, Callable[[Any], Any]] = {}
 
     def __init__(
         self,
@@ -271,9 +250,12 @@ class LibTuner(triton.runtime.Autotuner):
         use_cuda_graph=False,
         do_bench=None,
         strategy=None,
+        flagtune_op_name=None,
+        flagtune_expand_op_name=None,
+        flagtune_yaml_path=None,
+        flagtune_pre_hook=None,
     ):
-        # NOTE(zhengyang): See discussion in
-        # https://github.com/triton-lang/triton/pull/4496
+        # NOTE(zhengyang): See discussion in https://github.com/triton-lang/triton/pull/4496
         if major_version == 2 or (major_version == 3 and minor_version <= 1):
             if warmup is None:
                 warmup = 25
@@ -294,7 +276,7 @@ class LibTuner(triton.runtime.Autotuner):
             self.base_fn = fn
             while not inspect.isfunction(self.base_fn):
                 self.base_fn = self.base_fn.fn
-        else:
+        elif major_version == 3 and minor_version <= 1:
             super().__init__(
                 fn,
                 arg_names,
@@ -309,29 +291,113 @@ class LibTuner(triton.runtime.Autotuner):
                 rep,
                 use_cuda_graph,
             )
+        else:
+            # Triton 3.2+ removed warmup/rep/use_cuda_graph positional arguments.
+            # Preserve FlagGems tuning behavior by translating them into do_bench.
+            if do_bench is None:
+                if use_cuda_graph:
+                    from triton.testing import do_bench_cudagraph
+
+                    def do_bench(kernel_call, quantiles):
+                        return do_bench_cudagraph(
+                            kernel_call,
+                            rep=rep if rep is not None else 100,
+                            quantiles=quantiles,
+                        )
+
+                elif warmup is not None or rep is not None:
+
+                    def do_bench(kernel_call, quantiles):
+                        return triton.testing.do_bench(
+                            kernel_call,
+                            warmup=warmup if warmup is not None else 25,
+                            rep=rep if rep is not None else 100,
+                            quantiles=quantiles,
+                        )
+
+            super().__init__(
+                fn,
+                arg_names,
+                configs,
+                key,
+                reset_to_zero,
+                restore_value,
+                pre_hook=pre_hook,
+                post_hook=post_hook,
+                prune_configs_by=prune_configs_by,
+                do_bench=do_bench,
+            )
         self.__name__ = self.base_fn.__name__
         self.keys = key
+        self.strategy: List[Callable[[Any], Any]] = self._normalize_strategy(strategy)
+        self.config_table_name: str = f"{self.__name__}_{self.kernel_hash}"
+        self.benchmark_table_name: str = f"{self.__name__}_{self.cache_key}_benchmark"
+        self.cache: BenchmarkCache = libcache[self.config_table_name]
+        self._flagtune_default_configs = self.configs
+        self._flagtune_default_strategy = strategy
+        self._flagtune_active = False
+        self._flagtune_warned = False
+        self._flagtune_op_name = flagtune_op_name
+        self._flagtune_expand_op_name = flagtune_expand_op_name or flagtune_op_name
+        self._flagtune_yaml_path = flagtune_yaml_path
+        self._flagtune_pre_hook = flagtune_pre_hook
+
+    def _normalize_strategy(self, strategy):
         if isinstance(strategy, str):
             strategy = LibTuner.get_strategy(strategy)
         if not isinstance(strategy, (list, tuple)):
             strategy = [strategy] * len(self.keys)
-        assert len(strategy) == len(self.keys), (
-            f"the length of strategy"
-            f" {len(strategy)} must match"
-            f" the length of keys"
-            f" {len(self.keys)}"
+        assert len(strategy) == len(
+            self.keys
+        ), f"the length of strategy {len(strategy)} must match the length of keys {len(self.keys)}"
+        return [LibTuner.get_strategy(s) if isinstance(s, str) else s for s in strategy]
+
+    def _set_configs_and_strategy(self, configs, strategy):
+        self.configs = configs
+        self.strategy = self._normalize_strategy(strategy)
+        self.__dict__.pop("configs_hash", None)
+        self.__dict__.pop("kernel_hash", None)
+        self.config_table_name = f"{self.__name__}_{self.kernel_hash}"
+        self.benchmark_table_name = f"{self.__name__}_{self.cache_key}_benchmark"
+        self.cache = libcache[self.config_table_name]
+
+    def apply_flagtune(self):
+        if self._flagtune_op_name is None:
+            return False
+
+        enabled = runtime.flagtune_enabled(self._flagtune_op_name)
+        if enabled == self._flagtune_active:
+            return False
+
+        if not enabled:
+            self._set_configs_and_strategy(
+                self._flagtune_default_configs,
+                self._flagtune_default_strategy,
+            )
+            self._flagtune_active = False
+            return True
+
+        expand_config = runtime.get_expand_config(
+            self._flagtune_expand_op_name,
+            yaml_path=self._flagtune_yaml_path,
         )
-        strategy: List[Callable[[Any], Any]] = [  # type: ignore[no-redef]
-            LibTuner.get_strategy(s) if isinstance(s, str) else s for s in strategy
-        ]
-        self.strategy: List[Callable[[Any], Any]] = strategy
-        self.config_table_name: str = f"{self.__name__}_{self.kernel_hash}"
-        self.benchmark_table_name: str = f"{self.__name__}_{self.cache_key}_benchmark"
-        # wbj fix:
-        # self.cache: BenchmarkCache = (  # type: ignore[assignment]
-        #     libcache[self.config_table_name]
-        # )
-        self.cache: ConfigCache = libcache[self.config_table_name]
+        configs = runtime.ops_get_configs(
+            self._flagtune_expand_op_name,
+            yaml_path=self._flagtune_yaml_path,
+            pre_hook=self._flagtune_pre_hook,
+        )
+        if expand_config == -1 or not configs:
+            if not self._flagtune_warned:
+                logger.warning(
+                    "FlagTune expand config is unavailable for %s; using default configs.",
+                    self._flagtune_expand_op_name,
+                )
+                self._flagtune_warned = True
+            return False
+
+        self._set_configs_and_strategy(configs, expand_config["strategy"])
+        self._flagtune_active = True
+        return True
 
     @cached_property
     def cache_key(self) -> str:
@@ -398,12 +464,8 @@ class LibTuner(triton.runtime.Autotuner):
     def get(cls, name: str):
         return cls._dispatch_table[name]
 
-    # wbj fix:
-    # @classmethod
-    # def get_strategy(cls, name: str):
-    #     return cls._strategy_table[name]
     @classmethod
-    def get_strategy(cls, name: Optional[str]) -> Callable[[Any], Any]:
+    def get_strategy(cls, name: str):
         return cls._strategy_table[name]
 
     @staticmethod
@@ -412,13 +474,9 @@ class LibTuner(triton.runtime.Autotuner):
     ) -> Type[LibTuner]:
         """A decorator to register a policy for `LibTuner`.
 
-        This decorator allows you to create a new
-        `LibTuner` subclass without defining a new
-        class explicitly. The new subclass will have
-        the `policy` method set to the provided
-        policy function and will be registered under
-        the specified name in the `LibTuner`
-        dispatch table.
+        This decorator allows you to create a new `LibTuner` subclass without defining a new class explicitly.
+        The new subclass will have the `policy` method set to the provided policy function and will be registered under
+        the specified name in the `LibTuner` dispatch table.
         """
 
         def decorator(
@@ -437,7 +495,7 @@ class LibTuner(triton.runtime.Autotuner):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs)
 
-                def policy(  # type: ignore[override]
+                def policy(
                     self,
                     fn: Callable[[triton.Config], List[float]],
                     configs: Iterator[triton.Config],
@@ -448,36 +506,23 @@ class LibTuner(triton.runtime.Autotuner):
 
             return AnonymousLibTunerImpl
 
-        return decorator  # type: ignore[return-value]
+        return decorator
 
-    # wbj fix:
-    # @staticmethod
-    # def register_strategy(name: str):
-    #     def decorator(
-    # strategy: Union[Callable[[Any], Any],
-    # List[Callable[[Any], Any]]],
-    #     ):
-    #         LibTuner._strategy_table[  # type: ignore[assignment]
-    #             name
-    #         ] = strategy
-    #         return strategy
-
-    #     return decorator
     @staticmethod
-    def register_strategy(name: Optional[str]):
+    def register_strategy(name: str):
         def decorator(
-            strategy: Callable[[Any], Any],
-        ) -> Callable[[Any], Any]:
+            strategy: Union[Callable[[Any], Any], List[Callable[[Any], Any]]],
+        ):
             LibTuner._strategy_table[name] = strategy
             return strategy
 
         return decorator
 
-    def run(self, *args, **kwargs):  # type: ignore[override]
-        # `arg_names` corresponds to the arguments
-        # of the `JITFunction`'s signature, so
-        # please make sure the orders of `arg_names`
-        # and `args` match.
+    def run(self, *args, **kwargs):
+        if hasattr(self, "seen_tuned_metas"):
+            self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
+        # `arg_names` corresponds to the arguments of the `JITFunction`'s signature,
+        # so please make sure the orders of `arg_names` and `args` match.
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -495,7 +540,7 @@ class LibTuner(triton.runtime.Autotuner):
                     ret = cache.get(config)
                     if ret is None:
                         ret = self._bench(*args, config=config, **kwargs)
-                        cache[config] = tuple(ret)  # type: ignore[assignment]
+                        cache[config] = tuple(ret)
                     return list(ret)
 
                 best_config, timings = self.policy(
@@ -527,20 +572,16 @@ class LibTuner(triton.runtime.Autotuner):
         self.best_config = config
         if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
             print(
-                f"Triton autotuning for function"
-                f" {self.base_fn.__name__}"
-                f" finished after"
-                f" {self.bench_time:.2f}s;"
-                f" key info: {key},"
-                f" best config selected:"
-                f" {self.best_config};"
+                f"Triton autotuning for function {self.base_fn.__name__} finished after "
+                f"{self.bench_time:.2f}s; key info: {key}, best config selected: {self.best_config};"
             )
-        if config.pre_hook is not None:
-            full_nargs = {
-                **self.nargs,
-                **kwargs,
-                **config.all_kwargs(),
-            }
+        full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+        if (
+            hasattr(self, "shared_config_pre_hook")
+            and self.shared_config_pre_hook is not None
+        ):
+            self.shared_config_pre_hook(full_nargs)
+        elif config.pre_hook is not None:
             config.pre_hook(full_nargs)
         ret = self.fn.run(
             *args,
@@ -564,10 +605,14 @@ def log2_strategy(key: Union[int, float]) -> float:
 
 @LibTuner.register_strategy("align32")
 def align32_strategy(key: Union[int, float]) -> int:
+    if key == 0:
+        return 0
+    if key < 32:
+        return 2 ** math.ceil(math.log2(key))
     return math.ceil(key / 32) * 32
 
 
-@LibTuner.register_policy("default")  # type: ignore[call-arg]
+@LibTuner.register_policy("default")
 def default_policy(
     bench_fn: Callable[[triton.Config], List[float]],
     configs: Iterator[triton.Config],
@@ -582,13 +627,9 @@ def default_policy(
         args: Kernel launch arguments.
         kwargs: Kernel launch arguments.
     Returns:
-        A tuple containing the best configuration
-        and a dictionary of timings for each
-        configuration.
+        A tuple containing the best configuration and a dictionary of timings for each configuration.
 
-    This is one way to implement a default policy
-    for offline autotuning. It's equal to the
-    following
+    This is one way to implement a default policy for offline autotuning. It's equal to the following
     ```
     @LibTuner.register("default")
     class DefaultLibTunerImpl(LibTuner):
@@ -615,16 +656,14 @@ def default_policy(
             best_config: triton.Config = min(timings, key=timings.get)
             return best_config, timings
     ```
-    In this way policies could be extended by
-    registering a definition function quickly, or
-    by creating a new subclass of `LibTuner` and
-    overriding the `policy` method to have more
-    control over the autotuning process.
+    In this way policies could be extended by registering a definition function quickly,
+    or by creating a new subclass of `LibTuner` and overriding the `policy` method to have
+    more control over the autotuning process.
     """
     timings: Dict[triton.Config, float] = {
-        config: bench_fn(config) for config in configs  # type: ignore[misc]
+        config: bench_fn(config) for config in configs
     }
-    best_config: triton.Config = min(timings, key=timings.get)  # type: ignore[type-var]
+    best_config: triton.Config = min(timings, key=timings.get)
     return best_config, timings
 
 
@@ -646,30 +685,24 @@ def libtuner(
     policy: Union[str, Type[LibTuner]] = "default",
     flagtune_op_name=None,
     flagtune_expand_op_name=None,
+    flagtune_yaml_path=None,
+    flagtune_pre_hook=None,
 ):
     """Decorator for triton library autotuner.
 
     `strategy` is a function that takes a key and returns a value.
-    It accepts a string, which is the name of a
-    registered strategy, or a callable function.
-    In this form it will be applied to each key in
-    the `key` list.
-    If it's a tuple or list, it should have the same
-    length as `key`, and each element should be a
-    string or a callable function that takes a key
-    and returns a value.
-    `policy` accepts a string, which is the name of
-    a registered `LibTuner` subclass, or a
-    `LibTuner` subclass itself.
+    It accepts a string, which is the name of a registered strategy, or a callable function.
+    In this form it will be applied to each key in the `key` list.
+    If it's a tuple or list, it should have the same length as `key`,
+    and each element should be a string or a callable function that takes a key and returns a value.
+    `policy` accepts a string, which is the name of a registered `LibTuner` subclass, or a `LibTuner` subclass itself.
     """
 
     if isinstance(policy, str):
         policy = LibTuner.get(policy)
-    assert issubclass(policy, LibTuner), (  # type: ignore[arg-type]
-        f"the class of {policy.__name__} is"  # type: ignore[union-attr]
-        f" {policy.__class__.__name__},"
-        f" not a subclass of {LibTuner.__name__}"
-    )
+    assert issubclass(
+        policy, LibTuner
+    ), f"the class of {policy.__name__} is {policy.__class__.__name__}, not a subclass of {LibTuner.__name__}"
 
     def decorator(fn):
         return policy(
@@ -687,6 +720,10 @@ def libtuner(
             use_cuda_graph=use_cuda_graph,
             do_bench=do_bench,
             strategy=strategy,
+            flagtune_op_name=flagtune_op_name,
+            flagtune_expand_op_name=flagtune_expand_op_name,
+            flagtune_yaml_path=flagtune_yaml_path,
+            flagtune_pre_hook=flagtune_pre_hook,
         )
 
     return decorator
@@ -701,6 +738,8 @@ class LibEntry(triton.KernelInterface):
         self.arg_names = fn.arg_names
         self.divisibility = 16
         self.kernel_cache = tuple(dict() for _ in range(DEVICE_COUNT))
+        self._has_flagtune_tuner = self._contains_flagtune_tuner(fn)
+        self._cpu_cache = dict()
 
         while not isinstance(fn, triton.runtime.JITFunction):
             fn = fn.fn
@@ -718,9 +757,47 @@ class LibEntry(triton.KernelInterface):
         self.lock = multiprocessing.Lock()
         self.signature = fn.signature
 
+    @staticmethod
+    def _contains_flagtune_tuner(fn):
+        while not isinstance(fn, triton.runtime.JITFunction):
+            if (
+                getattr(fn, "apply_flagtune", None) is not None
+                and getattr(fn, "_flagtune_op_name", None) is not None
+            ):
+                return True
+            fn = getattr(fn, "fn", None)
+            if fn is None:
+                break
+        return False
+
+    def _apply_flagtune(self):
+        changed = False
+        fn = self.fn
+        while not isinstance(fn, triton.runtime.JITFunction):
+            apply_flagtune = getattr(fn, "apply_flagtune", None)
+            if apply_flagtune is not None:
+                changed = apply_flagtune() or changed
+            fn = getattr(fn, "fn", None)
+            if fn is None:
+                break
+        if changed:
+            for cache in self.kernel_cache:
+                cache.clear()
+
     def key(self, spec_args, dns_args, const_args):
         def spec_arg(arg):
             if hasattr(arg, "data_ptr"):
+                if runtime.device.vendor_name == "hygon" and hasattr(
+                    triton.backends, "hcu"
+                ):
+                    from triton.backends.hcu.compiler import HIPBackend
+
+                    if hasattr(HIPBackend, "get_tensor_specialization"):
+                        return (
+                            arg.dtype,
+                            arg.data_ptr() % self.divisibility == 0,
+                            HIPBackend.get_tensor_specialization(arg),
+                        )
                 return (arg.dtype, arg.data_ptr() % self.divisibility == 0)
             return (type(arg), arg)
 
@@ -742,6 +819,8 @@ class LibEntry(triton.KernelInterface):
 
     def run(self, *args, **kwargs):
         grid = kwargs["grid"]
+        if self._has_flagtune_tuner:
+            self._apply_flagtune()
 
         # collect all the arguments
         spec_args = []  # specialize arguments
@@ -760,7 +839,7 @@ class LibEntry(triton.KernelInterface):
                     "TensorDescriptor",
                     tuple(arg.shape) if hasattr(arg, "shape") else None,
                     tuple(arg.strides) if hasattr(arg, "strides") else None,
-                    (tuple(arg.block_shape) if hasattr(arg, "block_shape") else None),
+                    tuple(arg.block_shape) if hasattr(arg, "block_shape") else None,
                     arg.padding if hasattr(arg, "padding") else None,
                     # Add other relevant attributes
                 )
@@ -795,12 +874,17 @@ class LibEntry(triton.KernelInterface):
 
         entry_key = self.key(spec_args, dns_args, const_args)
         device = torch_device_fn.current_device()
-        cache = self.kernel_cache[device]
+        # CPU has one device per process and `current_device()` returns the
+        # string "cpu" (can't index into the int-keyed `kernel_cache` tuple).
+        # This branch is CPU-generic — any future x86 / RISC-V CPU backend
+        # reuses the same path; no ARM-specific assumption here.
+        if device == "cpu":
+            cache = self._cpu_cache
+        else:
+            cache = self.kernel_cache[device]
         while entry_key not in cache:
-            # NOTE: we serialize the first run of a
-            # jit function regardless of which device
-            # to run on because Triton runtime is
-            # currently not threadsafe.
+            # NOTE: we serialize the first run of a jit function regardless of which device to run on
+            # because Triton runtime is currently not threadsafe.
             with self.lock:
                 if entry_key in cache:
                     break
@@ -810,6 +894,7 @@ class LibEntry(triton.KernelInterface):
                 constexprs = {}
                 tune_constexprs = {}
                 heur_constexprs = {}
+                launch_pre_hooks = []
                 while not isinstance(fn, triton.runtime.JITFunction):
                     if isinstance(fn, triton.runtime.Autotuner):
                         config = fn.best_config
@@ -818,6 +903,10 @@ class LibEntry(triton.KernelInterface):
                         constexprs["num_ctas"] = config.num_ctas
                         constexprs = {**constexprs, **config.kwargs}
                         tune_constexprs = {**tune_constexprs, **config.kwargs}
+                        if config.pre_hook is not None:
+                            launch_pre_hooks.append(
+                                (config.pre_hook, config.all_kwargs())
+                            )
                     elif isinstance(fn, triton.runtime.Heuristics):
                         for v, heur in fn.values.items():
                             heur_constexprs[v] = heur(
@@ -843,27 +932,32 @@ class LibEntry(triton.KernelInterface):
                     constexprs,
                     tune_constexprs,
                     heur_constexprs,
+                    tuple(launch_pre_hooks),
                 )
             return kernel, constexprs
 
-        kernel, constexprs, tune_constexprs, heur_constexprs = cache[entry_key]
+        (
+            kernel,
+            constexprs,
+            tune_constexprs,
+            heur_constexprs,
+            launch_pre_hooks,
+        ) = cache[entry_key]
 
         if callable(grid):
             # collect all arguments to the grid fn，ie:
             # 1. args,
             # 2. kwargs,
-            # 3. all other captured arguments in
-            # CompiledKernel from Autotunner &
-            # Heuristics. When kwargs & captured args
-            # conflict, captured args have higher
-            # priority
-            meta = {
-                **dict(zip(self.arg_names, args)),
-                **kwargs,
-                **constexprs,
-            }
+            # 3. all all other captured arguments in CompiledKernel from Autotunner & Heuristics
+            # when kwargs & captured args conflict, captured args have higher priority
+            meta = {**dict(zip(self.arg_names, args)), **kwargs, **constexprs}
             grid = grid(meta)
         grid = grid + (1, 1)
+
+        if launch_pre_hooks:
+            hook_nargs = {**dict(zip(self.arg_names, args)), **kwargs}
+            for pre_hook, hook_kwargs in launch_pre_hooks:
+                pre_hook({**hook_nargs, **hook_kwargs})
 
         if major_version == 3 and 3 <= minor_version <= 6:
             all_args = []
@@ -881,11 +975,7 @@ class LibEntry(triton.KernelInterface):
                     missing_keys.append(key)
                 if len(missing_keys):
                     raise RuntimeError(
-                        "[libentry]: probably a"
-                        " bug, the following"
-                        " kernel params where"
-                        " not captured:"
-                        f" {missing_keys}"
+                        f"[libentry]: probably a bug, the following kernel params where not captured: {missing_keys}"
                     )
             kernel[grid[0:3]](*all_args)
         else:
