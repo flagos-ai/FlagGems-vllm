@@ -102,6 +102,25 @@ def is_cuda_available():
 CUDA_AVAILABLE = is_cuda_available()
 
 
+# FP8 fused MoE tests run on NVIDIA Hopper (CUDA_AVAILABLE) or on any other
+# device whose actual capability supports FP8. Instead of hard-coding vendor
+# or architecture tables, probe the active device with a real FP8 round-trip;
+# any failure conservatively disables the FP8 tests.
+def _probe_fp8_support() -> bool:
+    device = flaggems_vllm.device
+    if device == "cuda":
+        return False  # NVIDIA semantics stay with CUDA_AVAILABLE (Hopper)
+    try:
+        src = torch.ones(8, 8, device=device, dtype=torch.float32)
+        _ = src.to(torch.float8_e4m3fn).to(torch.float32)
+        return True
+    except Exception:
+        return False
+
+
+FP8_AVAILABLE = CUDA_AVAILABLE or _probe_fp8_support()
+
+
 def torch_fused_moe_reference(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -240,6 +259,9 @@ def test_fused_moe_vs_vllm(config, dtype):
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights.to(dtype)
+    # Real vLLM inference passes int32 topk_ids; torch.topk returns int64 by
+    # default, so convert to match the production dtype contract.
+    topk_ids = topk_ids.to(torch.int32)
 
     # FlagGems result
     result = flaggems_vllm.ops_experts_impl(
@@ -269,8 +291,8 @@ def test_fused_moe_vs_vllm(config, dtype):
 @pytest.mark.fused_experts_impl
 @pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
 @pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="FP8 quantization requires NVIDIA Hopper architecture",
+    not FP8_AVAILABLE,
+    reason="FP8 quantization requires NVIDIA Hopper or an FP8-capable accelerator",
 )
 def test_accuracy_fused_moe_fp8(config):
     """Test FlagGems fused_moe with FP8 W8A8 quantization."""
@@ -371,8 +393,9 @@ def _fake_quantize_fp8(tensor: torch.Tensor):
     finfo = torch.finfo(torch.float8_e4m3fn)
     fp8_max = finfo.max
     eps = 1e-10
-    # Per-tensor quantization
-    amax = tensor.abs().amax().clamp(min=eps).float()
+    # Per-token quantization (matches the fused Triton quant path in
+    # flaggems_vllm.ops.fused_moe._fp8_quantize: one scale per row)
+    amax = tensor.abs().amax(dim=-1, keepdim=True).clamp(min=eps).float()
     scale = amax / fp8_max
     q = (tensor.float() / scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
     return q.float() * scale  # dequantized
@@ -570,8 +593,8 @@ def torch_w8a8_block_fp8_moe(
 @pytest.mark.parametrize("config", FUSED_MOE_FP8_BLOCKWISE_CONFIGS)
 @pytest.mark.parametrize("block_shape", [[128, 128]])
 @pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="FP8 blockwise quantization requires NVIDIA Hopper architecture",
+    not FP8_AVAILABLE,
+    reason="FP8 blockwise quantization requires NVIDIA Hopper or an FP8-capable accelerator",
 )
 def test_fused_moe_fp8_blockwise(config, block_shape):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config

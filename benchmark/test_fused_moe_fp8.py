@@ -30,6 +30,24 @@ def is_cuda_available():
 
 CUDA_AVAILABLE = is_cuda_available()
 
+
+# FP8 runs on NVIDIA Hopper (CUDA_AVAILABLE) or on any other device whose
+# actual capability supports FP8. Probe the active device with a real FP8
+# round-trip instead of hard-coding vendor/architecture tables.
+def _probe_fp8_support() -> bool:
+    device = flaggems_vllm.device
+    if device == "cuda":
+        return False  # NVIDIA semantics stay with CUDA_AVAILABLE (Hopper)
+    try:
+        src = torch.ones(8, 8, device=device, dtype=torch.float32)
+        _ = src.to(torch.float8_e4m3fn).to(torch.float32)
+        return True
+    except Exception:
+        return False
+
+
+FP8_AVAILABLE = CUDA_AVAILABLE or _probe_fp8_support()
+
 try:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts_impl as vllm_fused_experts_impl,
@@ -76,6 +94,45 @@ class FusedMoEFP8Benchmark(base.Benchmark):
             (64, 256, 7168, 2048, 8),
             (128, 256, 7168, 2048, 8),
             (256, 256, 7168, 2048, 8),
+            # Qwen3.6-35B-A3B (real production shapes, E=256, H=2048, topk=8)
+            (1, 256, 2048, 128, 8),
+            (4, 256, 2048, 128, 8),
+            (16, 256, 2048, 128, 8),
+            (64, 256, 2048, 128, 8),
+            (128, 256, 2048, 128, 8),
+            (256, 256, 2048, 128, 8),
+            (512, 256, 2048, 128, 8),
+            (1024, 256, 2048, 128, 8),
+            (4096, 256, 2048, 128, 8),
+            (1, 256, 2048, 512, 8),
+            (4, 256, 2048, 512, 8),
+            (16, 256, 2048, 512, 8),
+            (64, 256, 2048, 512, 8),
+            (128, 256, 2048, 512, 8),
+            (256, 256, 2048, 512, 8),
+            (512, 256, 2048, 512, 8),
+            (1024, 256, 2048, 512, 8),
+            (4096, 256, 2048, 512, 8),
+            (1035, 256, 2048, 128, 8),
+            (1036, 256, 2048, 128, 8),
+            (2048, 256, 2048, 128, 8),
+            (4107, 256, 2048, 128, 8),
+            (4108, 256, 2048, 128, 8),
+            (4434, 256, 2048, 128, 8),
+            (4435, 256, 2048, 128, 8),
+            (13421, 256, 2048, 128, 8),
+            (13422, 256, 2048, 128, 8),
+            (16384, 256, 2048, 128, 8),
+            (1035, 256, 2048, 512, 8),
+            (1036, 256, 2048, 512, 8),
+            (2048, 256, 2048, 512, 8),
+            (4107, 256, 2048, 512, 8),
+            (4108, 256, 2048, 512, 8),
+            (4434, 256, 2048, 512, 8),
+            (4435, 256, 2048, 512, 8),
+            (13421, 256, 2048, 512, 8),
+            (13422, 256, 2048, 512, 8),
+            (16384, 256, 2048, 512, 8),
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -135,6 +192,9 @@ class FusedMoEFP8Benchmark(base.Benchmark):
             num_tokens, num_experts, device=device, dtype=torch.float32
         )
         topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+        # Real vLLM inference passes int32 topk_ids; torch.topk returns int64 by
+        # default, so convert to match the production dtype contract.
+        topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.to(dtype)
 
@@ -185,8 +245,8 @@ def _gems_fused_moe_fp8_wrapper(
 
 @pytest.mark.fused_experts_impl
 @pytest.mark.skipif(
-    not (HAS_VLLM_FUSED_MOE and CUDA_AVAILABLE),
-    reason="requires vLLM and NVIDIA Hopper architecture for FP8",
+    not (HAS_VLLM_FUSED_MOE and FP8_AVAILABLE),
+    reason="requires vLLM and an FP8-capable device (NVIDIA Hopper or FP8-capable accelerator)",
 )
 def test_fused_moe_fp8():
     """
