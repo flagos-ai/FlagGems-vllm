@@ -13,6 +13,25 @@
         "tests/test_mul.py"
       ]
     },
+    "mthreads-musa520": {
+      "tests_allow": [
+        "tests/test_scaled_int8_quant.py",
+        "tests/test_add_rms_norm.py",
+        "tests/test_silu_and_mul.py",
+        "tests/test_silu_and_mul_with_clamp.py",
+        "tests/test_swiglu.py",
+        "tests/test_reglu.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_scaled_int8_quant.py",
+        "benchmark/test_add_rms_norm.py",
+        "benchmark/test_silu_and_mul.py",
+        "benchmark/test_silu_and_mul_with_clamp.py",
+        "benchmark/test_swiglu.py",
+        "benchmark/test_reglu.py"
+      ]
+    },
     "nvidia-cuda133": {
       "allow_all_tests": true,
       "benchmarks_enabled": true,
