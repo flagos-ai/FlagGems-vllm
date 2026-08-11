@@ -14,5 +14,6 @@
 
 
 from .scaled_int8_quant import scaled_int8_quant
+from .silu_and_mul import silu_and_mul, silu_and_mul_out
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["scaled_int8_quant", "silu_and_mul", "silu_and_mul_out"]
