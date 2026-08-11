@@ -290,7 +290,12 @@ def _run_static(input, scale, azp, sym):
     return output, scale, azp
 
 
-def scaled_int8_quant(input, scale, azp, symmetric):
+def scaled_int8_quant(
+    input: torch.Tensor,
+    scale: torch.Tensor | None = None,
+    azp: torch.Tensor | None = None,
+    symmetric: bool = True,
+):
     if hasattr(symmetric, "item"):
         sym = bool(symmetric.item())
     else:
