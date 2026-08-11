@@ -17,8 +17,8 @@ import logging
 import torch
 import triton
 import triton.language as tl
-from flag_gems.config import use_c_extension
 
+from flaggems_vllm.config import use_c_extension
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
