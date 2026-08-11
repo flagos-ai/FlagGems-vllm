@@ -106,9 +106,7 @@ class SiluAndMul(torch.autograd.Function):
         BLOCK = _select_block_size(numel)
         grid = (triton.cdiv(numel, BLOCK),)
 
-        _silu_and_mul_fwd_kernel[grid](
-            A, B, out, numel, BLOCK=BLOCK, num_warps=4
-        )
+        _silu_and_mul_fwd_kernel[grid](A, B, out, numel, BLOCK=BLOCK, num_warps=4)
         return out
 
     @staticmethod
@@ -139,7 +137,5 @@ def silu_and_mul_out(A, B, out):
     BLOCK = _select_block_size(numel)
     grid = (triton.cdiv(numel, BLOCK),)
 
-    _silu_and_mul_fwd_kernel[grid](
-        A, B, out, numel, BLOCK=BLOCK, num_warps=4
-    )
+    _silu_and_mul_fwd_kernel[grid](A, B, out, numel, BLOCK=BLOCK, num_warps=4)
     return out
