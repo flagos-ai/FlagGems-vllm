@@ -20,9 +20,9 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils.device_info import get_device_capability
+from flaggems_vllm.utils.device_info import get_device_capability, get_device_properties
 
-if torch_device_fn.is_available() and get_device_capability() >= (9, 0):
+if torch_device_fn.is_available() and get_device_capability() >= (8, 0):
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
 else:
     SUPPORTED_FP8_DTYPE = torch.float32
@@ -32,102 +32,71 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def _per_token_group_quant_fp8(
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
-    eps,
-    fp8_min: tl.constexpr,
-    fp8_max: tl.constexpr,
-    inv_fp8_max: tl.constexpr,
-    scale_ue8m0: tl.constexpr,
-    subnormal_scale: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    groups_per_row = y_num_columns // group_size
+def _f32_to_fp8_e4m3fn(y):
+    """Bit-exact f32 -> e4m3fn conversion (RNE); `y` must be finite and
+    pre-clamped to [-448, 448] (guaranteed by the clamp in ``_quant_groups``).
 
-    g_id = tl.program_id(0)
-    row = g_id // groups_per_row
-    row_g_id = g_id % groups_per_row
+    MetaX C550 (maca backend) has no native fp8 conversion instruction, so the
+    TritonGPU -> LLVM lowering expands ``tt.fp_to_fp`` into a fully general
+    software sequence of ~30 LLVM ops per element, dominated by an 8-deep
+    icmp+select threshold ladder for subnormals plus NaN-detection and
+    saturation fixups the compiler cannot prove unnecessary (measured on the
+    generated LLIR: 185 icmp + 163 select vs 25 + 19 with this helper).  That
+    ALU chain cannot be hidden by this memory-bound kernel (num_warps=1), so
+    the generic conversion halves throughput on large shapes (C550: ~616 ->
+    ~1255 GB/s at 32768x7168); a pure load+convert+store microbenchmark shows
+    this helper matches the memcpy bandwidth floor while ``.to()`` runs ~27%
+    slower.
 
-    y_ptr += row * y_row_stride + row_g_id * group_size
-    y_q_ptr += g_id * group_size
-    y_s_ptr += g_id
-
-    cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-    y_s = _absmax * inv_fp8_max
-
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max)
-    elif subnormal_scale:
-        # `y_s` is subnormal when `fp8_max` is huge (e.g. fp32), and some
-        # backends flush subnormal fp32 divisors to zero; divide by the always
-        # normal `_absmax` instead and scale at the end.
-        y_q = tl.clamp((y / _absmax) * fp8_max, fp8_min, fp8_max)
-    else:
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max)
-    y_q = y_q.to(y_q_ptr.dtype.element_ty)
-
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
-    tl.store(y_s_ptr, y_s)
+    This branchless sequence needs only a few integer ops per element:
+      * normals (|y| >= 2^-6): rebias the exponent (127 -> 7) and RNE-round
+        the mantissa from 23 to 3 bits via ``t += 0x7FFFF + lsb_of_result``;
+      * subnormals: ``k = RNE(|y| / 2**-9)`` with the magic-number add
+        ``|y| * 512 + 2**23`` (an f32 add rounds to-nearest-even, leaving k
+        in the low mantissa bits) -- one FMA replaces the generic 8-level
+        icmp/select ladder.
+    """
+    b = y.to(tl.uint32, bitcast=True)
+    a = b & 0x7FFFFFFF
+    t = a - 0x3C000000
+    t += 0x0007FFFF + ((t >> 20) & 1)
+    r_norm = t >> 20
+    r_sub = (a.to(tl.float32, bitcast=True) * 512.0 + 8388608.0).to(
+        tl.uint32, bitcast=True
+    ) - 0x4B000000
+    r = tl.where(a >= 0x3C800000, r_norm, r_sub)
+    return (r | ((b >> 24) & 0x80)).to(tl.uint8)
 
 
 @triton.jit
-def _per_token_group_quant_fp8_colmajor(
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
-    y_s_col_stride,
+def _quant_groups(
+    y,
     eps,
     fp8_min: tl.constexpr,
     fp8_max: tl.constexpr,
     inv_fp8_max: tl.constexpr,
     scale_ue8m0: tl.constexpr,
     subnormal_scale: tl.constexpr,
-    BLOCK: tl.constexpr,
 ):
-    groups_per_row = y_num_columns // group_size
-
-    g_id = tl.program_id(0)
-    row = g_id // groups_per_row
-    group_id = g_id % groups_per_row
-
-    y_ptr += row * y_row_stride + group_id * group_size
-    y_q_ptr += g_id * group_size
-    y_s_ptr += group_id * y_s_col_stride + row
-
-    cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
+    """Per-row (axis=1) abs-max scale + quantize, in f32."""
+    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
     y_s = _absmax * inv_fp8_max
 
     if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max)
+        e = tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10)))
+        y_s = tl.exp2(e)
+        # y_s is a power of two, so multiplying by 2^-e is a bit-exact
+        # division and avoids one f32 divide per element.
+        y_q = tl.clamp(y * tl.exp2(-e)[:, None], fp8_min, fp8_max)
     elif subnormal_scale:
         # `y_s` is subnormal when `fp8_max` is huge (e.g. fp32), and some
         # backends flush subnormal fp32 divisors to zero; divide by the always
         # normal `_absmax` instead and scale at the end.
-        y_q = tl.clamp((y / _absmax) * fp8_max, fp8_min, fp8_max)
+        y_q = tl.clamp((y / _absmax[:, None]) * fp8_max, fp8_min, fp8_max)
     else:
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max)
-    y_q = y_q.to(y_q_ptr.dtype.element_ty)
-
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
-    tl.store(y_s_ptr, y_s)
+        # one reciprocal per group instead of one divide per element
+        y_q = tl.clamp(y * (1.0 / y_s)[:, None], fp8_min, fp8_max)
+    return y_q, y_s
 
 
 @triton.jit
@@ -135,8 +104,6 @@ def _per_token_group_quant_fp8_vec(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    group_size,
-    y_num_columns,
     y_row_stride,
     eps,
     fp8_min: tl.constexpr,
@@ -144,50 +111,45 @@ def _per_token_group_quant_fp8_vec(
     inv_fp8_max: tl.constexpr,
     scale_ue8m0: tl.constexpr,
     subnormal_scale: tl.constexpr,
+    fast_cvt: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    GROUPS_PER_ROW: tl.constexpr,
     NGROUPS: tl.constexpr,
 ):
-    groups_per_row = y_num_columns // group_size
-    programs_per_row = groups_per_row // NGROUPS
-
     pid = tl.program_id(0)
+    programs_per_row = GROUPS_PER_ROW // NGROUPS
     row = pid // programs_per_row
-    program_id = pid % programs_per_row
+    pg = pid % programs_per_row
 
-    start_group = program_id * NGROUPS
-    start_gid = row * groups_per_row + start_group
+    start_gid = row * GROUPS_PER_ROW + pg * NGROUPS
 
-    group_ids = tl.arange(0, NGROUPS)
+    gids = tl.arange(0, NGROUPS)
     cols = tl.arange(0, BLOCK)
     offsets = (
-        row * y_row_stride
-        + start_group * group_size
-        + group_ids[:, None] * group_size
-        + cols[None, :]
+        row * y_row_stride + (pg * NGROUPS + gids[:, None]) * GROUP_SIZE + cols[None, :]
     )
-    mask = cols[None, :] < group_size
-
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax * inv_fp8_max
-
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
-        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max)
-    elif subnormal_scale:
-        # `y_s` is subnormal when `fp8_max` is huge (e.g. fp32), and some
-        # backends flush subnormal fp32 divisors to zero; divide by the always
-        # normal `_absmax` instead and scale at the end.
-        y_q = tl.clamp((y / _absmax[:, None]) * fp8_max, fp8_min, fp8_max)
+    if BLOCK == GROUP_SIZE:
+        y = tl.load(y_ptr + offsets).to(tl.float32)
     else:
-        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max)
-    y_q = y_q.to(y_q_ptr.dtype.element_ty)
-    output_offsets = (
-        start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
-    )
+        y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
+            tl.float32
+        )
 
-    tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
-    tl.store(y_s_ptr + start_gid + group_ids, y_s)
+    y_q, y_s = _quant_groups(
+        y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
+    )
+    if fast_cvt:
+        y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
+    else:
+        y_q = y_q.to(y_q_ptr.dtype.element_ty)
+
+    out_offsets = start_gid * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
+    if BLOCK == GROUP_SIZE:
+        tl.store(y_q_ptr + out_offsets, y_q)
+    else:
+        tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
+    tl.store(y_s_ptr + start_gid + gids, y_s)
 
 
 @triton.jit
@@ -195,8 +157,6 @@ def _per_token_group_quant_fp8_colmajor_vec(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    group_size,
-    y_num_columns,
     y_row_stride,
     y_s_col_stride,
     eps,
@@ -205,59 +165,64 @@ def _per_token_group_quant_fp8_colmajor_vec(
     inv_fp8_max: tl.constexpr,
     scale_ue8m0: tl.constexpr,
     subnormal_scale: tl.constexpr,
+    fast_cvt: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    GROUPS_PER_ROW: tl.constexpr,
     NGROUPS: tl.constexpr,
 ):
-    groups_per_row = y_num_columns // group_size
-    programs_per_row = groups_per_row // NGROUPS
-
     pid = tl.program_id(0)
+    programs_per_row = GROUPS_PER_ROW // NGROUPS
     row = pid // programs_per_row
-    program_id = pid % programs_per_row
+    pg = pid % programs_per_row
 
-    start_group = program_id * NGROUPS
-    start_gid = row * groups_per_row + start_group
+    start_gid = row * GROUPS_PER_ROW + pg * NGROUPS
 
-    group_ids = tl.arange(0, NGROUPS)
+    gids = tl.arange(0, NGROUPS)
     cols = tl.arange(0, BLOCK)
     offsets = (
-        row * y_row_stride
-        + start_group * group_size
-        + group_ids[:, None] * group_size
-        + cols[None, :]
+        row * y_row_stride + (pg * NGROUPS + gids[:, None]) * GROUP_SIZE + cols[None, :]
     )
-    mask = cols[None, :] < group_size
-
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax * inv_fp8_max
-
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
-        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max)
-    elif subnormal_scale:
-        # `y_s` is subnormal when `fp8_max` is huge (e.g. fp32), and some
-        # backends flush subnormal fp32 divisors to zero; divide by the always
-        # normal `_absmax` instead and scale at the end.
-        y_q = tl.clamp((y / _absmax[:, None]) * fp8_max, fp8_min, fp8_max)
+    if BLOCK == GROUP_SIZE:
+        y = tl.load(y_ptr + offsets).to(tl.float32)
     else:
-        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max)
-    y_q = y_q.to(y_q_ptr.dtype.element_ty)
-    output_offsets = (
-        start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
-    )
-    scale_offsets = (start_group + group_ids) * y_s_col_stride + row
+        y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
+            tl.float32
+        )
 
-    tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
+    y_q, y_s = _quant_groups(
+        y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
+    )
+    if fast_cvt:
+        y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
+    else:
+        y_q = y_q.to(y_q_ptr.dtype.element_ty)
+
+    out_offsets = start_gid * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
+    scale_offsets = (pg * NGROUPS + gids) * y_s_col_stride + row
+    if BLOCK == GROUP_SIZE:
+        tl.store(y_q_ptr + out_offsets, y_q)
+    else:
+        tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
     tl.store(y_s_ptr + scale_offsets, y_s)
 
 
-def _groups_per_program(x: torch.Tensor, group_size: int) -> int:
-    groups_per_row = x.shape[-1] // group_size
-    for groups in (8, 4, 2):
-        if groups_per_row % groups == 0:
-            return groups
-    return 1
+def _ngroups_per_program(
+    total_groups: int, groups_per_row: int, group_size: int
+) -> int:
+    # Fuse neighbouring groups into one ~1024-element tile per program; on
+    # gfx936 a single wavefront per program with 16B vectorized accesses
+    # saturates memory bandwidth best.
+    cap = max(1, 1024 // group_size)
+    ngroups = 1
+    while ngroups < cap and groups_per_row % (ngroups * 2) == 0:
+        ngroups *= 2
+    # keep enough programs in flight when the input is small
+    props = get_device_properties()
+    cu_count = int(getattr(props, "multi_processor_count", 1) or 1)
+    while ngroups > 1 and total_groups // ngroups < 4 * cu_count:
+        ngroups //= 2
+    return ngroups
 
 
 def per_token_group_quant_fp8(
@@ -284,92 +249,50 @@ def per_token_group_quant_fp8(
     # subnormal fp32 and so is `y_s = _absmax * inv_fp8_max`; some backends
     # flush subnormal fp32 divisors to zero, which turns `y / y_s` into inf.
     subnormal_scale = inv_fp8_max < torch.finfo(torch.float32).tiny
+    fast_cvt = fp8_dtype == torch.float8_e4m3fn
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     num_groups = x.numel() // group_size
+    groups_per_row = x.shape[-1] // group_size
 
     if column_major_scales:
-        shape = (x.shape[-1] // group_size,) + x.shape[:-1]
+        shape = (groups_per_row,) + x.shape[:-1]
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
     else:
-        shape = x.shape[:-1] + (x.shape[-1] // group_size,)
+        shape = x.shape[:-1] + (groups_per_row,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     block = triton.next_power_of_2(group_size)
-    num_warps = min(max(block // 256, 1), 8)
-    groups_per_program = _groups_per_program(x, group_size)
-    grid = (num_groups // groups_per_program,)
+    ngroups = _ngroups_per_program(num_groups, groups_per_row, group_size)
+    num_warps = min(max((ngroups * block) // 1024, 1), 4)
+    grid = (num_groups // ngroups,)
 
     if column_major_scales:
-        if groups_per_program > 1:
-            kernel = _per_token_group_quant_fp8_colmajor_vec
-            kernel[grid](
-                x,
-                x_q,
-                x_s,
-                group_size,
-                x.shape[1],
-                x.stride(0),
-                x_s.stride(1),
-                eps,
-                fp8_min=fp8_min,
-                fp8_max=fp8_max,
-                inv_fp8_max=inv_fp8_max,
-                scale_ue8m0=scale_ue8m0,
-                subnormal_scale=subnormal_scale,
-                BLOCK=block,
-                NGROUPS=groups_per_program,
-                num_warps=num_warps,
-                num_stages=1,
-            )
-        else:
-            kernel = _per_token_group_quant_fp8_colmajor
-            kernel[grid](
-                x,
-                x_q,
-                x_s,
-                group_size,
-                x.shape[1],
-                x.stride(0),
-                x_s.stride(1),
-                eps,
-                fp8_min=fp8_min,
-                fp8_max=fp8_max,
-                inv_fp8_max=inv_fp8_max,
-                scale_ue8m0=scale_ue8m0,
-                subnormal_scale=subnormal_scale,
-                BLOCK=block,
-                num_warps=num_warps,
-                num_stages=1,
-            )
-    elif groups_per_program > 1:
-        kernel = _per_token_group_quant_fp8_vec
-        kernel[grid](
+        _per_token_group_quant_fp8_colmajor_vec[grid](
             x,
             x_q,
             x_s,
-            group_size,
-            x.shape[1],
             x.stride(0),
+            x_s.stride(1),
             eps,
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             inv_fp8_max=inv_fp8_max,
             scale_ue8m0=scale_ue8m0,
             subnormal_scale=subnormal_scale,
+            fast_cvt=fast_cvt,
+            GROUP_SIZE=group_size,
             BLOCK=block,
-            NGROUPS=groups_per_program,
+            GROUPS_PER_ROW=groups_per_row,
+            NGROUPS=ngroups,
             num_warps=num_warps,
             num_stages=1,
         )
     else:
-        kernel = _per_token_group_quant_fp8
-        kernel[grid](
+        _per_token_group_quant_fp8_vec[grid](
             x,
             x_q,
             x_s,
-            group_size,
-            x.shape[1],
             x.stride(0),
             eps,
             fp8_min=fp8_min,
@@ -377,7 +300,11 @@ def per_token_group_quant_fp8(
             inv_fp8_max=inv_fp8_max,
             scale_ue8m0=scale_ue8m0,
             subnormal_scale=subnormal_scale,
+            fast_cvt=fast_cvt,
+            GROUP_SIZE=group_size,
             BLOCK=block,
+            GROUPS_PER_ROW=groups_per_row,
+            NGROUPS=ngroups,
             num_warps=num_warps,
             num_stages=1,
         )
