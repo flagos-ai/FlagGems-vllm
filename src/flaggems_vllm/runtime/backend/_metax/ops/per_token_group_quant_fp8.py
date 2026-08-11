@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils.device_info import get_device_capability, get_device_properties
+from flaggems_vllm.utils.device_info import get_device_capability, get_sm_count
 
 if torch_device_fn.is_available() and get_device_capability() >= (8, 0):
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
@@ -127,7 +127,9 @@ def _per_token_group_quant_fp8_vec(
     gids = tl.arange(0, NGROUPS)
     cols = tl.arange(0, BLOCK)
     offsets = (
-        row * y_row_stride + (pg * NGROUPS + gids[:, None]) * GROUP_SIZE + cols[None, :]
+        row.to(tl.int64) * y_row_stride
+        + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
+        + cols[None, :]
     )
     if BLOCK == GROUP_SIZE:
         y = tl.load(y_ptr + offsets).to(tl.float32)
@@ -144,7 +146,9 @@ def _per_token_group_quant_fp8_vec(
     else:
         y_q = y_q.to(y_q_ptr.dtype.element_ty)
 
-    out_offsets = start_gid * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
+    out_offsets = (
+        start_gid.to(tl.int64) * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
+    )
     if BLOCK == GROUP_SIZE:
         tl.store(y_q_ptr + out_offsets, y_q)
     else:
@@ -181,7 +185,9 @@ def _per_token_group_quant_fp8_colmajor_vec(
     gids = tl.arange(0, NGROUPS)
     cols = tl.arange(0, BLOCK)
     offsets = (
-        row * y_row_stride + (pg * NGROUPS + gids[:, None]) * GROUP_SIZE + cols[None, :]
+        row.to(tl.int64) * y_row_stride
+        + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
+        + cols[None, :]
     )
     if BLOCK == GROUP_SIZE:
         y = tl.load(y_ptr + offsets).to(tl.float32)
@@ -198,7 +204,9 @@ def _per_token_group_quant_fp8_colmajor_vec(
     else:
         y_q = y_q.to(y_q_ptr.dtype.element_ty)
 
-    out_offsets = start_gid * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
+    out_offsets = (
+        start_gid.to(tl.int64) * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
+    )
     scale_offsets = (pg * NGROUPS + gids) * y_s_col_stride + row
     if BLOCK == GROUP_SIZE:
         tl.store(y_q_ptr + out_offsets, y_q)
@@ -210,16 +218,15 @@ def _per_token_group_quant_fp8_colmajor_vec(
 def _ngroups_per_program(
     total_groups: int, groups_per_row: int, group_size: int
 ) -> int:
-    # Fuse neighbouring groups into one ~1024-element tile per program; on
-    # gfx936 a single wavefront per program with 16B vectorized accesses
+    # Fuse neighbouring groups into one ~1024-element tile per program; on the
+    # MetaX C550 a single wavefront per program with 16B vectorized accesses
     # saturates memory bandwidth best.
     cap = max(1, 1024 // group_size)
     ngroups = 1
     while ngroups < cap and groups_per_row % (ngroups * 2) == 0:
         ngroups *= 2
     # keep enough programs in flight when the input is small
-    props = get_device_properties()
-    cu_count = int(getattr(props, "multi_processor_count", 1) or 1)
+    cu_count = get_sm_count()
     while ngroups > 1 and total_groups // ngroups < 4 * cu_count:
         ngroups //= 2
     return ngroups
@@ -240,6 +247,13 @@ def per_token_group_quant_fp8(
         f"by `group_size` {group_size}"
     )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
+    # The kernels flatten the leading dims into rows addressed by one uniform
+    # row stride; reject layouts that do not collapse that way instead of
+    # silently reading wrong addresses.
+    assert (
+        x.dim() <= 2 or x.is_contiguous()
+    ), "`x` with more than 2 dims must be contiguous"
+    row_stride = x.stride(-2) if x.dim() >= 2 else 0
 
     finfo = torch.finfo(fp8_dtype)
     fp8_min = finfo.min
@@ -256,6 +270,7 @@ def per_token_group_quant_fp8(
     groups_per_row = x.shape[-1] // group_size
 
     if column_major_scales:
+        assert x.dim() == 2, "column_major_scales only supports a 2-dim `x`"
         shape = (groups_per_row,) + x.shape[:-1]
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
     else:
@@ -272,7 +287,7 @@ def per_token_group_quant_fp8(
             x,
             x_q,
             x_s,
-            x.stride(0),
+            row_stride,
             x_s.stride(1),
             eps,
             fp8_min=fp8_min,
@@ -293,7 +308,7 @@ def per_token_group_quant_fp8(
             x,
             x_q,
             x_s,
-            x.stride(0),
+            row_stride,
             eps,
             fp8_min=fp8_min,
             fp8_max=fp8_max,
