@@ -70,9 +70,7 @@ def topk_gating_softmax_kernel(
             selected_sum += curr_max
 
         probs = tl.where(
-            cols[None, :] == (curr_arg[:, None] - start_expert),
-            -float("inf"),
-            probs,
+            cols[None, :] == (curr_arg[:, None] - start_expert), -float("inf"), probs
         )
 
     if renormalize:

@@ -91,6 +91,8 @@ class ConfigLoader(object):
             "num_stages": current_config["num_stages"],
             "num_ctas": current_config["num_ctas"],
         }
+        if "maxnreg" in single_config:
+            kwargs["maxnreg"] = single_config["maxnreg"]
         if (
             self.device.vendor_name == "hygon"
             and "num_ldmatrixes" in inspect.signature(triton.Config).parameters
@@ -263,6 +265,7 @@ class ConfigLoader(object):
             ]
 
         if op_name == "fused_marlin_moe_mxfp4":
+            maxnreg_values = ranges.get("maxnreg", [None])
             return [
                 triton.Config(
                     {
@@ -272,11 +275,33 @@ class ConfigLoader(object):
                     num_stages=s,
                     num_warps=w,
                     pre_hook=pre_hook,
+                    **({} if maxnreg is None else {"maxnreg": maxnreg}),
                 )
                 for block_size_n in ranges["BLOCK_SIZE_N"]
                 for group_size_m in ranges["GROUP_SIZE_M"]
                 for s in ranges["s"]
                 for w in ranges["w"]
+                for maxnreg in maxnreg_values
+            ]
+
+        if op_name == "fused_marlin_moe_mxfp4_gemm_silu":
+            maxnreg_values = ranges.get("maxnreg", [None])
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_SIZE_N": block_size_n,
+                        "GROUP_SIZE_M": group_size_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                    **({} if maxnreg is None else {"maxnreg": maxnreg}),
+                )
+                for block_size_n in ranges["BLOCK_SIZE_N"]
+                for group_size_m in ranges["GROUP_SIZE_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+                for maxnreg in maxnreg_values
             ]
 
         if op_name == "w8a8_block_fp8_bmm":
@@ -471,6 +496,12 @@ class ConfigLoader(object):
                 "fused_marlin_moe_mxfp4",
                 expand_yaml_path=self._get_expand_config_path("fused_marlin_moe_mxfp4"),
             ),
+            "fused_marlin_moe_mxfp4_gemm_silu": self._build_single_expand_spec(
+                "fused_marlin_moe_mxfp4_gemm_silu",
+                expand_yaml_path=self._get_expand_config_path(
+                    "fused_marlin_moe_mxfp4_gemm_silu"
+                ),
+            ),
             "gemv": self._build_single_expand_spec("gemv"),
             "mm": self._build_single_expand_spec(
                 "mm", expand_yaml_path=self._get_expand_config_path("mm")
@@ -553,14 +584,14 @@ class ConfigLoader(object):
             current_step = cur_state.get("current_step")
 
             if current_step == final_step:
-                all_configs.append(
-                    triton.Config(
-                        cur_config["META"],
-                        num_warps=cur_config["num_warps"],
-                        num_stages=cur_config["num_stages"],
-                        num_ctas=cur_config["num_ctas"],
-                    )
-                )
+                triton_kwargs = {
+                    "num_warps": cur_config["num_warps"],
+                    "num_stages": cur_config["num_stages"],
+                    "num_ctas": cur_config["num_ctas"],
+                }
+                if "maxnreg" in cur_config:
+                    triton_kwargs["maxnreg"] = cur_config["maxnreg"]
+                all_configs.append(triton.Config(cur_config["META"], **triton_kwargs))
             else:
                 cur_entry = iteration_plan[current_step]
                 cur_key = cur_entry["key"]
@@ -658,6 +689,12 @@ class ConfigLoader(object):
                 ranges[mapped_key.upper()] = gen_config[mapped_key]
             ranges["s"] = gen_config[param_map.get("num_stages")]
             ranges["w"] = gen_config[param_map.get("num_warps")]
+
+            extra_config_keys = ["maxnreg"]
+            for key in extra_config_keys:
+                source = param_map.get(key)
+                if source and source in gen_config:
+                    ranges[source] = gen_config[source]
 
             return {
                 "ranges": ranges,

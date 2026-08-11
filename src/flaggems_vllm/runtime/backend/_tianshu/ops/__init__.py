@@ -13,12 +13,14 @@
 # limitations under the License.
 
 
-from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
-from .scaled_int8_quant import scaled_int8_quant
+from .fused_moe import (  # noqa: F401
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
-    "scaled_int8_quant",
 ]

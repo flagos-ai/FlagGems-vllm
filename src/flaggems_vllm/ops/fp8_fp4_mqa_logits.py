@@ -226,9 +226,6 @@ def fp8_fp4_mqa_logits(
         logits.stride(1),
         weights.stride(0),
         weights.stride(1),
-        BLOCK_M=8,
-        BLOCK_N=128,
-        HEAD_BLOCK=8,
     )
 
     if clean_logits:
