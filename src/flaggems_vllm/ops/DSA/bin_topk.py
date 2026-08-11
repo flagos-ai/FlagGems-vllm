@@ -208,9 +208,7 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
         )
         l_threshold_bin_id = cond.argmax(0)
         l_new_topk -= tl.where(
-            tl.arange(0, HISTOGRAM_SIZE) == l_threshold_bin_id + 1,
-            s_histogram,
-            0,
+            tl.arange(0, HISTOGRAM_SIZE) == l_threshold_bin_id + 1, s_histogram, 0
         ).max(0)
         thre_bin_sum, old_thre_bin_sum = 0, thre_bin_sum
 
@@ -259,9 +257,7 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
             )
             s_input_mask = s_input_idx_mask
             tl.store(
-                indices_base + sum + tl.arange(0, BSS),
-                input_idx,
-                mask=s_input_mask,
+                indices_base + sum + tl.arange(0, BSS), input_idx, mask=s_input_mask
             )
             sum += BSS
 
@@ -1060,11 +1056,7 @@ def kernel_tle_bucket_sort_topk(
                     mask=take,
                     other=0,
                 )
-                tl.store(
-                    tle.gpu.local_ptr(s_out_indices, (dst_pos,)),
-                    idx_i,
-                    mask=take,
-                )
+                tl.store(tle.gpu.local_ptr(s_out_indices, (dst_pos,)), idx_i, mask=take)
             tl.store(s_found_topk_values_ptr, K)
 
     flush_chunks: tl.constexpr = (K + BLOCK_SIZE - 1) // BLOCK_SIZE

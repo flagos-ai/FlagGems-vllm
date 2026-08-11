@@ -274,3 +274,194 @@ gated_activation:
       - 8
     block_n:
       - 1024
+scaled_int8_quant_static:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 256
+      - 512
+      - 1024
+    warps:
+      - 4
+      - 8
+      - 16
+    stages:
+      - 2
+      - 3
+      - 4
+
+scaled_int8_quant_dynamic:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    warps:
+      - 4
+      - 8
+      - 16
+    stages:
+      - 3
+      - 4
+      - 5
+
+scaled_int8_quant_dynamic_single:
+  - gen: true
+    param_map:
+      META:
+        PLACEHOLDER_UNUSED: placeholder
+      num_warps: warps
+      num_stages: stages
+    placeholder:
+      - 1
+    warps:
+      - 2
+      - 4
+      - 8
+      - 16
+    stages:
+      - 1
+      - 2
+      - 3
+
+scaled_int8_quant_dynamic_main_tail:
+  - gen: true
+    param_map:
+      META:
+        PLACEHOLDER_UNUSED: placeholder
+      num_warps: warps
+      num_stages: stages
+    placeholder:
+      - 1
+    warps:
+      - 4
+      - 8
+      - 16
+    stages:
+      - 1
+      - 2
+      - 3
+
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 8
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK: 16
+      TPP: 4
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BLOCK: 16
+      TPP: 2
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 2
+    num_stages: 3
+fused_marlin_moe_mxfp4:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE_N: block_size_n
+        GROUP_SIZE_M: 1
+      num_stages: stages
+      num_warps: warps
+      maxnreg: 255
+    block_size_n: [16, 32, 64]
+    stages: [4, 5, 6]
+    warps: [2, 4]
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 5
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 5
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 64
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE_N: block_size_n
+        GROUP_SIZE_M: group_size_m
+      num_stages: stages
+      num_warps: warps
+      maxnreg: 255
+    block_size_n: [128, 256]
+    group_size_m: [1, 4]
+    stages: [2, 3, 4]
+    warps: [4, 8]
+
+fused_marlin_moe_mxfp4_gemm_silu:
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 4
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 2
+    num_stages: 5
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
+    num_warps: 4
+    num_stages: 4
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 1}
+    num_warps: 4
+    num_stages: 3
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 1}
+    num_warps: 4
+    num_stages: 4
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 128, GROUP_SIZE_M: 1}
+    num_warps: 4
+    num_stages: 3
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 128, GROUP_SIZE_M: 1}
+    num_warps: 4
+    num_stages: 4
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 128, GROUP_SIZE_M: 4}
+    num_warps: 4
+    num_stages: 4
+    maxnreg: 255
+  - META: {BLOCK_SIZE_N: 256, GROUP_SIZE_M: 4}

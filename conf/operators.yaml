@@ -892,6 +892,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: persistent_topk
+    description: |
+      vLLM-compatible persistent topk decode. Triton implementation supporting
+      three dispatch tiers (decode/medium/large) based on seq_len, with
+      cooperative multi-CTA kernels for large sequences.
+    for:
+      - _C.persistent_topk
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: top_k_per_row_prefill
     description: |
       Triton top-K per row for DeepSeek V4 sparse attention prefill phase.
