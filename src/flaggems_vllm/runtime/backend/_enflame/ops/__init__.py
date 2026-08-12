@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from .add import add, add_out
 from .scaled_int8_quant import scaled_int8_quant
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["add", "add_out", "scaled_int8_quant"]

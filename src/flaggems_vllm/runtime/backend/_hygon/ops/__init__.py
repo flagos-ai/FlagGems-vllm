@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from .add import add, add_out
 from .fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
@@ -22,6 +23,8 @@ from .scaled_int8_quant import scaled_int8_quant
 from .triton_scaled_mm import triton_scaled_mm
 
 __all__ = [
+    "add",
+    "add_out",
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",

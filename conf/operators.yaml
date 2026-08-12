@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Pull Request for test.
 
 ops:
   - id: act_quant_triton
@@ -23,6 +24,28 @@ ops:
       - Quantization
     stages:
       - beta: '5.3'
+  - id: add
+    description: Adds `other`, scaled by `alpha`, to `input`.
+    for:
+      - add.Tensor
+    labels:
+      - aten
+      - pointwise
+    kind:
+      - Math
+    stages:
+      - stable: '1.0'
+  - id: add_
+    description: The in-place version of `add()`.
+    for:
+      - add_.Tensor
+    labels:
+      - aten
+      - pointwise
+    kind:
+      - Math
+    stages:
+      - stable: '1.0'
   - id: add_rms_norm
     description: |
       Add two inputs element-wise and apply Root Mean Square Layer Normalization.

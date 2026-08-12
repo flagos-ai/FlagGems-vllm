@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from .add import add, add_out
 from .fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
@@ -20,6 +21,8 @@ from .fused_moe import (  # noqa: F401
 )
 
 __all__ = [
+    "add",
+    "add_out",
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
