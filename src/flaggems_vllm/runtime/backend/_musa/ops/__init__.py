@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
+from .add import add, add_out
 from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
 
 __all__ = [
+    "add",
+    "add_out",
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",

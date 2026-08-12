@@ -8,13 +8,100 @@
     "benchmarks_allow": []
   },
   "backends": {
+    "aipu": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "amd": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "arm": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "ascend": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "cambricon": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "enflame": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "hygon": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
     "iluvatar": {
       "tests_allow": [
+        "tests/test_add.py",
         "tests/test_mul.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "kunlunxin": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "metax": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
       ]
     },
     "mthreads-musa520": {
       "tests_allow": [
+        "tests/test_add.py",
         "tests/test_scaled_int8_quant.py",
         "tests/test_add_rms_norm.py",
         "tests/test_silu_and_mul.py",
@@ -24,6 +111,7 @@
       ],
       "benchmarks_enabled": true,
       "benchmarks_allow": [
+        "benchmark/test_add.py",
         "benchmark/test_scaled_int8_quant.py",
         "benchmark/test_add_rms_norm.py",
         "benchmark/test_silu_and_mul.py",
@@ -32,10 +120,64 @@
         "benchmark/test_reglu.py"
       ]
     },
+    "musa": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
     "nvidia-cuda133": {
       "allow_all_tests": true,
       "benchmarks_enabled": true,
       "allow_all_benchmarks": true
+    },
+    "spacemit": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "sunrise": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "thead": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "tianshu": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
+    },
+    "tsingmicro": {
+      "tests_allow": [
+        "tests/test_add.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_add.py"
+      ]
     }
   }
 }
