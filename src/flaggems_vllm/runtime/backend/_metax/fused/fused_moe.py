@@ -5,7 +5,6 @@
 
 import contextlib
 import threading
-from typing import Any
 
 import flaggems_vllm.ops.fused_moe as generic_fused_moe
 
@@ -17,14 +16,7 @@ _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 _DIRECT_SUM_DISABLED_MIN_TOKENS = 1 << 60
 
 
-def _is_qwen_moe_shape(
-    E: int,
-    N: int,
-    K: int,
-    topk: int,
-    dtype: str | None,
-    gemm_stage: str,
-) -> bool:
+def _is_qwen_moe_shape(E, N, K, topk, dtype, gemm_stage):
     if dtype not in _PLAIN_HALF_CONFIG_DTYPES:
         return False
     if E == 512 and topk == 10:
@@ -37,16 +29,16 @@ def _is_qwen_moe_shape(
 
 
 def _metax_get_default_config(
-    M: int,
-    E: int,
-    N: int,
-    K: int,
-    topk: int,
-    dtype: str | None,
-    block_shape: list[int] | None = None,
-    gemm_stage: str = "gemm1",
-    enable_gemm_fast_path: bool = False,
-) -> dict[str, Any]:
+    M,
+    E,
+    N,
+    K,
+    topk,
+    dtype,
+    block_shape=None,
+    gemm_stage="gemm1",
+    enable_gemm_fast_path=False,
+):
     if not _is_qwen_moe_shape(E, N, K, topk, dtype, gemm_stage):
         return _GENERIC_GET_DEFAULT_CONFIG(
             M,
@@ -86,6 +78,11 @@ def _metax_get_default_config(
         "num_warps": num_warps,
         "num_stages": num_stages,
     }
+    if gemm_stage == "gemm1" and (
+        M >= 8192 or (M >= 4096 and (E, N, K, topk) == (256, 256, 2048, 8))
+    ):
+        config["PAIR_GATE_UP_DOT"] = True
+
     shape = (E, N, K, topk)
     if gemm_stage == "gemm1" and M <= 8 and shape == (512, 2048, 4096, 10):
         config["SWAP_AB"] = True
@@ -118,6 +115,32 @@ def _metax_get_default_config(
             config.update(
                 BLOCK_SIZE_M=64, BLOCK_SIZE_N=256, BLOCK_SIZE_K=32, num_stages=2
             )
+    if M == 16384 and E == 256 and topk == 8:
+        if gemm_stage == "gemm1" and (N, K) == (1024, 2048):
+            config["BLOCK_SIZE_M"] = 64
+        elif gemm_stage == "gemm2" and (N, K) == (2048, 512):
+            config["BLOCK_SIZE_M"] = 64
+
+    if M == 16384 and E == 256 and topk == 8:
+        if gemm_stage == "gemm1" and (N, K) == (1024, 2048):
+            config["BLOCK_SIZE_M"] = 64
+            config.update(
+                {
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 64,
+                    "num_warps": 8,
+                }
+            )
+        elif gemm_stage == "gemm2" and (N, K) == (2048, 512):
+            config["BLOCK_SIZE_M"] = 64
+            config.update(
+                {
+                    "BLOCK_SIZE_N": 128,
+                    "BLOCK_SIZE_K": 64,
+                    "num_warps": 8,
+                }
+            )
+
     if M >= 8192 and E == 256 and topk == 8:
         if (gemm_stage, N, K) in (
             ("gemm1", 1024, 2048),
@@ -134,10 +157,16 @@ def _metax_get_default_config(
                     "SPLIT_K": 1,
                     "num_warps": 8,
                     "num_stages": 2,
+                    "PAIR_GATE_UP_DOT": False,
+                    "USE_INT32_OFFSETS": (
+                        dtype == "bf16"
+                        and max(M * K, M * topk * N, E * N * K) < (1 << 31)
+                    ),
+                    "FAST_BF16_OUTPUT": dtype == "bf16",
                 }
             )
 
-    # MC550 FlagTree pipeline selections retained from real-shape tuning.
+    # Temporary MC550 pipeline A/B overrides.
     if (
         M >= 8192
         and E == 256
@@ -181,7 +210,18 @@ def _metax_get_default_config(
             }
         )
 
-    # MC550 autotuned range: four_k_i128/bm64_bn64.
+    # MC550 shared-memory-safe Qwen3.6 I=128 real-shape range.
+    if (
+        4096 < M < 8192
+        and E == 256
+        and topk == 8
+        and gemm_stage == "gemm1"
+        and (N, K) == (256, 2048)
+    ):
+        config["PAIR_GATE_UP_DOT"] = False
+        config["num_stages"] = 2
+
+    # MC550 autotuned range: four_k_i128/pair_bm64_bn64.
     if 4097 <= M <= 8191 and E == 256 and topk == 8:
         if gemm_stage == "gemm1" and (N, K) == (256, 2048):
             config["BLOCK_SIZE_M"] = 64
@@ -190,6 +230,7 @@ def _metax_get_default_config(
             config["GROUP_SIZE_M"] = 1
             config["num_warps"] = 8
             config["num_stages"] = 2
+            config["PAIR_GATE_UP_DOT"] = True
         elif gemm_stage == "gemm2" and (N, K) == (2048, 128):
             config["BLOCK_SIZE_M"] = 64
             config["BLOCK_SIZE_N"] = 128
@@ -208,6 +249,7 @@ def _metax_get_default_config(
             config["GROUP_SIZE_M"] = 1
             config["num_warps"] = 8
             config["num_stages"] = 2
+            config.pop("PAIR_GATE_UP_DOT", None)
         elif gemm_stage == "gemm2" and (N, K) == (2048, 512):
             config["BLOCK_SIZE_M"] = 64
             config["BLOCK_SIZE_N"] = 256
@@ -226,6 +268,7 @@ def _metax_get_default_config(
             config["GROUP_SIZE_M"] = 1
             config["num_warps"] = 4
             config["num_stages"] = 2
+            config.pop("PAIR_GATE_UP_DOT", None)
         elif gemm_stage == "gemm2" and (N, K) == (2048, 512):
             config["BLOCK_SIZE_M"] = 32
             config["BLOCK_SIZE_N"] = 128
@@ -235,12 +278,10 @@ def _metax_get_default_config(
             config["num_stages"] = 2
             config["SWAP_AB"] = True
 
-    # Keep PAIR disabled because this backend-only path leaves the generic
-    # kernel unchanged, while the active MetaX compiler rejects its PAIR form.
     return config
 
 
-def _is_qwen_plain_half_call(args, kwargs) -> bool:
+def _is_qwen_plain_half_call(args, kwargs):
     try:
         hidden_states = args[0] if args else kwargs["hidden_states"]
         w1 = args[1] if len(args) > 1 else kwargs["w1"]
@@ -259,7 +300,7 @@ def _is_qwen_plain_half_call(args, kwargs) -> bool:
     )
 
 
-def _router_weight_is_already_applied(args, kwargs, positional_index: int) -> bool:
+def _router_weight_is_already_applied(args, kwargs, positional_index):
     if "apply_router_weight_on_input" in kwargs:
         return bool(kwargs["apply_router_weight_on_input"])
     if len(args) > positional_index:
@@ -267,7 +308,7 @@ def _router_weight_is_already_applied(args, kwargs, positional_index: int) -> bo
     return False
 
 
-def _should_defer_router_weight_to_sum(args, kwargs, positional_index: int) -> bool:
+def _should_defer_router_weight_to_sum(args, kwargs, positional_index):
     if not _is_qwen_plain_half_call(args, kwargs):
         return False
     if _router_weight_is_already_applied(args, kwargs, positional_index):
@@ -285,7 +326,7 @@ def _should_defer_router_weight_to_sum(args, kwargs, positional_index: int) -> b
 
 
 @contextlib.contextmanager
-def _metax_moe_config_patch(use_metax: bool, defer_router_weight: bool):
+def _metax_moe_config_patch(use_metax, defer_router_weight):
     if not use_metax:
         yield
         return
