@@ -31,6 +31,8 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8, fused_marlin_moe
 
+pytestmark = pytest.mark.fused_marlin_moe
+
 # -----------------------------------------------------------------------------
 # Local GPTQ uint4b8 quantization helper (self-contained, no vllm dependency).
 # Matches the layout produced by vllm.quantize_weights(..., uint4b8): values

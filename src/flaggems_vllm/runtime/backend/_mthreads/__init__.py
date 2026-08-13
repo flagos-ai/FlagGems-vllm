@@ -20,6 +20,14 @@ vendor_info = VendorDescriptor(
     device_query_cmd="mthreads-gmi",
     fp64_enabled=False,
     tle_enabled=True,
+    # MTT S5000: device properties report 192KB smem but the actual dynamic
+    # smem ceiling is 128KB (131072B); 3-stage pipelines crash for many tile
+    # shapes (NS<=2); fp16 fused GEMM1 stages both gate/up B tiles.
+    max_smem_bytes=131072,
+    moe_num_stages_min=1,
+    moe_num_stages_max=2,
+    moe_fp16_gemm1_b_tile_factor=2,
+    moe_direct_sum_enabled=False,
 )
 
 CUSTOMIZED_UNUSED_OPS = ()

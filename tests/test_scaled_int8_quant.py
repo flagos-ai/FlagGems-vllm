@@ -61,6 +61,10 @@ def _ref_dynamic_asymmetric(x):
 
 
 @pytest.mark.scaled_int8_quant
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="Issue #636: scaled_int8_quant API is incompatible on mthreads",
+)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -78,6 +82,10 @@ def test_dynamic_scaled_int8_quant(num_tokens, hidden_size, dtype):
 
 
 @pytest.mark.scaled_int8_quant
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="Issue #636: scaled_int8_quant API is incompatible on mthreads",
+)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -95,6 +103,10 @@ def test_dynamic_scaled_int8_azp_quant(num_tokens, hidden_size, dtype):
 
 
 @pytest.mark.scaled_int8_quant
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="Issue #636: scaled_int8_quant API is incompatible on mthreads",
+)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -159,6 +171,10 @@ def test_static_scaled_int8_azp_quant_saturating_cast(is_max):
 
 
 @pytest.mark.scaled_int8_quant
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="Issue #636: scaled_int8_quant API is incompatible on mthreads",
+)
 @pytest.mark.parametrize("value", [0.0, 3.0, -7.5])
 @torch.inference_mode()
 def test_dynamic_scaled_int8_azp_quant_constant_row(value):

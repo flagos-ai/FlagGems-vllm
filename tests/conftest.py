@@ -26,6 +26,15 @@ import yaml
 
 import flaggems_vllm
 
+# On platforms without a native CUDA backend, torchada redirects
+# torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
+# backend; tests call them directly.
+try:
+    if flaggems_vllm.runtime.device.vendor_name == "mthreads":
+        import torchada  # noqa: F401
+except ImportError:
+    pass
+
 BUILTIN_MARKS = {
     "filterwarnings",
     "parametrize",
