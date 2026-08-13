@@ -21,6 +21,8 @@ from flaggems_vllm.ops.deepseek_v4_attention_dequantize_and_gather_k_cache impor
 )
 from flaggems_vllm.utils.device_info import get_device_capability
 
+pytestmark = pytest.mark.dequantize_and_gather_k_cache
+
 try:
     from vllm.v1.attention.ops.deepseek_v4_ops import (
         dequantize_and_gather_k_cache as vllm_dequantize_and_gather_k_cache,

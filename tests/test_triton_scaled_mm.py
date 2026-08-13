@@ -60,6 +60,7 @@ MNK_FACTORS = [
 ]
 
 
+@pytest.mark.triton_scaled_mm
 @pytest.mark.parametrize("M,N,K", MNK_FACTORS)
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("in_dtype", get_8bit_types())

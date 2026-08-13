@@ -20,6 +20,8 @@ from flaggems_vllm.ops.deepseek_v4_attention_compute_global_topk_indices_and_len
     compute_global_topk_indices_and_lens,
 )
 
+pytestmark = pytest.mark.compute_global_topk_indices_and_lens
+
 try:
     from vllm.v1.attention.ops.deepseek_v4_ops import (
         compute_global_topk_indices_and_lens as vllm_compute_global_topk_indices_and_lens,

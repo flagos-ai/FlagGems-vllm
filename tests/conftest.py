@@ -25,6 +25,7 @@ import pytest
 import yaml
 
 import flaggems_vllm
+from tests.legacy_ci_skips import get_skip_reason
 
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
@@ -265,3 +266,18 @@ def pytest_collection_modifyitems(session, config, items):
 
         # Skip all tests
         items.clear()
+        return
+
+    vendor = flaggems_vllm.vendor_name
+    for item in items:
+        reason = get_skip_reason(
+            vendor,
+            (mark.name for mark in item.iter_markers()),
+        )
+        if reason:
+            # Put this skipif before older backend-specific skipif markers so
+            # the reported reason always points at the legacy CI tracking issue.
+            item.add_marker(
+                pytest.mark.skipif(True, reason=reason),
+                append=False,
+            )
