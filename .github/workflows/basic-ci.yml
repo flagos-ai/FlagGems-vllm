@@ -215,12 +215,15 @@ jobs:
   nvidia-tests:
     name: nvidia tests and benchmarks
     needs: select-targets
-    # Never execute fork-controlled code on the persistent H20 runner.
+    # Default: never execute fork-controlled code on the persistent H20 runner.
+    # Maintainers may opt in a fork PR with the write-gated `ci/nvidia` label
+    # (same trust model as `ci/benchmark` / `ci/all-vendors`).
     if: >-
       needs.select-targets.outputs.should_run == 'true'
       && (github.event_name != 'pull_request'
-          || (github.event.pull_request.head.repo.full_name == github.repository
-              && github.event.pull_request.user.login != 'dependabot[bot]'))
+          || (github.event.pull_request.user.login != 'dependabot[bot]'
+              && (github.event.pull_request.head.repo.full_name == github.repository
+                  || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))))
     runs-on: h20
     timeout-minutes: 60
     env:
@@ -331,8 +334,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           NVIDIA_RUN_ALLOWED: >-
             ${{ github.event_name != 'pull_request'
-                || (github.event.pull_request.head.repo.full_name == github.repository
-                    && github.event.pull_request.user.login != 'dependabot[bot]') }}
+                || (github.event.pull_request.user.login != 'dependabot[bot]'
+                    && (github.event.pull_request.head.repo.full_name == github.repository
+                        || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))) }}
           NON_NVIDIA_RUN_ALLOWED: >-
             ${{ github.event_name != 'pull_request'
                 || github.event.pull_request.user.login != 'dependabot[bot]' }}

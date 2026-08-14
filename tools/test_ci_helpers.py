@@ -582,6 +582,9 @@ class CiWorkflowPolicyTest(unittest.TestCase):
         repository_guard = (
             "github.event.pull_request.head.repo.full_name == github.repository"
         )
+        nvidia_label_opt_in = (
+            "contains(github.event.pull_request.labels.*.name, 'ci/nvidia')"
+        )
         nvidia_job = workflow.split("  nvidia-tests:", maxsplit=1)[1].split(
             "  non-nvidia-tests:", maxsplit=1
         )[0]
@@ -590,7 +593,9 @@ class CiWorkflowPolicyTest(unittest.TestCase):
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
+        self.assertIn(nvidia_label_opt_in, nvidia_job)
         self.assertNotIn(repository_guard, non_nvidia_job)
+        self.assertNotIn(nvidia_label_opt_in, non_nvidia_job)
         self.assertIn(author_guard, nvidia_job)
         self.assertIn(author_guard, non_nvidia_job)
         self.assertNotIn("github.actor != 'dependabot[bot]'", workflow)

@@ -15,6 +15,10 @@ benchmark merely because FlagGems can create its vendor environment.
   deliberate maintainer-approved validation run.
 - `ci/benchmark` enables the selected core benchmarks. Benchmarks also run on
   `main` pushes or when `run_benchmarks` is selected in `workflow_dispatch`.
+- `ci/nvidia` opts a fork pull request into the persistent H20 nvidia lane.
+  Only repository collaborators with write access can add the label; treat it
+  as an explicit maintainer trust decision before running fork-controlled
+  code on H20. Same-repository pull requests do not need this label.
 - `workflow_dispatch` can select all non-NVIDIA backends with
   `run_non_nvidia`; it also runs the H20 preflight/baseline so the result has
   a known reference lane.
@@ -23,7 +27,8 @@ benchmark merely because FlagGems can create its vendor environment.
   has passed its individual validation.
 - Fork pull requests may enter selected non-NVIDIA self-hosted jobs without a
   per-run maintainer gate. H20 remains restricted to same-repository pull
-  requests, and Dependabot pull requests remain excluded.
+  requests by default, or to fork pull requests labeled `ci/nvidia`.
+  Dependabot pull requests remain excluded.
 - Treat every file in a fork checkout as arbitrary code, including workflow
   files, local actions, package build hooks, setup scripts, and tests. Every
   non-NVIDIA runner exposed to this public repository must therefore be a
@@ -53,6 +58,7 @@ vendor/Thead
 vendor/TsingMicro
 ci/all-vendors
 ci/benchmark
+ci/nvidia
 ```
 
 `vendor/Thead` follows the backend registry exactly; do not use
