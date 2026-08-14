@@ -126,24 +126,27 @@ else
 fi
 
 # ── Detect or install uv ─────────────────────────────────────
+UV_VERSION="0.11.22"
+UV_MIRROR="https://resource.flagos.net/repository/flagos-filestore/utils"
+
 printf "Checking uv ..."
+export PATH="${HOME}/.local/bin:$PATH"
 if command -v uv &>/dev/null; then
-  printf " %s" "$(uv --version)"
+  printf " $(uv --version)"
   ok
 else
   printf " not found, installing ...\n"
-  command -v curl &>/dev/null || {
-    echo "Error: curl is required to install uv."
-    exit 1
-  }
-
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-
+  ARCH=$(uname -m)
+  mkdir -p "$HOME/.local/bin"
+  curl -sSf "${UV_MIRROR}/uv-${ARCH}-${UV_VERSION}-linux-gnu.tar.gz" \
+    | tar xz -C "$HOME/.local/bin" 2>/dev/null \
+    || { curl -LsSf https://astral.sh/uv/install.sh | sh; }
   command -v uv &>/dev/null || { printf "uv installation"; fail; }
-  printf "  Installed %s" "$(uv --version)"
+  printf "Installed $(uv --version)"
   ok
 fi
+# Persist PATH for subsequent GitHub Actions steps
+[ -n "${GITHUB_PATH:-}" ] && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
 # ── Install Python via uv ────────────────────────────────────
 printf "Installing Python ${PYTHON_VERSION} ..."
