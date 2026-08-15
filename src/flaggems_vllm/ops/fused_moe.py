@@ -25,9 +25,10 @@ import triton.language as tl
 import yaml
 
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
-from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import pointwise_dynamic
+
+from .moe_sum import moe_sum
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,7 @@ _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 @functools.lru_cache(maxsize=1)
 def get_embedded_moe_configs():
     config_path = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "utils",
-        "configs",
-        "fused_moe_config.yaml",
+        os.path.dirname(__file__), "..", "utils", "configs", "fused_moe_config.yaml"
     )
     if not os.path.exists(config_path):
         return {}, {}
@@ -161,6 +158,12 @@ def _get_device_name() -> str:
     return name
 
 
+@functools.lru_cache(maxsize=1)
+def _is_h20() -> bool:
+    """Whether the current device is an NVIDIA H20 (gates the FP8 MoE swap_ab default)."""
+    return "H20" in _get_device_name().split("_")
+
+
 def get_moe_configs(
     E: int,
     N: int,
@@ -178,7 +181,7 @@ def get_moe_configs(
     embedded_configs, _ = get_embedded_moe_configs()
     device_table = embedded_configs.get(device_name)
     if device_table is None:
-        logger.warning(
+        logger.debug(
             "No embedded MoE configs for device %s. Will use default config.",
             device_name,
         )
@@ -189,9 +192,11 @@ def get_moe_configs(
     key = f"{E},{N},{dtype},{_block_n},{_block_k}"
     configs = device_table.get(key)
     if configs is not None:
-        logger.info("Using embedded MoE config for device=%s, key=%s", device_name, key)
+        logger.debug(
+            "Using embedded MoE config for device=%s, key=%s", device_name, key
+        )
         return configs
-    logger.warning(
+    logger.debug(
         "No embedded MoE config for device=%s, key=%s. Will use default config.",
         device_name,
         key,
@@ -256,23 +261,13 @@ def _get_config_quant_dtype(
         return torch.int8
     elif ocp_mx_scheme == "w_mxfp4_a_mxfp4":
         return "mxfp4"
-    elif ocp_mx_scheme in {
-        "w_mxfp4_a_mxfp6_e3m2",
-        "w_mxfp6_e3m2_a_mxfp6_e3m2",
-    }:
+    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e3m2", "w_mxfp6_e3m2_a_mxfp6_e3m2"}:
         return "mxfp6_e3m2"
-    elif ocp_mx_scheme in {
-        "w_mxfp4_a_mxfp6_e2m3",
-        "w_mxfp6_e2m3_a_mxfp6_e2m3",
-    }:
+    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e2m3", "w_mxfp6_e2m3_a_mxfp6_e2m3"}:
         return "mxfp6_e2m3"
     elif ocp_mx_scheme in {"w_mxfp4", "w_mxfp6_e3m2", "w_mxfp6_e2m3"}:
         return torch.bfloat16
-    elif ocp_mx_scheme in {
-        "w_mxfp4_a_fp8",
-        "w_mxfp6_e3m2_a_fp8",
-        "w_mxfp6_e2m3_a_fp8",
-    }:
+    elif ocp_mx_scheme in {"w_mxfp4_a_fp8", "w_mxfp6_e3m2_a_fp8", "w_mxfp6_e2m3_a_fp8"}:
         return torch.float8_e4m3fn
 
     return None
@@ -349,162 +344,345 @@ def get_default_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
 ) -> dict[str, Any]:
-    """Default Triton config for fused MoE kernel.
+    """MUSA-tuned default config for the fused MoE kernel (MTT S5000).
 
-    Heuristic selection aligned with vLLM v0.17.0 defaults, tuned on H20/H100.
-    Key insight: for high-expert-count MoE (e.g. DeepSeek-V3 E=256), each
-    expert sees very few tokens, so small BLOCK_SIZE_M (16) is critical.
+    Dedicated copy (T2): replaces the NVIDIA-aligned vLLM v0.17 heuristics
+    with the MTT S5000 tuned tables below. Table configs are MUSA-safe
+    (BN<=128, BN*BK<=8192 for plain half; the MUSA Triton backend has no
+    smem overflow check and silently goes OOB otherwise); any shape that
+    misses the tables falls back to a conservative single-stage config.
+    Gemm fast paths (PAIR_GATE_UP_DOT / BLOCK_SIZE_N=256) are never used.
     """
-    is_fp8_blockwise = dtype == "fp8_w8a8" and block_shape is not None
-    if gemm_stage not in ("gemm1", "gemm2"):
-        raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
-
-    if is_fp8_blockwise:
-        avg_tokens_per_expert = M * max(topk, 1) // max(E, 1)
-        is_large_m = M >= 16384
-        if avg_tokens_per_expert <= 16:
-            block_m = 16
-        elif avg_tokens_per_expert <= 32:
-            block_m = 32
-        elif avg_tokens_per_expert <= 64 or not is_large_m:
-            block_m = 64
-        else:
-            block_m = 128
-
-        config = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_shape[0],
-            "BLOCK_SIZE_K": block_shape[1],
-            "GROUP_SIZE_M": (8 if (is_large_m and avg_tokens_per_expert > 16) else 1),
-            "num_warps": 8 if (is_large_m and block_m > 32) else 4,
-            "num_stages": 4 if M >= 1024 else 3,
-            "SWAP_AB": False,
-        }
-    elif dtype in _PLAIN_HALF_CONFIG_DTYPES:
-        # Routed rows per expert drives block_m.  Each token contributes topk
-        # rows to the expert-sorted GEMM input, so M * topk / E is the relevant
-        # density for high-expert-count MoE routing.
-        routed_tokens_per_expert = M * max(topk, 1) // max(E, 1)
-        tokens_per_expert = M // max(E, 1)
-
-        if routed_tokens_per_expert <= 16:
-            block_m = 16
-        elif routed_tokens_per_expert <= 64:
-            block_m = 64
-        else:
-            block_m = 128
-
-        if tokens_per_expert > 128:
-            group_m = 16
-        elif tokens_per_expert > 32:
-            group_m = 8
-        else:
-            group_m = 1
-
-        block_k = 128 if M <= 64 else 64
-
-        if N >= 4096:
-            block_n = 128 if M <= 128 else 256
-        else:
-            block_n = 64 if M <= 64 else 128
-
-        can_use_gemm_fast_path = (
-            enable_gemm_fast_path
-            and M >= MOE_GEMM_TUNING_MIN_TOKENS
-            and block_m == _HALF_GEMM_TILE_M
-            and block_k == _HALF_GEMM_TILE_K
+    if dtype in _PLAIN_HALF_CONFIG_DTYPES and block_shape is None:
+        # Qwen3.6 table only keys (256, 8); on miss fall back to the main
+        # table (Mixtral/DeepSeek etc.) instead of the generic heuristic,
+        # which can emit configs that crash on MUSA (e.g. BM64/BN128/BK128/NS2).
+        tables = (
+            (_MTHREADS_TUNED_CONFIGS_QWEN36, _MTHREADS_TUNED_CONFIGS)
+            if N <= 512
+            else (_MTHREADS_TUNED_CONFIGS,)
         )
+        for table in tables:
+            for m_max, cfg in table.get((E, topk), ()):
+                if M <= m_max:
+                    return dict(cfg)
+    if dtype == "fp8_w8a8" and block_shape is None:
+        for m_max, cfg in _MTHREADS_TUNED_CONFIGS_FP8.get((E, topk), ()):
+            if M <= m_max:
+                return dict(cfg)
+    if dtype == "fp8_w8a8" and block_shape == [128, 128]:
+        for m_max, cfg in _MTHREADS_TUNED_CONFIGS_FP8_BLOCKWISE.get((E, topk), ()):
+            if M <= m_max:
+                return dict(cfg)
+    # Non-target shapes: conservative MUSA-safe config instead of the generic
+    # (NVIDIA-derived) heuristic, which can emit configs that crash on MUSA
+    # (e.g. BM64/BN128/BK128/NS2 -- see notes/2026-08-14_musa_compat_patch_T2.md).
+    return {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
 
-        use_gemm2_fast_path = (
-            gemm_stage == "gemm2"
-            and can_use_gemm_fast_path
-            and N % _HALF_GEMM2_TILE_N == 0
-        )
-        use_gemm1_fast_path = (
-            gemm_stage == "gemm1" and can_use_gemm_fast_path and N % block_n == 0
-        )
 
-        if gemm_stage == "gemm2" and enable_gemm_fast_path:
-            block_n = (
-                _HALF_GEMM2_TILE_N if use_gemm2_fast_path else (64 if M <= 64 else 128)
-            )
+# Target model shape families: (w1.shape, w2.shape, topk).
+#   Qwen3-235B-A22B TP shards   : E=256, topk=8
+#   Qwen3-Max style             : E=512, topk=10
+#   DeepSeek-V3 TP8             : E=256, topk=8, hidden=7168
+_TARGET_SHAPES = (
+    # Qwen3 family
+    ((256, 1024, 2048), (256, 2048, 512), 8),
+    ((256, 256, 2048), (256, 2048, 128), 8),
+    ((512, 2048, 4096), (512, 4096, 1024), 10),
+    # DeepSeek-V3 TP8
+    ((256, 4096, 7168), (256, 7168, 2048), 8),
+)
 
-        # Prefer 4 warps for small tiles; only use 8 for large M
-        num_warps = 4 if M <= 128 else 8
-        num_stages = 3
+# MTT S5000 config sweep results (2026-08-04, 2026-08-05): (E, topk) -> (M threshold, config).
+# 2026-08-05: small-M (M<=16) configs added — BM16/BN64/BK32 single-stage wins for
+# sparse token-expert mapping (small-M tile padding dominates otherwise).
+# 16/128/64 single-stage tiles win for high-expert-count MoE (E=256/512);
+# E=8 (Mixtral-like) prefers BM=32 for small M and BM=64 beyond that.
+_MTHREADS_TUNED_CONFIGS = {
+    (8, 2): (
+        (
+            1,
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+                "SWAP_AB": True,
+            },
+        ),
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            128,
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        ),
+    ),
+    (256, 8): (
+        (
+            1,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+                "SWAP_AB": True,
+            },
+        ),
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            128,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        # M>128: GEMM2 (N>512, main table) must keep BLOCK_SIZE_M aligned with
+        # the GEMM1 Qwen3.6 table (BM64) — moe_align_block_size uses
+        # base_config["BLOCK_SIZE_M"], so GEMM2 BM < GEMM1 BM makes the GEMM2
+        # grid (cdiv(EM, BM2)) outrun expert_ids (padded by BM1) -> OOB IMA.
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        ),
+    ),
+    (512, 10): (
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+    ),
+}
 
-        if use_gemm1_fast_path:
-            group_m = 1
-            num_stages = 4
-        elif use_gemm2_fast_path:
-            group_m = 2
-            num_stages = 4
+# FP8 W8A8 (per-tensor) tuned configs, MTT S5000 (2026-08-06 sweep):
+# fp8 prefers BN=64/BK=64 (vs BK=32 for plain half); small-M only — larger M
+# keeps the generic (MUSA-safe) config.
+_MTHREADS_TUNED_CONFIGS_FP8 = {
+    (8, 2): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            64,
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 2,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+    ),
+    (256, 8): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            128,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        # M>128 (Qwen3.6/DeepSeek fp8 large-M): BM64/BN128/BK64 — 2026-08-07 scan,
+        # M=16384 I=128 9.2->7.4ms (-20%), I=512 30.1->18.5ms (-39%). GEMM1/GEMM2
+        # share this entry: BLOCK_SIZE_M must stay aligned with align BS(64).
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        ),
+    ),
+}
 
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
-            num_stages -= 1
+# FP8 W8A8 blockwise (128x128 blocks) tuned configs, MTT S5000 (2026-08-06 sweep).
+# BN/BK are fixed by the block shape; E=256 prefers BM16/NW8, E=8 prefers BM8/NW4.
+# Qwen3.6-35B-A3B tuned configs (E=256, H=2048, I=128/512, topk=8), MTT S5000
+# (2026-08-06 sweep): the small hidden/intermediate dims prefer BK=32 beyond
+# small M (vs BK=64 for DeepSeek's I=2048); selected by N(=I) <= 512.
+_MTHREADS_TUNED_CONFIGS_QWEN36 = {
+    (256, 8): (
+        (
+            1,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+                "SWAP_AB": True,
+            },
+        ),
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            128,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        ),
+    ),
+}
 
-        config = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": block_k,
-            "GROUP_SIZE_M": group_m,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        }
-        if use_gemm1_fast_path:
-            config["PAIR_GATE_UP_DOT"] = True
-    else:
-        tokens_per_expert = M // max(E, 1)
-
-        if tokens_per_expert <= 2:
-            block_m = 16
-        elif tokens_per_expert <= 4:
-            block_m = 32
-        elif tokens_per_expert <= 16:
-            block_m = 64
-        else:
-            block_m = 128
-
-        # Tile sizing
-        if N >= 4096:
-            block_n = 128 if M <= 128 else 256
-        elif N >= 1024:
-            block_n = 64 if M <= 64 else 128
-        else:
-            block_n = 64 if M <= 64 else 128
-
-        if dtype == "fp8_w8a8":
-            block_k = 128
-        elif M <= 64:
-            block_k = 128
-        else:
-            block_k = 64
-
-        if tokens_per_expert > 128:
-            group_m = 16
-        elif tokens_per_expert > 32:
-            group_m = 8
-        else:
-            group_m = 1
-
-        # Prefer 4 warps for small tiles; only use 8 for large M
-        num_warps = 4 if M <= 128 else 8
-        num_stages = 3
-
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
-            num_stages -= 1
-
-        config = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": block_k,
-            "GROUP_SIZE_M": group_m,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        }
-    return config
+_MTHREADS_TUNED_CONFIGS_FP8_BLOCKWISE = {
+    (8, 2): (
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 8,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 2,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+    ),
+    (256, 8): (
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        ),
+    ),
+    (512, 10): (
+        (
+            float("inf"),
+            {
+                "BLOCK_SIZE_M": 8,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        ),
+    ),
+}
 
 
 def _get_config_dtype_str(
@@ -1072,8 +1250,6 @@ def fused_moe_kernel(
     DIRECT_SUM: tl.constexpr,
     OUT_TOP_K: tl.constexpr,
     FUSE_SILU: tl.constexpr,
-    USE_INT32_OFFSETS: tl.constexpr,
-    FAST_BF16_OUTPUT: tl.constexpr,
 ):
     """Fused MoE kernel: token × expert GEMM with quantization support and optional SiLU fusion."""
     # Map pid to C block (grouped ordering for L2 reuse)
@@ -1090,10 +1266,7 @@ def fused_moe_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Create pointers for first blocks of A and B
-    if USE_INT32_OFFSETS:
-        offs = tl.arange(0, BLOCK_SIZE_M)
-    else:
-        offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
@@ -1106,18 +1279,13 @@ def fused_moe_kernel(
             pid_m,  # first element = pid_m
             num_valid_tokens,  # remaining elements = constant
         )
-    if not USE_INT32_OFFSETS:
-        offs_token = offs_token.to(tl.int64)
+    offs_token = offs_token.to(tl.int64)  # prevent int32 overflow
 
     token_mask = offs_token < num_valid_tokens
 
-    off_experts = tl.load(expert_ids_ptr + pid_m)
-    if not USE_INT32_OFFSETS:
-        off_experts = off_experts.to(tl.int64)
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    if not USE_INT32_OFFSETS:
-        offs_bn = offs_bn.to(tl.int64)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     if not N_DIVISIBLE_BY_BLOCK_N:
         offs_bn = offs_bn % N_out
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -1139,9 +1307,7 @@ def fused_moe_kernel(
             )
             return
 
-        offs_pair = tl.arange(0, BLOCK_SIZE_N * 2)
-        if not USE_INT32_OFFSETS:
-            offs_pair = offs_pair.to(tl.int64)
+        offs_pair = tl.arange(0, BLOCK_SIZE_N * 2).to(tl.int64)
         offs_pair_bn = tl.where(
             offs_pair < BLOCK_SIZE_N,
             pid_n * BLOCK_SIZE_N + offs_pair,
@@ -1188,9 +1354,7 @@ def fused_moe_kernel(
 
         gate_up = tl.trans(
             tl.reshape(pair_acc, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N)),
-            0,
-            2,
-            1,
+            (0, 2, 1),
         )
         gate_acc, up_acc = tl.split(gate_up)
         gate_sig = tl.sigmoid(gate_acc)
@@ -1279,9 +1443,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k
                     a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask,
-                        mask=token_mask,
-                        other=0.0,
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                     b_scale_val = tl.load(b_scale_gate_ptrs + offs_ks * stride_bsk)
 
@@ -1333,9 +1495,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k
                     a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask,
-                        mask=token_mask,
-                        other=0.0,
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                     b_scale_val = tl.load(b_scale_up_ptrs + offs_ks * stride_bsk)
 
@@ -1450,9 +1610,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k
                     a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask,
-                        mask=token_mask,
-                        other=0.0,
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                     if SWAP_AB:
                         b_scale_val = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
@@ -1513,10 +1671,7 @@ def fused_moe_kernel(
         )
         accumulator *= moe_weight[:, None]
 
-    if FAST_BF16_OUTPUT and compute_type == tl.bfloat16:
-        accumulator = accumulator.to(compute_type, "rtne_no_nan")
-    else:
-        accumulator = accumulator.to(compute_type)
+    accumulator = accumulator.to(compute_type)
 
     # Write back output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1566,10 +1721,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         # We assume that top_ids of each token is unique,
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
-        EM = min(
-            sorted_token_ids.size(0),
-            A.size(0) * top_k * config["BLOCK_SIZE_M"],
-        )
+        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
@@ -1679,8 +1831,7 @@ def invoke_fused_moe_triton_kernel(
         EM = sorted_token_ids.size(0)
         if A.size(0) < config["BLOCK_SIZE_M"]:
             EM = min(
-                sorted_token_ids.size(0),
-                A.size(0) * top_k * config["BLOCK_SIZE_M"],
+                sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"]
             )
     else:
         EM = num_tokens * config["BLOCK_SIZE_M"]
@@ -1701,8 +1852,6 @@ def invoke_fused_moe_triton_kernel(
 
     swap_AB = config.pop("SWAP_AB", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
-    use_int32_offsets = config.pop("USE_INT32_OFFSETS", False)
-    fast_bf16_output = config.pop("FAST_BF16_OUTPUT", False)
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
@@ -1755,8 +1904,6 @@ def invoke_fused_moe_triton_kernel(
         DIRECT_SUM=direct_sum,
         OUT_TOP_K=out_top_k,
         FUSE_SILU=FUSE_SILU,
-        USE_INT32_OFFSETS=use_int32_offsets,
-        FAST_BF16_OUTPUT=fast_bf16_output,
         **config,
     )
 
@@ -1910,11 +2057,7 @@ def fused_experts_impl(
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert hidden_states.dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ]
+    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
     E, N, _ = w1.size()
@@ -1992,32 +2135,20 @@ def fused_experts_impl(
             w2_scale = None
         elif ocp_mx_scheme.startswith("w_mxfp6_e3m2"):
             w1 = dequant_mxfp6(
-                w1,
-                w1_scale,
-                quant_dtype="fp6_e3m2",
-                float_dtype=hidden_states.dtype,
+                w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
             )
             w1_scale = None
             w2 = dequant_mxfp6(
-                w2,
-                w2_scale,
-                quant_dtype="fp6_e3m2",
-                float_dtype=hidden_states.dtype,
+                w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
             )
             w2_scale = None
         elif ocp_mx_scheme.startswith("w_mxfp6_e2m3"):
             w1 = dequant_mxfp6(
-                w1,
-                w1_scale,
-                quant_dtype="fp6_e2m3",
-                float_dtype=hidden_states.dtype,
+                w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
             )
             w1_scale = None
             w2 = dequant_mxfp6(
-                w2,
-                w2_scale,
-                quant_dtype="fp6_e2m3",
-                float_dtype=hidden_states.dtype,
+                w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
             )
             w2_scale = None
         else:
@@ -2035,17 +2166,8 @@ def fused_experts_impl(
     direct_sum_supported = is_plain_half_config or is_fp8_blockwise
 
     # Check if we can safely fuse the activation with the first GEMM pass
-    use_separate_activation_for_metax_qwen36_large = (
-        num_tokens >= 8192
-        and E == 256
-        and (N, w1.size(2)) in ((1024, 2048), (256, 2048))
-        and K == 2048
-        and top_k_num == 8
-        and hidden_states.dtype == torch.bfloat16
-    )
     can_use_fused_silu = (
-        not use_separate_activation_for_metax_qwen36_large
-        and activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
     )
@@ -2167,9 +2289,7 @@ def fused_experts_impl(
         # 4. Apply activation separately if the fused path was not taken
         if not do_fuse_silu:
             apply_moe_activation(
-                activation_enum,
-                intermediate_cache2,
-                intermediate_cache1.view(-1, N),
+                activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
             )
 
         # 5. Quantize activated intermediate for GEMM2

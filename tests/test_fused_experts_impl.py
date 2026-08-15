@@ -192,6 +192,9 @@ def test_fused_moe_vs_ref(config, dtype):
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+    # Real vLLM inference passes int32 topk_ids; torch.topk returns int64 by
+    # default, so convert to match the production dtype contract.
+    topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights.to(dtype)
 
@@ -257,11 +260,11 @@ def test_fused_moe_vs_vllm(config, dtype):
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
     # Real vLLM inference passes int32 topk_ids; torch.topk returns int64 by
     # default, so convert to match the production dtype contract.
     topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = topk_weights.to(dtype)
 
     # FlagGems result
     result = flaggems_vllm.ops_experts_impl(
