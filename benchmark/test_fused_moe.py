@@ -58,6 +58,12 @@ class FusedMoEBenchmark(base.Benchmark):
             (64, 256, 7168, 2048, 8),
             (128, 256, 7168, 2048, 8),
             (256, 256, 7168, 2048, 8),
+            # Qwen3.6-35B-A3B (real production shapes, representative subset)
+            (1, 256, 2048, 128, 8),
+            (16, 256, 2048, 128, 8),
+            (64, 256, 2048, 128, 8),
+            (512, 256, 2048, 128, 8),
+            (1035, 256, 2048, 128, 8),
         ]
 
     def get_input_iter(self, cur_dtype):

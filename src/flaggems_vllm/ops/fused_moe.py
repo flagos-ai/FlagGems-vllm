@@ -25,10 +25,9 @@ import triton.language as tl
 import yaml
 
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
+from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import pointwise_dynamic
-
-from .moe_sum import moe_sum
 
 logger = logging.getLogger(__name__)
 
@@ -344,345 +343,165 @@ def get_default_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
 ) -> dict[str, Any]:
-    """MUSA-tuned default config for the fused MoE kernel (MTT S5000).
+    """Default Triton config for fused MoE kernel.
 
-    Dedicated copy (T2): replaces the NVIDIA-aligned vLLM v0.17 heuristics
-    with the MTT S5000 tuned tables below. Table configs are MUSA-safe
-    (BN<=128, BN*BK<=8192 for plain half; the MUSA Triton backend has no
-    smem overflow check and silently goes OOB otherwise); any shape that
-    misses the tables falls back to a conservative single-stage config.
-    Gemm fast paths (PAIR_GATE_UP_DOT / BLOCK_SIZE_N=256) are never used.
+    Heuristic selection aligned with vLLM v0.17.0 defaults, tuned on H20/H100.
+    Key insight: for high-expert-count MoE (e.g. DeepSeek-V3 E=256), each
+    expert sees very few tokens, so small BLOCK_SIZE_M (16) is critical.
     """
-    if dtype in _PLAIN_HALF_CONFIG_DTYPES and block_shape is None:
-        # Qwen3.6 table only keys (256, 8); on miss fall back to the main
-        # table (Mixtral/DeepSeek etc.) instead of the generic heuristic,
-        # which can emit configs that crash on MUSA (e.g. BM64/BN128/BK128/NS2).
-        tables = (
-            (_MTHREADS_TUNED_CONFIGS_QWEN36, _MTHREADS_TUNED_CONFIGS)
-            if N <= 512
-            else (_MTHREADS_TUNED_CONFIGS,)
+    is_fp8_blockwise = dtype == "fp8_w8a8" and block_shape is not None
+    if gemm_stage not in ("gemm1", "gemm2"):
+        raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
+
+    if is_fp8_blockwise:
+        avg_tokens_per_expert = M * max(topk, 1) // max(E, 1)
+        is_large_m = M >= 16384
+        if avg_tokens_per_expert <= 16:
+            block_m = 16
+        elif avg_tokens_per_expert <= 32:
+            block_m = 32
+        elif avg_tokens_per_expert <= 64 or not is_large_m:
+            block_m = 64
+        else:
+            block_m = 128
+
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_K": block_shape[1],
+            "GROUP_SIZE_M": 8 if (is_large_m and avg_tokens_per_expert > 16) else 1,
+            "num_warps": 8 if (is_large_m and block_m > 32) else 4,
+            "num_stages": 4 if M >= 1024 else 3,
+            # H20: swap_ab puts the larger N dim on the wgmma M-axis, a measured
+            # win on H20 for small token tiles (block_m<=32) but a regression for
+            # large tiles (e.g. 16k/32k-token prefill), so gate on both.
+            "SWAP_AB": _is_h20() and block_m <= 32,
+        }
+    elif dtype in _PLAIN_HALF_CONFIG_DTYPES:
+        # Routed rows per expert drives block_m.  Each token contributes topk
+        # rows to the expert-sorted GEMM input, so M * topk / E is the relevant
+        # density for high-expert-count MoE routing.
+        routed_tokens_per_expert = M * max(topk, 1) // max(E, 1)
+        tokens_per_expert = M // max(E, 1)
+
+        if routed_tokens_per_expert <= 16:
+            block_m = 16
+        elif routed_tokens_per_expert <= 64:
+            block_m = 64
+        else:
+            block_m = 128
+
+        if tokens_per_expert > 128:
+            group_m = 16
+        elif tokens_per_expert > 32:
+            group_m = 8
+        else:
+            group_m = 1
+
+        block_k = 128 if M <= 64 else 64
+
+        if N >= 4096:
+            block_n = 128 if M <= 128 else 256
+        else:
+            block_n = 64 if M <= 64 else 128
+
+        can_use_gemm_fast_path = (
+            enable_gemm_fast_path
+            and M >= MOE_GEMM_TUNING_MIN_TOKENS
+            and block_m == _HALF_GEMM_TILE_M
+            and block_k == _HALF_GEMM_TILE_K
         )
-        for table in tables:
-            for m_max, cfg in table.get((E, topk), ()):
-                if M <= m_max:
-                    return dict(cfg)
-    if dtype == "fp8_w8a8" and block_shape is None:
-        for m_max, cfg in _MTHREADS_TUNED_CONFIGS_FP8.get((E, topk), ()):
-            if M <= m_max:
-                return dict(cfg)
-    if dtype == "fp8_w8a8" and block_shape == [128, 128]:
-        for m_max, cfg in _MTHREADS_TUNED_CONFIGS_FP8_BLOCKWISE.get((E, topk), ()):
-            if M <= m_max:
-                return dict(cfg)
-    # Non-target shapes: conservative MUSA-safe config instead of the generic
-    # (NVIDIA-derived) heuristic, which can emit configs that crash on MUSA
-    # (e.g. BM64/BN128/BK128/NS2 -- see notes/2026-08-14_musa_compat_patch_T2.md).
-    return {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 1,
-    }
 
+        use_gemm2_fast_path = (
+            gemm_stage == "gemm2"
+            and can_use_gemm_fast_path
+            and N % _HALF_GEMM2_TILE_N == 0
+        )
+        use_gemm1_fast_path = (
+            gemm_stage == "gemm1" and can_use_gemm_fast_path and N % block_n == 0
+        )
 
-# Target model shape families: (w1.shape, w2.shape, topk).
-#   Qwen3-235B-A22B TP shards   : E=256, topk=8
-#   Qwen3-Max style             : E=512, topk=10
-#   DeepSeek-V3 TP8             : E=256, topk=8, hidden=7168
-_TARGET_SHAPES = (
-    # Qwen3 family
-    ((256, 1024, 2048), (256, 2048, 512), 8),
-    ((256, 256, 2048), (256, 2048, 128), 8),
-    ((512, 2048, 4096), (512, 4096, 1024), 10),
-    # DeepSeek-V3 TP8
-    ((256, 4096, 7168), (256, 7168, 2048), 8),
-)
+        if gemm_stage == "gemm2" and enable_gemm_fast_path:
+            block_n = (
+                _HALF_GEMM2_TILE_N if use_gemm2_fast_path else (64 if M <= 64 else 128)
+            )
 
-# MTT S5000 config sweep results (2026-08-04, 2026-08-05): (E, topk) -> (M threshold, config).
-# 2026-08-05: small-M (M<=16) configs added — BM16/BN64/BK32 single-stage wins for
-# sparse token-expert mapping (small-M tile padding dominates otherwise).
-# 16/128/64 single-stage tiles win for high-expert-count MoE (E=256/512);
-# E=8 (Mixtral-like) prefers BM=32 for small M and BM=64 beyond that.
-_MTHREADS_TUNED_CONFIGS = {
-    (8, 2): (
-        (
-            1,
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-                "SWAP_AB": True,
-            },
-        ),
-        (
-            16,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            128,
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 8,
-                "num_stages": 1,
-            },
-        ),
-    ),
-    (256, 8): (
-        (
-            1,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-                "SWAP_AB": True,
-            },
-        ),
-        (
-            16,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            128,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        # M>128: GEMM2 (N>512, main table) must keep BLOCK_SIZE_M aligned with
-        # the GEMM1 Qwen3.6 table (BM64) — moe_align_block_size uses
-        # base_config["BLOCK_SIZE_M"], so GEMM2 BM < GEMM1 BM makes the GEMM2
-        # grid (cdiv(EM, BM2)) outrun expert_ids (padded by BM1) -> OOB IMA.
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 8,
-                "num_warps": 8,
-                "num_stages": 1,
-            },
-        ),
-    ),
-    (512, 10): (
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-    ),
-}
+        # Prefer 4 warps for small tiles; only use 8 for large M
+        num_warps = 4 if M <= 128 else 8
+        num_stages = 3
 
-# FP8 W8A8 (per-tensor) tuned configs, MTT S5000 (2026-08-06 sweep):
-# fp8 prefers BN=64/BK=64 (vs BK=32 for plain half); small-M only — larger M
-# keeps the generic (MUSA-safe) config.
-_MTHREADS_TUNED_CONFIGS_FP8 = {
-    (8, 2): (
-        (
-            16,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            64,
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 2,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-    ),
-    (256, 8): (
-        (
-            16,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            128,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        # M>128 (Qwen3.6/DeepSeek fp8 large-M): BM64/BN128/BK64 — 2026-08-07 scan,
-        # M=16384 I=128 9.2->7.4ms (-20%), I=512 30.1->18.5ms (-39%). GEMM1/GEMM2
-        # share this entry: BLOCK_SIZE_M must stay aligned with align BS(64).
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "num_warps": 8,
-                "num_stages": 1,
-            },
-        ),
-    ),
-}
+        if use_gemm1_fast_path:
+            group_m = 1
+            num_stages = 4
+        elif use_gemm2_fast_path:
+            group_m = 2
+            num_stages = 4
 
-# FP8 W8A8 blockwise (128x128 blocks) tuned configs, MTT S5000 (2026-08-06 sweep).
-# BN/BK are fixed by the block shape; E=256 prefers BM16/NW8, E=8 prefers BM8/NW4.
-# Qwen3.6-35B-A3B tuned configs (E=256, H=2048, I=128/512, topk=8), MTT S5000
-# (2026-08-06 sweep): the small hidden/intermediate dims prefer BK=32 beyond
-# small M (vs BK=64 for DeepSeek's I=2048); selected by N(=I) <= 512.
-_MTHREADS_TUNED_CONFIGS_QWEN36 = {
-    (256, 8): (
-        (
-            1,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-                "SWAP_AB": True,
-            },
-        ),
-        (
-            16,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            128,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 8,
-                "num_warps": 8,
-                "num_stages": 1,
-            },
-        ),
-    ),
-}
+        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
+        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+            num_stages -= 1
 
-_MTHREADS_TUNED_CONFIGS_FP8_BLOCKWISE = {
-    (8, 2): (
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 8,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 2,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-    ),
-    (256, 8): (
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 8,
-                "num_stages": 1,
-            },
-        ),
-    ),
-    (512, 10): (
-        (
-            float("inf"),
-            {
-                "BLOCK_SIZE_M": 8,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 1,
-            },
-        ),
-    ),
-}
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
+            "GROUP_SIZE_M": group_m,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+        if use_gemm1_fast_path:
+            config["PAIR_GATE_UP_DOT"] = True
+    else:
+        tokens_per_expert = M // max(E, 1)
+
+        if tokens_per_expert <= 2:
+            block_m = 16
+        elif tokens_per_expert <= 4:
+            block_m = 32
+        elif tokens_per_expert <= 16:
+            block_m = 64
+        else:
+            block_m = 128
+
+        # Tile sizing
+        if N >= 4096:
+            block_n = 128 if M <= 128 else 256
+        elif N >= 1024:
+            block_n = 64 if M <= 64 else 128
+        else:
+            block_n = 64 if M <= 64 else 128
+
+        if dtype == "fp8_w8a8":
+            block_k = 128
+        elif M <= 64:
+            block_k = 128
+        else:
+            block_k = 64
+
+        if tokens_per_expert > 128:
+            group_m = 16
+        elif tokens_per_expert > 32:
+            group_m = 8
+        else:
+            group_m = 1
+
+        # Prefer 4 warps for small tiles; only use 8 for large M
+        num_warps = 4 if M <= 128 else 8
+        num_stages = 3
+
+        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
+        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+            num_stages -= 1
+
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
+            "GROUP_SIZE_M": group_m,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    return config
 
 
 def _get_config_dtype_str(
