@@ -13,7 +13,7 @@ benchmark merely because FlagGems can create its vendor environment.
   maintainer to add a routing label.
 - `ci/all-vendors` selects every enabled non-NVIDIA backend. Use it only for a
   deliberate maintainer-approved validation run.
-- `ci/benchmark` enables the selected core benchmarks. Benchmarks also run on
+- Pull requests run correctness tests only. Selected core benchmarks run on
   `main` pushes or when `run_benchmarks` is selected in `workflow_dispatch`.
 - `ci/nvidia` opts a fork pull request into the persistent H20 nvidia lane.
   Only repository collaborators with write access can add the label; treat it
@@ -57,7 +57,6 @@ vendor/Sunrise
 vendor/Thead
 vendor/TsingMicro
 ci/all-vendors
-ci/benchmark
 ci/nvidia
 ```
 
