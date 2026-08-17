@@ -19,6 +19,14 @@ import torch.nn.functional as F
 import flaggems_vllm
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
+pytestmark = pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "nvidia",
+    reason=(
+        "NVIDIA H20 CUDA illegal memory access: "
+        "https://github.com/flagos-ai/FlagGems-vllm/issues/690"
+    ),
+)
+
 
 def naive_chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state):
     """
