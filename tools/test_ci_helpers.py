@@ -94,6 +94,75 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
         self.assertEqual(tests, ["tests/test_mul.py"])
         self.assertEqual(benchmarks, [])
 
+    def test_module_changes_select_wrapper_tests_and_operator_benchmarks(self):
+        targets = [
+            "tests/test_gems_activation.py",
+            "tests/test_gems_normalization.py",
+            "tests/test_gems_rotary_embedding.py",
+            "benchmark/test_apply_rotary_pos_emb.py",
+            "benchmark/test_fused_add_rms_norm.py",
+            "benchmark/test_rms_norm.py",
+            "benchmark/test_silu_and_mul.py",
+        ]
+        for target in targets:
+            self.make_file(target)
+
+        cases = {
+            "src/flaggems_vllm/modules/activation.py": (
+                ["tests/test_gems_activation.py"],
+                ["benchmark/test_silu_and_mul.py"],
+            ),
+            "src/flaggems_vllm/modules/normalization.py": (
+                ["tests/test_gems_normalization.py"],
+                [
+                    "benchmark/test_fused_add_rms_norm.py",
+                    "benchmark/test_rms_norm.py",
+                ],
+            ),
+            "src/flaggems_vllm/modules/rotary_embedding.py": (
+                ["tests/test_gems_rotary_embedding.py"],
+                ["benchmark/test_apply_rotary_pos_emb.py"],
+            ),
+            "src/flaggems_vllm/modules/__init__.py": (
+                [
+                    "tests/test_gems_activation.py",
+                    "tests/test_gems_normalization.py",
+                    "tests/test_gems_rotary_embedding.py",
+                ],
+                [
+                    "benchmark/test_apply_rotary_pos_emb.py",
+                    "benchmark/test_fused_add_rms_norm.py",
+                    "benchmark/test_rms_norm.py",
+                    "benchmark/test_silu_and_mul.py",
+                ],
+            ),
+        }
+
+        for source, (expected_tests, expected_benchmarks) in cases.items():
+            with self.subTest(source=source):
+                mode, tests, benchmarks = select_tests.select_targets(
+                    self.repo_root, [source]
+                )
+                self.assertEqual(mode, "selected")
+                self.assertEqual(tests, expected_tests)
+                self.assertEqual(benchmarks, expected_benchmarks)
+
+    def test_unknown_module_change_selects_all_tests(self):
+        self.make_file("tests/test_gems_activation.py")
+        self.make_file("tests/test_unrelated.py")
+
+        mode, tests, benchmarks = select_tests.select_targets(
+            self.repo_root,
+            ["src/flaggems_vllm/modules/future_module.py"],
+        )
+
+        self.assertEqual(mode, "selected")
+        self.assertEqual(
+            tests,
+            ["tests/test_gems_activation.py", "tests/test_unrelated.py"],
+        )
+        self.assertEqual(benchmarks, [])
+
     def test_documentation_change_is_skipped(self):
         self.assertEqual(
             select_tests.select_targets(self.repo_root, ["docs/guide.md"]),
