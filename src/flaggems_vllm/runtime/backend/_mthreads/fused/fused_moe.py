@@ -52,50 +52,6 @@ _CACHE13: dict = {}
 _CACHE2: dict = {}
 
 
-_DEQUANT_CACHE: dict = {}
-_DEQUANT_ORDER: list = []
-_DEQUANT_MAX_ENTRIES = 2
-
-
-def _dequant_fp8_blockwise(w: torch.Tensor, scale: torch.Tensor, block_shape):
-    """Host-side fp8 -> bf16 dequantization with blockwise scales, cached.
-
-    MUSA blockwise fp8 large-M: doing the per-block scale multiply inside the
-    K loop (dependent loads + converts) stalls the kernel, so the weights are
-    dequantized once here and cached by (tensor, scale) identity. The cache is
-    bounded (FIFO) since dequantized weights are large (bf16).
-    """
-    bn, bk = block_shape
-    key = (w.data_ptr(), scale.data_ptr(), w.shape, scale.shape)
-    entry = _DEQUANT_CACHE.get(key)
-    if entry is not None and entry[0]() is w:
-        return entry[1]
-    # fp8 -> bf16 is exact; the scale multiply is done in fp32 via reshape
-    # broadcast (per-E batch), preserving precision while bounding peak
-    # memory. Note: per-block slice loops over tensors with >2^31 elements
-    # silently corrupt data on MUSA, so batch over E instead.
-    E, N, K = w.shape
-    n_blk, k_blk = N // bn, K // bk
-    dq = torch.empty((E, N, K), device=w.device, dtype=torch.bfloat16)
-    for e0 in range(0, E, 64):
-        eb = min(64, E - e0)
-        we = w[e0 : e0 + eb].to(torch.bfloat16)
-        dq[e0 : e0 + eb] = (
-            (
-                we.view(eb, n_blk, bn, k_blk, bk).float()
-                * scale[e0 : e0 + eb].view(eb, n_blk, 1, k_blk, 1)
-            )
-            .reshape(eb, N, K)
-            .to(torch.bfloat16)
-        )
-    _DEQUANT_CACHE[key] = (__import__("weakref").ref(w), dq)
-    _DEQUANT_ORDER.append(key)
-    while len(_DEQUANT_ORDER) > _DEQUANT_MAX_ENTRIES:
-        old_key = _DEQUANT_ORDER.pop(0)
-        _DEQUANT_CACHE.pop(old_key, None)
-    return dq
-
-
 def _get_cached_buffer(cache: dict, min_numel: int, device, dtype) -> torch.Tensor:
     key = (str(device), str(dtype))
     buf = cache.get(key)
@@ -296,12 +252,6 @@ def _get_device_name() -> str:
         logger.info("Device %s not in config table, falling back to %s", name, fallback)
         return fallback
     return name
-
-
-@functools.lru_cache(maxsize=1)
-def _is_h20() -> bool:
-    """Whether the current device is an NVIDIA H20 (gates the FP8 MoE swap_ab default)."""
-    return "H20" in _get_device_name().split("_")
 
 
 def get_moe_configs(
