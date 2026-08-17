@@ -35,7 +35,6 @@ BUILTIN_MARKS = (
     "parametrize",
     "skip",
     "skipif",
-    "xfail",
     "usefixtures",
     "filterwarnings",
     "timeout",

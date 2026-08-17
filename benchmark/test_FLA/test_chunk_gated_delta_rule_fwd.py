@@ -103,7 +103,7 @@ class ChunkGatedDeltaRuleFwdBenchmark(Benchmark):
 
 
 @pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.xfail(
+@pytest.mark.skipif(
     not has_triton_tle(3, 6, 0),
     reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
