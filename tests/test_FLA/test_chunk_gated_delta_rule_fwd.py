@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 
 def naive_chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state):
@@ -73,8 +74,9 @@ def naive_chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state):
 
 
 @pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.xfail(
-    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue"
+@pytest.mark.skipif(
+    not has_triton_tle(3, 6, 0),
+    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
 @pytest.mark.parametrize("B", [1, 2])
 @pytest.mark.parametrize("T", [64, 128])
@@ -120,8 +122,9 @@ def test_chunk_gated_delta_rule_fwd_accuracy(B, T, H, K, V, dtype):
 
 
 @pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.xfail(
-    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue"
+@pytest.mark.skipif(
+    not has_triton_tle(3, 6, 0),
+    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
 @pytest.mark.parametrize("T", [64, 128, 256])
 def test_chunk_gated_delta_rule_fwd_no_initial_state(T):
@@ -156,8 +159,9 @@ def test_chunk_gated_delta_rule_fwd_no_initial_state(T):
 
 
 @pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.xfail(
-    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue"
+@pytest.mark.skipif(
+    not has_triton_tle(3, 6, 0),
+    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
 @pytest.mark.parametrize("T", [64, 128])
 def test_chunk_gated_delta_rule_fwd_with_cu_seqlens(T):

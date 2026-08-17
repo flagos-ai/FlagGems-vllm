@@ -44,7 +44,6 @@ BUILTIN_MARKS = {
     "tryfirst",
     "trylast",
     "usefixtures",
-    "xfail",
 }
 REGISTERED_MARKS = []
 TEST_RESULTS = {}
