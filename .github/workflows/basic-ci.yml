@@ -157,8 +157,7 @@ jobs:
           FORCE_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true }}
           RUN_BENCHMARKS: >-
             ${{ github.event_name == 'push' ||
-                (github.event_name == 'workflow_dispatch' && inputs.run_benchmarks == true) ||
-                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/benchmark')) }}
+                (github.event_name == 'workflow_dispatch' && inputs.run_benchmarks == true) }}
         run: |
           set -euo pipefail
           args=(
@@ -217,7 +216,7 @@ jobs:
     needs: select-targets
     # Default: never execute fork-controlled code on the persistent H20 runner.
     # Maintainers may opt in a fork PR with the write-gated `ci/nvidia` label
-    # (same trust model as `ci/benchmark` / `ci/all-vendors`).
+    # (same trust model as `ci/all-vendors`).
     if: >-
       needs.select-targets.outputs.should_run == 'true'
       && (github.event_name != 'pull_request'
