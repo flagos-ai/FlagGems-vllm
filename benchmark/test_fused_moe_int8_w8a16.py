@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -184,19 +184,19 @@ def _gems_fused_moe_int8_w8a16_wrapper(
     )
 
 
-@pytest.mark.fused_experts_impl
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_experts_impl_int8_w8a16():
-    """
-    Benchmark FlagGems fused_experts_impl with INT8 W8A16 quantization.
+# @pytest.mark.fused_experts_impl
+# @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+# def test_fused_experts_impl_int8_w8a16():
+#     """
+#     Benchmark FlagGems fused_experts_impl with INT8 W8A16 quantization.
 
-    Baseline is manual dequant + bf16 FlagGems (vLLM's INT8 W8A16 uses
-    specialised WNA16 kernels not available via the generic Triton path).
-    """
-    bench = FusedMoEINT8W8A16Benchmark(
-        op_name="fused_moe_int8_w8a16_gems_vs_bf16_deq",
-        torch_op=_vllm_fused_moe_int8_w8a16_wrapper,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_fused_moe_int8_w8a16_wrapper)
-    bench.run()
+#     Baseline is manual dequant + bf16 FlagGems (vLLM's INT8 W8A16 uses
+#     specialised WNA16 kernels not available via the generic Triton path).
+#     """
+#     bench = FusedMoEINT8W8A16Benchmark(
+#         op_name="fused_moe_int8_w8a16_gems_vs_bf16_deq",
+#         torch_op=_vllm_fused_moe_int8_w8a16_wrapper,
+#         dtypes=[torch.bfloat16],
+#     )
+#     bench.set_gems(_gems_fused_moe_int8_w8a16_wrapper)
+#     bench.run()

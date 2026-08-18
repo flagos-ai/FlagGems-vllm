@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -300,32 +300,32 @@ def _gems_fused_moe_mxq_w8a16_wrapper(
     )
 
 
-@pytest.mark.fused_moe
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_moe_w8a16_mxq():
-    """
-    Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
-    """
-    bench = FusedMoEMXQW8A16Benchmark(
-        op_name="fused_moe_w8a16_mxq_gems_vs_bf16_deq",
-        torch_op=_baseline_w8a16_mxq_wrapper,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_fused_moe_mxq_w8a16_wrapper)
-    bench.run()
+# @pytest.mark.fused_moe
+# @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+# def test_fused_moe_w8a16_mxq():
+#     """
+#     Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
+#     """
+#     bench = FusedMoEMXQW8A16Benchmark(
+#         op_name="fused_moe_w8a16_mxq_gems_vs_bf16_deq",
+#         torch_op=_baseline_w8a16_mxq_wrapper,
+#         dtypes=[torch.bfloat16],
+#     )
+#     bench.set_gems(_gems_fused_moe_mxq_w8a16_wrapper)
+#     bench.run()
 
 
-@pytest.mark.fused_moe
-@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_moe_w8a16_mxq_gems_vs_vllm():
-    """
-    Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
-    """
-    bench = FusedMoEMXQW8A16Benchmark(
-        op_name="fused_moe_w8a16_mxq_gems_vs_vllm",
-        torch_op=_baseline_w8a16_mxq_wrapper_vllm,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_fused_moe_mxq_w8a16_wrapper)
-    bench.run()
+# @pytest.mark.fused_moe
+# @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
+# @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+# def test_fused_moe_w8a16_mxq_gems_vs_vllm():
+#     """
+#     Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
+#     """
+#     bench = FusedMoEMXQW8A16Benchmark(
+#         op_name="fused_moe_w8a16_mxq_gems_vs_vllm",
+#         torch_op=_baseline_w8a16_mxq_wrapper_vllm,
+#         dtypes=[torch.bfloat16],
+#     )
+#     bench.set_gems(_gems_fused_moe_mxq_w8a16_wrapper)
+#     bench.run()

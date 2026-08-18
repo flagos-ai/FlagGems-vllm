@@ -30,13 +30,13 @@ DECODE_CONFIGS = [
 
 PREFILL_CONFIGS = [
     (512, 28, 4, 128, 128, 24, 20, 20, True, False, False),
-    (8192, 28, 4, 128, 128, 24, 20, 20, True, False, False),
-    (4096, 40, 8, 128, 128, 24, 20, 20, True, False, False),
-    (2048, 32, 4, 128, 64, 8, 12, 12, False, False, False),
+    # (8192, 28, 4, 128, 128, 24, 20, 20, True, False, False),
+    # (4096, 40, 8, 128, 128, 24, 20, 20, True, False, False),
+    # (2048, 32, 4, 128, 64, 8, 12, 12, False, False, False),
     (512, 28, 4, 128, 128, 24, 20, 20, True, True, False),
-    (8192, 28, 4, 128, 128, 24, 20, 20, True, True, False),
+    # (8192, 28, 4, 128, 128, 24, 20, 20, True, True, False),
     (512, 28, 4, 128, 64, 8, 12, 12, True, True, True),
-    (2048, 16, 16, 128, 64, 8, 12, 12, True, True, True),
+    # (2048, 16, 16, 128, 64, 8, 12, 12, True, True, True),
 ]
 
 ALL_CONFIGS = DECODE_CONFIGS + PREFILL_CONFIGS

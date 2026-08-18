@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 # vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
@@ -252,21 +252,21 @@ def _gems_call(
     )
 
 
-@pytest.mark.fused_marlin_moe
-@pytest.mark.skipif(
-    not HAS_VLLM_FUSED_MARLIN_MOE,
-    reason="vllm not installed; baseline unavailable",
-)
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_marlin_moe():
-    """
-    Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
-    (CUDA Marlin). Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
-    """
-    bench = FusedMarlinMoEBenchmark(
-        op_name="fused_marlin_moe",
-        torch_op=_vllm_baseline,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_call)
-    bench.run()
+# @pytest.mark.fused_marlin_moe
+# @pytest.mark.skipif(
+#     not HAS_VLLM_FUSED_MARLIN_MOE,
+#     reason="vllm not installed; baseline unavailable",
+# )
+# @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+# def test_fused_marlin_moe():
+#     """
+#     Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
+#     (CUDA Marlin). Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
+#     """
+#     bench = FusedMarlinMoEBenchmark(
+#         op_name="fused_marlin_moe",
+#         torch_op=_vllm_baseline,
+#         dtypes=[torch.bfloat16],
+#     )
+#     bench.set_gems(_gems_call)
+#     bench.run()

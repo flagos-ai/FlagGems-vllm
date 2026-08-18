@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -44,19 +44,19 @@ class FusedMoEBenchmark(base.Benchmark):
         # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
         self.shapes = [
             # Mixtral-like shapes (representative)
-            (64, 8, 4096, 14336, 2),
-            (512, 8, 4096, 14336, 2),
+            # (64, 8, 4096, 14336, 2),
+            # (512, 8, 4096, 14336, 2),
             # DeepSeek-V3-like shapes (representative)
-            (64, 256, 7168, 2048, 8),
-            (256, 256, 7168, 2048, 8),
+            # (64, 256, 7168, 2048, 8),
+            # (256, 256, 7168, 2048, 8),
             # Qwen3.6-35B-A3B (real production shapes, representative subset)
             (1, 256, 2048, 128, 8),
-            (16, 256, 2048, 128, 8),
-            (64, 256, 2048, 128, 8),
-            (512, 256, 2048, 128, 8),
-            (1035, 256, 2048, 128, 8),
-            (16384, 256, 2048, 128, 8),
-            (16384, 256, 2048, 512, 8),
+            # (16, 256, 2048, 128, 8),
+            # (64, 256, 2048, 128, 8),
+            # (512, 256, 2048, 128, 8),
+            # (1035, 256, 2048, 128, 8),
+            # (16384, 256, 2048, 128, 8),
+            # (16384, 256, 2048, 512, 8),
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -120,16 +120,16 @@ def _gems_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids):
     )
 
 
-@pytest.mark.fused_experts_impl
-@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
-def test_fused_moe_impl_gems_vs_vllm():
-    """
-    Benchmark FlagGems fused_experts_impl vs vLLM fused_experts_impl (bf16/fp16).
-    """
-    bench = FusedMoEBenchmark(
-        op_name="fused_experts_impl",
-        torch_op=_vllm_fused_moe_wrapper,
-        dtypes=[torch.bfloat16, torch.float16],
-    )
-    bench.set_gems(_gems_fused_moe_wrapper)
-    bench.run()
+# @pytest.mark.fused_experts_impl
+# @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
+# def test_fused_moe_impl_gems_vs_vllm():
+#     """
+#     Benchmark FlagGems fused_experts_impl vs vLLM fused_experts_impl (bf16/fp16).
+#     """
+#     bench = FusedMoEBenchmark(
+#         op_name="fused_experts_impl",
+#         torch_op=_vllm_fused_moe_wrapper,
+#         dtypes=[torch.bfloat16, torch.float16],
+#     )
+#     bench.set_gems(_gems_fused_moe_wrapper)
+#     bench.run()

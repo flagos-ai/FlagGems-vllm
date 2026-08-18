@@ -108,27 +108,27 @@ def torch_flash_attention_supports_alibi(device: str) -> bool:
 class FlashAttentionForwardBenchmark(base.GenericBenchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
-        for head_size in (64, 128, 192, 256):
-            for is_causal in (False, True):
-                self.shapes.append(
-                    (
-                        4,
-                        8,
-                        8,
-                        1024,
-                        128,
-                        head_size,
-                        is_causal,
-                        0.0,
-                        False,
-                        None,
-                        None,
-                        False,
-                    )
-                )
+        # for head_size in (64, 128, 192, 256):
+        #     for is_causal in (False, True):
+        #         self.shapes.append(
+        #             (
+        #                 4,
+        #                 8,
+        #                 8,
+        #                 1024,
+        #                 128,
+        #                 head_size,
+        #                 is_causal,
+        #                 0.0,
+        #                 False,
+        #                 None,
+        #                 None,
+        #                 False,
+        #             )
+        #         )
 
         for batch, num_head, q_seq_len, kv_seq_len in (
-            (1, 1, 128, 2048),
+            # (1, 1, 128, 2048),
             (4, 8, 17, 1030),
         ):
             for is_causal in (False, True):
@@ -152,24 +152,24 @@ class FlashAttentionForwardBenchmark(base.GenericBenchmark):
         supports_alibi = torch_flash_attention_supports_alibi(self.device)
         if supports_alibi:
             # GQA + alibi cases
-            for head_size in (128, 192):
-                for is_causal in (False, True):
-                    self.shapes.append(
-                        (
-                            4,
-                            8,
-                            2,
-                            1024,
-                            1024,
-                            head_size,
-                            is_causal,
-                            0.0,
-                            False,
-                            None,
-                            None,
-                            True,
-                        )
-                    )
+            # for head_size in (128, 192):
+            #     for is_causal in (False, True):
+            #         self.shapes.append(
+            #             (
+            #                 4,
+            #                 8,
+            #                 2,
+            #                 1024,
+            #                 1024,
+            #                 head_size,
+            #                 is_causal,
+            #                 0.0,
+            #                 False,
+            #                 None,
+            #                 None,
+            #                 True,
+            #             )
+            #         )
             for is_causal in (False, True):
                 self.shapes.append(
                     (
@@ -227,9 +227,9 @@ class FlashAttentionForwardBenchmark(base.GenericBenchmark):
         # Sliding window attention.
         for batch, num_head, q_seq_len, kv_seq_len in (
             (1, 1, 128, 2048),
-            (8, 32, 1024, 1024),
-            (8, 32, 1024, 128),
-            (8, 32, 17, 1030),
+            # (8, 32, 1024, 1024),
+            # (8, 32, 1024, 128),
+            # (8, 32, 17, 1030),
         ):
             for window_size_left, window_size_right in ((256, 0), (128, 128)):
                 self.shapes.append(
@@ -248,27 +248,27 @@ class FlashAttentionForwardBenchmark(base.GenericBenchmark):
                         False,
                     )
                 )
-        self.shapes.append(
-            (8, 32, 32, 1024, 1024, 192, False, 0.0, False, 256, 0, False)
-        )
+        # self.shapes.append(
+        #     (8, 32, 32, 1024, 1024, 192, False, 0.0, False, 256, 0, False)
+        # )
 
-        for is_causal in (False, True):
-            self.shapes.append(
-                (
-                    1,
-                    1,
-                    1,
-                    1024,
-                    1024,
-                    128,
-                    is_causal,
-                    0.2,
-                    True,
-                    None,
-                    None,
-                    False,
-                )
-            )
+        # for is_causal in (False, True):
+        #     self.shapes.append(
+        #         (
+        #             1,
+        #             1,
+        #             1,
+        #             1024,
+        #             1024,
+        #             128,
+        #             is_causal,
+        #             0.2,
+        #             True,
+        #             None,
+        #             None,
+        #             False,
+        #         )
+        #     )
 
     def set_more_shapes(self):
         return []

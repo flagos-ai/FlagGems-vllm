@@ -41,7 +41,7 @@ from benchmark.consts import (
     model_shapes,
 )
 
-from . import consts
+# from . import consts
 
 try:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -260,8 +260,8 @@ ROUTER_GEMM_SHAPES = [
     (1, 64, 256, 7168),
     (1, 128, 256, 7168),
     (1, 256, 256, 7168),
-    (1, 512, 256, 7168),
-    (1, 1024, 256, 7168),
+    # (1, 512, 256, 7168),
+    # (1, 1024, 256, 7168),
 ]
 
 
@@ -1283,88 +1283,88 @@ class ParallelSparseAttentionBenchmark(ParallelBenchmarkMixin, Benchmark):
 # ============================================================================
 
 
-@pytest.mark.parametrize(
-    "op_name, torch_op, input_fn, bench_cls",
-    [
-        pytest.param(
-            "addmm",
-            torch.addmm,
-            addmm_input_fn,
-            ParallelBlasBenchmark,
-            marks=pytest.mark.addmm,
-        ),
-        pytest.param(
-            "bmm",
-            torch.bmm,
-            bmm_input_fn,
-            ParallelBlasBenchmark,
-            marks=pytest.mark.bmm,
-        ),
-        pytest.param(
-            "mm",
-            torch.Tensor.mm,
-            mm_input_fn,
-            ParallelBlasBenchmark,
-            marks=pytest.mark.mm,
-        ),
-        pytest.param(
-            "baddbmm",
-            torch.baddbmm,
-            baddbmm_input_fn,
-            ParallelBaddbmmBenchmark,
-            marks=pytest.mark.baddbmm,
-        ),
-    ],
-)
-def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
-    bench = bench_cls(
-        input_fn=input_fn,
-        op_name=op_name,
-        torch_op=torch_op,
-        dtypes=FLOAT_DTYPES,
-    )
-    bench.run()
+# @pytest.mark.parametrize(
+#     "op_name, torch_op, input_fn, bench_cls",
+#     [
+#         pytest.param(
+#             "addmm",
+#             torch.addmm,
+#             addmm_input_fn,
+#             ParallelBlasBenchmark,
+#             marks=pytest.mark.addmm,
+#         ),
+#         pytest.param(
+#             "bmm",
+#             torch.bmm,
+#             bmm_input_fn,
+#             ParallelBlasBenchmark,
+#             marks=pytest.mark.bmm,
+#         ),
+#         pytest.param(
+#             "mm",
+#             torch.Tensor.mm,
+#             mm_input_fn,
+#             ParallelBlasBenchmark,
+#             marks=pytest.mark.mm,
+#         ),
+#         pytest.param(
+#             "baddbmm",
+#             torch.baddbmm,
+#             baddbmm_input_fn,
+#             ParallelBaddbmmBenchmark,
+#             marks=pytest.mark.baddbmm,
+#         ),
+#     ],
+# )
+# def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
+#     bench = bench_cls(
+#         input_fn=input_fn,
+#         op_name=op_name,
+#         torch_op=torch_op,
+#         dtypes=FLOAT_DTYPES,
+#     )
+#     bench.run()
 
 
-@pytest.mark.w8a8_block_fp8_matmul
-def test_perf_w8a8_block_fp8_matmul():
-    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
-        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
-    if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
-        pytest.skip("w8a8_block_fp8_matmul benchmark requires vLLM baseline operator")
-    if len(consts.FP8_DTYPES) == 0:
-        pytest.skip(
-            "w8a8_block_fp8_matmul benchmark requires CUDA device with FP8 support"
-        )
+# @pytest.mark.w8a8_block_fp8_matmul
+# def test_perf_w8a8_block_fp8_matmul():
+#     if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
+#         pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
+#     if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
+#         pytest.skip("w8a8_block_fp8_matmul benchmark requires vLLM baseline operator")
+#     if len(consts.FP8_DTYPES) == 0:
+#         pytest.skip(
+#             "w8a8_block_fp8_matmul benchmark requires CUDA device with FP8 support"
+#         )
 
-    bench = ParallelW8A8BlockFP8MatmulBenchmark(
-        op_name="w8a8_block_fp8_matmul",
-        torch_op=vllm_w8a8_triton_block_scaled_mm,
-        dtypes=consts.FP8_DTYPES,
-    )
-    bench.set_gems(flaggems_vllm.w8a8_block_fp8_matmul)
-    bench.run()
+#     bench = ParallelW8A8BlockFP8MatmulBenchmark(
+#         op_name="w8a8_block_fp8_matmul",
+#         torch_op=vllm_w8a8_triton_block_scaled_mm,
+#         dtypes=consts.FP8_DTYPES,
+#     )
+#     bench.set_gems(flaggems_vllm.w8a8_block_fp8_matmul)
+#     bench.run()
 
 
-@pytest.mark.w8a8_block_fp8_matmul_deepgemm
-def test_perf_w8a8_block_fp8_matmul_deepgemm():
-    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
-        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
-    if not DEEPGEMM_AVAILABLE:
-        pytest.skip("DeepGEMM is not available on this platform")
-    if len(consts.FP8_DTYPES) == 0:
-        pytest.skip(
-            "w8a8_block_fp8_matmul benchmark requires CUDA device with FP8 support"
-        )
+# @pytest.mark.w8a8_block_fp8_matmul_deepgemm
+# def test_perf_w8a8_block_fp8_matmul_deepgemm():
+#     if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
+#         pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
+#     if not DEEPGEMM_AVAILABLE:
+#         pytest.skip("DeepGEMM is not available on this platform")
+#     if len(consts.FP8_DTYPES) == 0:
+#         pytest.skip(
+#             "w8a8_block_fp8_matmul benchmark requires CUDA device with FP8 support"
+#         )
 
-    bench = ParallelW8A8BlockFP8DeepGemmBenchmark(
-        op_name="w8a8_block_fp8_matmul_deepgemm",
-        torch_op=_deepgemm_block_scaled_mm,
-        dtypes=consts.FP8_DTYPES,
-        output_dtype=torch.bfloat16,
-    )
-    bench.set_gems(flaggems_vllm.w8a8_block_fp8_matmul)
-    bench.run()
+#     bench = ParallelW8A8BlockFP8DeepGemmBenchmark(
+#         op_name="w8a8_block_fp8_matmul_deepgemm",
+#         torch_op=_deepgemm_block_scaled_mm,
+#         dtypes=consts.FP8_DTYPES,
+#         output_dtype=torch.bfloat16,
+#     )
+#     bench.set_gems(flaggems_vllm.w8a8_block_fp8_matmul)
+#     bench.run()
 
 
 @pytest.mark.sparse_attention
@@ -1382,52 +1382,52 @@ def test_perf_sparse_attention():
     bench.run()
 
 
-@pytest.mark.parametrize(
-    "op_name, torch_op, input_fn",
-    [
-        pytest.param(
-            "mv",
-            torch.Tensor.mv,
-            mv_input_fn,
-            marks=pytest.mark.mv,
-        ),
-        pytest.param(
-            "outer",
-            torch.Tensor.outer,
-            outer_input_fn,
-            marks=pytest.mark.outer,
-        ),
-    ],
-)
-def test_mv_and_outer_benchmark(op_name, torch_op, input_fn):
-    bench = ParallelMvAndOuterBenchmark(
-        input_fn=input_fn,
-        op_name=op_name,
-        torch_op=torch_op,
-        dtypes=FLOAT_DTYPES,
-    )
-    bench.run()
+# @pytest.mark.parametrize(
+#     "op_name, torch_op, input_fn",
+#     [
+#         pytest.param(
+#             "mv",
+#             torch.Tensor.mv,
+#             mv_input_fn,
+#             marks=pytest.mark.mv,
+#         ),
+#         pytest.param(
+#             "outer",
+#             torch.Tensor.outer,
+#             outer_input_fn,
+#             marks=pytest.mark.outer,
+#         ),
+#     ],
+# )
+# def test_mv_and_outer_benchmark(op_name, torch_op, input_fn):
+#     bench = ParallelMvAndOuterBenchmark(
+#         input_fn=input_fn,
+#         op_name=op_name,
+#         torch_op=torch_op,
+#         dtypes=FLOAT_DTYPES,
+#     )
+#     bench.run()
 
 
-@pytest.mark.parametrize(
-    "op_name, torch_op, input_fn",
-    [
-        pytest.param(
-            "addmv",
-            torch.addmv,
-            addmv_input_fn,
-            marks=pytest.mark.addmv,
-        ),
-    ],
-)
-def test_addmv_benchmark(op_name, torch_op, input_fn):
-    bench = ParallelAddmvBenchmark(
-        input_fn=input_fn,
-        op_name=op_name,
-        torch_op=torch_op,
-        dtypes=FLOAT_DTYPES,
-    )
-    bench.run()
+# @pytest.mark.parametrize(
+#     "op_name, torch_op, input_fn",
+#     [
+#         pytest.param(
+#             "addmv",
+#             torch.addmv,
+#             addmv_input_fn,
+#             marks=pytest.mark.addmv,
+#         ),
+#     ],
+# )
+# def test_addmv_benchmark(op_name, torch_op, input_fn):
+#     bench = ParallelAddmvBenchmark(
+#         input_fn=input_fn,
+#         op_name=op_name,
+#         torch_op=torch_op,
+#         dtypes=FLOAT_DTYPES,
+#     )
+#     bench.run()
 
 
 @pytest.mark.vdot

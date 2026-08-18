@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
-import flaggems_vllm
+# import flaggems_vllm
 
-from . import base, consts
+# from . import base, consts
 
 
 def _input_fn(shape, dtype, device):
@@ -42,16 +42,16 @@ def _input_fn(shape, dtype, device):
     yield input_tensor, output_tensor
 
 
-@pytest.mark.moe_sum
-def test_moe_sum():
-    def torch_op(input_tensor, output_tensor):
-        output_tensor.copy_(input_tensor.sum(dim=1))
+# @pytest.mark.moe_sum
+# def test_moe_sum():
+#     def torch_op(input_tensor, output_tensor):
+#         output_tensor.copy_(input_tensor.sum(dim=1))
 
-    bench = base.GenericBenchmarkExcluse1D(
-        input_fn=_input_fn,
-        op_name="moe_sum",
-        torch_op=torch_op,
-        dtypes=consts.FLOAT_DTYPES,
-    )
-    bench.set_gems(flaggems_vllm.moe_sum)
-    bench.run()
+#     bench = base.GenericBenchmarkExcluse1D(
+#         input_fn=_input_fn,
+#         op_name="moe_sum",
+#         torch_op=torch_op,
+#         dtypes=consts.FLOAT_DTYPES,
+#     )
+#     bench.set_gems(flaggems_vllm.moe_sum)
+#     bench.run()

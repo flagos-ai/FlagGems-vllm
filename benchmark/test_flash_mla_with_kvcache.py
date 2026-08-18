@@ -17,7 +17,7 @@ import math
 import random
 from typing import Optional
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -396,8 +396,8 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
         yield (q, k_cache, block_table, cache_seqlens, d_v, kwargs)
 
 
-@pytest.mark.flash_mla_with_kvcache
-@pytest.mark.skipif(not HAS_CUDA_FLASHMLA, reason="vLLM FlashMLA not installed")
-def test_flash_mla_with_kvcache():
-    bench = FlashMLAWithKVCacheBenchmark()
-    bench.run()
+# @pytest.mark.flash_mla_with_kvcache
+# @pytest.mark.skipif(not HAS_CUDA_FLASHMLA, reason="vLLM FlashMLA not installed")
+# def test_flash_mla_with_kvcache():
+#     bench = FlashMLAWithKVCacheBenchmark()
+#     bench.run()

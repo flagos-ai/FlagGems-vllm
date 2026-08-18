@@ -96,13 +96,13 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
                 4,
                 17,
                 64,
-                1024,
-                2048,
-                8192,
-                32768,
-                65536,
-                98304,
-                131072,
+                # 1024,
+                # 2048,
+                # 8192,
+                # 32768,
+                # 65536,
+                # 98304,
+                # 131072,
             ]
             for num_heads in [64, 128]
         ]

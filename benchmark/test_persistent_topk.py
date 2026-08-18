@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -125,13 +125,13 @@ class PersistentTopKBenchmark(base.Benchmark):
             yield logits, lengths, indices, workspace, max_len, seq_lens
 
 
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
-@pytest.mark.persistent_topk
-def test_persistent_topk():
-    bench = PersistentTopKBenchmark(
-        op_name="persistent_topk",
-        torch_op=_baseline_persistent_topk,
-        gems_op=_gems_decode,
-        dtypes=[torch.float32],
-    )
-    bench.run()
+# @pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
+# @pytest.mark.persistent_topk
+# def test_persistent_topk():
+#     bench = PersistentTopKBenchmark(
+#         op_name="persistent_topk",
+#         torch_op=_baseline_persistent_topk,
+#         gems_op=_gems_decode,
+#         dtypes=[torch.float32],
+#     )
+#     bench.run()

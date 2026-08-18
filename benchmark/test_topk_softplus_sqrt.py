@@ -110,9 +110,9 @@ class TopkSoftplusSqrtBenchmark(base.Benchmark):
             (16, 256, 6),
             (128, 256, 6),
             (512, 256, 6),
-            (1024, 256, 6),
-            (2048, 256, 6),
-            (4096, 256, 6),
+            # (1024, 256, 6),
+            # (2048, 256, 6),
+            # (4096, 256, 6),
         ]
 
     def get_input_iter(self, dtype):

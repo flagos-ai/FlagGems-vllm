@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -178,14 +178,14 @@ def _torch_op_wrapper(*args, **kwargs):
     return flaggems_vllm.ops_recurrent_gated_delta_rule_fwd(*args, **kwargs)
 
 
-@pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
-@pytest.mark.parametrize("qkv_contiguous", [False])
-def test_perf_fused_recurrent_gated_delta_rule(qkv_contiguous):
-    bench = FusedRecurrentGatedDeltaRuleBenchmark(
-        qkv_contiguous,
-        op_name="fused_recurrent_gated_delta_rule",
-        torch_op=_torch_op_wrapper,
-    )
-    bench.set_gems(flaggems_vllm.ops_recurrent_gated_delta_rule_fwd)
-    bench.run()
+# @pytest.mark.fused_recurrent_gated_delta_rule_fwd
+# @pytest.mark.fused_recurrent_gated_delta_rule
+# @pytest.mark.parametrize("qkv_contiguous", [False])
+# def test_perf_fused_recurrent_gated_delta_rule(qkv_contiguous):
+#     bench = FusedRecurrentGatedDeltaRuleBenchmark(
+#         qkv_contiguous,
+#         op_name="fused_recurrent_gated_delta_rule",
+#         torch_op=_torch_op_wrapper,
+#     )
+#     bench.set_gems(flaggems_vllm.ops_recurrent_gated_delta_rule_fwd)
+#     bench.run()

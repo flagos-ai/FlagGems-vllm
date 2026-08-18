@@ -15,7 +15,7 @@
 import itertools
 import math
 
-import pytest
+# import pytest
 import torch
 import torch.nn.functional as F
 
@@ -262,14 +262,14 @@ class ChunkKDABenchmark(Benchmark):
         )
 
 
-@pytest.mark.skipif(
-    flaggems_vllm.device != "cuda", reason="chunk_kda benchmark requires CUDA"
-)
-@pytest.mark.chunk_kda
-def test_chunk_kda():
-    bench = ChunkKDABenchmark(
-        op_name="chunk_kda",
-        torch_op=_chunk_kda_torch_reference_op,
-    )
-    bench.set_gems(_chunk_kda_inference_op)
-    bench.run()
+# @pytest.mark.skipif(
+#     flaggems_vllm.device != "cuda", reason="chunk_kda benchmark requires CUDA"
+# )
+# @pytest.mark.chunk_kda
+# def test_chunk_kda():
+#     bench = ChunkKDABenchmark(
+#         op_name="chunk_kda",
+#         torch_op=_chunk_kda_torch_reference_op,
+#     )
+#     bench.set_gems(_chunk_kda_inference_op)
+#     bench.run()

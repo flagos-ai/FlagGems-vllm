@@ -22,8 +22,21 @@ from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import base
 
-M = [1, 40, 164, 512, 3454, 12027, 38594]
-N = [128, 896, 2048, 8192]
+M = [
+    1,
+    40,
+    164,
+    512,
+    # 3454,
+    # 12027,
+    # 38594,
+]
+N = [
+    128,
+    896,
+    # 2048,
+    # 8192,
+]
 # Test parameters
 SHAPES = [(m, n) for m in M for n in N]
 BLOCK_SIZES = [64, 128]

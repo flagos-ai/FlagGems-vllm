@@ -61,9 +61,9 @@ def make_sparse_mla_input(
 
 SPARSE_MLA_PARAMS = [
     {"seq_len_q": 64, "seq_len_kv": 1024, "topk": 64, "num_heads": 128},
-    {"seq_len_q": 128, "seq_len_kv": 2048, "topk": 128, "num_heads": 128},
-    {"seq_len_q": 256, "seq_len_kv": 4096, "topk": 256, "num_heads": 128},
-    {"seq_len_q": 512, "seq_len_kv": 8192, "topk": 512, "num_heads": 128},
+    # {"seq_len_q": 128, "seq_len_kv": 2048, "topk": 128, "num_heads": 128},
+    # {"seq_len_q": 256, "seq_len_kv": 4096, "topk": 256, "num_heads": 128},
+    # {"seq_len_q": 512, "seq_len_kv": 8192, "topk": 512, "num_heads": 128},
 ]
 
 

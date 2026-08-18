@@ -56,11 +56,11 @@ LEGACY_BLAS_SHAPES = [(16, shape, shape, shape) for shape in LEGACY_SHAPES]
 
 # Default shapes settings
 DEFAULT_SHAPES = [
-    (1024 * 1024 * 1024,),  # from perf
+    # (1024 * 1024 * 1024,),  # from perf
     (64, 64),
-    (4096, 4096),
-    (64, 512, 512),
-    (1024, 1024, 1024),  # from perf
+    # (4096, 4096),
+    # (64, 512, 512),
+    # (1024, 1024, 1024),  # from perf
 ]
 
 

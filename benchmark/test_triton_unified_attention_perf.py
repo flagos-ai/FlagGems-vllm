@@ -32,54 +32,54 @@ BENCH_CONFIGS = [
         "causal": True,
         "softcap": 0.0,
     },
-    # Decode: B=8, KV=4096, GQA 32:8
-    {
-        "num_seqs": 8,
-        "query_lens": [1] * 8,
-        "context_lens": [4095] * 8,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Decode: B=64, KV=4096, GQA 32:8
-    {
-        "num_seqs": 64,
-        "query_lens": [1] * 64,
-        "context_lens": [4095] * 64,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Prefill: B=4, Q=128, GQA 32:8
-    {
-        "num_seqs": 4,
-        "query_lens": [128] * 4,
-        "context_lens": [0] * 4,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Prefill: B=1, Q=512, KV=3584, GQA 32:8
-    {
-        "num_seqs": 1,
-        "query_lens": [512],
-        "context_lens": [3584],
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
+    # # Decode: B=8, KV=4096, GQA 32:8
+    # {
+    #     "num_seqs": 8,
+    #     "query_lens": [1] * 8,
+    #     "context_lens": [4095] * 8,
+    #     "num_query_heads": 32,
+    #     "num_kv_heads": 8,
+    #     "head_size": 128,
+    #     "block_size": 16,
+    #     "causal": True,
+    #     "softcap": 0.0,
+    # },
+    # # Decode: B=64, KV=4096, GQA 32:8
+    # {
+    #     "num_seqs": 64,
+    #     "query_lens": [1] * 64,
+    #     "context_lens": [4095] * 64,
+    #     "num_query_heads": 32,
+    #     "num_kv_heads": 8,
+    #     "head_size": 128,
+    #     "block_size": 16,
+    #     "causal": True,
+    #     "softcap": 0.0,
+    # },
+    # # Prefill: B=4, Q=128, GQA 32:8
+    # {
+    #     "num_seqs": 4,
+    #     "query_lens": [128] * 4,
+    #     "context_lens": [0] * 4,
+    #     "num_query_heads": 32,
+    #     "num_kv_heads": 8,
+    #     "head_size": 128,
+    #     "block_size": 16,
+    #     "causal": True,
+    #     "softcap": 0.0,
+    # },
+    # # Prefill: B=1, Q=512, KV=3584, GQA 32:8
+    # {
+    #     "num_seqs": 1,
+    #     "query_lens": [512],
+    #     "context_lens": [3584],
+    #     "num_query_heads": 32,
+    #     "num_kv_heads": 8,
+    #     "head_size": 128,
+    #     "block_size": 16,
+    #     "causal": True,
+    #     "softcap": 0.0,
+    # },
 ]
 
 

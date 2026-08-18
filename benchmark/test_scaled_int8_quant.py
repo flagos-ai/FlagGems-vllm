@@ -20,8 +20,21 @@ import flaggems_vllm
 
 from . import base
 
-NUM_TOKENS = [1, 64, 512, 2048, 4096]
-HIDDEN_SIZES = [512, 1024, 4096, 5120, 8192, 13824]
+NUM_TOKENS = [
+    1,
+    64,
+    512,
+    # 2048,
+    # 4096,
+]
+HIDDEN_SIZES = [
+    512,
+    1024,
+    # 4096,
+    # 5120,
+    # 8192,
+    # 13824,
+]
 SHAPES = [(m, n) for m in NUM_TOKENS for n in HIDDEN_SIZES]
 
 

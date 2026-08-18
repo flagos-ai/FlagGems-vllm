@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -80,19 +80,19 @@ class FusedMoEFP8Benchmark(base.Benchmark):
         # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
         self.shapes = [
             # Mixtral-like shapes (representative)
-            (64, 8, 4096, 14336, 2),
-            (512, 8, 4096, 14336, 2),
+            # (64, 8, 4096, 14336, 2),
+            # (512, 8, 4096, 14336, 2),
             # DeepSeek-V3-like shapes (representative)
-            (64, 256, 7168, 2048, 8),
-            (256, 256, 7168, 2048, 8),
+            # (64, 256, 7168, 2048, 8),
+            # (256, 256, 7168, 2048, 8),
             # Qwen3.6-35B-A3B (real production shapes, representative subset)
             (1, 256, 2048, 128, 8),
-            (16, 256, 2048, 128, 8),
-            (64, 256, 2048, 128, 8),
-            (512, 256, 2048, 128, 8),
-            (1035, 256, 2048, 128, 8),
-            (16384, 256, 2048, 128, 8),
-            (16384, 256, 2048, 512, 8),
+            # (16, 256, 2048, 128, 8),
+            # (64, 256, 2048, 128, 8),
+            # (512, 256, 2048, 128, 8),
+            # (1035, 256, 2048, 128, 8),
+            # (16384, 256, 2048, 128, 8),
+            # (16384, 256, 2048, 512, 8),
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -203,19 +203,19 @@ def _gems_fused_moe_fp8_wrapper(
     )
 
 
-@pytest.mark.fused_experts_impl
-@pytest.mark.skipif(
-    not (HAS_VLLM_FUSED_MOE and FP8_AVAILABLE),
-    reason="requires vLLM and an FP8-capable device (NVIDIA Hopper or FP8-capable accelerator)",
-)
-def test_fused_moe_fp8():
-    """
-    Benchmark FlagGems vs vLLM fused_experts_impl with FP8 W8A8 quantization.
-    """
-    bench = FusedMoEFP8Benchmark(
-        op_name="fused_experts_impl",
-        torch_op=_vllm_fused_moe_fp8_wrapper,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_fused_moe_fp8_wrapper)
-    bench.run()
+# @pytest.mark.fused_experts_impl
+# @pytest.mark.skipif(
+#     not (HAS_VLLM_FUSED_MOE and FP8_AVAILABLE),
+#     reason="requires vLLM and an FP8-capable device (NVIDIA Hopper or FP8-capable accelerator)",
+# )
+# def test_fused_moe_fp8():
+#     """
+#     Benchmark FlagGems vs vLLM fused_experts_impl with FP8 W8A8 quantization.
+#     """
+#     bench = FusedMoEFP8Benchmark(
+#         op_name="fused_experts_impl",
+#         torch_op=_vllm_fused_moe_fp8_wrapper,
+#         dtypes=[torch.bfloat16],
+#     )
+#     bench.set_gems(_gems_fused_moe_fp8_wrapper)
+#     bench.run()

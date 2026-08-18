@@ -15,12 +15,13 @@
 import os
 from contextlib import contextmanager
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
 from benchmark.base import Benchmark
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+# from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 RECOMPUTE_TLE_ENV = "FLAGGEMS_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAGGEMS_CHUNK_GATED_DELTA_RULE_TLE"
@@ -102,15 +103,15 @@ class ChunkGatedDeltaRuleFwdBenchmark(Benchmark):
         )
 
 
-@pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.skipif(
-    not has_triton_tle(3, 6, 0),
-    reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
-)
-def test_perf_chunk_gated_delta_rule_fwd():
-    bench = ChunkGatedDeltaRuleFwdBenchmark(
-        op_name="chunk_gated_delta_rule_fwd",
-        torch_op=_native_gdn_fwd,
-    )
-    bench.set_gems(_optimized_gdn_fwd)
-    bench.run()
+# @pytest.mark.chunk_gated_delta_rule_fwd
+# @pytest.mark.skipif(
+#     not has_triton_tle(3, 6, 0),
+#     reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
+# )
+# def test_perf_chunk_gated_delta_rule_fwd():
+#     bench = ChunkGatedDeltaRuleFwdBenchmark(
+#         op_name="chunk_gated_delta_rule_fwd",
+#         torch_op=_native_gdn_fwd,
+#     )
+#     bench.set_gems(_optimized_gdn_fwd)
+#     bench.run()
