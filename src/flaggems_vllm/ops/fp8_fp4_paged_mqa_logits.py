@@ -23,12 +23,40 @@ different workload distributions.
 """
 
 import logging
+import os
 
 import torch
 import triton
 import triton.language as tl
+from flag_gems.utils.device_info import get_device_capability
+from flag_gems.utils.triton_version_utils import has_triton_tle
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# TLE (TMA + WGMMA) fast path — purely additive. The baseline below is left
+# byte-for-byte untouched; the fast path only fires inside its measured win
+# band and falls back to the baseline everywhere else (no regression).
+# =============================================================================
+
+HAS_TLE = has_triton_tle(3, 6, 0)
+if HAS_TLE:
+    try:
+        import triton.experimental.tle.language as tle
+
+        HAS_TLE = hasattr(tle.gpu, "wgmma")
+    except ImportError:
+        tle = None
+        HAS_TLE = False
+else:
+    tle = None
+
+
+def _tle_enabled() -> bool:
+    """Master switch for the TMA fast path (mirrors FLAGGEMS_FLASHMLA_DECODE_TLE)."""
+    value = os.environ.get("FLAGGEMS_FP8_FP4_PAGED_MQA_LOGITS_TLE", "1").lower()
+    return value not in {"0", "false", "off", "no"}
 
 
 @triton.jit
@@ -182,6 +210,201 @@ def _select_block_kv(max_ctx, block_size):
     return block_kv, num_blocks
 
 
+# =============================================================================
+# TLE fast path — TMA + WGMMA
+# =============================================================================
+
+_TLE_NUM_STAGES = 2
+_TLE_NUM_WARPS = 4
+
+
+@triton.jit
+def _mqa_logits_kernel_tle(
+    Q_ptr,  # [total_rows, num_heads * head_dim] uint8 (FP8)
+    KV_scales_ptr,  # [num_phys_blocks * BLOCK_SIZE] float32
+    Weights_ptr,  # [total_rows, num_heads] float32
+    Block_tables_ptr,  # [total_rows, max_blocks_per_seq] int32
+    Output_ptr,  # [total_rows, max_model_len] float32
+    Ctx_lens_ptr,  # [total_rows] int32
+    kv_desc,  # TMA descriptor over [num_phys_blocks, block_size, head_dim] fp8
+    total_rows,
+    max_ctx,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    max_model_len,
+    block_size: tl.constexpr,
+    num_phys_blocks,
+    stride_q_row,
+    stride_bt_row,
+    stride_out_row,
+    stride_w_row,
+    BLOCK_KV: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    KV_BYTES: tl.constexpr,
+):
+    """TLE fast path: each KV page lands in SMEM via the TMA engine (bulk
+    async copy, no per-lane register round-trip); WGMMA reads both operands
+    directly from shared memory. The page loop is pipelined with
+    tl.range(num_stages=NUM_STAGES) so the next page's TMA fill overlaps the
+    current page's WGMMA + epilogue.
+
+    The fast path fires only inside the measured win band and shares the
+    operator's BLOCK_KV selection, so it is bit-identical to the baseline
+    where it runs (see _can_use_tle).
+    """
+    kv_block = tl.program_id(0)
+    row_idx = tl.program_id(1)
+    if row_idx >= total_rows:
+        return
+
+    ctx_len = tl.load(Ctx_lens_ptr + row_idx)
+    kv_start = kv_block * BLOCK_KV
+    if kv_start >= ctx_len:
+        return
+
+    q_row_base = Q_ptr + row_idx * stride_q_row
+    w_row_base = Weights_ptr + row_idx * stride_w_row
+    bt_row_base = Block_tables_ptr + row_idx * stride_bt_row
+    out_row_base = Output_ptr + row_idx * stride_out_row
+
+    h_ids = tl.arange(0, num_heads)
+    d_ids = tl.arange(0, BLOCK_D)
+    p_ids = tl.arange(0, block_size)
+
+    # Q into SMEM once — WGMMA operand A
+    q_u8 = tl.load(q_row_base + h_ids[:, None] * head_dim + d_ids[None, :])
+    q_fp8 = q_u8.to(tl.float8e4nv, bitcast=True)
+    w_all = tl.load(w_row_base + tl.arange(0, num_heads))
+
+    q_smem = tle.gpu.alloc(
+        [num_heads, BLOCK_D], dtype=tl.float8e4nv, scope=tle.gpu.smem, layout=None
+    )
+    kv_smem = tle.gpu.alloc(
+        [block_size, BLOCK_D], dtype=tl.float8e4nv, scope=tle.gpu.smem, layout=None
+    )
+    qr = tl.broadcast_to(h_ids[:, None], (num_heads, BLOCK_D))
+    qc = tl.broadcast_to(d_ids[None, :], (num_heads, BLOCK_D))
+    tl.store(tle.gpu.local_ptr(q_smem, (qr, qc)), q_fp8)
+
+    kv_full = tle.gpu.alloc_barrier(expect_bytes=KV_BYTES)
+
+    end_pos = tl.minimum(kv_start + BLOCK_KV, ctx_len)
+    first_lb = kv_start // block_size
+
+    for blk_idx in tl.range(0, NUM_BLOCKS, num_stages=NUM_STAGES):
+        lb = first_lb + blk_idx
+        # Clamp the block-table read so a partial trailing tile never goes OOB;
+        # out-of-range pages compute garbage but are masked out of the store.
+        phys_block = tl.load(bt_row_base + tl.minimum(lb, stride_bt_row - 1))
+        phys_block = tl.maximum(phys_block, 0)
+        phys_block = tl.minimum(phys_block, num_phys_blocks - 1)
+
+        tle.gpu.copy(
+            kv_desc,
+            kv_smem,
+            [1, block_size, BLOCK_D],
+            [phys_block, 0, 0],
+            barrier=kv_full,
+        )
+        tle.gpu.barrier_wait(kv_full, phaseIdx=blk_idx)
+
+        # WGMMA: Q[heads, D] @ KV[page, D]^T — both read from SMEM
+        dots = tle.gpu.wgmma(q_smem, kv_smem, out_dtype=tl.float32, trans_b=True)
+        dots = tle.gpu.wgmma_wait(0, dots)
+
+        scale_tile = tl.load(KV_scales_ptr + phys_block * block_size + p_ids)
+        scores = tl.maximum(dots * scale_tile[None, :], 0.0)
+        weighted = scores * w_all[:, None]
+        output_tile = tl.sum(weighted, axis=0)
+
+        pos_ids = lb * block_size + p_ids
+        valid_mask = pos_ids < end_pos
+        tl.store(out_row_base + pos_ids, output_tile, mask=valid_mask)
+
+
+def _build_kv_descriptor(kv_data, num_phys_blocks, block_size, head_dim):
+    """TMA descriptor over the paged KV cache [num_phys_blocks, block_size, D] fp8.
+
+    kv_data is [num_phys_blocks * block_size, head_dim] uint8 (fp8 bit-cast);
+    reinterpret as the 3D fp8 view and wrap it in a TMA descriptor.
+    """
+    kv3d = kv_data.view(num_phys_blocks, block_size, head_dim)
+    kv3d = kv3d.view(torch.float8_e4m3fn)
+    return TensorDescriptor.from_tensor(kv3d, block_shape=[1, block_size, head_dim])
+
+
+def _can_use_tle(max_ctx, block_size, D) -> bool:
+    """Deterministic TMA fast-path guard (fixed, empirical — NOT autotune).
+
+    TMA + WGMMA pays off when the KV page is 256 tokens (32 KB fp8 tile) and
+    the page loop is long enough for pipelining to reach steady state. Measured
+    win band (H800, block_size=256, D=128): max_ctx in [12288, 16384], i.e.
+    BLOCK_KV=2048 with 6-8 pages per CTA. Everything else keeps the baseline.
+    The fast path shares the operator's BLOCK_KV selection, so it is
+    bit-identical to the baseline wherever it fires.
+    """
+    if not (HAS_TLE and _tle_enabled()):
+        return False
+    if get_device_capability() < (9, 0):
+        return False
+    if D != 128 or block_size != 256:
+        return False
+    return 12288 <= max_ctx <= 16384
+
+
+def _launch_tle_kernel(
+    q_u8,
+    kv_data,
+    kv_scales,
+    weights,
+    block_tables,
+    logits,
+    ctx_lens,
+    total_rows,
+    max_ctx,
+    H,
+    D,
+    max_model_len,
+    block_size,
+    num_phys_blocks,
+    max_blocks_per_seq,
+    block_kv,
+    num_blocks,
+):
+    """Launch the TMA fast path with the operator's BLOCK_KV geometry."""
+    kv_desc = _build_kv_descriptor(kv_data, num_phys_blocks, block_size, D)
+    grid = (triton.cdiv(max_ctx, block_kv), total_rows)
+    _mqa_logits_kernel_tle[grid](
+        q_u8,
+        kv_scales,
+        weights,
+        block_tables,
+        logits,
+        ctx_lens,
+        kv_desc,
+        total_rows=total_rows,
+        max_ctx=max_ctx,
+        num_heads=H,
+        head_dim=D,
+        max_model_len=max_model_len,
+        block_size=block_size,
+        num_phys_blocks=num_phys_blocks,
+        stride_q_row=H * D,
+        stride_bt_row=max_blocks_per_seq,
+        stride_out_row=max_model_len,
+        stride_w_row=H,
+        BLOCK_KV=block_kv,
+        BLOCK_D=128,
+        NUM_BLOCKS=num_blocks,
+        NUM_STAGES=_TLE_NUM_STAGES,
+        KV_BYTES=block_size * D,
+        num_warps=_TLE_NUM_WARPS,
+    )
+    return logits
+
+
 def fp8_fp4_paged_mqa_logits(
     q,
     kv_cache,
@@ -251,31 +474,52 @@ def fp8_fp4_paged_mqa_logits(
     num_phys_blocks = kv_cache.shape[0]
     max_blocks_per_seq = block_tables_expanded.shape[1]
 
-    grid = (triton.cdiv(max_ctx, BLOCK_KV), total_rows)
-    _mqa_logits_kernel[grid](
-        q_u8,
-        kv_data,
-        kv_scales,
-        weights,
-        block_tables_expanded,
-        logits,
-        ctx_lens_flat,
-        total_rows=total_rows,
-        max_ctx=max_ctx,
-        num_heads=H,
-        head_dim=D,
-        max_model_len=max_model_len,
-        block_size=block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
-        num_phys_blocks=num_phys_blocks,
-        stride_q_row=H * D,
-        stride_kv_flat=D,
-        stride_bt_row=max_blocks_per_seq,
-        stride_out_row=max_model_len,
-        stride_w_row=H,
-        BLOCK_KV=BLOCK_KV,
-        BLOCK_D=BLOCK_D,
-        NUM_BLOCKS=NUM_BLOCKS,
-    )
+    if _can_use_tle(max_ctx, block_size, D):
+        _launch_tle_kernel(
+            q_u8,
+            kv_data,
+            kv_scales,
+            weights,
+            block_tables_expanded,
+            logits,
+            ctx_lens_flat,
+            total_rows,
+            max_ctx,
+            H,
+            D,
+            max_model_len,
+            block_size,
+            num_phys_blocks,
+            max_blocks_per_seq,
+            BLOCK_KV,
+            NUM_BLOCKS,
+        )
+    else:
+        grid = (triton.cdiv(max_ctx, BLOCK_KV), total_rows)
+        _mqa_logits_kernel[grid](
+            q_u8,
+            kv_data,
+            kv_scales,
+            weights,
+            block_tables_expanded,
+            logits,
+            ctx_lens_flat,
+            total_rows=total_rows,
+            max_ctx=max_ctx,
+            num_heads=H,
+            head_dim=D,
+            max_model_len=max_model_len,
+            block_size=block_size,
+            max_blocks_per_seq=max_blocks_per_seq,
+            num_phys_blocks=num_phys_blocks,
+            stride_q_row=H * D,
+            stride_kv_flat=D,
+            stride_bt_row=max_blocks_per_seq,
+            stride_out_row=max_model_len,
+            stride_w_row=H,
+            BLOCK_KV=BLOCK_KV,
+            BLOCK_D=BLOCK_D,
+            NUM_BLOCKS=NUM_BLOCKS,
+        )
 
     return logits
