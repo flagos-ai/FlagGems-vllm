@@ -30,8 +30,7 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     mhc_split_sinkhorn_torch_ref,
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-
-# from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
+from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
 
 from . import base
@@ -63,15 +62,15 @@ class MHCPostBenchmark(base.Benchmark):
             yield x, residual, post_layer_mix, comb_res_mix
 
 
-# @pytest.mark.mhc_post
-# def test_mhc_post():
-#     bench = MHCPostBenchmark(
-#         op_name="mhc_post",
-#         torch_op=mhc_post_ref,
-#         gems_op=mhc_post,
-#         dtypes=[torch.bfloat16],
-#     )
-#     bench.run()
+@pytest.mark.mhc_post
+def test_mhc_post():
+    bench = MHCPostBenchmark(
+        op_name="mhc_post",
+        torch_op=mhc_post_ref,
+        gems_op=mhc_post,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
 
 
 class MHCPreBenchmark(base.Benchmark):
@@ -85,17 +84,17 @@ class MHCPreBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (512, 1280),
-            # (512, 2560),
-            # (512, 4096),
-            # (1024, 1280),
-            # (1024, 2560),
-            # (1024, 4096),
-            # (2048, 1280),
-            # (2048, 2560),
-            # (2048, 4096),
-            # (8192, 1280),
-            # (8192, 2560),
-            # (8192, 4096),
+            (512, 2560),
+            (512, 4096),
+            (1024, 1280),
+            (1024, 2560),
+            (1024, 4096),
+            (2048, 1280),
+            (2048, 2560),
+            (2048, 4096),
+            (8192, 1280),
+            (8192, 2560),
+            (8192, 4096),
         ]
 
     def get_input_iter(self, dtype):
@@ -157,13 +156,13 @@ class MHCSplitSinkhornBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (8, 16, 4),
-            # (32, 64, 4),
-            # (128, 128, 4),
-            # (256, 256, 4),
+            (32, 64, 4),
+            (128, 128, 4),
+            (256, 256, 4),
             (8, 16, 2),
-            # (32, 64, 2),
-            # (128, 128, 2),
-            # (256, 256, 2),
+            (32, 64, 2),
+            (128, 128, 2),
+            (256, 256, 2),
         ]
 
     def get_input_iter(self, dtype):
@@ -203,11 +202,11 @@ class MHCBwdBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (256, 4),
-            # (1024, 4),
-            # (4096, 4),
-            # (8192, 4),
-            # (16384, 4),
-            # (65536, 4),
+            (1024, 4),
+            (4096, 4),
+            (8192, 4),
+            (16384, 4),
+            (65536, 4),
         ]
 
     def get_input_iter(self, dtype):
@@ -240,21 +239,21 @@ class HCHeadFusedBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (1, 1280, 4),
-            # (4, 2560, 4),
-            # (16, 4096, 4),
-            # (64, 7168, 4),
-            # (256, 1280, 2),
-            # (256, 1280, 4),
-            # (512, 1280, 2),
-            # (512, 1280, 4),
-            # (512, 2560, 2),
-            # (512, 2560, 4),
-            # (1024, 2560, 2),
-            # (1024, 2560, 4),
-            # (2048, 4096, 2),
-            # (2048, 4096, 4),
-            # (4096, 4096, 2),
-            # (4096, 4096, 4),
+            (4, 2560, 4),
+            (16, 4096, 4),
+            (64, 7168, 4),
+            (256, 1280, 2),
+            (256, 1280, 4),
+            (512, 1280, 2),
+            (512, 1280, 4),
+            (512, 2560, 2),
+            (512, 2560, 4),
+            (1024, 2560, 2),
+            (1024, 2560, 4),
+            (2048, 4096, 2),
+            (2048, 4096, 4),
+            (4096, 4096, 2),
+            (4096, 4096, 4),
         ]
 
     def get_input_iter(self, dtype):

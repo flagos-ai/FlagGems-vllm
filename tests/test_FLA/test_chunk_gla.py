@@ -937,11 +937,11 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
         pytest.param(*c, id="B{}-T{}-H{}-D{}-gate_logit_normalizer{}-{}".format(*c))
         for c in [
             (1, 63, 1, 64, 1.0, torch.float16),
-            # (2, 1024, 4, 60, 1.0, torch.float16),
-            # (2, 1024, 8, 128, 0.1, torch.float16),
-            # (2, 1024, 8, 128, 1.0, torch.float16),
-            # (2, 1024, 8, 128, 10.0, torch.float16),
-            # (4, 2048, 8, 64, 1.0, torch.float16),
+            (2, 1024, 4, 60, 1.0, torch.float16),
+            (2, 1024, 8, 128, 0.1, torch.float16),
+            (2, 1024, 8, 128, 1.0, torch.float16),
+            (2, 1024, 8, 128, 10.0, torch.float16),
+            (4, 2048, 8, 64, 1.0, torch.float16),
         ]
     ],
 )
@@ -1003,7 +1003,7 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
         pytest.param(*c, id="B{}-T{}-H{}-D{}-{}".format(*c))
         for c in [
             (2, 256, 4, 64, torch.float),
-            # (2, 1024, 4, 128, torch.float16),
+            (2, 1024, 4, 128, torch.float16),
         ]
     ],
 )
@@ -1059,8 +1059,8 @@ def test_chunk_state_v_first(B, T, H, D, dtype):
         pytest.param(*c, id="H{}-D{}-cu_seqlens{}-{}".format(*c))
         for c in [
             (4, 64, [0, 15], torch.float16),
-            # (4, 64, [0, 256, 500, 1000], torch.float16),
-            # (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
+            (4, 64, [0, 256, 500, 1000], torch.float16),
+            (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
     ],
 )

@@ -127,9 +127,9 @@ class CpGatherIndexerKQuantCacheBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (4, 256, 16, 128, 128),
-            # (8, 512, 16, 128, 128),
-            # (16, 1024, 16, 512, 128),
-            # (32, 1024, 16, 512, 128),
+            (8, 512, 16, 128, 128),
+            (16, 1024, 16, 512, 128),
+            (32, 1024, 16, 512, 128),
         ]
 
     def get_input_iter(self, dtype):

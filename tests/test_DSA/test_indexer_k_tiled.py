@@ -15,18 +15,17 @@
 import random
 
 import numpy as np
-
-# import pytest
+import pytest
 import torch
+
+from flaggems_vllm.ops.DSA.indexer_k_tiled import (
+    triton_lighting_indexer_k_tiled_interface,
+)
 
 from .torch_src.fp8_lighting_indexer import (
     ref_fp8_mqa_logits,  # , mqa_attn_return_logits_interface
 )
 from .utils import generate_random_cu_seqlens
-
-# from flaggems_vllm.ops.DSA.indexer_k_tiled import (
-#     triton_lighting_indexer_k_tiled_interface,
-# )
 
 
 # Accuracy check function
@@ -174,66 +173,38 @@ def reference_lighting_indexer_implementation(q, kv, weights, ks, ke):
     )
 
 
-# @pytest.mark.skip(
-#     "#2353: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
-# )
-# @pytest.mark.triton_lighting_indexer_k_tiled_interface
-# @pytest.mark.parametrize(
-#     "seq_len_q",
-#     [
-#         1024,
-#         # 2048,
-#         # 4096,
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "seq_len_kv",
-#     [
-#         2048,
-#         # 4096,
-#         # 8192,
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "num_heads",
-#     [
-#         16,
-#         # 32,
-#         # 64,
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "qk_dim",
-#     [
-#         32,
-#         # 64,
-#         # 128,
-#     ],
-# )
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# def test_lighting_indexer_forward(
-#     seq_len_q: int,
-#     seq_len_kv: int,
-#     num_heads: int,
-#     qk_dim: int,
-#     dtype: torch.dtype,
-# ):
-#     # Create input
-#     q, kv, weights, ks, ke = make_lighting_indexer_input(
-#         seq_len_q, seq_len_kv, num_heads, qk_dim, dtype, device
-#     )
-#
-#     # Reference implementation
-#     ref_q = to_reference(q, False)
-#     ref_kv = to_reference(kv, False)
-#     ref_weights = to_reference(weights, False)
-#
-#     ref_output, cost_ref = reference_lighting_indexer_implementation(
-#         ref_q, ref_kv, ref_weights, ks, ke
-#     )
-#
-#     # Your operator implementation
-#     your_output = triton_lighting_indexer_k_tiled_interface(q, kv, weights, ks, ke)
-#
-#     # Accuracy comparison
-#     assert_close_inf(your_output, ref_output, 1e-2)
+@pytest.mark.skip(
+    "#2353: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
+)
+@pytest.mark.triton_lighting_indexer_k_tiled_interface
+@pytest.mark.parametrize("seq_len_q", [1024, 2048, 4096])
+@pytest.mark.parametrize("seq_len_kv", [2048, 4096, 8192])
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+@pytest.mark.parametrize("qk_dim", [32, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_lighting_indexer_forward(
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_heads: int,
+    qk_dim: int,
+    dtype: torch.dtype,
+):
+    # Create input
+    q, kv, weights, ks, ke = make_lighting_indexer_input(
+        seq_len_q, seq_len_kv, num_heads, qk_dim, dtype, device
+    )
+
+    # Reference implementation
+    ref_q = to_reference(q, False)
+    ref_kv = to_reference(kv, False)
+    ref_weights = to_reference(weights, False)
+
+    ref_output, cost_ref = reference_lighting_indexer_implementation(
+        ref_q, ref_kv, ref_weights, ks, ke
+    )
+
+    # Your operator implementation
+    your_output = triton_lighting_indexer_k_tiled_interface(q, kv, weights, ks, ke)
+
+    # Accuracy comparison
+    assert_close_inf(your_output, ref_output, 1e-2)

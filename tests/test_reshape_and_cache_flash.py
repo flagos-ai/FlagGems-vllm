@@ -62,30 +62,9 @@ def create_kv_caches_with_random_flash(
 @pytest.mark.reshape_and_cache_flash
 @pytest.mark.parametrize("num_tokens", [42])
 @pytest.mark.parametrize("num_heads", [8])
-@pytest.mark.parametrize(
-    "head_size",
-    [
-        64,
-        # 80,
-        # 120,
-        # 256,
-    ],
-)
-@pytest.mark.parametrize(
-    "block_size",
-    [
-        8,
-        # 16,
-        # 32,
-    ],
-)
-@pytest.mark.parametrize(
-    "num_blocks",
-    [
-        1024,
-        # 10000,
-    ],
-)
+@pytest.mark.parametrize("head_size", [64, 80, 120, 256])
+@pytest.mark.parametrize("block_size", [8, 16, 32])
+@pytest.mark.parametrize("num_blocks", [1024, 10000])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto"])
 @pytest.mark.parametrize("seed", [2025])

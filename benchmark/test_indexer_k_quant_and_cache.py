@@ -101,8 +101,8 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
         self.shapes = [
             (128, 16, 16, 128, 128),
             (512, 64, 16, 128, 128),
-            # (1024, 128, 16, 512, 128),
-            # (2048, 256, 16, 512, 128),
+            (1024, 128, 16, 512, 128),
+            (2048, 256, 16, 512, 128),
         ]
 
     def get_input_iter(self, dtype):

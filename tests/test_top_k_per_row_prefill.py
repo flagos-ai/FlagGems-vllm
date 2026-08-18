@@ -93,98 +93,92 @@ def check_topk_values_match(logits, indices_test, indices_ref, row_starts, top_k
     return True
 
 
-# @pytest.mark.top_k_per_row_prefill
-# @pytest.mark.parametrize("num_rows", [1, 32, 64, 2048])
-# @pytest.mark.parametrize("vocab_size", [129280])  # DeepSeek V4 vocab size
-# @pytest.mark.parametrize("top_k", [1024])  # DeepSeek V4 KV cache topk
-# def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
-#     """Test with full vocab range (row_starts=0, row_ends=vocab_size).
-#
-#     This is the most common case in inference: every token sees the full vocabulary.
-#     The masking kernel should early-exit for all rows.
-#     """
-#     torch.manual_seed(42)
-#
-#     logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
-#     row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
-#     row_ends = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
-#     stride0 = logits.stride(0)
-#     stride1 = logits.stride(1)
-#
-#     # Reference uses a clone because the Triton kernel modifies logits in-place
-#     indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
-#
-#     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-#     top_k_per_row_prefill(
-#         logits,
-#         row_starts,
-#         row_ends,
-#         indices_test,
-#         num_rows,
-#         stride0,
-#         stride1,
-#         top_k,
-#     )
-#
-#     assert check_topk_values_match(
-#         logits, indices_test, indices_ref, row_starts, top_k
-#     ), f"FAIL: num_rows={num_rows}, vocab_size={vocab_size}, top_k={top_k}"
-#
-#
-# @pytest.mark.top_k_per_row_prefill
-# @pytest.mark.parametrize("num_rows", [1, 32])
-# @pytest.mark.parametrize(
-#     "vocab_size",
-#     [20000, 129280],  # 20000: smaller vocab for edge case coverage
-# )
-# @pytest.mark.parametrize(
-#     "top_k", [1024, 2048]  # 2048: tests larger top_k (used in some configs)
-# )
-# def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
-#     """Test with variable row lengths (partial vocab per row).
-#
-#     Simulates the case where different tokens in a batch have different valid
-#     KV ranges (e.g., due to causal masking or sequence packing).
-#     row_ends is randomized in [top_k, vocab_size] to ensure enough valid elements.
-#     """
-#     torch.manual_seed(123)
-#
-#     logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
-#     row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
-#     # Ensure row_ends >= top_k so there are enough valid elements to select
-#     row_ends = torch.randint(
-#         top_k, vocab_size + 1, (num_rows,), dtype=torch.int32, device=device
-#     )
-#     stride0 = logits.stride(0)
-#     stride1 = logits.stride(1)
-#
-#     indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
-#
-#     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-#     top_k_per_row_prefill(
-#         logits,
-#         row_starts,
-#         row_ends,
-#         indices_test,
-#         num_rows,
-#         stride0,
-#         stride1,
-#         top_k,
-#     )
-#
-#     assert check_topk_values_match(
-#         logits, indices_test, indices_ref, row_starts, top_k
-#     ), f"FAIL: num_rows={num_rows}, vocab_size={vocab_size}, top_k={top_k}"
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize("num_rows", [1, 32, 64, 2048])
+@pytest.mark.parametrize("vocab_size", [129280])  # DeepSeek V4 vocab size
+@pytest.mark.parametrize("top_k", [1024])  # DeepSeek V4 KV cache topk
+def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
+    """Test with full vocab range (row_starts=0, row_ends=vocab_size).
+
+    This is the most common case in inference: every token sees the full vocabulary.
+    The masking kernel should early-exit for all rows.
+    """
+    torch.manual_seed(42)
+
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
+    stride0 = logits.stride(0)
+    stride1 = logits.stride(1)
+
+    # Reference uses a clone because the Triton kernel modifies logits in-place
+    indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
+
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices_test,
+        num_rows,
+        stride0,
+        stride1,
+        top_k,
+    )
+
+    assert check_topk_values_match(
+        logits, indices_test, indices_ref, row_starts, top_k
+    ), f"FAIL: num_rows={num_rows}, vocab_size={vocab_size}, top_k={top_k}"
 
 
 @pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize("num_rows", [1, 32])
 @pytest.mark.parametrize(
-    "num_rows",
-    [
-        1,
-        # 16,
-    ],
+    "vocab_size",
+    [20000, 129280],  # 20000: smaller vocab for edge case coverage
 )
+@pytest.mark.parametrize(
+    "top_k", [1024, 2048]  # 2048: tests larger top_k (used in some configs)
+)
+def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
+    """Test with variable row lengths (partial vocab per row).
+
+    Simulates the case where different tokens in a batch have different valid
+    KV ranges (e.g., due to causal masking or sequence packing).
+    row_ends is randomized in [top_k, vocab_size] to ensure enough valid elements.
+    """
+    torch.manual_seed(123)
+
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    # Ensure row_ends >= top_k so there are enough valid elements to select
+    row_ends = torch.randint(
+        top_k, vocab_size + 1, (num_rows,), dtype=torch.int32, device=device
+    )
+    stride0 = logits.stride(0)
+    stride1 = logits.stride(1)
+
+    indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
+
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices_test,
+        num_rows,
+        stride0,
+        stride1,
+        top_k,
+    )
+
+    assert check_topk_values_match(
+        logits, indices_test, indices_ref, row_starts, top_k
+    ), f"FAIL: num_rows={num_rows}, vocab_size={vocab_size}, top_k={top_k}"
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize("num_rows", [1, 16])
 def test_top_k_per_row_prefill_nonzero_starts(num_rows):
     """Test with non-zero row_starts.
 

@@ -181,7 +181,7 @@ pytestmark = [
     "batch,h_q,topk,num_pages",
     [
         (2, 64, 64, 50),
-        # (2, 128, 128, 100),
+        (2, 128, 128, 100),
     ],
 )
 def test_sparse_decode_v32_fp8(batch, h_q, topk, num_pages):

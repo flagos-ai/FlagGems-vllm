@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import pytest
+import pytest
 import torch
 
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
@@ -163,13 +163,13 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
             yield q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta
 
 
-# @pytest.mark.fp8_fp4_paged_mqa_logits
-# @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
-# def test_fp8_fp4_paged_mqa_logits():
-#     bench = Fp8Fp4PagedMqaLogitsBenchmark(
-#         op_name="fp8_fp4_paged_mqa_logits",
-#         torch_op=_baseline_fn,
-#         gems_op=_gems_fn,
-#         dtypes=[torch.float32],
-#     )
-#     bench.run()
+@pytest.mark.fp8_fp4_paged_mqa_logits
+@pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
+def test_fp8_fp4_paged_mqa_logits():
+    bench = Fp8Fp4PagedMqaLogitsBenchmark(
+        op_name="fp8_fp4_paged_mqa_logits",
+        torch_op=_baseline_fn,
+        gems_op=_gems_fn,
+        dtypes=[torch.float32],
+    )
+    bench.run()

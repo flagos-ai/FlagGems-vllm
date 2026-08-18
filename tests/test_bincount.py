@@ -20,28 +20,8 @@ import flaggems_vllm
 from . import accuracy_utils as utils
 from .conftest import QUICK_MODE
 
-BINCOUNT_SIZES = (
-    [
-        16,
-        100,
-        # 1024,
-        # 10000,
-    ]
-    if not QUICK_MODE
-    else [
-        100,
-        # 1024,
-    ]
-)
-BINCOUNT_MAXVALS = (
-    [
-        10,
-        100,
-        # 1000,
-    ]
-    if not QUICK_MODE
-    else [100]
-)
+BINCOUNT_SIZES = [16, 100, 1024, 10000] if not QUICK_MODE else [100, 1024]
+BINCOUNT_MAXVALS = [10, 100, 1000] if not QUICK_MODE else [100]
 
 
 @pytest.mark.bincount
@@ -84,14 +64,7 @@ def test_accuracy_bincount_with_weights(size, max_val, dtype):
 @pytest.mark.bincount
 @pytest.mark.parametrize("size", BINCOUNT_SIZES)
 @pytest.mark.parametrize("max_val", BINCOUNT_MAXVALS)
-@pytest.mark.parametrize(
-    "minlength",
-    [
-        0,
-        50,
-        # 2000,
-    ],
-)
+@pytest.mark.parametrize("minlength", [0, 50, 2000])
 def test_accuracy_bincount_with_minlength(size, max_val, minlength):
     """Test bincount with minlength parameter."""
     inp = torch.randint(

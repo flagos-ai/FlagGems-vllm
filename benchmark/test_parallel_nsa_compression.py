@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import pytest
+import pytest
 import torch
 import triton
 
@@ -73,11 +73,11 @@ class ParallelNSACompressionBenchmark(Benchmark):
         )
 
 
-# @pytest.mark.parallel_nsa_compression
-# def test_perf_parallel_nsa_compression():
-#     bench = ParallelNSACompressionBenchmark(
-#         op_name="parallel_nsa_compression",
-#         torch_op=flaggems_vllm.parallel_nsa_compression,
-#     )
-#     bench.set_gems(flaggems_vllm.parallel_nsa_compression)
-#     bench.run()
+@pytest.mark.parallel_nsa_compression
+def test_perf_parallel_nsa_compression():
+    bench = ParallelNSACompressionBenchmark(
+        op_name="parallel_nsa_compression",
+        torch_op=flaggems_vllm.parallel_nsa_compression,
+    )
+    bench.set_gems(flaggems_vllm.parallel_nsa_compression)
+    bench.run()

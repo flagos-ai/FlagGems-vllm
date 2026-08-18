@@ -86,9 +86,9 @@ class TopKPerRowDecodeBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            # (129280, 1024),
-            # (32768, 512),
-            # (16384, 256),
+            (129280, 1024),
+            (32768, 512),
+            (16384, 256),
             (8192, 128),
             (4096, 64),
         ]

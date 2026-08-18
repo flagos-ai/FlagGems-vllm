@@ -469,13 +469,13 @@ class GenericBenchmark(Benchmark):
         super().__init__(*args, **kwargs)
         self.input_fn = input_fn
 
-    # def set_more_shapes(self):
-    #     more_shapes_1d = [
-    #         (2**28,),
-    #     ]
-    #     more_shapes_2d = [(10000, 2**i) for i in (0, 8, 16)]
-    #     more_shapes_3d = [(100, 2**i, 100) for i in (0, 8, 16)]
-    #     return more_shapes_1d + more_shapes_2d + more_shapes_3d
+    def set_more_shapes(self):
+        more_shapes_1d = [
+            (2**28,),
+        ]
+        more_shapes_2d = [(10000, 2**i) for i in (0, 8, 16)]
+        more_shapes_3d = [(100, 2**i, 100) for i in (0, 8, 16)]
+        return more_shapes_1d + more_shapes_2d + more_shapes_3d
 
     def get_input_iter(self, dtype) -> Generator:
         for shape in self.shapes:
@@ -570,12 +570,12 @@ class TexGluBenchmark(Benchmark):
     # Triton grid_y is capped at 65535, BLOCK_SIZE_H=64 -> last dim <= 8388480.
     MAX_LAST_DIM = 2 * 64 * 65535
 
-    # def set_more_shapes(self):
-    #     # Last dim must be even for GLU operations to split
-    #     special_shapes_2d = [[1024, 2**i] for i in range(1, 20, 4)]
-    #     sp_shapes_3d = [[64, 64, 2**i] for i in range(1, 15, 4)]
-    #
-    #     return special_shapes_2d + sp_shapes_3d
+    def set_more_shapes(self):
+        # Last dim must be even for GLU operations to split
+        special_shapes_2d = [[1024, 2**i] for i in range(1, 20, 4)]
+        sp_shapes_3d = [[64, 64, 2**i] for i in range(1, 15, 4)]
+
+        return special_shapes_2d + sp_shapes_3d
 
     def init_user_config(self):
         super().init_user_config()

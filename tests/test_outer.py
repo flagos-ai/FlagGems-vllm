@@ -28,8 +28,8 @@ if cfg.QUICK_MODE:
 else:
     MN_SHAPES = [
         (1, 32),
-        # (160, 1024),
-        # (5333, 497),
+        (160, 1024),
+        (5333, 497),
     ]
     FLOAT_DTYPES = utils.FLOAT_DTYPES
 
@@ -37,14 +37,7 @@ else:
 @pytest.mark.outer
 @pytest.mark.parametrize(
     "M, N",
-    MN_SHAPES
-    + (
-        [
-            # (32, 131072),
-        ]
-        if flaggems_vllm.vendor_name == "cambricon"
-        else []
-    ),
+    MN_SHAPES + ([(32, 131072)] if flaggems_vllm.vendor_name == "cambricon" else []),
 )
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_outer(M, N, dtype):

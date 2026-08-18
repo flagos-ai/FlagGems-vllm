@@ -43,8 +43,7 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     mhc_split_sinkhorn_torch_ref,
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-
-# from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
+from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
 
 
@@ -75,19 +74,19 @@ MHC_POST_CONFIGS = list(
 )
 
 
-# @pytest.mark.mhc_post
-# @pytest.mark.parametrize(
-#     "n, h, hc_mult",
-#     MHC_POST_CONFIGS,
-#     ids=[f"n{n}_h{h}_hc{hc}" for n, h, hc in MHC_POST_CONFIGS],
-# )
-# def test_mhc_post_vs_ref(n, h, hc_mult):
-#     """Test Triton mhc_post against PyTorch CPU reference."""
-#     data = generate_mhc_post_data(n, h, hc_mult=hc_mult)
-#     out_triton = mhc_post(**data)
-#     data_cpu = {k: v.cpu() for k, v in data.items()}
-#     out_ref = mhc_post_ref(**data_cpu)
-#     torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=1e-2)
+@pytest.mark.mhc_post
+@pytest.mark.parametrize(
+    "n, h, hc_mult",
+    MHC_POST_CONFIGS,
+    ids=[f"n{n}_h{h}_hc{hc}" for n, h, hc in MHC_POST_CONFIGS],
+)
+def test_mhc_post_vs_ref(n, h, hc_mult):
+    """Test Triton mhc_post against PyTorch CPU reference."""
+    data = generate_mhc_post_data(n, h, hc_mult=hc_mult)
+    out_triton = mhc_post(**data)
+    data_cpu = {k: v.cpu() for k, v in data.items()}
+    out_ref = mhc_post_ref(**data_cpu)
+    torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=1e-2)
 
 
 def generate_mhc_split_sinkhorn_data(
@@ -106,13 +105,13 @@ def generate_mhc_split_sinkhorn_data(
 
 MHC_SPLIT_SINKHORN_CONFIGS = [
     (8, 16, 4),
-    # (32, 64, 4),
-    # (128, 128, 4),
-    # (256, 256, 4),
+    (32, 64, 4),
+    (128, 128, 4),
+    (256, 256, 4),
     (8, 16, 2),
-    # (32, 64, 2),
-    # (128, 128, 2),
-    # (256, 256, 2),
+    (32, 64, 2),
+    (128, 128, 2),
+    (256, 256, 2),
 ]
 
 
@@ -135,21 +134,9 @@ def test_mhc_split_sinkhorn(batch, seqlen, hc_mult):
 
 MHC_PRE_CONFIGS = list(
     product(
-        [
-            512,
-            # 1024,
-            # 2048,
-            # 8192,
-        ],  # n
-        [
-            1280,
-            # 2560,
-            # 4096,
-        ],  # hidden_size
-        [
-            2,
-            # 4,
-        ],  # hc_mult
+        [512, 1024, 2048, 8192],  # n
+        [1280, 2560, 4096],  # hidden_size
+        [2, 4],  # hc_mult
     )
 )
 
@@ -216,12 +203,7 @@ def test_mhc_pre_vs_ref(n, hidden_size, hc_mult):
 
 MHC_BWD_CONFIGS = list(
     product(
-        [
-            256,
-            # 1024,
-            # 4096,
-            # 65536,
-        ],  # seqlen
+        [256, 1024, 4096, 65536],  # seqlen
         [4],  # n_stream (optimized kernel only supports n_stream=4)
         [20],  # sinkhorn_iters
     )
@@ -267,21 +249,21 @@ def test_mhc_bwd_vs_ref(seqlen, n_stream, sinkhorn_iters):
 
 MHC_HC_HEAD_FUSED_CONFIGS = [
     (1, 1280, 4),
-    # (4, 2560, 4),
-    # (16, 4096, 4),
-    # (64, 7168, 4),
-    # (256, 1280, 2),
-    # (256, 1280, 4),
-    # (512, 1280, 2),
-    # (512, 1280, 4),
-    # (512, 2560, 2),
-    # (512, 2560, 4),
-    # (1024, 2560, 2),
-    # (1024, 2560, 4),
-    # (2048, 4096, 2),
-    # (2048, 4096, 4),
-    # (4096, 1280, 2),
-    # (4096, 1280, 4),
+    (4, 2560, 4),
+    (16, 4096, 4),
+    (64, 7168, 4),
+    (256, 1280, 2),
+    (256, 1280, 4),
+    (512, 1280, 2),
+    (512, 1280, 4),
+    (512, 2560, 2),
+    (512, 2560, 4),
+    (1024, 2560, 2),
+    (1024, 2560, 4),
+    (2048, 4096, 2),
+    (2048, 4096, 4),
+    (4096, 1280, 2),
+    (4096, 1280, 4),
 ]
 
 

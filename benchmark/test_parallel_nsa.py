@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import pytest
+import pytest
 import torch
 import triton
 
@@ -83,11 +83,11 @@ class ParallelNSABenchmark(Benchmark):
         )
 
 
-# @pytest.mark.parallel_nsa
-# def test_perf_parallel_nsa():
-#     bench = ParallelNSABenchmark(
-#         op_name="parallel_nsa",
-#         torch_op=flaggems_vllm.parallel_nsa,
-#     )
-#     bench.set_gems(flaggems_vllm.parallel_nsa)
-#     bench.run()
+@pytest.mark.parallel_nsa
+def test_perf_parallel_nsa():
+    bench = ParallelNSABenchmark(
+        op_name="parallel_nsa",
+        torch_op=flaggems_vllm.parallel_nsa,
+    )
+    bench.set_gems(flaggems_vllm.parallel_nsa)
+    bench.run()

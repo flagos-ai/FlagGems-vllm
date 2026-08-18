@@ -16,7 +16,7 @@ import dataclasses
 import random
 from typing import List
 
-# import pytest
+import pytest
 import torch
 
 import flaggems_vllm
@@ -202,8 +202,8 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         yield (q, kv, indices, 0.5, param.d_v, attn_sink, topk_length)
 
 
-# @pytest.mark.flash_mla_sparse_fwd
-# @pytest.mark.skipif(not HAS_VLLM_FLASHMLA_SPARSE, reason="vLLM not installed")
-# def test_flash_mla_sparse_fwd():
-#     bench = FlashmlaSparseBenchmark()
-#     bench.run()
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not HAS_VLLM_FLASHMLA_SPARSE, reason="vLLM not installed")
+def test_flash_mla_sparse_fwd():
+    bench = FlashmlaSparseBenchmark()
+    bench.run()

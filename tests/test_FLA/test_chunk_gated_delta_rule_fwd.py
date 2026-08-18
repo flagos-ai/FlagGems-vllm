@@ -86,20 +86,8 @@ def naive_chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state):
     not has_triton_tle(3, 6, 0),
     reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
-@pytest.mark.parametrize(
-    "B",
-    [
-        1,
-        # 2,
-    ],
-)
-@pytest.mark.parametrize(
-    "T",
-    [
-        64,
-        # 128,
-    ],
-)
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("T", [64, 128])
 @pytest.mark.parametrize("H", [4])
 @pytest.mark.parametrize("K", [64])
 @pytest.mark.parametrize("V", [64])
@@ -146,14 +134,7 @@ def test_chunk_gated_delta_rule_fwd_accuracy(B, T, H, K, V, dtype):
     not has_triton_tle(3, 6, 0),
     reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
-@pytest.mark.parametrize(
-    "T",
-    [
-        64,
-        # 128,
-        # 256,
-    ],
-)
+@pytest.mark.parametrize("T", [64, 128, 256])
 def test_chunk_gated_delta_rule_fwd_no_initial_state(T):
     device = flaggems_vllm.device
     dtype = torch.bfloat16
@@ -190,13 +171,7 @@ def test_chunk_gated_delta_rule_fwd_no_initial_state(T):
     not has_triton_tle(3, 6, 0),
     reason="Triton 3.6.0 compilation error on Hopper: 'ttng.warp_group_dot' op pipeliner issue",
 )
-@pytest.mark.parametrize(
-    "T",
-    [
-        64,
-        # 128,
-    ],
-)
+@pytest.mark.parametrize("T", [64, 128])
 def test_chunk_gated_delta_rule_fwd_with_cu_seqlens(T):
     device = flaggems_vllm.device
     dtype = torch.bfloat16

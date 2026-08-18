@@ -30,13 +30,13 @@ class RepetitionPenaltyBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (1, 1024),
-            # (1, 4096),
-            # (1, 8192),
-            # (8, 4096),
-            # (16, 4096),
-            # (32, 1024),
-            # (8, 8192),
-            # (64, 32000),
+            (1, 4096),
+            (1, 8192),
+            (8, 4096),
+            (16, 4096),
+            (32, 1024),
+            (8, 8192),
+            (64, 32000),
         ]
 
     def get_input_iter(self, dtype):

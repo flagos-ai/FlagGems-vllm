@@ -33,9 +33,9 @@ class TopKSoftmaxBenchmark(base.Benchmark):
         topk_softmax_configs = [
             (256, 128, 16),
             (1024, 256, 32),
-            # (4096, 64, 8),
-            # (8192, 128, 8),
-            # (16384, 256, 8),
+            (4096, 64, 8),
+            (8192, 128, 8),
+            (16384, 256, 8),
         ]
         self.shapes = topk_softmax_configs
 

@@ -48,9 +48,9 @@ def generate_test_params():
         (8, 16, 4),
         (32, 64, 8),
         (128, 128, 16),
-        # (500, 255, 30),
-        # (512, 256, 32),
-        # (1024, 512, 32),
+        (500, 255, 30),
+        (512, 256, 32),
+        (1024, 512, 32),
     ],
 )
 @pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16, torch.bfloat16])

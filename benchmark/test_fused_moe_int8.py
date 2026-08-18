@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import pytest
+import pytest
 import torch
 
 import flaggems_vllm
@@ -181,16 +181,16 @@ def _gems_fused_moe_int8_wrapper(
     )
 
 
-# @pytest.mark.fused_experts_impl
-# @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vllm not installed")
-# def test_fused_experts_impl_int8():
-#     """
-#     Benchmark FlagGems vs vLLM fused_experts_impl with INT8 W8A8 quantization.
-#     """
-#     bench = FusedMoEINT8Benchmark(
-#         op_name="fused_experts_impl",
-#         torch_op=_vllm_fused_moe_int8_wrapper,
-#         dtypes=[torch.bfloat16],
-#     )
-#     bench.set_gems(_gems_fused_moe_int8_wrapper)
-#     bench.run()
+@pytest.mark.fused_experts_impl
+@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vllm not installed")
+def test_fused_experts_impl_int8():
+    """
+    Benchmark FlagGems vs vLLM fused_experts_impl with INT8 W8A8 quantization.
+    """
+    bench = FusedMoEINT8Benchmark(
+        op_name="fused_experts_impl",
+        torch_op=_vllm_fused_moe_int8_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fused_moe_int8_wrapper)
+    bench.run()

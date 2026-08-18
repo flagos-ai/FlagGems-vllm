@@ -581,38 +581,38 @@ def test_unfused_path(num_tokens, num_heads, n_groups, tma_aligned_scales, seed)
     )
 
 
-# @pytest.mark.fused_inv_rope_fp8_quant
-# @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-# @pytest.mark.parametrize(
-#     "num_tokens",
-#     utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["REAL_ROPE_NUM_TOKENS"],
-# )
-# @pytest.mark.parametrize(
-#     "tma_aligned_scales",
-#     utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
-# )
-# def test_with_real_deepseek_v4_rope(num_tokens, tma_aligned_scales):
-#     num_heads, n_groups = 64, 8
-#     positions = torch.randint(
-#         0, 4096, (num_tokens,), device=flaggems_vllm.device, dtype=torch.long
-#     )
-#     cos_sin_cache = _make_real_deepseek_v4_cache(
-#         65536, ROPE_DIM, torch.device(flaggems_vllm.device)
-#     )
-#     result = _run_case(
-#         num_tokens,
-#         num_heads,
-#         n_groups,
-#         tma_aligned_scales,
-#         seed=0,
-#         positions=positions,
-#         cos_sin_cache=cos_sin_cache,
-#     )
-#     _assert_dequant_close(
-#         result["out"],
-#         result["scale"],
-#         result["ref_out"],
-#         result["ref_scale"],
-#         result["heads_per_group"],
-#         msg="Real DeepSeek V4 rope",
-#     )
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize(
+    "num_tokens",
+    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["REAL_ROPE_NUM_TOKENS"],
+)
+@pytest.mark.parametrize(
+    "tma_aligned_scales",
+    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+)
+def test_with_real_deepseek_v4_rope(num_tokens, tma_aligned_scales):
+    num_heads, n_groups = 64, 8
+    positions = torch.randint(
+        0, 4096, (num_tokens,), device=flaggems_vllm.device, dtype=torch.long
+    )
+    cos_sin_cache = _make_real_deepseek_v4_cache(
+        65536, ROPE_DIM, torch.device(flaggems_vllm.device)
+    )
+    result = _run_case(
+        num_tokens,
+        num_heads,
+        n_groups,
+        tma_aligned_scales,
+        seed=0,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+    )
+    _assert_dequant_close(
+        result["out"],
+        result["scale"],
+        result["ref_out"],
+        result["ref_scale"],
+        result["heads_per_group"],
+        msg="Real DeepSeek V4 rope",
+    )

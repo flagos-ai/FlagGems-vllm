@@ -29,13 +29,7 @@ class BeamSearchScoreBenchmark(base.Benchmark):
     """
 
     # Use smaller shapes suitable for beam search scenarios
-    DEFAULT_SHAPES = [
-        (16, 512),
-        (32, 1024),
-        (64, 2048),
-        # (128, 4096),
-        # (256, 8192),
-    ]
+    DEFAULT_SHAPES = [(16, 512), (32, 1024), (64, 2048), (128, 4096), (256, 8192)]
     DEFAULT_SHAPE_DESC = "batch_size, vocab_size"
 
     def get_input_iter(self, cur_dtype) -> Generator:

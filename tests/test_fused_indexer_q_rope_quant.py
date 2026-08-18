@@ -111,14 +111,7 @@ def _reference_mxfp4(q_rot, weights, softmax_scale, head_scale):
 @pytest.mark.fused_indexer_q_rope_quant
 @pytest.mark.skipif(flaggems_vllm.device != "cuda", reason="requires CUDA")
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-@pytest.mark.parametrize(
-    "num_tokens",
-    [
-        1,
-        7,
-        # 32,
-    ],
-)
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("use_fp4", [False, True])
 @torch.inference_mode()

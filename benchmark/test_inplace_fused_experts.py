@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import pytest
+import pytest
 import torch
 
 import flaggems_vllm
@@ -129,16 +129,16 @@ def _gems_inplace_fused_experts_wrapper(
     return hidden_states
 
 
-# @pytest.mark.inplace_fused_experts
-# @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
-# def test_inplace_fused_experts_gems_vs_vllm():
-#     """
-#     Benchmark FlagGems inplace_fused_experts vs vLLM in-place fused_experts_impl.
-#     """
-#     bench = InplaceFusedExpertsBenchmark(
-#         op_name="inplace_fused_experts",
-#         torch_op=_vllm_inplace_fused_experts_wrapper,
-#         dtypes=[torch.bfloat16, torch.float16],
-#     )
-#     bench.set_gems(_gems_inplace_fused_experts_wrapper)
-#     bench.run()
+@pytest.mark.inplace_fused_experts
+@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
+def test_inplace_fused_experts_gems_vs_vllm():
+    """
+    Benchmark FlagGems inplace_fused_experts vs vLLM in-place fused_experts_impl.
+    """
+    bench = InplaceFusedExpertsBenchmark(
+        op_name="inplace_fused_experts",
+        torch_op=_vllm_inplace_fused_experts_wrapper,
+        dtypes=[torch.bfloat16, torch.float16],
+    )
+    bench.set_gems(_gems_inplace_fused_experts_wrapper)
+    bench.run()

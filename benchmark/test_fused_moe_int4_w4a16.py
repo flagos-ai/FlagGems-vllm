@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import pytest
+import pytest
 import torch
 
 import flaggems_vllm
@@ -178,19 +178,19 @@ def _gems_fused_moe_int4_w4a16_wrapper(
     )
 
 
-# @pytest.mark.fused_experts_impl
-# @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-# def test_fused_moe_int4_w4a16():
-#     """
-#     Benchmark FlagGems fused_experts_impl with INT4 W4A16 quantization.
+@pytest.mark.fused_experts_impl
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+def test_fused_moe_int4_w4a16():
+    """
+    Benchmark FlagGems fused_experts_impl with INT4 W4A16 quantization.
 
-#     Baseline is manual dequant + bf16 FlagGems (vLLM's INT4 uses a
-#     specialised WNA16 CUDA kernel not available via the generic Triton path).
-#     """
-#     bench = FusedMoEINT4W4A16Benchmark(
-#         op_name="fused_experts_impl",
-#         torch_op=_vllm_fused_moe_int4_w4a16_wrapper,
-#         dtypes=[torch.bfloat16],
-#     )
-#     bench.set_gems(_gems_fused_moe_int4_w4a16_wrapper)
-#     bench.run()
+    Baseline is manual dequant + bf16 FlagGems (vLLM's INT4 uses a
+    specialised WNA16 CUDA kernel not available via the generic Triton path).
+    """
+    bench = FusedMoEINT4W4A16Benchmark(
+        op_name="fused_experts_impl",
+        torch_op=_vllm_fused_moe_int4_w4a16_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fused_moe_int4_w4a16_wrapper)
+    bench.run()
