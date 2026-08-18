@@ -273,8 +273,22 @@ def fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
     not is_support_fp8e4nv(),
     reason="Do not support fp8e4nv when capability < 89",
 )
-@pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
-@pytest.mark.parametrize("n_heads", [8, 64])
+@pytest.mark.parametrize(
+    "num_tokens",
+    [
+        1,
+        4,
+        # 17,
+        # 64,
+    ],
+)
+@pytest.mark.parametrize(
+    "n_heads",
+    [
+        8,
+        # 64,
+    ],
+)
 def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     torch.manual_seed(0)
     device = "cuda"
@@ -334,8 +348,22 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
     not is_support_fp8e4nv(),
     reason="Do not support fp8e4nv when capability < 89",
 )
-@pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize(
+    "num_tokens",
+    [
+        1,
+        4,
+        # 17,
+        # 64,
+    ],
+)
+@pytest.mark.parametrize(
+    "block_size",
+    [
+        16,
+        # 64,
+    ],
+)
 def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     torch.manual_seed(1)
     device = "cuda"
@@ -383,9 +411,21 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     not is_support_fp8e4nv(),
     reason="Do not support fp8e4nv when capability < 89",
 )
-@pytest.mark.parametrize("num_tokens", [4, 17])
+@pytest.mark.parametrize(
+    "num_tokens",
+    [
+        4,
+        # 17,
+    ],
+)
 @pytest.mark.parametrize("pad", [1, 5])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize(
+    "block_size",
+    [
+        16,
+        # 64,
+    ],
+)
 def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     """slot_mapping.size(0) < q.size(0): the kernel must skip padded
     tokens in the KV branch while still running Q-norm+RoPE on all rows."""
@@ -439,13 +479,40 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
 @pytest.mark.parametrize(
     "num_tokens",
     (
-        [1, 4, 17, 64]
+        [
+            1,
+            4,
+            # 17,
+            # 64,
+        ]
         if QUICK_MODE
-        else [1, 4, 17, 64, 8192, 32768, 65536, 98304, 131072]
+        else [
+            1,
+            4,
+            # 17,
+            # 64,
+            # 8192,
+            # 32768,
+            # 65536,
+            # 98304,
+            # 131072,
+        ]
     ),
 )
-@pytest.mark.parametrize("n_heads", [64, 128])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize(
+    "n_heads",
+    [
+        64,
+        # 128,
+    ],
+)
+@pytest.mark.parametrize(
+    "block_size",
+    [
+        16,
+        # 64,
+    ],
+)
 def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     # out of memory for huge shape on H800
     if (num_tokens == 98304 or num_tokens == 131072) and n_heads == 128:

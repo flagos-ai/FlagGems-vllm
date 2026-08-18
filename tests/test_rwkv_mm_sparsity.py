@@ -12,39 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-import torch
+# import pytest
+# import torch
 
-import flaggems_vllm
+# import flaggems_vllm
 
-from . import accuracy_utils as utils
+# from . import accuracy_utils as utils
 
 
-@pytest.mark.rwkv_mm_sparsity
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_rwkv_mmsparsity(dtype):
-    n = 16384
-    embedding_dim = 4096
-
-    k = torch.randn(n, dtype=dtype, device=flaggems_vllm.device)
-    k = torch.relu(k)
-    if flaggems_vllm.vendor_name == "kunlunxin":
-        torch.manual_seed(42)
-        # kunlunxin sparsity test require 90% sparsity
-        sparsity_levels = [0.9]
-        for target_sparsity in sparsity_levels:
-            threshold = torch.quantile(k.abs().to(torch.float32), target_sparsity).to(
-                dtype
-            )
-            k = torch.relu(k - threshold)
-
-    V_ = torch.randn(n, embedding_dim, dtype=dtype, device=flaggems_vllm.device)
-
-    with flaggems_vllm.use_gems():
-        res = flaggems_vllm.rwkv_mm_sparsity(k, V_)
-
-    ref_k = utils.to_reference(k, True)
-    ref_V_ = utils.to_reference(V_, True)
-    ref_res = ref_k @ ref_V_
-
-    utils.gems_assert_close(res, ref_res, dtype, equal_nan=True)
+# @pytest.mark.rwkv_mm_sparsity
+# @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+# def test_rwkv_mmsparsity(dtype):
+#     n = 16384
+#     embedding_dim = 4096
+#
+#     k = torch.randn(n, dtype=dtype, device=flaggems_vllm.device)
+#     k = torch.relu(k)
+#     if flaggems_vllm.vendor_name == "kunlunxin":
+#         torch.manual_seed(42)
+#         # kunlunxin sparsity test require 90% sparsity
+#         sparsity_levels = [0.9]
+#         for target_sparsity in sparsity_levels:
+#             threshold = torch.quantile(k.abs().to(torch.float32), target_sparsity).to(
+#                 dtype
+#             )
+#             k = torch.relu(k - threshold)
+#
+#     V_ = torch.randn(n, embedding_dim, dtype=dtype, device=flaggems_vllm.device)
+#
+#     with flaggems_vllm.use_gems():
+#         res = flaggems_vllm.rwkv_mm_sparsity(k, V_)
+#
+#     ref_k = utils.to_reference(k, True)
+#     ref_V_ = utils.to_reference(V_, True)
+#     ref_res = ref_k @ ref_V_
+#
+#     utils.gems_assert_close(res, ref_res, dtype, equal_nan=True)

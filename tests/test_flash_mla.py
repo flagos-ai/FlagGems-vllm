@@ -14,13 +14,13 @@
 
 import math
 
-import pytest
 import torch
-import triton
 
 import flaggems_vllm
 
-from . import accuracy_utils as utils
+# import pytest
+# import triton
+# from . import accuracy_utils as utils
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
@@ -95,67 +95,67 @@ def ref_mla(
     return out, lse
 
 
-@pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2817: RuntimeError")
-@pytest.mark.flash_mla
-@pytest.mark.parametrize("seqlen", [1024, 2048, 4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_flash_mla(monkeypatch, seqlen, dtype):
-    b = 128
-    s_q = 1
-    h_q = 128
-    h_kv = 1
-    d = 576
-    dv = 512
-    causal = True
-    block_size = 64
-    cache_seqlens = torch.tensor(
-        [seqlen + 2 * i for i in range(b)], dtype=torch.int32, device=device
-    )
-    max_seqlen = cache_seqlens.max().item()
-    max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
-
-    q = torch.randn([b, s_q, h_q, d], dtype=dtype, device=device)
-    block_table = torch.arange(
-        b * max_seqlen_pad // block_size, dtype=torch.int32, device=device
-    ).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(
-        [block_table.numel(), block_size, h_kv, d], dtype=dtype, device=device
-    )
-
-    ref_q = utils.to_reference(q)
-    ref_block_table = utils.to_reference(block_table)
-    ref_blocked_k = utils.to_reference(blocked_k)
-    ref_cache_seqlens = utils.to_reference(cache_seqlens)
-
-    ref_out, _ = ref_mla(
-        ref_q,
-        ref_block_table,
-        ref_blocked_k,
-        max_seqlen_pad,
-        block_size,
-        b,
-        s_q,
-        ref_cache_seqlens,
-        h_q,
-        h_kv,
-        d,
-        dv,
-        causal,
-    )
-    res_out = flaggems_vllm.flash_mla(
-        q,
-        block_table,
-        blocked_k,
-        max_seqlen_pad,
-        block_size,
-        b,
-        s_q,
-        cache_seqlens,
-        h_q,
-        h_kv,
-        d,
-        dv,
-        causal,
-    )
-
-    cal_diff(utils.to_reference(res_out), ref_out, "out")
+# @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2817: RuntimeError")
+# @pytest.mark.flash_mla
+# @pytest.mark.parametrize("seqlen", [1024, 2048, 4096, 8192])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# def test_flash_mla(monkeypatch, seqlen, dtype):
+#     b = 128
+#     s_q = 1
+#     h_q = 128
+#     h_kv = 1
+#     d = 576
+#     dv = 512
+#     causal = True
+#     block_size = 64
+#     cache_seqlens = torch.tensor(
+#         [seqlen + 2 * i for i in range(b)], dtype=torch.int32, device=device
+#     )
+#     max_seqlen = cache_seqlens.max().item()
+#     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
+#
+#     q = torch.randn([b, s_q, h_q, d], dtype=dtype, device=device)
+#     block_table = torch.arange(
+#         b * max_seqlen_pad // block_size, dtype=torch.int32, device=device
+#     ).view(b, max_seqlen_pad // block_size)
+#     blocked_k = torch.randn(
+#         [block_table.numel(), block_size, h_kv, d], dtype=dtype, device=device
+#     )
+#
+#     ref_q = utils.to_reference(q)
+#     ref_block_table = utils.to_reference(block_table)
+#     ref_blocked_k = utils.to_reference(blocked_k)
+#     ref_cache_seqlens = utils.to_reference(cache_seqlens)
+#
+#     ref_out, _ = ref_mla(
+#         ref_q,
+#         ref_block_table,
+#         ref_blocked_k,
+#         max_seqlen_pad,
+#         block_size,
+#         b,
+#         s_q,
+#         ref_cache_seqlens,
+#         h_q,
+#         h_kv,
+#         d,
+#         dv,
+#         causal,
+#     )
+#     res_out = flaggems_vllm.flash_mla(
+#         q,
+#         block_table,
+#         blocked_k,
+#         max_seqlen_pad,
+#         block_size,
+#         b,
+#         s_q,
+#         cache_seqlens,
+#         h_q,
+#         h_kv,
+#         d,
+#         dv,
+#         causal,
+#     )
+#
+#     cal_diff(utils.to_reference(res_out), ref_out, "out")

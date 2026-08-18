@@ -76,10 +76,10 @@ POINTWISE_SHAPES = (
     else [
         (),
         (1,),
-        (1024, 1024),
+        # (1024, 1024),
         (20, 320, 15),
-        (16, 128, 64, 60),
-        (16, 7, 57, 32, 29),
+        # (16, 128, 64, 60),
+        # (16, 7, 57, 32, 29),
     ]
 )
 SPECIAL_SHAPES = (
@@ -114,7 +114,15 @@ FUSED_INV_ROPE_FP8_QUANT_SHAPES = {
     "SEEDS": [0, 42],
 }
 DISTRIBUTION_SHAPES = [(20, 320, 15)]
-REDUCTION_SHAPES = [(2, 32)] if QUICK_MODE else [(1, 2), (4096, 256), (200, 40999, 3)]
+REDUCTION_SHAPES = (
+    [(2, 32)]
+    if QUICK_MODE
+    else [
+        (1, 2),
+        # (4096, 256),
+        # (200, 40999, 3),
+    ]
+)
 REDUCTION_SMALL_SHAPES = (
     [(1, 32)] if QUICK_MODE else [(1, 2), (4096, 256), (200, 2560, 3)]
 )

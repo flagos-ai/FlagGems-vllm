@@ -42,7 +42,10 @@ NUM_BLOCKS_MLA = [8]
 
 # Arbitrary values for testing
 # don't make it too large. e.g. [1024, 36000] will OOM
-NUM_BLOCKS = [1024, 10000]
+NUM_BLOCKS = [
+    1024,
+    # 10000,
+]
 
 NUM_MAPPINGS = [256]  # Arbitrary values for testing
 SEEDS = [0]

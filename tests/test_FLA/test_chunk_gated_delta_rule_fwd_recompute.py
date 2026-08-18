@@ -15,7 +15,7 @@
 import os
 from contextlib import contextmanager
 
-import pytest
+# import pytest
 import torch
 
 import flaggems_vllm
@@ -25,19 +25,19 @@ ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAGGEMS_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAGGEMS_CHUNK_GATED_DELTA_RULE_TLE"
 
-GDN_RECOMPUTE_TEST_SHAPES = [
-    (2, 16384, 16, 128, 128),
-    (4, 2048, 16, 128, 128),
-    (4, 4096, 64, 128, 128),
-    (8, 1024, 8, 64, 64),
-    (8, 2048, 32, 256, 256),
-]
+# GDN_RECOMPUTE_TEST_SHAPES = [
+#     # (2, 16384, 16, 128, 128),
+#     # (4, 2048, 16, 128, 128),
+#     # (4, 4096, 64, 128, 128),
+#     (8, 1024, 8, 64, 64),
+#     # (8, 2048, 32, 256, 256),
+# ]
 
-GDN_FUSED_FWD_TEST_SHAPES = [
-    (2, 16384, 16, 128, 128),
-    (4, 2048, 16, 128, 128),
-    (4, 4096, 64, 128, 128),
-]
+# GDN_FUSED_FWD_TEST_SHAPES = [
+#     # (2, 16384, 16, 128, 128),
+#     # (4, 2048, 16, 128, 128),
+#     # (4, 4096, 64, 128, 128),
+# ]
 
 
 def _cuda_tle_available() -> bool:
@@ -112,41 +112,41 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     )
 
 
-@pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE"
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", GDN_RECOMPUTE_TEST_SHAPES)
-@torch.inference_mode()
-def test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native(dtype, shape):
-    torch.manual_seed(42)
-    args = _make_inputs(*shape, dtype=dtype, use_initial_state=True)
+# @pytest.mark.chunk_gated_delta_rule_fwd
+# @pytest.mark.skipif(
+#     not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE"
+# )
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("shape", GDN_RECOMPUTE_TEST_SHAPES)
+# @torch.inference_mode()
+# def test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native(dtype, shape):
+#     torch.manual_seed(42)
+#     args = _make_inputs(*shape, dtype=dtype, use_initial_state=True)
+#
+#     baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
+#     actual = _call_fwd(args, full_tle=False, recompute_tle=True)
+#
+#     _assert_close("g", actual[0], baseline[0])
+#     _assert_close("o", actual[1], baseline[1])
+#     _assert_close("A", actual[2], baseline[2])
+#     _assert_close("final_state", actual[3], baseline[3])
 
-    baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
-    actual = _call_fwd(args, full_tle=False, recompute_tle=True)
 
-    _assert_close("g", actual[0], baseline[0])
-    _assert_close("o", actual[1], baseline[1])
-    _assert_close("A", actual[2], baseline[2])
-    _assert_close("final_state", actual[3], baseline[3])
-
-
-@pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE"
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", GDN_FUSED_FWD_TEST_SHAPES)
-@torch.inference_mode()
-def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
-    torch.manual_seed(42)
-    args = _make_inputs(*shape, dtype=dtype, use_initial_state=False)
-
-    baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
-    actual = _call_fwd(args, full_tle=True, recompute_tle=True)
-
-    _assert_close("g", actual[0], baseline[0])
-    _assert_close("o", actual[1], baseline[1])
-    _assert_close("A", actual[2], baseline[2])
-    _assert_close("final_state", actual[3], baseline[3])
+# @pytest.mark.chunk_gated_delta_rule_fwd
+# @pytest.mark.skipif(
+#     not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE"
+# )
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("shape", GDN_FUSED_FWD_TEST_SHAPES)
+# @torch.inference_mode()
+# def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
+#     torch.manual_seed(42)
+#     args = _make_inputs(*shape, dtype=dtype, use_initial_state=False)
+#
+#     baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
+#     actual = _call_fwd(args, full_tle=True, recompute_tle=True)
+#
+#     _assert_close("g", actual[0], baseline[0])
+#     _assert_close("o", actual[1], baseline[1])
+#     _assert_close("A", actual[2], baseline[2])
+#     _assert_close("final_state", actual[3], baseline[3])

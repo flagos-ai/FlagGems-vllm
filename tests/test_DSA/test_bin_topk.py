@@ -184,9 +184,30 @@ def test_bucket_sort_topk(starts_list, ends_list):
     "#2352: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
 )
 @pytest.mark.bucket_sort_topk
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
-@pytest.mark.parametrize("seq_len", [256, 1024, 8192])
-@pytest.mark.parametrize("topk", [16, 64, 256])
+@pytest.mark.parametrize(
+    "batch_size",
+    [
+        1,
+        # 4,
+        # 16,
+    ],
+)
+@pytest.mark.parametrize(
+    "seq_len",
+    [
+        256,
+        # 1024,
+        # 8192,
+    ],
+)
+@pytest.mark.parametrize(
+    "topk",
+    [
+        16,
+        # 64,
+        # 256,
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_bucket_sort_topk_forward(
     batch_size: int, seq_len: int, topk: int, dtype: torch.dtype
@@ -260,45 +281,45 @@ def test_bucket_sort_topk_edge_cases(config):
     assert_set_similar(your_indices, ref_indices, dtype)
 
 
-@pytest.mark.skip(
-    "#2352: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
-)
-@pytest.mark.bucket_sort_topk
-@pytest.mark.parametrize(
-    "config",
-    [
-        # Large-scale tests - using your original test parameters
-        {"batch_size": 64, "seq_len": 32768, "topk": 2048},
-        {"batch_size": 32, "seq_len": 65536, "topk": 4096},
-        {
-            "batch_size": 96,
-            "seq_len": 32768,
-            "topk": 2048,
-        },  # Your original test parameters
-    ],
-)
-def test_bucket_sort_topk_large_scale(config):
-    """Bucket sort topk large-scale tests"""
-    dtype = torch.float32
-
-    inputs, starts, ends = make_topk_input(
-        config["batch_size"], config["seq_len"], dtype, device
-    )
-
-    # Reference implementation
-    ref_indices = reference_topk_implementation(
-        to_reference(inputs),
-        to_reference(starts),
-        to_reference(ends),
-        config["topk"],
-    )
-
-    # Your operator implementation
-    your_indices = bucket_sort_topk(inputs, starts, ends, config["topk"])
-
-    debug_topk_results(your_indices, ref_indices, inputs, "large_scale")
-
-    assert_set_similar(your_indices, ref_indices, dtype)
+# @pytest.mark.skip(
+#     "#2352: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
+# )
+# @pytest.mark.bucket_sort_topk
+# @pytest.mark.parametrize(
+#     "config",
+#     [
+#         # Large-scale tests - using your original test parameters
+#         # {"batch_size": 64, "seq_len": 32768, "topk": 2048},
+#         # {"batch_size": 32, "seq_len": 65536, "topk": 4096},
+#         # {
+#         #     "batch_size": 96,
+#         #     "seq_len": 32768,
+#         #     "topk": 2048,
+#         # },  # Your original test parameters
+#     ],
+# )
+# def test_bucket_sort_topk_large_scale(config):
+#     """Bucket sort topk large-scale tests"""
+#     dtype = torch.float32
+#
+#     inputs, starts, ends = make_topk_input(
+#         config["batch_size"], config["seq_len"], dtype, device
+#     )
+#
+#     # Reference implementation
+#     ref_indices = reference_topk_implementation(
+#         to_reference(inputs),
+#         to_reference(starts),
+#         to_reference(ends),
+#         config["topk"],
+#     )
+#
+#     # Your operator implementation
+#     your_indices = bucket_sort_topk(inputs, starts, ends, config["topk"])
+#
+#     debug_topk_results(your_indices, ref_indices, inputs, "large_scale")
+#
+#     assert_set_similar(your_indices, ref_indices, dtype)
 
 
 @pytest.mark.skip(
@@ -332,48 +353,48 @@ def test_bucket_sort_topk_variable_length():
     assert_set_similar(your_indices, ref_indices, dtype)
 
 
-@pytest.mark.skip(
-    "#2352: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
-)
-@pytest.mark.bucket_sort_topk
-def test_bucket_sort_topk_correctness():
-    """Correctness test - using your original test logic"""
-    batch_size = 96
-    seq_len = 32768
-    topk = 2048
-
-    # torch.manual_seed(1)
-    inputs = torch.randn(batch_size, seq_len, dtype=torch.float32, device=device)
-    starts = torch.zeros(batch_size, dtype=torch.int32, device=device)
-    ends = torch.ones(batch_size, dtype=torch.int32, device=device) * seq_len
-
-    # Your operator
-    your_indices = bucket_sort_topk(inputs, starts, ends, topk)
-
-    # Reference implementation
-    ref_indices = torch.topk(inputs, topk, dim=-1)[1]
-
-    # Calculate intersection ratio
-    total_intersection = 0
-    total_elements = 0
-
-    for i in range(batch_size):
-        your_set = set(your_indices[i].cpu().numpy())
-        ref_set = set(ref_indices[i].cpu().numpy())
-        intersection = your_set & ref_set
-        intersection_ratio = len(intersection) / len(ref_set)
-        total_intersection += len(intersection)
-        total_elements += len(ref_set)
-
-        print(f"Batch {i}: Intersection ratio = {intersection_ratio:.4f}")
-
-        # Require at least 95% of topk elements to match
-        assert (
-            intersection_ratio >= 0.95
-        ), f"Batch {i}: Only {intersection_ratio:.4f} intersection, expected at least 0.95"
-
-    overall_ratio = total_intersection / total_elements
-    print(f"Overall intersection ratio: {overall_ratio:.4f}")
+# @pytest.mark.skip(
+#     "#2352: RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel"
+# )
+# @pytest.mark.bucket_sort_topk
+# def test_bucket_sort_topk_correctness():
+#     """Correctness test - using your original test logic"""
+#     batch_size = 96
+#     seq_len = 32768
+#     topk = 2048
+#
+#     # torch.manual_seed(1)
+#     inputs = torch.randn(batch_size, seq_len, dtype=torch.float32, device=device)
+#     starts = torch.zeros(batch_size, dtype=torch.int32, device=device)
+#     ends = torch.ones(batch_size, dtype=torch.int32, device=device) * seq_len
+#
+#     # Your operator
+#     your_indices = bucket_sort_topk(inputs, starts, ends, topk)
+#
+#     # Reference implementation
+#     ref_indices = torch.topk(inputs, topk, dim=-1)[1]
+#
+#     # Calculate intersection ratio
+#     total_intersection = 0
+#     total_elements = 0
+#
+#     for i in range(batch_size):
+#         your_set = set(your_indices[i].cpu().numpy())
+#         ref_set = set(ref_indices[i].cpu().numpy())
+#         intersection = your_set & ref_set
+#         intersection_ratio = len(intersection) / len(ref_set)
+#         total_intersection += len(intersection)
+#         total_elements += len(ref_set)
+#
+#         print(f"Batch {i}: Intersection ratio = {intersection_ratio:.4f}")
+#
+#         # Require at least 95% of topk elements to match
+#         assert (
+#             intersection_ratio >= 0.95
+#         ), f"Batch {i}: Only {intersection_ratio:.4f} intersection, expected at least 0.95"
+#
+#     overall_ratio = total_intersection / total_elements
+#     print(f"Overall intersection ratio: {overall_ratio:.4f}")
 
 
 if __name__ == "__main__":

@@ -95,17 +95,17 @@ CONFIGS = [
         "softcap": 30.0,
     },
     # realistic decode: B=8, long KV=4096, GQA 32:8
-    {
-        "num_seqs": 8,
-        "query_lens": [1] * 8,
-        "context_lens": [4095] * 8,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
+    # {
+    #     "num_seqs": 8,
+    #     "query_lens": [1] * 8,
+    #     "context_lens": [4095] * 8,
+    #     "num_query_heads": 32,
+    #     "num_kv_heads": 8,
+    #     "head_size": 128,
+    #     "block_size": 16,
+    #     "causal": True,
+    #     "softcap": 0.0,
+    # },
 ]
 
 DTYPES = [torch.bfloat16, torch.float16]

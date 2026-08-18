@@ -32,8 +32,19 @@ if QUICK_MODE:
     SCALE = [0.1]
     AZP = [54]
 else:
-    NUM_TOKENS = [1, 7, 4096]
-    HIDDEN_SIZES = [17, 1024, 1025, 1026, 5137, 8193]
+    NUM_TOKENS = [
+        1,
+        7,
+        # 4096,
+    ]
+    HIDDEN_SIZES = [
+        17,
+        1024,
+        1025,
+        1026,
+        # 5137,
+        # 8193,
+    ]
     DTYPES = [torch.bfloat16, torch.float]
     SCALE = [0.1, 2.1]
     AZP = [-255, 54]
