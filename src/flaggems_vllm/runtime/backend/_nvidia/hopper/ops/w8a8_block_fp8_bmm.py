@@ -289,6 +289,10 @@ if HAS_TLE_W8A8_BLOCK_FP8_BMM:
         key=["B", "M_aligned", "N", "K"],
         strategy=["default", "align32", "align32", "align32"],
         policy=_TLEW8A8BlockFP8BMMTuner,
+        # vLLM decode captures this kernel into a CUDA graph. Eager autotune
+        # ties on most shapes and can pick stage 4 on pro_b1, where graph
+        # prefers stage 8 (~9% on H20). Keep both stages in the search space.
+        use_cuda_graph=True,
         flagtune_op_name="w8a8_block_fp8_bmm",
         flagtune_expand_op_name="w8a8_block_fp8_bmm",
     )
@@ -423,6 +427,7 @@ if HAS_TLE_W8A8_BLOCK_FP8_BMM:
     strategy=["default", "align32", "align32", "align32", "align32", "align32"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
     flagtune_op_name="w8a8_block_fp8_bmm",
     flagtune_expand_op_name="w8a8_block_fp8_bmm_splitk",
 )
@@ -535,6 +540,7 @@ def w8a8_block_fp8_bmm_kernel_splitk(
     strategy=["default", "align32", "align32", "align32", "align32", "align32"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
     flagtune_op_name="w8a8_block_fp8_bmm",
     flagtune_expand_op_name="w8a8_block_fp8_bmm_general",
 )

@@ -214,6 +214,20 @@ def _force_tle_pipeline_config(num_stages):
 
 
 @pytest.mark.fp8_einsum
+def test_w8a8_block_fp8_bmm_tune_space_exposes_stage4_and_stage8():
+    """Autotune YAML must expose both TLE stages and non-empty fallback spaces."""
+    tle = flaggems_vllm.runtime.get_tuned_config("w8a8_block_fp8_bmm")
+    assert tle, "TLE search space must not be empty"
+    assert {c.num_stages for c in tle} == {4, 8}
+    assert {c.num_warps for c in tle} == {4, 8}
+
+    general = flaggems_vllm.runtime.get_tuned_config("w8a8_block_fp8_bmm_general")
+    splitk = flaggems_vllm.runtime.get_tuned_config("w8a8_block_fp8_bmm_splitk")
+    assert general, "general fallback search space must not be empty"
+    assert splitk, "split-K fallback search space must not be empty"
+
+
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("config", FP8_EINSUM_CONFIGS)
 @pytest.mark.parametrize("block_shape", [[128, 128]])
 @pytest.mark.skipif(

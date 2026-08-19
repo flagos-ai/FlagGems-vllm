@@ -317,7 +317,7 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "w8a8_block_fp8_general":
+        if op_name in ("w8a8_block_fp8_general", "w8a8_block_fp8_bmm_general"):
             return [
                 triton.Config(
                     {
@@ -375,7 +375,7 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "w8a8_block_fp8_general_splitk":
+        if op_name in ("w8a8_block_fp8_general_splitk", "w8a8_block_fp8_bmm_splitk"):
             return [
                 triton.Config(
                     {
@@ -528,6 +528,18 @@ class ConfigLoader(object):
             "w8a8_block_fp8_bmm": self._build_single_expand_spec(
                 "w8a8_block_fp8_bmm",
                 expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_bmm"),
+            ),
+            "w8a8_block_fp8_bmm_general": self._build_single_expand_spec(
+                "w8a8_block_fp8_bmm_general",
+                expand_yaml_path=self._get_expand_config_path(
+                    "w8a8_block_fp8_bmm_general"
+                ),
+            ),
+            "w8a8_block_fp8_bmm_splitk": self._build_single_expand_spec(
+                "w8a8_block_fp8_bmm_splitk",
+                expand_yaml_path=self._get_expand_config_path(
+                    "w8a8_block_fp8_bmm_splitk"
+                ),
             ),
             "mm_splitk": self._build_single_expand_spec("mm_splitk"),
             "sparse_attention": self._build_single_expand_spec("sparse_attention"),
