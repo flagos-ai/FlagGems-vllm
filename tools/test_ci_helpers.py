@@ -149,13 +149,19 @@ class SelectBackendsTest(unittest.TestCase):
 
     def test_pr_label_selects_only_matching_backend(self):
         selected = select_backends.select_backends(
-            self.registry, {"vendor/Ascend"}, all_enabled=False
+            self.registry,
+            {"vendor/Ascend"},
+            all_enabled=False,
+            auto_selected_backends=set(),
         )
         self.assertEqual([entry["backend"] for entry in selected], ["ascend-cann850"])
 
     def test_all_enabled_still_excludes_nvidia(self):
         selected = select_backends.select_backends(
-            self.registry, set(), all_enabled=True
+            self.registry,
+            set(),
+            all_enabled=True,
+            auto_selected_backends=set(),
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
@@ -168,11 +174,133 @@ class SelectBackendsTest(unittest.TestCase):
             set(),
             all_enabled=False,
             changed_files={"src/flaggems_vllm/runtime/backend/_kunlunxin/ops/mul.py"},
+            auto_selected_backends={"kunlunxin"},
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
             ["kunlunxin"],
         )
+
+    def test_path_inference_selects_only_preflight_verified_backends(self):
+        selected = select_backends.select_backends(
+            self.registry,
+            set(),
+            all_enabled=False,
+            changed_files={
+                "src/flaggems_vllm/runtime/backend/_ascend/ops/mul.py",
+                "src/flaggems_vllm/runtime/backend/_kunlunxin/ops/mul.py",
+            },
+            auto_selected_backends={"ascend-cann850"},
+        )
+        self.assertEqual(
+            [entry["backend"] for entry in selected],
+            ["ascend-cann850"],
+        )
+
+    def test_exact_label_overrides_automatic_selection_readiness(self):
+        selected = select_backends.select_backends(
+            self.registry,
+            {"vendor/Kunlunxin"},
+            all_enabled=False,
+            auto_selected_backends=set(),
+        )
+        self.assertEqual(
+            [entry["backend"] for entry in selected],
+            ["kunlunxin"],
+        )
+
+    def test_all_enabled_overrides_automatic_selection_readiness(self):
+        selected = select_backends.select_backends(
+            self.registry,
+            set(),
+            all_enabled=True,
+            auto_selected_backends=set(),
+        )
+        self.assertEqual(
+            [entry["backend"] for entry in selected],
+            ["ascend-cann850", "kunlunxin"],
+        )
+
+    def test_loads_auto_selected_backends_from_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capabilities.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "defaults": {"auto_select": False},
+                        "backends": {
+                            "ascend-cann850": {"auto_select": True},
+                            "kunlunxin": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                select_backends.load_auto_selected_backends(path),
+                {"ascend-cann850"},
+            )
+
+    def test_capabilities_must_default_to_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capabilities.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "defaults": {"auto_select": True},
+                        "backends": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must be false"):
+                select_backends.load_auto_selected_backends(path)
+
+    def test_capabilities_reject_non_boolean_backend_override(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capabilities.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "defaults": {"auto_select": False},
+                        "backends": {"kunlunxin": {"auto_select": "yes"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                select_backends.load_auto_selected_backends(path)
+
+    def test_unknown_auto_selected_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "missing from registry"):
+            select_backends.select_backends(
+                self.registry,
+                set(),
+                all_enabled=False,
+                auto_selected_backends={"misspelled-backend"},
+            )
+
+    def test_explicit_selection_cannot_enable_disabled_or_nvidia_backends(self):
+        registry = [
+            {
+                "backend": "disabled-vendor",
+                "runner_label": "disabled",
+                "label": "vendor/Disabled",
+                "gpu_check": "",
+                "enabled": False,
+            },
+            self.registry[2],
+        ]
+        selected = select_backends.select_backends(
+            registry,
+            {"vendor/Disabled", "vendor/NVIDIA"},
+            all_enabled=True,
+            auto_selected_backends=set(),
+        )
+        self.assertEqual(selected, [])
 
     def test_unrelated_source_change_does_not_select_a_vendor(self):
         selected = select_backends.select_backends(
@@ -180,6 +308,7 @@ class SelectBackendsTest(unittest.TestCase):
             set(),
             all_enabled=False,
             changed_files={"src/flaggems_vllm/ops/mul.py"},
+            auto_selected_backends=set(),
         )
         self.assertEqual(selected, [])
 
@@ -283,9 +412,10 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
 
         selected_backends = select_backends.select_backends(
             registry,
-            set(),
+            {"vendor/Iluvatar"},
             all_enabled=False,
             changed_files=set(changed_files),
+            auto_selected_backends=set(),
         )
         _, selected_tests, _ = select_tests.select_targets(
             self.repo_root, changed_files
@@ -622,6 +752,16 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 
 
 class CiWorkflowPolicyTest(unittest.TestCase):
+    def test_backend_path_routing_uses_local_preflight_readiness(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "--capabilities .github/backend-capabilities.json",
+            workflow,
+        )
+
     def test_all_backend_fanout_requires_an_explicit_request(self):
         repo_root = Path(__file__).resolve().parents[1]
         workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(

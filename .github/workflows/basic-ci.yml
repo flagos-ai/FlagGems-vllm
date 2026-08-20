@@ -202,6 +202,7 @@ jobs:
           set -euo pipefail
           args=(
             --registry .ci/flaggems-registry/.github/backends.json
+            --capabilities .github/backend-capabilities.json
             --labels-json "${PR_LABELS_JSON:-null}"
             --changed-files changed_files.bin
             --format github
