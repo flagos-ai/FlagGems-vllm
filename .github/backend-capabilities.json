@@ -53,9 +53,6 @@
       "benchmarks_enabled": true,
       "allow_all_benchmarks": true
     },
-    "thead": {
-      "auto_select": true
-    },
     "tsingmicro": {
       "auto_select": true
     }
