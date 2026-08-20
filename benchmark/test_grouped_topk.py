@@ -17,20 +17,75 @@ import torch
 
 import flaggems_vllm
 
-from . import base, utils
+from . import base
+
+
+def torch_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    """
+    Adapted from vLLM: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py.
+    Ignore the non-stablility of torch.topk in benchmark test.
+    """
+    scores = scores.float()
+    if scoring_func == 1:
+        scores = scores.sigmoid()
+
+    num_token = scores.size(0)
+    original_scores = scores
+    scores = scores + bias.unsqueeze(0)
+    group_scores = (
+        scores.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    )
+
+    use_sorted = True
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
+        1
+    ]  # [n, top_k_group]
+    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
+        .reshape(num_token, -1)
+    )  # [n, e]
+    tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+
+    if bias is not None:
+        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        # Use original unbiased scores for the routing weights
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(
+            tmp_scores, k=topk, dim=-1, sorted=use_sorted
+        )
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
 
 vendor_name = flaggems_vllm.vendor_name
 
 try:
-    if vendor_name == "metax":
-        from vllm_metax._custom_ops import grouped_topk as vllm_grouped_topk
-    else:
-        from vllm._custom_ops import grouped_topk as vllm_grouped_topk
+    import vllm._custom_ops as ops  # noqa: F401
 
-    HAS_VLLM = True
+    if hasattr(torch.ops._moe_C, "grouped_topk"):
+        ref_grouped_topk = torch.ops._moe_C.grouped_topk
+    else:
+        ref_grouped_topk = torch_grouped_topk
 except (ImportError, AttributeError):
-    HAS_VLLM = False
-    vllm_grouped_topk = None
+    ref_grouped_topk = torch_grouped_topk
 
 
 class GroupedTopKBenchmark(base.Benchmark):
@@ -83,24 +138,13 @@ class GroupedTopKBenchmark(base.Benchmark):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-@pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
-    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-)
-@pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
-    reason="The version prior to 2.7 is not compatible with VLLM.",
-)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_no_renorm():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
+        torch_op=ref_grouped_topk,
         dtypes=[torch.bfloat16],
         renormalize=False,
         scoring_func=0,
@@ -111,24 +155,13 @@ def test_grouped_topk_no_renorm():
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-@pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
-    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-)
-@pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
-    reason="The version prior to 2.7 is not compatible with VLLM.",
-)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_score_0():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
+        torch_op=ref_grouped_topk,
         dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=0,
@@ -139,24 +172,13 @@ def test_grouped_topk_score_0():
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-@pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
-    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-)
-@pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
-    reason="The version prior to 2.7 is not compatible with VLLM.",
-)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_score_1():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
+        torch_op=ref_grouped_topk,
         dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=1,
