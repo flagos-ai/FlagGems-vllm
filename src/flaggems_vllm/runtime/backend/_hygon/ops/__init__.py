@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fused_moe import (  # noqa: F401
+from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
-from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
-from .scaled_int8_quant import scaled_int8_quant
-from .triton_scaled_mm import triton_scaled_mm
+from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
+    SUPPORTED_FP8_DTYPE,
+    per_token_group_quant_fp8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_scaled_mm
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
