@@ -413,6 +413,8 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
         inherited_home_is_valid: bool = True,
         passwd_home_is_valid: bool = True,
         uv_overrides_are_invalid: bool = False,
+        uv_http_retries: str | None = None,
+        uv_http_timeout: str | None = None,
     ):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
@@ -457,8 +459,14 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
             "XDG_DATA_HOME",
             "UV_CACHE_DIR",
             "UV_PYTHON_INSTALL_DIR",
+            "UV_HTTP_RETRIES",
+            "UV_HTTP_TIMEOUT",
         ):
             environment.pop(name, None)
+        if uv_http_retries is not None:
+            environment["UV_HTTP_RETRIES"] = uv_http_retries
+        if uv_http_timeout is not None:
+            environment["UV_HTTP_TIMEOUT"] = uv_http_timeout
         if uv_overrides_are_invalid:
             invalid_cache = root / "invalid-uv-cache"
             invalid_python = root / "invalid-uv-python"
@@ -498,9 +506,14 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
             "FLAGGEMS_DIR": workspace / ".ci/flaggems",
             "FLAGGEMS_VENV": workspace / ".ci/flaggems/.venv",
         }
-        self.assertEqual(set(values), set(expected))
+        self.assertEqual(
+            set(values),
+            {*expected, "UV_HTTP_RETRIES", "UV_HTTP_TIMEOUT"},
+        )
         for name, path in expected.items():
             self.assertEqual(Path(values[name]), path)
+        self.assertEqual(values["UV_HTTP_RETRIES"], "5")
+        self.assertEqual(values["UV_HTTP_TIMEOUT"], "60")
         self.assertTrue((inherited_home / ".local/bin").is_dir())
         self.assertTrue((inherited_home / ".cache/uv").is_dir())
         self.assertTrue((inherited_home / ".local/share/uv/python").is_dir())
@@ -518,6 +531,25 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
             Path(values["UV_PYTHON_INSTALL_DIR"]),
             inherited_home / ".local/share/uv/python",
         )
+
+    def test_preserves_explicit_uv_http_settings(self):
+        result, values, *_ = self.run_helper(
+            "iluvatar",
+            uv_http_retries="7",
+            uv_http_timeout="90",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values["UV_HTTP_RETRIES"], "7")
+        self.assertEqual(values["UV_HTTP_TIMEOUT"], "90")
+
+    def test_rejects_invalid_uv_http_settings(self):
+        result, values, *_ = self.run_helper(
+            "iluvatar",
+            uv_http_retries="not-a-number",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Invalid UV_HTTP_RETRIES", result.stderr)
+        self.assertEqual(values, {})
 
     def test_uses_passwd_home_when_inherited_home_is_invalid(self):
         result, values, _, _, _, passwd_home = self.run_helper(
