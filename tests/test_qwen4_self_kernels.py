@@ -1,4 +1,4 @@
-"""Correctness coverage for the eight standalone Qwen4 kernels.
+"""Correctness coverage for eight self-developed and three vendor Qwen4 kernels.
 
 Torch references live in this test module only. The production wrappers are
 required to fail closed instead of dispatching a Torch compute fallback.
@@ -13,16 +13,23 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 
-from flaggems_vllm.ops.qwen4.hyperconnection import (
+from flaggems_vllm.ops.qwen4.hyperconnection import (  # noqa: E402
     qwen4_grouped_gemma_rmsnorm,
     qwen4_hc_gate_reduce,
     qwen4_hc_inject_combine,
 )
-from flaggems_vllm.ops.qwen4.ple_state import ple_state_gather, ple_state_scatter_
-from flaggems_vllm.ops.qwen4.qsa import (
+from flaggems_vllm.ops.qwen4.ple_state import (  # noqa: E402
+    ple_state_gather,
+    ple_state_scatter_,
+)
+from flaggems_vllm.ops.qwen4.qsa import (  # noqa: E402
+    QWEN4_VENDOR_QSA_SOURCE,
     qwen4_compress_norm_mrope_store_groups,
     qwen4_qsa_mqa_paged_dot,
     qwen4_store_qsa_kv_rows,
+    qwen4_vendor_compress_qsa_groups,
+    qwen4_vendor_qsa_mqa_paged,
+    qwen4_vendor_store_qsa_rows,
 )
 
 DEVICE = "cuda"
@@ -173,6 +180,19 @@ def test_qwen4_qsa_mqa_paged_dot_matches_torch_and_invalid_pages():
     )
     torch.testing.assert_close(out_visible, ref_visible, atol=0, rtol=0)
     torch.testing.assert_close(out_logits, ref_logits, atol=0.2, rtol=0.02)
+
+    vendor_logits, vendor_visible = qwen4_vendor_qsa_mqa_paged(
+        q,
+        cache,
+        table,
+        token_to_req,
+        positions,
+        lengths,
+        compress_ratio=4,
+        num_columns=columns,
+    )
+    torch.testing.assert_close(vendor_visible, ref_visible, atol=0, rtol=0)
+    torch.testing.assert_close(vendor_logits, ref_logits, atol=0.2, rtol=0.02)
     assert torch.isneginf(out_logits[6]).all()
     assert torch.isneginf(out_logits[2, 8:]).all()
 
@@ -219,6 +239,28 @@ def test_qwen4_qsa_kv_store_matches_torch_and_skips_invalid_slots():
     qwen4_store_qsa_kv_rows(out_k, out_v, slots, key, value)
     torch.testing.assert_close(out_k, ref_k, atol=0, rtol=0)
     torch.testing.assert_close(out_v, ref_v, atol=0, rtol=0)
+
+
+@pytest.mark.qwen4_qsa
+def test_qwen4_vendor_qsa_store_matches_torch_and_skips_invalid_slots():
+    _require_cuda()
+    blocks, page_size, rows = 3, 4, 5
+    torch.manual_seed(304)
+    initial = torch.randn(
+        (blocks, page_size, 1, 128), device=DEVICE, dtype=torch.bfloat16
+    )
+    values = torch.randn((rows, 1, 128), device=DEVICE, dtype=torch.bfloat16)
+    slots = torch.tensor([0, 3, 4, 11, -1], device=DEVICE, dtype=torch.int64)
+    expected = initial.clone()
+    valid = (slots >= 0) & (slots < blocks * page_size)
+    safe = slots[valid]
+    expected.index_put_(
+        (safe // page_size, safe % page_size), values[valid], accumulate=False
+    )
+
+    actual = initial.clone()
+    qwen4_vendor_store_qsa_rows(actual, slots, values)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _compress_reference(
@@ -313,6 +355,34 @@ def test_qwen4_qsa_fused_compress_norm_mrope_interleaved_matches_torch():
     )
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.02)
 
+    vendor_pooled, vendor_positions = qwen4_vendor_compress_qsa_groups(
+        raw,
+        table,
+        requests,
+        positions,
+        slots,
+        compress_ratio=4,
+        rope_cache=rope,
+    )
+    expected_pooled = []
+    expected_positions = []
+    for row in range(requests.numel()):
+        request = int(requests[row].item())
+        end = int(positions[row].item())
+        raw_rows = []
+        for offset in range(4):
+            position = end - (3 - offset)
+            page = int(table[request, position // raw.shape[1]].item())
+            raw_rows.append(raw[page, position % raw.shape[1], 0].float())
+        expected_pooled.append((torch.stack(raw_rows).sum(0) / 4).to(torch.bfloat16))
+        first = end - 3
+        page = int(table[request, first // raw.shape[1]].item())
+        expected_positions.append(rope[page, first % rope.shape[1], 0, :3])
+    expected_pooled = torch.stack(expected_pooled).unsqueeze(1)
+    expected_positions = torch.stack(expected_positions)
+    torch.testing.assert_close(vendor_pooled, expected_pooled, atol=0.015, rtol=0)
+    torch.testing.assert_close(vendor_positions, expected_positions, atol=0, rtol=0)
+
     snapshot = actual.clone()
     for _ in range(3):
         repeated = initial.clone()
@@ -379,7 +449,7 @@ def test_qwen4_ple_scatter_masked_null_and_duplicate_is_exact():
         ple_state_scatter_(baseline, indices, rows)
 
 
-def test_qsa_exports_exclude_vendor_kernels():
+def test_qsa_exports_and_vendor_source_are_explicit():
     from flaggems_vllm.ops.qwen4 import qsa as qsa_module
 
     names = set(qsa_module.__all__)
@@ -388,11 +458,17 @@ def test_qsa_exports_exclude_vendor_kernels():
         "_store_qsa_kv_rows_kernel",
         "_compress_norm_mrope_store_qsa_groups_kernel",
     } <= names
-    assert not any(
-        token in name
-        for name in names
-        for token in ("sparse", "expand", "_store_qsa_rows_kernel")
-    )
+    assert {
+        "_compress_qsa_groups_kernel",
+        "_qsa_mqa_paged_kernel",
+        "_store_qsa_rows_kernel",
+        "qwen4_vendor_compress_qsa_groups",
+        "qwen4_vendor_qsa_mqa_paged",
+        "qwen4_vendor_store_qsa_rows",
+    } <= names
+    assert QWEN4_VENDOR_QSA_SOURCE["repository"].endswith("vllm-plugin-FL")
+    assert QWEN4_VENDOR_QSA_SOURCE["base_commit"].startswith("fadbba0")
+    assert len(QWEN4_VENDOR_QSA_SOURCE["sha256"]) == 64
 
 
 def test_qwen4_cpu_guards_fail_closed():
@@ -407,6 +483,8 @@ def test_qwen4_cpu_guards_fail_closed():
     metadata = torch.zeros((1,), dtype=torch.int32)
     with pytest.raises(RuntimeError):
         qwen4_qsa_mqa_paged_dot(q, cache, table, metadata, metadata, metadata)
+    with pytest.raises(RuntimeError):
+        qwen4_vendor_qsa_mqa_paged(q, cache, table, metadata, metadata, metadata)
 
     state = torch.empty((2, 3, 5), dtype=torch.bfloat16)
     with pytest.raises(RuntimeError):

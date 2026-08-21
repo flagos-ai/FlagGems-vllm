@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The three self-developed Qwen4 QSA kernels.
+# Vendor-derived sections retain copyright of contributors to the vLLM project.
+"""Qwen4 QSA kernels and their model-vendor comparison baselines.
 
-The kernel bodies are direct extractions from the production
-``gpu/ops/qsa.py`` source. The five model-vendor QSA kernels (sparse,
-expand, single-cache-row store, and related helpers) are intentionally
-excluded.  The public wrappers below expose only these three kernels.
+The three ``qwen4_*`` fast paths are self-developed kernels extracted from the
+Qwen4 production implementation.  The three ``qwen4_vendor_*`` entry points
+are comparison baselines copied from the original model-vendor implementation:
+
+* repository: ``flagos-ai/vllm-plugin-FL``;
+* base commit: ``fadbba0ea59bbaa46c77b06d465321ab88b44643``;
+* source: ``vllm_fl/models/qwen3_8_flash_next/gpu/ops/qsa.py``;
+* source snapshot SHA256:
+  ``40a3190b04af28a1bc5944e29a334b041384ee6cc12bdd8c8a7382e23b207342``.
+
+The vendor kernels remain vendor-owned and are not counted as self-developed
+FlagGems-vllm kernels.
 """
 
 from __future__ import annotations
@@ -15,6 +24,13 @@ import torch
 import triton
 import triton.language as tl
 
+QWEN4_VENDOR_QSA_SOURCE = {
+    "repository": "https://github.com/flagos-ai/vllm-plugin-FL",
+    "base_commit": "fadbba0ea59bbaa46c77b06d465321ab88b44643",
+    "path": "vllm_fl/models/qwen3_8_flash_next/gpu/ops/qsa.py",
+    "sha256": "40a3190b04af28a1bc5944e29a334b041384ee6cc12bdd8c8a7382e23b207342",
+}
+
 
 def _is_triton_device(*tensors: torch.Tensor) -> bool:
     """Return true for same-device accelerator tensors accepted by Triton."""
@@ -23,6 +39,103 @@ def _is_triton_device(*tensors: torch.Tensor) -> bool:
         tensors
         and len({tensor.device for tensor in tensors}) == 1
         and all(tensor.device.type not in ("cpu", "meta") for tensor in tensors)
+    )
+
+
+# Model-vendor baseline. Source provenance is recorded in the module docstring.
+@triton.jit
+def _qsa_mqa_paged_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    logits_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_req,
+    stride_table_page,
+    stride_logits_row,
+    num_rows,
+    num_columns,
+    num_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    dims = tl.arange(0, BLOCK_D)
+    request = tl.load(token_to_req_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    query_position = tl.load(query_positions_ptr + row)
+    sequence_length = tl.load(
+        sequence_lengths_ptr + safe_request,
+        mask=(request >= 0) & (request < num_requests),
+        other=0,
+    )
+    visible = tl.minimum(
+        (query_position + 1) // COMPRESS_RATIO,
+        sequence_length // COMPRESS_RATIO,
+    )
+    if tl.program_id(1) == 0:
+        tl.store(visible_blocks_ptr + row, visible)
+    logical_page = columns // PAGE_SIZE
+    page_offset = columns % PAGE_SIZE
+    valid = (
+        (row < num_rows)
+        & (columns < num_columns)
+        & (columns < visible)
+        & (request >= 0)
+        & (request < num_requests)
+        & (logical_page < PAGE_TABLE_WIDTH)
+    )
+    safe_logical_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+    physical_page = tl.load(
+        page_table_ptr
+        + safe_request * stride_table_req
+        + safe_logical_page * stride_table_page,
+        mask=valid,
+        other=-1,
+    )
+    valid &= (physical_page >= 0) & (physical_page < num_pages)
+    safe_physical_page = tl.maximum(physical_page, 0).to(tl.int64)
+    score = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for head in tl.static_range(0, NUM_HEADS):
+        query = tl.load(
+            q_ptr + row * stride_q_row + head * stride_q_head + dims * stride_q_dim,
+            mask=dims < HEAD_DIM,
+            other=0.0,
+        ).to(tl.float32)
+        keys = tl.load(
+            k_cache_ptr
+            + safe_physical_page[:, None] * stride_cache_block
+            + page_offset[:, None] * stride_cache_token
+            + dims[None, :] * stride_cache_dim,
+            mask=valid[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        ).to(tl.float32)
+        dot = tl.sum(keys * query[None, :], axis=1)
+        score += tl.maximum(dot, 0.0)
+
+    score /= score_divisor
+    tl.store(
+        logits_ptr + row * stride_logits_row + columns,
+        tl.where(valid, score, -float("inf")),
+        mask=(row < num_rows) & (columns < num_columns),
     )
 
 
@@ -123,6 +236,44 @@ def _qsa_mqa_paged_dot_kernel(
     )
 
 
+# Model-vendor baseline. Source provenance is recorded in the module docstring.
+@triton.jit
+def _store_qsa_rows_kernel(
+    cache_ptr,
+    slots_ptr,
+    rows_ptr,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_rows_row,
+    stride_rows_dim,
+    num_rows,
+    num_blocks,
+    PAGE_SIZE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    dims = tl.arange(0, BLOCK_D)
+    slot = tl.load(slots_ptr + row)
+    valid = (row < num_rows) & (slot >= 0) & (slot < num_blocks * PAGE_SIZE)
+    block = tl.maximum(slot, 0) // PAGE_SIZE
+    token = tl.maximum(slot, 0) % PAGE_SIZE
+    values = tl.load(
+        rows_ptr + row * stride_rows_row + dims * stride_rows_dim,
+        mask=valid & (dims < WIDTH),
+        other=0,
+    )
+    tl.store(
+        cache_ptr
+        + block * stride_cache_block
+        + token * stride_cache_token
+        + dims * stride_cache_dim,
+        values,
+        mask=valid & (dims < WIDTH),
+    )
+
+
 @triton.jit
 def _store_qsa_kv_rows_kernel(
     k_cache_ptr,
@@ -194,6 +345,133 @@ def _store_qsa_kv_rows_kernel(
         v_values,
         mask=valid & (head < NUM_HEADS) & (dims < HEAD_DIM),
     )
+
+
+# Model-vendor baseline. Source provenance is recorded in the module docstring.
+@triton.jit
+def _compress_qsa_groups_kernel(
+    raw_cache_ptr,
+    rope_cache_ptr,
+    raw_table_ptr,
+    rope_table_ptr,
+    token_to_req_ptr,
+    logical_positions_ptr,
+    compressed_slots_ptr,
+    pooled_ptr,
+    first_positions_ptr,
+    stride_raw_block,
+    stride_raw_token,
+    stride_raw_dim,
+    stride_rope_block,
+    stride_rope_token,
+    stride_rope_dim,
+    stride_raw_table_req,
+    stride_raw_table_page,
+    stride_rope_table_req,
+    stride_rope_table_page,
+    stride_pooled_row,
+    stride_pooled_dim,
+    stride_positions_row,
+    stride_positions_dim,
+    num_rows,
+    num_raw_blocks,
+    num_rope_blocks,
+    num_raw_requests,
+    num_rope_requests,
+    RAW_PAGE_SIZE: tl.constexpr,
+    RAW_TABLE_WIDTH: tl.constexpr,
+    ROPE_PAGE_SIZE: tl.constexpr,
+    ROPE_TABLE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    LOAD_ROPE_POSITIONS: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    dims = tl.arange(0, BLOCK_D)
+    request = tl.load(token_to_req_ptr + row)
+    end_position = tl.load(logical_positions_ptr + row)
+    compressed_slot = tl.load(compressed_slots_ptr + row)
+    valid_row = (
+        (row < num_rows)
+        & (request >= 0)
+        & (request < num_raw_requests)
+        & (request < num_rope_requests)
+        & (end_position >= COMPRESS_RATIO - 1)
+        & (compressed_slot >= 0)
+    )
+    accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    if valid_row:
+        for group_offset in tl.range(0, COMPRESS_RATIO):
+            position = end_position - (COMPRESS_RATIO - 1 - group_offset)
+            logical_page = position // RAW_PAGE_SIZE
+            page_offset = position % RAW_PAGE_SIZE
+            valid = logical_page < RAW_TABLE_WIDTH
+            physical_page = tl.load(
+                raw_table_ptr
+                + request * stride_raw_table_req
+                + tl.minimum(logical_page, RAW_TABLE_WIDTH - 1) * stride_raw_table_page,
+                mask=valid,
+                other=-1,
+            )
+            valid &= (physical_page >= 0) & (physical_page < num_raw_blocks)
+            values = tl.load(
+                raw_cache_ptr
+                + tl.maximum(physical_page, 0).to(tl.int64) * stride_raw_block
+                + page_offset * stride_raw_token
+                + dims * stride_raw_dim,
+                mask=valid & (dims < HEAD_DIM),
+                other=0.0,
+            ).to(tl.float32)
+            accumulator += values
+
+    tl.store(
+        pooled_ptr + row * stride_pooled_row + dims * stride_pooled_dim,
+        accumulator / COMPRESS_RATIO,
+        mask=(row < num_rows) & (dims < HEAD_DIM),
+    )
+
+    position_dims = tl.arange(0, 4)
+    first_position = end_position - COMPRESS_RATIO + 1
+    if LOAD_ROPE_POSITIONS:
+        rope_logical_page = first_position // ROPE_PAGE_SIZE
+        rope_page_offset = first_position % ROPE_PAGE_SIZE
+        valid_rope = valid_row & (rope_logical_page < ROPE_TABLE_WIDTH)
+        rope_physical_page = tl.load(
+            rope_table_ptr
+            + tl.minimum(tl.maximum(request, 0), num_rope_requests - 1)
+            * stride_rope_table_req
+            + tl.minimum(rope_logical_page, ROPE_TABLE_WIDTH - 1)
+            * stride_rope_table_page,
+            mask=valid_rope,
+            other=-1,
+        )
+        valid_rope &= (rope_physical_page >= 0) & (rope_physical_page < num_rope_blocks)
+        rope_values = tl.load(
+            rope_cache_ptr
+            + tl.maximum(rope_physical_page, 0).to(tl.int64) * stride_rope_block
+            + rope_page_offset * stride_rope_token
+            + position_dims * stride_rope_dim,
+            mask=valid_rope & (position_dims < 3),
+            other=0,
+        )
+        tl.store(
+            first_positions_ptr
+            + row * stride_positions_row
+            + position_dims * stride_positions_dim,
+            rope_values,
+            mask=(row < num_rows) & (position_dims < 3),
+        )
+    else:
+        first_position = tl.where(valid_row, first_position, 0)
+        tl.store(
+            first_positions_ptr
+            + row * stride_positions_row
+            + position_dims * stride_positions_dim,
+            first_position,
+            mask=(row < num_rows) & (position_dims < 3),
+        )
 
 
 @triton.jit
@@ -390,6 +668,107 @@ def _compress_norm_mrope_store_qsa_groups_kernel(
     )
 
 
+def qwen4_vendor_qsa_mqa_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int = 4,
+    num_columns: int | None = None,
+    score_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the model-vendor scalar-reduction QSA paged-MQA kernel."""
+
+    if not _is_triton_device(
+        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths
+    ):
+        raise RuntimeError("Qwen4 vendor QSA MQA requires a Triton accelerator")
+    if q.ndim != 3 or q.shape[1:] != (4, 128) or q.dtype != torch.bfloat16:
+        raise ValueError("Qwen4 vendor QSA MQA requires BF16 q shaped [rows, 4, 128]")
+    if k_cache.ndim != 4 or k_cache.shape[2:] != (1, 128):
+        raise ValueError(
+            "Qwen4 vendor QSA MQA cache must be [pages, page_size, 1, 128]"
+        )
+    if k_cache.dtype != q.dtype:
+        raise ValueError("Qwen4 vendor QSA query and cache must have the same dtype")
+    if page_table.ndim != 2:
+        raise ValueError("Qwen4 vendor QSA MQA page table must be rank-2")
+    if page_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 vendor QSA page table must use int32 or int64")
+    rows = q.shape[0]
+    if rows and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
+        raise ValueError(
+            "Qwen4 vendor QSA cache and page table must be nonempty for nonempty q"
+        )
+    if token_to_req.shape != (rows,) or query_positions.shape != (rows,):
+        raise ValueError("Qwen4 vendor QSA request metadata must match query rows")
+    if token_to_req.dtype not in (
+        torch.int32,
+        torch.int64,
+    ) or query_positions.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise TypeError("Qwen4 vendor QSA request metadata must use int32 or int64")
+    if sequence_lengths.shape != (page_table.shape[0],):
+        raise ValueError(
+            "Qwen4 vendor QSA sequence lengths must match page-table requests"
+        )
+    if sequence_lengths.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 vendor QSA sequence lengths must use int32 or int64")
+    if compress_ratio <= 0:
+        raise ValueError("Qwen4 vendor QSA compression ratio must be positive")
+    divisor = math.sqrt(128) if score_scale is None else float(score_scale)
+    if divisor <= 0:
+        raise ValueError("Qwen4 vendor QSA score scale must be positive")
+    capacity = page_table.shape[1] * k_cache.shape[1]
+    columns = capacity if num_columns is None else int(num_columns)
+    if columns < 0 or columns > capacity:
+        raise ValueError(
+            "Qwen4 vendor QSA score width must be in [0, page-table capacity]"
+        )
+    logits = torch.empty((rows, columns), dtype=torch.float32, device=q.device)
+    visible_blocks = torch.empty((rows,), dtype=torch.int32, device=q.device)
+    if rows == 0 or columns == 0:
+        return logits, visible_blocks
+    block_n = 32
+    _qsa_mqa_paged_kernel[(rows, triton.cdiv(columns, block_n))](
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        visible_blocks,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(3),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        rows,
+        columns,
+        k_cache.shape[0],
+        page_table.shape[0],
+        divisor,
+        PAGE_SIZE=k_cache.shape[1],
+        PAGE_TABLE_WIDTH=page_table.shape[1],
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=block_n,
+        BLOCK_D=128,
+        COMPRESS_RATIO=compress_ratio,
+        num_warps=4,
+    )
+    return logits, visible_blocks
+
+
 def qwen4_qsa_mqa_paged_dot(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -493,6 +872,52 @@ def qwen4_qsa_mqa_paged_dot(
     return logits, visible_blocks
 
 
+def qwen4_vendor_store_qsa_rows(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Run the model-vendor single-cache-row QSA store kernel."""
+
+    if not _is_triton_device(cache, slot_mapping, rows):
+        raise RuntimeError("Qwen4 vendor QSA store requires a Triton accelerator")
+    if cache.ndim != 4 or cache.shape[2] != 1 or not all(cache.shape):
+        raise ValueError(
+            "Qwen4 vendor QSA cache must be nonempty [pages, page_size, 1, width]"
+        )
+    if slot_mapping.ndim != 1 or slot_mapping.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise TypeError("Qwen4 vendor QSA slots must be a rank-1 int32/int64 tensor")
+    if rows.ndim == 3:
+        if rows.shape[1] != 1:
+            raise ValueError("Qwen4 vendor QSA cache rows must have one head")
+        rows = rows[:, 0]
+    if rows.shape != (slot_mapping.numel(), cache.shape[3]):
+        raise ValueError("Qwen4 vendor QSA cache rows and slots are incompatible")
+    if rows.dtype != cache.dtype:
+        raise ValueError("Qwen4 vendor QSA rows and cache must have matching dtypes")
+    if not rows.shape[0]:
+        return
+    _store_qsa_rows_kernel[(rows.shape[0],)](
+        cache,
+        slot_mapping,
+        rows,
+        cache.stride(0),
+        cache.stride(1),
+        cache.stride(3),
+        rows.stride(0),
+        rows.stride(1),
+        rows.shape[0],
+        cache.shape[0],
+        PAGE_SIZE=cache.shape[1],
+        WIDTH=cache.shape[3],
+        BLOCK_D=triton.next_power_of_2(cache.shape[3]),
+        num_warps=4,
+    )
+
+
 def qwen4_store_qsa_kv_rows(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -551,6 +976,122 @@ def qwen4_store_qsa_kv_rows(
         BLOCK_D=triton.next_power_of_2(key.shape[2]),
         num_warps=4,
     )
+
+
+def qwen4_vendor_compress_qsa_groups(
+    raw_cache: torch.Tensor,
+    raw_block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    compress_ratio: int = 4,
+    rope_cache: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the model-vendor QSA group-pooling and position-load kernel."""
+
+    tensors = [
+        raw_cache,
+        raw_block_table,
+        token_to_req,
+        logical_positions,
+        compressed_slots,
+    ]
+    if rope_cache is not None:
+        tensors.append(rope_cache)
+    if not _is_triton_device(*tensors):
+        raise RuntimeError("Qwen4 vendor QSA compression requires a Triton accelerator")
+    rows = token_to_req.numel()
+    if compress_ratio <= 0:
+        raise ValueError("Qwen4 vendor QSA compression ratio must be positive")
+    if (
+        raw_cache.ndim != 4
+        or raw_cache.shape[2:] != (1, 128)
+        or raw_cache.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "Qwen4 vendor QSA raw cache must be BF16 [blocks, page, 1, 128]"
+        )
+    if raw_block_table.ndim != 2 or raw_block_table.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise TypeError("Qwen4 vendor QSA block table must be rank-2 int32/int64")
+    if rows and (not all(raw_cache.shape) or not all(raw_block_table.shape)):
+        raise ValueError("Qwen4 vendor QSA raw cache and block table must be nonempty")
+    if token_to_req.dtype not in (
+        torch.int32,
+        torch.int64,
+    ) or logical_positions.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise TypeError("Qwen4 vendor QSA request metadata must use int32 or int64")
+    if compressed_slots.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 vendor QSA compressed slots must use int32 or int64")
+    if logical_positions.shape != (rows,) or compressed_slots.shape != (rows,):
+        raise ValueError("Qwen4 vendor QSA compression metadata must match rows")
+    if rope_cache is not None and (
+        rope_cache.ndim != 4
+        or rope_cache.shape[:3] != raw_cache.shape[:3]
+        or rope_cache.shape[3] != 3
+        or rope_cache.dtype != torch.int64
+    ):
+        raise ValueError(
+            "Qwen4 vendor QSA packed position view must be [blocks, page, 1, 3] int64"
+        )
+    pooled = torch.empty(
+        (rows, 1, raw_cache.shape[3]),
+        dtype=raw_cache.dtype,
+        device=raw_cache.device,
+    )
+    first_positions = torch.empty((rows, 3), dtype=torch.int64, device=raw_cache.device)
+    if not rows:
+        return pooled, first_positions
+    if rope_cache is None:
+        rope_cache = raw_cache
+        load_rope_positions = False
+    else:
+        load_rope_positions = True
+    _compress_qsa_groups_kernel[(rows,)](
+        raw_cache,
+        rope_cache,
+        raw_block_table,
+        raw_block_table,
+        token_to_req,
+        logical_positions,
+        compressed_slots,
+        pooled,
+        first_positions,
+        raw_cache.stride(0),
+        raw_cache.stride(1),
+        raw_cache.stride(3),
+        rope_cache.stride(0),
+        rope_cache.stride(1),
+        rope_cache.stride(3),
+        raw_block_table.stride(0),
+        raw_block_table.stride(1),
+        raw_block_table.stride(0),
+        raw_block_table.stride(1),
+        pooled.stride(0),
+        pooled.stride(2),
+        first_positions.stride(0),
+        first_positions.stride(1),
+        rows,
+        raw_cache.shape[0],
+        rope_cache.shape[0],
+        raw_block_table.shape[0],
+        raw_block_table.shape[0],
+        RAW_PAGE_SIZE=raw_cache.shape[1],
+        RAW_TABLE_WIDTH=raw_block_table.shape[1],
+        ROPE_PAGE_SIZE=rope_cache.shape[1],
+        ROPE_TABLE_WIDTH=raw_block_table.shape[1],
+        COMPRESS_RATIO=compress_ratio,
+        HEAD_DIM=raw_cache.shape[3],
+        BLOCK_D=triton.next_power_of_2(raw_cache.shape[3]),
+        LOAD_ROPE_POSITIONS=load_rope_positions,
+        num_warps=4,
+    )
+    return pooled, first_positions
 
 
 def qwen4_compress_norm_mrope_store_groups(
@@ -710,10 +1251,17 @@ def qwen4_compress_norm_mrope_store_groups(
 
 
 __all__ = [
+    "QWEN4_VENDOR_QSA_SOURCE",
+    "_compress_qsa_groups_kernel",
     "_compress_norm_mrope_store_qsa_groups_kernel",
+    "_qsa_mqa_paged_kernel",
     "_qsa_mqa_paged_dot_kernel",
+    "_store_qsa_rows_kernel",
     "_store_qsa_kv_rows_kernel",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "qwen4_vendor_compress_qsa_groups",
+    "qwen4_vendor_qsa_mqa_paged",
+    "qwen4_vendor_store_qsa_rows",
 ]

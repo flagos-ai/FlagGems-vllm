@@ -88,6 +88,9 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_hc_inject_combine,
     qwen4_qsa_mqa_paged_dot,
     qwen4_store_qsa_kv_rows,
+    qwen4_vendor_compress_qsa_groups,
+    qwen4_vendor_qsa_mqa_paged,
+    qwen4_vendor_store_qsa_rows,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
@@ -214,6 +217,9 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "qwen4_vendor_compress_qsa_groups",
+    "qwen4_vendor_qsa_mqa_paged",
+    "qwen4_vendor_store_qsa_rows",
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
