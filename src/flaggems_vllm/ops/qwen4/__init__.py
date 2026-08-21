@@ -24,6 +24,9 @@ from flaggems_vllm.ops.qwen4.qsa import (
     qwen4_compress_norm_mrope_store_groups,
     qwen4_qsa_mqa_paged_dot,
     qwen4_store_qsa_kv_rows,
+    qwen4_vendor_compress_qsa_groups,
+    qwen4_vendor_qsa_mqa_paged,
+    qwen4_vendor_store_qsa_rows,
 )
 
 __all__ = [
@@ -37,4 +40,7 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "qwen4_vendor_compress_qsa_groups",
+    "qwen4_vendor_qsa_mqa_paged",
+    "qwen4_vendor_store_qsa_rows",
 ]
