@@ -43,6 +43,20 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         _ = shape_file_path
+
+        extra_shapes = []
+        for qdim, kvdim in [
+            (32, 32),
+            (64, 64),
+            (128, 128),
+            (256, 256),
+            (256, 128),
+            (1536, 512),
+            (1024, 512),
+        ]:
+            for tokens in [1024, 4096, 8192, 16384, 32768]:
+                extra_shapes.append((tokens, qdim, kvdim))
+
         self.shapes = [
             (1, 1536, 512),
             (32, 1536, 512),
@@ -51,7 +65,13 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
             (2048, 1536, 512),
             (32, 64 * 576, 576),
             (128, 64 * 576, 576),
-        ]
+            (7, 1536, 512),
+            (33, 1536, 512),
+            (129, 1536, 512),
+            (32, 576, 64 * 576),
+            (128, 576, 64 * 576),
+            (128, 64 * 576, 64 * 576),
+        ] + extra_shapes
 
     def get_input_iter(self, dtype):
         for tokens, qdim, kvdim in self.shapes:
