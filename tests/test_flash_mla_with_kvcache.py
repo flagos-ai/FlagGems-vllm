@@ -168,10 +168,13 @@ def _run_triton(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
     )
 
 
-pytestmark = pytest.mark.skipif(
-    not (VLLM_AVAILABLE and CUDA_AVAILABLE),
-    reason="vLLM FlashMLA and CUDA are required",
-)
+pytestmark = [
+    pytest.mark.flash_mla_with_kvcache,
+    pytest.mark.skipif(
+        not (VLLM_AVAILABLE and CUDA_AVAILABLE),
+        reason="vLLM FlashMLA and CUDA are required",
+    ),
+]
 
 
 @pytest.mark.parametrize(

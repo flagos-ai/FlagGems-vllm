@@ -36,6 +36,18 @@ class VendorDescriptor:
     bf16_enabled: bool = True
     int64_enabled: bool = True
     tle_enabled: bool = False
+    # Vendor limits consumed by the generic fused MoE config heuristics.
+    # max_smem_bytes: dynamic shared memory ceiling per block (NVIDIA: 200KB).
+    # moe_num_stages_min: lowest allowed pipeline depth (NVIDIA: 2).
+    # moe_num_stages_max: highest allowed pipeline depth (None: no limit).
+    # moe_fp16_gemm1_b_tile_factor: fp16 fused GEMM1 stages both gate/up B tiles.
+    # moe_direct_sum_enabled: GEMM2 may accumulate directly into the output
+    # (NVIDIA: enabled); some vendors have slower scattered write-backs.
+    max_smem_bytes: int = 200_000
+    moe_num_stages_min: int = 2
+    moe_num_stages_max: int | None = None
+    moe_fp16_gemm1_b_tile_factor: int = 1
+    moe_direct_sum_enabled: bool = True
 
 
 VendorInfoBase = VendorDescriptor

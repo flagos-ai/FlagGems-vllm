@@ -86,6 +86,19 @@ export HOME="${home_dir}"
 export FLAGGEMS_DIR="${flaggems_dir}"
 export FLAGGEMS_VENV="${flaggems_venv}"
 
+# Vendor runners often reach package mirrors through proxies. Keep retries
+# bounded, but allow runner owners to override both values when necessary.
+export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-5}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-60}"
+if [[ ! "${UV_HTTP_RETRIES}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UV_HTTP_RETRIES value: ${UV_HTTP_RETRIES}" >&2
+  exit 2
+fi
+if [[ ! "${UV_HTTP_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid UV_HTTP_TIMEOUT value: ${UV_HTTP_TIMEOUT}" >&2
+  exit 2
+fi
+
 # Respect valid runner-specific uv locations. If an inherited XDG/uv override
 # points to an unusable path, redirect only that uv store into the selected
 # writable HOME. This avoids probing one directory while uv writes elsewhere.
@@ -118,6 +131,8 @@ fi
   printf 'HOME=%s\n' "${HOME}"
   printf 'FLAGGEMS_DIR=%s\n' "${FLAGGEMS_DIR}"
   printf 'FLAGGEMS_VENV=%s\n' "${FLAGGEMS_VENV}"
+  printf 'UV_HTTP_RETRIES=%s\n' "${UV_HTTP_RETRIES}"
+  printf 'UV_HTTP_TIMEOUT=%s\n' "${UV_HTTP_TIMEOUT}"
   if [[ "${write_uv_cache_override}" == true ]]; then
     printf 'UV_CACHE_DIR=%s\n' "${UV_CACHE_DIR}"
   fi

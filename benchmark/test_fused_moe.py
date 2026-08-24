@@ -43,21 +43,20 @@ class FusedMoEBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
         self.shapes = [
-            # Mixtral-like shapes
-            (1, 8, 4096, 14336, 2),
-            (4, 8, 4096, 14336, 2),
-            (16, 8, 4096, 14336, 2),
+            # Mixtral-like shapes (representative)
             (64, 8, 4096, 14336, 2),
-            (128, 8, 4096, 14336, 2),
-            (256, 8, 4096, 14336, 2),
             (512, 8, 4096, 14336, 2),
-            # DeepSeek-V3-like shapes (TP=8 shard)
-            (1, 256, 7168, 2048, 8),
-            (4, 256, 7168, 2048, 8),
-            (16, 256, 7168, 2048, 8),
+            # DeepSeek-V3-like shapes (representative)
             (64, 256, 7168, 2048, 8),
-            (128, 256, 7168, 2048, 8),
             (256, 256, 7168, 2048, 8),
+            # Qwen3.6-35B-A3B (real production shapes, representative subset)
+            (1, 256, 2048, 128, 8),
+            (16, 256, 2048, 128, 8),
+            (64, 256, 2048, 128, 8),
+            (512, 256, 2048, 128, 8),
+            (1035, 256, 2048, 128, 8),
+            (16384, 256, 2048, 128, 8),
+            (16384, 256, 2048, 512, 8),
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -88,6 +87,9 @@ class FusedMoEBenchmark(base.Benchmark):
             num_tokens, num_experts, device=device, dtype=torch.float32
         )
         topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+        # Real vLLM inference passes int32 topk_ids; torch.topk returns int64 by
+        # default, so convert to match the production dtype contract.
+        topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.to(dtype)
 

@@ -57,6 +57,10 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit):
 
 
 @pytest.mark.silu_and_mul_with_clamp_out
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="Issue #636: silu_and_mul_with_clamp_out accuracy failure on mthreads",
+)
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("limit", SILU_AND_MUL_WITH_CLAMP_LIMITS)

@@ -20,6 +20,8 @@ from flaggems_vllm.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
 
+pytestmark = pytest.mark.combine_topk_swa_indices
+
 try:
     from vllm.v1.attention.ops.deepseek_v4_ops import (
         combine_topk_swa_indices as vllm_combine_topk_swa_indices,

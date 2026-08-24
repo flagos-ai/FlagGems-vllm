@@ -84,7 +84,7 @@ def reshape_and_cache_flash(
 ):
     if use_c_extension:
         logger.debug("GEMS RESHAPE_AND_CACHE_FLASH(C EXTENSION)")
-        torch.ops.flaggems_vllm.reshape_and_cache_flash(
+        torch.ops.flag_gems.reshape_and_cache_flash(
             key,
             value,
             key_cache,
