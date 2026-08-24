@@ -197,6 +197,172 @@ def test_sparse_attention(batch, seq_len, kv_len, topk, heads, dim, seed):
     utils.gems_assert_close(gems_result, torch_result, torch.bfloat16, atol=1e-3)
 
 
+QMAX_INT8 = 127.0
+QMAX_FP8 = 448.0
+KV_BLOCK = 64
+
+
+def _round_i8_sat(x):
+    # round-half-even then clamp to int8 range, matching the kernel _quant_i8
+    return torch.clamp(torch.round(x), -128.0, 127.0)
+
+
+def sparse_attention_quant_ref(q, kv, attn_sink, topk_idxs, scale, quant_dtype):
+    """Torch reference emulating the kernel's quantized arithmetic.
+
+    Quantization points (mirroring sparse_attn_triton_quant_kernel):
+      1. KV is quantized per 64-position block: max-abs / QMAX, stored as
+         int8 or fp8; the per-block descale is kept in KV_DESCALE.
+      2. Q is quantized per head with a per-head row scale q_scale_h.
+      3. P (softmax output) is quantized per element with the KV descale
+         folded in, so the PV dequantization is a single /QMAX after the dot.
+    Online softmax with correction rescaling is emulated block-by-block so
+    the P quantization input matches the kernel exactly.
+    """
+    batch, seq_len, heads, dim = q.shape
+    topk = topk_idxs.shape[-1]
+    kv_len = kv.shape[1]
+    is_fp8 = quant_dtype == torch.float8_e4m3fn
+    qmax = QMAX_FP8 if is_fp8 else QMAX_INT8
+
+    # ---- Q per-head symmetric quantization ----
+    qf = q.float()
+    q_max = qf.abs().amax(dim=-1, keepdim=True)  # (b, m, h, 1)
+    inv_q = torch.where(q_max == 0.0, 0.0, qmax / q_max)
+    if is_fp8:
+        q_q = (qf * inv_q).to(torch.float8_e4m3fn)
+    else:
+        q_q = _round_i8_sat(qf * inv_q).to(torch.int8)
+    q_scale_h = q_max / qmax  # (b, m, h, 1)
+
+    # ---- KV per-64-position-block symmetric quantization ----
+    nblocks = math.ceil(kv_len / KV_BLOCK)
+    kv_pad = torch.zeros(
+        (batch, nblocks * KV_BLOCK, dim), dtype=q.dtype, device=q.device
+    )
+    kv_pad[:, :kv_len, :] = kv
+    kv_r = kv_pad.view(batch, nblocks, KV_BLOCK, dim).float()
+    blk_max = kv_r.abs().amax(dim=(2, 3))  # (b, nblocks)
+    scale_b = blk_max / qmax
+    inv_b = torch.where(blk_max == 0.0, 0.0, 1.0 / scale_b)
+    if is_fp8:
+        kv_q_r = (kv_r * inv_b[:, :, None, None]).to(torch.float8_e4m3fn)
+    else:
+        kv_q_r = _round_i8_sat(kv_r * inv_b[:, :, None, None]).to(torch.int8)
+    kv_q = kv_q_r.view(batch, nblocks * KV_BLOCK, dim)[:, :kv_len, :]
+    kv_descale = scale_b  # (b, nblocks) fp32
+
+    # ---- gather quantized KV and per-position descale ----
+    idx = topk_idxs.long()
+    idx_safe = idx.clamp(min=0)
+    kv_gathered = torch.gather(
+        kv_q.unsqueeze(1).expand(batch, seq_len, kv_len, dim),
+        2,
+        idx.unsqueeze(-1).expand(batch, seq_len, topk, dim),
+    )  # (b, m, topk, dim)
+    desc_gathered = torch.gather(
+        kv_descale.unsqueeze(1).expand(batch, seq_len, nblocks),
+        2,
+        idx_safe // KV_BLOCK,
+    )  # (b, m, topk)
+
+    # ---- scores: Q @ KV^T with fp32 accumulation ----
+    scores = torch.einsum("bmhd,bmtd->bmht", q_q.float(), kv_gathered.float())
+    scores = scores * q_scale_h * desc_gathered.unsqueeze(-2) * scale
+
+    # ---- online softmax + per-block P quantization, mirroring the kernel ----
+    out = torch.zeros(
+        (batch, seq_len, heads, dim), dtype=torch.float32, device=q.device
+    )
+    scores_max = torch.full(
+        (batch, seq_len, heads, 1), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    sum_exp = torch.zeros(
+        (batch, seq_len, heads, 1), dtype=torch.float32, device=q.device
+    )
+    for t0 in range(0, topk, KV_BLOCK):
+        s_blk = scores[..., t0 : t0 + KV_BLOCK]  # (b, m, h, blk)
+        desc_blk = desc_gathered[..., t0 : t0 + KV_BLOCK]  # (b, m, blk)
+        kv_blk = kv_gathered[..., t0 : t0 + KV_BLOCK, :]  # (b, m, blk, d)
+
+        m_prev = scores_max
+        block_max = s_blk.amax(dim=-1, keepdim=True)
+        scores_max = torch.maximum(scores_max, block_max)
+        corr = torch.exp(m_prev - scores_max)
+        p = torch.exp(s_blk - scores_max)
+
+        if is_fp8:
+            p_q = (p * desc_blk.unsqueeze(-2) * qmax).to(torch.float8_e4m3fn)
+        else:
+            p_q = _round_i8_sat(p * desc_blk.unsqueeze(-2) * qmax).to(torch.int8)
+
+        out = out * corr
+        out += torch.einsum("bmht,bmtd->bmhd", p_q.float(), kv_blk.float()) * (
+            1.0 / qmax
+        )
+        sum_exp = sum_exp * corr + p.sum(dim=-1, keepdim=True)
+
+    # ---- incorporate attention sink (stays fp32) ----
+    sink_vals = attn_sink[None, None, :, None].expand(batch, seq_len, heads, 1)
+    sum_exp = sum_exp + torch.exp(sink_vals - scores_max)
+
+    return (out / sum_exp).to(q.dtype)
+
+
+SPARSE_ATTN_QUANT_SHAPES = (
+    [
+        (2, 1, 128, 32, 8, 64, 2025),
+        (1, 4, 130, 96, 16, 64, 2026),
+    ]
+    if cfg.QUICK_MODE
+    else [
+        (2, 1, 128, 32, 8, 64, 2025),
+        (1, 4, 130, 96, 16, 64, 2026),
+        (16, 1, 400, 392, 16, 512, 2027),
+        (1, 240, 240, 128, 8, 512, 2028),
+    ]
+)
+
+QUANT_DTYPES = [torch.int8, torch.float8_e4m3fn]
+
+
+@pytest.mark.sparse_attn_quant
+@pytest.mark.parametrize(
+    "batch, seq_len, kv_len, topk, heads, dim, seed", SPARSE_ATTN_QUANT_SHAPES
+)
+@pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
+def test_sparse_attention_quant(
+    batch, seq_len, kv_len, topk, heads, dim, seed, quant_dtype
+):
+    device = torch_device_fn.current_device()
+    utils.init_seed(seed)
+
+    q = torch.empty((batch, seq_len, heads, dim), device=device, dtype=torch.bfloat16)
+    q.uniform_(-0.5, 0.5)
+    kv = torch.empty((batch, kv_len, dim), device=device, dtype=torch.bfloat16)
+    kv.uniform_(-0.5, 0.5)
+    attn_sink = torch.empty((heads,), device=device, dtype=torch.float32)
+    attn_sink.uniform_(-0.5, 0.5)
+    topk_idxs = torch.randint(
+        0, kv_len, (batch, seq_len, topk), device=device, dtype=torch.int32
+    )
+    scale = float(1.0 / math.sqrt(dim))
+
+    ref_q = utils.to_reference(q, False)
+    ref_kv = utils.to_reference(kv, False)
+    ref_attn_sink = utils.to_reference(attn_sink, False)
+    ref_topk_idxs = utils.to_reference(topk_idxs, False)
+
+    torch_result = sparse_attention_quant_ref(
+        ref_q, ref_kv, ref_attn_sink, ref_topk_idxs, scale, quant_dtype
+    )
+    gems_result = flaggems_vllm.sparse_attn_triton_quant(
+        q, kv, attn_sink, topk_idxs, scale, quant_dtype=quant_dtype
+    )
+
+    utils.gems_assert_close(gems_result, torch_result, torch.bfloat16, atol=2e-3)
+
+
 def attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=False):
     # batch, nheads = slopes.shape
     device = slopes.device

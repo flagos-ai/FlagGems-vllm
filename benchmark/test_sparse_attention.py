@@ -57,6 +57,14 @@ def torch_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale):
     return out.to(q.dtype)
 
 
+def torch_sparse_attention_quant(
+    q, kv, attn_sink, topk_idxs, softmax_scale, quant_dtype
+):
+    # fp32 torch baseline for the quantized sparse attention op. The quant_dtype
+    # argument keeps the same call signature as the gemm op under test.
+    return torch_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
 class SparseAttentionBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = SPARSE_ATTENTION_SHAPES[:]
@@ -93,4 +101,58 @@ def test_sparse_attn_triton():
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(flaggems_vllm.sparse_attn_triton)
+    bench.run()
+
+
+class SparseAttentionQuantBenchmark(base.Benchmark):
+    quant_dtype = torch.int8
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = SPARSE_ATTENTION_SHAPES[:]
+        self.shape_desc = "B, M, KV_LEN, TOPK, H, D"
+
+    def set_more_shapes(self):
+        return None
+
+    def get_input_iter(self, dtype):
+        for seed, (batch, seq_len, kv_len, topk, heads, dim) in enumerate(self.shapes):
+            torch.manual_seed(2026 + seed)
+            q = torch.randn(
+                (batch, seq_len, heads, dim), dtype=dtype, device=self.device
+            )
+            kv = torch.randn((batch, kv_len, dim), dtype=dtype, device=self.device)
+            attn_sink = torch.zeros((heads,), dtype=torch.float32, device=self.device)
+            topk_idxs = torch.randint(
+                0,
+                kv_len,
+                (batch, seq_len, topk),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            yield q, kv, attn_sink, topk_idxs, 1.0 / math.sqrt(dim), self.quant_dtype
+
+
+@pytest.mark.skipif(flaggems_vllm.device == "cpu", reason="Unsupported in CPU mode")
+@pytest.mark.sparse_attn_quant
+def test_sparse_attn_triton_quant_int8():
+    bench = SparseAttentionQuantBenchmark(
+        op_name="sparse_attention_quant_int8",
+        torch_op=torch_sparse_attention_quant,
+        dtypes=[torch.bfloat16],
+        quant_dtype=torch.int8,
+    )
+    bench.set_gems(flaggems_vllm.sparse_attn_triton_quant)
+    bench.run()
+
+
+@pytest.mark.skipif(flaggems_vllm.device == "cpu", reason="Unsupported in CPU mode")
+@pytest.mark.sparse_attn_quant
+def test_sparse_attn_triton_quant_fp8():
+    bench = SparseAttentionQuantBenchmark(
+        op_name="sparse_attention_quant_fp8",
+        torch_op=torch_sparse_attention_quant,
+        dtypes=[torch.bfloat16],
+        quant_dtype=torch.float8_e4m3fn,
+    )
+    bench.set_gems(flaggems_vllm.sparse_attn_triton_quant)
     bench.run()

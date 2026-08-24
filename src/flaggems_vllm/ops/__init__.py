@@ -125,7 +125,10 @@ from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp_out,
 )
 from flaggems_vllm.ops.skip_layernorm import skip_layer_norm
-from flaggems_vllm.ops.sparse_attention import sparse_attn_triton
+from flaggems_vllm.ops.sparse_attention import (
+    sparse_attn_triton,
+    sparse_attn_triton_quant,
+)
 from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
@@ -234,6 +237,7 @@ __all__ = [
     "sinkhorn_forward",
     "skip_layer_norm",
     "sparse_attn_triton",
+    "sparse_attn_triton_quant",
     "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
