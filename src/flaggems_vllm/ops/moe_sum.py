@@ -67,27 +67,109 @@ def moe_sum_kernel(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
+    ],
+    key=["hidden_size", "topk"],
+)
+@triton.jit
+def moe_sum_pair_kernel(
+    input_ptr,
+    output_ptr,
+    num_tokens,
+    topk: tl.constexpr,
+    hidden_size,
+    input_stride_token,
+    input_stride_topk,
+    output_stride_token,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    hidden_start = block_idx * BLOCK_SIZE
+    hidden_offsets = hidden_start + tl.arange(0, BLOCK_SIZE)
+    hidden_mask = hidden_offsets < hidden_size
+    if token_idx >= num_tokens:
+        return
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    input_base = input_ptr + token_idx * input_stride_token
+
+    for i in tl.static_range(0, topk, 2):
+        x0 = tl.load(
+            input_base + i * input_stride_topk + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        )
+        if i + 1 < topk:
+            x1 = tl.load(
+                input_base + (i + 1) * input_stride_topk + hidden_offsets,
+                mask=hidden_mask,
+                other=0.0,
+            )
+            acc += x0.to(tl.float32) + x1.to(tl.float32)
+        else:
+            acc += x0.to(tl.float32)
+    output_ptr_pos = output_ptr + token_idx * output_stride_token + hidden_offsets
+
+    tl.store(
+        output_ptr_pos,
+        (acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc),
+        mask=hidden_mask,
+    )
+
+
+def _use_pair_kernel(
+    num_tokens: int,
+    topk: int,
+    hidden_size: int,
+) -> bool:
+    if topk > 16:
+        return False
+    if hidden_size >= 8192 and topk >= 8 and num_tokens <= 64:
+        return False
+    return True
+
+
 def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
 ):
     logger.debug("GEMS MOE SUM")
     num_tokens, topk, hidden_size = input.shape
+
+    if topk == 1:
+        output.copy_(input[:, 0, :])
+        return
+
     input_strides = input.stride()
     output_strides = output.stride()
-    grid = lambda meta: (
-        num_tokens,
-        triton.cdiv(hidden_size, meta["BLOCK_SIZE"]),
-    )
-    moe_sum_kernel[grid](
-        input,
-        output,
-        num_tokens,
-        topk,
-        hidden_size,
-        input_strides[0],
-        input_strides[1],
-        input_strides[2],
-        output_strides[0],
-        output_strides[1],
-    )
+    grid = lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_SIZE"]))
+    if _use_pair_kernel(num_tokens, topk, hidden_size):
+        moe_sum_pair_kernel[grid](
+            input,
+            output,
+            num_tokens,
+            topk,
+            hidden_size,
+            input_strides[0],
+            input_strides[1],
+            output_strides[0],
+        )
+    else:
+        moe_sum_kernel[grid](
+            input,
+            output,
+            num_tokens,
+            topk,
+            hidden_size,
+            input_strides[0],
+            input_strides[1],
+            input_strides[2],
+            output_strides[0],
+            output_strides[1],
+        )
