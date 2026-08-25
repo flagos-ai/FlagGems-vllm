@@ -14,11 +14,13 @@
 
 
 from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
+from .qsa import qwen4_store_qsa_kv_rows
 from .scaled_int8_quant import scaled_int8_quant
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
 ]
