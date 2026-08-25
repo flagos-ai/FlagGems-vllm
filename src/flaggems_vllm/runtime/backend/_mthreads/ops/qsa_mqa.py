@@ -117,51 +117,6 @@ def _qsa_mqa_paged_dot_kernel(
     )
 
 
-def run(
-    q,
-    k_cache,
-    page_table,
-    token_to_req,
-    query_positions,
-    sequence_lengths,
-    compress_ratio,
-    num_columns,
-):
-    rows = q.shape[0]
-    num_pages = k_cache.shape[0]
-    page_size = k_cache.shape[1]
-    num_heads = q.shape[1]
-    head_dim = q.shape[2]
-    num_requests = page_table.shape[0]
-    page_table_width = page_table.shape[1]
-    num_columns = int(num_columns)
-    compress_ratio = int(compress_ratio)
-
-    logits = torch.empty((rows, num_columns), dtype=torch.float32, device=q.device)
-    visible = torch.empty((rows,), dtype=torch.int32, device=q.device)
-
-    grid = (rows, triton.cdiv(num_columns, page_size))
-    _qsa_mqa_paged_dot_kernel[grid](
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        logits,
-        visible,
-        num_requests,
-        num_pages,
-        page_table_width,
-        num_columns,
-        compress_ratio=compress_ratio,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-    )
-    return logits, visible
-
-
 def qwen4_qsa_mqa_paged_dot(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -214,4 +169,39 @@ def qwen4_qsa_mqa_paged_dot(
             compress_ratio,
         )
 
-    return run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, compress_ratio, num_columns)
+
+    rows = q.shape[0]
+    num_pages = k_cache.shape[0]
+    page_size = k_cache.shape[1]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    num_requests = page_table.shape[0]
+    page_table_width = page_table.shape[1]
+    num_columns = int(num_columns)
+    compress_ratio = int(compress_ratio)
+
+    logits = torch.empty((rows, num_columns), dtype=torch.float32, device=q.device)
+    visible = torch.empty((rows,), dtype=torch.int32, device=q.device)
+
+    grid = (rows, triton.cdiv(num_columns, page_size))
+    _qsa_mqa_paged_dot_kernel[grid](
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        logits,
+        visible,
+        num_requests,
+        num_pages,
+        page_table_width,
+        num_columns,
+        compress_ratio=compress_ratio,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+    )
+    return logits, visible
+
+

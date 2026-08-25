@@ -163,8 +163,59 @@ def _qsa_mma_kernel(
     tl.store(LOG_PTR + r * log_stride_row + col_offs, out, mask=col_mask)
 
 
-def run(q, k_cache, page_table, token_to_req, query_positions,
-        sequence_lengths, compress_ratio, num_columns):
+def qwen4_qsa_mqa_paged_dot(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int = 4,
+    num_columns: int | None = None,
+    score_scale: float | None = None,
+):
+    if not all(
+        t.device.type not in ("cpu", "meta")
+        for t in (q, k_cache, page_table, token_to_req, query_positions, sequence_lengths)
+    ):
+        raise RuntimeError("Qwen4 QSA MQA dot requires a Triton accelerator")
+    if q.ndim != 3 or q.shape[1:] != (4, 128) or q.dtype != torch.bfloat16:
+        raise ValueError("Qwen4 QSA MQA dot requires BF16 q shaped [rows, 4, 128]")
+    if k_cache.ndim != 4 or k_cache.shape[2:] != (1, 128):
+        raise ValueError("Qwen4 QSA MQA cache must be [pages, page_size, 1, 128]")
+    if k_cache.dtype != q.dtype:
+        raise ValueError("Qwen4 QSA query and cache must have the same dtype")
+    if page_table.ndim != 2:
+        raise ValueError("Qwen4 QSA MQA page table must be rank-2")
+    if page_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 QSA page table must use int32 or int64")
+
+    rows = q.shape[0]
+    if rows and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
+        raise ValueError("Qwen4 QSA MQA cache and page table must be nonempty for nonempty q")
+    if token_to_req.shape != (rows,) or query_positions.shape != (rows,):
+        raise ValueError("Qwen4 QSA request metadata must match query rows")
+    if token_to_req.dtype not in (torch.int32, torch.int64) or query_positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 QSA request metadata must use int32 or int64")
+    if sequence_lengths.shape != (page_table.shape[0],):
+        raise ValueError("Qwen4 QSA sequence lengths must match page-table requests")
+    if sequence_lengths.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 QSA sequence lengths must use int32 or int64")
+    if compress_ratio <= 0:
+        raise ValueError("Qwen4 QSA compression ratio must be positive")
+
+    if score_scale is not None:
+        raise NotImplementedError(
+            "Vendor QSA MQA uses hardcoded scale 1/sqrt(128); custom score_scale not supported"
+        )
+
+    if num_columns is None:
+        num_columns = triton.cdiv(
+            sequence_lengths.max().item() if sequence_lengths.numel() else 0,
+            compress_ratio,
+        )
+
+
     rows = q.shape[0]
     heads = q.shape[1]
     d = q.shape[2]
@@ -245,56 +296,3 @@ def run(q, k_cache, page_table, token_to_req, query_positions,
     return logits, visible
 
 
-def qwen4_qsa_mqa_paged_dot(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    compress_ratio: int = 4,
-    num_columns: int | None = None,
-    score_scale: float | None = None,
-):
-    if not all(
-        t.device.type not in ("cpu", "meta")
-        for t in (q, k_cache, page_table, token_to_req, query_positions, sequence_lengths)
-    ):
-        raise RuntimeError("Qwen4 QSA MQA dot requires a Triton accelerator")
-    if q.ndim != 3 or q.shape[1:] != (4, 128) or q.dtype != torch.bfloat16:
-        raise ValueError("Qwen4 QSA MQA dot requires BF16 q shaped [rows, 4, 128]")
-    if k_cache.ndim != 4 or k_cache.shape[2:] != (1, 128):
-        raise ValueError("Qwen4 QSA MQA cache must be [pages, page_size, 1, 128]")
-    if k_cache.dtype != q.dtype:
-        raise ValueError("Qwen4 QSA query and cache must have the same dtype")
-    if page_table.ndim != 2:
-        raise ValueError("Qwen4 QSA MQA page table must be rank-2")
-    if page_table.dtype not in (torch.int32, torch.int64):
-        raise TypeError("Qwen4 QSA page table must use int32 or int64")
-
-    rows = q.shape[0]
-    if rows and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
-        raise ValueError("Qwen4 QSA MQA cache and page table must be nonempty for nonempty q")
-    if token_to_req.shape != (rows,) or query_positions.shape != (rows,):
-        raise ValueError("Qwen4 QSA request metadata must match query rows")
-    if token_to_req.dtype not in (torch.int32, torch.int64) or query_positions.dtype not in (torch.int32, torch.int64):
-        raise TypeError("Qwen4 QSA request metadata must use int32 or int64")
-    if sequence_lengths.shape != (page_table.shape[0],):
-        raise ValueError("Qwen4 QSA sequence lengths must match page-table requests")
-    if sequence_lengths.dtype not in (torch.int32, torch.int64):
-        raise TypeError("Qwen4 QSA sequence lengths must use int32 or int64")
-    if compress_ratio <= 0:
-        raise ValueError("Qwen4 QSA compression ratio must be positive")
-
-    if score_scale is not None:
-        raise NotImplementedError(
-            "Vendor QSA MQA uses hardcoded scale 1/sqrt(128); custom score_scale not supported"
-        )
-
-    if num_columns is None:
-        num_columns = triton.cdiv(
-            sequence_lengths.max().item() if sequence_lengths.numel() else 0,
-            compress_ratio,
-        )
-
-    return run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, compress_ratio, num_columns)

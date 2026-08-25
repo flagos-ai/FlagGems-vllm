@@ -101,57 +101,6 @@ def _qsa_mqa_paged_dot_kernel(
     tl.store(LOG_PTR + r * log_stride_row + col_offs, out, mask=col_mask)
 
 
-def run(q, k_cache, page_table, token_to_req, query_positions,
-        sequence_lengths, compress_ratio, num_columns):
-    rows = q.shape[0]
-    heads = q.shape[1]
-    d = q.shape[2]
-    num_pages, page_size, _, _ = k_cache.shape
-    num_requests, page_table_width = page_table.shape
-
-    compress_ratio = int(compress_ratio)
-    num_columns = int(num_columns)
-
-    device = q.device
-    logits = torch.empty((rows, num_columns), device=device, dtype=torch.float32)
-    visible = torch.empty((rows,), device=device, dtype=torch.int32)
-
-    if rows == 0 or num_columns == 0:
-        return logits, visible
-
-    if num_columns <= 64:
-        BLOCK_C = triton.next_power_of_2(num_columns)
-    elif rows >= 32:
-        BLOCK_C = 64
-    elif rows >= 2:
-        BLOCK_C = 64
-    else:
-        BLOCK_C = 32
-
-    num_tiles = triton.cdiv(num_columns, BLOCK_C)
-    grid = (rows, num_tiles)
-
-    _qsa_mqa_paged_dot_kernel[grid](
-        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
-        logits, visible,
-        num_requests, num_pages,
-        q.stride(0), q.stride(1),
-        k_cache.stride(0), k_cache.stride(1),
-        page_table.stride(0),
-        logits.stride(0),
-        COMPRESS_RATIO=compress_ratio,
-        PAGE_SIZE=page_size,
-        PAGE_TABLE_WIDTH=page_table_width,
-        NUM_COLS=num_columns,
-        D_C=d,
-        HEADS_C=heads,
-        HEADS_PAD_C=HEADS_PAD,
-        BLOCK_C=BLOCK_C,
-        INV_SQRT=1.0 / math.sqrt(d),
-    )
-    return logits, visible
-
-
 def qwen4_qsa_mqa_paged_dot(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -204,4 +153,53 @@ def qwen4_qsa_mqa_paged_dot(
             compress_ratio,
         )
 
-    return run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, compress_ratio, num_columns)
+
+    rows = q.shape[0]
+    heads = q.shape[1]
+    d = q.shape[2]
+    num_pages, page_size, _, _ = k_cache.shape
+    num_requests, page_table_width = page_table.shape
+
+    compress_ratio = int(compress_ratio)
+    num_columns = int(num_columns)
+
+    device = q.device
+    logits = torch.empty((rows, num_columns), device=device, dtype=torch.float32)
+    visible = torch.empty((rows,), device=device, dtype=torch.int32)
+
+    if rows == 0 or num_columns == 0:
+        return logits, visible
+
+    if num_columns <= 64:
+        BLOCK_C = triton.next_power_of_2(num_columns)
+    elif rows >= 32:
+        BLOCK_C = 64
+    elif rows >= 2:
+        BLOCK_C = 64
+    else:
+        BLOCK_C = 32
+
+    num_tiles = triton.cdiv(num_columns, BLOCK_C)
+    grid = (rows, num_tiles)
+
+    _qsa_mqa_paged_dot_kernel[grid](
+        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
+        logits, visible,
+        num_requests, num_pages,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1),
+        page_table.stride(0),
+        logits.stride(0),
+        COMPRESS_RATIO=compress_ratio,
+        PAGE_SIZE=page_size,
+        PAGE_TABLE_WIDTH=page_table_width,
+        NUM_COLS=num_columns,
+        D_C=d,
+        HEADS_C=heads,
+        HEADS_PAD_C=HEADS_PAD,
+        BLOCK_C=BLOCK_C,
+        INV_SQRT=1.0 / math.sqrt(d),
+    )
+    return logits, visible
+
+

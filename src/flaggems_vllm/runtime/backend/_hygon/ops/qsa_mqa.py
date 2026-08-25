@@ -83,44 +83,6 @@ def _qsa_mqa_paged_dot_kernel(
     tl.store(logits_ptr + row * num_columns + cols, out, mask=col_mask)
 
 
-def run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
-        compress_ratio, num_columns):
-    rows = q.shape[0]
-    num_pages = k_cache.shape[0]
-    page_size = k_cache.shape[1]
-    num_requests = page_table.shape[0]
-    page_table_width = page_table.shape[1]
-    num_columns = int(num_columns)
-    compress_ratio = int(compress_ratio)
-    head_dim = q.shape[2]
-    num_heads = q.shape[1]
-
-    logits = torch.empty((rows, num_columns), dtype=torch.float32, device=q.device)
-    visible = torch.empty((rows,), dtype=torch.int32, device=q.device)
-
-    # Low-row workloads are launch-bound: use a smaller per-program tile.
-    if rows <= 8:
-        BLOCK_PAGES = 2
-    else:
-        BLOCK_PAGES = 4
-
-    pages_per_row = triton.cdiv(num_columns, page_size)
-    num_page_blocks = triton.cdiv(pages_per_row, BLOCK_PAGES)
-    grid = (rows, num_page_blocks)
-    inv_sqrt_dim = 1.0 / math.sqrt(head_dim)
-
-    _qsa_mqa_paged_dot_kernel[grid](
-        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
-        logits, visible,
-        num_columns, num_pages, num_requests, page_table_width,
-        compress_ratio, inv_sqrt_dim,
-        BLOCK_PAGES=BLOCK_PAGES, PAGE_SIZE=page_size, HEAD_DIM=head_dim,
-        NUM_HEADS=num_heads,
-        num_warps=4,
-    )
-    return logits, visible
-
-
 def qwen4_qsa_mqa_paged_dot(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -173,4 +135,40 @@ def qwen4_qsa_mqa_paged_dot(
             compress_ratio,
         )
 
-    return run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, compress_ratio, num_columns)
+
+    rows = q.shape[0]
+    num_pages = k_cache.shape[0]
+    page_size = k_cache.shape[1]
+    num_requests = page_table.shape[0]
+    page_table_width = page_table.shape[1]
+    num_columns = int(num_columns)
+    compress_ratio = int(compress_ratio)
+    head_dim = q.shape[2]
+    num_heads = q.shape[1]
+
+    logits = torch.empty((rows, num_columns), dtype=torch.float32, device=q.device)
+    visible = torch.empty((rows,), dtype=torch.int32, device=q.device)
+
+    # Low-row workloads are launch-bound: use a smaller per-program tile.
+    if rows <= 8:
+        BLOCK_PAGES = 2
+    else:
+        BLOCK_PAGES = 4
+
+    pages_per_row = triton.cdiv(num_columns, page_size)
+    num_page_blocks = triton.cdiv(pages_per_row, BLOCK_PAGES)
+    grid = (rows, num_page_blocks)
+    inv_sqrt_dim = 1.0 / math.sqrt(head_dim)
+
+    _qsa_mqa_paged_dot_kernel[grid](
+        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
+        logits, visible,
+        num_columns, num_pages, num_requests, page_table_width,
+        compress_ratio, inv_sqrt_dim,
+        BLOCK_PAGES=BLOCK_PAGES, PAGE_SIZE=page_size, HEAD_DIM=head_dim,
+        NUM_HEADS=num_heads,
+        num_warps=4,
+    )
+    return logits, visible
+
+
