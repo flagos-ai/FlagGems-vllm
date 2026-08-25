@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from .compress_norm_mrope import qwen4_compress_norm_mrope_store_groups
 from .scaled_int8_quant import scaled_int8_quant
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["qwen4_compress_norm_mrope_store_groups", "scaled_int8_quant"]
