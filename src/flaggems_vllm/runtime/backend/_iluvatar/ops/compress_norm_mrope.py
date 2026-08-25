@@ -221,7 +221,6 @@ def _compress_norm_mrope_store_qsa_groups_kernel(
         mask=valid_row & ((ROTARY_DIM + pass_offsets) < HEAD_DIM),
     )
 
-
 def qwen4_compress_norm_mrope_store_groups(
     raw_cache: torch.Tensor,
     raw_block_table: torch.Tensor,
@@ -234,10 +233,61 @@ def qwen4_compress_norm_mrope_store_groups(
     compress_ratio: int = 4,
     norm_eps: float = 1.0e-6,
     rotary_dim: int = 64,
-    mrope_section: tuple[int, int, int] = (11, 11, 10),
+    mrope_section: tuple = (11, 11, 10),
     mrope_interleaved: bool = True,
     rope_cache: torch.Tensor | None = None,
 ) -> None:
+    """Fuse QSA group pooling, Gemma RMSNorm, interleaved MRoPE, and store."""
+
+    tensors = [
+        raw_cache, raw_block_table, token_to_req, logical_positions,
+        compressed_slots, compressed_cache, norm_weight, cos_sin_cache,
+    ]
+    if rope_cache is not None:
+        tensors.append(rope_cache)
+    if any(t.device.type in ("cpu", "meta") for t in tensors):
+        raise RuntimeError("Qwen4 QSA compression requires a Triton accelerator")
+
+    if (raw_cache.ndim != 4 or raw_cache.shape[2:] != (1, 128)
+            or not all(raw_cache.shape)):
+        raise ValueError("Qwen4 QSA raw cache must be nonempty [blocks, page, 1, 128]")
+    if (compressed_cache.ndim != 4 or compressed_cache.shape[2:] != (1, 128)
+            or not all(compressed_cache.shape)):
+        raise ValueError("Qwen4 QSA compressed cache must be [blocks, page, 1, 128]")
+    if compressed_cache.dtype != raw_cache.dtype:
+        raise ValueError("Qwen4 QSA raw and compressed caches must match dtype")
+    if raw_block_table.ndim != 2:
+        raise ValueError("Qwen4 QSA raw block table must be rank-2")
+    if raw_block_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Qwen4 QSA raw block table must use int32 or int64")
+
+    rows = token_to_req.numel()
+    if rows and not all(raw_block_table.shape):
+        raise ValueError("Qwen4 QSA raw block table must be nonempty for nonempty rows")
+    if logical_positions.shape != (rows,) or compressed_slots.shape != (rows,):
+        raise ValueError("Qwen4 QSA compression metadata must match token rows")
+    if (token_to_req.dtype not in (torch.int32, torch.int64)
+            or logical_positions.dtype not in (torch.int32, torch.int64)
+            or compressed_slots.dtype not in (torch.int32, torch.int64)):
+        raise TypeError("Qwen4 QSA compression metadata must use int32 or int64")
+    if norm_weight.shape != (128,) or norm_weight.dtype != raw_cache.dtype:
+        raise ValueError("Qwen4 QSA norm weight must be a same-dtype [128] vector")
+    if norm_weight.stride(0) != 1:
+        raise ValueError("Qwen4 QSA norm weight must be contiguous")
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != rotary_dim:
+        raise ValueError("Qwen4 QSA cos/sin cache must be [positions, rotary_dim]")
+    if cos_sin_cache.dtype != raw_cache.dtype or not cos_sin_cache.shape[0]:
+        raise ValueError("Qwen4 QSA cos/sin cache must be nonempty and match cache dtype")
+    if (len(mrope_section) != 3 or any(section < 0 for section in mrope_section)
+            or rotary_dim != 64 or sum(mrope_section) != rotary_dim // 2):
+        raise ValueError("Qwen4 QSA MRoPE requires rotary_dim=64 and sections summing to 32")
+    if compress_ratio <= 0 or norm_eps <= 0:
+        raise ValueError("Qwen4 QSA compression ratio and norm epsilon must be positive")
+    if rope_cache is not None and (rope_cache.ndim != 4
+            or rope_cache.shape[:3] != raw_cache.shape[:3]
+            or rope_cache.shape[3] != 3 or rope_cache.dtype != torch.int64):
+        raise ValueError("Qwen4 QSA packed MRoPE cache must be [blocks, page, 1, 3] int64")
+
     rows = token_to_req.numel()
     if rows == 0:
         return
@@ -290,149 +340,4 @@ def qwen4_compress_norm_mrope_store_groups(
         MROPE_INTERLEAVED=mrope_interleaved,
         LOAD_MROPE_POSITIONS=load_mrope_positions,
         num_warps=1,
-    )
-
-
-def run(
-    raw_cache,
-    raw_block_table,
-    token_to_req,
-    logical_positions,
-    compressed_slots,
-    compressed_cache,
-    norm_weight,
-    cos_sin_cache,
-    compress_ratio,
-    norm_eps,
-    rotary_dim,
-    mrope_section,
-    mrope_interleaved,
-    rope_cache,
-):
-    out = compressed_cache.clone()
-    qwen4_compress_norm_mrope_store_groups(
-        raw_cache,
-        raw_block_table,
-        token_to_req,
-        logical_positions,
-        compressed_slots,
-        out,
-        norm_weight,
-        cos_sin_cache,
-        compress_ratio,
-        norm_eps,
-        rotary_dim,
-        tuple(mrope_section),
-        mrope_interleaved,
-        rope_cache,
-    )
-    return out
-
-
-def qwen4_compress_norm_mrope_store_groups(
-    raw_cache: torch.Tensor,
-    raw_block_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    logical_positions: torch.Tensor,
-    compressed_slots: torch.Tensor,
-    compressed_cache: torch.Tensor,
-    norm_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    compress_ratio: int = 4,
-    norm_eps: float = 1.0e-6,
-    rotary_dim: int = 64,
-    mrope_section: tuple = (11, 11, 10),
-    mrope_interleaved: bool = True,
-    rope_cache: torch.Tensor | None = None,
-) -> None:
-    """Fuse QSA group pooling, Gemma RMSNorm, interleaved MRoPE, and store."""
-
-    tensors = [
-        raw_cache,
-        raw_block_table,
-        token_to_req,
-        logical_positions,
-        compressed_slots,
-        compressed_cache,
-        norm_weight,
-        cos_sin_cache,
-    ]
-    if rope_cache is not None:
-        tensors.append(rope_cache)
-    if any(t.device.type in ("cpu", "meta") for t in tensors):
-        raise RuntimeError("Qwen4 QSA compression requires a Triton accelerator")
-
-    if (
-        raw_cache.ndim != 4
-        or raw_cache.shape[2:] != (1, 128)
-        or not all(raw_cache.shape)
-    ):
-        raise ValueError("Qwen4 QSA raw cache must be nonempty [blocks, page, 1, 128]")
-    if (
-        compressed_cache.ndim != 4
-        or compressed_cache.shape[2:] != (1, 128)
-        or not all(compressed_cache.shape)
-    ):
-        raise ValueError("Qwen4 QSA compressed cache must be [blocks, page, 1, 128]")
-    if compressed_cache.dtype != raw_cache.dtype:
-        raise ValueError("Qwen4 QSA raw and compressed caches must match dtype")
-    if raw_block_table.ndim != 2:
-        raise ValueError("Qwen4 QSA raw block table must be rank-2")
-    if raw_block_table.dtype not in (torch.int32, torch.int64):
-        raise TypeError("Qwen4 QSA raw block table must use int32 or int64")
-
-    rows = token_to_req.numel()
-    if rows and not all(raw_block_table.shape):
-        raise ValueError("Qwen4 QSA raw block table must be nonempty for nonempty rows")
-    if logical_positions.shape != (rows,) or compressed_slots.shape != (rows,):
-        raise ValueError("Qwen4 QSA compression metadata must match token rows")
-    if (
-        token_to_req.dtype not in (torch.int32, torch.int64)
-        or logical_positions.dtype not in (torch.int32, torch.int64)
-        or compressed_slots.dtype not in (torch.int32, torch.int64)
-    ):
-        raise TypeError("Qwen4 QSA compression metadata must use int32 or int64")
-    if norm_weight.shape != (128,) or norm_weight.dtype != raw_cache.dtype:
-        raise ValueError("Qwen4 QSA norm weight must be a same-dtype [128] vector")
-    if norm_weight.stride(0) != 1:
-        raise ValueError("Qwen4 QSA norm weight must be contiguous")
-    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != rotary_dim:
-        raise ValueError("Qwen4 QSA cos/sin cache must be [positions, rotary_dim]")
-    if cos_sin_cache.dtype != raw_cache.dtype or not cos_sin_cache.shape[0]:
-        raise ValueError("Qwen4 QSA cos/sin cache must be nonempty and match cache dtype")
-    if (
-        len(mrope_section) != 3
-        or any(section < 0 for section in mrope_section)
-        or rotary_dim != 64
-        or sum(mrope_section) != rotary_dim // 2
-    ):
-        raise ValueError("Qwen4 QSA MRoPE requires rotary_dim=64 and sections summing to 32")
-    if compress_ratio <= 0 or norm_eps <= 0:
-        raise ValueError("Qwen4 QSA compression ratio and norm epsilon must be positive")
-    if rope_cache is not None and (
-        rope_cache.ndim != 4
-        or rope_cache.shape[:3] != raw_cache.shape[:3]
-        or rope_cache.shape[3] != 3
-        or rope_cache.dtype != torch.int64
-    ):
-        raise ValueError("Qwen4 QSA packed MRoPE cache must be [blocks, page, 1, 3] int64")
-
-    if rows == 0:
-        return
-
-    run(
-        raw_cache,
-        raw_block_table,
-        token_to_req,
-        logical_positions,
-        compressed_slots,
-        compressed_cache,
-        norm_weight,
-        cos_sin_cache,
-        compress_ratio,
-        norm_eps,
-        rotary_dim,
-        mrope_section,
-        mrope_interleaved,
-        rope_cache,
     )
