@@ -13,10 +13,12 @@
 # limitations under the License.
 
 from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
+from .qsa_mqa import qwen4_qsa_mqa_paged_dot
 from .scaled_int8_quant import scaled_int8_quant
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
+    "qwen4_qsa_mqa_paged_dot",
     "scaled_int8_quant",
 ]
