@@ -75,15 +75,51 @@ def torch_grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def aiter_biased_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    num_tokens = scores.size(0)
+    topk_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=scores.device
+    )
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+    moe_fused_gate(
+        scores.float(),
+        bias.float(),
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        topk=topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
+
+
 vendor_name = flaggems_vllm.vendor_name
+USE_AITER = False
 
 try:
-    import vllm._custom_ops as ops  # noqa: F401
+    if vendor_name == "hygon":
+        from aiter import moe_fused_gate  # noqa: F401
 
-    if hasattr(torch.ops._moe_C, "grouped_topk"):
-        ref_grouped_topk = torch.ops._moe_C.grouped_topk
+        ref_grouped_topk = aiter_biased_grouped_topk
+        USE_AITER = True
     else:
-        ref_grouped_topk = torch_grouped_topk
+        import vllm._custom_ops  # noqa: F401
+
+        if hasattr(torch.ops._moe_C, "grouped_topk"):
+            ref_grouped_topk = torch.ops._moe_C.grouped_topk
+        else:
+            ref_grouped_topk = torch_grouped_topk
 except (ImportError, AttributeError):
     ref_grouped_topk = torch_grouped_topk
 
@@ -138,6 +174,9 @@ class GroupedTopKBenchmark(base.Benchmark):
 
 
 @pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    USE_AITER, reason="scoring_func == 0 is not supported by moe_fused_gate in aiter"
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
@@ -155,6 +194,9 @@ def test_grouped_topk_no_renorm():
 
 
 @pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    USE_AITER, reason="scoring_func == 0 is not supported by moe_fused_gate in aiter"
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")

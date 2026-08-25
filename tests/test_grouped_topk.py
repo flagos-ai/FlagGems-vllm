@@ -152,13 +152,61 @@ def torch_grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-try:
-    import vllm._custom_ops as ops  # noqa: F401
-
-    if hasattr(torch.ops._moe_C, "grouped_topk"):
-        ref_grouped_topk = torch.ops._moe_C.grouped_topk
+def aiter_biased_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    if renormalize and scoring_func == 1:
+        num_tokens = scores.size(0)
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=scores.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=scores.device
+        )
+        moe_fused_gate(
+            scores.float(),
+            bias.float(),
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            topk=topk,
+            num_fused_shared_experts=0,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        return topk_weights, topk_ids
     else:
-        ref_grouped_topk = torch_grouped_topk
+        return torch_grouped_topk(
+            scores,
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            bias,
+            scoring_func,
+        )
+
+
+try:
+    if vendor_name == "hygon":
+        from aiter import moe_fused_gate  # noqa: F401
+
+        ref_grouped_topk = aiter_biased_grouped_topk
+    else:
+        import vllm._custom_ops  # noqa: F401
+
+        if hasattr(torch.ops._moe_C, "grouped_topk"):
+            ref_grouped_topk = torch.ops._moe_C.grouped_topk
+        else:
+            ref_grouped_topk = torch_grouped_topk
 except (ImportError, AttributeError):
     ref_grouped_topk = torch_grouped_topk
 
