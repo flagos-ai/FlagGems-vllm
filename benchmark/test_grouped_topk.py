@@ -104,8 +104,35 @@ def aiter_biased_grouped_topk(
     return topk_weights, topk_ids
 
 
+def mthreads_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    num_fused_shared_experts = 0
+    apply_routed_scaling_factor_on_output = routed_scaling_factor != 1.0
+    topk_weights, topk_ids = moe_fused_gate(
+        scores.float(),
+        bias.float(),
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+        renormalize,
+        apply_routed_scaling_factor_on_output,
+    )
+    return topk_weights, topk_ids
+
+
 vendor_name = flaggems_vllm.vendor_name
 USE_AITER = False
+USE_MATE = False
 
 try:
     if vendor_name == "hygon":
@@ -113,6 +140,11 @@ try:
 
         ref_grouped_topk = aiter_biased_grouped_topk
         USE_AITER = True
+    elif vendor_name == "mthreads":
+        from mate import moe_fused_gate  # noqa: F401
+
+        ref_grouped_topk = mthreads_grouped_topk
+        USE_MATE = True
     else:
         import vllm._custom_ops  # noqa: F401
 
@@ -177,6 +209,9 @@ class GroupedTopKBenchmark(base.Benchmark):
 @pytest.mark.skipif(
     USE_AITER, reason="scoring_func == 0 is not supported by moe_fused_gate in aiter"
 )
+@pytest.mark.skipif(
+    USE_MATE, reason="scoring_func == 0 is not supported by moe_fused_gate in mate"
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
@@ -196,6 +231,9 @@ def test_grouped_topk_no_renorm():
 @pytest.mark.grouped_topk
 @pytest.mark.skipif(
     USE_AITER, reason="scoring_func == 0 is not supported by moe_fused_gate in aiter"
+)
+@pytest.mark.skipif(
+    USE_MATE, reason="scoring_func == 0 is not supported by moe_fused_gate in mate"
 )
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")

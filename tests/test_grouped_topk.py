@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import random
 import time
 
@@ -195,11 +196,71 @@ def aiter_biased_grouped_topk(
         )
 
 
+def is_power_of_two(n):
+    return n > 0 and math.log2(n).is_integer()
+
+
+def mthreads_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    """
+    Adapted from vllm-musa: vllm_musa/model_executor/layers/fused_moe/router/grouped_topk_router.py
+    """
+    if (
+        scoring_func == 1
+        and scores.shape[1] % 32 == 0
+        and (
+            scores.shape[1] // num_expert_group <= 32
+            or (num_expert_group == 1 and scores.shape[1] in {160, 256, 384})
+        )
+        and (bias is not None and is_power_of_two(bias.shape[0]))
+    ):
+        # Conditions added relative to vllm-musa:
+        # 1. moe_fused_gate in mate always perform a sigmoid operation
+        # 2. moe_fused_gate in mate requires (num_expert % WARP_SIZE) == 0
+        num_fused_shared_experts = 0
+        apply_routed_scaling_factor_on_output = routed_scaling_factor != 1.0
+        topk_weights, topk_ids = moe_fused_gate(
+            scores.float(),
+            bias.float(),
+            num_expert_group,
+            topk_group,
+            topk,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            renormalize,
+            apply_routed_scaling_factor_on_output,
+        )
+        return topk_weights, topk_ids
+    else:
+        return torch_grouped_topk(
+            scores,
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            bias,
+            scoring_func,
+        )
+
+
 try:
     if vendor_name == "hygon":
         from aiter import moe_fused_gate  # noqa: F401
 
         ref_grouped_topk = aiter_biased_grouped_topk
+    elif vendor_name == "mthreads":
+        from mate import moe_fused_gate  # noqa: F401
+
+        ref_grouped_topk = mthreads_grouped_topk
     else:
         import vllm._custom_ops  # noqa: F401
 
