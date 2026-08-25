@@ -14,11 +14,13 @@
 
 
 from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
+from .ple_state import ple_state_scatter_
 from .scaled_int8_quant import scaled_int8_quant
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "ple_state_scatter_",
     "scaled_int8_quant",
 ]

@@ -13,10 +13,12 @@
 # limitations under the License.
 
 from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
+from .ple_state import ple_state_scatter_
 from .scaled_int8_quant import scaled_int8_quant
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
+    "ple_state_scatter_",
     "scaled_int8_quant",
 ]

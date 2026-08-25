@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from .ple_state import ple_state_scatter_
 from .scaled_int8_quant import scaled_int8_quant
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["ple_state_scatter_", "scaled_int8_quant"]

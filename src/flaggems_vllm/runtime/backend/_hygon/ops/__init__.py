@@ -18,6 +18,7 @@ from .fused_moe import (  # noqa: F401
     outplace_fused_experts,
 )
 from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
+from .ple_state import ple_state_scatter_
 from .scaled_int8_quant import scaled_int8_quant
 from .triton_scaled_mm import triton_scaled_mm
 
@@ -27,6 +28,7 @@ __all__ = [
     "inplace_fused_experts",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
+    "ple_state_scatter_",
     "scaled_int8_quant",
     "triton_scaled_mm",
 ]
