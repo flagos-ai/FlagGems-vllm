@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
+from flaggems_vllm.runtime.backend._mthreads.fused.fused_moe import (
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
 
 __all__ = [
     "fused_experts_impl",

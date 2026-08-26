@@ -32,12 +32,12 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.FLA.gdn2_native.chunk_fwd import chunk_gdn2_fwd
+
 # 此仓库的pre index的入口参数没有BT，不支持varlen
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-
-from .gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
