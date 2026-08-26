@@ -113,6 +113,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_fused_experts_impl.py",
         "tests/test_moe_sum.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
@@ -162,6 +165,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
         "benchmark/test_fused_moe.py",
         "benchmark/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
     ],
 }
 
