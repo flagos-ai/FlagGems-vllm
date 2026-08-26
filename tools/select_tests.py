@@ -106,6 +106,16 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "tests/test_FLA/test_chunk_gated_delta_rule.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
+        "tests/test_fused_experts_impl.py",
+        "tests/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
@@ -148,6 +158,16 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
+        "benchmark/test_fused_moe.py",
+        "benchmark/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
     ],
 }
 
@@ -269,6 +289,31 @@ def triggers_env_smoke_tests(path: str) -> bool:
     )
 
 
+def _is_operator_implementation(path: str) -> bool:
+    """Return True if *path* looks like an operator implementation file.
+
+    Only operator files (under ops/ or vendor fused/ops directories) should
+    trigger the fail-closed full-test-suite behaviour when they lack a test
+    mapping.  Infrastructure files — __init__.py, utils/, runtime plumbing,
+    testing helpers — are covered by the smoke lane and should not escalate.
+    """
+    # __init__.py files are package markers, never standalone operators.
+    if path.endswith("/__init__.py"):
+        return False
+
+    # Shared operator implementations.
+    if path.startswith("src/flaggems_vllm/ops/"):
+        return True
+
+    # Vendor-specific operator / fused-kernel implementations.
+    if path.startswith("src/flaggems_vllm/runtime/backend/_") and (
+        "/ops/" in path or "/fused/" in path
+    ):
+        return True
+
+    return False
+
+
 def select_targets(
     repo_root: Path, changed_files: list[str]
 ) -> tuple[str, list[str], list[str]]:
@@ -308,10 +353,16 @@ def select_targets(
         # Changed Python implementation code without a known test mapping must
         # fail closed. Running all tests on the trusted NVIDIA lane is safer
         # than silently reporting success without testing the changed code.
+        #
+        # However, infrastructure files (runtime plumbing, utils, __init__.py)
+        # are already covered by the ENV_SMOKE_TRIGGER_PREFIXES mechanism or
+        # are not operator implementations — they should not escalate to a full
+        # test suite on every change.
         if (
             path.startswith("src/flaggems_vllm/")
             and path.endswith(".py")
             and not source_tests
+            and _is_operator_implementation(path)
         ):
             full_tests_required = True
 

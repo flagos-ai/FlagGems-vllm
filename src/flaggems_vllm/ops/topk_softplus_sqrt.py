@@ -149,9 +149,7 @@ def _hash_kernel(
     k_offsets = tl.arange(0, BLOCK_K)
     kmask = k_offsets < topk
     expert_ids = tl.load(
-        hash_indices_table_ptr + token_id * topk + k_offsets,
-        mask=kmask,
-        other=0,
+        hash_indices_table_ptr + token_id * topk + k_offsets, mask=kmask, other=0
     )
 
     # Gather weights for each selected expert

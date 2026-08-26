@@ -37,6 +37,10 @@ FlagGems-vllm 是一个使用 OpenAI 推出的[Triton 编程语言](https://gith
 ```shell
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 ```
+
+安装 FlagGems-vllm 前，请先安装与目标加速器兼容的 PyTorch。与 FlagGems
+一致，PyTorch 由后端环境管理，FlagGems-vllm 软件包不会重复安装 PyTorch。
+
 ### 安装FlagGems-vllm
 ```shell
 git clone https://github.com/flagos-ai/FlagGems-vllm.git

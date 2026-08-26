@@ -20,6 +20,8 @@ from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
 
+pytestmark = pytest.mark.stage_deepseek_v4_mega_moe_inputs
+
 
 def _supports_fp8e4nv():
     if not torch.cuda.is_available():

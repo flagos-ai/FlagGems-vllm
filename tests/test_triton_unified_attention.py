@@ -19,6 +19,8 @@ import torch
 
 from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 
+pytestmark = pytest.mark.triton_unified_attention
+
 CONFIGS = [
     # single-seq decode (query_len=1)
     {

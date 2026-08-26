@@ -64,26 +64,10 @@ def mhc_split_sinkhorn_kernel_hcmult_4(
     tl.store(pre_ptr + pre_base + 3, tl.sigmoid(m3 * scale_0 + b3) + 1e-6, mask=mask)
 
     post_base = offs * 4
-    tl.store(
-        post_ptr + post_base + 0,
-        2.0 * tl.sigmoid(m4 * scale_1 + b4),
-        mask=mask,
-    )
-    tl.store(
-        post_ptr + post_base + 1,
-        2.0 * tl.sigmoid(m5 * scale_1 + b5),
-        mask=mask,
-    )
-    tl.store(
-        post_ptr + post_base + 2,
-        2.0 * tl.sigmoid(m6 * scale_1 + b6),
-        mask=mask,
-    )
-    tl.store(
-        post_ptr + post_base + 3,
-        2.0 * tl.sigmoid(m7 * scale_1 + b7),
-        mask=mask,
-    )
+    tl.store(post_ptr + post_base + 0, 2.0 * tl.sigmoid(m4 * scale_1 + b4), mask=mask)
+    tl.store(post_ptr + post_base + 1, 2.0 * tl.sigmoid(m5 * scale_1 + b5), mask=mask)
+    tl.store(post_ptr + post_base + 2, 2.0 * tl.sigmoid(m6 * scale_1 + b6), mask=mask)
+    tl.store(post_ptr + post_base + 3, 2.0 * tl.sigmoid(m7 * scale_1 + b7), mask=mask)
 
     cb = 8
     b8 = tl.load(hc_base_ptr + cb + 0)
@@ -282,10 +266,7 @@ def mhc_split_sinkhorn_kernel_generic(
         pre_b = tl.load(hc_base_ptr + pre_idx)
         post_b = tl.load(hc_base_ptr + post_idx)
         tl.store(pre_ptr + pre_base + j, tl.sigmoid(pre_m * scale_0 + pre_b) + 1e-6)
-        tl.store(
-            post_ptr + post_base + j,
-            2.0 * tl.sigmoid(post_m * scale_1 + post_b),
-        )
+        tl.store(post_ptr + post_base + j, 2.0 * tl.sigmoid(post_m * scale_1 + post_b))
 
     comb_offset = 2 * HC_MULT
 
@@ -370,10 +351,7 @@ def hc_split_sinkhorn(
             num_tokens, hc_mult, dtype=torch.float32, device=mixes.device
         )
         comb = torch.empty(
-            num_tokens,
-            hc_mult * hc_mult,
-            dtype=torch.float32,
-            device=mixes.device,
+            num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=mixes.device
         )
 
         if num_tokens <= 256:

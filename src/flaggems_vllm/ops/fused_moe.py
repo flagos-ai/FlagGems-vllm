@@ -1072,6 +1072,8 @@ def fused_moe_kernel(
     DIRECT_SUM: tl.constexpr,
     OUT_TOP_K: tl.constexpr,
     FUSE_SILU: tl.constexpr,
+    USE_INT32_OFFSETS: tl.constexpr,
+    FAST_BF16_OUTPUT: tl.constexpr,
 ):
     """Fused MoE kernel: token × expert GEMM with quantization support and optional SiLU fusion."""
     # Map pid to C block (grouped ordering for L2 reuse)
@@ -1088,7 +1090,10 @@ def fused_moe_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Create pointers for first blocks of A and B
-    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    if USE_INT32_OFFSETS:
+        offs = tl.arange(0, BLOCK_SIZE_M)
+    else:
+        offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
@@ -1101,13 +1106,18 @@ def fused_moe_kernel(
             pid_m,  # first element = pid_m
             num_valid_tokens,  # remaining elements = constant
         )
-    offs_token = offs_token.to(tl.int64)  # prevent int32 overflow
+    if not USE_INT32_OFFSETS:
+        offs_token = offs_token.to(tl.int64)
 
     token_mask = offs_token < num_valid_tokens
 
-    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    if not USE_INT32_OFFSETS:
+        off_experts = off_experts.to(tl.int64)
 
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if not USE_INT32_OFFSETS:
+        offs_bn = offs_bn.to(tl.int64)
     if not N_DIVISIBLE_BY_BLOCK_N:
         offs_bn = offs_bn % N_out
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -1129,7 +1139,9 @@ def fused_moe_kernel(
             )
             return
 
-        offs_pair = tl.arange(0, BLOCK_SIZE_N * 2).to(tl.int64)
+        offs_pair = tl.arange(0, BLOCK_SIZE_N * 2)
+        if not USE_INT32_OFFSETS:
+            offs_pair = offs_pair.to(tl.int64)
         offs_pair_bn = tl.where(
             offs_pair < BLOCK_SIZE_N,
             pid_n * BLOCK_SIZE_N + offs_pair,
@@ -1176,7 +1188,9 @@ def fused_moe_kernel(
 
         gate_up = tl.trans(
             tl.reshape(pair_acc, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N)),
-            (0, 2, 1),
+            0,
+            2,
+            1,
         )
         gate_acc, up_acc = tl.split(gate_up)
         gate_sig = tl.sigmoid(gate_acc)
@@ -1499,7 +1513,10 @@ def fused_moe_kernel(
         )
         accumulator *= moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
+    if FAST_BF16_OUTPUT and compute_type == tl.bfloat16:
+        accumulator = accumulator.to(compute_type, "rtne_no_nan")
+    else:
+        accumulator = accumulator.to(compute_type)
 
     # Write back output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1684,6 +1701,8 @@ def invoke_fused_moe_triton_kernel(
 
     swap_AB = config.pop("SWAP_AB", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
+    use_int32_offsets = config.pop("USE_INT32_OFFSETS", False)
+    fast_bf16_output = config.pop("FAST_BF16_OUTPUT", False)
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
@@ -1736,6 +1755,8 @@ def invoke_fused_moe_triton_kernel(
         DIRECT_SUM=direct_sum,
         OUT_TOP_K=out_top_k,
         FUSE_SILU=FUSE_SILU,
+        USE_INT32_OFFSETS=use_int32_offsets,
+        FAST_BF16_OUTPUT=fast_bf16_output,
         **config,
     )
 
@@ -2014,8 +2035,17 @@ def fused_experts_impl(
     direct_sum_supported = is_plain_half_config or is_fp8_blockwise
 
     # Check if we can safely fuse the activation with the first GEMM pass
+    use_separate_activation_for_metax_qwen36_large = (
+        num_tokens >= 8192
+        and E == 256
+        and (N, w1.size(2)) in ((1024, 2048), (256, 2048))
+        and K == 2048
+        and top_k_num == 8
+        and hidden_states.dtype == torch.bfloat16
+    )
     can_use_fused_silu = (
-        activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        not use_separate_activation_for_metax_qwen36_large
+        and activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
     )
