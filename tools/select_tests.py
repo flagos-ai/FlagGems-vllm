@@ -83,6 +83,29 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "tests/mhc_reference.py": ["tests/test_mhc_ops.py"],
+    "src/flaggems_vllm/ops/mhc/mhc_fused_post_pre.py": [
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_triton_only.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_post.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_triton_only.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_triton_only.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_with_norm.py": [
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_triton_only.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_prenorm.py": [
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_triton_only.py",
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
@@ -117,6 +140,24 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "tests/mhc_reference.py": ["benchmark/test_mhc.py"],
+    "src/flaggems_vllm/ops/mhc/mhc_fused_post_pre.py": [
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_post.py": [
+        "benchmark/test_mhc.py",
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre.py": [
+        "benchmark/test_mhc.py",
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_with_norm.py": [
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_prenorm.py": [
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
     ],
@@ -233,7 +274,11 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
 
     if path.startswith("src/flaggems_vllm/ops/mhc/"):
-        return ["tests/test_mhc_ops.py"] if "tests/test_mhc_ops.py" in tests else []
+        return [
+            target
+            for target in ("tests/test_mhc_ops.py", "tests/test_mhc_triton_only.py")
+            if target in tests
+        ]
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (

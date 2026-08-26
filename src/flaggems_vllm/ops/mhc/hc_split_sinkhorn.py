@@ -336,24 +336,56 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if mixes.device.type != "cuda":
+        raise NotImplementedError("hc_split_sinkhorn only supports CUDA tensors")
+    if hc_scale.device.type != "cuda" or hc_base.device.type != "cuda":
+        raise NotImplementedError("hc_scale and hc_base must be CUDA tensors")
+    if mixes.device != hc_scale.device or mixes.device != hc_base.device:
+        raise NotImplementedError("all inputs must be on the same CUDA device")
+    if mixes.device.index != torch.cuda.current_device():
+        raise NotImplementedError("input device must be the current CUDA device")
+    if (
+        mixes.dtype != torch.float32
+        or hc_scale.dtype != torch.float32
+        or hc_base.dtype != torch.float32
+    ):
+        raise NotImplementedError("hc_split_sinkhorn only supports float32 inputs")
+    if (
+        not mixes.is_contiguous()
+        or not hc_scale.is_contiguous()
+        or not hc_base.is_contiguous()
+    ):
+        raise NotImplementedError("hc_split_sinkhorn requires contiguous inputs")
+    if mixes.requires_grad or hc_scale.requires_grad or hc_base.requires_grad:
+        raise NotImplementedError("hc_split_sinkhorn is an inference-only path")
+    if mixes.ndim < 1:
+        raise ValueError("mixes must have at least one dimension")
+    if not isinstance(hc_mult, int) or hc_mult < 1:
+        raise ValueError("hc_mult must be a positive integer")
+    if not isinstance(sinkhorn_iters, int) or sinkhorn_iters < 1:
+        raise ValueError("sinkhorn_iters must be a positive integer")
+    if eps != 1e-6:
+        raise NotImplementedError("hc_split_sinkhorn Triton kernels require eps=1e-6")
+
     mix_hc = (2 + hc_mult) * hc_mult
-    assert mixes.shape[-1] == mix_hc
-    assert hc_scale.shape == (3,)
-    assert hc_base.shape == (mix_hc,)
+    if mixes.shape[-1] != mix_hc:
+        raise ValueError(f"mixes.shape[-1] must be {mix_hc}")
+    if hc_scale.shape != (3,):
+        raise ValueError("hc_scale must have shape (3,)")
+    if hc_base.shape != (mix_hc,):
+        raise ValueError(f"hc_base must have shape ({mix_hc},)")
 
-    if mixes.device.type == "cuda" and eps == 1e-6 and hc_mult >= 1:
-        outer_shape = mixes.shape[:-1]
-        mixes_flat = mixes.reshape(-1, mix_hc).contiguous()
-        num_tokens = mixes_flat.shape[0]
+    outer_shape = mixes.shape[:-1]
+    mixes_flat = mixes.view(-1, mix_hc)
+    num_tokens = mixes_flat.shape[0]
 
-        pre = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=mixes.device)
-        post = torch.empty(
-            num_tokens, hc_mult, dtype=torch.float32, device=mixes.device
-        )
-        comb = torch.empty(
-            num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=mixes.device
-        )
+    pre = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=mixes.device)
+    post = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=mixes.device)
+    comb = torch.empty(
+        num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=mixes.device
+    )
 
+    if num_tokens != 0:
         if num_tokens <= 256:
             block_n = 16
             num_warps = 1
@@ -404,15 +436,6 @@ def hc_split_sinkhorn(
                 num_warps=num_warps,
                 num_stages=1,
             )
-    else:
-        return mhc_split_sinkhorn_torch_ref(
-            mixes,
-            hc_scale,
-            hc_base,
-            hc_mult=hc_mult,
-            sinkhorn_iters=sinkhorn_iters,
-            eps=eps,
-        )
 
     return (
         pre.view(*outer_shape, hc_mult),
@@ -421,31 +444,4 @@ def hc_split_sinkhorn(
     )
 
 
-def mhc_split_sinkhorn_torch_ref(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    outer_shape = mixes.shape[:-1]
-    mix_hc = (2 + hc_mult) * hc_mult
-    assert mixes.shape[-1] == mix_hc
-
-    pre = torch.sigmoid(mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
-    post = 2 * torch.sigmoid(
-        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
-    comb = mixes[..., 2 * hc_mult :].view(*outer_shape, hc_mult, hc_mult) * hc_scale[
-        2
-    ] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
-
-    row_max = comb.max(dim=-1, keepdim=True).values
-    comb = (comb - row_max).exp()
-    comb = comb / comb.sum(dim=-1, keepdim=True) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
+__all__ = ["hc_split_sinkhorn"]

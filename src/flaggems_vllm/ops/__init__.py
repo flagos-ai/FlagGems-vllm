@@ -72,12 +72,10 @@ from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cach
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.mhc import (
     hc_head_fused_kernel,
-    hc_head_fused_kernel_ref,
     mhc_bwd,
-    mhc_bwd_ref,
+    mhc_fused_post_pre,
     mhc_post,
     mhc_pre,
-    sinkhorn_forward,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
@@ -173,13 +171,12 @@ __all__ = [
     "gelu_and_mul",
     "grouped_topk",
     "hc_head_fused_kernel",
-    "hc_head_fused_kernel_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
     "invoke_fused_moe_triton_kernel",
     "mhc_bwd",
-    "mhc_bwd_ref",
+    "mhc_fused_post_pre",
     "mhc_post",
     "mhc_pre",
     "moe_align_block_size",
@@ -207,7 +204,6 @@ __all__ = [
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
-    "sinkhorn_forward",
     "skip_layer_norm",
     "sparse_attn_triton",
     "stage_deepseek_v4_mega_moe_inputs",
