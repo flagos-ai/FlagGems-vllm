@@ -86,16 +86,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
-    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
-        "tests/test_fused_experts_impl.py",
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
-        "tests/test_fused_experts_impl.py",
-        "tests/test_moe_sum.py",
-    ],
-    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
-        "tests/test_fused_experts_impl.py",
-    ],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
@@ -116,6 +106,16 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "tests/test_FLA/test_chunk_gated_delta_rule.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
+        "tests/test_fused_experts_impl.py",
+        "tests/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
@@ -134,20 +134,6 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_fused_moe_int8.py",
         "benchmark/test_fused_moe_int8_w8a16.py",
         "benchmark/test_fused_moe_w8a16.py",
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
-        "benchmark/test_fused_moe.py",
-        "benchmark/test_fused_moe_fp8.py",
-        "benchmark/test_fused_moe_fp8_blockwise.py",
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
-        "benchmark/test_fused_moe.py",
-        "benchmark/test_moe_sum.py",
-    ],
-    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
-        "benchmark/test_fused_moe.py",
-        "benchmark/test_fused_moe_fp8.py",
-        "benchmark/test_fused_moe_fp8_blockwise.py",
     ],
     "src/flaggems_vllm/ops/sparse_attention.py": [
         "benchmark/test_sparse_attention.py",
@@ -172,6 +158,16 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
+        "benchmark/test_fused_moe.py",
+        "benchmark/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
     ],
 }
 
