@@ -25,9 +25,20 @@ import triton.language as tl
 
 
 @triton.jit
-def _scatter_kernel(dst, indices, rows, wmask, cache_rows, s0, s1, s2,
-                    HIDDEN: tl.constexpr, WIDTH: tl.constexpr,
-                    HP: tl.constexpr, BW: tl.constexpr):
+def _scatter_kernel(
+    dst,
+    indices,
+    rows,
+    wmask,
+    cache_rows,
+    s0,
+    s1,
+    s2,
+    HIDDEN: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HP: tl.constexpr,
+    BW: tl.constexpr,
+):
     pid = tl.program_id(0)
     idx = tl.load(indices + pid).to(tl.int32)
     m = tl.load(wmask + pid)
@@ -53,7 +64,9 @@ def _validate(state, name):
         )
 
 
-def ple_state_scatter_(state, indices, rows, *, write_mask=None, indices_are_safe=False):
+def ple_state_scatter_(
+    state, indices, rows, *, write_mask=None, indices_are_safe=False
+):
     del indices_are_safe
     _validate(state, "state")
     _validate(rows, "state rows")
@@ -70,15 +83,11 @@ def ple_state_scatter_(state, indices, rows, *, write_mask=None, indices_are_saf
     if rows.shape[0] != indices.numel() or tuple(rows.shape[1:]) != tuple(
         state.shape[1:]
     ):
-        raise ValueError(
-            "PLE state scatter rows and indices have incompatible shapes"
-        )
+        raise ValueError("PLE state scatter rows and indices have incompatible shapes")
     if rows.device != state.device or rows.dtype != state.dtype:
         raise ValueError("PLE state scatter rows must match state device and dtype")
     if write_mask is None:
-        raise NotImplementedError(
-            "Qwen4 PLE scatter requires an explicit write_mask"
-        )
+        raise NotImplementedError("Qwen4 PLE scatter requires an explicit write_mask")
     if write_mask.ndim != 1 or write_mask.numel() != indices.numel():
         raise ValueError("PLE state scatter write_mask must match indices")
     if write_mask.device != state.device or write_mask.dtype != torch.bool:
@@ -93,7 +102,17 @@ def ple_state_scatter_(state, indices, rows, *, write_mask=None, indices_are_saf
     HP = triton.next_power_of_2(hidden)
     BW = triton.next_power_of_2(width)
     _scatter_kernel[(n,)](
-        state, indices, rows, write_mask, cache_rows,
-        s0, s1, s2, HIDDEN=hidden, WIDTH=width, HP=HP, BW=BW
+        state,
+        indices,
+        rows,
+        write_mask,
+        cache_rows,
+        s0,
+        s1,
+        s2,
+        HIDDEN=hidden,
+        WIDTH=width,
+        HP=HP,
+        BW=BW,
     )
     return state

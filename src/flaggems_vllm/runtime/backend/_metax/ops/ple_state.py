@@ -66,7 +66,9 @@ def _validate(state, name):
         )
 
 
-def ple_state_scatter_(state, indices, rows, *, write_mask=None, indices_are_safe=False):
+def ple_state_scatter_(
+    state, indices, rows, *, write_mask=None, indices_are_safe=False
+):
     del indices_are_safe
     _validate(state, "state")
     _validate(rows, "state rows")
@@ -83,15 +85,11 @@ def ple_state_scatter_(state, indices, rows, *, write_mask=None, indices_are_saf
     if rows.shape[0] != indices.numel() or tuple(rows.shape[1:]) != tuple(
         state.shape[1:]
     ):
-        raise ValueError(
-            "PLE state scatter rows and indices have incompatible shapes"
-        )
+        raise ValueError("PLE state scatter rows and indices have incompatible shapes")
     if rows.device != state.device or rows.dtype != state.dtype:
         raise ValueError("PLE state scatter rows must match state device and dtype")
     if write_mask is None:
-        raise NotImplementedError(
-            "Qwen4 PLE scatter requires an explicit write_mask"
-        )
+        raise NotImplementedError("Qwen4 PLE scatter requires an explicit write_mask")
     if write_mask.ndim != 1 or write_mask.numel() != indices.numel():
         raise ValueError("PLE state scatter write_mask must match indices")
     if write_mask.device != state.device or write_mask.dtype != torch.bool:

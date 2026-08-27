@@ -80,7 +80,9 @@ def _validate(state, name):
         )
 
 
-def ple_state_scatter_(state, indices, rows, *, write_mask=None, indices_are_safe=False):
+def ple_state_scatter_(
+    state, indices, rows, *, write_mask=None, indices_are_safe=False
+):
     del indices_are_safe
     _validate(state, "state")
     _validate(rows, "state rows")
