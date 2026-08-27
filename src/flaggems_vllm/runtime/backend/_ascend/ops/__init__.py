@@ -14,7 +14,7 @@
 
 
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
-    qwen4_compress_norm_mrope_store_groups
+    qwen4_compress_norm_mrope_store_groups,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,

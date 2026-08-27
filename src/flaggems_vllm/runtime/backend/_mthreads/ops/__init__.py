@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
-    qwen4_compress_norm_mrope_store_groups
+    qwen4_compress_norm_mrope_store_groups,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
