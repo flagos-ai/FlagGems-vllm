@@ -17,8 +17,9 @@ import threading
 from typing import Any
 
 import flaggems_vllm.ops.fused_moe as generic_fused_moe
-
-from .moe_sum import moe_sum as mthreads_moe_sum
+from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import (
+    moe_sum as mthreads_moe_sum,
+)
 
 _PATCH_LOCK = threading.RLock()
 _GENERIC_GET_DEFAULT_CONFIG = generic_fused_moe.get_default_config

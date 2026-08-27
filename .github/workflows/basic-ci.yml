@@ -182,7 +182,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: flagos-ai/FlagGems
-          ref: b10f1d47401b2df7166ac0aff8958128338ed237
+          ref: 42d396ff8270f7b051f478217929f75484e53ef4
           sparse-checkout: .github/backends.json
           sparse-checkout-cone-mode: false
           path: .ci/flaggems-registry
@@ -202,6 +202,7 @@ jobs:
           set -euo pipefail
           args=(
             --registry .ci/flaggems-registry/.github/backends.json
+            --capabilities .github/backend-capabilities.json
             --labels-json "${PR_LABELS_JSON:-null}"
             --changed-files changed_files.bin
             --format github
@@ -297,7 +298,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select-targets.outputs.non_nvidia_matrix) }}
-    uses: flagos-ai/FlagGems/.github/workflows/backend-test.yaml@b10f1d47401b2df7166ac0aff8958128338ed237
+    uses: flagos-ai/FlagGems/.github/workflows/backend-test.yaml@42d396ff8270f7b051f478217929f75484e53ef4
     with:
       backend: ${{ matrix.backend }}
       runner_label: ${{ matrix.runner_label }}

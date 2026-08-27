@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from backend_utils import VendorDescriptor
+from flaggems_vllm.runtime.backend.backend_utils import VendorDescriptor
 
 
 def get_triton_extra_name():
