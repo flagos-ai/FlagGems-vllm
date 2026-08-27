@@ -24,5 +24,5 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
 __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
-    "scaled_int8_quant"
+    "scaled_int8_quant",
 ]
