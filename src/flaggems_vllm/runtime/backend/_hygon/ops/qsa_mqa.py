@@ -28,12 +28,24 @@ import triton.language as tl
 
 @triton.jit
 def _qsa_mqa_paged_dot_kernel(
-    q_ptr, k_ptr, pt_ptr, t2r_ptr, qpos_ptr, seq_ptr,
-    logits_ptr, visible_ptr,
-    num_columns, num_pages, num_requests, page_table_width,
-    compress_ratio, inv_sqrt_dim,
-    BLOCK_PAGES: tl.constexpr, PAGE_SIZE: tl.constexpr,
-    HEAD_DIM: tl.constexpr, NUM_HEADS: tl.constexpr,
+    q_ptr,
+    k_ptr,
+    pt_ptr,
+    t2r_ptr,
+    qpos_ptr,
+    seq_ptr,
+    logits_ptr,
+    visible_ptr,
+    num_columns,
+    num_pages,
+    num_requests,
+    page_table_width,
+    compress_ratio,
+    inv_sqrt_dim,
+    BLOCK_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
 ):
     row = tl.program_id(0)
     page_block = tl.program_id(1)
@@ -54,8 +66,9 @@ def _qsa_mqa_paged_dot_kernel(
     logical_page = page_block * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
     lp_valid = logical_page < page_table_width
     safe_lp = tl.minimum(logical_page, page_table_width - 1)
-    phys = tl.load(pt_ptr + safe_req * page_table_width + safe_lp,
-                   mask=lp_valid, other=-1)
+    phys = tl.load(
+        pt_ptr + safe_req * page_table_width + safe_lp, mask=lp_valid, other=-1
+    )
     phys_valid = (phys >= 0) & (phys < num_pages)
     page_valid = lp_valid & phys_valid
 
@@ -64,14 +77,15 @@ def _qsa_mqa_paged_dot_kernel(
         + offs_p[None, :, None] * HEAD_DIM
         + offs_d[None, None, :]
     )
-    k_tile = tl.load(k_ptr + k_offsets, mask=page_valid[:, None, None],
-                     other=0.0).to(tl.float32)
+    k_tile = tl.load(k_ptr + k_offsets, mask=page_valid[:, None, None], other=0.0).to(
+        tl.float32
+    )
 
     acc = tl.zeros([BLOCK_PAGES, PAGE_SIZE], dtype=tl.float32)
     for h in tl.static_range(NUM_HEADS):
-        qh = tl.load(
-            q_ptr + row * (NUM_HEADS * HEAD_DIM) + h * HEAD_DIM + offs_d
-        ).to(tl.float32)
+        qh = tl.load(q_ptr + row * (NUM_HEADS * HEAD_DIM) + h * HEAD_DIM + offs_d).to(
+            tl.float32
+        )
         dots_h = tl.sum(k_tile * qh[None, None, :], axis=2)
         acc += tl.maximum(dots_h, 0.0)
     score = acc * inv_sqrt_dim
@@ -96,7 +110,14 @@ def qwen4_qsa_mqa_paged_dot(
 ):
     if not all(
         t.device.type not in ("cpu", "meta")
-        for t in (q, k_cache, page_table, token_to_req, query_positions, sequence_lengths)
+        for t in (
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+        )
     ):
         raise RuntimeError("Qwen4 QSA MQA dot requires a Triton accelerator")
     if q.ndim != 3 or q.shape[1:] != (4, 128) or q.dtype != torch.bfloat16:
@@ -112,10 +133,15 @@ def qwen4_qsa_mqa_paged_dot(
 
     rows = q.shape[0]
     if rows and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
-        raise ValueError("Qwen4 QSA MQA cache and page table must be nonempty for nonempty q")
+        raise ValueError(
+            "Qwen4 QSA MQA cache and page table must be nonempty for nonempty q"
+        )
     if token_to_req.shape != (rows,) or query_positions.shape != (rows,):
         raise ValueError("Qwen4 QSA request metadata must match query rows")
-    if token_to_req.dtype not in (torch.int32, torch.int64) or query_positions.dtype not in (torch.int32, torch.int64):
+    if token_to_req.dtype not in (
+        torch.int32,
+        torch.int64,
+    ) or query_positions.dtype not in (torch.int32, torch.int64):
         raise TypeError("Qwen4 QSA request metadata must use int32 or int64")
     if sequence_lengths.shape != (page_table.shape[0],):
         raise ValueError("Qwen4 QSA sequence lengths must match page-table requests")
@@ -134,7 +160,6 @@ def qwen4_qsa_mqa_paged_dot(
             sequence_lengths.max().item() if sequence_lengths.numel() else 0,
             compress_ratio,
         )
-
 
     rows = q.shape[0]
     num_pages = k_cache.shape[0]
@@ -161,14 +186,24 @@ def qwen4_qsa_mqa_paged_dot(
     inv_sqrt_dim = 1.0 / math.sqrt(head_dim)
 
     _qsa_mqa_paged_dot_kernel[grid](
-        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
-        logits, visible,
-        num_columns, num_pages, num_requests, page_table_width,
-        compress_ratio, inv_sqrt_dim,
-        BLOCK_PAGES=BLOCK_PAGES, PAGE_SIZE=page_size, HEAD_DIM=head_dim,
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        logits,
+        visible,
+        num_columns,
+        num_pages,
+        num_requests,
+        page_table_width,
+        compress_ratio,
+        inv_sqrt_dim,
+        BLOCK_PAGES=BLOCK_PAGES,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
         NUM_HEADS=num_heads,
         num_warps=4,
     )
     return logits, visible
-
-

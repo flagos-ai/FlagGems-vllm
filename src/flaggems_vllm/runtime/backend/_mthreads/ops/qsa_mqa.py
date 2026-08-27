@@ -65,7 +65,6 @@ def _qsa_mqa_paged_dot_kernel(
 
     # --- per-page (block of columns) work ---
     cols = pid_col * page_size + tl.arange(0, page_size)
-    page_offset = tl.arange(0, page_size)
 
     logical_page = pid_col
     lp_valid = logical_page < page_table_width
@@ -97,10 +96,18 @@ def _qsa_mqa_paged_dot_kernel(
     # compute the four head dots independently and combine with a balanced
     # tree so the reduction dependency chain stays short. The q rows are
     # re-read by every column program of a row, so keep them resident.
-    q0 = tl.load(q_ptr + q_base + 0 * head_dim + d, eviction_policy="evict_last").to(tl.float32)
-    q1 = tl.load(q_ptr + q_base + 1 * head_dim + d, eviction_policy="evict_last").to(tl.float32)
-    q2 = tl.load(q_ptr + q_base + 2 * head_dim + d, eviction_policy="evict_last").to(tl.float32)
-    q3 = tl.load(q_ptr + q_base + 3 * head_dim + d, eviction_policy="evict_last").to(tl.float32)
+    q0 = tl.load(q_ptr + q_base + 0 * head_dim + d, eviction_policy="evict_last").to(
+        tl.float32
+    )
+    q1 = tl.load(q_ptr + q_base + 1 * head_dim + d, eviction_policy="evict_last").to(
+        tl.float32
+    )
+    q2 = tl.load(q_ptr + q_base + 2 * head_dim + d, eviction_policy="evict_last").to(
+        tl.float32
+    )
+    q3 = tl.load(q_ptr + q_base + 3 * head_dim + d, eviction_policy="evict_last").to(
+        tl.float32
+    )
     d0 = tl.sum(q0[None, :] * k_block, axis=1)
     d1 = tl.sum(q1[None, :] * k_block, axis=1)
     d2 = tl.sum(q2[None, :] * k_block, axis=1)
@@ -112,9 +119,7 @@ def _qsa_mqa_paged_dot_kernel(
     score = score * (1.0 / math.sqrt(head_dim))
 
     result = tl.where(valid, score, float("-inf"))
-    tl.store(
-        logits_ptr + pid_row * num_columns + cols, result, mask=cols < num_columns
-    )
+    tl.store(logits_ptr + pid_row * num_columns + cols, result, mask=cols < num_columns)
 
 
 def qwen4_qsa_mqa_paged_dot(
@@ -130,7 +135,14 @@ def qwen4_qsa_mqa_paged_dot(
 ):
     if not all(
         t.device.type not in ("cpu", "meta")
-        for t in (q, k_cache, page_table, token_to_req, query_positions, sequence_lengths)
+        for t in (
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+        )
     ):
         raise RuntimeError("Qwen4 QSA MQA dot requires a Triton accelerator")
     if q.ndim != 3 or q.shape[1:] != (4, 128) or q.dtype != torch.bfloat16:
@@ -146,10 +158,15 @@ def qwen4_qsa_mqa_paged_dot(
 
     rows = q.shape[0]
     if rows and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
-        raise ValueError("Qwen4 QSA MQA cache and page table must be nonempty for nonempty q")
+        raise ValueError(
+            "Qwen4 QSA MQA cache and page table must be nonempty for nonempty q"
+        )
     if token_to_req.shape != (rows,) or query_positions.shape != (rows,):
         raise ValueError("Qwen4 QSA request metadata must match query rows")
-    if token_to_req.dtype not in (torch.int32, torch.int64) or query_positions.dtype not in (torch.int32, torch.int64):
+    if token_to_req.dtype not in (
+        torch.int32,
+        torch.int64,
+    ) or query_positions.dtype not in (torch.int32, torch.int64):
         raise TypeError("Qwen4 QSA request metadata must use int32 or int64")
     if sequence_lengths.shape != (page_table.shape[0],):
         raise ValueError("Qwen4 QSA sequence lengths must match page-table requests")
@@ -168,7 +185,6 @@ def qwen4_qsa_mqa_paged_dot(
             sequence_lengths.max().item() if sequence_lengths.numel() else 0,
             compress_ratio,
         )
-
 
     rows = q.shape[0]
     num_pages = k_cache.shape[0]
@@ -203,5 +219,3 @@ def qwen4_qsa_mqa_paged_dot(
         page_size=page_size,
     )
     return logits, visible
-
-

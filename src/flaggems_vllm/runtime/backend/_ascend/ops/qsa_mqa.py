@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-
 import math
 
 import torch
@@ -29,10 +28,20 @@ import triton.language as tl
 
 @triton.jit
 def _qsa_mqa_paged_dot_kernel(
-    Q_PTR, K_PTR, PT_PTR, T2R_PTR, QPOS_PTR, SL_PTR, LOG_PTR, VIS_PTR,
-    NUM_REQUESTS, NUM_PAGES,
-    q_stride_row, q_stride_head,
-    k_stride_page, k_stride_off,
+    Q_PTR,
+    K_PTR,
+    PT_PTR,
+    T2R_PTR,
+    QPOS_PTR,
+    SL_PTR,
+    LOG_PTR,
+    VIS_PTR,
+    NUM_REQUESTS,
+    NUM_PAGES,
+    q_stride_row,
+    q_stride_head,
+    k_stride_page,
+    k_stride_off,
     pt_stride_req,
     log_stride_row,
     COMPRESS_RATIO: tl.constexpr,
@@ -72,7 +81,9 @@ def _qsa_mqa_paged_dot_kernel(
     lp_valid = (logical_page < PAGE_TABLE_WIDTH) & col_mask
     valid_col = valid_req & (col_offs < visible) & lp_valid
     safe_lp = tl.where(lp_valid, logical_page, 0)
-    phys = tl.load(PT_PTR + safe_req * pt_stride_req + safe_lp, mask=valid_col, other=-1)
+    phys = tl.load(
+        PT_PTR + safe_req * pt_stride_req + safe_lp, mask=valid_col, other=-1
+    )
     phys_valid = valid_col & (phys >= 0) & (phys < NUM_PAGES)
     safe_phys = tl.where(phys_valid, phys, 0)
     safe_off = tl.where(phys_valid, page_off, 0)
@@ -86,7 +97,9 @@ def _qsa_mqa_paged_dot_kernel(
     # ---- Per-head dot, direct Q slice load (4 tiny 128-elem loads) ----
     scores = tl.zeros([BLOCK_C], dtype=tl.float32)
     for h in tl.static_range(HEADS_C):
-        q_h = tl.load(Q_PTR + r * q_stride_row + h * q_stride_head + d_idx).to(tl.float32)
+        q_h = tl.load(Q_PTR + r * q_stride_row + h * q_stride_head + d_idx).to(
+            tl.float32
+        )
         dot_h = tl.sum(k_f32 * q_h[None, :], axis=1)  # [BLOCK_C]
         scores += tl.maximum(dot_h, 0.0)
     scores = scores * INV_SQRT
@@ -108,7 +121,14 @@ def qwen4_qsa_mqa_paged_dot(
 ):
     if not all(
         t.device.type not in ("cpu", "meta")
-        for t in (q, k_cache, page_table, token_to_req, query_positions, sequence_lengths)
+        for t in (
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+        )
     ):
         raise RuntimeError("Qwen4 QSA MQA dot requires a Triton accelerator")
     if q.ndim != 3 or q.shape[1:] != (4, 128) or q.dtype != torch.bfloat16:
@@ -124,10 +144,15 @@ def qwen4_qsa_mqa_paged_dot(
 
     rows = q.shape[0]
     if rows and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
-        raise ValueError("Qwen4 QSA MQA cache and page table must be nonempty for nonempty q")
+        raise ValueError(
+            "Qwen4 QSA MQA cache and page table must be nonempty for nonempty q"
+        )
     if token_to_req.shape != (rows,) or query_positions.shape != (rows,):
         raise ValueError("Qwen4 QSA request metadata must match query rows")
-    if token_to_req.dtype not in (torch.int32, torch.int64) or query_positions.dtype not in (torch.int32, torch.int64):
+    if token_to_req.dtype not in (
+        torch.int32,
+        torch.int64,
+    ) or query_positions.dtype not in (torch.int32, torch.int64):
         raise TypeError("Qwen4 QSA request metadata must use int32 or int64")
     if sequence_lengths.shape != (page_table.shape[0],):
         raise ValueError("Qwen4 QSA sequence lengths must match page-table requests")
@@ -146,7 +171,6 @@ def qwen4_qsa_mqa_paged_dot(
             sequence_lengths.max().item() if sequence_lengths.numel() else 0,
             compress_ratio,
         )
-
 
     rows = q.shape[0]
     heads = q.shape[1]
@@ -173,17 +197,26 @@ def qwen4_qsa_mqa_paged_dot(
     elif rows >= 4:
         BLOCK_C = 128  # 8r*8 tiles = 64 programs
     else:
-        BLOCK_C = 64   # 1r*16 tiles = 16 programs
+        BLOCK_C = 64  # 1r*16 tiles = 16 programs
 
     num_tiles = triton.cdiv(num_columns, BLOCK_C)
     grid = (rows, num_tiles)
 
     _qsa_mqa_paged_dot_kernel[grid](
-        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
-        logits, visible,
-        num_requests, num_pages,
-        q.stride(0), q.stride(1),
-        k_cache.stride(0), k_cache.stride(1),
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        logits,
+        visible,
+        num_requests,
+        num_pages,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
         page_table.stride(0),
         logits.stride(0),
         COMPRESS_RATIO=compress_ratio,
@@ -196,5 +229,3 @@ def qwen4_qsa_mqa_paged_dot(
         INV_SQRT=1.0 / math.sqrt(d),
     )
     return logits, visible
-
-

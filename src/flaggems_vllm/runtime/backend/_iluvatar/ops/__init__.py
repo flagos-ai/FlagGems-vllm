@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
-from .qsa_mqa import qwen4_qsa_mqa_paged_dot
-from .scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
+    scaled_int8_quant,
+)
 
 __all__ = ["qwen4_qsa_mqa_paged_dot", "scaled_int8_quant"]
