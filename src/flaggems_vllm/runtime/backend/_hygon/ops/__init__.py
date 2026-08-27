@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
+    qwen4_compress_norm_mrope_store_groups,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
@@ -32,6 +35,7 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "qwen4_qsa_mqa_paged_dot",
+    "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
     "triton_scaled_mm",
 ]
