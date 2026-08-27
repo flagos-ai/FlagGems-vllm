@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
-    qwen4_hc_inject_combine,
-)
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
+)
+from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
