@@ -47,9 +47,9 @@ def _hc_inject_combine_kernel(
         other=0.0,
     ).to(tl.float32)
     for branch in tl.static_range(0, hc_count):
-        logits = tl.load(
-            injection_logits_ptr + row * stride_logits_row + branch
-        ).to(tl.float32)
+        logits = tl.load(injection_logits_ptr + row * stride_logits_row + branch).to(
+            tl.float32
+        )
         injection_weight = 2.0 * tl.sigmoid(logits / hc_count)
         branch_offsets = branch * hidden_size + offsets
         residual = tl.load(

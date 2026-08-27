@@ -13,7 +13,11 @@
 # limitations under the License.
 
 
-from .hyperconnection import qwen4_hc_inject_combine
-from .scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
+    scaled_int8_quant,
+)
 
 __all__ = ["qwen4_hc_inject_combine", "scaled_int8_quant"]

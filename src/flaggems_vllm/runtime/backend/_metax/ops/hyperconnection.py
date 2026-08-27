@@ -87,9 +87,9 @@ def _hc_inject_combine_fused_kernel(
         other=0.0,
     ).to(tl.float32)
     for branch in tl.static_range(0, hc_count):
-        logits = tl.load(
-            injection_logits_ptr + row * stride_logits_row + branch
-        ).to(tl.float32)
+        logits = tl.load(injection_logits_ptr + row * stride_logits_row + branch).to(
+            tl.float32
+        )
         injection_weight = 2.0 * tl.sigmoid(logits / hc_count)
         branch_offsets = branch * hidden_size + offsets
         residual = tl.load(
@@ -161,9 +161,7 @@ def qwen4_hc_inject_combine(
             num_warps=2,
         )
     else:
-        _hc_inject_combine_kernel[
-            (rows, hc_count, triton.cdiv(hidden_size, block_h))
-        ](
+        _hc_inject_combine_kernel[(rows, hc_count, triton.cdiv(hidden_size, block_h))](
             *common_args,
             hidden_size=hidden_size,
             hc_count=hc_count,
