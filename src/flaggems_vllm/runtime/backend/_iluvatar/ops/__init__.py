@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
-    qwen4_hc_inject_combine,
-)
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._iluvatar.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
