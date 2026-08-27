@@ -13,9 +13,17 @@
 # limitations under the License.
 
 
-from .compress_norm_mrope import qwen4_compress_norm_mrope_store_groups
-from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
-from .scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
+    qwen4_compress_norm_mrope_store_groups
+)
+from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
+    scaled_int8_quant,
+)
 
 __all__ = [
     "fused_experts_impl",

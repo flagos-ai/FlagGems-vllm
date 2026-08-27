@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .compress_norm_mrope import qwen4_compress_norm_mrope_store_groups
-from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
-from .scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
+    qwen4_compress_norm_mrope_store_groups
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
+    SUPPORTED_FP8_DTYPE,
+    per_token_group_quant_fp8,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
+    scaled_int8_quant,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",

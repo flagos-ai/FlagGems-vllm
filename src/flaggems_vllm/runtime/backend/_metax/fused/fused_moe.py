@@ -7,8 +7,7 @@ import contextlib
 import threading
 
 import flaggems_vllm.ops.fused_moe as generic_fused_moe
-
-from .moe_sum import moe_sum as metax_moe_sum
+from flaggems_vllm.runtime.backend._metax.fused.moe_sum import moe_sum as metax_moe_sum
 
 _PATCH_LOCK = threading.RLock()
 _GENERIC_GET_DEFAULT_CONFIG = generic_fused_moe.get_default_config

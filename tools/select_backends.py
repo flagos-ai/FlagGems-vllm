@@ -56,6 +56,33 @@ def load_registry(path: Path) -> list[dict[str, Any]]:
     return registry
 
 
+def load_auto_selected_backends(path: Path) -> set[str]:
+    """Return backends approved for automatic path-based CI routing."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or config.get("schema_version") != 1:
+        raise ValueError("backend capabilities must use schema_version 1")
+
+    defaults = config.get("defaults")
+    backends = config.get("backends")
+    if not isinstance(defaults, dict) or not isinstance(backends, dict):
+        raise ValueError("backend capabilities require defaults and backends objects")
+
+    default = defaults.get("auto_select")
+    if default is not False:
+        raise ValueError("defaults.auto_select must be false")
+
+    selected = set()
+    for backend, override in backends.items():
+        if not isinstance(backend, str) or not isinstance(override, dict):
+            raise ValueError("backend capability entries must be named objects")
+        value = override.get("auto_select", default)
+        if not isinstance(value, bool):
+            raise ValueError(f"auto_select for {backend!r} must be a boolean")
+        if value:
+            selected.add(backend)
+    return selected
+
+
 def parse_labels(value: str) -> set[str]:
     labels = json.loads(value)
     if labels is None:
@@ -90,18 +117,26 @@ def select_backends(
     labels: set[str],
     all_enabled: bool,
     changed_files: set[str] | None = None,
+    *,
+    auto_selected_backends: set[str],
 ) -> list[dict[str, str]]:
     changed_files = changed_files or set()
+    registry_backends = {entry["backend"] for entry in registry}
+    unknown_backends = auto_selected_backends - registry_backends
+    if unknown_backends:
+        unknown = ", ".join(sorted(unknown_backends))
+        raise ValueError(f"auto-selected backends missing from registry: {unknown}")
+
     selected = []
     for entry in registry:
         backend = entry["backend"]
         if not entry["enabled"] or backend.startswith("nvidia"):
             continue
-        if (
-            not all_enabled
-            and entry["label"] not in labels
-            and not backend_changed(backend, changed_files)
-        ):
+        explicitly_selected = all_enabled or entry["label"] in labels
+        automatically_selected = backend_changed(backend, changed_files) and (
+            backend in auto_selected_backends
+        )
+        if not explicitly_selected and not automatically_selected:
             continue
 
         selected.append(
@@ -119,6 +154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--registry", required=True, type=Path)
     parser.add_argument("--labels-json", default="[]")
     parser.add_argument("--changed-files", type=Path)
+    parser.add_argument("--capabilities", required=True, type=Path)
     parser.add_argument("--all-enabled", action="store_true")
     parser.add_argument("--format", choices=("github", "json", "list"), default="list")
     return parser.parse_args()
@@ -126,11 +162,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    auto_selected_backends = load_auto_selected_backends(args.capabilities)
     selected = select_backends(
         load_registry(args.registry),
         parse_labels(args.labels_json),
         args.all_enabled,
         read_changed_files(args.changed_files),
+        auto_selected_backends=auto_selected_backends,
     )
     matrix = {"include": selected}
 
