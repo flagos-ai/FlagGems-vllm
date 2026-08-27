@@ -13,10 +13,10 @@
 # limitations under the License.
 
 
-from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
