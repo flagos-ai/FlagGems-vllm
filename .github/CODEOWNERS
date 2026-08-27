@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-/.github/CODEOWNERS @huangyiqun @0x45f
-/.github/workflows/** @huangyiqun @0x45f
-/.github/actions/** @huangyiqun @0x45f
-/.github/backend-capabilities.json @huangyiqun @0x45f
-/.github/MULTI_BACKEND_CI.md @huangyiqun @0x45f
-/tools/check_backend_env.py @huangyiqun @0x45f
-/tools/check_ci_pins.py @huangyiqun @0x45f
-/tools/prepare-flaggems-ci-env.sh @huangyiqun @0x45f
-/tools/run-multi-backend-tests.sh @huangyiqun @0x45f
-/tools/run_ci_targets.py @huangyiqun @0x45f
-/tools/select_backends.py @huangyiqun @0x45f
-/tools/select_tests.py @huangyiqun @0x45f
-/tools/setup.sh @huangyiqun @0x45f
-/tools/test_ci_helpers.py @huangyiqun @0x45f
+/.github/CODEOWNERS @huangyiqun @0x45f @Vincent-Xiao
+/.github/workflows/** @huangyiqun @0x45f @Vincent-Xiao
+/.github/actions/** @huangyiqun @0x45f @Vincent-Xiao
+/.github/backend-capabilities.json @huangyiqun @0x45f @Vincent-Xiao
+/.github/MULTI_BACKEND_CI.md @huangyiqun @0x45f @Vincent-Xiao
+/tools/check_backend_env.py @huangyiqun @0x45f @Vincent-Xiao
+/tools/check_ci_pins.py @huangyiqun @0x45f @Vincent-Xiao
+/tools/prepare-flaggems-ci-env.sh @huangyiqun @0x45f @Vincent-Xiao
+/tools/run-multi-backend-tests.sh @huangyiqun @0x45f @Vincent-Xiao
+/tools/run_ci_targets.py @huangyiqun @0x45f @Vincent-Xiao
+/tools/select_backends.py @huangyiqun @0x45f @Vincent-Xiao
+/tools/select_tests.py @huangyiqun @0x45f @Vincent-Xiao
+/tools/setup.sh @huangyiqun @0x45f @Vincent-Xiao
+/tools/test_ci_absolute_imports.py @huangyiqun @0x45f @Vincent-Xiao
+/tools/test_ci_helpers.py @huangyiqun @0x45f @Vincent-Xiao
