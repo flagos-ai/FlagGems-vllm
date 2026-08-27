@@ -24,11 +24,12 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.FLA.gdn2_native.chunk_intra_token_parallel import (
+    chunk_gdn2_fwd_intra_token_parallel,
+)
+from flaggems_vllm.ops.FLA.gdn2_native.wy_fast import recompute_w_u_fwd_gdn2
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
 from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
-
-from .chunk_intra_token_parallel import chunk_gdn2_fwd_intra_token_parallel
-from .wy_fast import recompute_w_u_fwd_gdn2
 
 IS_TF32_SUPPORTED = (
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8

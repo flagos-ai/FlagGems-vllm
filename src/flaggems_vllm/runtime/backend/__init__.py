@@ -17,12 +17,23 @@ import functools
 import importlib
 import inspect
 import os
-import sys
 from pathlib import Path
 
 from ..common import vendors
 from . import backend_utils
 from .backend_utils import BackendEventBase
+
+_BACKEND_PACKAGE = __name__
+
+
+def _get_vendor_module_name(vendor_name):
+    """Return the package-qualified module name for a vendor backend."""
+    if not vendor_name:
+        raise ValueError("vendor_name is required")
+    vendor_module_name = vendor_name.rsplit(".", 1)[-1]
+    if not vendor_module_name.startswith("_"):
+        vendor_module_name = "_" + vendor_module_name
+    return f"{_BACKEND_PACKAGE}.{vendor_module_name}"
 
 
 class BackendState:
@@ -111,11 +122,7 @@ class TritonVersionEvent(BackendEventBase):
 
     def get_version_spec_module(self):
         module_name = f"triton_{self.version}"
-        path_dir = os.path.dirname(self.dir)
-        sys.path.insert(0, str(path_dir))
-        version_module = importlib.import_module(module_name)
-        sys.path.remove(str(path_dir))
-        return version_module
+        return importlib.import_module(f"{_state.vendor_module.__name__}.{module_name}")
 
     def get_ops(self, *args, **kwargs):
         return self.get_version_ops()
@@ -167,9 +174,11 @@ class BackendArchEvent(BackendEventBase):
         try:
             heuristic_module = self.arch_module
         except Exception:  # noqa E722
-            sys.path.insert(0, str(self.current_arch_path))
-            heuristic_module = importlib.import_module("heuristics_config_utils")
-            sys.path.remove(str(self.current_arch_path))
+            module_name = (
+                f"{_state.vendor_module.__name__}.{self.arch}."
+                "heuristics_config_utils"
+            )
+            heuristic_module = importlib.import_module(module_name)
         return getattr(heuristic_module, "HEURISTICS_CONFIGS", None)
 
     def get_autotune_configs(self):
@@ -213,11 +222,8 @@ class BackendArchEvent(BackendEventBase):
 
     def get_arch_module(self):
         """Load backend.<arch>"""
-        path_dir = os.path.dirname(self.current_arch_path)
-        sys.path.insert(0, str(path_dir))
-        current_arch_module = importlib.import_module(self.arch)
-        sys.path.remove(str(path_dir))
-        return current_arch_module
+        module_name = f"{_state.vendor_module.__name__}.{self.arch}"
+        return importlib.import_module(module_name)
 
     def get_ops(self, *args, **kwargs):
         """Provide a unified interface for the upper layer"""
@@ -225,15 +231,14 @@ class BackendArchEvent(BackendEventBase):
 
     def get_arch_ops(self):
         arch_specialized_ops = []
-        sys.path.append(self.current_arch_path)
         ops_module = getattr(self.arch_module, "ops", None)
+        module_name = f"{self.arch_module.__name__}.ops"
         try:
             if ops_module is None:
-                ops_module = importlib.import_module(f"{self.arch}.ops")
+                ops_module = importlib.import_module(module_name)
         except Exception:
             try:
-                sys.path.append(self.current_arch_path)
-                ops_module = importlib.import_module(f"{self.arch}.ops")
+                ops_module = importlib.import_module(module_name)
                 arch_specialized_ops.extend(self.get_functions_from_module(ops_module))
             except Exception as err_msg:
                 self.error_msgs.append(err_msg)
@@ -280,11 +285,16 @@ def _import_module_safe(module_name, vendor_name, module_type):
 def import_vendor_extra_lib(vendor_name=None):
     if _state.vendor_extra_lib_imported:
         return
+    vendor_module_name = (
+        _state.vendor_module.__name__
+        if vendor_name is None and _state.vendor_module is not None
+        else _get_vendor_module_name(vendor_name)
+    )
     _state.ops_module = _import_module_safe(
-        f"_{vendor_name}.ops", vendor_name, "common"
+        f"{vendor_module_name}.ops", vendor_name, "common"
     )
     _state.fused_module = _import_module_safe(
-        f"_{vendor_name}.fused", vendor_name, "fused"
+        f"{vendor_module_name}.fused", vendor_name, "fused"
     )
     _state.vendor_extra_lib_imported = True
 
@@ -375,20 +385,17 @@ fn = torch.{_state.device_name}
 
 
 def get_vendor_module(vendor_name, query=False):
-    def get_module(vendor_name):
-        current_file_path = os.path.abspath(__file__)
-        current_dir_path = os.path.dirname(current_file_path)
-        sys.path.append(current_dir_path)
-        return importlib.import_module(vendor_name)
+    if not query and _state.vendor_module is not None:
+        return _state.vendor_module
 
+    module_name = _get_vendor_module_name(vendor_name)
     if query:
         # The query path returns the requested vendor module directly.
-        return get_module(vendor_name)
+        return importlib.import_module(module_name)
 
     global vendor_module
-    if _state.vendor_module is None:
-        _state.vendor_module = get_module("_" + vendor_name)
-        vendor_module = _state.vendor_module
+    _state.vendor_module = importlib.import_module(module_name)
+    vendor_module = _state.vendor_module
     return _state.vendor_module
 
 
@@ -451,7 +458,7 @@ def get_heuristic_config(vendor_name=None):
     global heuristic_config_module
     config_name = "heuristics_config_utils"
     vendor_name = vendor_name or "nvidia"
-    mod_name = f"_{vendor_name}.{config_name}"
+    mod_name = f"{_get_vendor_module_name(vendor_name)}.{config_name}"
     _state.heuristic_config_module = importlib.import_module(mod_name)
     heuristic_config_module = _state.heuristic_config_module
     return getattr(_state.heuristic_config_module, "HEURISTICS_CONFIGS", None)

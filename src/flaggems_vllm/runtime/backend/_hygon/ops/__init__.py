@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fused_moe import (  # noqa: F401
+from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,

@@ -27,7 +27,7 @@ runs:
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         repository: flagos-ai/FlagGems
-        ref: b10f1d47401b2df7166ac0aff8958128338ed237
+        ref: 42d396ff8270f7b051f478217929f75484e53ef4
         path: .ci/flaggems
         persist-credentials: false
 
