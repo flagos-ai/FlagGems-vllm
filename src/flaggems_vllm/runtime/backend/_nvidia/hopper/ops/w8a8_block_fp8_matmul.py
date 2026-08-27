@@ -89,8 +89,8 @@ def _can_use_tle_2c(a, b, M, N, K, group_n, group_k) -> bool:
 # The explicit-TLE machinery imports triton.experimental.tle, which is absent on
 # many Triton builds; define it only behind a positive capability check.
 if HAS_TLE_2C and _HAS_DEVICE_TMA:
-    import triton.language.core as tlc
     import triton.experimental.tle.language as tle
+    import triton.language.core as tlc
     from triton.experimental.tle.language.gpu import types as tle_types
     from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -109,22 +109,44 @@ if HAS_TLE_2C and _HAS_DEVICE_TMA:
         offsets = [int(tlc._unwrap_if_constexpr(o)) for o in offsets]
         shape = [int(tlc._unwrap_if_constexpr(s)) for s in shape]
         result_ty = tle_types.buffered_tensor_type(
-            buf.dtype, shape, buf.type.storage, buf.type.layout, _semantic,
+            buf.dtype,
+            shape,
+            buf.type.storage,
+            buf.type.layout,
+            _semantic,
             alloc_shape=buf.type.alloc_shape,
         )
         handle = _semantic.builder.create_memdesc_subslice(
             result_ty.to_ir(_semantic.builder), buf.handle, offsets
         )
         return tle_types.buffered_tensor(
-            handle, buf.dtype, shape, buf.type.storage, buf.type.layout, _semantic,
+            handle,
+            buf.dtype,
+            shape,
+            buf.type.storage,
+            buf.type.layout,
+            _semantic,
             alloc_shape=buf.type.alloc_shape,
         )
 
     @triton.jit
-    def _producer(desc_a, desc_b, a_buf, b_buf, ab_empty, a_full, b_full, M, N, K,
-                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                  BLOCK_K: tl.constexpr, NUM_BUFS: tl.constexpr,
-                  NUM_SMS: tl.constexpr):
+    def _producer(
+        desc_a,
+        desc_b,
+        a_buf,
+        b_buf,
+        ab_empty,
+        a_full,
+        b_full,
+        M,
+        N,
+        K,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_BUFS: tl.constexpr,
+        NUM_SMS: tl.constexpr,
+    ):
         pid = tl.program_id(0)
         num_pid_n = tl.cdiv(N, BLOCK_N)
         num_tiles = tl.cdiv(M, BLOCK_M) * num_pid_n
@@ -138,23 +160,52 @@ if HAS_TLE_2C and _HAS_DEVICE_TMA:
                 cycle = ctr // NUM_BUFS
                 tle.gpu.barrier_wait(ab_empty[buf], phaseIdx=cycle)
                 # one barrier per TMA transfer (a single barrier can't cover two)
-                tle.gpu.copy(desc_a, a_buf.slot(buf), [BLOCK_M, BLOCK_K],
-                             [pid_m * BLOCK_M, k * BLOCK_K], barrier=a_full[buf])
-                tle.gpu.copy(desc_b, b_buf.slot(buf), [BLOCK_N, BLOCK_K],
-                             [pid_n * BLOCK_N, k * BLOCK_K], barrier=b_full[buf])
+                tle.gpu.copy(
+                    desc_a,
+                    a_buf.slot(buf),
+                    [BLOCK_M, BLOCK_K],
+                    [pid_m * BLOCK_M, k * BLOCK_K],
+                    barrier=a_full[buf],
+                )
+                tle.gpu.copy(
+                    desc_b,
+                    b_buf.slot(buf),
+                    [BLOCK_N, BLOCK_K],
+                    [pid_n * BLOCK_N, k * BLOCK_K],
+                    barrier=b_full[buf],
+                )
                 ctr += 1
 
     @triton.jit
-    def _consumer(c_ptr, As, Bs, M, N, K,
-                  stride_cm, stride_cn, stride_As_m, stride_As_k,
-                  stride_Bs_n, stride_Bs_k,
-                  a_buf, b_buf, ab_empty, a_full, b_full,
-                  OUT_DTYPE: tl.constexpr,
-                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                  BLOCK_K: tl.constexpr, BLOCK_N_HALF: tl.constexpr,
-                  GROUP_N: tl.constexpr, NUM_BUFS: tl.constexpr,
-                  NUM_SMS: tl.constexpr, HALF: tl.constexpr,
-                  PARTITION_ID: tl.constexpr):
+    def _consumer(
+        c_ptr,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        stride_cm,
+        stride_cn,
+        stride_As_m,
+        stride_As_k,
+        stride_Bs_n,
+        stride_Bs_k,
+        a_buf,
+        b_buf,
+        ab_empty,
+        a_full,
+        b_full,
+        OUT_DTYPE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_N_HALF: tl.constexpr,
+        GROUP_N: tl.constexpr,
+        NUM_BUFS: tl.constexpr,
+        NUM_SMS: tl.constexpr,
+        HALF: tl.constexpr,
+        PARTITION_ID: tl.constexpr,
+    ):
         """One warpgroup computes the HALF-th N-slice of each owned tile. A
         BLOCK_N_HALF-wide slice lies inside one GROUP_N scale group, so b_s is a
         scalar per K-tile."""
@@ -183,13 +234,16 @@ if HAS_TLE_2C and _HAS_DEVICE_TMA:
                 cycle = ctr // NUM_BUFS
                 tle.gpu.barrier_wait(a_full[buf], phaseIdx=cycle)
                 tle.gpu.barrier_wait(b_full[buf], phaseIdx=cycle)
-                b_half = tle_subslice(b_buf.slot(buf), [HALF * BLOCK_N_HALF, 0],
-                                      [BLOCK_N_HALF, BLOCK_K])
-                prod = tle.gpu.wgmma(a_buf.slot(buf), b_half,
-                                     out_dtype=tl.float32, trans_b=True)
+                b_half = tle_subslice(
+                    b_buf.slot(buf), [HALF * BLOCK_N_HALF, 0], [BLOCK_N_HALF, BLOCK_K]
+                )
+                prod = tle.gpu.wgmma(
+                    a_buf.slot(buf), b_half, out_dtype=tl.float32, trans_b=True
+                )
                 a_s = tl.load(As_ptrs + k * stride_As_k, mask=m_mask, other=0.0)
-                b_s = tl.load(Bs_scalar_ptr + k * stride_Bs_k, mask=half_valid,
-                              other=0.0)
+                b_s = tl.load(
+                    Bs_scalar_ptr + k * stride_Bs_k, mask=half_valid, other=0.0
+                )
                 prod = tle.gpu.wgmma_wait(0, prod)
                 tle.gpu.barrier_arrive(ab_empty[buf], phaseIdx=cycle)
                 acc += prod * (a_s * b_s)[:, None]
@@ -202,50 +256,157 @@ if HAS_TLE_2C and _HAS_DEVICE_TMA:
             tl.store(c_ptrs, acc.to(OUT_DTYPE), mask=c_mask)
 
     @triton.jit
-    def _gemm_tle_kernel(desc_a, desc_b, c_ptr, As, Bs, M, N, K,
-                         stride_cm, stride_cn, stride_As_m, stride_As_k,
-                         stride_Bs_n, stride_Bs_k,
-                         OUT_DTYPE: tl.constexpr,
-                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                         BLOCK_K: tl.constexpr, BLOCK_N_HALF: tl.constexpr,
-                         GROUP_N: tl.constexpr, NUM_BUFS: tl.constexpr,
-                         NUM_SMS: tl.constexpr, C_REGS: tl.constexpr):
-        a_buf = tle.gpu.alloc([NUM_BUFS, BLOCK_M, BLOCK_K], dtype=tl.float8e4nv,
-                              scope=tle.gpu.smem)
-        b_buf = tle.gpu.alloc([NUM_BUFS, BLOCK_N, BLOCK_K], dtype=tl.float8e4nv,
-                              scope=tle.gpu.smem)
+    def _gemm_tle_kernel(
+        desc_a,
+        desc_b,
+        c_ptr,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        stride_cm,
+        stride_cn,
+        stride_As_m,
+        stride_As_k,
+        stride_Bs_n,
+        stride_Bs_k,
+        OUT_DTYPE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_N_HALF: tl.constexpr,
+        GROUP_N: tl.constexpr,
+        NUM_BUFS: tl.constexpr,
+        NUM_SMS: tl.constexpr,
+        C_REGS: tl.constexpr,
+    ):
+        a_buf = tle.gpu.alloc(
+            [NUM_BUFS, BLOCK_M, BLOCK_K], dtype=tl.float8e4nv, scope=tle.gpu.smem
+        )
+        b_buf = tle.gpu.alloc(
+            [NUM_BUFS, BLOCK_N, BLOCK_K], dtype=tl.float8e4nv, scope=tle.gpu.smem
+        )
         # fill barriers: each TMA arrives once. empty barrier: BOTH consumers
         # release the slot (arrive_count=2) before the producer may refill.
         a_full = tle.gpu.alloc_barriers(
-            num_barriers=NUM_BUFS, arrive_count=1, expect_bytes=BLOCK_M * BLOCK_K)
+            num_barriers=NUM_BUFS, arrive_count=1, expect_bytes=BLOCK_M * BLOCK_K
+        )
         b_full = tle.gpu.alloc_barriers(
-            num_barriers=NUM_BUFS, arrive_count=1, expect_bytes=BLOCK_N * BLOCK_K)
+            num_barriers=NUM_BUFS, arrive_count=1, expect_bytes=BLOCK_N * BLOCK_K
+        )
         ab_empty = tle.gpu.alloc_barriers(
-            num_barriers=NUM_BUFS, arrive_count=2, init=tle.gpu.READY)
+            num_barriers=NUM_BUFS, arrive_count=2, init=tle.gpu.READY
+        )
 
         tle.gpu.warp_specialize(
             [
-                (_producer, (desc_a, desc_b, a_buf, b_buf, ab_empty, a_full,
-                             b_full, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
-                             NUM_BUFS, NUM_SMS)),
-                (_consumer, (c_ptr, As, Bs, M, N, K, stride_cm, stride_cn,
-                             stride_As_m, stride_As_k, stride_Bs_n, stride_Bs_k,
-                             a_buf, b_buf, ab_empty, a_full, b_full, OUT_DTYPE,
-                             BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_HALF, GROUP_N,
-                             NUM_BUFS, NUM_SMS, 0, 1)),
-                (_consumer, (c_ptr, As, Bs, M, N, K, stride_cm, stride_cn,
-                             stride_As_m, stride_As_k, stride_Bs_n, stride_Bs_k,
-                             a_buf, b_buf, ab_empty, a_full, b_full, OUT_DTYPE,
-                             BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_HALF, GROUP_N,
-                             NUM_BUFS, NUM_SMS, 1, 2)),
+                (
+                    _producer,
+                    (
+                        desc_a,
+                        desc_b,
+                        a_buf,
+                        b_buf,
+                        ab_empty,
+                        a_full,
+                        b_full,
+                        M,
+                        N,
+                        K,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_K,
+                        NUM_BUFS,
+                        NUM_SMS,
+                    ),
+                ),
+                (
+                    _consumer,
+                    (
+                        c_ptr,
+                        As,
+                        Bs,
+                        M,
+                        N,
+                        K,
+                        stride_cm,
+                        stride_cn,
+                        stride_As_m,
+                        stride_As_k,
+                        stride_Bs_n,
+                        stride_Bs_k,
+                        a_buf,
+                        b_buf,
+                        ab_empty,
+                        a_full,
+                        b_full,
+                        OUT_DTYPE,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_K,
+                        BLOCK_N_HALF,
+                        GROUP_N,
+                        NUM_BUFS,
+                        NUM_SMS,
+                        0,
+                        1,
+                    ),
+                ),
+                (
+                    _consumer,
+                    (
+                        c_ptr,
+                        As,
+                        Bs,
+                        M,
+                        N,
+                        K,
+                        stride_cm,
+                        stride_cn,
+                        stride_As_m,
+                        stride_As_k,
+                        stride_Bs_n,
+                        stride_Bs_k,
+                        a_buf,
+                        b_buf,
+                        ab_empty,
+                        a_full,
+                        b_full,
+                        OUT_DTYPE,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_K,
+                        BLOCK_N_HALF,
+                        GROUP_N,
+                        NUM_BUFS,
+                        NUM_SMS,
+                        1,
+                        2,
+                    ),
+                ),
             ],
-            [4, 4],            # two consumers, 4 warps each
+            [4, 4],  # two consumers, 4 warps each
             [C_REGS, C_REGS],  # per-consumer reg budget
         )
 
-    def w8a8_block_fp8_matmul_tle(a, b, c, a_s, b_s, M, N, K, group_n, group_k,
-                                  BLOCK_M, BLOCK_N, BLOCK_N_HALF, NUM_BUFS,
-                                  C_REGS):
+    def w8a8_block_fp8_matmul_tle(
+        a,
+        b,
+        c,
+        a_s,
+        b_s,
+        M,
+        N,
+        K,
+        group_n,
+        group_k,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_N_HALF,
+        NUM_BUFS,
+        C_REGS,
+    ):
         """Explicit 2-consumer TLE launcher; numerics match the general kernel.
         Caller (_can_use_tle_2c) guarantees fp8 inputs, K % group_k == 0,
         N % BLOCK_N_HALF == 0, group_n == 128."""
@@ -258,24 +419,47 @@ if HAS_TLE_2C and _HAS_DEVICE_TMA:
         block_k = group_k  # one K-tile == one K scale group
 
         desc_a = TensorDescriptor(
-            a, shape=[M, K], strides=[a.stride(0), a.stride(1)],
-            block_shape=[BLOCK_M, block_k])
+            a,
+            shape=[M, K],
+            strides=[a.stride(0), a.stride(1)],
+            block_shape=[BLOCK_M, block_k],
+        )
         desc_b = TensorDescriptor(
-            b, shape=[N, K], strides=[b.stride(0), b.stride(1)],
-            block_shape=[BLOCK_N, block_k])
+            b,
+            shape=[N, K],
+            strides=[b.stride(0), b.stride(1)],
+            block_shape=[BLOCK_N, block_k],
+        )
 
         num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
         num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
         grid = (min(num_sms, num_tiles),)
 
         _gemm_tle_kernel[grid](
-            desc_a, desc_b, c, a_s, b_s, M, N, K,
-            c.stride(0), c.stride(1), a_s.stride(0), a_s.stride(1),
-            b_s.stride(0), b_s.stride(1),
+            desc_a,
+            desc_b,
+            c,
+            a_s,
+            b_s,
+            M,
+            N,
+            K,
+            c.stride(0),
+            c.stride(1),
+            a_s.stride(0),
+            a_s.stride(1),
+            b_s.stride(0),
+            b_s.stride(1),
             OUT_DTYPE=out_tl,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=block_k,
-            BLOCK_N_HALF=BLOCK_N_HALF, GROUP_N=group_n, NUM_BUFS=NUM_BUFS,
-            NUM_SMS=grid[0], C_REGS=C_REGS, num_warps=4,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=block_k,
+            BLOCK_N_HALF=BLOCK_N_HALF,
+            GROUP_N=group_n,
+            NUM_BUFS=NUM_BUFS,
+            NUM_SMS=grid[0],
+            C_REGS=C_REGS,
+            num_warps=4,
         )
         return c
 
@@ -334,6 +518,7 @@ def _get_placeholder_tuner_configs(pre_hook=None):
         )
     ]
 
+
 def _get_swap_ab_placeholder_configs(pre_hook=None):
     return [
         triton.Config(
@@ -348,6 +533,7 @@ def _get_swap_ab_placeholder_configs(pre_hook=None):
             pre_hook=pre_hook,
         )
     ]
+
 
 def _get_swap_ab_splitk_placeholder_configs(pre_hook=None):
     return [
@@ -365,6 +551,7 @@ def _get_swap_ab_splitk_placeholder_configs(pre_hook=None):
         )
     ]
 
+
 def _get_short_k256_placeholder_configs(pre_hook=None):
     return [
         triton.Config(
@@ -377,6 +564,7 @@ def _get_short_k256_placeholder_configs(pre_hook=None):
             pre_hook=pre_hook,
         )
     ]
+
 
 @functools.lru_cache
 def _get_fixed_matmul_meta(M: int, N: int, K: int, block_n: int, block_k: int):
@@ -574,17 +762,9 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
     offs_an = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    b_ptrs = (
-        B
-        + offs_bm[:, None] * stride_bn
-        + offs_k[None, :] * stride_bk
-    )
+    b_ptrs = B + offs_bm[:, None] * stride_bn + offs_k[None, :] * stride_bk
 
-    a_t_ptrs = (
-        A
-        + offs_k[:, None] * stride_ak
-        + offs_an[None, :] * stride_am
-    )
+    a_t_ptrs = A + offs_k[:, None] * stride_ak + offs_an[None, :] * stride_am
 
     as_ptrs = As + offs_an * stride_As_m
 
@@ -611,19 +791,13 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
 
             b_tile = tl.load(
                 b_ptrs,
-                mask=(
-                    (offs_bm[:, None] < N)
-                    & k_mask[None, :]
-                ),
+                mask=((offs_bm[:, None] < N) & k_mask[None, :]),
                 other=0.0,
             )
 
             a_t_tile = tl.load(
                 a_t_ptrs,
-                mask=(
-                    k_mask[:, None]
-                    & (offs_an[None, :] < M)
-                ),
+                mask=(k_mask[:, None] & (offs_an[None, :] < M)),
                 other=0.0,
             )
 
@@ -639,9 +813,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
             b_scale_group = (pid_m * BLOCK_M) // GROUP_N
 
             b_scale = tl.load(
-                Bs
-                + scale_k_idx * stride_Bs_k
-                + b_scale_group * stride_Bs_n
+                Bs + scale_k_idx * stride_Bs_k + b_scale_group * stride_Bs_n
             )
 
             partial = tl.dot(
@@ -657,9 +829,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
             b_scale_group = offs_bm // GROUP_N
 
             b_scale = tl.load(
-                Bs
-                + scale_k_idx * stride_Bs_k
-                + b_scale_group * stride_Bs_n,
+                Bs + scale_k_idx * stride_Bs_k + b_scale_group * stride_Bs_n,
                 mask=offs_bm < N,
                 other=0.0,
             )
@@ -670,11 +840,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
                 out_dtype=tl.float32,
             )
 
-            acc += (
-                partial
-                * b_scale[:, None]
-                * a_scale[None, :]
-            )
+            acc += partial * b_scale[:, None] * a_scale[None, :]
 
         b_ptrs += BLOCK_K * stride_bk
         a_t_ptrs += BLOCK_K * stride_ak
@@ -686,18 +852,12 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
     else:
         output = acc
 
-    c_ptrs = (
-        C
-        + offs_bm[:, None] * stride_cn
-        + offs_an[None, :] * stride_cm
-    )
+    c_ptrs = C + offs_bm[:, None] * stride_cn + offs_an[None, :] * stride_cm
 
-    c_mask = (
-        (offs_bm[:, None] < N)
-        & (offs_an[None, :] < M)
-    )
+    c_mask = (offs_bm[:, None] < N) & (offs_an[None, :] < M)
 
     tl.store(c_ptrs, output, mask=c_mask)
+
 
 @libentry()
 @libtuner(
@@ -765,16 +925,8 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
     k_end = min((pid_k + 1) * k_per_split, total_k_tiles)
 
     k_off0 = k_start * BLOCK_K
-    b_ptrs = (
-        B
-        + offs_bm[:, None] * stride_bn
-        + (k_off0 + offs_k)[None, :] * stride_bk
-    )
-    a_t_ptrs = (
-        A
-        + (k_off0 + offs_k)[:, None] * stride_ak
-        + offs_an[None, :] * stride_am
-    )
+    b_ptrs = B + offs_bm[:, None] * stride_bn + (k_off0 + offs_k)[None, :] * stride_bk
+    a_t_ptrs = A + (k_off0 + offs_k)[:, None] * stride_ak + offs_an[None, :] * stride_am
 
     as_ptrs = As + offs_an * stride_As_m
 
@@ -839,11 +991,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = (
-        C
-        + offs_cm[:, None] * stride_cn
-        + offs_cn[None, :] * stride_cm
-    )
+    c_ptrs = C + offs_cm[:, None] * stride_cn + offs_cn[None, :] * stride_cm
     c_mask = (offs_cm[:, None] < N) & (offs_cn[None, :] < M)
 
     if C.dtype.element_ty == tl.bfloat16:
@@ -852,6 +1000,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
         tl.atomic_add(c_ptrs, acc.to(tl.float16), mask=c_mask, sem="relaxed")
     else:
         tl.atomic_add(c_ptrs, acc.to(tl.float32), mask=c_mask, sem="relaxed")
+
 
 @libentry()
 @libtuner(
@@ -905,17 +1054,9 @@ def w8a8_block_fp8_matmul_kernel_short_k256(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    a_ptrs = (
-        A
-        + offs_m[:, None] * stride_am
-        + offs_k[None, :] * stride_ak
-    )
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
 
-    b_ptrs = (
-        B
-        + offs_k[:, None] * stride_bk
-        + offs_n[None, :] * stride_bn
-    )
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
     as_base = As + offs_m * stride_As_m
 
@@ -942,11 +1083,7 @@ def w8a8_block_fp8_matmul_kernel_short_k256(
             other=0.0,
         )
 
-        b_scale = tl.load(
-            Bs
-            + k_tile * stride_Bs_k
-            + b_scale_group * stride_Bs_n
-        )
+        b_scale = tl.load(Bs + k_tile * stride_Bs_k + b_scale_group * stride_Bs_n)
 
         ab_scale = a_scale * b_scale
         acc += (
@@ -968,11 +1105,7 @@ def w8a8_block_fp8_matmul_kernel_short_k256(
     else:
         output = acc
 
-    c_ptrs = (
-        C
-        + offs_m[:, None] * stride_cm
-        + offs_n[None, :] * stride_cn
-    )
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
 
     c_mask = mask_m[:, None] & mask_n[None, :]
 
@@ -981,6 +1114,7 @@ def w8a8_block_fp8_matmul_kernel_short_k256(
         output,
         mask=c_mask,
     )
+
 
 def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
     logger.debug(
@@ -1197,9 +1331,7 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             grid_mn = grid_m * grid_n
             total_k_iters = triton.cdiv(K, _SWAP_SPLITK_BLOCK_K)
 
-            sm_count = torch.cuda.get_device_properties(
-                dev_index
-            ).multi_processor_count
+            sm_count = torch.cuda.get_device_properties(dev_index).multi_processor_count
             split_k = min(total_k_iters, max(4, 2 * sm_count // max(grid_mn, 1)))
 
             c.zero_()
@@ -1241,12 +1373,8 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
         )
 
         if _can_use_tle_2c(a, b, M, N, K, group_n, group_k):
-            num_sms = torch.cuda.get_device_properties(
-                a.device
-            ).multi_processor_count
-            n128_tiles = triton.cdiv(M, TLE2C_BLOCK_M) * triton.cdiv(
-                N, TLE2C_BLOCK_N
-            )
+            num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+            n128_tiles = triton.cdiv(M, TLE2C_BLOCK_M) * triton.cdiv(N, TLE2C_BLOCK_N)
             n64_tiles = triton.cdiv(M, N64_BLOCK_M) * triton.cdiv(N, N64_BLOCK_N)
             cost_n128 = triton.cdiv(n128_tiles, num_sms) * TLE2C_BLOCK_N
             cost_n64 = triton.cdiv(n64_tiles, num_sms) * N64_BLOCK_N
@@ -1258,15 +1386,39 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             with torch_device_fn.device(a.device):
                 if use_n64:
                     w8a8_block_fp8_matmul_tle(
-                        a, b, c, a_s, b_s, M, N, K, group_n, group_k,
-                        N64_BLOCK_M, N64_BLOCK_N, N64_BLOCK_N_HALF,
-                        N64_NUM_BUFS, N64_C_REGS,
+                        a,
+                        b,
+                        c,
+                        a_s,
+                        b_s,
+                        M,
+                        N,
+                        K,
+                        group_n,
+                        group_k,
+                        N64_BLOCK_M,
+                        N64_BLOCK_N,
+                        N64_BLOCK_N_HALF,
+                        N64_NUM_BUFS,
+                        N64_C_REGS,
                     )
                 else:
                     w8a8_block_fp8_matmul_tle(
-                        a, b, c, a_s, b_s, M, N, K, group_n, group_k,
-                        TLE2C_BLOCK_M, TLE2C_BLOCK_N, TLE2C_BLOCK_N_HALF,
-                        TLE2C_NUM_BUFS, TLE2C_C_REGS,
+                        a,
+                        b,
+                        c,
+                        a_s,
+                        b_s,
+                        M,
+                        N,
+                        K,
+                        group_n,
+                        group_k,
+                        TLE2C_BLOCK_M,
+                        TLE2C_BLOCK_N,
+                        TLE2C_BLOCK_N_HALF,
+                        TLE2C_NUM_BUFS,
+                        TLE2C_C_REGS,
                     )
             return c
 

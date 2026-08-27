@@ -43,7 +43,7 @@ from typing import (
 import triton
 
 from flaggems_vllm import runtime
-from flaggems_vllm.runtime import device, torch_device_fn
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend import _state
 from flaggems_vllm.utils.code_cache import config_cache_dir
 from flaggems_vllm.utils.models import PersistantModel, SQLPersistantModel

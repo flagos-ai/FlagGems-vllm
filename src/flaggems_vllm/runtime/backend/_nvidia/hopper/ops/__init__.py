@@ -18,4 +18,3 @@ if triton.__version__ >= "3.4":
     from .w8a8_block_fp8_matmul import w8a8_block_fp8_matmul  # noqa: F401
 
 __all__ = ["w8a8_block_fp8_matmul"]
-
