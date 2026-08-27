@@ -38,6 +38,11 @@ This means `FlagGems` and `FlagGems-vllm` are complementary: `FlagGems` provides
 ```shell
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 ```
+
+Install a PyTorch build compatible with the target accelerator before installing
+FlagGems-vllm. As in FlagGems, PyTorch is managed by the backend environment and
+is not reinstalled by the FlagGems-vllm package.
+
 ### Install FlagGems-vllm
 ```shell
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
