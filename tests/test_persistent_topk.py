@@ -41,7 +41,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 HAS_VLLM = False
-_vllm_persistent_topk = None
 
 try:
     import vllm._custom_ops  # noqa: F401
@@ -65,6 +64,7 @@ try:
     HAS_VLLM = True
 except (ImportError, AttributeError, NotImplementedError, RuntimeError):
     HAS_VLLM = False
+    _vllm_persistent_topk = None
 
 STRIDE = 262144
 K = 512
