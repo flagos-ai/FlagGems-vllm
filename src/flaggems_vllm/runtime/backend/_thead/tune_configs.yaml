@@ -12,4 +12,109 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{}
+# PPU-ZW810E: 64 CUs, 2048 threads/CU, warp_size 32. Wider warp counts win
+# on large rows (w32), small shapes prefer low warp counts (w2/w4).
+scaled_int8_quant_static:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 256
+      - 512
+      - 1024
+    warps:
+      - 4
+      - 8
+      - 16
+      - 32
+    stages:
+      - 2
+      - 3
+      - 4
+
+scaled_int8_quant_static_flat:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    warps:
+      - 2
+      - 4
+      - 8
+      - 16
+    stages:
+      - 1
+      - 2
+      - 3
+
+scaled_int8_quant_dynamic:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_warps: warps
+      num_stages: stages
+    block_size:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    warps:
+      - 4
+      - 8
+      - 16
+      - 32
+    stages:
+      - 3
+      - 4
+      - 5
+
+scaled_int8_quant_dynamic_single:
+  - gen: true
+    param_map:
+      META:
+        PLACEHOLDER_UNUSED: placeholder
+      num_warps: warps
+      num_stages: stages
+    placeholder:
+      - 1
+    warps:
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+    stages:
+      - 1
+      - 2
+      - 3
+
+scaled_int8_quant_dynamic_main_tail:
+  - gen: true
+    param_map:
+      META:
+        PLACEHOLDER_UNUSED: placeholder
+      num_warps: warps
+      num_stages: stages
+    placeholder:
+      - 1
+    warps:
+      - 4
+      - 8
+      - 16
+      - 32
+    stages:
+      - 1
+      - 2
+      - 3
