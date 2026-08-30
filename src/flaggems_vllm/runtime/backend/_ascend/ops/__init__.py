@@ -31,6 +31,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
+from flaggems_vllm.runtime.backend._ascend.ops.swiglu import (
+    swiglu,
+)
+
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
@@ -41,4 +45,5 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "swiglu",
 ]
