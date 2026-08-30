@@ -19,6 +19,11 @@ import flaggems_vllm
 
 from . import base, consts
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 
 @pytest.mark.add_rms_norm
 def test_add_rms_norm():
@@ -30,7 +35,10 @@ def test_add_rms_norm():
         yield (inp1, inp2, (N,), weight)
 
     # Use a custom wrapper for torch implementation
+    # On ascend the baseline is torch_npu
     def torch_add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
+        if flaggems_vllm.vendor_name == "ascend" and torch_npu is not None:
+            return torch_npu.npu_add_rms_norm(x1, x2, weight, eps)[0]
         x = x1 + x2
         variance = x.pow(2).mean(-1, keepdim=True)
         hidden_states = x * torch.rsqrt(variance + eps)

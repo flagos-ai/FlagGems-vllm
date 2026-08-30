@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._ascend.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -32,6 +33,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
 )
 
 __all__ = [
+    "add_rms_norm",
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
