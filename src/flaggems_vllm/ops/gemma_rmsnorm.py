@@ -7,136 +7,187 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 
-def get_gemma_rmsnorm_configs():
-    """Generate autotune configurations for gemma_rmsnorm.
-
-    Inspired by flashinfer's adaptive hyperparameter selection:
-    - Small N (≤1024): smaller BLOCK_N, more BLOCK_M parallelism
-    - Medium N (1024-4096): balanced tiling
-    - Large N (>4096): larger BLOCK_N, fewer warps for register pressure
-    """
+def get_gemma_rmsnorm_may_2d_splitn_configs():
     configs = []
-
-    # Small N: prioritize M parallelism
-    for block_m in [1, 4, 8, 16, 32]:
-        for block_n in [256, 512]:
-            for num_warps in [4, 8]:
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_M": block_m, "BLOCK_N": block_n},
-                        num_warps=num_warps,
-                        num_stages=2,
-                    )
-                )
-
-    # Medium N: balanced
-    for block_m in [1, 4, 8, 16]:
-        for block_n in [1024, 2048]:
-            for num_warps in [4, 8, 16]:
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_M": block_m, "BLOCK_N": block_n},
-                        num_warps=num_warps,
-                        num_stages=2,
-                    )
-                )
-
-    # Large N: prioritize N coverage, reduce M to control register pressure
     for block_m in [1, 4, 8]:
-        for block_n in [4096, 8192, 16384]:
-            for num_warps in [8, 16, 32]:
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_M": block_m, "BLOCK_N": block_n},
-                        num_warps=num_warps,
-                        num_stages=2,
-                    )
+        for block_n in [128, 256, 512]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_M": block_m, "BLOCK_N": block_n},
+                    num_warps=4,
+                    num_stages=2,
                 )
+            )
 
+    for block_m in [1, 4, 8]:
+        configs.append(
+            triton.Config(
+                {"BLOCK_M": block_m, "BLOCK_N": 1024},
+                num_warps=8,
+                num_stages=2,
+            )
+        )
+
+    for block_m in [1, 4, 8]:
+        configs.append(
+            triton.Config(
+                {"BLOCK_M": block_m, "BLOCK_N": 2048},
+                num_warps=16,
+                num_stages=2,
+            )
+        )
+
+    for block_m in [16, 32]:
+        for block_n in [256, 512]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_M": block_m, "BLOCK_N": block_n},
+                    num_warps=8,
+                    num_stages=2,
+                )
+            )
+
+    for block_m in [4, 8]:
+        configs.append(
+            triton.Config(
+                {"BLOCK_M": block_m, "BLOCK_N": 1024},
+                num_warps=16,
+                num_stages=2,
+            )
+        )
     return configs
 
 
 @triton.autotune(
-    configs=get_gemma_rmsnorm_configs(),
+    configs=get_gemma_rmsnorm_may_2d_splitn_configs(),
     key=["M", "N"],
 )
 @triton.jit
-def gemma_rmsnorm_kernel(
+def gemma_rmsnorm_may_2d_splitn_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
     M,
     N,
-    eps,
+    eps: float,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # Process BLOCK_M rows at a time, with N chunked into BLOCK_N tiles
-    # This avoids loading the entire row at once for large N
-    pid_m = tl.program_id(0)
+    m_block_id = tl.program_id(0)
+    m_offs = m_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_offs < M
 
-    # Row indices for this M-block
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = rows < M
-
-    # Compute base offsets for these rows
-    offsets_base = rows[:, None] * N
-
-    # First pass: compute sum of squares across all N (in chunks)
+    offsets_base = m_offs[:, None] * N
     sum_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # pass‑1: accumulate sum‑of‑squares, split over N dimension
     for n_chunk in range(0, N, BLOCK_N):
-        chunk_cols = n_chunk + tl.arange(0, BLOCK_N)
-        chunk_mask = row_mask[:, None] & (chunk_cols[None, :] < N)
-        chunk_offsets = offsets_base + chunk_cols[None, :]
-        x_chunk = tl.load(x_ptr + chunk_offsets, mask=chunk_mask, other=0.0).to(
+        n_offs = n_chunk + tl.arange(0, BLOCK_N)
+        mn_mask = m_mask[:, None] & (n_offs[None, :] < N)
+        x = tl.load(x_ptr + offsets_base + n_offs[None, :], mask=mn_mask, other=0.0).to(
             tl.float32
         )
-        sum_sq += tl.sum(x_chunk * x_chunk, axis=1)
+        xq = x * x
+        sum_sq += tl.sum(xq, axis=1)
 
-    # Compute RMS normalization factor: 1 / sqrt(mean(x^2) + eps)
-    rrms = 1.0 / tl.sqrt(sum_sq / N + eps)
+    xq_mean = sum_sq / N
+    rrms = tl.rsqrt(xq_mean + eps)
 
-    # Second pass: apply normalization (in chunks)
+    # pass‑2: normalize & apply weight, split over N dimension
     for n_chunk in range(0, N, BLOCK_N):
-        chunk_cols = n_chunk + tl.arange(0, BLOCK_N)
-        chunk_mask = row_mask[:, None] & (chunk_cols[None, :] < N)
-        chunk_offsets = offsets_base + chunk_cols[None, :]
+        n_offs = n_chunk + tl.arange(0, BLOCK_N)
+        mn_mask = m_mask[:, None] & (n_offs[None, :] < N)
+        n_mask = n_offs < N
 
-        # Load input and weight for this chunk
-        x_chunk = tl.load(x_ptr + chunk_offsets, mask=chunk_mask, other=0.0).to(
+        x = tl.load(x_ptr + offsets_base + n_offs[None, :], mask=mn_mask, other=0.0).to(
             tl.float32
         )
-        weight_chunk = tl.load(w_ptr + chunk_cols, mask=(chunk_cols < N), other=0.0).to(
-            tl.float32
-        )
+        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
 
-        # Apply normalization: y = x * (1/RMS) * (1 + weight)
-        y_chunk = x_chunk * rrms[:, None] * (1.0 + weight_chunk[None, :])
+        out = (1.0 + w[None, :]) * x * rrms[:, None]
+        tl.store(out_ptr + offsets_base + n_offs[None, :], out, mask=mn_mask)
 
-        # Store output
-        tl.store(out_ptr + chunk_offsets, y_chunk, mask=chunk_mask)
+
+def get_gemma_rmsnorm_may_2d_no_splitn_configs():
+    configs = []
+    for block_m in [1, 4, 8, 16]:
+        for num_warps in [1, 2, 4, 8, 16]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_M": block_m},
+                    num_warps=num_warps,
+                    num_stages=2,
+                )
+            )
+    return configs
+
+
+@triton.autotune(
+    configs=get_gemma_rmsnorm_may_2d_no_splitn_configs(),
+    key=["M", "N"],
+)
+@triton.jit
+def gemma_rmsnorm_may_2d_no_splitn_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    M,
+    N,
+    eps: float,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    if BLOCK_M == 1:
+        m = tl.program_id(0)
+        n_offs = tl.arange(0, BLOCK_N)
+        n_mask = n_offs < N
+        x = tl.load(x_ptr + m * N + n_offs, mask=n_mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
+        xq = x * x
+        xq_mean = tl.sum(xq, axis=-1, keep_dims=True) / N  # tensor<1xf32>
+        rrms = tl.rsqrt(xq_mean + eps)
+        out = (1 + w) * x * rrms
+        tl.store(out_ptr + m * N + n_offs, out, mask=n_mask)
+    else:
+        m_block_id = tl.program_id(0)
+        m = m_block_id * BLOCK_M
+        n_offs = tl.arange(0, BLOCK_N)
+        m_offs = m + tl.arange(0, BLOCK_M)
+        n_mask = n_offs < N
+        m_mask = m_offs < M
+        mn_mask = n_mask[None, :] & m_mask[:, None]
+        x = tl.load(
+            x_ptr + m_offs[:, None] * N + n_offs[None, :], mask=mn_mask, other=0.0
+        ).to(tl.float32)
+        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
+        xq = x * x
+        xq_mean = tl.sum(xq, axis=-1, keep_dims=True) / N  # tensor<BLOCK_Mx1xf32>
+        rrms = tl.rsqrt(xq_mean + eps)
+        out = (1 + w) * x * rrms
+        tl.store(out_ptr + m_offs[:, None] * N + n_offs[None, :], out, mask=mn_mask)
 
 
 def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     logger.debug("GEMS GEMMA_RMSNORM")
     x = x.contiguous()
     w = w.contiguous()
-
     orig_shape = x.shape
     N = orig_shape[-1]
     x = x.reshape(-1, N)
     M = x.shape[0]
     out = torch.empty_like(x)
-
-    # Grid is 1D over M dimension only
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-    gemma_rmsnorm_kernel[grid](
-        x,
-        w,
-        out,
-        M,
-        N,
-        eps,
-    )
-
+    if M == 1:
+        gemma_rmsnorm_may_2d_no_splitn_kernel[grid](
+            x, w, out, M, N, eps, BLOCK_N=triton.next_power_of_2(N)
+        )
+    else:
+        gemma_rmsnorm_may_2d_splitn_kernel[grid](
+            x,
+            w,
+            out,
+            M,
+            N,
+            eps,
+        )
     return out.reshape(orig_shape)
