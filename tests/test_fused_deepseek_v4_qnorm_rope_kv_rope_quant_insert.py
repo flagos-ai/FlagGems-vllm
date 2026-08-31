@@ -12,23 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert as _generic_impl,
+)
 from flaggems_vllm.utils.device_info import get_device_capability
 
 from .conftest import QUICK_MODE
 
+_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads"})
+
 
 def is_support_fp8e4nv():
+    if not hasattr(torch, "float8_e4m3fn"):
+        return False
+    if flaggems_vllm.vendor_name in _FP8E4NV_CAPABLE_VENDORS:
+        return True
     major, minor = get_device_capability()
     return major * 10 + minor >= 89
 
 
-VLLM_REF_AVAILABLE = hasattr(
-    torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
-)
+OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+
+HAS_VLLM = False
+try:
+    import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
+
+    HAS_VLLM = True
+except (ImportError, AttributeError, RuntimeError):
+    # RuntimeError because a misconfigured vLLM should mean "no baseline", not a
+    # collection error: with two platform plugins registered it raises
+    # "Only one platform plugin can be activated, but got: ['fl', 'musa']" at
+    # import, which aborted collection of this whole file on an MTT box.
+    pass
+
+VLLM_REF_AVAILABLE = HAS_VLLM and hasattr(torch.ops._C, OP_NAME)
 HEAD_DIM = 512
 ROPE_DIM = 64
 NOPE_DIM = HEAD_DIM - ROPE_DIM  # 448
@@ -129,6 +151,42 @@ def rmsnorm_no_weight_f32(x: torch.Tensor, eps: float) -> torch.Tensor:
 # ─── pytorch reference implementation from vllm end ───
 
 
+def _exact_pow2(exponent: torch.Tensor) -> torch.Tensor:
+    """2 ** exponent for an integer-valued `exponent`, exactly.
+
+    `torch.exp2` and `torch.pow` do not return an exact power of two on every
+    backend: on Ascend, torch.exp2 is one ULP low for 492 of 512 integer
+    arguments. Almost anywhere else that is invisible, but the oracle divides by
+    this value, so every quantised element comes out a ULP high and the ones
+    sitting exactly between two E4M3 codes round the other way. The operator's
+    inputs keep bfloat16's 8 significand bits while E4M3 has 4, so such exact
+    ties are common, not a corner case -- this showed up as 16 differing bytes
+    per token, every one of them off by a single LSB.
+
+    Assembling the float from its exponent field is exact by construction. Done
+    on CPU because the exponent is small and this keeps it independent of what
+    the device's bit-level ops happen to support.
+    """
+    code = (exponent.detach().cpu().to(torch.int32) + 127).clamp(0, 255)
+    pow2 = (code << 23).contiguous().view(torch.float32)
+    return pow2.to(device=exponent.device, dtype=exponent.dtype)
+
+
+def _to_e4m3_uint8(x: torch.Tensor) -> torch.Tensor:
+    """The reference FP8 conversion, returned as uint8 bit patterns.
+
+    A backend can carry the `float8_e4m3fn` dtype and still be unable to cast to
+    it: torch_npu raises `Float8_e4m3fn has not been supported`. That would fail
+    the oracle rather than the kernel under test, so fall back to CPU for this
+    one step. The cast is elementwise and device-independent, so the numbers are
+    unaffected -- only where they are computed.
+    """
+    try:
+        return x.to(torch.float8_e4m3fn).view(torch.uint8)
+    except RuntimeError:
+        return x.cpu().to(torch.float8_e4m3fn).view(torch.uint8).to(x.device)
+
+
 def torch_quantize_and_insert_k_cache(
     k: torch.Tensor,  # [num_tokens, 512] bf16
     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
@@ -153,7 +211,7 @@ def torch_quantize_and_insert_k_cache(
     num_tokens_insert = slot_mapping.shape[0]
     assert num_tokens_insert <= num_tokens
 
-    token_id = torch.arange(num_tokens_insert)
+    token_id = torch.arange(num_tokens_insert, device=slot_mapping.device)
     slot_id = slot_mapping[token_id]
     mask = slot_id >= 0
     num = mask.sum()
@@ -182,11 +240,10 @@ def torch_quantize_and_insert_k_cache(
     raw_scale = block_max / FP8_MAX
     log_scale = torch.log2(raw_scale)
     exponent = torch.ceil(log_scale)
-    scale = torch.exp2(exponent)
+    scale = _exact_pow2(exponent)
     x_scaled = kv_quant_blk / scale[:, :, None]
     x_clamped = torch.clamp(x_scaled, min=-FP8_MAX, max=FP8_MAX)
-    x_fp8 = x_clamped.to(torch.float8_e4m3fn)
-    x_uint8 = x_fp8.view(torch.uint8).view(num, NOPE_DIM)
+    x_uint8 = _to_e4m3_uint8(x_clamped).view(num, NOPE_DIM)
     fp8_range = torch.arange(NOPE_DIM, dtype=torch.int64, device=k.device)
     k_cache[block_id[:, None], fp8_off[:, None] + fp8_range[None, :]] = x_uint8
     encoded_scale = exponent + 127.0
@@ -245,22 +302,27 @@ def k_cache_compare(
 
 
 def ref_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
-    if VLLM_REF_AVAILABLE:
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
-        )
-    else:
-        q_norm_f32 = rmsnorm_no_weight_f32(q, eps)
-        apply_rope_gptj_last_k(q, q_norm_f32, positions, cos_sin_cache)
-        if kv.size(0) > slot_mapping.size(0):
-            kv = kv[: slot_mapping.size(0), :]
-            positions = positions[: slot_mapping.size(0)]
-        apply_rope_gptj_last_k(kv, None, positions, cos_sin_cache)
-        torch_quantize_and_insert_k_cache(kv, k_cache, slot_mapping, block_size=bs)
+    """The oracle: always this file's torch reference.
+
+    This used to run vLLM's C++ kernel instead whenever `torch.ops._C` happened
+    to carry the op, which made the oracle depend on collection order -- nothing
+    here imports vLLM, but `test_cp_gather_indexer_k_quant_cache` and
+    `test_cutlass_scaled_mm` do so at module level and both sort earlier, so the
+    reference silently differed between running this file alone and running the
+    suite. Cross-checking against vLLM is worth doing, but as its own test
+    (`test_matches_vllm_reference`), not as a substitution inside the oracle.
+    """
+    q_norm_f32 = rmsnorm_no_weight_f32(q, eps)
+    apply_rope_gptj_last_k(q, q_norm_f32, positions, cos_sin_cache)
+    if kv.size(0) > slot_mapping.size(0):
+        kv = kv[: slot_mapping.size(0), :]
+        positions = positions[: slot_mapping.size(0)]
+    apply_rope_gptj_last_k(kv, None, positions, cos_sin_cache)
+    torch_quantize_and_insert_k_cache(kv, k_cache, slot_mapping, block_size=bs)
 
 
 def fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
-    flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
     )
 
@@ -277,7 +339,7 @@ def fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
 @pytest.mark.parametrize("n_heads", [8, 64])
 def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     torch.manual_seed(0)
-    device = "cuda"
+    device = flaggems_vllm.device
     dtype = torch.bfloat16
     eps = 1e-6
     max_pos = max(4096, num_tokens)
@@ -326,7 +388,7 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
     absmax = blocks.abs().amax(dim=-1).clamp(min=1e-4)
     raw = absmax / FP8_MAX
     exponent = torch.ceil(torch.log2(raw))
-    return torch.pow(2.0, exponent)  # [n_tok, n_blocks]
+    return _exact_pow2(exponent)  # [n_tok, n_blocks]
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
@@ -338,7 +400,7 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     torch.manual_seed(1)
-    device = "cuda"
+    device = flaggems_vllm.device
     dtype = torch.bfloat16
     eps = 1e-6
     max_pos = max(4096, num_tokens)
@@ -390,7 +452,7 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     """slot_mapping.size(0) < q.size(0): the kernel must skip padded
     tokens in the KV branch while still running Q-norm+RoPE on all rows."""
     torch.manual_seed(3)
-    device = "cuda"
+    device = flaggems_vllm.device
     dtype = torch.bfloat16
     eps = 1e-6
     max_pos = max(4096, num_tokens)
@@ -447,12 +509,9 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
 @pytest.mark.parametrize("n_heads", [64, 128])
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
-    # out of memory for huge shape on H800
-    if (num_tokens == 98304 or num_tokens == 131072) and n_heads == 128:
-        return
 
     torch.manual_seed(2)
-    device = "cuda"
+    device = flaggems_vllm.device
     dtype = torch.bfloat16
     eps = 1e-6
     max_pos = max(4096, num_tokens)
@@ -483,6 +542,119 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
         eps,
         block_size,
     )
+    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+
+    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
+
+
+_OVERRIDE_ACTIVE = (
+    flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert is not _generic_impl
+)
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
+@pytest.mark.skipif(
+    not _OVERRIDE_ACTIVE,
+    reason="No backend override registered; the generic kernel is in use",
+)
+@pytest.mark.parametrize(
+    "num_tokens",
+    [1, 17, 513] if QUICK_MODE else [1, 17, 64, 511, 512, 777, 1000, 4096],
+)
+@pytest.mark.parametrize("n_heads", [64, 128])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_backend_override_matches_reference(
+    num_tokens: int, n_heads: int, block_size: int
+):
+    torch.manual_seed(3)
+    device = flaggems_vllm.device
+    eps = 1e-6
+    max_pos = max(4096, num_tokens)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_cache = torch.zeros(
+        num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
+
+    q_ref, kv_ref = q.clone(), kv.clone()
+    k_cache_ref = k_cache.clone()
+    ref_impl(
+        q_ref,
+        kv_ref,
+        k_cache_ref,
+        slot_mapping.clone(),
+        positions.clone(),
+        cos_sin_cache.clone(),
+        eps,
+        block_size,
+    )
+    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+
+    k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
+@pytest.mark.skipif(not VLLM_REF_AVAILABLE, reason="vLLM is not installed")
+@pytest.mark.parametrize(
+    "num_tokens", [17, 512] if QUICK_MODE else [17, 512, 777, 4096]
+)
+@pytest.mark.parametrize("n_heads", [64, 128])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
+    """Cross-check against vLLM's own kernel -- the implementation this replaces.
+
+    Kept separate from the tests above, which compare against this file's torch
+    reference. That reference is the oracle; this is a comparison of two
+    production kernels, and it is skipped where vLLM is absent. Merging the two
+    is what the module used to do and it made the oracle order-dependent; see
+    `ref_impl`.
+    """
+    torch.manual_seed(4)
+    device = flaggems_vllm.device
+    dtype = torch.bfloat16
+    eps = 1e-6
+    max_pos = max(4096, num_tokens)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    k_cache = torch.zeros(
+        num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    q_ref = q.clone()
+    kv_ref = kv.clone()
+    k_cache_ref = k_cache.clone()
+
+    try:
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q_ref,
+            kv_ref,
+            k_cache_ref,
+            slot_mapping.clone(),
+            positions.clone(),
+            cos_sin_cache.clone(),
+            eps,
+            block_size,
+        )
+        torch.zeros(1, device=device).sum()  # a launch is what surfaces the error
+        flaggems_vllm.runtime.torch_device_fn.synchronize()
+    except Exception as e:  # registered but unlaunchable -- e.g. MetaX C550
+        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+        pytest.skip("vLLM kernel is registered but fails to run: " + reason)
+
     fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
 
     torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
