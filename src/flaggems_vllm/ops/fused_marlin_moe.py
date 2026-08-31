@@ -201,6 +201,21 @@ def _block_m_padding_ratio(M: int, E: int, top_k: int, block_m: int) -> float:
     return E * block_m / max(M * max(top_k, 1), 1)
 
 
+def _halve_block_m_if_padding_dominates(
+    block_m: int, M: int, E: int, top_k: int
+) -> int:
+    """Halve a token tile whose padding costs more than the smaller tile's lower
+    per-CTA efficiency.
+
+    Only the 16 and 32 tiers can reach the crossover ratio, and the 32 tier only
+    under the cutoff `swap_ab` lowers to 8. Halving is a scheduling change, so
+    outputs are bit-identical either way.
+    """
+    if block_m in (16, 32) and _block_m_padding_ratio(M, E, top_k, block_m) >= 2.5:
+        return block_m // 2
+    return block_m
+
+
 def _select_block_m(
     M: int,
     E: int,
@@ -224,6 +239,10 @@ def _select_w4a16_int4_kernel_policy(
     apply_router_weight_on_input: bool,
 ) -> _W4A16Int4KernelPolicy:
     device_info = _get_device_info(device)
+    is_full_hopper = device_info.is_hopper and device_info.has_full_hopper_sm_count
+    is_reduced_hopper = (
+        device_info.is_hopper and not device_info.has_full_hopper_sm_count
+    )
 
     # Base tiling policy. Full Hopper uses a smaller cutoff because it has
     # enough SMs to keep smaller routed-token CTAs busy; reduced Hopper uses a
@@ -236,14 +255,12 @@ def _select_w4a16_int4_kernel_policy(
         block_m_cutoff = 16
 
     block_m = _select_block_m(M, E, top_k, block_m_cutoff)
+    if is_reduced_hopper:
+        block_m = _halve_block_m_if_padding_dominates(block_m, M, E, top_k)
 
     # Full Hopper keeps the fused GEMM1+SiLU path on broadly. Reduced Hopper
     # uses it for tiny decode and larger-token batches, while avoiding the
     # small-mid token range that regressed in H20 sweeps.
-    is_full_hopper = device_info.is_hopper and device_info.has_full_hopper_sm_count
-    is_reduced_hopper = (
-        device_info.is_hopper and not device_info.has_full_hopper_sm_count
-    )
     if is_full_hopper:
         use_fused_gemm1_silu = True
     elif is_reduced_hopper:
@@ -277,14 +294,8 @@ def _select_w4a16_mxfp4_kernel_policy(
     block_m = _select_block_m(M, E, top_k, 8 if swap_ab else 16)
     if is_reduced_hopper and M <= 128 and routed_tokens_per_expert < 8:
         block_m = 8
-    elif (
-        is_reduced_hopper
-        and block_m == 16
-        # Halve the tile once padding costs more than the smaller tile's lower
-        # per-CTA efficiency; the crossover sits around 2.5x.
-        and _block_m_padding_ratio(M, E, top_k, block_m) >= 2.5
-    ):
-        block_m = 8
+    elif is_reduced_hopper:
+        block_m = _halve_block_m_if_padding_dominates(block_m, M, E, top_k)
 
     if is_reduced_hopper and M == 1:
         align_mode = _MXFP4AlignMode.singleton
