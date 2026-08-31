@@ -22,12 +22,14 @@ from . import conftest as cfg
 
 if cfg.QUICK_MODE:
     FLOAT_DTYPES = [torch.float32]
+    FUSED_SHAPES = [*utils.REDUCTION_SHAPES, (2, 8192)]
 else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
+    FUSED_SHAPES = utils.REDUCTION_SHAPES
 
 
 @pytest.mark.fused_add_rms_norm
-@pytest.mark.parametrize("shape", utils.REDUCTION_SHAPES)
+@pytest.mark.parametrize("shape", FUSED_SHAPES)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_fused_add_rms_norm(shape, dtype):
     N = shape[1]
@@ -62,3 +64,60 @@ def test_fused_add_rms_norm(shape, dtype):
 
     utils.gems_assert_close(res_out, ref_out, dtype)
     utils.gems_assert_close(res_new_residual, ref_new_residual, dtype)
+
+
+@pytest.mark.fused_add_rms_norm
+def test_fused_add_rms_norm_rejects_unsafe_execution_modes():
+    device = flaggems_vllm.device
+    noncontiguous_x = torch.randn((4, 2), device=device).T
+    residual = torch.randn((2, 4), device=device)
+    weight = torch.randn((4,), device=device)
+
+    with pytest.raises(NotImplementedError, match="contiguous"):
+        flaggems_vllm.ops.fused_add_rms_norm(noncontiguous_x, residual, (4,), weight)
+
+    grad_x = torch.randn((2, 4), device=device, requires_grad=True)
+    with pytest.raises(NotImplementedError, match="inference-only"):
+        flaggems_vllm.ops.fused_add_rms_norm(grad_x, residual, (4,), weight)
+
+    with pytest.raises(TypeError, match="same dtype"):
+        flaggems_vllm.ops.fused_add_rms_norm(
+            torch.randn((2, 4), device=device, dtype=torch.float16),
+            torch.randn((2, 4), device=device, dtype=torch.float16),
+            (4,),
+            weight,
+        )
+
+    with pytest.raises(TypeError, match="only supports"):
+        flaggems_vllm.ops.fused_add_rms_norm(
+            torch.randn((2, 4), device=device, dtype=torch.float64),
+            torch.randn((2, 4), device=device, dtype=torch.float64),
+            (4,),
+            weight.to(torch.float64),
+        )
+
+    aliased_x = torch.randn((2, 4), device=device)
+    with pytest.raises(ValueError, match="must not overlap"):
+        flaggems_vllm.ops.fused_add_rms_norm(aliased_x, aliased_x, (4,), weight)
+
+    overlapping_storage = torch.randn((3, 4), device=device)
+    partially_overlapping_x = overlapping_storage[:2]
+    partially_overlapping_residual = overlapping_storage[1:]
+    assert partially_overlapping_x.is_contiguous()
+    assert partially_overlapping_residual.is_contiguous()
+    with pytest.raises(ValueError, match="must not overlap"):
+        flaggems_vllm.ops.fused_add_rms_norm(
+            partially_overlapping_x,
+            partially_overlapping_residual,
+            (4,),
+            weight,
+        )
+
+    overlapping_weight_x = torch.randn((2, 4), device=device)
+    with pytest.raises(ValueError, match="must not overlap"):
+        flaggems_vllm.ops.fused_add_rms_norm(
+            overlapping_weight_x,
+            residual,
+            (4,),
+            overlapping_weight_x[0],
+        )

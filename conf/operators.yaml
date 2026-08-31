@@ -475,6 +475,41 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: gems_activation
+    description: FlagGems-vLLM module wrapper for fused SiLU and multiplication.
+    for:
+      - gems_silu_and_mul
+    labels:
+      - fused
+      - Activation
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: gems_normalization
+    description: FlagGems-vLLM RMSNorm module with optional fused residual addition.
+    for:
+      - gems_rms_forward
+    labels:
+      - fused
+      - Normalization
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: gems_rotary_embedding
+    description: FlagGems-vLLM rotary embedding modules and YaRN cache support.
+    for:
+      - gems_rope_forward
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
@@ -742,6 +777,17 @@ ops:
     stages:
       - stable: '3.0'
     cpp: '4.0'
+  - id: rms_norm
+    description: Apply weighted Root Mean Square Layer Normalization.
+    for:
+      - rms_norm
+    labels:
+      - aten
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: rwkv_ka_fusion
     description: |
       Merges, aligns, and enhances features from different data sources or spatial directions
