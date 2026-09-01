@@ -44,7 +44,7 @@ import triton
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend import _state
+from flaggems_vllm.runtime.backend import vendor_module
 from flaggems_vllm.utils.code_cache import config_cache_dir
 from flaggems_vllm.utils.models import PersistantModel, SQLPersistantModel
 
@@ -171,7 +171,7 @@ class LibCache(object):
     def __init__(self, db_url: Optional[str] = None):
         self.global_cache: Dict = {}
         self.volumn: Dict = {}
-        vendor_name = _state.vendor_module.vendor_info.vendor_name
+        vendor_name = vendor_module.vendor_info.vendor_name
         if db_url is None:
             cache_file_name: str = (
                 f"TunedConfig_{vendor_name}_triton_{major_version}_{minor_version}.db"
