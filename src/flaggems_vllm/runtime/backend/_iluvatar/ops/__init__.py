@@ -13,8 +13,24 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
+    qwen4_compress_norm_mrope_store_groups,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.ple_state import ple_state_scatter_
+from flaggems_vllm.runtime.backend._iluvatar.ops.qsa import qwen4_store_qsa_kv_rows
+from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
-__all__ = ["scaled_int8_quant"]
+__all__ = [
+    "qwen4_store_qsa_kv_rows",
+    "qwen4_hc_inject_combine",
+    "ple_state_scatter_",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_compress_norm_mrope_store_groups",
+    "scaled_int8_quant",
+]
