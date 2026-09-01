@@ -12,10 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
+    qwen4_compress_norm_mrope_store_groups,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.ple_state import ple_state_scatter_
+from flaggems_vllm.runtime.backend._mthreads.ops.qsa import qwen4_store_qsa_kv_rows
+from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -23,5 +32,10 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
+    "qwen4_store_qsa_kv_rows",
+    "qwen4_hc_inject_combine",
+    "ple_state_scatter_",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
 ]
