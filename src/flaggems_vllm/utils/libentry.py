@@ -831,6 +831,21 @@ class LibEntry(triton.KernelInterface):
         for i, arg in enumerate(args):
             hashable_arg = arg
             if (
+                isinstance(arg, tuple)
+                and arg
+                and all(hasattr(item, "data_ptr") for item in arg)
+            ):
+                # Tensor tuples carry runtime pointer values, not compile-time
+                # specialization. Key them like individual tensor arguments so
+                # recreating equivalent views does not retrigger autotuning.
+                hashable_arg = (
+                    type(arg),
+                    tuple(
+                        (item.dtype, item.data_ptr() % self.divisibility)
+                        for item in arg
+                    ),
+                )
+            if (
                 hasattr(arg, "__class__")
                 and arg.__class__.__name__ == "TensorDescriptor"
             ):
