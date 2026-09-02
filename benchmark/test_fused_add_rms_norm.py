@@ -19,30 +19,274 @@ import flaggems_vllm
 
 from . import base, consts
 
+VENDOR = flaggems_vllm.vendor_name
+
+
+# NVIDIA and Hygon/BW1000 expose the same vLLM custom-op API.
+VLLM_NATIVE_VENDORS = {
+    "nvidia",
+    "hygon",
+}
+
+
+# -----------------------------------------------------------------------------
+# Vendor-specific native baseline import
+# -----------------------------------------------------------------------------
+
+if VENDOR in VLLM_NATIVE_VENDORS:
+    # Import vLLM custom ops so that the native extension is
+    # loaded/registered.
+    from vllm import _custom_ops as vendor_ops
+
+elif VENDOR == "mthreads":
+    # Only Moore Threads environments need vLLM-MUSA.
+    from vllm_musa import _custom_ops as vendor_ops
+
+else:
+    vendor_ops = None
+
+
+# -----------------------------------------------------------------------------
+# Vendor capability
+# -----------------------------------------------------------------------------
+
+
+def _mthreads_shape_supported(shape):
+    """Check whether vLLM-MUSA fused_add_rms_norm supports the shape.
+
+    vLLM-MUSA requirements:
+      - input: 2-D
+      - residual: 2-D
+      - weight: 1-D
+      - input.shape == residual.shape
+      - weight.shape[0] == input.shape[1]
+      - hidden_size % 8 == 0
+      - hidden_size <= 16384
+
+    _input_fn already guarantees:
+      - input.shape == residual.shape
+      - weight.shape == (shape[-1],)
+
+    Therefore only the remaining shape restrictions are checked here.
+    """
+    if len(shape) != 2:
+        return False
+
+    hidden_size = shape[-1]
+
+    return hidden_size > 0 and hidden_size % 8 == 0 and hidden_size <= 16384
+
+
+def _get_supported_dtypes():
+    """Return dtypes supported by both FlagGems and the selected baseline."""
+
+    if VENDOR == "mthreads":
+        # vLLM-MUSA fused_add_rms_norm supports FP16/BF16 only.
+        return [
+            dtype
+            for dtype in consts.FLOAT_DTYPES
+            if dtype in (torch.float16, torch.bfloat16)
+        ]
+
+    # NVIDIA/Hygon vLLM native baseline and the generic reference use
+    # the benchmark's normal floating-point dtype set.
+    return consts.FLOAT_DTYPES
+
+
+# -----------------------------------------------------------------------------
+# Inputs
+# -----------------------------------------------------------------------------
+
 
 def _input_fn(shape, dtype, device):
-    inp = torch.randn(shape, dtype=dtype, device=device)
-    residual = torch.randn(shape, dtype=dtype, device=device)
+    inp = torch.randn(
+        shape,
+        dtype=dtype,
+        device=device,
+    )
+
+    residual = torch.randn(
+        shape,
+        dtype=dtype,
+        device=device,
+    )
+
     layer_shape = (shape[-1],)
-    weight = torch.randn(layer_shape, dtype=dtype, device=device)
+
+    weight = torch.randn(
+        layer_shape,
+        dtype=dtype,
+        device=device,
+    )
+
     yield inp, residual, layer_shape, weight, 1e-5
 
 
-def torch_op(x, residual, layer_shape, weight, eps):
+# -----------------------------------------------------------------------------
+# Baseline implementations
+# -----------------------------------------------------------------------------
+
+
+def torch_reference_op(x, residual, layer_shape, weight, eps):
+    """Generic PyTorch reference implementation."""
+    del layer_shape
+
     x = x + residual
     variance = x.pow(2).mean(-1, keepdim=True)
     hidden_states = x * torch.rsqrt(variance + eps)
+
     return weight * hidden_states
 
 
+def vllm_native_op(x, residual, layer_shape, weight, eps):
+    """Call the native vLLM fused_add_rms_norm implementation.
+
+    Used by:
+      - NVIDIA
+      - Hygon/BW1000
+    """
+    del layer_shape
+
+    vendor_ops.fused_add_rms_norm(
+        x,
+        residual,
+        weight,
+        eps,
+    )
+
+    # Native vLLM fused_add_rms_norm updates x/residual in-place and
+    # normally returns None. Return x only to keep a normal benchmark
+    # callable interface.
+    return x
+
+
+def vllm_musa_op(x, residual, layer_shape, weight, eps):
+    """Call vLLM-MUSA fused_add_rms_norm."""
+    del layer_shape
+
+    vendor_ops.musa_fused_add_rms_norm(
+        x,
+        residual,
+        weight,
+        eps,
+        block_x=0,
+    )
+
+    # vLLM-MUSA also updates x/residual in-place.
+    return x
+
+
+def _get_baseline_op():
+    """Select the native/reference baseline for the current vendor."""
+
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        return vllm_native_op
+
+    if VENDOR == "mthreads":
+        return vllm_musa_op
+
+    # Vendors without an explicitly configured native vLLM baseline
+    # continue to use the original PyTorch reference implementation.
+    return torch_reference_op
+
+
+# -----------------------------------------------------------------------------
+# Benchmark
+# -----------------------------------------------------------------------------
+
+
+class FusedAddRmsNormBenchmark(base.GenericBenchmarkExcluse1D):
+    """Benchmark FlagGems-vllm fused_add_rms_norm.
+
+    Baseline:
+      NVIDIA      -> vLLM native C/CUDA kernel
+      Hygon       -> vLLM native kernel
+      MooreThreads -> vLLM-MUSA native kernel
+      Other       -> PyTorch reference
+    """
+
+    def get_latency(self, op, *args, **kwargs):
+        """Give each measured implementation independent mutable buffers.
+
+        fused_add_rms_norm modifies input and residual in-place.
+
+        The generic benchmark passes the original tensors separately to
+        get_latency() for the baseline and FlagGems implementations.
+
+        Clone input/residual once before entering the timed region so that:
+          1. baseline and FlagGems start from the same original values;
+          2. one implementation cannot mutate the other's buffers;
+          3. clone/copy overhead is excluded from kernel latency.
+        """
+        args = list(args)
+
+        # args:
+        #   0: input
+        #   1: residual
+        #   2: layer_shape
+        #   3: weight
+        #   4: eps
+        args[0] = args[0].clone()
+        args[1] = args[1].clone()
+
+        return super().get_latency(op, *args, **kwargs)
+
+    def init_user_config(self):
+        """Apply restrictions imposed by the selected native baseline."""
+        super().init_user_config()
+
+        if VENDOR == "mthreads":
+            # GenericBenchmarkExcluse1D contains both 2-D and 3-D shapes.
+            # vLLM-MUSA supports only a subset of the 2-D shapes.
+            self.shapes = [
+                shape for shape in self.shapes if _mthreads_shape_supported(shape)
+            ]
+
+            if not self.shapes:
+                pytest.skip(
+                    "No benchmark shapes are supported by "
+                    "vLLM-MUSA fused_add_rms_norm."
+                )
+
+
+# -----------------------------------------------------------------------------
+# Test
+# -----------------------------------------------------------------------------
+
+
 @pytest.mark.fused_add_rms_norm
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "tsingmicro",
+    reason="Issue #4131: not working",
+)
 def test_fused_add_rms_norm():
-    bench = base.GenericBenchmarkExcluse1D(
+    baseline_op = _get_baseline_op()
+
+    # Check that the native baseline is actually available before
+    # starting the benchmark.
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        assert hasattr(
+            torch.ops._C,
+            "fused_add_rms_norm",
+        ), "vLLM native fused_add_rms_norm is not available"
+
+    elif VENDOR == "mthreads":
+        assert hasattr(
+            vendor_ops,
+            "musa_fused_add_rms_norm",
+        ), "vLLM-MUSA musa_fused_add_rms_norm is not available"
+
+    bench = FusedAddRmsNormBenchmark(
         input_fn=_input_fn,
         op_name="fused_add_rms_norm",
-        torch_op=torch_op,
-        gems_op=flaggems_vllm.ops.fused_add_rms_norm,
-        dtypes=consts.FLOAT_DTYPES,
+        # GenericBenchmark calls this field torch_op, but for native
+        # platforms it is actually the corresponding vLLM baseline.
+        torch_op=baseline_op,
+        # Use the top-level API so that FlagGems-vllm's vendor-specific
+        # backend override is respected.
+        gems_op=flaggems_vllm.fused_add_rms_norm,
+        dtypes=_get_supported_dtypes(),
+        is_inplace=True,
     )
 
     bench.run()

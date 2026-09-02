@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
+    fused_add_rms_norm,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
@@ -46,4 +49,5 @@ __all__ = [
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
     "triton_scaled_mm",
+    "fused_add_rms_norm",
 ]
