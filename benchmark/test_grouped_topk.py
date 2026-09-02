@@ -130,9 +130,38 @@ def mthreads_grouped_topk(
     return topk_weights, topk_ids
 
 
+def ascend_moe_gating_top_k(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    norm_type = 1  # 0: softmax; 1: sigmoid
+    renorm = int(renormalize)
+    topk_weights, topk_ids, _out = torch.ops._C_ascend.moe_gating_top_k(
+        scores.float(),
+        k=topk,
+        k_group=topk_group,
+        group_count=num_expert_group,
+        group_select_mode=1,
+        renorm=renorm,
+        norm_type=norm_type,
+        out_flag=False,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=1e-20,
+        bias_opt=bias.float(),
+    )
+    return topk_weights, topk_ids.to(torch.int32)
+
+
 vendor_name = flaggems_vllm.vendor_name
 USE_AITER = False
 USE_MATE = False
+USE_C_ASCEND = False
 
 try:
     if vendor_name == "hygon":
@@ -145,6 +174,15 @@ try:
 
         ref_grouped_topk = mthreads_grouped_topk
         USE_MATE = True
+    elif vendor_name == "ascend":
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+        if hasattr(torch.ops._C_ascend, "moe_gating_top_k"):
+            ref_grouped_topk = ascend_moe_gating_top_k
+        else:
+            ref_grouped_topk = torch_grouped_topk
+        USE_C_ASCEND = True
     else:
         import vllm._custom_ops  # noqa: F401
 
@@ -212,6 +250,10 @@ class GroupedTopKBenchmark(base.Benchmark):
 @pytest.mark.skipif(
     USE_MATE, reason="scoring_func == 0 is not supported by moe_fused_gate in mate"
 )
+@pytest.mark.skipif(
+    USE_C_ASCEND,
+    reason="scoring_func == 0 is not supported by moe_gating_top_k in vllm-ascend",
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
@@ -234,6 +276,10 @@ def test_grouped_topk_no_renorm():
 )
 @pytest.mark.skipif(
     USE_MATE, reason="scoring_func == 0 is not supported by moe_fused_gate in mate"
+)
+@pytest.mark.skipif(
+    USE_C_ASCEND,
+    reason="scoring_func == 0 is not supported by moe_gating_top_k in vllm-ascend",
 )
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
