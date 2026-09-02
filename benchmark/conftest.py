@@ -100,10 +100,11 @@ def pytest_addoption(parser):
         action="store",
         default="kernel",
         required=False,
-        choices=["kernel", "operator", "wrapper"],
+        choices=["kernel", "operator", "wrapper", "cudagraph"],
         help=(
             "Specify how to measure latency, 'kernel' for device kernel, "
-            "'operator' for end2end operator or 'wrapper' for runtime wrapper."
+            "'operator' for end2end operator, 'wrapper' for runtime wrapper, "
+            "or 'cudagraph' for CUDA Graph captured execution."
         ),
     )
 
@@ -119,13 +120,19 @@ def pytest_addoption(parser):
     parser.addoption(
         "--warmup",
         default=consts.DEFAULT_WARMUP_COUNT,
-        help="Number of warmup runs before benchmark run.",
+        help=(
+            "Warmup time in ms for kernel mode, call count for "
+            "operator/wrapper modes; unused by cudagraph mode."
+        ),
     )
 
     parser.addoption(
         "--iter",
         default=consts.DEFAULT_ITER_COUNT,
-        help="Number of reps for each benchmark run.",
+        help=(
+            "Measurement time in ms for kernel/cudagraph modes, call count "
+            "for operator/wrapper modes."
+        ),
     )
 
     parser.addoption(

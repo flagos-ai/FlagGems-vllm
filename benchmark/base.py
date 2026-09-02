@@ -298,10 +298,21 @@ class Benchmark:
                 fn()
             end = time.time()
             latency = (end - start) / Config.repetition * 1000
+        elif Config.mode == consts.BenchMode.CUDAGRAPH:
+            latency = triton.testing.do_bench_cudagraph(
+                fn,
+                rep=Config.repetition,
+                return_mode="median",
+                grad_to_none=xs if self.is_backward else None,
+            )
         else:
             raise ValueError("Undefined Value of Benchmark Mode.")
         # average latency in ms
         return latency
+
+    def get_paired_latency(self, baseline_op, gems_op, *args, **kwargs):
+        """Optionally measure baseline and Gems together to control ordering."""
+        return None
 
     def get_gbps(self, args, latency=None):
         # """Return the dynamic input iterator for each Operator."""
@@ -394,11 +405,25 @@ class Benchmark:
                 try:
                     args, kwargs = self.unpack_to_args_kwargs(input)
                     metric.shape_detail = self.record_shapes(*args, **kwargs)
-                    if "latency_base" in self.to_bench_metrics:
+                    paired_latency = None
+                    if (
+                        self.gems_op
+                        and "latency_base" in self.to_bench_metrics
+                        and "latency" in self.to_bench_metrics
+                    ):
+                        paired_latency = self.get_paired_latency(
+                            self.torch_op,
+                            self.gems_op,
+                            *args,
+                            **kwargs,
+                        )
+                    if paired_latency is not None:
+                        metric.latency_base, metric.latency = paired_latency
+                    elif "latency_base" in self.to_bench_metrics:
                         metric.latency_base = self.get_latency(
                             self.torch_op, *args, **kwargs
                         )
-                    if "latency" in self.to_bench_metrics:
+                    if "latency" in self.to_bench_metrics and paired_latency is None:
                         if self.gems_op:
                             metric.latency = self.get_latency(
                                 self.gems_op, *args, **kwargs
