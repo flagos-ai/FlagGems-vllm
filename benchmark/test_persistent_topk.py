@@ -26,8 +26,22 @@ HAS_VLLM = False
 try:
     import vllm._custom_ops  # noqa: F401
 
+    # `vllm._custom_ops` may import cleanly even when the compiled C++ extension
+    # is missing, in which case the native op raises NotImplementedError at
+    # dispatch time. Probe one tiny call so the benchmark is skipped (rather
+    # than errored) when the kernel is not actually available.
+    _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
+    _probe_lengths = torch.tensor([4102], dtype=torch.int32, device="cuda")
+    torch.ops._C.persistent_topk(
+        _probe_logits,
+        _probe_lengths,
+        torch.empty((1, 512), dtype=torch.int32, device="cuda"),
+        torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda"),
+        512,
+        4102,
+    )
     HAS_VLLM = True
-except (ImportError, AttributeError):
+except (ImportError, AttributeError, NotImplementedError, RuntimeError):
     pass
 
 STRIDE = 262144

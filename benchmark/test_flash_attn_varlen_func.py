@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+from functools import wraps
 from typing import Any, List, Optional
 
 import pytest
@@ -22,6 +24,44 @@ import flaggems_vllm
 from . import base, utils
 
 vendor_name = flaggems_vllm.vendor_name
+
+
+def _with_supported_kwargs(op):
+    """Wrap ``op`` while omitting keyword arguments it does not support.
+
+    vLLM has changed the order and availability of the optional FlashAttention
+    arguments following ``out`` across releases.  Inspecting the signature up
+    front avoids relying on a ``TypeError`` fallback, which could accidentally
+    hide a real error raised from inside the operator.
+    """
+    try:
+        parameters = inspect.signature(op).parameters
+    except (TypeError, ValueError):
+        # Some vendor extension callables do not expose a Python signature.
+        # Every kwarg supplied by this benchmark carries the API default, so
+        # omitting them is the safest compatibility fallback.
+        parameters = {}
+    accepts_var_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    supported_kwargs = {
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+    }
+
+    @wraps(op)
+    def wrapped(*args, **kwargs):
+        if not accepts_var_kwargs:
+            kwargs = {
+                name: value
+                for name, value in kwargs.items()
+                if name in supported_kwargs
+            }
+        return op(*args, **kwargs)
+
+    return wrapped
 
 
 class FlashAttnVarlenBenchmark(base.Benchmark):
@@ -222,11 +262,11 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
             block_tables,
             False,
             out,
-            None,
-            None,
-            None,
-            None,
             {
+                "scheduler_metadata": None,
+                "q_descale": None,
+                "k_descale": None,
+                "v_descale": None,
                 "s_aux": None,
                 "num_splits": 0,
                 "cp_world_size": 1,
@@ -321,6 +361,8 @@ def test_flash_attn_varlen_func(monkeypatch):
         flash_attn_varlen_func = flash_attn_varlen_legacy
     else:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+        flash_attn_varlen_func = _with_supported_kwargs(flash_attn_varlen_func)
 
     bench = FlashAttnVarlenBenchmark(
         op_name="flash_attn_varlen_func",
