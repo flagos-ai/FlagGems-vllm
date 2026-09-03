@@ -509,20 +509,31 @@ sparse_attn_quant:
   - gen: true
     param_map:
       META:
-        PLACEHOLDER_UNUSED: placeholder
+        BLOCK: block
       num_warps: warps
       num_stages: stages
-    placeholder: [1]
-    warps: [4, 8]
-    stages: [2, 3]
+    block: [64]
+    warps: [8]
+    stages: [2]
+
+sparse_attn_quant_fp8:
+  - gen: true
+    param_map:
+      META:
+        BLOCK: block
+      num_warps: warps
+      num_stages: stages
+    block: [64]
+    warps: [8]
+    stages: [2]
 
 sparse_attn_kv_quant:
   - gen: true
     param_map:
       META:
-        PLACEHOLDER_UNUSED: placeholder
+        KV_BLOCK_SIZE: kv_block
       num_warps: warps
       num_stages: stages
-    placeholder: [1]
-    warps: [2, 4]
-    stages: [2, 3]
+    kv_block: [64]
+    warps: [8]
+    stages: [2]
