@@ -192,6 +192,7 @@ runs:
       shell: bash
       env:
         BACKEND: ${{ inputs.backend }}
+        TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       run: |
         set -eo pipefail
         trap 'status=$?; echo "::error title=Portable backend preflight failed::Exit ${status}"; exit "${status}"' ERR
