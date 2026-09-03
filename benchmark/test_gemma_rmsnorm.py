@@ -31,7 +31,7 @@ from . import consts  # noqa: E402
 
 vendor = flaggems_vllm.vendor_name
 
-if vendor == "nvidia":
+if vendor == "nvidia" or vendor == "thead":
     try:
         os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
         from flashinfer.norm import gemma_rmsnorm as baseline_op
@@ -91,7 +91,7 @@ class GemmaRmsNormBenchmark(Benchmark):
 )
 @pytest.mark.gemma_rmsnorm
 def test_gemma_rmsnorm():
-    if flaggems_vllm.vendor_name != "mthreads":
+    if flaggems_vllm.vendor_name not in ["mthreads", "thead"]:
         dtypes = consts.FLOAT_DTYPES
     else:
         dtypes = [torch.float16, torch.bfloat16]
