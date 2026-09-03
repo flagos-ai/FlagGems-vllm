@@ -48,6 +48,18 @@ class VendorDescriptor:
     moe_num_stages_max: int | None = None
     moe_fp16_gemm1_b_tile_factor: int = 1
     moe_direct_sum_enabled: bool = True
+    # Per-vendor fused MoE kernel paths (defaults preserve NVIDIA behavior).
+    # moe_use_int32_offsets: use int32 token/offset arithmetic when all
+    # offset products stay below 2^31 (saves registers).
+    # moe_fast_bf16_output: bf16 accumulator conversion with rtne_no_nan.
+    # moe_separate_activation: run the gated activation as a separate pass
+    # instead of the fused SiLU path.
+    # moe_fast_paths_min_m: the vendor-tuned fast paths above only apply to
+    # token counts >= this threshold (model-level M, not GEMM2-padded rows).
+    moe_use_int32_offsets: bool = False
+    moe_fast_bf16_output: bool = False
+    moe_separate_activation: bool = False
+    moe_fast_paths_min_m: int = 0
 
 
 VendorInfoBase = VendorDescriptor

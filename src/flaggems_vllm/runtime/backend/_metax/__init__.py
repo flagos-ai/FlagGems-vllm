@@ -18,6 +18,10 @@ vendor_info = VendorDescriptor(
     vendor_name="metax",
     device_name="cuda",
     device_query_cmd="mx-smi",
+    moe_use_int32_offsets=True,
+    moe_fast_bf16_output=True,
+    moe_separate_activation=True,
+    moe_fast_paths_min_m=8192,
 )
 
 CUSTOMIZED_UNUSED_OPS = ()

@@ -31,6 +31,12 @@ from flaggems_vllm.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
+# On devices without embedded MoE config tables, every fused_moe call
+# queries the default config; emit the "No embedded MoE configs" warning
+# only once (first call) to avoid spamming do_bench iterations (matches
+# upstream warning_once semantics).
+_WARNED_NO_EMBEDDED_CONFIG = False
+
 # OCP MX quantization helpers (requires amd-quark)
 
 OCP_MX_BLOCK_SIZE = 32
@@ -48,11 +54,7 @@ _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 @functools.lru_cache(maxsize=1)
 def get_embedded_moe_configs():
     config_path = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "utils",
-        "configs",
-        "fused_moe_config.yaml",
+        os.path.dirname(__file__), "..", "utils", "configs", "fused_moe_config.yaml"
     )
     if not os.path.exists(config_path):
         return {}, {}
@@ -161,6 +163,12 @@ def _get_device_name() -> str:
     return name
 
 
+@functools.lru_cache(maxsize=1)
+def _is_h20() -> bool:
+    """Whether the current device is an NVIDIA H20 (gates the FP8 MoE swap_ab default)."""
+    return "H20" in _get_device_name().split("_")
+
+
 def get_moe_configs(
     E: int,
     N: int,
@@ -178,7 +186,7 @@ def get_moe_configs(
     embedded_configs, _ = get_embedded_moe_configs()
     device_table = embedded_configs.get(device_name)
     if device_table is None:
-        logger.warning(
+        logger.debug(
             "No embedded MoE configs for device %s. Will use default config.",
             device_name,
         )
@@ -189,9 +197,11 @@ def get_moe_configs(
     key = f"{E},{N},{dtype},{_block_n},{_block_k}"
     configs = device_table.get(key)
     if configs is not None:
-        logger.info("Using embedded MoE config for device=%s, key=%s", device_name, key)
+        logger.debug(
+            "Using embedded MoE config for device=%s, key=%s", device_name, key
+        )
         return configs
-    logger.warning(
+    logger.debug(
         "No embedded MoE config for device=%s, key=%s. Will use default config.",
         device_name,
         key,
@@ -256,23 +266,13 @@ def _get_config_quant_dtype(
         return torch.int8
     elif ocp_mx_scheme == "w_mxfp4_a_mxfp4":
         return "mxfp4"
-    elif ocp_mx_scheme in {
-        "w_mxfp4_a_mxfp6_e3m2",
-        "w_mxfp6_e3m2_a_mxfp6_e3m2",
-    }:
+    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e3m2", "w_mxfp6_e3m2_a_mxfp6_e3m2"}:
         return "mxfp6_e3m2"
-    elif ocp_mx_scheme in {
-        "w_mxfp4_a_mxfp6_e2m3",
-        "w_mxfp6_e2m3_a_mxfp6_e2m3",
-    }:
+    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e2m3", "w_mxfp6_e2m3_a_mxfp6_e2m3"}:
         return "mxfp6_e2m3"
     elif ocp_mx_scheme in {"w_mxfp4", "w_mxfp6_e3m2", "w_mxfp6_e2m3"}:
         return torch.bfloat16
-    elif ocp_mx_scheme in {
-        "w_mxfp4_a_fp8",
-        "w_mxfp6_e3m2_a_fp8",
-        "w_mxfp6_e2m3_a_fp8",
-    }:
+    elif ocp_mx_scheme in {"w_mxfp4_a_fp8", "w_mxfp6_e3m2_a_fp8", "w_mxfp6_e2m3_a_fp8"}:
         return torch.float8_e4m3fn
 
     return None
@@ -338,6 +338,42 @@ def get_moe_wna16_block_config(
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
 
+def _get_max_smem_bytes() -> int:
+    """Maximum dynamic shared memory per block for the current vendor."""
+    return device.info.max_smem_bytes
+
+
+def _clamp_num_stages_for_vendor(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_stages: int,
+    gemm_stage: str,
+    dtype: str | None,
+) -> int:
+    """Clamp the pipeline depth to vendor-specific MoE limits.
+
+    Driven by ``VendorDescriptor`` fields (see backend_utils.py); NVIDIA
+    defaults make this a no-op (same smem loop as the heuristic already runs,
+    NS floor of 2, no NS ceiling, fp16 B-tile factor of 1).
+    """
+    info = device.info
+    b_tile_factor = (
+        info.moe_fp16_gemm1_b_tile_factor
+        if (dtype == "fp16" and gemm_stage == "gemm1")
+        else 1
+    )
+    smem_per_stage = (block_m * block_k + b_tile_factor * block_k * block_n) * 2
+    while (
+        num_stages > info.moe_num_stages_min
+        and smem_per_stage * num_stages > info.max_smem_bytes
+    ):
+        num_stages -= 1
+    if info.moe_num_stages_max is not None:
+        num_stages = min(num_stages, info.moe_num_stages_max)
+    return num_stages
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -375,11 +411,22 @@ def get_default_config(
             "BLOCK_SIZE_M": block_m,
             "BLOCK_SIZE_N": block_shape[0],
             "BLOCK_SIZE_K": block_shape[1],
-            "GROUP_SIZE_M": (8 if (is_large_m and avg_tokens_per_expert > 16) else 1),
+            "GROUP_SIZE_M": 8 if (is_large_m and avg_tokens_per_expert > 16) else 1,
             "num_warps": 8 if (is_large_m and block_m > 32) else 4,
             "num_stages": 4 if M >= 1024 else 3,
-            "SWAP_AB": False,
+            # H20: swap_ab puts the larger N dim on the wgmma M-axis, a measured
+            # win on H20 for small token tiles (block_m<=32) but a regression for
+            # large tiles (e.g. 16k/32k-token prefill), so gate on both.
+            "SWAP_AB": _is_h20() and block_m <= 32,
         }
+        config["num_stages"] = _clamp_num_stages_for_vendor(
+            block_m,
+            block_shape[0],
+            block_shape[1],
+            config["num_stages"],
+            gemm_stage,
+            dtype,
+        )
     elif dtype in _PLAIN_HALF_CONFIG_DTYPES:
         # Routed rows per expert drives block_m.  Each token contributes topk
         # rows to the expert-sorted GEMM input, so M * topk / E is the relevant
@@ -441,8 +488,11 @@ def get_default_config(
             num_stages = 4
 
         smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+        while num_stages > 2 and smem_per_stage * num_stages > _get_max_smem_bytes():
             num_stages -= 1
+        num_stages = _clamp_num_stages_for_vendor(
+            block_m, block_n, block_k, num_stages, gemm_stage, dtype
+        )
 
         config = {
             "BLOCK_SIZE_M": block_m,
@@ -495,6 +545,9 @@ def get_default_config(
         smem_per_stage = (block_m * block_k + block_k * block_n) * 2
         while num_stages > 2 and smem_per_stage * num_stages > 200_000:
             num_stages -= 1
+        num_stages = _clamp_num_stages_for_vendor(
+            block_m, block_n, block_k, num_stages, gemm_stage, dtype
+        )
 
         config = {
             "BLOCK_SIZE_M": block_m,
@@ -648,7 +701,7 @@ def _fp8_quantize(
         block_k = block_shape[1]
         assert A.size(-1) % block_k == 0
         if A.ndim == 2 and A.stride(-1) == 1:
-            from flaggems_vllm.ops.per_token_group_quant_fp8 import (
+            from flag_gems.ops.per_token_group_quant_fp8 import (
                 per_token_group_quant_fp8,
             )
 
@@ -694,11 +747,25 @@ def _fp8_quantize(
             A_q = (A.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
             return A_q, A_scale
         else:
-            amax = A.abs().amax().clamp(min=eps).to(torch.float32)
-            scale = amax / fp8_max
-            iscale = 1.0 / scale
-            A_q = (A.float() * iscale).clamp(fp8_min, fp8_max).to(fp8_dtype)
-            return A_q, scale.view(1)
+            # Use the fused Triton kernel (single pass) instead of multiple
+            # torch passes: A.abs().amax() + A.float() + scale + clamp + cast
+            # cost ~5-6 torch kernels per call (~660us for small M); the
+            # Triton path is ~90us. group_size=K yields one scale per row
+            # (per-token), which the fused MoE kernel consumes via a_scale
+            # token-stride indexing.
+            from flaggems_vllm.ops.per_token_group_quant_fp8 import (
+                per_token_group_quant_fp8,
+            )
+
+            A_q, scale = per_token_group_quant_fp8(
+                A,
+                group_size=A.size(-1),
+                eps=eps,
+                dtype=fp8_dtype,
+                column_major_scales=False,
+                scale_ue8m0=False,
+            )
+            return A_q, scale
 
 
 def _int8_quantize(
@@ -1250,7 +1317,10 @@ def fused_moe_kernel(
                 a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
                 a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
             else:  # tensor-wise
-                a_scale = tl.load(a_scale_ptr)
+                # Per-token A scales: one scale per routed row (per-tensor
+                # scales use stride_asm=0 and reduce to the same scalar load).
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
                 b_scale_gate = tl.load(b_scale_ptr + off_experts)
                 b_scale_up = b_scale_gate
 
@@ -1279,9 +1349,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k
                     a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask,
-                        mask=token_mask,
-                        other=0.0,
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                     b_scale_val = tl.load(b_scale_gate_ptrs + offs_ks * stride_bsk)
 
@@ -1333,9 +1401,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k
                     a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask,
-                        mask=token_mask,
-                        other=0.0,
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                     b_scale_val = tl.load(b_scale_up_ptrs + offs_ks * stride_bsk)
 
@@ -1417,7 +1483,10 @@ def fused_moe_kernel(
                 a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
                 a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
             else:  # tensor-wise
-                a_scale = tl.load(a_scale_ptr)
+                # Per-token A scales: one scale per routed row (per-tensor
+                # scales use stride_asm=0 and reduce to the same scalar load).
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
                 b_scale = tl.load(b_scale_ptr + off_experts)
 
         if HAS_BIAS:
@@ -1450,9 +1519,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k
                     a_scale = tl.load(
-                        a_scale_ptrs + offs_ks * stride_ask,
-                        mask=token_mask,
-                        other=0.0,
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                     if SWAP_AB:
                         b_scale_val = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
@@ -1566,10 +1633,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         # We assume that top_ids of each token is unique,
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
-        EM = min(
-            sorted_token_ids.size(0),
-            A.size(0) * top_k * config["BLOCK_SIZE_M"],
-        )
+        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
@@ -1679,8 +1743,7 @@ def invoke_fused_moe_triton_kernel(
         EM = sorted_token_ids.size(0)
         if A.size(0) < config["BLOCK_SIZE_M"]:
             EM = min(
-                sorted_token_ids.size(0),
-                A.size(0) * top_k * config["BLOCK_SIZE_M"],
+                sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"]
             )
     else:
         EM = num_tokens * config["BLOCK_SIZE_M"]
@@ -1701,8 +1764,25 @@ def invoke_fused_moe_triton_kernel(
 
     swap_AB = config.pop("SWAP_AB", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
-    use_int32_offsets = config.pop("USE_INT32_OFFSETS", False)
-    fast_bf16_output = config.pop("FAST_BF16_OUTPUT", False)
+    # Vendor-gated kernel paths: defaults (False) preserve the behavior on
+    # all other platforms. int32 offsets are only safe while every offset
+    # product stays below 2^31 (computed from the real tensor sizes).
+    # GEMM2 receives top_k=1 and topk-merged rows, so recover the
+    # model-level token count before applying the vendor M threshold.
+    m, k = A.size(0), A.size(1)
+    e, n, _ = B.size()
+    model_m = m if top_k > 1 else m // out_top_k
+    use_int32_offsets = (
+        device.info.moe_use_int32_offsets
+        and model_m >= device.info.moe_fast_paths_min_m
+        and compute_type == tl.bfloat16
+        and max(model_m * k, model_m * max(top_k, out_top_k) * n, e * n * k) < (1 << 31)
+    )
+    fast_bf16_output = (
+        device.info.moe_fast_bf16_output
+        and model_m >= device.info.moe_fast_paths_min_m
+        and compute_type == tl.bfloat16
+    )
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
@@ -1910,11 +1990,7 @@ def fused_experts_impl(
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert hidden_states.dtype in [
-        torch.float32,
-        torch.float16,
-        torch.bfloat16,
-    ]
+    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
     E, N, _ = w1.size()
@@ -1992,32 +2068,20 @@ def fused_experts_impl(
             w2_scale = None
         elif ocp_mx_scheme.startswith("w_mxfp6_e3m2"):
             w1 = dequant_mxfp6(
-                w1,
-                w1_scale,
-                quant_dtype="fp6_e3m2",
-                float_dtype=hidden_states.dtype,
+                w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
             )
             w1_scale = None
             w2 = dequant_mxfp6(
-                w2,
-                w2_scale,
-                quant_dtype="fp6_e3m2",
-                float_dtype=hidden_states.dtype,
+                w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
             )
             w2_scale = None
         elif ocp_mx_scheme.startswith("w_mxfp6_e2m3"):
             w1 = dequant_mxfp6(
-                w1,
-                w1_scale,
-                quant_dtype="fp6_e2m3",
-                float_dtype=hidden_states.dtype,
+                w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
             )
             w1_scale = None
             w2 = dequant_mxfp6(
-                w2,
-                w2_scale,
-                quant_dtype="fp6_e2m3",
-                float_dtype=hidden_states.dtype,
+                w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
             )
             w2_scale = None
         else:
@@ -2034,17 +2098,15 @@ def fused_experts_impl(
 
     direct_sum_supported = is_plain_half_config or is_fp8_blockwise
 
-    # Check if we can safely fuse the activation with the first GEMM pass
-    use_separate_activation_for_metax_qwen36_large = (
-        num_tokens >= 8192
-        and E == 256
-        and (N, w1.size(2)) in ((1024, 2048), (256, 2048))
-        and K == 2048
-        and top_k_num == 8
+    # Backends may opt out when a separately measured activation is faster.
+    # The default preserves the existing path on all other platforms.
+    use_separate_activation = (
+        device.info.moe_separate_activation
+        and num_tokens >= device.info.moe_fast_paths_min_m
         and hidden_states.dtype == torch.bfloat16
     )
     can_use_fused_silu = (
-        not use_separate_activation_for_metax_qwen36_large
+        not use_separate_activation
         and activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
@@ -2167,9 +2229,7 @@ def fused_experts_impl(
         # 4. Apply activation separately if the fused path was not taken
         if not do_fuse_silu:
             apply_moe_activation(
-                activation_enum,
-                intermediate_cache2,
-                intermediate_cache1.view(-1, N),
+                activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
             )
 
         # 5. Quantize activated intermediate for GEMM2
@@ -2193,8 +2253,12 @@ def fused_experts_impl(
                 gemm_stage="gemm2",
                 enable_gemm_fast_path=True,
             )
+        # GEMM2 direct_sum (write-back accumulation into out_hidden_states)
+        # is slower on some vendors (measured -27% on large M); gate it via
+        # the vendor descriptor so other platforms keep the original path.
         use_direct_sum = (
-            not is_embedded_config
+            device.info.moe_direct_sum_enabled
+            and not is_embedded_config
             and direct_sum_supported
             and tokens_in_chunk >= MOE_DIRECT_SUM_MIN_TOKENS
             and expert_map is None
