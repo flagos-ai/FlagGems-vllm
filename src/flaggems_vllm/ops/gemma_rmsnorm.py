@@ -58,13 +58,13 @@ def _gemma_rmsnorm_may_2d_kernel(
     else:
         m = tl.program_id(0)
         n_offs = tl.arange(0, BLOCK_N)
-        offs = m * N + n_offs[None, :]
+        offs = m * N + n_offs
 
         n_mask = n_offs < N
         x = tl.load(x_ptr + offs, mask=n_mask, other=0.0).to(tl.float32)
         w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
 
-        inv_rms = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / N + eps)
+        inv_rms = 1.0 / tl.sqrt(tl.sum(x * x, axis=-1) / N + eps)
         y = x * inv_rms * (1.0 + w)
         tl.store(out_ptr + offs, y, mask=n_mask)
 
