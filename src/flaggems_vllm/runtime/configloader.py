@@ -402,6 +402,88 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name == "w8a8_block_fp8_matmul":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for group_m in ranges["GROUP_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_swap_ab":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for group_m in ranges["GROUP_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_swap_ab_splitk":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "GROUP_M": group_m,
+                        "SPLIT_K": split_k,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for group_m in ranges["GROUP_M"]
+                for split_k in ranges["SPLIT_K"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_short_k256":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
         return []
 
     def _build_single_expand_spec(
@@ -527,6 +609,23 @@ class ConfigLoader(object):
             "w8a8_block_fp8_bmm": self._build_single_expand_spec(
                 "w8a8_block_fp8_bmm",
                 expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_bmm"),
+            ),
+            "w8a8_block_fp8_matmul": self._build_single_expand_spec(
+                "w8a8_block_fp8_matmul",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+                yaml_op_name="w8a8_block_fp8_general",
+            ),
+            "w8a8_block_fp8_swap_ab": self._build_single_expand_spec(
+                "w8a8_block_fp8_swap_ab",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+            ),
+            "w8a8_block_fp8_swap_ab_splitk": self._build_single_expand_spec(
+                "w8a8_block_fp8_swap_ab_splitk",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+            ),
+            "w8a8_block_fp8_short_k256": self._build_single_expand_spec(
+                "w8a8_block_fp8_short_k256",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
             ),
             "mm_splitk": self._build_single_expand_spec("mm_splitk"),
             "sparse_attention": self._build_single_expand_spec("sparse_attention"),
