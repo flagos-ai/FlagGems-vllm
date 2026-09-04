@@ -15,96 +15,90 @@
 """Benchmark for top_k_per_row_decode (DeepSeek V4 decode-phase top-K).
 
 Shapes match DeepSeek V4 production config (vocab=129280, top_k=1024).
-The baseline uses vLLM's CUDA kernel when available,
-falling back to a pure-PyTorch reference (torch.topk).
+The baseline is vLLM's own top_k_per_row_decode op, falling back to a
+pure-PyTorch reference (torch.topk) when that op is absent.
 """
-
-import inspect
 
 import pytest
 import torch
-import triton.language as tl
 
-from flaggems_vllm.ops import top_k_per_row_decode
+import flaggems_vllm
 
 from . import base
 
 
-def _has_histogram_mask():
-    if not hasattr(tl, "histogram"):
-        return False
-    try:
-        return "mask" in inspect.signature(tl.histogram).parameters
-    except (ValueError, TypeError):
-        return False
-
-
 pytestmark = pytest.mark.skipif(
-    not _has_histogram_mask(),
-    reason="tl.histogram with mask parameter not available",
+    not flaggems_vllm.runtime.torch_device_fn.is_available(),
+    reason="accelerator device required",
 )
 
-# --- vLLM CUDA baseline (preferred) with PyTorch fallback ---
+# --- vLLM's own kernel as the baseline, non-TLE Triton path as fallback ---
 try:
     import vllm._custom_ops  # noqa: F401 — loads torch.ops._C
+
+    # Importing vLLM is NOT proof the op exists. A build can import fine and
+    # still expose no top_k_per_row_decode -- and the vendor of the build is not
+    # the test: the MUSA build on the Moore Threads box DOES export it, while
+    # some others do not. HAS_VLLM would then be a lie and the benchmark would
+    # report a SpeedUp against a baseline that is not there. Check the symbol
+    # itself, after the import, with hasattr -- never dir(), since
+    # torch.ops._C is a lazy namespace that lists only what it has resolved.
+    if not hasattr(torch.ops._C, "top_k_per_row_decode"):
+        raise AttributeError("vLLM build exposes no top_k_per_row_decode")
 
     def _vllm_top_k_per_row_decode(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
     ):
         torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            seq_lens,
-            indices,
-            num_rows,
-            stride0,
-            stride1,
-            top_k,
+            logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
         )
 
     HAS_VLLM = True
-except (ImportError, AttributeError):
+except (ImportError, AttributeError, RuntimeError):
+    # RuntimeError because a misconfigured vLLM should mean "no baseline", not a
+    # collection error: with two platform plugins registered it raises
+    # "Only one platform plugin can be activated" at import, which aborted
+    # collection of this whole file on an MTT box.
     HAS_VLLM = False
     _vllm_top_k_per_row_decode = None
 
 
-def _torch_topk_ref(
-    logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
-):
-    """Pure-PyTorch fallback reference using torch.topk."""
-    seq_len = seq_lens[0].item()
-    valid_logits = logits[:, :seq_len]
-    _, top_idx = torch.topk(valid_logits, top_k, dim=1, largest=True, sorted=False)
-    indices.copy_(top_idx.to(torch.int32))
-
-
-_baseline_op = _vllm_top_k_per_row_decode if HAS_VLLM else _torch_topk_ref
-
-
 class TopKPerRowDecodeBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_DESC = "vocab_size, top_k"
+    DEFAULT_SHAPE_DESC = "num_rows, vocab_size, next_n, top_k, stride0, stride1"
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            (129280, 1024),
-            (32768, 512),
-            (16384, 256),
-            (8192, 128),
-            (4096, 64),
+            # DeepSeek-V4-Flash
+            (1, 262144, 1, 512, 262144, 1),
+            (496, 262144, 1, 512, 262144, 1),
+            (512, 262144, 1, 512, 262144, 1),
+            (16, 262144, 1, 512, 262144, 1),
+            (32, 262144, 1, 512, 262144, 1),
+            (48, 262144, 1, 512, 262144, 1),
+            (40, 262144, 1, 512, 262144, 1),
+            (56, 262144, 1, 512, 262144, 1),
+            (4, 262144, 1, 512, 262144, 1),
+            (8, 262144, 1, 512, 262144, 1),
+            (24, 262144, 1, 512, 262144, 1),
         ]
 
     def get_input_iter(self, dtype):
-        for vocab_size, top_k in self.shapes:
+        for num_rows, vocab_size, next_n, top_k, stride0, stride1 in self.shapes:
             torch.manual_seed(42)
-            logits = torch.randn(
-                (1, vocab_size), dtype=torch.float32, device=self.device
+            buf = torch.randn(
+                (num_rows - 1) * stride0 + (vocab_size - 1) * stride1 + 1,
+                device=self.device,
+                dtype=torch.float32,
             )
-            seq_lens = torch.tensor([vocab_size], dtype=torch.int32, device=self.device)
-            indices = torch.zeros((1, top_k), dtype=torch.int32, device=self.device)
-            num_rows = 1
-            next_n = 1
-            stride0 = logits.stride(0)
-            stride1 = logits.stride(1)
+            logits = torch.as_strided(buf, (num_rows, vocab_size), (stride0, stride1))
+
+            batch_size = num_rows // next_n
+            seq_lens = torch.full(
+                (batch_size,), vocab_size, dtype=torch.int32, device=self.device
+            )
+            indices = torch.zeros(
+                (num_rows, top_k), dtype=torch.int32, device=self.device
+            )
 
             yield (
                 logits,
@@ -119,11 +113,12 @@ class TopKPerRowDecodeBenchmark(base.Benchmark):
 
 
 @pytest.mark.top_k_per_row_decode
+@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
 def test_top_k_per_row_decode():
     bench = TopKPerRowDecodeBenchmark(
         op_name="top_k_per_row_decode",
-        torch_op=_baseline_op,
-        gems_op=top_k_per_row_decode,
+        torch_op=_vllm_top_k_per_row_decode,
+        gems_op=flaggems_vllm.top_k_per_row_decode,
         dtypes=[torch.float32],
     )
     bench.run()

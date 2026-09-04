@@ -20,14 +20,84 @@ https://github.com/flagos-ai/FlagTree.git, align with vLLM implementation.
 """
 
 import logging
+import os
 
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-if has_triton_tle(3, 6, 0):
+
+_LAUNCH_GEOMETRY = None
+
+
+def _launch_geometry():
+    """(warp_size, max_threads_per_block) for this device, cached."""
+    global _LAUNCH_GEOMETRY
+    if _LAUNCH_GEOMETRY is None:
+        warp, maxt = 32, 1024
+        try:
+            props = runtime.torch_device_fn.get_device_properties(0)
+            warp = getattr(props, "warp_size", 0) or 32
+            maxt = getattr(props, "max_threads_per_block", 0) or 1024
+        except Exception:  # noqa: BLE001 - never let detection break dispatch
+            pass
+        _LAUNCH_GEOMETRY = (warp, maxt)
+    return _LAUNCH_GEOMETRY
+
+
+def _num_warps(block_size):
+    """Warps needed to cover a BLOCK_SIZE-wide tile, within the thread ceiling.
+
+    This used to be `block_size // 32`, which silently assumes a 32-lane warp.
+    On MetaX C550 the warp is 64 lanes and the per-block ceiling is 512 threads,
+    so BLOCK_SIZE=512 asked for 16 warps x 64 = 1024 threads and every launch
+    failed with OutOfResources -- the op could not run on that card at all.
+
+    Dividing by the real warp size is an identity on 32-lane parts (512 -> 16
+    warps either way), so NVIDIA and Moore Threads are unchanged. The clamp
+    matters where a tile is wider than the device can staff: the tile stays the
+    same width and each thread simply covers more of it.
+    """
+    warp, maxt = _launch_geometry()
+    return max(1, min(block_size // warp, maxt // warp))
+
+
+def _vendor_tle_enabled() -> bool:
+    """Does this backend actually support TLE, per its own VendorDescriptor?
+
+    `has_triton_tle()` only proves the Python module imports. It does not prove
+    the backend can LOWER tle.gpu.alloc. MetaX C550 is exactly that case: every
+    tle symbol resolves, but compilation dies with
+
+        'triton._C.libtriton.ir.builder' object has no attribute
+        'make_swizzled_shared_encoding_attr'
+
+    which took both ops from "slow" to "cannot run at all", when the non-TLE
+    fallback would have worked fine.
+
+    The VendorDescriptor already carries `tle_enabled`, and it is already correct
+    -- nvidia/mthreads/enflame declare True, everyone else defaults False. It was
+    simply never read by anything. Reading it here makes the non-TLE path the
+    default for any backend that has not declared TLE support, which is the safe
+    direction: that path is plain Triton over global scratch and works everywhere.
+
+    FLAGGEMS_FORCE_TLE=1 overrides, so a vendor can test whether its TLE works
+    without editing the descriptor.
+    """
+    override = os.environ.get("FLAGGEMS_FORCE_TLE")
+    if override is not None:
+        return override.lower() not in {"0", "false", "off", "no"}
+    try:
+        return bool(getattr(runtime.device.info, "tle_enabled", False))
+    except Exception:  # noqa: BLE001 - never let detection break the import
+        return False
+
+
+if has_triton_tle(3, 6, 0) and _vendor_tle_enabled():
     try:
         import triton.experimental.tle.language as tle
 
@@ -49,6 +119,8 @@ SPLIT_WORK_THRESHOLD = 200 * 1000
 NUM_THREADS_PER_BLOCK = 512
 MULTIPLE_BLOCKS_PER_ROW_CONFIG = 10
 NUM_THREADS_PER_BLOCK_MERGE = 1024
+
+
 NUM_FILNAL_ITEMS = 2048
 NUM_BINS = 2048
 RADIX_BITS_FINAL = 8
@@ -1225,7 +1297,7 @@ def top_k_per_row_prefill(
                 BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
                 USE_RADIX_FINAL=False,
                 ROW_OFFSET=0,
-                num_warps=NUM_THREADS_PER_BLOCK // 32,
+                num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
             )
         if num_rows > num_insert_sort_blocks:
             num_radix_sort_blocks = num_rows - num_insert_sort_blocks
@@ -1242,7 +1314,7 @@ def top_k_per_row_prefill(
                 BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
                 USE_RADIX_FINAL=True,
                 ROW_OFFSET=num_insert_sort_blocks,
-                num_warps=NUM_THREADS_PER_BLOCK // 32,
+                num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
             )
     else:
         # based on tle version
@@ -1280,5 +1352,5 @@ def top_k_per_row_prefill(
             TOPK=top_k,
             BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
             ROW_OFFSET=0,
-            num_warps=NUM_THREADS_PER_BLOCK // 32,
+            num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
         )

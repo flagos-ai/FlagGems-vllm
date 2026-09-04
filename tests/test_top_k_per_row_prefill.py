@@ -14,8 +14,9 @@
 
 """Accuracy tests for top_k_per_row_prefill (DeepSeek V4 sparse attention).
 
-Tests the Triton kernel against a pure-PyTorch reference implementation.
-Verifies that the selected top-K values match (set comparison, order-independent).
+Tests the Triton kernel against vLLM's own kernel (when available) and a
+pure-PyTorch fallback. Verifies that the selected top-K values match
+(set comparison, order-independent).
 
 Test shapes match DeepSeek V4 production config:
     - vocab_size=129280: DeepSeek V4 vocabulary size
@@ -24,18 +25,64 @@ Test shapes match DeepSeek V4 production config:
     - num_rows=32/64/2048: prefill batch sizes
 """
 
+from importlib import import_module
+
 import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops import top_k_per_row_prefill
+from flaggems_vllm.ops.top_k_per_row_prefill import (
+    top_k_per_row_prefill as _generic_impl,
+)
+
+from . import conftest as cfg
 
 device = flaggems_vllm.device
 
+# Shape configs for QUICK_MODE
+if cfg.QUICK_MODE:
+    NUM_ROWS_FULL_VOCAB = [1, 64]
+    NUM_ROWS_VARIABLE = [4, 16383]
+    NUM_ROWS_NONZERO = [1]
+else:
+    NUM_ROWS_FULL_VOCAB = [1, 32, 64, 2048]
+    NUM_ROWS_VARIABLE = [4, 16383]
+    NUM_ROWS_NONZERO = [1, 16]
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA device required",
+    not flaggems_vllm.runtime.torch_device_fn.is_available(),
+    reason="accelerator device required",
 )
+
+# --- vLLM's own kernel as reference (optional) ---
+try:
+    import vllm._custom_ops  # noqa: F401 — loads torch.ops._C
+
+    # Importing vLLM is NOT proof the op exists; the vendor of the build
+    # is not the test either -- this box's MUSA build DOES export
+    # top_k_per_row_prefill. Check the symbol itself with hasattr, never
+    # dir(): torch.ops._C lists only what it has already resolved.
+    # Without this check HAS_VLLM would
+    # then be a lie -- the benchmark would report a SpeedUp against a baseline
+    # that does not exist. Check for the symbol itself, after the import.
+    if not hasattr(torch.ops._C, "top_k_per_row_prefill"):
+        raise AttributeError("vLLM build exposes no top_k_per_row_prefill")
+
+    def _vllm_top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
+    ):
+        torch.ops._C.top_k_per_row_prefill(
+            logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
+        )
+
+    HAS_VLLM = True
+except (ImportError, AttributeError, RuntimeError):
+    # RuntimeError because a misconfigured vLLM should mean "no baseline", not a
+    # collection error: with two platform plugins registered it raises
+    # "Only one platform plugin can be activated" at import, which aborted
+    # collection of this whole file on an MTT box.
+    HAS_VLLM = False
+    _vllm_top_k_per_row_prefill = None
 
 
 def reference_top_k_per_row(logits, row_starts, row_ends, top_k):
@@ -53,7 +100,6 @@ def reference_top_k_per_row(logits, row_starts, row_ends, top_k):
         row_slice = logits[i, start:end]
         k = min(top_k, end - start)
         _, topk_idx = torch.topk(row_slice, k, largest=True, sorted=False)
-        # topk_idx is already 0-based relative to start (since we sliced)
         indices[i, :k] = topk_idx.to(torch.int32)
         if k < top_k:
             indices[i, k:] = -1
@@ -65,26 +111,21 @@ def check_topk_values_match(logits, indices_test, indices_ref, row_starts, top_k
     """Value-based set comparison: verify that the actual logit values selected
     by test indices match those selected by reference indices.
 
-    This is order-independent — we only care that the same top-K values are found,
-    not that they appear in the same order. This is important because argsort and
-    topk may break ties differently.
+    Order-independent — we only care that the same top-K values are found,
+    not that they appear in the same order (argsort and topk break ties differently).
     """
     num_rows = logits.shape[0]
     for i in range(num_rows):
         offset = row_starts[i].item()
-        # Convert 0-based row-relative indices back to absolute vocab indices
         abs_test = indices_test[i].long() + offset
         abs_ref = indices_ref[i].long() + offset
 
-        # Filter out padding (-1 + offset could be invalid)
         valid_test = abs_test[abs_test >= offset]
         valid_ref = abs_ref[abs_ref >= offset]
 
         vals_test = logits[i].gather(0, valid_test)
         vals_ref = logits[i].gather(0, valid_ref)
 
-        # Sort values descending and compare — if same top-K values are selected,
-        # sorted arrays must match regardless of index order
         vals_test_sorted, _ = vals_test.sort(descending=True)
         vals_ref_sorted, _ = vals_ref.sort(descending=True)
 
@@ -94,7 +135,16 @@ def check_topk_values_match(logits, indices_test, indices_ref, row_starts, top_k
 
 
 @pytest.mark.top_k_per_row_prefill
-@pytest.mark.parametrize("num_rows", [1, 32, 64, 2048])
+def test_top_k_per_row_prefill_radix_final_config_prefers_large_vocab():
+    topk_prefill = import_module("flaggems_vllm.ops.top_k_per_row_prefill")
+
+    assert topk_prefill._use_radix_final_for_prefill(129280)
+    assert not topk_prefill._use_radix_final_for_prefill(8193)
+    assert not topk_prefill._use_radix_final_for_prefill(4095)
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize("num_rows", NUM_ROWS_FULL_VOCAB)
 @pytest.mark.parametrize("vocab_size", [129280])  # DeepSeek V4 vocab size
 @pytest.mark.parametrize("top_k", [1024])  # DeepSeek V4 KV cache topk
 def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
@@ -103,6 +153,9 @@ def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
     This is the most common case in inference: every token sees the full vocabulary.
     The masking kernel should early-exit for all rows.
     """
+    if top_k > vocab_size:
+        return
+
     torch.manual_seed(42)
 
     logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
@@ -111,19 +164,11 @@ def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
     stride0 = logits.stride(0)
     stride1 = logits.stride(1)
 
-    # Reference uses a clone because the Triton kernel modifies logits in-place
     indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
 
     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-    top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices_test,
-        num_rows,
-        stride0,
-        stride1,
-        top_k,
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
     )
 
     assert check_topk_values_match(
@@ -132,14 +177,38 @@ def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
 
 
 @pytest.mark.top_k_per_row_prefill
-@pytest.mark.parametrize("num_rows", [1, 32])
-@pytest.mark.parametrize(
-    "vocab_size",
-    [20000, 129280],  # 20000: smaller vocab for edge case coverage
+@pytest.mark.skipif(
+    not import_module("flaggems_vllm.ops.top_k_per_row_prefill").HAS_TLE,
+    reason="TLE top_k_per_row_prefill path is unavailable",
 )
-@pytest.mark.parametrize(
-    "top_k", [1024, 2048]  # 2048: tests larger top_k (used in some configs)
-)
+def test_top_k_per_row_prefill_large_vocab_partial_nonzero_range():
+    torch.manual_seed(321)
+    num_rows = 2
+    vocab_size = 65536
+    top_k = 1024
+
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.tensor([128, 4096], dtype=torch.int32, device=device)
+    row_ends = torch.tensor([4096, 8192], dtype=torch.int32, device=device)
+    stride0 = logits.stride(0)
+    stride1 = logits.stride(1)
+
+    indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
+
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
+    )
+
+    assert check_topk_values_match(
+        logits, indices_test, indices_ref, row_starts, top_k
+    ), "FAIL: large vocab partial nonzero range"
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize("num_rows", NUM_ROWS_VARIABLE)
+@pytest.mark.parametrize("vocab_size", [4095, 8193])
+@pytest.mark.parametrize("top_k", [512])
 def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
     """Test with variable row lengths (partial vocab per row).
 
@@ -147,11 +216,13 @@ def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
     KV ranges (e.g., due to causal masking or sequence packing).
     row_ends is randomized in [top_k, vocab_size] to ensure enough valid elements.
     """
+    if top_k > vocab_size:
+        return
+
     torch.manual_seed(123)
 
     logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
-    # Ensure row_ends >= top_k so there are enough valid elements to select
     row_ends = torch.randint(
         top_k, vocab_size + 1, (num_rows,), dtype=torch.int32, device=device
     )
@@ -161,15 +232,8 @@ def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
     indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
 
     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-    top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices_test,
-        num_rows,
-        stride0,
-        stride1,
-        top_k,
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
     )
 
     assert check_topk_values_match(
@@ -178,28 +242,21 @@ def test_top_k_per_row_prefill_variable_lengths(num_rows, vocab_size, top_k):
 
 
 @pytest.mark.top_k_per_row_prefill
-@pytest.mark.parametrize("num_rows", [1, 16])
+@pytest.mark.parametrize("num_rows", NUM_ROWS_NONZERO)
 def test_top_k_per_row_prefill_nonzero_starts(num_rows):
     """Test with non-zero row_starts.
 
     Verifies the index subtraction logic: output indices must be 0-based relative
-    to row_starts[i], not absolute vocab positions. This catches off-by-one errors
-    in the _fused_postprocess_kernel.
+    to row_starts[i], not absolute vocab positions.
     """
     torch.manual_seed(456)
     vocab_size = 50000
     top_k = 1024
 
     logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
-    # row_starts in [0, 1000): simulates offset within a packed sequence
     row_starts = torch.randint(0, 1000, (num_rows,), dtype=torch.int32, device=device)
-    # row_ends in [top_k+1000, vocab_size]: ensures enough valid range after start
     row_ends = torch.randint(
-        top_k + 1000,
-        vocab_size + 1,
-        (num_rows,),
-        dtype=torch.int32,
-        device=device,
+        top_k + 1000, vocab_size + 1, (num_rows,), dtype=torch.int32, device=device
     )
     stride0 = logits.stride(0)
     stride1 = logits.stride(1)
@@ -207,17 +264,116 @@ def test_top_k_per_row_prefill_nonzero_starts(num_rows):
     indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
 
     indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-    top_k_per_row_prefill(
-        logits,
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
+    )
+
+    assert check_topk_values_match(
+        logits, indices_test, indices_ref, row_starts, top_k
+    ), f"FAIL: num_rows={num_rows}, nonzero starts"
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.skipif(not HAS_VLLM, reason="vLLM is not installed")
+@pytest.mark.parametrize("num_rows", [1, 32, 64])
+def test_top_k_per_row_prefill_vs_vllm(num_rows):
+    """Test against vLLM's own top_k_per_row_prefill."""
+    torch.manual_seed(789)
+    vocab_size = 129280
+    top_k = 1024
+
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
+    stride0 = logits.stride(0)
+    stride1 = logits.stride(1)
+
+    # vLLM reference
+    logits_vllm = logits.clone()
+    indices_vllm = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    _vllm_top_k_per_row_prefill(
+        logits_vllm,
         row_starts,
         row_ends,
-        indices_test,
+        indices_vllm,
         num_rows,
         stride0,
         stride1,
         top_k,
     )
 
+    # FlagGems Triton kernel
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
+    )
+
+    assert check_topk_values_match(
+        logits, indices_test, indices_vllm, row_starts, top_k
+    ), f"FAIL vs vLLM: num_rows={num_rows}"
+
+
+@pytest.mark.top_k_per_row_prefill
+def test_topk_greater_than_row_len():
+    torch.manual_seed(456)
+    num_rows = 4
+    vocab_size = 257
+    top_k = 512
+
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.randint(
+        0, vocab_size // 2, (num_rows,), dtype=torch.int32, device=device
+    )
+    row_ends = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
+    stride0 = logits.stride(0)
+    stride1 = logits.stride(1)
+
+    indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
+
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
+    )
+
+    assert check_topk_values_match(logits, indices_test, indices_ref, row_starts, top_k)
+
+
+_OVERRIDE_ACTIVE = flaggems_vllm.top_k_per_row_prefill is not _generic_impl
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.skipif(
+    not _OVERRIDE_ACTIVE,
+    reason="No backend override registered; the generic kernel is in use",
+)
+@pytest.mark.parametrize("num_rows", NUM_ROWS_FULL_VOCAB)
+def test_backend_override_matches_reference(num_rows):
+    """Validate the vendor override itself.
+
+    The other tests call the same top-level binding, so they cover the override
+    too. This one exists to make its presence *visible*: it PASSES only when a
+    vendor kernel is actually registered and SKIPS when the generic kernel is in
+    use, so a silently-unregistered override cannot look like a green run.
+    """
+    torch.manual_seed(4242)
+    vocab_size, top_k = 129280, 1024
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
+
+    indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices_test,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+
     assert check_topk_values_match(
         logits, indices_test, indices_ref, row_starts, top_k
-    ), f"FAIL: num_rows={num_rows}, nonzero starts"
+    ), f"FAIL: override, num_rows={num_rows}"
