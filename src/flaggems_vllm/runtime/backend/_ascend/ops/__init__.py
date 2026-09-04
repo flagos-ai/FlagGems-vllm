@@ -14,6 +14,9 @@
 
 
 from flaggems_vllm.runtime.backend._ascend.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_update import (
+    causal_conv1d_update,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -36,6 +39,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
 __all__ = [
     "add_rms_norm",
+    "causal_conv1d_update",
     "fused_experts_impl",
     "grouped_topk",
     "inplace_fused_experts",
