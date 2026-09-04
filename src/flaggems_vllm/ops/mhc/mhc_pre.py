@@ -21,12 +21,18 @@ Key optimizations:
   Two passes over residual: pass 1 computes sqrsum, pass 2 does weighted sum
 """
 
+from __future__ import annotations
+
 import logging
+import os
 import weakref
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,22 @@ logger = logging.getLogger(__name__)
 _FN_BF16_CACHE: weakref.WeakKeyDictionary[torch.Tensor, tuple[int, torch.Tensor]] = (
     weakref.WeakKeyDictionary()
 )
+
+# TLE build variant gate (flashmla_sparse style): the *_tle kernels below are
+# auto-selected when Triton TLE is available and enabled (FLAGGEMS_MHC_TLE=0
+# forces the original kernels - the fallback path).
+# ``tle`` is statically opaque (Any): the TLE module has no stubs, and the
+# fallback None assignment would otherwise poison every tle.* use site.
+tle: Any = None
+if has_triton_tle(3, 6, 0):
+    try:
+        from triton.experimental.tle import language as tle
+
+        HAS_TLE_MHC_PRE = True
+    except ImportError:
+        HAS_TLE_MHC_PRE = False
+else:
+    HAS_TLE_MHC_PRE = False
 
 
 def _get_fn_bf16_cached(fn: torch.Tensor) -> torch.Tensor:
@@ -621,6 +643,372 @@ def mhc_pre_generic_kernel(
         )
 
 
+# ---- TLE build variant kernels (auto-selected; FLAGGEMS_MHC_TLE=0 forces the originals) ----
+if HAS_TLE_MHC_PRE:
+
+    @triton.jit
+    def _mhc_pre_fused_kernel_hc_mult_4_impl_tle(
+        gemm_out_ptr,  # (num_tokens, hc_mult3), float32
+        hc_scale_ptr,  # (3,), float32
+        hc_base_ptr,  # (hc_mult3,), float32
+        residual_ptr,  # (num_tokens, 4, hidden_size), bfloat16
+        post_mix_ptr,  # (num_tokens, 4), float32
+        comb_mix_ptr,  # (num_tokens, 16), float32
+        layer_input_ptr,  # (num_tokens, hidden_size), bfloat16
+        num_tokens,
+        num_tokens_bucket,
+        res_stride_n,
+        res_stride_i,
+        res_stride_h,
+        li_stride_n,
+        li_stride_h,
+        hidden_size,
+        hc_hidden_size,
+        rms_eps: tl.constexpr,
+        hc_pre_eps: tl.constexpr,
+        hc_sinkhorn_eps: tl.constexpr,
+        hc_post_mult_value: tl.constexpr,
+        sinkhorn_repeat: tl.constexpr,
+        HC_MULT3: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        """Fused sqrsum + RMS + sigmoid + tile-Sinkhorn + weighted sum (1 token/program).
+
+        The 24 gemm_out values of a token are viewed as a [4, 8] tile; pre_mix /
+        post_mix / comb_mix sub-tiles are pulled out with ``tle.extract_tile`` and
+        the comb_mix [4, 4] matrix is assembled with ``tle.insert_tile`` before the
+        Sinkhorn iteration runs as row/column tile reductions.
+        """
+        pid_n = tl.program_id(0)
+        if pid_n >= num_tokens:
+            return
+
+        # ══ Pass 1: compute sqrsum over all 4 heads ══
+        sq = 0.0
+        res_base = pid_n * res_stride_n
+        r4c = tl.arange(0, 4)[:, None]  # [4, 1] head column vector
+        r4r = tl.arange(0, 4)[None, :]  # [1, 4] row vector
+        for k in tl.static_range(4):
+            head_base = res_base + k * res_stride_i
+            for h_start in range(0, hidden_size, BLOCK_H):
+                h_offsets = h_start + tl.arange(0, BLOCK_H)
+                h_mask = h_offsets < hidden_size
+                v = tle.load(
+                    residual_ptr + head_base + h_offsets * res_stride_h,
+                    mask=h_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                sq += tl.sum(v * v)
+
+        rms_inv = tl.rsqrt(sq / hc_hidden_size + rms_eps)
+
+        # ══ Load scales ══
+        scale_0 = tle.load(hc_scale_ptr + 0)
+        scale_1 = tle.load(hc_scale_ptr + 1)
+        scale_2 = tle.load(hc_scale_ptr + 2)
+
+        go_base = pid_n * HC_MULT3
+
+        # ══ mix / hc_base as [4, 8] tiles (row 3 is padding, never extracted) ══
+        r8 = tl.arange(0, 8)[None, :]  # [1, 8] row vector
+        row_ok = r4c < 3  # row 3 is padding: guards OOB hc_base reads
+        mix = tle.load(
+            gemm_out_ptr + go_base + r4c * 8 + r8,
+            mask=row_ok,
+            other=0.0,
+        )
+        # NOTE: hc_base is shared across tokens (shape (hc_mult3,)) - NO go_base here.
+        hb = tle.load(
+            hc_base_ptr + r4c * 8 + r8,
+            mask=row_ok,
+            other=0.0,
+        )
+
+        # ══ pre_mix: indices 0..3 ══
+        # tile (0, 0): sigmoid(v * rms_inv * scale_0 + b) + eps
+        pre_mix = tle.extract_tile(mix, (0, 0), (1, 4))
+        pre_b = tle.extract_tile(hb, (0, 0), (1, 4))
+        pre_mix = tl.sigmoid(pre_mix * rms_inv * scale_0 + pre_b) + hc_pre_eps
+
+        # ══ post_mix: indices 4..7 ══
+        # tile (0, 1): sigmoid(v * rms_inv * scale_1 + b) * mult
+        post_mix = tle.extract_tile(mix, (0, 1), (1, 4))
+        post_b = tle.extract_tile(hb, (0, 1), (1, 4))
+        post_mix = (
+            tl.sigmoid(post_mix * rms_inv * scale_1 + post_b) * hc_post_mult_value
+        )
+        tl.store(
+            post_mix_ptr + pid_n * 4 + tl.arange(0, 4)[None, :],
+            post_mix,
+        )
+
+        # ══ comb_mix: indices 8..23 → 4x4 Sinkhorn ══
+        # [4, 4] assembled from four [1, 4] tiles at rows 1..2
+        # gemm[8 + 4i + j] == mix[(1 + i // 2), (i % 2) * 4 + j]  (tile idx (1 + i // 2, i % 2))
+        cm = tl.zeros([4, 4], dtype=tl.float32)
+        for i in tl.static_range(4):
+            row_mix = tle.extract_tile(mix, (1 + i // 2, i % 2), (1, 4))
+            row_b = tle.extract_tile(hb, (1 + i // 2, i % 2), (1, 4))
+            row = row_mix * rms_inv * scale_2 + row_b
+            cm = tle.insert_tile(cm, row, (i, 0))
+
+        # ── Sinkhorn as tile reductions (matches scalar math of the original) ──
+        rm = tl.max(cm, axis=1)  # [4]
+        e = tl.exp(cm - tl.reshape(rm, [4, 1]))
+        rs = tl.sum(e, axis=1)  # [4]
+        cm = e * tl.reshape(1.0 / rs, [4, 1]) + hc_sinkhorn_eps
+        cs = tl.sum(cm, axis=0)  # [4]
+        cm = cm * tl.reshape(1.0 / (cs + hc_sinkhorn_eps), [1, 4])
+
+        for _ in tl.static_range(sinkhorn_repeat - 1):
+            rs = tl.sum(cm, axis=1)
+            cm = cm * tl.reshape(1.0 / (rs + hc_sinkhorn_eps), [4, 1])
+            cs = tl.sum(cm, axis=0)
+            cm = cm * tl.reshape(1.0 / (cs + hc_sinkhorn_eps), [1, 4])
+
+        tl.store(comb_mix_ptr + pid_n * 16 + r4c * 4 + r4r, cm)
+
+        # ══ Pass 2: weighted sum  layer_input = sum_k(pre_mix_k * residual[n, k, :]) ══
+        for h_start in range(0, hidden_size, BLOCK_H):
+            h_offsets = h_start + tl.arange(0, BLOCK_H)
+            hm = (h_offsets < hidden_size)[None, :]
+            acc = tl.zeros([1, BLOCK_H], dtype=tl.float32)
+            for k in tl.static_range(4):
+                pre_k = tle.extract_tile(pre_mix, (0, k), (1, 1))
+                rk = tle.load(
+                    residual_ptr
+                    + res_base
+                    + k * res_stride_i
+                    + h_offsets[None, :] * res_stride_h,
+                    mask=hm,
+                    other=0.0,
+                ).to(tl.float32)
+                acc += pre_k * rk
+            tl.store(
+                layer_input_ptr
+                + pid_n * li_stride_n
+                + h_offsets[None, :] * li_stride_h,
+                acc.to(tl.bfloat16),
+                mask=hm,
+            )
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 1024}, num_warps=16, num_stages=1),
+            triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=2),
+        ],
+        key=["hidden_size", "num_tokens_bucket"],
+    )
+    @triton.jit
+    def mhc_pre_fused_kernel_hc_mult_4_tle(
+        gemm_out_ptr,  # (num_tokens, hc_mult3), float32
+        hc_scale_ptr,  # (3,), float32
+        hc_base_ptr,  # (hc_mult3,), float32
+        residual_ptr,  # (num_tokens, 4, hidden_size), bfloat16
+        post_mix_ptr,  # (num_tokens, 4), float32
+        comb_mix_ptr,  # (num_tokens, 16), float32
+        layer_input_ptr,  # (num_tokens, hidden_size), bfloat16
+        num_tokens,
+        num_tokens_bucket,
+        res_stride_n,
+        res_stride_i,
+        res_stride_h,
+        li_stride_n,
+        li_stride_h,
+        hidden_size,
+        hc_hidden_size,
+        rms_eps: tl.constexpr,
+        hc_pre_eps: tl.constexpr,
+        hc_sinkhorn_eps: tl.constexpr,
+        hc_post_mult_value: tl.constexpr,
+        sinkhorn_repeat: tl.constexpr,
+        HC_MULT3: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        _mhc_pre_fused_kernel_hc_mult_4_impl_tle(
+            gemm_out_ptr,
+            hc_scale_ptr,
+            hc_base_ptr,
+            residual_ptr,
+            post_mix_ptr,
+            comb_mix_ptr,
+            layer_input_ptr,
+            num_tokens,
+            num_tokens_bucket,
+            res_stride_n,
+            res_stride_i,
+            res_stride_h,
+            li_stride_n,
+            li_stride_h,
+            hidden_size,
+            hc_hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            HC_MULT3,
+            BLOCK_H,
+        )
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=1),
+        ],
+        key=["hidden_size", "num_tokens_bucket", "HC"],
+    )
+    @triton.jit
+    def mhc_pre_generic_kernel_tle(
+        gemm_out_ptr,  # (num_tokens, hc_mult3), float32
+        hc_scale_ptr,  # (3,), float32
+        hc_base_ptr,  # (hc_mult3,), float32
+        residual_ptr,  # (num_tokens, HC, hidden_size), bfloat16
+        post_mix_ptr,  # (num_tokens, HC), float32
+        comb_mix_ptr,  # (num_tokens, HC*HC), float32
+        layer_input_ptr,  # (num_tokens, hidden_size), bfloat16
+        num_tokens,
+        num_tokens_bucket,
+        res_stride_n,
+        res_stride_i,
+        res_stride_h,
+        li_stride_n,
+        li_stride_h,
+        hidden_size,
+        hc_hidden_size,
+        rms_eps: tl.constexpr,
+        hc_pre_eps: tl.constexpr,
+        hc_sinkhorn_eps: tl.constexpr,
+        hc_post_mult_value: tl.constexpr,
+        sinkhorn_repeat: tl.constexpr,
+        HC: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        # Same math/layout as mhc_pre_generic_kernel.
+        pid_n = tl.program_id(0)
+        if pid_n >= num_tokens:
+            return
+
+        res_base = pid_n * res_stride_n
+        go_base = pid_n * (HC * 2 + HC * HC)
+        comb_base = pid_n * (HC * HC)
+
+        sq = 0.0
+        for k in tl.static_range(HC):
+            head_base = res_base + k * res_stride_i
+            for h_start in range(0, hidden_size, BLOCK_H):
+                h_offsets = h_start + tl.arange(0, BLOCK_H)
+                h_mask = h_offsets < hidden_size
+                v = tle.load(
+                    residual_ptr + head_base + h_offsets * res_stride_h,
+                    mask=h_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                sq += tl.sum(v * v)
+
+        rms_inv = tl.rsqrt(sq / hc_hidden_size + rms_eps)
+
+        scale_0 = tle.load(hc_scale_ptr + 0)
+        scale_1 = tle.load(hc_scale_ptr + 1)
+        scale_2 = tle.load(hc_scale_ptr + 2)
+
+        for i in tl.static_range(HC):
+            post_i = (
+                tl.sigmoid(
+                    tle.load(gemm_out_ptr + go_base + HC + i) * rms_inv * scale_1
+                    + tle.load(hc_base_ptr + HC + i)
+                )
+                * hc_post_mult_value
+            )
+            tl.store(post_mix_ptr + pid_n * HC + i, post_i)
+
+        # comb_mix: Sinkhorn.
+        cb = 2 * HC
+        cm = tl.zeros([HC, HC], dtype=tl.float32)
+        for i in tl.static_range(HC):
+            row = tle.load(
+                gemm_out_ptr + go_base + cb + i * HC + tl.arange(0, HC)[None, :]
+            ) * rms_inv * scale_2 + tle.load(
+                hc_base_ptr + cb + i * HC + tl.arange(0, HC)[None, :]
+            )
+            cm = tle.insert_tile(cm, row, (i, 0))
+
+        # Row normalization
+        rm = tl.max(cm, axis=1)
+        cm = tl.exp(cm - tl.reshape(rm, [HC, 1]))
+        rs = tl.sum(cm, axis=1)
+        cm = cm * tl.reshape(1.0 / rs, [HC, 1]) + hc_sinkhorn_eps
+        # Column normalization
+        cs = tl.sum(cm, axis=0)
+        cm = cm * tl.reshape(1.0 / (cs + hc_sinkhorn_eps), [1, HC])
+
+        for _ in tl.static_range(sinkhorn_repeat - 1):
+            rs = tl.sum(cm, axis=1)
+            cm = cm * tl.reshape(1.0 / (rs + hc_sinkhorn_eps), [HC, 1])
+            cs = tl.sum(cm, axis=0)
+            cm = cm * tl.reshape(1.0 / (cs + hc_sinkhorn_eps), [1, HC])
+
+        # Store result to global via extract_tile per row
+        rHC = tl.arange(0, HC)[None, :]
+        for i in tl.static_range(HC):
+            row = tle.extract_tile(cm, (i, 0), (1, HC))
+            tl.store(
+                comb_mix_ptr + comb_base + i * HC + rHC,
+                row,
+            )
+
+        for h_start in range(0, hidden_size, BLOCK_H):
+            h_offsets = h_start + tl.arange(0, BLOCK_H)
+            h_mask = h_offsets < hidden_size
+            acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+            for k in tl.static_range(HC):
+                pre_k = (
+                    tl.sigmoid(
+                        tle.load(gemm_out_ptr + go_base + k) * rms_inv * scale_0
+                        + tle.load(hc_base_ptr + k)
+                    )
+                    + hc_pre_eps
+                )
+                rk = tle.load(
+                    residual_ptr
+                    + res_base
+                    + k * res_stride_i
+                    + h_offsets * res_stride_h,
+                    mask=h_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                acc += pre_k * rk
+            tl.store(
+                layer_input_ptr + pid_n * li_stride_n + h_offsets * li_stride_h,
+                acc.to(tl.bfloat16),
+                mask=h_mask,
+            )
+
+
+def _can_use_tle_mhc_pre(residual: torch.Tensor) -> bool:
+    tle_enabled = os.environ.get("FLAGGEMS_MHC_TLE", "1").lower() not in {
+        "0",
+        "off",
+        "no",
+        "false",
+    }
+    if not (HAS_TLE_MHC_PRE and tle_enabled):
+        return False
+    return residual.device.type in ("cuda", "musa")
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -639,15 +1027,30 @@ def mhc_pre(
     - hc_mult == 4: specialized fused Triton kernel
     - hc_mult != 4: generic Triton kernel aligned to reference math
     """
-    assert residual.dtype == torch.bfloat16
-    assert fn.dtype == torch.float32
+    if residual.dtype != torch.bfloat16:
+        raise NotImplementedError("mHC pre residual must use bfloat16")
+    if fn.dtype != torch.float32:
+        raise NotImplementedError("mHC pre fn must use float32")
+    if residual.device.type not in ("cuda", "musa"):
+        raise NotImplementedError("mHC pre requires CUDA or MUSA tensors")
+    if any(tensor.requires_grad for tensor in (residual, fn, hc_scale, hc_base)):
+        raise NotImplementedError("mHC pre is an inference-only path")
 
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
     hc_hidden_size = hc_mult * hidden_size
 
-    assert fn.shape == (hc_mult3, hc_hidden_size)
+    if fn.shape != (hc_mult3, hc_hidden_size):
+        raise ValueError(
+            f"fn must have shape ({hc_mult3}, {hc_hidden_size}), got {tuple(fn.shape)}"
+        )
+    if hc_scale.shape != (3,):
+        raise ValueError(f"hc_scale must have shape (3,), got {tuple(hc_scale.shape)}")
+    if hc_base.shape != (hc_mult3,):
+        raise ValueError(
+            f"hc_base must have shape ({hc_mult3},), got {tuple(hc_base.shape)}"
+        )
 
     outer_shape = residual.shape[:-2]
     residual_flat = residual.reshape(-1, hc_mult, hidden_size).contiguous()
@@ -678,8 +1081,15 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=device
     )
 
+    use_tle = _can_use_tle_mhc_pre(residual_flat)
+
     if hc_mult == 4:
-        mhc_pre_fused_kernel_hc_mult_4[(num_tokens,)](
+        kernel = (
+            mhc_pre_fused_kernel_hc_mult_4_tle
+            if use_tle
+            else mhc_pre_fused_kernel_hc_mult_4
+        )
+        kernel[(num_tokens,)](
             gemm_out,
             hc_scale,
             hc_base,
@@ -704,7 +1114,8 @@ def mhc_pre(
             HC_MULT3=hc_mult3,
         )
     else:
-        mhc_pre_generic_kernel[(num_tokens,)](
+        kernel = mhc_pre_generic_kernel_tle if use_tle else mhc_pre_generic_kernel
+        kernel[(num_tokens,)](
             gemm_out,
             hc_scale,
             hc_base,
@@ -734,6 +1145,9 @@ def mhc_pre(
     layer_input = layer_input.view(*outer_shape, hidden_size)
 
     return post_mix, comb_mix, layer_input
+
+
+__all__ = ["mhc_pre"]
 
 
 # ───────────────────────── Reference implementations ─────────────────────────
