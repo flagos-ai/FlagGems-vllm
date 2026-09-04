@@ -15,6 +15,7 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -31,6 +32,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
+    "grouped_topk",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
     "qwen4_hc_inject_combine",
