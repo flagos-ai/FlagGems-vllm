@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._ascend.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -21,6 +22,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -30,9 +32,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
 __all__ = [
+    "add_rms_norm",
     "fused_experts_impl",
+    "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "qwen4_store_qsa_kv_rows",
@@ -41,4 +46,5 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "swiglu",
 ]
