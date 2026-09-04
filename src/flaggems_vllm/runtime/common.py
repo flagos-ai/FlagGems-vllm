@@ -48,14 +48,31 @@ DEFAULT_STRATEGIES = {
     "bmm": ["align32", "align32", "align32", "align32", "align32"],
     "bmm_sqmma": ["align32", "align32", "align32"],
     "compute_global_topk_indices_and_lens": ["align32", "align32"],
-    "fused_marlin_moe_mxfp4": [
+    "fused_marlin_moe_w4a16_int4": [
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "default",
+        "default",
+    ],
+    "fused_marlin_moe_w4a16_int4_gemm_silu": [
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "default",
+        "default",
+        "default",
+    ],
+    "fused_marlin_moe_w4a16_mxfp4": [
         "align32",
         "align32",
         "align32",
         "align32",
         "default",
     ],
-    "fused_marlin_moe_mxfp4_gemm_silu": [
+    "fused_marlin_moe_w4a16_mxfp4_gemm_silu": [
         "align32",
         "align32",
         "align32",
@@ -98,6 +115,22 @@ DEFAULT_STRATEGIES = {
         "default",
     ],
     "w8a8_block_fp8_bmm": ["default", "align32", "align32", "align32"],
+    "w8a8_block_fp8_matmul": ["align32", "align32", "align32", "align32", "align32"],
+    "w8a8_block_fp8_swap_ab": ["default", "default", "default", "default", "default"],
+    "w8a8_block_fp8_swap_ab_splitk": [
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
+    "w8a8_block_fp8_short_k256": [
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
     "mm_splitk": ["align32", "align32", "align32", "align32", "align32"],
 }
 
@@ -108,14 +141,31 @@ OP_KEY_ORDERS = {
     "bmm_sqmma": ["M", "N", "K"],
     "baddbmm": ["M", "N", "K"],
     "compute_global_topk_indices_and_lens": ["topk", "num_tokens"],
-    "fused_marlin_moe_mxfp4": [
+    "fused_marlin_moe_w4a16_int4": [
+        "N",
+        "K",
+        "EM",
+        "BLOCK_SIZE_M",
+        "MUL_ROUTED_WEIGHT",
+        "top_k",
+    ],
+    "fused_marlin_moe_w4a16_int4_gemm_silu": [
+        "N",
+        "K",
+        "EM",
+        "BLOCK_SIZE_M",
+        "APPLY_ROUTER_WEIGHT_BEFORE_SILU",
+        "APPLY_ROUTER_WEIGHT_AFTER_SILU",
+        "top_k",
+    ],
+    "fused_marlin_moe_w4a16_mxfp4": [
         "N",
         "K",
         "EM_BUCKET",
         "BLOCK_SIZE_M",
         "SWAP_AB",
     ],
-    "fused_marlin_moe_mxfp4_gemm_silu": [
+    "fused_marlin_moe_w4a16_mxfp4_gemm_silu": [
         "N",
         "K",
         "BLOCK_SIZE_M",
@@ -132,6 +182,10 @@ OP_KEY_ORDERS = {
     "w8a8_block_fp8_general_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
     "w8a8_block_fp8_general_tma": ["M", "N", "K", "stride_am", "stride_bk", "dtype"],
     "w8a8_block_fp8_bmm": ["B", "M_aligned", "N", "K"],
+    "w8a8_block_fp8_matmul": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_fp8_swap_ab": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_fp8_swap_ab_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_fp8_short_k256": ["M", "N", "K", "stride_am", "stride_bk"],
     "mm_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
 }
 

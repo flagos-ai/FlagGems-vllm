@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from backend_utils import VendorDescriptor
+from flaggems_vllm.runtime.backend.backend_utils import VendorDescriptor
 
 vendor_info = VendorDescriptor(
     vendor_name="aipu",

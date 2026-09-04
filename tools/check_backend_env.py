@@ -49,6 +49,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     print("python:", sys.version.replace("\n", " "))
+
+    # Disable automatic device backend loading to avoid crashes when
+    # vendor-specific extensions (e.g., torch_npu) are installed but
+    # the underlying runtime (e.g., CANN) is missing or incompatible.
+    # FlagGems vendors are loaded explicitly via flaggems_vllm.runtime.
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
     for name in REQUIRED_MODULES:
         module = importlib.import_module(name)
         print(f"{name}:", module_version(module))
@@ -62,12 +69,32 @@ def main() -> int:
     import flaggems_vllm
     from flaggems_vllm import runtime
 
+    expected_vendor = args.expected_vendor.lower()
+    expected_vendor_module = f"flaggems_vllm.runtime.backend._{expected_vendor}"
+    vendor_module = runtime.backend.get_backend_state().vendor_module
+    descriptor_type = type(runtime.device.info)
+
     print("flaggems_vllm:", flaggems_vllm.__version__)
     print("vendor:", flaggems_vllm.vendor_name)
+    print("vendor module:", vendor_module.__name__)
     print("device:", flaggems_vllm.device)
     print("device count:", runtime.device.device_count)
 
-    expected_vendor = args.expected_vendor.lower()
+    if vendor_module.__name__ != expected_vendor_module:
+        raise RuntimeError(
+            "vendor backend module collision: "
+            f"expected {expected_vendor_module!r}, got {vendor_module.__name__!r} "
+            f"from {getattr(vendor_module, '__file__', None)!r}"
+        )
+    if not isinstance(
+        runtime.device.info, runtime.backend.backend_utils.VendorDescriptor
+    ):
+        raise RuntimeError(
+            "vendor descriptor module collision: "
+            "expected a flaggems_vllm VendorDescriptor, "
+            f"got {descriptor_type.__module__}.{descriptor_type.__name__}"
+        )
+
     configured_vendor = os.environ.get("FLAGGEMS_VENDOR", "").lower()
     if configured_vendor != expected_vendor:
         raise RuntimeError(

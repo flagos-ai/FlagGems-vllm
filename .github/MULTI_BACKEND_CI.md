@@ -8,9 +8,11 @@ benchmark merely because FlagGems can create its vendor environment.
 
 - Pull requests select a non-NVIDIA backend either through the exact `label`
   values in FlagGems' pinned `.github/backends.json` or by changing a path
-  under `src/flaggems_vllm/runtime/backend/_<vendor>/`. Path inference lets a
-  fork test the backend implementation it changes without waiting for a
-  maintainer to add a routing label.
+  under `src/flaggems_vllm/runtime/backend/_<vendor>/`. Automatic path
+  inference is limited to profiles with `auto_select: true` in the local
+  capability policy, so a runner/profile must pass explicit bring-up before
+  becoming an automatic required check. An exact vendor label still schedules
+  an unvalidated profile for an explicit bring-up or revalidation run.
 - `ci/all-vendors` selects every enabled non-NVIDIA backend. Use it only for a
   deliberate maintainer-approved validation run.
 - Pull requests run correctness tests only. Selected core benchmarks run on
@@ -46,6 +48,7 @@ The repository must provide these labels (spelling and case are significant):
 
 ```text
 vendor/Ascend
+vendor/Cambricon
 vendor/Enflame
 vendor/Hygon
 vendor/Iluvatar
@@ -54,26 +57,32 @@ vendor/MetaX
 vendor/MooreThreads
 vendor/SpaceMit
 vendor/Sunrise
-vendor/Thead
+vendor/THead
 vendor/TsingMicro
 ci/all-vendors
 ci/nvidia
 ```
 
-`vendor/Thead` follows the backend registry exactly; do not use
-`vendor/THead`.
+`vendor/THead` follows the backend registry exactly; do not use
+`vendor/Thead`.
 
 ## Capability rollout
 
-`.github/backend-capabilities.json` is fail closed. Unknown backends receive an
-empty operator allowlist and cannot run benchmarks. The setup action still runs
-`tools/check_backend_env.py`, which verifies imports, the configured vendor,
-device discovery, and a small float32 allocation/addition.
+`.github/backend-capabilities.json` is fail closed. Unknown backends are not
+automatically selected by backend source-path changes, receive an empty
+operator allowlist, and cannot run benchmarks. Exact vendor labels,
+`ci/all-vendors`, and the explicit all-backend workflow dispatch bypass only
+the automatic-selection gate; the setup and portable preflight remain
+mandatory. The setup action runs `tools/check_backend_env.py`, which verifies
+imports, the configured vendor, device discovery, and a small float32
+allocation/addition.
 
-After a backend passes the preflight on a trusted same-repository branch, add
-only tests confirmed on that hardware to its `tests_allow` list. Enable and
-allowlist benchmarks separately after correctness is stable. The NVIDIA H20
-profile is the only initial `allow_all_tests` profile.
+After a backend passes the preflight on a trusted same-repository branch, set
+`auto_select: true` and add only tests confirmed on that hardware to its
+`tests_allow` list. Enable and allowlist benchmarks separately after
+correctness is stable. Automatic selection also requires the self-hosted
+runner to satisfy the disposable/no-secrets trust boundary described below.
+The NVIDIA H20 profile is the only initial `allow_all_tests` profile.
 
 `iluvatar` currently allows only `tests/test_mul.py` so PR #50 can provide its
 first hardware validation; a failure must be fixed or the candidate removed,
@@ -99,8 +108,9 @@ FlagGems remains the source of truth for backend profiles and runner routing:
    `$GITHUB_WORKSPACE/.ci/flaggems`, and the physical vendor environment at
    `$GITHUB_WORKSPACE/.ci/flaggems/.venv`; a root `.venv` symlink exists only
    for compatibility with the reusable workflow.
-4. `.github/backend-capabilities.json` records only the FlagGems-vllm tests
-   proven on each backend. It is not a second backend registry.
+4. `.github/backend-capabilities.json` records automatic-routing readiness and
+   the FlagGems-vllm tests proven on each backend. It is not a second backend
+   registry.
 
 Do not add a hand-maintained vendor matrix or copy vendor setup scripts into
 FlagGems-vllm. Add or change a backend in FlagGems first, then advance all
