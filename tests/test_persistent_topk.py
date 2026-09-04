@@ -41,12 +41,30 @@ pytestmark = pytest.mark.skipif(
 )
 
 HAS_VLLM = False
+
 try:
     import vllm._custom_ops  # noqa: F401
 
+    def _vllm_persistent_topk(logits, seq_lens, max_seq_len, top_k):
+        num_rows = logits.shape[0]
+        lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+        torch.ops._C.persistent_topk(
+            logits, lengths, indices, workspace, top_k, max_seq_len
+        )
+        return indices
+
+    # `vllm._custom_ops` may import cleanly even when the compiled C++ extension
+    # is missing, in which case the native op raises NotImplementedError at
+    # dispatch time. Probe one tiny call so vLLM-dependent tests are skipped
+    # (rather than errored) when the kernel is not actually available.
+    _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
+    _vllm_persistent_topk(_probe_logits, [4102], 4102, 512)
     HAS_VLLM = True
-except (ImportError, AttributeError):
-    pass
+except (ImportError, AttributeError, NotImplementedError, RuntimeError):
+    HAS_VLLM = False
+    _vllm_persistent_topk = None
 
 STRIDE = 262144
 K = 512
@@ -121,17 +139,6 @@ def _torch_ref(logits, seq_lens, top_k):
         ref[i, :k] = logits[i, : seq_lens[i]].topk(k, dim=-1)[1]
         ref[i, k:] = -1
     return ref
-
-
-def _vllm_persistent_topk(logits, seq_lens, max_seq_len, top_k):
-    num_rows = logits.shape[0]
-    lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
-    torch.ops._C.persistent_topk(
-        logits, lengths, indices, workspace, top_k, max_seq_len
-    )
-    return indices
 
 
 def _gems_decode(logits, seq_lens, top_k, max_seq_len=None):

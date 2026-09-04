@@ -11,3 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import triton
+
+if triton.__version__ >= "3.4":
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.w8a8_block_fp8_matmul import (  # noqa: F401
+        w8a8_block_fp8_matmul,
+    )
+
+__all__ = ["w8a8_block_fp8_matmul"]
