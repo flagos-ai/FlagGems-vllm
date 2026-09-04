@@ -12,9 +12,8 @@ import torch
 from flaggems_vllm.ops.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla_fwd_o_gk
 from flaggems_vllm.ops.FLA.cumsum import chunk_local_cumsum
-
-from .chunk_intra import chunk_gdn2_fwd_intra
-from .gate import kda_gate_chunk_cumsum
+from flaggems_vllm.ops.FLA.gdn2_native.chunk_intra import chunk_gdn2_fwd_intra
+from flaggems_vllm.ops.FLA.gdn2_native.gate import kda_gate_chunk_cumsum
 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634

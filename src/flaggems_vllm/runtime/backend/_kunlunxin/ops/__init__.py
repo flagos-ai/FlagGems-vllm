@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
-from .scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._kunlunxin.ops.scaled_int8_quant import (
+    scaled_int8_quant,
+)
 
 __all__ = ["scaled_int8_quant"]

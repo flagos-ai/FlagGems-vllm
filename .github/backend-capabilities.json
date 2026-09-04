@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "defaults": {
+    "auto_select": false,
     "allow_all_tests": false,
     "tests_allow": [],
     "benchmarks_enabled": false,
@@ -8,10 +9,25 @@
     "benchmarks_allow": []
   },
   "backends": {
+    "ascend-cann850": {
+      "auto_select": true
+    },
+    "ascend-cann900": {
+      "auto_select": true
+    },
+    "hygon": {
+      "auto_select": true
+    },
     "iluvatar": {
       "tests_allow": [
         "tests/test_mul.py"
       ]
+    },
+    "metax-maca3720": {
+      "auto_select": true
+    },
+    "metax-maca3810": {
+      "auto_select": true
     },
     "mthreads-musa520": {
       "tests_allow": [
@@ -36,6 +52,9 @@
       "allow_all_tests": true,
       "benchmarks_enabled": true,
       "allow_all_benchmarks": true
+    },
+    "tsingmicro": {
+      "auto_select": true
     }
   }
 }
