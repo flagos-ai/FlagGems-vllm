@@ -17,9 +17,11 @@ from flaggems_vllm.runtime.backend._mthreads.fused.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import moe_sum
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "moe_sum",
 ]
