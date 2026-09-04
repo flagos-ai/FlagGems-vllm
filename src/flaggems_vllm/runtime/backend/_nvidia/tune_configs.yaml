@@ -504,3 +504,36 @@ fused_marlin_moe_w4a16_mxfp4_gemm_silu:
     num_warps: 8
     num_stages: 3
     maxnreg: 255
+
+sparse_attn_quant:
+  - gen: true
+    param_map:
+      META:
+        BLOCK: block
+      num_warps: warps
+      num_stages: stages
+    block: [64]
+    warps: [8]
+    stages: [2]
+
+sparse_attn_quant_fp8:
+  - gen: true
+    param_map:
+      META:
+        BLOCK: block
+      num_warps: warps
+      num_stages: stages
+    block: [64]
+    warps: [8]
+    stages: [2]
+
+sparse_attn_kv_quant:
+  - gen: true
+    param_map:
+      META:
+        KV_BLOCK_SIZE: kv_block
+      num_warps: warps
+      num_stages: stages
+    kv_block: [64]
+    warps: [8]
+    stages: [2]

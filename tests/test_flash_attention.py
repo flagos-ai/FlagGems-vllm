@@ -132,6 +132,11 @@ def gems_flash_fwd(
 
 
 def sparse_attention_ref(q, kv, attn_sink, topk_idxs, scale):
+    """fp32 torch reference for the full-precision sparse attention.
+
+    Gathers the topk KV rows, computes QK^T * scale with the attention sink
+    appended as an extra logit column, softmaxes and reduces over V.
+    """
     batch, seq_len, heads, dim = q.shape
     topk = topk_idxs.shape[-1]
 
@@ -140,6 +145,7 @@ def sparse_attention_ref(q, kv, attn_sink, topk_idxs, scale):
     gathered_kv = torch.gather(kv_expanded, 2, idx_expanded)
 
     scores = torch.einsum("bmhd,bmtd->bmht", q.float(), gathered_kv.float()) * scale
+    scores = torch.where(topk_idxs[:, :, None, :] >= 0, scores, float("-inf"))
     sink = attn_sink[None, None, :, None].expand(batch, seq_len, heads, 1)
     attn = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)
 
@@ -147,9 +153,39 @@ def sparse_attention_ref(q, kv, attn_sink, topk_idxs, scale):
     return out.to(q.dtype)
 
 
-@pytest.mark.skip(
-    reason="Issue #2809: The operator fails this test on Nvidia at least."
-)
+def sparse_attention_quant_ref(q, kv_q, kv_descale, attn_sink, topk_idxs, scale):
+    """fp32 torch reference for the quantized-KV sparse attention.
+
+    KV arrives already quantized (kv_q + per-64-block kv_descale). Each
+    gathered position is dequantized to fp32 with the descale of the block it
+    lies in, then the same gather+einsum attention as sparse_attention_ref
+    runs on it.
+    """
+    batch, seq_len, heads, dim = q.shape
+    topk = topk_idxs.shape[-1]
+    kv_len = kv_q.shape[1]
+
+    idx = topk_idxs.long()
+    idx_safe = idx.clamp(min=0)
+    desc = torch.gather(
+        kv_descale.unsqueeze(1).expand(batch, seq_len, -1), 2, idx_safe // KV_BLOCK
+    )
+    kv_g = torch.gather(
+        kv_q.unsqueeze(1).expand(batch, seq_len, kv_len, dim),
+        2,
+        idx.unsqueeze(-1).expand(batch, seq_len, topk, dim),
+    )
+    kv_deq = kv_g.float() * desc[..., None]
+
+    scores = torch.einsum("bmhd,bmtd->bmht", q.float(), kv_deq) * scale
+    scores = torch.where(topk_idxs[:, :, None, :] >= 0, scores, float("-inf"))
+    sink = attn_sink[None, None, :, None].expand(batch, seq_len, heads, 1)
+    attn = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)
+
+    out = torch.einsum("bmht,bmtd->bmhd", attn[:, :, :, :-1], kv_deq)
+    return out.to(q.dtype)
+
+
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.sparse_attn_triton
 @pytest.mark.parametrize(
@@ -195,6 +231,112 @@ def test_sparse_attention(batch, seq_len, kv_len, topk, heads, dim, seed):
     gems_result = flaggems_vllm.sparse_attn_triton(q, kv, attn_sink, topk_idxs, scale)
 
     utils.gems_assert_close(gems_result, torch_result, torch.bfloat16, atol=1e-3)
+
+
+QMAX_INT8 = 127.0
+QMAX_FP8 = 448.0
+KV_BLOCK = 64
+
+
+def _round_i8_sat(x):
+    # round-half-even then clamp to int8 range, matching the kernel _quant_i8
+    return torch.clamp(torch.round(x), -128.0, 127.0)
+
+
+SPARSE_ATTN_QUANT_SHAPES = (
+    [
+        (2, 1, 128, 32, 8, 64, 2025),
+        (1, 4, 130, 96, 16, 64, 2026),
+    ]
+    if cfg.QUICK_MODE
+    else [
+        (2, 1, 128, 32, 8, 64, 2025),
+        (1, 4, 130, 96, 16, 64, 2026),
+        (16, 1, 400, 392, 16, 512, 2027),
+        (1, 240, 240, 128, 8, 512, 2028),
+    ]
+)
+
+QUANT_DTYPES = [torch.int8, torch.float8_e4m3fn]
+
+
+def _quantize_kv_torch(kv, quant_dtype):
+    """Reference KV quantizer (per-64-block symmetric, matches _kv_quant_kernel).
+
+    Used by tests to build the operator's quantized-KV input.
+    """
+    batch, kv_len, dim = kv.shape
+    qmax = QMAX_FP8 if quant_dtype == torch.float8_e4m3fn else QMAX_INT8
+    nblocks = math.ceil(kv_len / KV_BLOCK)
+    kv_pad = torch.zeros(
+        (batch, nblocks * KV_BLOCK, dim), dtype=kv.dtype, device=kv.device
+    )
+    kv_pad[:, :kv_len, :] = kv
+    kv_r = kv_pad.view(batch, nblocks, KV_BLOCK, dim).float()
+    blk_max = kv_r.abs().amax(dim=(2, 3))  # (b, nblocks)
+    scale_b = blk_max / qmax
+    inv_b = torch.where(blk_max == 0.0, 0.0, 1.0 / scale_b)
+    if quant_dtype == torch.float8_e4m3fn:
+        kv_q_r = (kv_r * inv_b[:, :, None, None]).to(torch.float8_e4m3fn)
+    else:
+        kv_q_r = _round_i8_sat(kv_r * inv_b[:, :, None, None]).to(torch.int8)
+    kv_q = kv_q_r.view(batch, nblocks * KV_BLOCK, dim)[:, :kv_len, :]
+    return kv_q, scale_b  # kv_q (b, n, d), kv_descale (b, nblocks) fp32
+
+
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.sparse_attn_quant
+@pytest.mark.parametrize(
+    "batch, seq_len, kv_len, topk, heads, dim, seed", SPARSE_ATTN_QUANT_SHAPES
+)
+@pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
+def test_sparse_attention_quant(
+    batch, seq_len, kv_len, topk, heads, dim, seed, quant_dtype
+):
+    """The quantized-KV entry points consume an externally quantized KV cache.
+
+    The KV cache is quantized once (by the reference quantizer here) and the
+    attention op reads only the quantized cache; the output must reproduce
+    the fp32 torch reference on that quantized input.
+    """
+    device = torch_device_fn.current_device()
+    utils.init_seed(seed)
+
+    q = torch.empty((batch, seq_len, heads, dim), device=device, dtype=torch.bfloat16)
+    q.uniform_(-0.5, 0.5)
+    kv = torch.empty((batch, kv_len, dim), device=device, dtype=torch.bfloat16)
+    kv.uniform_(-0.5, 0.5)
+    attn_sink = torch.empty((heads,), device=device, dtype=torch.float32)
+    attn_sink.uniform_(-0.5, 0.5)
+    topk_idxs = torch.randint(
+        0, kv_len, (batch, seq_len, topk), device=device, dtype=torch.int32
+    )
+    scale = float(1.0 / math.sqrt(dim))
+
+    kv_q, kv_descale = _quantize_kv_torch(kv, quant_dtype)
+    assert kv_q.dtype == quant_dtype
+    assert kv_descale.shape == (batch, (kv_len + 63) // 64)
+
+    ref_q = utils.to_reference(q, False)
+    ref_kv_q = utils.to_reference(kv_q, False)
+    ref_kv_descale = utils.to_reference(kv_descale, False)
+    ref_attn_sink = utils.to_reference(attn_sink, False)
+    ref_topk_idxs = utils.to_reference(topk_idxs, False)
+
+    torch_result = sparse_attention_quant_ref(
+        ref_q, ref_kv_q, ref_kv_descale, ref_attn_sink, ref_topk_idxs, scale
+    )
+
+    if quant_dtype == torch.float8_e4m3fn:
+        gems_result = flaggems_vllm.sparse_attn_triton_quant_fp8(
+            q, kv_q, kv_descale, attn_sink, topk_idxs, scale
+        )
+    else:
+        gems_result = flaggems_vllm.sparse_attn_triton_quant_int8(
+            q, kv_q, kv_descale, attn_sink, topk_idxs, scale
+        )
+
+    utils.gems_assert_close(gems_result, torch_result, torch.bfloat16, atol=2e-3)
 
 
 def attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=False):
