@@ -125,7 +125,7 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
 class SelectBackendsTest(unittest.TestCase):
     registry = [
         {
-            "backend": "ascend-cann850",
+            "backend": "ascend-cann900",
             "runner_label": "ascend",
             "label": "vendor/Ascend",
             "gpu_check": "tools/gpu_check_ascend.sh",
@@ -154,7 +154,7 @@ class SelectBackendsTest(unittest.TestCase):
             all_enabled=False,
             auto_selected_backends=set(),
         )
-        self.assertEqual([entry["backend"] for entry in selected], ["ascend-cann850"])
+        self.assertEqual([entry["backend"] for entry in selected], ["ascend-cann900"])
 
     def test_all_enabled_still_excludes_nvidia(self):
         selected = select_backends.select_backends(
@@ -165,7 +165,7 @@ class SelectBackendsTest(unittest.TestCase):
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
-            ["ascend-cann850", "kunlunxin"],
+            ["ascend-cann900", "kunlunxin"],
         )
 
     def test_backend_source_change_selects_vendor_without_a_label(self):
@@ -190,11 +190,11 @@ class SelectBackendsTest(unittest.TestCase):
                 "src/flaggems_vllm/runtime/backend/_ascend/ops/mul.py",
                 "src/flaggems_vllm/runtime/backend/_kunlunxin/ops/mul.py",
             },
-            auto_selected_backends={"ascend-cann850"},
+            auto_selected_backends={"ascend-cann900"},
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
-            ["ascend-cann850"],
+            ["ascend-cann900"],
         )
 
     def test_exact_label_overrides_automatic_selection_readiness(self):
@@ -218,7 +218,7 @@ class SelectBackendsTest(unittest.TestCase):
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
-            ["ascend-cann850", "kunlunxin"],
+            ["ascend-cann900", "kunlunxin"],
         )
 
     def test_loads_auto_selected_backends_from_capabilities(self):
@@ -230,7 +230,7 @@ class SelectBackendsTest(unittest.TestCase):
                         "schema_version": 1,
                         "defaults": {"auto_select": False},
                         "backends": {
-                            "ascend-cann850": {"auto_select": True},
+                            "ascend-cann900": {"auto_select": True},
                             "kunlunxin": {},
                         },
                     }
@@ -239,7 +239,7 @@ class SelectBackendsTest(unittest.TestCase):
             )
             self.assertEqual(
                 select_backends.load_auto_selected_backends(path),
-                {"ascend-cann850"},
+                {"ascend-cann900"},
             )
 
     def test_capabilities_must_default_to_fail_closed(self):
