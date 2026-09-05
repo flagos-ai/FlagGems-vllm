@@ -28,13 +28,17 @@ except ImportError:  # pragma: no cover - requires a TLE-enabled FlagTree build
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_UINT4B8,
-    _RouterWeightPlacement,
     _invoke_w4a16_int4_moe_gemm,
     _invoke_w4a16_int4_moe_gemm_silu,
     _router_weight_placement,
+    _RouterWeightPlacement,
     _select_w4a16_int4_kernel_policy,
     _stack_8,
+)
+from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
+)
+from flaggems_vllm.ops.fused_marlin_moe import (
     w4a16_int4_pack,
 )
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
@@ -43,6 +47,19 @@ from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
+
+
+def _activation_name(activation: Any) -> str:
+    if activation is None:
+        return "silu"
+    if isinstance(activation, str):
+        return activation.lower()
+    for attr in ("value", "name"):
+        value = getattr(activation, attr, None)
+        if isinstance(value, str):
+            return value.lower()
+    return ""
+
 
 @triton.jit
 def _ppu_dequant_int4(b_packed, scale, compute_type: tl.constexpr):
@@ -125,9 +142,7 @@ if tle_async is not None:
         )
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
 
-        for k_tile in tl.range(
-            0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES
-        ):
+        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             a = tle_async.load(
                 a_block_ptr,
                 boundary_check=(0, 1),
@@ -215,9 +230,7 @@ if tle_async is not None:
         for topk_index in tl.range(0, TOP_K):
             route = token * TOP_K + topk_index
             expert = tl.load(topk_ids_ptr + route).to(tl.int64)
-            route_acc = tl.zeros(
-                (BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32
-            )
+            route_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
             a_block_ptr = tl.make_block_ptr(
                 base=a_ptr + route * stride_am,
                 shape=(1, K),
@@ -263,28 +276,20 @@ if tle_async is not None:
                 )[None, :]
                 bs = _ppu_dequant_int4(b_packed, scale, compute_type)
                 b = _stack_8(bs, BLOCK_SIZE_K_PACK, BLOCK_SIZE_N)
-                route_acc = tl.dot(
-                    tl.trans(b), tl.trans(a), acc=route_acc
-                )
+                route_acc = tl.dot(tl.trans(b), tl.trans(a), acc=route_acc)
 
                 a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-                b_block_ptr = tl.advance(
-                    b_block_ptr, (BLOCK_SIZE_K_PACK, 0)
-                )
+                b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
 
             if MUL_ROUTED_WEIGHT:
-                routed_weight = tl.load(topk_weights_ptr + route).to(
-                    tl.float32
-                )
+                routed_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
                 route_acc *= routed_weight
             acc += route_acc
 
         offs_m = tl.arange(0, BLOCK_SIZE_M)
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = (
-            c_ptr
-            + (token + offs_m[None, :]) * stride_cm
-            + offs_n[:, None] * stride_cn
+            c_ptr + (token + offs_m[None, :]) * stride_cm + offs_n[:, None] * stride_cn
         )
         tl.store(
             c_ptrs,
@@ -357,9 +362,7 @@ if tle_async is not None:
         acc_gate = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
 
-        for k_tile in tl.range(
-            0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES
-        ):
+        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             a = tle_async.load(
                 a_block_ptr,
                 boundary_check=(0, 1),
@@ -387,17 +390,13 @@ if tle_async is not None:
                 + scale_group * stride_bsg
                 + offs_n * stride_bsn
             )
-            scale_gate = tl.load(
-                scale_base, mask=offs_n < N, other=0.0
-            )[None, :]
+            scale_gate = tl.load(scale_base, mask=offs_n < N, other=0.0)[None, :]
             scale_up = tl.load(
                 scale_base + N * stride_bsn,
                 mask=offs_n < N,
                 other=0.0,
             )[None, :]
-            gate_bs = _ppu_dequant_int4(
-                b_gate_packed, scale_gate, compute_type
-            )
+            gate_bs = _ppu_dequant_int4(b_gate_packed, scale_gate, compute_type)
             up_bs = _ppu_dequant_int4(b_up_packed, scale_up, compute_type)
             gate_b = _stack_8(gate_bs, BLOCK_SIZE_K_PACK, BLOCK_SIZE_N)
             up_b = _stack_8(up_bs, BLOCK_SIZE_K_PACK, BLOCK_SIZE_N)
@@ -406,12 +405,8 @@ if tle_async is not None:
             acc_up = tl.dot(tl.trans(up_b), a_trans, acc=acc_up)
 
             a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-            b_gate_block_ptr = tl.advance(
-                b_gate_block_ptr, (BLOCK_SIZE_K_PACK, 0)
-            )
-            b_up_block_ptr = tl.advance(
-                b_up_block_ptr, (BLOCK_SIZE_K_PACK, 0)
-            )
+            b_gate_block_ptr = tl.advance(b_gate_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+            b_up_block_ptr = tl.advance(b_up_block_ptr, (BLOCK_SIZE_K_PACK, 0))
 
         if APPLY_ROUTER_WEIGHT_BEFORE_SILU:
             routed_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
@@ -422,16 +417,13 @@ if tle_async is not None:
         offs_m = tl.arange(0, BLOCK_SIZE_M)
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = (
-            c_ptr
-            + (route + offs_m[None, :]) * stride_cm
-            + offs_n[:, None] * stride_cn
+            c_ptr + (route + offs_m[None, :]) * stride_cm + offs_n[:, None] * stride_cn
         )
         tl.store(
             c_ptrs,
             acc.to(compute_type),
             mask=(offs_m[None, :] == 0) & (offs_n[:, None] < N),
         )
-
 
     @triton.jit
     def _ppu_stage_routed_activations_kernel(
@@ -518,9 +510,7 @@ if tle_async is not None:
         )
 
     @libentry()
-    @triton.jit(
-        do_not_specialize_on_alignment=["routed_a_ptr", "b_ptr", "c_ptr"]
-    )
+    @triton.jit(do_not_specialize_on_alignment=["routed_a_ptr", "b_ptr", "c_ptr"])
     def _ppu_w4a16_int4_moe_gemm_grouped_kernel(
         routed_a_ptr,
         b_ptr,
@@ -580,9 +570,7 @@ if tle_async is not None:
         if expert == -1:
             zeros = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=compute_type)
             tl.store(
-                c_ptr
-                + routed_token[None, :] * stride_cm
-                + offs_n[:, None] * stride_cn,
+                c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn,
                 zeros,
                 mask=token_mask[None, :] & (offs_n[:, None] < N),
             )
@@ -606,9 +594,7 @@ if tle_async is not None:
         )
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
 
-        for k_tile in tl.range(
-            0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES
-        ):
+        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             activation = tle_async.load(
                 a_block_ptr,
                 boundary_check=(0, 1),
@@ -645,12 +631,12 @@ if tle_async is not None:
             acc *= routed_weight[None, :]
 
         tl.store(
-            c_ptr
-            + routed_token[None, :] * stride_cm
-            + offs_n[:, None] * stride_cn,
+            c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn,
             acc.to(compute_type),
             mask=token_mask[None, :] & (offs_n[:, None] < N),
         )
+
+
 def _select_ppu_direct_block_n(n: int) -> int:
     if n <= 32:
         return 32
@@ -923,7 +909,9 @@ def _silu_and_stage_ppu_grouped(
     block_m: int,
 ) -> torch.Tensor:
     n = intermediate1.size(1) // 2
-    routed = torch.empty((em, n), dtype=intermediate1.dtype, device=intermediate1.device)
+    routed = torch.empty(
+        (em, n), dtype=intermediate1.dtype, device=intermediate1.device
+    )
     grid = (triton.cdiv(em, block_m), triton.cdiv(n, 128))
     _ppu_silu_and_stage_routed_kernel[grid](
         intermediate1,
@@ -1097,14 +1085,11 @@ def fused_marlin_moe_w4a16_int4(
     # batches stay on the expert-grouped W4A16 kernel. Do not force the fused
     # grouped variant: its two live accumulators increase register pressure.
     use_fused_gemm1_silu = policy.use_fused_gemm1_silu or use_ppu_direct_route
-    move_router_weight_before_gemm2 = (
-        policy.move_router_weight_before_gemm2
-        or (
-            is_ppu
-            and use_fused_gemm1_silu
-            and not apply_router_weight_on_input
-            and M >= 512
-        )
+    move_router_weight_before_gemm2 = policy.move_router_weight_before_gemm2 or (
+        is_ppu
+        and use_fused_gemm1_silu
+        and not apply_router_weight_on_input
+        and M >= 512
     )
     router_weight_placement = _router_weight_placement(
         apply_router_weight_on_input,
@@ -1117,21 +1102,17 @@ def fused_marlin_moe_w4a16_int4(
     if not use_ppu_reduce_direct:
         cache13_size = M * top_k_num * K
         if not use_fused_gemm1_silu:
-            cache13_size = max(
-                cache13_size, M * top_k_num * 2 * intermediate_size
-            )
+            cache13_size = max(cache13_size, M * top_k_num * 2 * intermediate_size)
         cache13 = torch.empty(
             cache13_size,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         if not use_fused_gemm1_silu:
-            intermediate_cache1 = cache13[
-                : M * top_k_num * 2 * intermediate_size
-            ].view(M * top_k_num, 2 * intermediate_size)
-        intermediate_cache3 = cache13[: M * top_k_num * K].view(
-            M, top_k_num, K
-        )
+            intermediate_cache1 = cache13[: M * top_k_num * 2 * intermediate_size].view(
+                M * top_k_num, 2 * intermediate_size
+            )
+        intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
     intermediate_cache2 = torch.empty(
         (M * top_k_num, intermediate_size),
         device=hidden_states.device,
@@ -1160,9 +1141,7 @@ def fused_marlin_moe_w4a16_int4(
                 B=w1_packed,
                 C=intermediate_cache2,
                 B_scale=w1_scale_packed,
-                topk_weights=(
-                    topk_weights if apply_router_weight_on_input else None
-                ),
+                topk_weights=(topk_weights if apply_router_weight_on_input else None),
                 topk_ids=topk_ids,
                 apply_router_weight_before_silu=apply_router_weight_on_input,
                 a_route_divisor=top_k_num,
@@ -1279,9 +1258,7 @@ def fused_marlin_moe_w4a16_int4(
                 B=w2_packed,
                 C=intermediate_cache3,
                 B_scale=w2_scale_packed,
-                topk_weights=(
-                    topk_weights if mul_routed_weight_in_gemm2 else None
-                ),
+                topk_weights=(topk_weights if mul_routed_weight_in_gemm2 else None),
                 topk_ids=topk_ids,
                 mul_routed_weight=mul_routed_weight_in_gemm2,
                 a_route_divisor=1,
@@ -1334,8 +1311,6 @@ def fused_marlin_moe_w4a16_int4(
     return out_hidden_states
 
 
-
-
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1375,16 +1350,31 @@ def fused_marlin_moe(
 ) -> torch.Tensor:
     """Use the PPU AIU path for supported W4A16 INT4 inputs."""
 
-    activation_str = "silu"
-    if activation is not None:
-        for attr in ("value", "name"):
-            value = getattr(activation, attr, None)
-            if isinstance(value, str):
-                activation_str = value.lower()
-                break
-        if isinstance(activation, str):
-            activation_str = activation.lower()
-
+    activation_str = _activation_name(activation)
+    optional_features = (
+        activation_func,
+        moe_sum,
+        expert_map,
+        input_global_scale1,
+        input_global_scale2,
+        global_scale1,
+        global_scale2,
+        g_idx1,
+        g_idx2,
+        sort_indices1,
+        sort_indices2,
+        w1_zeros,
+        w2_zeros,
+        workspace,
+        intermediate_cache13,
+        intermediate_cache2,
+        output,
+        input_dtype,
+        clamp_limit,
+    )
+    # Keep the established generic Triton implementation for other precision
+    # schemes and optional vLLM features.  This gate reads metadata only and is
+    # evaluated before allocating or transforming an input.
     use_ppu_w4a16 = (
         tle_async is not None
         and quant_type_id == QUANT_TYPE_UINT4B8
@@ -1394,27 +1384,14 @@ def fused_marlin_moe(
         and w2.dtype == torch.uint8
         and bias1 is None
         and bias2 is None
-        and w1_zeros is None
-        and w2_zeros is None
-        and expert_map is None
-        and input_dtype is None
-        and clamp_limit is None
-        and input_global_scale1 is None
-        and input_global_scale2 is None
-        and global_scale1 is None
-        and global_scale2 is None
-        and g_idx1 is None
-        and g_idx2 is None
-        and sort_indices1 is None
-        and sort_indices2 is None
+        and all(value is None for value in optional_features)
+        and is_k_full
         and (global_num_experts == -1 or global_num_experts == w1.size(0))
         and group_size == 128
         and w1_scale.dtype == hidden_states.dtype
         and w2_scale.dtype == hidden_states.dtype
     )
     if use_ppu_w4a16:
-        if inplace and output is not None:
-            raise ValueError("Cannot pass both inplace=True and output")
         result = fused_marlin_moe_w4a16_int4(
             hidden_states=hidden_states,
             w1=w1,
@@ -1428,9 +1405,6 @@ def fused_marlin_moe(
             apply_router_weight_on_input=apply_router_weight_on_input,
             inplace=inplace,
         )
-        if output is not None:
-            output.copy_(result)
-            return output
         return result
 
     return _generic_fused_marlin_moe(

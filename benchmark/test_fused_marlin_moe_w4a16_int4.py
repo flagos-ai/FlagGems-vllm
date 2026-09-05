@@ -105,9 +105,7 @@ def _pack_gptq_int32(weight):
         dtype=torch.int32,
     )
     for expert in range(experts):
-        bytes4 = weight[expert].to(torch.int32).reshape(
-            output_size, packed_k // 4, 4
-        )
+        bytes4 = weight[expert].to(torch.int32).reshape(output_size, packed_k // 4, 4)
         words = (
             bytes4[..., 0]
             | (bytes4[..., 1] << 8)
@@ -203,9 +201,7 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
 
     def get_input_iter(self, dtype):
         num_experts, hidden_size, intermediate_size, top_k = MODEL_GEOMETRY
-        weights = _make_weights(
-            num_experts, hidden_size, intermediate_size, dtype
-        )
+        weights = _make_weights(num_experts, hidden_size, intermediate_size, dtype)
         for num_tokens, call_count in PR5140_TRACE:
             torch.manual_seed(7 + num_tokens)
             hidden_states = (
@@ -217,16 +213,12 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
                 * 0.1
             )
             topk_ids = (
-                torch.rand(
-                    (num_tokens, num_experts), device=flaggems_vllm.device
-                )
+                torch.rand((num_tokens, num_experts), device=flaggems_vllm.device)
                 .topk(top_k, dim=-1)
                 .indices
             )
             topk_weights = torch.softmax(
-                torch.randn(
-                    (num_tokens, top_k), device=flaggems_vllm.device
-                ),
+                torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
                 dim=-1,
             ).to(torch.float32)
             yield (hidden_states, *weights, topk_weights, topk_ids, call_count)
@@ -298,7 +290,7 @@ def _gems_call(
 )
 def test_fused_marlin_moe_w4a16_int4():
     bench = FusedMarlinMoEW4A16INT4Benchmark(
-        op_name="fused_marlin_moe",
+        op_name="fused_marlin_moe_w4a16_int4",
         torch_op=_vllm_baseline,
         dtypes=[torch.bfloat16],
     )

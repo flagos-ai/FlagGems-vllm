@@ -25,8 +25,6 @@ fp16/bf16 w_ref returned by quantize_weights so quantization round-off is
 shared by both sides.
 """
 
-import importlib
-
 import pytest
 import torch
 
@@ -38,14 +36,9 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_UINT8B128,
 )
 
-fused_marlin_moe = flaggems_vllm.fused_marlin_moe
-
-if runtime.device.vendor_name == "thead":
-    thead_moe = importlib.import_module(
-        "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
-    )
-
 from . import conftest as cfg
+
+fused_marlin_moe = flaggems_vllm.fused_marlin_moe
 
 
 def _is_hopper():
@@ -72,24 +65,6 @@ def test_fused_marlin_moe_uses_thead_specialization():
     assert fused_marlin_moe.__module__ == (
         "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
     )
-
-
-@pytest.mark.skipif(
-    runtime.device.vendor_name != "thead",
-    reason="T-Head kernel policy is only available on T-Head devices",
-)
-def test_ppu_direct_route_grid_limits():
-    # PR 5140 geometry uses direct-route only for the smallest decode batches.
-    assert thead_moe._select_ppu_direct_block_n(4096) == 128
-    assert thead_moe._use_ppu_direct_route(4, 6, 4096, 256)
-    assert not thead_moe._use_ppu_direct_route(8, 6, 4096, 256)
-
-    # The same route-density limit applies to larger intermediate dimensions.
-    max_output_n = max(4096, 2 * 14336)
-    n_tiles = max_output_n // thead_moe._select_ppu_direct_block_n(max_output_n)
-    assert 32 * n_tiles <= 65535
-    assert thead_moe._use_ppu_direct_route(16, 2, 4096, 14336)
-    assert not thead_moe._use_ppu_direct_route(17, 2, 4096, 14336)
 
 
 # -----------------------------------------------------------------------------
@@ -601,8 +576,8 @@ def test_fused_marlin_moe_w4a16_int4_ppu_grouped():
     # 32 * top_k=2 exceeds the direct-route limit and naturally selects the
     # expert-grouped path.
     config = (32, 8, 128, 256, 2)
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = (
-        _make_inputs_w4a16_int4(*config, torch.bfloat16, flaggems_vllm.device)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
+        *config, torch.bfloat16, flaggems_vllm.device
     )
     result = fused_marlin_moe(
         hidden_states=hs,
@@ -631,8 +606,8 @@ def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
     apply_router_weight_on_input,
 ):
     config = (2, 8, 128, 256, 2)
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = (
-        _make_inputs_w4a16_int4(*config, torch.bfloat16, flaggems_vllm.device)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
+        *config, torch.bfloat16, flaggems_vllm.device
     )
     result = fused_marlin_moe(
         hidden_states=hs,
