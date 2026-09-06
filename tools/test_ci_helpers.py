@@ -47,6 +47,34 @@ class TemporaryRepositoryTestCase(unittest.TestCase):
 
 
 class SelectTestsTest(TemporaryRepositoryTestCase):
+    def test_mhc_reference_change_selects_consumers(self):
+        self.make_file("tests/test_mhc_ops.py")
+        self.make_file("benchmark/test_mhc.py")
+
+        mode, tests, benchmarks = select_tests.select_targets(
+            self.repo_root,
+            ["tests/mhc_reference.py"],
+        )
+
+        self.assertEqual(mode, "selected")
+        self.assertEqual(tests, ["tests/test_mhc_ops.py"])
+        self.assertEqual(benchmarks, ["benchmark/test_mhc.py"])
+
+    def test_mhc_source_change_includes_triton_provenance_gate(self):
+        self.make_file("tests/test_mhc_ops.py")
+        self.make_file("tests/test_mhc_triton_only.py")
+
+        mode, tests, _ = select_tests.select_targets(
+            self.repo_root,
+            ["src/flaggems_vllm/ops/mhc/hc_split_sinkhorn.py"],
+        )
+
+        self.assertEqual(mode, "selected")
+        self.assertEqual(
+            tests,
+            ["tests/test_mhc_ops.py", "tests/test_mhc_triton_only.py"],
+        )
+
     def test_environment_and_operator_changes_are_combined(self):
         self.make_file("tests/test_mul.py")
 

@@ -25,15 +25,64 @@ try:
     HAS_VLLM = True
 except ImportError:
     HAS_VLLM = False
-from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
-    hc_split_sinkhorn,
+from flaggems_vllm.ops.mhc.hc_split_sinkhorn import hc_split_sinkhorn
+from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd
+from flaggems_vllm.ops.mhc.mhc_post import mhc_post
+from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
+from tests.mhc_reference import (
+    mhc_bwd_ref,
     mhc_split_sinkhorn_torch_ref,
+    sinkhorn_forward,
 )
-from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
 
 from . import base
+
+
+def _mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
+    output = x.unsqueeze(-2) * post_layer_mix
+    output += torch.bmm(comb_res_mix.mT, residual.float())
+    return output.type_as(x)
+
+
+def _mhc_pre_ref(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+):
+    hc_mult = residual.shape[-2]
+    residual_flat = residual.flatten(-2, -1).float()
+    sqrsum = residual_flat.square().sum(-1, keepdim=True)
+    mixes = residual_flat @ fn.mT
+    mixes *= torch.rsqrt(sqrsum / fn.shape[-1] + rms_eps)
+    pre = (
+        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]).unsqueeze(
+            -1
+        )
+        + hc_pre_eps
+    )
+    post = (
+        torch.sigmoid(
+            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult]
+        )
+        * hc_post_mult_value
+    ).unsqueeze(-1)
+    comb = (mixes[:, 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]).view(
+        -1, hc_mult, hc_mult
+    )
+    comb = torch.softmax(comb, dim=-1) + hc_sinkhorn_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+    layer = (residual * pre).sum(-2).bfloat16()
+    return post, comb, layer
 
 
 class MHCPostBenchmark(base.Benchmark):
@@ -66,7 +115,7 @@ class MHCPostBenchmark(base.Benchmark):
 def test_mhc_post():
     bench = MHCPostBenchmark(
         op_name="mhc_post",
-        torch_op=mhc_post_ref,
+        torch_op=_mhc_post_ref,
         gems_op=mhc_post,
         dtypes=[torch.bfloat16],
     )
@@ -82,20 +131,7 @@ class MHCPreBenchmark(base.Benchmark):
         super().__init__(*args, **kwargs)
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (512, 1280),
-            (512, 2560),
-            (512, 4096),
-            (1024, 1280),
-            (1024, 2560),
-            (1024, 4096),
-            (2048, 1280),
-            (2048, 2560),
-            (2048, 4096),
-            (8192, 1280),
-            (8192, 2560),
-            (8192, 4096),
-        ]
+        self.shapes = [(64, 4096), (96, 4096), (128, 4096)]
 
     def get_input_iter(self, dtype):
         for n, hidden_size in self.shapes:
@@ -138,7 +174,7 @@ class MHCPreBenchmark(base.Benchmark):
 def test_mhc_pre():
     bench = MHCPreBenchmark(
         op_name="mhc_pre",
-        torch_op=mhc_pre_ref,
+        torch_op=_mhc_pre_ref,
         gems_op=mhc_pre,
         dtypes=[torch.bfloat16],
     )

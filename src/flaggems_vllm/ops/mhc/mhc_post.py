@@ -21,7 +21,7 @@ Computes:
 
 Key optimizations (v3):
 - 2D grid = (N, cdiv(H, BLOCK_H)): high program count for latency hiding.
-- @triton.autotune over BLOCK_H / num_warps / num_stages.
+- M/H-aware library tuning over BLOCK_H and num_warps using CUDA Graph timing.
 - Contiguous layout: stride math removed, enabling LDG.128.
 - All 4 accumulators computed then stored (better ILP).
 - BLOCK_H chosen to evenly divide H when possible (256 divides all targets).
@@ -33,28 +33,17 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+from flaggems_vllm.utils import libentry, libtuner
+
 logger = logging.getLogger(__name__)
 
 
-@triton.autotune(
-    configs=[
-        # Small BLOCK_H: many programs, good for latency hiding
-        triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=2),
-        # Medium BLOCK_H
-        triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=2),
-        # Large BLOCK_H
-        triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=1),
-    ],
-    key=["H"],
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mhc_post_hc4"),
+    key=["N", "H"],
+    use_cuda_graph=True,
 )
 @triton.jit
 def mhc_post_kernel_hc_mult_4(
@@ -63,8 +52,10 @@ def mhc_post_kernel_hc_mult_4(
     c_ptr,  # post_layer_mix: (N, 4),   float32
     d_ptr,  # x            : (N, H),    bfloat16
     out_ptr,  # output       : (N, 4, H), bfloat16
+    N,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,
 ):
     """
     Grid: (N, cdiv(H, BLOCK_H)).
@@ -72,6 +63,9 @@ def mhc_post_kernel_hc_mult_4(
     """
     pid_n = tl.program_id(0)
     pid_h = tl.program_id(1)
+
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
 
     h_off = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_off < H
@@ -124,18 +118,15 @@ def mhc_post_kernel_hc_mult_4(
     tl.store(out_ptr + out_base + 1 * H + h_off, acc1.to(tl.bfloat16), mask=h_mask)
     tl.store(out_ptr + out_base + 2 * H + h_off, acc2.to(tl.bfloat16), mask=h_mask)
     tl.store(out_ptr + out_base + 3 * H + h_off, acc3.to(tl.bfloat16), mask=h_mask)
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
-    ],
-    key=["H", "HC"],
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mhc_post_generic"),
+    key=["N", "H", "HC"],
+    use_cuda_graph=True,
 )
 @triton.jit
 def mhc_post_kernel_generic(
@@ -144,9 +135,11 @@ def mhc_post_kernel_generic(
     c_ptr,  # post_layer_mix: (N, HC), float32
     d_ptr,  # x            : (N, H), bfloat16
     out_ptr,  # output      : (N, HC, H), bfloat16
+    N,
     H: tl.constexpr,
     HC: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,
 ):
     """Generic mHC post kernel for arbitrary HC.
 
@@ -156,6 +149,9 @@ def mhc_post_kernel_generic(
     pid_n = tl.program_id(0)
     pid_i = tl.program_id(1)
     pid_h = tl.program_id(2)
+
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
 
     h_off = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_off < H
@@ -178,6 +174,8 @@ def mhc_post_kernel_generic(
         acc += a_ji * b_j
 
     tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def mhc_post(
@@ -206,17 +204,47 @@ def mhc_post(
         comb_res_mix.shape,
     )
 
+    if residual.ndim != 3:
+        raise ValueError("residual must have shape [N, HC, H]")
     N, hc, H = residual.shape
-    assert x.shape == (N, H)
-    assert post_layer_mix.shape in ((N, hc, 1), (N, hc))
-    assert comb_res_mix.shape == (N, hc, hc)
+    if N == 0 or hc == 0 or H == 0:
+        raise NotImplementedError("mHC post does not support empty inputs")
+    if x.shape != (N, H):
+        raise ValueError(f"x must have shape ({N}, {H})")
+    if post_layer_mix.shape not in ((N, hc, 1), (N, hc)):
+        raise ValueError(
+            f"post_layer_mix must have shape ({N}, {hc}, 1) or ({N}, {hc})"
+        )
+    if comb_res_mix.shape != (N, hc, hc):
+        raise ValueError(f"comb_res_mix must have shape ({N}, {hc}, {hc})")
+    if x.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
+        raise NotImplementedError("x and residual must use bfloat16")
+    if post_layer_mix.dtype != torch.float32 or comb_res_mix.dtype != torch.float32:
+        raise NotImplementedError("mHC post mix tensors must use float32")
+    inputs = (x, residual, post_layer_mix, comb_res_mix)
+    if not residual.is_cuda:
+        raise NotImplementedError("mHC post requires CUDA tensors")
+    if not all(tensor.device == residual.device for tensor in inputs):
+        raise ValueError("all mHC post tensors must be on the same device")
+    if not all(tensor.is_contiguous() for tensor in inputs):
+        raise NotImplementedError("mHC post requires contiguous tensors")
+    if any(tensor.requires_grad for tensor in inputs):
+        raise NotImplementedError("mHC post is an inference-only path")
+    if residual.device.index != torch.cuda.current_device():
+        raise NotImplementedError(
+            "mHC post requires its tensor device to be the current CUDA device"
+        )
 
     out = torch.empty_like(residual)
 
-    c = post_layer_mix.squeeze(-1).contiguous()  # (N, hc)
-    a = comb_res_mix.contiguous()  # (N, hc, hc)
-    b = residual.contiguous()  # (N, hc, H)
-    d = x.contiguous()  # (N, H)
+    c = post_layer_mix.squeeze(-1)  # (N, hc), no-copy view
+    a = comb_res_mix
+    b = residual
+    d = x
+    launch_pdl = (
+        torch.version.hip is None
+        and torch.cuda.get_device_capability(residual.device)[0] >= 9
+    )
 
     if hc == 4:
 
@@ -229,7 +257,10 @@ def mhc_post(
             c,
             d,
             out,
+            N,
             H=H,
+            LAUNCH_PDL=launch_pdl,
+            launch_pdl=launch_pdl,
         )
     else:
 
@@ -242,18 +273,13 @@ def mhc_post(
             c,
             d,
             out,
+            N,
             H=H,
             HC=hc,
+            LAUNCH_PDL=launch_pdl,
+            launch_pdl=launch_pdl,
         )
     return out
 
 
-def mhc_post_ref(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-) -> torch.Tensor:
-    """PyTorch reference implementation."""
-    y = x.unsqueeze(-2) * post_layer_mix + torch.bmm(comb_res_mix.mT, residual.float())
-    return y.type_as(x)
+__all__ = ["mhc_post"]
