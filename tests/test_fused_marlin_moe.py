@@ -38,7 +38,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 
 from . import conftest as cfg
 
-fused_marlin_moe = flaggems_vllm.fused_marlin_moe
+fused_marlin_moe = flaggems_vllm.fused_marlin_moe_w4a16_int4
 
 
 def _is_hopper():
@@ -63,7 +63,7 @@ def _supports_w4a16_int4():
 )
 def test_fused_marlin_moe_uses_thead_specialization():
     assert fused_marlin_moe.__module__ == (
-        "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
+        "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_int4"
     )
 
 
@@ -773,3 +773,19 @@ def test_rejects_fp8_input_dtype():
             quant_type_id=QUANT_TYPE_UINT4B8,
             input_dtype=torch.float8_e4m3fn,
         )
+
+
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "thead", reason="THead public dispatch"
+)
+def test_public_operator_registration():
+    import flaggems_vllm.ops as public_ops
+
+    op = flaggems_vllm.fused_marlin_moe_w4a16_int4
+    assert op.__name__ == "fused_marlin_moe_w4a16_int4"
+    assert (
+        op.__module__
+        == "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_int4"
+    )
+    assert "fused_marlin_moe_w4a16_int4" in public_ops.__all__
+    assert ("fused_marlin_moe_w4a16_int4", op) in flaggems_vllm._FULL_CONFIG

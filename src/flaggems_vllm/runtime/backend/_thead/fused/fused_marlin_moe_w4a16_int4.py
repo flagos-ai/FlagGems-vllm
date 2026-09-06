@@ -38,9 +38,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
 )
-from flaggems_vllm.ops.fused_marlin_moe import (
-    w4a16_int4_pack,
-)
+from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
@@ -1009,7 +1007,7 @@ def _invoke_ppu_w4a16_int4_moe_gemm_grouped(
     )
 
 
-def fused_marlin_moe_w4a16_int4(
+def _fused_marlin_moe_w4a16_int4_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -1311,7 +1309,7 @@ def fused_marlin_moe_w4a16_int4(
     return out_hidden_states
 
 
-def fused_marlin_moe(
+def fused_marlin_moe_w4a16_int4(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -1392,7 +1390,7 @@ def fused_marlin_moe(
         and w2_scale.dtype == hidden_states.dtype
     )
     if use_ppu_w4a16:
-        result = fused_marlin_moe_w4a16_int4(
+        result = _fused_marlin_moe_w4a16_int4_impl(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -1446,4 +1444,4 @@ def fused_marlin_moe(
     )
 
 
-__all__ = ["fused_marlin_moe"]
+__all__ = ["fused_marlin_moe_w4a16_int4"]
