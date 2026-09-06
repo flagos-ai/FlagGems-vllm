@@ -22,7 +22,8 @@ import pytest
 import torch
 
 from flaggems_vllm.ops.mhc.mhc_fused_post_pre import mhc_fused_post_pre
-from flaggems_vllm.ops.mhc.mhc_prenorm import mhc_prenorm_gemm
+from flaggems_vllm.ops.mhc.mhc_post import mhc_post
+from flaggems_vllm.ops.mhc.mhc_prenorm import mhc_prenorm_gemm, mhc_prepare_weights
 
 HIDDEN_SIZE = 4096
 HC_MULT = 4
@@ -284,3 +285,121 @@ def test_mhc_fused_post_pre_rejects_unvalidated_token_count() -> None:
             20,
             norm_weight=norm_weight,
         )
+
+
+@pytest.mark.mhc_fused_post_pre
+@pytest.mark.parametrize("num_tokens", [64, 96, 128])
+@pytest.mark.parametrize("weight_scale", [1e-4, 1e-2, 1.0])
+def test_mhc_prenorm_preserves_fp32_weight_precision(num_tokens, weight_scale):
+    _require_gpu_runtime()
+    torch.manual_seed(83)
+    residual = torch.randn(
+        (num_tokens, HC_MULT * HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16
+    )
+    fn = (
+        torch.randn(
+            (MIX_COUNT, HC_MULT * HIDDEN_SIZE), device="cuda", dtype=torch.float32
+        )
+        * weight_scale
+    )
+    expected = residual.cpu().float() @ fn.cpu().mT
+    for _ in range(3):
+        partial, sqrsum = mhc_prenorm_gemm(residual, fn)
+        actual = partial.sum(0)[:, :MIX_COUNT].cpu()
+        relative_rmse = (
+            actual - expected
+        ).square().mean().sqrt() / expected.square().mean().sqrt()
+        assert relative_rmse < 1e-5
+        torch.testing.assert_close(
+            sqrsum.sum(0).cpu(),
+            residual.cpu().float().square().sum(1),
+            rtol=1e-6,
+            atol=2e-3,
+        )
+
+
+@pytest.mark.mhc_fused_post_pre
+def test_mhc_prenorm_retains_small_weight_components_after_cancellation():
+    _require_gpu_runtime()
+    residual = torch.ones(
+        (64, HC_MULT * HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16
+    )
+    fn = torch.ones(
+        (MIX_COUNT, HC_MULT * HIDDEN_SIZE), device="cuda", dtype=torch.float32
+    )
+    fn[:, 1::2] = -1.0 + 2.0**-12
+    # The low component is exactly representable in BF16; casting each full
+    # FP32 weight to a single BF16 would instead erase the entire answer.
+    partial, _ = mhc_prenorm_gemm(residual, fn)
+    expected = torch.full((64, MIX_COUNT), 2.0, device="cuda", dtype=torch.float32)
+    torch.testing.assert_close(
+        partial.sum(0)[:, :MIX_COUNT], expected, rtol=1e-6, atol=1e-6
+    )
+
+
+@pytest.mark.mhc_fused_post_pre
+def test_mhc_prenorm_rebuilds_pack_after_weight_mutation():
+    _require_gpu_runtime()
+    inputs = _make_inputs(96, seed=91)
+    residual = inputs.residual.view(96, HC_MULT * HIDDEN_SIZE)
+    initial, _ = mhc_prenorm_gemm(residual, inputs.fn)
+    inputs.fn.mul_(3.0)
+    updated, _ = mhc_prenorm_gemm(residual, inputs.fn)
+    torch.testing.assert_close(
+        updated.sum(0), initial.sum(0) * 3.0, rtol=1e-4, atol=1e-6
+    )
+
+
+@pytest.mark.mhc_fused_post_pre
+def test_mhc_prepare_weights_allows_first_prenorm_call_in_graph():
+    _require_gpu_runtime()
+    inputs = _make_inputs(96, seed=92)
+    residual = inputs.residual.view(96, HC_MULT * HIDDEN_SIZE)
+    mhc_prepare_weights(inputs.fn)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        partial, _ = mhc_prenorm_gemm(residual, inputs.fn)
+    graph.replay()
+    expected = residual.cpu().float() @ inputs.fn.cpu().mT
+    torch.testing.assert_close(
+        partial.sum(0)[:, :MIX_COUNT].cpu(), expected, rtol=1e-4, atol=1e-6
+    )
+
+
+def test_mhc_weight_preparation_is_not_a_dispatch_operator():
+    import flaggems_vllm
+
+    assert flaggems_vllm.mhc_prepare_weights is mhc_prepare_weights
+    assert "mhc_prepare_weights" not in dict(flaggems_vllm._FULL_CONFIG)
+
+
+@pytest.mark.mhc_fused_post_pre
+@pytest.mark.parametrize("num_tokens", [64, 96, 128])
+@pytest.mark.parametrize("seed", [3, 41])
+def test_mhc_prenorm_graph_reads_current_post_output(num_tokens, seed):
+    _require_gpu_runtime()
+    inputs = _make_inputs(num_tokens, seed=seed)
+    inputs.fn.mul_(10000.0)
+
+    def chain():
+        residual = mhc_post(inputs.x, inputs.residual, inputs.post_mix, inputs.comb_mix)
+        partial, _ = mhc_prenorm_gemm(
+            residual.view(num_tokens, HC_MULT * HIDDEN_SIZE), inputs.fn
+        )
+        return residual, partial
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [chain() for _ in range(8)]
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    for residual, partial in (outputs[0], outputs[-1]):
+        expected = residual.cpu().flatten(1).float() @ inputs.fn.cpu().mT
+        actual = partial.sum(0)[:, :MIX_COUNT].cpu()
+        relative_rmse = (
+            actual - expected
+        ).square().mean().sqrt() / expected.square().mean().sqrt()
+        assert relative_rmse < 1e-5

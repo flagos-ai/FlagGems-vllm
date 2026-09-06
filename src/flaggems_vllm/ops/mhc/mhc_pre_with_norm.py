@@ -24,9 +24,11 @@ _HIDDEN_SIZE = 4096
 _HC_MULT = 4
 _PADDED_MIX_COUNT = 32
 _SEMANTIC_MIX_COUNT = 24
+# These are full-chain CUDA Graph choices. Per-kernel autotuning is deliberately
+# avoided because PDL overlap with the adjacent GEMM changes the winner.
 _SPLIT_COUNTS = {64: 64, 96: 32, 128: 32}
-_NUM_WARPS = {64: 4, 96: 2, 128: 4}
-_MAX_NUM_REGS = {64: 80, 96: None, 128: 80}
+_NUM_WARPS = {64: 4, 96: 4, 128: 4}
+_MAX_NUM_REGS = {64: 80, 96: 64, 128: 80}
 
 
 @triton.jit
@@ -81,25 +83,68 @@ def _mhc_pre_epilogue_kernel(
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
 
-    mix_offsets = tl.arange(0, 32)
-    mixes = tl.zeros((32,), dtype=tl.float32)
-    residual_sqrsum = 0.0
-    # One contiguous 32-wide transaction per split is faster than separately
-    # reducing pre/post/comb, and preserves the split-order FP32 accumulation.
-    for split in tl.static_range(SPLITS):
-        mixes += tl.load(partial_ptr + (split * M + token) * 32 + mix_offsets)
-        residual_sqrsum += tl.load(partial_sqrsum_ptr + split * M + token)
-
-    residual_inv_rms = tl.rsqrt(residual_sqrsum * (1.0 / 16384.0) + RMS_EPS)
     # Two independent CTA roles share one launch. Both repeat the small split
     # reduction, then the scheduler can overlap the long-latency 4x4 Sinkhorn
     # role with the bandwidth-heavy weighted-sum/RMSNorm role. The roles write
     # disjoint outputs, so no inter-CTA synchronization or scratch is needed.
     if role == 0:
+        # This role only consumes post[4:8] and comb[8:24]. Keep a 32-lane
+        # vector for efficient transactions, but mask the unused pre/padding
+        # columns instead of moving all 32 values for every split.
+        role_mix_offsets = 4 + tl.arange(0, 32)
+        if SPLITS == 64:
+            # Four independent chains hide split-load latency at S=64. The
+            # pairwise merge is only enabled for the measured M=64 path.
+            mixes0 = tl.zeros((32,), dtype=tl.float32)
+            mixes1 = tl.zeros((32,), dtype=tl.float32)
+            mixes2 = tl.zeros((32,), dtype=tl.float32)
+            mixes3 = tl.zeros((32,), dtype=tl.float32)
+            sqrsum0 = 0.0
+            sqrsum1 = 0.0
+            sqrsum2 = 0.0
+            sqrsum3 = 0.0
+            for split in tl.static_range(0, SPLITS, 4):
+                mixes0 += tl.load(
+                    partial_ptr + (split * M + token) * 32 + role_mix_offsets,
+                    mask=role_mix_offsets < 24,
+                    other=0.0,
+                )
+                mixes1 += tl.load(
+                    partial_ptr + ((split + 1) * M + token) * 32 + role_mix_offsets,
+                    mask=role_mix_offsets < 24,
+                    other=0.0,
+                )
+                mixes2 += tl.load(
+                    partial_ptr + ((split + 2) * M + token) * 32 + role_mix_offsets,
+                    mask=role_mix_offsets < 24,
+                    other=0.0,
+                )
+                mixes3 += tl.load(
+                    partial_ptr + ((split + 3) * M + token) * 32 + role_mix_offsets,
+                    mask=role_mix_offsets < 24,
+                    other=0.0,
+                )
+                sqrsum0 += tl.load(partial_sqrsum_ptr + split * M + token)
+                sqrsum1 += tl.load(partial_sqrsum_ptr + (split + 1) * M + token)
+                sqrsum2 += tl.load(partial_sqrsum_ptr + (split + 2) * M + token)
+                sqrsum3 += tl.load(partial_sqrsum_ptr + (split + 3) * M + token)
+            mixes = (mixes0 + mixes1) + (mixes2 + mixes3)
+            residual_sqrsum = (sqrsum0 + sqrsum1) + (sqrsum2 + sqrsum3)
+        else:
+            mixes = tl.zeros((32,), dtype=tl.float32)
+            residual_sqrsum = 0.0
+            for split in tl.static_range(SPLITS):
+                mixes += tl.load(
+                    partial_ptr + (split * M + token) * 32 + role_mix_offsets,
+                    mask=role_mix_offsets < 24,
+                    other=0.0,
+                )
+                residual_sqrsum += tl.load(partial_sqrsum_ptr + split * M + token)
+        residual_inv_rms = tl.rsqrt(residual_sqrsum * (1.0 / 16384.0) + RMS_EPS)
         offsets4 = tl.arange(0, 4)
         offsets16 = tl.arange(0, 16)
-        post_mix = tl.gather(mixes, 4 + offsets4, 0)
-        comb_mix = tl.gather(mixes, 8 + offsets16, 0)
+        post_mix = tl.gather(mixes, offsets4, 0)
+        comb_mix = tl.gather(mixes, 4 + offsets16, 0)
         post_mix = (
             tl.sigmoid(
                 post_mix * residual_inv_rms * tl.load(hc_scale_ptr + 1)
@@ -114,8 +159,42 @@ def _mhc_pre_epilogue_kernel(
         tl.store(post_mix_ptr + token * 4 + offsets4, post_mix)
         tl.store(comb_mix_ptr + token * 16 + offsets16, comb_mix)
     else:
+        # The weighted-sum role only needs pre[0:4]. Narrowing this reduction
+        # also removes the 32-element mix vector from its hot path.
         offsets4 = tl.arange(0, 4)
-        pre_mix = tl.gather(mixes, offsets4, 0)
+        if SPLITS == 64:
+            pre_mix0 = tl.zeros((4,), dtype=tl.float32)
+            pre_mix1 = tl.zeros((4,), dtype=tl.float32)
+            pre_mix2 = tl.zeros((4,), dtype=tl.float32)
+            pre_mix3 = tl.zeros((4,), dtype=tl.float32)
+            sqrsum0 = 0.0
+            sqrsum1 = 0.0
+            sqrsum2 = 0.0
+            sqrsum3 = 0.0
+            for split in tl.static_range(0, SPLITS, 4):
+                pre_mix0 += tl.load(partial_ptr + (split * M + token) * 32 + offsets4)
+                pre_mix1 += tl.load(
+                    partial_ptr + ((split + 1) * M + token) * 32 + offsets4
+                )
+                pre_mix2 += tl.load(
+                    partial_ptr + ((split + 2) * M + token) * 32 + offsets4
+                )
+                pre_mix3 += tl.load(
+                    partial_ptr + ((split + 3) * M + token) * 32 + offsets4
+                )
+                sqrsum0 += tl.load(partial_sqrsum_ptr + split * M + token)
+                sqrsum1 += tl.load(partial_sqrsum_ptr + (split + 1) * M + token)
+                sqrsum2 += tl.load(partial_sqrsum_ptr + (split + 2) * M + token)
+                sqrsum3 += tl.load(partial_sqrsum_ptr + (split + 3) * M + token)
+            pre_mix = (pre_mix0 + pre_mix1) + (pre_mix2 + pre_mix3)
+            residual_sqrsum = (sqrsum0 + sqrsum1) + (sqrsum2 + sqrsum3)
+        else:
+            pre_mix = tl.zeros((4,), dtype=tl.float32)
+            residual_sqrsum = 0.0
+            for split in tl.static_range(SPLITS):
+                pre_mix += tl.load(partial_ptr + (split * M + token) * 32 + offsets4)
+                residual_sqrsum += tl.load(partial_sqrsum_ptr + split * M + token)
+        residual_inv_rms = tl.rsqrt(residual_sqrsum * (1.0 / 16384.0) + RMS_EPS)
         pre_mix = (
             tl.sigmoid(
                 pre_mix * residual_inv_rms * tl.load(hc_scale_ptr)

@@ -52,8 +52,11 @@ class _PackedFnEntry(NamedTuple):
 
 
 # Static specializations are intentional. These are fixed decode shapes, and
-# the choices below were measured on the NVIDIA SM90 target. Keeping the split
-# count static also lets the downstream epilogue fully unroll its reduction.
+# the choices below were validated on NVIDIA H20 (SM90). Other SM90 devices
+# still need their own performance validation. Keeping the split count static
+# also lets the downstream epilogue fully unroll its reduction. Pipeline
+# parameters are not interchangeable: validate the complete producer/consumer
+# CUDA Graph whenever changing them, not only isolated GEMM output.
 _PRENORM_CONFIGS = {
     64: _PrenormConfig(64, 128, 64, 4, 3),
     # S=32 is within 0.11 us of the isolated S=128 GEMM while cutting the
@@ -88,13 +91,18 @@ def _pack_mhc_fn_kernel(
     offsets_k = block * BLOCK_K + tl.arange(0, BLOCK_K)[:, None]
     offsets_n = tl.arange(0, PADDED_N)[None, :]
     values = tl.load(
-        fn_ptr + offsets_n * K + offsets_k,
+        fn_ptr + offsets_n * K + (offsets_k % K),
         mask=offsets_n < N,
         other=0.0,
     )
+    # A single BF16 cast loses small FP32 components, including weights that
+    # remain after cancellation. Keep a second BF16 component in a separate
+    # contiguous plane and accumulate both tensor-core products in FP32.
+    high = values.to(tl.bfloat16)
+    low = (values - high.to(tl.float32)).to(tl.bfloat16)
     tl.store(
         packed_ptr + offsets_k * PADDED_N + offsets_n,
-        values.to(tl.bfloat16),
+        tl.where(offsets_k < K, high, low),
     )
 
     if LAUNCH_PDL:
@@ -130,6 +138,13 @@ def _mhc_prenorm_gemm_kernel(
         current_k = k_start + k_delta
         residual = residual_desc.load([token_start, current_k])
         packed_fn = packed_fn_desc.load([current_k, 0])
+        packed_fn_low = packed_fn_desc.load([K + current_k, 0])
+        accumulator = tl.dot(
+            residual,
+            packed_fn_low,
+            acc=accumulator,
+            allow_tf32=False,
+        )
         accumulator = tl.dot(
             residual,
             packed_fn,
@@ -222,11 +237,11 @@ def _get_packed_fn(fn: torch.Tensor) -> tuple[torch.Tensor, bool]:
         )
 
     packed = torch.empty(
-        (_HC_HIDDEN_SIZE, _PADDED_MIX_COUNT),
+        (2 * _HC_HIDDEN_SIZE, _PADDED_MIX_COUNT),
         dtype=torch.bfloat16,
         device=fn.device,
     )
-    _pack_mhc_fn_kernel[(triton.cdiv(_HC_HIDDEN_SIZE, _PACK_BLOCK_K),)](
+    _pack_mhc_fn_kernel[(triton.cdiv(2 * _HC_HIDDEN_SIZE, _PACK_BLOCK_K),)](
         fn,
         packed,
         K=_HC_HIDDEN_SIZE,
@@ -262,6 +277,31 @@ def _get_packed_fn(fn: torch.Tensor) -> tuple[torch.Tensor, bool]:
     return packed, False
 
 
+def mhc_prepare_weights(fn: torch.Tensor) -> None:
+    """Prepare immutable FP32 mHC weights before CUDA Graph capture.
+
+    This is a host preparation helper, not a dispatchable operator. The first
+    call launches a Triton packing kernel and waits for its completion, making
+    subsequent use safe on every stream. Keep ``fn`` alive and unchanged for
+    the lifetime of captured graphs. Ordinary tensors are repacked after an
+    in-place update on the next eager call; inference tensors have no version
+    counter and must remain immutable.
+    """
+    if fn.shape != (_MIX_COUNT, _HC_HIDDEN_SIZE):
+        raise ValueError(f"fn must have shape ({_MIX_COUNT}, {_HC_HIDDEN_SIZE})")
+    if fn.dtype != torch.float32 or not fn.is_cuda:
+        raise NotImplementedError("mHC weights must be float32 CUDA tensors")
+    if not fn.is_contiguous() or fn.requires_grad:
+        raise NotImplementedError("mHC weights must be contiguous inference tensors")
+    if fn.device.index != torch.cuda.current_device():
+        raise NotImplementedError("mHC weights must be on the current CUDA device")
+    if torch.cuda.get_device_capability(fn.device)[0] < 9 or TensorDescriptor is None:
+        raise NotImplementedError(
+            "mHC weights require SM90+ and Triton TensorDescriptor"
+        )
+    _get_packed_fn(fn)
+
+
 def mhc_prenorm_gemm(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -273,11 +313,12 @@ def mhc_prenorm_gemm(
     zero-padding that keeps TMA and tensor-core accesses contiguous. ``S`` is
     selected from the static token-count specialization.
 
-    ``fn`` is converted and transposed by a Triton kernel, then cached by the
-    source tensor and its in-place version. The one-time pack completes before
-    its cache entry is published; CUDA Graph capture therefore requires one
-    warm-up call for each immutable ``fn`` identity. No PyTorch compute or copy
-    kernel is used by this production path.
+    ``fn`` is split into high/low BF16 components and transposed by a Triton
+    kernel, then cached by the source tensor and its in-place version. The
+    one-time pack completes before its cache entry is published. CUDA Graph
+    capture requires a warm-up call or ``mhc_prepare_weights`` for each
+    immutable ``fn`` identity. No PyTorch compute or copy kernel is used by
+    this production path.
     """
     config = _validate_inputs(residual, fn)
 
@@ -343,4 +384,4 @@ def mhc_prenorm_split_count(num_tokens: int) -> int:
     return config.split_k
 
 
-__all__ = ["mhc_prenorm_gemm", "mhc_prenorm_split_count"]
+__all__ = ["mhc_prepare_weights", "mhc_prenorm_gemm", "mhc_prenorm_split_count"]
