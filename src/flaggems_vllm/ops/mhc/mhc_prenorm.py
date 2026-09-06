@@ -323,11 +323,13 @@ def mhc_prenorm_gemm(
     config = _validate_inputs(residual, fn)
 
     with torch_device_fn.device(residual.device):
-        packed_fn, packed_cache_hit = _get_packed_fn(fn)
-        # A cache miss launches the packing kernel immediately before this
-        # GEMM. Keep ordinary stream ordering for that first invocation; later
-        # steady-state invocations can overlap with their upstream producer.
-        launch_pdl = packed_cache_hit and _supports_pdl(residual)
+        packed_fn, _ = _get_packed_fn(fn)
+        # Keep ordinary stream ordering even on packed-weight cache hits.
+        # PDL-enabled TMA consumption of freshly produced residuals can yield
+        # incorrect split projections when inputs change between graph replays.
+        # Weight-cache integrity and single-call tests do not establish safe
+        # producer/consumer ordering.
+        launch_pdl = False
         partial = torch.empty(
             (config.split_k, residual.shape[0], _PADDED_MIX_COUNT),
             dtype=torch.float32,

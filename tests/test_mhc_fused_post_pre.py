@@ -375,11 +375,12 @@ def test_mhc_weight_preparation_is_not_a_dispatch_operator():
 
 @pytest.mark.mhc_fused_post_pre
 @pytest.mark.parametrize("num_tokens", [64, 96, 128])
-@pytest.mark.parametrize("seed", [3, 41])
-def test_mhc_prenorm_graph_reads_current_post_output(num_tokens, seed):
+@pytest.mark.parametrize("seed", [3, 17, 41])
+@pytest.mark.parametrize("weight_scale", [1.0, 100.0, 10000.0])
+def test_mhc_prenorm_graph_reads_current_post_output(num_tokens, seed, weight_scale):
     _require_gpu_runtime()
     inputs = _make_inputs(num_tokens, seed=seed)
-    inputs.fn.mul_(10000.0)
+    inputs.fn.mul_(weight_scale)
 
     def chain():
         residual = mhc_post(inputs.x, inputs.residual, inputs.post_mix, inputs.comb_mix)
@@ -392,14 +393,47 @@ def test_mhc_prenorm_graph_reads_current_post_output(num_tokens, seed):
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        outputs = [chain() for _ in range(8)]
-    for _ in range(3):
+        outputs = [chain() for _ in range(16)]
+    torch.manual_seed(20260906 + num_tokens + seed)
+    for replay in range(12):
+        if replay % 3 == 0:
+            inputs.x.copy_(torch.randn_like(inputs.x))
         graph.replay()
+        if replay % 3 != 0:
+            continue
+        torch.cuda.synchronize()
+        for residual, partial in (outputs[0], outputs[7], outputs[-1]):
+            expected = residual.cpu().flatten(1).float() @ inputs.fn.cpu().mT
+            actual = partial.sum(0)[:, :MIX_COUNT].cpu()
+            relative_rmse = (
+                actual - expected
+            ).square().mean().sqrt() / expected.square().mean().sqrt()
+            assert relative_rmse < 1e-5
+
+
+@pytest.mark.mhc_fused_post_pre
+@pytest.mark.parametrize("num_tokens", [64, 96, 128])
+def test_mhc_prenorm_disables_pdl_on_cold_and_warm_weights(monkeypatch, num_tokens):
+    _require_gpu_runtime()
+    import importlib
+
+    prenorm = importlib.import_module("flaggems_vllm.ops.mhc.mhc_prenorm")
+    kernel = prenorm._mhc_prenorm_gemm_kernel
+    launches = []
+
+    class RecordingKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((kwargs["LAUNCH_PDL"], kwargs["launch_pdl"]))
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(prenorm, "_mhc_prenorm_gemm_kernel", RecordingKernel())
+    inputs = _make_inputs(num_tokens, seed=173)
+    for _ in range(2):
+        mhc_prenorm_gemm(
+            inputs.residual.view(num_tokens, HC_MULT * HIDDEN_SIZE), inputs.fn
+        )
     torch.cuda.synchronize()
-    for residual, partial in (outputs[0], outputs[-1]):
-        expected = residual.cpu().flatten(1).float() @ inputs.fn.cpu().mT
-        actual = partial.sum(0)[:, :MIX_COUNT].cpu()
-        relative_rmse = (
-            actual - expected
-        ).square().mean().sqrt() / expected.square().mean().sqrt()
-        assert relative_rmse < 1e-5
+    assert launches == [(False, False), (False, False)]
