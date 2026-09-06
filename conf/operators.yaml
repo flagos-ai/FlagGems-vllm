@@ -423,6 +423,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: fused_marlin_moe_w4a16_int4
+    description: |
+      Computes a fused mixture-of-experts feed-forward network with packed
+      Marlin quantized weights.
+    for:
+      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+    labels:
+      - fused
+      - vLLM
+      - MoE
+      - Quantization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_q_kv_rmsnorm
     description: |
       Applies RMSNorm to Q and KV tensors in a single fused kernel for DeepSeekV4 attention.

@@ -29,14 +29,16 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP4_E2M1,
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
-    fused_marlin_moe,
 )
 
 from . import conftest as cfg
+
+fused_marlin_moe = flaggems_vllm.fused_marlin_moe_w4a16_int4
 
 
 def _is_hopper():
@@ -47,6 +49,22 @@ def _is_hopper():
     major, minor = torch.cuda.get_device_capability()
     sm = major * 10 + minor
     return 90 <= sm < 100
+
+
+def _supports_w4a16_int4():
+    # Hopper uses the specialized PTX path. T-Head PPU uses the TLE AIU
+    # direct-route path and an expert-grouped W4A16 path for larger grids.
+    return runtime.device.vendor_name == "thead" or _is_hopper()
+
+
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "thead",
+    reason="T-Head dispatch is only available on T-Head devices",
+)
+def test_fused_marlin_moe_uses_thead_specialization():
+    assert fused_marlin_moe.__module__ == (
+        "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_int4"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -502,8 +520,8 @@ def _reference_swiglu_moe(
 
 
 @pytest.mark.skipif(
-    not _is_hopper(),
-    reason="W4A16 fast path uses Hopper-only bf16 SIMD PTX (sm_90+)",
+    not _supports_w4a16_int4(),
+    reason="W4A16 INT4 is validated on NVIDIA Hopper and T-Head PPU",
 )
 @pytest.mark.parametrize("config", FULL_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -546,6 +564,73 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
     )
     torch.cuda.synchronize()
 
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "thead",
+    reason="This test forces the T-Head expert-grouped AIU path",
+)
+def test_fused_marlin_moe_w4a16_int4_ppu_grouped():
+    # 32 * top_k=2 exceeds the direct-route limit and naturally selects the
+    # expert-grouped path.
+    config = (32, 8, 128, 256, 2)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
+        *config, torch.bfloat16, flaggems_vllm.device
+    )
+    result = fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1_q,
+        w2=w2_q,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+    )
+    ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    torch.cuda.synchronize()
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "thead",
+    reason="This test covers the T-Head fused GEMM2/top-k reduction path",
+)
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
+    apply_router_weight_on_input,
+):
+    config = (2, 8, 128, 256, 2)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
+        *config, torch.bfloat16, flaggems_vllm.device
+    )
+    result = fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1_q,
+        w2=w2_q,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    ref = _reference_swiglu_moe(
+        hs,
+        w1_ref,
+        w2_ref,
+        tw,
+        ti,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    torch.cuda.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
@@ -688,3 +773,19 @@ def test_rejects_fp8_input_dtype():
             quant_type_id=QUANT_TYPE_UINT4B8,
             input_dtype=torch.float8_e4m3fn,
         )
+
+
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "thead", reason="THead public dispatch"
+)
+def test_public_operator_registration():
+    import flaggems_vllm.ops as public_ops
+
+    op = flaggems_vllm.fused_marlin_moe_w4a16_int4
+    assert op.__name__ == "fused_marlin_moe_w4a16_int4"
+    assert (
+        op.__module__
+        == "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_int4"
+    )
+    assert "fused_marlin_moe_w4a16_int4" in public_ops.__all__
+    assert ("fused_marlin_moe_w4a16_int4", op) in flaggems_vllm._FULL_CONFIG
