@@ -1188,7 +1188,7 @@ def _validate_mxfp4(a, w1, w2, s1, s2, tw, ids, output, inplace):
     return m, k, n, e, ids.shape[1]
 
 
-def fused_marlin_moe_w4a16_mxfp4(
+def _fused_marlin_moe_w4a16_mxfp4_impl(
     hidden_states,
     w1,
     w2,
@@ -1328,7 +1328,7 @@ def fused_marlin_moe_w4a16_mxfp4(
     return out
 
 
-def fused_marlin_moe(
+def fused_marlin_moe_w4a16_mxfp4(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -1403,7 +1403,7 @@ def fused_marlin_moe(
         raise NotImplementedError("PPU MXFP4 requires group_size=32")
     if w1.ndim != 3 or global_num_experts not in (-1, w1.shape[0]):
         raise NotImplementedError("PPU MXFP4 requires local expert weights")
-    return fused_marlin_moe_w4a16_mxfp4(
+    return _fused_marlin_moe_w4a16_mxfp4_impl(
         hidden_states,
         w1,
         w2,
@@ -1417,4 +1417,4 @@ def fused_marlin_moe(
     )
 
 
-__all__ = ["fused_marlin_moe"]
+__all__ = ["fused_marlin_moe_w4a16_mxfp4"]

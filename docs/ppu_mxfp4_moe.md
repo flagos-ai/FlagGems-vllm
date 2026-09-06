@@ -1,7 +1,7 @@
 # THead MXFP4 fused Marlin MoE
 
 The THead backend exposes MXFP4 W4A16 inference through
-`flaggems_vllm.fused_marlin_moe`. Use `QUANT_TYPE_FP4_E2M1` from
+`flaggems_vllm.fused_marlin_moe_w4a16_mxfp4`. Use `QUANT_TYPE_FP4_E2M1` from
 `flaggems_vllm.ops.fused_marlin_moe` and `group_size=32`.
 
 ## Input and output contract
@@ -24,7 +24,7 @@ The THead backend exposes MXFP4 W4A16 inference through
 ## Implementation
 
 The existing backend-dispatch mechanism selects the specialization in
-`src/flaggems_vllm/runtime/backend/_thead/fused/fused_marlin_moe.py`.
+`src/flaggems_vllm/runtime/backend/_thead/fused/fused_marlin_moe_w4a16_mxfp4.py`.
 The generic operator is unchanged.
 
 - TLE AIU asynchronous block-pointer loads transfer activations and INT32

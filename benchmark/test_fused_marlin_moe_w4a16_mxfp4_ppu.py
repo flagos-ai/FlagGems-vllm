@@ -84,7 +84,7 @@ def graph_us(fn):
 )
 def test_benchmark_mxfp4(shape, dtype):
     args, refs = make_inputs(*shape, dtype=dtype)
-    gems = lambda: flaggems_vllm.fused_marlin_moe(**args)
+    gems = lambda: flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     baseline = lambda: torch_moe(args, refs)
     actual, expected = gems(), baseline()
     error = (

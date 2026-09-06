@@ -21,7 +21,7 @@ import triton.language as tl
 
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP4_E2M1
-from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import (
+from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_mxfp4 import (
     _decode_e2m1,
     _pack_mxfp4,
     _ppu_dequant_mxfp4,
@@ -109,7 +109,7 @@ def reference(args, refs):
 def test_mxfp4(shape, dtype, router):
     args, refs = make_inputs(*shape, dtype=dtype)
     args["apply_router_weight_on_input"] = router
-    actual = flaggems_vllm.fused_marlin_moe(**args)
+    actual = flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     expected = reference(args, refs)
     err = (actual.float() - expected).abs().mean() / expected.abs().mean().clamp_min(
         1e-8
@@ -177,7 +177,7 @@ def test_output_and_empty(m, mode):
     else:
         for key in ("w1_scale", "w2_scale"):
             args[key] = args[key].view(torch.float8_e8m0fnu)
-    actual = flaggems_vllm.fused_marlin_moe(**args)
+    actual = flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     if mode in ("output", "inplace"):
         assert actual is args["output" if mode == "output" else "hidden_states"]
     if m:
@@ -199,14 +199,14 @@ def test_unsupported(change):
     args, _ = make_inputs()
     args.update(change)
     with pytest.raises(NotImplementedError):
-        flaggems_vllm.fused_marlin_moe(**args)
+        flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
 
 
 def test_bad_metadata():
     args, _ = make_inputs()
     args["topk_ids"] = args["topk_ids"].to(torch.float32)
     with pytest.raises(NotImplementedError):
-        flaggems_vllm.fused_marlin_moe(**args)
+        flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
 
 
 @pytest.mark.parametrize("m", [1, 33])
@@ -215,10 +215,10 @@ def test_cuda_graph(m):
     expected = reference(args, refs)
     # Include alignment and all dispatch paths in the captured operator.
     for _ in range(2):
-        flaggems_vllm.fused_marlin_moe(**args)
+        flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = flaggems_vllm.fused_marlin_moe(**args)
+        actual = flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     graph.replay()
     torch.cuda.synchronize()
     err = (actual.float() - expected).abs().mean() / expected.abs().mean()
@@ -233,7 +233,7 @@ def test_strided_weights_scales_and_skew(m):
         args[key] = args[key].transpose(1, 2).contiguous().transpose(1, 2)
     args["topk_ids"] = torch.zeros_like(args["topk_ids"], dtype=torch.int32)
     args["topk_weights"] = args["topk_weights"].to(torch.bfloat16)
-    actual = flaggems_vllm.fused_marlin_moe(**args)
+    actual = flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     expected = reference(args, refs)
     err = (actual.float() - expected).abs().mean() / expected.abs().mean()
     assert err < 0.04
@@ -269,7 +269,7 @@ def test_reject_bad_contract(case):
     elif case == "strided_activation":
         args["hidden_states"] = args["hidden_states"].T.contiguous().T
     with pytest.raises((ValueError, NotImplementedError)):
-        flaggems_vllm.fused_marlin_moe(**args)
+        flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
 
 
 @pytest.mark.parametrize(
@@ -289,7 +289,7 @@ def test_decode_all_scale_code_combinations(dtype, tltype, use_cache):
     expected = (lut[q] * scale).to(dtype)
     out = torch.empty(4096, device="cuda", dtype=dtype)
     if use_cache:
-        from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import (
+        from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_mxfp4 import (
             _pack_e8m0,
         )
 
@@ -306,7 +306,9 @@ def test_decode_all_scale_code_combinations(dtype, tltype, use_cache):
 
 @pytest.mark.parametrize("as_float8", [False, True])
 def test_scale_pack_extremes_and_invalidation(as_float8):
-    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import _pack_e8m0
+    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_mxfp4 import (
+        _pack_e8m0,
+    )
 
     raw = torch.arange(256, device="cuda", dtype=torch.uint8).repeat(2, 3, 1)
     raw = raw.transpose(1, 2).contiguous().transpose(1, 2)
@@ -326,17 +328,17 @@ def test_scale_pack_extremes_and_invalidation(as_float8):
 
 @pytest.mark.parametrize("m", [1, 33])
 def test_cold_cuda_graph_cache_ownership(m):
-    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import (
+    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_mxfp4 import (
         _PACK_CACHE,
         _SCALE_CACHE,
     )
 
     warm, _ = make_inputs(m=m)
-    flaggems_vllm.fused_marlin_moe(**warm)
+    flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**warm)
     args, refs = make_inputs(m=m)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = flaggems_vllm.fused_marlin_moe(**args)
+        actual = flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(**args)
     for key in ("w1", "w2"):
         assert _PACK_CACHE.get(args[key]) is None
     for key in ("w1_scale", "w2_scale"):
@@ -373,7 +375,9 @@ def _decode_packed_tile_test(W, S, Out, T: tl.constexpr):
     "dtype,tltype", [(torch.float16, tl.float16), (torch.bfloat16, tl.bfloat16)]
 )
 def test_full_packed_tile_decode(dtype, tltype):
-    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import _pack_e8m0
+    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_mxfp4 import (
+        _pack_e8m0,
+    )
 
     # Vary the code across both the 16-row subtile and the eight packed
     # nibbles. Every scale byte is exercised with every E2M1 code.
@@ -397,3 +401,16 @@ def test_full_packed_tile_decode(dtype, tltype):
     valid = ~torch.isnan(expected)
     assert torch.equal(got.view(torch.int16)[valid], expected.view(torch.int16)[valid])
     assert torch.equal(torch.isnan(got), torch.isnan(expected))
+
+
+def test_public_operator_registration():
+    import flaggems_vllm.ops as public_ops
+
+    op = flaggems_vllm.fused_marlin_moe_w4a16_mxfp4
+    assert op.__name__ == "fused_marlin_moe_w4a16_mxfp4"
+    assert (
+        op.__module__
+        == "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w4a16_mxfp4"
+    )
+    assert "fused_marlin_moe_w4a16_mxfp4" in public_ops.__all__
+    assert ("fused_marlin_moe_w4a16_mxfp4", op) in flaggems_vllm._FULL_CONFIG

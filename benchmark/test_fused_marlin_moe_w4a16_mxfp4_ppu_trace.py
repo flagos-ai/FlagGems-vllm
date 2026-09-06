@@ -291,7 +291,7 @@ def _gems_call(
     call_count,
 ):
     del vllm_w1, vllm_w2, vllm_w1_scale, vllm_w2_scale, call_count
-    return flaggems_vllm.fused_marlin_moe(
+    return flaggems_vllm.fused_marlin_moe_w4a16_mxfp4(
         hidden_states,
         w1,
         w2,
@@ -306,7 +306,7 @@ def _gems_call(
     )
 
 
-@pytest.mark.fused_marlin_moe
+@pytest.mark.fused_marlin_moe_w4a16_mxfp4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU trace benchmark")
 @pytest.mark.skipif(
     not HAS_VLLM_FUSED_MARLIN_MOE,
