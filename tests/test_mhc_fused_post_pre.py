@@ -112,22 +112,46 @@ def _candidate(inputs: Inputs) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _round_bfloat16_reference(values: torch.Tensor) -> torch.Tensor:
+    # Some CPU casts narrow FP64 through FP32. Quantize to the BF16 grid in
+    # FP64 first: eight significant bits, with a fixed subnormal step 2**-133.
+    # torch.round uses round-to-nearest, ties-to-even.
+    _, exponent = torch.frexp(values)
+    step_exponent = (exponent - 8).clamp(min=-133)
+    quantized = torch.ldexp(
+        torch.round(torch.ldexp(values, -step_exponent)), step_exponent
+    )
+    return quantized.bfloat16()
+
+
+def _reference_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+) -> torch.Tensor:
+    # An FP32 sum can round onto a BF16 midpoint, then double-round to the
+    # wrong BF16 neighbor. FP32 projection weights can amplify that error.
+    # Evaluate only this sum in CPU FP64 before the required BF16 boundary.
+    x, residual, post_mix, comb_mix = (
+        tensor.cpu().double() for tensor in (x, residual, post_mix, comb_mix)
+    )
+    post = x.unsqueeze(1) * post_mix.unsqueeze(-1) + torch.bmm(comb_mix.mT, residual)
+    return _round_bfloat16_reference(post)
+
+
 def _reference(inputs: Inputs) -> tuple[torch.Tensor, ...]:
     # Keep the reference independent from every candidate GPU implementation.
     # Running it on CPU also prevents TF32/library-specific behavior from
     # becoming part of the expected result.
-    x = inputs.x.cpu().float()
-    residual = inputs.residual.cpu().float()
-    post_mix = inputs.post_mix.cpu()
-    comb_mix = inputs.comb_mix.cpu()
     fn = inputs.fn.cpu()
     hc_scale = inputs.hc_scale.cpu()
     hc_base = inputs.hc_base.cpu()
     norm_weight = inputs.norm_weight.cpu().float()
 
-    residual_cur = (
-        x.unsqueeze(1) * post_mix.unsqueeze(-1) + torch.bmm(comb_mix.mT, residual)
-    ).bfloat16()
+    residual_cur = _reference_post(
+        inputs.x, inputs.residual, inputs.post_mix, inputs.comb_mix
+    )
     residual_fp32 = residual_cur.float()
     residual_2d = residual_fp32.flatten(1)
     mixes = residual_2d @ fn.mT
@@ -179,6 +203,82 @@ def _assert_outputs_close(
 
 
 @pytest.mark.mhc_fused_post_pre
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_mhc_post_reference_avoids_bf16_double_rounding(sign):
+    # Exact positive sum: 2.671875 + (2**-7 - 2**-23).
+    # It is below the BF16 midpoint 2.6796875, so round-to-nearest gives
+    # 2.671875. FP32 first rounds to the midpoint, whose even BF16 neighbor
+    # is 2.6875. The negative construction checks the opposite sign as well.
+    x = torch.tensor([[sign * 2.671875]], dtype=torch.bfloat16)
+    residual = torch.zeros((1, HC_MULT, 1), dtype=torch.bfloat16)
+    residual[0, 0, 0] = 1.0
+    post_mix = torch.ones((1, HC_MULT), dtype=torch.float32)
+    comb_mix = torch.zeros((1, HC_MULT, HC_MULT), dtype=torch.float32)
+    comb_mix[0, 0, 0] = sign * (2.0**-7 - 2.0**-23)
+
+    rounded_fp32 = x.float().unsqueeze(1) * post_mix.unsqueeze(-1) + torch.bmm(
+        comb_mix.mT, residual.float()
+    )
+    assert rounded_fp32[0, 0, 0].item() == sign * 2.6796875
+    assert rounded_fp32.bfloat16()[0, 0, 0].item() == sign * 2.6875
+    expected = torch.full((1, HC_MULT, 1), sign * 2.671875, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        _reference_post(x, residual, post_mix, comb_mix), expected, rtol=0, atol=0
+    )
+
+
+@pytest.mark.mhc_fused_post_pre
+def test_mhc_reference_bfloat16_rounding_edges():
+    maximum = torch.finfo(torch.bfloat16).max
+    overflow_midpoint = (2.0 - 2.0**-8) * 2.0**127
+    values = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            2.0**-134,
+            -(2.0**-134),
+            2.0**-133,
+            -(2.0**-133),
+            3.0 * 2.0**-134,
+            2.0**-126 - 2.0**-134,
+            maximum,
+            -maximum,
+            overflow_midpoint - 2.0**100,
+            overflow_midpoint,
+            -overflow_midpoint,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+        ],
+        dtype=torch.float64,
+    )
+    expected = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            0.0,
+            -0.0,
+            2.0**-133,
+            -(2.0**-133),
+            2.0**-132,
+            2.0**-126,
+            maximum,
+            -maximum,
+            maximum,
+            float("inf"),
+            float("-inf"),
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+        ],
+        dtype=torch.bfloat16,
+    )
+    actual = _round_bfloat16_reference(values)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(torch.signbit(actual[:4]), torch.signbit(expected[:4]))
+
+
+@pytest.mark.mhc_fused_post_pre
 @pytest.mark.parametrize("num_tokens", [64, 96, 128])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_mhc_fused_post_pre_matches_reference(num_tokens: int, seed: int) -> None:
@@ -204,6 +304,28 @@ def test_mhc_fused_post_pre_cuda_graph_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     _assert_outputs_close(actual, expected)
+
+
+@pytest.mark.mhc_fused_post_pre
+def test_mhc_fused_post_pre_graph_post_rounding_with_fp32_weights() -> None:
+    _require_gpu_runtime()
+    inputs = _make_inputs(96, seed=17)
+    inputs.fn.mul_(10000.0)
+    _candidate(inputs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [_candidate(inputs) for _ in range(16)]
+    # The second update includes a post sum very close to a BF16 midpoint.
+    # Keep the actual full wrapper: no hook extends intermediate lifetimes.
+    for _ in range(2):
+        inputs.x.copy_(torch.randn_like(inputs.x))
+        expected = _reference(inputs)
+        for _ in range(9):
+            graph.replay()
+        torch.cuda.synchronize()
+        for index in (0, 7, 15):
+            _assert_outputs_close(outputs[index], expected)
 
 
 @pytest.mark.mhc_fused_post_pre
