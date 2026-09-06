@@ -1,7 +1,7 @@
 # THead FP8 W8A16 fused Marlin MoE
 
-The THead specialization is `runtime/backend/_thead/fused/fused_marlin_moe_fp8.py`.
-Call the public `flaggems_vllm.fused_marlin_moe` with `QUANT_TYPE_FP8_E4M3`
+The THead specialization is `runtime/backend/_thead/fused/fused_marlin_moe_w8a16_fp8.py`.
+Call the public `flaggems_vllm.fused_marlin_moe_w8a16_fp8` with `QUANT_TYPE_FP8_E4M3`
 from `flaggems_vllm.ops.fused_marlin_moe`. This constant matches native
 `vllm.scalar_type.scalar_types.float8_e4m3fn.id`.
 
@@ -61,7 +61,7 @@ the existing native vLLM PPU extension. NVIDIA compute and tuning are unchanged.
 
 ## Validation
 
-143 passed, 4 skipped. The four skipped checks require native FP8 Marlin
+144 passed, 4 skipped. The four skipped checks require native FP8 Marlin
 configurations for group32/64 small shapes unavailable in the installed version.
 Independent references cover those supported PPU paths. Coverage includes
 all E4M3FN encodings, actual packed-tile decoding, FP16/BF16, all supported

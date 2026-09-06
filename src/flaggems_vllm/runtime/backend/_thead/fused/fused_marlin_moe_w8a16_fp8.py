@@ -1314,7 +1314,7 @@ def _validate_fp8(a, w1, w2, s1, s2, tw, ids, output, inplace, group_size):
     return m, k, n, e, ids.shape[1]
 
 
-def fused_marlin_moe_w8a16_fp8(
+def _fused_marlin_moe_w8a16_fp8_impl(
     hidden_states,
     w1,
     w2,
@@ -1467,7 +1467,7 @@ def fused_marlin_moe_w8a16_fp8(
     return out
 
 
-def fused_marlin_moe(
+def fused_marlin_moe_w8a16_fp8(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -1542,7 +1542,7 @@ def fused_marlin_moe(
         raise NotImplementedError("PPU FP8 requires group_size -1, 32, 64 or 128")
     if w1.ndim != 3 or global_num_experts not in (-1, w1.shape[0]):
         raise NotImplementedError("PPU FP8 requires local expert weights")
-    return fused_marlin_moe_w8a16_fp8(
+    return _fused_marlin_moe_w8a16_fp8_impl(
         hidden_states,
         w1,
         w2,
@@ -1557,4 +1557,4 @@ def fused_marlin_moe(
     )
 
 
-__all__ = ["fused_marlin_moe"]
+__all__ = ["fused_marlin_moe_w8a16_fp8"]

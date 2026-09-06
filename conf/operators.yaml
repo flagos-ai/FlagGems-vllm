@@ -423,7 +423,7 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
-  - id: fused_marlin_moe
+  - id: fused_marlin_moe_w8a16_fp8
     description: |
       Computes a fused mixture-of-experts feed-forward network with packed
       Marlin quantized weights.

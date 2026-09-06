@@ -22,7 +22,7 @@ import triton.language as tl
 
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3
-from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_fp8 import (
+from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w8a16_fp8 import (
     _PACK_CACHE,
     _SCALE_CACHE,
     _decode_e4m3,
@@ -110,7 +110,7 @@ def reference(args, refs):
 
 def check(args, refs):
     expected = reference(args, refs)
-    actual = flaggems_vllm.fused_marlin_moe(**args)
+    actual = flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args)
     if actual.numel():
         error = (
             actual.float() - expected
@@ -209,14 +209,14 @@ def test_output_layout(m, mode):
 @pytest.mark.parametrize("cold", [False, True])
 def test_graph(m, cold):
     warm, _ = make_inputs(m=m)
-    flaggems_vllm.fused_marlin_moe(**warm)
+    flaggems_vllm.fused_marlin_moe_w8a16_fp8(**warm)
     args, refs = make_inputs(m=m)
     expected = reference(args, refs)
     if not cold:
-        flaggems_vllm.fused_marlin_moe(**args)
+        flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = flaggems_vllm.fused_marlin_moe(**args)
+        actual = flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args)
     if cold:
         for key in ["w1", "w2"]:
             assert _PACK_CACHE.get(args[key]) is None
@@ -250,7 +250,7 @@ def test_rejections(case):
     elif case == "output":
         args["output"] = torch.empty(1, device="cuda")
     with pytest.raises((NotImplementedError, ValueError)):
-        flaggems_vllm.fused_marlin_moe(**args)
+        flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args)
 
 
 def test_native_type_id():
@@ -358,7 +358,7 @@ def test_native_marlin_groups(dtype, group_size):
                 "Independent FP32-reference tests cover this supported PPU path."
             )
         raise
-    actual = flaggems_vllm.fused_marlin_moe(**args)
+    actual = flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args)
     error = (
         actual.float() - expected.float()
     ).abs().mean() / expected.float().abs().mean()
@@ -366,7 +366,7 @@ def test_native_marlin_groups(dtype, group_size):
 
 
 def test_safety_flags_and_updates():
-    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_fp8 import (
+    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w8a16_fp8 import (
         _pack_fp8_cache,
         _pack_fp8_scale_cache,
     )
@@ -415,7 +415,7 @@ def test_mixed_fast_and_general_experts(m, projection):
             args["hidden_states"].dtype
         )
     expected = reference(args, refs)
-    actual = flaggems_vllm.fused_marlin_moe(**args).float()
+    actual = flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args).float()
     assert torch.equal(torch.isnan(actual), torch.isnan(expected))
     assert torch.equal(torch.isinf(actual), torch.isinf(expected))
     finite = torch.isfinite(expected)
@@ -449,7 +449,7 @@ def _decode_guarded_tile(W, S, WSafe, SSafe, Out, E: tl.constexpr, T: tl.constex
     "dtype,tltype", [(torch.float16, tl.float16), (torch.bfloat16, tl.bfloat16)]
 )
 def test_guarded_decode_scale_extremes(dtype, tltype):
-    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_fp8 import (
+    from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w8a16_fp8 import (
         _pack_fp8_cache,
         _pack_fp8_scale_cache,
     )
@@ -499,14 +499,14 @@ def test_guarded_decode_scale_extremes(dtype, tltype):
 @pytest.mark.parametrize("m", [4, 33])
 def test_cold_graph_switches_safety_paths(m):
     warm, _ = make_inputs(m=m)
-    flaggems_vllm.fused_marlin_moe(**warm)
+    flaggems_vllm.fused_marlin_moe_w8a16_fp8(**warm)
     args, refs = make_inputs(m=m)
     args["topk_ids"] = (
         (torch.arange(m, device="cuda")[:, None] % 4).expand(m, 2).contiguous()
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = flaggems_vllm.fused_marlin_moe(**args)
+        actual = flaggems_vllm.fused_marlin_moe_w8a16_fp8(**args)
     graph.replay()
     torch.cuda.synchronize()
     # Cold capture includes packing and flag generation, so changing the
@@ -529,3 +529,16 @@ def test_cold_graph_switches_safety_paths(m):
         (got[finite] - expected[finite]).abs().mean()
         / expected[finite].abs().mean().clamp_min(1e-12)
     ) < 0.04
+
+
+def test_public_operator_registration():
+    import flaggems_vllm.ops as public_ops
+
+    op = flaggems_vllm.fused_marlin_moe_w8a16_fp8
+    assert op.__name__ == "fused_marlin_moe_w8a16_fp8"
+    assert (
+        op.__module__
+        == "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w8a16_fp8"
+    )
+    assert "fused_marlin_moe_w8a16_fp8" in public_ops.__all__
+    assert ("fused_marlin_moe_w8a16_fp8", op) in flaggems_vllm._FULL_CONFIG

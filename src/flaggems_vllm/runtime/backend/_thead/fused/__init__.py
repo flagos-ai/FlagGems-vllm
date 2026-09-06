@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_fp8 import (
-    fused_marlin_moe,
+from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe_w8a16_fp8 import (
+    fused_marlin_moe_w8a16_fp8,
 )
 
-__all__ = ["fused_marlin_moe"]
+__all__ = ["fused_marlin_moe_w8a16_fp8"]
