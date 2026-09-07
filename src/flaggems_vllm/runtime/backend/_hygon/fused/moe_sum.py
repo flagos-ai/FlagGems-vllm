@@ -256,7 +256,7 @@ def moe_sum(
     output: torch.Tensor,
     router_weights: torch.Tensor | None = None,
 ):
-    logger.debug("GEMS MOE SUM")
+    logger.debug("GEMS_HYGON MOE SUM")
     _check_moe_sum_inputs(input, output)
     num_tokens, topk, hidden_size = input.shape
 
