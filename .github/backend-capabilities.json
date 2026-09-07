@@ -9,9 +9,6 @@
     "benchmarks_allow": []
   },
   "backends": {
-    "ascend-cann850": {
-      "auto_select": true
-    },
     "ascend-cann900": {
       "auto_select": true
     },
