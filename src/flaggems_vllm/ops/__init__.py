@@ -47,6 +47,9 @@ from flaggems_vllm.ops.attention import (
     flash_attn_varlen_func,
     flash_attn_varlen_opt_func,
 )
+from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
+    flash_attn_varlen_func_w8a8_fp8,
+)
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
@@ -170,6 +173,7 @@ __all__ = [
     "dswiglu",
     "flash_attention_forward",
     "flash_attn_varlen_func",
+    "flash_attn_varlen_func_w8a8_fp8",
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",

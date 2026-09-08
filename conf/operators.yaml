@@ -291,6 +291,22 @@ ops:
     stages:
       - stable: '3.1'
     cpp: '4.0'
+  - id: flash_attn_varlen_func_w8a8_fp8
+    description: |
+      Compute variable-length FlashAttention-2 on NVIDIA Hopper or newer with
+      block-wise FP8 query, key, and value tensors, per-block descales, and
+      FP16/BF16 output.
+    for:
+      - None
+    labels:
+      - NoCPU
+      - Attention
+      - FlashAttention
+      - Quantization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: flash_attn_varlen_opt_func
     description: A variant of `flash_attn_varlen_func` that has `lse` as an optional parameter.
     for:
