@@ -20,9 +20,9 @@ import math
 
 import torch
 
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post
-from flaggems_vllm.ops.mhc.mhc_pre_with_norm import mhc_pre_with_norm
-from flaggems_vllm.ops.mhc.mhc_prenorm import mhc_prenorm_gemm
+from flaggems_vllm.ops.mhc.mhc_post import _mhc_post_impl
+from flaggems_vllm.ops.mhc.mhc_pre_with_norm import _mhc_pre_impl
+from flaggems_vllm.ops.mhc.mhc_prenorm import _mhc_prenorm_gemm_impl
 
 _HC_MULT = 4
 _HIDDEN_SIZE = 4096
@@ -188,8 +188,12 @@ def mhc_fused_post_pre(
     else:
         post_mix_flat = post_layer_mix.view(num_tokens, _HC_MULT)
 
-    residual_cur = mhc_post(x_flat, residual_flat, post_mix_flat, comb_mix_flat)
-    gemm_out_mul, gemm_out_sqrsum = mhc_prenorm_gemm(
+    # The public validation above covers the inputs to all three stages.
+    # Intermediate tensors are fresh, contiguous allocations from these helpers.
+    residual_cur = _mhc_post_impl(
+        x_flat, residual_flat, post_mix_flat, comb_mix_flat, torch.version.hip is None
+    )
+    gemm_out_mul, gemm_out_sqrsum = _mhc_prenorm_gemm_impl(
         residual_cur.view(num_tokens, _HC_MULT * _HIDDEN_SIZE), fn
     )
     post_mix_cur = torch.empty(
@@ -206,7 +210,7 @@ def mhc_fused_post_pre(
         device=residual.device,
     )
 
-    mhc_pre_with_norm(
+    _mhc_pre_impl(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
@@ -222,6 +226,7 @@ def mhc_fused_post_pre(
         hc_post_mult_value,
         sinkhorn_repeat,
         norm_eps,
+        True,
     )
 
     return (

@@ -105,6 +105,8 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/mhc/mhc_prenorm.py": [
         "tests/test_mhc_fused_post_pre.py",
         "tests/test_mhc_triton_only.py",
+        "tests/test_mhc_prenorm_dispatch.py",
+        "tests/test_mhc_host_validation.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],

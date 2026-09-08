@@ -329,7 +329,7 @@ def _launch(
     norm_eps: float,
     fuse_norm: bool,
 ) -> None:
-    num_tokens, split_count = _validate_common(
+    _validate_common(
         partial,
         partial_sqrsum,
         hc_scale,
@@ -354,6 +354,47 @@ def _launch(
             raise ValueError("norm_weight must be contiguous and on the input device")
         if norm_weight.requires_grad:
             raise NotImplementedError("mHC pre is an inference-only path")
+    _mhc_pre_impl(
+        partial,
+        partial_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+        fuse_norm,
+    )
+
+
+def _mhc_pre_impl(
+    partial: torch.Tensor,
+    partial_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    fuse_norm: bool,
+) -> None:
+    """Launch for validated inputs allocated by the public mHC entry points."""
+    num_tokens = residual.shape[0]
+    split_count = _SPLIT_COUNTS[num_tokens]
     launch_pdl = torch.version.hip is None
     launch_kwargs = {
         "num_warps": _NUM_WARPS[num_tokens],

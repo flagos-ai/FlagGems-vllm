@@ -33,6 +33,7 @@ except ImportError:
 
 _HC_HIDDEN_SIZE = 16384
 _MIX_COUNT = 24
+_MIX_COUNT_TL = tl.constexpr(24)
 _PADDED_MIX_COUNT = 32
 _PACK_BLOCK_K = 256
 
@@ -66,6 +67,10 @@ _PRENORM_CONFIGS = {
     # traffic outweighs the small isolated GEMM cost at this token count.
     128: _PrenormConfig(64, 128, 32, 4, 3),
 }
+
+# This exact two-iteration pipeline has no TMA slot refills inside the loop.
+# Do not enable loop-exit completion for other stage/tile configurations.
+_TWO_STEP_COMPLETION_CONFIG = _PrenormConfig(64, 128, 64, 4, 3)
 
 
 # ``WeakKeyDictionary`` cannot safely use ``torch.Tensor`` directly because
@@ -122,7 +127,11 @@ def _mhc_prenorm_gemm_kernel(
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    TWO_STEP_COMPLETION: tl.constexpr,
 ):
+    if TWO_STEP_COMPLETION:
+        tl.static_assert(M == 64 and K == 16384)
+        tl.static_assert(BLOCK_M == 64 and BLOCK_K == 128 and SPLIT_K == 64)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
 
@@ -151,8 +160,23 @@ def _mhc_prenorm_gemm_kernel(
             acc=accumulator,
             allow_tf32=False,
         )
+        # Consume the accumulator before a later iteration can refill its
+        # asynchronous operands. The fixed two-step path has no such refills.
+        if not TWO_STEP_COMPLETION:
+            accumulator = tl.where(
+                tl.arange(0, PADDED_N)[None, :] < _MIX_COUNT_TL,
+                accumulator,
+                0.0,
+            )
         residual_f32 = residual.to(tl.float32)
         square_sum += tl.sum(residual_f32 * residual_f32, axis=1)
+
+    if TWO_STEP_COMPLETION:
+        accumulator = tl.where(
+            tl.arange(0, PADDED_N)[None, :] < _MIX_COUNT_TL,
+            accumulator,
+            0.0,
+        )
 
     offsets_m = token_block * BLOCK_M + tl.arange(0, BLOCK_M)
     offsets_n = tl.arange(0, PADDED_N)
@@ -320,7 +344,18 @@ def mhc_prenorm_gemm(
     immutable ``fn`` identity. No PyTorch compute or copy kernel is used by
     this production path.
     """
-    config = _validate_inputs(residual, fn)
+    _validate_inputs(residual, fn)
+    return _mhc_prenorm_gemm_impl(residual, fn)
+
+
+def _mhc_prenorm_gemm_impl(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch for metadata-validated inputs; retain the original weight cache."""
+    if TensorDescriptor is None:
+        raise NotImplementedError("mHC prenorm requires Triton TensorDescriptor")
+    config = _PRENORM_CONFIGS[residual.shape[0]]
 
     with torch_device_fn.device(residual.device):
         packed_fn, _ = _get_packed_fn(fn)
@@ -368,6 +403,9 @@ def mhc_prenorm_gemm(
             BLOCK_K=config.block_k,
             SPLIT_K=config.split_k,
             LAUNCH_PDL=launch_pdl,
+            TWO_STEP_COMPLETION=(
+                residual.shape[0] == 64 and config == _TWO_STEP_COMPLETION_CONFIG
+            ),
             num_warps=config.num_warps,
             num_stages=config.num_stages,
             launch_pdl=launch_pdl,
