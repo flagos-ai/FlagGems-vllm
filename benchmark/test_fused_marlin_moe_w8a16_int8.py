@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -39,7 +41,8 @@ import flaggems_vllm
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe_w8a16_int8 import fused_marlin_moe_w8a16_int8
 
-from . import base
+from . import base, consts
+from .conftest import Config
 
 
 def is_cuda_available():
@@ -165,7 +168,7 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        yield (
+        inputs = (
             hidden_states,
             w1_q_wna16,
             w2_q_wna16,
@@ -178,6 +181,15 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
             topk_weights,
             topk_ids,
         )
+        if Config.mode == consts.BenchMode.CUDAGRAPH:
+            _vllm_baseline_int8(*inputs)
+            # Compile/autotune the fixed-capacity routing path before capture.
+            with mock.patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                _gems_call_int8(*inputs)
+            torch.cuda.synchronize()
+        yield inputs
 
 
 class FusedMarlinMoEW8A16INT8MXQBenchmark(FusedMarlinMoEW8A16INT8Benchmark):

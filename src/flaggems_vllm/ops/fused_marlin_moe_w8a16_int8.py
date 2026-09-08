@@ -2960,12 +2960,12 @@ def moe_bsm_route_count_kernel(
     stride_tk,
     counts,
     num_dispatch,
-    top_k_ptr,
+    top_k: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= num_dispatch:
         return
-    tk = tl.load(top_k_ptr).to(tl.int32)
+    tk = top_k
     t = pid // tk
     rk = pid - t * tk
     eid = tl.load(topk_ids + t * stride_tid + rk * stride_tk).to(tl.int32)
@@ -2986,12 +2986,12 @@ def moe_bsm_route_scatter_kernel(
     out_w,
     num_dispatch,
     num_tokens,
-    top_k_ptr,
+    top_k: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= num_dispatch:
         return
-    tk = tl.load(top_k_ptr).to(tl.int32)
+    tk = top_k
     t = pid // tk
     rk = pid - t * tk
     eid = tl.load(topk_ids + t * stride_tid + rk * stride_tk).to(tl.int32)
@@ -3002,6 +3002,121 @@ def moe_bsm_route_scatter_kernel(
     pos = base + slot.to(tl.int64)
     tl.store(out_tid + pos, tok)
     tl.store(out_w + pos, w)
+
+
+@triton.jit
+def moe_bsm_route_graph_init_kernel(
+    counts,
+    cursor,
+    out_tid,
+    out_w,
+    expert_ids_per_block,
+    num_experts,
+    num_post_padded,
+    num_blocks,
+    num_tokens,
+    BLOCK: tl.constexpr,
+):
+    """Initialize all graph-routing workspaces in one launch."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    expert_mask = offs < num_experts
+    tl.store(counts + offs, 0, mask=expert_mask)
+    tl.store(cursor + offs, 0, mask=expert_mask)
+    tl.store(out_tid + offs, num_tokens, mask=offs < num_post_padded)
+    tl.store(out_w + offs, 0.0, mask=offs < num_post_padded)
+    tl.store(expert_ids_per_block + offs, 0, mask=offs < num_blocks)
+
+
+@triton.jit
+def moe_bsm_route_graph_count_kernel(
+    topk_ids,
+    stride_tid,
+    stride_tk,
+    counts,
+    num_dispatch,
+    top_k: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Build the expert histogram with one vectorized program per dispatch tile."""
+    dispatch_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = dispatch_ids < num_dispatch
+    token_ids = dispatch_ids // top_k
+    topk_slots = dispatch_ids - token_ids * top_k
+    expert_ids = tl.load(
+        topk_ids + token_ids * stride_tid + topk_slots * stride_tk,
+        mask=mask,
+        other=0,
+    ).to(tl.int32)
+    tl.atomic_add(counts + expert_ids, 1, mask=mask)
+
+
+@triton.jit
+def moe_bsm_route_graph_prefix_kernel(
+    counts,
+    new_offsets,
+    num_experts,
+    block_size_m: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Pad expert counts and form exclusive offsets in one program."""
+    expert_ids = tl.arange(0, BLOCK_E)
+    mask = expert_ids < num_experts
+    counts_i32 = tl.load(counts + expert_ids, mask=mask, other=0)
+    padded_counts = ((counts_i32 + block_size_m - 1) // block_size_m) * block_size_m
+    inclusive_offsets = tl.cumsum(padded_counts, axis=0)
+    tl.store(
+        new_offsets + expert_ids + 1,
+        inclusive_offsets.to(tl.int64),
+        mask=mask,
+    )
+    tl.store(new_offsets + expert_ids, 0, mask=expert_ids == 0)
+
+
+@triton.jit
+def moe_bsm_route_graph_scatter_kernel(
+    topk_ids,
+    topk_weights,
+    stride_tid,
+    stride_tk,
+    stride_wt,
+    stride_wk,
+    new_offsets,
+    cursor,
+    out_tid,
+    out_w,
+    expert_ids_per_block,
+    num_dispatch,
+    top_k: tl.constexpr,
+    block_size_m: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scatter routes and materialize each occupied block's expert id."""
+    dispatch_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = dispatch_ids < num_dispatch
+    token_ids = dispatch_ids // top_k
+    topk_slots = dispatch_ids - token_ids * top_k
+    expert_ids = tl.load(
+        topk_ids + token_ids * stride_tid + topk_slots * stride_tk,
+        mask=mask,
+        other=0,
+    ).to(tl.int32)
+    weights = tl.load(
+        topk_weights + token_ids * stride_wt + topk_slots * stride_wk,
+        mask=mask,
+        other=0.0,
+    )
+    slots = tl.atomic_add(cursor + expert_ids, 1, mask=mask)
+    bases = tl.load(new_offsets + expert_ids.to(tl.int64), mask=mask, other=0)
+    positions = bases + slots.to(tl.int64)
+    tl.store(out_tid + positions, token_ids.to(tl.int64), mask=mask)
+    tl.store(out_w + positions, weights, mask=mask)
+
+    block_start_mask = mask & (slots % block_size_m == 0)
+    tl.store(
+        expert_ids_per_block + positions // block_size_m,
+        expert_ids,
+        mask=block_start_mask,
+    )
 
 
 def _prepare_bsm_routing_triton(
@@ -3018,8 +3133,86 @@ def _prepare_bsm_routing_triton(
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
 
+    if torch.cuda.is_current_stream_capturing():
+        # Capture cannot synchronize the true padded count to Python. Reserve
+        # a tight worst-case capacity; sentinel rows make unused blocks no-op.
+        max_nonempty_experts = min(num_dispatch, num_experts)
+        max_extra_blocks = max(num_dispatch - num_experts, 0) // block_size_m
+        num_post_padded = (max_nonempty_experts + max_extra_blocks) * block_size_m
+        num_blocks = num_post_padded // block_size_m
+
+        counts = torch.empty(num_experts, dtype=torch.int32, device=device)
+        cursor = torch.empty(num_experts, dtype=torch.int32, device=device)
+        new_offsets = torch.empty(num_experts + 1, dtype=torch.int64, device=device)
+        sorted_token_ids_out = torch.empty(
+            num_post_padded, dtype=torch.int64, device=device
+        )
+        sorted_weights_out = torch.empty(
+            num_post_padded, dtype=topk_weights.dtype, device=device
+        )
+        expert_ids_per_block = torch.empty(num_blocks, dtype=torch.int64, device=device)
+
+        route_block = 256
+        init_size = max(num_experts, num_post_padded, num_blocks)
+        init_grid = (triton.cdiv(init_size, route_block),)
+        route_grid = (triton.cdiv(num_dispatch, route_block),)
+        moe_bsm_route_graph_init_kernel[init_grid](
+            counts,
+            cursor,
+            sorted_token_ids_out,
+            sorted_weights_out,
+            expert_ids_per_block,
+            num_experts,
+            num_post_padded,
+            num_blocks,
+            num_tokens,
+            BLOCK=route_block,
+            num_warps=4,
+        )
+        moe_bsm_route_graph_count_kernel[route_grid](
+            topk_ids,
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            counts,
+            num_dispatch,
+            top_k,
+            BLOCK=route_block,
+            num_warps=4,
+        )
+        moe_bsm_route_graph_prefix_kernel[(1,)](
+            counts,
+            new_offsets,
+            num_experts,
+            block_size_m,
+            BLOCK_E=triton.next_power_of_2(num_experts),
+            num_warps=8,
+        )
+        moe_bsm_route_graph_scatter_kernel[route_grid](
+            topk_ids,
+            topk_weights,
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            new_offsets,
+            cursor,
+            sorted_token_ids_out,
+            sorted_weights_out,
+            expert_ids_per_block,
+            num_dispatch,
+            top_k,
+            block_size_m,
+            BLOCK=route_block,
+            num_warps=4,
+        )
+        return (
+            sorted_token_ids_out,
+            expert_ids_per_block,
+            sorted_weights_out,
+            num_post_padded,
+        )
+
     counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
-    top_k_ptr = torch.tensor([top_k], dtype=torch.int32, device=device)
 
     grid = (num_dispatch,)
     moe_bsm_route_count_kernel[grid](
@@ -3028,7 +3221,7 @@ def _prepare_bsm_routing_triton(
         topk_ids.stride(1),
         counts,
         num_dispatch,
-        top_k_ptr,
+        top_k,
     )
 
     counts_i64 = counts.to(torch.int64)
@@ -3059,13 +3252,14 @@ def _prepare_bsm_routing_triton(
         sorted_weights_out,
         num_dispatch,
         num_tokens,
-        top_k_ptr,
+        top_k,
     )
 
     block_starts = torch.arange(
         0, num_post_padded, block_size_m, dtype=torch.int64, device=device
     )
     expert_ids_per_block = torch.searchsorted(new_offsets, block_starts, right=True) - 1
+    expert_ids_per_block.clamp_(max=num_experts - 1)
 
     return (
         sorted_token_ids_out,
