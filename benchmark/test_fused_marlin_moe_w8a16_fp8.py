@@ -295,7 +295,7 @@ def _gems_call_fp8(
     not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
 )
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_marlin_moe_fp8_weight_mxq():
+def test_fused_marlin_moe_w8a16_fp8():
     """Compare identical E4M3 weights and per-group-128 scales."""
     bench = FusedMarlinMoEW8A16FP8Benchmark(
         op_name="fused_marlin_moe_fp8_weight_mxq",
