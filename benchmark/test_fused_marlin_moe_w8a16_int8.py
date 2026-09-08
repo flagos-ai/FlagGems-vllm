@@ -253,24 +253,8 @@ def test_fused_marlin_moe_w8a16_int8():
     Benchmark FlagGems fused_marlin_moe W8A16 (Triton wna16) vs vLLM
     fused_marlin_moe W8A16 (CUDA Marlin). Both run GPTQ uint8b128 + per-group-128.
     """
-    bench = FusedMarlinMoEW8A16INT8Benchmark(
-        op_name="fused_marlin_moe_w8a16_int8",
-        torch_op=_vllm_baseline_int8,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_call_int8)
-    bench.run()
-
-
-@pytest.mark.fused_marlin_moe
-@pytest.mark.skipif(
-    not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
-)
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_marlin_moe_int8_mxq():
-    """Benchmark the Qwen 512-expert W8A16 shapes against vLLM Marlin."""
     bench = FusedMarlinMoEW8A16INT8MXQBenchmark(
-        op_name="fused_marlin_moe_int8_mxq",
+        op_name="fused_marlin_moe_w8a16_int8",
         torch_op=_vllm_baseline_int8,
         dtypes=[torch.bfloat16],
     )
