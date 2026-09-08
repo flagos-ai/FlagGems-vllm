@@ -1007,6 +1007,7 @@ def fused_moe_kernel_w8a16_down(
     DOWN_GRID_N_FIRST: tl.constexpr,
     INTER_PREWEIGHTED: tl.constexpr,
     SMALL_TOKEN_MXQ_PATH: tl.constexpr,
+    SKIP_EMPTY_BLOCKS: tl.constexpr,
     SWAP_AB: tl.constexpr,
     compute_type: tl.constexpr,
 ):
@@ -1027,6 +1028,9 @@ def fused_moe_kernel_w8a16_down(
 
     token_ids = tl.load(sorted_token_ids + offs_m).to(tl.int64)
     token_mask = token_ids < T
+    if SKIP_EMPTY_BLOCKS:
+        if tl.sum(token_mask.to(tl.int32), axis=0) == 0:
+            return
     expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
 
     n_mask = offs_n < H
@@ -2675,6 +2679,11 @@ def _launch_w8a16_down(
     """Autotuned down, or I=1024 gs=128 fixed-tile + unrolled K when enabled."""
     num_blocks_m = num_post_padded // BLOCK_SIZE_M
     swap_ab = 1 < num_valid_tokens <= 64
+    # Direct routing (T<=16) gives every block a live route. Only the graph-safe
+    # BSM workspace can contain wholly empty reserved blocks.
+    skip_empty_blocks = (
+        num_valid_tokens > 16 and torch.cuda.is_current_stream_capturing()
+    )
     bsn_fast = bsk_fast = 128
 
     pin = _mxq_b2_down_pin(num_valid_tokens)
@@ -2725,6 +2734,7 @@ def _launch_w8a16_down(
             DOWN_GRID_N_FIRST=down_grid_n_first,
             INTER_PREWEIGHTED=preweight_intermediate,
             SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
+            SKIP_EMPTY_BLOCKS=skip_empty_blocks,
             SWAP_AB=swap_ab,
             compute_type=compute_type,
             num_warps=pin["num_warps"],
@@ -2817,6 +2827,7 @@ def _launch_w8a16_down(
         DOWN_GRID_N_FIRST=down_grid_n_first,
         INTER_PREWEIGHTED=preweight_intermediate,
         SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
+        SKIP_EMPTY_BLOCKS=skip_empty_blocks,
         SWAP_AB=swap_ab,
         compute_type=compute_type,
     )
