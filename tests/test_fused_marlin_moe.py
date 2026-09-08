@@ -768,7 +768,7 @@ def test_rejects_fp8_input_dtype():
 @pytest.mark.skipif(not _is_hopper(), reason="W(FP8)A16 fast path requires Hopper")
 @pytest.mark.parametrize("config", QUICK_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_vs_ref_fp8_weight(config, dtype):
+def test_fused_marlin_moe_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
