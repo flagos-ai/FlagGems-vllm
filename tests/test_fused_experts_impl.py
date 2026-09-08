@@ -115,10 +115,14 @@ CUDA_AVAILABLE = is_cuda_available()
 
 
 # FP8 fused MoE tests run on NVIDIA Hopper (CUDA_AVAILABLE) or on any other
-# device whose actual capability supports FP8. Instead of hard-coding vendor
-# or architecture tables, probe the active device with a real FP8 round-trip;
-# any failure conservatively disables the FP8 tests.
+# device whose actual capability supports FP8. The Hygon HCU is excluded by
+# platform property: it has no native FP8 MFMA (flagtree software-emulates
+# fp8 dot, ~10x slower than bf16), and its CUDA capability probe would
+# wrongly match the Hopper check. Other platforms are probed with a real
+# FP8 round-trip; any failure conservatively disables the FP8 tests.
 def _probe_fp8_support() -> bool:
+    if flaggems_vllm.vendor_name == "hygon":
+        return False  # Hygon HCU: no native FP8 compute, skip by platform
     device = flaggems_vllm.device
     if device == "cuda":
         return False  # NVIDIA semantics stay with CUDA_AVAILABLE (Hopper)
@@ -130,7 +134,9 @@ def _probe_fp8_support() -> bool:
         return False
 
 
-FP8_AVAILABLE = CUDA_AVAILABLE or _probe_fp8_support()
+FP8_AVAILABLE = flaggems_vllm.vendor_name != "hygon" and (
+    CUDA_AVAILABLE or _probe_fp8_support()
+)
 
 
 def make_topk_routing(gating, topk, dtype):
@@ -243,6 +249,13 @@ try:
 except ImportError:
     HAS_VLLM_FUSED_MOE = False
 
+# On the Hygon HCU backend vLLM's upstream fused_moe kernel (no HCU
+# adaptation) is unreliable for small-E shapes (E<256): it intermittently
+# segfaults (a process-killing crash that cannot be caught by try/except)
+# or produces wrong results, so those comparisons are skipped by platform
+# property rather than probed. E>=256 (Qwen/DeepSeek) is unaffected.
+VLLM_SMALL_E_CRASH = flaggems_vllm.vendor_name == "hygon"
+
 
 def _supports_keyword(op, keyword):
     try:
@@ -267,6 +280,11 @@ VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
 def test_fused_moe_vs_vllm(config, dtype):
     """Test FlagGems fused_moe against a pure PyTorch reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
+    if VLLM_SMALL_E_CRASH and num_experts < 256:
+        pytest.skip(
+            "vLLM fused_moe segfaults/errs for small-E shapes on Hygon HCU "
+            "(upstream kernel, no HCU adaptation)"
+        )
     device = flaggems_vllm.device
 
     torch.manual_seed(0)
