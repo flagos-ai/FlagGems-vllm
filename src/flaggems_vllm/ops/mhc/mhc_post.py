@@ -235,17 +235,22 @@ def mhc_post(
             "mHC post requires its tensor device to be the current CUDA device"
         )
 
+    launch_pdl = (
+        torch.version.hip is None
+        and torch.cuda.get_device_capability(residual.device)[0] >= 9
+    )
+    return _mhc_post_impl(x, residual, post_layer_mix, comb_res_mix, launch_pdl)
+
+
+def _mhc_post_impl(x, residual, post_layer_mix, comb_res_mix, launch_pdl):
+    """Launch after the caller has validated input metadata and PDL support."""
+    N, hc, H = residual.shape
     out = torch.empty_like(residual)
 
     c = post_layer_mix.squeeze(-1)  # (N, hc), no-copy view
     a = comb_res_mix
     b = residual
     d = x
-    launch_pdl = (
-        torch.version.hip is None
-        and torch.cuda.get_device_capability(residual.device)[0] >= 9
-    )
-
     if hc == 4:
 
         def grid_specialized(META):

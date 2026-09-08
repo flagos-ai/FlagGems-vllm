@@ -320,7 +320,18 @@ def mhc_prenorm_gemm(
     immutable ``fn`` identity. No PyTorch compute or copy kernel is used by
     this production path.
     """
-    config = _validate_inputs(residual, fn)
+    _validate_inputs(residual, fn)
+    return _mhc_prenorm_gemm_impl(residual, fn)
+
+
+def _mhc_prenorm_gemm_impl(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch for metadata-validated inputs; retain the original weight cache."""
+    if TensorDescriptor is None:
+        raise NotImplementedError("mHC prenorm requires Triton TensorDescriptor")
+    config = _PRENORM_CONFIGS[residual.shape[0]]
 
     with torch_device_fn.device(residual.device):
         packed_fn, _ = _get_packed_fn(fn)
