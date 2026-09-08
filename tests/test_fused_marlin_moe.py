@@ -32,9 +32,9 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP4_E2M1,
     QUANT_TYPE_UINT4B8,
-    QUANT_TYPE_UINT8B128,
     fused_marlin_moe,
 )
+from flaggems_vllm.ops.fused_marlin_moe_w8a16_int8 import fused_marlin_moe_w8a16_int8
 
 from . import conftest as cfg
 
@@ -103,8 +103,8 @@ def _gptq_quantize_uint8b128(w_2d, group_size):
 
     Sister function to _gptq_quantize_uint4b8. Self-contained replacement for
     vllm.quantize_weights(w, scalar_types.uint8b128, group_size, False, False).
-    Produces unpacked integer codes (each cell a byte in [1, 255], i.e.
-    signed [-127, 127] shifted by +128) plus the exact dequantized FP
+    Produces unpacked integer codes (each cell a byte in [0, 255], i.e.
+    signed [-128, 127] shifted by +128) plus the exact dequantized FP
     reference, in the layout fused_moe_kernel_gptq_awq's W8A16 branch consumes
     (no nibble packing — one byte per element).
 
@@ -114,19 +114,20 @@ def _gptq_quantize_uint8b128(w_2d, group_size):
 
     Returns:
         w_ref:  (out_dim, in_dim), same dtype.  Dequantized reference values.
-        w_q_unsigned: (out_dim, in_dim), uint8.  Each cell in [1, 255].
+        w_q_unsigned: (out_dim, in_dim), uint8.  Each cell in [0, 255].
         scales: (out_dim, in_dim // group_size), same dtype as w_2d.
     """
     out_dim, in_dim = w_2d.shape
     assert in_dim % group_size == 0
     ng = in_dim // group_size
 
-    w_grouped = w_2d.reshape(out_dim, ng, group_size).to(torch.float32)
-    max_abs = w_grouped.abs().amax(dim=-1, keepdim=True)
-    # scale = max_abs / 127 (symmetric INT8 range [-127, 127] after +128 -> [1, 255])
-    scales_fp = (max_abs / 127.0).clamp(min=1e-8)
+    w_grouped = w_2d.reshape(out_dim, ng, group_size)
+    max_val = w_grouped.amax(dim=-1, keepdim=True)
+    min_val = w_grouped.amin(dim=-1, keepdim=True)
+    scales_fp = torch.maximum((max_val / 127.0).abs(), (min_val / -128.0).abs())
+    scales_fp = scales_fp.clamp(min=1e-8)
 
-    w_q_signed = torch.round(w_grouped / scales_fp).clamp(-127, 127)
+    w_q_signed = torch.round(w_grouped / scales_fp).clamp(-128, 127)
     w_ref_grouped = (w_q_signed * scales_fp).to(w_2d.dtype)
     w_q_unsigned = (w_q_signed + 128).clamp(0, 255).to(torch.uint8)
 
@@ -148,6 +149,11 @@ QUICK_CONFIGS = [
     (4, 8, 128, 256, 2),
     (16, 8, 256, 512, 2),
     (32, 8, 128, 256, 4),
+]
+
+W8A16_INT8_CONFIGS = QUICK_CONFIGS + [
+    (16, 16, 4096, 1024, 10),
+    (64, 8, 256, 512, 2),
 ]
 
 if cfg.QUICK_MODE:
@@ -550,7 +556,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
-@pytest.mark.parametrize("config", QUICK_CONFIGS)
+@pytest.mark.parametrize("config", W8A16_INT8_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_int8(config, dtype):
     """Compare fused_marlin_moe (unpacked INT8) against PyTorch reference (dequant)."""
@@ -566,17 +572,14 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
         dtype,
         device,
     )
-    result = fused_marlin_moe(
+    result = fused_marlin_moe_w8a16_int8(
         hidden_states=hs,
         w1=w1_q,
         w2=w2_q,
-        bias1=None,
-        bias2=None,
         w1_scale=w1s,
         w2_scale=w2s,
         topk_weights=tw,
         topk_ids=ti,
-        quant_type_id=QUANT_TYPE_UINT8B128,
     )
     ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     torch.cuda.synchronize()

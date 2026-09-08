@@ -37,8 +37,7 @@ except ImportError:
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128
-from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
+from flaggems_vllm.ops.fused_marlin_moe_w8a16_int8 import fused_marlin_moe_w8a16_int8
 
 from . import base
 
@@ -181,6 +180,16 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         )
 
 
+class FusedMarlinMoEW8A16INT8MXQBenchmark(FusedMarlinMoEW8A16INT8Benchmark):
+    """Qwen/MXQ W8A16 shape set for fused_marlin_moe INT8 benchmarking."""
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (tokens, 512, 4096, 1024, 10)
+            for tokens in (1, 4, 16, 64, 128, 256, 512, 1024, 4096, 16384, 32768)
+        ]
+
+
 def _vllm_baseline_int8(
     hidden_states,
     w1_q_wna16,
@@ -223,17 +232,14 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
-    return gems_fused_marlin_moe(
+    return fused_marlin_moe_w8a16_int8(
         hidden_states=hidden_states,
         w1=w1_q_wna16,
         w2=w2_q_wna16,
-        bias1=None,
-        bias2=None,
         w1_scale=w1_scale_wna16,
         w2_scale=w2_scale_wna16,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        quant_type_id=QUANT_TYPE_UINT8B128,
     )
 
 
@@ -249,6 +255,22 @@ def test_fused_marlin_moe_w8a16_int8():
     """
     bench = FusedMarlinMoEW8A16INT8Benchmark(
         op_name="fused_marlin_moe_w8a16_int8",
+        torch_op=_vllm_baseline_int8,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_call_int8)
+    bench.run()
+
+
+@pytest.mark.fused_marlin_moe
+@pytest.mark.skipif(
+    not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
+)
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+def test_fused_marlin_moe_int8_mxq():
+    """Benchmark the Qwen 512-expert W8A16 shapes against vLLM Marlin."""
+    bench = FusedMarlinMoEW8A16INT8MXQBenchmark(
+        op_name="fused_marlin_moe_int8_mxq",
         torch_op=_vllm_baseline_int8,
         dtypes=[torch.bfloat16],
     )
