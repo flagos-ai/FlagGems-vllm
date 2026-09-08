@@ -152,6 +152,24 @@ def _build_w8a16_fp8_fused_autotune_configs():
             {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=1
         ),
         triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=1,
+            maxnreg=64,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=1,
+            maxnreg=80,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=1,
+            maxnreg=96,
+        ),
+        triton.Config(
             {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=1
         ),
         triton.Config(
@@ -276,6 +294,24 @@ def _build_w8a16_fp8_down_autotune_configs():
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=1,
+            maxnreg=64,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=1,
+            maxnreg=80,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=1,
+            maxnreg=96,
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
@@ -409,6 +445,7 @@ def fused_moe_kernel_w8a16_gateup(
     use_fp8_w8a16: tl.constexpr,
     SMALL_TOKEN_MXQ_PATH: tl.constexpr,
     even_Ks: tl.constexpr,
+    SWAP_AB: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     """gate_up = W1[expert] @ x, written to GATEUP[dispatch_idx, :]. Full N coverage."""
@@ -429,18 +466,32 @@ def fused_moe_kernel_w8a16_gateup(
         return
     expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if SWAP_AB:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for k_start in range(0, H, BLOCK_SIZE_K):
         k_indices = k_start + offs_k
         k_mask = k_indices < H
         if even_Ks:
-            a = tl.load(
-                A + token_ids[:, None] * stride_a_t + k_indices[None, :] * stride_a_k,
-                mask=token_mask[:, None],
-                other=0.0,
-            )
+            if SWAP_AB:
+                a = tl.load(
+                    A
+                    + token_ids[None, :] * stride_a_t
+                    + k_indices[:, None] * stride_a_k,
+                    mask=token_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                a = tl.load(
+                    A
+                    + token_ids[:, None] * stride_a_t
+                    + k_indices[None, :] * stride_a_k,
+                    mask=token_mask[:, None],
+                    other=0.0,
+                )
             b_int = tl.load(
                 W1_q
                 + expert_id * stride_w1_e
@@ -450,11 +501,22 @@ def fused_moe_kernel_w8a16_gateup(
                 other=0.0 if use_fp8_w8a16 else 128,
             ).to(tl.float32)
         else:
-            a = tl.load(
-                A + token_ids[:, None] * stride_a_t + k_indices[None, :] * stride_a_k,
-                mask=token_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
+            if SWAP_AB:
+                a = tl.load(
+                    A
+                    + token_ids[None, :] * stride_a_t
+                    + k_indices[:, None] * stride_a_k,
+                    mask=token_mask[None, :] & k_mask[:, None],
+                    other=0.0,
+                )
+            else:
+                a = tl.load(
+                    A
+                    + token_ids[:, None] * stride_a_t
+                    + k_indices[None, :] * stride_a_k,
+                    mask=token_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
             b_int = tl.load(
                 W1_q
                 + expert_id * stride_w1_e
@@ -475,7 +537,10 @@ def fused_moe_kernel_w8a16_gateup(
         ).to(tl.float32)
 
         if use_fp8_w8a16 and SMALL_TOKEN_MXQ_PATH:
-            accumulator += tl.dot(a, tl.trans(b_int.to(a.dtype))) * s[None, :]
+            if SWAP_AB:
+                accumulator += tl.dot(b_int.to(a.dtype), a) * s[:, None]
+            else:
+                accumulator += tl.dot(a, tl.trans(b_int.to(a.dtype))) * s[None, :]
         elif has_zp:
             zp = tl.load(
                 W1_zp
@@ -486,16 +551,34 @@ def fused_moe_kernel_w8a16_gateup(
                 other=0.0,
             ).to(tl.float32)
             b_deq = (b_int - zp[:, None]) * s[:, None]
-            accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         elif use_fp8_w8a16:
             b_deq = b_int * s[:, None]
-            accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
             b_deq = (b_int - 128.0) * s[:, None]
-            accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
 
-    out_ptrs = GATEUP + offs_m[:, None] * stride_gu_m + offs_n[None, :] * stride_gu_n
-    tl.store(out_ptrs, accumulator.to(compute_type), mask=n_mask[None, :])
+    if SWAP_AB:
+        out_ptrs = (
+            GATEUP + offs_m[None, :] * stride_gu_m + offs_n[:, None] * stride_gu_n
+        )
+        out_mask = token_mask[None, :] & n_mask[:, None]
+    else:
+        out_ptrs = (
+            GATEUP + offs_m[:, None] * stride_gu_m + offs_n[None, :] * stride_gu_n
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
+    tl.store(out_ptrs, accumulator.to(compute_type), mask=out_mask)
 
 
 _fused_moe_kernel_w8a16_gateup_fp8 = triton.autotune(
@@ -1008,6 +1091,7 @@ def fused_moe_kernel_w8a16_down(
     DOWN_GRID_N_FIRST: tl.constexpr,
     INTER_PREWEIGHTED: tl.constexpr,
     SMALL_TOKEN_MXQ_PATH: tl.constexpr,
+    SWAP_AB: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     """y = W2[expert] @ intermediate, output[token] += weight * y. Full H coverage."""
@@ -1032,21 +1116,38 @@ def fused_moe_kernel_w8a16_down(
     expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
 
     n_mask = offs_n < H
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if SWAP_AB:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for k_start in range(0, I, BLOCK_SIZE_K):
         k_indices = k_start + offs_k
         k_mask = k_indices < I
+        if SWAP_AB:
+            a_ptrs = (
+                INTER
+                + offs_m[None, :] * stride_inter_m
+                + k_indices[:, None] * stride_inter_k
+            )
+            a_mask = token_mask[None, :]
+        else:
+            a_ptrs = (
+                INTER
+                + offs_m[:, None] * stride_inter_m
+                + k_indices[None, :] * stride_inter_k
+            )
+            a_mask = token_mask[:, None]
+        if not even_Ks:
+            if SWAP_AB:
+                a_mask = a_mask & k_mask[:, None]
+            else:
+                a_mask = a_mask & k_mask[None, :]
         if even_Ks:
             if SMALL_TOKEN_MXQ_PATH:
                 a = tl.load(
-                    INTER
-                    + offs_m[:, None] * stride_inter_m
-                    + k_indices[None, :] * stride_inter_k,
-                    mask=token_mask[:, None],
-                    other=0.0,
-                    eviction_policy="evict_last",
+                    a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_last"
                 )
                 b_int = tl.load(
                     W2_q
@@ -1059,12 +1160,7 @@ def fused_moe_kernel_w8a16_down(
                 ).to(tl.float32)
             else:
                 a = tl.load(
-                    INTER
-                    + offs_m[:, None] * stride_inter_m
-                    + k_indices[None, :] * stride_inter_k,
-                    mask=token_mask[:, None],
-                    other=0.0,
-                    eviction_policy="evict_first",
+                    a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_first"
                 )
                 b_int = tl.load(
                     W2_q
@@ -1078,12 +1174,7 @@ def fused_moe_kernel_w8a16_down(
         else:
             if SMALL_TOKEN_MXQ_PATH:
                 a = tl.load(
-                    INTER
-                    + offs_m[:, None] * stride_inter_m
-                    + k_indices[None, :] * stride_inter_k,
-                    mask=token_mask[:, None] & k_mask[None, :],
-                    other=0.0,
-                    eviction_policy="evict_last",
+                    a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_last"
                 )
                 b_int = tl.load(
                     W2_q
@@ -1096,12 +1187,7 @@ def fused_moe_kernel_w8a16_down(
                 ).to(tl.float32)
             else:
                 a = tl.load(
-                    INTER
-                    + offs_m[:, None] * stride_inter_m
-                    + k_indices[None, :] * stride_inter_k,
-                    mask=token_mask[:, None] & k_mask[None, :],
-                    other=0.0,
-                    eviction_policy="evict_first",
+                    a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_first"
                 )
                 b_int = tl.load(
                     W2_q
@@ -1137,7 +1223,10 @@ def fused_moe_kernel_w8a16_down(
                 ).to(tl.float32)
 
             if use_fp8_w8a16 and SMALL_TOKEN_MXQ_PATH:
-                accumulator += tl.dot(a, tl.trans(b_int.to(a.dtype))) * s[None, :]
+                if SWAP_AB:
+                    accumulator += tl.dot(b_int.to(a.dtype), a) * s[:, None]
+                else:
+                    accumulator += tl.dot(a, tl.trans(b_int.to(a.dtype))) * s[None, :]
             elif has_zp:
                 if SMALL_TOKEN_MXQ_PATH:
                     zp = tl.load(
@@ -1160,13 +1249,22 @@ def fused_moe_kernel_w8a16_down(
                         eviction_policy="evict_last",
                     ).to(tl.float32)
                 b_deq = (b_int - zp[:, None]) * s[:, None]
-                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+                if SWAP_AB:
+                    accumulator += tl.dot(b_deq.to(a.dtype), a)
+                else:
+                    accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
             elif use_fp8_w8a16:
                 b_deq = b_int * s[:, None]
-                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+                if SWAP_AB:
+                    accumulator += tl.dot(b_deq.to(a.dtype), a)
+                else:
+                    accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
             else:
                 b_deq = (b_int - 128.0) * s[:, None]
-                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+                if SWAP_AB:
+                    accumulator += tl.dot(b_deq.to(a.dtype), a)
+                else:
+                    accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
             scale_groups = k_indices // group_size
             scale_mask = n_mask[:, None] & k_mask[None, :]
@@ -1218,16 +1316,27 @@ def fused_moe_kernel_w8a16_down(
             else:
                 b_deq = (b_int - 128.0) * s
 
-            accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
 
     if not INTER_PREWEIGHTED:
         weights = tl.load(topk_weights + offs_m, mask=token_mask, other=0.0).to(
             tl.float32
         )
-        accumulator = accumulator * weights[:, None]
+        accumulator = accumulator * (weights[None, :] if SWAP_AB else weights[:, None])
 
-    out_ptrs = OUT + token_ids[:, None] * stride_out_t + offs_n[None, :] * stride_out_n
-    out_mask = token_mask[:, None] & n_mask[None, :]
+    if SWAP_AB:
+        out_ptrs = (
+            OUT + token_ids[None, :] * stride_out_t + offs_n[:, None] * stride_out_n
+        )
+        out_mask = token_mask[None, :] & n_mask[:, None]
+    else:
+        out_ptrs = (
+            OUT + token_ids[:, None] * stride_out_t + offs_n[None, :] * stride_out_n
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
     tl.atomic_add(out_ptrs, accumulator.to(compute_type), mask=out_mask)
 
 
@@ -2713,6 +2822,7 @@ def _launch_w8a16_down(
 ) -> None:
     """Autotuned down, or I=1024 gs=128 fixed-tile + unrolled K when enabled."""
     num_blocks_m = num_post_padded // BLOCK_SIZE_M
+    swap_ab = 1 < num_valid_tokens <= 1024
     bsn_fast = bsk_fast = 128
 
     pin = _mxq_b2_down_pin(num_valid_tokens)
@@ -2764,6 +2874,7 @@ def _launch_w8a16_down(
             DOWN_GRID_N_FIRST=down_grid_n_first,
             INTER_PREWEIGHTED=preweight_intermediate,
             SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
+            SWAP_AB=swap_ab,
             compute_type=compute_type,
             num_warps=pin["num_warps"],
             num_stages=pin["num_stages"],
@@ -2861,6 +2972,7 @@ def _launch_w8a16_down(
         DOWN_GRID_N_FIRST=down_grid_n_first,
         INTER_PREWEIGHTED=preweight_intermediate,
         SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
+        SWAP_AB=swap_ab,
         compute_type=compute_type,
     )
 
@@ -2904,6 +3016,96 @@ def _mxq_alloc_intermediate_buffer(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     return torch.empty((m_padded, i_dim), dtype=dtype, device=device)
+
+
+@triton.jit
+def moe_direct_route_padded_kernel(
+    topk_ids,
+    topk_weights,
+    stride_tid,
+    stride_tk,
+    stride_wt,
+    stride_wk,
+    out_token_ids,
+    out_expert_ids,
+    out_weights,
+    num_dispatch,
+    num_tokens,
+    top_k: tl.constexpr,
+    block_size_m: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Expand routes directly into one padded BSM block per dispatch."""
+    row_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    dispatch_ids = row_ids // block_size_m
+    lanes = row_ids - dispatch_ids * block_size_m
+    valid_rows = dispatch_ids < num_dispatch
+    route_mask = valid_rows & (lanes == 0)
+
+    token_ids = dispatch_ids // top_k
+    topk_slots = dispatch_ids - token_ids * top_k
+    expert_ids = tl.load(
+        topk_ids + token_ids * stride_tid + topk_slots * stride_tk,
+        mask=route_mask,
+        other=0,
+    )
+    weights = tl.load(
+        topk_weights + token_ids * stride_wt + topk_slots * stride_wk,
+        mask=route_mask,
+        other=0.0,
+    )
+
+    padded_token_ids = tl.where(route_mask, token_ids, num_tokens)
+    padded_weights = tl.where(route_mask, weights, 0.0)
+    tl.store(
+        out_token_ids + row_ids,
+        padded_token_ids.to(tl.int64),
+        mask=valid_rows,
+    )
+    tl.store(out_weights + row_ids, padded_weights, mask=valid_rows)
+    tl.store(
+        out_expert_ids + dispatch_ids,
+        expert_ids.to(tl.int64),
+        mask=route_mask,
+    )
+
+
+def _prepare_direct_routing(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    block_size_m: int,
+):
+    """Build BSM routing in one launch when expert reuse is negligible."""
+    num_dispatch = num_tokens * top_k
+    num_post_padded = num_dispatch * block_size_m
+    device = topk_ids.device
+    sorted_token_ids = torch.empty(num_post_padded, dtype=torch.int64, device=device)
+    expert_ids_per_block = torch.empty(num_dispatch, dtype=torch.int64, device=device)
+    sorted_weights = torch.empty(
+        num_post_padded, dtype=topk_weights.dtype, device=device
+    )
+    route_block = 256
+    grid = (triton.cdiv(num_post_padded, route_block),)
+    moe_direct_route_padded_kernel[grid](
+        topk_ids,
+        topk_weights,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        sorted_token_ids,
+        expert_ids_per_block,
+        sorted_weights,
+        num_dispatch,
+        num_tokens,
+        top_k,
+        block_size_m,
+        BLOCK=route_block,
+        num_warps=4,
+    )
+    return sorted_token_ids, expert_ids_per_block, sorted_weights, num_post_padded
 
 
 @triton.jit
@@ -3406,9 +3608,9 @@ def invoke_fused_moe_full_swiglu(
     # BLOCK_SIZE_M is inferred from routing: one BSM block row count per program.
     BLOCK_SIZE_M = num_post_padded // max(int(expert_ids_per_block.numel()), 1)
 
-    # B2 path selection (default ON).  Fall back to 3-kernel legacy path when
-    # the env var is set to 0 — useful for A/B comparison and as a safety net.
-    use_fused_gateup_silu = 1 != 0
+    # Separate gateup and SwiGLU for T=4..1024; the smaller stage-specific tiles
+    # reduce register pressure and fixed overhead in short-M workloads.
+    use_fused_gateup_silu = True
     three_kernel_min_tokens = 4
     three_kernel_max_tokens = 1024
     if (
@@ -3811,6 +4013,7 @@ def invoke_fused_moe_full_swiglu(
             use_fp8_w8a16=quant_config.use_fp8,
             SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
             even_Ks=even_Ks_gateup,
+            SWAP_AB=1 < num_valid_tokens <= 1024,
             compute_type=compute_type,
         )
 
@@ -3911,25 +4114,34 @@ def fused_marlin_moe_w8a16_fp8(
         per_channel_quant=False,
     )
 
-    split_th = _mxq_split_small_large_threshold()
-    if num_tokens <= max(split_th, _mxq_bsm_avg_load_max_tokens()):
-        bsm_block_m = _select_bsm_block_m(num_tokens, num_experts, top_k_num)
+    if num_tokens <= 16:
+        bsm_block_m = 2 if num_tokens == 1 else 4
+        routing = _prepare_direct_routing(
+            topk_ids,
+            topk_weights,
+            num_tokens,
+            top_k_num,
+            bsm_block_m,
+        )
     else:
+        routing = None
+
+    split_th = _mxq_split_small_large_threshold()
+    if routing is None and num_tokens <= max(split_th, _mxq_bsm_avg_load_max_tokens()):
+        bsm_block_m = _select_bsm_block_m(num_tokens, num_experts, top_k_num)
+    elif routing is None:
         bsm_block_m = _select_bsm_block_m_rollback_large_path(num_tokens)
 
-    (
-        sorted_token_ids,
-        expert_ids_per_block,
-        sorted_weights,
-        num_post_padded,
-    ) = _prepare_bsm_routing_mxq_cached(
-        topk_ids,
-        topk_weights,
-        num_tokens,
-        top_k_num,
-        num_experts,
-        bsm_block_m,
-    )
+    if routing is None:
+        routing = _prepare_bsm_routing_mxq_cached(
+            topk_ids,
+            topk_weights,
+            num_tokens,
+            top_k_num,
+            num_experts,
+            bsm_block_m,
+        )
+    sorted_token_ids, expert_ids_per_block, sorted_weights, num_post_padded = routing
 
     invoke_fused_moe_full_swiglu(
         hidden_states,
