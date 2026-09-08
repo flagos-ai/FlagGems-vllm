@@ -110,6 +110,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
@@ -210,6 +211,7 @@ __all__ = [
     "parallel_nsa_compression",
     "pack_seq_triton",
     "per_token_group_quant_fp8",
+    "permute_copy",
     "persistent_topk",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_grouped_gemma_rmsnorm",

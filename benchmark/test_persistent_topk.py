@@ -16,27 +16,34 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 from . import base
 
+# Bind the top-level entry: on vendor backends with a specialized
+# implementation (e.g. _hygon/fused), flaggems_vllm.persistent_topk is the
+# vendor version (replaced at import time); on NVIDIA it is the generic one.
+persistent_topk = flaggems_vllm.persistent_topk
+
 device = flaggems_vllm.device
 
+# The vLLM native op is used as the baseline where available (NVIDIA); on
+# platforms without torch.ops._C.persistent_topk (e.g. Hygon vllm-hcu) the
+# benchmark falls back to a torch.topk reference below.
 HAS_VLLM = False
 try:
     import vllm._custom_ops  # noqa: F401
 
     # `vllm._custom_ops` may import cleanly even when the compiled C++ extension
     # is missing, in which case the native op raises NotImplementedError at
-    # dispatch time. Probe one tiny call so the benchmark is skipped (rather
-    # than errored) when the kernel is not actually available.
+    # dispatch time. Probe one tiny call so the benchmark falls back (rather
+    # than errors) when the kernel is not actually available.
     _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
     _probe_lengths = torch.tensor([4102], dtype=torch.int32, device="cuda")
     torch.ops._C.persistent_topk(
         _probe_logits,
         _probe_lengths,
         torch.empty((1, 512), dtype=torch.int32, device="cuda"),
-        torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda"),
+        torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
         512,
         4102,
     )
@@ -47,11 +54,57 @@ except (ImportError, AttributeError, NotImplementedError, RuntimeError):
 STRIDE = 262144
 K = 512
 
+# CUDA-Graph-safe lengths (torch.topk fallback only): the reference needs
+# host-side seq_lens to decide batched-vs-padded and to slice logits. Reading
+# the device tensor back (seq_lens.tolist()) inside CUDA Graph capture is
+# illegal on HIP, and even a warmed cache does not help: torch.topk's own
+# graph capture (small slices first, then large) leaves its private memory
+# pool reused by a later shape's seq_lens tensor, whose content is then
+# observed as 0/garbage on the first D2H read -> baseline collapses to
+# ~0.0018ms. Fix: precompute the host list once per shape in get_input_iter,
+# keyed by tensor id; _host_lengths only looks up the dict and never reads
+# the device tensor in the measured path.
+_HLEN_CACHE: dict = {}
+
+
+def _host_lengths(seq_lens):
+    return _HLEN_CACHE[id(seq_lens)]
+
 
 def _baseline_persistent_topk(
     logits, lengths, indices, workspace, max_seq_len, seq_lens
 ):
-    torch.ops._C.persistent_topk(logits, lengths, indices, workspace, K, max_seq_len)
+    """torch.topk baseline: vLLM native op where available, else a torch.topk
+    reference.
+
+    Matches persistent_topk semantics: top-k column indices in arbitrary
+    order (sorted=False), -1 padding when seq_len < k.
+
+    The torch.topk fallback is batched when all seq_lens are equal, else a
+    single batched topk over the -inf-padded rows (the heterogeneous rows are
+    -inf-padded to the full stride by get_input_iter, so one batched call
+    returns the per-row top-min(K, seq_len) real entries, and pad slots are
+    masked back to -1 via the returned values). A per-row baseline loop is
+    avoided: its sequential launches inflated the measured latency and made
+    the SpeedUp comparison unreliable.
+    """
+    if HAS_VLLM:
+        torch.ops._C.persistent_topk(
+            logits, lengths, indices, workspace, K, max_seq_len
+        )
+        return indices
+    lens = _host_lengths(seq_lens)
+    first = lens[0]
+    if all(x == first for x in lens):
+        k = min(K, first)
+        if k > 0:
+            _, idx = logits[:, :first].topk(k, dim=-1, sorted=False)
+            indices[:, :k] = idx
+        indices[:, k:] = -1
+        return indices
+    vals, idx = logits.topk(K, dim=-1, sorted=False)
+    real = vals > -1e30
+    indices[:, :] = torch.where(real, idx, -1)
     return indices
 
 
@@ -109,10 +162,19 @@ class PersistentTopKBenchmark(base.Benchmark):
                 (num_rows,), seq_len, dtype=torch.int32, device=self.device
             )
             indices = torch.empty((num_rows, K), dtype=torch.int32, device=self.device)
-            workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=self.device)
+            # vLLM native op uses its own layout (1MB suffices); the torch.topk
+            # fallback runs the vendor kernels, which need 2MB headroom.
+            workspace = torch.empty(
+                (1 if HAS_VLLM else 2) * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self.device,
+            )
             seq_lens = torch.full(
                 (num_rows,), seq_len, dtype=torch.int32, device=self.device
             )
+            # precompute host lengths once per shape; _host_lengths only looks
+            # this up (never reads the device tensor in the measured path)
+            _HLEN_CACHE[id(seq_lens)] = [seq_len] * num_rows
 
             yield logits, lengths, indices, workspace, max_seq_len, seq_lens
 
@@ -133,13 +195,17 @@ class PersistentTopKBenchmark(base.Benchmark):
 
             lengths = lengths_values
             indices = torch.empty((num_rows, K), dtype=torch.int32, device=self.device)
-            workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=self.device)
+            workspace = torch.empty(
+                (1 if HAS_VLLM else 2) * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self.device,
+            )
             seq_lens = lengths_values
+            _HLEN_CACHE[id(seq_lens)] = lengths_values.tolist()
 
             yield logits, lengths, indices, workspace, max_len, seq_lens
 
 
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
 @pytest.mark.persistent_topk
 def test_persistent_topk():
     bench = PersistentTopKBenchmark(
