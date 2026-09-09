@@ -298,7 +298,7 @@ def _gems_call_fp8(
 def test_fused_marlin_moe_w8a16_fp8():
     """Compare identical E4M3 weights and per-group-128 scales."""
     bench = FusedMarlinMoEW8A16FP8Benchmark(
-        op_name="fused_marlin_moe_fp8_weight_mxq",
+        op_name="fused_marlin_moe_w8a16_fp8",
         torch_op=_vllm_baseline_fp8,
         dtypes=[torch.bfloat16],
     )
