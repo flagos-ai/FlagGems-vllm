@@ -20,6 +20,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "src/flaggems_vllm"
@@ -117,6 +118,61 @@ class AbsoluteOperatorImportTest(unittest.TestCase):
                 (2, "from backend_utils import VendorDescriptor"),
             ],
         )
+
+
+class OptionalTritonImportTest(unittest.TestCase):
+    def test_paged_mqa_import_without_tensor_descriptor(self):
+        names = (
+            "torch",
+            "triton",
+            "triton.language",
+            "triton.tools",
+            "flag_gems",
+            "flag_gems.utils",
+            "flag_gems.utils.device_info",
+            "flag_gems.utils.triton_version_utils",
+        )
+        modules = {name: types.ModuleType(name) for name in names}
+        for module in modules.values():
+            module.__path__ = []
+        modules["triton"].jit = lambda fn: fn
+        modules["triton"].language = modules["triton.language"]
+        modules["triton.language"].constexpr = object()
+        modules["torch"].float8_e4m3fn = object()
+        modules["flag_gems.utils.triton_version_utils"].has_triton_tle = (
+            lambda *_version: False
+        )
+        capability = mock.Mock(side_effect=AssertionError("unexpected device query"))
+        modules["flag_gems.utils.device_info"].get_device_capability = capability
+        # Simulate Triton 3.1 even if a newer Triton is installed on the runner.
+        modules["triton.tools.tensor_descriptor"] = None
+        source = PACKAGE_ROOT / "ops/fp8_fp4_paged_mqa_logits.py"
+        spec = importlib.util.spec_from_file_location("_test_paged_mqa", source)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        operator = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, modules):
+            spec.loader.exec_module(operator)
+            self.assertTrue(callable(operator.fp8_fp4_paged_mqa_logits))
+            self.assertFalse(operator.HAS_TLE)
+            self.assertFalse(operator._can_use_tle(16384, 256, 128))
+            capability.assert_not_called()
+
+            # On a supporting backend, descriptor construction still uses TMA.
+            descriptor = types.ModuleType("triton.tools.tensor_descriptor")
+            descriptor.TensorDescriptor = mock.Mock()
+            sys.modules[descriptor.__name__] = descriptor
+            kv_data = mock.Mock()
+            result = operator._build_kv_descriptor(kv_data, 2, 256, 128)
+            kv_data.view.assert_called_once_with(2, 256, 128)
+            kv_data.view.return_value.view.assert_called_once_with(
+                modules["torch"].float8_e4m3fn
+            )
+            descriptor.TensorDescriptor.from_tensor.assert_called_once_with(
+                kv_data.view.return_value.view.return_value,
+                block_shape=[1, 256, 128],
+            )
+            self.assertIs(result, descriptor.TensorDescriptor.from_tensor.return_value)
 
 
 class CanonicalBackendLoaderTest(unittest.TestCase):
