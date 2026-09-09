@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest import mock
-
 import pytest
 import torch
 
@@ -39,10 +37,9 @@ except ImportError:
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe_w8a16_int8
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
 
-from . import base, consts
-from .conftest import Config
+from . import base
 
 
 def is_cuda_available():
@@ -181,14 +178,6 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
             topk_weights,
             topk_ids,
         )
-        if Config.mode == consts.BenchMode.CUDAGRAPH:
-            _vllm_baseline_int8(*inputs)
-            # Compile/autotune the fixed-capacity routing path before capture.
-            with mock.patch.object(
-                torch.cuda, "is_current_stream_capturing", return_value=True
-            ):
-                _gems_call_int8(*inputs)
-            torch.cuda.synchronize()
         yield inputs
 
 
@@ -244,7 +233,10 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
-    return fused_marlin_moe_w8a16_int8(
+    return fused_marlin_moe(
+        bias1=None,
+        bias2=None,
+        quant_type_id=QUANT_TYPE_UINT8B128,
         hidden_states=hidden_states,
         w1=w1_q_wna16,
         w2=w2_q_wna16,
