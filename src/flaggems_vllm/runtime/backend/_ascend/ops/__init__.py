@@ -30,6 +30,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
+from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
@@ -39,6 +41,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
 __all__ = [
+    "mhc_pre",
+    "mhc_post",
     "add_rms_norm",
     "causal_conv1d_fn",
     "causal_conv1d_update",
