@@ -138,6 +138,7 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": [
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
     ],
     "src/flaggems_vllm/ops/sparse_attention.py": [
         "benchmark/test_sparse_attention.py",
