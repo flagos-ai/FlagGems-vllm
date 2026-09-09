@@ -577,20 +577,9 @@ def _flaggems_varlen_reference(
 
 
 def _assert_w8a8_attention_close(actual, expected):
-    actual_f = actual.float()
-    expected_f = expected.float()
-    diff = actual_f - expected_f
-    mse = torch.mean(diff * diff)
-    rel_mse = mse / torch.mean(expected_f * expected_f).clamp_min(
-        torch.finfo(torch.float32).tiny
+    torch.testing.assert_close(
+        actual.float(), expected.float(), rtol=1.0e-2, atol=2.0e-2
     )
-    cosine = torch.nn.functional.cosine_similarity(
-        actual_f.flatten(), expected_f.flatten(), dim=0
-    )
-
-    assert mse.item() < 1.0e-4, f"mse={mse.item():.6e}"
-    assert rel_mse.item() < 2.0e-2, f"rel_mse={rel_mse.item():.6e}"
-    assert cosine.item() > 0.99, f"cosine={cosine.item():.6f}"
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8_fp8
