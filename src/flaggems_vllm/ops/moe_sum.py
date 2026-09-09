@@ -80,7 +80,7 @@ def _moe_sum_pair_kernel(
     output_ptr_pos = output_ptr + token_idx * output_stride_token + hidden_offsets
     tl.store(
         output_ptr_pos,
-        acc.to(output_ptr.dtype.element_ty),
+        acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc,
         mask=hidden_mask,
     )
 
@@ -144,7 +144,11 @@ def _moe_sum_mt_kernel(
         + token_offsets[:, None] * output_stride_token
         + hidden_offsets[None, :]
     )
-    tl.store(output_ptr_pos, acc.to(output_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        output_ptr_pos,
+        acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc,
+        mask=mask,
+    )
 
 
 @triton.autotune(
@@ -192,11 +196,14 @@ def _moe_sum_general_kernel(
         )
         acc += expert_data.to(tl.float32)
 
-    tl.store(
+    output_ptr_pos = (
         output_ptr
         + token_idx * output_stride_token
-        + hidden_offsets * output_stride_hidden,
-        acc.to(output_ptr.dtype.element_ty),
+        + hidden_offsets * output_stride_hidden
+    )
+    tl.store(
+        output_ptr_pos,
+        acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc,
         mask=hidden_mask,
     )
 
