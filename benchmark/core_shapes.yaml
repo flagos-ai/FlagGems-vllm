@@ -493,3 +493,13 @@ chunk_gated_delta_rule_fwd:
     - [4, 2048, 16, 128, 128]
     - [4, 4096, 64, 128, 128]
   shape_desc: "B, T, H, K, V"
+
+swiglu:
+  shapes:
+    - [4, 32]
+    - [256, 128]
+    - [8192, 128]
+    - [15000, 128]
+    - [2560, 2048]
+    - [15000, 2048]
+  shape_desc: "M, 2H (last dim is split in half)"

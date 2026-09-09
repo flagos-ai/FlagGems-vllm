@@ -49,6 +49,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     print("python:", sys.version.replace("\n", " "))
+
+    # Disable automatic device backend loading to avoid crashes when
+    # vendor-specific extensions (e.g., torch_npu) are installed but
+    # the underlying runtime (e.g., CANN) is missing or incompatible.
+    # FlagGems vendors are loaded explicitly via flaggems_vllm.runtime.
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
+    # On Ascend, torch_npu must be fully initialized before triton is imported
+    # to prevent a circular import (triton -> torch_npu -> torch._dynamo -> triton).
+    if args.expected_vendor.lower().startswith("cann"):
+        importlib.import_module("torch_npu")
+
     for name in REQUIRED_MODULES:
         module = importlib.import_module(name)
         print(f"{name}:", module_version(module))

@@ -13,18 +13,44 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._ascend.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_fn import causal_conv1d_fn
+from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_update import (
+    causal_conv1d_update,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
+    qwen4_compress_norm_mrope_store_groups,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
+from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
+from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
 __all__ = [
+    "add_rms_norm",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
     "fused_experts_impl",
+    "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "qwen4_store_qsa_kv_rows",
+    "qwen4_hc_inject_combine",
+    "ple_state_scatter_",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "swiglu",
 ]

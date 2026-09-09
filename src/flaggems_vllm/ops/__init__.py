@@ -79,6 +79,19 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     sinkhorn_forward,
 )
+from flaggems_vllm.ops.qwen4 import (
+    ple_state_gather,
+    ple_state_scatter_,
+    qwen4_compress_norm_mrope_store_groups,
+    qwen4_grouped_gemma_rmsnorm,
+    qwen4_hc_gate_reduce,
+    qwen4_hc_inject_combine,
+    qwen4_qsa_mqa_paged_dot,
+    qwen4_store_qsa_kv_rows,
+    qwen4_vendor_compress_qsa_groups,
+    qwen4_vendor_qsa_mqa_paged,
+    qwen4_vendor_store_qsa_rows,
+)
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
     moe_align_block_size_triton,
@@ -97,6 +110,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
@@ -191,11 +205,23 @@ __all__ = [
     "mv",
     "outer",
     "outplace_fused_experts",
+    "ple_state_gather",
+    "ple_state_scatter_",
     "parallel_nsa",
     "parallel_nsa_compression",
     "pack_seq_triton",
     "per_token_group_quant_fp8",
+    "permute_copy",
     "persistent_topk",
+    "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_grouped_gemma_rmsnorm",
+    "qwen4_hc_gate_reduce",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
+    "qwen4_vendor_compress_qsa_groups",
+    "qwen4_vendor_qsa_mqa_paged",
+    "qwen4_vendor_store_qsa_rows",
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",

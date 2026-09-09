@@ -81,6 +81,20 @@ def _broadcast_vec(i, ndim):
     return f"[{_cs(axes)}]"
 
 
+def _tensor_inputs_all_complex(schema: "FunctionSchema") -> bool:
+    saw_typed_tensor = False
+    for i in range(schema.num_inputs()):
+        if not schema.is_tensor(i):
+            continue
+        input_dtype = schema.input_type(i)
+        if input_dtype is None:
+            return False
+        saw_typed_tensor = True
+        if input_dtype not in (torch.complex64, torch.complex128):
+            return False
+    return saw_typed_tensor
+
+
 class FunctionSchema:
     _num_inputs: int
     _is_tensor: List[bool]
@@ -318,7 +332,9 @@ class KernelGenerator:
             if ndim > 0:
                 # strides for inputs
                 for i in range(schema.num_input_tensors()):
-                    stride_args = _cs(f"in{i}_stride{j}: int" for j in range(ndim))
+                    stride_args = _cs(
+                        f"in{i}_stride{j}: tl.constexpr" for j in range(ndim)
+                    )
                     code.writeline(f"{stride_args}, # strides for in{i}")
                     if with_block_pointer:
                         stride_order_args = _cs(
@@ -328,7 +344,9 @@ class KernelGenerator:
 
                 # strides for outputs
                 for i in range(schema.num_output_tensors()):
-                    stride_args = _cs(f"out{i}_stride{j}: int" for j in range(ndim))
+                    stride_args = _cs(
+                        f"out{i}_stride{j}: tl.constexpr" for j in range(ndim)
+                    )
                     code.writeline(f"{stride_args}, # strides for out{i}")
                     if with_block_pointer:
                         stride_order_args = _cs(
@@ -848,19 +866,7 @@ class WrapperGenerator:
             with code.indent():
                 self.gen_return(code)
             max_tile_size = self.config.max_tile_size
-            # Check if all input and output dtypes are complex
-            all_complex = True
-            for i in range(self.fx.num_inputs()):
-                if self.fx.is_tensor(i):
-                    input_dtype = self.fx.input_type(i)
-                    if input_dtype is not None and not (
-                        input_dtype == torch.complex64
-                        or input_dtype == torch.complex128
-                    ):
-                        all_complex = False
-                        break
-            if all_complex:
-                # If all inputs are complex, set max_tile_size to half
+            if _tensor_inputs_all_complex(self.fx):
                 max_tile_size = max_tile_size // 2
             major, _ = get_device_capability()
             if self.name.find("fill_scalar") != -1 and major >= 9:
@@ -898,18 +904,7 @@ class WrapperGenerator:
             with code.indent():
                 self.gen_return(code)
             max_tile_size = self.config.max_tile_size
-            # Check if all input and output dtypes are complex
-            all_complex = True
-            for i in range(self.fx.num_inputs()):
-                if self.fx.is_tensor(i):
-                    input_dtype = self.fx.input_type(i)
-                    if input_dtype is not None and not (
-                        input_dtype == torch.complex64
-                        or input_dtype == torch.complex128
-                    ):
-                        all_complex = False
-                        break
-            if all_complex:
+            if _tensor_inputs_all_complex(self.fx):
                 max_tile_size = max_tile_size // 2
             major, _ = get_device_capability()
             if self.name.find("fill_scalar") != -1 and major >= 9:
@@ -1297,11 +1292,7 @@ class PointwiseDynamicFunction:
     # -------------------- register_complex --------------------
 
     def register_complex(
-        self,
-        mode,
-        cross_kernel=None,
-        tensorize_scalars=False,
-        fallback_target=None,
+        self, mode, cross_kernel=None, tensorize_scalars=False, fallback_target=None
     ):
         """Register complex number support for this kernel.
 
@@ -1514,10 +1505,15 @@ class PointwiseDynamicFunction:
         out_tensors = []
         for i in range(schema.num_output_tensors()):
             k = f"out{i}"
-            if k in kwargs:
+            if k in kwargs and kwargs[k] is not None:
                 out_tensors.append(kwargs[k])
             else:
                 outputs_that_need_allocation.append(i)
+
+        # Clean kwargs: only keep valid outN keys, discard mismatched keys
+        # and None values that leaked through caller wrappers.
+        valid_out_keys = {f"out{i}" for i in range(schema.num_output_tensors())}
+        kwargs = {k: v for k, v in kwargs.items() if k in valid_out_keys}
         # input arguments must be passed by position
         if not _skip_tensor_check and schema._is_tensor is not None:
             if not check_tensor_attributes(args, (schema._is_tensor)):
@@ -1649,6 +1645,7 @@ class PointwiseDynamicFunction:
             f"pointwise_dynamic_{self._scalar_fn_cache_key}_{kernel_name}_"
             f"{'1d_tile_' if self.config.prefer_1d_tile else ''}"
             f"{'bptr' if (not self.config.prefer_1d_tile and self.config.prefer_block_pointer) else ''}"
+            f"_t{self.config.max_tile_size}"
             ".py"
         )
         file_path = str(code_cache_dir() / file_name)

@@ -94,10 +94,7 @@ def _marlin_quantize_per_expert(w_fp):
     for e in range(E):
         # marlin_quantize expects (in_dim, out_dim)
         _, qw, sc, _, _, _ = marlin_quantize(
-            w_fp[e].T.contiguous(),
-            VLLM_QUANT_TYPE,
-            GROUP_SIZE,
-            act_order=False,
+            w_fp[e].T.contiguous(), VLLM_QUANT_TYPE, GROUP_SIZE, act_order=False
         )
         qweight_l.append(qw)
         scales_l.append(sc)
@@ -106,9 +103,9 @@ def _marlin_quantize_per_expert(w_fp):
     return qweight, scales
 
 
-class FusedMarlinMoEBenchmark(base.Benchmark):
+class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     """
-    Benchmark for fused_marlin_moe (W4A16 INT4 fused-dequant MoE GEMM).
+    Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
 
     Compares FlagGems' Triton wna16 kernel against vLLM's Marlin CUDA kernel.
     Both consume per-group-128 GPTQ uint4b8 weights (different packed layouts).
@@ -118,15 +115,45 @@ class FusedMarlinMoEBenchmark(base.Benchmark):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
+        # The three production MoE architectures from profile_fused_marlin_moe.py
+        # over the decode token range (1 .. 256).
         self.shapes = [
-            # Mixtral-8x7B-like
+            # Mixtral-8x7B
             (1, 8, 4096, 14336, 2),
+            (4, 8, 4096, 14336, 2),
+            (8, 8, 4096, 14336, 2),
             (16, 8, 4096, 14336, 2),
+            (32, 8, 4096, 14336, 2),
             (64, 8, 4096, 14336, 2),
-            # DeepSeek-V3-like (TP=8 shard)
+            (128, 8, 4096, 14336, 2),
+            (256, 8, 4096, 14336, 2),
+            # DeepSeek-V3 (TP=8 shard)
             (1, 256, 7168, 2048, 8),
+            (4, 256, 7168, 2048, 8),
+            (8, 256, 7168, 2048, 8),
             (16, 256, 7168, 2048, 8),
+            (32, 256, 7168, 2048, 8),
             (64, 256, 7168, 2048, 8),
+            (128, 256, 7168, 2048, 8),
+            (256, 256, 7168, 2048, 8),
+            # Qwen3-5-397B-A17B
+            (1, 512, 4096, 1024, 10),
+            (4, 512, 4096, 1024, 10),
+            (8, 512, 4096, 1024, 10),
+            (16, 512, 4096, 1024, 10),
+            (32, 512, 4096, 1024, 10),
+            (64, 512, 4096, 1024, 10),
+            (128, 512, 4096, 1024, 10),
+            (256, 512, 4096, 1024, 10),
+            # DeepSeek-V4-Flash
+            (1, 256, 4096, 2048, 6),
+            (4, 256, 4096, 2048, 6),
+            (8, 256, 4096, 2048, 6),
+            (16, 256, 4096, 2048, 6),
+            (32, 256, 4096, 2048, 6),
+            (64, 256, 4096, 2048, 6),
+            (128, 256, 4096, 2048, 6),
+            (256, 256, 4096, 2048, 6),
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -254,17 +281,16 @@ def _gems_call(
 
 @pytest.mark.fused_marlin_moe
 @pytest.mark.skipif(
-    not HAS_VLLM_FUSED_MARLIN_MOE,
-    reason="vllm not installed; baseline unavailable",
+    not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
 )
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
-def test_fused_marlin_moe():
+def test_fused_marlin_moe_w4a16_int4():
     """
     Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
     (CUDA Marlin). Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
     """
-    bench = FusedMarlinMoEBenchmark(
-        op_name="fused_marlin_moe",
+    bench = FusedMarlinMoEW4A16INT4Benchmark(
+        op_name="fused_marlin_moe_w4a16_int4",
         torch_op=_vllm_baseline,
         dtypes=[torch.bfloat16],
     )

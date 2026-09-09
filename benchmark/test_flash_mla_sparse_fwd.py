@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import math
 import random
 from typing import List
 
@@ -23,14 +24,40 @@ import flaggems_vllm
 
 from . import base
 
-try:
-    from vllm.v1.attention.ops.flashmla import (
-        flash_mla_sparse_fwd as vllm_flash_mla_sparse_fwd,
-    )
 
-    HAS_VLLM_FLASHMLA_SPARSE = True
-except ImportError:
-    HAS_VLLM_FLASHMLA_SPARSE = False
+def _get_vllm_flashmla_sparse_reference():
+    """Return vLLM's sparse FlashMLA op only when its extension is usable."""
+    try:
+        from vllm.v1.attention.ops import flashmla
+    except Exception as error:
+        return None, f"vLLM FlashMLA could not be imported: {error}"
+
+    support_check = getattr(flashmla, "is_flashmla_sparse_supported", None)
+    if not callable(support_check):
+        return None, "vLLM does not expose is_flashmla_sparse_supported()"
+
+    try:
+        support = support_check()
+    except Exception as error:
+        return None, f"vLLM FlashMLA capability check failed: {error}"
+
+    if isinstance(support, tuple):
+        supported, reason = support
+    else:
+        supported, reason = bool(support), None
+    if not supported:
+        return None, reason or "vLLM sparse FlashMLA is not supported"
+
+    reference = getattr(flashmla, "flash_mla_sparse_fwd", None)
+    if not callable(reference):
+        return None, "vLLM sparse FlashMLA reference is not callable"
+    return reference, None
+
+
+vllm_flash_mla_sparse_fwd, VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON = (
+    _get_vllm_flashmla_sparse_reference()
+)
+HAS_VLLM_FLASHMLA_SPARSE = vllm_flash_mla_sparse_fwd is not None
 
 
 @dataclasses.dataclass
@@ -111,26 +138,46 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         If, for some `i`, `perm_range[i] < perm_size` holds, then `res[i, :]` contains
         values in `[0, perm_range[i])` as many as possible, and the rest are filled with `padding`.
         """
+        if perm_range.numel() != batch_size:
+            raise ValueError("perm_range must contain one value per batch row")
+        if perm_size < 0:
+            raise ValueError("perm_size must be non-negative")
+        if not paddings:
+            raise ValueError("paddings must not be empty")
 
-        assert not torch.are_deterministic_algorithms_enabled()
+        ranges = perm_range.to(device="cpu", dtype=torch.int64).reshape(-1)
+        if torch.any(ranges < 0):
+            raise ValueError("perm_range values must be non-negative")
 
-        torch.use_deterministic_algorithms(True)
-        perm_range_max = max(int(torch.max(perm_range).item()), perm_size)
-        rand = torch.rand(batch_size, perm_range_max, dtype=torch.float32)
-        rand[
-            torch.arange(0, perm_range_max).broadcast_to(batch_size, perm_range_max)
-            >= perm_range.view(batch_size, 1)
-        ] = float("-inf")
-        res = rand.topk(perm_size, dim=-1, sorted=True).indices.to(torch.int32)
-        if len(paddings) == 1:
-            res[res >= perm_range.view(batch_size, 1)] = paddings[0]
-        else:
-            fillers = torch.tensor(paddings, dtype=torch.int32).index_select(
-                0,
-                torch.randint(0, len(paddings), (res.numel(),), dtype=torch.int32),
-            )
-            res.masked_scatter_(res >= perm_range.view(batch_size, 1), fillers)
-        torch.use_deterministic_algorithms(False)
+        # An affine permutation (offset + step * i) % range is unique whenever
+        # step and range are coprime.  It needs only O(perm_size) temporary
+        # storage instead of the previous O(batch_size * max(perm_range))
+        # random score matrix (about 2 GiB for the largest benchmark case).
+        positions = torch.arange(perm_size, dtype=torch.int64)
+        padding_values = torch.tensor(paddings, dtype=torch.int32)
+        res = torch.empty((batch_size, perm_size), dtype=torch.int32)
+        for row, range_value in enumerate(ranges.tolist()):
+            valid_size = min(range_value, perm_size)
+            if valid_size:
+                offset = random.randrange(range_value)
+                step = 1
+                if range_value > 1:
+                    step = random.randrange(1, range_value)
+                    while math.gcd(step, range_value) != 1:
+                        step += 1
+                        if step == range_value:
+                            step = 1
+                values = (offset + step * positions[:valid_size]) % range_value
+                res[row, :valid_size] = values.to(torch.int32)
+
+            if valid_size < perm_size:
+                if len(paddings) == 1:
+                    res[row, valid_size:].fill_(paddings[0])
+                else:
+                    filler_indices = torch.randint(
+                        0, len(paddings), (perm_size - valid_size,)
+                    )
+                    res[row, valid_size:] = padding_values[filler_indices]
         return res
 
     @staticmethod
@@ -203,7 +250,12 @@ class FlashmlaSparseBenchmark(base.Benchmark):
 
 
 @pytest.mark.flash_mla_sparse_fwd
-@pytest.mark.skipif(not HAS_VLLM_FLASHMLA_SPARSE, reason="vLLM not installed")
+@pytest.mark.skipif(
+    not HAS_VLLM_FLASHMLA_SPARSE,
+    reason=(
+        VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON or "vLLM sparse FlashMLA is unavailable"
+    ),
+)
 def test_flash_mla_sparse_fwd():
     bench = FlashmlaSparseBenchmark()
     bench.run()

@@ -151,7 +151,7 @@ def _dyn_asym_kernel(
 
 @triton.jit
 def _static_sym_kernel(input_ptr, scale_ptr, output_ptr, numel, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0) + tl.program_id(1) * tl.num_programs(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
     x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -165,7 +165,7 @@ def _static_sym_kernel(input_ptr, scale_ptr, output_ptr, numel, BLOCK: tl.conste
 def _static_asym_kernel(
     input_ptr, scale_ptr, azp_ptr, output_ptr, numel, BLOCK: tl.constexpr
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0) + tl.program_id(1) * tl.num_programs(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
     x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -280,7 +280,12 @@ def _run_static(input, scale, azp, sym):
         BLOCK, nw = 512, 8
     else:
         BLOCK, nw = 256, 2
-    grid = (triton.cdiv(numel, BLOCK),)
+    # grid.x is hardware-limited (e.g. 65535 on Enflame GCU). Spread blocks
+    # across a 2-D grid so the tuned BLOCK size is unaffected by tensor size;
+    # the kernels recombine (pid_x, pid_y) into a single flat block index.
+    num_blocks = triton.cdiv(numel, BLOCK)
+    grid_x = min(num_blocks, 65535)
+    grid = (grid_x, triton.cdiv(num_blocks, grid_x))
     if sym:
         _static_sym_kernel[grid](input, scale, output, numel, BLOCK=BLOCK, num_warps=nw)
         return output, scale, None

@@ -84,6 +84,7 @@ class ComputeGlobalTopkIndicesAndLensBenchmark(base.Benchmark):
             )
 
 
+@pytest.mark.compute_global_topk_indices_and_lens
 @pytest.mark.skipif(
     (not torch.cuda.is_available())
     or (not _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS),

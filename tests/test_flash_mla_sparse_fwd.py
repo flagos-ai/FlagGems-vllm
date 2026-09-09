@@ -23,17 +23,41 @@ import flaggems_vllm
 
 random.seed(42)
 
-try:
-    from vllm.v1.attention.ops.flashmla import (
-        flash_mla_sparse_fwd as vllm_flash_mla_sparse_fwd,
-    )
 
-    HAS_VLLM_FLASHMLA_SPARSE = True
-except ImportError:
-    HAS_VLLM_FLASHMLA_SPARSE = False
-    print(
-        "vLLM not installed, the native pytorch implementation of FlashMLA for comparison"
-    )
+def _get_vllm_flashmla_sparse_reference():
+    """Return vLLM's sparse FlashMLA op only when its extension is usable."""
+    try:
+        from vllm.v1.attention.ops import flashmla
+    except Exception as error:
+        return None, f"vLLM FlashMLA could not be imported: {error}"
+
+    support_check = getattr(flashmla, "is_flashmla_sparse_supported", None)
+    if not callable(support_check):
+        return None, "vLLM does not expose is_flashmla_sparse_supported()"
+
+    try:
+        support = support_check()
+    except Exception as error:
+        return None, f"vLLM FlashMLA capability check failed: {error}"
+
+    if isinstance(support, tuple):
+        supported, reason = support
+    else:
+        supported, reason = bool(support), None
+    if not supported:
+        return None, reason or "vLLM sparse FlashMLA is not supported"
+
+    reference = getattr(flashmla, "flash_mla_sparse_fwd", None)
+    if not callable(reference):
+        return None, "vLLM sparse FlashMLA reference is not callable"
+    return reference, None
+
+
+vllm_flash_mla_sparse_fwd, VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON = (
+    _get_vllm_flashmla_sparse_reference()
+)
+HAS_VLLM_FLASHMLA_SPARSE = vllm_flash_mla_sparse_fwd is not None
+if not HAS_VLLM_FLASHMLA_SPARSE:
     torch.set_float32_matmul_precision("high")
 
 

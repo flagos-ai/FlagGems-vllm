@@ -187,6 +187,14 @@ def _radix_topk(
     # tl.debug_barrier()
 
     if cta_in_group == 0:
+        # Ring-slot clearing (next_hist per round) assumes every row is a radix
+        # row. With non-radix rows interleaved (decode/medium/trivial), a later
+        # radix row's first current_hist can read stale counts from an earlier
+        # radix row. Clear all 3 slots at the start of each radix row; the
+        # round-0 barrier below makes the clearing visible to all CTAs.
+        tl.store(g_histogram_ptr + lane, 0, mask=lane < RADIX)
+        tl.store(g_histogram_ptr + RADIX + lane, 0, mask=lane < RADIX)
+        tl.store(g_histogram_ptr + 2 * RADIX + lane, 0, mask=lane < RADIX)
         tl.store(g_state_ptr + 3 + zeros, 0, mask=lane == 0)  # output_counter
 
     # -- Stage 2: 4 rounds of radix select --
@@ -1206,25 +1214,25 @@ def persistent_topk_kernel(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# V1 top-k path — per-row single-CTA kernel, dispatched when num_rows > 32.
+# Per-Row CTA top-k path — per-row single-CTA kernel, dispatched when num_rows > 32.
 # Ported from persistent_topk.py: 4-step radix (2048/2048/2048/1024 bins)
 # with tle.cumsum streaming threshold search and _final_select_radix.
 # Uses inverted sortable-key convention compared to vLLM-style paths above.
 # ════════════════════════════════════════════════════════════════════════════
 
-V1_SIGN_BIT = tl.constexpr(-(1 << 31))
+PER_ROW_CTA_SIGN_BIT = tl.constexpr(-(1 << 31))
 
 
 @triton.jit
-def _v1_float_to_sortable(val):
+def _per_row_cta_float_to_sortable(val):
     bits = val.to(tl.int32, bitcast=True)
     sign_ext = bits >> 31
-    mask = sign_ext | tl.full(bits.shape, V1_SIGN_BIT, dtype=tl.int32)
+    mask = sign_ext | tl.full(bits.shape, PER_ROW_CTA_SIGN_BIT, dtype=tl.int32)
     return bits ^ mask
 
 
 @triton.jit
-def _v1_convert_to_trt_uint32(x):
+def _per_row_cta_convert_to_sortable_uint32(x):
     bits = x.to(tl.uint32, bitcast=True)
     sign_mask = tl.full(bits.shape, 0x80000000, tl.uint32)
     sign_set = (bits & sign_mask) != 0
@@ -1233,7 +1241,7 @@ def _v1_convert_to_trt_uint32(x):
 
 
 @triton.jit
-def _v1_convert_to_trt_uint16_hi11(x):
+def _per_row_cta_convert_to_fp16_hi11(x):
     h = x.to(tl.float16)
     bits = h.to(tl.uint16, bitcast=True)
     sign_mask = tl.full(bits.shape, 0x8000, tl.uint16)
@@ -1244,7 +1252,7 @@ def _v1_convert_to_trt_uint16_hi11(x):
 
 
 @triton.jit
-def _v1_distribute_to_bins(
+def _per_row_cta_distribute_to_bins(
     x,
     in_range,
     ones,
@@ -1254,9 +1262,9 @@ def _v1_distribute_to_bins(
 ):
     RADIX11_MASK: tl.constexpr = 0x7FF
     RADIX10_MASK: tl.constexpr = 0x3FF
-    key = _v1_convert_to_trt_uint32(x)
+    key = _per_row_cta_convert_to_sortable_uint32(x)
     if step_idx == 0:
-        digit = _v1_convert_to_trt_uint16_hi11(x)
+        digit = _per_row_cta_convert_to_fp16_hi11(x)
     elif step_idx == 1:
         digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
     elif step_idx == 2:
@@ -1281,7 +1289,7 @@ def _v1_distribute_to_bins(
 
 
 @triton.jit
-def _v1_process_bins(
+def _per_row_cta_process_bins(
     x,
     in_range,
     found_ptrs,
@@ -1307,9 +1315,9 @@ def _v1_process_bins(
     RADIX11_MASK: tl.constexpr = 0x7FF
     RADIX10_MASK: tl.constexpr = 0x3FF
 
-    key = _v1_convert_to_trt_uint32(x)
+    key = _per_row_cta_convert_to_sortable_uint32(x)
     if step_idx == 0:
-        digit = _v1_convert_to_trt_uint16_hi11(x)
+        digit = _per_row_cta_convert_to_fp16_hi11(x)
     elif step_idx == 1:
         digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
     elif step_idx == 2:
@@ -1415,7 +1423,7 @@ def _v1_process_bins(
 
 
 @triton.jit
-def _v1_processHistogramStep(
+def _per_row_cta_process_histogram_step(
     row_ptr,
     stride_xn,
     row_start,
@@ -1472,7 +1480,7 @@ def _v1_processHistogramStep(
             base = t * BLOCK_SIZE * VEC + lane * VEC
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + offs)
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x_vec,
                 True,
                 ones_vec_2d,
@@ -1483,7 +1491,7 @@ def _v1_processHistogramStep(
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + offs)
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x,
                 True,
                 ones,
@@ -1502,7 +1510,7 @@ def _v1_processHistogramStep(
             base = t * BLOCK_SIZE * VEC + lane * VEC
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + aligned_row_start + offs)
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x_vec,
                 True,
                 ones_vec_2d,
@@ -1513,7 +1521,7 @@ def _v1_processHistogramStep(
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + aligned_row_start + offs)
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x,
                 True,
                 ones,
@@ -1525,7 +1533,7 @@ def _v1_processHistogramStep(
             offs = lane
             in_range = lane < skip_elems
             x = tl.load(row_ptr + row_start + offs, mask=in_range, other=float("-inf"))
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x,
                 in_range,
                 ones,
@@ -1539,7 +1547,7 @@ def _v1_processHistogramStep(
             x = tl.load(
                 row_ptr + aligned_row_start + offs, mask=in_range, other=float("-inf")
             )
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x,
                 in_range,
                 ones,
@@ -1558,7 +1566,7 @@ def _v1_processHistogramStep(
                 mask=in_range,
                 other=float("-inf"),
             )
-            _v1_distribute_to_bins(
+            _per_row_cta_distribute_to_bins(
                 x,
                 in_range,
                 ones,
@@ -1611,7 +1619,7 @@ def _v1_processHistogramStep(
             base = t * BLOCK_SIZE * VEC + lane * VEC
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + offs)
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x_vec,
                 True,
                 found_ptrs_vec_2d,
@@ -1630,7 +1638,7 @@ def _v1_processHistogramStep(
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + offs)
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x,
                 True,
                 found_ptrs,
@@ -1659,7 +1667,7 @@ def _v1_processHistogramStep(
             base = t * BLOCK_SIZE * VEC + lane * VEC
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + aligned_row_start + offs)
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x_vec,
                 True,
                 found_ptrs_vec_2d,
@@ -1678,7 +1686,7 @@ def _v1_processHistogramStep(
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(row_ptr + aligned_row_start + offs)
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x,
                 True,
                 found_ptrs,
@@ -1698,7 +1706,7 @@ def _v1_processHistogramStep(
             offs = lane
             in_range = lane < skip_elems
             x = tl.load(row_ptr + row_start + offs, mask=in_range, other=float("-inf"))
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x,
                 in_range,
                 found_ptrs,
@@ -1720,7 +1728,7 @@ def _v1_processHistogramStep(
             x = tl.load(
                 row_ptr + aligned_row_start + offs, mask=in_range, other=float("-inf")
             )
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x,
                 in_range,
                 found_ptrs,
@@ -1747,7 +1755,7 @@ def _v1_processHistogramStep(
                 mask=in_range,
                 other=float("-inf"),
             )
-            _v1_process_bins(
+            _per_row_cta_process_bins(
                 x,
                 in_range,
                 found_ptrs,
@@ -1772,7 +1780,7 @@ def _v1_processHistogramStep(
 
 
 @triton.jit
-def _v1_final_select_radix(
+def _per_row_cta_final_radix_select(
     hist_base_ptr,
     s_out_indices_ptr,
     s_final_cnt_ptr,
@@ -1818,7 +1826,7 @@ def _v1_final_select_radix(
                     other=0,
                 )
                 x = x_bits_i32.to(tl.float32, bitcast=True)
-                key = _v1_convert_to_trt_uint32(x)
+                key = _per_row_cta_convert_to_sortable_uint32(x)
                 matches = (key & desired_mask) == desired
                 digit = ((key >> digit_pos) & RADIX_MASK_FINAL).to(tl.int32)
                 take = valid & matches
@@ -1868,7 +1876,7 @@ def _v1_final_select_radix(
                 other=0,
             )
             x = x_bits_i32.to(tl.float32, bitcast=True)
-            key = _v1_convert_to_trt_uint32(x)
+            key = _per_row_cta_convert_to_sortable_uint32(x)
             take_lt = valid & (key < thr_key)
             out_pos_gt = tl.atomic_add(
                 found_ptrs,
@@ -1898,7 +1906,7 @@ def _v1_final_select_radix(
                         other=0,
                     )
                     x = x_bits_i32.to(tl.float32, bitcast=True)
-                    key = _v1_convert_to_trt_uint32(x)
+                    key = _per_row_cta_convert_to_sortable_uint32(x)
                     take_eq = valid & (key == thr_key)
                     out_pos_eq = tl.atomic_add(
                         found_ptrs,
@@ -1918,7 +1926,7 @@ def _v1_final_select_radix(
 
 
 @triton.jit
-def _v1_top_k_per_row_selector(
+def _per_row_cta_topk_selector(
     row_ptr,
     out_row,
     row_start,
@@ -1978,7 +1986,7 @@ def _v1_top_k_per_row_selector(
     for step_idx in tl.static_range(0, 4):
         if continue_to_next_step:
             continue_to_next_step, logit_pattern, threshold_bin_idx = (
-                _v1_processHistogramStep(
+                _per_row_cta_process_histogram_step(
                     row_ptr,
                     stride_xn,
                     row_start,
@@ -2004,7 +2012,7 @@ def _v1_top_k_per_row_selector(
 
     if not continue_to_next_step:
         if USE_RADIX_FINAL:
-            _v1_final_select_radix(
+            _per_row_cta_final_radix_select(
                 hist_base_ptr,
                 s_out_indices_ptr,
                 s_final_cnt_ptr,
@@ -2050,7 +2058,7 @@ def _v1_top_k_per_row_selector(
 
 
 @triton.jit
-def _v1_tle_top_k_per_row_decode_wrapper2(
+def _per_row_cta_topk_wrapper(
     x_ptr,
     out_ptr,
     seq_lens_ptr,
@@ -2146,7 +2154,7 @@ def _v1_tle_top_k_per_row_decode_wrapper2(
     else:
         s_radix_count_ptr = None
 
-    _v1_top_k_per_row_selector(
+    _per_row_cta_topk_selector(
         x_ptr,
         out_ptr,
         row_start,
@@ -2217,7 +2225,7 @@ def persistent_topk(
     max_seq_len = min(logits.shape[1], actual_max)
 
     if num_rows > 32:
-        _v1_tle_top_k_per_row_decode_wrapper2[(num_rows,)](
+        _per_row_cta_topk_wrapper[(num_rows,)](
             logits,
             output,
             seq_lens,
