@@ -23,31 +23,51 @@ import torch  # noqa: E402
 
 import flaggems_vllm  # noqa: E402
 
-from . import accuracy_utils as utils  # noqa: E402
+from . import base  # noqa: E402
 
-_gemma_rmsnorm_ns = [1152, 5376, 16384]
-_gemma_rmsnorm_ms = [1, 32, 128, 256]
-_gemma_rmsnorm_shapes = list(product(_gemma_rmsnorm_ms, _gemma_rmsnorm_ns))
+vendor = flaggems_vllm.vendor_name
+
+baseline_op = None
+HAS_BASELINE_OP = False
+
+try:
+    import torch_npu
+
+    baseline_op = torch_npu.npu_gemma_rms_norm
+    HAS_BASELINE_OP = True
+except Exception as e:
+    print(e)
+    HAS_BASELINE_OP = False
 
 
-@pytest.mark.gemma_rms_norm
-@pytest.mark.parametrize("shape", _gemma_rmsnorm_shapes)
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_gemma_rmsnorm(shape, dtype):
-    N = shape[-1]
-    x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
-    w = torch.randn((N), dtype=dtype, device=flaggems_vllm.device)
-    eps = 1e-5
+class GemmaRmsNormBenchmark(base.Benchmark):
+    _gemma_rmsnorm_ns = [1152, 5376, 16384]
+    _gemma_rmsnorm_ms = [1, 32, 128, 256]
+    _gemma_rmsnorm_shapes = list(product(_gemma_rmsnorm_ms, _gemma_rmsnorm_ns))
 
-    def _torch_gemma_rmsnorm(x, w, eps):
-        x = x.to(dtype=torch.float32)
-        w = w.to(dtype=torch.float32)
-        rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
-        return (1 + w) * x * rrms
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = GemmaRmsNormBenchmark._gemma_rmsnorm_shapes
 
-    ref_out = _torch_gemma_rmsnorm(x, w, eps)
+    def get_input_iter(self, dtype):
+        device = flaggems_vllm.runtime.device.name
+        for shape in self.shapes:
+            N = shape[-1]
+            x = torch.randn(shape, dtype=dtype, device=device)
+            w = torch.randn((N,), dtype=dtype, device=device)
+            eps = 1e-5
+            yield x, w, eps
 
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.gemma_rmsnorm(x, w, eps)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+@pytest.mark.skipif(
+    not HAS_BASELINE_OP, reason="Missing baseline ops on current platform"
+)
+@pytest.mark.gemma_rmsnorm
+def test_gemma_rmsnorm():
+    dtypes = [torch.bfloat16]
+    bench = GemmaRmsNormBenchmark(
+        op_name="gemma_rmsnorm",
+        torch_op=baseline_op,
+        dtypes=dtypes,
+    )
+    bench.set_gems(flaggems_vllm.gemma_rmsnorm)
+    bench.run()
