@@ -39,7 +39,7 @@ except ImportError:
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe_w8a16_int8 import fused_marlin_moe_w8a16_int8
+from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe_w8a16_int8
 
 from . import base, consts
 from .conftest import Config

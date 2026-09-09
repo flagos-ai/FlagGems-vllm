@@ -33,8 +33,8 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP4_E2M1,
     QUANT_TYPE_UINT4B8,
     fused_marlin_moe,
+    fused_marlin_moe_w8a16_int8,
 )
-from flaggems_vllm.ops.fused_marlin_moe_w8a16_int8 import fused_marlin_moe_w8a16_int8
 
 from . import conftest as cfg
 
