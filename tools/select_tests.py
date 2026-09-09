@@ -86,9 +86,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
-    "src/flaggems_vllm/ops/fused_marlin_moe_w8a16_fp8.py": [
-        "tests/test_fused_marlin_moe.py"
-    ],
+    "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
@@ -138,7 +136,7 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_fused_moe_int8_w8a16.py",
         "benchmark/test_fused_moe_w8a16.py",
     ],
-    "src/flaggems_vllm/ops/fused_marlin_moe_w8a16_fp8.py": [
+    "src/flaggems_vllm/ops/fused_marlin_moe.py": [
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
     ],
     "src/flaggems_vllm/ops/sparse_attention.py": [

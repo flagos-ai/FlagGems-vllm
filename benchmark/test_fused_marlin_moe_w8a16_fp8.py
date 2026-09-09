@@ -37,7 +37,7 @@ except ImportError:
     HAS_VLLM_FUSED_MARLIN_MOE = False
 
 import flaggems_vllm
-from flaggems_vllm.ops.fused_marlin_moe_w8a16_fp8 import fused_marlin_moe_w8a16_fp8
+from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe_w8a16_fp8
 
 from . import base, consts
 from .conftest import Config
