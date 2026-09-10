@@ -141,6 +141,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/moe_align_block_size.py": [
         "benchmark/test_moe_align_block_size_triton.py",
     ],
+    "src/flaggems_vllm/ops/triton_unified_attention.py": [
+        "benchmark/test_triton_unified_attention_perf.py",
+    ],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
     ],
