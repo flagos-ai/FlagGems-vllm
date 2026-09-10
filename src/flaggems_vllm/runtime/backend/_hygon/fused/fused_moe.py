@@ -22,20 +22,108 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.moe_align_block_size import (
+    ceil_div,
+    moe_align_block_size_stage1,
+    moe_align_block_size_stage2,
+    moe_align_block_size_stage2_vec,
+    moe_align_block_size_stage3,
+    moe_align_block_size_stage4,
+)
 from flaggems_vllm.utils import pointwise_dynamic
 
 
-def _moe_align_block_size(topk_ids, block_size, num_experts, expert_map=None):
-    """moe_align_block_size resolved through the top-level dispatch table.
-
-    The vendor ``fused/__init__`` exports this backend's TLE-free
-    implementation, so the SpecOpRegistrar overwrites
-    ``flaggems_vllm.moe_align_block_size`` at import time. Resolve lazily:
-    this module is imported while that patch is being applied.
+def _moe_align_block_size(
+    topk_ids,
+    block_size,
+    num_experts,
+    expert_map=None,
+    pad_sorted_ids=False,
+):
+    """Inline generic non-TLE moe_align_block_size (same semantics as the
+    generic entry point, 4-stage pipeline built from the generic exported
+    kernels). The generic entry point would first attempt a TLE cooperative
+    kernel whose ``tle.distributed_barrier`` cannot compile on the HCU backend
+    (failed-JIT ~257ms per call + MLIR error spam), so vendor fused_moe runs
+    the non-TLE stages directly.
     """
-    from flaggems_vllm import moe_align_block_size as _impl
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        max_num_tokens_padded = (
+            (max_num_tokens_padded + block_size - 1) // block_size
+        ) * block_size
+    if topk_ids.numel() < num_experts:
+        # Small-batch tightening (same as vLLM): otherwise the
+        # (numel + E*(block_size-1)) bound inflates the sorted/expert buffers
+        # and the per-block masks of stage1/stage4.
+        max_num_tokens_padded = min(
+            topk_ids.numel() * block_size, max_num_tokens_padded
+        )
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    numel_expert_ids = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (numel_expert_ids,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    return _impl(topk_ids, block_size, num_experts, expert_map=expert_map)
+    numel = topk_ids.numel()
+    numel_sorted_token_ids = sorted_ids.numel()
+    grid = (num_experts,)
+    tokens_per_thread = triton.next_power_of_2(ceil_div(numel, num_experts))
+    block_size_sorted = triton.next_power_of_2(
+        ceil_div(numel_sorted_token_ids, num_experts)
+    )
+    block_size_expert = triton.next_power_of_2(ceil_div(numel_expert_ids, num_experts))
+
+    cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
+    tokens_cnts = torch.zeros(
+        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
+    )
+    num_experts_next_power_of_2 = triton.next_power_of_2(num_experts)
+
+    moe_align_block_size_stage1[grid](
+        topk_ids,
+        tokens_cnts,
+        num_experts,
+        numel,
+        tokens_per_thread,
+        sorted_ids,
+        expert_ids,
+        numel_sorted_token_ids,
+        numel_expert_ids,
+        block_size_sorted,
+        block_size_expert,
+    )
+    if num_experts == num_experts_next_power_of_2:
+        moe_align_block_size_stage2_vec[grid](tokens_cnts, num_experts)
+    else:
+        moe_align_block_size_stage2[grid](tokens_cnts, num_experts)
+    moe_align_block_size_stage3[(1,)](
+        num_tokens_post_pad,
+        tokens_cnts,
+        cumsum,
+        num_experts,
+        num_experts_next_power_of_2,
+        block_size,
+    )
+    moe_align_block_size_stage4[grid](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        tokens_cnts,
+        cumsum,
+        num_experts,
+        block_size,
+        numel,
+        tokens_per_thread,
+    )
+
+    if expert_map is not None:
+        expert_ids = expert_map[expert_ids]
+
+    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 @triton.jit
