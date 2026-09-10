@@ -743,6 +743,108 @@ def test_fused_marlin_moe_w8a16_shared_routing(concentrated):
     ]
     assert sorted(actual) == sorted(expected)
     assert torch.all(tids.view(-1, block_m)[experts < 0] == t)
+    assert torch.all((tids.view(-1, block_m)[experts >= 0] < t).any(dim=1))
+
+
+@pytest.mark.parametrize("fp32_scales", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "precision,t,group_size,zero_points",
+    [
+        (precision, t, group_size, "none")
+        for precision in ("int8", "fp8")
+        for t, group_size in ((1, 256), (16, 384), (64, 256), (1025, 128), (1025, 384))
+    ]
+    + [
+        ("int8", 1, 256, "both"),
+        ("int8", 16, 384, "w1"),
+        ("int8", 64, 256, "w2"),
+        ("int8", 1025, 384, "both"),
+    ],
+)
+def test_fused_marlin_moe_w8a16_group_alignment(
+    dtype, precision, t, group_size, zero_points, fp32_scales
+):
+    """Exercise aligned K tiles, non-power-of-two groups, and optional zero points."""
+    torch.manual_seed(91)
+    device = flaggems_vllm.device
+    e, h, i, topk = 2, 2 * group_size, 2 * group_size, 1
+    hs = torch.randn((t, h), device=device, dtype=dtype) * 0.1
+    ti = (torch.arange(t, device=device) % e).reshape(t, topk)
+    tw = torch.full((t, topk), 0.7, device=device, dtype=torch.float32)
+
+    def make_weight(n, k, with_zero):
+        scale = (torch.rand((e, n, k // group_size), device=device) + 0.5) * 0.005
+        scale = scale.to(torch.float32 if fp32_scales else dtype)
+        zeros = None
+        if precision == "fp8":
+            q = (torch.randn((e, n, k), device=device) * 4).to(torch.float8_e4m3fn)
+            dequant = q.float()
+        else:
+            q = torch.randint(116, 140, (e, n, k), device=device, dtype=torch.uint8)
+            if with_zero:
+                zeros = torch.randint(
+                    124, 132, scale.shape, device=device, dtype=torch.uint8
+                )
+                dequant = q.float() - zeros.float().repeat_interleave(
+                    group_size, dim=-1
+                )
+            else:
+                dequant = q.float() - 128
+        ref = (dequant * scale.repeat_interleave(group_size, dim=-1)).to(dtype)
+        return q, scale, zeros, ref
+
+    w1, s1, z1, w1_ref = make_weight(2 * i, h, zero_points in ("both", "w1"))
+    w2, s2, z2, w2_ref = make_weight(h, i, zero_points in ("both", "w2"))
+    result = fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128,
+        group_size=group_size,
+        w1_zeros=z1,
+        w2_zeros=z2,
+    )
+    ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    assert compute_max_diff(result.float(), ref) < 0.04
+
+
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1025, 4096, 32768])
+def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
+    """Cover the fused large-M path and accumulation from multiple expert routes."""
+    make_inputs = (
+        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
+    )
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_inputs(
+        num_tokens, 8, 1024, 1024, 2, dtype, flaggems_vllm.device
+    )
+    result = fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128,
+    )
+    ref = torch.zeros_like(hs, dtype=torch.float32)
+    for expert in range(w1.shape[0]):
+        tokens, slots = torch.where(ti == expert)
+        gate, up = (hs[tokens].float() @ w1_ref[expert].float().T).chunk(2, dim=-1)
+        values = (torch.nn.functional.silu(gate) * up) @ w2_ref[expert].float().T
+        ref.index_add_(0, tokens, values * tw[tokens, slots, None].float())
+    assert compute_max_diff(result.float(), ref) < 0.04
 
 
 @pytest.mark.parametrize("config", W8A16_INT8_CONFIGS)
