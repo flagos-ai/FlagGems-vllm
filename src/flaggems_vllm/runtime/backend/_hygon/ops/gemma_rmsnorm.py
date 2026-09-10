@@ -1,168 +1,215 @@
-import logging
-
 import torch
 import triton
 import triton.language as tl
 
-logger = logging.getLogger(__name__)
-
-
-_gemma_rmsnorm_may_2d_configs = [
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=1),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=2),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=16),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=1),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=2),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=16),
-    triton.Config(kwargs={"BLOCK_M": 4}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 4}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 4}, num_warps=16),
-    triton.Config(kwargs={"BLOCK_M": 8}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 8}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 8}, num_warps=16),
+# Autotune candidates: BLOCK_N x num_warps (row) / BLOCK_M x num_warps (multirow).
+# BLOCK_N only applies to the masked (non-exact decomposition) path. Kept small:
+# every (M, N) shape sweeps the whole list once.
+_ROW_CONFIGS = [
+    triton.Config(kwargs={"BLOCK_N": bn}, num_warps=nw)
+    for bn in (2048, 8192)
+    for nw in (4, 8, 16)
 ]
 
-_gemma_rmsnorm_loop_configs = [
-    triton.Config(kwargs={"TILE_N": tile_n}, num_warps=num_warps)
-    for tile_n in [512, 1024, 2048, 4096, 8192, 16384]
-    for num_warps in [4, 8, 16]
+_MULTIROW_CONFIGS = [
+    triton.Config(kwargs={"BLOCK_M": bm}, num_warps=nw)
+    for bm in (2, 4, 8, 16)
+    for nw in (4, 8, 16)
+]
+
+_LOOP_CONFIGS = [
+    triton.Config(kwargs={"TILE_N": tn}, num_warps=nw)
+    for tn in (2048, 8192, 16384)
+    for nw in (8, 16)
 ]
 
 
-@triton.jit
-def prev_multiple_of(a, b):
-    return tl.cdiv(a, b) * b - b
+def _pow2_chunks(n):
+    """Greedy decomposition of n into at most three power-of-two chunks.
+
+    Returns (chunks, exact) where exact is True iff the chunks sum to n
+    (i.e. n has at most three bits set).
+    """
+    chunks, rem = [], n
+    while rem > 0 and len(chunks) < 3:
+        c = 1 << (rem.bit_length() - 1)
+        chunks.append(c)
+        rem -= c
+    return chunks, rem == 0
 
 
-@triton.autotune(_gemma_rmsnorm_may_2d_configs, key=["M", "N"])
+@triton.autotune(configs=_ROW_CONFIGS, key=["M", "N"])
 @triton.jit
-def _gemma_rmsnorm_may_2d_kernel(
+def _gemma_rmsnorm_row_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    M,
+    N: tl.constexpr,
+    eps,
+    C0: tl.constexpr,
+    C1: tl.constexpr,
+    C2: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EXACT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    base = row * N
+    if EXACT:
+        # exact pow2 chunks, C0 + C1 + C2 == N: no mask anywhere
+        o0 = tl.arange(0, C0)
+        x0 = tl.load(x_ptr + base + o0).to(tl.float32)
+        w0 = tl.load(w_ptr + o0).to(tl.float32)
+        ssq = tl.sum(x0 * x0)
+        if C1 > 0:
+            o1 = C0 + tl.arange(0, C1)
+            x1 = tl.load(x_ptr + base + o1).to(tl.float32)
+            ssq += tl.sum(x1 * x1)
+        if C2 > 0:
+            o2 = C0 + C1 + tl.arange(0, C2)
+            x2 = tl.load(x_ptr + base + o2).to(tl.float32)
+            ssq += tl.sum(x2 * x2)
+        rrms = tl.rsqrt(ssq / N + eps)
+        y0 = x0 * rrms * (1.0 + w0)
+        tl.store(out_ptr + base + o0, y0.to(out_ptr.dtype.element_ty))
+        if C1 > 0:
+            w1 = tl.load(w_ptr + o1).to(tl.float32)
+            y1 = x1 * rrms * (1.0 + w1)
+            tl.store(out_ptr + base + o1, y1.to(out_ptr.dtype.element_ty))
+        if C2 > 0:
+            w2 = tl.load(w_ptr + o2).to(tl.float32)
+            y2 = x2 * rrms * (1.0 + w2)
+            tl.store(out_ptr + base + o2, y2.to(out_ptr.dtype.element_ty))
+    else:
+        # decomposition not exact (>3 bits set): ordinary masked tiles,
+        # looped so every autotuned BLOCK_N stays correct even when < N
+        tile = tl.arange(0, BLOCK_N)
+        acc = tl.zeros((), dtype=tl.float32)
+        for start in range(0, N, BLOCK_N):
+            offs = start + tile
+            x = tl.load(x_ptr + base + offs, mask=offs < N, other=0.0).to(tl.float32)
+            acc += tl.sum(x * x)
+        rrms = tl.rsqrt(acc / N + eps)
+        for start in range(0, N, BLOCK_N):
+            offs = start + tile
+            mask = offs < N
+            x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            y = x * rrms * (1.0 + w)
+            tl.store(out_ptr + base + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.autotune(configs=_MULTIROW_CONFIGS, key=["M", "N"])
+@triton.jit
+def _gemma_rmsnorm_multirow_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    M,
+    N: tl.constexpr,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EXACT: tl.constexpr,
+):
+    m_offs = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_offs < M
+    if EXACT:
+        n_offs = tl.arange(0, N)
+        ld_mask = m_mask[:, None]
+    else:
+        n_offs = tl.arange(0, BLOCK_N)
+        ld_mask = m_mask[:, None] & (n_offs < N)[None, :]
+    ptrs = m_offs[:, None] * N + n_offs[None, :]
+    x = tl.load(x_ptr + ptrs, mask=ld_mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + n_offs, mask=n_offs < N, other=0.0).to(tl.float32)
+    rrms = tl.rsqrt(tl.sum(x * x, axis=1) / N + eps)
+    y = x * rrms[:, None] * (1.0 + w)[None, :]
+    tl.store(out_ptr + ptrs, y.to(out_ptr.dtype.element_ty), mask=ld_mask)
+
+
+@triton.autotune(configs=_LOOP_CONFIGS, key=["M", "N"])
+@triton.jit
+def _gemma_rmsnorm_loop_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
     M,
     N,
     eps,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    if BLOCK_M != 1:
-        m_block_id = tl.program_id(0)
-        m_offs = m_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
-        n_offs = tl.arange(0, BLOCK_N)
-        offs = m_offs[:, None] * N + n_offs[None, :]
-
-        m_mask = m_offs < M
-        n_mask = n_offs < N
-        mask = m_mask[:, None] & n_mask[None, :]
-
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
-
-        inv_rms = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / N + eps)
-        y = x * inv_rms[:, None] * (1.0 + w[None, :])
-        tl.store(out_ptr + offs, y, mask=mask)
-    else:
-        m = tl.program_id(0)
-        n_offs = tl.arange(0, BLOCK_N)
-        offs = m * N + n_offs
-
-        n_mask = n_offs < N
-        x = tl.load(x_ptr + offs, mask=n_mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
-
-        inv_rms = 1.0 / tl.sqrt(tl.sum(x * x, axis=-1) / N + eps)
-        y = x * inv_rms * (1.0 + w)
-        tl.store(out_ptr + offs, y, mask=n_mask)
-
-
-@triton.autotune(_gemma_rmsnorm_loop_configs, key=["M", "N"])
-@triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_loop_kernel(
-    out_ptr,
-    in_ptr,
-    w_ptr,
-    M,
-    N,
-    eps,
     TILE_N: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    row = tl.program_id(0)
+    base = row * N
+    tile = tl.arange(0, TILE_N)
 
-    acc = tl.zeros((1,), dtype=tl.float32)
-    num_steps = tl.cdiv(N, TILE_N)
+    # pass 1: sum of squares
+    acc = tl.zeros((), dtype=tl.float32)
+    for start in range(0, N, TILE_N):
+        offs = start + tile
+        x = tl.load(x_ptr + base + offs, mask=offs < N, other=0.0).to(tl.float32)
+        acc += tl.sum(x * x)
+    rrms = tl.rsqrt(acc / N + eps)
 
-    for step in range(0, num_steps - 1):
-        start_n = step * TILE_N
-        n_offsets = start_n + tl.arange(0, TILE_N)
-        x = tl.load(in_ptr + pid * N + n_offsets).to(tl.float32)
-        acc += tl.sum(x * x, axis=0)
-
-    start_n = (num_steps - 1) * TILE_N
-    n_offsets = start_n + tl.arange(0, TILE_N)
-    mask = n_offsets < N
-    x = tl.load(in_ptr + pid * N + n_offsets, mask=mask, other=0.0).to(tl.float32)
-    acc += tl.sum(x * x, axis=0)
-
-    var = tl.sum(acc) / N
-    rrms = 1 / tl.sqrt(var + eps)
-
-    prev_multiple = prev_multiple_of(N, TILE_N)
-
-    for start_n in range(0, TILE_N, TILE_N):
-        n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
-        mask = n_offsets < N
-        x = tl.load(
-            in_ptr + pid * N + n_offsets,
-            mask=mask,
-            other=0.0,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
-        w = tl.load(w_ptr + n_offsets, mask=mask, other=0.0).to(tl.float32)
+    # pass 2: scale and store
+    for start in range(0, N, TILE_N):
+        offs = start + tile
+        mask = offs < N
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         y = x * rrms * (1.0 + w)
-        tl.store(out_ptr + pid * N + n_offsets, y, mask=mask)
-
-    for start_n in range(TILE_N, N, TILE_N):
-        n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
-        x = tl.load(
-            in_ptr + pid * N + n_offsets,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
-        w = tl.load(w_ptr + n_offsets).to(tl.float32)
-        y = x * rrms * (1.0 + w)
-        tl.store(out_ptr + pid * N + n_offsets, y)
+        tl.store(out_ptr + base + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    logger.debug("GEMS GEMMA_RMSNORM")
-
-    if x.ndim == 0:
-        raise ValueError("gemma_rmsnorm expects an input with at least one dimension")
-    orig_shape = x.shape
-    N = orig_shape[-1]
-    if w.ndim != 1 or w.shape[0] != N:
-        raise ValueError(f"weight must have shape ({N},), got {tuple(w.shape)}")
-
-    if any(dim == 0 for dim in orig_shape):
+def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps=1e-6) -> torch.Tensor:
+    assert x.is_contiguous()
+    assert w.is_contiguous()
+    n = x.shape[-1]
+    if n == 0:
         return torch.empty_like(x)
-
-    x.is_contiguous()
-    w.is_contiguous()
-
-    x = x.view(-1, N)
-    M = x.shape[0]
+    m = x.numel() // n
     out = torch.empty_like(x)
+    if m == 0:
+        return out
 
-    if N <= 8192:
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        _gemma_rmsnorm_may_2d_kernel[grid](
-            x, w, out, M, N, eps, BLOCK_N=triton.next_power_of_2(N)
+    block_n = triton.next_power_of_2(n)
+
+    if block_n <= 1024 and m >= 256:
+        # large-M x small-N: rows share one weight load, fewer programs
+        _gemma_rmsnorm_multirow_kernel[lambda META: (triton.cdiv(m, META["BLOCK_M"]),)](
+            x.view(m, n),
+            w,
+            out.view(m, n),
+            m,
+            n,
+            eps,
+            BLOCK_N=block_n,
+            EXACT=n == block_n,
         )
-    else:
-        _gemma_rmsnorm_loop_kernel[M,](out, x, w, M, N, eps)
+        return out
 
-    return out.view(orig_shape)
+    if block_n <= 16384:
+        chunks, exact = _pow2_chunks(n)
+        _gemma_rmsnorm_row_kernel[(m,)](
+            x.view(m, n),
+            w,
+            out.view(m, n),
+            m,
+            n,
+            eps,
+            C0=chunks[0],
+            C1=chunks[1] if len(chunks) > 1 else 0,
+            C2=chunks[2] if len(chunks) > 2 else 0,
+            EXACT=exact,
+        )
+        return out
+
+    _gemma_rmsnorm_loop_kernel[(m,)](
+        x.view(m, n),
+        w,
+        out.view(m, n),
+        m,
+        n,
+        eps,
+    )
+    return out

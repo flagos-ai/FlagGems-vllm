@@ -41,8 +41,11 @@ except Exception as e:
 
 
 class GemmaRmsNormBenchmark(Benchmark):
-    _gemma_rmsnorm_ns = [1152, 5376, 16384]
-    _gemma_rmsnorm_ms = [1, 32, 128, 256]
+    _gemma_rmsnorm_ms = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    _gemma_rmsnorm_ns = [
+        512, 576, 1152, 1536, 2048, 2560, 4096, 5376,
+        6144, 8192, 12288, 16384, 24576, 32768,
+    ]
     _gemma_rmsnorm_shapes = list(product(_gemma_rmsnorm_ms, _gemma_rmsnorm_ns))
 
     def set_shapes(self, shape_file_path=None):
