@@ -57,7 +57,7 @@ def _chunk_params(n):
 
 
 @triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_kernel(
+def _gemma_rms_norm_kernel(
     y_ptr,
     x_ptr,
     w_ptr,
@@ -126,7 +126,7 @@ def _gemma_rmsnorm_kernel(
 
 
 @triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_bm2_kernel(
+def _gemma_rms_norm_bm2_kernel(
     y_ptr,
     x_ptr,
     w_ptr,
@@ -219,7 +219,7 @@ def _gemma_rmsnorm_bm2_kernel(
 
 
 @triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_wide_kernel(
+def _gemma_rms_norm_wide_kernel(
     y_ptr,
     x_ptr,
     w_ptr,
@@ -254,11 +254,11 @@ def _gemma_rmsnorm_wide_kernel(
             )
 
 
-def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+def gemma_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     logger.debug("GEMS_ASCEND GEMMA_RMSNORM [shape]: %s", tuple(x.shape))
 
     if x.ndim == 0:
-        raise ValueError("gemma_rmsnorm expects an input with at least one dimension")
+        raise ValueError("gemma_rms_norm expects an input with at least one dimension")
     orig_shape = x.shape
     N = orig_shape[-1]
     if w.ndim != 1 or w.shape[0] != N:
@@ -280,16 +280,16 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         if M <= CORES:
             # one program per row: no weight reuse to amortize
             grid, n_rows, num_warps = M, 1, 8
-            kernel = _gemma_rmsnorm_kernel
+            kernel = _gemma_rms_norm_kernel
         else:
             target = 2 * CORES if M >= _FINE_GRID_M else CORES
             n_rows = triton.cdiv(M, target)
             grid = triton.cdiv(M, n_rows)
             if exact and N <= _BM2_N_MAX:
-                kernel = _gemma_rmsnorm_bm2_kernel
+                kernel = _gemma_rms_norm_bm2_kernel
                 num_warps = 8
             else:
-                kernel = _gemma_rmsnorm_kernel
+                kernel = _gemma_rms_norm_kernel
                 num_warps = 4
         kernel[(grid,)](
             out,
@@ -317,7 +317,7 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         # BLOCK tuned per width: 8192 covers 16384 in two exact steps;
         # smaller wide rows (12288) prefer 4096
         BLOCK = 8192 if N >= 16384 else 4096
-        _gemma_rmsnorm_wide_kernel[(grid,)](
+        _gemma_rms_norm_wide_kernel[(grid,)](
             out,
             x,
             w,

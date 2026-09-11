@@ -26,7 +26,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.gemma_rmsnorm import gemma_rmsnorm
+from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -44,7 +44,7 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_experts_impl",
-    "gemma_rmsnorm",
+    "gemma_rms_norm",
     "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
