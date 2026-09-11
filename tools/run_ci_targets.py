@@ -28,6 +28,11 @@ from typing import Any
 
 TARGET_ROOTS = {"tests": "tests", "benchmarks": "benchmark"}
 
+DISTRIBUTED_TARGET_WORLD_SIZES = {
+    "tests/test_fused_allreduce_rms_norm.py": (2, 4, 8),
+    "benchmark/test_fused_allreduce_rms_norm.py": (2, 4, 8),
+}
+
 
 def _string_list(value: Any, field: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
@@ -115,28 +120,72 @@ def apply_policy(
     }
 
 
+def _distributed_pytest_command(
+    target: str, world_size: int, pytest_args: list[str]
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node",
+        str(world_size),
+        "-m",
+        "pytest",
+        *pytest_args,
+        target,
+    ]
+
+
 def build_commands(targets: dict[str, list[str]]) -> list[list[str]]:
     commands = []
-    if targets["tests"]:
+    regular_tests = [
+        target
+        for target in targets["tests"]
+        if target not in DISTRIBUTED_TARGET_WORLD_SIZES
+    ]
+    distributed_tests = [
+        target
+        for target in targets["tests"]
+        if target in DISTRIBUTED_TARGET_WORLD_SIZES
+    ]
+    regular_benchmarks = [
+        target
+        for target in targets["benchmarks"]
+        if target not in DISTRIBUTED_TARGET_WORLD_SIZES
+    ]
+    distributed_benchmarks = [
+        target
+        for target in targets["benchmarks"]
+        if target in DISTRIBUTED_TARGET_WORLD_SIZES
+    ]
+
+    if regular_tests:
         commands.append(
-            [sys.executable, "-m", "pytest", "-q", "--quick", *targets["tests"]]
+            [sys.executable, "-m", "pytest", "-q", "--quick", *regular_tests]
         )
-    if targets["benchmarks"]:
+    for target in distributed_tests:
+        for world_size in DISTRIBUTED_TARGET_WORLD_SIZES[target]:
+            commands.append(
+                _distributed_pytest_command(target, world_size, ["-q", "--quick"])
+            )
+
+    benchmark_args = ["-q", "--level", "core", "--warmup", "1", "--iter", "1"]
+    if regular_benchmarks:
         commands.append(
             [
                 sys.executable,
                 "-m",
                 "pytest",
-                "-q",
-                "--level",
-                "core",
-                "--warmup",
-                "1",
-                "--iter",
-                "1",
-                *targets["benchmarks"],
+                *benchmark_args,
+                *regular_benchmarks,
             ]
         )
+    for target in distributed_benchmarks:
+        for world_size in DISTRIBUTED_TARGET_WORLD_SIZES[target]:
+            commands.append(
+                _distributed_pytest_command(target, world_size, benchmark_args)
+            )
     return commands
 
 
