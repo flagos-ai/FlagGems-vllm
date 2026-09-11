@@ -28,7 +28,13 @@ import os
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+from flag_gems.utils.device_info import get_device_capability
+from flag_gems.utils.triton_version_utils import has_triton_tle
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    TensorDescriptor = None
 
 from flaggems_vllm.utils.device_info import get_device_capability
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
@@ -41,7 +47,7 @@ logger = logging.getLogger(__name__)
 # band and falls back to the baseline everywhere else (no regression).
 # =============================================================================
 
-HAS_TLE = has_triton_tle(3, 6, 0)
+HAS_TLE = has_triton_tle(3, 6, 0) and TensorDescriptor is not None
 if HAS_TLE:
     try:
         import triton.experimental.tle.language as tle
