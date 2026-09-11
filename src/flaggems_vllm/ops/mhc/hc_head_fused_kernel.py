@@ -175,32 +175,6 @@ def _hc_head_fused_kernel(
         tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
 
 
-def hc_head_fused_kernel_ref(
-    hs_flat: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    out: torch.Tensor,
-    hidden_size: int,
-    rms_eps: float,
-    hc_eps: float,
-    hc_mult: int,
-) -> torch.Tensor:
-    """Pure PyTorch reference implementation for correctness testing."""
-    if hs_flat.shape[0] == 0:
-        return out
-    x = hs_flat.reshape(hs_flat.shape[0], hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn.t())
-    sqrsum = x.square().sum(dim=-1, keepdim=True)
-    rsqrt = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
-    pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale[0] + hc_base) + hc_eps
-    result = torch.sum(pre_mix.unsqueeze(-1) * hs_flat.to(torch.float32), dim=1).to(
-        out.dtype
-    )
-    out.copy_(result)
-    return out
-
-
 def hc_head_fused_kernel(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -214,50 +188,59 @@ def hc_head_fused_kernel(
 ) -> torch.Tensor:
     """HC head fused kernel: fully fused Triton implementation."""
     logger.debug("GEMS HC_HEAD_FUSED")
-    assert hs_flat.dtype == torch.bfloat16
-    assert fn.dtype == torch.float32
-    assert hc_scale.dtype == torch.float32
-    assert hc_base.dtype == torch.float32
+    tensors = (hs_flat, fn, hc_scale, hc_base, out)
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise NotImplementedError("hc_head_fused_kernel only supports CUDA tensors")
+    if any(tensor.device != hs_flat.device for tensor in tensors[1:]):
+        raise NotImplementedError("all inputs and out must be on the same CUDA device")
+    if hs_flat.device.index != torch.cuda.current_device():
+        raise NotImplementedError("input device must be the current CUDA device")
+    if hs_flat.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise NotImplementedError("hs_flat and out must have bfloat16 dtype")
+    if any(tensor.dtype != torch.float32 for tensor in (fn, hc_scale, hc_base)):
+        raise NotImplementedError("fn, hc_scale, and hc_base must have float32 dtype")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise NotImplementedError("hc_head_fused_kernel requires contiguous tensors")
+    if any(tensor.requires_grad for tensor in tensors):
+        raise NotImplementedError("hc_head_fused_kernel is an inference-only path")
+    if hc_mult not in (2, 4):
+        raise NotImplementedError("hc_head_fused_kernel only supports hc_mult=2 or 4")
 
     num_tokens = hs_flat.shape[0]
+    if hidden_size < 1:
+        raise ValueError("hidden_size must be positive")
+    if hs_flat.shape != (num_tokens, hc_mult, hidden_size):
+        raise ValueError("hs_flat has an incompatible shape")
+    if fn.shape != (hc_mult, hc_mult * hidden_size):
+        raise ValueError("fn has an incompatible shape")
+    if hc_scale.shape != (1,):
+        raise ValueError("hc_scale must have shape (1,)")
+    if hc_base.shape != (hc_mult,):
+        raise ValueError(f"hc_base must have shape ({hc_mult},)")
+    if out.shape != (num_tokens, hidden_size):
+        raise ValueError("out has an incompatible shape")
     if num_tokens == 0:
         return out
 
-    assert hs_flat.shape == (num_tokens, hc_mult, hidden_size)
-    assert fn.shape == (hc_mult, hc_mult * hidden_size)
-    assert hc_scale.shape == (1,)
-    assert hc_base.shape == (hc_mult,)
-    assert out.shape == (num_tokens, hidden_size)
-    assert out.dtype == hs_flat.dtype
-
-    if hs_flat.device.type != "cuda":
-        return hc_head_fused_kernel_ref(
-            hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
-        )
-
     H = hidden_size
 
-    residual_c = hs_flat.contiguous()
-    fn_c = fn.contiguous()
-    out_c = out if out.is_contiguous() else torch.empty_like(out)
-
     _hc_head_fused_kernel[(num_tokens,)](
-        residual_c,
-        fn_c,
+        hs_flat,
+        fn,
         hc_scale,
         hc_base,
-        out_c,
+        out,
         num_tokens,
         H,
         rms_eps,
         hc_eps,
-        residual_c.stride(0),
-        fn_c.stride(0),
-        out_c.stride(0),
+        hs_flat.stride(0),
+        fn.stride(0),
+        out.stride(0),
         HC=hc_mult,
     )
 
-    if out.data_ptr() != out_c.data_ptr():
-        out.copy_(out_c)
-
     return out
+
+
+__all__ = ["hc_head_fused_kernel"]

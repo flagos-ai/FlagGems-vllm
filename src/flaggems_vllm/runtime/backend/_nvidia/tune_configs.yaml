@@ -260,6 +260,46 @@ add_rms_norm_loop:
       - 2048
       - 4096
       - 8192
+mhc_post_hc4:
+  - META:
+      BLOCK_H: 128
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_H: 256
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_H: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_H: 512
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_H: 512
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_H: 1024
+    num_warps: 4
+    num_stages: 1
+mhc_post_generic:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_H: block_h
+      num_warps: warps
+      num_stages: 1
+    block_h:
+      - 128
+      - 256
+      - 512
+    warps:
+      - 2
+      - 4
+      - 8
 gated_activation:
   - gen: true
     param_map:

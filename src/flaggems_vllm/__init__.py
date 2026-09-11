@@ -23,6 +23,7 @@ from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.config import aten_patch_list, resolve_user_setting
 from flaggems_vllm.ops import *  # noqa: F401,F403
+from flaggems_vllm.ops.mhc.mhc_prenorm import mhc_prepare_weights  # noqa: F401
 from flaggems_vllm.runtime.register import Register
 
 device = runtime.device.name

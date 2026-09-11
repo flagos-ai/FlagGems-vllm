@@ -15,8 +15,7 @@
 """
 Accuracy tests for mHC (Manifold Constrained Hyper-Connection) operators.
 
-Tests both mhc_post and mhc_pre against PyTorch reference implementations,
-and optionally compares with TileLang implementations.
+Tests mHC operators against independent PyTorch reference implementations.
 """
 
 from itertools import product
@@ -25,10 +24,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.mhc.hc_head_fused_kernel import (
-    hc_head_fused_kernel,
-    hc_head_fused_kernel_ref,
-)
+from flaggems_vllm.ops.mhc.hc_head_fused_kernel import hc_head_fused_kernel
 
 try:
     from vllm.model_executor.layers.mhc import (
@@ -38,13 +34,16 @@ try:
     HAS_VLLM = True
 except ImportError:
     HAS_VLLM = False
-from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
-    hc_split_sinkhorn,
+from flaggems_vllm.ops.mhc.hc_split_sinkhorn import hc_split_sinkhorn
+from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd
+from flaggems_vllm.ops.mhc.mhc_post import mhc_post
+from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
+from tests.mhc_reference import (
+    hc_head_fused_kernel_ref,
+    mhc_bwd_ref,
     mhc_split_sinkhorn_torch_ref,
+    sinkhorn_forward,
 )
-from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
 
 
 def generate_mhc_post_data(
@@ -63,6 +62,17 @@ def generate_mhc_post_data(
         post_layer_mix=post_layer_mix,
         comb_res_mix=comb_res_mix,
     )
+
+
+def _mhc_post_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    output = x.unsqueeze(-2) * post_layer_mix
+    output += torch.bmm(comb_res_mix.mT, residual.float())
+    return output.type_as(x)
 
 
 MHC_POST_CONFIGS = list(
@@ -85,7 +95,7 @@ def test_mhc_post_vs_ref(n, h, hc_mult):
     data = generate_mhc_post_data(n, h, hc_mult=hc_mult)
     out_triton = mhc_post(**data)
     data_cpu = {k: v.cpu() for k, v in data.items()}
-    out_ref = mhc_post_ref(**data_cpu)
+    out_ref = _mhc_post_ref(**data_cpu)
     torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=1e-2)
 
 
@@ -125,20 +135,24 @@ def test_mhc_split_sinkhorn(batch, seqlen, hc_mult):
     """Test FlagGems split+sinkhorn implementation against DV."""
     data = generate_mhc_split_sinkhorn_data(batch, seqlen, hc_mult)
     pre_triton, post_triton, comb_triton = hc_split_sinkhorn(**data)
-    pre_dv, post_dv, comb_dv = mhc_split_sinkhorn_torch_ref(**data)
+    data_ref = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in data.items()
+    }
+    pre_dv, post_dv, comb_dv = mhc_split_sinkhorn_torch_ref(**data_ref)
 
-    torch.testing.assert_close(pre_triton, pre_dv, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(post_triton, post_dv, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(comb_triton, comb_dv, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(pre_triton.cpu(), pre_dv, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(post_triton.cpu(), post_dv, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(comb_triton.cpu(), comb_dv, rtol=1e-4, atol=1e-4)
 
 
-MHC_PRE_CONFIGS = list(
-    product(
-        [512, 1024, 2048, 8192],  # n
-        [1280, 2560, 4096],  # hidden_size
-        [2, 4],  # hc_mult
-    )
-)
+def test_mhc_split_sinkhorn_rejects_cpu_production_input():
+    data = generate_mhc_split_sinkhorn_data(1, 1, device="cpu")
+    with pytest.raises(NotImplementedError, match="only supports CUDA"):
+        hc_split_sinkhorn(**data)
+
+
+MHC_PRE_CONFIGS = [(64, 4096, 4), (96, 4096, 4), (128, 4096, 4)]
 
 
 def generate_mhc_pre_data(
@@ -181,6 +195,52 @@ def generate_mhc_pre_data(
     )
 
 
+def _sinkhorn_normalize_ref(
+    value: torch.Tensor, repeat: int, eps: float
+) -> torch.Tensor:
+    value = value.softmax(-1) + eps
+    value = value / (value.sum(-2, keepdim=True) + eps)
+    for _ in range(repeat - 1):
+        value = value / (value.sum(-1, keepdim=True) + eps)
+        value = value / (value.sum(-2, keepdim=True) + eps)
+    return value
+
+
+def _mhc_pre_ref(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual.shape[-2]
+    residual_flat = residual.flatten(-2, -1).float()
+    sqrsum = residual_flat.square().sum(-1)
+    mixes = residual_flat @ fn.mT
+    mixes *= (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
+    pre_mix = (
+        mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ).sigmoid().unsqueeze(-1) + hc_pre_eps
+    post_mix = (
+        (mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult])
+        .sigmoid()
+        .mul(hc_post_mult_value)
+        .unsqueeze(-1)
+    )
+    comb_mix = (mixes[:, 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]).view(
+        -1, hc_mult, hc_mult
+    )
+    comb_mix = _sinkhorn_normalize_ref(
+        comb_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+    )
+    layer_input = (residual * pre_mix).sum(-2).bfloat16()
+    return post_mix, comb_mix, layer_input
+
+
 @pytest.mark.mhc_pre
 @pytest.mark.parametrize(
     "n, hidden_size, hc_mult",
@@ -194,11 +254,17 @@ def test_mhc_pre_vs_ref(n, hidden_size, hc_mult):
     data_cpu = {
         k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in data.items()
     }
-    post_ref, comb_ref, li_ref = mhc_pre_ref(**data_cpu)
+    post_ref, comb_ref, li_ref = _mhc_pre_ref(**data_cpu)
 
     torch.testing.assert_close(post_triton.cpu(), post_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(comb_triton.cpu(), comb_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(li_triton.cpu(), li_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_mhc_pre_rejects_unvalidated_shape():
+    data = generate_mhc_pre_data(32, 4, 4096, device="cpu")
+    with pytest.raises(NotImplementedError, match="token counts"):
+        mhc_pre(**data)
 
 
 MHC_BWD_CONFIGS = list(
@@ -222,9 +288,10 @@ def generate_mhc_bwd_data(
     """
     torch.manual_seed(42)
     dist = torch.distributions.uniform.Uniform(0.0, 4.0)
-    M = dist.sample((seqlen, n_stream, n_stream)).to(device)
+    M = dist.sample((seqlen, n_stream, n_stream))
 
     R, _P = sinkhorn_forward(M, iters=sinkhorn_iters)
+    R = R.to(device)
     dR = torch.randn_like(R)
 
     return dict(R=R.detach(), dR=dR, n_stream=n_stream)
@@ -245,6 +312,12 @@ def test_mhc_bwd_vs_ref(seqlen, n_stream, sinkhorn_iters):
     out_ref = mhc_bwd_ref(R.cpu(), dR.cpu())
 
     torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_mhc_bwd_rejects_cpu_production_input():
+    out = torch.empty((1, 4, 4), dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="only supports CUDA"):
+        mhc_bwd(out, out)
 
 
 MHC_HC_HEAD_FUSED_CONFIGS = [
@@ -304,11 +377,20 @@ def generate_hc_head_fused_data(
 def test_hc_head_fused_kernel_vs_ref(n, hidden_size, hc_mult):
     dtype = torch.bfloat16
     data = generate_hc_head_fused_data(n, hidden_size, hc_mult, dtype=dtype)
-    data_ref = generate_hc_head_fused_data(n, hidden_size, hc_mult, dtype=dtype)
+    data_ref = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in data.items()
+    }
 
     out_triton = hc_head_fused_kernel(**data)
     out_ref = hc_head_fused_kernel_ref(**data_ref)
-    torch.testing.assert_close(out_triton, out_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=2e-2, atol=2e-2)
+
+
+def test_hc_head_fused_kernel_rejects_cpu_production_input():
+    data = generate_hc_head_fused_data(1, 128, 4, dtype=torch.bfloat16, device="cpu")
+    with pytest.raises(NotImplementedError, match="only supports CUDA"):
+        hc_head_fused_kernel(**data)
 
 
 def _hc_head_fused_kernel_ref(

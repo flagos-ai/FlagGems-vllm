@@ -29,8 +29,6 @@ import torch
 import triton
 import triton.language as tl
 
-EPS = 1e-10
-
 
 def _get_autotune_configs():
     """Generate autotune configurations for different tile sizes and warps."""
@@ -363,136 +361,49 @@ def mhc_bwd(
     Returns:
         Gradient w.r.t. pre-Sinkhorn input, same shape as out.
     """
-    assert out.shape == dout.shape, "out and dout must have same shape"
-    assert out.ndim == 3, "Expected 3D tensors (seqlen, n_stream, n_stream)"
-    assert out.shape[1] == out.shape[2], "n_stream dimensions must match"
+    if out.device.type != "cuda" or dout.device.type != "cuda":
+        raise NotImplementedError("mhc_bwd only supports CUDA tensors")
+    if out.device != dout.device:
+        raise NotImplementedError("out and dout must be on the same CUDA device")
+    if out.device.index != torch.cuda.current_device():
+        raise NotImplementedError("input device must be the current CUDA device")
+    if out.dtype != torch.float32 or dout.dtype != torch.float32:
+        raise NotImplementedError("mhc_bwd only supports float32 inputs")
+    if not out.is_contiguous() or not dout.is_contiguous():
+        raise NotImplementedError("mhc_bwd requires contiguous inputs")
+    if out.requires_grad or dout.requires_grad:
+        raise NotImplementedError("mhc_bwd does not support higher-order gradients")
+    if out.shape != dout.shape:
+        raise ValueError("out and dout must have the same shape")
+    if out.ndim != 3:
+        raise ValueError("expected 3D tensors (seqlen, n_stream, n_stream)")
+    if out.shape[1] != out.shape[2]:
+        raise ValueError("n_stream dimensions must match")
 
     seqlen, n_stream, _ = out.shape
+    if n_stream != 4:
+        raise NotImplementedError("mhc_bwd Triton kernel only supports n_stream=4")
     if cg_iters is None:
         cg_iters = 2 * n_stream
+    if not isinstance(cg_iters, int) or cg_iters < 1:
+        raise ValueError("cg_iters must be a positive integer")
 
-    # Ensure contiguous and float32
-    out = out.contiguous().float()
-    dout = dout.contiguous().float()
-
-    # Allocate output
     res = torch.empty_like(out)
+    if seqlen == 0:
+        return res
 
-    # For n_stream=4, use optimized kernel
-    if n_stream == 4:
-        BLOCK_S = 64
-        grid = (triton.cdiv(seqlen, BLOCK_S),)
-        _mhc_bwd_kernel_n4[grid](
-            out,
-            dout,
-            res,
-            seqlen,
-            cg_iters,
-            BLOCK_S=BLOCK_S,
-        )
-    else:
-        res = mhc_bwd_ref(out, dout, cg_iters=cg_iters)
+    BLOCK_S = 64
+    grid = (triton.cdiv(seqlen, BLOCK_S),)
+    _mhc_bwd_kernel_n4[grid](
+        out,
+        dout,
+        res,
+        seqlen,
+        cg_iters,
+        BLOCK_S=BLOCK_S,
+    )
 
     return res
 
 
-def mhc_bwd_ref(
-    out: torch.Tensor,
-    dout: torch.Tensor,
-    cg_iters: int = None,
-) -> torch.Tensor:
-    """PyTorch reference implementation of Sinkhorn backward via implicit CG.
-
-    Args:
-        out: Sinkhorn output R, shape (seqlen, n_stream, n_stream), float32.
-        dout: Upstream gradient dR, same shape as out, float32.
-        cg_iters: Number of CG iterations. Defaults to 2 * n_stream.
-
-    Returns:
-        Gradient w.r.t. pre-Sinkhorn input, same shape as out.
-    """
-    seqlen, n_stream, _ = out.shape
-    if cg_iters is None:
-        cg_iters = 2 * n_stream
-
-    R = out.float()
-    dR = dout.float()
-
-    # RdR = R * dR
-    RdR = R * dR
-
-    # b1 = sum(RdR, dim=-1), b2 = sum(RdR, dim=-2)
-    b1 = RdR.sum(dim=-1)  # (seqlen, n_stream)
-    b2 = RdR.sum(dim=-2)  # (seqlen, n_stream)
-
-    # Initialize CG
-    x1 = torch.zeros_like(b1)
-    x2 = torch.zeros_like(b2)
-
-    def matvec(r, x1_in, x2_in):
-        # y1[i] = sum_j(R[i,j] * x2[j]) + x1[i]
-        y1 = (r * x2_in.unsqueeze(-2)).sum(dim=-1) + x1_in
-        # y2[j] = sum_i(R[i,j] * x1[i]) + x2[j]
-        y2 = (r * x1_in.unsqueeze(-1)).sum(dim=-2) + x2_in
-        return y1, y2
-
-    # r = b - A*x (with x=0, r = b)
-    r1, r2 = b1.clone(), b2.clone()
-    p1, p2 = r1.clone(), r2.clone()
-    r_normsq = (r1 * r1 + r2 * r2).sum(dim=-1)  # (seqlen,)
-
-    for _ in range(cg_iters):
-        # Ap = A * p
-        Ap1, Ap2 = matvec(R, p1, p2)
-
-        # pAp = dot(p, Ap)
-        pAp = (p1 * Ap1 + p2 * Ap2).sum(dim=-1)  # (seqlen,)
-
-        # alpha = r_normsq / (pAp + eps)
-        alpha = r_normsq / (pAp + EPS)
-        alpha = alpha.unsqueeze(-1)  # (seqlen, 1)
-
-        # x = x + alpha * p
-        x1 = x1 + alpha * p1
-        x2 = x2 + alpha * p2
-
-        # r = r - alpha * Ap
-        r1 = r1 - alpha * Ap1
-        r2 = r2 - alpha * Ap2
-
-        # r_new_normsq = dot(r, r)
-        r_new_normsq = (r1 * r1 + r2 * r2).sum(dim=-1)
-
-        # beta = r_new_normsq / (r_normsq + eps)
-        beta = r_new_normsq / (r_normsq + EPS)
-        beta = beta.unsqueeze(-1)
-
-        # p = r + beta * p
-        p1 = r1 + beta * p1
-        p2 = r2 + beta * p2
-
-        r_normsq = r_new_normsq
-
-    # res = (dR - x1 - x2) * R
-    res = (dR - x1.unsqueeze(-1) - x2.unsqueeze(-2)) * R
-    return res
-
-
-def sinkhorn_forward(
-    M: torch.Tensor, iters: int = 20
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sinkhorn normalization forward pass.
-
-    Args:
-        M: Input logits, shape (..., n, n).
-        iters: Number of Sinkhorn iterations.
-
-    Returns:
-        (R, P) where P = exp(M) and R is the doubly-stochastic matrix.
-    """
-    P = torch.exp(M)
-    R = P.clone()
-    for _ in range(iters):
-        R = R / R.sum(-2, keepdim=True)
-        R = R / R.sum(-1, keepdim=True)
-    return R, P
+__all__ = ["mhc_bwd"]
