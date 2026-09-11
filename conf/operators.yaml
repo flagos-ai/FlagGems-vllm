@@ -327,6 +327,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: fp8_einsum
+    description: Block-scaled FP8 bhr,hdr->bhd contraction on NVIDIA Hopper.
+    for:
+      - vllm.utils.deep_gemm.fp8_einsum
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fp8_fp4_mqa_logits
     description: |
       Compute weighted MQA logits with FP8 quantized Q and K tensors.
