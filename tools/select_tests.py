@@ -109,6 +109,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "tests/test_FLA/test_chunk_gated_delta_rule.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_hygon/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
@@ -117,6 +120,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_moe_sum.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
 }
@@ -165,6 +171,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_hygon/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
@@ -173,6 +182,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_moe_sum.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
 }

@@ -95,6 +95,7 @@ from flaggems_vllm.ops.qwen4 import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_block_size_no_tle,
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
@@ -199,6 +200,7 @@ __all__ = [
     "mhc_post",
     "mhc_pre",
     "moe_align_block_size",
+    "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
     "moe_sum",
     "mrope",
