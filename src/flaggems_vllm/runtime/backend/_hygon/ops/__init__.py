@@ -32,6 +32,8 @@ from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.mhc_post import mhc_post
+from flaggems_vllm.runtime.backend._hygon.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -43,6 +45,8 @@ from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_in
 from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_scaled_mm
 
 __all__ = [
+    "mhc_pre",
+    "mhc_post",
     "SUPPORTED_FP8_DTYPE",
     "fused_experts_impl",
     "inplace_fused_experts",

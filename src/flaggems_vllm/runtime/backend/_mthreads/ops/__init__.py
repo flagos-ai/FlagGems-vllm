@@ -19,6 +19,8 @@ from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_top
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.mhc_post import mhc_post
+from flaggems_vllm.runtime.backend._mthreads.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -31,6 +33,8 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 )
 
 __all__ = [
+    "mhc_pre",
+    "mhc_post",
     "SUPPORTED_FP8_DTYPE",
     "grouped_topk",
     "per_token_group_quant_fp8",

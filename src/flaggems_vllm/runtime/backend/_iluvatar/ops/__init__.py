@@ -19,6 +19,8 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.mhc_post import mhc_post
+from flaggems_vllm.runtime.backend._iluvatar.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._iluvatar.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._iluvatar.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
@@ -27,6 +29,8 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
 )
 
 __all__ = [
+    "mhc_pre",
+    "mhc_post",
     "qwen4_store_qsa_kv_rows",
     "qwen4_hc_inject_combine",
     "ple_state_scatter_",
