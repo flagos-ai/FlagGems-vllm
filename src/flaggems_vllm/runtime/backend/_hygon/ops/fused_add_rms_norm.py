@@ -234,6 +234,11 @@ def fused_add_rms_norm_tiled_kernel(
 
 def _prefer_whole_row(N):
     """Empirical whole-row selector without the removed Cluster paths."""
+
+    # Force N=1024 to use the tiled kernel for performance comparison.
+    if N == 1024:
+        return False
+
     if N <= _WHOLE_ROW_SAFE_N:
         return True
 
@@ -253,16 +258,19 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     """Fused residual addition + RMSNorm, in-place.
 
     Dispatch:
-      A) N <= 16384
-           -> whole-row baseline.
-
-      B) 16384 < N < 24576
+      A) N == 1024
            -> Single-CTA tiled.
 
-      C) 24576 <= N <= 32768
+      B) N <= 16384
            -> whole-row baseline.
 
-      D) N > 32768
+      C) 16384 < N < 24576
+           -> Single-CTA tiled.
+
+      D) 24576 <= N <= 32768
+           -> whole-row baseline.
+
+      E) N > 32768
            -> Single-CTA tiled.
     """
     logger.debug(

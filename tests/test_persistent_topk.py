@@ -19,9 +19,13 @@ import torch
 import triton.language as tl
 
 import flaggems_vllm
-from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 from . import conftest as cfg
+
+# Bind the top-level entry: on vendor backends with a specialized
+# implementation (e.g. _hygon/fused), flaggems_vllm.persistent_topk is the
+# vendor version (replaced at import time); on NVIDIA it is the generic one.
+persistent_topk = flaggems_vllm.persistent_topk
 
 device = flaggems_vllm.device
 
@@ -49,7 +53,7 @@ try:
         num_rows = logits.shape[0]
         lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
-        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+        workspace = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
         torch.ops._C.persistent_topk(
             logits, lengths, indices, workspace, top_k, max_seq_len
         )
@@ -155,7 +159,7 @@ def _gems_decode(logits, seq_lens, top_k, max_seq_len=None):
 
 
 @pytest.mark.persistent_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
+@pytest.mark.skipif(not HAS_VLLM, reason="vLLM native op unavailable")
 @pytest.mark.parametrize("num_rows, seq_len, max_seq_len", SHAPES)
 @pytest.mark.parametrize("data_type", DATA_TYPES)
 @torch.inference_mode()
@@ -172,7 +176,6 @@ def test_persistent_topk_cross_agreement(num_rows, seq_len, max_seq_len, data_ty
 
 
 @pytest.mark.persistent_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
 @pytest.mark.parametrize("num_rows, seq_len, max_seq_len", SHAPES)
 @pytest.mark.parametrize("data_type", DATA_TYPES)
 @torch.inference_mode()
@@ -223,7 +226,7 @@ def test_persistent_topk_heterogeneous(max_seq_len, lengths_list, case_id):
     logits, lengths = _make_hetero_logits(lengths_list)
     num_rows = len(lengths_list)
 
-    ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    ws = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
     indices = torch.empty((num_rows, K), dtype=torch.int32, device=device)
 
     persistent_topk(logits, lengths, indices, ws, k=K, max_seq_len=max_seq_len)
@@ -248,7 +251,7 @@ def test_persistent_topk_k_values(k, lengths_list, max_seq_len):
     logits, lengths = _make_hetero_logits(lengths_list)
     num_rows = len(lengths_list)
 
-    ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    ws = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
     indices = torch.empty((num_rows, k), dtype=torch.int32, device=device)
 
     persistent_topk(logits, lengths, indices, ws, k=k, max_seq_len=max_seq_len)
@@ -278,7 +281,7 @@ def test_persistent_topk_mtp():
         logits[i, :sl] = torch.randn(sl, device=device)
 
     indices = torch.empty((num_rows, K), dtype=torch.int32, device=device)
-    ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    ws = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
 
     persistent_topk(logits, lengths_2d, indices, ws, k=K, max_seq_len=32774)
 
@@ -302,7 +305,7 @@ def test_persistent_topk_boundary(lengths_list, max_seq_len, case_id):
     logits, lengths = _make_hetero_logits(lengths_list)
     num_rows = len(lengths_list)
 
-    ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    ws = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
     indices = torch.empty((num_rows, K), dtype=torch.int32, device=device)
 
     persistent_topk(logits, lengths, indices, ws, k=K, max_seq_len=max_seq_len)
@@ -351,7 +354,7 @@ def test_persistent_topk_random_stress():
             logits[i, :sl] = torch.randn(sl, dtype=torch.float32, device=device)
         lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
-        ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+        ws = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
         indices = torch.empty((B, K), dtype=torch.int32, device=device)
 
         persistent_topk(logits, lengths, indices, ws, k=K, max_seq_len=max_seq_len)
@@ -377,7 +380,7 @@ def test_persistent_topk_data_distributions(lengths_list, dist):
     logits, lengths = _make_hetero_logits_dist(lengths_list, dist)
     num_rows = len(lengths_list)
 
-    ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    ws = torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device)
     indices = torch.empty((num_rows, K), dtype=torch.int32, device=device)
 
     persistent_topk(logits, lengths, indices, ws, k=K, max_seq_len=max(lengths_list))
