@@ -1,0 +1,20 @@
+[seq_no]
+other = "No."
+
+[op_name]
+other = "Operator Name"
+
+[op_kind]
+other = "Kind"
+
+[op_stage]
+other = "Stage"
+
+[op_since]
+other = "Since"
+
+[op_labels]
+other = "Labels"
+
+[op_desc]
+other = "Description"
