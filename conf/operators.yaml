@@ -327,6 +327,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: flash_mla_with_kvcache
+    description: Dense and sparse Multi-head Latent Attention decoding with a paged KV cache.
+    for:
+      - vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fp8_fp4_mqa_logits
     description: |
       Compute weighted MQA logits with FP8 quantized Q and K tensors.
@@ -411,6 +423,30 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_marlin_moe_w4a16_int4
+    description: Fused mixture-of-experts computation with GPTQ INT4 weights and 16-bit activations.
+    for:
+      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: fused_marlin_moe_w4a16_mxfp4
+    description: Fused mixture-of-experts computation with MXFP4 weights and 16-bit activations.
+    for:
+      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_moe
     description: The generic interface for fused MoE.
     for:
