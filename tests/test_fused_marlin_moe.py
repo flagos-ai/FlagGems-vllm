@@ -607,6 +607,7 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
     return ref
 
 
+@pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(
     not _is_hopper(),
     reason="W4A16 fast path uses Hopper-only bf16 SIMD PTX (sm_90+)",
@@ -905,6 +906,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
+@pytest.mark.fused_marlin_moe_w4a16_mxfp4
 @pytest.mark.skipif(
     not _is_hopper(),
     reason="MXFP4 fast path uses Hopper-only bf16/fp16 SIMD PTX (sm_90+)",

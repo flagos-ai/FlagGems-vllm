@@ -50,6 +50,7 @@ from flaggems_vllm.ops.attention import (
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
+from flaggems_vllm.ops.fp8_einsum import fp8_einsum
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
@@ -95,6 +96,7 @@ from flaggems_vllm.ops.qwen4 import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_block_size_no_tle,
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
@@ -175,6 +177,7 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "fp8_einsum",
     "fp8_fp4_mqa_logits",
     "fp8_fp4_paged_mqa_logits",
     "fused_add_rms_norm",
@@ -199,6 +202,7 @@ __all__ = [
     "mhc_post",
     "mhc_pre",
     "moe_align_block_size",
+    "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
     "moe_sum",
     "mrope",

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
@@ -38,6 +40,24 @@ try:
     HAS_VLLM_FUSED_MOE = True
 except ImportError:
     HAS_VLLM_FUSED_MOE = False
+
+
+def _supports_keyword(op, keyword):
+    try:
+        parameters = inspect.signature(op).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+# vLLM versions differ: newer ones require ``inplace`` (no default), older ones
+# do not accept the keyword at all.
+VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
+    vllm_fused_experts_impl, "inplace"
+)
 
 
 class FusedMoEMXQW8A16Benchmark(base.Benchmark):
@@ -244,17 +264,18 @@ def _baseline_w8a16_mxq_wrapper_vllm(
 ):
     """Wrapper to call vllm fused_experts_impl with W8A16 quantized weights."""
     del w1_fp16, w2_fp16, w3_q, w3_scale, num_experts, topk
+    kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(
         hidden_states.clone(),
         w1_q,
         w2_q,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation="silu",
         use_int8_w8a16=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        **kwargs,
     )
 
 
