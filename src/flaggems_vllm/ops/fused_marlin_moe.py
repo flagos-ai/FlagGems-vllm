@@ -73,6 +73,8 @@ QUANT_TYPE_UINT4B8 = 0
 QUANT_TYPE_UINT8B128 = 1
 # MXFP4 (FP4 E2M1 weight + per-32 E8M0 scale). Mirrors vLLM scalar_types.float4_e2m1f.id.
 QUANT_TYPE_FP4_E2M1 = 6
+# vLLM ScalarType's stable E4M3FN encoding.
+QUANT_TYPE_FP8_E4M3 = 2814749767172868
 # MXFP4 block size (E8M0 scale shared by every 32 weights).
 MXFP4_GROUP_SIZE = 32
 
@@ -2564,4 +2566,5 @@ __all__ = [
     "QUANT_TYPE_UINT4B8",
     "QUANT_TYPE_UINT8B128",
     "QUANT_TYPE_FP4_E2M1",
+    "QUANT_TYPE_FP8_E4M3",
 ]
