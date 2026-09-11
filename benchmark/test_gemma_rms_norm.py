@@ -28,7 +28,7 @@ from benchmark.base import Benchmark  # noqa: E402
 
 try:
     os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
-    from flashinfer.norm import gemma_rmsnorm as baseline_op
+    from flashinfer.norm import gemma_rms_norm as baseline_op
 
     HAS_BASELINE_OP = True
 except Exception as e:
@@ -37,12 +37,12 @@ except Exception as e:
 
 
 class GemmaRmsNormBenchmark(Benchmark):
-    _gemma_rmsnorm_ns = [1152, 5376, 16384]
-    _gemma_rmsnorm_ms = [1, 32, 128, 256]
-    _gemma_rmsnorm_shapes = list(product(_gemma_rmsnorm_ms, _gemma_rmsnorm_ns))
+    _gemma_rms_norm_ns = [1152, 5376, 16384]
+    _gemma_rms_norm_ms = [1, 32, 128, 256]
+    _gemma_rms_norm_shapes = list(product(_gemma_rms_norm_ms, _gemma_rms_norm_ns))
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = GemmaRmsNormBenchmark._gemma_rmsnorm_shapes
+        self.shapes = GemmaRmsNormBenchmark._gemma_rms_norm_shapes
 
     def get_input_iter(self, dtype):
         device = flaggems_vllm.runtime.device.name
@@ -57,13 +57,13 @@ class GemmaRmsNormBenchmark(Benchmark):
 @pytest.mark.skipif(
     not HAS_BASELINE_OP, reason="Missing baseline ops on current platform"
 )
-@pytest.mark.gemma_rmsnorm
-def test_gemma_rmsnorm():
+@pytest.mark.gemma_rms_norm
+def test_gemma_rms_norm():
     dtypes = [torch.float16, torch.float32]
     bench = GemmaRmsNormBenchmark(
-        op_name="gemma_rmsnorm",
+        op_name="gemma_rms_norm",
         torch_op=baseline_op,
         dtypes=dtypes,
     )
-    bench.set_gems(flaggems_vllm.gemma_rmsnorm)
+    bench.set_gems(flaggems_vllm.gemma_rms_norm)
     bench.run()

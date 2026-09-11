@@ -15,7 +15,7 @@ _WHOLE_ROW_MAX_BLOCK_N = 16384
 #   M=1,   N<=2048  -> num_warps=16 (or 4 for fp32)
 #   M>=32, N<=2048  -> num_warps=8
 #   N>=4096         -> 4/8/16 within noise of each other.
-_gemma_rmsnorm_configs = [
+_gemma_rms_norm_configs = [
     triton.Config({"BLOCK_M": 1}, num_warps=8),
     triton.Config({"BLOCK_M": 1}, num_warps=16),
     triton.Config({"BLOCK_M": 1}, num_warps=4),
@@ -27,7 +27,7 @@ _gemma_rmsnorm_configs = [
     triton.Config({"BLOCK_M": 4}, num_warps=4),
 ]
 
-_gemma_rmsnorm_loop_configs = [
+_gemma_rms_norm_loop_configs = [
     triton.Config(kwargs={"TILE_N": tile_n}, num_warps=num_warps)
     for tile_n in [1024, 2048, 4096, 8192]
     for num_warps in [4, 8, 16]
@@ -39,9 +39,9 @@ def prev_multiple_of(a, b):
     return tl.cdiv(a, b) * b - b
 
 
-@triton.autotune(_gemma_rmsnorm_configs, key=["M", "N"])
+@triton.autotune(_gemma_rms_norm_configs, key=["M", "N"])
 @triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_kernel(
+def _gemma_rms_norm_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
@@ -69,9 +69,9 @@ def _gemma_rmsnorm_kernel(
     tl.store(out_ptr + offs, y, mask=mask)
 
 
-@triton.autotune(_gemma_rmsnorm_loop_configs, key=["M", "N"])
+@triton.autotune(_gemma_rms_norm_loop_configs, key=["M", "N"])
 @triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_loop_kernel(
+def _gemma_rms_norm_loop_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -126,11 +126,11 @@ def _gemma_rmsnorm_loop_kernel(
         tl.store(out_ptr + pid * N + n_offsets, y)
 
 
-def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+def gemma_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     logger.debug("GEMS GEMMA_RMSNORM")
 
     if x.ndim == 0:
-        raise ValueError("gemma_rmsnorm expects an input with at least one dimension")
+        raise ValueError("gemma_rms_norm expects an input with at least one dimension")
     orig_shape = x.shape
     N = orig_shape[-1]
     if w.ndim != 1 or w.shape[0] != N:
@@ -140,7 +140,7 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         return torch.empty_like(x)
 
     if not x.is_contiguous() or not w.is_contiguous():
-        raise NotImplementedError("gemma_rmsnorm requires contiguous tensors")
+        raise NotImplementedError("gemma_rms_norm requires contiguous tensors")
 
     M = 1
     for dim in orig_shape[:-1]:
@@ -149,7 +149,7 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
     if triton.next_power_of_2(N) <= _WHOLE_ROW_MAX_BLOCK_N:
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        _gemma_rmsnorm_kernel[grid](
+        _gemma_rms_norm_kernel[grid](
             x,
             w,
             out,
@@ -159,6 +159,6 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
             BLOCK_N=triton.next_power_of_2(N),
         )
     else:
-        _gemma_rmsnorm_loop_kernel[M,](out, x, w, M, N, eps)
+        _gemma_rms_norm_loop_kernel[M,](out, x, w, M, N, eps)
 
     return out.view(orig_shape)
