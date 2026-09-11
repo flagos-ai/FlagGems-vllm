@@ -6,29 +6,30 @@ import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
+# Whole-row register-resident kernel covers up to this next_power_of_2(N); larger N
+# falls back to the streaming two-pass kernel (register footprint would not fit).
+_WHOLE_ROW_MAX_BLOCK_N = 16384
 
-_gemma_rmsnorm_may_2d_configs = [
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=1),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=2),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 1}, num_warps=16),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=1),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=2),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 2}, num_warps=16),
-    triton.Config(kwargs={"BLOCK_M": 4}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 4}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 4}, num_warps=16),
-    triton.Config(kwargs={"BLOCK_M": 8}, num_warps=4),
-    triton.Config(kwargs={"BLOCK_M": 8}, num_warps=8),
-    triton.Config(kwargs={"BLOCK_M": 8}, num_warps=16),
+# The kernel is one row per program with BLOCK_N fixed by N, so the tunable knob is
+# the warp count.:
+#   M=1,   N<=2048  -> num_warps=16 (or 4 for fp32)
+#   M>=32, N<=2048  -> num_warps=8
+#   N>=4096         -> 4/8/16 within noise of each other.
+_gemma_rmsnorm_configs = [
+    triton.Config({"BLOCK_M": 1}, num_warps=8),
+    triton.Config({"BLOCK_M": 1}, num_warps=16),
+    triton.Config({"BLOCK_M": 1}, num_warps=4),
+    triton.Config({"BLOCK_M": 2}, num_warps=8),
+    triton.Config({"BLOCK_M": 2}, num_warps=16),
+    triton.Config({"BLOCK_M": 2}, num_warps=4),
+    triton.Config({"BLOCK_M": 4}, num_warps=8),
+    triton.Config({"BLOCK_M": 4}, num_warps=16),
+    triton.Config({"BLOCK_M": 4}, num_warps=4),
 ]
 
 _gemma_rmsnorm_loop_configs = [
     triton.Config(kwargs={"TILE_N": tile_n}, num_warps=num_warps)
-    for tile_n in [512, 1024, 2048, 4096, 8192, 16384]
+    for tile_n in [1024, 2048, 4096, 8192]
     for num_warps in [4, 8, 16]
 ]
 
@@ -38,9 +39,9 @@ def prev_multiple_of(a, b):
     return tl.cdiv(a, b) * b - b
 
 
-@triton.autotune(_gemma_rmsnorm_may_2d_configs, key=["M", "N"])
-@triton.jit
-def _gemma_rmsnorm_may_2d_kernel(
+@triton.autotune(_gemma_rmsnorm_configs, key=["M", "N"])
+@triton.jit(do_not_specialize=["eps"])
+def _gemma_rmsnorm_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
@@ -50,34 +51,22 @@ def _gemma_rmsnorm_may_2d_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    if BLOCK_M != 1:
-        m_block_id = tl.program_id(0)
-        m_offs = m_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
-        n_offs = tl.arange(0, BLOCK_N)
-        offs = m_offs[:, None] * N + n_offs[None, :]
+    # Single pass: x stays register-resident in its native dtype between the sum of
+    # squares and the elementwise update; fp32 conversion happens lazily so the
+    # whole row of x plus w is live only once.  Loading w before the reduction lets
+    # both DRAM round trips overlap, which is worth ~2us on latency-bound M=1 rows.
+    m_offs = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offs = tl.arange(0, BLOCK_N)
+    offs = m_offs[:, None] * N + n_offs[None, :]
+    mask = (m_offs < M)[:, None] & (n_offs < N)[None, :]
 
-        m_mask = m_offs < M
-        n_mask = n_offs < N
-        mask = m_mask[:, None] & n_mask[None, :]
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + n_offs, mask=n_offs < N, other=0.0)
 
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
-
-        inv_rms = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / N + eps)
-        y = x * inv_rms[:, None] * (1.0 + w[None, :])
-        tl.store(out_ptr + offs, y, mask=mask)
-    else:
-        m = tl.program_id(0)
-        n_offs = tl.arange(0, BLOCK_N)
-        offs = m * N + n_offs
-
-        n_mask = n_offs < N
-        x = tl.load(x_ptr + offs, mask=n_mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + n_offs, mask=n_mask, other=0.0).to(tl.float32)
-
-        inv_rms = 1.0 / tl.sqrt(tl.sum(x * x, axis=-1) / N + eps)
-        y = x * inv_rms * (1.0 + w)
-        tl.store(out_ptr + offs, y, mask=n_mask)
+    xf = x.to(tl.float32)
+    inv_rms = 1.0 / tl.sqrt(tl.sum(xf * xf, axis=1) / N + eps)
+    y = xf * inv_rms[:, None] * (1.0 + w.to(tl.float32)[None, :])
+    tl.store(out_ptr + offs, y, mask=mask)
 
 
 @triton.autotune(_gemma_rmsnorm_loop_configs, key=["M", "N"])
@@ -150,17 +139,24 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     if any(dim == 0 for dim in orig_shape):
         return torch.empty_like(x)
 
-    x.is_contiguous()
-    w.is_contiguous()
+    if not x.is_contiguous() or not w.is_contiguous():
+        raise NotImplementedError("gemma_rmsnorm requires contiguous tensors")
 
-    x = x.view(-1, N)
-    M = x.shape[0]
+    M = 1
+    for dim in orig_shape[:-1]:
+        M *= dim
     out = torch.empty_like(x)
 
-    if N <= 8192:
+    if triton.next_power_of_2(N) <= _WHOLE_ROW_MAX_BLOCK_N:
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        _gemma_rmsnorm_may_2d_kernel[grid](
-            x, w, out, M, N, eps, BLOCK_N=triton.next_power_of_2(N)
+        _gemma_rmsnorm_kernel[grid](
+            x,
+            w,
+            out,
+            M,
+            N,
+            eps,
+            BLOCK_N=triton.next_power_of_2(N),
         )
     else:
         _gemma_rmsnorm_loop_kernel[M,](out, x, w, M, N, eps)

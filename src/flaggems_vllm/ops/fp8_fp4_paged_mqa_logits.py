@@ -28,9 +28,10 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flag_gems.utils.device_info import get_device_capability
-from flag_gems.utils.triton_version_utils import has_triton_tle
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+from flaggems_vllm.utils.device_info import get_device_capability
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 logger = logging.getLogger(__name__)
 
