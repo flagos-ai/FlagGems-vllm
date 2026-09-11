@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 import triton
 import triton.language as tl
@@ -40,7 +54,7 @@ def _pow2_chunks(n):
 
 @triton.autotune(configs=_ROW_CONFIGS, key=["M", "N"])
 @triton.jit
-def _gemma_rmsnorm_row_kernel(
+def _gemma_rms_norm_row_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
@@ -101,7 +115,7 @@ def _gemma_rmsnorm_row_kernel(
 
 @triton.autotune(configs=_MULTIROW_CONFIGS, key=["M", "N"])
 @triton.jit
-def _gemma_rmsnorm_multirow_kernel(
+def _gemma_rms_norm_multirow_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
@@ -130,7 +144,7 @@ def _gemma_rmsnorm_multirow_kernel(
 
 @triton.autotune(configs=_LOOP_CONFIGS, key=["M", "N"])
 @triton.jit
-def _gemma_rmsnorm_loop_kernel(
+def _gemma_rms_norm_loop_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
@@ -161,7 +175,7 @@ def _gemma_rmsnorm_loop_kernel(
         tl.store(out_ptr + base + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps=1e-6) -> torch.Tensor:
+def gemma_rms_norm(x: torch.Tensor, w: torch.Tensor, eps=1e-6) -> torch.Tensor:
     assert x.is_contiguous()
     assert w.is_contiguous()
     n = x.shape[-1]
@@ -176,7 +190,9 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps=1e-6) -> torch.Tensor:
 
     if block_n <= 1024 and m >= 256:
         # large-M x small-N: rows share one weight load, fewer programs
-        _gemma_rmsnorm_multirow_kernel[lambda META: (triton.cdiv(m, META["BLOCK_M"]),)](
+        _gemma_rms_norm_multirow_kernel[
+            lambda META: (triton.cdiv(m, META["BLOCK_M"]),)
+        ](
             x.view(m, n),
             w,
             out.view(m, n),
@@ -190,7 +206,7 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps=1e-6) -> torch.Tensor:
 
     if block_n <= 16384:
         chunks, exact = _pow2_chunks(n)
-        _gemma_rmsnorm_row_kernel[(m,)](
+        _gemma_rms_norm_row_kernel[(m,)](
             x.view(m, n),
             w,
             out.view(m, n),
@@ -204,7 +220,7 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps=1e-6) -> torch.Tensor:
         )
         return out
 
-    _gemma_rmsnorm_loop_kernel[(m,)](
+    _gemma_rms_norm_loop_kernel[(m,)](
         x.view(m, n),
         w,
         out.view(m, n),

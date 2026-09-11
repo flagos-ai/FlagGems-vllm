@@ -26,8 +26,8 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     inplace_fused_experts,
     outplace_fused_experts,
 )
-from flaggems_vllm.runtime.backend._hygon.ops.gemma_rmsnorm import (  # noqa: F401
-    gemma_rmsnorm,
+from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
+    gemma_rms_norm,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -46,7 +46,7 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "fused_experts_impl",
     "inplace_fused_experts",
-    "gemma_rmsnorm",
+    "gemma_rms_norm",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",

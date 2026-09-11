@@ -15,7 +15,6 @@
 import os
 
 # ruff: noqa: I001
-os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 os.environ["FLAGTREE_AABS"] = "0"
 
 from itertools import product  # noqa: E402
@@ -31,7 +30,7 @@ try:
 
     def baseline_op(x, w, eps=1e-5):
         out = torch.empty_like(x)
-        op.gemma_rmsnorm(out, x, w, eps)
+        op.gemma_rms_norm(out, x, w, eps)
         return out
 
     HAS_BASELINE_OP = True
@@ -41,15 +40,27 @@ except Exception as e:
 
 
 class GemmaRmsNormBenchmark(Benchmark):
-    _gemma_rmsnorm_ms = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
-    _gemma_rmsnorm_ns = [
-        512, 576, 1152, 1536, 2048, 2560, 4096, 5376,
-        6144, 8192, 12288, 16384, 24576, 32768,
+    _gemma_rms_norm_ms = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    _gemma_rms_norm_ns = [
+        512,
+        576,
+        1152,
+        1536,
+        2048,
+        2560,
+        4096,
+        5376,
+        6144,
+        8192,
+        12288,
+        16384,
+        24576,
+        32768,
     ]
-    _gemma_rmsnorm_shapes = list(product(_gemma_rmsnorm_ms, _gemma_rmsnorm_ns))
+    _gemma_rms_norm_shapes = list(product(_gemma_rms_norm_ms, _gemma_rms_norm_ns))
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = GemmaRmsNormBenchmark._gemma_rmsnorm_shapes
+        self.shapes = GemmaRmsNormBenchmark._gemma_rms_norm_shapes
 
     def get_input_iter(self, dtype):
         device = flaggems_vllm.runtime.device.name
@@ -64,13 +75,13 @@ class GemmaRmsNormBenchmark(Benchmark):
 @pytest.mark.skipif(
     not HAS_BASELINE_OP, reason="Missing baseline ops on current platform"
 )
-@pytest.mark.gemma_rmsnorm
-def test_gemma_rmsnorm():
+@pytest.mark.gemma_rms_norm
+def test_gemma_rms_norm():
     dtypes = [torch.float16, torch.float32]
     bench = GemmaRmsNormBenchmark(
-        op_name="gemma_rmsnorm",
+        op_name="gemma_rms_norm",
         torch_op=baseline_op,
         dtypes=dtypes,
     )
-    bench.set_gems(flaggems_vllm.gemma_rmsnorm)
+    bench.set_gems(flaggems_vllm.gemma_rms_norm)
     bench.run()
