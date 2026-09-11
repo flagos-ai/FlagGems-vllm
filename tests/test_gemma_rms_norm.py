@@ -13,18 +13,19 @@
 # limitations under the License.
 
 import os
-import random
-from itertools import product
-
-import pytest
-import torch
-
-import flaggems_vllm
-
-from . import accuracy_utils as utils
-from . import conftest as cfg
 
 os.environ["FLAGTREE_AABS"] = "0"
+
+import random  # noqa: E402
+from itertools import product  # noqa: E402
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+import flaggems_vllm  # noqa: E402
+
+from . import accuracy_utils as utils  # noqa: E402
+from . import conftest as cfg  # noqa: E402
 
 # hidden_size of the gemma-3 series models
 _gemma_rms_norm_ns = [1152, 3840, 5376]
