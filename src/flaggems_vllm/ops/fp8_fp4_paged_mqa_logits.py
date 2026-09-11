@@ -334,9 +334,6 @@ def _build_kv_descriptor(kv_data, num_phys_blocks, block_size, head_dim):
     kv_data is [num_phys_blocks * block_size, head_dim] uint8 (fp8 bit-cast);
     reinterpret as the 3D fp8 view and wrap it in a TMA descriptor.
     """
-    # Older backend Triton builds do not provide the optional TMA module.
-    from triton.tools.tensor_descriptor import TensorDescriptor
-
     kv3d = kv_data.view(num_phys_blocks, block_size, head_dim)
     kv3d = kv3d.view(torch.float8_e4m3fn)
     return TensorDescriptor.from_tensor(kv3d, block_shape=[1, block_size, head_dim])

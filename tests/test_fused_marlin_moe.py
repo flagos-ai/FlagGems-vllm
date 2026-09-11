@@ -153,13 +153,21 @@ QUICK_CONFIGS = [
     (32, 8, 128, 256, 4),
 ]
 
-W8A16_INT8_CONFIGS = QUICK_CONFIGS + [
-    (1, 16, 4096, 1024, 10),
-    (16, 16, 4096, 1024, 10),
-    (64, 8, 256, 512, 2),
-]
-
-W8A16_FP8_CONFIGS = QUICK_CONFIGS + [(1, 16, 4096, 1024, 10)]
+W8A16_CONFIGS = (
+    QUICK_CONFIGS[:2]
+    if cfg.QUICK_MODE
+    else QUICK_CONFIGS
+    + [
+        (tokens, experts, hidden, intermediate, topk)
+        for experts, hidden, intermediate, topk in (
+            (8, 4096, 14336, 2),  # Mixtral-8x7B
+            (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
+            (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
+            (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+        )
+        for tokens in (1, 16, 64, 256)
+    ]
+)
 
 if cfg.QUICK_MODE:
     FULL_CONFIGS = QUICK_CONFIGS[:2]
@@ -586,6 +594,19 @@ def _reference_swiglu_moe(
     return out
 
 
+def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
+    """FP32 MoE reference with one weight conversion per active expert."""
+    ref = torch.zeros_like(hs, dtype=torch.float32)
+    for expert in range(w1_ref.shape[0]):
+        tokens, slots = torch.where(ti == expert)
+        if tokens.numel() == 0:
+            continue
+        gate, up = (hs[tokens].float() @ w1_ref[expert].float().T).chunk(2, dim=-1)
+        values = (torch.nn.functional.silu(gate) * up) @ w2_ref[expert].float().T
+        ref.index_add_(0, tokens, values * tw[tokens, slots, None].float())
+    return ref
+
+
 @pytest.mark.skipif(
     not _is_hopper(),
     reason="W4A16 fast path uses Hopper-only bf16 SIMD PTX (sm_90+)",
@@ -717,14 +738,21 @@ def test_fused_marlin_moe_w8a16_empty_and_invalid(precision):
 
 
 @pytest.mark.parametrize("concentrated", [False, True])
-def test_fused_marlin_moe_w8a16_shared_routing(concentrated):
-    t, e, k, block_m = 65, 16, 2, 16
+@pytest.mark.parametrize("zero_output", [False, True])
+@pytest.mark.parametrize("t,block_m", [(1, 2), (4, 4), (16, 1), (16, 4), (65, 16)])
+def test_fused_marlin_moe_w8a16_shared_routing(concentrated, zero_output, t, block_m):
+    e, k = 16, 2
     dispatch = torch.arange(t * k, device=flaggems_vllm.device).reshape(t, k)
     ids = dispatch % (2 if concentrated else e)
     weights = (dispatch + 1).float() / (t * k)
-    tids, experts, sorted_weights, capacity = _prepare_w8a16_routing(
-        ids, weights, e, block_m
+    output = (
+        torch.full((t, 128), 3.0, device=flaggems_vllm.device) if zero_output else None
     )
+    tids, experts, sorted_weights, capacity = _prepare_w8a16_routing(
+        ids, weights, e, block_m, output=output
+    )
+    if output is not None:
+        assert torch.count_nonzero(output) == 0
     tids, experts, sorted_weights = tids.cpu(), experts.cpu(), sorted_weights.cpu()
     ids, weights = ids.cpu(), weights.cpu()
     actual = []
@@ -838,16 +866,11 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
         ti,
         QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128,
     )
-    ref = torch.zeros_like(hs, dtype=torch.float32)
-    for expert in range(w1.shape[0]):
-        tokens, slots = torch.where(ti == expert)
-        gate, up = (hs[tokens].float() @ w1_ref[expert].float().T).chunk(2, dim=-1)
-        values = (torch.nn.functional.silu(gate) * up) @ w2_ref[expert].float().T
-        ref.index_add_(0, tokens, values * tw[tokens, slots, None].float())
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
-@pytest.mark.parametrize("config", W8A16_INT8_CONFIGS)
+@pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_int8(config, dtype):
     """Compare fused_marlin_moe (unpacked INT8) against PyTorch reference (dequant)."""
@@ -875,7 +898,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
         topk_weights=tw,
         topk_ids=ti,
     )
-    ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     torch.cuda.synchronize()
     # INT8 should be tighter than INT4; same vLLM Marlin metric.
     max_diff = compute_max_diff(result.float(), ref)
@@ -988,7 +1011,7 @@ def test_rejects_fp8_input_dtype():
 
 
 @pytest.mark.skipif(not _is_hopper(), reason="W(FP8)A16 fast path requires Hopper")
-@pytest.mark.parametrize("config", W8A16_FP8_CONFIGS)
+@pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
@@ -1015,7 +1038,7 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         topk_weights=tw,
         topk_ids=ti,
     )
-    ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     torch.cuda.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"

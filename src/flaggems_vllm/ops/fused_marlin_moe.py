@@ -3496,96 +3496,6 @@ def _launch_w8a16_down(
 
 
 @triton.jit
-def moe_direct_route_padded_kernel(
-    topk_ids,
-    topk_weights,
-    stride_tid,
-    stride_tk,
-    stride_wt,
-    stride_wk,
-    out_token_ids,
-    out_expert_ids,
-    out_weights,
-    num_dispatch,
-    num_tokens,
-    top_k: tl.constexpr,
-    block_size_m: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Expand routes directly into one padded BSM block per dispatch."""
-    row_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    dispatch_ids = row_ids // block_size_m
-    lanes = row_ids - dispatch_ids * block_size_m
-    valid_rows = dispatch_ids < num_dispatch
-    route_mask = valid_rows & (lanes == 0)
-
-    token_ids = dispatch_ids // top_k
-    topk_slots = dispatch_ids - token_ids * top_k
-    expert_ids = tl.load(
-        topk_ids + token_ids * stride_tid + topk_slots * stride_tk,
-        mask=route_mask,
-        other=0,
-    )
-    weights = tl.load(
-        topk_weights + token_ids * stride_wt + topk_slots * stride_wk,
-        mask=route_mask,
-        other=0.0,
-    )
-
-    padded_token_ids = tl.where(route_mask, token_ids, num_tokens)
-    padded_weights = tl.where(route_mask, weights, 0.0)
-    tl.store(
-        out_token_ids + row_ids,
-        padded_token_ids.to(tl.int64),
-        mask=valid_rows,
-    )
-    tl.store(out_weights + row_ids, padded_weights, mask=valid_rows)
-    tl.store(
-        out_expert_ids + dispatch_ids,
-        expert_ids.to(tl.int64),
-        mask=route_mask,
-    )
-
-
-def _prepare_direct_routing(
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    num_tokens: int,
-    top_k: int,
-    block_size_m: int,
-):
-    """Build BSM routing in one launch when expert reuse is negligible."""
-    num_dispatch = num_tokens * top_k
-    num_post_padded = num_dispatch * block_size_m
-    device = topk_ids.device
-    sorted_token_ids = torch.empty(num_post_padded, dtype=torch.int64, device=device)
-    expert_ids_per_block = torch.empty(num_dispatch, dtype=torch.int64, device=device)
-    sorted_weights = torch.empty(
-        num_post_padded, dtype=topk_weights.dtype, device=device
-    )
-    route_block = 256
-    grid = (triton.cdiv(num_post_padded, route_block),)
-    moe_direct_route_padded_kernel[grid](
-        topk_ids,
-        topk_weights,
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        sorted_token_ids,
-        expert_ids_per_block,
-        sorted_weights,
-        num_dispatch,
-        num_tokens,
-        top_k,
-        block_size_m,
-        BLOCK=route_block,
-        num_warps=4,
-    )
-    return sorted_token_ids, expert_ids_per_block, sorted_weights, num_post_padded
-
-
-@triton.jit
 def _unpack_w8a16_routing(
     dispatch_ids,
     expert_ids,
@@ -3594,10 +3504,13 @@ def _unpack_w8a16_routing(
     token_ids_out,
     expert_ids_out,
     weights_out,
+    output,
+    output_size,
     capacity,
     num_tokens,
     top_k: tl.constexpr,
     block_size_m: tl.constexpr,
+    ZERO_OUTPUT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Adapt shared dispatch-id routing to the W8A16 token-id/weight layout."""
@@ -3612,20 +3525,37 @@ def _unpack_w8a16_routing(
     tl.store(weights_out + rows, weights, mask=rows < capacity)
     experts = tl.load(expert_ids + rows, mask=rows < count // block_size_m, other=-1)
     tl.store(expert_ids_out + rows, experts, mask=rows < capacity // block_size_m)
+    if ZERO_OUTPUT:
+        tl.store(output + rows, 0.0, mask=rows < output_size)
 
 
-def _prepare_w8a16_routing(topk_ids, topk_weights, num_experts, block_size_m):
+def _prepare_w8a16_routing(
+    topk_ids, topk_weights, num_experts, block_size_m, output=None
+):
     """Reuse shared expert grouping without host synchronization or capture branches."""
-    dispatch_ids, expert_ids, padded_count = moe_align_block_size(
-        topk_ids, block_size_m, num_experts, pad_sorted_ids=True
-    )
+    if topk_ids.shape[0] <= 16:
+        # Preserve one route per block without sorting sparse expert assignments.
+        dispatch_ids, expert_ids, padded_count = moe_align_block_size_singleton(
+            topk_ids, block_size_m
+        )
+        # Each adapter lane reads only its own route before overwriting it.
+        token_ids, experts = dispatch_ids, expert_ids
+    else:
+        dispatch_ids, expert_ids, padded_count = moe_align_block_size(
+            topk_ids, block_size_m, num_experts, pad_sorted_ids=True
+        )
+        token_ids = torch.empty(
+            (dispatch_ids.numel(),), dtype=torch.int64, device=topk_ids.device
+        )
+        experts = torch.empty(
+            (dispatch_ids.numel() // block_size_m,),
+            dtype=torch.int64,
+            device=topk_ids.device,
+        )
     capacity = dispatch_ids.numel()
-    token_ids = torch.empty((capacity,), dtype=torch.int64, device=topk_ids.device)
-    experts = torch.empty(
-        (capacity // block_size_m,), dtype=torch.int64, device=topk_ids.device
-    )
     weights = torch.empty((capacity,), dtype=topk_weights.dtype, device=topk_ids.device)
-    _unpack_w8a16_routing[(triton.cdiv(capacity, 256),)](
+    output_size = output.numel() if output is not None else 0
+    _unpack_w8a16_routing[(triton.cdiv(max(capacity, output_size), 256),)](
         dispatch_ids,
         expert_ids,
         padded_count,
@@ -3633,10 +3563,13 @@ def _prepare_w8a16_routing(topk_ids, topk_weights, num_experts, block_size_m):
         token_ids,
         experts,
         weights,
+        output,
+        output_size,
         capacity,
         topk_ids.shape[0],
         topk_ids.shape[1],
         block_size_m,
+        ZERO_OUTPUT=output is not None,
         BLOCK=256,
     )
     return token_ids, experts, weights, capacity
@@ -4010,18 +3943,19 @@ def _fused_marlin_moe_w8a16(
         return result if destination is None else destination
     with runtime.torch_device_fn.device(hidden_states.device):
         output_grid = (triton.cdiv(result.numel(), 1024),)
-        _w8a16_output_kernel[output_grid](
-            result, result, result.numel(), ZERO=True, BLOCK=1024
-        )
         if t <= 16:
             if use_fp8:
                 block_m = 2 if t == 1 else 4
             else:
                 block_m = 1 if t == 16 else _select_bsm_block_m(t, e, top_k)
-            routing = _prepare_direct_routing(topk_ids, topk_weights, t, top_k, block_m)
         else:
+            _w8a16_output_kernel[output_grid](
+                result, result, result.numel(), ZERO=True, BLOCK=1024
+            )
             block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
-            routing = _prepare_w8a16_routing(topk_ids, topk_weights, e, block_m)
+        routing = _prepare_w8a16_routing(
+            topk_ids, topk_weights, e, block_m, output=result if t <= 16 else None
+        )
         quant_config = _W8A16Config(use_fp8=use_fp8, group_size=group_size)
         invoke_fused_moe_full_swiglu(
             hidden_states,
@@ -4153,6 +4087,9 @@ def fused_marlin_moe(
     ``quant_type_id`` uses this module's ``QUANT_TYPE_*`` constants. W8 weights
     have shapes ``w1[E, 2I, H]`` and ``w2[E, H, I]``; packed Marlin INT32 weights
     and vLLM scalar-type IDs must be converted before calling this entry point.
+    No automatic Marlin layout conversion is performed here. The benchmarks
+    compare equal quantized weights in each implementation's required layout,
+    with layout conversion excluded from timing; this is not a drop-in Marlin API.
     """
     # ---- MVP guardrails --------------------------------------------------
     if quant_type_id not in _SUPPORTED_QUANT_TYPES:

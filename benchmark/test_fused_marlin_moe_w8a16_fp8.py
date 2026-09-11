@@ -111,7 +111,7 @@ def _marlin_repack_per_expert_fp8(w_q, scales, dtype):
 
 
 class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
-    """FlagGems W(fp8)A16 against vLLM Marlin W(fp8)A16."""
+    """Compare the same E4M3 codes/scales in native and Marlin-repacked layouts."""
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
@@ -119,17 +119,14 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            (1, 512, 4096, 1024, 10),
-            (4, 512, 4096, 1024, 10),
-            (16, 512, 4096, 1024, 10),
-            (64, 512, 4096, 1024, 10),
-            (128, 512, 4096, 1024, 10),
-            (256, 512, 4096, 1024, 10),
-            (512, 512, 4096, 1024, 10),
-            (1024, 512, 4096, 1024, 10),
-            (4096, 512, 4096, 1024, 10),
-            (16384, 512, 4096, 1024, 10),
-            (32768, 512, 4096, 1024, 10),
+            (tokens, experts, hidden, intermediate, topk)
+            for experts, hidden, intermediate, topk in (
+                (8, 4096, 14336, 2),  # Mixtral-8x7B
+                (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
+                (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
+                (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+            )
+            for tokens in (1, 16, 64, 256)
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -143,6 +140,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         cached = self._weight_cache.get(cache_key)
         if cached is not None:
             return cached
+        self._weight_cache.clear()
 
         w1_fp = (
             torch.randn(
