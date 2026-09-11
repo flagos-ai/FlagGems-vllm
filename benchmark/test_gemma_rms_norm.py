@@ -14,7 +14,9 @@
 
 import os
 
+# ruff: noqa: I001
 os.environ["FLAGTREE_AABS"] = "0"
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 from itertools import product  # noqa: E402
 
@@ -22,27 +24,50 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 import flaggems_vllm  # noqa: E402
-
-from . import base  # noqa: E402
+from benchmark.base import Benchmark  # noqa: E402
 
 vendor = flaggems_vllm.vendor_name
-
-baseline_op = None
-HAS_BASELINE_OP = False
-
 try:
-    import torch_npu
+    if vendor == "nvidia" or vendor == "thead":
 
-    baseline_op = torch_npu.npu_gemma_rms_norm
-    HAS_BASELINE_OP = True
+        os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+        from flashinfer.norm import gemma_rmsnorm as baseline_op
+
+        HAS_BASELINE_OP = True
+    elif vendor == "hygon":
+
+        from lightop import op
+
+        def baseline_op(x, w, eps=1e-5):
+            out = torch.empty_like(x)
+            op.gemma_rmsnorm(out, x, w, eps)
+            return out
+
+        HAS_BASELINE_OP = True
+    elif vendor == "ascend":
+
+        from torch_npu import npu_gemma_rms_norm as baseline_op
+
+        HAS_BASELINE_OP = True
 except Exception as e:
     print(e)
     HAS_BASELINE_OP = False
 
 
-class GemmaRmsNormBenchmark(base.Benchmark):
-    _gemma_rms_norm_ns = [1152, 5376, 16384]
-    _gemma_rms_norm_ms = [1, 32, 128, 256]
+class GemmaRmsNormBenchmark(Benchmark):
+    # Shapes aligned to powers of two and the hidden dimensions of the Gemma‑series models
+    _gemma_rms_norm_ns = [128, 256, 1024, 16384] + [
+        1152,
+        2048,
+        2560,
+        3072,
+        3584,
+        3840,
+        4608,
+        5376,
+    ]
+    # Batch size
+    _gemma_rms_norm_ms = [1, 256, 1024]
     _gemma_rms_norm_shapes = list(product(_gemma_rms_norm_ms, _gemma_rms_norm_ns))
 
     def set_shapes(self, shape_file_path=None):
@@ -59,11 +84,11 @@ class GemmaRmsNormBenchmark(base.Benchmark):
 
 
 @pytest.mark.skipif(
-    not HAS_BASELINE_OP, reason="Missing baseline ops on current platform"
+    not HAS_BASELINE_OP, reason=f"Missing baseline ops on current platform: {vendor}"
 )
 @pytest.mark.gemma_rms_norm
 def test_gemma_rms_norm():
-    dtypes = [torch.bfloat16]
+    dtypes = [torch.float16]
     bench = GemmaRmsNormBenchmark(
         op_name="gemma_rms_norm",
         torch_op=baseline_op,
