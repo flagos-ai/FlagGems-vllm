@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
 
@@ -34,6 +36,23 @@ from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
 
 from . import base
+
+
+def _mhc_tle_op(op, enabled):
+    """Wrap op with FLAGGEMS_MHC_TLE forced (the ops read it at call time)."""
+
+    def wrapped(*args, **kwargs):
+        old = os.environ.get("FLAGGEMS_MHC_TLE")
+        os.environ["FLAGGEMS_MHC_TLE"] = "1" if enabled else "0"
+        try:
+            return op(*args, **kwargs)
+        finally:
+            if old is None:
+                os.environ.pop("FLAGGEMS_MHC_TLE", None)
+            else:
+                os.environ["FLAGGEMS_MHC_TLE"] = old
+
+    return wrapped
 
 
 class MHCPostBenchmark(base.Benchmark):
@@ -111,9 +130,7 @@ class MHCPreBenchmark(base.Benchmark):
             )
             fn = (
                 torch.randn(
-                    (hc_mult3, hc_mult, hidden_size),
-                    dtype=torch.float,
-                    device=device,
+                    (hc_mult3, hc_mult, hidden_size), dtype=torch.float, device=device
                 )
                 * 1e-4
                 * (1 + torch.arange(hc_mult, device=device).mul(0.01).view(1, -1, 1))
@@ -141,6 +158,60 @@ def test_mhc_pre():
         torch_op=mhc_pre_ref,
         gems_op=mhc_pre,
         dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+class MHCPreTLEDBenchmark(MHCPreBenchmark):
+    """Benchmark mhc_pre TLE kernels (FLAGGEMS_MHC_TLE=1) vs original kernels (=0)."""
+
+
+@pytest.mark.mhc_pre_tle
+def test_mhc_pre_tle():
+    bench = MHCPreTLEDBenchmark(
+        op_name="mhc_pre_tle",
+        torch_op=_mhc_tle_op(mhc_pre, False),  # original kernels (fallback path)
+        gems_op=_mhc_tle_op(mhc_pre, True),  # TLE kernels (in-place branch)
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+class MHCPreTLEDHc2Benchmark(MHCPreTLEDBenchmark):
+    """Benchmark the TLE generic (hc_mult != 4) path: optimized vs TLE smem-Sinkhorn."""
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (512, 1280),
+            (2048, 2560),
+            (8192, 4096),
+        ]
+
+
+class MHCPostTLEDBenchmark(MHCPostBenchmark):
+    """Benchmark mhc_post TLE kernels (FLAGGEMS_MHC_TLE=1) vs original kernels (=0)."""
+
+
+@pytest.mark.mhc_post_tle
+def test_mhc_post_tle():
+    bench = MHCPostTLEDBenchmark(
+        op_name="mhc_post_tle",
+        torch_op=_mhc_tle_op(mhc_post, False),  # original kernels (fallback path)
+        gems_op=_mhc_tle_op(mhc_post, True),  # TLE kernels (in-place branch)
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.mhc_pre_tle
+def test_mhc_pre_tle_hc2():
+    """hc_mult=2: optimized generic kernel vs TLE smem-Sinkhorn generic kernel."""
+    bench = MHCPreTLEDHc2Benchmark(
+        op_name="mhc_pre_tle_hc2",
+        torch_op=_mhc_tle_op(mhc_pre, False),  # original kernels (fallback path)
+        gems_op=_mhc_tle_op(mhc_pre, True),  # TLE kernels (in-place branch)
+        dtypes=[torch.bfloat16],
+        hc_mult=2,
     )
     bench.run()
 
@@ -262,9 +333,7 @@ class HCHeadFusedBenchmark(base.Benchmark):
             torch.manual_seed(42)
             hs_flat = torch.randn((n, hc_mult, hidden_size), dtype=dtype, device=device)
             fn = torch.randn(
-                (hc_mult, hc_mult * hidden_size),
-                dtype=torch.float32,
-                device=device,
+                (hc_mult, hc_mult * hidden_size), dtype=torch.float32, device=device
             )
             hc_scale = torch.randn((1,), dtype=torch.float32, device=device) * 0.1
             hc_base = torch.randn((hc_mult,), dtype=torch.float32, device=device) * 0.1
@@ -277,15 +346,7 @@ def _hc_head_fused_kernel_ref(
     hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
 ):
     _vllm_hc_head_fused(
-        hs_flat,
-        fn,
-        hc_scale,
-        hc_base,
-        out,
-        hidden_size,
-        rms_eps,
-        hc_eps,
-        hc_mult,
+        hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
     )
     return out
 
