@@ -12,8 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._hygon.fused.moe_sum import moe_sum
+from flaggems_vllm.runtime.backend._hygon.fused.fused_moe import (  # noqa: F401
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._hygon.fused.moe_align_block_size import (  # noqa: F401
+    moe_align_block_size,
+)
+from flaggems_vllm.runtime.backend._hygon.fused.moe_sum import moe_sum  # noqa: F401
 
 __all__ = [
+    "fused_experts_impl",
+    "inplace_fused_experts",
+    "outplace_fused_experts",
+    "moe_align_block_size",
     "moe_sum",
 ]
