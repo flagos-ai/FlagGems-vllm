@@ -279,9 +279,7 @@ def _load_fp8_block_descales(
 
 
 @triton.jit
-def _fp8_pv_dot(
-    P, V, acc, v_descale, fp8_p_max: tl.constexpr, fp8_dtype: tl.constexpr
-):
+def _fp8_pv_dot(P, V, acc, v_descale, fp8_p_max: tl.constexpr, fp8_dtype: tl.constexpr):
     if fp8_p_max == 448.0:
         # The scaled row sum cancels the factor of 256 during normalization.
         P_fp8 = P.to(fp8_dtype)
@@ -791,9 +789,7 @@ def flash_fwd_kernel(
                         mask=kvmask[:, None] & v_dmask[None, :],
                         cache_modifier=".cg",
                     )
-            acc_ = _fp8_pv_dot(
-                P, V, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty
-            )
+            acc_ = _fp8_pv_dot(P, V, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty)
 
     for col_start in tl.range(
         col_min, col_max - masking_cols, step=BLOCK_N, num_stages=num_stages
@@ -1238,9 +1234,7 @@ def flash_fwd_splitkv_kernel(
                         other=0.0,
                     )
             # split-KV PV uses an in-kernel FP8 P tile and FP8 V.
-            acc_ = _fp8_pv_dot(
-                P, V, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty
-            )
+            acc_ = _fp8_pv_dot(P, V, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty)
     else:
         for n_block in tl.range(split_block_min, min(split_block_max, n_block_max)):
             kv_off = n_block * BLOCK_N * k_row_stride
@@ -1346,9 +1340,7 @@ def flash_fwd_splitkv_kernel(
                         other=0.0,
                     )
             # masked split-KV PV runs as FP8 P * FP8 V.
-            acc_ = _fp8_pv_dot(
-                P, V, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty
-            )
+            acc_ = _fp8_pv_dot(P, V, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty)
 
     # LSE
     lse = tl.where(

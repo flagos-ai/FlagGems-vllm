@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fp8_einsum:
+  shapes:
+    - [1, 8, 4096, 1024]
+    - [16, 8, 4096, 1024]
+    - [128, 8, 4096, 1024]
+    - [4096, 8, 4096, 1024]
+    - [1, 16, 7168, 1024]
+    - [16, 16, 7168, 1024]
+    - [128, 16, 7168, 1024]
+    - [4096, 16, 7168, 1024]
+  shape_desc: "b, h, r, d"
+
 single_dim_shapes: &single_dim_shapes
   shapes:
     - [64]

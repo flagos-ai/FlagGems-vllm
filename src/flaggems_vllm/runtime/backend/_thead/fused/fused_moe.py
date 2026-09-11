@@ -22,11 +22,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
-from flaggems_vllm.runtime.backend._thead.fused.moe_align_block_size import (
-    moe_align_block_size,
-)
 from flaggems_vllm.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
@@ -1815,12 +1813,14 @@ def fused_experts_impl(
         )
 
         if not naive_block_assignment:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                curr_topk_ids,
-                base_config["BLOCK_SIZE_M"],
-                global_num_experts,
-                expert_map,
-                # ignore_invalid_experts=True,
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size_no_tle(
+                    curr_topk_ids,
+                    base_config["BLOCK_SIZE_M"],
+                    global_num_experts,
+                    expert_map,
+                    # ignore_invalid_experts=True,
+                )
             )
         else:
             max_num_tokens_padded = topk_ids.numel() * base_config["BLOCK_SIZE_M"]

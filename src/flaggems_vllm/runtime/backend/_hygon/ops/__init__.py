@@ -18,10 +18,16 @@ from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # no
 from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
+    fused_add_rms_norm,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
+    gemma_rms_norm,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -40,6 +46,7 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "fused_experts_impl",
     "inplace_fused_experts",
+    "gemma_rms_norm",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
@@ -50,4 +57,5 @@ __all__ = [
     "scaled_int8_quant",
     "triton_scaled_mm",
     "fused_q_kv_rmsnorm",
+    "fused_add_rms_norm",
 ]
