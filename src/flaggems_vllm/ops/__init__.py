@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.fused_marlin_moe_w4a16_int4 import fused_marlin_moe_w4a16_int4
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -147,6 +148,7 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 # isort: on
 
 __all__ = [
+    "fused_marlin_moe_w4a16_int4",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
