@@ -18,12 +18,34 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flag_gems import runtime
-from flag_gems.utils import libentry, libtuner
-from flag_gems.utils.device_info import get_device_capability
-from flag_gems.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm import runtime
+from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.device_info import get_device_capability
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _e2m1_to_f32(nibble):
+    """Dequantize an E2M1 nibble (uint8 in [0, 16)) to fp32.
+
+    E2M1 bit layout: bit3 = sign, bits[2:1] = 2-bit exponent (bias 1),
+    bit0 = 1-bit mantissa. Representable magnitudes: {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+    Matches the quantization used by `fused_indexer_q_rope_quant(use_fp4=True)`.
+    """
+    n = nibble.to(tl.int32)
+    sign = 1.0 - 2.0 * ((n >> 3) & 1).to(tl.float32)
+    e = (n >> 1) & 0x3
+    m = (n & 0x1).to(tl.float32)
+    mag = tl.where(
+        e == 0,
+        0.5 * m,
+        tl.where(e == 1, 1.0 + 0.5 * m, tl.where(e == 2, 2.0 + m, 4.0 + 2.0 * m)),
+    )
+    return sign * mag
+
+
 
 # =============================================================================
 # TLE (WGMMA) fast path — purely additive. The tuned baseline below is left
@@ -201,6 +223,143 @@ def _clean_logits_kernel(
     )
 
 
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("fp8_fp4_mqa_logits"),
+    key=["M", "N", "H", "D"],
+)
+@triton.jit
+def _fp8_fp4_mqa_logits_mxfp4_kernel(
+    Q_ptr,  # uint8 [M, H, D//2] packed E2M1 (2 nibbles per byte)
+    Q_scale_ptr,  # int32 [M, H] holding D//32 ue8m0 bytes (little-endian)
+    K_ptr,  # fp8 [N, D]
+    K_scale_ptr,  # fp32 [N] per-token scale
+    W_ptr,  # fp32 [M, H] per-head weights (NO q_scale folded)
+    O_ptr,  # fp32 [M, N]
+    M,
+    N,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_qsm,
+    stride_qsh,
+    stride_kn,
+    stride_kd,
+    stride_om,
+    stride_on,
+    stride_wm,
+    stride_wh,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+):
+    """Fused MXFP4 MQA logits with software E2M1 dequant + fp16 MMA.
+
+    Consumes MXFP4 Q (packed E2M1 values + ue8m0 per-32 block scales) against
+    FP8 K with per-token fp32 scales. K stays fp8 because the flaggems K-side
+    producer (`indexer_k_quant_and_cache`) does not emit fp4.
+
+    logits[m, n] = sum_h( ReLU( sum_d(q[m,h,d]*k[n,d]) * k_scale[n] ) * w[m,h] )
+    with q[m,h,d] = e2m1(packed[m,h,d//2], d%2) * 2^(ue8m0[m,h,d//32] - 127).
+    """
+    D2: tl.constexpr = D // 2
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    d_offs = tl.arange(0, D)
+    d2_offs = tl.arange(0, D2)
+
+    m_mask = m_offs < M
+    n_mask = n_offs < N
+
+    # K is fp8 [N, D] with per-token fp32 scale; upcast to fp16 for the MMA.
+    k = tl.load(
+        K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
+        mask=n_mask[:, None] & (d_offs[None, :] < D),
+        other=0.0,
+    ).to(tl.float16)
+
+    k_scale = tl.load(K_scale_ptr + n_offs, mask=n_mask, other=0.0)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    # Per-dim scale block index: dim d belongs to ue8m0 block d // 32.
+    block_id = (d_offs // 32)[None, None, :]  # [1, 1, D]
+
+    for hb in range(0, H, HEAD_BLOCK):
+        hb_offs = hb + tl.arange(0, HEAD_BLOCK)
+
+        # Packed Q bytes: [BLOCK_M, HEAD_BLOCK, D//2]
+        q_packed = tl.load(
+            Q_ptr
+            + m_offs[:, None, None] * stride_qm
+            + hb_offs[None, :, None] * stride_qh
+            + d2_offs[None, None, :] * stride_qd,
+            mask=m_mask[:, None, None]
+            & (hb_offs[None, :, None] < H)
+            & (d2_offs[None, None, :] < D2),
+            other=0,
+        )
+
+        # Unpack nibbles: low nibble = even dim, high nibble = odd dim.
+        lo = q_packed & 0xF
+        hi = (q_packed >> 4) & 0xF
+        nibble = tl.reshape(tl.join(lo, hi), [BLOCK_M, HEAD_BLOCK, D])
+
+        q_f32 = _e2m1_to_f32(nibble)
+
+        # Per-block ue8m0 scale: extract the byte for each dim's block.
+        q_scale_val = tl.load(
+            Q_scale_ptr
+            + m_offs[:, None] * stride_qsm
+            + hb_offs[None, :] * stride_qsh,
+            mask=m_mask[:, None] & (hb_offs[None, :] < H),
+            other=0,
+        )  # [BLOCK_M, HEAD_BLOCK] int32
+        byte = ((q_scale_val[:, :, None] >> (8 * block_id)) & 0xFF).to(tl.float32)
+        scale = tl.exp2(byte - 127.0)  # [BLOCK_M, HEAD_BLOCK, D]
+
+        q_f32 = q_f32 * scale
+
+        # Flatten to 2D for MMA: [BLOCK_M * HEAD_BLOCK, D]
+        q_2d = tl.reshape(q_f32, [BLOCK_M * HEAD_BLOCK, D]).to(tl.float16)
+
+        # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
+        dot = tl.dot(q_2d, tl.trans(k))
+
+        # Fused k_scale + ReLU activation
+        dot = tl.maximum(dot * k_scale[None, :], 0.0)
+
+        # Load weights for this head batch: [BLOCK_M, HEAD_BLOCK]
+        w = tl.load(
+            W_ptr + m_offs[:, None] * stride_wm + hb_offs[None, :] * stride_wh,
+            mask=m_mask[:, None] & (hb_offs[None, :] < H),
+            other=0.0,
+        )
+
+        # Weight each head's contribution
+        w_flat = tl.reshape(w, [BLOCK_M * HEAD_BLOCK])
+        dot = dot * w_flat[:, None]
+
+        # Reduce over head dimension: [BLOCK_M, HEAD_BLOCK, BLOCK_N] -> sum
+        dot_3d = tl.reshape(dot, [BLOCK_M, HEAD_BLOCK, BLOCK_N])
+        dot_reduced = tl.sum(dot_3d, axis=1)
+
+        acc += dot_reduced
+
+    # Store output tile
+    write_mask = m_mask[:, None] & n_mask[None, :]
+    out_ptrs = O_ptr + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
+    tl.store(out_ptrs, acc, mask=write_mask)
+
+
 @libentry()
 @triton.jit
 def _fp8_fp4_mqa_logits_kernel_tle(
@@ -375,7 +534,7 @@ def fp8_fp4_mqa_logits(
 ) -> torch.Tensor:
     """Triton implementation of fp8_fp4_mqa_logits.
 
-    Computes weighted MQA logits with FP8 quantized Q and K tensors.
+    Computes weighted MQA logits with FP8 or MXFP4 quantized Q and FP8 K.
     Uses head-batched tiled dot products with K reuse for high throughput.
 
     On Hopper+ (SM90) with TLE available, shapes with D >= 256 (K tile exceeds
@@ -383,7 +542,11 @@ def fp8_fp4_mqa_logits(
     shape keeps the tuned baseline below. See TLE_OPTIMIZATION_CASE_STUDY.md.
 
     Args:
-        q: Tuple of (q_values [M, H, D] fp8, q_scale or None).
+        q: Tuple of (q_values, q_scale).
+            FP8 path: q_values [M, H, D] float8_e4m3fn, q_scale is None
+                (per-token q_scale already folded into `weights`).
+            FP4 path: q_values [M, H, D//2] uint8 (packed E2M1), q_scale
+                [M, H] int32 (D//32 ue8m0 bytes per token-head, little-endian).
         kv: Tuple of (k_values [N, D] fp8, k_scales [N] fp32).
         weights: [M, H] fp32 per-head weights.
         cu_seqlen_ks: [M] int32 start indices for valid K range.
@@ -395,22 +558,54 @@ def fp8_fp4_mqa_logits(
     """
     logger.debug("GEMS FP8_FP4_MQA_LOGITS")
 
-    q_values, _ = q
+    q_values, q_scale = q
     k_values, k_scales = kv
 
-    M, H, D = q_values.shape
-    N = k_values.shape[0]
+    logits = torch.empty(
+        (q_values.shape[0], k_values.shape[0]),
+        dtype=torch.float32,
+        device=q_values.device,
+    )
 
-    logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
+    grid = lambda META: (
+        triton.cdiv(q_values.shape[0], META["BLOCK_M"]),
+        triton.cdiv(k_values.shape[0], META["BLOCK_N"]),
+    )
 
-    if _can_use_tle(M, N, H, D):
-        _launch_tle_kernel(q_values, k_values, k_scales, weights, logits, M, N, H, D)
-    else:
-        grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_M"]),
-            triton.cdiv(N, META["BLOCK_N"]),
+    if q_scale is not None:
+        # MXFP4 Q path: q_values is packed uint8 [M, H, D//2], q_scale is
+        # int32 [M, H] holding D//32 ue8m0 bytes per (token, head).
+        M, H, D2 = q_values.shape
+        D = D2 * 2
+        N = k_values.shape[0]
+        assert k_values.shape[1] == D
+
+        _fp8_fp4_mqa_logits_mxfp4_kernel[grid](
+            q_values,
+            q_scale,
+            k_values,
+            k_scales,
+            weights,
+            logits,
+            M,
+            N,
+            H,
+            D,
+            q_values.stride(0),
+            q_values.stride(1),
+            q_values.stride(2),
+            q_scale.stride(0),
+            q_scale.stride(1),
+            k_values.stride(0),
+            k_values.stride(1),
+            logits.stride(0),
+            logits.stride(1),
+            weights.stride(0),
+            weights.stride(1),
         )
-
+    else:
+        M, H, D = q_values.shape
+        N = k_values.shape[0]
         _fp8_fp4_mqa_logits_kernel[grid](
             q_values,
             k_values,
@@ -452,3 +647,4 @@ def fp8_fp4_mqa_logits(
         )
 
     return logits
+
