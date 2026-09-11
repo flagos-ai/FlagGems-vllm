@@ -82,7 +82,7 @@ except NotImplementedError as e:
    ```python
    # Identity case
    x = torch.eye(4, device='cuda')
-   
+
    # Small random
    x = torch.randn(4, 4, device='cuda') * 0.1
    ```
@@ -98,7 +98,7 @@ except NotImplementedError as e:
    ```python
    for _ in range(10):  # Warmup
        flaggems_vllm.my_operator(x)
-   
+
    import time
    torch.cuda.synchronize()
    start = time.time()

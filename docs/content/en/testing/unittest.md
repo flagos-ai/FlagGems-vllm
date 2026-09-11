@@ -113,13 +113,13 @@ from tests.accuracy_utils import to_reference, gems_assert_close
 def test_grouped_topk(shape, dtype):
     # Setup
     scores = torch.randn(shape, device='cuda', dtype=dtype)
-    
+
     # FlagGems-vllm implementation
     result = flaggems_vllm.grouped_topk(scores, ...)
-    
+
     # Reference implementation
     ref_result = reference_grouped_topk(to_reference(scores), ...)
-    
+
     # Validation
     gems_assert_close(result, ref_result, rtol=1e-3, atol=1e-4)
 ```
@@ -251,10 +251,10 @@ from tests.accuracy_utils import to_reference, gems_assert_close
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_my_new_op(shape, dtype):
     input_tensor = torch.randn(shape, device='cuda', dtype=dtype)
-    
+
     result = flaggems_vllm.my_new_op(input_tensor)
     expected = reference_my_new_op(to_reference(input_tensor))
-    
+
     gems_assert_close(result, expected, rtol=1e-3, atol=1e-5)
 ```
 

@@ -104,10 +104,10 @@ from benchmark.conftest import Config
 def test_moe_align_block_size_perf(benchmark, shape, dtype):
     # Setup
     inputs = create_inputs(shape, dtype)
-    
+
     # Benchmark
     result = benchmark(lambda: flaggems_vllm.moe_align_block_size(*inputs))
-    
+
     # Validation
     assert result is not None
 ```

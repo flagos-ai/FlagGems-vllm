@@ -53,7 +53,7 @@ Edit `src/flaggems_vllm/runtime/device_finder.py`:
 ```python
 def detect_vendor():
     # Existing detection logic...
-    
+
     # Add your backend
     try:
         import myvendor_torch  # Vendor's PyTorch extension
@@ -61,7 +61,7 @@ def detect_vendor():
             return "myvendor"
     except ImportError:
         pass
-    
+
     return "nvidia"  # default
 ```
 

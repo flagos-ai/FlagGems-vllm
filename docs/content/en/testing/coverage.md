@@ -83,7 +83,7 @@ To improve coverage for an operator:
        x = torch.empty(0, 256, device='cuda')
        result = flaggems_vllm.my_operator(x)
        assert result.shape == (0, 256)
-       
+
        # Identity
        x = torch.eye(256, device='cuda')
        result = flaggems_vllm.my_operator(x)

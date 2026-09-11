@@ -20,8 +20,8 @@ vllm-plugin-fl (plugin layer)
     └─→ flaggems_vllm.<op>()      (vLLM-specific fused kernels)
 ```
 
-**FlagGems** provides general operator replacements registered into PyTorch dispatch.  
-**FlagGems-vllm** provides vLLM-specific fused operators called explicitly by the plugin.  
+**FlagGems** provides general operator replacements registered into PyTorch dispatch.
+**FlagGems-vllm** provides vLLM-specific fused operators called explicitly by the plugin.
 **vllm-plugin-fl** orchestrates both layers.
 
 ## Installation

@@ -140,11 +140,11 @@ from tests.accuracy_utils import gems_assert_close
 def test_<op>(shape, dtype):
     # Setup
     inputs = create_inputs(shape, dtype)
-    
+
     # Test
     result = flaggems_vllm.<op>(*inputs)
     expected = reference_<op>(*inputs)
-    
+
     # Validate
     gems_assert_close(result, expected, rtol=1e-3, atol=1e-5)
 ```
@@ -207,13 +207,13 @@ def my_operator(x):
     shape = x.shape              # ✓
     dtype = x.dtype              # ✓
     device = x.device            # ✓
-    
+
     # Uninitialized allocation:
     output = torch.empty_like(x) # ✓
-    
+
     # True no-copy views:
     view = x.view(new_shape)     # ✓
-    
+
     # Triton kernel launch:
     triton_kernel[grid](x, ...)  # ✓
 ```
@@ -246,7 +246,7 @@ Torch compute is allowed **only** in:
 4. **Commit with clear messages**:
    ```
    Add grouped_topk operator for MoE routing
-   
+
    - Implements grouped topk with bias and renormalization
    - Adds autotune configs for NVIDIA H100
    - Tests pass with rtol=1e-3
