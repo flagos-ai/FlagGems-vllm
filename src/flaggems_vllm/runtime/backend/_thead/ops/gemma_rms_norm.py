@@ -7,7 +7,7 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 
-_gemma_rmsnorm_may_2d_configs = [
+_gemma_rms_norm_may_2d_configs = [
     triton.Config(kwargs={"BLOCK_M": 1}, num_warps=1),
     triton.Config(kwargs={"BLOCK_M": 1}, num_warps=2),
     triton.Config(kwargs={"BLOCK_M": 1}, num_warps=4),
@@ -26,7 +26,7 @@ _gemma_rmsnorm_may_2d_configs = [
     triton.Config(kwargs={"BLOCK_M": 8}, num_warps=16),
 ]
 
-_gemma_rmsnorm_loop_configs = [
+_gemma_rms_norm_loop_configs = [
     triton.Config(kwargs={"TILE_N": tile_n}, num_warps=num_warps)
     for tile_n in [512, 1024, 2048, 4096, 8192, 16384]
     for num_warps in [4, 8, 16]
@@ -38,9 +38,9 @@ def prev_multiple_of(a, b):
     return tl.cdiv(a, b) * b - b
 
 
-@triton.autotune(_gemma_rmsnorm_may_2d_configs, key=["M", "N"])
+@triton.autotune(_gemma_rms_norm_may_2d_configs, key=["M", "N"])
 @triton.jit
-def _gemma_rmsnorm_may_2d_kernel(
+def _gemma_rms_norm_may_2d_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
@@ -80,9 +80,9 @@ def _gemma_rmsnorm_may_2d_kernel(
         tl.store(out_ptr + offs, y, mask=n_mask)
 
 
-@triton.autotune(_gemma_rmsnorm_loop_configs, key=["M", "N"])
+@triton.autotune(_gemma_rms_norm_loop_configs, key=["M", "N"])
 @triton.jit(do_not_specialize=["eps"])
-def _gemma_rmsnorm_loop_kernel(
+def _gemma_rms_norm_loop_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -137,11 +137,11 @@ def _gemma_rmsnorm_loop_kernel(
         tl.store(out_ptr + pid * N + n_offsets, y)
 
 
-def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+def gemma_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     logger.debug("GEMS GEMMA_RMSNORM")
 
     if x.ndim == 0:
-        raise ValueError("gemma_rmsnorm expects an input with at least one dimension")
+        raise ValueError("gemma_rms_norm expects an input with at least one dimension")
     orig_shape = x.shape
     N = orig_shape[-1]
     if w.ndim != 1 or w.shape[0] != N:
@@ -159,10 +159,10 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
     if N <= 8192:
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        _gemma_rmsnorm_may_2d_kernel[grid](
+        _gemma_rms_norm_may_2d_kernel[grid](
             x, w, out, M, N, eps, BLOCK_N=triton.next_power_of_2(N)
         )
     else:
-        _gemma_rmsnorm_loop_kernel[M,](out, x, w, M, N, eps)
+        _gemma_rms_norm_loop_kernel[M,](out, x, w, M, N, eps)
 
     return out.view(orig_shape)
