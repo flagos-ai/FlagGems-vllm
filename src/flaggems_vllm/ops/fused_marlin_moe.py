@@ -14,29 +14,17 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """
-Fused Marlin MoE for FlagGems.
+Fused MoE with native W4A16 and INT8/FP8 W8A16 expert weights.
 
-Aligns the interface of vLLM v0.20.0:
-    vllm/model_executor/layers/fused_moe/fused_marlin_moe.py :: fused_marlin_moe
-
-PHASE 2 (this file): bypass `fused_experts_impl`'s dequant-then-FP16-GEMM
-shortcut and dispatch directly to the wna16 Triton kernel
-(`fused_moe_kernel_gptq_awq`) for true fused-dequant W4A16/W8A16 GEMM.
-
-The local helper `_fused_marlin_moe_impl` mirrors `fused_experts_impl`'s
-orchestration (chunk loop, moe_align, two GEMMs, activation, reduction)
-but deletes the INT4/INT8 dequant branch and forwards `block_shape` so
-the wna16 path is actually taken.
-
-MVP scope:
-  - quant_type: GPTQ uint4b8 (INT4) and uint8b128 (INT8)
-  - activation: SwiGLU / SiLU
-  - act_order:  NOT supported (g_idx / sort_indices must be None)
-  - FP8 input:  NOT supported
-  - LoRA, clamp_limit, expert_map: NOT supported
+The public wrapper selects precision-specific kernels from local quantization
+tags. W8A16 retains FP16/BF16 activations and decodes weight tiles in the GEMM.
+Expert grouping is shared with moe_align_block_size. Generic WNA16 options use
+the imported dispatch_fused_moe_kernel without materializing full dequantized
+weights. This API does not consume vLLM's packed Marlin INT32 weight layout.
 """
 
 import functools
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
@@ -57,6 +45,7 @@ from flaggems_vllm.ops.fused_moe import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
     moe_align_block_size_small_grouped,
 )
@@ -65,13 +54,14 @@ from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry, libtuner
 
 # ----------------------------------------------------------------------------
-# quant_type_id constants — mirror a subset of vLLM scalar_types ids.
+# Local quantization tags for native expert-major tensors, not packed Marlin IDs.
 # ----------------------------------------------------------------------------
 # GPTQ INT4 (weight stored as w + 8, dequant subtracts 8)
 QUANT_TYPE_UINT4B8 = 0
 # INT8 (weight stored as w + 128)
 QUANT_TYPE_UINT8B128 = 1
-# MXFP4 (FP4 E2M1 weight + per-32 E8M0 scale). Mirrors vLLM scalar_types.float4_e2m1f.id.
+QUANT_TYPE_FP8_E4M3 = 2
+# MXFP4 (FP4 E2M1 weight + per-32 E8M0 scale).
 QUANT_TYPE_FP4_E2M1 = 6
 # MXFP4 block size (E8M0 scale shared by every 32 weights).
 MXFP4_GROUP_SIZE = 32
@@ -79,7 +69,9 @@ MXFP4_GROUP_SIZE = 32
 _QUANT_TYPE_INT4 = {QUANT_TYPE_UINT4B8}
 _QUANT_TYPE_INT8 = {QUANT_TYPE_UINT8B128}
 _QUANT_TYPE_FP4 = {QUANT_TYPE_FP4_E2M1}
-_SUPPORTED_QUANT_TYPES = _QUANT_TYPE_INT4 | _QUANT_TYPE_INT8 | _QUANT_TYPE_FP4
+_SUPPORTED_QUANT_TYPES = (
+    _QUANT_TYPE_INT4 | _QUANT_TYPE_INT8 | _QUANT_TYPE_FP4 | {QUANT_TYPE_FP8_E4M3}
+)
 _FULL_HOPPER_MIN_SM_COUNT = 100
 
 
@@ -2376,6 +2368,1956 @@ def _fused_marlin_moe_impl(
     return out_hidden_states
 
 
+# Native INT8/FP8 W8A16 implementation.
+
+
+@dataclass
+class _W8A16Config:
+    """Native W8A16 precision and groupwise quantization metadata."""
+
+    use_fp8: bool
+    group_size: int
+    use_packed_int8: bool = False
+
+
+@triton.jit
+def _dequant_w8a16_int8_packed(q, scale, compute_type: tl.constexpr):
+    """Decode four native UINT8 codes; no persistent Marlin repacking is needed."""
+    scales = tl.broadcast_to(scale.to(compute_type), q.shape)
+    if compute_type == tl.bfloat16:
+        # Place each byte in an FP32 mantissa, subtract the bias, then pack BF16.
+        return tl.inline_asm_elementwise(
+            """{
+            .reg .b32 f0, f1, f2, f3, p0, p1;
+            prmt.b32 f0, $2, 0x4b000000, 0x7650;
+            prmt.b32 f1, $2, 0x4b000000, 0x7651;
+            prmt.b32 f2, $2, 0x4b000000, 0x7652;
+            prmt.b32 f3, $2, 0x4b000000, 0x7653;
+            sub.f32 f0, f0, 0f4b000080;
+            sub.f32 f1, f1, 0f4b000080;
+            sub.f32 f2, f2, 0f4b000080;
+            sub.f32 f3, f3, 0f4b000080;
+            prmt.b32 p0, f0, f1, 0x7632;
+            prmt.b32 p1, f2, f3, 0x7632;
+            mul.bf16x2 $0, p0, $3;
+            mul.bf16x2 $1, p1, $4;
+            }""",
+            constraints="=r,=r,r,r,r",
+            args=[q.to(tl.uint8), scales],
+            dtype=tl.bfloat16,
+            is_pure=True,
+            pack=4,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """{
+            .reg .b32 p0, p1, bias;
+            prmt.b32 p0, $2, 0x64646464, 0x5150;
+            prmt.b32 p1, $2, 0x64646464, 0x5352;
+            mov.b32 bias, 0x64806480;
+            sub.f16x2 p0, p0, bias;
+            sub.f16x2 p1, p1, bias;
+            mul.f16x2 $0, p0, $3;
+            mul.f16x2 $1, p1, $4;
+            }""",
+            constraints="=r,=r,r,r,r",
+            args=[q.to(tl.uint8), scales],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=4,
+        )
+
+
+@triton.autotune(
+    configs=runtime.get_tuned_config("fused_marlin_moe_w8a16_int8_gemv"),
+    key=["N", "K", "H", "TOP_K", "GATE"],
+    reset_to_zero=["OUT"],
+)
+@triton.jit
+def _w8a16_int8_route_gemv(
+    A,
+    W,
+    S,
+    IDS,
+    ROUTE_WEIGHTS,
+    INTER,
+    OUT,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    STRIDE_WE: tl.constexpr,
+    STRIDE_SE: tl.constexpr,
+    STRIDE_SN: tl.constexpr,
+    STRIDE_SK: tl.constexpr,
+    GATE: tl.constexpr,
+    ZERO_BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    """Decode-only route GEMV, shared by gate/SwiGLU and atomic down stages."""
+    tl.static_assert(BLOCK_N <= 128 and BLOCK_K == 128)
+    tl.static_assert(K % BLOCK_K == 0)
+    route, tile = tl.program_id(0), tl.program_id(1)
+    expert = tl.load(IDS + route).to(tl.int64)
+    rows = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    ks = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_N, BLOCK_K), tl.float32)
+    if GATE:
+        acc_up = tl.zeros((BLOCK_N, BLOCK_K), tl.float32)
+        a_ptr = A
+    else:
+        a_ptr = A + route * K
+    for start in tl.range(0, K, BLOCK_K, loop_unroll_factor=UNROLL):
+        kk = start + ks
+        a = tl.load(a_ptr + kk).to(tl.float32)
+        q = tl.load(
+            W + expert * STRIDE_WE + rows[:, None] * K + kk[None, :],
+            rows[:, None] < N,
+            other=128,
+        )
+        scale = tl.load(
+            S + expert * STRIDE_SE + rows * STRIDE_SN + start // 128 * STRIDE_SK,
+            rows < N,
+            other=0,
+        )
+        b = _dequant_w8a16_int8_packed(q, scale[:, None], A.dtype.element_ty)
+        acc = tl.fma(b.to(tl.float32), a[None, :], acc)
+        if GATE:
+            q_up = tl.load(
+                W + expert * STRIDE_WE + (rows[:, None] + N) * K + kk[None, :],
+                rows[:, None] < N,
+                other=128,
+            )
+            scale_up = tl.load(
+                S
+                + expert * STRIDE_SE
+                + (rows + N) * STRIDE_SN
+                + start // 128 * STRIDE_SK,
+                rows < N,
+                other=0,
+            )
+            b_up = _dequant_w8a16_int8_packed(
+                q_up, scale_up[:, None], A.dtype.element_ty
+            )
+            acc_up = tl.fma(b_up.to(tl.float32), a[None, :], acc_up)
+    values = tl.sum(acc, 1)
+    if GATE:
+        up = tl.sum(acc_up, 1)
+        weight = tl.load(ROUTE_WEIGHTS + route).to(tl.float32)
+        values = values * tl.sigmoid(values) * up * weight
+        tl.store(INTER + route * N + rows, values.to(INTER.dtype.element_ty), rows < N)
+        if route == 0:
+            zeros = tile * ZERO_BLOCK + tl.arange(0, ZERO_BLOCK)
+            tl.store(OUT + zeros, 0.0, zeros < H)
+    else:
+        tl.atomic_add(OUT + rows, values.to(OUT.dtype.element_ty), rows < N)
+
+
+def _launch_w8a16_int8_gemv(x, w1, w2, s1, s2, weights, ids, output):
+    h, intermediate, top_k = x.shape[1], w2.shape[2], ids.shape[1]
+    inter = torch.empty((top_k, intermediate), dtype=x.dtype, device=x.device)
+    # Every configured N tile is <=128, so the first route covers all output zeros.
+    zero_block = triton.next_power_of_2(triton.cdiv(h, triton.cdiv(intermediate, 128)))
+    _w8a16_int8_route_gemv[
+        lambda meta: (top_k, triton.cdiv(intermediate, meta["BLOCK_N"]))
+    ](
+        x,
+        w1,
+        s1,
+        ids,
+        weights,
+        inter,
+        output,
+        N=intermediate,
+        K=h,
+        H=h,
+        TOP_K=top_k,
+        STRIDE_WE=w1.stride(0),
+        STRIDE_SE=s1.stride(0),
+        STRIDE_SN=s1.stride(1),
+        STRIDE_SK=s1.stride(2),
+        GATE=True,
+        ZERO_BLOCK=zero_block,
+    )
+    _w8a16_int8_route_gemv[lambda meta: (top_k, triton.cdiv(h, meta["BLOCK_N"]))](
+        inter,
+        w2,
+        s2,
+        ids,
+        weights,
+        inter,
+        output,
+        N=h,
+        K=intermediate,
+        H=h,
+        TOP_K=top_k,
+        STRIDE_WE=w2.stride(0),
+        STRIDE_SE=s2.stride(0),
+        STRIDE_SN=s2.stride(1),
+        STRIDE_SK=s2.stride(2),
+        GATE=False,
+        ZERO_BLOCK=1,
+    )
+
+
+def _w8a16_gemm_configs(tiles):
+    """Build the validated (N, K, warps, maxnreg) candidates; keep stage=1."""
+    return [
+        triton.Config(
+            {"BLOCK_SIZE_N": n, "BLOCK_SIZE_K": k},
+            num_warps=warps,
+            num_stages=1,
+            **({"maxnreg": registers} if registers is not None else {}),
+        )
+        for n, k, warps, registers in tiles
+    ]
+
+
+# Fused gateup/SwiGLU and down retain stage 1 for Hopper compiler compatibility.
+_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
+    [
+        (32, 64, 4, None),
+        (64, 64, 4, None),
+        (64, 128, 4, None),
+        (64, 128, 4, 64),
+        (64, 128, 4, 80),
+        (64, 128, 4, 96),
+        (128, 64, 4, None),
+        (128, 128, 8, None),
+    ]
+)
+
+_W8A16_FUSED_LARGE_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
+    [
+        (64, 128, 4, None),
+        (64, 128, 8, None),
+        (128, 128, 4, None),
+        (128, 64, 4, None),
+        (64, 64, 4, None),
+        (128, 128, 8, None),
+    ]
+)
+
+_W8A16_FP8_DOWN_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
+    [
+        (64, 64, 4, None),
+        (128, 64, 4, None),
+        (64, 128, 4, None),
+        (64, 128, 4, 64),
+        (64, 128, 4, 80),
+        (64, 128, 4, 96),
+        (128, 128, 8, None),
+    ]
+)
+
+_W8A16_UNIFIED_MOE_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 64},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 64, "BLOCK_K_H": 128},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 64, "BLOCK_K_H": 128},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 128, "BLOCK_K_H": 128},
+        num_warps=8,
+        num_stages=1,
+    ),
+]
+
+_W8A16_FP8_UNIFIED_MOE_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 64},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
+        num_warps=4,
+        num_stages=1,
+    ),
+]
+
+_W8A16_AUTOTUNE_CONFIGS_INT8 = _w8a16_gemm_configs(
+    [
+        (64, 64, 4, None),
+        (128, 64, 4, None),
+        (128, 64, 4, 64),
+        (128, 64, 4, 80),
+        (128, 64, 4, 96),
+        (128, 64, 8, None),
+        (256, 64, 8, None),
+        (256, 32, 8, None),
+    ]
+)
+
+_W8A16_FUSED_AUTOTUNE_CONFIGS_INT8 = _w8a16_gemm_configs(
+    [
+        (32, 64, 4, None),
+        (32, 128, 4, None),
+        (64, 32, 4, None),
+        (64, 64, 4, None),
+        (64, 128, 8, None),
+        (128, 32, 4, None),
+        (128, 64, 4, None),
+        (128, 64, 8, None),
+        (64, 128, 4, None),
+        (64, 128, 4, 64),
+        (64, 128, 4, 80),
+        (64, 128, 4, 96),
+        (128, 128, 4, None),
+        (128, 128, 8, None),
+    ]
+)
+
+_W8A16_DOWN_AUTOTUNE_CONFIGS_INT8 = _w8a16_gemm_configs(
+    [
+        (64, 64, 4, None),
+        (128, 64, 4, None),
+        (128, 64, 8, None),
+        (64, 128, 4, None),
+        (64, 128, 4, 64),
+        (64, 128, 4, 80),
+        (64, 128, 4, 96),
+        (64, 128, 8, None),
+        (128, 128, 4, None),
+        (128, 128, 4, 96),
+        (128, 128, 8, None),
+    ]
+)
+
+
+@triton.jit
+def fused_moe_kernel_w8a16_gateup(
+    A,
+    W1_q,
+    W1_scales,
+    W1_zp,
+    GATEUP,
+    sorted_token_ids,
+    expert_ids_per_block,
+    M_padded,
+    T,
+    Nw1,
+    H,
+    stride_a_t,
+    stride_a_k,
+    stride_w1_e,
+    stride_w1_n,
+    stride_w1_k,
+    stride_s_e,
+    stride_s_n,
+    stride_s_k,
+    stride_zp_e,
+    stride_zp_n,
+    stride_zp_k,
+    stride_gu_m,
+    stride_gu_n,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_fp8_w8a16: tl.constexpr,
+    SMALL_TOKEN_MXQ_PATH: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    compute_type: tl.constexpr,
+    USE_PACKED_INT8: tl.constexpr = False,
+):
+    """gate_up = W1[expert] @ x, written to GATEUP[dispatch_idx, :]. Full N coverage."""
+    tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
+    tl.static_assert(
+        group_size % BLOCK_SIZE_K == 0, "W8A16 groups must align with contraction tiles"
+    )
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    block_start = pid_m * BLOCK_SIZE_M
+    if block_start >= M_padded:
+        return
+    offs_m = block_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    n_mask = offs_n < Nw1
+    token_ids = tl.load(sorted_token_ids + offs_m).to(tl.int64)
+    token_mask = token_ids < T
+    expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
+    if expert_id < 0:
+        return
+    if SWAP_AB:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    for k_start in range(0, H, BLOCK_SIZE_K):
+        k_indices = k_start + offs_k
+        if SWAP_AB:
+            a = tl.load(
+                A + token_ids[None, :] * stride_a_t + k_indices[:, None] * stride_a_k,
+                mask=token_mask[None, :],
+                other=0.0,
+            )
+        else:
+            a = tl.load(
+                A + token_ids[:, None] * stride_a_t + k_indices[None, :] * stride_a_k,
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+        b_int = tl.load(
+            W1_q
+            + expert_id * stride_w1_e
+            + offs_n[:, None] * stride_w1_n
+            + k_indices[None, :] * stride_w1_k,
+            mask=n_mask[:, None],
+            other=0.0 if use_fp8_w8a16 else 128,
+        )
+        if not USE_PACKED_INT8:
+            b_int = b_int.to(tl.float32)
+        group_idx = k_start // group_size
+        s = tl.load(
+            W1_scales
+            + expert_id * stride_s_e
+            + offs_n * stride_s_n
+            + group_idx * stride_s_k,
+            mask=n_mask,
+            other=0.0,
+        ).to(tl.float32)
+        if use_fp8_w8a16 and SMALL_TOKEN_MXQ_PATH:
+            if SWAP_AB:
+                accumulator += tl.dot(b_int.to(a.dtype), a) * s[:, None]
+            else:
+                accumulator += tl.dot(a, tl.trans(b_int.to(a.dtype))) * s[None, :]
+        elif has_zp:
+            zp = tl.load(
+                W1_zp
+                + expert_id * stride_zp_e
+                + offs_n * stride_zp_n
+                + group_idx * stride_zp_k,
+                mask=n_mask,
+                other=0.0,
+            ).to(tl.float32)
+            b_deq = (b_int - zp[:, None]) * s[:, None]
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+        elif use_fp8_w8a16:
+            b_deq = b_int * s[:, None]
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+        else:
+            if USE_PACKED_INT8:
+                b_deq = _dequant_w8a16_int8_packed(b_int, s[:, None], compute_type)
+            else:
+                b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+    if SWAP_AB:
+        out_ptrs = (
+            GATEUP + offs_m[None, :] * stride_gu_m + offs_n[:, None] * stride_gu_n
+        )
+        out_mask = token_mask[None, :] & n_mask[:, None]
+    else:
+        out_ptrs = (
+            GATEUP + offs_m[:, None] * stride_gu_m + offs_n[None, :] * stride_gu_n
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
+    tl.store(out_ptrs, accumulator.to(compute_type), mask=out_mask)
+
+
+@triton.jit
+def silu_mul_kernel(
+    GATEUP,  # (M_padded, 2*I) bf16
+    INTER,  # (M_padded, I) bf16
+    sorted_token_ids,
+    sorted_weights,
+    M_padded,
+    T,
+    I,
+    stride_gu_m,
+    stride_gu_n,
+    stride_inter_m,
+    stride_inter_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_I: tl.constexpr,
+    APPLY_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """SwiGLU: intermediate[m, i] = silu(gate_up[m, i]) * gate_up[m, i + I]."""
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_i = pid_i * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
+
+    m_mask = offs_m < M_padded
+    token_ids = tl.load(sorted_token_ids + offs_m, mask=m_mask, other=T)
+    m_mask = m_mask & (token_ids < T)
+    i_mask = offs_i < I
+    full_mask = m_mask[:, None] & i_mask[None, :]
+
+    gate_ptr = GATEUP + offs_m[:, None] * stride_gu_m + offs_i[None, :] * stride_gu_n
+    up_ptr = (
+        GATEUP + offs_m[:, None] * stride_gu_m + (offs_i + I)[None, :] * stride_gu_n
+    )
+
+    gate = tl.load(gate_ptr, mask=full_mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr, mask=full_mask, other=0.0).to(tl.float32)
+
+    silu_gate = gate * tl.sigmoid(gate)
+    result = silu_gate * up
+    if APPLY_ROUTED_WEIGHT:
+        route_weights = tl.load(sorted_weights + offs_m, mask=m_mask, other=0.0).to(
+            tl.float32
+        )
+        result *= route_weights[:, None]
+
+    out_ptr = (
+        INTER + offs_m[:, None] * stride_inter_m + offs_i[None, :] * stride_inter_n
+    )
+    tl.store(out_ptr, result.to(compute_type), mask=full_mask)
+
+
+@triton.jit
+def fused_moe_kernel_w8a16_gateup_silu(
+    A,
+    W1_q,
+    W1_scales,
+    W1_zp,
+    INTER,
+    sorted_token_ids,
+    expert_ids_per_block,
+    sorted_weights,
+    M_padded,
+    T,
+    I,
+    H,
+    stride_a_t,
+    stride_a_k,
+    stride_w1_e,
+    stride_w1_n,
+    stride_w1_k,
+    stride_s_e,
+    stride_s_n,
+    stride_s_k,
+    stride_zp_e,
+    stride_zp_n,
+    stride_zp_k,
+    stride_inter_m,
+    stride_inter_n,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_fp8_w8a16: tl.constexpr,
+    APPLY_ROUTED_WEIGHT: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    STORE_PADDED: tl.constexpr,
+    compute_type: tl.constexpr,
+    USE_PACKED_INT8: tl.constexpr = False,
+):
+    """Fused gate/up and SwiGLU; write only the intermediate projection."""
+    tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
+    tl.static_assert(
+        group_size % BLOCK_SIZE_K == 0, "W8A16 groups must align with contraction tiles"
+    )
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    block_start = pid_m * BLOCK_SIZE_M
+    if block_start >= M_padded:
+        return
+    offs_m = block_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    n_mask = offs_n < I
+    up_offs_n = offs_n + I
+    token_ids = tl.load(sorted_token_ids + offs_m).to(tl.int64)
+    token_mask = token_ids < T
+    expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
+    if expert_id < 0:
+        return
+    if SWAP_AB:
+        gate_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        up_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        gate_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        up_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    for k_start in range(0, H, BLOCK_SIZE_K):
+        k_indices = k_start + offs_k
+        if SWAP_AB:
+            a = tl.load(
+                A + token_ids[None, :] * stride_a_t + k_indices[:, None] * stride_a_k,
+                mask=token_mask[None, :],
+                other=0.0,
+                eviction_policy="evict_last",
+            )
+        else:
+            a = tl.load(
+                A + token_ids[:, None] * stride_a_t + k_indices[None, :] * stride_a_k,
+                mask=token_mask[:, None],
+                other=0.0,
+                eviction_policy="evict_last",
+            )
+        b_int_gate = tl.load(
+            W1_q
+            + expert_id * stride_w1_e
+            + offs_n[:, None] * stride_w1_n
+            + k_indices[None, :] * stride_w1_k,
+            mask=n_mask[:, None],
+            other=0.0 if use_fp8_w8a16 else 128,
+            eviction_policy="evict_first",
+        )
+        b_int_up = tl.load(
+            W1_q
+            + expert_id * stride_w1_e
+            + up_offs_n[:, None] * stride_w1_n
+            + k_indices[None, :] * stride_w1_k,
+            mask=n_mask[:, None],
+            other=0.0 if use_fp8_w8a16 else 128,
+            eviction_policy="evict_first",
+        )
+        if not USE_PACKED_INT8:
+            b_int_gate = b_int_gate.to(tl.float32)
+            b_int_up = b_int_up.to(tl.float32)
+        group_idx = k_start // group_size
+        s_gate = tl.load(
+            W1_scales
+            + expert_id * stride_s_e
+            + offs_n * stride_s_n
+            + group_idx * stride_s_k,
+            mask=n_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        s_up = tl.load(
+            W1_scales
+            + expert_id * stride_s_e
+            + up_offs_n * stride_s_n
+            + group_idx * stride_s_k,
+            mask=n_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        if has_zp:
+            zp_gate = tl.load(
+                W1_zp
+                + expert_id * stride_zp_e
+                + offs_n * stride_zp_n
+                + group_idx * stride_zp_k,
+                mask=n_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            zp_up = tl.load(
+                W1_zp
+                + expert_id * stride_zp_e
+                + up_offs_n * stride_zp_n
+                + group_idx * stride_zp_k,
+                mask=n_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            b_deq_gate = (b_int_gate - zp_gate[:, None]) * s_gate[:, None]
+            b_deq_up = (b_int_up - zp_up[:, None]) * s_up[:, None]
+        elif use_fp8_w8a16:
+            b_deq_gate = b_int_gate * s_gate[:, None]
+            b_deq_up = b_int_up * s_up[:, None]
+        else:
+            if USE_PACKED_INT8:
+                b_deq_gate = _dequant_w8a16_int8_packed(
+                    b_int_gate, s_gate[:, None], compute_type
+                )
+                b_deq_up = _dequant_w8a16_int8_packed(
+                    b_int_up, s_up[:, None], compute_type
+                )
+            else:
+                b_deq_gate = tl.fma(
+                    b_int_gate, s_gate[:, None], -128.0 * s_gate[:, None]
+                )
+                b_deq_up = tl.fma(b_int_up, s_up[:, None], -128.0 * s_up[:, None])
+        if SWAP_AB:
+            gate_acc += tl.dot(b_deq_gate.to(a.dtype), a)
+            up_acc += tl.dot(b_deq_up.to(a.dtype), a)
+        else:
+            gate_acc += tl.dot(a, tl.trans(b_deq_gate.to(a.dtype)))
+            up_acc += tl.dot(a, tl.trans(b_deq_up.to(a.dtype)))
+    silu_gate = gate_acc * tl.sigmoid(gate_acc)
+    result = silu_gate * up_acc
+    if APPLY_ROUTED_WEIGHT:
+        weights = tl.load(sorted_weights + offs_m, mask=token_mask, other=0.0).to(
+            tl.float32
+        )
+        result = result * (weights[None, :] if SWAP_AB else weights[:, None])
+    if SWAP_AB:
+        out_ptrs = (
+            INTER + offs_m[None, :] * stride_inter_m + offs_n[:, None] * stride_inter_n
+        )
+        out_mask = token_mask[None, :] & n_mask[:, None]
+    else:
+        out_ptrs = (
+            INTER + offs_m[:, None] * stride_inter_m + offs_n[None, :] * stride_inter_n
+        )
+        out_mask = (
+            n_mask[None, :] if STORE_PADDED else token_mask[:, None] & n_mask[None, :]
+        )
+    tl.store(out_ptrs, result.to(compute_type), mask=out_mask)
+
+
+_fused_moe_kernel_w8a16_gateup_silu_large = triton.autotune(
+    configs=_W8A16_FUSED_LARGE_AUTOTUNE_CONFIGS,
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
+)(fused_moe_kernel_w8a16_gateup_silu)
+
+
+@triton.jit
+def fused_moe_kernel_w8a16_down(
+    INTER,
+    W2_q,
+    W2_scales,
+    W2_zp,
+    OUT,
+    sorted_token_ids,
+    expert_ids_per_block,
+    topk_weights,
+    M_padded,
+    T,
+    H,
+    I,
+    stride_inter_m,
+    stride_inter_k,
+    stride_w2_e,
+    stride_w2_n,
+    stride_w2_k,
+    stride_s_e,
+    stride_s_n,
+    stride_s_k,
+    stride_zp_e,
+    stride_zp_n,
+    stride_zp_k,
+    stride_out_t,
+    stride_out_n,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_fp8_w8a16: tl.constexpr,
+    DOWN_GRID_N_FIRST: tl.constexpr,
+    INTER_PREWEIGHTED: tl.constexpr,
+    SMALL_TOKEN_MXQ_PATH: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    compute_type: tl.constexpr,
+    USE_PACKED_INT8: tl.constexpr = False,
+):
+    """y = W2[expert] @ intermediate, output[token] += weight * y. Full H coverage."""
+    tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
+    tl.static_assert(
+        group_size % BLOCK_SIZE_K == 0, "W8A16 groups must align with contraction tiles"
+    )
+    if DOWN_GRID_N_FIRST:
+        pid_n = tl.program_id(0)
+        pid_m = tl.program_id(1)
+    else:
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+    block_start = pid_m * BLOCK_SIZE_M
+    if block_start >= M_padded:
+        return
+    offs_m = block_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    token_ids = tl.load(sorted_token_ids + offs_m).to(tl.int64)
+    token_mask = token_ids < T
+    expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
+    if expert_id < 0:
+        return
+    n_mask = offs_n < H
+    if SWAP_AB:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    for k_start in range(0, I, BLOCK_SIZE_K):
+        k_indices = k_start + offs_k
+        if SWAP_AB:
+            a_ptrs = (
+                INTER
+                + offs_m[None, :] * stride_inter_m
+                + k_indices[:, None] * stride_inter_k
+            )
+            a_mask = token_mask[None, :]
+        else:
+            a_ptrs = (
+                INTER
+                + offs_m[:, None] * stride_inter_m
+                + k_indices[None, :] * stride_inter_k
+            )
+            a_mask = token_mask[:, None]
+        if SMALL_TOKEN_MXQ_PATH:
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_last")
+            b_int = tl.load(
+                W2_q
+                + expert_id * stride_w2_e
+                + offs_n[:, None] * stride_w2_n
+                + k_indices[None, :] * stride_w2_k,
+                mask=n_mask[:, None],
+                other=0.0 if use_fp8_w8a16 else 128,
+                eviction_policy="evict_first",
+            )
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_first")
+            b_int = tl.load(
+                W2_q
+                + expert_id * stride_w2_e
+                + offs_n[:, None] * stride_w2_n
+                + k_indices[None, :] * stride_w2_k,
+                mask=n_mask[:, None],
+                other=0.0 if use_fp8_w8a16 else 128,
+                eviction_policy="evict_last",
+            )
+        if not USE_PACKED_INT8:
+            b_int = b_int.to(tl.float32)
+        group_idx = k_start // group_size
+        if SMALL_TOKEN_MXQ_PATH:
+            s = tl.load(
+                W2_scales
+                + expert_id * stride_s_e
+                + offs_n * stride_s_n
+                + group_idx * stride_s_k,
+                mask=n_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+        else:
+            s = tl.load(
+                W2_scales
+                + expert_id * stride_s_e
+                + offs_n * stride_s_n
+                + group_idx * stride_s_k,
+                mask=n_mask,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+        if use_fp8_w8a16 and SMALL_TOKEN_MXQ_PATH:
+            if SWAP_AB:
+                accumulator += tl.dot(b_int.to(a.dtype), a) * s[:, None]
+            else:
+                accumulator += tl.dot(a, tl.trans(b_int.to(a.dtype))) * s[None, :]
+        elif has_zp:
+            if SMALL_TOKEN_MXQ_PATH:
+                zp = tl.load(
+                    W2_zp
+                    + expert_id * stride_zp_e
+                    + offs_n * stride_zp_n
+                    + group_idx * stride_zp_k,
+                    mask=n_mask,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                ).to(tl.float32)
+            else:
+                zp = tl.load(
+                    W2_zp
+                    + expert_id * stride_zp_e
+                    + offs_n * stride_zp_n
+                    + group_idx * stride_zp_k,
+                    mask=n_mask,
+                    other=0.0,
+                    eviction_policy="evict_last",
+                ).to(tl.float32)
+            b_deq = (b_int - zp[:, None]) * s[:, None]
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+        elif use_fp8_w8a16:
+            b_deq = b_int * s[:, None]
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+        else:
+            if USE_PACKED_INT8:
+                b_deq = _dequant_w8a16_int8_packed(b_int, s[:, None], compute_type)
+            else:
+                b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
+            if SWAP_AB:
+                accumulator += tl.dot(b_deq.to(a.dtype), a)
+            else:
+                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
+    if not INTER_PREWEIGHTED:
+        weights = tl.load(topk_weights + offs_m, mask=token_mask, other=0.0).to(
+            tl.float32
+        )
+        accumulator = accumulator * (weights[None, :] if SWAP_AB else weights[:, None])
+    if SWAP_AB:
+        out_ptrs = (
+            OUT + token_ids[None, :] * stride_out_t + offs_n[:, None] * stride_out_n
+        )
+        out_mask = token_mask[None, :] & n_mask[:, None]
+    else:
+        out_ptrs = (
+            OUT + token_ids[:, None] * stride_out_t + offs_n[None, :] * stride_out_n
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
+    tl.atomic_add(out_ptrs, accumulator.to(compute_type), mask=out_mask)
+
+
+@triton.jit
+def fused_moe_kernel_w8a16_unified_moe(
+    A,
+    W1_q,
+    W1_scales,
+    W1_zp,
+    W2_q,
+    W2_scales,
+    W2_zp,
+    OUT,
+    sorted_token_ids,
+    expert_ids_per_block,
+    topk_weights,
+    M_padded,
+    T,
+    I,
+    H,
+    stride_a_t,
+    stride_a_k,
+    stride_w1_e,
+    stride_w1_n,
+    stride_w1_k,
+    stride_s1_e,
+    stride_s1_n,
+    stride_s1_k,
+    stride_zp1_e,
+    stride_zp1_n,
+    stride_zp1_k,
+    stride_w2_e,
+    stride_w2_n,
+    stride_w2_k,
+    stride_s2_e,
+    stride_s2_n,
+    stride_s2_k,
+    stride_zp2_e,
+    stride_zp2_n,
+    stride_zp2_k,
+    stride_out_t,
+    stride_out_n,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_I_TILE: tl.constexpr,
+    BLOCK_K_H: tl.constexpr,
+    has_zp_w1: tl.constexpr,
+    has_zp_w2: tl.constexpr,
+    use_fp8_w8a16: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """One launch: BSM-matched SwiGLU MoE without materializing ``(M_padded, I)`` in HBM.
+
+    Grid **(num_blocks_m, I_tiles)** — same contract as ``gateup_silu``: each CTA owns one
+    ``(m_block, i_tile)``, runs **one** reduction over ``H`` for gate/up, then applies W2
+    across ``H`` output tiles via ``atomic_add`` (same as split down, without intermediate
+    write/read).
+    """
+    tl.static_assert(128 % BLOCK_K_H == 0, "W8A16 contraction tiles must divide 128")
+    tl.static_assert(
+        group_size % BLOCK_K_H == 0, "W8A16 groups must align with contraction tiles"
+    )
+    tl.static_assert(128 % BLOCK_I_TILE == 0, "W8A16 contraction tiles must divide 128")
+    tl.static_assert(
+        group_size % BLOCK_I_TILE == 0, "W8A16 groups must align with contraction tiles"
+    )
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    block_start = pid_m * BLOCK_SIZE_M
+    if block_start >= M_padded:
+        return
+    offs_m = block_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_i = pid_i * BLOCK_I_TILE + tl.arange(0, BLOCK_I_TILE)
+    i_mask = offs_i < I
+    up_offs_i = offs_i + I
+    token_ids = tl.load(sorted_token_ids + offs_m).to(tl.int64)
+    token_mask = token_ids < T
+    expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
+    if expert_id < 0:
+        return
+    weights_row = tl.load(topk_weights + offs_m, mask=token_mask, other=0.0).to(
+        tl.float32
+    )
+    offs_k_h = tl.arange(0, BLOCK_K_H)
+    gate_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_I_TILE), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_I_TILE), dtype=tl.float32)
+    for k_start in range(0, H, BLOCK_K_H):
+        k_indices = k_start + offs_k_h
+        a = tl.load(
+            A + token_ids[:, None] * stride_a_t + k_indices[None, :] * stride_a_k,
+            mask=token_mask[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        b_int_gate = tl.load(
+            W1_q
+            + expert_id * stride_w1_e
+            + offs_i[:, None] * stride_w1_n
+            + k_indices[None, :] * stride_w1_k,
+            mask=i_mask[:, None],
+            other=0.0 if use_fp8_w8a16 else 128,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b_int_up = tl.load(
+            W1_q
+            + expert_id * stride_w1_e
+            + up_offs_i[:, None] * stride_w1_n
+            + k_indices[None, :] * stride_w1_k,
+            mask=i_mask[:, None],
+            other=0.0 if use_fp8_w8a16 else 128,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        group_idx = k_start // group_size
+        s_gate = tl.load(
+            W1_scales
+            + expert_id * stride_s1_e
+            + offs_i * stride_s1_n
+            + group_idx * stride_s1_k,
+            mask=i_mask,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        s_up = tl.load(
+            W1_scales
+            + expert_id * stride_s1_e
+            + up_offs_i * stride_s1_n
+            + group_idx * stride_s1_k,
+            mask=i_mask,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        if use_fp8_w8a16:
+            gate_acc += tl.dot(a, tl.trans(b_int_gate.to(a.dtype))) * s_gate[None, :]
+            up_acc += tl.dot(a, tl.trans(b_int_up.to(a.dtype))) * s_up[None, :]
+        elif has_zp_w1:
+            zp_gate = tl.load(
+                W1_zp
+                + expert_id * stride_zp1_e
+                + offs_i * stride_zp1_n
+                + group_idx * stride_zp1_k,
+                mask=i_mask,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            zp_up = tl.load(
+                W1_zp
+                + expert_id * stride_zp1_e
+                + up_offs_i * stride_zp1_n
+                + group_idx * stride_zp1_k,
+                mask=i_mask,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            b_deq_gate = (b_int_gate - zp_gate[:, None]) * s_gate[:, None]
+            b_deq_up = (b_int_up - zp_up[:, None]) * s_up[:, None]
+            gate_acc += tl.dot(a, tl.trans(b_deq_gate.to(a.dtype)))
+            up_acc += tl.dot(a, tl.trans(b_deq_up.to(a.dtype)))
+        else:
+            b_deq_gate = (b_int_gate - 128.0) * s_gate[:, None]
+            b_deq_up = (b_int_up - 128.0) * s_up[:, None]
+            gate_acc += tl.dot(a, tl.trans(b_deq_gate.to(a.dtype)))
+            up_acc += tl.dot(a, tl.trans(b_deq_up.to(a.dtype)))
+    silu_gate = gate_acc * tl.sigmoid(gate_acc)
+    inter = silu_gate * up_acc
+    inter = inter * weights_row[:, None]
+    inter_typed = inter.to(compute_type)
+    k_indices_i = offs_i
+    group_idx_i = pid_i * BLOCK_I_TILE // group_size
+    num_h_tiles = (H + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    for h_tile_idx in range(num_h_tiles):
+        offs_n = h_tile_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        n_mask = offs_n < H
+        b_int = tl.load(
+            W2_q
+            + expert_id * stride_w2_e
+            + offs_n[:, None] * stride_w2_n
+            + k_indices_i[None, :] * stride_w2_k,
+            mask=n_mask[:, None],
+            other=0.0 if use_fp8_w8a16 else 128,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        s2 = tl.load(
+            W2_scales
+            + expert_id * stride_s2_e
+            + offs_n * stride_s2_n
+            + group_idx_i * stride_s2_k,
+            mask=n_mask,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        if use_fp8_w8a16:
+            partial = (
+                tl.dot(inter_typed, tl.trans(b_int.to(inter_typed.dtype))) * s2[None, :]
+            )
+        elif has_zp_w2:
+            zp2 = tl.load(
+                W2_zp
+                + expert_id * stride_zp2_e
+                + offs_n * stride_zp2_n
+                + group_idx_i * stride_zp2_k,
+                mask=n_mask,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            b_deq = (b_int - zp2[:, None]) * s2[:, None]
+            partial = tl.dot(inter_typed, tl.trans(b_deq.to(inter_typed.dtype)))
+        else:
+            b_deq = (b_int - 128.0) * s2[:, None]
+            partial = tl.dot(inter_typed, tl.trans(b_deq.to(inter_typed.dtype)))
+        out_ptrs = (
+            OUT + token_ids[:, None] * stride_out_t + offs_n[None, :] * stride_out_n
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
+        tl.atomic_add(out_ptrs, partial.to(compute_type), mask=out_mask)
+
+
+def _prune_w8a16_fp8_gateup_configs(configs, named_args, **kwargs):
+    named_args = {**named_args, **kwargs}
+    if named_args["T"] < 16 or named_args["H"] < 1024 or named_args["Nw1"] < 2048:
+        return [config for config in configs if config.num_stages == 1]
+    return configs
+
+
+# Share kernel bodies while tuning INT8 and FP8 independently. Only the split
+# gateup enables deeper pipelines; multi-stage down fails on Triton 3.6/Hopper.
+_fused_moe_kernel_w8a16_gateup_fp8 = triton.autotune(
+    configs=_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS
+    + runtime.get_tuned_config("fused_marlin_moe_w8a16_fp8_gateup_pipeline"),
+    key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
+    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_gateup_configs},
+)(fused_moe_kernel_w8a16_gateup)
+
+_fused_moe_kernel_w8a16_gateup_silu_fp8 = triton.autotune(
+    configs=_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS,
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T"],
+)(fused_moe_kernel_w8a16_gateup_silu)
+
+_fused_moe_kernel_w8a16_down_fp8 = triton.autotune(
+    configs=_W8A16_FP8_DOWN_AUTOTUNE_CONFIGS,
+    key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
+    reset_to_zero=["OUT"],
+)(fused_moe_kernel_w8a16_down)
+
+_fused_moe_kernel_w8a16_unified_moe_fp8 = triton.autotune(
+    configs=_W8A16_FP8_UNIFIED_MOE_AUTOTUNE_CONFIGS,
+    key=["M_padded", "H", "I", "T"],
+    reset_to_zero=["OUT"],
+)(fused_moe_kernel_w8a16_unified_moe)
+
+
+def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
+    if not {**named_args, **kwargs}.get("USE_PACKED_INT8", False):
+        return [config for config in configs if config.kwargs["BLOCK_SIZE_K"] <= 64]
+    return configs
+
+
+_fused_moe_kernel_w8a16_gateup_int8 = triton.autotune(
+    configs=_W8A16_AUTOTUNE_CONFIGS_INT8
+    + runtime.get_tuned_config("fused_marlin_moe_w8a16_int8_gateup"),
+    key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T", "USE_PACKED_INT8"],
+    prune_configs_by={"early_config_prune": _prune_w8a16_int8_gateup_configs},
+)(fused_moe_kernel_w8a16_gateup)
+
+_fused_moe_kernel_w8a16_down_int8 = triton.autotune(
+    configs=_W8A16_DOWN_AUTOTUNE_CONFIGS_INT8,
+    key=[
+        "BLOCK_SIZE_M",
+        "M_padded",
+        "H",
+        "I",
+        "T",
+        "SMALL_TOKEN_MXQ_PATH",
+        "USE_PACKED_INT8",
+    ],
+    reset_to_zero=["OUT"],
+)(fused_moe_kernel_w8a16_down)
+
+_fused_moe_kernel_w8a16_unified_moe_int8 = triton.autotune(
+    configs=_W8A16_UNIFIED_MOE_AUTOTUNE_CONFIGS,
+    key=["M_padded", "H", "I", "T"],
+    reset_to_zero=["OUT"],
+)(fused_moe_kernel_w8a16_unified_moe)
+
+_fused_moe_kernel_w8a16_gateup_silu_int8 = triton.autotune(
+    configs=_W8A16_FUSED_AUTOTUNE_CONFIGS_INT8,
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
+)(fused_moe_kernel_w8a16_gateup_silu)
+
+
+def _launch_w8a16_gateup_silu(
+    x,
+    W1_q,
+    W1_scales,
+    zp1,
+    intermediate,
+    sorted_token_ids,
+    expert_ids_per_block,
+    sorted_weights,
+    *,
+    num_post_padded: int,
+    num_valid_tokens: int,
+    I: int,
+    H: int,
+    BLOCK_SIZE_M: int,
+    preweight_intermediate: bool,
+    compute_type,
+    quant_config: _W8A16Config,
+    has_zp_w1: bool,
+    stride_zp_e: int,
+    stride_zp_n: int,
+    stride_zp_k: int,
+) -> None:
+    """Launch the precision-specific autotuned kernel."""
+    num_blocks_m = num_post_padded // BLOCK_SIZE_M
+
+    def _grid_gateup_silu(META):
+        return (num_blocks_m, triton.cdiv(I, META["BLOCK_SIZE_N"]))
+
+    use_large_gateup_silu = (
+        num_valid_tokens >= 1024
+        and not quant_config.use_fp8
+        and quant_config.group_size == 128
+        and not has_zp_w1
+    )
+    if quant_config.use_fp8:
+        gateup_kernel = _fused_moe_kernel_w8a16_gateup_silu_fp8
+    elif use_large_gateup_silu:
+        gateup_kernel = _fused_moe_kernel_w8a16_gateup_silu_large
+    else:
+        gateup_kernel = _fused_moe_kernel_w8a16_gateup_silu_int8
+    gateup_kernel[_grid_gateup_silu](
+        x,
+        W1_q,
+        W1_scales,
+        zp1,
+        intermediate,
+        sorted_token_ids,
+        expert_ids_per_block,
+        sorted_weights,
+        M_padded=num_post_padded,
+        T=num_valid_tokens,
+        I=I,
+        H=H,
+        stride_a_t=x.stride(0),
+        stride_a_k=x.stride(1),
+        stride_w1_e=W1_q.stride(0),
+        stride_w1_n=W1_q.stride(1),
+        stride_w1_k=W1_q.stride(2),
+        stride_s_e=W1_scales.stride(0),
+        stride_s_n=W1_scales.stride(1),
+        stride_s_k=W1_scales.stride(2),
+        stride_zp_e=stride_zp_e,
+        stride_zp_n=stride_zp_n,
+        stride_zp_k=stride_zp_k,
+        stride_inter_m=intermediate.stride(0),
+        stride_inter_n=intermediate.stride(1),
+        group_size=quant_config.group_size,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        has_zp=has_zp_w1,
+        use_fp8_w8a16=quant_config.use_fp8,
+        SWAP_AB=not quant_config.use_fp8 and 1 < num_valid_tokens <= 16,
+        STORE_PADDED=quant_config.use_fp8 or use_large_gateup_silu,
+        APPLY_ROUTED_WEIGHT=preweight_intermediate,
+        compute_type=compute_type,
+        USE_PACKED_INT8=quant_config.use_packed_int8,
+    )
+
+
+def _launch_w8a16_down(
+    intermediate,
+    W2_q,
+    W2_scales,
+    zp2,
+    output,
+    sorted_token_ids,
+    expert_ids_per_block,
+    sorted_weights,
+    *,
+    num_post_padded: int,
+    num_valid_tokens: int,
+    H: int,
+    I: int,
+    BLOCK_SIZE_M: int,
+    quant_config: _W8A16Config,
+    has_zp_w2: bool,
+    down_grid_n_first: bool,
+    preweight_intermediate: bool,
+    small_token_mxq_path: bool,
+    compute_type,
+    stride_zp_e: int,
+    stride_zp_n: int,
+    stride_zp_k: int,
+) -> None:
+    """Launch the precision-specific autotuned kernel."""
+    num_blocks_m = num_post_padded // BLOCK_SIZE_M
+    swap_ab = 1 < num_valid_tokens <= 1024
+
+    def _grid_down(META):
+        h_tiles = triton.cdiv(H, META["BLOCK_SIZE_N"])
+        if down_grid_n_first:
+            return (h_tiles, num_blocks_m)
+        return (num_blocks_m, h_tiles)
+
+    down_kernel = (
+        _fused_moe_kernel_w8a16_down_fp8
+        if quant_config.use_fp8
+        else _fused_moe_kernel_w8a16_down_int8
+    )
+    down_kernel[_grid_down](
+        intermediate,
+        W2_q,
+        W2_scales,
+        zp2,
+        output,
+        sorted_token_ids,
+        expert_ids_per_block,
+        sorted_weights,
+        M_padded=num_post_padded,
+        T=num_valid_tokens,
+        H=H,
+        I=I,
+        stride_inter_m=intermediate.stride(0),
+        stride_inter_k=intermediate.stride(1),
+        stride_w2_e=W2_q.stride(0),
+        stride_w2_n=W2_q.stride(1),
+        stride_w2_k=W2_q.stride(2),
+        stride_s_e=W2_scales.stride(0),
+        stride_s_n=W2_scales.stride(1),
+        stride_s_k=W2_scales.stride(2),
+        stride_zp_e=stride_zp_e,
+        stride_zp_n=stride_zp_n,
+        stride_zp_k=stride_zp_k,
+        stride_out_t=output.stride(0),
+        stride_out_n=output.stride(1),
+        group_size=quant_config.group_size,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        has_zp=has_zp_w2,
+        use_fp8_w8a16=quant_config.use_fp8,
+        DOWN_GRID_N_FIRST=down_grid_n_first,
+        INTER_PREWEIGHTED=preweight_intermediate,
+        SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
+        SWAP_AB=swap_ab,
+        compute_type=compute_type,
+        USE_PACKED_INT8=quant_config.use_packed_int8,
+    )
+
+
+@triton.jit
+def _unpack_w8a16_routing(
+    dispatch_ids,
+    expert_ids,
+    padded_count,
+    topk_weights,
+    token_ids_out,
+    expert_ids_out,
+    weights_out,
+    output,
+    output_size,
+    capacity,
+    num_tokens,
+    top_k: tl.constexpr,
+    block_size_m: tl.constexpr,
+    ZERO_OUTPUT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Adapt shared dispatch-id routing to the W8A16 token-id/weight layout."""
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    count = tl.load(padded_count)
+    num_routes = num_tokens * top_k
+    dispatch = tl.load(dispatch_ids + rows, mask=rows < count, other=num_routes)
+    valid = dispatch < num_routes
+    weights = tl.load(topk_weights + dispatch, mask=valid, other=0.0)
+    tokens = tl.where(valid, dispatch // top_k, num_tokens)
+    tl.store(token_ids_out + rows, tokens, mask=rows < capacity)
+    tl.store(weights_out + rows, weights, mask=rows < capacity)
+    experts = tl.load(expert_ids + rows, mask=rows < count // block_size_m, other=-1)
+    tl.store(expert_ids_out + rows, experts, mask=rows < capacity // block_size_m)
+    if ZERO_OUTPUT:
+        tl.store(output + rows, 0.0, mask=rows < output_size)
+
+
+def _prepare_w8a16_routing(
+    topk_ids, topk_weights, num_experts, block_size_m, output=None
+):
+    """Reuse shared expert grouping without host synchronization or capture branches."""
+    num_tokens = topk_ids.shape[0]
+    if num_tokens <= 4:
+        dispatch_ids, expert_ids, padded_count = moe_align_block_size_singleton(
+            topk_ids, block_size_m
+        )
+    elif num_tokens <= 16 and topk_ids.numel() <= 32:
+        dispatch_ids, expert_ids, padded_count = moe_align_block_size_small_grouped(
+            topk_ids, num_experts, block_size_m
+        )
+    else:
+        # The shared non-TLE helper also tightens the capacity for sparse routes.
+        align = (
+            moe_align_block_size_no_tle if num_tokens <= 1024 else moe_align_block_size
+        )
+        dispatch_ids, expert_ids, padded_count = align(
+            topk_ids, block_size_m, num_experts, pad_sorted_ids=True
+        )
+    # Each adapter lane reads only its own entry before overwriting it.
+    token_ids, experts = dispatch_ids, expert_ids
+    capacity = dispatch_ids.numel()
+    weights = torch.empty((capacity,), dtype=topk_weights.dtype, device=topk_ids.device)
+    output_size = output.numel() if output is not None else 0
+    _unpack_w8a16_routing[(triton.cdiv(max(capacity, output_size), 256),)](
+        dispatch_ids,
+        expert_ids,
+        padded_count,
+        topk_weights,
+        token_ids,
+        experts,
+        weights,
+        output,
+        output_size,
+        capacity,
+        topk_ids.shape[0],
+        topk_ids.shape[1],
+        block_size_m,
+        ZERO_OUTPUT=output is not None,
+        BLOCK=256,
+    )
+    return token_ids, experts, weights, capacity
+
+
+@triton.jit
+def _w8a16_output_kernel(src, dst, size, ZERO: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    if ZERO:
+        values = tl.full((BLOCK,), 0, tl.float32)
+    else:
+        values = tl.load(src + offsets, mask=offsets < size, other=0)
+    tl.store(dst + offsets, values, mask=offsets < size)
+
+
+def _bsm_block_m_for_avg_load(avg_tokens_per_expert: int, num_tokens: int) -> int:
+    """Map average routed load per expert to a routing block size."""
+    if num_tokens <= 4:
+        return 4
+    if num_tokens <= 16:
+        return 4 if avg_tokens_per_expert < 1 else 8
+    if avg_tokens_per_expert < 8:
+        return 8
+    if avg_tokens_per_expert < 16:
+        return 16
+    if avg_tokens_per_expert <= 32:
+        return 32
+    return 64
+
+
+def _select_bsm_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
+    experts = max(int(num_experts), 1)
+    avg_tokens_per_expert = (int(num_tokens) * int(top_k)) // experts
+    return _bsm_block_m_for_avg_load(avg_tokens_per_expert, int(num_tokens))
+
+
+def invoke_fused_moe_full_swiglu(
+    x: torch.Tensor,
+    W1_q: torch.Tensor,
+    W1_scales: torch.Tensor,
+    W1_zeros: Optional[torch.Tensor],
+    W2_q: torch.Tensor,
+    W2_scales: torch.Tensor,
+    W2_zeros: Optional[torch.Tensor],
+    output: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids_per_block: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    num_post_padded: int,
+    num_valid_tokens: int,
+    quant_config: _W8A16Config,
+) -> None:
+    """Launch unified, split SwiGLU, or fused gateup/SwiGLU with atomic down."""
+
+    H = x.shape[1]
+    Nw1 = W1_q.shape[1]
+    intermediate_size = Nw1 // 2
+
+    small_token_mxq_path = num_valid_tokens <= 512
+
+    # NOTE: Tile K/N/warps/stages come from each kernel's `@triton.autotune`.
+    # BLOCK_SIZE_M is inferred from routing: one BSM block row count per program.
+    BLOCK_SIZE_M = num_post_padded // max(int(expert_ids_per_block.numel()), 1)
+
+    # Stage-specific tiles reduce register pressure in short-M workloads.
+    three_kernel_min_tokens = 4 if quant_config.use_fp8 else 16
+    use_fused_gateup_silu = not (three_kernel_min_tokens <= num_valid_tokens <= 1024)
+    if (
+        not quant_config.use_fp8
+        and 128 <= num_valid_tokens <= 1024
+        and BLOCK_SIZE_M >= 64
+    ):
+        use_fused_gateup_silu = True
+
+    compute_type = tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float16
+
+    has_zp_w1 = W1_zeros is not None
+    has_zp_w2 = W2_zeros is not None
+    # Unused pointers are eliminated by constexpr zero-point branches.
+    zp1 = W1_zeros if has_zp_w1 else W1_q
+    zp2 = W2_zeros if has_zp_w2 else W2_q
+    s_zp1_e, s_zp1_n, s_zp1_k = zp1.stride()
+    s_zp2_e, s_zp2_n, s_zp2_k = zp2.stride()
+
+    num_blocks_m = num_post_padded // BLOCK_SIZE_M
+
+    down_grid_n_first = num_valid_tokens >= 64
+    preweight_intermediate = num_valid_tokens <= 512
+
+    # Tiny FP8 unit-test dimensions can trigger unsupported Hopper codegen.
+    unified_shape_supported = not quant_config.use_fp8 or (
+        H >= 1024 and intermediate_size >= 1024
+    )
+    if num_valid_tokens == 1 and unified_shape_supported:
+
+        def _grid_unified_mi(META):
+            return (
+                num_blocks_m,
+                triton.cdiv(intermediate_size, META["BLOCK_I_TILE"]),
+            )
+
+        unified_moe_kernel = (
+            _fused_moe_kernel_w8a16_unified_moe_fp8
+            if quant_config.use_fp8
+            else _fused_moe_kernel_w8a16_unified_moe_int8
+        )
+        unified_moe_kernel[_grid_unified_mi](
+            x,
+            W1_q,
+            W1_scales,
+            zp1,
+            W2_q,
+            W2_scales,
+            zp2,
+            output,
+            sorted_token_ids,
+            expert_ids_per_block,
+            sorted_weights,
+            M_padded=num_post_padded,
+            T=num_valid_tokens,
+            I=intermediate_size,
+            H=H,
+            stride_a_t=x.stride(0),
+            stride_a_k=x.stride(1),
+            stride_w1_e=W1_q.stride(0),
+            stride_w1_n=W1_q.stride(1),
+            stride_w1_k=W1_q.stride(2),
+            stride_s1_e=W1_scales.stride(0),
+            stride_s1_n=W1_scales.stride(1),
+            stride_s1_k=W1_scales.stride(2),
+            stride_zp1_e=s_zp1_e,
+            stride_zp1_n=s_zp1_n,
+            stride_zp1_k=s_zp1_k,
+            stride_w2_e=W2_q.stride(0),
+            stride_w2_n=W2_q.stride(1),
+            stride_w2_k=W2_q.stride(2),
+            stride_s2_e=W2_scales.stride(0),
+            stride_s2_n=W2_scales.stride(1),
+            stride_s2_k=W2_scales.stride(2),
+            stride_zp2_e=s_zp2_e,
+            stride_zp2_n=s_zp2_n,
+            stride_zp2_k=s_zp2_k,
+            stride_out_t=output.stride(0),
+            stride_out_n=output.stride(1),
+            group_size=quant_config.group_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            has_zp_w1=has_zp_w1,
+            has_zp_w2=has_zp_w2,
+            use_fp8_w8a16=quant_config.use_fp8,
+            compute_type=compute_type,
+        )
+        return
+
+    intermediate = torch.empty(
+        (num_post_padded, intermediate_size), dtype=x.dtype, device=x.device
+    )
+    if use_fused_gateup_silu:
+        _launch_w8a16_gateup_silu(
+            x,
+            W1_q,
+            W1_scales,
+            zp1,
+            intermediate,
+            sorted_token_ids,
+            expert_ids_per_block,
+            sorted_weights,
+            num_post_padded=num_post_padded,
+            num_valid_tokens=num_valid_tokens,
+            I=intermediate_size,
+            H=H,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            preweight_intermediate=preweight_intermediate,
+            compute_type=compute_type,
+            quant_config=quant_config,
+            has_zp_w1=has_zp_w1,
+            stride_zp_e=s_zp1_e,
+            stride_zp_n=s_zp1_n,
+            stride_zp_k=s_zp1_k,
+        )
+    else:
+        # Separate projections reduce register pressure for short-M workloads.
+        gate_up = torch.empty((num_post_padded, Nw1), dtype=x.dtype, device=x.device)
+
+        def _grid_gateup(META):
+            return (num_blocks_m, triton.cdiv(Nw1, META["BLOCK_SIZE_N"]))
+
+        gateup_kernel = (
+            _fused_moe_kernel_w8a16_gateup_fp8
+            if quant_config.use_fp8
+            else _fused_moe_kernel_w8a16_gateup_int8
+        )
+        gateup_kernel[_grid_gateup](
+            x,
+            W1_q,
+            W1_scales,
+            zp1,
+            gate_up,
+            sorted_token_ids,
+            expert_ids_per_block,
+            M_padded=num_post_padded,
+            T=num_valid_tokens,
+            Nw1=Nw1,
+            H=H,
+            stride_a_t=x.stride(0),
+            stride_a_k=x.stride(1),
+            stride_w1_e=W1_q.stride(0),
+            stride_w1_n=W1_q.stride(1),
+            stride_w1_k=W1_q.stride(2),
+            stride_s_e=W1_scales.stride(0),
+            stride_s_n=W1_scales.stride(1),
+            stride_s_k=W1_scales.stride(2),
+            stride_zp_e=s_zp1_e,
+            stride_zp_n=s_zp1_n,
+            stride_zp_k=s_zp1_k,
+            stride_gu_m=gate_up.stride(0),
+            stride_gu_n=gate_up.stride(1),
+            group_size=quant_config.group_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            has_zp=has_zp_w1,
+            use_fp8_w8a16=quant_config.use_fp8,
+            SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
+            SWAP_AB=1 < num_valid_tokens <= 1024,
+            compute_type=compute_type,
+            USE_PACKED_INT8=quant_config.use_packed_int8,
+        )
+
+        SWIGLU_BSM = 32
+        SWIGLU_BSI = 256
+        grid2 = (
+            triton.cdiv(num_post_padded, SWIGLU_BSM),
+            triton.cdiv(intermediate_size, SWIGLU_BSI),
+        )
+        silu_mul_kernel[grid2](
+            gate_up,
+            intermediate,
+            sorted_token_ids,
+            sorted_weights,
+            M_padded=num_post_padded,
+            T=num_valid_tokens,
+            I=intermediate_size,
+            stride_gu_m=gate_up.stride(0),
+            stride_gu_n=gate_up.stride(1),
+            stride_inter_m=intermediate.stride(0),
+            stride_inter_n=intermediate.stride(1),
+            BLOCK_SIZE_M=SWIGLU_BSM,
+            BLOCK_SIZE_I=SWIGLU_BSI,
+            APPLY_ROUTED_WEIGHT=preweight_intermediate,
+            compute_type=compute_type,
+            num_warps=4,
+            num_stages=1,
+        )
+
+        del gate_up
+
+    # Accumulate each expert contribution into its token's output.
+    _launch_w8a16_down(
+        intermediate,
+        W2_q,
+        W2_scales,
+        zp2,
+        output,
+        sorted_token_ids,
+        expert_ids_per_block,
+        sorted_weights,
+        num_post_padded=num_post_padded,
+        num_valid_tokens=num_valid_tokens,
+        H=H,
+        I=intermediate_size,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        quant_config=quant_config,
+        has_zp_w2=has_zp_w2,
+        down_grid_n_first=down_grid_n_first,
+        preweight_intermediate=preweight_intermediate,
+        small_token_mxq_path=small_token_mxq_path,
+        compute_type=compute_type,
+        stride_zp_e=s_zp2_e,
+        stride_zp_n=s_zp2_n,
+        stride_zp_k=s_zp2_k,
+    )
+
+
+def _fused_marlin_moe_w8a16(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    *,
+    w1_scale,
+    w2_scale,
+    group_size=128,
+    inplace=False,
+    output=None,
+    w1_zeros=None,
+    w2_zeros=None,
+):
+    """Run native W8A16 expert weights, retaining A16 activations throughout."""
+    if hidden_states.ndim != 2 or hidden_states.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise ValueError("hidden_states must be a rank-2 FP16/BF16 tensor")
+    if w1.dtype not in (torch.uint8, torch.float8_e4m3fn) or w2.dtype != w1.dtype:
+        raise ValueError("W8A16 requires matching UINT8-offset128 or FP8 E4M3 weights")
+    if not isinstance(group_size, int) or group_size < 128 or group_size % 128:
+        raise ValueError(
+            "The optimized W8A16 path requires group_size to be a multiple of 128"
+        )
+    t, h = hidden_states.shape
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[1] % 2:
+        raise ValueError("W8A16 expects w1[E, 2I, H] and w2[E, H, I]")
+    e, two_i, _ = w1.shape
+    i = two_i // 2
+    if e <= 0 or h <= 0 or i <= 0 or w1.shape[2] != h or w2.shape != (e, h, i):
+        raise ValueError("Inconsistent expert, hidden, or intermediate dimensions")
+    if h % group_size or i % group_size:
+        raise ValueError(
+            "Hidden and intermediate dimensions must be divisible by group_size"
+        )
+    if w1_scale.shape != (e, two_i, h // group_size) or w2_scale.shape != (
+        e,
+        h,
+        i // group_size,
+    ):
+        raise ValueError("Scales must have shape [E, N, K / group_size]")
+    if (
+        topk_ids.ndim != 2
+        or topk_ids.shape[0] != t
+        or topk_weights.shape != topk_ids.shape
+    ):
+        raise ValueError("Routing tensors must have matching [T, TopK] shapes")
+    top_k = topk_ids.shape[1]
+    if not 0 < top_k <= e or topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "TopK must be in [1, E] and expert indices must be INT32/INT64"
+        )
+    if topk_weights.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("Routing weights must be floating point")
+    if (
+        w1_scale.dtype not in (torch.float32, hidden_states.dtype)
+        or w2_scale.dtype != w1_scale.dtype
+    ):
+        raise ValueError("Scales must match the activation dtype or use FP32")
+    tensors = (hidden_states, w1, w2, w1_scale, w2_scale, topk_ids, topk_weights)
+    if any(x.device != hidden_states.device or not x.is_contiguous() for x in tensors):
+        raise ValueError("W8A16 tensors must be contiguous and on the same device")
+    if hidden_states.device.type != "cuda":
+        raise NotImplementedError("The optimized W8A16 kernels require CUDA")
+    use_fp8 = w1.dtype == torch.float8_e4m3fn
+    for zeros, scale in ((w1_zeros, w1_scale), (w2_zeros, w2_scale)):
+        if zeros is not None:
+            if use_fp8:
+                raise NotImplementedError("FP8 weights do not use zero points")
+            if (
+                zeros.shape != scale.shape
+                or zeros.dtype != torch.uint8
+                or zeros.device != hidden_states.device
+                or not zeros.is_contiguous()
+            ):
+                raise ValueError(
+                    "INT8 zero points must be contiguous UINT8 tensors matching their scales"
+                )
+    if inplace and output is not None:
+        raise ValueError("Cannot pass both inplace=True and output")
+    destination = hidden_states if inplace else output
+    if destination is not None and (
+        destination.shape != hidden_states.shape
+        or destination.dtype != hidden_states.dtype
+        or destination.device != hidden_states.device
+        or not destination.is_contiguous()
+    ):
+        raise ValueError(
+            "output must match hidden_states shape, dtype, device, and contiguous layout"
+        )
+    # Accumulate separately even when output aliases the input. Clearing the input
+    # before gate-up would destroy the activations needed by every expert.
+    result = torch.empty_like(hidden_states)
+    if t == 0:
+        return result if destination is None else destination
+    with runtime.torch_device_fn.device(hidden_states.device):
+        output_grid = (triton.cdiv(result.numel(), 1024),)
+        packed_int8 = (
+            not use_fp8
+            and group_size == 128
+            and w1_zeros is None
+            and w2_zeros is None
+            and w1_scale.dtype == hidden_states.dtype
+            and _get_device_info(hidden_states.device).is_hopper
+        )
+        if packed_int8 and t == 1 and h >= 1024 and i >= 1024:
+            _launch_w8a16_int8_gemv(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                result,
+            )
+            if destination is not None:
+                _w8a16_output_kernel[output_grid](
+                    result, destination, result.numel(), ZERO=False, BLOCK=1024
+                )
+                return destination
+            return result
+        block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
+        if use_fp8:
+            if t <= 4:
+                block_m = 2 if t == 1 else 4
+            elif t <= 1024:
+                block_m = min(block_m, 32)
+        if t > 16:
+            _w8a16_output_kernel[output_grid](
+                result, result, result.numel(), ZERO=True, BLOCK=1024
+            )
+        routing = _prepare_w8a16_routing(
+            topk_ids, topk_weights, e, block_m, output=result if t <= 16 else None
+        )
+        quant_config = _W8A16Config(
+            use_fp8=use_fp8,
+            group_size=group_size,
+            use_packed_int8=packed_int8 and 1 < t <= 1024,
+        )
+        invoke_fused_moe_full_swiglu(
+            hidden_states,
+            w1,
+            w1_scale,
+            w1_zeros,
+            w2,
+            w2_scale,
+            w2_zeros,
+            result,
+            *routing,
+            t,
+            quant_config,
+        )
+        if destination is not None:
+            _w8a16_output_kernel[output_grid](
+                result, destination, result.numel(), ZERO=False, BLOCK=1024
+            )
+            return destination
+    return result
+
+
+def fused_marlin_moe_w8a16_fp8(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_size: int = 128,
+    inplace: bool = False,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 E4M3 [E, N, K] weights with groupwise scales and A16 activations."""
+    if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        raise ValueError("FP8 W8A16 requires E4M3 weights")
+    return _fused_marlin_moe_w8a16(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        group_size=group_size,
+        inplace=inplace,
+        output=output,
+    )
+
+
+def fused_marlin_moe_w8a16_int8(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_size: int = 128,
+    inplace: bool = False,
+    w1_zeros: Optional[torch.Tensor] = None,
+    w2_zeros: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """UINT8-offset128 [E, N, K] weights with groupwise scales and A16 activations."""
+    if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
+        raise ValueError("INT8 W8A16 requires UINT8-offset128 weights")
+    return _fused_marlin_moe_w8a16(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        group_size=group_size,
+        inplace=inplace,
+        output=output,
+        w1_zeros=w1_zeros,
+        w2_zeros=w2_zeros,
+    )
+
+
 # ----------------------------------------------------------------------------
 # Public entry point: vLLM-aligned wrapper.
 # ----------------------------------------------------------------------------
@@ -2416,7 +4358,15 @@ def fused_marlin_moe(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Phase-2 entry point: dispatch to local wna16-using impl."""
+    """Dispatch native expert-major weights to W4A16 or INT8/FP8 W8A16.
+
+    ``quant_type_id`` uses this module's ``QUANT_TYPE_*`` constants. W8 weights
+    have shapes ``w1[E, 2I, H]`` and ``w2[E, H, I]``; packed Marlin INT32 weights
+    and vLLM scalar-type IDs must be converted before calling this entry point.
+    No automatic Marlin layout conversion is performed here. The benchmarks
+    compare equal quantized weights in each implementation's required layout,
+    with layout conversion excluded from timing; this is not a drop-in Marlin API.
+    """
     # ---- MVP guardrails --------------------------------------------------
     if quant_type_id not in _SUPPORTED_QUANT_TYPES:
         raise NotImplementedError(
@@ -2456,6 +4406,62 @@ def fused_marlin_moe(
 
     if inplace and output is not None:
         raise ValueError("Cannot pass both inplace=True and output")
+
+    use_fp8_w8a16 = quant_type_id == QUANT_TYPE_FP8_E4M3
+    if use_int8_w8a16 or use_fp8_w8a16:
+        if w1.ndim != 3 or w2.ndim != 3:
+            raise ValueError("W8A16 expects rank-3 expert weights")
+        if not isinstance(group_size, int) or group_size <= 0:
+            raise ValueError("group_size must be a positive integer")
+        expected_dtype = torch.float8_e4m3fn if use_fp8_w8a16 else torch.uint8
+        if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
+            raise ValueError(
+                "W8A16 weight dtype must match quant_type_id; packed Marlin weights are not supported"
+            )
+        fast_options = (
+            bias1 is None
+            and bias2 is None
+            and expert_map is None
+            and global_num_experts in (-1, w1.shape[0])
+            and not apply_router_weight_on_input
+            and group_size >= 128
+            and group_size % 128 == 0
+        )
+        if activation_func is not None or moe_sum is not None:
+            raise NotImplementedError(
+                "W8A16 does not support custom activation/reduction callbacks"
+            )
+        if not is_k_full:
+            raise NotImplementedError("W8A16 requires complete expert weights")
+        if use_fp8_w8a16 and (
+            not fast_options or w1_zeros is not None or w2_zeros is not None
+        ):
+            raise NotImplementedError(
+                "FP8 W8A16 requires group_size divisible by 128, no bias/zero "
+                "points/expert map, and output-side routing weights"
+            )
+        if fast_options:
+            fn = (
+                fused_marlin_moe_w8a16_fp8
+                if use_fp8_w8a16
+                else fused_marlin_moe_w8a16_int8
+            )
+            zero_points = (
+                {} if use_fp8_w8a16 else {"w1_zeros": w1_zeros, "w2_zeros": w2_zeros}
+            )
+            return fn(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                group_size=group_size,
+                inplace=inplace,
+                output=output,
+                **zero_points,
+            )
 
     if (
         # The magic-trick kernel's bf16 dequant uses sub.bf16x2/mul.bf16 PTX,
@@ -2560,8 +4566,11 @@ def fused_marlin_moe(
 
 
 __all__ = [
+    "fused_marlin_moe_w8a16_int8",
+    "fused_marlin_moe_w8a16_fp8",
     "fused_marlin_moe",
     "QUANT_TYPE_UINT4B8",
     "QUANT_TYPE_UINT8B128",
+    "QUANT_TYPE_FP8_E4M3",
     "QUANT_TYPE_FP4_E2M1",
 ]

@@ -18,11 +18,12 @@ import torch
 # vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
 # the entire benchmark is skipped via the skipif marker below.
 try:
+    import vllm._custom_ops as vllm_ops
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
         fused_marlin_moe as vllm_fused_marlin_moe,
     )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-        marlin_quantize,
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_permute_scales,
     )
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         quantize_weights,
@@ -37,8 +38,7 @@ except ImportError:
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128
-from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
 
 from . import base
 
@@ -82,13 +82,17 @@ def _wna16_quantize_per_expert_int8(w_fp):
     return w_q, scales
 
 
-def _marlin_quantize_per_expert_int8(w_fp):
-    """Per-expert Marlin-layout INT8 quantization for vLLM's fused_marlin_moe."""
+def _marlin_repack_per_expert_int8(w_q, scales):
+    """Repack the same UINT8 codes and scales for vLLM's CUDA Marlin kernel."""
     qweight_l, scales_l = [], []
-    E = w_fp.shape[0]
+    E, out_dim, in_dim = w_q.shape
+    perm = torch.empty(0, dtype=torch.int, device=w_q.device)
     for e in range(E):
-        _, qw, sc, _, _, _ = marlin_quantize(
-            w_fp[e].T.contiguous(), VLLM_QUANT_TYPE_INT8, GROUP_SIZE, act_order=False
+        qw = vllm_ops.gptq_marlin_repack(
+            w_q[e].view(torch.int32).T.contiguous(), perm, in_dim, out_dim, 8
+        )
+        sc = marlin_permute_scales(
+            scales[e].T.contiguous(), in_dim, out_dim, GROUP_SIZE
         )
         qweight_l.append(qw)
         scales_l.append(sc)
@@ -108,14 +112,14 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            # Mixtral-8x7B-like
-            (1, 8, 4096, 14336, 2),
-            (16, 8, 4096, 14336, 2),
-            (64, 8, 4096, 14336, 2),
-            # DeepSeek-V3-like (TP=8 shard)
-            (1, 256, 7168, 2048, 8),
-            (16, 256, 7168, 2048, 8),
-            (64, 256, 7168, 2048, 8),
+            (tokens, experts, hidden, intermediate, topk)
+            for experts, hidden, intermediate, topk in (
+                (8, 4096, 14336, 2),  # Mixtral-8x7B
+                (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
+                (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
+                (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+            )
+            for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -153,9 +157,13 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         w1_q_wna16, w1_scale_wna16 = _wna16_quantize_per_expert_int8(w1_fp)
         w2_q_wna16, w2_scale_wna16 = _wna16_quantize_per_expert_int8(w2_fp)
 
-        # vLLM Marlin INT8 layout
-        w1_q_marlin, w1_scale_marlin = _marlin_quantize_per_expert_int8(w1_fp)
-        w2_q_marlin, w2_scale_marlin = _marlin_quantize_per_expert_int8(w2_fp)
+        # Repacking preserves quantized values; it is outside benchmark timing.
+        w1_q_marlin, w1_scale_marlin = _marlin_repack_per_expert_int8(
+            w1_q_wna16, w1_scale_wna16
+        )
+        w2_q_marlin, w2_scale_marlin = _marlin_repack_per_expert_int8(
+            w2_q_wna16, w2_scale_wna16
+        )
 
         del w1_fp, w2_fp
         torch.cuda.empty_cache()
@@ -166,7 +174,7 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        yield (
+        inputs = (
             hidden_states,
             w1_q_wna16,
             w2_q_wna16,
@@ -179,6 +187,7 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
             topk_weights,
             topk_ids,
         )
+        yield inputs
 
 
 def _vllm_baseline_int8(
@@ -223,17 +232,17 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
-    return gems_fused_marlin_moe(
+    return fused_marlin_moe(
+        bias1=None,
+        bias2=None,
+        quant_type_id=QUANT_TYPE_UINT8B128,
         hidden_states=hidden_states,
         w1=w1_q_wna16,
         w2=w2_q_wna16,
-        bias1=None,
-        bias2=None,
         w1_scale=w1_scale_wna16,
         w2_scale=w2_scale_wna16,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        quant_type_id=QUANT_TYPE_UINT8B128,
     )
 
 
@@ -245,7 +254,8 @@ def _gems_call_int8(
 def test_fused_marlin_moe_w8a16_int8():
     """
     Benchmark FlagGems fused_marlin_moe W8A16 (Triton wna16) vs vLLM
-    fused_marlin_moe W8A16 (CUDA Marlin). Both run GPTQ uint8b128 + per-group-128.
+    fused_marlin_moe W8A16 (CUDA Marlin). Both use the same UINT8 codes and
+    per-group-128 scales, in native and Marlin-repacked layouts respectively.
     """
     bench = FusedMarlinMoEW8A16INT8Benchmark(
         op_name="fused_marlin_moe_w8a16_int8",
