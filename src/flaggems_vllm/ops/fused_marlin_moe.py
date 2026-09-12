@@ -45,6 +45,7 @@ from flaggems_vllm.ops.fused_moe import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
     moe_align_block_size_small_grouped,
 )
@@ -2391,7 +2392,7 @@ def _w8a16_gemm_configs(tiles):
     ]
 
 
-# Stage 1 avoids multi-stage FP8 dequant codegen failures on Hopper.
+# Fused gateup/SwiGLU and down retain stage 1 for Hopper compiler compatibility.
 _W8A16_FP8_FUSED_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
     [
         (32, 64, 4, None),
@@ -2644,7 +2645,7 @@ def fused_moe_kernel_w8a16_gateup(
             else:
                 accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
-            b_deq = (b_int - 128.0) * s[:, None]
+            b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
             if SWAP_AB:
                 accumulator += tl.dot(b_deq.to(a.dtype), a)
             else:
@@ -2857,8 +2858,8 @@ def fused_moe_kernel_w8a16_gateup_silu(
             b_deq_gate = b_int_gate * s_gate[:, None]
             b_deq_up = b_int_up * s_up[:, None]
         else:
-            b_deq_gate = (b_int_gate - 128.0) * s_gate[:, None]
-            b_deq_up = (b_int_up - 128.0) * s_up[:, None]
+            b_deq_gate = tl.fma(b_int_gate, s_gate[:, None], -128.0 * s_gate[:, None])
+            b_deq_up = tl.fma(b_int_up, s_up[:, None], -128.0 * s_up[:, None])
         if SWAP_AB:
             gate_acc += tl.dot(b_deq_gate.to(a.dtype), a)
             up_acc += tl.dot(b_deq_up.to(a.dtype), a)
@@ -3056,7 +3057,7 @@ def fused_moe_kernel_w8a16_down(
             else:
                 accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
-            b_deq = (b_int - 128.0) * s[:, None]
+            b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
             if SWAP_AB:
                 accumulator += tl.dot(b_deq.to(a.dtype), a)
             else:
@@ -3293,10 +3294,20 @@ def fused_moe_kernel_w8a16_unified_moe(
         tl.atomic_add(out_ptrs, partial.to(compute_type), mask=out_mask)
 
 
-# Share kernel bodies while tuning INT8 and FP8 independently.
+def _prune_w8a16_fp8_gateup_configs(configs, named_args, **kwargs):
+    named_args = {**named_args, **kwargs}
+    if named_args["T"] < 16 or named_args["H"] < 1024 or named_args["Nw1"] < 2048:
+        return [config for config in configs if config.num_stages == 1]
+    return configs
+
+
+# Share kernel bodies while tuning INT8 and FP8 independently. Only the split
+# gateup enables deeper pipelines; multi-stage down fails on Triton 3.6/Hopper.
 _fused_moe_kernel_w8a16_gateup_fp8 = triton.autotune(
-    configs=_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS,
+    configs=_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS
+    + runtime.get_tuned_config("fused_marlin_moe_w8a16_fp8_gateup_pipeline"),
     key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
+    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_gateup_configs},
 )(fused_moe_kernel_w8a16_gateup)
 
 _fused_moe_kernel_w8a16_gateup_silu_fp8 = triton.autotune(
@@ -3533,25 +3544,25 @@ def _prepare_w8a16_routing(
     topk_ids, topk_weights, num_experts, block_size_m, output=None
 ):
     """Reuse shared expert grouping without host synchronization or capture branches."""
-    if topk_ids.shape[0] <= 16:
-        # Preserve one route per block without sorting sparse expert assignments.
+    num_tokens = topk_ids.shape[0]
+    if num_tokens <= 4:
         dispatch_ids, expert_ids, padded_count = moe_align_block_size_singleton(
             topk_ids, block_size_m
         )
-        # Each adapter lane reads only its own route before overwriting it.
-        token_ids, experts = dispatch_ids, expert_ids
+    elif num_tokens <= 16 and topk_ids.numel() <= 32:
+        dispatch_ids, expert_ids, padded_count = moe_align_block_size_small_grouped(
+            topk_ids, num_experts, block_size_m
+        )
     else:
-        dispatch_ids, expert_ids, padded_count = moe_align_block_size(
+        # The shared non-TLE helper also tightens the capacity for sparse routes.
+        align = (
+            moe_align_block_size_no_tle if num_tokens <= 1024 else moe_align_block_size
+        )
+        dispatch_ids, expert_ids, padded_count = align(
             topk_ids, block_size_m, num_experts, pad_sorted_ids=True
         )
-        token_ids = torch.empty(
-            (dispatch_ids.numel(),), dtype=torch.int64, device=topk_ids.device
-        )
-        experts = torch.empty(
-            (dispatch_ids.numel() // block_size_m,),
-            dtype=torch.int64,
-            device=topk_ids.device,
-        )
+    # Each adapter lane reads only its own entry before overwriting it.
+    token_ids, experts = dispatch_ids, expert_ids
     capacity = dispatch_ids.numel()
     weights = torch.empty((capacity,), dtype=topk_weights.dtype, device=topk_ids.device)
     output_size = output.numel() if output is not None else 0
@@ -3587,11 +3598,13 @@ def _w8a16_output_kernel(src, dst, size, ZERO: tl.constexpr, BLOCK: tl.constexpr
 
 def _bsm_block_m_for_avg_load(avg_tokens_per_expert: int, num_tokens: int) -> int:
     """Map average routed load per expert to a routing block size."""
-    if avg_tokens_per_expert <= 16:
-        if num_tokens <= 4:
-            return 4
-        if num_tokens <= 64:
-            return 8
+    if num_tokens <= 4:
+        return 4
+    if num_tokens <= 16:
+        return 4 if avg_tokens_per_expert < 1 else 8
+    if avg_tokens_per_expert < 8:
+        return 8
+    if avg_tokens_per_expert < 16:
         return 16
     if avg_tokens_per_expert <= 32:
         return 32
@@ -3632,10 +3645,15 @@ def invoke_fused_moe_full_swiglu(
     # BLOCK_SIZE_M is inferred from routing: one BSM block row count per program.
     BLOCK_SIZE_M = num_post_padded // max(int(expert_ids_per_block.numel()), 1)
 
-    # Separate gateup and SwiGLU for T=4..1024; the smaller stage-specific tiles
-    # reduce register pressure and fixed overhead in short-M workloads.
-    three_kernel_min_tokens = 4 if quant_config.use_fp8 else 64
+    # Stage-specific tiles reduce register pressure in short-M workloads.
+    three_kernel_min_tokens = 4 if quant_config.use_fp8 else 16
     use_fused_gateup_silu = not (three_kernel_min_tokens <= num_valid_tokens <= 1024)
+    if (
+        not quant_config.use_fp8
+        and 128 <= num_valid_tokens <= 1024
+        and BLOCK_SIZE_M >= 64
+    ):
+        use_fused_gateup_silu = True
 
     compute_type = tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float16
 
@@ -3943,16 +3961,16 @@ def _fused_marlin_moe_w8a16(
         return result if destination is None else destination
     with runtime.torch_device_fn.device(hidden_states.device):
         output_grid = (triton.cdiv(result.numel(), 1024),)
-        if t <= 16:
-            if use_fp8:
+        block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
+        if use_fp8:
+            if t <= 4:
                 block_m = 2 if t == 1 else 4
-            else:
-                block_m = 1 if t == 16 else _select_bsm_block_m(t, e, top_k)
-        else:
+            elif t <= 1024:
+                block_m = min(block_m, 32)
+        if t > 16:
             _w8a16_output_kernel[output_grid](
                 result, result, result.numel(), ZERO=True, BLOCK=1024
             )
-            block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
         routing = _prepare_w8a16_routing(
             topk_ids, topk_weights, e, block_m, output=result if t <= 16 else None
         )

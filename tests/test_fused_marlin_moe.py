@@ -740,9 +740,23 @@ def test_fused_marlin_moe_w8a16_empty_and_invalid(precision):
 
 @pytest.mark.parametrize("concentrated", [False, True])
 @pytest.mark.parametrize("zero_output", [False, True])
-@pytest.mark.parametrize("t,block_m", [(1, 2), (4, 4), (16, 1), (16, 4), (65, 16)])
-def test_fused_marlin_moe_w8a16_shared_routing(concentrated, zero_output, t, block_m):
-    e, k = 16, 2
+@pytest.mark.parametrize(
+    "t,e,k,block_m",
+    [
+        (1, 16, 2, 2),
+        (4, 16, 2, 4),
+        (16, 16, 2, 1),
+        (16, 16, 2, 4),
+        (65, 16, 2, 16),
+        (16, 8, 2, 8),
+        (64, 8, 2, 32),
+        (16, 512, 10, 4),
+        (256, 512, 10, 8),
+    ],
+)
+def test_fused_marlin_moe_w8a16_shared_routing(
+    concentrated, zero_output, t, e, k, block_m
+):
     dispatch = torch.arange(t * k, device=flaggems_vllm.device).reshape(t, k)
     ids = dispatch % (2 if concentrated else e)
     weights = (dispatch + 1).float() / (t * k)
