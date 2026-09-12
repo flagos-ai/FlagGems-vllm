@@ -94,6 +94,19 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
         self.assertEqual(tests, ["tests/test_mul.py"])
         self.assertEqual(benchmarks, [])
 
+    def test_distributed_op_uses_standard_name_selection(self):
+        self.make_file("tests/test_fused_allreduce_rms_norm.py")
+        self.make_file("benchmark/test_fused_allreduce_rms_norm.py")
+
+        mode, tests, benchmarks = select_tests.select_targets(
+            self.repo_root,
+            ["src/flaggems_vllm/ops/fused_allreduce_rms_norm.py"],
+        )
+
+        self.assertEqual(mode, "selected")
+        self.assertEqual(tests, ["tests/test_fused_allreduce_rms_norm.py"])
+        self.assertEqual(benchmarks, ["benchmark/test_fused_allreduce_rms_norm.py"])
+
     def test_documentation_change_is_skipped(self):
         self.assertEqual(
             select_tests.select_targets(self.repo_root, ["docs/guide.md"]),
@@ -375,6 +388,50 @@ class RunCiTargetsTest(TemporaryRepositoryTestCase):
         self.assertEqual(commands[0][commands[0].index("--warmup") + 1], "1")
         self.assertIn("--iter", commands[0])
         self.assertEqual(commands[0][commands[0].index("--iter") + 1], "1")
+
+    def test_distributed_correctness_runs_tp2_tp4_and_tp8(self):
+        target = "tests/test_fused_allreduce_rms_norm.py"
+        commands = run_ci_targets.build_commands({"tests": [target], "benchmarks": []})
+
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(
+            [command[command.index("--nproc-per-node") + 1] for command in commands],
+            ["2", "4", "8"],
+        )
+        for command in commands:
+            self.assertIn("torch.distributed.run", command)
+            self.assertIn("--quick", command)
+            self.assertEqual(command[-1], target)
+
+    def test_distributed_benchmark_runs_all_tp_sizes_with_core_settings(self):
+        target = "benchmark/test_fused_allreduce_rms_norm.py"
+        commands = run_ci_targets.build_commands({"tests": [], "benchmarks": [target]})
+
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(
+            [command[command.index("--nproc-per-node") + 1] for command in commands],
+            ["2", "4", "8"],
+        )
+        for command in commands:
+            self.assertIn("torch.distributed.run", command)
+            self.assertIn("--level", command)
+            self.assertEqual(command[command.index("--level") + 1], "core")
+            self.assertEqual(command[command.index("--warmup") + 1], "1")
+            self.assertEqual(command[command.index("--iter") + 1], "1")
+            self.assertEqual(command[-1], target)
+
+    def test_distributed_targets_are_not_repeated_by_regular_pytest(self):
+        regular_test = "tests/test_op.py"
+        distributed_test = "tests/test_fused_allreduce_rms_norm.py"
+        commands = run_ci_targets.build_commands(
+            {"tests": [regular_test, distributed_test], "benchmarks": []}
+        )
+
+        self.assertEqual(commands[0][-1], regular_test)
+        self.assertNotIn(distributed_test, commands[0])
+        self.assertEqual(
+            [command[-1] for command in commands[1:]], [distributed_test] * 3
+        )
 
     def test_rejects_unsafe_or_malformed_targets(self):
         with self.assertRaises(ValueError):
