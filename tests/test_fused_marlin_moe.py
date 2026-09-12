@@ -27,6 +27,8 @@ shared by both sides.
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import (
@@ -34,6 +36,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP8_E4M3,
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
+    _dequant_w8a16_int8_packed,
     _prepare_w8a16_routing,
     fused_marlin_moe,
 )
@@ -660,12 +663,13 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])
-def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode):
+@pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024)])
+def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
     hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_inputs(
-        4, 4, 256, 512, 2, dtype, flaggems_vllm.device
+        shape[0], 4, shape[1], shape[2], 2, dtype, flaggems_vllm.device
     )
     ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     destination = torch.empty_like(hs) if output_mode == "out" else hs
@@ -685,6 +689,28 @@ def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode):
     )
     assert result is destination
     assert compute_max_diff(result.float(), ref) < 0.04
+
+
+@triton.jit
+def _check_w8a16_int8_dequant(Q, S, OUT, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    q = tl.load(Q + offsets)
+    scale = tl.load(S + offsets)
+    result = _dequant_w8a16_int8_packed(q, scale, OUT.dtype.element_ty)
+    tl.store(OUT + offsets, result)
+
+
+@pytest.mark.skipif(not _is_hopper(), reason="Packed BF16 PTX requires Hopper")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_marlin_moe_w8a16_int8_packed_dequant(dtype):
+    # Check byte ordering, signed centering, and rounding for every UINT8 code.
+    q = torch.arange(256, device=flaggems_vllm.device).to(torch.uint8).repeat(257)
+    torch.manual_seed(750)
+    scales = (torch.randn(q.numel(), device=q.device) * 0.1).to(dtype)
+    result = torch.empty_like(scales)
+    _check_w8a16_int8_dequant[(q.numel() // 256,)](q, scales, result, BLOCK=256)
+    expected = ((q.float() - 128.0) * scales.float()).to(dtype)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("precision", ["int8", "fp8"])

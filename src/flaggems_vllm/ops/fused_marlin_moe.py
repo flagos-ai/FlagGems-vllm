@@ -2377,6 +2377,189 @@ class _W8A16Config:
 
     use_fp8: bool
     group_size: int
+    use_packed_int8: bool = False
+
+
+@triton.jit
+def _dequant_w8a16_int8_packed(q, scale, compute_type: tl.constexpr):
+    """Decode four native UINT8 codes; no persistent Marlin repacking is needed."""
+    scales = tl.broadcast_to(scale.to(compute_type), q.shape)
+    if compute_type == tl.bfloat16:
+        # Place each byte in an FP32 mantissa, subtract the bias, then pack BF16.
+        return tl.inline_asm_elementwise(
+            """{
+            .reg .b32 f0, f1, f2, f3, p0, p1;
+            prmt.b32 f0, $2, 0x4b000000, 0x7650;
+            prmt.b32 f1, $2, 0x4b000000, 0x7651;
+            prmt.b32 f2, $2, 0x4b000000, 0x7652;
+            prmt.b32 f3, $2, 0x4b000000, 0x7653;
+            sub.f32 f0, f0, 0f4b000080;
+            sub.f32 f1, f1, 0f4b000080;
+            sub.f32 f2, f2, 0f4b000080;
+            sub.f32 f3, f3, 0f4b000080;
+            prmt.b32 p0, f0, f1, 0x7632;
+            prmt.b32 p1, f2, f3, 0x7632;
+            mul.bf16x2 $0, p0, $3;
+            mul.bf16x2 $1, p1, $4;
+            }""",
+            constraints="=r,=r,r,r,r",
+            args=[q.to(tl.uint8), scales],
+            dtype=tl.bfloat16,
+            is_pure=True,
+            pack=4,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """{
+            .reg .b32 p0, p1, bias;
+            prmt.b32 p0, $2, 0x64646464, 0x5150;
+            prmt.b32 p1, $2, 0x64646464, 0x5352;
+            mov.b32 bias, 0x64806480;
+            sub.f16x2 p0, p0, bias;
+            sub.f16x2 p1, p1, bias;
+            mul.f16x2 $0, p0, $3;
+            mul.f16x2 $1, p1, $4;
+            }""",
+            constraints="=r,=r,r,r,r",
+            args=[q.to(tl.uint8), scales],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=4,
+        )
+
+
+@triton.autotune(
+    configs=runtime.get_tuned_config("fused_marlin_moe_w8a16_int8_gemv"),
+    key=["N", "K", "H", "TOP_K", "GATE"],
+    reset_to_zero=["OUT"],
+)
+@triton.jit
+def _w8a16_int8_route_gemv(
+    A,
+    W,
+    S,
+    IDS,
+    ROUTE_WEIGHTS,
+    INTER,
+    OUT,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    STRIDE_WE: tl.constexpr,
+    STRIDE_SE: tl.constexpr,
+    STRIDE_SN: tl.constexpr,
+    STRIDE_SK: tl.constexpr,
+    GATE: tl.constexpr,
+    ZERO_BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    """Decode-only route GEMV, shared by gate/SwiGLU and atomic down stages."""
+    tl.static_assert(BLOCK_N <= 128 and BLOCK_K == 128)
+    tl.static_assert(K % BLOCK_K == 0)
+    route, tile = tl.program_id(0), tl.program_id(1)
+    expert = tl.load(IDS + route).to(tl.int64)
+    rows = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    ks = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_N, BLOCK_K), tl.float32)
+    if GATE:
+        acc_up = tl.zeros((BLOCK_N, BLOCK_K), tl.float32)
+        a_ptr = A
+    else:
+        a_ptr = A + route * K
+    for start in tl.range(0, K, BLOCK_K, loop_unroll_factor=UNROLL):
+        kk = start + ks
+        a = tl.load(a_ptr + kk).to(tl.float32)
+        q = tl.load(
+            W + expert * STRIDE_WE + rows[:, None] * K + kk[None, :],
+            rows[:, None] < N,
+            other=128,
+        )
+        scale = tl.load(
+            S + expert * STRIDE_SE + rows * STRIDE_SN + start // 128 * STRIDE_SK,
+            rows < N,
+            other=0,
+        )
+        b = _dequant_w8a16_int8_packed(q, scale[:, None], A.dtype.element_ty)
+        acc = tl.fma(b.to(tl.float32), a[None, :], acc)
+        if GATE:
+            q_up = tl.load(
+                W + expert * STRIDE_WE + (rows[:, None] + N) * K + kk[None, :],
+                rows[:, None] < N,
+                other=128,
+            )
+            scale_up = tl.load(
+                S
+                + expert * STRIDE_SE
+                + (rows + N) * STRIDE_SN
+                + start // 128 * STRIDE_SK,
+                rows < N,
+                other=0,
+            )
+            b_up = _dequant_w8a16_int8_packed(
+                q_up, scale_up[:, None], A.dtype.element_ty
+            )
+            acc_up = tl.fma(b_up.to(tl.float32), a[None, :], acc_up)
+    values = tl.sum(acc, 1)
+    if GATE:
+        up = tl.sum(acc_up, 1)
+        weight = tl.load(ROUTE_WEIGHTS + route).to(tl.float32)
+        values = values * tl.sigmoid(values) * up * weight
+        tl.store(INTER + route * N + rows, values.to(INTER.dtype.element_ty), rows < N)
+        if route == 0:
+            zeros = tile * ZERO_BLOCK + tl.arange(0, ZERO_BLOCK)
+            tl.store(OUT + zeros, 0.0, zeros < H)
+    else:
+        tl.atomic_add(OUT + rows, values.to(OUT.dtype.element_ty), rows < N)
+
+
+def _launch_w8a16_int8_gemv(x, w1, w2, s1, s2, weights, ids, output):
+    h, intermediate, top_k = x.shape[1], w2.shape[2], ids.shape[1]
+    inter = torch.empty((top_k, intermediate), dtype=x.dtype, device=x.device)
+    # Every configured N tile is <=128, so the first route covers all output zeros.
+    zero_block = triton.next_power_of_2(triton.cdiv(h, triton.cdiv(intermediate, 128)))
+    _w8a16_int8_route_gemv[
+        lambda meta: (top_k, triton.cdiv(intermediate, meta["BLOCK_N"]))
+    ](
+        x,
+        w1,
+        s1,
+        ids,
+        weights,
+        inter,
+        output,
+        N=intermediate,
+        K=h,
+        H=h,
+        TOP_K=top_k,
+        STRIDE_WE=w1.stride(0),
+        STRIDE_SE=s1.stride(0),
+        STRIDE_SN=s1.stride(1),
+        STRIDE_SK=s1.stride(2),
+        GATE=True,
+        ZERO_BLOCK=zero_block,
+    )
+    _w8a16_int8_route_gemv[lambda meta: (top_k, triton.cdiv(h, meta["BLOCK_N"]))](
+        inter,
+        w2,
+        s2,
+        ids,
+        weights,
+        inter,
+        output,
+        N=h,
+        K=intermediate,
+        H=h,
+        TOP_K=top_k,
+        STRIDE_WE=w2.stride(0),
+        STRIDE_SE=s2.stride(0),
+        STRIDE_SN=s2.stride(1),
+        STRIDE_SK=s2.stride(2),
+        GATE=False,
+        ZERO_BLOCK=1,
+    )
 
 
 def _w8a16_gemm_configs(tiles):
@@ -2564,6 +2747,7 @@ def fused_moe_kernel_w8a16_gateup(
     SMALL_TOKEN_MXQ_PATH: tl.constexpr,
     SWAP_AB: tl.constexpr,
     compute_type: tl.constexpr,
+    USE_PACKED_INT8: tl.constexpr = False,
 ):
     """gate_up = W1[expert] @ x, written to GATEUP[dispatch_idx, :]. Full N coverage."""
     tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
@@ -2609,7 +2793,9 @@ def fused_moe_kernel_w8a16_gateup(
             + k_indices[None, :] * stride_w1_k,
             mask=n_mask[:, None],
             other=0.0 if use_fp8_w8a16 else 128,
-        ).to(tl.float32)
+        )
+        if not USE_PACKED_INT8:
+            b_int = b_int.to(tl.float32)
         group_idx = k_start // group_size
         s = tl.load(
             W1_scales
@@ -2645,7 +2831,10 @@ def fused_moe_kernel_w8a16_gateup(
             else:
                 accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
-            b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
+            if USE_PACKED_INT8:
+                b_deq = _dequant_w8a16_int8_packed(b_int, s[:, None], compute_type)
+            else:
+                b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
             if SWAP_AB:
                 accumulator += tl.dot(b_deq.to(a.dtype), a)
             else:
@@ -2753,6 +2942,7 @@ def fused_moe_kernel_w8a16_gateup_silu(
     SWAP_AB: tl.constexpr,
     STORE_PADDED: tl.constexpr,
     compute_type: tl.constexpr,
+    USE_PACKED_INT8: tl.constexpr = False,
 ):
     """Fused gate/up and SwiGLU; write only the intermediate projection."""
     tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
@@ -2804,7 +2994,7 @@ def fused_moe_kernel_w8a16_gateup_silu(
             mask=n_mask[:, None],
             other=0.0 if use_fp8_w8a16 else 128,
             eviction_policy="evict_first",
-        ).to(tl.float32)
+        )
         b_int_up = tl.load(
             W1_q
             + expert_id * stride_w1_e
@@ -2813,7 +3003,10 @@ def fused_moe_kernel_w8a16_gateup_silu(
             mask=n_mask[:, None],
             other=0.0 if use_fp8_w8a16 else 128,
             eviction_policy="evict_first",
-        ).to(tl.float32)
+        )
+        if not USE_PACKED_INT8:
+            b_int_gate = b_int_gate.to(tl.float32)
+            b_int_up = b_int_up.to(tl.float32)
         group_idx = k_start // group_size
         s_gate = tl.load(
             W1_scales
@@ -2858,8 +3051,18 @@ def fused_moe_kernel_w8a16_gateup_silu(
             b_deq_gate = b_int_gate * s_gate[:, None]
             b_deq_up = b_int_up * s_up[:, None]
         else:
-            b_deq_gate = tl.fma(b_int_gate, s_gate[:, None], -128.0 * s_gate[:, None])
-            b_deq_up = tl.fma(b_int_up, s_up[:, None], -128.0 * s_up[:, None])
+            if USE_PACKED_INT8:
+                b_deq_gate = _dequant_w8a16_int8_packed(
+                    b_int_gate, s_gate[:, None], compute_type
+                )
+                b_deq_up = _dequant_w8a16_int8_packed(
+                    b_int_up, s_up[:, None], compute_type
+                )
+            else:
+                b_deq_gate = tl.fma(
+                    b_int_gate, s_gate[:, None], -128.0 * s_gate[:, None]
+                )
+                b_deq_up = tl.fma(b_int_up, s_up[:, None], -128.0 * s_up[:, None])
         if SWAP_AB:
             gate_acc += tl.dot(b_deq_gate.to(a.dtype), a)
             up_acc += tl.dot(b_deq_up.to(a.dtype), a)
@@ -2890,7 +3093,7 @@ def fused_moe_kernel_w8a16_gateup_silu(
 
 _fused_moe_kernel_w8a16_gateup_silu_large = triton.autotune(
     configs=_W8A16_FUSED_LARGE_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T"],
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
 )(fused_moe_kernel_w8a16_gateup_silu)
 
 
@@ -2932,6 +3135,7 @@ def fused_moe_kernel_w8a16_down(
     SMALL_TOKEN_MXQ_PATH: tl.constexpr,
     SWAP_AB: tl.constexpr,
     compute_type: tl.constexpr,
+    USE_PACKED_INT8: tl.constexpr = False,
 ):
     """y = W2[expert] @ intermediate, output[token] += weight * y. Full H coverage."""
     tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
@@ -2986,7 +3190,7 @@ def fused_moe_kernel_w8a16_down(
                 mask=n_mask[:, None],
                 other=0.0 if use_fp8_w8a16 else 128,
                 eviction_policy="evict_first",
-            ).to(tl.float32)
+            )
         else:
             a = tl.load(a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_first")
             b_int = tl.load(
@@ -2997,7 +3201,9 @@ def fused_moe_kernel_w8a16_down(
                 mask=n_mask[:, None],
                 other=0.0 if use_fp8_w8a16 else 128,
                 eviction_policy="evict_last",
-            ).to(tl.float32)
+            )
+        if not USE_PACKED_INT8:
+            b_int = b_int.to(tl.float32)
         group_idx = k_start // group_size
         if SMALL_TOKEN_MXQ_PATH:
             s = tl.load(
@@ -3057,7 +3263,10 @@ def fused_moe_kernel_w8a16_down(
             else:
                 accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
-            b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
+            if USE_PACKED_INT8:
+                b_deq = _dequant_w8a16_int8_packed(b_int, s[:, None], compute_type)
+            else:
+                b_deq = tl.fma(b_int, s[:, None], -128.0 * s[:, None])
             if SWAP_AB:
                 accumulator += tl.dot(b_deq.to(a.dtype), a)
             else:
@@ -3327,14 +3536,31 @@ _fused_moe_kernel_w8a16_unified_moe_fp8 = triton.autotune(
     reset_to_zero=["OUT"],
 )(fused_moe_kernel_w8a16_unified_moe)
 
+
+def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
+    if not {**named_args, **kwargs}.get("USE_PACKED_INT8", False):
+        return [config for config in configs if config.kwargs["BLOCK_SIZE_K"] <= 64]
+    return configs
+
+
 _fused_moe_kernel_w8a16_gateup_int8 = triton.autotune(
-    configs=_W8A16_AUTOTUNE_CONFIGS_INT8,
-    key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
+    configs=_W8A16_AUTOTUNE_CONFIGS_INT8
+    + runtime.get_tuned_config("fused_marlin_moe_w8a16_int8_gateup"),
+    key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T", "USE_PACKED_INT8"],
+    prune_configs_by={"early_config_prune": _prune_w8a16_int8_gateup_configs},
 )(fused_moe_kernel_w8a16_gateup)
 
 _fused_moe_kernel_w8a16_down_int8 = triton.autotune(
     configs=_W8A16_DOWN_AUTOTUNE_CONFIGS_INT8,
-    key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
+    key=[
+        "BLOCK_SIZE_M",
+        "M_padded",
+        "H",
+        "I",
+        "T",
+        "SMALL_TOKEN_MXQ_PATH",
+        "USE_PACKED_INT8",
+    ],
     reset_to_zero=["OUT"],
 )(fused_moe_kernel_w8a16_down)
 
@@ -3346,7 +3572,7 @@ _fused_moe_kernel_w8a16_unified_moe_int8 = triton.autotune(
 
 _fused_moe_kernel_w8a16_gateup_silu_int8 = triton.autotune(
     configs=_W8A16_FUSED_AUTOTUNE_CONFIGS_INT8,
-    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T"],
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
 )(fused_moe_kernel_w8a16_gateup_silu)
 
 
@@ -3425,6 +3651,7 @@ def _launch_w8a16_gateup_silu(
         STORE_PADDED=quant_config.use_fp8 or use_large_gateup_silu,
         APPLY_ROUTED_WEIGHT=preweight_intermediate,
         compute_type=compute_type,
+        USE_PACKED_INT8=quant_config.use_packed_int8,
     )
 
 
@@ -3503,6 +3730,7 @@ def _launch_w8a16_down(
         SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
         SWAP_AB=swap_ab,
         compute_type=compute_type,
+        USE_PACKED_INT8=quant_config.use_packed_int8,
     )
 
 
@@ -3804,6 +4032,7 @@ def invoke_fused_moe_full_swiglu(
             SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
             SWAP_AB=1 < num_valid_tokens <= 1024,
             compute_type=compute_type,
+            USE_PACKED_INT8=quant_config.use_packed_int8,
         )
 
         SWIGLU_BSM = 32
@@ -3961,6 +4190,31 @@ def _fused_marlin_moe_w8a16(
         return result if destination is None else destination
     with runtime.torch_device_fn.device(hidden_states.device):
         output_grid = (triton.cdiv(result.numel(), 1024),)
+        packed_int8 = (
+            not use_fp8
+            and group_size == 128
+            and w1_zeros is None
+            and w2_zeros is None
+            and w1_scale.dtype == hidden_states.dtype
+            and _get_device_info(hidden_states.device).is_hopper
+        )
+        if packed_int8 and t == 1 and h >= 1024 and i >= 1024:
+            _launch_w8a16_int8_gemv(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                result,
+            )
+            if destination is not None:
+                _w8a16_output_kernel[output_grid](
+                    result, destination, result.numel(), ZERO=False, BLOCK=1024
+                )
+                return destination
+            return result
         block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
         if use_fp8:
             if t <= 4:
@@ -3974,7 +4228,11 @@ def _fused_marlin_moe_w8a16(
         routing = _prepare_w8a16_routing(
             topk_ids, topk_weights, e, block_m, output=result if t <= 16 else None
         )
-        quant_config = _W8A16Config(use_fp8=use_fp8, group_size=group_size)
+        quant_config = _W8A16Config(
+            use_fp8=use_fp8,
+            group_size=group_size,
+            use_packed_int8=packed_int8 and 1 < t <= 1024,
+        )
         invoke_fused_moe_full_swiglu(
             hidden_states,
             w1,

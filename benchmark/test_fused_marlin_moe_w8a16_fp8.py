@@ -126,7 +126,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
                 (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
                 (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
             )
-            for tokens in (1, 16, 64, 256)
+            for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
         ]
 
     def get_input_iter(self, cur_dtype):
