@@ -36,9 +36,6 @@ try:
 except ImportError:
     TensorDescriptor = None
 
-from flaggems_vllm.utils.device_info import get_device_capability
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-
 logger = logging.getLogger(__name__)
 
 # =============================================================================
