@@ -20,10 +20,14 @@ from flaggems_vllm.runtime.backend._mthreads.fused.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._mthreads.fused.persistent_topk import (
+    persistent_topk,
+)
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "fused_add_rms_norm",
+    "persistent_topk",
 ]
