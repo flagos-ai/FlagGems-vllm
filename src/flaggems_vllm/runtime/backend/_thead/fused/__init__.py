@@ -17,11 +17,13 @@ from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 from flaggems_vllm.runtime.backend._thead.fused.persistent_topk import persistent_topk
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
+    "moe_sum",
     "outplace_fused_experts",
     "persistent_topk",
 ]
