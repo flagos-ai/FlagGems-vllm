@@ -15,6 +15,7 @@
 import logging
 
 import torch
+import torch_npu
 import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
@@ -427,6 +428,235 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     tl.store(topk_indices_ptr + topk_offs, top_experts_idx, mask=topk_offs < topk)
 
 
+# Adapted from vllm-ascend:
+#   ./csrc/moe_gating_top_k/op_kernel/moe_gating_top_k_e_k_fullload.h
+@triton.jit
+def triton_moe_gating_topk_e_k_fullload_kernel(
+    scores_ptr,
+    topk_values_ptr,
+    topk_indices_ptr,
+    routing_bias_ptr,
+    topk: tl.constexpr,
+    renormalize,
+    routed_scaling_factor,
+    SCORE_DTYPE: tl.constexpr,
+    BIAS_DTYPE: tl.constexpr,
+    SCORING_FUNC: tl.constexpr,
+    TOPK_PAD: tl.constexpr,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    DEFAULT_BLOCK_SIZE: tl.constexpr = 256
+    ONE_REPEAT_SORT_NUM: tl.constexpr = 32
+    NUM_EXPERTS: tl.constexpr = 256
+    NUM_GROUPS: tl.constexpr = 8
+    GROUP_SIZE: tl.constexpr = 32
+
+    # init buffer
+    score_ub = tle.dsa.alloc(
+        [NUM_EXPERTS], dtype=SCORE_DTYPE, mem_addr_space=tle.dsa.ascend.UB
+    )
+    bias_ub = tle.dsa.alloc(
+        [NUM_EXPERTS], dtype=BIAS_DTYPE, mem_addr_space=tle.dsa.ascend.UB
+    )
+    # scores sort by group, {val, idx} format, (NUM_EXPERTS * 2) float
+    sorted_in_group_ub = tle.dsa.alloc(
+        [NUM_EXPERTS * 2], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    sorted_in_group = tle.dsa.to_tensor(sorted_in_group_ub, writable=True)
+    # top2 scores per group, (NUM_GROUPS * 2) float, but padding to DEFAULT_BLOCK_SIZE bytes
+    top2_value_in_group_ub = tle.dsa.alloc(
+        [DEFAULT_BLOCK_SIZE // 4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    top2_value_in_group = tle.dsa.to_tensor(top2_value_in_group_ub, writable=True)
+    # sorted group_score(top2 sum), {val, idx} format, (NUM_GROUPS * 2) float, but padding to (ONE_REPEAT_SORT_NUM * 2)
+    # bytes
+    sorted_group_ub = tle.dsa.alloc(
+        [ONE_REPEAT_SORT_NUM * 2], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    sorted_group = tle.dsa.to_tensor(sorted_group_ub, writable=True)
+    # idx part of {val, idx} in group_score, NUM_GROUPS float, but padding to DEFAULT_BLOCK_SIZE bytes
+    sorted_group_index_ub = tle.dsa.alloc(
+        [DEFAULT_BLOCK_SIZE // 4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    sorted_group_index = tle.dsa.to_tensor(sorted_group_index_ub, writable=True)
+    # sorted scores from TOPK_GROUP, {val, idx} format, (GROUP_SIZE * 8) float
+    sorted_expert_ub = tle.dsa.alloc(
+        [GROUP_SIZE * 2 * 4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    sorted_expert = tle.dsa.to_tensor(sorted_expert_ub, writable=True)
+    # idx part of {val, idx} in sorted_expert, (GROUP_SIZE * 4) float
+    expert_idx_ub = tle.dsa.alloc(
+        [GROUP_SIZE * 4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    expert_idx = tle.dsa.to_tensor(expert_idx_ub, writable=True)
+
+    offs = tl.arange(0, NUM_EXPERTS)
+    sort32_offs = tl.arange(0, ONE_REPEAT_SORT_NUM)
+    topk_offs = tl.arange(0, TOPK_PAD)
+    # custom pattern for top2 value gather
+    gather_pattern = tl.zeros([2], tl.uint32)
+    gather_pattern = tl.where(tl.arange(0, 2) == 0, 5, gather_pattern)  # [0b0101, 0]
+    # bitwise mask to padding top2_value_in_group with neg-inf
+    duplicate_mask = tl.zeros([2], dtype=tl.int64)
+    duplicate_mask = tl.where(tl.arange(0, 2) == 0, (-1) << NUM_GROUPS, duplicate_mask)
+    duplicate_neg_inf = tl.full([1], float("-inf"), dtype=tl.float32)
+    # gather count
+    rsvd_cnt = tl.zeros([1], dtype=tl.int64)
+
+    # CopyInBias
+    tle.dsa.copy(routing_bias_ptr + offs, bias_ub, [NUM_EXPERTS])
+    bias = tle.dsa.to_tensor(bias_ub).to(tl.float32)
+
+    pid = tl.program_id(0)
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for row_idx in tl.range(row_len):
+        token_id = pid * PER_CORE_ROWS + row_idx
+        cur_scores_ptr = scores_ptr + token_id * NUM_EXPERTS
+        cur_topk_values_ptr = topk_values_ptr + token_id * topk
+        cur_topk_indices_ptr = topk_indices_ptr + token_id * topk
+        # CopyInX
+        tle.dsa.copy(cur_scores_ptr + offs, score_ub, [NUM_EXPERTS])
+        score = tle.dsa.to_tensor(score_ub).to(tl.float32)
+        # ComputeX
+        if SCORING_FUNC == 1:
+            score_sigmoid = _sigmoid(score)
+        else:
+            score_sigmoid = score
+        score_bias = score_sigmoid + bias
+        # SortInGroup
+        sorted_in_group = tle.dsa.ascend.raw(
+            "sort32", score_bias, offs, NUM_GROUPS, out=sorted_in_group
+        )
+        # SelectTopKGroupIndex
+        top2_value_in_group, rsvd_cnt = tle.dsa.ascend.raw(
+            "gather_mask_custom_pattern",
+            sorted_in_group,
+            gather_pattern,
+            True,
+            64,
+            1,
+            8,
+            8,
+            0,
+            out=[top2_value_in_group, rsvd_cnt],
+        )
+        top2_value_in_group = tle.dsa.ascend.raw(
+            "pair_reduce_sum_continuous_mask",
+            top2_value_in_group,
+            1,
+            NUM_GROUPS * 2,
+            1,
+            1,
+            1,
+            out=top2_value_in_group,
+        )
+        top2_value_in_group = tle.dsa.ascend.raw(
+            "duplicate_bitwise_mask",
+            duplicate_neg_inf,
+            duplicate_mask,
+            1,
+            1,
+            8,
+            out=top2_value_in_group,
+        )
+        sorted_group = tle.dsa.ascend.raw(
+            "sort32", top2_value_in_group, sort32_offs, 1, out=sorted_group
+        )
+        sorted_group_index, rsvd_cnt = tle.dsa.ascend.raw(
+            "gather_mask_builtin_pattern",
+            sorted_group,
+            2,
+            False,
+            0,
+            1,
+            1,
+            0,
+            0,
+            out=[sorted_group_index, rsvd_cnt],
+        )
+        group_idx0 = tle.dsa.extract_element(sorted_group_index, indice=[0]).to(
+            tl.int32, bitcast=True
+        )
+        group_idx1 = tle.dsa.extract_element(sorted_group_index, indice=[1]).to(
+            tl.int32, bitcast=True
+        )
+        group_idx2 = tle.dsa.extract_element(sorted_group_index, indice=[2]).to(
+            tl.int32, bitcast=True
+        )
+        group_idx3 = tle.dsa.extract_element(sorted_group_index, indice=[3]).to(
+            tl.int32, bitcast=True
+        )
+        sorted_expert = tle.dsa.ascend.raw(
+            "mrgsort",
+            sorted_in_group,
+            GROUP_SIZE * group_idx0,
+            GROUP_SIZE * group_idx1,
+            GROUP_SIZE * group_idx2,
+            GROUP_SIZE * group_idx3,
+            topk,
+            topk,
+            topk,
+            topk,
+            True,
+            15,
+            1,
+            out=sorted_expert,
+        )
+        expert_idx, rsvd_cnt = tle.dsa.ascend.raw(
+            "gather_mask_builtin_pattern",
+            sorted_expert,
+            2,
+            False,
+            0,
+            1,
+            1,
+            0,
+            0,
+            out=[expert_idx, rsvd_cnt],
+        )
+        expert_idx_ub = tle.dsa.to_buffer(expert_idx, tle.dsa.ascend.UB)
+        topk_expert_idx_view = tle.dsa.subview(
+            expert_idx_ub, offsets=[0], sizes=[TOPK_PAD], strides=[1]
+        )
+        topk_expert_idx = tle.dsa.to_tensor(topk_expert_idx_view).to(
+            tl.int32, bitcast=True
+        )
+        topk_unbiased = tl.gather(score_sigmoid, topk_expert_idx, axis=0)
+        topk_unbiased = tl.where(topk_offs < topk, topk_unbiased, 0.0)
+        topk_sum = 1e-20
+
+        if renormalize:
+            topk_sum += tl.sum(topk_unbiased)
+        scale = routed_scaling_factor.to(tl.float32)
+        if renormalize:
+            scale /= topk_sum
+        tl.store(
+            cur_topk_values_ptr + topk_offs,
+            topk_unbiased * scale,
+            mask=topk_offs < topk,
+        )
+        tl.store(
+            cur_topk_indices_ptr + topk_offs, topk_expert_idx, mask=topk_offs < topk
+        )
+
+
+def _has_required_raw_ops():
+    try:
+        if (
+            hasattr(tle.dsa.ascend.custom_ops, "sort32")
+            & hasattr(tle.dsa.ascend.custom_ops, "gather_mask_custom_pattern")
+            & hasattr(tle.dsa.ascend.custom_ops, "pair_reduce_sum_continuous_mask")
+            & hasattr(tle.dsa.ascend.custom_ops, "duplicate_bitwise_mask")
+            & hasattr(tle.dsa.ascend.custom_ops, "gather_mask_builtin_pattern")
+            & hasattr(tle.dsa.ascend.custom_ops, "mrgsort")
+        ):
+            return True
+        return False
+    except AttributeError:
+        return False
+
+
 def grouped_topk(
     scores: torch.Tensor,
     n_group: int,
@@ -468,7 +698,66 @@ def grouped_topk(
     else:
         raise ValueError(f"Unsupported dtype: {scores.dtype}")
 
+    if bias.dtype == torch.float32:
+        BIAS_DTYPE = tl.float32
+    elif bias.dtype == torch.float16:
+        BIAS_DTYPE = tl.float16
+    elif bias.dtype == torch.bfloat16:
+        BIAS_DTYPE = tl.bfloat16
+    else:
+        raise ValueError(f"Unsupported dtype: {bias.dtype}")
+
+    topk_values = torch.empty(
+        (num_tokens, topk),
+        device=scores.device,
+        dtype=torch.float32,
+    )
+
+    topk_indices = torch.empty(
+        (num_tokens, topk),
+        device=scores.device,
+        dtype=torch.int32,
+    )
+
     if (
+        _has_required_raw_ops()
+        & (num_experts == 256)
+        & (n_group == 8)
+        & (topk_group == 4)
+        & (topk <= 32)
+        & scores.is_contiguous()
+        & bias.is_contiguous()
+    ):
+        n_group_pad = triton.next_power_of_2(n_group)
+        topk_pad = triton.next_power_of_2(topk)
+        vector_core_num = torch_npu.npu.get_device_properties(
+            scores.device.index
+        ).vector_core_num
+        per_core_rows = (num_tokens + vector_core_num - 1) // vector_core_num
+        need_core_num = (num_tokens + per_core_rows - 1) // per_core_rows
+        last_core_rows = (
+            per_core_rows
+            if num_tokens % per_core_rows == 0
+            else num_tokens % per_core_rows
+        )
+
+        triton_moe_gating_topk_e_k_fullload_kernel[(need_core_num,)](
+            scores,
+            topk_values,
+            topk_indices,
+            bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            SCORE_DTYPE=INPUT_DTYPE,
+            BIAS_DTYPE=BIAS_DTYPE,
+            SCORING_FUNC=scoring_func,
+            TOPK_PAD=topk_pad,
+            PER_CORE_ROWS=per_core_rows,
+            LAST_CORE_ROWS=last_core_rows,
+        )
+        return topk_values, topk_indices
+    elif (
         (n_group > 1)
         & (n_group <= 32)
         & (num_experts <= 256)
@@ -478,24 +767,6 @@ def grouped_topk(
         & (topk_group <= 4)
     ):
         # DeepSeek-v3.2
-        topk_values = torch.empty(
-            (num_tokens, topk),
-            device=scores.device,
-            dtype=torch.float32,
-        )
-        topk_indices = torch.empty(
-            (num_tokens, topk),
-            device=scores.device,
-            dtype=torch.int32,
-        )
-        if bias.dtype == torch.float32:
-            BIAS_DTYPE = tl.float32
-        elif bias.dtype == torch.float16:
-            BIAS_DTYPE = tl.float16
-        elif bias.dtype == torch.bfloat16:
-            BIAS_DTYPE = tl.bfloat16
-        else:
-            raise ValueError(f"Unsupported dtype: {bias.dtype}")
         n_group_pad = triton.next_power_of_2(n_group)
 
         triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
@@ -530,18 +801,6 @@ def grouped_topk(
         (num_tokens, n_group),
         device=scores.device,
         dtype=scores.dtype,
-    )
-
-    topk_values = torch.empty(
-        (num_tokens, topk),
-        device=scores.device,
-        dtype=torch.float32,
-    )
-
-    topk_indices = torch.empty(
-        (num_tokens, topk),
-        device=scores.device,
-        dtype=torch.int32,
     )
 
     BLOCK1 = triton.next_power_of_2(num_experts_per_group)

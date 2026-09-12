@@ -252,6 +252,49 @@ def mthreads_grouped_topk(
         )
 
 
+def ascend_moe_gating_top_k(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    """
+    Adapted from vllm-ascend: ./vllm_ascend/ops/fused_moe/experts_selector.py
+    """
+    if scoring_func == 1 and renormalize:
+        norm_type = 1  # 0: softmax; 1: sigmoid
+        renorm = int(renormalize)
+        topk_weights, topk_ids, _out = torch.ops._C_ascend.moe_gating_top_k(
+            scores.float(),
+            k=topk,
+            k_group=topk_group,
+            group_count=num_expert_group,
+            group_select_mode=1,
+            renorm=renorm,
+            norm_type=norm_type,
+            out_flag=False,
+            routed_scaling_factor=routed_scaling_factor,
+            eps=1e-20,
+            bias_opt=bias.float(),
+        )
+        return topk_weights, topk_ids.to(torch.int32)
+    else:
+        return torch_grouped_topk(
+            scores,
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            bias,
+            scoring_func,
+        )
+
+
 try:
     if vendor_name == "hygon":
         from aiter import moe_fused_gate  # noqa: F401
@@ -261,6 +304,14 @@ try:
         from mate import moe_fused_gate  # noqa: F401
 
         ref_grouped_topk = mthreads_grouped_topk
+    elif vendor_name == "ascend":
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+        if hasattr(torch.ops._C_ascend, "moe_gating_top_k"):
+            ref_grouped_topk = ascend_moe_gating_top_k
+        else:
+            ref_grouped_topk = torch_grouped_topk
     else:
         import vllm._custom_ops  # noqa: F401
 
