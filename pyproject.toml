@@ -61,6 +61,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
 
 [tool.scikit-build]
 build.verbose = true
