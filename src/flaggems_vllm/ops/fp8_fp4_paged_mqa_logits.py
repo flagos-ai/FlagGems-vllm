@@ -36,6 +36,7 @@ try:
 except ImportError:
     TensorDescriptor = None
 
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
