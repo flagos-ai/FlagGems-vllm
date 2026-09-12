@@ -23,14 +23,97 @@ from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import base
 
+torch_device_fn = flaggems_vllm.runtime.torch_device_fn
+
+_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads"})
+
 
 def is_support_fp8e4nv():
+    if not hasattr(torch, "float8_e4m3fn"):
+        return False
+    if flaggems_vllm.vendor_name in _FP8E4NV_CAPABLE_VENDORS:
+        return True
     major, minor = get_device_capability()
     return major * 10 + minor >= 89
 
 
-VLLM_REF_AVAILABLE = hasattr(
-    torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+
+HAS_VLLM = False
+try:
+    import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
+
+    HAS_VLLM = True
+except (ImportError, AttributeError, RuntimeError):
+    # RuntimeError because a misconfigured vLLM should mean "no baseline", not a
+    # collection error: with two platform plugins registered it raises
+    # "Only one platform plugin can be activated, but got: ['fl', 'musa']" at
+    # import, which aborted collection of this whole file on an MTT box.
+    pass
+
+
+def _skip_if_unrunnable(ref, op_name):
+    """Wrap the reference so a registered-but-unlaunchable kernel skips.
+
+    A vendor can register the op and still not run it: MetaX's build returns
+    `mcErrorInvalidValue` from every launch on C550. Failing there blames FlagGems
+    for someone else's defect, while the old `hasattr` gate hid it entirely by
+    skipping as "not installed". Skip, with the launch error as the reason.
+
+    Only the first call pays. A failed launch is reported asynchronously, so left
+    alone it lands on whatever comes next -- here `do_bench`'s 256 MB L2-flush
+    allocation, too late to convert and pointing at the wrong frame. Surfacing it
+    takes a *new kernel launch*: on this backend `synchronize()` and a
+    device-to-host copy are both silent, while any launch raises. Hence the
+    throwaway reduction below. `pytest.skip` then raises `Skipped`, which derives
+    from `BaseException` and so passes through the harness's
+    `except (RuntimeError, Exception)` intact.
+
+    The sibling `torch.ops._C` benchmarks (`top_k_per_row_decode`,
+    `persistent_topk`, `cutlass_scaled_mm`) gate on the import alone; this is the
+    one deliberate deviation, since none of them has met a build that registers the
+    op but cannot launch it.
+
+    KEEP THIS WRAPPER even though mcoplib 0.4.9 fixes the defect in source (it drops
+    the `cudaLaunchKernelEx` path 0.4.6 calls with an uninitialised
+    `cudaLaunchConfig_t`), because no wheel carrying that fix is reachable -- MetaX
+    publishes none on GitHub (every release has zero assets) and the C550 image
+    installs mcoplib from a local file, not an index, so whoever runs this still
+    has 0.4.6 -- and because 0.4.9 is a different operator:
+    vLLM changed the schema at v0.22.0 (`q` read-only, `q_head_padded` added, the
+    result returned rather than written in place) and 0.4.9 follows it, while this
+    file targets the v0.21.0 contract the repo pins.
+
+    Rebuilt from 0.4.6 source with MetaX's own 0.4.9 launch fix the kernel runs on
+    C550 and scores what it did under an LD_PRELOAD shim, so only the published
+    binary is unusable.
+    """
+    checked = False
+
+    def wrapper(*args, **kwargs):
+        nonlocal checked
+        if checked:
+            return ref(*args, **kwargs)
+        try:
+            out = ref(*args, **kwargs)
+            torch.zeros(1, device=flaggems_vllm.device).sum()
+            torch_device_fn.synchronize()
+        except Exception as e:
+            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+            pytest.skip(
+                f"{op_name} is registered but its kernel fails to run: {reason}"
+            )
+        checked = True
+        return out
+
+    return wrapper
+
+
+VLLM_REF_AVAILABLE = HAS_VLLM and hasattr(torch.ops._C, OP_NAME)
+_VENDOR_REF = (
+    _skip_if_unrunnable(getattr(torch.ops._C, OP_NAME), OP_NAME)
+    if VLLM_REF_AVAILABLE
+    else None
 )
 HEAD_DIM = 512
 ROPE_DIM = 64
@@ -59,12 +142,10 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+            _VENDOR_REF,
             [torch.bfloat16],
         )
-        self.set_gems(
-            flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-        )
+        self.set_gems(flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = []

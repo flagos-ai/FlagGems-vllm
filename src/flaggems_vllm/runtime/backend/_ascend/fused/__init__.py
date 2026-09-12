@@ -11,23 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from flaggems_vllm.runtime.backend._hygon.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+from flaggems_vllm.runtime.backend._ascend.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
-)
-from flaggems_vllm.runtime.backend._hygon.fused.fused_moe import (  # noqa: F401
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
-from flaggems_vllm.runtime.backend._hygon.fused.persistent_topk import (  # noqa: F401
-    persistent_topk,
 )
 
 __all__ = [
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
-    "persistent_topk",
 ]
