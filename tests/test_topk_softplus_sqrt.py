@@ -20,6 +20,7 @@ import flaggems_vllm
 
 from . import accuracy_utils as utils
 from . import conftest as cfg
+from flaggems_vllm.ops.topk_softplus_sqrt import HAS_TLE, topk_softplus_sqrt_tle
 
 device = flaggems_vllm.device
 
@@ -251,3 +252,107 @@ def test_topk_softplus_sqrt_vs_vllm(num_tokens, num_experts, topk, renormalize):
         )
 
     _check_topk_results(res_weights, res_ids, vllm_weights, vllm_ids)
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS_LIST)
+@pytest.mark.parametrize("topk", TOPK_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
+@pytest.mark.parametrize("routed_scaling_factor", RSF_LIST)
+def test_topk_softplus_sqrt_tle(
+    num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
+):
+    """Test topk_softplus_sqrt_tle (dense path, forced TLE) against PyTorch reference."""
+    torch.manual_seed(0)
+
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
+    correction_bias = torch.randn((num_experts,), dtype=torch.float32, device=device)
+
+    ref_weights, ref_ids = _torch_topk_softplus_sqrt_reference(
+        gating_output,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        correction_bias=correction_bias,
+    )
+    ref_weights = utils.to_reference(ref_weights)
+    ref_ids = utils.to_reference(ref_ids)
+
+    res_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
+    res_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+    res_tei = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+
+    topk_softplus_sqrt_tle(
+        res_weights,
+        res_ids,
+        res_tei,
+        gating_output,
+        renormalize,
+        routed_scaling_factor,
+        correction_bias=correction_bias,
+    )
+
+    _check_topk_results(res_weights, res_ids, ref_weights, ref_ids)
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+@pytest.mark.parametrize("num_tokens", HASH_NUM_TOKENS_LIST)
+@pytest.mark.parametrize("num_experts", HASH_NUM_EXPERTS_LIST)
+@pytest.mark.parametrize("topk", HASH_TOPK_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
+@pytest.mark.parametrize("routed_scaling_factor", HASH_RSF_LIST)
+def test_topk_softplus_sqrt_tle_hash(
+    num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
+):
+    """Test topk_softplus_sqrt_tle (hash path, forced TLE) against PyTorch reference."""
+    torch.manual_seed(0)
+
+    vocab_size = 1024
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
+    tid2eid = torch.stack(
+        [torch.randperm(num_experts)[:topk] for _ in range(vocab_size)]
+    ).to(device=device, dtype=torch.int32)
+    input_ids = torch.randint(
+        0, vocab_size, (num_tokens,), dtype=torch.int32, device=device
+    )
+
+    ref_weights, ref_ids = _torch_topk_softplus_sqrt_reference(
+        gating_output,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+    )
+    ref_weights = utils.to_reference(ref_weights)
+    ref_ids = utils.to_reference(ref_ids)
+
+    res_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
+    res_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+    res_tei = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+
+    topk_softplus_sqrt_tle(
+        res_weights,
+        res_ids,
+        res_tei,
+        gating_output,
+        renormalize,
+        routed_scaling_factor,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+    )
+
+    _check_topk_results(res_weights, res_ids, ref_weights, ref_ids)
