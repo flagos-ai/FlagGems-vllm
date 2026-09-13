@@ -23,6 +23,11 @@ from . import accuracy_utils as utils
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
+IS_HOPPER = (
+    vendor_name == "nvidia"
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 9
+)
 
 
 # Following varlen and paged attn tests are copied from
@@ -196,7 +201,7 @@ def test_flash_attn_varlen_func(
         else:
             alibi_slopes, attn_bias = None, None
 
-        if vendor_name == "cambricon":
+        if vendor_name == "cambricon" or IS_HOPPER:
             output = flaggems_vllm.flash_attn_varlen_func(
                 q=query,
                 k=key_cache,
@@ -211,7 +216,7 @@ def test_flash_attn_varlen_func(
                 block_table=block_tables,
                 softcap=soft_cap if soft_cap is not None else 0,
                 alibi_slopes=alibi_slopes,
-                fa_version=2,
+                fa_version=3 if IS_HOPPER else 2,
             )
         else:
             if optimize_init:
@@ -322,7 +327,7 @@ def test_flash_attn_varlen_func_swap_qg(
             device=device,
         )
 
-        if vendor_name == "cambricon":
+        if vendor_name == "cambricon" or IS_HOPPER:
             output = flaggems_vllm.flash_attn_varlen_func(
                 q=query,
                 k=key_cache,
@@ -336,7 +341,7 @@ def test_flash_attn_varlen_func_swap_qg(
                 window_size=window_size,
                 block_table=block_tables,
                 softcap=soft_cap if soft_cap is not None else 0,
-                fa_version=2,
+                fa_version=3 if IS_HOPPER else 2,
             )
         else:
             output = flaggems_vllm.ops.flash_attn_varlen_func(
@@ -370,3 +375,108 @@ def test_flash_attn_varlen_func_swap_qg(
         torch.testing.assert_close(
             output, ref_output, atol=2e-2, rtol=1e-2
         ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not IS_HOPPER, reason="Requires Hopper TLE FA3")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "query_lens,kv_lens,causal,window,head_size",
+    [
+        ([129, 97], [270, 193], True, (-1, -1), 64),
+        ([137, 65], [517, 259], False, (-1, -1), 128),
+        ([129, 67], [273, 139], False, (31, 7), 128),
+        ([129, 3], [19, 0], True, (-1, -1), 64),
+        ([129], [513], False, (-1, -1), 256),
+    ],
+)
+@torch.inference_mode()
+def test_hopper_varlen_dense_boundaries(
+    monkeypatch, dtype, query_lens, kv_lens, causal, window, head_size
+):
+    from flaggems_vllm.ops.attention import flash_attn_varlen_func
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention import (
+        launcher,
+    )
+
+    # These boundary shapes select persistent through the production dispatch.
+    # Check the exercised path without requiring a production configuration knob.
+    persistent_calls = []
+    launch_persistent = launcher.launch_persistent
+
+    def record_persistent(*args, **kwargs):
+        persistent_calls.append(True)
+        return launch_persistent(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "launch_persistent", record_persistent)
+    assert flaggems_vllm.flash_attn_varlen_func is flash_attn_varlen_func
+    utils.init_seed(20261015)
+    q = torch.randn(sum(query_lens), 4, head_size, device=device, dtype=dtype)
+    k = torch.randn(sum(kv_lens), 4, head_size, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    cu_q = torch.tensor([0] + query_lens, device=device, dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    cu_k = torch.tensor([0] + kv_lens, device=device, dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    out = torch.empty_like(q)
+
+    def call():
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            max(query_lens),
+            cu_q,
+            max(kv_lens),
+            cu_k,
+            causal=causal,
+            window_size=window,
+            out=out,
+            return_softmax_lse=True,
+            fa_version=3,
+        )
+
+    result, lse = call()
+    assert persistent_calls
+    assert result.data_ptr() == out.data_ptr()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out, graph_lse = call()
+    torch.cuda.current_stream().wait_stream(stream)
+    # Both replays must use the updated inputs and retain sequence boundaries.
+    q.mul_(0.75)
+    v.mul_(0.5)
+    refs, lses = [], []
+    q_start = k_start = 0
+    for q_len, k_len in zip(query_lens, kv_lens):
+        qi = q[q_start : q_start + q_len].float().transpose(0, 1)
+        ki = k[k_start : k_start + k_len].float().transpose(0, 1)
+        vi = v[k_start : k_start + k_len].float().transpose(0, 1)
+        score = qi @ ki.transpose(-1, -2) * head_size**-0.5
+        row = torch.arange(q_len, device=device)[:, None] + k_len - q_len
+        col = torch.arange(k_len, device=device)[None, :]
+        mask = col > row if causal else torch.zeros_like(row + col, dtype=torch.bool)
+        if window[0] >= 0:
+            mask |= col < row - window[0]
+        if window[1] >= 0:
+            mask |= col > row + window[1]
+        score = score.masked_fill(mask, float("-inf"))
+        ref_lse = torch.logsumexp(score, -1)
+        prob = torch.exp(score - ref_lse[..., None]).nan_to_num()
+        refs.append((prob @ vi).transpose(0, 1))
+        lses.append(ref_lse)
+        q_start += q_len
+        k_start += k_len
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_out.float(), torch.cat(refs), atol=2e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(graph_lse, torch.cat(lses, 1), atol=2e-3, rtol=1e-3)
