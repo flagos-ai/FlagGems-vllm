@@ -26,7 +26,6 @@ __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
-    "moe_align_block_size",
     "moe_sum",
     "persistent_topk",
 ]
