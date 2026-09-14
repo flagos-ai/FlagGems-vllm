@@ -1,0 +1,109 @@
+baseURL: https://flagos-ai.github.io/FlagGems-vllm/
+title: FlagGems-vllm
+languageCode: en-us
+theme:
+  - hugo-book
+
+# Language settings
+contentDir: content/en
+defaultContentLanguage: en
+defaultContentLanguageInSubdir: false
+
+# Adopt a global timezone
+timeZone: UTC
+
+enableGitInfo: true
+
+# Caches
+caches:
+  images:
+    dir: :cacheDir/images
+    maxAge: -1
+  modules:
+    dir: :cacheDir/modules
+    maxAge: -1
+
+markup:
+  goldmark:
+    extensions:
+      definitionList: true
+      table: true
+      typographer: false
+    parser:
+      attribute: true
+      autoHeadingID: true
+      autoHeadingIDType: blackfriday
+    renderer:
+      unsafe: true
+  highlight:
+    codeFences: true
+    guessSyntax: false
+    hl_Lines: ""
+    lineNoStart: 1
+    lineNos: false
+    lineNumbersInTable: true
+    noClasses: true
+    style: github-dark
+    tabWidth: 4
+
+  tableOfContents:
+    endLevel: 3
+    ordered: false
+    startLevel: 1
+
+menus:
+  main:
+    - name: Home
+      pageRef: /
+      weight: 10
+    - name: Getting Started
+      pageRef: /getting-started
+      weight: 20
+    - name: Usage
+      pageRef: /usage
+      weight: 30
+    - name: Performance
+      pageRef: /performance
+      weight: 40
+  after:
+    - name: "Github"
+      url: "https://github.com/flagos-ai/FlagGems-vllm"
+      weight: 10
+    - name: "FlagOS"
+      url: "https://flagos.io/"
+      weight: 20
+
+# Language definitions.
+languages:
+  en:
+    title: FlagGems-vllm
+    languageName: English
+    contentDir: content/en
+    weight: 1
+    languagedirection: ltr
+
+  zh-cn:
+    title: FlagGems-vllm
+    languageName: 简体中文
+    weight: 2
+    contentDir: content/zh-cn
+    languagedirection: ltr
+
+module:
+  mounts:
+    - source: i18n/en
+      target: i18n
+    - source: i18n/zh-cn
+      target: i18n
+    - source: ../conf
+      target: data
+    - source: ../benchmark
+      target: data/benchmark
+
+params:
+  copyright_flagos: The FlagOS contributors
+  BookSection: '*'
+  BookSearch: false   # search is using flexsearch, enable later
+  BookTheme: "auto"
+  BookToC: true
+  BookLastChangeLink: 'https://github.com/flagos-ai/FlagGems-vllm/commit/{{ .GitInfo.Hash }}'
