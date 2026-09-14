@@ -22,12 +22,15 @@ from flaggems_vllm.runtime.backend._mthreads.fused.fused_moe import (
 )
 from flaggems_vllm.runtime.backend._mthreads.fused.persistent_topk import (
     persistent_topk,
+from flaggems_vllm.runtime.backend._mthreads.fused.top_k_per_row_prefill import (
+    top_k_per_row_prefill,
 )
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "top_k_per_row_prefill",
     "fused_add_rms_norm",
     "persistent_topk",
 ]
