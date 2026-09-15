@@ -1,94 +1,31 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 FlagOS Contributors
 #
-# Adapted from the vLLM project (https://github.com/vllm-project/vllm).
-# Source files under vllm/model_executor/layers/:
-#   fused_moe/fused_moe.py      – Triton kernels, dispatch, fused_experts_impl
-#   fused_moe/activation.py     – MoEActivation enum, apply_moe_activation
-#   fused_moe/utils.py          – _fp8_quantize, _int8_quantize, moe_kernel_quantize_input
-#   fused_moe/config.py         – _get_config_dtype_str
-#   quantization/utils/mxfp4_utils.py   – dequant_mxfp4
-#   quantization/utils/mxfp6_utils.py   – dequant_mxfp6
-#   quantization/utils/ocp_mx_utils.py  – OCP_MX_BLOCK_SIZE
-
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import functools
 import logging
+import weakref
 from enum import Enum
 from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
+from flaggems_vllm.ops.moe_sum import moe_sum
+from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import pointwise_dynamic
-
-
-@triton.jit
-def _hygon_moe_sum_kernel(
-    input_ptr,
-    output_ptr,
-    num_tokens,
-    topk,
-    hidden_size,
-    input_stride_token,
-    input_stride_topk,
-    input_stride_hidden,
-    output_stride_token,
-    output_stride_hidden,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """moe_sum with a fixed config (no triton.autotune).
-
-    The upstream kernel uses ``triton.autotune`` keyed on
-    (hidden_size, topk); autotune re-runs at every process start and its
-    probe results vary on Hygon DCU, causing small-batch latency to swing
-    between runs. BLOCK_SIZE=1024/num_warps=8 was measured best for both
-    decode (M<=16) and prefill (M=16384) on gfx936.
-    """
-    token_idx = tl.program_id(0)
-    block_idx = tl.program_id(1)
-    hidden_start = block_idx * BLOCK_SIZE
-    hidden_offsets = hidden_start + tl.arange(0, BLOCK_SIZE)
-    hidden_mask = hidden_offsets < hidden_size
-    if token_idx >= num_tokens:
-        return
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    input_base = input_ptr + token_idx * input_stride_token
-    for expert_idx in range(topk):
-        expert_ptr = input_base + expert_idx * input_stride_topk
-        expert_data = tl.load(expert_ptr + hidden_offsets, mask=hidden_mask, other=0.0)
-        acc += expert_data
-    output_ptr_pos = output_ptr + token_idx * output_stride_token + hidden_offsets
-    tl.store(
-        output_ptr_pos,
-        acc.to(tl.float16) if input_ptr.dtype.element_ty == tl.float16 else acc,
-        mask=hidden_mask,
-    )
-
-
-def _hygon_moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
-    num_tokens, topk, hidden_size = input.shape
-    input_strides = input.stride()
-    output_strides = output.stride()
-    grid = (num_tokens, triton.cdiv(hidden_size, 1024))
-    _hygon_moe_sum_kernel[grid](
-        input,
-        output,
-        num_tokens,
-        topk,
-        hidden_size,
-        input_strides[0],
-        input_strides[1],
-        input_strides[2],
-        output_strides[0],
-        output_strides[1],
-        BLOCK_SIZE=1024,
-        num_warps=8,
-    )
-
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +36,7 @@ OCP_MX_BLOCK_SIZE = 32
 # positive from 4096 tokens; direct_sum is kept separate because it is a
 # reduction-layout decision even though it currently shares the same cutoff.
 MOE_GEMM_TUNING_MIN_TOKENS = 4096
-# The generic GEMM2 "direct sum" path uses `tl.atomic_add` on bf16/fp16
-# accumulators, which the Hygon DCU backend cannot select
-# (AtomicLoadFAdd on v2bf16). Disable it and rely on moe_sum instead.
-MOE_DIRECT_SUM_MIN_TOKENS = 1 << 60
+MOE_DIRECT_SUM_MIN_TOKENS = 1 << 60  # PPU: atomic_add ~9x slower than store + moe_sum
 _HALF_GEMM_TILE_M = 128
 _HALF_GEMM_TILE_K = 64
 _HALF_GEMM2_TILE_N = 256
@@ -110,53 +44,26 @@ _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 
 
 @functools.lru_cache(maxsize=1)
-def dequant_mxfp4(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    float_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Dequantize MXFP4 tensor via quark.torch.kernel.mx.dq_mxfp4."""
+def _get_device_name() -> str:
+    """Return the normalised device name (spaces replaced by underscores)."""
     try:
-        from quark.torch.kernel import mx
-    except ImportError as err:
-        raise ImportError("amd-quark is required for MX-FP4") from err
-
-    return mx.dq_mxfp4(x, scale, float_dtype)
+        return torch_device_fn.get_device_name().replace(" ", "_")
+    except AttributeError:
+        return device.name
 
 
-def dequant_mxfp6(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    float_dtype: torch.dtype,
-    quant_dtype: str,
-) -> torch.Tensor:
-    """Dequantize MXFP6 tensor via quark hw_emulation."""
-    try:
-        from quark.torch.kernel.hw_emulation.hw_emulation_interface import (
-            dequantize_fp4_fp6_per_group,
-        )
-        from quark.torch.utils.pack import create_pack_method
-    except ImportError as err:
-        raise ImportError("amd-quark is required for MX-FP6") from err
-
-    pack_method = create_pack_method(None, dtype=quant_dtype)
-    unpacked_x = pack_method.unpack(x, reorder=False)
-
-    scale = 2 ** (scale.view(torch.uint8).to(torch.int16) - 127).to(float_dtype)
-
-    return dequantize_fp4_fp6_per_group(
-        unpacked_x,
-        scale,
-        axis=-1,
-        group_size=OCP_MX_BLOCK_SIZE,
-        quant_dtype=quant_dtype,
-    ).to(float_dtype)
+def get_moe_configs(
+    E: int,
+    N: int,
+    dtype: str | None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+) -> dict[int, Any] | None:
+    """PPU: no embedded (NVIDIA-tuned) config table; always use the
+    PPU per-M config via get_default_config (try_get_optimal_moe_config)."""
+    return None
 
 
-# Activation quantization helpers
-
-
-@functools.lru_cache(maxsize=1)
 def try_get_optimal_moe_config(
     w1_shape: tuple[int, ...],
     w2_shape: tuple[int, ...],
@@ -171,46 +78,43 @@ def try_get_optimal_moe_config(
 ) -> dict[str, Any] | tuple[dict[str, Any], bool]:
     if gemm_stage not in ("gemm1", "gemm2"):
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
-    if gemm_stage == "gemm1":
-        _, N, K = w1_shape
+    _, _, config_n = w2_shape
+    if dtype == "int4_w4a16":
+        config_n = config_n * 2
+    block_n = block_shape[0] if block_shape else 0
+    block_k = block_shape[1] if block_shape else 0
+    configs = get_moe_configs(E, config_n, dtype, block_n, block_k)
+    if configs:
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))].copy()
+        is_embedded = True
     else:
-        _, N, K = w2_shape
-    config = get_default_config(
-        M,
-        E,
-        N,
-        K,
-        top_k,
-        dtype,
-        block_shape,
-        gemm_stage=gemm_stage,
-        enable_gemm_fast_path=enable_gemm_fast_path,
-    )
+        if gemm_stage == "gemm1":
+            _, N, K = w1_shape
+        else:
+            _, N, K = w2_shape
+        config = get_default_config(
+            M,
+            E,
+            N,
+            K,
+            top_k,
+            dtype,
+            block_shape,
+            gemm_stage=gemm_stage,
+            enable_gemm_fast_path=enable_gemm_fast_path,
+        )
+        is_embedded = False
     if return_is_embedded:
-        return config, False
+        return config, is_embedded
     return config
 
 
 def _get_config_quant_dtype(
-    use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
-    ocp_mx_scheme: str | None,
-) -> None | torch.dtype | str:
+) -> None | torch.dtype:
     """Map quantization flags to the corresponding dtype."""
-    if use_fp8_w8a8:
-        return torch.float8_e4m3fn
-    elif use_int8_w8a8:
+    if use_int8_w8a8:
         return torch.int8
-    elif ocp_mx_scheme == "w_mxfp4_a_mxfp4":
-        return "mxfp4"
-    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e3m2", "w_mxfp6_e3m2_a_mxfp6_e3m2"}:
-        return "mxfp6_e3m2"
-    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e2m3", "w_mxfp6_e2m3_a_mxfp6_e2m3"}:
-        return "mxfp6_e2m3"
-    elif ocp_mx_scheme in {"w_mxfp4", "w_mxfp6_e3m2", "w_mxfp6_e2m3"}:
-        return torch.bfloat16
-    elif ocp_mx_scheme in {"w_mxfp4_a_fp8", "w_mxfp6_e3m2_a_fp8", "w_mxfp6_e2m3_a_fp8"}:
-        return torch.float8_e4m3fn
 
     return None
 
@@ -286,299 +190,42 @@ def get_default_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
 ) -> dict[str, Any]:
-    """Default Triton config for fused MoE kernel.
+    """PPU-tuned per-M config (V6 sweep 2026-08-14; small-M re-sweep
+    2026-08-17).
 
-    Heuristic selection aligned with vLLM v0.17.0 defaults, tuned on H20/H100.
-    Key insight: for high-expert-count MoE (e.g. DeepSeek-V3 E=256), each
-    expert sees very few tokens, so small BLOCK_SIZE_M (16) is critical.
+    Sweep-verified tiers (BM/BN/BK, w4/s4/GM8 fixed):
+      M > 1024: 64/256/32 (large-M workhorse)
+      512 < M <= 1024: 32/128/64
+      128 < M <= 512: 16/256/32
+      M <= 128: gemm1 16/256/64, gemm2 16/128/32 (2026-08-17 stage-split
+      sweep; BM must stay >=16 for the PPU m16n16k16 MMA. Split beats the
+      uniform 16/256/32 by ~3% on M<=128; a BM=8 gemm1 measured ~20%
+      faster but is incorrect (MMA m16 constraint), so it is not used.)
     """
-    is_fp8_blockwise = dtype == "fp8_w8a8" and block_shape is not None
-    if gemm_stage not in ("gemm1", "gemm2"):
-        raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
-
-    if is_fp8_blockwise:
-        avg_tokens_per_expert = M * max(topk, 1) // max(E, 1)
-        is_large_m = M >= 16384
-        if avg_tokens_per_expert <= 16:
-            block_m = 16
-        elif avg_tokens_per_expert <= 32:
-            block_m = 32
-        elif avg_tokens_per_expert <= 64 or not is_large_m:
-            block_m = 64
-        else:
-            block_m = 128
-
-        config = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_shape[0],
-            "BLOCK_SIZE_K": block_shape[1],
-            "GROUP_SIZE_M": 8 if (is_large_m and avg_tokens_per_expert > 16) else 1,
-            "num_warps": 8 if (is_large_m and block_m > 32) else 4,
-            "num_stages": 4 if M >= 1024 else 3,
-            # H20: swap_ab puts the larger N dim on the wgmma M-axis, a measured
-            # win on H20 for small token tiles (block_m<=32) but a regression for
-            # large tiles (e.g. 16k/32k-token prefill), so gate on both.
-        }
-    elif dtype in _PLAIN_HALF_CONFIG_DTYPES:
-        # Routed rows per expert drives block_m.  Each token contributes topk
-        # rows to the expert-sorted GEMM input, so M * topk / E is the relevant
-        # density for high-expert-count MoE routing.
-        routed_tokens_per_expert = M * max(topk, 1) // max(E, 1)
-        tokens_per_expert = M // max(E, 1)
-
-        if routed_tokens_per_expert <= 16:
-            block_m = 16
-        elif routed_tokens_per_expert <= 64:
-            block_m = 64
-        else:
-            block_m = 128
-
-        if tokens_per_expert > 128:
-            group_m = 16
-        elif tokens_per_expert > 32:
-            group_m = 8
-        else:
-            group_m = 1
-
-        block_k = 128 if M <= 64 else 64
-
-        if N >= 4096:
-            block_n = 128 if M <= 128 else 256
-        else:
-            block_n = 64 if M <= 64 else 128
-
-        can_use_gemm_fast_path = (
-            enable_gemm_fast_path
-            and M >= MOE_GEMM_TUNING_MIN_TOKENS
-            and block_m == _HALF_GEMM_TILE_M
-            and block_k == _HALF_GEMM_TILE_K
-        )
-
-        use_gemm2_fast_path = (
-            gemm_stage == "gemm2"
-            and can_use_gemm_fast_path
-            and N % _HALF_GEMM2_TILE_N == 0
-        )
-        use_gemm1_fast_path = (
-            gemm_stage == "gemm1" and can_use_gemm_fast_path and N % block_n == 0
-        )
-
-        if gemm_stage == "gemm2" and enable_gemm_fast_path:
-            block_n = (
-                _HALF_GEMM2_TILE_N if use_gemm2_fast_path else (64 if M <= 64 else 128)
-            )
-
-        # Prefer 4 warps for small tiles; only use 8 for large M
-        num_warps = 4 if M <= 128 else 8
-        num_stages = 3
-
-        if use_gemm1_fast_path:
-            group_m = 1
-            num_stages = 4
-        elif use_gemm2_fast_path:
-            group_m = 2
-            num_stages = 4
-
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
-            num_stages -= 1
-
-        config = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": block_k,
-            "GROUP_SIZE_M": group_m,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        }
-        if use_gemm1_fast_path:
-            config["PAIR_GATE_UP_DOT"] = True
+    if M > 1024:
+        bm, bn, bk = 64, 256, 32
+    elif M > 512:
+        bm, bn, bk = 32, 128, 64
+    elif M > 128:
+        bm, bn, bk = 16, 256, 32
+    elif gemm_stage == "gemm2":
+        bm, bn, bk = 16, 128, 32
     else:
-        tokens_per_expert = M // max(E, 1)
-
-        if tokens_per_expert <= 2:
-            block_m = 16
-        elif tokens_per_expert <= 4:
-            block_m = 32
-        elif tokens_per_expert <= 16:
-            block_m = 64
-        else:
-            block_m = 128
-
-        # Tile sizing
-        if N >= 4096:
-            block_n = 128 if M <= 128 else 256
-        elif N >= 1024:
-            block_n = 64 if M <= 64 else 128
-        else:
-            block_n = 64 if M <= 64 else 128
-
-        if dtype == "fp8_w8a8":
-            block_k = 128
-        elif M <= 64:
-            block_k = 128
-        else:
-            block_k = 64
-
-        if tokens_per_expert > 128:
-            group_m = 16
-        elif tokens_per_expert > 32:
-            group_m = 8
-        else:
-            group_m = 1
-
-        # Prefer 4 warps for small tiles; only use 8 for large M
-        num_warps = 4 if M <= 128 else 8
-        num_stages = 3
-
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
-            num_stages -= 1
-
-        config = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": block_k,
-            "GROUP_SIZE_M": group_m,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        }
-
-    # ------------------------------------------------------------------
-    # Hygon DCU adjustments (gfx936):
-    #   1. The hardware shared-memory limit is 64KB; generic H20/H100-tuned
-    #      configs (e.g. BLOCK_SIZE_M=128 with 3 stages requiring ~147KB)
-    #      must be shrunk. Reduce num_stages -> BLOCK_SIZE_K -> BLOCK_SIZE_N
-    #      -> BLOCK_SIZE_M in that order.
-    #   2. Qwen3.6-35B-A3B real-workload tuning (E=256, top_k=8):
-    #      hidden=2048, intermediate=1024 (TP=1) / 256 (TP=4).
-    #      get_default_config(M, E, N, K, ...) is called with the GEMM's B
-    #      matrix dims: GEMM1 has B=(E, 2*intermediate, hidden), GEMM2 has
-    #      B=(E, hidden, intermediate). So GEMM1: N=2*intermediate
-    #      (2048 or 512), K=hidden=2048; GEMM2: N=hidden=2048,
-    #      K=intermediate (1024 or 256).
-    # ------------------------------------------------------------------
-    block_m = config.get("BLOCK_SIZE_M", 128)
-    block_n = config.get("BLOCK_SIZE_N", 128)
-    block_k = config.get("BLOCK_SIZE_K", 64)
-    num_stages = config.get("num_stages", 3)
-
-    # V2: large-M TP1 GEMM2 (K=1024) keeps BLOCK_SIZE_K=64 even though the
-    # resulting smem (98304B) exceeds the nominal 64KB limit: measured 7%
-    # faster than the BK=32 fallback on gfx936, and 98304B smem kernels
-    # compile and run fine (same as mid-M GEMM1 BN=256).
-    keep_bk64 = gemm_stage == "gemm2" and M > 4096 and K == 1024
-
-    def _calc_smem():
-        return (block_m * block_k + block_k * block_n) * 2 * num_stages
-
-    if _calc_smem() > 65536 and num_stages > 2:
-        num_stages = 2
-    if _calc_smem() > 65536 and block_k > 32 and not keep_bk64:
-        block_k = 32
-    if _calc_smem() > 65536 and block_n > 128:
-        block_n = 128
-    if _calc_smem() > 65536 and block_m > 64:
-        block_m = 64
-    if _calc_smem() > 65536 and block_n > 64:
-        block_n = 64
-    if _calc_smem() > 65536 and block_m > 32:
-        block_m = 32
-    config["BLOCK_SIZE_M"] = block_m
-    config["BLOCK_SIZE_N"] = block_n
-    config["BLOCK_SIZE_K"] = block_k
-    config["num_stages"] = num_stages
-
-    is_qwen3_6 = (
-        dtype in _PLAIN_HALF_CONFIG_DTYPES
-        and E == 256
-        and topk == 8
-        and (
-            (gemm_stage == "gemm1" and K == 2048 and N in (2048, 512))
-            or (gemm_stage == "gemm2" and N == 2048 and K in (1024, 256))
-        )
+        bm, bn, bk = 16, 256, 64
+    use_int32 = dtype in ("bf16", "fp16") and max(M * K, M * topk * N, E * N * K) < (
+        1 << 31
     )
-    if is_qwen3_6:
-        # Decode (M small) is latency/bandwidth-bound, prefill (M large) is
-        # compute-bound. num_stages=2 matches vLLM's small-batch choice.
-        #
-        # V2 tuning (measured on gfx936, vs vLLM Triton fused_moe):
-        #  - GEMM1 PAIR_GATE_UP_DOT: single-pass gate+up dot wins for small
-        #    batches (fewer K-loop passes / A re-reads), but the wider 2N dot
-        #    loses register pressure battles at mid M (224-464). M>=4096
-        #    (prefill) keeps PAIR.
-        #  - GEMM2 BLOCK_SIZE_K=128 (K=1024, mid M): halves the K-loop and
-        #    A re-reads, +3~4% at M=224/352/464/1036. Hurts N=256 (TP=4)
-        #    GEMM2 (K=256) and exceeds 64KB smem at large M.
-        if gemm_stage == "gemm1":
-            # PAIR (single-pass gate+up dot) measured wins on gfx936 only
-            # for: decode M<=2 TP=4 (N=512, narrow dot), and prefill
-            # M>=4096. Mid-M TP=1 (64<M<4096, N=2*intermediate=2048) loses
-            # registers with the 2N-wide dot; TP=4 mid-M keeps pair.
-            if N == 512 and M <= 2:
-                config["PAIR_GATE_UP_DOT"] = True
-            elif N == 512 and M == 8:
-                config["BLOCK_SIZE_N"] = 128
-            elif N == 512 and M == 16:
-                config["num_warps"] = 2
-            elif not (M <= 64 or (M < 4096 and N == 2048)):
-                config["PAIR_GATE_UP_DOT"] = True
-        if gemm_stage == "gemm2" and K == 256:
-            # TP4 GEMM2 (K=256) tuning (cudagraph-measured):
-            # M=8 -> BN=128; M=16 -> W4/BK=128 (vLLM single-pass config,
-            # part of the M=16 unfused setup: 0.928 -> 0.977); BK=64 for
-            # every other M (+1% at M=4108, +3.7% at 13422, +4.6% at
-            # 16384 vs BK=32).
-            if M == 8:
-                config["BLOCK_SIZE_N"] = 128
-            elif M == 16:
-                config["num_warps"] = 4
-                config["BLOCK_SIZE_K"] = 128
-            if M != 16:
-                config["BLOCK_SIZE_K"] = 64
-        # V2: wider GEMM1 N-tile wins on gfx936 for mid-M TP=1 (measured
-        # +2~3% at M=464/1036/2048; smem 81920 compiles and runs fine).
-        if gemm_stage == "gemm1" and N == 2048 and 224 <= M <= 2048:
-            config["BLOCK_SIZE_N"] = 256
-        # V2: mid-M TP=1 GEMM1 BK=128 (with BN=128) halves the two-pass
-        # K-loop iterations (2048/128=16 vs 32 per pass): +18~19% at
-        # M=224/352/464 (1.04-1.06 -> 1.23-1.25).
-        if gemm_stage == "gemm1" and N == 2048 and 64 < M < 4096:
-            config["BLOCK_SIZE_K"] = 128
-            config["BLOCK_SIZE_N"] = 128
-        # V2: mid-M TP=4 GEMM1 (N=512) BK=128 with BN=64: +6~8% at
-        # M=224/352/464 (smem 65536 exactly fits).
-        if gemm_stage == "gemm1" and N == 512 and 64 < M < 4096:
-            config["BLOCK_SIZE_K"] = 128
-            config["BLOCK_SIZE_N"] = 64
-        if M < 16:
-            config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 32)
-            config["num_warps"] = 4
-        # TP4 large M: 16 warps for the BM128 tile measured +12-13% on
-        # gfx936 (M=4108: 1.02->1.15, 13422: 1.07->1.21, 16384: 1.10->1.24).
-        if (N == 512 or K == 256) and M > 4096:
-            config["num_warps"] = 16
-        elif M == 16:
-            # TP4 unfused single-pass setup (see fusion note): BM=16/W4
-            # matches vLLM's M=16 config (0.928 -> 0.977 cudagraph).
-            config["BLOCK_SIZE_M"] = 16
-            config["num_warps"] = 4
-        elif M <= 128:
-            config["BLOCK_SIZE_M"] = 32
-            config["num_warps"] = 4
-        elif M <= 1024:
-            config["BLOCK_SIZE_M"] = 64
-            config["num_warps"] = 8
-        elif M <= 4096:
-            config["BLOCK_SIZE_M"] = max(config["BLOCK_SIZE_M"], 64)
-            config["num_warps"] = 8
-        else:
-            config["BLOCK_SIZE_M"] = max(config["BLOCK_SIZE_M"], 64)
-            config["num_warps"] = 8
-        if M <= 4096:
-            config["num_stages"] = 2
-
-    return config
+    return {
+        "BLOCK_SIZE_M": bm,
+        "BLOCK_SIZE_N": bn,
+        "BLOCK_SIZE_K": bk,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 4,
+        # PPU: int32 addressing ~2-3% faster than int64 (V6 exp); gated to
+        # plain-half dtypes and overflow-safe shapes.
+        "USE_INT32_OFFSETS": use_int32,
+    }
 
 
 def _get_config_dtype_str(
@@ -590,16 +237,10 @@ def _get_config_dtype_str(
     ocp_mx_scheme: str | None = None,
 ) -> str | None:
     """Return dtype string for kernel config lookup."""
-    if use_fp8_w8a8:
-        return "fp8_w8a8"
-    elif use_fp8_w8a16:
-        return "fp8_w8a16"
-    elif use_int8_w8a16:
+    if use_int8_w8a16:
         return "int8_w8a16"
     elif use_int4_w4a16:
         return "int4_w4a16"
-    elif ocp_mx_scheme is not None:
-        return None
     elif dtype == torch.float16:
         return "fp16"
     elif dtype == torch.bfloat16:
@@ -677,102 +318,10 @@ def apply_moe_activation(
         N = output.size(-1)
         x, y = input[:, :N], input[:, N:]
         _silu_and_mul_kernel(x, y, out0=output)
-    elif activation == MoEActivation.GELU:
-        N = output.size(-1)
-        gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.gelu(gate) * up)
-    elif activation == MoEActivation.SWIGLUSTEP:
-        N = output.size(-1)
-        gate, up = input[:, :N], input[:, N:]
-        output.copy_(torch.sigmoid(gate) * up)
-    elif activation == MoEActivation.RELU2:
-        N = output.size(-1)
-        gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.relu(gate).square() * up)
-
-    elif activation == MoEActivation.SILU_NO_MUL:
-        output.copy_(F.silu(input))
-    elif activation == MoEActivation.GELU_NO_MUL:
-        output.copy_(F.gelu(input))
-    elif activation == MoEActivation.RELU2_NO_MUL:
-        F.relu(input, inplace=True)
-        torch.square(input, out=output)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
     return output
-
-
-def _fp8_quantize(
-    A: torch.Tensor,
-    A_scale: Optional[torch.Tensor],
-    per_act_token: bool,
-    block_shape: Optional[list[int]] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP8 E4M3 quantization: per-tensor, per-token, or block-wise."""
-    fp8_dtype = torch.float8_e4m3fn
-    finfo = torch.finfo(fp8_dtype)
-    fp8_max = finfo.max
-    fp8_min = finfo.min
-    eps = 1e-10
-
-    if block_shape is not None:
-        assert not per_act_token
-        assert len(block_shape) == 2
-        block_k = block_shape[1]
-        assert A.size(-1) % block_k == 0
-        if A.ndim == 2 and A.stride(-1) == 1:
-            from flaggems_vllm.ops.per_token_group_quant_fp8 import (
-                per_token_group_quant_fp8,
-            )
-
-            return per_token_group_quant_fp8(
-                A,
-                group_size=block_k,
-                eps=eps,
-                dtype=fp8_dtype,
-                column_major_scales=False,
-                scale_ue8m0=False,
-            )
-        orig_shape = A.shape
-        A_flat = A.reshape(-1, A.size(-1))
-        M, K = A_flat.shape
-        A_groups = A_flat.reshape(M * (K // block_k), block_k)
-        amax = (
-            A_groups.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
-        )
-        scale = amax / fp8_max
-        A_q = (A_groups.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
-        A_q = A_q.reshape(orig_shape)
-        scale = scale.reshape(M, K // block_k)
-        return A_q, scale
-
-    elif per_act_token:
-        A_flat = A.reshape(-1, A.size(-1))
-        amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
-        scale = amax / fp8_max
-        min_scale = torch.tensor(
-            1.0 / (fp8_max * 512.0), dtype=torch.float32, device=A.device
-        )
-        scale = scale.clamp(min=min_scale)
-        A_q = (A_flat.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
-        A_q = A_q.reshape(A.shape)
-        scale = scale.reshape(A.shape[:-1] + (1,))
-        return A_q, scale
-
-    else:
-        if A_scale is not None:
-            scale = (
-                A_scale.float().view(1, 1) if A_scale.numel() == 1 else A_scale.float()
-            )
-            A_q = (A.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
-            return A_q, A_scale
-        else:
-            amax = A.abs().amax().clamp(min=eps).to(torch.float32)
-            scale = amax / fp8_max
-            iscale = 1.0 / scale
-            A_q = (A.float() * iscale).clamp(fp8_min, fp8_max).to(fp8_dtype)
-            return A_q, scale.view(1)
 
 
 def _int8_quantize(
@@ -832,18 +381,8 @@ def moe_kernel_quantize_input(
     ocp_mx_scheme: str | None = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Quantize MoE input activations before GEMM."""
-    if ocp_mx_scheme is not None:
-        if ocp_mx_scheme in {"w_mxfp4", "w_mxfp4_a_mxfp4"}:
-            pass
-        elif ocp_mx_scheme.endswith("a_fp8"):
-            qA, qA_scale = _fp8_quantize(A, A_scale, per_act_token=False)
-            A = (qA.float() * qA_scale.float()).to(A.dtype)
-            return A, None
-
     if quant_dtype is None:
         return A, A_scale
-    elif quant_dtype == torch.float8_e4m3fn:
-        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
     else:
@@ -896,11 +435,6 @@ def write_zeros_to_output(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
-
 
 @triton.jit
 def fused_moe_kernel_gptq_awq(
@@ -945,6 +479,7 @@ def fused_moe_kernel_gptq_awq(
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    USE_INT32_OFFSETS: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
@@ -972,7 +507,9 @@ def fused_moe_kernel_gptq_awq(
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
-    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    if not USE_INT32_OFFSETS:
+        off_experts = off_experts.to(tl.int64)
     if off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
@@ -1095,6 +632,87 @@ def fused_moe_kernel_gptq_awq(
 
 
 @triton.jit
+def fused_moe_gemv_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    expert_ids_ptr,
+    num_valid_tokens,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    N_DIVISIBLE_BY_BLOCK_N: tl.constexpr,
+):
+    """Per-row (token, expert) GEMV kernel, mirroring DeepGemm's Gemvt.
+
+    One block computes one routed row (a single token-expert pair): the A row
+    is the token's hidden state, B is the expert's weight slice. No BLOCK_M
+    tiling, so there is no 1/16 MMA-row waste on the naive small-M path.
+    Output layout matches fused_moe_kernel (row = routed index), so moe_sum
+    and the surrounding data flow are unchanged.
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    if pid_m >= num_valid_tokens:
+        return
+    off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_expert < 0:
+        return
+    token = pid_m // top_k
+
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_bn_m = offs_bn < N
+    if not N_DIVISIBLE_BY_BLOCK_N:
+        offs_bn = offs_bn % N
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        a = tl.load(
+            a_ptr + token * stride_am + offs_k * stride_ak,
+            mask=offs_k < K,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr
+            + off_expert * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn,
+            mask=(offs_k[:, None] < K) & offs_bn_m[None, :],
+            other=0.0,
+        )
+        # bf16 x bf16 would truncate the product to bf16 (8-bit mantissa),
+        # inflating rounding error vs the DeepGemm reference (which multiplies
+        # in fp32). Promote both operands before the product.
+        acc += tl.sum(a.to(tl.float32)[:, None] * b.to(tl.float32), axis=0)
+
+    if MUL_ROUTED_WEIGHT:
+        w = tl.load(topk_weights_ptr + pid_m)
+        acc *= w
+
+    acc = acc.to(compute_type)
+    tl.store(
+        c_ptr + pid_m * stride_cm + offs_bn * stride_cn,
+        acc,
+        mask=offs_bn_m,
+    )
+
+
+@triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -1137,6 +755,7 @@ def fused_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    USE_INT32_OFFSETS: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
@@ -1166,7 +785,10 @@ def fused_moe_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Create pointers for first blocks of A and B
-    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    if USE_INT32_OFFSETS:
+        offs = tl.arange(0, BLOCK_SIZE_M)
+    else:
+        offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
@@ -1179,13 +801,18 @@ def fused_moe_kernel(
             pid_m,  # first element = pid_m
             num_valid_tokens,  # remaining elements = constant
         )
-    offs_token = offs_token.to(tl.int64)  # prevent int32 overflow
+    if not USE_INT32_OFFSETS:
+        offs_token = offs_token.to(tl.int64)
 
     token_mask = offs_token < num_valid_tokens
 
-    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    if not USE_INT32_OFFSETS:
+        off_experts = off_experts.to(tl.int64)
 
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if not USE_INT32_OFFSETS:
+        offs_bn = offs_bn.to(tl.int64)
     if not N_DIVISIBLE_BY_BLOCK_N:
         offs_bn = offs_bn % N_out
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -1207,7 +834,9 @@ def fused_moe_kernel(
             )
             return
 
-        offs_pair = tl.arange(0, BLOCK_SIZE_N * 2).to(tl.int64)
+        offs_pair = tl.arange(0, BLOCK_SIZE_N * 2)
+        if not USE_INT32_OFFSETS:
+            offs_pair = offs_pair.to(tl.int64)
         offs_pair_bn = tl.where(
             offs_pair < BLOCK_SIZE_N,
             pid_n * BLOCK_SIZE_N + offs_pair,
@@ -1724,7 +1353,63 @@ def invoke_fused_moe_triton_kernel(
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
 
+    use_int32_offsets = config.pop("USE_INT32_OFFSETS", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
+
+    # PPU small-M naive path: per-row GEMV kernel (mirrors DeepGemm Gemvt).
+    # No BLOCK_M tiling -> no 1/16 MMA-row waste for one-token-per-expert
+    # routing. Only for plain-half, non-fused, non-direct-sum calls, and only
+    # where per-row work is large enough to amortise the block: >=32 routed
+    # rows and N >= 1024 (measured: wins on M=8/2I=2048, regresses on M=1
+    # and small-N shapes, which keep the tiled kernel).
+    if (
+        sorted_token_ids is None
+        and not FUSE_SILU
+        and not direct_sum
+        and not (use_int8_w8a16 or use_int4_w4a16)
+        and A_scale is None
+        and B_scale is None
+        and num_tokens >= 32
+        and actual_N >= 1024
+    ):
+        _g = _GEMV_CFG
+        if _g is not None:
+            gemv_block_n = _g["BLOCK_N"]
+            gemv_block_k = _g["BLOCK_K"]
+            gemv_warps = _g.get("num_warps", 1)
+            gemv_stages = _g.get("num_stages", 3)
+        else:
+            gemv_block_n = 128
+            gemv_block_k = 32
+            gemv_warps = 1
+            gemv_stages = 2
+        grid_gemv = (num_tokens * triton.cdiv(actual_N, gemv_block_n),)
+        fused_moe_gemv_kernel[grid_gemv](
+            A,
+            B,
+            C,
+            topk_weights,
+            expert_ids,
+            num_tokens,
+            B.size(1),  # N
+            B.size(2),  # K
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            BLOCK_N=gemv_block_n,
+            BLOCK_K=gemv_block_k,
+            N_DIVISIBLE_BY_BLOCK_N=(actual_N % gemv_block_n == 0),
+            num_warps=gemv_warps,
+            num_stages=gemv_stages,
+        )
+        return
 
     fused_moe_kernel[grid](
         A,
@@ -1772,6 +1457,7 @@ def invoke_fused_moe_triton_kernel(
         PAIR_GATE_UP_DOT=pair_gate_up_dot,
         DIRECT_SUM=direct_sum,
         OUT_TOP_K=out_top_k,
+        USE_INT32_OFFSETS=use_int32_offsets,
         FUSE_SILU=FUSE_SILU,
         **config,
     )
@@ -1868,6 +1554,49 @@ def dispatch_fused_moe_kernel(
         )
 
 
+_TRANSPOSE_CACHE: dict = {}
+_GEMV_CFG = None  # optional gemv tuning override: {"BLOCK_N":..,"BLOCK_K":..}
+_TRANSPOSE_CACHE_MAX = 4
+# Memory-pressure adaptive degradation: below LOW the transpose cache is
+# dropped and the path degrades to the untransposed layout; only above HIGH
+# is transposing re-enabled (hysteresis prevents flapping). Re-transposing on
+# every call under sustained pressure would cost ~21ms per call, far worse
+# than the ~1.8ms kernel win the transpose provides.
+_TRANSPOSE_MEM_LOW_BYTES = 10 * 1024**3
+_TRANSPOSE_MEM_HIGH_BYTES = 16 * 1024**3
+_TRANSPOSE_DISABLED = False
+_ENABLE_TRANSPOSE = True  # debug: set False to disable weight transposition
+
+
+def _transposed_view(w: torch.Tensor) -> torch.Tensor:
+
+    from flaggems_vllm.ops.permute_copy import permute_copy  # FlagGems kernel
+
+    key = (w.data_ptr(), w.shape, w.dtype)
+    entry = _TRANSPOSE_CACHE.get(key)
+    if entry is not None and entry[0]() is w:
+        return entry[1]
+    if len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
+        dead = [k for k, (r, _) in _TRANSPOSE_CACHE.items() if r() is None]
+        for k in dead:
+            del _TRANSPOSE_CACHE[k]
+        while len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
+            _TRANSPOSE_CACHE.pop(next(iter(_TRANSPOSE_CACHE)))
+    t = permute_copy(w, (0, 2, 1))  # (E, K, N) contiguous, FlagGems kernel
+    E, N, K = w.shape
+    view = t.as_strided((E, N, K), (K * N, 1, N))
+
+    # Transpose-copy lifetime is tied to the original weight: when the weight
+    # is garbage-collected the weakref callback drops the cache entry, so the
+    # (possibly huge) transposed copy is released immediately instead of
+    # lingering until the next LRU-triggered sweep.
+    def _cleanup(ref, _cache=_TRANSPOSE_CACHE, _key=key):
+        _cache.pop(_key, None)
+
+    _TRANSPOSE_CACHE[key] = (weakref.ref(w, _cleanup), view)
+    return view
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1900,6 +1629,13 @@ def fused_experts_impl(
         activation == "silu"
     ), f"Only 'silu' activation is supported, got {activation}"
 
+    # PPU: fp8 (e4m3fn) and MXFP (ocp_mx_scheme) are not supported by the
+    # architecture (fp8e4nv unsupported; MXFP relies on the same MMA path).
+    if use_fp8_w8a8 or ocp_mx_scheme is not None:
+        raise NotImplementedError(
+            "PPU: fp8_w8a8 / ocp_mx_scheme not supported (thead fused_moe)"
+        )
+
     activation_enum = MoEActivation.from_str(activation)
 
     # Check constraints
@@ -1908,15 +1644,6 @@ def fused_experts_impl(
         assert hidden_states.size(1) == w1.size(
             2
         ), f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
-    elif ocp_mx_scheme is not None:
-        if ocp_mx_scheme.startswith("w_mxfp4"):
-            assert hidden_states.size(1) == w1.size(2) * 2, "hidden size mismatch"
-        elif ocp_mx_scheme.startswith("w_mxfp6"):
-            assert (
-                hidden_states.size(1) == (w1.size(2) * 4) // 3
-            ), "hidden size mismatch"
-        else:
-            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
     else:
         assert hidden_states.size(1) == w1.size(
             2
@@ -1926,6 +1653,31 @@ def fused_experts_impl(
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+
+    # PPU: transposed weight view -> b-tile BN-contiguous reads (nopad layout
+    # win). Same shape, so N/K semantics are untouched. Quantized paths keep
+    # their original layout. Under memory pressure (free < LOW) the transpose
+    # cache is dropped and this path degrades to the untransposed layout;
+    # recovery (> HIGH) re-enables transposing. Hysteresis avoids flapping.
+    global _TRANSPOSE_DISABLED
+    try:
+        _free, _ = torch.cuda.mem_get_info()
+        if _free < _TRANSPOSE_MEM_LOW_BYTES:
+            if not _TRANSPOSE_DISABLED:
+                _TRANSPOSE_CACHE.clear()
+            _TRANSPOSE_DISABLED = True
+        elif _TRANSPOSE_DISABLED and _free > _TRANSPOSE_MEM_HIGH_BYTES:
+            _TRANSPOSE_DISABLED = False
+    except (AttributeError, RuntimeError):
+        _TRANSPOSE_DISABLED = False  # no CUDA-semantic mem query -> keep cache
+
+    if (
+        _ENABLE_TRANSPOSE
+        and not (use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and not (_TRANSPOSE_DISABLED)
+    ):
+        w1 = _transposed_view(w1)
+        w2 = _transposed_view(w2)
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
@@ -1949,9 +1701,7 @@ def fused_experts_impl(
     is_fp8_blockwise = config_dtype == "fp8_w8a8" and block_shape is not None
 
     quant_dtype = _get_config_quant_dtype(
-        use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
-        ocp_mx_scheme=ocp_mx_scheme,
     )
 
     get_moe_config = functools.partial(
@@ -1960,9 +1710,7 @@ def fused_experts_impl(
         w2.size(),
         top_k_num,
         config_dtype,
-        # try_get_optimal_moe_config is lru_cached: block_shape must be
-        # hashable (list would raise TypeError: unhashable type).
-        block_shape=tuple(block_shape) if block_shape is not None else None,
+        block_shape=block_shape,
         E=E,
         return_is_embedded=True,
     )
@@ -1997,34 +1745,6 @@ def fused_experts_impl(
 
     out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
 
-    if ocp_mx_scheme is not None:
-        # Dequantize OCP MX weights (TODO: skip on platforms with native MX)
-        if ocp_mx_scheme.startswith("w_mxfp4"):
-            w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
-            w1_scale = None
-            w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
-            w2_scale = None
-        elif ocp_mx_scheme.startswith("w_mxfp6_e3m2"):
-            w1 = dequant_mxfp6(
-                w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
-            )
-            w1_scale = None
-            w2 = dequant_mxfp6(
-                w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
-            )
-            w2_scale = None
-        elif ocp_mx_scheme.startswith("w_mxfp6_e2m3"):
-            w1 = dequant_mxfp6(
-                w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
-            )
-            w1_scale = None
-            w2 = dequant_mxfp6(
-                w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
-            )
-            w2_scale = None
-        else:
-            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
-
     # Dequant INT8/INT4 weights (Triton can't do mixed-dtype dot)
     if use_int8_w8a16 or use_int4_w4a16:
         w1 = w1.to(hidden_states.dtype) * w1_scale.unsqueeze(-1).to(hidden_states.dtype)
@@ -2036,9 +1756,16 @@ def fused_experts_impl(
 
     direct_sum_supported = is_plain_half_config or is_fp8_blockwise
 
-    # Check if we can safely fuse the activation with the first GEMM pass
+    _FUSE_SILU_SMALL_M_TOKENS = 256
+
+    # PPU: for large M, fused GEMM1 (dual accumulator) measures 11-20%
+    # slower than the non-fused path (FUSE_SILU experiments, 2026-08-13),
+    # so large M keeps non-fused. Small M prefers fusion (per-launch fixed
+    # cost dominates; V4 measured the padded fused kernel ~3x faster on
+    # M<=128, 2026-08-14).
     can_use_fused_silu = (
-        activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        num_tokens < _FUSE_SILU_SMALL_M_TOKENS
+        and activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
     )
@@ -2104,25 +1831,8 @@ def fused_experts_impl(
             num_tokens_post_padded.fill_(max_num_tokens_padded)
             sorted_token_ids = None
 
-        # 1. Extract a unified boolean flag for GEMM1 fusion and select config.
-        # (naive path also fuses: saves a silu_and_mul launch, measured win
-        # on Hygon DCU in launch mode). Cudagraph-measured exceptions (vLLM
-        # structure wins): TP=4 M<=2 (N=256), M=2, and M=16 TP4 (unfused
-        # single-pass 2N GEMM1 + separate silu + BM16/W4 + gemm2 BK128:
-        # 0.928 -> 0.977).
-        # Fused SiLU only for plain half configs: FP8/INT8 fused GEMM1
-        # halves N_out (single-pass 2N) which halves the grid and starves
-        # the GPU at small M (measured 1.85x slower vs vLLM's unfused).
-        do_fuse_silu = can_use_fused_silu and is_plain_half_config
-        if is_plain_half_config and (
-            (tokens_in_chunk <= 2 and (N <= 512 or tokens_in_chunk == 2))
-            or (tokens_in_chunk == 16 and N <= 512)
-            or (tokens_in_chunk >= 8192 and N == 2048)
-        ):
-            # TP1 huge M (>=8192): unfused single-pass 2N GEMM1 + separate
-            # silu measured +1.4~1.6% (3-round stable) vs fused PAIR;
-            # vLLM's narrower dot partitioning wins at this scale.
-            do_fuse_silu = False
+        # 1. Extract a unified boolean flag for GEMM1 fusion and select config
+        do_fuse_silu = can_use_fused_silu and not naive_block_assignment
         use_half_gemm_fast_paths = not is_embedded_config and is_plain_half_config
 
         gemm1_config = base_config
@@ -2248,7 +1958,7 @@ def fused_experts_impl(
 
         # 8. Reduce GEMM2 top-k outputs unless direct_sum wrote final output directly
         if not use_direct_sum:
-            _hygon_moe_sum(
+            moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.size()),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
