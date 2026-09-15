@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from math import ceil
 
 import pytest
@@ -41,6 +42,24 @@ try:
     HAS_VLLM_FUSED_MOE = True
 except ImportError:
     HAS_VLLM_FUSED_MOE = False
+
+
+def _supports_keyword(op, keyword):
+    try:
+        parameters = inspect.signature(op).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+# vLLM versions differ: newer ones require ``inplace`` (no default), older ones
+# do not accept the keyword at all.
+VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
+    vllm_fused_experts_impl, "inplace"
+)
 
 
 DEFAULT_BLOCK_SHAPE = [128, 128]
@@ -167,18 +186,19 @@ def _vllm_fused_moe_fp8_blockwise_wrapper(
     hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
 ):
     """Wrapper to call vllm fused_experts_impl with block-wise FP8."""
+    kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(
         hidden_states.clone(),
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation="silu",
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=DEFAULT_BLOCK_SHAPE,
+        **kwargs,
     )
 
 
