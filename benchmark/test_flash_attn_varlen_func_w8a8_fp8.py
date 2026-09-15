@@ -117,7 +117,9 @@ def baseline_flash_attn_varlen_func_w8a8_fp8(
     baseline_out,
     w8a8_out,
 ):
-    return flaggems_vllm.flash_attn_varlen_func(
+    from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
         q,
         k,
         v,
@@ -128,6 +130,7 @@ def baseline_flash_attn_varlen_func_w8a8_fp8(
         softmax_scale=scale,
         causal=causal,
         out=baseline_out,
+        fa_version=2,
     )
 
 
@@ -271,8 +274,10 @@ def flash_attn_varlen_func_w8a8_fp8_input_fn(config, dtype, device):
     ) = _quantize_qkv_w8a8(q, k, v, q_seq_lens, kv_seq_lens)
     cu_seqlens_q = _make_cu_seqlens(q_seq_lens, device)
     cu_seqlens_k = _make_cu_seqlens(kv_seq_lens, device)
-    baseline_out = torch.empty_like(q)
     w8a8_out = torch.empty_like(q)
+    # Keep BF16 conversion outside the timed baseline call.
+    q, k, v = [x.to(torch.bfloat16) for x in (q, k, v)]
+    baseline_out = torch.empty_like(q)
     torch.cuda.synchronize()
 
     yield (

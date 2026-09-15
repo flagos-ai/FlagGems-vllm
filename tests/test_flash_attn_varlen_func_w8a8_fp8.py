@@ -186,14 +186,14 @@ def _run_w8a8_varlen(
         v_descale=v_descale,
     )
     reference_inputs = (
-        _dequantize_varlen_per_block_fp8(q_fp8, q_lengths, q_descale, q.dtype),
-        _dequantize_varlen_per_block_fp8(k_fp8, kv_lengths, k_descale, k.dtype),
-        _dequantize_varlen_per_block_fp8(v_fp8, kv_lengths, v_descale, v.dtype),
+        _dequantize_varlen_per_block_fp8(q_fp8, q_lengths, q_descale, torch.bfloat16),
+        _dequantize_varlen_per_block_fp8(k_fp8, kv_lengths, k_descale, torch.bfloat16),
+        _dequantize_varlen_per_block_fp8(v_fp8, kv_lengths, v_descale, torch.bfloat16),
     )
     return result, reference_inputs, cu_seqlens_q, cu_seqlens_k
 
 
-def _flaggems_varlen_reference(
+def _vllm_varlen_reference(
     q,
     k,
     v,
@@ -205,13 +205,15 @@ def _flaggems_varlen_reference(
     seqused_k=None,
     block_table=None,
 ):
+    from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+
     max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
     max_seqlen_k = int(
         (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
         if cu_seqlens_k is not None
         else seqused_k.max().item()
     )
-    return flaggems_vllm.flash_attn_varlen_func(
+    return flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -225,6 +227,7 @@ def _flaggems_varlen_reference(
         block_table=block_table,
         out=torch.empty_like(q),
         return_softmax_lse=return_softmax_lse,
+        fa_version=2,
     )
 
 
@@ -266,9 +269,7 @@ def test_flash_attn_varlen_func_w8a8_fp8(
     result, (ref_q, ref_k, ref_v), cu_q, cu_k = _run_w8a8_varlen(
         q, k, v, q_lengths, kv_lengths, scale, causal
     )
-    expected = _flaggems_varlen_reference(
-        ref_q, ref_k, ref_v, cu_q, cu_k, scale, causal
-    )
+    expected = _vllm_varlen_reference(ref_q, ref_k, ref_v, cu_q, cu_k, scale, causal)
     _assert_w8a8_attention_close(result, expected)
 
 
@@ -318,7 +319,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_uniform_lse(
         return_softmax_lse=True,
         fp8_dtype=fp8_dtype,
     )
-    expected, expected_lse = _flaggems_varlen_reference(
+    expected, expected_lse = _vllm_varlen_reference(
         ref_q,
         ref_k,
         ref_v,
@@ -376,7 +377,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ragged(
         causal,
         return_softmax_lse=True,
     )
-    expected, expected_lse = _flaggems_varlen_reference(
+    expected, expected_lse = _vllm_varlen_reference(
         ref_q,
         ref_k,
         ref_v,
@@ -475,7 +476,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size):
     ref_q = _dequantize_varlen_per_block_fp8(q_fp8, q_lengths, q_descale, dtype)
     ref_k = _dequantize_varlen_per_block_fp8(k_fp8, kv_lengths, k_descale, dtype)
     ref_v = _dequantize_varlen_per_block_fp8(v_fp8, kv_lengths, v_descale, dtype)
-    expected = _flaggems_varlen_reference(
+    expected = _vllm_varlen_reference(
         ref_q,
         to_paged_cache(ref_k),
         to_paged_cache(ref_v),
