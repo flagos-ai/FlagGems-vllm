@@ -17,9 +17,15 @@ from flaggems_vllm.runtime.backend._hygon.fused.fused_moe import (  # noqa: F401
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.fused.moe_sum import moe_sum  # noqa: F401
+from flaggems_vllm.runtime.backend._hygon.fused.persistent_topk import (  # noqa: F401
+    persistent_topk,
+)
 
 __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
+    "moe_sum",
     "outplace_fused_experts",
+    "persistent_topk",
 ]
