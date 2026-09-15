@@ -254,3 +254,13 @@ __all__ = [
     "weight_norm_interface",
     "weight_norm_interface_backward",
 ]
+
+# Backend-only APIs have no implementation on other vendors.
+from flaggems_vllm.runtime import device as _device
+
+if _device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.fused.attention import (  # noqa: F401
+        flash_attn_varlen_func_w8a8_int8,
+    )
+
+    __all__.append("flash_attn_varlen_func_w8a8_int8")

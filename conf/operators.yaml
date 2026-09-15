@@ -291,6 +291,18 @@ ops:
     stages:
       - stable: '3.1'
     cpp: '4.0'
+  - id: flash_attn_varlen_func_w8a8_int8
+    description: PPU INT8 Q/K/V variable-length attention with per-128-token descales and FP16/BF16 output.
+    for:
+      - flash_attn_varlen_func_w8a8_int8
+    labels:
+      - fused
+      - Attention
+      - FlashAttention
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: flash_attn_varlen_opt_func
     description: A variant of `flash_attn_varlen_func` that has `lse` as an optional parameter.
     for:

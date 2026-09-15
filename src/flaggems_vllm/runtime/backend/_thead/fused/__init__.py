@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._thead.fused.attention import (
+    flash_attn_varlen_func_w8a8_int8,
+)
 from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -21,6 +24,7 @@ from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 from flaggems_vllm.runtime.backend._thead.fused.persistent_topk import persistent_topk
 
 __all__ = [
+    "flash_attn_varlen_func_w8a8_int8",
     "fused_experts_impl",
     "inplace_fused_experts",
     "moe_sum",
