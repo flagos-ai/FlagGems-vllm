@@ -43,6 +43,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
+from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import (
+    chunk_gated_delta_rule_fwd,
+)
+
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "add_rms_norm",
@@ -60,5 +64,6 @@ __all__ = [
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
     "swiglu",
+    "chunk_gated_delta_rule_fwd",
     "persistent_topk",
 ]
