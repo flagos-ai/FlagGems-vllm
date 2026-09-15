@@ -112,17 +112,17 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_hygon/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
     "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
         "tests/test_fused_experts_impl.py",
         "tests/test_moe_sum.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+    "src/flaggems_vllm/runtime/backend/_metax/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_thead/fused/fused_moe.py": [
+    "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
 }
@@ -174,17 +174,17 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_hygon/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/fused/fused_moe.py": [
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
     "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
         "benchmark/test_fused_moe.py",
         "benchmark/test_moe_sum.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_moe.py": [
+    "src/flaggems_vllm/runtime/backend/_metax/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_thead/fused/fused_moe.py": [
+    "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
 }

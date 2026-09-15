@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._ascend.fused.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "fused_experts_impl",
+    "inplace_fused_experts",
+    "outplace_fused_experts",
     "persistent_topk",
 ]
