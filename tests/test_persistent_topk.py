@@ -28,6 +28,7 @@ from . import conftest as cfg
 persistent_topk = flaggems_vllm.persistent_topk
 
 device = flaggems_vllm.device
+vendor_name = flaggems_vllm.vendor_name
 
 
 def _has_histogram_mask():
@@ -69,6 +70,14 @@ try:
 except (ImportError, AttributeError, NotImplementedError, RuntimeError):
     HAS_VLLM = False
     _vllm_persistent_topk = None
+
+# Platform workaround: vllm-metax's C++ baseline decode path (seq_len <= 8192,
+# histogram_2048_topk) emits out-of-range indices on MetaX hardware
+# (1055/4102/8192 all produce garbage, >8192 all correct; root cause:
+# 32-warp/cub assumption vs mccub warp=64). On MetaX, skip the baseline
+# comparison for that region only; our implementation is still covered by
+# test_persistent_topk_vs_torch against torch.topk.
+BASELINE_BROKEN_MAX_SEQ = 8192 if vendor_name == "metax" else 0
 
 STRIDE = 262144
 K = 512
@@ -164,6 +173,8 @@ def _gems_decode(logits, seq_lens, top_k, max_seq_len=None):
 @pytest.mark.parametrize("data_type", DATA_TYPES)
 @torch.inference_mode()
 def test_persistent_topk_cross_agreement(num_rows, seq_len, max_seq_len, data_type):
+    if seq_len <= BASELINE_BROKEN_MAX_SEQ:
+        pytest.skip("vllm-metax baseline decode path broken on MetaX (seq_len<=8192)")
     seq_lens = [seq_len] * num_rows
     logits = _padded_logits(num_rows, seq_len, data_type)
 
