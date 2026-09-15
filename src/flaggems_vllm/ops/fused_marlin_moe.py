@@ -83,6 +83,8 @@ from typing import Any, Callable, NamedTuple, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from flag_gems.ops.copy import _copy_kernel
+from flag_gems.ops.zero import zero
 from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm import runtime
@@ -97,7 +99,6 @@ from flaggems_vllm.ops.fused_moe import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
-    moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
     moe_align_block_size_small_grouped,
 )
@@ -3654,11 +3655,7 @@ def _prepare_w8a16_routing(
             topk_ids, num_experts, block_size_m
         )
     else:
-        # The shared non-TLE helper also tightens the capacity for sparse routes.
-        align = (
-            moe_align_block_size_no_tle if num_tokens <= 1024 else moe_align_block_size
-        )
-        dispatch_ids, expert_ids, padded_count = align(
+        dispatch_ids, expert_ids, padded_count = moe_align_block_size(
             topk_ids, block_size_m, num_experts, pad_sorted_ids=True
         )
     # Each adapter lane reads only its own entry before overwriting it.
@@ -3684,16 +3681,6 @@ def _prepare_w8a16_routing(
         BLOCK=256,
     )
     return token_ids, experts, weights, capacity
-
-
-@triton.jit
-def _w8a16_output_kernel(src, dst, size, ZERO: tl.constexpr, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if ZERO:
-        values = tl.full((BLOCK,), 0, tl.float32)
-    else:
-        values = tl.load(src + offsets, mask=offsets < size, other=0)
-    tl.store(dst + offsets, values, mask=offsets < size)
 
 
 def _bsm_block_m_for_avg_load(avg_tokens_per_expert: int, num_tokens: int) -> int:
@@ -4040,7 +4027,6 @@ def _fused_marlin_moe_w8a16(
     if t == 0:
         return result if destination is None else destination
     with runtime.torch_device_fn.device(hidden_states.device):
-        output_grid = (triton.cdiv(result.numel(), 1024),)
         packed_int8 = (
             not use_fp8
             and group_size == 128
@@ -4061,9 +4047,7 @@ def _fused_marlin_moe_w8a16(
                 result,
             )
             if destination is not None:
-                _w8a16_output_kernel[output_grid](
-                    result, destination, result.numel(), ZERO=False, BLOCK=1024
-                )
+                _copy_kernel(result, out0=destination)
                 return destination
             return result
         block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
@@ -4073,9 +4057,7 @@ def _fused_marlin_moe_w8a16(
             elif t <= 1024:
                 block_m = min(block_m, 32)
         if t > 16:
-            _w8a16_output_kernel[output_grid](
-                result, result, result.numel(), ZERO=True, BLOCK=1024
-            )
+            zero(result)
         routing = _prepare_w8a16_routing(
             topk_ids, topk_weights, e, block_m, output=result if t <= 16 else None
         )
@@ -4098,9 +4080,7 @@ def _fused_marlin_moe_w8a16(
             quant_config,
         )
         if destination is not None:
-            _w8a16_output_kernel[output_grid](
-                result, destination, result.numel(), ZERO=False, BLOCK=1024
-            )
+            _copy_kernel(result, out0=destination)
             return destination
     return result
 
@@ -4452,9 +4432,7 @@ def fused_marlin_moe(
                 or not output.is_contiguous()
             ):
                 raise ValueError("output must match the W8A16 result and be contiguous")
-            _w8a16_output_kernel[(triton.cdiv(result.numel(), 1024),)](
-                result, output, result.numel(), ZERO=False, BLOCK=1024
-            )
+            _copy_kernel(result, out0=output)
         else:
             output.copy_(result)
         return output

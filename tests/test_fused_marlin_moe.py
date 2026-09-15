@@ -666,7 +666,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])
-@pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024)])
+@pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024), (65, 256, 512)])
 def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
@@ -977,8 +977,17 @@ def test_fused_marlin_moe_w8a16_empty_and_invalid(precision):
     ],
 )
 def test_fused_marlin_moe_w8a16_shared_routing(
-    concentrated, zero_output, t, e, k, block_m
+    monkeypatch, concentrated, zero_output, t, e, k, block_m
 ):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    align = module.moe_align_block_size
+    calls = []
+
+    def shared_align(*args, **kwargs):
+        calls.append(True)
+        return align(*args, **kwargs)
+
+    monkeypatch.setattr(module, "moe_align_block_size", shared_align)
     dispatch = torch.arange(t * k, device=flaggems_vllm.device).reshape(t, k)
     ids = dispatch % (2 if concentrated else e)
     weights = (dispatch + 1).float() / (t * k)
@@ -988,6 +997,7 @@ def test_fused_marlin_moe_w8a16_shared_routing(
     tids, experts, sorted_weights, capacity = _prepare_w8a16_routing(
         ids, weights, e, block_m, output=output
     )
+    assert bool(calls) == (t > 4 and not (t <= 16 and t * k <= 32))
     if output is not None:
         assert torch.count_nonzero(output) == 0
     tids, experts, sorted_weights = tids.cpu(), experts.cpu(), sorted_weights.cpu()

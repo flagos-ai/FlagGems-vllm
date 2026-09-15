@@ -17,6 +17,8 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.moe_align_block_size import (
+    moe_align_block_size,
+    moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
     moe_align_block_size_small_grouped,
 )
@@ -377,3 +379,42 @@ def test_accuracy_moe_align_block_size_fast_paths(fast_path):
     torch.testing.assert_close(actual[0][:num_tokens], expected[0][:num_tokens])
     torch.testing.assert_close(actual[1][:num_blocks], expected[1][:num_blocks])
     torch.testing.assert_close(actual[2], expected[2])
+
+
+@pytest.mark.moe_align_block_size
+@pytest.mark.parametrize("align", [moe_align_block_size, moe_align_block_size_no_tle])
+@pytest.mark.parametrize("pad_sorted_ids", [False, True])
+@pytest.mark.parametrize("concentrated", [False, True])
+@pytest.mark.parametrize(
+    "routes,num_experts,block_size",
+    [(1, 7, 16), (160, 512, 4), (511, 512, 64), (512, 512, 64), (513, 512, 64)],
+)
+def test_accuracy_moe_align_block_size_shared_capacity(
+    align, pad_sorted_ids, concentrated, routes, num_experts, block_size
+):
+    dispatch = torch.arange(routes, dtype=torch.int32, device=flaggems_vllm.device)
+    topk_ids = (dispatch % (1 if concentrated else num_experts)).view(-1, 1)
+    sorted_ids, expert_ids, padded_count = align(
+        topk_ids, block_size, num_experts, pad_sorted_ids=pad_sorted_ids
+    )
+    capacity = routes + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        capacity = ((capacity + block_size - 1) // block_size) * block_size
+    if routes < num_experts:
+        capacity = min(capacity, routes * block_size)
+    assert sorted_ids.numel() == capacity
+    assert expert_ids.numel() == (capacity + block_size - 1) // block_size
+
+    count = padded_count.item()
+    expected_counts = torch.bincount(topk_ids.flatten().long(), minlength=num_experts)
+    expected_padded = ((expected_counts + block_size - 1) // block_size) * block_size
+    assert count == expected_padded.sum().item()
+    assert count <= capacity and count % block_size == 0
+    block_experts = expert_ids[: count // block_size].repeat_interleave(block_size)
+    routed = sorted_ids[:count]
+    valid = routed < routes
+    torch.testing.assert_close(torch.sort(routed[valid]).values, dispatch)
+    torch.testing.assert_close(block_experts[valid], topk_ids.flatten()[routed[valid]])
+    assert torch.all(routed[~valid] == routes)
+    assert torch.all(sorted_ids[count:] == routes)
+    assert torch.all(expert_ids[count // block_size :] == -1)
