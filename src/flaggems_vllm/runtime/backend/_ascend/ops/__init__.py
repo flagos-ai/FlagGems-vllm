@@ -30,6 +30,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
+    lightning_indexer,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -54,6 +57,7 @@ __all__ = [
     "outplace_fused_experts",
     "qwen4_store_qsa_kv_rows",
     "qwen4_hc_inject_combine",
+    "lightning_indexer",
     "per_token_group_quant_fp8",
     "ple_state_scatter_",
     "qwen4_qsa_mqa_paged_dot",
