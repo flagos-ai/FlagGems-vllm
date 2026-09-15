@@ -130,6 +130,13 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
+        "--topk",
+        type=int,
+        default=16,
+        help="Set Top-K for benchmarks that expose a configurable Top-K value.",
+    )
+
+    parser.addoption(
         "--query", action="store_true", default=False, help="Enable query mode"
     )
 
