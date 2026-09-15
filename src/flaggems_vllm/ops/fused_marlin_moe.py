@@ -2432,6 +2432,11 @@ class _W8A16Config:
     use_packed_int8: bool = False
 
 
+def _require_w8a16_nvidia(device):
+    if device.type != "cuda" or runtime.device.vendor_name != "nvidia":
+        raise NotImplementedError("Native W8A16 MoE requires the NVIDIA CUDA backend")
+
+
 @triton.jit
 def _dequant_w8a16_int8_packed(q, scale, compute_type: tl.constexpr):
     """Decode four native UINT8 codes; no persistent Marlin repacking is needed."""
@@ -2480,7 +2485,8 @@ def _dequant_w8a16_int8_packed(q, scale, compute_type: tl.constexpr):
         )
 
 
-@triton.autotune(
+@libentry()
+@libtuner(
     configs=runtime.get_tuned_config("fused_marlin_moe_w8a16_int8_gemv"),
     key=["N", "K", "H", "TOP_K", "GATE"],
     reset_to_zero=["OUT"],
@@ -2614,154 +2620,13 @@ def _launch_w8a16_int8_gemv(x, w1, w2, s1, s2, weights, ids, output):
     )
 
 
-def _w8a16_gemm_configs(tiles):
-    """Build the validated (N, K, warps, maxnreg) candidates; keep stage=1."""
-    return [
-        triton.Config(
-            {"BLOCK_SIZE_N": n, "BLOCK_SIZE_K": k},
-            num_warps=warps,
-            num_stages=1,
-            **({"maxnreg": registers} if registers is not None else {}),
+def _w8a16_tuned_kernel(kernel, config_name, key, **kwargs):
+    """Share JIT bodies while keeping each precision's library tuning cache."""
+    return libentry()(
+        libtuner(configs=runtime.get_tuned_config(config_name), key=key, **kwargs)(
+            kernel
         )
-        for n, k, warps, registers in tiles
-    ]
-
-
-# Fused gateup/SwiGLU and down retain stage 1 for Hopper compiler compatibility.
-_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
-    [
-        (32, 64, 4, None),
-        (64, 64, 4, None),
-        (64, 128, 4, None),
-        (64, 128, 4, 64),
-        (64, 128, 4, 80),
-        (64, 128, 4, 96),
-        (128, 64, 4, None),
-        (128, 128, 8, None),
-    ]
-)
-
-_W8A16_FUSED_LARGE_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
-    [
-        (64, 128, 4, None),
-        (64, 128, 8, None),
-        (128, 128, 4, None),
-        (128, 64, 4, None),
-        (64, 64, 4, None),
-        (128, 128, 8, None),
-    ]
-)
-
-_W8A16_FP8_DOWN_AUTOTUNE_CONFIGS = _w8a16_gemm_configs(
-    [
-        (64, 64, 4, None),
-        (128, 64, 4, None),
-        (64, 128, 4, None),
-        (64, 128, 4, 64),
-        (64, 128, 4, 80),
-        (64, 128, 4, 96),
-        (128, 128, 8, None),
-    ]
-)
-
-_W8A16_UNIFIED_MOE_AUTOTUNE_CONFIGS = [
-    triton.Config(
-        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 64},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 64, "BLOCK_K_H": 128},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 64, "BLOCK_K_H": 128},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 128, "BLOCK_K_H": 128},
-        num_warps=8,
-        num_stages=1,
-    ),
-]
-
-_W8A16_FP8_UNIFIED_MOE_AUTOTUNE_CONFIGS = [
-    triton.Config(
-        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 64},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 64, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_N": 128, "BLOCK_I_TILE": 32, "BLOCK_K_H": 128},
-        num_warps=4,
-        num_stages=1,
-    ),
-]
-
-_W8A16_AUTOTUNE_CONFIGS_INT8 = _w8a16_gemm_configs(
-    [
-        (64, 64, 4, None),
-        (128, 64, 4, None),
-        (128, 64, 4, 64),
-        (128, 64, 4, 80),
-        (128, 64, 4, 96),
-        (128, 64, 8, None),
-        (256, 64, 8, None),
-        (256, 32, 8, None),
-    ]
-)
-
-_W8A16_FUSED_AUTOTUNE_CONFIGS_INT8 = _w8a16_gemm_configs(
-    [
-        (32, 64, 4, None),
-        (32, 128, 4, None),
-        (64, 32, 4, None),
-        (64, 64, 4, None),
-        (64, 128, 8, None),
-        (128, 32, 4, None),
-        (128, 64, 4, None),
-        (128, 64, 8, None),
-        (64, 128, 4, None),
-        (64, 128, 4, 64),
-        (64, 128, 4, 80),
-        (64, 128, 4, 96),
-        (128, 128, 4, None),
-        (128, 128, 8, None),
-    ]
-)
-
-_W8A16_DOWN_AUTOTUNE_CONFIGS_INT8 = _w8a16_gemm_configs(
-    [
-        (64, 64, 4, None),
-        (128, 64, 4, None),
-        (128, 64, 8, None),
-        (64, 128, 4, None),
-        (64, 128, 4, 64),
-        (64, 128, 4, 80),
-        (64, 128, 4, 96),
-        (64, 128, 8, None),
-        (128, 128, 4, None),
-        (128, 128, 4, 96),
-        (128, 128, 8, None),
-    ]
-)
+    )
 
 
 @triton.jit
@@ -2796,12 +2661,14 @@ def fused_moe_kernel_w8a16_gateup(
     BLOCK_SIZE_K: tl.constexpr,
     has_zp: tl.constexpr,
     use_fp8_w8a16: tl.constexpr,
-    SMALL_TOKEN_MXQ_PATH: tl.constexpr,
     SWAP_AB: tl.constexpr,
     compute_type: tl.constexpr,
     USE_PACKED_INT8: tl.constexpr = False,
 ):
-    """gate_up = W1[expert] @ x, written to GATEUP[dispatch_idx, :]. Full N coverage."""
+    """gate_up = W1[expert] @ x, written to GATEUP[dispatch_idx, :]. Full N coverage.
+
+    FP8 codes are exact in A16; apply the constant group scale after each dot.
+    """
     tl.static_assert(128 % BLOCK_SIZE_K == 0, "W8A16 contraction tiles must divide 128")
     tl.static_assert(
         group_size % BLOCK_SIZE_K == 0, "W8A16 groups must align with contraction tiles"
@@ -2818,6 +2685,11 @@ def fused_moe_kernel_w8a16_gateup(
     token_mask = token_ids < T
     expert_id = tl.load(expert_ids_per_block + pid_m).to(tl.int64)
     if expert_id < 0:
+        tl.store(
+            GATEUP + offs_m[:, None] * stride_gu_m + offs_n[None, :] * stride_gu_n,
+            0.0,
+            mask=n_mask[None, :],
+        )
         return
     if SWAP_AB:
         accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
@@ -2857,7 +2729,7 @@ def fused_moe_kernel_w8a16_gateup(
             mask=n_mask,
             other=0.0,
         ).to(tl.float32)
-        if use_fp8_w8a16 and SMALL_TOKEN_MXQ_PATH:
+        if use_fp8_w8a16:
             if SWAP_AB:
                 accumulator += tl.dot(b_int.to(a.dtype), a) * s[:, None]
             else:
@@ -2876,12 +2748,6 @@ def fused_moe_kernel_w8a16_gateup(
                 accumulator += tl.dot(b_deq.to(a.dtype), a)
             else:
                 accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
-        elif use_fp8_w8a16:
-            b_deq = b_int * s[:, None]
-            if SWAP_AB:
-                accumulator += tl.dot(b_deq.to(a.dtype), a)
-            else:
-                accumulator += tl.dot(a, tl.trans(b_deq.to(a.dtype)))
         else:
             if USE_PACKED_INT8:
                 b_deq = _dequant_w8a16_int8_packed(b_int, s[:, None], compute_type)
@@ -2895,66 +2761,13 @@ def fused_moe_kernel_w8a16_gateup(
         out_ptrs = (
             GATEUP + offs_m[None, :] * stride_gu_m + offs_n[:, None] * stride_gu_n
         )
-        out_mask = token_mask[None, :] & n_mask[:, None]
+        out_mask = n_mask[:, None]
     else:
         out_ptrs = (
             GATEUP + offs_m[:, None] * stride_gu_m + offs_n[None, :] * stride_gu_n
         )
-        out_mask = token_mask[:, None] & n_mask[None, :]
+        out_mask = n_mask[None, :]
     tl.store(out_ptrs, accumulator.to(compute_type), mask=out_mask)
-
-
-@triton.jit
-def silu_mul_kernel(
-    GATEUP,  # (M_padded, 2*I) bf16
-    INTER,  # (M_padded, I) bf16
-    sorted_token_ids,
-    sorted_weights,
-    M_padded,
-    T,
-    I,
-    stride_gu_m,
-    stride_gu_n,
-    stride_inter_m,
-    stride_inter_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_I: tl.constexpr,
-    APPLY_ROUTED_WEIGHT: tl.constexpr,
-    compute_type: tl.constexpr,
-):
-    """SwiGLU: intermediate[m, i] = silu(gate_up[m, i]) * gate_up[m, i + I]."""
-    pid_m = tl.program_id(0)
-    pid_i = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_i = pid_i * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
-
-    m_mask = offs_m < M_padded
-    token_ids = tl.load(sorted_token_ids + offs_m, mask=m_mask, other=T)
-    m_mask = m_mask & (token_ids < T)
-    i_mask = offs_i < I
-    full_mask = m_mask[:, None] & i_mask[None, :]
-
-    gate_ptr = GATEUP + offs_m[:, None] * stride_gu_m + offs_i[None, :] * stride_gu_n
-    up_ptr = (
-        GATEUP + offs_m[:, None] * stride_gu_m + (offs_i + I)[None, :] * stride_gu_n
-    )
-
-    gate = tl.load(gate_ptr, mask=full_mask, other=0.0).to(tl.float32)
-    up = tl.load(up_ptr, mask=full_mask, other=0.0).to(tl.float32)
-
-    silu_gate = gate * tl.sigmoid(gate)
-    result = silu_gate * up
-    if APPLY_ROUTED_WEIGHT:
-        route_weights = tl.load(sorted_weights + offs_m, mask=m_mask, other=0.0).to(
-            tl.float32
-        )
-        result *= route_weights[:, None]
-
-    out_ptr = (
-        INTER + offs_m[:, None] * stride_inter_m + offs_i[None, :] * stride_inter_n
-    )
-    tl.store(out_ptr, result.to(compute_type), mask=full_mask)
 
 
 @triton.jit
@@ -3141,12 +2954,6 @@ def fused_moe_kernel_w8a16_gateup_silu(
             n_mask[None, :] if STORE_PADDED else token_mask[:, None] & n_mask[None, :]
         )
     tl.store(out_ptrs, result.to(compute_type), mask=out_mask)
-
-
-_fused_moe_kernel_w8a16_gateup_silu_large = triton.autotune(
-    configs=_W8A16_FUSED_LARGE_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
-)(fused_moe_kernel_w8a16_gateup_silu)
 
 
 @triton.jit
@@ -3562,48 +3369,52 @@ def _prune_w8a16_fp8_gateup_configs(configs, named_args, **kwargs):
     return configs
 
 
-# Share kernel bodies while tuning INT8 and FP8 independently. Only the split
-# gateup enables deeper pipelines; multi-stage down fails on Triton 3.6/Hopper.
-_fused_moe_kernel_w8a16_gateup_fp8 = triton.autotune(
-    configs=_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS
-    + runtime.get_tuned_config("fused_marlin_moe_w8a16_fp8_gateup_pipeline"),
-    key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
-    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_gateup_configs},
-)(fused_moe_kernel_w8a16_gateup)
-
-_fused_moe_kernel_w8a16_gateup_silu_fp8 = triton.autotune(
-    configs=_W8A16_FP8_FUSED_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T"],
-)(fused_moe_kernel_w8a16_gateup_silu)
-
-_fused_moe_kernel_w8a16_down_fp8 = triton.autotune(
-    configs=_W8A16_FP8_DOWN_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
-    reset_to_zero=["OUT"],
-)(fused_moe_kernel_w8a16_down)
-
-_fused_moe_kernel_w8a16_unified_moe_fp8 = triton.autotune(
-    configs=_W8A16_FP8_UNIFIED_MOE_AUTOTUNE_CONFIGS,
-    key=["M_padded", "H", "I", "T"],
-    reset_to_zero=["OUT"],
-)(fused_moe_kernel_w8a16_unified_moe)
-
-
 def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
     if not {**named_args, **kwargs}.get("USE_PACKED_INT8", False):
         return [config for config in configs if config.kwargs["BLOCK_SIZE_K"] <= 64]
     return configs
 
 
-_fused_moe_kernel_w8a16_gateup_int8 = triton.autotune(
-    configs=_W8A16_AUTOTUNE_CONFIGS_INT8
-    + runtime.get_tuned_config("fused_marlin_moe_w8a16_int8_gateup"),
+# Share kernel bodies while tuning INT8 and FP8 independently. Only the split
+# gateup enables deeper pipelines; multi-stage down fails on Triton 3.6/Hopper.
+_fused_moe_kernel_w8a16_gateup_fp8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_gateup,
+    "fused_marlin_moe_w8a16_fp8_gateup",
+    key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
+    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_gateup_configs},
+)
+
+_fused_moe_kernel_w8a16_gateup_silu_fp8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_gateup_silu,
+    "fused_marlin_moe_w8a16_fp8_gateup_silu",
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T"],
+)
+
+_fused_moe_kernel_w8a16_down_fp8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_down,
+    "fused_marlin_moe_w8a16_fp8_down",
+    key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
+    reset_to_zero=["OUT"],
+)
+
+_fused_moe_kernel_w8a16_unified_moe_fp8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_unified_moe,
+    "fused_marlin_moe_w8a16_fp8_unified",
+    key=["M_padded", "H", "I", "T"],
+    reset_to_zero=["OUT"],
+)
+
+
+_fused_moe_kernel_w8a16_gateup_int8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_gateup,
+    "fused_marlin_moe_w8a16_int8_gateup",
     key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T", "USE_PACKED_INT8"],
     prune_configs_by={"early_config_prune": _prune_w8a16_int8_gateup_configs},
-)(fused_moe_kernel_w8a16_gateup)
+)
 
-_fused_moe_kernel_w8a16_down_int8 = triton.autotune(
-    configs=_W8A16_DOWN_AUTOTUNE_CONFIGS_INT8,
+_fused_moe_kernel_w8a16_down_int8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_down,
+    "fused_marlin_moe_w8a16_int8_down",
     key=[
         "BLOCK_SIZE_M",
         "M_padded",
@@ -3614,18 +3425,27 @@ _fused_moe_kernel_w8a16_down_int8 = triton.autotune(
         "USE_PACKED_INT8",
     ],
     reset_to_zero=["OUT"],
-)(fused_moe_kernel_w8a16_down)
+)
 
-_fused_moe_kernel_w8a16_unified_moe_int8 = triton.autotune(
-    configs=_W8A16_UNIFIED_MOE_AUTOTUNE_CONFIGS,
+_fused_moe_kernel_w8a16_unified_moe_int8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_unified_moe,
+    "fused_marlin_moe_w8a16_int8_unified",
     key=["M_padded", "H", "I", "T"],
     reset_to_zero=["OUT"],
-)(fused_moe_kernel_w8a16_unified_moe)
+)
 
-_fused_moe_kernel_w8a16_gateup_silu_int8 = triton.autotune(
-    configs=_W8A16_FUSED_AUTOTUNE_CONFIGS_INT8,
+_fused_moe_kernel_w8a16_gateup_silu_int8 = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_gateup_silu,
+    "fused_marlin_moe_w8a16_int8_gateup_silu",
     key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
-)(fused_moe_kernel_w8a16_gateup_silu)
+)
+
+
+_fused_moe_kernel_w8a16_gateup_silu_large = _w8a16_tuned_kernel(
+    fused_moe_kernel_w8a16_gateup_silu,
+    "fused_marlin_moe_w8a16_int8_gateup_silu_large",
+    key=["BLOCK_SIZE_M", "M_padded", "I", "H", "T", "USE_PACKED_INT8"],
+)
 
 
 def _launch_w8a16_gateup_silu(
@@ -3921,7 +3741,7 @@ def invoke_fused_moe_full_swiglu(
 
     small_token_mxq_path = num_valid_tokens <= 512
 
-    # NOTE: Tile K/N/warps/stages come from each kernel's `@triton.autotune`.
+    # NOTE: Tile K/N/warps/stages come from each kernel's library tuner.
     # BLOCK_SIZE_M is inferred from routing: one BSM block row count per program.
     BLOCK_SIZE_M = num_post_padded // max(int(expert_ids_per_block.numel()), 1)
 
@@ -3948,7 +3768,7 @@ def invoke_fused_moe_full_swiglu(
     num_blocks_m = num_post_padded // BLOCK_SIZE_M
 
     down_grid_n_first = num_valid_tokens >= 64
-    preweight_intermediate = num_valid_tokens <= 512
+    preweight_intermediate = use_fused_gateup_silu and num_valid_tokens <= 512
 
     # Tiny FP8 unit-test dimensions can trigger unsupported Hopper codegen.
     unified_shape_supported = not quant_config.use_fp8 or (
@@ -4081,36 +3901,16 @@ def invoke_fused_moe_full_swiglu(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             has_zp=has_zp_w1,
             use_fp8_w8a16=quant_config.use_fp8,
-            SMALL_TOKEN_MXQ_PATH=small_token_mxq_path,
             SWAP_AB=1 < num_valid_tokens <= 1024,
             compute_type=compute_type,
             USE_PACKED_INT8=quant_config.use_packed_int8,
         )
 
-        SWIGLU_BSM = 32
-        SWIGLU_BSI = 256
-        grid2 = (
-            triton.cdiv(num_post_padded, SWIGLU_BSM),
-            triton.cdiv(intermediate_size, SWIGLU_BSI),
-        )
-        silu_mul_kernel[grid2](
-            gate_up,
+        # The producer initializes padded rows; these slices are no-copy views.
+        silu_and_mul_out(
+            gate_up[:, :intermediate_size],
+            gate_up[:, intermediate_size:],
             intermediate,
-            sorted_token_ids,
-            sorted_weights,
-            M_padded=num_post_padded,
-            T=num_valid_tokens,
-            I=intermediate_size,
-            stride_gu_m=gate_up.stride(0),
-            stride_gu_n=gate_up.stride(1),
-            stride_inter_m=intermediate.stride(0),
-            stride_inter_n=intermediate.stride(1),
-            BLOCK_SIZE_M=SWIGLU_BSM,
-            BLOCK_SIZE_I=SWIGLU_BSI,
-            APPLY_ROUTED_WEIGHT=preweight_intermediate,
-            compute_type=compute_type,
-            num_warps=4,
-            num_stages=1,
         )
 
         del gate_up
@@ -4207,8 +4007,7 @@ def _fused_marlin_moe_w8a16(
     tensors = (hidden_states, w1, w2, w1_scale, w2_scale, topk_ids, topk_weights)
     if any(x.device != hidden_states.device or not x.is_contiguous() for x in tensors):
         raise ValueError("W8A16 tensors must be contiguous and on the same device")
-    if hidden_states.device.type != "cuda":
-        raise NotImplementedError("The optimized W8A16 kernels require CUDA")
+    _require_w8a16_nvidia(hidden_states.device)
     use_fp8 = w1.dtype == torch.float8_e4m3fn
     for zeros, scale in ((w1_zeros, w1_scale), (w2_zeros, w2_scale)):
         if zeros is not None:
@@ -4373,6 +4172,58 @@ def fused_marlin_moe_w8a16_int8(
 # ----------------------------------------------------------------------------
 # Public entry point: vLLM-aligned wrapper.
 # ----------------------------------------------------------------------------
+def _w8a16_fast_path_supported(
+    hidden_states,
+    w1,
+    w2,
+    quant_type_id,
+    group_size,
+    bias1,
+    bias2,
+    expert_map,
+    global_num_experts,
+    apply_router_weight_on_input,
+    activation_func,
+    moe_sum,
+    is_k_full,
+    w1_zeros,
+    w2_zeros,
+):
+    """Validate native W8 options; INT8 alone has a shared WNA16 fallback."""
+    use_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
+    if w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError("W8A16 expects rank-3 expert weights")
+    if not isinstance(group_size, int) or group_size <= 0:
+        raise ValueError("group_size must be a positive integer")
+    expected_dtype = torch.float8_e4m3fn if use_fp8 else torch.uint8
+    if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
+        raise ValueError(
+            "W8A16 weight dtype must match quant_type_id; packed Marlin weights are not supported"
+        )
+    _require_w8a16_nvidia(hidden_states.device)
+    if activation_func is not None or moe_sum is not None:
+        raise NotImplementedError(
+            "W8A16 does not support custom activation/reduction callbacks"
+        )
+    if not is_k_full:
+        raise NotImplementedError("W8A16 requires complete expert weights")
+    fast_options = (
+        bias1 is None
+        and bias2 is None
+        and expert_map is None
+        and global_num_experts in (-1, w1.shape[0])
+        and not apply_router_weight_on_input
+        and group_size >= 128
+        and group_size % 128 == 0
+    )
+    if use_fp8 and (not fast_options or w1_zeros is not None or w2_zeros is not None):
+        raise NotImplementedError(
+            "FP8 W8A16 requires group_size divisible by 128, no bias/zero "
+            "points/expert map, and output-side routing weights"
+        )
+    return fast_options
+
+
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -4464,47 +4315,24 @@ def fused_marlin_moe(
 
     use_fp8_w8a16 = quant_type_id == QUANT_TYPE_FP8_E4M3
     if use_int8_w8a16 or use_fp8_w8a16:
-        if w1.ndim != 3 or w2.ndim != 3:
-            raise ValueError("W8A16 expects rank-3 expert weights")
-        if not isinstance(group_size, int) or group_size <= 0:
-            raise ValueError("group_size must be a positive integer")
-        expected_dtype = torch.float8_e4m3fn if use_fp8_w8a16 else torch.uint8
-        if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
-            raise ValueError(
-                "W8A16 weight dtype must match quant_type_id; packed Marlin weights are not supported"
-            )
-        fast_options = (
-            bias1 is None
-            and bias2 is None
-            and expert_map is None
-            and global_num_experts in (-1, w1.shape[0])
-            and not apply_router_weight_on_input
-            and group_size >= 128
-            and group_size % 128 == 0
-        )
-        if activation_func is not None or moe_sum is not None:
-            raise NotImplementedError(
-                "W8A16 does not support custom activation/reduction callbacks"
-            )
-        if not is_k_full:
-            raise NotImplementedError("W8A16 requires complete expert weights")
-        if use_fp8_w8a16 and (
-            not fast_options or w1_zeros is not None or w2_zeros is not None
+        if _w8a16_fast_path_supported(
+            hidden_states,
+            w1,
+            w2,
+            quant_type_id,
+            group_size,
+            bias1,
+            bias2,
+            expert_map,
+            global_num_experts,
+            apply_router_weight_on_input,
+            activation_func,
+            moe_sum,
+            is_k_full,
+            w1_zeros,
+            w2_zeros,
         ):
-            raise NotImplementedError(
-                "FP8 W8A16 requires group_size divisible by 128, no bias/zero "
-                "points/expert map, and output-side routing weights"
-            )
-        if fast_options:
-            fn = (
-                fused_marlin_moe_w8a16_fp8
-                if use_fp8_w8a16
-                else fused_marlin_moe_w8a16_int8
-            )
-            zero_points = (
-                {} if use_fp8_w8a16 else {"w1_zeros": w1_zeros, "w2_zeros": w2_zeros}
-            )
-            return fn(
+            return _fused_marlin_moe_w8a16(
                 hidden_states,
                 w1,
                 w2,
@@ -4515,14 +4343,15 @@ def fused_marlin_moe(
                 group_size=group_size,
                 inplace=inplace,
                 output=output,
-                **zero_points,
+                w1_zeros=w1_zeros,
+                w2_zeros=w2_zeros,
             )
 
-    if (
+    elif (
         # The magic-trick kernel's bf16 dequant uses sub.bf16x2/mul.bf16 PTX,
         # which require sm_90+; on pre-Hopper fall back to the generic wna16 kernel.
-        _is_hopper()
-        and use_int4_w4a16
+        use_int4_w4a16
+        and _is_hopper()
         and hidden_states.dtype in (torch.float16, torch.bfloat16)
         and w1.dtype == torch.uint8
         and w2.dtype == torch.uint8
@@ -4555,7 +4384,7 @@ def fused_marlin_moe(
         return result
 
     # MXFP4 fast path: FP4 (E2M1) weights + per-32 E8M0 scale.
-    if use_fp4_w4a16:
+    elif use_fp4_w4a16:
         if not (
             _is_hopper()
             and hidden_states.dtype in (torch.float16, torch.bfloat16)
@@ -4615,7 +4444,19 @@ def fused_marlin_moe(
     )
 
     if output is not None:
-        output.copy_(result)
+        if use_int8_w8a16:
+            if (
+                output.shape != result.shape
+                or output.dtype != result.dtype
+                or output.device != result.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError("output must match the W8A16 result and be contiguous")
+            _w8a16_output_kernel[(triton.cdiv(result.numel(), 1024),)](
+                result, output, result.numel(), ZERO=False, BLOCK=1024
+            )
+        else:
+            output.copy_(result)
         return output
     return result
 

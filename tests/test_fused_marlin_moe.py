@@ -25,6 +25,9 @@ fp16/bf16 w_ref returned by quantize_weights so quantization round-off is
 shared by both sides.
 """
 
+import importlib
+from types import SimpleNamespace
+
 import pytest
 import torch
 import triton
@@ -711,6 +714,199 @@ def test_fused_marlin_moe_w8a16_int8_packed_dequant(dtype):
     _check_w8a16_int8_dequant[(q.numel() // 256,)](q, scales, result, BLOCK=256)
     expected = ((q.float() - 128.0) * scales.float()).to(dtype)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_marlin_moe_w8a16_shared_silu(monkeypatch, precision, dtype):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    make_inputs = (
+        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
+    )
+    hs, w1, w2, r1, r2, tw, ti, s1, s2 = make_inputs(
+        16, 8, 256, 512, 2, dtype, flaggems_vllm.device
+    )
+    ti[:, 0] = 0
+    ti[:, 1] = 1
+    shared_silu = module.silu_and_mul_out
+    calls = []
+
+    def checked_silu(gate, up, out):
+        assert torch.isfinite(gate).all() and torch.isfinite(up).all()
+        assert gate.stride(0) == 2 * gate.shape[1]
+        assert up.stride() == gate.stride()
+        calls.append(out.shape)
+        return shared_silu(gate, up, out)
+
+    monkeypatch.setattr(module, "silu_and_mul_out", checked_silu)
+    ref = _reference_swiglu_moe(hs, r1, r2, tw, ti)
+    for _ in range(2):
+        result = fused_marlin_moe(
+            hs,
+            w1,
+            w2,
+            None,
+            None,
+            s1,
+            s2,
+            tw,
+            ti,
+            QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128,
+        )
+        assert compute_max_diff(result.float(), ref) < 0.04
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "precision,fast", [("int8", True), ("fp8", True), ("int8", False)]
+)
+@pytest.mark.parametrize("with_output", [False, True])
+def test_fused_marlin_moe_w8a16_dispatch(monkeypatch, precision, fast, with_output):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    device = flaggems_vllm.device
+    hs = torch.randn((1, 128), dtype=torch.bfloat16, device=device)
+    output = torch.empty_like(hs) if with_output else None
+    dtype = torch.float8_e4m3fn if precision == "fp8" else torch.uint8
+    w1 = torch.empty((2, 256, 128), dtype=dtype, device=device)
+    w2 = torch.empty((2, 128, 128), dtype=dtype, device=device)
+    s1 = torch.empty((2, 256, 1), dtype=hs.dtype, device=device)
+    s2 = torch.empty((2, 128, 1), dtype=hs.dtype, device=device)
+    tw = torch.empty((1, 1), device=device)
+    ti = torch.empty((1, 1), dtype=torch.int64, device=device)
+    bias = None if fast else torch.empty((2, 256), dtype=hs.dtype, device=device)
+    calls = []
+
+    def native(*args, **kwargs):
+        calls.append("native")
+        assert kwargs["output"] is output
+        return output if with_output else hs
+
+    def generic(**kwargs):
+        assert kwargs["use_int8_w8a16"] and not kwargs["use_int4_w4a16"]
+        assert kwargs["w1_bias"] is bias
+        calls.append("generic")
+        return hs
+
+    def wrong_precision():
+        pytest.fail("W8A16 dispatch must not evaluate the W4 architecture branch")
+
+    monkeypatch.setattr(module, "_is_hopper", wrong_precision)
+    monkeypatch.setattr(module, "_fused_marlin_moe_w8a16", native)
+    monkeypatch.setattr(module, "_fused_marlin_moe_impl", generic)
+    result = fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        bias,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128,
+        output=output,
+    )
+    assert result is (output if with_output else hs)
+    assert calls == ["native" if fast else "generic"]
+    if not fast:
+        torch.testing.assert_close(result, hs, rtol=0, atol=0)
+        invalid_outputs = (
+            torch.empty((128,), dtype=hs.dtype, device=device),
+            torch.empty(hs.shape, dtype=torch.float32, device=device),
+            torch.empty(hs.shape, dtype=hs.dtype, device="cpu"),
+            torch.empty((1, 256), dtype=hs.dtype, device=device)[:, ::2],
+        )
+        for invalid in invalid_outputs:
+            with pytest.raises(ValueError, match="output must match"):
+                fused_marlin_moe(
+                    hs,
+                    w1,
+                    w2,
+                    bias,
+                    None,
+                    s1,
+                    s2,
+                    tw,
+                    ti,
+                    QUANT_TYPE_UINT8B128,
+                    output=invalid,
+                )
+
+
+@pytest.mark.parametrize(
+    "vendor,device_type", [("mthreads", "musa"), ("amd", "cuda"), ("nvidia", "cpu")]
+)
+def test_fused_marlin_moe_w8a16_backend_guard(monkeypatch, vendor, device_type):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    monkeypatch.setattr(module.runtime.device, "vendor_name", vendor)
+    with pytest.raises(NotImplementedError, match="NVIDIA CUDA"):
+        module._require_w8a16_nvidia(SimpleNamespace(type=device_type))
+
+
+def test_fused_marlin_moe_w8a16_library_tuning():
+    from flaggems_vllm.utils.libentry import LibEntry, LibTuner
+
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    kernels = [
+        value
+        for name, value in vars(module).items()
+        if name.startswith("_fused_moe_kernel_w8a16_")
+    ]
+    kernels.append(module._w8a16_int8_route_gemv)
+    assert len(kernels) == 10
+    for kernel in kernels:
+        assert isinstance(kernel, LibEntry)
+        assert isinstance(kernel.fn, LibTuner)
+        assert kernel.fn.configs
+        assert all(config.maxnreg != -1 for config in kernel.fn.configs)
+
+
+@pytest.mark.parametrize("registers", [(None, 64), (64, None)])
+def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, registers):
+    from flaggems_vllm.utils.models.sql import SQLPersistantModel
+
+    url = f"sqlite:///{tmp_path / 'tuning.sqlite'}"
+    name = f"w8a16_{tmp_path.name}"
+    model = SQLPersistantModel(url)
+    configs = [
+        triton.Config({"BLOCK_SIZE_N": 64}, maxnreg=limit) for limit in registers
+    ]
+    for index, config in enumerate(configs):
+        key = (index, "torch.bfloat16")
+        model.put_config(name, key, config)
+        model.put_benchmark(name, key, config, (1.0, 0.9, 1.1))
+    # Exercise persistent reload as well as replacement of one winning config.
+    reloaded = SQLPersistantModel(url)
+    for index, config in enumerate(configs):
+        key = (index, "torch.bfloat16")
+        assert reloaded.get_config(name, key).all_kwargs() == config.all_kwargs()
+        assert reloaded.get_benchmark(name, key, config) == (1.0, 0.9, 1.1)
+    key = (0, "torch.bfloat16")
+    reloaded.put_config(name, key, configs[1].all_kwargs())
+    assert reloaded.get_config(name, key).all_kwargs() == configs[1].all_kwargs()
+    reloaded.put_benchmark(name, key, configs[1].all_kwargs(), (2.0, 1.9, 2.1))
+    assert reloaded.get_benchmark(name, key, configs[1]) == (2.0, 1.9, 2.1)
+
+
+@pytest.mark.parametrize("num_tokens", [512, 513, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_marlin_moe_w8a16_fp8_gateup_pipeline(num_tokens, dtype):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    configs = module._fused_moe_kernel_w8a16_gateup_fp8.fn.configs
+    eligible = module._prune_w8a16_fp8_gateup_configs(
+        configs, {"T": num_tokens, "H": 1024, "Nw1": 2048}
+    )
+    assert any(config.num_stages > 1 for config in eligible)
+    hs, w1, w2, r1, r2, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        num_tokens, 8, 1024, 1024, 2, dtype, flaggems_vllm.device
+    )
+    ref = _reference_w8a16_grouped(hs, r1, r2, tw, ti)
+    for _ in range(2):
+        result = fused_marlin_moe(
+            hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3
+        )
+        assert torch.isfinite(result).all()
+        assert compute_max_diff(result.float(), ref) < 0.04
 
 
 @pytest.mark.parametrize("precision", ["int8", "fp8"])

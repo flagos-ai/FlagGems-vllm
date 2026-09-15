@@ -97,11 +97,16 @@ class SQLPersistantModel(PersistantModel):
     def get_config_dict(
         config: triton.Config,
     ) -> Dict[str, Union[bool, int, float, str]]:
-        return {
+        values = {
             k: v
             for k, v in config.all_kwargs().items()
             if isinstance(v, (int, float, str))
         }
+        # Keep one SQL schema for constrained and compiler-default registers.
+        # The sentinel is serialized only, never passed to the compiler.
+        if hasattr(config, "maxnreg"):
+            values["maxnreg"] = -1 if config.maxnreg is None else config.maxnreg
+        return values
 
     def get_sql_model(
         self,
@@ -136,6 +141,7 @@ class SQLPersistantModel(PersistantModel):
     def get_config(
         self, name: str, keys: Sequence[Union[bool, int, float, str]]
     ) -> Optional[triton.Config]:
+        name = f"{name}_optional_registers_v2"
         key_dict: Dict[str, Union[bool, int, float, str]] = (
             SQLPersistantModel.get_key_dict(keys)
         )
@@ -159,11 +165,13 @@ class SQLPersistantModel(PersistantModel):
             kwargs: Dict[str, Union[bool, int, float, str]] = {
                 k: v for k, v in obj_dict.items() if k not in self.signature.parameters
             }
-            config_dict: Dict[str, int] = {
+            config_dict: Dict[str, Optional[int]] = {
                 k: v  # type: ignore[misc]
                 for k, v in obj_dict.items()
                 if k in self.signature.parameters
             }
+            if config_dict.get("maxnreg") == -1:
+                config_dict["maxnreg"] = None
             return triton.Config(kwargs, **config_dict)
 
     @override
@@ -200,10 +208,15 @@ class SQLPersistantModel(PersistantModel):
         keys: Sequence[Union[bool, int, float, str]],
         config: Union[triton.Config, Dict[str, Union[bool, int, float, str]]],
     ) -> None:
+        name = f"{name}_optional_registers_v2"
         if isinstance(config, triton.Config):
             config: Dict[  # type: ignore[no-redef]
                 str, Union[bool, int, float, str]
             ] = SQLPersistantModel.get_config_dict(config)
+        elif "maxnreg" in self.signature.parameters:
+            config = dict(config)
+            if config.get("maxnreg") is None:
+                config["maxnreg"] = -1
         key_dict: Dict[str, Union[bool, int, float, str]] = (
             SQLPersistantModel.get_key_dict(keys)
         )
@@ -234,6 +247,10 @@ class SQLPersistantModel(PersistantModel):
             config: Dict[  # type: ignore[no-redef]
                 str, Union[bool, int, float, str]
             ] = SQLPersistantModel.get_config_dict(config)
+        elif "maxnreg" in self.signature.parameters:
+            config = dict(config)
+            if config.get("maxnreg") is None:
+                config["maxnreg"] = -1
         p50, p20, p80 = benchmark
         benchmark: Dict[str, float] = {  # type: ignore[no-redef]
             "p50": p50,

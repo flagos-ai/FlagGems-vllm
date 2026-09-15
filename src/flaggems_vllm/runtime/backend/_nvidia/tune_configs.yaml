@@ -448,26 +448,6 @@ compute_global_topk_indices_and_lens:
       TPP: 1
     num_warps: 2
     num_stages: 3
-fused_marlin_moe_w8a16_fp8_gateup_pipeline:
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-    maxnreg: 96
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
-    num_warps: 8
-    num_stages: 3
-
 fused_marlin_moe_w4a16_int4:
   - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 4}
     num_warps: 4
@@ -553,44 +533,6 @@ fused_marlin_moe_w4a16_mxfp4:
     stages: [2, 3, 4]
     warps: [4, 8]
 
-fused_marlin_moe_w8a16_int8_gemv:
-  - gen: true
-    param_map:
-      META: {BLOCK_N: n, BLOCK_K: 128, UNROLL: unroll}
-      num_warps: warps
-      num_stages: 1
-    n: [16, 32]
-    warps: [4, 8]
-    unroll: [1, 2]
-  - gen: true
-    param_map:
-      META: {BLOCK_N: 64, BLOCK_K: 128, UNROLL: unroll}
-      num_warps: 8
-      num_stages: 1
-    unroll: [1, 2]
-  - gen: true
-    param_map:
-      META: {BLOCK_N: 128, BLOCK_K: 128, UNROLL: unroll}
-      num_warps: 16
-      num_stages: 1
-    unroll: [1, 2]
-
-fused_marlin_moe_w8a16_int8_gateup:
-  - gen: true
-    param_map:
-      META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
-      num_warps: 4
-      num_stages: 1
-    n: [64, 128]
-  - gen: true
-    param_map:
-      META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
-      num_warps: 4
-      num_stages: 1
-      maxnreg: registers
-    n: [64, 128]
-    registers: [64, 96]
-
 fused_marlin_moe_w4a16_mxfp4_gemm_silu:
   - META: {BLOCK_SIZE_N: 32, GROUP_SIZE_M: 1}
     num_warps: 2
@@ -636,3 +578,309 @@ fused_marlin_moe_w4a16_mxfp4_gemm_silu:
     num_warps: 8
     num_stages: 3
     maxnreg: 255
+
+# W8A16 candidates shared by the precision-specific library tuners.
+fused_marlin_moe_w8a16_fp8_gateup_silu:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_int8_gateup_silu_large:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_fp8_down:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_int8_unified:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_fp8_unified:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+
+fused_marlin_moe_w8a16_int8_gateup:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 256, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 256, BLOCK_SIZE_K: 32}
+    num_warps: 8
+    num_stages: 1
+  - gen: true
+    param_map:
+      META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
+      num_warps: 4
+      num_stages: 1
+    n: [64, 128]
+  - gen: true
+    param_map:
+      META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
+      num_warps: 4
+      num_stages: 1
+      maxnreg: registers
+    n: [64, 128]
+    registers: [64, 96]
+
+fused_marlin_moe_w8a16_int8_gateup_silu:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_int8_down:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+# The split FP8 gateup applies group scales after dot for all token sizes.
+fused_marlin_moe_w8a16_fp8_gateup:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+    maxnreg: 64
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+    maxnreg: 80
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+    maxnreg: 96
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+
+fused_marlin_moe_w8a16_int8_gemv:
+  - gen: true
+    param_map:
+      META: {BLOCK_N: n, BLOCK_K: 128, UNROLL: unroll}
+      num_warps: warps
+      num_stages: 1
+    n: [16, 32]
+    warps: [4, 8]
+    unroll: [1, 2]
+  - gen: true
+    param_map:
+      META: {BLOCK_N: 64, BLOCK_K: 128, UNROLL: unroll}
+      num_warps: 8
+      num_stages: 1
+    unroll: [1, 2]
+  - gen: true
+    param_map:
+      META: {BLOCK_N: 128, BLOCK_K: 128, UNROLL: unroll}
+      num_warps: 16
+      num_stages: 1
+    unroll: [1, 2]
