@@ -22,6 +22,7 @@ from flaggems_vllm.runtime.backend._mthreads.fused.fused_moe import (
 )
 from flaggems_vllm.runtime.backend._mthreads.fused.persistent_topk import (
     persistent_topk,
+)
 from flaggems_vllm.runtime.backend._mthreads.fused.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
