@@ -20,14 +20,59 @@ https://github.com/flagos-ai/FlagTree.git, align with vLLM implementation.
 """
 
 import logging
+import os
 
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-if has_triton_tle(3, 6, 0):
+_LAUNCH_GEOMETRY = None
+
+
+def _launch_geometry():
+    """(warp_size, max_threads_per_block) for this device, cached."""
+    global _LAUNCH_GEOMETRY
+    if _LAUNCH_GEOMETRY is None:
+        warp, maxt = 32, 1024
+        try:
+            props = runtime.torch_device_fn.get_device_properties(0)
+            warp = getattr(props, "warp_size", 0) or 32
+            maxt = getattr(props, "max_threads_per_block", 0) or 1024
+        except Exception:  # noqa: BLE001 - never let detection break dispatch
+            pass
+        _LAUNCH_GEOMETRY = (warp, maxt)
+    return _LAUNCH_GEOMETRY
+
+
+def _num_warps(block_size):
+    """Warps covering a BLOCK_SIZE-wide tile, divided by the real warp size.
+
+    `block_size // 32` assumed 32-lane warps and failed every launch on 64-lane
+    parts; this is an identity on 32-lane ones.
+    """
+    warp, maxt = _launch_geometry()
+    return max(1, min(block_size // warp, maxt // warp))
+
+
+def _vendor_tle_enabled() -> bool:
+    """Whether the backend declares TLE support in its VendorDescriptor.
+
+    `has_triton_tle()` only proves the module imports, not that the backend can
+    lower `tle.gpu.alloc`. FLAGGEMS_FORCE_TLE overrides.
+    """
+    override = os.environ.get("FLAGGEMS_FORCE_TLE")
+    if override is not None:
+        return override.lower() not in {"0", "false", "off", "no"}
+    try:
+        return bool(getattr(runtime.device.info, "tle_enabled", False))
+    except Exception:  # noqa: BLE001 - never let detection break the import
+        return False
+
+
+if has_triton_tle(3, 6, 0) and _vendor_tle_enabled():
     try:
         import triton.experimental.tle.language as tle
 
@@ -49,6 +94,8 @@ SPLIT_WORK_THRESHOLD = 200 * 1000
 NUM_THREADS_PER_BLOCK = 512
 MULTIPLE_BLOCKS_PER_ROW_CONFIG = 10
 NUM_THREADS_PER_BLOCK_MERGE = 1024
+
+
 NUM_FILNAL_ITEMS = 2048
 NUM_BINS = 2048
 RADIX_BITS_FINAL = 8
@@ -1225,7 +1272,7 @@ def top_k_per_row_prefill(
                 BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
                 USE_RADIX_FINAL=False,
                 ROW_OFFSET=0,
-                num_warps=NUM_THREADS_PER_BLOCK // 32,
+                num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
             )
         if num_rows > num_insert_sort_blocks:
             num_radix_sort_blocks = num_rows - num_insert_sort_blocks
@@ -1242,7 +1289,7 @@ def top_k_per_row_prefill(
                 BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
                 USE_RADIX_FINAL=True,
                 ROW_OFFSET=num_insert_sort_blocks,
-                num_warps=NUM_THREADS_PER_BLOCK // 32,
+                num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
             )
     else:
         # based on tle version
@@ -1280,5 +1327,5 @@ def top_k_per_row_prefill(
             TOPK=top_k,
             BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
             ROW_OFFSET=0,
-            num_warps=NUM_THREADS_PER_BLOCK // 32,
+            num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
         )
