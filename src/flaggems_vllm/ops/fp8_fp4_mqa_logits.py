@@ -18,6 +18,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.device_info import get_device_capability
@@ -44,7 +45,6 @@ def _e2m1_to_f32(nibble):
         tl.where(e == 1, 1.0 + 0.5 * m, tl.where(e == 2, 2.0 + m, 4.0 + 2.0 * m)),
     )
     return sign * mag
-
 
 
 # =============================================================================
@@ -223,8 +223,6 @@ def _clean_logits_kernel(
     )
 
 
-
-
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("fp8_fp4_mqa_logits"),
@@ -317,9 +315,7 @@ def _fp8_fp4_mqa_logits_mxfp4_kernel(
 
         # Per-block ue8m0 scale: extract the byte for each dim's block.
         q_scale_val = tl.load(
-            Q_scale_ptr
-            + m_offs[:, None] * stride_qsm
-            + hb_offs[None, :] * stride_qsh,
+            Q_scale_ptr + m_offs[:, None] * stride_qsm + hb_offs[None, :] * stride_qsh,
             mask=m_mask[:, None] & (hb_offs[None, :] < H),
             other=0,
         )  # [BLOCK_M, HEAD_BLOCK] int32
@@ -606,26 +602,30 @@ def fp8_fp4_mqa_logits(
     else:
         M, H, D = q_values.shape
         N = k_values.shape[0]
-        _fp8_fp4_mqa_logits_kernel[grid](
-            q_values,
-            k_values,
-            k_scales,
-            weights,
-            logits,
-            M,
-            N,
-            H,
-            D,
-            q_values.stride(0),
-            q_values.stride(1),
-            q_values.stride(2),
-            k_values.stride(0),
-            k_values.stride(1),
-            logits.stride(0),
-            logits.stride(1),
-            weights.stride(0),
-            weights.stride(1),
-        )
+        use_tle = _can_use_tle(M, N, H, D)
+        if use_tle:
+            _launch_tle_kernel(q_values, k_values, k_scales, weights, logits, M, N, H, D)
+        else:
+            _fp8_fp4_mqa_logits_kernel[grid](
+                q_values,
+                k_values,
+                k_scales,
+                weights,
+                logits,
+                M,
+                N,
+                H,
+                D,
+                q_values.stride(0),
+                q_values.stride(1),
+                q_values.stride(2),
+                k_values.stride(0),
+                k_values.stride(1),
+                logits.stride(0),
+                logits.stride(1),
+                weights.stride(0),
+                weights.stride(1),
+            )
 
     if clean_logits:
         CLEAN_BLOCK_M = 8
@@ -647,4 +647,3 @@ def fp8_fp4_mqa_logits(
         )
 
     return logits
-

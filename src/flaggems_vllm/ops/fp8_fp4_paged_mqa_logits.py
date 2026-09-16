@@ -28,8 +28,9 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flaggems_vllm.utils.device_info import get_device_capability
+
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import _e2m1_to_f32
+from flaggems_vllm.utils.device_info import get_device_capability
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 try:
@@ -181,7 +182,7 @@ def _mqa_logits_kernel(
             tl.store(out_row_base + pos_ids, output_tile, mask=valid_mask)
 
 
-(kv_cache, block_tables, context_lens, total_rows, next_n_val):
+def _preprocess_kv_cache(kv_cache, block_tables, context_lens, total_rows, next_n_val):
     """Reshape paged KV cache from [num_blocks, block_size, 1, D+4] uint8
     into flat data [flat_size, D] and scales [flat_size] arrays.
     """
@@ -524,34 +525,42 @@ def fp8_fp4_paged_mqa_logits(
     max_blocks_per_seq = block_tables_expanded.shape[1]
 
     grid = (triton.cdiv(max_ctx, BLOCK_KV), total_rows)
-    _mqa_logits_kernel[grid](
-        q_u8,
-        q_scale_flat,
-        kv_data,
-        kv_scales,
-        weights,
-        block_tables_expanded,
-        logits,
-        ctx_lens_flat,
-        total_rows=total_rows,
-        max_ctx=max_ctx,
-        num_heads=H,
-        head_dim=head_dim,
-        max_model_len=max_model_len,
-        block_size=block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
-        num_phys_blocks=num_phys_blocks,
-        stride_q_row=stride_q_row,
-        stride_qs_row=H,
-        stride_kv_flat=head_dim,
-        stride_bt_row=max_blocks_per_seq,
-        stride_out_row=max_model_len,
-        stride_w_row=H,
-        BLOCK_KV=BLOCK_KV,
-        BLOCK_D=BLOCK_D,
-        NUM_BLOCKS=NUM_BLOCKS,
-        IS_MXFP4=is_fp4,
-    )
+    use_tle = _can_use_tle(max_ctx, block_size, head_dim)
+    if use_tle:
+        _launch_tle_kernel(
+            q_u8, kv_data, kv_scales, weights, block_tables_expanded,
+            logits, ctx_lens_flat, total_rows, max_ctx, H, head_dim,
+            max_model_len, block_size, num_phys_blocks, max_blocks_per_seq,
+            BLOCK_KV, NUM_BLOCKS,
+        )
+    else:
+        _mqa_logits_kernel[grid](
+            q_u8,
+            q_scale_flat,
+            kv_data,
+            kv_scales,
+            weights,
+            block_tables_expanded,
+            logits,
+            ctx_lens_flat,
+            total_rows=total_rows,
+            max_ctx=max_ctx,
+            num_heads=H,
+            head_dim=head_dim,
+            max_model_len=max_model_len,
+            block_size=block_size,
+            max_blocks_per_seq=max_blocks_per_seq,
+            num_phys_blocks=num_phys_blocks,
+            stride_q_row=stride_q_row,
+            stride_qs_row=H,
+            stride_kv_flat=head_dim,
+            stride_bt_row=max_blocks_per_seq,
+            stride_out_row=max_model_len,
+            stride_w_row=H,
+            BLOCK_KV=BLOCK_KV,
+            BLOCK_D=BLOCK_D,
+            NUM_BLOCKS=NUM_BLOCKS,
+            IS_MXFP4=is_fp4,
+        )
 
     return logits
-
