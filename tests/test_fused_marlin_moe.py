@@ -858,19 +858,17 @@ def test_fused_marlin_moe_w8a16_library_tuning():
         assert isinstance(kernel, LibEntry)
         assert isinstance(kernel.fn, LibTuner)
         assert kernel.fn.configs
-        assert all(config.maxnreg != -1 for config in kernel.fn.configs)
+        assert all(config.maxnreg is None for config in kernel.fn.configs)
 
 
-@pytest.mark.parametrize("registers", [(None, 64), (64, None)])
-def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, registers):
+@pytest.mark.parametrize("blocks", [(64, 128), (128, 64)])
+def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, blocks):
     from flaggems_vllm.utils.models.sql import SQLPersistantModel
 
     url = f"sqlite:///{tmp_path / 'tuning.sqlite'}"
     name = f"w8a16_{tmp_path.name}"
     model = SQLPersistantModel(url)
-    configs = [
-        triton.Config({"BLOCK_SIZE_N": 64}, maxnreg=limit) for limit in registers
-    ]
+    configs = [triton.Config({"BLOCK_SIZE_N": block}) for block in blocks]
     for index, config in enumerate(configs):
         key = (index, "torch.bfloat16")
         model.put_config(name, key, config)
@@ -997,6 +995,9 @@ def test_fused_marlin_moe_w8a16_shared_routing(
     tids, experts, sorted_weights, capacity = _prepare_w8a16_routing(
         ids, weights, e, block_m, output=output
     )
+    assert capacity <= t * k * block_m
+    assert tids.numel() == sorted_weights.numel() == capacity
+    assert experts.numel() == capacity // block_m
     assert bool(calls) == (t > 4 and not (t <= 16 and t * k <= 32))
     if output is not None:
         assert torch.count_nonzero(output) == 0

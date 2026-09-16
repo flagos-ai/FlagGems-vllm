@@ -3658,9 +3658,13 @@ def _prepare_w8a16_routing(
         dispatch_ids, expert_ids, padded_count = moe_align_block_size(
             topk_ids, block_size_m, num_experts, pad_sorted_ids=True
         )
+    # Each route contributes at most one padded block; trim unused capacity by view.
+    capacity = min(dispatch_ids.numel(), topk_ids.numel() * block_size_m)
+    if capacity < dispatch_ids.numel():
+        dispatch_ids = dispatch_ids[:capacity]
+        expert_ids = expert_ids[: capacity // block_size_m]
     # Each adapter lane reads only its own entry before overwriting it.
     token_ids, experts = dispatch_ids, expert_ids
-    capacity = dispatch_ids.numel()
     weights = torch.empty((capacity,), dtype=topk_weights.dtype, device=topk_ids.device)
     output_size = output.numel() if output is not None else 0
     _unpack_w8a16_routing[(triton.cdiv(max(capacity, output_size), 256),)](

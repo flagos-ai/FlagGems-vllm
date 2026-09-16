@@ -579,7 +579,7 @@ fused_marlin_moe_w4a16_mxfp4_gemm_silu:
     num_stages: 3
     maxnreg: 255
 
-# W8A16 candidates shared by the precision-specific library tuners.
+# W8A16 candidates use default register limits for a uniform library SQL schema.
 fused_marlin_moe_w8a16_fp8_gateup_silu:
   - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
     num_warps: 4
@@ -590,18 +590,6 @@ fused_marlin_moe_w8a16_fp8_gateup_silu:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
     num_warps: 4
     num_stages: 1
@@ -639,18 +627,6 @@ fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
@@ -694,18 +670,6 @@ fused_marlin_moe_w8a16_int8_gateup:
     num_warps: 4
     num_stages: 1
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
     num_warps: 8
     num_stages: 1
   - META: {BLOCK_SIZE_N: 256, BLOCK_SIZE_K: 64}
@@ -717,17 +681,10 @@ fused_marlin_moe_w8a16_int8_gateup:
   - gen: true
     param_map:
       META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
-      num_warps: 4
+      num_warps: warps
       num_stages: 1
     n: [64, 128]
-  - gen: true
-    param_map:
-      META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
-      num_warps: 4
-      num_stages: 1
-      maxnreg: registers
-    n: [64, 128]
-    registers: [64, 96]
+    warps: [4, 8]
 
 fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
@@ -757,18 +714,6 @@ fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 1
@@ -790,27 +735,11 @@ fused_marlin_moe_w8a16_int8_down:
     num_warps: 4
     num_stages: 1
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
@@ -826,18 +755,6 @@ fused_marlin_moe_w8a16_fp8_gateup:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 1
-    maxnreg: 96
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
     num_warps: 4
     num_stages: 1
@@ -847,18 +764,6 @@ fused_marlin_moe_w8a16_fp8_gateup:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
     num_warps: 4
     num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-    maxnreg: 64
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-    maxnreg: 80
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-    maxnreg: 96
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 3
