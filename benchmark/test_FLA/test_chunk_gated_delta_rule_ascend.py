@@ -45,6 +45,8 @@ try:
     from vllm_ascend.ops.triton.fla import chunk as _vllm_ascend_chunk
     from vllm_ascend.ops.triton.fla.utils import (
         prepare_chunk_indices as _vllm_ascend_prepare_chunk_indices,
+    )
+    from vllm_ascend.ops.triton.fla.utils import (
         prepare_chunk_offsets as _vllm_ascend_prepare_chunk_offsets,
     )
     from vllm_ascend.ops.triton.triton_utils import (
