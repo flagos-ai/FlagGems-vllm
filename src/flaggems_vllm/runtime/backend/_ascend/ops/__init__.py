@@ -35,11 +35,15 @@ from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import 
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
+    sparse_attn_sharedkv,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
@@ -60,5 +64,7 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "sparse_attn_sharedkv",
     "swiglu",
+    "persistent_topk",
 ]
