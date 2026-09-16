@@ -21,6 +21,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_update import (
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
+    build_compressor_metadata,
+    compressor,
+    compressor_prepared,
+    prepare_compressor_workspace,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -40,6 +46,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_row
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
+    sparse_attn_sharedkv,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 
@@ -63,7 +72,12 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "sparse_attn_sharedkv",
     "swiglu",
     "chunk_gated_delta_rule_fwd",
     "persistent_topk",
+    "compressor",
+    "compressor_prepared",
+    "prepare_compressor_workspace",
+    "build_compressor_metadata",
 ]
