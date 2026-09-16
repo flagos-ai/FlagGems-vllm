@@ -2433,11 +2433,6 @@ class _W8A16Config:
     use_packed_int8: bool = False
 
 
-def _require_w8a16_nvidia(device):
-    if device.type != "cuda" or runtime.device.vendor_name != "nvidia":
-        raise NotImplementedError("Native W8A16 MoE requires the NVIDIA CUDA backend")
-
-
 @triton.jit
 def _dequant_w8a16_int8_packed(q, scale, compute_type: tl.constexpr):
     """Decode four native UINT8 codes; no persistent Marlin repacking is needed."""
@@ -3942,26 +3937,22 @@ def _fused_marlin_moe_w8a16(
     *,
     w1_scale,
     w2_scale,
+    use_fp8: bool,
+    device_info: _DeviceInfo,
     group_size=128,
     inplace=False,
     output=None,
     w1_zeros=None,
     w2_zeros=None,
 ):
-    """Run native W8A16 expert weights, retaining A16 activations throughout."""
+    """Run native W8A16 after public precision/device dispatch, retaining A16."""
     if hidden_states.ndim != 2 or hidden_states.dtype not in (
         torch.float16,
         torch.bfloat16,
     ):
         raise ValueError("hidden_states must be a rank-2 FP16/BF16 tensor")
-    if w1.dtype not in (torch.uint8, torch.float8_e4m3fn) or w2.dtype != w1.dtype:
-        raise ValueError("W8A16 requires matching UINT8-offset128 or FP8 E4M3 weights")
-    if not isinstance(group_size, int) or group_size < 128 or group_size % 128:
-        raise ValueError(
-            "The optimized W8A16 path requires group_size to be a multiple of 128"
-        )
     t, h = hidden_states.shape
-    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[1] % 2:
+    if w1.shape[1] % 2:
         raise ValueError("W8A16 expects w1[E, 2I, H] and w2[E, H, I]")
     e, two_i, _ = w1.shape
     i = two_i // 2
@@ -3998,12 +3989,8 @@ def _fused_marlin_moe_w8a16(
     tensors = (hidden_states, w1, w2, w1_scale, w2_scale, topk_ids, topk_weights)
     if any(x.device != hidden_states.device or not x.is_contiguous() for x in tensors):
         raise ValueError("W8A16 tensors must be contiguous and on the same device")
-    _require_w8a16_nvidia(hidden_states.device)
-    use_fp8 = w1.dtype == torch.float8_e4m3fn
     for zeros, scale in ((w1_zeros, w1_scale), (w2_zeros, w2_scale)):
         if zeros is not None:
-            if use_fp8:
-                raise NotImplementedError("FP8 weights do not use zero points")
             if (
                 zeros.shape != scale.shape
                 or zeros.dtype != torch.uint8
@@ -4013,8 +4000,6 @@ def _fused_marlin_moe_w8a16(
                 raise ValueError(
                     "INT8 zero points must be contiguous UINT8 tensors matching their scales"
                 )
-    if inplace and output is not None:
-        raise ValueError("Cannot pass both inplace=True and output")
     destination = hidden_states if inplace else output
     if destination is not None and (
         destination.shape != hidden_states.shape
@@ -4037,7 +4022,7 @@ def _fused_marlin_moe_w8a16(
             and w1_zeros is None
             and w2_zeros is None
             and w1_scale.dtype == hidden_states.dtype
-            and _get_device_info(hidden_states.device).is_hopper
+            and device_info.is_hopper
         )
         if packed_int8 and t == 1 and h >= 1024 and i >= 1024:
             _launch_w8a16_int8_gemv(
@@ -4103,16 +4088,17 @@ def fused_marlin_moe_w8a16_fp8(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP8 E4M3 [E, N, K] weights with groupwise scales and A16 activations."""
-    if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
-        raise ValueError("FP8 W8A16 requires E4M3 weights")
-    return _fused_marlin_moe_w8a16(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
+    return fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_type_id=QUANT_TYPE_FP8_E4M3,
         group_size=group_size,
         inplace=inplace,
         output=output,
@@ -4135,16 +4121,17 @@ def fused_marlin_moe_w8a16_int8(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """UINT8-offset128 [E, N, K] weights with groupwise scales and A16 activations."""
-    if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
-        raise ValueError("INT8 W8A16 requires UINT8-offset128 weights")
-    return _fused_marlin_moe_w8a16(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
+    return fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_type_id=QUANT_TYPE_UINT8B128,
         group_size=group_size,
         inplace=inplace,
         output=output,
@@ -4156,58 +4143,6 @@ def fused_marlin_moe_w8a16_int8(
 # ----------------------------------------------------------------------------
 # Public entry point: vLLM-aligned wrapper.
 # ----------------------------------------------------------------------------
-def _w8a16_fast_path_supported(
-    hidden_states,
-    w1,
-    w2,
-    quant_type_id,
-    group_size,
-    bias1,
-    bias2,
-    expert_map,
-    global_num_experts,
-    apply_router_weight_on_input,
-    activation_func,
-    moe_sum,
-    is_k_full,
-    w1_zeros,
-    w2_zeros,
-):
-    """Validate native W8 options; INT8 alone has a shared WNA16 fallback."""
-    use_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
-    if w1.ndim != 3 or w2.ndim != 3:
-        raise ValueError("W8A16 expects rank-3 expert weights")
-    if not isinstance(group_size, int) or group_size <= 0:
-        raise ValueError("group_size must be a positive integer")
-    expected_dtype = torch.float8_e4m3fn if use_fp8 else torch.uint8
-    if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
-        raise ValueError(
-            "W8A16 weight dtype must match quant_type_id; packed Marlin weights are not supported"
-        )
-    _require_w8a16_nvidia(hidden_states.device)
-    if activation_func is not None or moe_sum is not None:
-        raise NotImplementedError(
-            "W8A16 does not support custom activation/reduction callbacks"
-        )
-    if not is_k_full:
-        raise NotImplementedError("W8A16 requires complete expert weights")
-    fast_options = (
-        bias1 is None
-        and bias2 is None
-        and expert_map is None
-        and global_num_experts in (-1, w1.shape[0])
-        and not apply_router_weight_on_input
-        and group_size >= 128
-        and group_size % 128 == 0
-    )
-    if use_fp8 and (not fast_options or w1_zeros is not None or w2_zeros is not None):
-        raise NotImplementedError(
-            "FP8 W8A16 requires group_size divisible by 128, no bias/zero "
-            "points/expert map, and output-side routing weights"
-        )
-    return fast_options
-
-
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -4279,6 +4214,8 @@ def fused_marlin_moe(
     use_int4_w4a16 = quant_type_id in _QUANT_TYPE_INT4
     use_int8_w8a16 = quant_type_id in _QUANT_TYPE_INT8
     use_fp4_w4a16 = quant_type_id in _QUANT_TYPE_FP4
+    use_fp8_w8a16 = quant_type_id == QUANT_TYPE_FP8_E4M3
+    use_w8a16 = use_int8_w8a16 or use_fp8_w8a16
 
     activation_str = "silu"
     if activation is not None:
@@ -4297,39 +4234,69 @@ def fused_marlin_moe(
     if inplace and output is not None:
         raise ValueError("Cannot pass both inplace=True and output")
 
-    use_fp8_w8a16 = quant_type_id == QUANT_TYPE_FP8_E4M3
-    if use_int8_w8a16 or use_fp8_w8a16:
-        if _w8a16_fast_path_supported(
+    if use_w8a16:
+        if w1.ndim != 3 or w2.ndim != 3:
+            raise ValueError("W8A16 expects rank-3 expert weights")
+        if not isinstance(group_size, int) or group_size <= 0:
+            raise ValueError("group_size must be a positive integer")
+        expected_dtype = torch.float8_e4m3fn if use_fp8_w8a16 else torch.uint8
+        if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
+            raise ValueError(
+                "W8A16 weight dtype must match quant_type_id; packed Marlin weights are not supported"
+            )
+        if (
+            hidden_states.device.type != "cuda"
+            or runtime.device.vendor_name != "nvidia"
+        ):
+            raise NotImplementedError(
+                "Native W8A16 MoE requires the NVIDIA CUDA backend"
+            )
+        device_info = _get_device_info(hidden_states.device)
+        if activation_func is not None or moe_sum is not None:
+            raise NotImplementedError(
+                "W8A16 does not support custom activation/reduction callbacks"
+            )
+        if not is_k_full:
+            raise NotImplementedError("W8A16 requires complete expert weights")
+
+    if (
+        use_w8a16
+        and bias1 is None
+        and bias2 is None
+        and expert_map is None
+        and global_num_experts in (-1, w1.shape[0])
+        and not apply_router_weight_on_input
+        and group_size >= 128
+        and group_size % 128 == 0
+        # INT8 retains ordinary pre-Hopper kernels; FP8 currently targets SM90+.
+        and (
+            use_int8_w8a16
+            or (device_info.is_hopper and w1_zeros is None and w2_zeros is None)
+        )
+    ):
+        return _fused_marlin_moe_w8a16(
             hidden_states,
             w1,
             w2,
-            quant_type_id,
-            group_size,
-            bias1,
-            bias2,
-            expert_map,
-            global_num_experts,
-            apply_router_weight_on_input,
-            activation_func,
-            moe_sum,
-            is_k_full,
-            w1_zeros,
-            w2_zeros,
-        ):
-            return _fused_marlin_moe_w8a16(
-                hidden_states,
-                w1,
-                w2,
-                topk_weights,
-                topk_ids,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                group_size=group_size,
-                inplace=inplace,
-                output=output,
-                w1_zeros=w1_zeros,
-                w2_zeros=w2_zeros,
-            )
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            use_fp8=use_fp8_w8a16,
+            device_info=device_info,
+            group_size=group_size,
+            inplace=inplace,
+            output=output,
+            w1_zeros=w1_zeros,
+            w2_zeros=w2_zeros,
+        )
+
+    elif use_fp8_w8a16:
+        # The shared WNA16 fallback supports INT4/INT8, never FP8 weights.
+        raise NotImplementedError(
+            "FP8 W8A16 requires NVIDIA SM90+, group_size divisible by 128, "
+            "no bias/zero points/expert map, and output-side routing weights"
+        )
 
     elif (
         # The magic-trick kernel's bf16 dequant uses sub.bf16x2/mul.bf16 PTX,

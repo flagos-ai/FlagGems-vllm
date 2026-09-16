@@ -694,6 +694,27 @@ def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_fused_marlin_moe_w8a16_precision_entry(precision, dtype, num_tokens):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    make_inputs = (
+        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
+    )
+    hs, w1, w2, r1, r2, tw, ti, s1, s2 = make_inputs(
+        num_tokens, 4, 1024, 1024, 2, dtype, flaggems_vllm.device
+    )
+    fn = getattr(module, f"fused_marlin_moe_w8a16_{precision}")
+    result = fn(hs, w1, w2, tw, ti, w1_scale=s1, w2_scale=s2)
+    ref = _reference_swiglu_moe(hs, r1, r2, tw, ti)
+    assert compute_max_diff(result.float(), ref) < 0.04
+    with pytest.raises(ValueError, match="weight dtype"):
+        fn(hs, w1, w2.float(), tw, ti, w1_scale=s1, w2_scale=s2)
+    with pytest.raises(ValueError, match="both inplace"):
+        fn(hs, w1, w2, tw, ti, w1_scale=s1, w2_scale=s2, inplace=True, output=hs)
+
+
 @triton.jit
 def _check_w8a16_int8_dequant(Q, S, OUT, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -760,8 +781,9 @@ def test_fused_marlin_moe_w8a16_shared_silu(monkeypatch, precision, dtype):
 @pytest.mark.parametrize(
     "precision,fast", [("int8", True), ("fp8", True), ("int8", False)]
 )
+@pytest.mark.parametrize("sm", [80, 89, 90, 100])
 @pytest.mark.parametrize("with_output", [False, True])
-def test_fused_marlin_moe_w8a16_dispatch(monkeypatch, precision, fast, with_output):
+def test_fused_marlin_moe_w8a16_dispatch(monkeypatch, precision, fast, sm, with_output):
     module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
     device = flaggems_vllm.device
     hs = torch.randn((1, 128), dtype=torch.bfloat16, device=device)
@@ -779,6 +801,8 @@ def test_fused_marlin_moe_w8a16_dispatch(monkeypatch, precision, fast, with_outp
     def native(*args, **kwargs):
         calls.append("native")
         assert kwargs["output"] is output
+        assert kwargs["use_fp8"] == (precision == "fp8")
+        assert kwargs["device_info"].is_hopper == (sm >= 90)
         return output if with_output else hs
 
     def generic(**kwargs):
@@ -791,8 +815,18 @@ def test_fused_marlin_moe_w8a16_dispatch(monkeypatch, precision, fast, with_outp
         pytest.fail("W8A16 dispatch must not evaluate the W4 architecture branch")
 
     monkeypatch.setattr(module, "_is_hopper", wrong_precision)
+    monkeypatch.setattr(
+        module, "_get_device_info", lambda device: module._DeviceInfo(sm >= 90, False)
+    )
     monkeypatch.setattr(module, "_fused_marlin_moe_w8a16", native)
     monkeypatch.setattr(module, "_fused_marlin_moe_impl", generic)
+    if precision == "fp8" and sm < 90:
+        with pytest.raises(NotImplementedError, match="FP8 W8A16.*SM90"):
+            fused_marlin_moe(
+                hs, w1, w2, bias, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3
+            )
+        assert not calls
+        return
     result = fused_marlin_moe(
         hs,
         w1,
@@ -836,11 +870,112 @@ def test_fused_marlin_moe_w8a16_dispatch(monkeypatch, precision, fast, with_outp
 @pytest.mark.parametrize(
     "vendor,device_type", [("mthreads", "musa"), ("amd", "cuda"), ("nvidia", "cpu")]
 )
-def test_fused_marlin_moe_w8a16_backend_guard(monkeypatch, vendor, device_type):
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_fused_marlin_moe_w8a16_backend_guard(
+    monkeypatch, vendor, device_type, use_fp8
+):
     module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
     monkeypatch.setattr(module.runtime.device, "vendor_name", vendor)
+    hs = SimpleNamespace(device=SimpleNamespace(type=device_type))
+    w = SimpleNamespace(ndim=3, dtype=torch.float8_e4m3fn if use_fp8 else torch.uint8)
     with pytest.raises(NotImplementedError, match="NVIDIA CUDA"):
-        module._require_w8a16_nvidia(SimpleNamespace(type=device_type))
+        fused_marlin_moe(
+            hs,
+            w,
+            w,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            QUANT_TYPE_FP8_E4M3 if use_fp8 else QUANT_TYPE_UINT8B128,
+        )
+
+
+def test_fused_marlin_moe_w8a16_target_device(monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    monkeypatch.setattr(module.runtime.device, "vendor_name", "nvidia")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(
+            major=8 if index == 0 else 9, multi_processor_count=100
+        ),
+    )
+    # Bypass the cache to avoid leaking simulated properties into other tests.
+    monkeypatch.setattr(module, "_get_device_info", module._get_device_info.__wrapped__)
+    monkeypatch.setattr(
+        module, "_fused_marlin_moe_w8a16", lambda *a, **kw: kw["device_info"]
+    )
+    w = SimpleNamespace(ndim=3, dtype=torch.float8_e4m3fn, shape=(2, 256, 128))
+    hs = SimpleNamespace(device=torch.device("cuda:1"))
+    assert fused_marlin_moe(
+        hs, w, w, None, None, None, None, None, None, QUANT_TYPE_FP8_E4M3
+    ).is_hopper
+    hs.device = torch.device("cuda:0")
+    with pytest.raises(NotImplementedError, match="SM90"):
+        fused_marlin_moe(
+            hs, w, w, None, None, None, None, None, None, QUANT_TYPE_FP8_E4M3
+        )
+    w.dtype = torch.uint8
+    assert not fused_marlin_moe(
+        hs, w, w, None, None, None, None, None, None, QUANT_TYPE_UINT8B128
+    ).is_hopper
+
+
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("sm", [80, 89, 90])
+@pytest.mark.parametrize("num_tokens", [1, 16, 1024, 4096])
+def test_fused_marlin_moe_w8a16_native_arch_dispatch(
+    monkeypatch, precision, sm, num_tokens
+):
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    device = flaggems_vllm.device
+    hs = torch.empty((num_tokens, 1024), dtype=torch.bfloat16, device=device)
+    dtype = torch.float8_e4m3fn if precision == "fp8" else torch.uint8
+    w1 = torch.empty((2, 2048, 1024), dtype=dtype, device=device)
+    w2 = torch.empty((2, 1024, 1024), dtype=dtype, device=device)
+    s1 = torch.empty((2, 2048, 8), dtype=hs.dtype, device=device)
+    s2 = torch.empty((2, 1024, 8), dtype=hs.dtype, device=device)
+    tw = torch.empty((num_tokens, 1), device=device)
+    ti = torch.empty((num_tokens, 1), dtype=torch.int64, device=device)
+    calls = []
+    queried_devices = []
+
+    def device_info(device):
+        queried_devices.append(device)
+        return module._DeviceInfo(sm >= 90, False)
+
+    monkeypatch.setattr(module, "_get_device_info", device_info)
+    monkeypatch.setattr(module, "zero", lambda output: None)
+    monkeypatch.setattr(module, "_prepare_w8a16_routing", lambda *a, **kw: ())
+    monkeypatch.setattr(
+        module, "_launch_w8a16_int8_gemv", lambda *a: calls.append("gemv")
+    )
+    monkeypatch.setattr(
+        module, "invoke_fused_moe_full_swiglu", lambda *a: calls.append(a[-1])
+    )
+    fn = getattr(module, f"fused_marlin_moe_w8a16_{precision}")
+    if precision == "fp8" and sm < 90:
+        with pytest.raises(NotImplementedError, match="FP8 W8A16.*SM90"):
+            fn(hs, w1, w2, tw, ti, w1_scale=s1, w2_scale=s2)
+        assert not calls
+        assert queried_devices == [hs.device]
+        return
+    result = fn(hs, w1, w2, tw, ti, w1_scale=s1, w2_scale=s2)
+    assert queried_devices == [hs.device]
+    assert result.shape == hs.shape and result.dtype == hs.dtype
+    if precision == "int8" and sm >= 90 and num_tokens == 1:
+        assert calls == ["gemv"]
+    else:
+        assert len(calls) == 1
+        assert calls[0].use_fp8 == (precision == "fp8")
+        assert calls[0].use_packed_int8 == (
+            precision == "int8" and sm >= 90 and 1 < num_tokens <= 1024
+        )
 
 
 def test_fused_marlin_moe_w8a16_library_tuning():
@@ -952,6 +1087,15 @@ def test_fused_marlin_moe_w8a16_empty_and_invalid(precision):
         fused_marlin_moe(**dict(args, inplace=True, output=hs))
     with pytest.raises(NotImplementedError, match="callbacks"):
         fused_marlin_moe(**dict(args, activation_func=lambda x: x))
+    if precision == "fp8":
+        for options in (
+            {"group_size": 64},
+            {"bias1": torch.empty((4, 1024), dtype=hs.dtype, device=hs.device)},
+            {"w1_zeros": torch.empty_like(s1, dtype=torch.uint8)},
+            {"apply_router_weight_on_input": True},
+        ):
+            with pytest.raises(NotImplementedError, match="FP8 W8A16 requires"):
+                fused_marlin_moe(**dict(args, **options))
     empty = dict(args, hidden_states=hs[:0], topk_ids=ti[:0], topk_weights=tw[:0])
     result = fused_marlin_moe(**empty)
     assert result.shape == (0, 256) and result.dtype == hs.dtype
@@ -1032,6 +1176,7 @@ def test_fused_marlin_moe_w8a16_shared_routing(
         for t, group_size in ((1, 256), (16, 384), (64, 256), (1025, 128), (1025, 384))
     ]
     + [
+        ("int8", 16, 64, "none"),
         ("int8", 1, 256, "both"),
         ("int8", 16, 384, "w1"),
         ("int8", 64, 256, "w2"),
