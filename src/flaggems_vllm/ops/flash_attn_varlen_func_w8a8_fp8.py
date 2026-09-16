@@ -274,17 +274,35 @@ def _load_fp8_block_descales(
 
 
 @triton.jit
-def _fp8_pv_dot(P, V, acc, v_descale, fp8_p_max: tl.constexpr, fp8_dtype: tl.constexpr):
+def _fp8_pv_dot(
+    P,
+    V,
+    acc,
+    v_descale,
+    fp8_p_max: tl.constexpr,
+    fp8_dtype: tl.constexpr,
+    precise_p: tl.constexpr = False,
+):
     if fp8_p_max == 448.0:
         # The scaled row sum cancels the factor of 256 during normalization.
-        P_fp8 = P.to(fp8_dtype)
-        pv = tl.dot(P_fp8, V, out_dtype=tl.float32)
-        return acc + pv * v_descale
+        P_scaled = P
+        p_descale = 1.0
+        p_dtype: tl.constexpr = fp8_dtype
     else:
-        p_descale = 1.0 / fp8_p_max
-        P_fp8 = (P * fp8_p_max).to(fp8_dtype)
-        pv = tl.dot(P_fp8, V, out_dtype=tl.float32)
-        return acc + pv * (p_descale * v_descale)
+        # Probabilities do not need E5M2's wider exponent range. Keep the
+        # extra E4M3 mantissa bit even when V uses E5M2; Hopper supports
+        # mixed FP8 formats in the PV dot product.
+        P_scaled = P * 256.0
+        p_descale = 1.0 / 256.0
+        p_dtype: tl.constexpr = tl.float8e4nv
+    P_fp8 = P_scaled.to(p_dtype)
+    pv = tl.dot(P_fp8, V, out_dtype=tl.float32)
+    if precise_p:
+        # Short KV sequences and sparse boundary rows amplify P rounding.
+        # Correct its residual with another FP8 dot, not a BF16 fallback.
+        P_residual = ((P_scaled - P_fp8.to(tl.float32)) * 32.0).to(p_dtype)
+        pv += tl.dot(P_residual, V, out_dtype=tl.float32) * (1.0 / 32.0)
+    return acc + pv * (p_descale * v_descale)
 
 
 @triton.jit
@@ -1617,6 +1635,7 @@ def flash_varlen_fwd_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     SPLIT_D: tl.constexpr,
+    PRECISE_SHORT_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
 ):
@@ -1657,6 +1676,11 @@ def flash_varlen_fwd_kernel(
         k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
     else:
         k_len = k_len_cache
+
+    # Specialize the full KV loop, rather than putting a runtime branch
+    # around every PV dot and disabling the long-sequence pipeline.
+    if (k_len <= 128) != PRECISE_SHORT_K:
+        return
 
     # Noop CTA
     if m_block * BLOCK_M >= q_len:
@@ -1705,10 +1729,13 @@ def flash_varlen_fwd_kernel(
         block_shape=(BLOCK_M, BLOCK_K),
         order=(1, 0),
     )
-    bQ = tl.load(gQ.advance([m_block * BLOCK_M, 0]), boundary_check=(0, 1))
+    bQ = tl.load(
+        gQ.advance([m_block * BLOCK_M, 0]),
+        boundary_check=(0, 1),
+        padding_option="zero",
+    )
 
-    # Partition the varlen PV accumulator by BLOCK_D as well, so each CTA
-    # holds only D64 for D128.
+    # Partition wide PV accumulators into D64 slices to bound register use.
     acc_ = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
     rowmax_ = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     rowsum_ = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -1769,9 +1796,9 @@ def flash_varlen_fwd_kernel(
                 block_shape=(BLOCK_N, BLOCK_D),
                 order=(0, 1),
             )
-            bK = tl.load(gK, boundary_check=(0, 1))
+            bK = tl.load(gK, boundary_check=(0, 1), padding_option="zero")
             bK = tl.trans(bK)
-            bV = tl.load(gV, boundary_check=(0, 1))
+            bV = tl.load(gV, boundary_check=(0, 1), padding_option="zero")
         q_descale, k_descale, v_descale = _load_fp8_block_descales(
             q_descale_ptr,
             k_descale_ptr,
@@ -1846,7 +1873,15 @@ def flash_varlen_fwd_kernel(
             )
 
         # varlen PV uses dynamically quantized FP8 P and FP8 V.
-        acc_ = _fp8_pv_dot(P, bV, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty)
+        acc_ = _fp8_pv_dot(
+            P,
+            bV,
+            acc_,
+            v_descale,
+            fp8_p_max,
+            v_ptr.type.element_ty,
+            precise_p=is_causal or is_local or PRECISE_SHORT_K,
+        )
         n_block -= 1
 
     for n_block in tl.range(
@@ -1891,9 +1926,10 @@ def flash_varlen_fwd_kernel(
                 block_shape=(BLOCK_N, BLOCK_D),
                 order=(0, 1),
             )
-            bK = tl.load(gK)
+            # Sequence tiles are complete here, but head_dim may be padded.
+            bK = tl.load(gK, boundary_check=(1,), padding_option="zero")
             bK = tl.trans(bK)
-            bV = tl.load(gV)
+            bV = tl.load(gV, boundary_check=(1,), padding_option="zero")
         q_descale, k_descale, v_descale = _load_fp8_block_descales(
             q_descale_ptr,
             k_descale_ptr,
@@ -1967,7 +2003,15 @@ def flash_varlen_fwd_kernel(
                 BLOCK_N=BLOCK_N,
             )
         # non-masking varlen PV runs as FP8 P * FP8 V.
-        acc_ = _fp8_pv_dot(P, bV, acc_, v_descale, fp8_p_max, v_ptr.type.element_ty)
+        acc_ = _fp8_pv_dot(
+            P,
+            bV,
+            acc_,
+            v_descale,
+            fp8_p_max,
+            v_ptr.type.element_ty,
+            precise_p=PRECISE_SHORT_K,
+        )
 
     # LSE
     lse = tl.where(
@@ -2000,7 +2044,7 @@ def flash_varlen_fwd_kernel(
     # lse shape: [h, total_q]
     softmax_lse_ptr += hid * total_q
     lse_row_offset = lse_offset + m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    # Both varlen split-D CTAs produce the same LSE, so only D split 0 writes
+    # All varlen split-D CTAs produce the same LSE, so only D split 0 writes
     # it back.
     tl.store(
         softmax_lse_ptr + lse_row_offset,
@@ -2349,12 +2393,21 @@ def _get_varlen_fwd_config(
     cfg_params = {
         "BLOCK_M": cfg["BLOCK_M"](args),
         "BLOCK_N": cfg["BLOCK_N"](args),
-        "BLOCK_K": triton.next_power_of_2(head_size),
-        "BLOCK_D": 64 if use_varlen_split_d else triton.next_power_of_2(head_size),
+        # FP8 QK reduction tiles require at least 32 elements. Padding is
+        # internal to the kernel; the public tensor shape and scale stay intact.
+        "BLOCK_K": max(32, triton.next_power_of_2(head_size)),
+        "BLOCK_D": (
+            64 if use_varlen_split_d else max(32, triton.next_power_of_2(head_size))
+        ),
         "SPLIT_D": use_varlen_split_d,
         "num_warps": cfg["num_warps"](args),
         "num_stages": 1 if not is_paged else cfg["num_stages"](args),
     }
+
+    if head_size not in (64, 128) and not is_paged:
+        # Bound register use for new dimensions and avoid oversized query
+        # tiles on ragged batches. Wide heads use D64 output slices.
+        cfg_params.update(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=1)
 
     # Hopper FP8 tuning favors wider KV tiles and eight warps. Keep unmeasured
     # feature combinations on the generic runtime configuration.
@@ -2737,9 +2790,9 @@ def mha_varlan_fwd(
             params.k_ptr = k.view(k.shape[0], k.shape[1], -1)
             params.v_ptr = v.view(v.shape[0], v.shape[1], -1)
         logger.debug("kernel: flash_varlen_fwd")
-        # Enable two-way split-D for non-paged D128 varlen attention. The
+        # Use D64 output slices for non-paged dimensions above 64. The
         # paged-cache loader continues to load the full D dimension.
-        use_varlen_split_d = head_size == 128 and not is_paged
+        use_varlen_split_d = head_size > 64 and not is_paged
         args = tuple(getattr(params, k) for k in params.__slots__)
 
         cfg_params = _get_varlen_fwd_config(
@@ -2758,7 +2811,7 @@ def mha_varlan_fwd(
             num_heads,
             max_seqlen_q,
         )
-        num_d_splits = 2 if use_varlen_split_d else 1
+        num_d_splits = triton.cdiv(head_size, cfg_params["BLOCK_D"])
         grid = (
             triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"]),
             batch_size,
@@ -2767,7 +2820,20 @@ def mha_varlan_fwd(
         kernel = flash_varlen_fwd_kernel[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        kernel(*args, **cfg_params)
+        if max_seqlen_k <= 128:
+            short_k_modes = (True,)
+        elif (
+            not is_paged
+            and seqused_k is None
+            and k.shape[0] == batch_size * max_seqlen_k
+        ):
+            # A full packed allocation at the declared maximum is uniform.
+            short_k_modes = (False,)
+        else:
+            # Each CTA runs in exactly one variant, selected by its KV length.
+            short_k_modes = (False, True)
+        for precise_short_k in short_k_modes:
+            kernel(*args, PRECISE_SHORT_K=precise_short_k, **cfg_params)
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(
@@ -3240,6 +3306,7 @@ def flash_attn_varlen_func_w8a8_fp8(
     applied per logical 128-token block. The returned tensor uses ``out.dtype``
     when supplied and BF16 otherwise. This W8A8 path currently requires Q, K,
     and V to have the same number of heads; MQA and GQA are not supported.
+    Head dimensions must be multiples of 8 between 8 and 256, inclusive.
     """
     if dropout_p != 0.0:
         raise NotImplementedError("dropout is not supported by this inference path")
@@ -3286,8 +3353,11 @@ def flash_attn_varlen_func_w8a8_fp8(
         raise NotImplementedError("q, k, and v must be contiguous in head_dim")
     if k.shape != v.shape:
         raise ValueError("k and v must have identical shapes")
-    if q.shape[-1] not in (64, 128) or k.shape[-1] != q.shape[-1]:
-        raise NotImplementedError("only head_dim 64 and 128 are supported")
+    head_size = q.shape[-1]
+    if not 8 <= head_size <= 256 or head_size % 8 != 0:
+        raise NotImplementedError("head_dim must be a multiple of 8 between 8 and 256")
+    if k.shape[-1] != head_size:
+        raise ValueError("q, k, and v must have the same head_dim")
     if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_q.device != q.device:
         raise ValueError("cu_seqlens_q must be an int32 tensor on q.device")
     if cu_seqlens_k is not None and (
@@ -3348,8 +3418,11 @@ def flash_attn_varlen_func_w8a8_fp8(
         raise ValueError(
             "block_table must be contiguous in its last dimension with shape [batch, pages]"
         )
+    # Other head dimensions use the padded varlen kernel below; this guard
+    # restricts only the tuned dense shortcut, not public dimension support.
     uniform_nonpaged = (
-        block_table is None
+        head_size in (64, 128)
+        and block_table is None
         and cu_seqlens_k is not None
         and seqused_k is None
         and dropout_p == 0.0

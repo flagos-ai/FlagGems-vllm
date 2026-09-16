@@ -38,17 +38,24 @@ def _get_fp8_dtype():
 
 
 def _hadamard_matrix(dim, device):
-    assert dim > 0 and dim & (dim - 1) == 0, "head_size must be a power of two"
-    matrix = torch.tensor([[1.0]], device=device)
-    while matrix.shape[0] < dim:
-        matrix = torch.cat(
-            (
-                torch.cat((matrix, matrix), dim=1),
-                torch.cat((matrix, -matrix), dim=1),
-            ),
-            dim=0,
-        )
-    return matrix / math.sqrt(dim)
+    assert dim > 0, "head_size must be positive"
+    # Use orthogonal blocks so non-power-of-two dimensions need no padding.
+    blocks = []
+    remaining = dim
+    while remaining:
+        block_dim = 1 << (remaining.bit_length() - 1)
+        matrix = torch.tensor([[1.0]], device=device)
+        while matrix.shape[0] < block_dim:
+            matrix = torch.cat(
+                (
+                    torch.cat((matrix, matrix), dim=1),
+                    torch.cat((matrix, -matrix), dim=1),
+                ),
+                dim=0,
+            )
+        blocks.append(matrix / math.sqrt(block_dim))
+        remaining -= block_dim
+    return torch.block_diag(*blocks)
 
 
 def _apply_incoherent_qk(x):
@@ -206,6 +213,23 @@ class FlashAttnVarlenFuncW8A8FP8Benchmark(base.GenericBenchmark):
             for causal in (False, True):
                 all_shapes.append((ragged_q, ragged_kv, num_heads, head_size, causal))
 
+        dimension_q = (17, 63, 129, 511)
+        dimension_kv = (33, 1, 257, 513)
+        for head_size in range(8, 257, 8):
+            if head_size in (64, 128):
+                continue
+            for causal in (False, True):
+                all_shapes.extend(
+                    [
+                        (1, 512, 8, head_size, causal),
+                        (dimension_q, dimension_kv, 8, head_size, causal),
+                    ]
+                )
+
+        for head_size in (192, 256):
+            for causal in (False, True):
+                all_shapes.append((1, 4096, 8, head_size, causal))
+
         core_shapes = [
             (1, 512, 16, 128, False),
             (1, 512, 32, 64, False),
@@ -214,6 +238,9 @@ class FlashAttnVarlenFuncW8A8FP8Benchmark(base.GenericBenchmark):
             (4, 4096, 32, 64, False),
             (8, 8192, 16, 128, True),
             (ragged_q, ragged_kv, 32, 64, False),
+            (1, 512, 8, 96, False),
+            (dimension_q, dimension_kv, 8, 192, True),
+            (1, 4096, 8, 256, False),
         ]
         self.shapes = (
             all_shapes

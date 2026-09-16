@@ -28,6 +28,15 @@ from . import conftest as cfg
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
+W8A8_HEAD_SIZES = tuple(range(8, 257, 8))
+W8A8_FP8_DTYPES = [
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+    )
+    if dtype is not None
+]
 
 if cfg.QUICK_MODE:
     W8A8_CONFIGS = [(1, 16, 512, 512)]
@@ -53,17 +62,24 @@ def _get_fp8_dtype():
 
 
 def _hadamard_matrix(dim, tensor_device):
-    assert dim > 0 and dim & (dim - 1) == 0, "head_size must be a power of two"
-    matrix = torch.tensor([[1.0]], device=tensor_device)
-    while matrix.shape[0] < dim:
-        matrix = torch.cat(
-            (
-                torch.cat((matrix, matrix), dim=1),
-                torch.cat((matrix, -matrix), dim=1),
-            ),
-            dim=0,
-        )
-    return matrix / math.sqrt(dim)
+    assert dim > 0, "head_size must be positive"
+    # Use orthogonal blocks so non-power-of-two dimensions need no padding.
+    blocks = []
+    remaining = dim
+    while remaining:
+        block_dim = 1 << (remaining.bit_length() - 1)
+        matrix = torch.tensor([[1.0]], device=tensor_device)
+        while matrix.shape[0] < block_dim:
+            matrix = torch.cat(
+                (
+                    torch.cat((matrix, matrix), dim=1),
+                    torch.cat((matrix, -matrix), dim=1),
+                ),
+                dim=0,
+            )
+        blocks.append(matrix / math.sqrt(block_dim))
+        remaining -= block_dim
+    return torch.block_diag(*blocks)
 
 
 def _apply_incoherent_qk(x):
@@ -147,6 +163,18 @@ def _make_packed_inputs(q_lengths, kv_lengths, num_heads, head_size, dtype):
     return q, k, v
 
 
+def _with_padded_strides(x, copy_data=True):
+    storage = torch.empty(
+        (x.shape[0] * 2, x.shape[1] * 2, x.shape[2]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    result = storage[::2, ::2, :]
+    if copy_data:
+        result.copy_(x)
+    return result
+
+
 def _run_w8a8_varlen(
     q,
     k,
@@ -157,6 +185,7 @@ def _run_w8a8_varlen(
     causal,
     return_softmax_lse=False,
     fp8_dtype=None,
+    strided=False,
 ):
     (
         q_fp8,
@@ -169,6 +198,9 @@ def _run_w8a8_varlen(
     cu_seqlens_q = _cu_seqlens_from_lengths(q_lengths, q.device)
     cu_seqlens_k = _cu_seqlens_from_lengths(kv_lengths, q.device)
     out = torch.empty_like(q)
+    if strided:
+        q_fp8, k_fp8, v_fp8 = map(_with_padded_strides, (q_fp8, k_fp8, v_fp8))
+        out = _with_padded_strides(out, copy_data=False)
     result = w8a8_varlen(
         q_fp8,
         k_fp8,
@@ -185,6 +217,7 @@ def _run_w8a8_varlen(
         k_descale=k_descale,
         v_descale=v_descale,
     )
+    assert (result[0] if return_softmax_lse else result) is out
     reference_inputs = (
         _dequantize_varlen_per_block_fp8(q_fp8, q_lengths, q_descale, torch.bfloat16),
         _dequantize_varlen_per_block_fp8(k_fp8, kv_lengths, k_descale, torch.bfloat16),
@@ -237,6 +270,72 @@ def _assert_w8a8_attention_close(actual, expected):
     )
 
 
+def _assert_w8a8_lse_close(result, lse, expected_lse, q_lengths, kv_lengths, causal):
+    # Fully masked causal rows use implementation-specific LSE sentinels.
+    valid_rows = torch.cat(
+        [
+            (
+                torch.arange(q_len, device=device) >= max(0, q_len - kv_len)
+                if causal
+                else torch.ones(q_len, device=device, dtype=torch.bool)
+            )
+            for q_len, kv_len in zip(q_lengths, kv_lengths)
+        ]
+    )
+    assert torch.isfinite(lse[:, valid_rows]).all()
+    torch.testing.assert_close(
+        lse[:, valid_rows], expected_lse[:, valid_rows], rtol=1.0e-2, atol=5.0e-2
+    )
+    torch.testing.assert_close(
+        result[~valid_rows], torch.zeros_like(result[~valid_rows]), rtol=0, atol=0
+    )
+
+
+def _check_w8a8_head_dim(
+    head_size,
+    dtype,
+    fp8_dtype,
+    q_lengths,
+    kv_lengths,
+    causal,
+    return_lse,
+    strided=False,
+):
+    utils.init_seed(1234567890)
+    q, k, v = _make_packed_inputs(q_lengths, kv_lengths, 4, head_size, dtype)
+    # Unit-scale inputs exercise quantization and attention beyond near-uniform logits.
+    for tensor in (q, k, v):
+        tensor.normal_()
+    scale = 1.0 / math.sqrt(head_size)
+    actual, (ref_q, ref_k, ref_v), cu_q, cu_k = _run_w8a8_varlen(
+        q,
+        k,
+        v,
+        q_lengths,
+        kv_lengths,
+        scale,
+        causal,
+        return_softmax_lse=return_lse,
+        fp8_dtype=fp8_dtype,
+        strided=strided,
+    )
+    expected = _vllm_varlen_reference(
+        ref_q,
+        ref_k,
+        ref_v,
+        cu_q,
+        cu_k,
+        scale,
+        causal,
+        return_softmax_lse=return_lse,
+    )
+    if return_lse:
+        actual, lse = actual
+        expected, expected_lse = expected
+        _assert_w8a8_lse_close(actual, lse, expected_lse, q_lengths, kv_lengths, causal)
+    _assert_w8a8_attention_close(actual, expected)
+
+
 @pytest.mark.flash_attn_varlen_func_w8a8_fp8
 def test_flash_attn_varlen_func_w8a8_fp8_signature():
     assert inspect.signature(w8a8_varlen) == inspect.signature(fa2_varlen)
@@ -280,6 +379,104 @@ def test_flash_attn_varlen_func_w8a8_fp8(
 @pytest.mark.skipif(
     not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
 )
+@pytest.mark.parametrize("head_size", W8A8_HEAD_SIZES)
+@pytest.mark.parametrize("fp8_dtype", W8A8_FP8_DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["uniform", "ragged"])
+def test_flash_attn_varlen_func_w8a8_fp8_all_head_dims(
+    head_size, fp8_dtype, dtype, layout
+):
+    if layout == "uniform":
+        q_lengths, kv_lengths = [128, 128], [256, 256]
+    else:
+        q_lengths, kv_lengths = [129, 17], [65, 257]
+    _check_w8a8_head_dim(
+        head_size,
+        dtype,
+        fp8_dtype,
+        q_lengths,
+        kv_lengths,
+        causal=layout == "ragged",
+        return_lse=layout == "ragged",
+    )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
+@pytest.mark.skipif(
+    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+)
+@pytest.mark.parametrize("head_size", [8, 24, 96, 192, 248, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["uniform", "ragged"])
+def test_flash_attn_varlen_func_w8a8_fp8_head_dim_strides(head_size, dtype, layout):
+    if layout == "uniform":
+        q_lengths, kv_lengths = [128, 128], [256, 256]
+    else:
+        q_lengths, kv_lengths = [129, 17], [65, 257]
+    _check_w8a8_head_dim(
+        head_size,
+        dtype,
+        _get_fp8_dtype(),
+        q_lengths,
+        kv_lengths,
+        causal=layout == "uniform",
+        return_lse=True,
+        strided=True,
+    )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
+@pytest.mark.skipif(
+    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+)
+@pytest.mark.parametrize("head_size", [8, 24, 96, 136, 192, 248, 256])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_func_w8a8_fp8_head_dim_long_sequences(head_size, causal):
+    _check_w8a8_head_dim(
+        head_size,
+        torch.bfloat16,
+        _get_fp8_dtype(),
+        [2049, 1023],
+        [4097, 3073],
+        causal=causal,
+        return_lse=True,
+    )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
+@pytest.mark.skipif(
+    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+)
+@pytest.mark.parametrize("head_size", [8, 96, 256])
+@pytest.mark.parametrize("kv_len", [1, 128])
+def test_flash_attn_varlen_func_w8a8_fp8_head_dim_short_kv(head_size, kv_len):
+    _check_w8a8_head_dim(
+        head_size,
+        torch.bfloat16,
+        _get_fp8_dtype(),
+        [17],
+        [kv_len],
+        causal=True,
+        return_lse=True,
+    )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
+@pytest.mark.skipif(
+    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+)
 @pytest.mark.skipif(
     getattr(torch, "float8_e4m3fn", None) is None,
     reason="FP8 is not available",
@@ -287,17 +484,7 @@ def test_flash_attn_varlen_func_w8a8_fp8(
 @pytest.mark.parametrize("head_size", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("q_len,kv_len", [(129, 257), (17, 8192), (1024, 8192)])
-@pytest.mark.parametrize(
-    "fp8_dtype",
-    [
-        dtype
-        for dtype in (
-            getattr(torch, "float8_e4m3fn", None),
-            getattr(torch, "float8_e5m2", None),
-        )
-        if dtype is not None
-    ],
-)
+@pytest.mark.parametrize("fp8_dtype", W8A8_FP8_DTYPES)
 def test_flash_attn_varlen_func_w8a8_fp8_uniform_lse(
     head_size, causal, q_len, kv_len, fp8_dtype
 ):
@@ -419,15 +606,19 @@ def test_flash_attn_varlen_func_w8a8_fp8_ragged(
     getattr(torch, "float8_e4m3fn", None) is None,
     reason="FP8 is not available",
 )
-@pytest.mark.parametrize("head_size", [64, 128])
-def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size):
+@pytest.mark.parametrize("head_size", W8A8_HEAD_SIZES)
+@pytest.mark.parametrize("fp8_dtype", W8A8_FP8_DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size, fp8_dtype, dtype):
     utils.init_seed(1234567890)
-    dtype = torch.bfloat16
+    causal = dtype == torch.float16
     num_heads = 8
     q_lengths = [33, 17]
     kv_lengths = [129, 65]
     block_size = 64
     q, k, v = _make_packed_inputs(q_lengths, kv_lengths, num_heads, head_size, dtype)
+    for tensor in (q, k, v):
+        tensor.normal_()
     (
         q_fp8,
         k_fp8,
@@ -435,7 +626,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size):
         q_descale,
         k_descale,
         v_descale,
-    ) = _quantize_qkv_w8a8(q, k, v, q_lengths, kv_lengths)
+    ) = _quantize_qkv_w8a8(q, k, v, q_lengths, kv_lengths, fp8_dtype=fp8_dtype)
     page_table = torch.tensor([[5, 1, 7], [3, 6, 0]], dtype=torch.int32, device=device)
     num_pages = 8
 
@@ -458,7 +649,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size):
     cu_q = _cu_seqlens_from_lengths(q_lengths, device)
     seqused_k = torch.tensor(kv_lengths, dtype=torch.int32, device=device)
     scale = 1.0 / math.sqrt(head_size)
-    result = w8a8_varlen(
+    result, lse = w8a8_varlen(
         q_fp8,
         to_paged_cache(k_fp8),
         to_paged_cache(v_fp8),
@@ -467,27 +658,37 @@ def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size):
         max(kv_lengths),
         seqused_k=seqused_k,
         softmax_scale=scale,
+        causal=causal,
         block_table=page_table,
         out=torch.empty_like(q),
+        return_softmax_lse=True,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
     )
-    ref_q = _dequantize_varlen_per_block_fp8(q_fp8, q_lengths, q_descale, dtype)
-    ref_k = _dequantize_varlen_per_block_fp8(k_fp8, kv_lengths, k_descale, dtype)
-    ref_v = _dequantize_varlen_per_block_fp8(v_fp8, kv_lengths, v_descale, dtype)
-    expected = _vllm_varlen_reference(
+    ref_q = _dequantize_varlen_per_block_fp8(
+        q_fp8, q_lengths, q_descale, torch.bfloat16
+    )
+    ref_k = _dequantize_varlen_per_block_fp8(
+        k_fp8, kv_lengths, k_descale, torch.bfloat16
+    )
+    ref_v = _dequantize_varlen_per_block_fp8(
+        v_fp8, kv_lengths, v_descale, torch.bfloat16
+    )
+    expected, expected_lse = _vllm_varlen_reference(
         ref_q,
         to_paged_cache(ref_k),
         to_paged_cache(ref_v),
         cu_q,
         None,
         scale,
-        False,
+        causal,
+        return_softmax_lse=True,
         seqused_k=seqused_k,
         block_table=page_table,
     )
     _assert_w8a8_attention_close(result, expected)
+    _assert_w8a8_lse_close(result, lse, expected_lse, q_lengths, kv_lengths, causal)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8_fp8
@@ -562,6 +763,41 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_unsupported_inputs():
             seqused_k=torch.tensor([128], dtype=torch.int32, device=device),
             block_table=torch.zeros((1, 1, 1), dtype=torch.int32, device=device),
         )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
+@pytest.mark.skipif(
+    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+)
+@pytest.mark.parametrize("head_size", [0, 7, 65, 264])
+def test_flash_attn_varlen_func_w8a8_fp8_rejects_invalid_head_dim(head_size):
+    q = torch.empty((1, 4, head_size), dtype=_get_fp8_dtype(), device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(NotImplementedError, match="head_dim"):
+        w8a8_varlen(
+            q, torch.empty_like(q), torch.empty_like(q), 1, cu_seqlens, 1, cu_seqlens
+        )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
+@pytest.mark.skipif(
+    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+)
+def test_flash_attn_varlen_func_w8a8_fp8_rejects_mismatched_head_dims():
+    fp8_dtype = _get_fp8_dtype()
+    q = torch.empty((1, 4, 64), dtype=fp8_dtype, device=device)
+    k = torch.empty((1, 4, 96), dtype=fp8_dtype, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="head_dim"):
+        w8a8_varlen(q, k, torch.empty_like(k), 1, cu_seqlens, 1, cu_seqlens)
+    with pytest.raises(ValueError, match="identical shapes"):
+        w8a8_varlen(q, torch.empty_like(q), k, 1, cu_seqlens, 1, cu_seqlens)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8_fp8
