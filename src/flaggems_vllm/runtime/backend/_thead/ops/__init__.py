@@ -18,11 +18,8 @@ from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
-from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import (  # noqa: F401
-    gemma_rms_norm,
-)
+from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
-
 
 __all__ = [
     "fused_experts_impl",
