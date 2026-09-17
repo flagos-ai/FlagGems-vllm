@@ -139,45 +139,30 @@ def _fp8_fp4_mqa_logits_kernel(
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     for hb in range(0, H, HEAD_BLOCK):
-        hb_offs = hb + tl.arange(0, HEAD_BLOCK)
+        acc_h = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-        # Load Q for this head batch: [BLOCK_M, HEAD_BLOCK, D]
-        q = tl.load(
-            Q_ptr
-            + m_offs[:, None, None] * stride_qm
-            + hb_offs[None, :, None] * stride_qh
-            + d_offs[None, None, :] * stride_qd,
-            mask=m_mask[:, None, None]
-            & (hb_offs[None, :, None] < H)
-            & (d_offs[None, None, :] < D),
-            other=0.0,
-        )
+        for i in tl.static_range(HEAD_BLOCK):
+            h = hb + i
+            q_i = tl.load(
+                Q_ptr
+                + m_offs[:, None] * stride_qm
+                + h * stride_qh
+                + d_offs[None, :] * stride_qd,
+                mask=m_mask[:, None] & (h < H) & (d_offs[None, :] < D),
+                other=0.0,
+            )  # [BLOCK_M, D]
 
-        # Flatten to 2D for MMA: [BLOCK_M * HEAD_BLOCK, D]
-        q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
+            dot_i = tl.dot(q_i, tl.trans(k))  # [BLOCK_M, BLOCK_N]
 
-        # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
-        dot = tl.dot(q_2d, tl.trans(k))
+            w_i = tl.load(
+                W_ptr + m_offs * stride_wm + h * stride_wh,
+                mask=m_mask & (h < H),
+                other=0.0,
+            )
 
-        # Fused k_scale + ReLU activation
-        dot = tl.maximum(dot * k_scale[None, :], 0.0)
+            acc_h += tl.maximum(dot_i * k_scale[None, :], 0.0) * w_i[:, None]
 
-        # Load weights for this head batch: [BLOCK_M, HEAD_BLOCK]
-        w = tl.load(
-            W_ptr + m_offs[:, None] * stride_wm + hb_offs[None, :] * stride_wh,
-            mask=m_mask[:, None] & (hb_offs[None, :] < H),
-            other=0.0,
-        )
-
-        # Weight each head's contribution
-        w_flat = tl.reshape(w, [BLOCK_M * HEAD_BLOCK])
-        dot = dot * w_flat[:, None]
-
-        # Reduce over head dimension: [BLOCK_M, HEAD_BLOCK, BLOCK_N] -> sum
-        dot_3d = tl.reshape(dot, [BLOCK_M, HEAD_BLOCK, BLOCK_N])
-        dot_reduced = tl.sum(dot_3d, axis=1)
-
-        acc += dot_reduced
+        acc += acc_h
 
     # Store output tile
     write_mask = m_mask[:, None] & n_mask[None, :]
@@ -289,64 +274,85 @@ def _fp8_fp4_mqa_logits_mxfp4_kernel(
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     # Per-dim scale block index: dim d belongs to ue8m0 block d // 32.
-    block_id = (d_offs // 32)[None, None, :]  # [1, 1, D]
+    block_id = d_offs // 32  # [D] 1D for MUSA Triton compatibility
 
     for hb in range(0, H, HEAD_BLOCK):
-        hb_offs = hb + tl.arange(0, HEAD_BLOCK)
+        # Per-head dot products to avoid 3D reshape SQMMA incompatibility on MUSA
+        h0 = hb
+        h1 = hb + 1
 
-        # Packed Q bytes: [BLOCK_M, HEAD_BLOCK, D//2]
-        q_packed = tl.load(
+        # Extract per-head Q packed bytes: [BLOCK_M, D//2]
+        q_packed_0 = tl.load(
             Q_ptr
-            + m_offs[:, None, None] * stride_qm
-            + hb_offs[None, :, None] * stride_qh
-            + d2_offs[None, None, :] * stride_qd,
-            mask=m_mask[:, None, None]
-            & (hb_offs[None, :, None] < H)
-            & (d2_offs[None, None, :] < D2),
+            + m_offs[:, None] * stride_qm
+            + h0 * stride_qh
+            + d2_offs[None, :] * stride_qd,
+            mask=m_mask[:, None] & (d2_offs[None, :] < D2),
+            other=0,
+        )
+        q_packed_1 = tl.load(
+            Q_ptr
+            + m_offs[:, None] * stride_qm
+            + h1 * stride_qh
+            + d2_offs[None, :] * stride_qd,
+            mask=m_mask[:, None] & (h1 < H) & (d2_offs[None, :] < D2),
             other=0,
         )
 
-        # Unpack nibbles: low nibble = even dim, high nibble = odd dim.
-        lo = q_packed & 0xF
-        hi = (q_packed >> 4) & 0xF
-        nibble = tl.reshape(tl.join(lo, hi), [BLOCK_M, HEAD_BLOCK, D])
+        # Unpack nibbles for each head
+        lo0 = q_packed_0 & 0xF
+        hi0 = (q_packed_0 >> 4) & 0xF
+        nibble0 = tl.reshape(tl.join(lo0, hi0), [BLOCK_M, D])
+        q0_f32 = _e2m1_to_f32(nibble0)
 
-        q_f32 = _e2m1_to_f32(nibble)
+        lo1 = q_packed_1 & 0xF
+        hi1 = (q_packed_1 >> 4) & 0xF
+        nibble1 = tl.reshape(tl.join(lo1, hi1), [BLOCK_M, D])
+        q1_f32 = _e2m1_to_f32(nibble1)
 
-        # Per-block ue8m0 scale: extract the byte for each dim's block.
-        q_scale_val = tl.load(
-            Q_scale_ptr + m_offs[:, None] * stride_qsm + hb_offs[None, :] * stride_qsh,
-            mask=m_mask[:, None] & (hb_offs[None, :] < H),
+        # Per-block ue8m0 scale for each head
+        q_scale_val_0 = tl.load(
+            Q_scale_ptr + m_offs * stride_qsm + h0 * stride_qsh,
+            mask=m_mask,
             other=0,
-        )  # [BLOCK_M, HEAD_BLOCK] int32
-        byte = ((q_scale_val[:, :, None] >> (8 * block_id)) & 0xFF).to(tl.float32)
-        scale = tl.exp2(byte - 127.0)  # [BLOCK_M, HEAD_BLOCK, D]
+        )
+        q_scale_val_1 = tl.load(
+            Q_scale_ptr + m_offs * stride_qsm + h1 * stride_qsh,
+            mask=m_mask & (h1 < H),
+            other=0,
+        )
 
-        q_f32 = q_f32 * scale
+        byte0 = ((q_scale_val_0[:, None] >> (8 * block_id[None, :])) & 0xFF).to(
+            tl.float32
+        )
+        scale0 = tl.exp2(byte0 - 127.0)
+        q0_f32 = q0_f32 * scale0
 
-        # Flatten to 2D for MMA: [BLOCK_M * HEAD_BLOCK, D]
-        q_2d = tl.reshape(q_f32, [BLOCK_M * HEAD_BLOCK, D]).to(tl.float16)
+        byte1 = ((q_scale_val_1[:, None] >> (8 * block_id[None, :])) & 0xFF).to(
+            tl.float32
+        )
+        scale1 = tl.exp2(byte1 - 127.0)
+        q1_f32 = q1_f32 * scale1
 
-        # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
-        dot = tl.dot(q_2d, tl.trans(k))
+        # Dot products: [BLOCK_M, BLOCK_N]
+        dot0 = tl.dot(q0_f32.to(tl.float16), tl.trans(k))
+        dot1 = tl.dot(q1_f32.to(tl.float16), tl.trans(k))
 
-        # Fused k_scale + ReLU activation
-        dot = tl.maximum(dot * k_scale[None, :], 0.0)
-
-        # Load weights for this head batch: [BLOCK_M, HEAD_BLOCK]
-        w = tl.load(
-            W_ptr + m_offs[:, None] * stride_wm + hb_offs[None, :] * stride_wh,
-            mask=m_mask[:, None] & (hb_offs[None, :] < H),
+        # Load weights for each head
+        w0 = tl.load(
+            W_ptr + m_offs * stride_wm + h0 * stride_wh, mask=m_mask, other=0.0
+        )
+        w1 = tl.load(
+            W_ptr + m_offs * stride_wm + h1 * stride_wh,
+            mask=m_mask & (h1 < H),
             other=0.0,
         )
 
-        # Weight each head's contribution
-        w_flat = tl.reshape(w, [BLOCK_M * HEAD_BLOCK])
-        dot = dot * w_flat[:, None]
-
-        # Reduce over head dimension: [BLOCK_M, HEAD_BLOCK, BLOCK_N] -> sum
-        dot_3d = tl.reshape(dot, [BLOCK_M, HEAD_BLOCK, BLOCK_N])
-        dot_reduced = tl.sum(dot_3d, axis=1)
+        # Fused k_scale + ReLU + weight for each head, then sum
+        dot_reduced = (
+            tl.maximum(dot0 * k_scale[None, :], 0.0) * w0[:, None]
+            + tl.maximum(dot1 * k_scale[None, :], 0.0) * w1[:, None]
+        )
 
         acc += dot_reduced
 
