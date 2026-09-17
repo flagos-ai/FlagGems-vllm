@@ -18,6 +18,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_fn import causal_co
 from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_update import (
     causal_conv1d_update,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import (
+    chunk_gated_delta_rule_fwd,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -70,6 +73,7 @@ __all__ = [
     "scaled_int8_quant",
     "sparse_attn_sharedkv",
     "swiglu",
+    "chunk_gated_delta_rule_fwd",
     "persistent_topk",
     "compressor",
     "compressor_prepared",
