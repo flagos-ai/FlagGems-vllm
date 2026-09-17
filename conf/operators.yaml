@@ -539,6 +539,21 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: gemma_rms_norm
+    description: |
+      RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
+      the learnable weight is offset by one: the output is
+      `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
+    for:
+      - vllm.model_executor.layers.layernorm.GemmaRMSNorm
+    labels:
+      - fused
+      - NoCPU
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
