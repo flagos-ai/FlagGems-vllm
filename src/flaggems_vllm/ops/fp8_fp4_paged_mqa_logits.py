@@ -528,10 +528,23 @@ def fp8_fp4_paged_mqa_logits(
     use_tle = _can_use_tle(max_ctx, block_size, head_dim)
     if use_tle:
         _launch_tle_kernel(
-            q_u8, kv_data, kv_scales, weights, block_tables_expanded,
-            logits, ctx_lens_flat, total_rows, max_ctx, H, head_dim,
-            max_model_len, block_size, num_phys_blocks, max_blocks_per_seq,
-            BLOCK_KV, NUM_BLOCKS,
+            q_u8,
+            kv_data,
+            kv_scales,
+            weights,
+            block_tables_expanded,
+            logits,
+            ctx_lens_flat,
+            total_rows,
+            max_ctx,
+            H,
+            head_dim,
+            max_model_len,
+            block_size,
+            num_phys_blocks,
+            max_blocks_per_seq,
+            BLOCK_KV,
+            NUM_BLOCKS,
         )
     else:
         _mqa_logits_kernel[grid](

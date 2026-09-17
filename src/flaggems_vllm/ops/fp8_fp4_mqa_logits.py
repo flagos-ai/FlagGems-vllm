@@ -604,7 +604,9 @@ def fp8_fp4_mqa_logits(
         N = k_values.shape[0]
         use_tle = _can_use_tle(M, N, H, D)
         if use_tle:
-            _launch_tle_kernel(q_values, k_values, k_scales, weights, logits, M, N, H, D)
+            _launch_tle_kernel(
+                q_values, k_values, k_scales, weights, logits, M, N, H, D
+            )
         else:
             _fp8_fp4_mqa_logits_kernel[grid](
                 q_values,
