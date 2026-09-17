@@ -498,6 +498,21 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: gemma_rms_norm
+    description: |
+      RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
+      the learnable weight is offset by one: the output is
+      `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
+    for:
+      - vllm.model_executor.layers.layernorm.GemmaRMSNorm
+    labels:
+      - fused
+      - NoCPU
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: geglu
     description: Gaussian Error Gated Linear Unit with GELU activation instead of sigmoid function.
     for:
