@@ -40,6 +40,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
+    chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
 )
 from flaggems_vllm.ops.attention import (
@@ -161,6 +162,7 @@ __all__ = [
     "beam_search_score_",
     "bincount",
     "bucket_sort_topk",
+    "chunk_kda",
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "combine_topk_swa_indices",

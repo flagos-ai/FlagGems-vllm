@@ -106,6 +106,18 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: chunk_kda
+    description: |
+      Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
+    for:
+      - chunk_kda
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: chunk_gated_delta_rule_fwd
     description: |
       The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear Attention (FLA).
