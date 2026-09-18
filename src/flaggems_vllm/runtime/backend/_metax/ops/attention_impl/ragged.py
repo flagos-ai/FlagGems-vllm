@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CW1 materialized compact-ragged worklist adapter."""
+"""Compact worklists for variable-length attention requests."""
 
 import torch
 import triton
@@ -75,7 +75,7 @@ def build_two_request_cost_ordered_worklist_kernel(
         k0_len = tl.load(seqused_k_ptr).to(tl.int32)
         k1_len = tl.load(seqused_k_ptr + 1).to(tl.int32)
     else:
-        tl.static_assert(IS_CU_SEQLENS_K, "TN2 requires a KV length source")
+        tl.static_assert(IS_CU_SEQLENS_K, "Async-TN requires a KV length source")
         k0_bos = tl.load(cu_seqlens_k_ptr).to(tl.int32)
         k1_bos = tl.load(cu_seqlens_k_ptr + 1).to(tl.int32)
         k1_eos = tl.load(cu_seqlens_k_ptr + 2).to(tl.int32)
@@ -118,7 +118,7 @@ def launch_compact_worklist(
 
     expected_upper = compact_worklist_task_upper_bound(total_q, batch_size, block_m)
     if task_upper != expected_upper or task_upper <= 0:
-        raise ValueError("CW1 worklist task upper bound is inconsistent")
+        raise ValueError("Compact worklist task upper bound is inconsistent")
     worklist = torch.empty(
         (task_upper, 2),
         dtype=torch.int32,
@@ -160,13 +160,13 @@ def launch_d256_tn_compact_worklist(
     block_m,
     block_n,
 ):
-    """Build PackGQA descriptors and launch the TN2 async-TN kernel."""
+    """Build PackGQA descriptors and launch the async-TN kernel."""
 
     expected_upper = compact_worklist_task_upper_bound(total_q, batch_size, block_m)
     if task_upper != expected_upper or task_upper <= 0:
-        raise ValueError("TN1 worklist task upper bound is inconsistent")
+        raise ValueError("Async-TN worklist task upper bound is inconsistent")
     if block_m % params.h_hk_ratio != 0:
-        raise ValueError("TN2 PackGQA requires BLOCK_M divisible by the GQA ratio")
+        raise ValueError("Async-TN PackGQA requires BLOCK_M divisible by the GQA ratio")
     if params.block_size == 16 and params.h_hk_ratio == 4:
         from .tn_direct import _d256_tn_bulk_policy
 

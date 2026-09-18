@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""D2 explicit varlen Split-KV producer and safe FP32 merge."""
+"""Varlen Split-KV partial attention and FP32 merge."""
 
 import logging
 
@@ -550,12 +550,12 @@ def launch_splitkv(
     """Launch split partial attention followed by an FP32 softmax merge."""
 
     if not 2 <= num_splits <= 32:
-        raise RuntimeError("MetaX D2 Split-KV requires 2 to 32 splits")
+        raise RuntimeError("MetaX Split-KV requires 2 to 32 splits")
     if (block_m, block_n) not in ((4, 16), (16, 16)):
-        raise RuntimeError("MetaX D2 Split-KV received an invalid tile")
+        raise RuntimeError("MetaX Split-KV received an invalid tile")
     expected_q_tiles = (max_seqlen_q + block_m - 1) // block_m
     if q_tiles != expected_q_tiles:
-        raise RuntimeError("MetaX D2 Split-KV received an invalid q_tiles value")
+        raise RuntimeError("MetaX Split-KV received an invalid q_tiles value")
 
     original_out = params.o_ptr
     original_lse = params.softmax_lse_ptr

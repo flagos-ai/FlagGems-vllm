@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Base-equivalent direct varlen FlashAttention kernel and launcher."""
+"""Direct varlen FlashAttention kernel and launcher."""
 
 import logging
 
@@ -519,7 +519,6 @@ def launch_direct(
     kernel = flash_varlen_fwd_kernel[grid]
     args = tuple(getattr(params, k) for k in params.__slots__)
 
-    # We assess which phase the requests are likely to be in and set the config accordingly.
     total_rows = total_q * num_heads
     num_sms = torch_device_fn.get_device_properties(
         flaggems_vllm.device
@@ -527,8 +526,7 @@ def launch_direct(
     avg_rows_per_sm = total_rows / num_sms
     avg_rows_per_batch = total_q / batch_size
     avg_rows_per_cta = min(avg_rows_per_batch, avg_rows_per_sm)
-    # Heuristic: if avg_rows_per_sm >= 128, we are likely in prefill phase.
-    # This is a rough heuristic and may not be accurate for all scenarios.
+    # Choose the Q tile from the average rows per request and processor.
     if avg_rows_per_cta > 64:
         varlen_fwd_config_str = "mha_block_128"
     elif avg_rows_per_cta > 32:

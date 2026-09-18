@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""D256 production routing and generic varlen fallback for MetaX C550."""
+"""D256 and general varlen attention routing for MetaX C550."""
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -38,7 +38,7 @@ class MetaXGridOrder(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class MetaXAttentionPlan:
-    """Only values consumed by dispatch or workspace validation are retained."""
+    """Kernel routing and workspace requirements."""
 
     family: MetaXKernelFamily
     task_mapper: MetaXTaskMapper
@@ -52,12 +52,14 @@ class MetaXAttentionPlan:
     workspace_bytes: int = 0
 
 
+# Fixed TN tiles preserve the C550 w4/s4 Async-TN compiler pipeline.
+# Changing warps or stages can disable it or exceed shared-memory limits.
 D256_TN_BLOCK_M = 32
 D256_TN_BLOCK_N = 128
 
 
 class MetaXAttentionScheduler:
-    """Select fixed production routes without reading GPU metadata on the host."""
+    """Select kernel routes without reading GPU metadata on the host."""
 
     SPLIT_KV_BLOCK_M = 4
     SPLIT_KV_BLOCK_N = 16
@@ -105,7 +107,7 @@ class MetaXAttentionScheduler:
 
     @staticmethod
     def _select_auto_splits(*, base_tasks: int, k_blocks: int, split_cap: int) -> int:
-        """Choose D256 decode splits using the existing CTA-wave cost model."""
+        """Choose D256 decode splits using the CTA-wave cost model."""
         resident_ctas = 2
         capacity = MetaXAttentionScheduler.C550_NUM_SMS * resident_ctas
         if base_tasks <= 0 or k_blocks <= 0 or split_cap < 2:

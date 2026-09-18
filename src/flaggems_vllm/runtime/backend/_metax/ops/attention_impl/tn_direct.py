@@ -37,7 +37,7 @@ def _paged_tile_coords(
     BOUNDARY_CHECK: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 32,
 ):
-    """Resolve physical rows; retain the validated page32 scalar gather."""
+    """Resolve physical rows from the page table."""
     if PAGE_SIZE == 16:
         tl.static_assert(BLOCK_N == 128, "page16 scalar gather requires BN128")
         page_slot = tl.arange(0, BLOCK_N) // 16
@@ -154,7 +154,7 @@ def _paged_tile_coords(
                 tl.where(page_slot == 1, page1, tl.where(page_slot == 2, page2, page3)),
             )
         else:
-            tl.static_assert(False, "TN1 BLOCK_N must be 32, 64, or 128")
+            tl.static_assert(False, "Async-TN BLOCK_N must be 32, 64, or 128")
         col_idx = start_n + tl.arange(0, BLOCK_N)
         col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
         page_offset = col_idx % 32
@@ -239,11 +239,11 @@ def flash_varlen_fwd_d256_tn_kernel(
     )
     tl.static_assert(
         (not SPLIT_KV) | (not COMPACT_WORKLIST) & (NUM_SPLITS > 1),
-        "TN2 async-TN Split-KV requires a rectangular multi-split grid",
+        "Async-TN Split-KV requires a rectangular multi-split grid",
     )
     tl.static_assert(
         SPLIT_KV | (NUM_SPLITS == 1) & (Q_TILES > 0),
-        "TN2 Direct requires the neutral split configuration",
+        "Async-TN Direct requires the neutral split configuration",
     )
     if GRID_ORDER == 1:
         head_pid = tl.program_id(0)
@@ -283,7 +283,7 @@ def flash_varlen_fwd_d256_tn_kernel(
     if IS_SEQUSED_K:
         k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
     else:
-        tl.static_assert(IS_CU_SEQLENS_K, "TN1 requires a KV length source")
+        tl.static_assert(IS_CU_SEQLENS_K, "Async-TN requires a KV length source")
         k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
         k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
         k_len = k_eos - k_bos
@@ -534,13 +534,13 @@ def _launch_d256_tn_base(
 ):
     """Launch the fixed MetaX cpasync/s4 async-TN specialization."""
     if params.block_size not in (16, 32) or params.d != 256:
-        raise ValueError("TN1 requires paged D256 with page size 16 or 32")
+        raise ValueError("Async-TN requires paged D256 with page size 16 or 32")
     if params.cu_seqlens_q_ptr is None:
-        raise ValueError("TN1 requires varlen Q prefix sums")
+        raise ValueError("Async-TN requires varlen Q prefix sums")
     if params.cu_seqlens_k_ptr is None and params.seqused_k_ptr is None:
-        raise ValueError("TN1 requires KV lengths")
+        raise ValueError("Async-TN requires KV lengths")
     if block_m != 32 or block_n != 128:
-        raise ValueError("TN1 production kernel requires BM32 x BN128")
+        raise ValueError("Async-TN kernel requires BM32 x BN128")
     use_compact_worklist = compact_worklist is not None
     fast_causal_aligned = (
         not fallback_for_fast

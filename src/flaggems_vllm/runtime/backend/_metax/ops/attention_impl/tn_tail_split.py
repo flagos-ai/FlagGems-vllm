@@ -45,25 +45,25 @@ def launch_tail_split(
     if prefix_only and peel_q:
         raise ValueError("Prefix Split-KV must retain the original Q base and length")
     if params.q_ptr.dtype != torch.bfloat16:
-        raise ValueError("TN3 tail Split-KV requires BF16 Q/K/V")
+        raise ValueError("Async-TN tail Split-KV requires BF16 Q/K/V")
     if not params.is_paged or params.block_size not in (16, 32) or params.d != 256:
         raise ValueError(
-            "TN3 tail Split-KV requires paged D256 with page size 16 or 32"
+            "Async-TN tail Split-KV requires paged D256 with page size 16 or 32"
         )
     if not params.is_causal or params.is_local:
-        raise ValueError("TN3 tail Split-KV only supports causal global attention")
+        raise ValueError("Async-TN tail Split-KV only supports causal global attention")
     if params.is_dropout or params.is_alibi or params.is_softcap:
         raise ValueError(
-            "TN3 tail Split-KV does not support optional attention features"
+            "Async-TN tail Split-KV does not support optional attention features"
         )
     if params.cu_seqlens_q_ptr is None:
-        raise ValueError("TN3 tail Split-KV requires varlen Q prefix sums")
+        raise ValueError("Async-TN tail Split-KV requires varlen Q prefix sums")
     if params.cu_seqlens_k_ptr is None and params.seqused_k_ptr is None:
-        raise ValueError("TN3 tail Split-KV requires KV lengths")
+        raise ValueError("Async-TN tail Split-KV requires KV lengths")
     if not 2 <= num_splits <= 32:
-        raise ValueError("TN3 tail Split-KV requires 2 to 32 splits")
+        raise ValueError("Async-TN tail Split-KV requires 2 to 32 splits")
     if num_heads % params.h_hk_ratio != 0:
-        raise ValueError("TN3 tail Split-KV received an invalid GQA ratio")
+        raise ValueError("Async-TN tail Split-KV received an invalid GQA ratio")
     if params.h_hk_ratio != 8 and (
         not (params.block_size == 16 and params.h_hk_ratio == 4)
     ):

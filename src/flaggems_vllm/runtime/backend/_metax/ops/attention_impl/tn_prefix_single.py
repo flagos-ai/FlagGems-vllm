@@ -36,7 +36,7 @@ def _paged_tile_coords(
     BOUNDARY_CHECK: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 32,
 ):
-    """Resolve physical rows; retain the validated page32 scalar gather."""
+    """Resolve physical rows from the page table."""
     if PAGE_SIZE == 16:
         tl.static_assert(BLOCK_N == 128, "page16 scalar gather requires BN128")
         page_slot = tl.arange(0, BLOCK_N) // 16
@@ -153,7 +153,7 @@ def _paged_tile_coords(
                 tl.where(page_slot == 1, page1, tl.where(page_slot == 2, page2, page3)),
             )
         else:
-            tl.static_assert(False, "TN1 BLOCK_N must be 32, 64, or 128")
+            tl.static_assert(False, "Async-TN BLOCK_N must be 32, 64, or 128")
         col_idx = start_n + tl.arange(0, BLOCK_N)
         col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
         page_offset = col_idx % 32
@@ -238,11 +238,11 @@ def flash_varlen_fwd_d256_tn_kernel(
     )
     tl.static_assert(
         (not SPLIT_KV) | (not COMPACT_WORKLIST) & (NUM_SPLITS > 1),
-        "TN2 async-TN Split-KV requires a rectangular multi-split grid",
+        "Async-TN Split-KV requires a rectangular multi-split grid",
     )
     tl.static_assert(
         SPLIT_KV | (NUM_SPLITS == 1) & (Q_TILES > 0),
-        "TN2 Direct requires the neutral split configuration",
+        "Async-TN Direct requires the neutral split configuration",
     )
     if GRID_ORDER == 1:
         head_pid = tl.program_id(0)
@@ -282,7 +282,7 @@ def flash_varlen_fwd_d256_tn_kernel(
     if IS_SEQUSED_K:
         k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
     else:
-        tl.static_assert(IS_CU_SEQLENS_K, "TN1 requires a KV length source")
+        tl.static_assert(IS_CU_SEQLENS_K, "Async-TN requires a KV length source")
         k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
         k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
         k_len = k_eos - k_bos
@@ -340,7 +340,6 @@ def flash_varlen_fwd_d256_tn_kernel(
         tl.cdiv(k_len, BLOCK_N), tl.cdiv(q_block_end + k_len - q_len, BLOCK_N)
     )
     if SPLIT_KV:
-        # Retain the validated TN10 kernel structure during this migration.
         span_blocks = max(n_block_max - n_block_min, 0)  # noqa: F841
         blocks_per_split = 1
         split_block_min = min(n_block_max, n_block_min + split_id * blocks_per_split)

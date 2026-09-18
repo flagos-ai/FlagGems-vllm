@@ -17,7 +17,7 @@ from .splitkv import flash_varlen_splitkv_kernel
 
 
 def launch_page16_decode(params, *, batch_size):
-    """Reuse the established BM4/N16 MMA loop without partial buffers or merge."""
+    """Run BM4/N16 MMA without partial buffers or merge."""
     args = tuple(getattr(params, key) for key in params.__slots__)
     cfg = {
         "BLOCK_M": 4,

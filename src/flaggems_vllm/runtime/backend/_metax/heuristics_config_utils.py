@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TN10 Direct defaults; paged D128/D256 resource overrides live in launch_direct.
+# Direct defaults; paged D128/D256 resource overrides live in launch_direct.
 HEURISTICS_CONFIGS = {
     "mha_block_128": {
         "BLOCK_M": lambda args: 128,

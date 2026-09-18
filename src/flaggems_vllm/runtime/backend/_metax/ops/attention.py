@@ -64,8 +64,8 @@ def flash_attn_varlen_func(
     """MetaX inference varlen attention, with optional FP32 [heads, total_q] LSE.
 
     Matches the public vLLM-compatible FA2 signature. Nonzero dropout and FA3
-    extensions are unsupported. The forward-only deterministic flag requires
-    no separate path. No original FlagGems C extension is used.
+    extensions are unsupported. The deterministic flag does not change
+    the forward path.
     """
     if fa_version != 2:
         raise NotImplementedError("MetaX varlen attention supports fa_version=2")

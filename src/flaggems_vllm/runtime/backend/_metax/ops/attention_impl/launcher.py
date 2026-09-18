@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validated execution-plan dispatch for MetaX FlashAttention."""
+"""MetaX FlashAttention plan validation and dispatch."""
 import torch
 
 from .direct import launch_direct

@@ -37,7 +37,7 @@ def _paged_tile_coords(
     BOUNDARY_CHECK: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 32,
 ):
-    """Resolve physical rows; retain the validated page32 scalar gather."""
+    """Resolve physical rows from the page table."""
     if PAGE_SIZE == 16:
         tl.static_assert(BLOCK_N == 128, "page16 scalar gather requires BN128")
         page_slot = tl.arange(0, BLOCK_N) // 16
@@ -154,7 +154,7 @@ def _paged_tile_coords(
                 tl.where(page_slot == 1, page1, tl.where(page_slot == 2, page2, page3)),
             )
         else:
-            tl.static_assert(False, "TN1 BLOCK_N must be 32, 64, or 128")
+            tl.static_assert(False, "Async-TN BLOCK_N must be 32, 64, or 128")
         col_idx = start_n + tl.arange(0, BLOCK_N)
         col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
         page_offset = col_idx % 32
@@ -453,20 +453,20 @@ def launch_d256_tn_direct(
 ):
     """Launch the fixed MetaX cpasync/s4 async-TN specialization."""
     if params.block_size not in (16, 32) or params.d != 256:
-        raise ValueError("TN1 requires paged D256 with page size 16 or 32")
+        raise ValueError("Async-TN requires paged D256 with page size 16 or 32")
     if params.cu_seqlens_q_ptr is None:
-        raise ValueError("TN1 requires varlen Q prefix sums")
+        raise ValueError("Async-TN requires varlen Q prefix sums")
     if params.cu_seqlens_k_ptr is None and params.seqused_k_ptr is None:
-        raise ValueError("TN1 requires KV lengths")
+        raise ValueError("Async-TN requires KV lengths")
     if batch_size != 1 or total_q != max_seqlen_q:
-        raise ValueError("TN2 fast path requires one dense varlen request")
+        raise ValueError("Async-TN fast path requires one dense varlen request")
     long_fast = max_seqlen_q > 4108 and (
         params.h_hk_ratio == 8 or (params.block_size == 16 and params.h_hk_ratio == 4)
     )
     if block_m == 32 and long_fast:
         block_m = 64
     if block_m not in (32, 64) or block_n != 128:
-        raise ValueError("TN3 fast kernel requires BM32/BM64 x BN128")
+        raise ValueError("Async-TN fast kernel requires BM32/BM64 x BN128")
     pack_group = 4 if block_m == 64 and params.h_hk_ratio == 8 else params.h_hk_ratio
     use_compact_worklist = compact_worklist is not None
     output_fragment_d = _D256_FRAGMENT

@@ -28,23 +28,25 @@ logger = logging.getLogger(__name__)
 def launch_d256_tn_splitkv(
     params, *, max_seqlen_q, batch_size, num_heads, total_q, num_splits
 ):
-    """Run BM32xBN128 PackGQA partials and the existing FP32 merge."""
+    """Run BM32xBN128 PackGQA partials and FP32 merge."""
     if params.q_ptr.dtype != torch.bfloat16:
-        raise ValueError("TN2 Split-KV requires BF16 Q/K/V")
+        raise ValueError("Async-TN Split-KV requires BF16 Q/K/V")
     if not params.is_paged or params.block_size != 32 or params.d != 256:
-        raise ValueError("TN2 Split-KV requires paged D256 with page size 32")
+        raise ValueError("Async-TN Split-KV requires paged D256 with page size 32")
     if not params.is_causal or params.is_local:
-        raise ValueError("TN2 Split-KV only supports causal global attention")
+        raise ValueError("Async-TN Split-KV only supports causal global attention")
     if params.is_dropout or params.is_alibi or params.is_softcap:
-        raise ValueError("TN2 Split-KV does not support optional attention features")
+        raise ValueError(
+            "Async-TN Split-KV does not support optional attention features"
+        )
     if params.cu_seqlens_q_ptr is None:
-        raise ValueError("TN2 Split-KV requires varlen Q prefix sums")
+        raise ValueError("Async-TN Split-KV requires varlen Q prefix sums")
     if params.cu_seqlens_k_ptr is None and params.seqused_k_ptr is None:
-        raise ValueError("TN2 Split-KV requires KV lengths")
+        raise ValueError("Async-TN Split-KV requires KV lengths")
     if not 2 <= num_splits <= 32:
-        raise ValueError("TN2 Split-KV requires 2 to 32 splits")
+        raise ValueError("Async-TN Split-KV requires 2 to 32 splits")
     if num_heads % params.h_hk_ratio != 0:
-        raise ValueError("TN2 Split-KV received an invalid GQA ratio")
+        raise ValueError("Async-TN Split-KV received an invalid GQA ratio")
     block_m = 32
     block_n = 128
     block_k = 128
