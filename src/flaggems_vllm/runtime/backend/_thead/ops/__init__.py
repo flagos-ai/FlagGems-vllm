@@ -29,6 +29,7 @@ from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
 )
 
 __all__ = [
+    "SUPPORTED_FP8_DTYPE",
     "fused_experts_impl",
     "gemma_rms_norm",
     "inplace_fused_experts",
