@@ -106,6 +106,18 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: chunk_kda
+    description: |
+      Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
+    for:
+      - chunk_kda
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: chunk_gated_delta_rule_fwd
     description: |
       The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear Attention (FLA).
@@ -291,6 +303,22 @@ ops:
     stages:
       - stable: '3.1'
     cpp: '4.0'
+  - id: flash_attn_varlen_func_w8a8_fp8
+    description: |
+      Compute variable-length FlashAttention-2 on NVIDIA Hopper or newer with
+      block-wise FP8 query, key, and value tensors, per-block descales, and
+      FP16/BF16 output.
+    for:
+      - None
+    labels:
+      - NoCPU
+      - Attention
+      - FlashAttention
+      - Quantization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: flash_attn_varlen_opt_func
     description: A variant of `flash_attn_varlen_func` that has `lse` as an optional parameter.
     for:
@@ -327,6 +355,30 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: flash_mla_with_kvcache
+    description: Dense and sparse Multi-head Latent Attention decoding with a paged KV cache.
+    for:
+      - vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: fp8_einsum
+    description: Block-scaled FP8 bhr,hdr->bhd contraction on NVIDIA Hopper.
+    for:
+      - vllm.utils.deep_gemm.fp8_einsum
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fp8_fp4_mqa_logits
     description: |
       Compute weighted MQA logits with FP8 quantized Q and K tensors.
@@ -411,6 +463,30 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_marlin_moe_w4a16_int4
+    description: Fused mixture-of-experts computation with GPTQ INT4 weights and 16-bit activations.
+    for:
+      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: fused_marlin_moe_w4a16_mxfp4
+    description: Fused mixture-of-experts computation with MXFP4 weights and 16-bit activations.
+    for:
+      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_moe
     description: The generic interface for fused MoE.
     for:
@@ -450,6 +526,21 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: gemma_rms_norm
+    description: |
+      RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
+      the learnable weight is offset by one: the output is
+      `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
+    for:
+      - vllm.model_executor.layers.layernorm.GemmaRMSNorm
+    labels:
+      - fused
+      - NoCPU
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: geglu
     description: Gaussian Error Gated Linear Unit with GELU activation instead of sigmoid function.
     for:

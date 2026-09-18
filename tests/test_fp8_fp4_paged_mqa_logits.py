@@ -18,6 +18,9 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
 
+from .accuracy_utils import gems_assert_close
+from .test_fp8_fp4_mqa_logits import quantize_to_mxfp4, reference_fp4_mqa_logits
+
 device = flaggems_vllm.device
 
 # DeepSeek-V4 model parameters
@@ -70,8 +73,8 @@ def _kv_cache_cast_to_fp8(x):
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
 
-def _make_inputs(batch_size, next_n, avg_kv):
-    """Generate test inputs for FP8 paged MQA logits."""
+def _make_inputs(batch_size, next_n, avg_kv, use_fp4=False):
+    """Generate test inputs for FP8/FP4 paged MQA logits."""
     num_total_blocks = max(MAX_MODEL_LEN * 3 // BLOCK_KV, 1000)
 
     q_bf16 = torch.randn(
@@ -98,7 +101,12 @@ def _make_inputs(batch_size, next_n, avg_kv):
     base_ctx = base_ctx.clamp(max=MAX_MODEL_LEN)
     context_lens = base_ctx.unsqueeze(1).expand(-1, next_n).contiguous()
 
-    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+    if use_fp4:
+        q_packed, q_scale = quantize_to_mxfp4(q_bf16)
+    else:
+        q_packed = q_bf16.to(torch.float8_e4m3fn)
+        q_scale = None
+
     kv_fp8 = _kv_cache_cast_to_fp8(kv_cache_bf16)
 
     max_ctx = int(base_ctx.max().item())
@@ -118,7 +126,7 @@ def _make_inputs(batch_size, next_n, avg_kv):
         block_table[i, :n_blocks] = block_idx_pool[offset : offset + n_blocks]
         offset += n_blocks
 
-    return q_fp8, kv_fp8, weights, context_lens, block_table
+    return q_packed, q_scale, kv_fp8, weights, context_lens, block_table
 
 
 try:
@@ -133,7 +141,7 @@ except ImportError:
 
 
 def _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
-    """Reference: call vLLM DeepGEMM CUDA kernel."""
+    """Reference: call vLLM DeepGEMM CUDA kernel (FP8 only)."""
     assert _HAS_VLLM, "vLLM is required for reference implementation"
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
@@ -156,17 +164,18 @@ def _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
     TEST_SHAPES,
     ids=[f"B{b}_N{n}_L{l}" for b, n, l in TEST_SHAPES],
 )
+@pytest.mark.parametrize("use_fp4", [False, True])
 @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
-def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv):
+def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
     torch.manual_seed(0)
-    q_fp8, kv_fp8, weights, context_lens, block_table = _make_inputs(
-        batch_size, next_n, avg_kv
+    q_packed, q_scale, kv_fp8, weights, context_lens, block_table = _make_inputs(
+        batch_size, next_n, avg_kv, use_fp4=use_fp4
     )
 
     # Run Triton kernel
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
-    q_input = (q_fp8, None)
+    q_input = (q_packed, q_scale)
     triton_out = fp8_fp4_paged_mqa_logits(
         q=q_input,
         kv_cache=kv_fp8,
@@ -178,26 +187,77 @@ def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv):
         clean_logits=False,
     )
 
-    # Run reference (vLLM DeepGEMM CUDA)
-    ref_out = _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table)
+    if use_fp4:
+        # For FP4, verify paged output against dense float32 reference.
+        # Extract flat K from the paged cache and call reference_fp4_mqa_logits.
+        assert not torch.isnan(triton_out).any(), "NaN detected in Triton FP4 output"
+        assert torch.isfinite(triton_out).all(), "Inf detected in Triton FP4 output"
 
-    # Compare valid positions only (up to each row's context length)
-    total_rows = batch_size * next_n
-    ctx_flat = context_lens.reshape(-1)[:total_rows]
-    diffs = []
-    for row in range(total_rows):
-        ctx = ctx_flat[row].item()
-        if ctx == 0:
-            continue
-        t_row = triton_out[row, :ctx].float()
-        r_row = ref_out[row, :ctx].float()
-        # Mean relative difference
-        denom = r_row.abs().clamp(min=1e-6)
-        rel_diff = ((t_row - r_row).abs() / denom).mean().item()
-        diffs.append(rel_diff)
+        total_rows = batch_size * next_n
+        ctx_flat = context_lens.reshape(-1)[:total_rows]
 
-    mean_diff = sum(diffs) / len(diffs) if diffs else 0.0
-    assert (
-        mean_diff < 1e-3
-    ), f"Mean relative diff {mean_diff:.6f} exceeds threshold 1e-3"
-    assert not torch.isnan(triton_out).any(), "NaN detected in Triton output"
+        # Extract flat K and scales from paged cache (same as _preprocess_kv_cache)
+        num_phys = kv_fp8.shape[0]
+        flat_size = num_phys * BLOCK_KV
+        kv_flat = kv_fp8.reshape(num_phys, BLOCK_KV * (HEAD_DIM + 4))
+        kv_data = kv_flat[:, : BLOCK_KV * HEAD_DIM].reshape(flat_size, HEAD_DIM)
+        kv_scales = kv_flat[:, BLOCK_KV * HEAD_DIM :].reshape(-1).view(torch.float32)
+
+        for row in range(total_rows):
+            ctx = ctx_flat[row].item()
+            if ctx == 0:
+                continue
+            b_idx = row // next_n
+
+            # Gather flat K for this row's context
+            positions = torch.arange(ctx, device=device)
+            logical_pages = positions // BLOCK_KV
+            page_offsets = positions % BLOCK_KV
+            phys_pages = block_table[b_idx, logical_pages]
+            flat_indices = phys_pages * BLOCK_KV + page_offsets
+
+            k_flat = kv_data[flat_indices].contiguous().view(torch.float8_e4m3fn)
+            k_scale_flat = kv_scales[flat_indices]
+
+            # Reference output using the dense reference
+            ref_row = reference_fp4_mqa_logits(
+                q_packed.reshape(total_rows, NUM_HEADS, HEAD_DIM // 2)[row : row + 1],
+                q_scale.reshape(total_rows, NUM_HEADS, 1)[row : row + 1],
+                k_flat,
+                k_scale_flat,
+                weights[row : row + 1],
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.tensor([ctx], dtype=torch.int32, device=device),
+            )
+
+            gems_assert_close(
+                ref_row,
+                triton_out[row, :ctx].unsqueeze(0),
+                torch.float32,
+                equal_nan=True,
+                atol=0.15,
+            )
+    else:
+        # FP8 path: compare against vLLM reference
+        ref_out = _reference_fn(q_packed, kv_fp8, weights, context_lens, block_table)
+
+        # Compare valid positions only (up to each row's context length)
+        total_rows = batch_size * next_n
+        ctx_flat = context_lens.reshape(-1)[:total_rows]
+        diffs = []
+        for row in range(total_rows):
+            ctx = ctx_flat[row].item()
+            if ctx == 0:
+                continue
+            t_row = triton_out[row, :ctx].float()
+            r_row = ref_out[row, :ctx].float()
+            # Mean relative difference
+            denom = r_row.abs().clamp(min=1e-6)
+            rel_diff = ((t_row - r_row).abs() / denom).mean().item()
+            diffs.append(rel_diff)
+
+        mean_diff = sum(diffs) / len(diffs) if diffs else 0.0
+        assert (
+            mean_diff < 1e-3
+        ), f"Mean relative diff {mean_diff:.6f} exceeds threshold 1e-3"
+        assert not torch.isnan(triton_out).any(), "NaN detected in Triton output"
