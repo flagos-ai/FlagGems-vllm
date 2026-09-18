@@ -1674,6 +1674,16 @@ def invoke_fused_moe_triton_kernel(
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
+        # The sequential FUSE_SILU path keeps two accumulators (gate + up) alive
+        # simultaneously, each of size BLOCK_SIZE_M * BLOCK_SIZE_N fp32 values.
+        # When both together exceed roughly half the SM register file (leaving
+        # room for pointers/indices/loop vars), spilling to local memory tanks
+        # performance.  Halve BLOCK_SIZE_N to keep accumulator pressure in check.
+        if not pair_gate_up_dot:
+            num_threads = config.get("num_warps", 4) * 32
+            dual_acc_regs = 2 * config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_N"] // num_threads
+            if dual_acc_regs > 128:
+                config["BLOCK_SIZE_N"] = config["BLOCK_SIZE_N"] // 2
 
     fused_moe_kernel[grid](
         A,
