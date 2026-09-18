@@ -16,7 +16,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
+from flaggems_vllm.ops.topk_softplus_sqrt import (
+    HAS_TLE,
+    topk_softplus_sqrt,
+    topk_softplus_sqrt_baseline,
+    topk_softplus_sqrt_tle,
+)
 
 from . import base
 
@@ -144,6 +149,88 @@ class TopkSoftplusSqrtBenchmark(base.Benchmark):
             )
 
 
+class TopkSoftplusSqrtLargeBenchmark(TopkSoftplusSqrtBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (32768, 256, 8),
+            (65536, 256, 8),
+            (131072, 256, 8),
+            (4096, 1024, 8),
+            (4096, 2048, 8),
+            (4096, 4096, 8),
+            (4096, 256, 16),
+            (4096, 256, 32),
+            (4096, 256, 64),
+            (4096, 2048, 32),
+            (16384, 2048, 32),
+        ]
+
+
+class TopkSoftplusSqrtHashBenchmark(base.Benchmark):
+    DEFAULT_SHAPE_DESC = "num_tokens, num_experts, topk"
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (256, 256, 8),
+            (1024, 256, 8),
+            (4096, 256, 8),
+            (16384, 256, 8),
+            (4096, 128, 8),
+            (4096, 512, 8),
+            (32768, 256, 8),
+            (65536, 256, 8),
+            (131072, 256, 8),
+            (4096, 1024, 8),
+            (4096, 2048, 8),
+            (4096, 4096, 8),
+            (4096, 256, 16),
+            (4096, 256, 32),
+            (4096, 256, 64),
+            (4096, 2048, 32),
+            (16384, 2048, 32),
+        ]
+
+    def get_input_iter(self, dtype):
+        for num_tokens, num_experts, topk in self.shapes:
+            torch.manual_seed(1)
+            gating_output = torch.randn(
+                (num_tokens, num_experts), dtype=dtype, device=self.device
+            )
+            correction_bias = torch.randn(
+                (num_experts,), dtype=torch.float32, device=self.device
+            )
+            topk_weights = torch.empty(
+                (num_tokens, topk), dtype=torch.float32, device=self.device
+            )
+            topk_indices = torch.empty(
+                (num_tokens, topk), dtype=torch.int32, device=self.device
+            )
+            token_expert_indices = torch.empty(
+                (num_tokens, topk), dtype=torch.int32, device=self.device
+            )
+            input_ids = torch.arange(
+                num_tokens, device=self.device, dtype=torch.int64
+            )
+            tid2eid = torch.randint(
+                0,
+                num_experts,
+                (num_tokens, topk),
+                device=self.device,
+                dtype=torch.int32,
+            )
+            yield (
+                topk_weights,
+                topk_indices,
+                token_expert_indices,
+                gating_output,
+                True,
+                1.0,
+                correction_bias,
+                input_ids,
+                tid2eid,
+            )
+
+
 @pytest.mark.topk_softplus_sqrt
 def test_topk_softplus_sqrt():
     bench = TopkSoftplusSqrtBenchmark(
@@ -151,5 +238,135 @@ def test_topk_softplus_sqrt():
         torch_op=_baseline_op,
         gems_op=topk_softplus_sqrt,
         dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+def test_topk_softplus_sqrt_baseline_triton():
+    bench = TopkSoftplusSqrtBenchmark(
+        op_name="topk_softplus_sqrt_baseline_triton",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_baseline,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+def test_topk_softplus_sqrt_tle():
+    bench = TopkSoftplusSqrtBenchmark(
+        op_name="topk_softplus_sqrt_tle",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_tle,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+def test_topk_softplus_sqrt_baseline_triton_large():
+    bench = TopkSoftplusSqrtLargeBenchmark(
+        op_name="topk_softplus_sqrt_baseline_triton_large",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_baseline,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+def test_topk_softplus_sqrt_tle_large():
+    bench = TopkSoftplusSqrtLargeBenchmark(
+        op_name="topk_softplus_sqrt_tle_large",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_tle,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+def test_topk_softplus_sqrt_baseline_triton_large_fp32():
+    bench = TopkSoftplusSqrtLargeBenchmark(
+        op_name="topk_softplus_sqrt_baseline_triton_large_fp32",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_baseline,
+        dtypes=[torch.float32],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+def test_topk_softplus_sqrt_tle_large_fp32():
+    bench = TopkSoftplusSqrtLargeBenchmark(
+        op_name="topk_softplus_sqrt_tle_large_fp32",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_tle,
+        dtypes=[torch.float32],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+def test_topk_softplus_sqrt_baseline_triton_hash():
+    bench = TopkSoftplusSqrtHashBenchmark(
+        op_name="topk_softplus_sqrt_baseline_triton_hash",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_baseline,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+def test_topk_softplus_sqrt_tle_hash():
+    bench = TopkSoftplusSqrtHashBenchmark(
+        op_name="topk_softplus_sqrt_tle_hash",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_tle,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+def test_topk_softplus_sqrt_baseline_triton_hash_fp32():
+    bench = TopkSoftplusSqrtHashBenchmark(
+        op_name="topk_softplus_sqrt_baseline_triton_hash_fp32",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_baseline,
+        dtypes=[torch.float32],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="Triton TLE (triton.experimental.tle) is not available in this environment",
+)
+def test_topk_softplus_sqrt_tle_hash_fp32():
+    bench = TopkSoftplusSqrtHashBenchmark(
+        op_name="topk_softplus_sqrt_tle_hash_fp32",
+        torch_op=_baseline_op,
+        gems_op=topk_softplus_sqrt_tle,
+        dtypes=[torch.float32],
     )
     bench.run()
