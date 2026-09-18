@@ -50,6 +50,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_state_gather import gather_kd
 from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
     scatter_kda_state,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -71,6 +72,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -83,6 +85,7 @@ __all__ = [
     "outplace_fused_experts",
     "qwen4_store_qsa_kv_rows",
     "qwen4_hc_inject_combine",
+    "pack_seq_triton",
     "per_token_group_quant_fp8",
     "ple_state_scatter_",
     "qwen4_qsa_mqa_paged_dot",
@@ -103,4 +106,5 @@ __all__ = [
     "gather_kda_state",
     "scatter_kda_state",
     "gather_conv_state",
+    "unpack_seq_triton",
 ]
