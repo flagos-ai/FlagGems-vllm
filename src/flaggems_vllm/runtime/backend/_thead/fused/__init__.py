@@ -12,20 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
-from flaggems_vllm.runtime.backend._thead.fused.moe_align_block_size import (  # noqa: F401
-    moe_align_block_size,
-)
-from flaggems_vllm.runtime.backend._thead.fused.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 
 __all__ = [
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
-    "moe_align_block_size",
-    "persistent_topk",
+    "moe_sum",
 ]

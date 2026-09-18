@@ -15,9 +15,7 @@
 import pytest
 import torch
 
-from flaggems_vllm.ops.deepseek_v4_attention_combine_topk_swa_indices import (
-    combine_topk_swa_indices,
-)
+import flaggems_vllm
 
 try:
     from vllm.v1.attention.ops.deepseek_v4_ops import (
@@ -31,12 +29,94 @@ except Exception:
 
 from . import base
 
+# Bind through the top-level entry rather than the ops submodule: when a vendor
+# ships a specialized implementation, the runtime rebinds it on the package at
+# import time, so importing from flaggems_vllm.ops.<module> would bypass vendor
+# dispatch (same reasoning as persistent_topk).
+combine_topk_swa_indices = flaggems_vllm.combine_topk_swa_indices
+
+# Device-agnostic entry point: "cuda" on NVIDIA / MetaX / Hygon / T-Head,
+# "musa" on MThreads, "npu" on Ascend. Never hard-code "cuda" below.
+device = flaggems_vllm.device
+_device_module = getattr(torch, device, None)
+_HAS_DEVICE = _device_module is not None and _device_module.is_available()
+
+# Keep in sync with _SPARSE_PREFILL_TOPK_ALIGNMENT in the operator module.
+_TOPK_ALIGNMENT = 128
+
+
+def _torch_combine_topk_swa_indices(
+    topk_indices,
+    query_start_loc,
+    seq_lens,
+    gather_lens,
+    window_size,
+    compress_ratio,
+    topk,
+    M,
+    N,
+):
+    """Vectorized PyTorch baseline.
+
+    The vLLM op is CUDA-only, so it is unavailable on every non-NVIDIA backend.
+    This reference keeps the benchmark runnable there; it is built from plain
+    PyTorch ops so it lowers on any vendor backend. Note that when this
+    fallback is in use the reported speedup is against PyTorch, not vLLM.
+    """
+    dev = topk_indices.device
+    num_tokens = topk_indices.shape[0]
+    num_reqs = seq_lens.shape[0]
+    combined_topk = (
+        (topk + window_size + _TOPK_ALIGNMENT - 1) // _TOPK_ALIGNMENT * _TOPK_ALIGNMENT
+    )
+
+    base_off = query_start_loc[0].to(torch.int64)
+    starts = query_start_loc[:-1].to(torch.int64) - base_off
+    ends = query_start_loc[1:].to(torch.int64) - base_off
+    query_lens = ends - starts
+
+    batch_id = torch.repeat_interleave(
+        torch.arange(num_reqs, device=dev, dtype=torch.int64), query_lens
+    )
+    seq = seq_lens.to(torch.int64)[batch_id]
+    gat = gather_lens.to(torch.int64)[batch_id]
+    token_idx = torch.arange(num_tokens, device=dev, dtype=torch.int64)
+    pos = (seq - query_lens[batch_id]) + (token_idx - starts[batch_id])
+    gather_start = seq - gat
+
+    topk_len = torch.clamp((pos + 1) // compress_ratio, max=topk)
+    swa_len = torch.clamp(pos + 1, max=window_size)
+    row_off = M * batch_id
+
+    combined = torch.full(
+        (num_tokens, combined_topk), -1, device=dev, dtype=torch.int32
+    )
+    cols_k = torch.arange(topk, device=dev, dtype=torch.int64).unsqueeze(0)
+    combined[:, :topk] = torch.where(
+        cols_k < topk_len.unsqueeze(1),
+        (topk_indices.to(torch.int64) + row_off.unsqueeze(1)).to(torch.int32),
+        combined[:, :topk],
+    )
+    cols = torch.arange(combined_topk, device=dev, dtype=torch.int64).unsqueeze(0)
+    off = cols - topk_len.unsqueeze(1)
+    swa_base = row_off + N + pos - swa_len + 1 - gather_start
+    combined = torch.where(
+        (off >= 0) & (off < swa_len.unsqueeze(1)),
+        (swa_base.unsqueeze(1) + off).to(torch.int32),
+        combined,
+    )
+    return combined, (topk_len + swa_len).to(torch.int32)
+
 
 class CombineTopkSwaIndicesBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "combine_topk_swa_indices",
-            vllm_combine_topk_swa_indices,
+            (
+                vllm_combine_topk_swa_indices
+                if _HAS_VLLM_COMBINE_TOPK_SWA_INDICES
+                else _torch_combine_topk_swa_indices
+            ),
             [torch.int32],
             gems_op=combine_topk_swa_indices,
         )
@@ -79,18 +159,18 @@ class CombineTopkSwaIndicesBenchmark(base.Benchmark):
                 -1,
                 max(N, 1),
                 (num_tokens, topk),
-                device="cuda",
+                device=device,
                 dtype=torch.int32,
             )
             query_start_values = [0]
             for query_len in query_lens:
                 query_start_values.append(query_start_values[-1] + query_len)
             query_start_loc = torch.tensor(
-                query_start_values, device="cuda", dtype=torch.int32
+                query_start_values, device=device, dtype=torch.int32
             )
-            seq_lens = torch.tensor(seq_lens_values, device="cuda", dtype=torch.int32)
+            seq_lens = torch.tensor(seq_lens_values, device=device, dtype=torch.int32)
             gather_lens = torch.tensor(
-                gather_lens_values, device="cuda", dtype=torch.int32
+                gather_lens_values, device=device, dtype=torch.int32
             )
             yield (
                 topk_indices,
@@ -106,9 +186,6 @@ class CombineTopkSwaIndicesBenchmark(base.Benchmark):
 
 
 @pytest.mark.combine_topk_swa_indices
-@pytest.mark.skipif(
-    (not torch.cuda.is_available()) or (not _HAS_VLLM_COMBINE_TOPK_SWA_INDICES),
-    reason="requires cuda and vllm deepseek_v4_ops.combine_topk_swa_indices",
-)
+@pytest.mark.skipif(not _HAS_DEVICE, reason=f"requires an available {device} device")
 def test_combine_topk_swa_indices_benchmark():
     CombineTopkSwaIndicesBenchmark().run()

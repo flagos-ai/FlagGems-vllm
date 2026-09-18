@@ -26,12 +26,18 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
+    gemma_rms_norm,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.persistent_topk import (  # noqa: F401
+    persistent_topk,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
@@ -43,6 +49,7 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "fused_experts_impl",
     "inplace_fused_experts",
+    "gemma_rms_norm",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
@@ -54,4 +61,5 @@ __all__ = [
     "triton_scaled_mm",
     "fused_q_kv_rmsnorm",
     "fused_add_rms_norm",
+    "persistent_topk",
 ]
