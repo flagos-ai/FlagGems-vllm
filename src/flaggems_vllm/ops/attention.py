@@ -1278,6 +1278,44 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    if q.dtype == torch.int8 and runtime.device.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.fused.attention import (
+            flash_attn_varlen_func_w8a8_int8,
+        )
+
+        return flash_attn_varlen_func_w8a8_int8(
+            q,
+            k,
+            v,
+            max_seqlen_q,
+            cu_seqlens_q,
+            max_seqlen_k,
+            cu_seqlens_k,
+            seqused_k,
+            q_v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            alibi_slopes,
+            deterministic,
+            return_attn_probs,
+            block_table,
+            return_softmax_lse,
+            out,
+            scheduler_metadata,
+            q_descale,
+            k_descale,
+            v_descale,
+            s_aux,
+            num_splits,
+            cp_world_size,
+            cp_rank,
+            cp_tot_seqused_k,
+            fa_version,
+        )
+
     if fa_version != 2:
         raise RuntimeError("Only FA2 is implemented.")
     if num_splits > 0:
