@@ -15,17 +15,13 @@
 from flaggems_vllm.runtime.backend._mthreads.fused.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
-from flaggems_vllm.runtime.backend._mthreads.fused.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
 from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import moe_sum
+from flaggems_vllm.runtime.backend._mthreads.fused.top_k_per_row_prefill import (
+    top_k_per_row_prefill,
+)
 
 __all__ = [
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
-    "moe_sum",
     "fused_add_rms_norm",
+    "moe_sum",
+    "top_k_per_row_prefill",
 ]
