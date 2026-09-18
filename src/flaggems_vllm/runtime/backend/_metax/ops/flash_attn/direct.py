@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Direct varlen FlashAttention kernel and launcher."""
-
 import logging
 
 import triton
@@ -570,6 +568,3 @@ def launch_direct(
     logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
     worklist_ptr = compact_worklist if use_compact_worklist else params.page_table_ptr
     return kernel(*args, worklist_ptr, **cfg_params)
-
-
-__all__ = ["flash_varlen_fwd_kernel", "launch_direct"]

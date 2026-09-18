@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._metax.ops.attention import flash_attn_varlen_func
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -34,7 +33,6 @@ from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged
 from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_int8_quant
 
 __all__ = [
-    "flash_attn_varlen_func",
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",

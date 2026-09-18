@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One CTA per request for page16/GQA4 Decode, with direct final output."""
-from .splitkv import flash_varlen_splitkv_kernel
+# These FlashAttention kernels and scheduling policies are tuned for MetaX C550:
+# 104 SMs, 64 threads per warp, at most 512 threads and 64 KiB shared memory
+# per CTA. TN kernels retain the compiler-dependent w4/s4 Async-TN pipeline;
+# tile sizes, split thresholds, and worklist policies require revalidation on
+# other MetaX architectures.
 
+from .launcher import launch_attention
 
-def launch_page16_decode(params, *, batch_size):
-    """Run BM4/N16 MMA without partial buffers or merge."""
-    args = tuple(getattr(params, key) for key in params.__slots__)
-    cfg = {
-        "BLOCK_M": 4,
-        "BLOCK_N": 16,
-        "BLOCK_K": 256,
-        "num_warps": 1,
-        "num_stages": 1,
-        "NUM_SPLITS": 1,
-        "Q_TILES": 1,
-    }
-    return flash_varlen_splitkv_kernel[(1, batch_size, 1)](*args, **cfg)
+__all__ = ["launch_attention"]

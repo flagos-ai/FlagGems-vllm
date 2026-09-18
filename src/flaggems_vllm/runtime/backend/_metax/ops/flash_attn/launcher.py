@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MetaX FlashAttention plan validation and dispatch."""
 import torch
 
 from .direct import launch_direct
@@ -21,17 +20,20 @@ from .scheduling import (
     D256_TN_BLOCK_M,
     D256_TN_BLOCK_N,
     MetaXAttentionPlan,
+    MetaXAttentionScheduler,
     MetaXKernelFamily,
     MetaXTaskMapper,
+    validate_metax_attention_plan,
 )
-from .splitkv import launch_splitkv
-from .tn_direct import launch_d256_tn_direct
-from .tn_direct_fast import launch_d256_tn_direct as launch_d256_tn_direct_fast
-from .tn_splitkv import launch_d256_tn_splitkv
-from .validation import validate_metax_attention_plan
+from .splitkv import launch_d256_tn_splitkv, launch_splitkv
+from .tn_direct import launch_d256_tn_direct, launch_d256_tn_direct_fast
 
 D256_TN_SPLITKV_MIN_K = 32768
+
+
 D256_TN_SPLITKV_MAX_Q = 132
+
+
 D256_TN_SPLITKV_MAX_TOTAL_Q = 139
 
 
@@ -63,7 +65,7 @@ def launch_metax_attention(
             and (total_q == batch_size * 4)
             and params.is_seqused_k
         ):
-            from .decode_direct import launch_page16_decode
+            from .splitkv import launch_page16_decode
 
             return launch_page16_decode(
                 params,
@@ -117,7 +119,7 @@ def launch_metax_attention(
             grid_order=plan.grid_order,
         )
     if plan.family is MetaXKernelFamily.D256_TN_DIRECT:
-        from .tn_page_repack import maybe_repack
+        from .ragged import maybe_repack
 
         if max_seqlen_k < 32768 or batch_size == 1:
             params = maybe_repack(
@@ -185,4 +187,37 @@ def launch_metax_attention(
     raise RuntimeError(f"unsupported MetaX attention family: {plan.family.value}")
 
 
-__all__ = ["launch_metax_attention"]
+def launch_attention(params, *, num_splits=0):
+    """Plan and launch C550 attention after common API input preparation."""
+    plan = MetaXAttentionScheduler.build(
+        is_bfloat16=params.q_ptr.dtype is torch.bfloat16,
+        is_paged=params.is_paged,
+        block_size=params.block_size,
+        is_cu_seqlens_q=params.is_cu_seqlens_q,
+        max_seqlen_q=params.seqlen_q,
+        max_seqlen_k=params.seqlen_k,
+        total_q=params.total_q,
+        batch_size=params.b,
+        num_heads=params.h,
+        num_heads_k=params.hk,
+        head_size=params.d,
+        is_causal=params.is_causal,
+        is_local=params.is_local,
+        is_dropout=params.is_dropout,
+        is_alibi=params.is_alibi,
+        is_softcap=params.is_softcap,
+        seqlenq_ngroups_swapped=params.seqlenq_ngroups_swapped,
+        num_splits=num_splits,
+    )
+    return launch_metax_attention(
+        plan,
+        params,
+        max_seqlen_q=params.seqlen_q,
+        max_seqlen_k=params.seqlen_k,
+        batch_size=params.b,
+        num_heads=params.h,
+        num_heads_k=params.hk,
+        total_q=params.total_q,
+        head_size=params.d,
+        is_paged=params.is_paged,
+    )
