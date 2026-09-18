@@ -15,26 +15,53 @@
 import pytest
 import torch
 
-try:
-    from vllm.platforms import current_platform
-    from vllm.third_party.deep_gemm.utils import per_custom_dims_cast_to_fp8
-    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits as vllm_fp8_fp4_mqa_logits
-
-    VLLM_AVAILABLE = True
-    SM90_AVAILABLE = current_platform.has_device_capability(90)
-except ImportError:
-    VLLM_AVAILABLE = False
-    SM90_AVAILABLE = False
-
-from vllm.third_party.deep_gemm.utils.math import (
-    cast_back_from_fp4,
-    per_token_cast_to_fp4,
-)
-
 import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 
-from .accuracy_utils import gems_assert_close, to_reference
+from .accuracy_utils import calc_diff, to_reference
+from .fp8_fp4_quant import (
+    dequantize_mxfp4,
+    per_custom_dims_cast_to_fp8,
+    quantize_to_mxfp4,
+)
+
+_vendor = flaggems_vllm.vendor_name
+_skip_arch = False
+_skip_ref = False
+
+if _vendor == "mthreads":
+    try:
+        from deep_gemm import fp8_mqa_logits as _ref_fp8_mqa_logits
+    except ImportError:
+        _skip_ref = "requires deep_gemm with fp8_mqa_logits support"
+
+    def _ref_dense_mqa(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits):
+        return _ref_fp8_mqa_logits(
+            q[0],
+            kv=kv,
+            weights=weights,
+            cu_seq_len_k_start=cu_seqlen_ks,
+            cu_seq_len_k_end=cu_seqlen_ke,
+            clean_logits=clean_logits,
+        )
+
+elif _vendor == "nvidia":
+    try:
+        from vllm.platforms import current_platform
+        from vllm.utils.deep_gemm import fp8_fp4_mqa_logits as _ref_fp8_fp4_mqa_logits
+
+        if not (
+            torch.cuda.is_available() and current_platform.has_device_capability(90)
+        ):
+            _skip_arch = "requires SM90+"
+    except ImportError:
+        _skip_ref = "requires vLLM with DeepGEMM and FP8 quantization support"
+
+    _ref_dense_mqa = _ref_fp8_fp4_mqa_logits
+
+else:
+    _skip_arch = f"unsupported vendor: {_vendor}"
+    _skip_ref = f"unsupported vendor: {_vendor}"
 
 
 def reference_fp4_mqa_logits(q_packed, q_scale, k_fp8, k_scale, weights, ks, ke):
@@ -58,83 +85,11 @@ def reference_fp4_mqa_logits(q_packed, q_scale, k_fp8, k_scale, weights, ks, ke)
             dot = dot.clamp_min(0.0)
             logits[m] += dot * weights[m, h]
 
-    # Fill invalid positions with -inf
-    for m in range(M):
-        logits[m, : ks[m]] = float("-inf")
-        logits[m, ke[m] :] = float("-inf")
+    # Fill invalid positions with -inf (vectorized, matches mate semantics)
+    positions = torch.arange(N, device=q_packed.device).unsqueeze(0)
+    valid = (positions >= ks.unsqueeze(1)) & (positions < ke.unsqueeze(1))
+    logits.masked_fill_(~valid, float("-inf"))
     return logits
-
-
-MXFP4_BLOCK_SIZE = 32
-
-
-def quantize_to_mxfp4(x):
-    """Quantize a bf16/fp32 tensor to MXFP4 (E2M1) packed format.
-
-    Uses vLLM's ``per_token_cast_to_fp4`` internally, then repacks the
-    per-block scales into a single int32 per token-head (little-endian)
-    so the Triton kernels can extract byte_i via ``(val >> (8*i)) & 0xFF``.
-
-    Returns:
-        packed: int8 tensor with shape [..., D//2] (two E2M1 nibbles per byte)
-        scales: int32 tensor with shape [..., 1] (packed ue8m0 per-block scales)
-    """
-    orig_shape = x.shape
-    D = orig_shape[-1]
-    flat = x.float().reshape(-1, D)  # [flat_rows, D]
-
-    packed_2d, sf_2d = per_token_cast_to_fp4(
-        flat, use_ue8m0=False, gran_k=MXFP4_BLOCK_SIZE
-    )
-    # packed_2d: [flat_rows, D//2] int8, sf_2d: [flat_rows, D//32] float32
-
-    # Convert float32 scales to ue8m0 bytes: val = round(log2(sf)) + 127
-    n_blocks = D // MXFP4_BLOCK_SIZE
-    ue8m0 = (
-        sf_2d.abs().clamp(min=2**-126).log2().round().clamp(-127.0, 127.0) + 127.0
-    ).to(
-        torch.uint8
-    )  # [flat_rows, n_blocks]
-    packed_scales = torch.zeros(flat.shape[0], dtype=torch.int32, device=flat.device)
-    for i in range(n_blocks):
-        packed_scales |= ue8m0[:, i].to(torch.int32) << (8 * i)
-    packed_scales = packed_scales.reshape(*orig_shape[:-1], 1)
-
-    packed = packed_2d.to(torch.int8).reshape(*orig_shape[:-1], D // 2)
-    return packed, packed_scales
-
-
-def dequantize_mxfp4(packed, scales, head_dim):
-    """Dequantize MXFP4 packed E2M1 values to float32.
-
-    Uses vLLM's ``cast_back_from_fp4`` internally, after unpacking the
-    per-token-head int32 scale back to per-block float32.
-
-    Args:
-        packed: int8 [..., D//2] (two E2M1 nibbles per byte)
-        scales: int32 [..., 1] (packed ue8m0: D//32 bytes little-endian in one int32)
-        head_dim: D
-    Returns:
-        x_f32: float32 [..., D]
-    """
-    orig_batch = packed.shape[:-1]
-    D = head_dim
-    n_blocks = D // MXFP4_BLOCK_SIZE
-
-    # Unpack int32 scales -> ue8m0 bytes -> float32 scales
-    scales_flat = scales.squeeze(-1).reshape(-1)  # [flat_rows]
-    block_id = torch.arange(n_blocks, device=packed.device)  # [n_blocks]
-    ue8m0_bytes = ((scales_flat[..., None] >> (8 * block_id[None, :])) & 0xFF).to(
-        torch.float32
-    )  # [flat_rows, n_blocks]
-    # Convert ue8m0 byte codes to actual scale values: 2^(byte - 127)
-    sf_2d = torch.exp2(ue8m0_bytes - 127.0)  # [flat_rows, n_blocks]
-
-    # Reshape packed to 2D [flat_rows, D//2] int8 for cast_back_from_fp4
-    packed_2d = packed.reshape(-1, D // 2).to(torch.int8)
-
-    x_2d = cast_back_from_fp4(packed_2d, sf_2d, gran_k=MXFP4_BLOCK_SIZE)
-    return x_2d.reshape(*orig_batch, D)
 
 
 device = flaggems_vllm.device
@@ -176,14 +131,8 @@ def _build_inputs(M, N, device, use_fp4=False):
 
 
 @pytest.mark.fp8_fp4_mqa_logits
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and SM90_AVAILABLE),
-    reason="requires CUDA with Hopper architecture (SM90+)",
-)
-@pytest.mark.skipif(
-    not VLLM_AVAILABLE,
-    reason="requires vLLM with DeepGEMM and FP8 quantization support",
-)
+@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
+@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
 @pytest.mark.parametrize(
     "M, N",
     DECODE_SHAPES + PREFILL_SHAPES,
@@ -201,7 +150,7 @@ def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
             q_values, q_scale, k_fp8, k_scale, weights, ks, ke
         )
     else:
-        ref_out = vllm_fp8_fp4_mqa_logits(
+        ref_out = _ref_dense_mqa(
             q=(q_values, None),
             kv=(k_fp8, k_scale),
             weights=weights,
@@ -221,8 +170,14 @@ def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
             clean_logits=clean_logits,
         )
 
-    # FP4 has lower precision than FP8, so use a wider tolerance
-    atol = 0.15 if use_fp4 else 5e-2
-    gems_assert_close(
-        res_out, ref_out, res_out.dtype, equal_nan=True, atol=atol, reduce_dim=1
-    )
+    if clean_logits:
+        ref_neginf_mask = ref_out == float("-inf")
+        neginf_mask = res_out == float("-inf")
+        assert torch.equal(
+            neginf_mask, ref_neginf_mask
+        ), f"-inf pattern mismatch: kernel {neginf_mask.sum()} vs ref {ref_neginf_mask.sum()}"
+        ref_out = ref_out.masked_fill(ref_neginf_mask, 0)
+        res_out = res_out.masked_fill(ref_neginf_mask, 0)
+
+    diff = calc_diff(res_out.float(), ref_out.float())
+    assert diff < 1e-3, f"calc_diff={diff}"

@@ -135,9 +135,7 @@ def _mqa_logits_kernel(
 
         q_f16 = (q_f32 * scale).to(tl.float16)  # [num_heads, head_dim]
     else:
-        q_offsets = h_ids[:, None] * head_dim + d_ids[None, :]
-        q_u8 = tl.load(q_row_base + q_offsets)
-        q_fp8 = q_u8.to(tl.float8e4nv, bitcast=True)
+        pass  # FP8 Q loaded per-head inside the loop
 
     # Pre-load weights: [num_heads] float32
     w_all = tl.load(w_row_base + tl.arange(0, num_heads))
@@ -161,21 +159,30 @@ def _mqa_logits_kernel(
             kv_offsets = (flat_base + p_ids[:, None]) * stride_kv_flat + d_ids[None, :]
             kv_u8 = tl.load(KV_data_ptr + kv_offsets)
 
-            # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
-            if IS_MXFP4:
-                kv_fp16 = kv_u8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-                dots = tl.dot(q_f16, tl.trans(kv_fp16))
-            else:
-                kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
-                dots = tl.dot(q_fp8, tl.trans(kv_fp8))
-
             # Coalesced scale load: [block_size] float32
             scale_tile = tl.load(KV_scales_ptr + flat_base + p_ids)
 
-            # Fused scale, relu, weight, reduce over heads
-            scores = tl.maximum(dots * scale_tile[None, :], 0.0)
-            weighted = scores * w_all[:, None]
-            output_tile = tl.sum(weighted, axis=0)
+            if IS_MXFP4:
+                # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
+                kv_fp16 = kv_u8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                dots = tl.dot(q_f16, tl.trans(kv_fp16))
+                scores = tl.maximum(dots * scale_tile[None, :], 0.0)
+                weighted = scores * w_all[:, None]
+                output_tile = tl.sum(weighted, axis=0)
+            else:
+                # Per-head dot to avoid SQMMA batch-matmul issue on MUSA.
+                # Load Q per-head as [1, D] for compatible tl.dot.
+                output_tile = tl.zeros([block_size], dtype=tl.float32)
+                for h_idx in tl.static_range(num_heads):
+                    q_u8_h = tl.load(q_row_base + h_idx * head_dim + d_ids)
+                    q_fp8_h = tl.reshape(
+                        q_u8_h.to(tl.float8e4nv, bitcast=True), [1, head_dim]
+                    )
+                    kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
+                    dot_h = tl.reshape(tl.dot(q_fp8_h, tl.trans(kv_fp8)), [block_size])
+                    w_h = tl.load(w_row_base + h_idx)
+                    score_h = tl.maximum(dot_h * scale_tile, 0.0)
+                    output_tile += score_h * w_h
 
             pos_ids = logical_base + p_ids
             valid_mask = pos_ids < end_pos

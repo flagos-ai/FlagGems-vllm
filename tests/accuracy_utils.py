@@ -298,6 +298,16 @@ def to_cpu(res, ref):
     return res
 
 
+def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Cosine-similarity-based difference metric (same as mate/vLLM)."""
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:
+        return 0.0
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
 def gems_assert_close(res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4):
     res = to_cpu(res, ref)
     flaggems_vllm.testing.assert_close(

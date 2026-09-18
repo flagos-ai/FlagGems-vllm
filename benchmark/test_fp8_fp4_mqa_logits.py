@@ -15,20 +15,44 @@
 import pytest
 import torch
 
-try:
-    from vllm.platforms import current_platform
-    from vllm.third_party.deep_gemm.utils import per_custom_dims_cast_to_fp8
-    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits as vllm_fp8_fp4_mqa_logits
-
-    VLLM_AVAILABLE = True
-    SM90_AVAILABLE = current_platform.has_device_capability(90)
-except ImportError:
-    VLLM_AVAILABLE = False
-    SM90_AVAILABLE = False
-
-from tests.test_fp8_fp4_mqa_logits import quantize_to_mxfp4
+import flaggems_vllm
+from flaggems_vllm.ops import fp8_fp4_mqa_logits
+from tests.fp8_fp4_quant import quantize_to_mxfp4
+from tests.test_fp8_fp4_mqa_logits import _ref_dense_mqa
 
 from . import base
+
+_vendor = flaggems_vllm.vendor_name
+_skip_arch = False
+_skip_ref = False
+
+if _vendor == "mthreads":
+    from tests.fp8_fp4_quant import per_custom_dims_cast_to_fp8
+elif _vendor == "nvidia":
+    try:
+        from vllm.platforms import current_platform
+        from vllm.third_party.deep_gemm.utils import per_custom_dims_cast_to_fp8
+
+        if not current_platform.has_device_capability(90):
+            _skip_arch = "requires CUDA with Hopper architecture (SM90+)"
+    except ImportError:
+        _skip_ref = "requires vLLM with DeepGEMM and FP8 quantization support"
+else:
+    _skip_arch = f"unsupported vendor: {_vendor}"
+    _skip_ref = f"unsupported vendor: {_vendor}"
+
+# FP4 dense DeepGEMM requires SM120+; skip on unsupported architectures
+_fp4_supported = True
+if _vendor == "nvidia":
+    try:
+        cap = torch.cuda.get_device_capability()
+        if cap[0] < 12:
+            _fp4_supported = False
+    except Exception:
+        pass
+elif _vendor == "mthreads":
+    _fp4_supported = False
+
 
 # DeepSeek V4 production config
 H = 64
@@ -73,28 +97,26 @@ BENCH_SHAPES = [
 ]
 
 
-class FP8FP4MQALogitsBenchmark(base.Benchmark):
-    """Benchmark for fp8_fp4_mqa_logits: FlagGems Triton vs vLLM DeepGEMM."""
+class Fp8Fp4MqaLogitsBenchmark(base.Benchmark):
+    """Common benchmark class for fp8/fp4 mqa logits"""
+
+    use_fp4: bool
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (M, N, use_fp4) for use_fp4 in (False, True) for (M, N) in BENCH_SHAPES
-        ]
+        self.shapes = list(BENCH_SHAPES)
 
     def get_input_iter(self, dtype):
-        for M, N, use_fp4 in self.shapes:
-            q_values, q_scale, k_fp8, k_scale, weights, ks, ke = _build_case(
-                M, N, dtype, self.device, use_fp4
+        for M, N in self.shapes:
+            q_packed, q_scale, k_fp8, k_scale, weights, ks, ke = _build_case(
+                M, N, dtype, self.device, use_fp4=self.use_fp4
             )
-            yield (q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4)
+            yield ((q_packed, q_scale), k_fp8, k_scale, weights, ks, ke)
 
 
-def _vllm_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
-    if use_fp4:
-        # vLLM doesn't support FP4, skip
-        return None
-    return vllm_fp8_fp4_mqa_logits(
-        q=(q_values, None),
+def _vllm_wrapper(q, k_fp8, k_scale, weights, ks, ke):
+    """Baseline: platform-specific DeepGEMM kernel (FP8 only currently)."""
+    return _ref_dense_mqa(
+        q=q,
         kv=(k_fp8, k_scale),
         weights=weights,
         cu_seqlen_ks=ks,
@@ -103,11 +125,9 @@ def _vllm_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
     )
 
 
-def _gems_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
-    from flaggems_vllm.ops import fp8_fp4_mqa_logits
-
+def _gems_wrapper(q, k_fp8, k_scale, weights, ks, ke):
     return fp8_fp4_mqa_logits(
-        q=(q_values, q_scale),
+        q=q,
         kv=(k_fp8, k_scale),
         weights=weights,
         cu_seqlen_ks=ks,
@@ -116,20 +136,33 @@ def _gems_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
     )
 
 
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and SM90_AVAILABLE),
-    reason="requires CUDA with Hopper architecture (SM90+)",
-)
-@pytest.mark.skipif(
-    not VLLM_AVAILABLE,
-    reason="requires vLLM with DeepGEMM and FP8 quantization support",
-)
+@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
+@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
 @pytest.mark.fp8_fp4_mqa_logits
-def test_fp8_fp4_mqa_logits():
-    bench = FP8FP4MQALogitsBenchmark(
-        op_name="fp8_fp4_mqa_logits",
+def test_fp8_mqa_logits():
+    bench = Fp8Fp4MqaLogitsBenchmark(
+        op_name="fp8_mqa_logits",
         torch_op=_vllm_wrapper,
         gems_op=_gems_wrapper,
         dtypes=[torch.bfloat16],
     )
+    bench.use_fp4 = False
+    bench.run()
+
+
+@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
+@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(
+    not _fp4_supported,
+    reason="FP4 dense DeepGEMM requires SM120+",
+)
+@pytest.mark.fp8_fp4_mqa_logits
+def test_fp4_mqa_logits():
+    bench = Fp8Fp4MqaLogitsBenchmark(
+        op_name="fp4_mqa_logits",
+        torch_op=_vllm_wrapper,
+        gems_op=_gems_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.use_fp4 = True
     bench.run()
