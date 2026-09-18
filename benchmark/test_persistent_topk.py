@@ -25,6 +25,26 @@ from . import base
 persistent_topk = flaggems_vllm.persistent_topk
 
 device = flaggems_vllm.device
+vendor_name = flaggems_vllm.vendor_name
+
+# Platform workaround (mirrors tests/test_persistent_topk.py): vllm-metax's
+# C++ baseline decode path (seq_len <= 8192, histogram_2048_topk) is broken on
+# MetaX (emits out-of-range indices), so the baseline latency for those shapes
+# is meaningless. Skip them on MetaX.
+BASELINE_BROKEN_MAX_SEQ = 8192 if vendor_name == "metax" else 0
+
+# Real FlagOSTune DeepSeek-V4-Flash shapes (num_rows 33..512, seq_len=262144,
+# max_seq_len=1048576) observed in production persistent_topk calls — the
+# 33..495 row range is missing from the generic shape list. MetaX-only.
+_METAX_EXTRA_SHAPES = [
+    (40, 262144, 1048576),
+    (64, 262144, 1048576),
+    (96, 262144, 1048576),
+    (128, 262144, 1048576),
+    (192, 262144, 1048576),
+    (256, 262144, 1048576),
+    (384, 262144, 1048576),
+]
 
 # The vLLM native op is used as the baseline where available (NVIDIA); on
 # platforms without torch.ops._C.persistent_topk (e.g. Hygon vllm-hcu) the
@@ -146,6 +166,13 @@ class PersistentTopKBenchmark(base.Benchmark):
             (496, 1048576),
             (496, 1),
         ]
+        # MetaX: drop shapes whose baseline runs the broken decode path.
+        self.shapes = [s for s in self.shapes if s[1] > BASELINE_BROKEN_MAX_SEQ]
+        self.hetero_shapes = [
+            s for s in self.hetero_shapes if s[1] > BASELINE_BROKEN_MAX_SEQ
+        ]
+        if vendor_name == "metax":
+            self.shapes += _METAX_EXTRA_SHAPES
 
     def get_input_iter(self, dtype):
         for num_rows, seq_len, max_seq_len in self.shapes:
