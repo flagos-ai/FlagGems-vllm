@@ -31,6 +31,8 @@ aten_lib = torch.library.Library("aten", "IMPL")
 registrar = Register
 current_work_registrar = None
 runtime.replace_customized_ops(globals())
+if vendor_name == "metax":
+    _ops_module.flash_attn_varlen_func = flash_attn_varlen_func
 
 __version__ = "0.1.0"
 
