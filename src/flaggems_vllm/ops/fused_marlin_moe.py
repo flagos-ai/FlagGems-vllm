@@ -83,8 +83,6 @@ from typing import Any, Callable, NamedTuple, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from flag_gems.ops.copy import _copy_kernel
-from flag_gems.ops.zero import zero
 from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm import runtime
@@ -3708,6 +3706,11 @@ def _bsm_block_m_for_avg_load(avg_tokens_per_expert: int, num_tokens: int) -> in
     return 64
 
 
+def zero(output: torch.Tensor) -> torch.Tensor:
+    """Zero ``output`` in place; module-level so tests can stub it."""
+    return output.zero_()
+
+
 def _select_bsm_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     experts = max(int(num_experts), 1)
     avg_tokens_per_expert = (int(num_tokens) * int(top_k)) // experts
@@ -4047,7 +4050,7 @@ def _fused_marlin_moe_w8a16(
                 result,
             )
             if destination is not None:
-                _copy_kernel(result, out0=destination)
+                destination.copy_(result)
                 return destination
             return result
         block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
@@ -4080,7 +4083,7 @@ def _fused_marlin_moe_w8a16(
             quant_config,
         )
         if destination is not None:
-            _copy_kernel(result, out0=destination)
+            destination.copy_(result)
             return destination
     return result
 
@@ -4414,7 +4417,7 @@ def fused_marlin_moe(
                 or not output.is_contiguous()
             ):
                 raise ValueError("output must match the W8A16 result and be contiguous")
-            _copy_kernel(result, out0=output)
+            output.copy_(result)
         else:
             output.copy_(result)
         return output
