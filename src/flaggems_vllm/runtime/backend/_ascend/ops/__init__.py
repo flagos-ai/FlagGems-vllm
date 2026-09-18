@@ -33,6 +33,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
+    fused_marlin_moe_w4a16_int4,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -69,6 +72,7 @@ __all__ = [
     "add_rms_norm",
     "causal_conv1d_fn",
     "causal_conv1d_update",
+    "fused_marlin_moe_w4a16_int4",
     "fused_experts_impl",
     "grouped_topk",
     "inplace_fused_experts",
