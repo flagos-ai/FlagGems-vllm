@@ -78,6 +78,68 @@ def get_iter_count(fn):
     )
 
 
+def do_bench_cudagraph(
+    fn,
+    *,
+    rep=20,
+    return_mode="median",
+    grad_to_none=None,
+    replay_count=None,
+    warmup_replay_count=0,
+    rank_barrier=None,
+):
+    """Run the repository's common CUDA Graph benchmark path.
+
+    ``replay_count`` gives distributed collectives an identical replay count
+    on every rank. The default keeps Triton's duration-based behavior.
+    """
+    if replay_count is None:
+        return triton.testing.do_bench_cudagraph(
+            fn,
+            rep=rep,
+            return_mode=return_mode,
+            grad_to_none=grad_to_none,
+        )
+    if replay_count < 1 or warmup_replay_count < 0:
+        raise ValueError(
+            "replay_count must be positive and warmup_replay_count nonnegative"
+        )
+    if grad_to_none is not None:
+        raise ValueError("fixed CUDA Graph replay does not support gradients")
+    if return_mode != "mean":
+        raise ValueError("fixed CUDA Graph replay reports mean latency")
+
+    fn()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+
+    for _ in range(warmup_replay_count):
+        graph.replay()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(replay_count):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    latency = start.elapsed_time(end) / replay_count
+    if rank_barrier is not None:
+        rank_barrier()
+    graph.reset()
+    return latency
+
+
 class Benchmark:
     device: str = device
     DEFAULT_METRICS = consts.DEFAULT_METRICS
@@ -334,7 +396,6 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / n_rep * 1000
         elif Config.mode == consts.BenchMode.CUDAGRAPH:
-            do_bench_cudagraph = triton.testing.do_bench_cudagraph
             latency = do_bench_cudagraph(
                 fn,
                 rep=Config.repetition,
