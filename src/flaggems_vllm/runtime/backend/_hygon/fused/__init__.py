@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._hygon.fused.attention import (
+    flash_attn_varlen_func_w8a8_int8,
+)
 from flaggems_vllm.runtime.backend._hygon.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -21,6 +24,7 @@ from flaggems_vllm.runtime.backend._hygon.fused.fused_marlin_moe import (  # noq
 from flaggems_vllm.runtime.backend._hygon.fused.moe_sum import moe_sum  # noqa: F401
 
 __all__ = [
+    "flash_attn_varlen_func_w8a8_int8",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_marlin_moe",
     "moe_sum",
