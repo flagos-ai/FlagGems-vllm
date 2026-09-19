@@ -161,6 +161,7 @@ def launch_d256_tn_compact_worklist(
     task_upper,
     block_m,
     block_n,
+    allow_split_kv=True,
 ):
     """Build PackGQA descriptors and launch the async-TN kernel."""
 
@@ -169,7 +170,7 @@ def launch_d256_tn_compact_worklist(
         raise ValueError("Async-TN worklist task upper bound is inconsistent")
     if block_m % params.h_hk_ratio != 0:
         raise ValueError("Async-TN PackGQA requires BLOCK_M divisible by the GQA ratio")
-    if params.block_size == 16 and params.h_hk_ratio == 4:
+    if allow_split_kv and params.block_size == 16 and params.h_hk_ratio == 4:
         from .tn_direct import _d256_tn_bulk_policy
 
         use_bulk, _, _ = _d256_tn_bulk_policy(
@@ -191,6 +192,7 @@ def launch_d256_tn_compact_worklist(
                 block_m=block_m,
                 block_n=block_n,
                 grid_order=grid_order,
+                allow_split_kv=allow_split_kv,
             )
     packed_block_m = block_m // params.h_hk_ratio
     packed_task_upper = compact_worklist_task_upper_bound(
@@ -236,6 +238,7 @@ def launch_d256_tn_compact_worklist(
         block_m=block_m,
         block_n=block_n,
         grid_order=grid_order,
+        allow_split_kv=allow_split_kv,
     )
 
 

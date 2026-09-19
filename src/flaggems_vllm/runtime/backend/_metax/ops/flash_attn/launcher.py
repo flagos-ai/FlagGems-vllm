@@ -25,7 +25,7 @@ from .scheduling import (
     MetaXTaskMapper,
     validate_metax_attention_plan,
 )
-from .splitkv import launch_d256_tn_splitkv, launch_splitkv
+from .splitkv import launch_d256_tn_splitkv, launch_page16_decode, launch_splitkv
 from .tn_direct import launch_d256_tn_direct, launch_d256_tn_direct_fast
 
 D256_TN_SPLITKV_MIN_K = 32768
@@ -54,23 +54,9 @@ def launch_metax_attention(
     validate_metax_attention_plan(plan)
     if total_q == 0:
         return None
+    if plan.family is MetaXKernelFamily.PAGE16_DECODE:
+        return launch_page16_decode(params, batch_size=batch_size)
     if plan.family is MetaXKernelFamily.SPLIT_KV:
-        if (
-            params.seqlenq_ngroups_swapped
-            and is_paged
-            and (params.block_size == 16)
-            and (head_size == 256)
-            and (max_seqlen_q == 4)
-            and (num_heads == 1)
-            and (total_q == batch_size * 4)
-            and params.is_seqused_k
-        ):
-            from .splitkv import launch_page16_decode
-
-            return launch_page16_decode(
-                params,
-                batch_size=batch_size,
-            )
         use_d256_tn_splitkv = (
             is_paged
             and params.q_ptr.dtype == torch.bfloat16
@@ -141,6 +127,7 @@ def launch_metax_attention(
                 task_upper=plan.worklist_task_upper,
                 block_m=plan.worklist_block_m,
                 block_n=D256_TN_BLOCK_N,
+                allow_split_kv=plan.allow_split_kv,
             )
         fast_causal_aligned = (
             batch_size == 1
@@ -170,6 +157,7 @@ def launch_metax_attention(
             block_m=D256_TN_BLOCK_M,
             block_n=D256_TN_BLOCK_N,
             grid_order=plan.grid_order,
+            allow_split_kv=plan.allow_split_kv,
         )
     if plan.family is MetaXKernelFamily.COMPACT_WORKLIST:
         return launch_compact_worklist(
@@ -194,6 +182,7 @@ def launch_attention(params, *, num_splits=0):
         is_paged=params.is_paged,
         block_size=params.block_size,
         is_cu_seqlens_q=params.is_cu_seqlens_q,
+        is_seqused_k=params.is_seqused_k,
         max_seqlen_q=params.seqlen_q,
         max_seqlen_k=params.seqlen_k,
         total_q=params.total_q,

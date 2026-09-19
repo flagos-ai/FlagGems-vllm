@@ -24,6 +24,7 @@ class MetaXKernelFamily(str, Enum):
     LEGACY = "legacy"
     COMPACT_WORKLIST = "compact_worklist"
     SPLIT_KV = "split_kv"
+    PAGE16_DECODE = "page16_decode"
     D256_TN_DIRECT = "d256_tn_direct"
 
 
@@ -52,6 +53,7 @@ class MetaXAttentionPlan:
     worklist_task_upper: int = 0
     worklist_block_m: int = 0
     workspace_bytes: int = 0
+    allow_split_kv: bool = True
 
 
 D256_TN_BLOCK_M = 32
@@ -145,6 +147,7 @@ class MetaXAttentionScheduler:
         is_paged: bool = False,
         block_size: int = 0,
         is_cu_seqlens_q: bool = False,
+        is_seqused_k: bool = False,
         max_seqlen_q: int = 0,
         max_seqlen_k: int = 0,
         total_q: int = 0,
@@ -160,6 +163,7 @@ class MetaXAttentionScheduler:
         seqlenq_ngroups_swapped: bool = False,
         num_splits: int = 0,
     ) -> MetaXAttentionPlan:
+        """Use 0 for auto, 1 for no KV splits, and >1 for explicit splits."""
         if isinstance(num_splits, bool) or not isinstance(num_splits, int):
             raise TypeError(
                 f"num_splits must be an integer in [0, 32], got {num_splits!r}"
@@ -297,38 +301,54 @@ class MetaXAttentionScheduler:
         split_kv_k_blocks = MetaXAttentionScheduler._ceildiv(
             max_seqlen_k, split_kv_block_n
         )
-        explicit_split_kv = split_kv_capable and num_splits >= 2
-        auto_split_kv = (
-            split_kv_capable
-            and num_splits == 0
-            and seqlenq_ngroups_swapped
-            and (head_size == 256)
-            and (
+        selected_splits = 0
+        if num_splits > 1:
+            if not split_kv_capable:
+                raise NotImplementedError(
+                    "Explicit MetaX Split-KV is not supported for these inputs"
+                )
+            selected_splits = min(num_splits, workspace_split_cap)
+            if selected_splits < 2:
+                raise ValueError(
+                    "MetaX Split-KV requires at least two splits within the "
+                    "32 MiB workspace limit"
+                )
+        elif num_splits == 0 and split_kv_capable and head_size == 256:
+            if short_q_long_kv:
+                selected_splits = min(
+                    MetaXAttentionScheduler._ceildiv(
+                        split_kv_k_blocks,
+                        MetaXAttentionScheduler.D256_SHORT_Q_TARGET_K_BLOCKS_PER_SPLIT,
+                    ),
+                    MetaXAttentionScheduler.SPLIT_KV_MAX_SPLITS,
+                    workspace_split_cap,
+                )
+            elif seqlenq_ngroups_swapped and (
                 split_kv_k_blocks >= MetaXAttentionScheduler.SPLIT_KV_AUTO_MIN_K_BLOCKS
-            )
-        )
-        auto_split_cap = min(
-            MetaXAttentionScheduler.SPLIT_KV_AUTO_MAX_SPLITS, workspace_split_cap
-        )
-        auto_selected_splits = MetaXAttentionScheduler._select_auto_splits(
-            base_tasks=split_kv_base_tasks,
-            k_blocks=split_kv_k_blocks,
-            split_cap=auto_split_cap if auto_split_kv else 0,
-        )
-        selected_splits = (
-            min(num_splits, workspace_split_cap)
-            if explicit_split_kv
-            else auto_selected_splits
-        )
-        if explicit_split_kv and short_q_long_kv and (head_size == 256):
-            d256_short_q_splits = MetaXAttentionScheduler._ceildiv(
-                split_kv_k_blocks,
-                MetaXAttentionScheduler.D256_SHORT_Q_TARGET_K_BLOCKS_PER_SPLIT,
-            )
-            selected_splits = min(selected_splits, d256_short_q_splits)
+            ):
+                selected_splits = MetaXAttentionScheduler._select_auto_splits(
+                    base_tasks=split_kv_base_tasks,
+                    k_blocks=split_kv_k_blocks,
+                    split_cap=min(
+                        MetaXAttentionScheduler.SPLIT_KV_AUTO_MAX_SPLITS,
+                        workspace_split_cap,
+                    ),
+                )
         if selected_splits < 2:
             selected_splits = 0
         split_kv_enabled = selected_splits >= 2
+        page16_decode_enabled = (
+            split_kv_capable
+            and not split_kv_enabled
+            and num_splits <= 1
+            and seqlenq_ngroups_swapped
+            and is_seqused_k
+            and block_size == 16
+            and head_size == 256
+            and max_seqlen_q == 4
+            and num_heads == 1
+            and total_q == batch_size * 4
+        )
         d256_tn_enabled = d256_tn_eligible and (not split_kv_enabled)
         if d256_tn_enabled:
             worklist_block_m = D256_TN_BLOCK_M
@@ -349,19 +369,16 @@ class MetaXAttentionScheduler:
                 <= MetaXAttentionScheduler.COMPACT_WORKLIST_MAX_WORKSPACE_BYTES
             )
         )
-        family = (
-            MetaXKernelFamily.SPLIT_KV
-            if split_kv_enabled
-            else (
-                MetaXKernelFamily.D256_TN_DIRECT
-                if d256_tn_enabled
-                else (
-                    MetaXKernelFamily.COMPACT_WORKLIST
-                    if compact_worklist_enabled
-                    else MetaXKernelFamily.LEGACY
-                )
-            )
-        )
+        if split_kv_enabled:
+            family = MetaXKernelFamily.SPLIT_KV
+        elif page16_decode_enabled:
+            family = MetaXKernelFamily.PAGE16_DECODE
+        elif d256_tn_enabled:
+            family = MetaXKernelFamily.D256_TN_DIRECT
+        elif compact_worklist_enabled:
+            family = MetaXKernelFamily.COMPACT_WORKLIST
+        else:
+            family = MetaXKernelFamily.LEGACY
         return MetaXAttentionPlan(
             family=family,
             task_mapper=(
@@ -389,6 +406,7 @@ class MetaXAttentionScheduler:
                 if split_kv_enabled
                 else worklist_workspace_bytes if compact_worklist_enabled else 0
             ),
+            allow_split_kv=num_splits != 1,
         )
 
 
@@ -399,6 +417,7 @@ def validate_metax_attention_plan(plan: MetaXAttentionPlan) -> None:
         MetaXKernelFamily.LEGACY: (MetaXTaskMapper.RECTANGULAR,),
         MetaXKernelFamily.COMPACT_WORKLIST: (MetaXTaskMapper.COMPACT_WORKLIST,),
         MetaXKernelFamily.SPLIT_KV: (MetaXTaskMapper.SPLIT_BATCH_HEAD,),
+        MetaXKernelFamily.PAGE16_DECODE: (MetaXTaskMapper.RECTANGULAR,),
         MetaXKernelFamily.D256_TN_DIRECT: (
             MetaXTaskMapper.RECTANGULAR,
             MetaXTaskMapper.COMPACT_WORKLIST,
@@ -414,6 +433,8 @@ def validate_metax_attention_plan(plan: MetaXAttentionPlan) -> None:
     split = plan.family is MetaXKernelFamily.SPLIT_KV
     compact = plan.task_mapper is MetaXTaskMapper.COMPACT_WORKLIST
     if split:
+        if not plan.allow_split_kv:
+            raise RuntimeError("Split-KV is disabled by the attention plan")
         if not 2 <= plan.max_splits <= 32:
             raise RuntimeError("Split-KV split count must be in [2, 32]")
         if (plan.split_kv_block_m, plan.split_kv_block_n) not in ((4, 16), (16, 16)):

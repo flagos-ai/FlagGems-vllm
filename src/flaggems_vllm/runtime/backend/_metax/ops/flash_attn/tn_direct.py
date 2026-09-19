@@ -674,8 +674,9 @@ def launch_d256_tn_direct(
     block_m,
     block_n,
     grid_order,
+    allow_split_kv=True,
 ):
-    """Peel Q into aligned BM64 bulk and disjoint Split-KV boundaries."""
+    """Use split boundaries when allowed, otherwise run unsplit async-TN."""
     use_bulk, sparse_bulk, compact_tiles = _d256_tn_bulk_policy(
         params,
         max_seqlen_q=max_seqlen_q,
@@ -683,7 +684,7 @@ def launch_d256_tn_direct(
         batch_size=batch_size,
         total_q=total_q,
     )
-    if not use_bulk:
+    if not allow_split_kv or not use_bulk:
         if max_seqlen_k >= 32768 and batch_size > 1:
             from .ragged import maybe_repack
 
