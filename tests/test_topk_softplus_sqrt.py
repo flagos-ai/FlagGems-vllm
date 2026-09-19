@@ -22,6 +22,17 @@ from . import accuracy_utils as utils
 from . import conftest as cfg
 
 device = flaggems_vllm.device
+vendor = flaggems_vllm.vendor_name
+
+HAS_TLE = False
+
+if vendor == "ascend":
+    try:
+        from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
+            HAS_TLE,
+        )
+    except ImportError:
+        pass
 
 if cfg.QUICK_MODE:
     NUM_TOKENS_LIST = [1, 33]
@@ -103,7 +114,6 @@ def _check_topk_results(
 
 
 @pytest.mark.topk_softplus_sqrt
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS_LIST)
 @pytest.mark.parametrize("topk", TOPK_LIST)
@@ -113,7 +123,12 @@ def _check_topk_results(
 def test_topk_softplus_sqrt(
     num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
 ):
-    """Test topk_softplus_sqrt in standard mode (with bias) against PyTorch reference."""
+    """Test topk_softplus_sqrt in standard mode (with bias) against PyTorch reference.
+
+    Runs on any backend with a valid device (CUDA, Ascend NPU, etc.) — not
+    gated on torch.cuda.is_available(), since that is always False on
+    non-CUDA backends like Ascend.
+    """
     torch.manual_seed(0)
 
     gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
@@ -148,7 +163,136 @@ def test_topk_softplus_sqrt(
 
 
 @pytest.mark.topk_softplus_sqrt
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason=f"Ascend TLE optimized kernel is not available on {vendor}",
+)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS_LIST)
+@pytest.mark.parametrize("topk", TOPK_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
+@pytest.mark.parametrize("routed_scaling_factor", RSF_LIST)
+def test_topk_softplus_sqrt_tle(
+    num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
+):
+    """Test topk_softplus_sqrt with use_ascend_tle=True (the UB-buffer
+    optimized kernel, _fused_topk_kernel_ascend_tle) against the PyTorch
+    reference.
+
+    This mirrors test_topk_softplus_sqrt but forces the TLE code path,
+    which is otherwise only exercised by the (non-numerical) benchmark
+    in benchmark/test_topk_softplus_sqrt.py. It is gated on HAS_TLE
+    rather than torch.cuda.is_available(), since the TLE kernel targets
+    Ascend NPUs, not CUDA.
+    """
+    torch.manual_seed(0)
+
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
+    correction_bias = torch.randn((num_experts,), dtype=torch.float32, device=device)
+
+    ref_weights, ref_ids = _torch_topk_softplus_sqrt_reference(
+        gating_output,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        correction_bias=correction_bias,
+    )
+    ref_weights = utils.to_reference(ref_weights)
+    ref_ids = utils.to_reference(ref_ids)
+
+    res_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
+    res_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+    res_tei = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+
+    with flaggems_vllm.use_gems():
+        flaggems_vllm.topk_softplus_sqrt(
+            res_weights,
+            res_ids,
+            res_tei,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            correction_bias=correction_bias,
+            use_ascend_tle=True,
+        )
+
+    _check_topk_results(res_weights, res_ids, ref_weights, ref_ids)
+
+
+@pytest.mark.topk_softplus_sqrt
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason=f"Ascend TLE optimized kernel is not available on {vendor}",
+)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS_LIST)
+@pytest.mark.parametrize("topk", TOPK_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
+@pytest.mark.parametrize("routed_scaling_factor", RSF_LIST)
+def test_topk_softplus_sqrt_tle_vs_baseline(
+    num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
+):
+    """Cross-check the TLE kernel (use_ascend_tle=True) against the
+    baseline Triton kernel (use_ascend_tle=False) on identical inputs.
+
+    This isolates the effect of the UB-buffer optimization itself
+    (insert_slice-based renormalize) from any discrepancy that might
+    otherwise be masked by comparing both against a looser PyTorch
+    reference tolerance.
+    """
+    torch.manual_seed(0)
+
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
+    correction_bias = torch.randn((num_experts,), dtype=torch.float32, device=device)
+
+    baseline_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=device
+    )
+    baseline_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+    baseline_tei = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+
+    tle_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
+    tle_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+    tle_tei = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+
+    with flaggems_vllm.use_gems():
+        flaggems_vllm.topk_softplus_sqrt(
+            baseline_weights,
+            baseline_ids,
+            baseline_tei,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            correction_bias=correction_bias,
+            use_ascend_tle=False,
+        )
+        flaggems_vllm.topk_softplus_sqrt(
+            tle_weights,
+            tle_ids,
+            tle_tei,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            correction_bias=correction_bias,
+            use_ascend_tle=True,
+        )
+
+    # Same inputs, deterministic tie-break rule -> indices should match
+    # exactly, and token_expert_indices are computed identically in both
+    # kernels, so require an exact match there too.
+    utils.gems_assert_equal(tle_ids, baseline_ids)
+    utils.gems_assert_equal(tle_tei, baseline_tei)
+
+    # Weights: allow tight but non-zero tolerance since insert_slice /
+    # HBM store-load may not be bit-identical in floating point.
+    tle_w = utils.to_reference(tle_weights)
+    baseline_w = utils.to_reference(baseline_weights)
+    torch.testing.assert_close(tle_w, baseline_w, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.topk_softplus_sqrt
 @pytest.mark.parametrize("num_tokens", HASH_NUM_TOKENS_LIST)
 @pytest.mark.parametrize("num_experts", HASH_NUM_EXPERTS_LIST)
 @pytest.mark.parametrize("topk", HASH_TOPK_LIST)

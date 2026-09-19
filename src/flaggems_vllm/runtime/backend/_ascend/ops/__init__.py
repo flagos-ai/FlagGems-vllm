@@ -63,6 +63,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -91,4 +94,5 @@ __all__ = [
     "combine_topk_swa_indices",
     "top_k_per_row_prefill",
     "top_k_per_row_decode",
+    "topk_softplus_sqrt",
 ]
