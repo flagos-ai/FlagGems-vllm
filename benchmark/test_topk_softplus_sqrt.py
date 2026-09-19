@@ -12,13 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
+import flaggems_vllm
 
 from . import base
+
+vendor = flaggems_vllm.vendor_name
+topk_softplus_sqrt = flaggems_vllm.topk_softplus_sqrt
+
+HAS_TLE = False
+
+if vendor == "ascend":
+    try:
+        from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import HAS_TLE
+    except ImportError:
+        pass
+
 
 try:
     from vllm._custom_ops import topk_hash_softplus_sqrt as _vllm_topk_softplus_sqrt
@@ -99,8 +113,17 @@ _baseline_op = (
     _vllm_topk_softplus_sqrt_wrapper if HAS_VLLM else _torch_topk_softplus_sqrt_ref
 )
 
+# TLE-optimized entry point: same public function, `use_ascend_tle=True`
+# pinned via functools.partial so it drops into the benchmark framework's
+# `gems_op` slot exactly like the plain `topk_softplus_sqrt` callable did
+# in the baseline test. Falls back to the baseline kernel internally
+# (inside topk_softplus_sqrt) if HAS_TLE is False, e.g. off-Ascend --
+# see the module-level skip below to avoid a misleading "0 speedup" run
+# in that case.
+_gems_tle_op = functools.partial(topk_softplus_sqrt, use_ascend_tle=True)
 
-class TopkSoftplusSqrtBenchmark(base.Benchmark):
+
+class TopkSoftplusSqrtTleBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "num_tokens, num_experts, topk"
 
     def set_shapes(self, shape_file_path=None):
@@ -145,11 +168,15 @@ class TopkSoftplusSqrtBenchmark(base.Benchmark):
 
 
 @pytest.mark.topk_softplus_sqrt
-def test_topk_softplus_sqrt():
-    bench = TopkSoftplusSqrtBenchmark(
-        op_name="topk_softplus_sqrt",
+@pytest.mark.skipif(
+    not HAS_TLE,
+    reason="triton.experimental.tle (Ascend TLE) is not importable in this environment",
+)
+def test_topk_softplus_sqrt_tle():
+    bench = TopkSoftplusSqrtTleBenchmark(
+        op_name="topk_softplus_sqrt_tle",
         torch_op=_baseline_op,
-        gems_op=topk_softplus_sqrt,
+        gems_op=_gems_tle_op,
         dtypes=[torch.bfloat16],
     )
     bench.run()
