@@ -18,12 +18,14 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     compact_ragged_tile_coords,
     tn_compile_scenario,
 )
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.direct import launch_direct
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.direct import (
+    launch_direct,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.tn_direct import (
     launch_d256_tn_direct,
 )
 from flaggems_vllm.utils import libentry
@@ -175,7 +177,7 @@ def launch_d256_tn_compact_worklist(
     if block_m % params.h_hk_ratio != 0:
         raise ValueError("Async-TN PackGQA requires BLOCK_M divisible by the GQA ratio")
     if allow_split_kv and params.block_size == 16 and params.h_hk_ratio == 4:
-        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention.tn_direct import (
             _d256_tn_bulk_policy,
         )
 

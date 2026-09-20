@@ -277,8 +277,10 @@ def mha_varlan_fwd(
             raise NotImplementedError(
                 "MetaX varlen attention supports inference without dropout"
             )
-        from flaggems_vllm.runtime.backend._metax.ops.flash_attn import launch_attention
-        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+            launch_attention,
+        )
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
             copy_tensor,
             fill_tensor,
             reshape_view_or_copy,

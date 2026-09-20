@@ -20,7 +20,7 @@ import triton.language as tl
 import flaggems_vllm
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     apply_alibi,
     apply_dropout,
     apply_mask,

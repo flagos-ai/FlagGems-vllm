@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     apply_alibi,
     apply_dropout,
     apply_mask,
@@ -27,7 +27,7 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
     softmax_rescale,
     tn_compile_scenario,
 )
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.tn_direct import (
     flash_varlen_fwd_d256_tn_kernel,
 )
 from flaggems_vllm.utils import libentry

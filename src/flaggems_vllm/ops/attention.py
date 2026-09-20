@@ -1393,7 +1393,7 @@ def flash_attn_varlen_func(
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])
         if is_metax:
-            from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+            from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
                 ensure_last_dim_contiguous,
             )
 

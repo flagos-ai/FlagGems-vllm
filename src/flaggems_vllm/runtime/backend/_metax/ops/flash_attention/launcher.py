@@ -14,12 +14,14 @@
 
 import torch
 
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.direct import launch_direct
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.direct import (
+    launch_direct,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.ragged import (
     launch_compact_worklist,
     launch_d256_tn_compact_worklist,
 )
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.scheduling import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.scheduling import (
     D256_TN_BLOCK_M,
     D256_TN_BLOCK_N,
     MetaXAttentionPlan,
@@ -28,12 +30,12 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_attn.scheduling import (
     MetaXTaskMapper,
     validate_metax_attention_plan,
 )
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.splitkv import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.splitkv import (
     launch_d256_tn_splitkv,
     launch_page16_decode,
     launch_splitkv,
 )
-from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.tn_direct import (
     launch_d256_tn_direct,
     launch_d256_tn_direct_fast,
 )
@@ -115,7 +117,7 @@ def launch_metax_attention(
             grid_order=plan.grid_order,
         )
     if plan.family is MetaXKernelFamily.D256_TN_DIRECT:
-        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention.ragged import (
             maybe_repack,
         )
 
