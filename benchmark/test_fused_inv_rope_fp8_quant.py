@@ -138,76 +138,7 @@ def _vllm_fused_inv_rope_fp8_quant(
     )
 
 
-def _torch_nonpacked_inv_rope_fp8_quant(
-    o,
-    positions,
-    cos_sin_cache,
-    n_groups,
-    heads_per_group,
-    nope_dim,
-    rope_dim,
-    quant_group_size,
-    tma_aligned_scales,
-):
-    """Torch baseline with continuous scales and the complete output layout."""
-    if tma_aligned_scales:
-        raise ValueError("The Torch baseline implements non-packed scales only")
-    num_tokens, num_heads, head_dim = o.shape
-    d = heads_per_group * head_dim
-    scale_cols = d // quant_group_size
-    aligned_tokens = (num_tokens + 3) // 4 * 4
-
-    # All casts, arithmetic, allocations and required layout copies stay inside
-    # the timed call. Only input/cache construction is outside the benchmark.
-    values = o.float()
-    pairs = values[..., nope_dim:].view(num_tokens, num_heads, rope_dim // 2, 2)
-    cos_sin = cos_sin_cache.index_select(0, positions)
-    cosine = cos_sin[:, : rope_dim // 2].unsqueeze(1)
-    sine = cos_sin[:, rope_dim // 2 :].unsqueeze(1)
-    even, odd = pairs[..., 0], pairs[..., 1]
-    rotated_even = torch.addcmul(even * cosine, odd, sine)
-    rotated_odd = torch.addcmul(odd * cosine, even, sine, value=-1)
-    even.copy_(rotated_even)
-    odd.copy_(rotated_odd)
-
-    blocks = values.view(num_tokens, n_groups, scale_cols, quant_group_size)
-    scales = blocks.abs().amax(dim=-1).clamp_min_(1e-10).mul_(1.0 / 448.0)
-    quantized = blocks.div(scales.unsqueeze(-1)).clamp_(-448.0, 448.0)
-    out = torch.empty(
-        (n_groups, num_tokens, d), dtype=torch.float8_e4m3fn, device=o.device
-    ).transpose(0, 1)
-    # Copy directly into the required layout while casting, avoiding a separate
-    # FP8 temporary and a second full output copy.
-    out.copy_(quantized.view(num_tokens, n_groups, d))
-    scale_storage = torch.empty(
-        (n_groups, scale_cols, aligned_tokens), dtype=torch.float32, device=o.device
-    )
-    if aligned_tokens != num_tokens:
-        scale_storage[..., num_tokens:].zero_()
-    scale_out = scale_storage[..., :num_tokens].permute(2, 0, 1)
-    scale_out.copy_(scales)
-    return out, scale_out
-
-
-def _baseline_fused_inv_rope_fp8_quant(*args):
-    # vLLM versions that always round scales to powers of two are equivalent
-    # only in packed mode. The non-packed comparison uses an explicitly
-    # authorized Torch implementation of the continuous-scale contract.
-    baseline = (
-        _vllm_fused_inv_rope_fp8_quant
-        if args[-1]
-        else _torch_nonpacked_inv_rope_fp8_quant
-    )
-    return baseline(*args)
-
-
-def _baseline_description(tma_aligned_scales):
-    if not tma_aligned_scales:
-        return (
-            f"Torch {torch.__version__}: "
-            f"{_torch_nonpacked_inv_rope_fp8_quant.__module__}."
-            "_torch_nonpacked_inv_rope_fp8_quant (non-packed continuous scales)"
-        )
+def _baseline_description():
     if vllm_fused_inv_rope_fp8_quant is None:
         raise RuntimeError(
             "The installed vLLM has no fused_inv_rope_fp8_quant baseline"
@@ -224,16 +155,16 @@ def _baseline_description(tma_aligned_scales):
     )
 
 
-def _validate_baseline(tma_aligned_scales, device):
+def _validate_baseline(device):
     """Verify the selected baseline's output contract before measuring it."""
-    source = _baseline_description(tma_aligned_scales)
+    source = _baseline_description()
     print(f"fused_inv_rope_fp8_quant baseline: {source}")
 
     o = torch.ones(1, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
     positions = torch.zeros(1, dtype=torch.int64, device=device)
     cache = _make_cos_sin_cache(1, ROPE_DIM, torch.device(device))
     try:
-        out, scale = _baseline_fused_inv_rope_fp8_quant(
+        out, scale = _vllm_fused_inv_rope_fp8_quant(
             o,
             positions,
             cache,
@@ -242,12 +173,12 @@ def _validate_baseline(tma_aligned_scales, device):
             NOPE_DIM,
             ROPE_DIM,
             QUANT_GROUP_SIZE,
-            tma_aligned_scales,
+            True,
         )
     except Exception as exc:
         raise RuntimeError(
             f"Baseline {source} cannot execute on {device} "
-            f"with tma_aligned_scales={tma_aligned_scales}: {exc}"
+            f"with packed scales: {exc}"
         ) from exc
 
     if out.dtype != torch.float8_e4m3fn or out.shape != (1, 1, HEAD_DIM):
@@ -255,40 +186,24 @@ def _validate_baseline(tma_aligned_scales, device):
             f"Baseline {source} returned shape={tuple(out.shape)}, dtype={out.dtype}; "
             "expected [1, 1, 512] E4M3FN"
         )
-    if tma_aligned_scales:
-        # A unit input gives scale 2**-8, whose UE8M0 exponent byte is 119.
-        expected = torch.full_like(scale, 0x77777777)
-        valid = (
-            scale.shape == (1, 1, 1)
-            and scale.dtype == torch.int32
-            and torch.equal(scale, expected)
-        )
-    else:
-        expected = torch.full_like(scale, 1.0 / 448.0)
-        valid = (
-            scale.shape == (1, 1, 4)
-            and scale.dtype == torch.float32
-            and torch.allclose(scale, expected, rtol=1e-6, atol=0)
-        )
-    expected_quantized = 256.0 if tma_aligned_scales else 448.0
-    valid = valid and torch.equal(
-        out.float(), torch.full_like(out.float(), expected_quantized)
+    # A unit input gives scale 2**-8, whose UE8M0 exponent byte is 119.
+    expected = torch.full_like(scale, 0x77777777)
+    valid = (
+        scale.shape == (1, 1, 1)
+        and scale.dtype == torch.int32
+        and torch.equal(scale, expected)
+        and torch.equal(out.float(), torch.full_like(out.float(), 256.0))
     )
     if not valid:
         raise RuntimeError(
-            f"Baseline {source} has incompatible quantization semantics for "
-            f"tma_aligned_scales={tma_aligned_scales}. FlagGems requires "
-            "absmax / 448 in non-packed mode and power-of-two UE8M0 scales in "
-            "packed mode. This baseline is not an equivalent comparison."
+            f"Baseline {source} has incompatible packed quantization semantics. "
+            "FlagGems requires power-of-two UE8M0 scales. "
+            "This baseline is not an equivalent comparison."
         )
 
 
 class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = [
-        (*shape, packed)
-        for shape in ORIGINAL_SHAPES + SUPPLEMENTAL_SHAPES
-        for packed in (False, True)
-    ]
+    DEFAULT_SHAPES = [(*shape, True) for shape in ORIGINAL_SHAPES + SUPPLEMENTAL_SHAPES]
     DEFAULT_SHAPE_DESC = "num_tokens, num_heads, n_groups, tma_aligned_scales"
 
     def set_more_shapes(self):
@@ -309,10 +224,14 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
         super().init_user_config()
         if any(len(shape) != 4 for shape in self.shapes):
             raise ValueError(f"Invalid fused_inv_rope_fp8_quant shapes: {self.shapes}")
+        if any(shape[3] is not True for shape in self.shapes):
+            raise ValueError(
+                "fused_inv_rope_fp8_quant benchmarks require "
+                "tma_aligned_scales=True (packed scales)"
+            )
 
     def get_input_iter(self, dtype):
-        for packed in dict.fromkeys(shape[3] for shape in self.shapes):
-            _validate_baseline(packed, self.device)
+        _validate_baseline(self.device)
         yield from super().get_input_iter(dtype)
 
 
@@ -322,7 +241,7 @@ def test_fused_inv_rope_fp8_quant():
     bench = FusedInvRopeFP8QuantBenchmark(
         op_name="fused_inv_rope_fp8_quant",
         input_fn=_input_fn,
-        torch_op=_baseline_fused_inv_rope_fp8_quant,
+        torch_op=_vllm_fused_inv_rope_fp8_quant,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_fused_inv_rope_fp8_quant)

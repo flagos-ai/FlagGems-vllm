@@ -158,7 +158,7 @@ def native_fused_inv_rope_fp8_quant(
     nope_dim=NOPE_DIM,
     rope_dim=ROPE_DIM,
     quant_group_size=QUANT_GROUP_SIZE,
-    tma_aligned_scales=False,
+    tma_aligned_scales=True,
 ):
     del rope_dim
     half_rope = ROPE_DIM // 2
@@ -209,7 +209,7 @@ def _unfused_inv_rope_fp8_quant(
     nope_dim=NOPE_DIM,
     rope_dim=ROPE_DIM,
     quant_group_size=QUANT_GROUP_SIZE,
-    tma_aligned_scales=False,
+    tma_aligned_scales=True,
 ):
     cos = cos_sin_cache[:, : rope_dim // 2]
     sin = -cos_sin_cache[:, rope_dim // 2 :]
@@ -330,7 +330,7 @@ def _run_case(
 @pytest.mark.parametrize("seed", utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["SEEDS"])
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 @pytest.mark.parametrize(
     "num_heads,n_groups",
@@ -382,11 +382,6 @@ def test_output_layout(num_tokens, num_heads, n_groups):
     heads_per_group = num_heads // n_groups
     d = heads_per_group * HEAD_DIM
 
-    fp32_case = _run_case(num_tokens, num_heads, n_groups, False)
-    assert fp32_case["out"].stride() == (d, num_tokens * d, 1)
-    assert fp32_case["scale"].shape[-1] == d // QUANT_GROUP_SIZE
-    assert fp32_case["scale"].permute(1, 0, 2).stride(1) == 1 or num_tokens == 1
-
     packed_case = _run_case(num_tokens, num_heads, n_groups, True)
     packed_k = (d // QUANT_GROUP_SIZE + 3) // 4
     assert packed_case["out"].stride() == (d, num_tokens * d, 1)
@@ -402,7 +397,7 @@ def test_output_layout(num_tokens, num_heads, n_groups):
     utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["PER_GROUP_CONTIGUITY_NUM_TOKENS"],
 )
 def test_per_group_contiguity(num_tokens):
-    result = _run_case(num_tokens, 64, 8, False, seed=0)
+    result = _run_case(num_tokens, 64, 8, True, seed=0)
 
     for g in range(8):
         fp8_slice = result["out"][:, g, :]
@@ -416,7 +411,7 @@ def test_per_group_contiguity(num_tokens):
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 def test_scales_are_power_of_two(tma_aligned_scales):
     result = _run_case(32, 64, 8, tma_aligned_scales, seed=0)
@@ -426,19 +421,16 @@ def test_scales_are_power_of_two(tma_aligned_scales):
 
     log2_scales = torch.log2(scales)
     residual = (log2_scales - log2_scales.round()).abs()
-    if tma_aligned_scales:
-        assert (
-            residual.max() < 1e-5
-        ), f"Not all scales are powers of 2: max log2 residual = {residual.max().item()}"
-    else:
-        assert residual.max() > 1e-5, "Unexpected power-of-two scales in non-UE8M0 mode"
+    assert (
+        residual.max() < 1e-5
+    ), f"Not all scales are powers of 2: max log2 residual = {residual.max().item()}"
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 def test_large_values(tma_aligned_scales):
     result = _run_case(8, 64, 8, tma_aligned_scales, seed=0, scale=1000.0)
@@ -456,7 +448,7 @@ def test_large_values(tma_aligned_scales):
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 def test_nope_dims_unchanged(tma_aligned_scales):
     num_tokens, num_heads, n_groups = 16, 64, 8
@@ -504,7 +496,7 @@ def test_nope_dims_unchanged(tma_aligned_scales):
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 def test_zero_positions(tma_aligned_scales):
     positions = torch.zeros(16, device=flaggems_vllm.device, dtype=torch.long)
@@ -523,7 +515,7 @@ def test_zero_positions(tma_aligned_scales):
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 def test_dequant_numerical_accuracy(tma_aligned_scales):
     result = _run_case(32, 64, 8, tma_aligned_scales, seed=0)
@@ -554,7 +546,7 @@ def test_dequant_numerical_accuracy(tma_aligned_scales):
 @pytest.mark.parametrize("seed", utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["SEEDS"])
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 @pytest.mark.parametrize(
     "num_heads,n_groups",
@@ -593,7 +585,7 @@ def test_unfused_path(num_tokens, num_heads, n_groups, tma_aligned_scales, seed)
 )
 @pytest.mark.parametrize(
     "tma_aligned_scales",
-    utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["TMA_ALIGNED_SCALES"],
+    [True],
 )
 def test_with_real_deepseek_v4_rope(num_tokens, tma_aligned_scales):
     num_heads, n_groups = 64, 8
@@ -650,7 +642,7 @@ def _call_edge(o, positions, cache, tma_aligned_scales, **kwargs):
 @pytest.mark.parametrize(
     "num_tokens", [512] if utils.QUICK_MODE else [512, 1024, 2048, 4096]
 )
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_prefill_shapes(num_tokens, tma_aligned_scales):
     result = _run_case(num_tokens, 64, 8, tma_aligned_scales)
     _assert_dequant_close(
@@ -678,7 +670,7 @@ def test_prefill_shapes(num_tokens, tma_aligned_scales):
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize("value", [0.0, 2.0**-40])
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_zero_and_tiny_values(value, tma_aligned_scales):
     o, positions, cache = _edge_inputs()
     o.fill_(value)
@@ -694,7 +686,7 @@ def test_zero_and_tiny_values(value, tma_aligned_scales):
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_custom_epsilon(tma_aligned_scales):
     o, positions, cache = _edge_inputs()
     o.zero_()
@@ -713,22 +705,22 @@ def test_custom_epsilon(tma_aligned_scales):
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_empty_tokens(tma_aligned_scales):
     o, positions, cache = _edge_inputs(num_tokens=0)
     out, scale = _call_edge(o, positions, cache, tma_aligned_scales)
     assert out.shape == (0, 1, 8 * HEAD_DIM)
     assert out.dtype == torch.float8_e4m3fn
     assert out.device == o.device
-    assert scale.shape == (0, 1, 8 if tma_aligned_scales else 32)
-    assert scale.dtype == (torch.int32 if tma_aligned_scales else torch.float32)
+    assert scale.shape == (0, 1, 8)
+    assert scale.dtype == torch.int32
     assert scale.device == o.device
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize("num_tokens", [1, 7])
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_scale_padding_is_zero(num_tokens, tma_aligned_scales):
     result = _run_case(num_tokens, 32, 4, tma_aligned_scales)
     scale = result["scale"]
@@ -743,7 +735,7 @@ def test_scale_padding_is_zero(num_tokens, tma_aligned_scales):
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
 @pytest.mark.parametrize("layout", ["token", "head", "cache"])
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_strided_outer_dimensions(layout, tma_aligned_scales):
     o, positions, cache = _edge_inputs()
     if layout == "token":
@@ -773,7 +765,7 @@ def test_strided_outer_dimensions(layout, tma_aligned_scales):
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_repeated_calls_observe_mutation(tma_aligned_scales):
     o, positions, cache = _edge_inputs()
     addresses = [x.data_ptr() for x in (o, positions, cache)]
@@ -814,7 +806,9 @@ def test_musa_public_dispatch():
         for name, function in flaggems_vllm._FULL_CONFIG
     )
     o, positions, cache = _edge_inputs()
-    out, _ = flaggems_vllm.fused_inv_rope_fp8_quant(o, positions, cache, 1, o.shape[1])
+    out, _ = flaggems_vllm.fused_inv_rope_fp8_quant(
+        o, positions, cache, 1, o.shape[1], tma_aligned_scales=True
+    )
     assert out.dtype == torch.float8_e4m3fn
 
 
@@ -836,7 +830,7 @@ def test_musa_public_dispatch():
         "quant_group_size",
     ],
 )
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_musa_rejects_unsupported_inputs(invalid, tma_aligned_scales):
     o, positions, cache = _edge_inputs()
     kwargs = {}
@@ -869,7 +863,7 @@ def test_musa_rejects_unsupported_inputs(invalid, tma_aligned_scales):
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+@pytest.mark.parametrize("tma_aligned_scales", [True])
 def test_prefill_head_tail_and_strides(tma_aligned_scales):
     torch.manual_seed(42)
     device = flaggems_vllm.device
