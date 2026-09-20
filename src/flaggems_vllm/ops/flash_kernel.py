@@ -26,7 +26,8 @@ def u64_to_lohi(x):
 
 @triton.jit
 def u64_from_lohi(lo, hi):
-    return hi.to(tl.uint64) << 32 + lo.to(tl.uint64)
+    # Pack the low and high 32-bit words into one 64-bit value.
+    return (hi.to(tl.uint64) << 32) + lo.to(tl.uint64)
 
 
 @triton.jit
