@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -50,4 +53,5 @@ __all__ = [
     "inplace_fused_experts",
     "outplace_fused_experts",
     "persistent_topk",
+    "fused_q_kv_rmsnorm",
 ]
