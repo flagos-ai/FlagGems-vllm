@@ -18,8 +18,10 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.flash_kernel import apply_mask
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
-    apply_mask,
+    online_softmax_stats,
+    paged_tile_coords,
     tn_compile_scenario,
 )
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.tn_direct import (
@@ -34,157 +36,6 @@ _D256_FRAGMENT = 128
 
 
 _QK_FRAGMENT = 64
-
-
-@triton.jit
-def _prefix_paged_tile_coords(
-    start_n,
-    k_len,
-    page_table_ptr,
-    BLOCK_N: tl.constexpr,
-    BOUNDARY_CHECK: tl.constexpr,
-    PAGE_SIZE: tl.constexpr = 32,
-):
-    """Resolve physical rows from the page table."""
-    if PAGE_SIZE == 16:
-        tl.static_assert(BLOCK_N == 128, "page16 scalar gather requires BN128")
-        page_slot = tl.arange(0, BLOCK_N) // 16
-        virtual_page = start_n // 16
-        if BOUNDARY_CHECK:
-            page0 = tl.load(
-                page_table_ptr + virtual_page + 0, mask=start_n + 0 < k_len, other=0
-            )
-        else:
-            page0 = tl.load(page_table_ptr + virtual_page + 0)
-        if BOUNDARY_CHECK:
-            page1 = tl.load(
-                page_table_ptr + virtual_page + 1, mask=start_n + 16 < k_len, other=0
-            )
-        else:
-            page1 = tl.load(page_table_ptr + virtual_page + 1)
-        if BOUNDARY_CHECK:
-            page2 = tl.load(
-                page_table_ptr + virtual_page + 2, mask=start_n + 32 < k_len, other=0
-            )
-        else:
-            page2 = tl.load(page_table_ptr + virtual_page + 2)
-        if BOUNDARY_CHECK:
-            page3 = tl.load(
-                page_table_ptr + virtual_page + 3, mask=start_n + 48 < k_len, other=0
-            )
-        else:
-            page3 = tl.load(page_table_ptr + virtual_page + 3)
-        if BOUNDARY_CHECK:
-            page4 = tl.load(
-                page_table_ptr + virtual_page + 4, mask=start_n + 64 < k_len, other=0
-            )
-        else:
-            page4 = tl.load(page_table_ptr + virtual_page + 4)
-        if BOUNDARY_CHECK:
-            page5 = tl.load(
-                page_table_ptr + virtual_page + 5, mask=start_n + 80 < k_len, other=0
-            )
-        else:
-            page5 = tl.load(page_table_ptr + virtual_page + 5)
-        if BOUNDARY_CHECK:
-            page6 = tl.load(
-                page_table_ptr + virtual_page + 6, mask=start_n + 96 < k_len, other=0
-            )
-        else:
-            page6 = tl.load(page_table_ptr + virtual_page + 6)
-        if BOUNDARY_CHECK:
-            page7 = tl.load(
-                page_table_ptr + virtual_page + 7, mask=start_n + 112 < k_len, other=0
-            )
-        else:
-            page7 = tl.load(page_table_ptr + virtual_page + 7)
-        page_id = tl.where(
-            page_slot < 4,
-            tl.where(
-                page_slot < 2,
-                tl.where(page_slot == 0, page0, page1),
-                tl.where(page_slot == 2, page2, page3),
-            ),
-            tl.where(
-                page_slot < 6,
-                tl.where(page_slot == 4, page4, page5),
-                tl.where(page_slot == 6, page6, page7),
-            ),
-        ).to(tl.int64)
-        col_idx = start_n + tl.arange(0, BLOCK_N)
-        col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
-        return (col_idx, page_id, col_idx % 16)
-    else:
-        page_slot = tl.arange(0, BLOCK_N) // 32
-        virtual_page = start_n // 32
-        if BOUNDARY_CHECK:
-            page0 = tl.load(
-                page_table_ptr + virtual_page, mask=start_n < k_len, other=0
-            ).to(tl.int64)
-        else:
-            page0 = tl.load(page_table_ptr + virtual_page).to(tl.int64)
-        if BLOCK_N == 32:
-            page_id = page0
-        elif BLOCK_N == 64:
-            if BOUNDARY_CHECK:
-                page1 = tl.load(
-                    page_table_ptr + virtual_page + 1,
-                    mask=start_n + 32 < k_len,
-                    other=0,
-                ).to(tl.int64)
-            else:
-                page1 = tl.load(page_table_ptr + virtual_page + 1).to(tl.int64)
-            page_id = tl.where(page_slot == 0, page0, page1)
-        elif BLOCK_N == 128:
-            if BOUNDARY_CHECK:
-                page1 = tl.load(
-                    page_table_ptr + virtual_page + 1,
-                    mask=start_n + 32 < k_len,
-                    other=0,
-                ).to(tl.int64)
-                page2 = tl.load(
-                    page_table_ptr + virtual_page + 2,
-                    mask=start_n + 64 < k_len,
-                    other=0,
-                ).to(tl.int64)
-                page3 = tl.load(
-                    page_table_ptr + virtual_page + 3,
-                    mask=start_n + 96 < k_len,
-                    other=0,
-                ).to(tl.int64)
-            else:
-                page1 = tl.load(page_table_ptr + virtual_page + 1).to(tl.int64)
-                page2 = tl.load(page_table_ptr + virtual_page + 2).to(tl.int64)
-                page3 = tl.load(page_table_ptr + virtual_page + 3).to(tl.int64)
-            page_id = tl.where(
-                page_slot == 0,
-                page0,
-                tl.where(page_slot == 1, page1, tl.where(page_slot == 2, page2, page3)),
-            )
-        else:
-            tl.static_assert(False, "Async-TN BLOCK_N must be 32, 64, or 128")
-        col_idx = start_n + tl.arange(0, BLOCK_N)
-        col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
-        page_offset = col_idx % 32
-        return (col_idx, page_id, page_offset)
-
-
-@triton.jit
-def _prefix_online_softmax_stats(
-    scores, row_max, row_sum, scale_softmax_log2, IS_BORDER: tl.constexpr
-):
-    previous_max = row_max
-    row_max = tl.maximum(row_max, tl.max(scores, 1))
-    if IS_BORDER:
-        current_max = tl.where(row_max == float("-inf"), 0.0, row_max)
-    else:
-        current_max = row_max
-    accumulator_scale = tl.math.exp2((previous_max - current_max) * scale_softmax_log2)
-    row_sum *= accumulator_scale
-    max_scaled = tl.where(row_max == float("-inf"), 0.0, row_max * scale_softmax_log2)
-    probabilities = tl.math.exp2(scores * scale_softmax_log2 - max_scaled[:, None])
-    row_sum += tl.sum(probabilities, 1)
-    return (accumulator_scale, probabilities, row_max, row_sum)
 
 
 @libentry()
@@ -386,7 +237,7 @@ def flash_varlen_fwd_d256_tn_prefix_kernel(
     )
     if n_block_min < n_block_max:
         start_n = n_block * BLOCK_N
-        (col_idx, page_id, page_offset) = _prefix_paged_tile_coords(
+        (col_idx, page_id, page_offset) = paged_tile_coords(
             start_n,
             k_len,
             page_table_ptr,
@@ -484,157 +335,6 @@ def flash_varlen_fwd_d256_tn_prefix_kernel(
         lse,
         mask=lse_mask,
     )
-
-
-@triton.jit
-def _aligned_paged_tile_coords(
-    start_n,
-    k_len,
-    page_table_ptr,
-    BLOCK_N: tl.constexpr,
-    BOUNDARY_CHECK: tl.constexpr,
-    PAGE_SIZE: tl.constexpr = 32,
-):
-    """Resolve physical rows from the page table."""
-    if PAGE_SIZE == 16:
-        tl.static_assert(BLOCK_N == 128, "page16 scalar gather requires BN128")
-        page_slot = tl.arange(0, BLOCK_N) // 16
-        virtual_page = start_n // 16
-        if BOUNDARY_CHECK:
-            page0 = tl.load(
-                page_table_ptr + virtual_page + 0, mask=start_n + 0 < k_len, other=0
-            )
-        else:
-            page0 = tl.load(page_table_ptr + virtual_page + 0)
-        if BOUNDARY_CHECK:
-            page1 = tl.load(
-                page_table_ptr + virtual_page + 1, mask=start_n + 16 < k_len, other=0
-            )
-        else:
-            page1 = tl.load(page_table_ptr + virtual_page + 1)
-        if BOUNDARY_CHECK:
-            page2 = tl.load(
-                page_table_ptr + virtual_page + 2, mask=start_n + 32 < k_len, other=0
-            )
-        else:
-            page2 = tl.load(page_table_ptr + virtual_page + 2)
-        if BOUNDARY_CHECK:
-            page3 = tl.load(
-                page_table_ptr + virtual_page + 3, mask=start_n + 48 < k_len, other=0
-            )
-        else:
-            page3 = tl.load(page_table_ptr + virtual_page + 3)
-        if BOUNDARY_CHECK:
-            page4 = tl.load(
-                page_table_ptr + virtual_page + 4, mask=start_n + 64 < k_len, other=0
-            )
-        else:
-            page4 = tl.load(page_table_ptr + virtual_page + 4)
-        if BOUNDARY_CHECK:
-            page5 = tl.load(
-                page_table_ptr + virtual_page + 5, mask=start_n + 80 < k_len, other=0
-            )
-        else:
-            page5 = tl.load(page_table_ptr + virtual_page + 5)
-        if BOUNDARY_CHECK:
-            page6 = tl.load(
-                page_table_ptr + virtual_page + 6, mask=start_n + 96 < k_len, other=0
-            )
-        else:
-            page6 = tl.load(page_table_ptr + virtual_page + 6)
-        if BOUNDARY_CHECK:
-            page7 = tl.load(
-                page_table_ptr + virtual_page + 7, mask=start_n + 112 < k_len, other=0
-            )
-        else:
-            page7 = tl.load(page_table_ptr + virtual_page + 7)
-        page_id = tl.where(
-            page_slot < 4,
-            tl.where(
-                page_slot < 2,
-                tl.where(page_slot == 0, page0, page1),
-                tl.where(page_slot == 2, page2, page3),
-            ),
-            tl.where(
-                page_slot < 6,
-                tl.where(page_slot == 4, page4, page5),
-                tl.where(page_slot == 6, page6, page7),
-            ),
-        ).to(tl.int64)
-        col_idx = start_n + tl.arange(0, BLOCK_N)
-        col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
-        return (col_idx, page_id, col_idx % 16)
-    else:
-        page_slot = tl.arange(0, BLOCK_N) // 32
-        virtual_page = start_n // 32
-        if BOUNDARY_CHECK:
-            page0 = tl.load(
-                page_table_ptr + virtual_page, mask=start_n < k_len, other=0
-            ).to(tl.int64)
-        else:
-            page0 = tl.load(page_table_ptr + virtual_page).to(tl.int64)
-        if BLOCK_N == 32:
-            page_id = page0
-        elif BLOCK_N == 64:
-            if BOUNDARY_CHECK:
-                page1 = tl.load(
-                    page_table_ptr + virtual_page + 1,
-                    mask=start_n + 32 < k_len,
-                    other=0,
-                ).to(tl.int64)
-            else:
-                page1 = tl.load(page_table_ptr + virtual_page + 1).to(tl.int64)
-            page_id = tl.where(page_slot == 0, page0, page1)
-        elif BLOCK_N == 128:
-            if BOUNDARY_CHECK:
-                page1 = tl.load(
-                    page_table_ptr + virtual_page + 1,
-                    mask=start_n + 32 < k_len,
-                    other=0,
-                ).to(tl.int64)
-                page2 = tl.load(
-                    page_table_ptr + virtual_page + 2,
-                    mask=start_n + 64 < k_len,
-                    other=0,
-                ).to(tl.int64)
-                page3 = tl.load(
-                    page_table_ptr + virtual_page + 3,
-                    mask=start_n + 96 < k_len,
-                    other=0,
-                ).to(tl.int64)
-            else:
-                page1 = tl.load(page_table_ptr + virtual_page + 1).to(tl.int64)
-                page2 = tl.load(page_table_ptr + virtual_page + 2).to(tl.int64)
-                page3 = tl.load(page_table_ptr + virtual_page + 3).to(tl.int64)
-            page_id = tl.where(
-                page_slot == 0,
-                page0,
-                tl.where(page_slot == 1, page1, tl.where(page_slot == 2, page2, page3)),
-            )
-        else:
-            tl.static_assert(False, "Async-TN BLOCK_N must be 32, 64, or 128")
-        col_idx = start_n + tl.arange(0, BLOCK_N)
-        col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
-        page_offset = col_idx % 32
-        return (col_idx, page_id, page_offset)
-
-
-@triton.jit
-def _aligned_online_softmax_stats(
-    scores, row_max, row_sum, scale_softmax_log2, IS_BORDER: tl.constexpr
-):
-    previous_max = row_max
-    row_max = tl.maximum(row_max, tl.max(scores, 1))
-    if IS_BORDER:
-        current_max = tl.where(row_max == float("-inf"), 0.0, row_max)
-    else:
-        current_max = row_max
-    accumulator_scale = tl.math.exp2((previous_max - current_max) * scale_softmax_log2)
-    row_sum *= accumulator_scale
-    max_scaled = tl.where(row_max == float("-inf"), 0.0, row_max * scale_softmax_log2)
-    probabilities = tl.math.exp2(scores * scale_softmax_log2 - max_scaled[:, None])
-    row_sum += tl.sum(probabilities, 1)
-    return (accumulator_scale, probabilities, row_max, row_sum)
 
 
 @libentry()
@@ -830,7 +530,7 @@ def flash_varlen_fwd_d256_tn_aligned_kernel(
     n_block = n_block_max - 1
     for _ in tl.range(0, n_masking_steps):
         start_n = n_block * BLOCK_N
-        (col_idx, page_id, page_offset) = _aligned_paged_tile_coords(
+        (col_idx, page_id, page_offset) = paged_tile_coords(
             start_n,
             k_len,
             page_table_ptr,
@@ -878,7 +578,7 @@ def flash_varlen_fwd_d256_tn_aligned_kernel(
                 mask=col_idx[:, None] < k_len,
                 other=0.0,
             )
-        (acc_scale, probabilities, row_max, row_sum) = _aligned_online_softmax_stats(
+        (acc_scale, probabilities, row_max, row_sum) = online_softmax_stats(
             scores,
             row_max,
             row_sum,
@@ -904,7 +604,7 @@ def flash_varlen_fwd_d256_tn_aligned_kernel(
         n_block_max - n_masking_steps - 1, n_block_min - 1, step=-1
     ):
         start_n = n_block * BLOCK_N
-        (col_idx, page_id, page_offset) = _aligned_paged_tile_coords(
+        (col_idx, page_id, page_offset) = paged_tile_coords(
             start_n,
             k_len,
             page_table_ptr,
@@ -930,7 +630,7 @@ def flash_varlen_fwd_d256_tn_aligned_kernel(
         scores = tl.trans(scores_t)
         v_cache_offset = page_id * v_page_stride + page_offset * v_row_stride
         v0 = tl.load(v_base + v_cache_offset[:, None] + d_idx[None, :])
-        (acc_scale, probabilities, row_max, row_sum) = _aligned_online_softmax_stats(
+        (acc_scale, probabilities, row_max, row_sum) = online_softmax_stats(
             scores,
             row_max,
             row_sum,

@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry, tl_extra_shim
+from flaggems_vllm.utils import libentry
 
 
 @triton.jit
@@ -69,277 +69,173 @@ def compact_ragged_tile_coords(
 
 
 @triton.jit
-def u64_to_lohi(x):
-    return (x >> 32).to(tl.uint32), (x & 0xFFFFFFFF).to(tl.uint32)
-
-
-@triton.jit
-def u64_from_lohi(lo, hi):
-    # Pack the low and high 32-bit words into one 64-bit value.
-    return (hi.to(tl.uint64) << 32) + lo.to(tl.uint64)
-
-
-@triton.jit
-def philox_(seed, subsequence, offset):
-    kPhilox10A: tl.constexpr = 0x9E3779B9
-    kPhilox10B: tl.constexpr = 0xBB67AE85
-    k0, k1 = u64_to_lohi(seed.to(tl.uint64))
-    c0, c1 = u64_to_lohi(offset.to(tl.uint64))
-    c2, c3 = u64_to_lohi(subsequence.to(tl.uint64))
-
-    # pragma unroll
-    kPhiloxSA: tl.constexpr = 0xD2511F53
-    kPhiloxSB: tl.constexpr = 0xCD9E8D57
-    for _ in tl.static_range(6):
-        res0 = kPhiloxSA * c0.to(tl.uint64)
-        res1 = kPhiloxSB * c2.to(tl.uint64)
-        res0_x, res0_y = u64_to_lohi(res0)
-        res1_x, res1_y = u64_to_lohi(res1)
-        c0, c1, c2, c3 = res1_y ^ c1 ^ k0, res1_x, res0_y ^ c3 ^ k1, res0_x
-        k0 += kPhilox10A
-        k1 += kPhilox10B
-
-    res0 = kPhiloxSA * c0.to(tl.uint64)
-    res1 = kPhiloxSB * c2.to(tl.uint64)
-    res0_x, res0_y = u64_to_lohi(res0)
-    res1_x, res1_y = u64_to_lohi(res1)
-    c0, c1, c2, c3 = res1_y ^ c1 ^ k0, res1_x, res0_y ^ c3 ^ k1, res0_x
-
-    return c0, c1, c2, c3
-
-
-@triton.jit
-def apply_dropout_mask(
-    P,
-    mask,
-    encode_dropout_in_sign_bit: tl.constexpr,
-):
-    if encode_dropout_in_sign_bit:
-        P = tl.where(mask, -P, P)
-    else:
-        P = tl.where(mask, (P * 0).to(P.dtype), P)
-    return P
-
-
-@triton.jit
-def apply_dropout(
-    P,
-    row_start,
-    col_start,
-    n_cols,
-    bid,
-    hid,
-    philox_seed,
-    philox_offset,
-    p_dropout_uint8: tl.constexpr,
-    is_dropout: tl.constexpr,
-    encode_dropout_in_sign_bit: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+def paged_tile_coords(
+    start_n,
+    k_len,
+    page_table_ptr,
     BLOCK_N: tl.constexpr,
+    BOUNDARY_CHECK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr = 32,
 ):
-    if is_dropout:
-        row_start = tl.multiple_of(row_start, BLOCK_M)
-        col_start = tl.multiple_of(col_start, BLOCK_N)
-        row = row_start + tl.arange(0, BLOCK_M)[:, None]
-        # Down scale col_idx by 4
-        col = col_start // 4 + tl.arange(0, BLOCK_N // 4)[None, :]
-
-        subsequence = row.to(tl.uint64) * n_cols + col.to(tl.uint64)
-
-        offset = philox_offset + bid * NUM_HEADS + hid
-        offset += subsequence * 0
-        r0, r1, r2, r3 = philox_(philox_seed, subsequence, offset)
-
-        r = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(BLOCK_M, BLOCK_N)
-
-        mask = (r & 0xFF) >= p_dropout_uint8
-
-        P = apply_dropout_mask(
-            P, mask, encode_dropout_in_sign_bit=encode_dropout_in_sign_bit
-        )
-    return P
-
-
-@triton.jit
-def apply_alibi(
-    S,
-    col_idx,
-    row_idx,
-    max_seqlen_q,
-    max_seqlen_k,
-    is_causal: tl.constexpr,
-    is_alibi: tl.constexpr,
-    alibi_slope: tl.constexpr = None,
-):
-    if is_alibi:
-        if is_causal:
-            # The row independent alibi bias renders the same attention output
-            # as with the standard alibi because softmax is shift invariant, i.e.,
-            # softmax(A + bias + const) = softamx(A + bias). The following two
-            # biases are no different if causal is true.
-            # bias_1 = [
-            #   -4, -3, -2,  X, X,
-            #   -4, -3, -2, -1, X,
-            #   -4, -3, -2, -1, 0,
-            # ]
-            # bias_2 = [
-            #   -2, -1, 0,  X,  X,
-            #   -3, -2, -1, 0,  X,
-            #   -4, -3, -2, -1, 0,
-            # ]
-            bias = alibi_slope * (-max_seqlen_k + 1 + col_idx[None, :]).to(tl.float32)
-            S += bias
-        else:
-            bias = -alibi_slope * tl.abs(
-                col_idx[None, :] - max_seqlen_k + max_seqlen_q - row_idx[:, None]
-            ).to(tl.float32)
-            S += bias
-
-    return S
-
-
-@triton.jit
-def apply_mask(
-    S,
-    col_idx,
-    row_idx,
-    max_seqlen_q,
-    max_seqlen_k,
-    window_size_left,
-    window_size_right,
-    is_even_mn: tl.constexpr,
-    is_causal: tl.constexpr,
-    is_local: tl.constexpr,
-):
-    need_mask = is_causal | is_local | (not is_even_mn)
-    # need_mask: tl.constexpr = is_causal | is_local
-    if need_mask:
-        # Extra care should be taken to void one-off errors: both col_lb and col_rb are inclusive!
-        col_lb = max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left)
-        col_rb = min(
-            max_seqlen_k - 1, row_idx + max_seqlen_k - max_seqlen_q + window_size_right
-        )
-
-        if is_causal:
-            S = tl.where(col_idx[None, :] > col_rb[:, None], float("-inf"), S)
-
-        if is_local:
-            S = tl.where(
-                (col_idx[None, :] > col_rb[:, None])
-                | (col_idx[None, :] < col_lb[:, None]),
-                float("-inf"),
-                S,
+    """Resolve physical rows from the page table."""
+    if PAGE_SIZE == 16:
+        tl.static_assert(BLOCK_N == 128, "page16 scalar gather requires BN128")
+        page_slot = tl.arange(0, BLOCK_N) // 16
+        virtual_page = start_n // 16
+        if BOUNDARY_CHECK:
+            page0 = tl.load(
+                page_table_ptr + virtual_page + 0, mask=start_n + 0 < k_len, other=0
             )
-
-        if (not is_local) & (not is_causal) & (not is_even_mn):
-            S = tl.where(col_idx[None, :] >= max_seqlen_k, float("-inf"), S)
-
-    return S
-
-
-@triton.jit
-def softmax_rescale(
-    O_acc,
-    S,
-    row_max,
-    row_sum,
-    softmax_scale_log2e: tl.constexpr,
-    is_border: tl.constexpr,
-    # is_init: tl.constexpr
-):
-    prev_max = row_max
-    row_max = tl.maximum(row_max, tl.max(S, 1))
-
-    if is_border:
-        cur_max = tl.where(row_max == float("-inf"), 0, row_max)
-    else:
-        cur_max = row_max
-
-    p_scale = tl.math.exp2((prev_max - cur_max) * softmax_scale_log2e)
-    row_sum *= p_scale
-    O_acc *= p_scale[:, None]
-
-    max_scaled = tl.where(row_max == float("-inf"), 0, row_max * softmax_scale_log2e)
-    P = tl.math.exp2(S * softmax_scale_log2e - max_scaled[:, None])
-    row_sum = row_sum + tl.sum(P, 1)
-    return O_acc, P, row_max, row_sum
-
-
-@triton.jit
-def apply_softcap(S, softcap, is_softcap: tl.constexpr):
-    if is_softcap:
-        S = tl_extra_shim.tanh(S * softcap)
-
-    return S
-
-
-@triton.jit
-def virtual_to_cache_offset(
-    virtual_index,
-    max_virtual_index,
-    page_table_ptr,
-    block_size,
-    k_row_stride,
-    k_page_stride,
-    boundary_check: tl.constexpr = False,
-):
-    # virtual_index is the kv sequence index in the current batch element
-    # page_table_ptr is already pointed at current batch element's block table entry
-    # block_size is the size of each block in the page table
-    virtual_page_index = virtual_index // block_size
-    page_offset = virtual_index % block_size
-    if boundary_check:
-        page_block_index = tl.load(
-            page_table_ptr + virtual_page_index,
-            mask=virtual_index < max_virtual_index,
-            other=0,
+        else:
+            page0 = tl.load(page_table_ptr + virtual_page + 0)
+        if BOUNDARY_CHECK:
+            page1 = tl.load(
+                page_table_ptr + virtual_page + 1, mask=start_n + 16 < k_len, other=0
+            )
+        else:
+            page1 = tl.load(page_table_ptr + virtual_page + 1)
+        if BOUNDARY_CHECK:
+            page2 = tl.load(
+                page_table_ptr + virtual_page + 2, mask=start_n + 32 < k_len, other=0
+            )
+        else:
+            page2 = tl.load(page_table_ptr + virtual_page + 2)
+        if BOUNDARY_CHECK:
+            page3 = tl.load(
+                page_table_ptr + virtual_page + 3, mask=start_n + 48 < k_len, other=0
+            )
+        else:
+            page3 = tl.load(page_table_ptr + virtual_page + 3)
+        if BOUNDARY_CHECK:
+            page4 = tl.load(
+                page_table_ptr + virtual_page + 4, mask=start_n + 64 < k_len, other=0
+            )
+        else:
+            page4 = tl.load(page_table_ptr + virtual_page + 4)
+        if BOUNDARY_CHECK:
+            page5 = tl.load(
+                page_table_ptr + virtual_page + 5, mask=start_n + 80 < k_len, other=0
+            )
+        else:
+            page5 = tl.load(page_table_ptr + virtual_page + 5)
+        if BOUNDARY_CHECK:
+            page6 = tl.load(
+                page_table_ptr + virtual_page + 6, mask=start_n + 96 < k_len, other=0
+            )
+        else:
+            page6 = tl.load(page_table_ptr + virtual_page + 6)
+        if BOUNDARY_CHECK:
+            page7 = tl.load(
+                page_table_ptr + virtual_page + 7, mask=start_n + 112 < k_len, other=0
+            )
+        else:
+            page7 = tl.load(page_table_ptr + virtual_page + 7)
+        page_id = tl.where(
+            page_slot < 4,
+            tl.where(
+                page_slot < 2,
+                tl.where(page_slot == 0, page0, page1),
+                tl.where(page_slot == 2, page2, page3),
+            ),
+            tl.where(
+                page_slot < 6,
+                tl.where(page_slot == 4, page4, page5),
+                tl.where(page_slot == 6, page6, page7),
+            ),
         ).to(tl.int64)
+        col_idx = start_n + tl.arange(0, BLOCK_N)
+        col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
+        return (col_idx, page_id, col_idx % 16)
     else:
-        page_block_index = tl.load(page_table_ptr + virtual_page_index).to(tl.int64)
-    return page_block_index * k_page_stride + page_offset * k_row_stride
+        page_slot = tl.arange(0, BLOCK_N) // 32
+        virtual_page = start_n // 32
+        if BOUNDARY_CHECK:
+            page0 = tl.load(
+                page_table_ptr + virtual_page, mask=start_n < k_len, other=0
+            ).to(tl.int64)
+        else:
+            page0 = tl.load(page_table_ptr + virtual_page).to(tl.int64)
+        if BLOCK_N == 32:
+            page_id = page0
+        elif BLOCK_N == 64:
+            if BOUNDARY_CHECK:
+                page1 = tl.load(
+                    page_table_ptr + virtual_page + 1,
+                    mask=start_n + 32 < k_len,
+                    other=0,
+                ).to(tl.int64)
+            else:
+                page1 = tl.load(page_table_ptr + virtual_page + 1).to(tl.int64)
+            page_id = tl.where(page_slot == 0, page0, page1)
+        elif BLOCK_N == 128:
+            if BOUNDARY_CHECK:
+                page1 = tl.load(
+                    page_table_ptr + virtual_page + 1,
+                    mask=start_n + 32 < k_len,
+                    other=0,
+                ).to(tl.int64)
+                page2 = tl.load(
+                    page_table_ptr + virtual_page + 2,
+                    mask=start_n + 64 < k_len,
+                    other=0,
+                ).to(tl.int64)
+                page3 = tl.load(
+                    page_table_ptr + virtual_page + 3,
+                    mask=start_n + 96 < k_len,
+                    other=0,
+                ).to(tl.int64)
+            else:
+                page1 = tl.load(page_table_ptr + virtual_page + 1).to(tl.int64)
+                page2 = tl.load(page_table_ptr + virtual_page + 2).to(tl.int64)
+                page3 = tl.load(page_table_ptr + virtual_page + 3).to(tl.int64)
+            page_id = tl.where(
+                page_slot == 0,
+                page0,
+                tl.where(page_slot == 1, page1, tl.where(page_slot == 2, page2, page3)),
+            )
+        else:
+            tl.static_assert(False, "Async-TN BLOCK_N must be 32, 64, or 128")
+        col_idx = start_n + tl.arange(0, BLOCK_N)
+        col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_N), BLOCK_N)
+        page_offset = col_idx % 32
+        return (col_idx, page_id, page_offset)
 
 
 @triton.jit
-def load_from_kvcache(
-    virtual_index,
-    max_virtual_index,
-    page_table_ptr,
-    k_ptr_base,
-    v_ptr_base,
-    block_size,
-    d: tl.constexpr,
-    k_row_stride,
-    BLOCK_K: tl.constexpr,
-    k_page_stride=0,
-    boundary_check: tl.constexpr = False,
+def online_softmax_stats(
+    scores, row_max, row_sum, scale_softmax_log2, IS_BORDER: tl.constexpr
 ):
-    cache_offset = virtual_to_cache_offset(
-        virtual_index,
-        max_virtual_index,
-        page_table_ptr,
-        block_size,
-        k_row_stride,
-        k_page_stride,
-        boundary_check,
-    )
-    k_offset = tl.arange(0, BLOCK_K)[:, None] + cache_offset[None, :]
-    v_offset = tl.arange(0, BLOCK_K)[None, :] + cache_offset[:, None]
-    if d == BLOCK_K:
-        bK_mask = virtual_index[None, :] < max_virtual_index[None, :]
-        bV_mask = virtual_index[:, None] < max_virtual_index[:, None]
-        bK = tl.load(k_ptr_base + k_offset, mask=bK_mask, other=0.0)
-        bV = tl.load(v_ptr_base + v_offset, mask=bV_mask, other=0.0)
+    previous_max = row_max
+    row_max = tl.maximum(row_max, tl.max(scores, 1))
+    if IS_BORDER:
+        current_max = tl.where(row_max == float("-inf"), 0.0, row_max)
     else:
-        bK_mask = (tl.arange(0, BLOCK_K)[:, None] < d) & (
-            virtual_index[None, :] < max_virtual_index[None, :]
-        )
-        bV_mask = (tl.arange(0, BLOCK_K)[None, :] < d) & (
-            virtual_index[:, None] < max_virtual_index[:, None]
-        )
-        bK = tl.load(k_ptr_base + k_offset, mask=bK_mask, other=0.0)
-        bV = tl.load(v_ptr_base + v_offset, mask=bV_mask, other=0.0)
-    return bK, bV
+        current_max = row_max
+    accumulator_scale = tl.math.exp2((previous_max - current_max) * scale_softmax_log2)
+    row_sum *= accumulator_scale
+    max_scaled = tl.where(row_max == float("-inf"), 0.0, row_max * scale_softmax_log2)
+    probabilities = tl.math.exp2(scores * scale_softmax_log2 - max_scaled[:, None])
+    row_sum += tl.sum(probabilities, 1)
+    return (accumulator_scale, probabilities, row_max, row_sum)
+
+
+@triton.jit
+def scaled_online_softmax_stats(
+    scores, row_max, row_sum, scale_softmax_log2, IS_BORDER: tl.constexpr
+):
+    scores *= scale_softmax_log2
+    previous_max = row_max
+    row_max = tl.maximum(row_max, tl.max(scores, 1))
+    if IS_BORDER:
+        current_max = tl.where(row_max == float("-inf"), 0.0, row_max)
+    else:
+        current_max = row_max
+    accumulator_scale = tl.math.exp2(previous_max - current_max)
+    row_sum *= accumulator_scale
+    max_scaled = tl.where(row_max == float("-inf"), 0.0, row_max)
+    probabilities = tl.math.exp2(scores - max_scaled[:, None])
+    row_sum += tl.sum(probabilities, 1)
+    return (accumulator_scale, probabilities, row_max, row_sum)
 
 
 @libentry()

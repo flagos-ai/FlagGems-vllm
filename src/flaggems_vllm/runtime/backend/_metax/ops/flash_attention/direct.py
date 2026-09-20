@@ -19,8 +19,7 @@ import triton.language as tl
 
 import flaggems_vllm
 from flaggems_vllm import runtime
-from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+from flaggems_vllm.ops.flash_kernel import (
     apply_alibi,
     apply_dropout,
     apply_mask,
@@ -28,6 +27,7 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     load_from_kvcache,
     softmax_rescale,
 )
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
 logger = logging.getLogger(__name__)
