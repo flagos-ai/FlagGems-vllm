@@ -12,6 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""MetaX-specialized fused inverse-RoPE + FP8 group quant for DeepSeek-V4.
+
+On MetaX, triton lowers `.to(tl.float8e4nv)` to a software sequence that runs
+at roughly half the achievable load/store bandwidth (measured ~716 GB/s vs
+~1446 GB/s for a pure int8-view copy on C550). This variant replaces it with:
+
+1. A software RNE fp32 -> e4m3fn encoder built from integer bit operations
+   (bit-identical to the hardware cast, verified over dense random coverage
+   including subnormal-to-normal carry boundaries), storing fp8 bytes through
+   an int8 pointer view.
+2. A compact RoPE stage: the rope region is loaded once at [ROPE_DIM] width
+   and the partner value is recovered arithmetically as
+   ``pair_sum - x`` instead of re-loading it through a full-width
+   ``x[k ^ 1]`` masked load; cos/sin are read at [HALF_ROPE] width instead of
+   full-width masked loads. The rotated values are spliced back through a
+   [HEAD_DIM // ROPE_DIM, ROPE_DIM] block-shaped `where`.
+3. Reciprocal multiplication (``r = fp8_max / absmax``, ``y = x * r``) instead
+   of per-element division. For power-of-two scales the reciprocal is exact,
+   so the TMA path stays bit-identical to the reference; on the fp32-scale
+   path only ~0.03% of bytes flip by one step at subnormal tie boundaries.
+
+Fallback: shapes whose rope_dim is not a power of two or does not divide
+head_dim (never hit by DeepSeek-V4 configs) use the general implementation.
+"""
+
+import importlib
 import logging
 from typing import Optional, Tuple
 
@@ -20,6 +46,12 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
+
+# `flaggems_vllm` rebinds its top-level `fused_inv_rope_fp8_quant` attribute to
+# the vendor-specific function (SpecOpRegistrar), so importing the name from
+# the package would yield this function instead of the general one;
+# import_module returns the general module itself.
+_general_module = importlib.import_module("flaggems_vllm.ops.fused_inv_rope_fp8_quant")
 
 if kernel_supports_fp8_e4m3():
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
@@ -32,6 +64,31 @@ logger = logging.getLogger(__name__)
 
 def _get_tma_aligned_size(size: int, align: int) -> int:
     return ((size + align - 1) // align) * align
+
+
+@triton.jit
+def _encode_fp8e4m3(x, FP8_MAX: tl.constexpr):
+    """Round-to-nearest-even fp32 -> e4m3fn encoder, bit-identical to the
+    hardware ``.to(tl.float8e4nv)`` cast (NaN inputs excluded)."""
+    bits = x.to(tl.int32, bitcast=True)
+    neg = bits < 0
+    a = (bits & 0x7FFFFFFF).to(tl.float32, bitcast=True)
+    a = tl.minimum(a, FP8_MAX)
+    Ef = a.to(tl.int32, bitcast=True) >> 23
+    # map onto the e4m3 grid: normals scale by 2^(130-Ef), subnormals by 2^9
+    pw = ((tl.minimum(130 - Ef, 9) + 127) << 23).to(tl.float32, bitcast=True)
+    v = a * pw  # grid points land on integers
+    vi = v.to(tl.int32)
+    frac = v - vi.to(tl.float32)
+    inc = (frac > 0.5) | ((frac == 0.5) & ((vi & 1) != 0))
+    m = vi + tl.where(inc, 1, 0)
+    m16 = m == 16
+    m8sub = (m == 8) & (Ef < 121)  # subnormal rounding up to smallest normal
+    carry = m16 | m8sub
+    mm = tl.where(carry, 8, m)
+    Ef2 = Ef + tl.where(carry, 1, 0)
+    byte = tl.where(m >= 8, ((Ef2 - 120) << 3) | (mm - 8), mm)
+    return (byte | tl.where(neg, 0x80, 0)).to(tl.int8)
 
 
 @triton.jit
@@ -54,8 +111,9 @@ def _fused_inv_rope_fp8_quant_per_head(
     eps: tl.constexpr,
     QUANT_GROUP_SIZE: tl.constexpr,
     CHUNKS_PER_HEAD: tl.constexpr,
-    ROPE_START: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     HALF_ROPE: tl.constexpr,
+    NBLOCKS: tl.constexpr,
     TMA_ALIGNED_SCALES: tl.constexpr,
 ):
     pid_token = tl.program_id(0).to(tl.int64)
@@ -64,7 +122,6 @@ def _fused_inv_rope_fp8_quant_per_head(
     g = pid_gh // heads_per_group
     head_in_group = pid_gh % heads_per_group
     global_head = pid_gh
-    qb_start = head_in_group * CHUNKS_PER_HEAD
 
     if pid_token >= num_tokens:
         if TMA_ALIGNED_SCALES:
@@ -77,7 +134,7 @@ def _fused_inv_rope_fp8_quant_per_head(
             tl.store(scale_addr, tl.zeros((), dtype=tl.int32))
         else:
             block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-            qb_indices = qb_start + block_offsets
+            qb_indices = head_in_group * CHUNKS_PER_HEAD + block_offsets
             scale_addrs = (
                 scale_ptr
                 + g * scale_stride_group
@@ -87,55 +144,64 @@ def _fused_inv_rope_fp8_quant_per_head(
             tl.store(scale_addrs, tl.zeros((CHUNKS_PER_HEAD,), dtype=tl.float32))
         return
 
-    input_base = o_ptr + pid_token * o_stride_token + global_head * o_stride_head
-
     HEAD_DIM: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
-    offsets = tl.arange(0, HEAD_DIM)
-    x = tl.load(input_base + offsets).to(tl.float32)
+    cols = tl.arange(0, HEAD_DIM)
+    o_base = o_ptr + pid_token * o_stride_token + global_head * o_stride_head
+    x = tl.load(o_base + cols).to(tl.float32)
 
-    rope_abs_start: tl.constexpr = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE + ROPE_START
+    # --- compact inverse RoPE on the trailing rope segment ---
+    rope_abs_start: tl.constexpr = HEAD_DIM - ROPE_DIM
+    rope_cols = tl.arange(0, ROPE_DIM)
+    xr = tl.load(o_base + rope_abs_start + rope_cols).to(tl.float32)
     pos = tl.load(positions_ptr + pid_token)
     cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
-    is_rope = offsets >= rope_abs_start
-    rope_local = offsets - rope_abs_start
+    j = tl.arange(0, HALF_ROPE)
+    cos_v = tl.load(cache_base + j)
+    sin_v = tl.load(cache_base + HALF_ROPE + j)
 
-    x_partner = tl.load(input_base + (offsets ^ 1), mask=is_rope, other=0.0).to(
-        tl.float32
-    )
-    cs_idx = tl.maximum(rope_local >> 1, 0)
-    cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
-    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
-    x_add = x * cos_v + x_partner * sin_v
-    x_sub = x * cos_v - x_partner * sin_v
-    is_even = (rope_local & 1) == 0
-    rotated = tl.where(is_even, x_add, x_sub)
-    x = tl.where(is_rope, rotated, x)
+    # pairs are interleaved (even, odd); partner of each lane is the other
+    # lane of its pair, recoverable as pair_sum - x without a second load
+    pairs = tl.reshape(xr, (HALF_ROPE, 2))
+    pair_sum = tl.sum(pairs, axis=1)
+    partner = pair_sum[:, None] - pairs
+    sgn = tl.where(tl.arange(0, 2)[None, :] == 0, 1.0, -1.0)
+    rope_out = pairs * cos_v[:, None] + partner * sin_v[:, None] * sgn
+    rope_out = tl.reshape(rope_out, (ROPE_DIM,))
+    # splice: [HEAD_DIM] -> [NBLOCKS, ROPE_DIM]; rope is the last block
+    xb = tl.reshape(x, (NBLOCKS, ROPE_DIM))
+    xb = tl.where(tl.arange(0, NBLOCKS)[:, None] == NBLOCKS - 1, rope_out[None, :], xb)
+    x = tl.reshape(xb, (HEAD_DIM,))
 
+    # --- per-group absmax quant ---
     x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
     block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
-    scales = block_absmax * (1.0 / fp8_max)
     if TMA_ALIGNED_SCALES:
+        scales = block_absmax * (1.0 / fp8_max)
         scales = tl.math.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scales), 1e-10))))
-
-    scales_exp = tl.reshape(
+        recip = 1.0 / scales  # exact for powers of two
+    else:
+        scales = block_absmax * (1.0 / fp8_max)
+        recip = fp8_max / block_absmax
+    recip_exp = tl.reshape(
         tl.broadcast_to(
-            tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
+            tl.reshape(recip, (CHUNKS_PER_HEAD, 1)),
             (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    y = x * recip_exp
+    q_bytes = _encode_fp8e4m3(y, FP8_MAX=fp8_max)
 
     fp8_base = (
-        fp8_ptr
+        fp8_ptr.to(tl.pointer_type(tl.int8))
         + g * fp8_stride_group
         + pid_token * fp8_stride_token
-        + qb_start * QUANT_GROUP_SIZE
+        + head_in_group * HEAD_DIM
     )
-    tl.store(fp8_base + offsets, x_quant)
+    tl.store(fp8_base + cols, q_bytes)
 
     block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-    qb_indices = qb_start + block_offsets
+    qb_indices = head_in_group * CHUNKS_PER_HEAD + block_offsets
     if TMA_ALIGNED_SCALES:
         scale_bits = scales.to(tl.int32, bitcast=True)
         ue8m0_bytes = (scale_bits >> 23) & 0xFF
@@ -152,6 +218,16 @@ def _fused_inv_rope_fp8_quant_per_head(
             scale_ptr + g * scale_stride_group + pid_token + qb_indices * scale_stride_k
         )
         tl.store(scale_addrs, scales)
+
+
+def _compact_rope_supported(head_dim: int, rope_dim: int) -> bool:
+    # tl.arange power-of-two requirements plus the block-splice divisibility;
+    # head_dim being a power of two is already required by the general kernel
+    if head_dim & (head_dim - 1) != 0:
+        return False
+    if rope_dim & (rope_dim - 1) != 0:
+        return False
+    return head_dim % rope_dim == 0
 
 
 def fused_inv_rope_fp8_quant(
@@ -197,6 +273,21 @@ def fused_inv_rope_fp8_quant(
     assert rope_dim % 2 == 0
     assert cos_sin_cache.shape[-1] == rope_dim
     assert cos_sin_cache.dtype == torch.float32
+
+    if not _compact_rope_supported(head_dim, rope_dim):
+        return _general_module.fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups,
+            heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            quant_group_size=quant_group_size,
+            eps=eps,
+            dtype=dtype,
+            tma_aligned_scales=tma_aligned_scales,
+        )
 
     chunks_per_head = head_dim // quant_group_size
     if tma_aligned_scales:
@@ -246,8 +337,9 @@ def fused_inv_rope_fp8_quant(
         eps=eps,
         QUANT_GROUP_SIZE=quant_group_size,
         CHUNKS_PER_HEAD=chunks_per_head,
-        ROPE_START=nope_dim % quant_group_size,
+        ROPE_DIM=rope_dim,
         HALF_ROPE=rope_dim // 2,
+        NBLOCKS=head_dim // rope_dim,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
         num_warps=1,
         num_stages=1,
