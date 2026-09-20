@@ -28,6 +28,7 @@
     },
     "mthreads-musa520": {
       "tests_allow": [
+        "tests/test_fused_inv_rope_fp8_quant.py",
         "tests/test_scaled_int8_quant.py",
         "tests/test_add_rms_norm.py",
         "tests/test_silu_and_mul.py",

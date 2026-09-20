@@ -19,6 +19,7 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops import per_token_group_quant_fp8
+from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import accuracy_utils as utils
 
@@ -30,6 +31,7 @@ EPS = 1e-10
 
 HAS_NATIVE_FP8 = hasattr(torch, "float8_e4m3fn") and (
     flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
+    or (flaggems_vllm.vendor_name == "mthreads" and get_device_capability() >= (3, 1))
 )
 
 
@@ -231,6 +233,7 @@ def _unfused_inv_rope_fp8_quant(
     o_fp8, o_scale = per_token_group_quant_fp8(
         o_flat,
         group_size=quant_group_size,
+        dtype=torch.float8_e4m3fn,
         scale_ue8m0=tma_aligned_scales,
     )
     o_fp8 = o_fp8.view(n_groups, num_tokens, d).transpose(0, 1)
@@ -306,6 +309,7 @@ def _run_case(
             cos_sin_cache,
             n_groups,
             heads_per_group,
+            dtype=torch.float8_e4m3fn,
             tma_aligned_scales=tma_aligned_scales,
         )
 
@@ -616,3 +620,280 @@ def test_with_real_deepseek_v4_rope(num_tokens, tma_aligned_scales):
         result["heads_per_group"],
         msg="Real DeepSeek V4 rope",
     )
+
+
+def _edge_inputs(num_tokens=7, num_heads=8):
+    device = flaggems_vllm.device
+    o = torch.randn(
+        num_tokens, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cache = _make_cos_sin_cache(max(16, num_tokens), ROPE_DIM, torch.device(device))
+    return o, positions, cache
+
+
+def _call_edge(o, positions, cache, tma_aligned_scales, **kwargs):
+    kwargs.setdefault("dtype", torch.float8_e4m3fn)
+    return flaggems_vllm.fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cache,
+        1,
+        o.shape[1],
+        tma_aligned_scales=tma_aligned_scales,
+        **kwargs,
+    )
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize(
+    "num_tokens", [512] if utils.QUICK_MODE else [512, 1024, 2048, 4096]
+)
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_prefill_shapes(num_tokens, tma_aligned_scales):
+    result = _run_case(num_tokens, 64, 8, tma_aligned_scales)
+    _assert_dequant_close(
+        result["out"],
+        result["scale"],
+        result["ref_out"],
+        result["ref_scale"],
+        result["heads_per_group"],
+        msg="medium and long prefill",
+    )
+    o_after_rope = _reference_inv_rope(
+        result["o"], result["positions"], result["cos_sin_cache"]
+    ).view(num_tokens, 8, result["heads_per_group"] * HEAD_DIM)
+    dequant = _dequantize(
+        result["out"], result["scale"], result["heads_per_group"], QUANT_GROUP_SIZE
+    )
+    abs_err = (dequant.float() - o_after_rope.float()).abs()
+    rel_err = abs_err / o_after_rope.float().abs().clamp(min=1e-6)
+    mean_rel_err = rel_err.mean().item()
+    assert (
+        mean_rel_err < 0.15
+    ), f"Mean relative error too high: {mean_rel_err:.4f} (expected < 0.15)"
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("value", [0.0, 2.0**-40])
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_zero_and_tiny_values(value, tma_aligned_scales):
+    o, positions, cache = _edge_inputs()
+    o.fill_(value)
+    positions.zero_()
+    out, scale = _call_edge(o, positions, cache, tma_aligned_scales)
+    ref_out, ref_scale = native_fused_inv_rope_fp8_quant(
+        o, positions, cache, 1, o.shape[1], tma_aligned_scales=tma_aligned_scales
+    )
+    assert out.dtype == torch.float8_e4m3fn
+    assert torch.equal(out.view(torch.uint8), ref_out.view(torch.uint8))
+    torch.testing.assert_close(scale, ref_scale, rtol=1e-6, atol=0)
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_custom_epsilon(tma_aligned_scales):
+    o, positions, cache = _edge_inputs()
+    o.zero_()
+    eps = 1e-6
+    out, scale = _call_edge(o, positions, cache, tma_aligned_scales, eps=eps)
+    if tma_aligned_scales:
+        scale = _unpack_ue8m0_scales(scale, HEAD_DIM // QUANT_GROUP_SIZE)
+    expected_scale = eps / torch.finfo(torch.float8_e4m3fn).max
+    if tma_aligned_scales:
+        expected_scale = 2.0 ** math.ceil(math.log2(max(expected_scale, EPS)))
+    assert torch.count_nonzero(out.float()).item() == 0
+    torch.testing.assert_close(
+        scale, torch.full_like(scale, expected_scale), rtol=1e-6, atol=0
+    )
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_empty_tokens(tma_aligned_scales):
+    o, positions, cache = _edge_inputs(num_tokens=0)
+    out, scale = _call_edge(o, positions, cache, tma_aligned_scales)
+    assert out.shape == (0, 1, 8 * HEAD_DIM)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.device == o.device
+    assert scale.shape == (0, 1, 8 if tma_aligned_scales else 32)
+    assert scale.dtype == (torch.int32 if tma_aligned_scales else torch.float32)
+    assert scale.device == o.device
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_scale_padding_is_zero(num_tokens, tma_aligned_scales):
+    result = _run_case(num_tokens, 32, 4, tma_aligned_scales)
+    scale = result["scale"]
+    aligned_tokens = (num_tokens + 3) // 4 * 4
+    assert scale.stride() == (1, scale.shape[2] * aligned_tokens, aligned_tokens)
+    storage_view = scale.as_strided(
+        (aligned_tokens, scale.shape[1], scale.shape[2]), scale.stride()
+    )
+    assert torch.count_nonzero(storage_view[num_tokens:]).item() == 0
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("layout", ["token", "head", "cache"])
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_strided_outer_dimensions(layout, tma_aligned_scales):
+    o, positions, cache = _edge_inputs()
+    if layout == "token":
+        storage = torch.empty(
+            o.shape[0] * 2, o.shape[1], HEAD_DIM, dtype=o.dtype, device=o.device
+        )
+        storage[::2].copy_(o)
+        o = storage[::2]
+    elif layout == "head":
+        storage = torch.empty(
+            o.shape[0], o.shape[1] * 2, HEAD_DIM, dtype=o.dtype, device=o.device
+        )
+        storage[:, ::2].copy_(o)
+        o = storage[:, ::2]
+    else:
+        storage = torch.empty(
+            cache.shape[0] * 2, ROPE_DIM, dtype=cache.dtype, device=cache.device
+        )
+        storage[::2].copy_(cache)
+        cache = storage[::2]
+    out, scale = _call_edge(o, positions, cache, tma_aligned_scales)
+    ref_out, ref_scale = native_fused_inv_rope_fp8_quant(
+        o, positions, cache, 1, o.shape[1], tma_aligned_scales=tma_aligned_scales
+    )
+    _assert_dequant_close(out, scale, ref_out, ref_scale, o.shape[1])
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_repeated_calls_observe_mutation(tma_aligned_scales):
+    o, positions, cache = _edge_inputs()
+    addresses = [x.data_ptr() for x in (o, positions, cache)]
+    previous = None
+    for iteration in range(2):
+        if iteration:
+            o.add_(0.75)
+            positions.add_(1)
+            cache.mul_(0.5)
+        snapshots = [x.clone() for x in (o, positions, cache)]
+        out, scale = _call_edge(o, positions, cache, tma_aligned_scales)
+        for actual, saved, address in zip((o, positions, cache), snapshots, addresses):
+            assert actual.data_ptr() == address
+            assert torch.equal(actual, saved), "operator mutated an input"
+        ref_out, ref_scale = native_fused_inv_rope_fp8_quant(
+            o, positions, cache, 1, o.shape[1], tma_aligned_scales=tma_aligned_scales
+        )
+        _assert_dequant_close(out, scale, ref_out, ref_scale, o.shape[1])
+        assert out.data_ptr() != o.data_ptr()
+        if previous is not None:
+            assert not torch.equal(out.view(torch.uint8), previous.view(torch.uint8))
+        previous = out
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MUSA dispatch contract"
+)
+def test_musa_public_dispatch():
+    from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
+        fused_inv_rope_fp8_quant,
+    )
+
+    assert flaggems_vllm.fused_inv_rope_fp8_quant is fused_inv_rope_fp8_quant
+    assert flaggems_vllm.ops_inv_rope_fp8_quant is fused_inv_rope_fp8_quant
+    assert any(
+        name == "fused_inv_rope_fp8_quant" and function is fused_inv_rope_fp8_quant
+        for name, function in flaggems_vllm._FULL_CONFIG
+    )
+    o, positions, cache = _edge_inputs()
+    out, _ = flaggems_vllm.fused_inv_rope_fp8_quant(o, positions, cache, 1, o.shape[1])
+    assert out.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MUSA input contract"
+)
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "positions_stride",
+        "cache_stride",
+        "input_stride",
+        "input_dtype",
+        "positions_dtype",
+        "cache_dtype",
+        "head_dim",
+        "output_dtype",
+        "quant_group_size",
+    ],
+)
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_musa_rejects_unsupported_inputs(invalid, tma_aligned_scales):
+    o, positions, cache = _edge_inputs()
+    kwargs = {}
+    if invalid == "positions_stride":
+        positions = torch.zeros(2 * o.shape[0], dtype=positions.dtype, device=o.device)[
+            ::2
+        ]
+    elif invalid == "cache_stride":
+        cache = torch.zeros(cache.shape[0], 2 * ROPE_DIM, device=o.device)[:, ::2]
+    elif invalid == "input_stride":
+        o = torch.zeros(*o.shape[:-1], 2 * HEAD_DIM, dtype=o.dtype, device=o.device)[
+            ..., ::2
+        ]
+    elif invalid == "input_dtype":
+        o = o.float()
+    elif invalid == "positions_dtype":
+        positions = positions.float()
+    elif invalid == "cache_dtype":
+        cache = cache.bfloat16()
+    elif invalid == "head_dim":
+        o = o[..., :256]
+        kwargs["nope_dim"] = 192
+    elif invalid == "output_dtype":
+        kwargs["dtype"] = torch.float32
+    else:
+        kwargs["quant_group_size"] = 64
+    with pytest.raises((AssertionError, ValueError, NotImplementedError)):
+        _call_edge(o, positions, cache, tma_aligned_scales, **kwargs)
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_prefill_head_tail_and_strides(tma_aligned_scales):
+    torch.manual_seed(42)
+    device = flaggems_vllm.device
+    o = torch.randn(258, 20, HEAD_DIM, dtype=torch.bfloat16, device=device)[::2, ::2]
+    positions = torch.arange(129, dtype=torch.int64, device=device)
+    cache = _make_cos_sin_cache(512, ROPE_DIM, torch.device(device))[::2]
+    out, scale = flaggems_vllm.fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cache,
+        2,
+        5,
+        dtype=torch.float8_e4m3fn,
+        tma_aligned_scales=tma_aligned_scales,
+    )
+    ref_out, ref_scale = native_fused_inv_rope_fp8_quant(
+        o, positions, cache, 2, 5, tma_aligned_scales=tma_aligned_scales
+    )
+    _assert_dequant_close(out, scale, ref_out, ref_scale, 5)
+    dequant = _dequantize(out, scale, 5, QUANT_GROUP_SIZE)
+    reference = _reference_inv_rope(o, positions, cache).reshape(129, 2, 5 * HEAD_DIM)
+    relative_error = (
+        dequant - reference.float()
+    ).abs() / reference.float().abs().clamp(min=1e-6)
+    assert relative_error.mean().item() < 0.15
+    padded_scale = scale.as_strided((132, 2, scale.shape[-1]), scale.stride())
+    assert torch.count_nonzero(padded_scale[129:]).item() == 0

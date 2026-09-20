@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -38,6 +41,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
+    "fused_inv_rope_fp8_quant",
     "grouped_topk",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
