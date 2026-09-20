@@ -25,6 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "src/flaggems_vllm"
 BACKEND_ROOT = PACKAGE_ROOT / "runtime/backend"
 CANONICAL_PACKAGE = "flaggems_vllm"
+# Third-party imports can share a name with nested operator packages.
+# Match exact modules so bare internal paths such as flash_attn.launcher fail.
+EXTERNAL_MODULES = {"flash_attn"}
 
 
 def production_operator_files() -> list[Path]:
@@ -72,6 +75,8 @@ def non_absolute_internal_imports(
                 f"{CANONICAL_PACKAGE}."
             ):
                 continue
+            if module_name in EXTERNAL_MODULES:
+                continue
             if module_name.partition(".")[0] in internal_names:
                 violations.append((node.lineno, lines[node.lineno - 1].strip()))
                 break
@@ -115,6 +120,30 @@ class AbsoluteOperatorImportTest(unittest.TestCase):
             [
                 (1, "from .scaled_int8_quant import scaled_int8_quant"),
                 (2, "from backend_utils import VendorDescriptor"),
+            ],
+        )
+
+    def test_scanner_distinguishes_external_flash_attn_from_internal_imports(self):
+        source = "\n".join(
+            (
+                "import flash_attn",
+                "import flash_attn as native_flash_attn",
+                "from flash_attn import flash_attn_func, flash_attn_varlen_func",
+                "from .flash_attn import launch_attention",
+                "from flash_attn.launcher import launch_attention",
+                "import flash_attn.common",
+                "from launcher import launch_attention",
+                "from flaggems_vllm.runtime.backend._metax.ops.flash_attn import launch_attention",
+            )
+        )
+
+        self.assertEqual(
+            non_absolute_internal_imports(source, {"flash_attn", "launcher"}),
+            [
+                (4, "from .flash_attn import launch_attention"),
+                (5, "from flash_attn.launcher import launch_attention"),
+                (6, "import flash_attn.common"),
+                (7, "from launcher import launch_attention"),
             ],
         )
 

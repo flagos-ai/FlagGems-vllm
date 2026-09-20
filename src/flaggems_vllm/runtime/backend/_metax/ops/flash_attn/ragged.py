@@ -18,11 +18,15 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+    compact_ragged_tile_coords,
+    tn_compile_scenario,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.direct import launch_direct
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+    launch_d256_tn_direct,
+)
 from flaggems_vllm.utils import libentry
-
-from .common import compact_ragged_tile_coords, tn_compile_scenario
-from .direct import launch_direct
-from .tn_direct import launch_d256_tn_direct
 
 
 def compact_worklist_task_upper_bound(total_q, batch_size, block_m):
@@ -171,7 +175,9 @@ def launch_d256_tn_compact_worklist(
     if block_m % params.h_hk_ratio != 0:
         raise ValueError("Async-TN PackGQA requires BLOCK_M divisible by the GQA ratio")
     if allow_split_kv and params.block_size == 16 and params.h_hk_ratio == 4:
-        from .tn_direct import _d256_tn_bulk_policy
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+            _d256_tn_bulk_policy,
+        )
 
         use_bulk, _, _ = _d256_tn_bulk_policy(
             params,

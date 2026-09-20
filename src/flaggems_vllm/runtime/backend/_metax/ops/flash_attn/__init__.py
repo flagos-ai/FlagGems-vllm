@@ -18,6 +18,8 @@
 # tile sizes, split thresholds, and worklist policies require revalidation on
 # other MetaX architectures.
 
-from .launcher import launch_attention
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.launcher import (
+    launch_attention,
+)
 
 __all__ = ["launch_attention"]

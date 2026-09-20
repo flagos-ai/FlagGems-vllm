@@ -14,9 +14,12 @@
 
 import torch
 
-from .direct import launch_direct
-from .ragged import launch_compact_worklist, launch_d256_tn_compact_worklist
-from .scheduling import (
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.direct import launch_direct
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+    launch_compact_worklist,
+    launch_d256_tn_compact_worklist,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.scheduling import (
     D256_TN_BLOCK_M,
     D256_TN_BLOCK_N,
     MetaXAttentionPlan,
@@ -25,8 +28,15 @@ from .scheduling import (
     MetaXTaskMapper,
     validate_metax_attention_plan,
 )
-from .splitkv import launch_d256_tn_splitkv, launch_page16_decode, launch_splitkv
-from .tn_direct import launch_d256_tn_direct, launch_d256_tn_direct_fast
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.splitkv import (
+    launch_d256_tn_splitkv,
+    launch_page16_decode,
+    launch_splitkv,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_direct import (
+    launch_d256_tn_direct,
+    launch_d256_tn_direct_fast,
+)
 
 D256_TN_SPLITKV_MIN_K = 32768
 
@@ -105,7 +115,9 @@ def launch_metax_attention(
             grid_order=plan.grid_order,
         )
     if plan.family is MetaXKernelFamily.D256_TN_DIRECT:
-        from .ragged import maybe_repack
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+            maybe_repack,
+        )
 
         if max_seqlen_k < 32768 or batch_size == 1:
             params = maybe_repack(

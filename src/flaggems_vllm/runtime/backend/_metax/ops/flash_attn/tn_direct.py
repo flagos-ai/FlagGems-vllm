@@ -17,9 +17,11 @@ import logging
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime.backend._metax.ops.flash_attn.common import (
+    apply_mask,
+    tn_compile_scenario,
+)
 from flaggems_vllm.utils import libentry
-
-from .common import apply_mask, tn_compile_scenario
 
 logger = logging.getLogger(__name__)
 
@@ -686,7 +688,9 @@ def launch_d256_tn_direct(
     )
     if not allow_split_kv or not use_bulk:
         if max_seqlen_k >= 32768 and batch_size > 1:
-            from .ragged import maybe_repack
+            from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+                maybe_repack,
+            )
 
             params = maybe_repack(
                 params,
@@ -722,7 +726,9 @@ def launch_d256_tn_direct(
     if sparse_bulk:
         import torch
 
-        from .ragged import build_compact_worklist_kernel
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+            build_compact_worklist_kernel,
+        )
 
         bulk_worklist = torch.empty(
             (compact_tiles, 2), dtype=torch.int32, device=params.q_ptr.device
@@ -737,7 +743,9 @@ def launch_d256_tn_direct(
         )
     bulk_params = params
     if max_seqlen_k >= 32768 and batch_size > 1:
-        from .ragged import maybe_repack
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.ragged import (
+            maybe_repack,
+        )
 
         bulk_params = maybe_repack(
             params,
@@ -750,10 +758,14 @@ def launch_d256_tn_direct(
     launch_bulk(
         bulk_params, block_m=64, compact_worklist=bulk_worklist, peel_q=True, **common
     )
-    from .tn_boundary import launch_tail_split
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_boundary import (
+        launch_tail_split,
+    )
 
     if params.block_size == 16 and params.h_hk_ratio == 4 and (max_seqlen_k <= 2048):
-        from .tn_boundary import launch_boundary_merge
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attn.tn_boundary import (
+            launch_boundary_merge,
+        )
 
         boundary_args = dict(
             max_seqlen_q=max_seqlen_q,
