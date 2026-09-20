@@ -65,6 +65,64 @@ def _tle_enabled() -> bool:
     return value not in {"0", "false", "off", "no"}
 
 
+# =========================================================================
+# Platform-specialized FP8 dot subkernels.
+# On nvidia or other platforms, batched tl.dot (Q[H,D] @ KV[N,D]^T) is ~6-10x faster.
+# On mthreads, SQMMA requires per-head tl.dot ([1,D] @ [N,D]^T).
+# =========================================================================
+
+
+@triton.jit
+def _fp8_dot_batched(
+    q_fp8,
+    kv_u8,
+    w_all,
+    scale_tile,
+    h_ids,
+    d_ids,
+    num_heads,
+    head_dim,
+    BLOCK_SIZE: tl.constexpr,
+    w_row_base=0,
+):
+    """Batched FP8 dot: Q[H,D] @ KV[N,D]^T -> [H,N], then weight-reduce."""
+    kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
+    dots = tl.dot(q_fp8, tl.trans(kv_fp8))
+    scores = tl.maximum(dots * scale_tile[None, :], 0.0)
+    weighted = scores * w_all[:, None]
+    return tl.sum(weighted, axis=0)
+
+
+@triton.jit
+def _fp8_dot_per_head(
+    q_row_base,
+    kv_u8,
+    w_all,
+    scale_tile,
+    h_ids,
+    d_ids,
+    num_heads,
+    head_dim,
+    BLOCK_SIZE: tl.constexpr,
+    w_row_base=0,
+):
+    """Per-head FP8 dot: each head [1,D] @ KV[N,D]^T -> [N], accumulated."""
+    output_tile = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for h_idx in tl.static_range(num_heads):
+        q_u8_h = tl.load(q_row_base + h_idx * head_dim + d_ids)
+        q_fp8_h = tl.reshape(q_u8_h.to(tl.float8e4nv, bitcast=True), [1, head_dim])
+        kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
+        dot_h = tl.reshape(tl.dot(q_fp8_h, tl.trans(kv_fp8)), [BLOCK_SIZE])
+        w_h = tl.load(w_row_base + h_idx)
+        score_h = tl.maximum(dot_h * scale_tile, 0.0)
+        output_tile += score_h * w_h
+    return output_tile
+
+
+_use_fp8_batched_dot = not hasattr(torch, "musa")
+_fp8_dot = _fp8_dot_batched if _use_fp8_batched_dot else _fp8_dot_per_head
+
+
 @triton.jit
 def _mqa_logits_kernel(
     Q_ptr,  # [total_rows, H * D] uint8 (FP8 bitcast) or [total_rows, H * D//2] uint8 (packed E2M1)
@@ -93,6 +151,7 @@ def _mqa_logits_kernel(
     BLOCK_D: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     IS_MXFP4: tl.constexpr,
+    USE_FP8_BATCHED_DOT: tl.constexpr,
 ):
     """Per-tile kernel: each program processes one BLOCK_KV tile for one row."""
     kv_block = tl.program_id(0)
@@ -133,9 +192,14 @@ def _mqa_logits_kernel(
         byte = ((q_scale_val[:, None] >> (8 * block_id)) & 0xFF).to(tl.float32)
         scale = tl.exp2(byte - 127.0)  # [num_heads, head_dim]
 
-        q_f16 = (q_f32 * scale).to(tl.float16)  # [num_heads, head_dim]
+        q_param = (q_f32 * scale).to(tl.float16)  # [num_heads, head_dim]
+    elif USE_FP8_BATCHED_DOT:
+        q_offsets = h_ids[:, None] * head_dim + d_ids[None, :]
+        q_u8 = tl.load(q_row_base + q_offsets)
+        q_param = q_u8.to(tl.float8e4nv, bitcast=True)
     else:
-        pass  # FP8 Q loaded per-head inside the loop
+        # FP8 Q per-head dots load inside the loop, thus pass the base addr
+        q_param = q_row_base
 
     # Pre-load weights: [num_heads] float32
     w_all = tl.load(w_row_base + tl.arange(0, num_heads))
@@ -165,24 +229,23 @@ def _mqa_logits_kernel(
             if IS_MXFP4:
                 # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
                 kv_fp16 = kv_u8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-                dots = tl.dot(q_f16, tl.trans(kv_fp16))
+                dots = tl.dot(q_param, tl.trans(kv_fp16))
                 scores = tl.maximum(dots * scale_tile[None, :], 0.0)
                 weighted = scores * w_all[:, None]
                 output_tile = tl.sum(weighted, axis=0)
             else:
-                # Per-head dot to avoid SQMMA batch-matmul issue on MUSA.
-                # Load Q per-head as [1, D] for compatible tl.dot.
-                output_tile = tl.zeros([block_size], dtype=tl.float32)
-                for h_idx in tl.static_range(num_heads):
-                    q_u8_h = tl.load(q_row_base + h_idx * head_dim + d_ids)
-                    q_fp8_h = tl.reshape(
-                        q_u8_h.to(tl.float8e4nv, bitcast=True), [1, head_dim]
-                    )
-                    kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
-                    dot_h = tl.reshape(tl.dot(q_fp8_h, tl.trans(kv_fp8)), [block_size])
-                    w_h = tl.load(w_row_base + h_idx)
-                    score_h = tl.maximum(dot_h * scale_tile, 0.0)
-                    output_tile += score_h * w_h
+                output_tile = _fp8_dot(
+                    q_param,
+                    kv_u8,
+                    w_all,
+                    scale_tile,
+                    h_ids,
+                    d_ids,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    w_row_base,
+                )
 
             pos_ids = logical_base + p_ids
             valid_mask = pos_ids < end_pos
@@ -581,6 +644,7 @@ def fp8_fp4_paged_mqa_logits(
             BLOCK_D=BLOCK_D,
             NUM_BLOCKS=NUM_BLOCKS,
             IS_MXFP4=is_fp4,
+            USE_FP8_BATCHED_DOT=_use_fp8_batched_dot,
         )
 
     return logits
