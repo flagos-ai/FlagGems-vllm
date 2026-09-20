@@ -19,15 +19,20 @@ import torch
 import triton
 
 import flaggems_vllm
-from flaggems_vllm.ops import flash_attn_varlen_func_w8a8_fp8 as w8a8_varlen
+from flaggems_vllm import flash_attn_varlen_func_w8a8_fp8 as w8a8_varlen
+from flaggems_vllm.runtime import torch_device_fn
 
 from . import base, utils
 
 vendor_name = flaggems_vllm.vendor_name
 
 
-def _supports_hopper_fp8() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+def _supports_fp8_backend() -> bool:
+    if not torch_device_fn.is_available():
+        return False
+    if vendor_name == "mthreads":
+        return torch_device_fn.get_device_capability()[0] >= 3
+    return vendor_name == "nvidia" and torch_device_fn.get_device_capability()[0] >= 9
 
 
 def _get_fp8_dtype():
@@ -105,6 +110,20 @@ def _quantize_qkv_w8a8(q, k, v, q_seq_lens, kv_seq_lens):
     return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
 
 
+def _dequantize_varlen_per_block_fp8(x, seq_lens, descale, block_size=128):
+    dequantized = torch.empty_like(x, dtype=torch.bfloat16)
+    token_offset = 0
+    for batch_idx, seq_len in enumerate(seq_lens):
+        for block_idx in range(triton.cdiv(seq_len, block_size)):
+            lo = token_offset + block_idx * block_size
+            hi = min(token_offset + seq_len, lo + block_size)
+            dequantized[lo:hi] = (
+                x[lo:hi].float() * descale[batch_idx, :, block_idx][None, :, None]
+            ).to(torch.bfloat16)
+        token_offset += seq_len
+    return dequantized.contiguous()
+
+
 def baseline_flash_attn_varlen_func_w8a8_fp8(
     q,
     k,
@@ -123,7 +142,29 @@ def baseline_flash_attn_varlen_func_w8a8_fp8(
     causal,
     baseline_out,
     w8a8_out,
+    seqused_k=None,
+    block_table=None,
 ):
+    if vendor_name == "mthreads":
+        # vLLM has no MUSA FA2 backend; compare with the repository BF16 FA2.
+        from flaggems_vllm import flash_attn_varlen_func
+
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            seqused_k=seqused_k,
+            block_table=block_table,
+            softmax_scale=scale,
+            causal=causal,
+            out=baseline_out,
+            fa_version=2,
+        )
+
     from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
     return flash_attn_varlen_func(
@@ -159,6 +200,8 @@ def gems_flash_attn_varlen_func_w8a8_fp8(
     causal,
     baseline_out,
     w8a8_out,
+    seqused_k=None,
+    block_table=None,
 ):
     return w8a8_varlen(
         q_fp8,
@@ -170,11 +213,104 @@ def gems_flash_attn_varlen_func_w8a8_fp8(
         cu_seqlens_k,
         softmax_scale=scale,
         causal=causal,
+        seqused_k=seqused_k,
+        block_table=block_table,
         out=w8a8_out,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
     )
+
+
+def _ordinary_paged_shapes():
+    # Preserve the four ordinary-precision paged GQA workloads.
+    all_cu_seq_lens_q = [
+        (
+            0,
+            512,
+        ),
+        (
+            0,
+            1,
+            2,
+            72,
+        ),
+        tuple(range(0, 45))
+        + (
+            105,
+            121,
+            137,
+            153,
+            169,
+            185,
+            201,
+            217,
+            233,
+            249,
+            265,
+        ),
+        tuple(range(0, 196))
+        + (
+            211,
+            226,
+            240,
+            253,
+            265,
+        ),
+    ]
+    all_seqused_k = [
+        (512,),
+        (
+            1,
+            1,
+            70,
+        ),
+        (515,) + (514,) * 20 + (513,) * 20 + (512,) * 14,
+        (2333,)
+        + (2331,) * 20
+        + (2330,) * 20
+        + (2329,) * 14
+        + (2328,) * 18
+        + (2327,) * 15
+        + (2326,) * 17
+        + (2325,) * 18
+        + (2324,) * 21
+        + (2323,) * 22
+        + (2322,) * 24
+        + (2321,) * 5
+        + (
+            2320,
+            2319,
+            2318,
+            2317,
+            2316,
+        ),
+    ]
+
+    num_heads = 16
+    num_heads_k = 8
+    head_dim = 128
+    block_size = 16
+    num_blocks = 2000
+    alibi = False
+    soft_cap = None
+
+    all_configs = [
+        (
+            cu_seq_lens_q,
+            seqused_k,
+            num_heads,
+            num_heads_k,
+            head_dim,
+            block_size,
+            num_blocks,
+            alibi,
+            soft_cap,
+        )
+        for cu_seq_lens_q, seqused_k in zip(all_cu_seq_lens_q, all_seqused_k)
+    ]
+
+    return all_configs
 
 
 class FlashAttnVarlenFuncW8A8FP8Benchmark(base.GenericBenchmark):
@@ -230,6 +366,9 @@ class FlashAttnVarlenFuncW8A8FP8Benchmark(base.GenericBenchmark):
             for causal in (False, True):
                 all_shapes.append((1, 4096, 8, head_size, causal))
 
+        if vendor_name == "mthreads":
+            all_shapes.extend(_ordinary_paged_shapes())
+
         core_shapes = [
             (1, 512, 16, 128, False),
             (1, 512, 32, 64, False),
@@ -274,6 +413,9 @@ def _make_cu_seqlens(seq_lens, device):
 
 
 def flash_attn_varlen_func_w8a8_fp8_input_fn(config, dtype, device):
+    if len(config) == 9:
+        yield from _paged_w8a8_input_fn(config, dtype, device)
+        return
     batch_or_q_lens, seq_len_or_kv_lens, num_heads, head_size, causal = config
     if isinstance(batch_or_q_lens, (list, tuple)):
         q_seq_lens = tuple(batch_or_q_lens)
@@ -302,10 +444,13 @@ def flash_attn_varlen_func_w8a8_fp8_input_fn(config, dtype, device):
     cu_seqlens_q = _make_cu_seqlens(q_seq_lens, device)
     cu_seqlens_k = _make_cu_seqlens(kv_seq_lens, device)
     w8a8_out = torch.empty_like(q)
-    # Keep BF16 conversion outside the timed baseline call.
-    q, k, v = [x.to(torch.bfloat16) for x in (q, k, v)]
+    # Both paths consume the same effective FP8 values and block descales.
+    # The BF16 fallback's reference preparation is outside operator timing.
+    q = _dequantize_varlen_per_block_fp8(q_fp8, q_seq_lens, q_descale)
+    k = _dequantize_varlen_per_block_fp8(k_fp8, kv_seq_lens, k_descale)
+    v = _dequantize_varlen_per_block_fp8(v_fp8, kv_seq_lens, v_descale)
     baseline_out = torch.empty_like(q)
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     yield (
         q,
@@ -328,15 +473,84 @@ def flash_attn_varlen_func_w8a8_fp8_input_fn(config, dtype, device):
     )
 
 
+def _paged_w8a8_input_fn(config, dtype, device):
+    (
+        cu_q,
+        kv_lens,
+        q_heads,
+        kv_heads,
+        head_size,
+        page_size,
+        num_pages,
+        alibi,
+        softcap,
+    ) = config
+    assert not alibi and softcap is None
+    q_lens = tuple(right - left for left, right in zip(cu_q, cu_q[1:]))
+    fp8_dtype = _get_fp8_dtype()
+    q_fp8 = torch.randn((cu_q[-1], q_heads, head_size), device=device, dtype=dtype).to(
+        fp8_dtype
+    )
+    k_fp8 = torch.randn(
+        (num_pages, page_size, kv_heads, head_size), device=device, dtype=dtype
+    ).to(fp8_dtype)
+    v_fp8 = torch.randn(k_fp8.shape, device=device, dtype=dtype).to(fp8_dtype)
+    q_descale = torch.ones(
+        (len(q_lens), q_heads, triton.cdiv(max(q_lens), 128)),
+        device=device,
+        dtype=torch.float32,
+    )
+    k_descale = torch.ones(
+        (len(kv_lens), kv_heads, triton.cdiv(max(kv_lens), 128)),
+        device=device,
+        dtype=torch.float32,
+    )
+    v_descale = torch.ones_like(k_descale)
+    block_table = torch.randint(
+        num_pages,
+        (len(kv_lens), triton.cdiv(max(kv_lens), page_size)),
+        device=device,
+        dtype=torch.int32,
+    )
+    q, k, v = (value.to(torch.bfloat16) for value in (q_fp8, k_fp8, v_fp8))
+    torch_device_fn.synchronize()
+    yield (
+        q,
+        k,
+        v,
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        max(q_lens),
+        torch.tensor(cu_q, device=device, dtype=torch.int32),
+        max(kv_lens),
+        None,
+        1.0 / math.sqrt(head_size),
+        True,
+        torch.empty_like(q),
+        torch.empty(q.shape, device=device, dtype=dtype),
+        torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        block_table,
+    )
+
+
 @pytest.mark.skipif(
     utils.SkipVersion("torch", "<2.7"),
     reason="Torch version prior to 2.7 is not compatible with vLLM.",
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.skipif(flaggems_vllm.device == "cpu", reason="Unsupported in CPU mode")
-@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA-only path")
 @pytest.mark.skipif(
-    not _supports_hopper_fp8(), reason="Requires NVIDIA Hopper or newer"
+    not torch_device_fn.is_available(), reason="Accelerator is not available"
+)
+@pytest.mark.skipif(flaggems_vllm.device == "cpu", reason="Unsupported in CPU mode")
+@pytest.mark.skipif(
+    vendor_name not in ("nvidia", "mthreads"), reason="Requires NVIDIA or Moore Threads"
+)
+@pytest.mark.skipif(
+    not _supports_fp8_backend(),
+    reason="Requires NVIDIA Hopper or newer, or Moore Threads",
 )
 @pytest.mark.skipif(
     getattr(torch, "float8_e4m3fn", None) is None,

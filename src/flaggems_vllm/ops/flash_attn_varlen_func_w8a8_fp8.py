@@ -14,6 +14,7 @@
 
 import logging
 import math
+from functools import wraps
 
 import torch
 import triton
@@ -27,6 +28,7 @@ from flaggems_vllm.utils.random_utils import philox_backend_seed_offset
 
 logger = logging.getLogger(__name__)
 _debug = False
+_MUSA_FP8_PV = tl.constexpr(runtime.device.vendor_name == "mthreads")
 
 
 @triton.jit
@@ -294,10 +296,13 @@ def _fp8_pv_dot(
         # mixed FP8 formats in the PV dot product.
         P_scaled = P * 256.0
         p_descale = 1.0 / 256.0
-        p_dtype: tl.constexpr = tl.float8e4nv
+        # MUSA lowers same-format E5M2 products to native matrix instructions.
+        # Compensate its shorter mantissa with the residual product below.
+        p_dtype: tl.constexpr = tl.float8e5 if _MUSA_FP8_PV else tl.float8e4nv
     P_fp8 = P_scaled.to(p_dtype)
     pv = tl.dot(P_fp8, V, out_dtype=tl.float32)
-    if precise_p:
+    if precise_p or _MUSA_FP8_PV:
+        # MUSA also needs this in long-KV loops for non-unit block descales.
         # Short KV sequences and sparse boundary rows amplify P rounding.
         # Correct its residual with another FP8 dot, not a BF16 fallback.
         P_residual = ((P_scaled - P_fp8.to(tl.float32)) * 32.0).to(p_dtype)
@@ -2556,14 +2561,30 @@ def mha_varlan_fwd(
     # check disable swa
     if window_size_left >= max_seqlen_k:
         window_size_left = -1
-    if window_size_right >= max_seqlen_k:
+    unlimited_right = (
+        max(max_seqlen_q, max_seqlen_k)
+        if runtime.device.vendor_name == "mthreads"
+        else max_seqlen_k
+    )
+    if window_size_right >= unlimited_right:
         window_size_right = -1
 
     is_local = window_size_left >= 0
+    if runtime.device.vendor_name == "mthreads":
+        is_local = is_local or (window_size_right >= 0 and not is_causal)
+        if is_local:
+            # A negative side means unbounded, not an offset of minus one.
+            window_size_left = (
+                max_seqlen_k if window_size_left < 0 else window_size_left
+            )
+            window_size_right = (
+                unlimited_right if window_size_right < 0 else window_size_right
+            )
 
     # Optimize all single-query sequences by swapping the query-group and sequence dimensions
     seqlenq_ngroups_swapped = (
-        max_seqlen_q == 1
+        runtime.device.vendor_name != "mthreads"
+        and max_seqlen_q == 1
         and alibi_slopes is None
         and num_heads > num_heads_k
         and window_size_left < 0
@@ -3252,7 +3273,7 @@ def mha_fwd(
     return out, q, k, v, lse, philox_args, unused, p
 
 
-def flash_attn_varlen_func_w8a8_fp8(
+def _flash_attn_varlen_func_w8a8_fp8(
     q,
     k,
     v,
@@ -3295,17 +3316,17 @@ def flash_attn_varlen_func_w8a8_fp8(
         cu_seqlens_q: Cumulative query sequence lengths with shape ``[batch + 1]``.
         max_seqlen_k: Maximum key sequence length in the batch.
         cu_seqlens_k: Cumulative key sequence lengths with shape ``[batch + 1]``.
-        q_descale: Query descales normalized to ``[batch, heads, q_blocks]``.
-        k_descale: Key descales normalized to ``[batch, heads, kv_blocks]``.
-        v_descale: Value descales normalized to ``[batch, heads, kv_blocks]``.
+        q_descale: Query descales normalized to ``[batch, q_heads, q_blocks]``.
+        k_descale: Key descales normalized to ``[batch, kv_heads, kv_blocks]``.
+        v_descale: Value descales normalized to ``[batch, kv_heads, kv_blocks]``.
         softmax_scale: Score scale. Defaults to ``1 / sqrt(head_dim)``.
         causal: Whether to apply a causal mask.
         out: Optional packed FP16/BF16 output tensor.
 
     The public signature matches ``flash_attn_varlen_func``. Descales are
     applied per logical 128-token block. The returned tensor uses ``out.dtype``
-    when supplied and BF16 otherwise. This W8A8 path currently requires Q, K,
-    and V to have the same number of heads; MQA and GQA are not supported.
+    when supplied and BF16 otherwise. NVIDIA requires equal Q/K/V head counts;
+    the MUSA backend also supports MQA and GQA.
     Head dimensions must be multiples of 8 between 8 and 256, inclusive.
     """
     if dropout_p != 0.0:
@@ -3318,8 +3339,6 @@ def flash_attn_varlen_func_w8a8_fp8(
         raise NotImplementedError("scheduler arguments are not supported")
     if cp_world_size != 1 or cp_rank != 0 or cp_tot_seqused_k is not None:
         raise NotImplementedError("context parallel attention is not supported")
-    if runtime.device.vendor_name != "nvidia" or get_device_capability()[0] < 9:
-        raise NotImplementedError("W8A8 FP8 attention requires NVIDIA Hopper or newer")
     if fa_version != 2:
         raise RuntimeError("Only FA2 is implemented.")
     if num_splits > 0:
@@ -3345,7 +3364,12 @@ def flash_attn_varlen_func_w8a8_fp8(
     expected_kv_ndim = 4 if block_table is not None else 3
     if k.ndim != expected_kv_ndim or v.ndim != expected_kv_ndim:
         raise ValueError("k and v rank does not match the selected cache layout")
-    if q.dtype not in _FP8_DTYPES or k.dtype != q.dtype or v.dtype != q.dtype:
+    fp8_dtypes = (
+        (torch.float8_e4m3fn, torch.float8_e5m2)
+        if runtime.device.vendor_name == "mthreads"
+        else _FP8_DTYPES
+    )
+    if q.dtype not in fp8_dtypes or k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("q, k, and v must have the same supported FP8 dtype")
     if q.device != k.device or q.device != v.device:
         raise ValueError("q, k, and v must be on the same device")
@@ -3383,8 +3407,10 @@ def flash_attn_varlen_func_w8a8_fp8(
             raise ValueError("out must not alias q, k, or v")
 
     num_heads_k = k.shape[2] if block_table is not None else k.shape[1]
-    if q.shape[1] != num_heads_k:
+    if q.shape[1] != num_heads_k and runtime.device.vendor_name != "mthreads":
         raise NotImplementedError("GQA is not supported by this W8A8 path")
+    if num_heads_k <= 0 or q.shape[1] % num_heads_k:
+        raise ValueError("query heads must be divisible by KV heads")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -3421,7 +3447,8 @@ def flash_attn_varlen_func_w8a8_fp8(
     # Other head dimensions use the padded varlen kernel below; this guard
     # restricts only the tuned dense shortcut, not public dimension support.
     uniform_nonpaged = (
-        head_size in (64, 128)
+        runtime.device.vendor_name == "nvidia"
+        and head_size in (64, 128)
         and block_table is None
         and cu_seqlens_k is not None
         and seqused_k is None
@@ -3498,3 +3525,10 @@ def flash_attn_varlen_func_w8a8_fp8(
         fp8_p_max=float(torch.finfo(q.dtype).max),
     )
     return (result[0], result[4]) if return_softmax_lse else result[0]
+
+
+@wraps(_flash_attn_varlen_func_w8a8_fp8, assigned=("__doc__", "__annotations__"))
+def flash_attn_varlen_func_w8a8_fp8(*args, **kwargs):
+    if runtime.device.vendor_name != "nvidia" or get_device_capability()[0] < 9:
+        raise NotImplementedError("W8A8 FP8 attention requires NVIDIA Hopper or newer")
+    return _flash_attn_varlen_func_w8a8_fp8(*args, **kwargs)
