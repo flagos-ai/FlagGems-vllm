@@ -160,3 +160,15 @@ hygon_marlin_gemv:
       BK: 256
     num_warps: 8
     num_stages: 1
+
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 1
+    num_stages: 3
+  - META:
+      BLOCK: 128
+      TPP: 8
+    num_warps: 4
+    num_stages: 3

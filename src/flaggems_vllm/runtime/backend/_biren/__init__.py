@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._thead.fused.fused_inv_rope_fp8_quant import (
-    fused_inv_rope_fp8_quant,
-)
-from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
+import torch_supa
 
-__all__ = [
-    "fused_inv_rope_fp8_quant",
-    "moe_sum",
-]
+from flaggems_vllm.runtime.backend.backend_utils import VendorDescriptor
+
+torch_supa._C._transfer.device_type(True)
+
+vendor_info = VendorDescriptor(
+    vendor_name="biren",
+    device_name="cuda",
+    device_query_cmd="brsmi",
+    dispatch_key="PrivateUse1",
+    triton_extra_name=None,
+)
+
+CUSTOMIZED_UNUSED_OPS = ("copy_",)
+
+__all__ = ["*"]
