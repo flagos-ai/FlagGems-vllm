@@ -18,9 +18,7 @@ from flaggems_vllm.runtime.backend._mthreads.fused.fused_add_rms_norm import (
 from flaggems_vllm.runtime.backend._mthreads.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
-from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import (
-    moe_sum,
-)
+from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import moe_sum
 from flaggems_vllm.runtime.backend._mthreads.fused.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
