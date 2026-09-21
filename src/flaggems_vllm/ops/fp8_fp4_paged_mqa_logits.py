@@ -28,8 +28,10 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flag_gems.utils.device_info import get_device_capability
-from flag_gems.utils.triton_version_utils import has_triton_tle
+
+from flaggems_vllm.ops.fp8_fp4_mqa_logits import _e2m1_to_f32
+from flaggems_vllm.utils.device_info import get_device_capability
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
@@ -65,7 +67,8 @@ def _tle_enabled() -> bool:
 
 @triton.jit
 def _mqa_logits_kernel(
-    Q_ptr,  # [total_rows, H * D] uint8 (FP8 bitcast)
+    Q_ptr,  # [total_rows, H * D] uint8 (FP8 bitcast) or [total_rows, H * D//2] uint8 (packed E2M1)
+    Q_scale_ptr,  # [total_rows, H] int32 (MXFP4 ue8m0 bytes; unused when not IS_MXFP4)
     KV_data_ptr,  # [num_phys_blocks * BLOCK_SIZE, D] uint8 (FP8, flat paged)
     KV_scales_ptr,  # [num_phys_blocks * BLOCK_SIZE] float32
     Weights_ptr,  # [total_rows, H] float32
@@ -81,6 +84,7 @@ def _mqa_logits_kernel(
     max_blocks_per_seq,
     num_phys_blocks,
     stride_q_row,
+    stride_qs_row,
     stride_kv_flat,
     stride_bt_row,
     stride_out_row,
@@ -88,6 +92,7 @@ def _mqa_logits_kernel(
     BLOCK_KV: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    IS_MXFP4: tl.constexpr,
 ):
     """Per-tile kernel: each program processes one BLOCK_KV tile for one row."""
     kv_block = tl.program_id(0)
@@ -109,10 +114,30 @@ def _mqa_logits_kernel(
     h_ids = tl.arange(0, num_heads)
     d_ids = tl.arange(0, BLOCK_D)
 
-    # Pre-load Q as FP8: [num_heads, head_dim]
-    q_offsets = h_ids[:, None] * head_dim + d_ids[None, :]
-    q_u8 = tl.load(q_row_base + q_offsets)
-    q_fp8 = q_u8.to(tl.float8e4nv, bitcast=True)
+    # Pre-load Q as FP8 [num_heads, head_dim], or dequantize packed MXFP4 Q.
+    if IS_MXFP4:
+        d2_ids = tl.arange(0, BLOCK_D // 2)
+        q_offsets = h_ids[:, None] * (head_dim // 2) + d2_ids[None, :]
+        q_packed = tl.load(q_row_base + q_offsets)  # [num_heads, head_dim//2] uint8
+
+        lo = q_packed & 0xF
+        hi = (q_packed >> 4) & 0xF
+        nibble = tl.reshape(tl.join(lo, hi), [num_heads, head_dim])
+
+        q_f32 = _e2m1_to_f32(nibble)  # [num_heads, head_dim] fp32
+
+        block_id = (d_ids // 32)[None, :]  # [1, head_dim]
+        q_scale_val = tl.load(
+            Q_scale_ptr + row_idx * stride_qs_row + h_ids
+        )  # [num_heads] int32
+        byte = ((q_scale_val[:, None] >> (8 * block_id)) & 0xFF).to(tl.float32)
+        scale = tl.exp2(byte - 127.0)  # [num_heads, head_dim]
+
+        q_f16 = (q_f32 * scale).to(tl.float16)  # [num_heads, head_dim]
+    else:
+        q_offsets = h_ids[:, None] * head_dim + d_ids[None, :]
+        q_u8 = tl.load(q_row_base + q_offsets)
+        q_fp8 = q_u8.to(tl.float8e4nv, bitcast=True)
 
     # Pre-load weights: [num_heads] float32
     w_all = tl.load(w_row_base + tl.arange(0, num_heads))
@@ -135,10 +160,14 @@ def _mqa_logits_kernel(
             # Coalesced KV load: [block_size, head_dim] as FP8
             kv_offsets = (flat_base + p_ids[:, None]) * stride_kv_flat + d_ids[None, :]
             kv_u8 = tl.load(KV_data_ptr + kv_offsets)
-            kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
 
             # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
-            dots = tl.dot(q_fp8, tl.trans(kv_fp8))
+            if IS_MXFP4:
+                kv_fp16 = kv_u8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+                dots = tl.dot(q_f16, tl.trans(kv_fp16))
+            else:
+                kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
+                dots = tl.dot(q_fp8, tl.trans(kv_fp8))
 
             # Coalesced scale load: [block_size] float32
             scale_tile = tl.load(KV_scales_ptr + flat_base + p_ids)
@@ -419,11 +448,15 @@ def fp8_fp4_paged_mqa_logits(
     max_model_len,
     clean_logits=False,
 ):
-    """Compute paged MQA logits from FP8 queries against FP8/FP4 KV cache.
+    """Compute paged MQA logits from FP8/MXFP4 queries against FP8 KV cache.
 
     Args:
-        q: Tuple of (q_values [B, next_n, H, D] float8_e4m3fn, q_scale).
-        kv_cache: [num_blocks, block_size, 1, D+4] uint8 paged KV cache.
+        q: Tuple of (q_values, q_scale).
+            FP8 path: q_values [B, next_n, H, D] float8_e4m3fn, q_scale is None.
+            FP4 path: q_values [B, next_n, H, D//2] uint8 (packed E2M1),
+                q_scale [B, next_n, H] int32 (D//32 ue8m0 bytes per token-head).
+        kv_cache: [num_blocks, block_size, 1, D+4] uint8 paged KV cache (fp8 K
+            + trailing per-token fp32 scale; K stays fp8 in both paths).
         weights: [B*next_n, H] float32 per-head weights.
         context_lens: [B] or [B, next_n] int32 context lengths.
         block_tables: [B, max_blocks] int32 block table mapping.
@@ -438,16 +471,20 @@ def fp8_fp4_paged_mqa_logits(
     logger.debug("GEMS FP8_FP4_PAGED_MQA_LOGITS")
 
     q_values, q_scale = q
+    is_fp4 = q_scale is not None
 
     if q_values.dim() == 3:
         q_values = q_values.unsqueeze(1)
 
-    B, next_n_val, H, D = q_values.shape
+    B, next_n_val, H, q_last_dim = q_values.shape
     total_rows = B * next_n_val
 
     block_size = kv_cache.shape[1]
     head_dim = kv_cache.shape[3] - 4
-    assert head_dim == D
+    if is_fp4:
+        assert q_last_dim == head_dim // 2
+    else:
+        assert q_last_dim == head_dim
 
     if context_lens.dim() == 2:
         ctx_lens_flat = (
@@ -462,8 +499,17 @@ def fp8_fp4_paged_mqa_logits(
         kv_cache, block_tables, ctx_lens_flat, total_rows, next_n_val
     )
 
-    q_flat = q_values.reshape(total_rows, H, D).contiguous()
-    q_u8 = q_flat.view(torch.uint8).reshape(total_rows, H * D)
+    q_flat = q_values.reshape(total_rows, H, q_last_dim).contiguous()
+    q_u8 = q_flat.view(torch.uint8).reshape(total_rows, H * q_last_dim)
+    stride_q_row = H * q_last_dim
+
+    if is_fp4:
+        q_scale_flat = q_scale.reshape(total_rows, H).contiguous().to(torch.int32)
+    else:
+        # Dummy scale tensor; the kernel never dereferences it when not IS_MXFP4.
+        q_scale_flat = torch.empty(
+            (total_rows, H), dtype=torch.int32, device=q_values.device
+        )
 
     logits = torch.full(
         (total_rows, max_model_len),
@@ -478,7 +524,9 @@ def fp8_fp4_paged_mqa_logits(
     num_phys_blocks = kv_cache.shape[0]
     max_blocks_per_seq = block_tables_expanded.shape[1]
 
-    if _can_use_tle(max_ctx, block_size, D):
+    grid = (triton.cdiv(max_ctx, BLOCK_KV), total_rows)
+    use_tle = _can_use_tle(max_ctx, block_size, head_dim)
+    if use_tle:
         _launch_tle_kernel(
             q_u8,
             kv_data,
@@ -490,7 +538,7 @@ def fp8_fp4_paged_mqa_logits(
             total_rows,
             max_ctx,
             H,
-            D,
+            head_dim,
             max_model_len,
             block_size,
             num_phys_blocks,
@@ -499,9 +547,9 @@ def fp8_fp4_paged_mqa_logits(
             NUM_BLOCKS,
         )
     else:
-        grid = (triton.cdiv(max_ctx, BLOCK_KV), total_rows)
         _mqa_logits_kernel[grid](
             q_u8,
+            q_scale_flat,
             kv_data,
             kv_scales,
             weights,
@@ -511,19 +559,21 @@ def fp8_fp4_paged_mqa_logits(
             total_rows=total_rows,
             max_ctx=max_ctx,
             num_heads=H,
-            head_dim=D,
+            head_dim=head_dim,
             max_model_len=max_model_len,
             block_size=block_size,
             max_blocks_per_seq=max_blocks_per_seq,
             num_phys_blocks=num_phys_blocks,
-            stride_q_row=H * D,
-            stride_kv_flat=D,
+            stride_q_row=stride_q_row,
+            stride_qs_row=H,
+            stride_kv_flat=head_dim,
             stride_bt_row=max_blocks_per_seq,
             stride_out_row=max_model_len,
             stride_w_row=H,
             BLOCK_KV=BLOCK_KV,
             BLOCK_D=BLOCK_D,
             NUM_BLOCKS=NUM_BLOCKS,
+            IS_MXFP4=is_fp4,
         )
 
     return logits

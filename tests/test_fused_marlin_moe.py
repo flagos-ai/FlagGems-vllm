@@ -49,12 +49,36 @@ from . import conftest as cfg
 
 def _is_hopper():
     # The W4A16 fast-path kernel's bf16 dequant uses sm_90-only PTX
-    # (sub.bf16x2 / mul.bf16); the fast path is gated to Hopper.
-    if flaggems_vllm.device != "cuda":
+    # (sub.bf16x2 / mul.bf16); the fast path is gated to Hopper. Other vendors
+    # report a 9.x capability through their CUDA compatibility layer, so the
+    # vendor has to be checked too.
+    if flaggems_vllm.vendor_name != "nvidia" or flaggems_vllm.device != "cuda":
         return False
     major, minor = torch.cuda.get_device_capability()
     sm = major * 10 + minor
     return 90 <= sm < 100
+
+
+def _has_vendor_op():
+    """True when a vendor backend overrides the generic operator.
+
+    Such a backend brings its own kernels, so the Hopper gate that protects the
+    generic fast path does not apply to it.
+    """
+    return flaggems_vllm.fused_marlin_moe is not fused_marlin_moe
+
+
+def _runs_quantized_moe():
+    return _is_hopper() or _has_vendor_op()
+
+
+_GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
+
+_GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
+
+
+def _runs_generic_impl():
+    return not _has_vendor_op()
 
 
 # -----------------------------------------------------------------------------
@@ -400,6 +424,9 @@ def _make_inputs_w8a16_int8(
 # MXFP4 (E2M1 weight + per-32 E8M0 scale) round-to-nearest quantization.
 # -----------------------------------------------------------------------------
 MXFP4_GROUP_SIZE = 32
+# Older/device-limited torch builds (e.g. Hygon torch 2.4.1) lack
+# float8_e8m0fnu; uint8 carries the same E8M0 byte pattern.
+_MXFP4_SCALE_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 _E2M1_POS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_MID = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 _E2M1_MAX = 6.0
@@ -425,7 +452,7 @@ def _quantize_mxfp4(w_2d, group_size):
     ref = torch.where(sign, -q, q) * scale
     nibbles = (sign.to(torch.uint8) * 8 + mag.to(torch.uint8)).reshape(out_dim, in_dim)
     w_ref = ref.reshape(out_dim, in_dim).to(w_2d.dtype)
-    scale_e8m0 = e8m0_byte.squeeze(-1).view(torch.float8_e8m0fnu)
+    scale_e8m0 = e8m0_byte.squeeze(-1).view(_MXFP4_SCALE_DTYPE)
     return w_ref, nibbles, scale_e8m0
 
 
@@ -439,7 +466,7 @@ def _quantize_moe_weight_mxfp4(w_fp, group_size):
         out_dim,
         in_dim // group_size,
         device=w_fp.device,
-        dtype=torch.float8_e8m0fnu,
+        dtype=_MXFP4_SCALE_DTYPE,
     )
     for e in range(E):
         ref_e, nib_e, sc_e = _quantize_mxfp4(w_fp[e], group_size)
@@ -614,10 +641,7 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
 
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
-@pytest.mark.skipif(
-    not _is_hopper(),
-    reason="W4A16 fast path uses Hopper-only bf16 SIMD PTX (sm_90+)",
-)
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", FULL_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
@@ -636,7 +660,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
         device,
     )
 
-    result = fused_marlin_moe(
+    result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
         w2=w2_q,
@@ -694,6 +718,7 @@ def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 16])
@@ -737,6 +762,7 @@ def test_fused_marlin_moe_w8a16_int8_packed_dequant(dtype):
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_shared_silu(monkeypatch, precision, dtype):
@@ -778,6 +804,7 @@ def test_fused_marlin_moe_w8a16_shared_silu(monkeypatch, precision, dtype):
     assert len(calls) == 2
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize(
     "precision,fast", [("int8", True), ("fp8", True), ("int8", False)]
 )
@@ -926,6 +953,7 @@ def test_fused_marlin_moe_w8a16_target_device(monkeypatch):
     ).is_hopper
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("sm", [80, 89, 90])
 @pytest.mark.parametrize("num_tokens", [1, 16, 1024, 4096])
@@ -1021,6 +1049,7 @@ def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, blocks):
     assert reloaded.get_benchmark(name, key, configs[1]) == (2.0, 1.9, 2.1)
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("num_tokens", [512, 513, 1024])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_fp8_gateup_pipeline(num_tokens, dtype):
@@ -1042,6 +1071,7 @@ def test_fused_marlin_moe_w8a16_fp8_gateup_pipeline(num_tokens, dtype):
         assert compute_max_diff(result.float(), ref) < 0.04
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 def test_fused_marlin_moe_w8a16_empty_and_invalid(precision):
     make_inputs = (
@@ -1102,6 +1132,7 @@ def test_fused_marlin_moe_w8a16_empty_and_invalid(precision):
     assert fused_marlin_moe(**empty, inplace=True) is empty["hidden_states"]
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("concentrated", [False, True])
 @pytest.mark.parametrize("zero_output", [False, True])
 @pytest.mark.parametrize(
@@ -1166,6 +1197,7 @@ def test_fused_marlin_moe_w8a16_shared_routing(
     assert torch.all((tids.view(-1, block_m)[experts >= 0] < t).any(dim=1))
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("fp32_scales", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
@@ -1236,6 +1268,7 @@ def test_fused_marlin_moe_w8a16_group_alignment(
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
+@pytest.mark.skipif(not _runs_generic_impl(), reason=_GENERIC_GATE_REASON)
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1025, 4096, 32768])
@@ -1263,6 +1296,7 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_int8(config, dtype):
@@ -1279,7 +1313,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
         dtype,
         device,
     )
-    result = fused_marlin_moe(
+    result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
         quant_type_id=QUANT_TYPE_UINT8B128,
@@ -1299,10 +1333,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
 
 
 @pytest.mark.fused_marlin_moe_w4a16_mxfp4
-@pytest.mark.skipif(
-    not _is_hopper(),
-    reason="MXFP4 fast path uses Hopper-only bf16/fp16 SIMD PTX (sm_90+)",
-)
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", FULL_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w4a16_mxfp4(config, dtype):
@@ -1319,7 +1350,7 @@ def test_fused_marlin_moe_w4a16_mxfp4(config, dtype):
         dtype,
         device,
     )
-    result = fused_marlin_moe(
+    result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
         w2=w2_q,
@@ -1353,7 +1384,7 @@ def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     with pytest.raises(NotImplementedError, match="quant_type_id"):
-        fused_marlin_moe(
+        flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
             w2=w2_q,
@@ -1371,7 +1402,7 @@ def test_rejects_act_order():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     g_idx = torch.zeros(8, dtype=torch.long, device=hs.device)
     with pytest.raises(NotImplementedError, match="act_order"):
-        fused_marlin_moe(
+        flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
             w2=w2_q,
@@ -1389,7 +1420,7 @@ def test_rejects_act_order():
 def test_rejects_fp8_input_dtype():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     with pytest.raises(NotImplementedError, match="FP8"):
-        fused_marlin_moe(
+        flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
             w2=w2_q,
@@ -1404,7 +1435,7 @@ def test_rejects_fp8_input_dtype():
         )
 
 
-@pytest.mark.skipif(not _is_hopper(), reason="W(FP8)A16 fast path requires Hopper")
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_marlin_moe_w8a16_fp8(config, dtype):
@@ -1420,7 +1451,7 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         dtype,
         device,
     )
-    result = fused_marlin_moe(
+    result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
         quant_type_id=QUANT_TYPE_FP8_E4M3,

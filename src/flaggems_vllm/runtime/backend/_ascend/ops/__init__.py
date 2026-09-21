@@ -30,6 +30,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     compressor_prepared,
     prepare_compressor_workspace,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
+    combine_topk_swa_indices,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -38,6 +41,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
+    kda_gate_cumsum_triton,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -54,6 +60,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
+    top_k_per_row_decode,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
+    top_k_per_row_prefill,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -79,4 +91,8 @@ __all__ = [
     "compressor_prepared",
     "prepare_compressor_workspace",
     "build_compressor_metadata",
+    "combine_topk_swa_indices",
+    "top_k_per_row_prefill",
+    "top_k_per_row_decode",
+    "kda_gate_cumsum_triton",
 ]

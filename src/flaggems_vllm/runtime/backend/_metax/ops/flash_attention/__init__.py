@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._hygon.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
-    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
-)
-from flaggems_vllm.runtime.backend._hygon.fused.fused_marlin_moe import (  # noqa: F401
-    fused_marlin_moe,
-)
-from flaggems_vllm.runtime.backend._hygon.fused.moe_sum import moe_sum  # noqa: F401
+# These FlashAttention kernels and scheduling policies are tuned for MetaX C550:
+# 104 SMs, 64 threads per warp, at most 512 threads and 64 KiB shared memory
+# per CTA. TN kernels retain the compiler-dependent w4/s4 Async-TN pipeline;
+# tile sizes, split thresholds, and worklist policies require revalidation on
+# other MetaX architectures.
 
-__all__ = [
-    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-    "fused_marlin_moe",
-    "moe_sum",
-]
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.launcher import (
+    launch_attention,
+)
+
+__all__ = ["launch_attention"]
