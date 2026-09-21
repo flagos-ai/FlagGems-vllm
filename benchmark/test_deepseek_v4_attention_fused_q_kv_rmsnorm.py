@@ -17,24 +17,36 @@ import torch
 
 import flaggems_vllm
 
-try:
-    from vllm.v1.attention.ops.deepseek_v4_ops import (
-        fused_q_kv_rmsnorm as vllm_fused_q_kv_rmsnorm,
-    )
-
-    _HAS_VLLM_FUSED_Q_KV_RMSNORM = True
-except Exception:
-    vllm_fused_q_kv_rmsnorm = None
-    _HAS_VLLM_FUSED_Q_KV_RMSNORM = False
-
 from . import base
+
+_IS_MTHREADS = flaggems_vllm.vendor_name == "mthreads"
+
+if _IS_MTHREADS:
+    try:
+        from vllm_musa import _custom_ops as vendor_ops
+
+        reference_fused_q_kv_rmsnorm = vendor_ops.deepseek_v4_fused_q_kv_rmsnorm
+        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = True
+    except (ImportError, AttributeError):
+        reference_fused_q_kv_rmsnorm = None
+        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = False
+else:
+    try:
+        from vllm.v1.attention.ops.deepseek_v4_ops import (
+            fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
+        )
+
+        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = True
+    except (ImportError, AttributeError):
+        reference_fused_q_kv_rmsnorm = None
+        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = False
 
 
 class FusedQKVRMSNormBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "fused_q_kv_rmsnorm",
-            vllm_fused_q_kv_rmsnorm,
+            reference_fused_q_kv_rmsnorm,
             [torch.bfloat16],
             # Use the top-level API so vendor-specific backend
             # overrides are respected.
@@ -43,7 +55,6 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         _ = shape_file_path
-
         self.shapes = [
             (1, 1536, 512),
             (32, 1536, 512),
@@ -61,19 +72,16 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
                 device="cuda",
                 dtype=dtype,
             )
-
             kv = torch.randn(
                 (tokens, kvdim),
                 device="cuda",
                 dtype=dtype,
             )
-
             q_weight = torch.randn(
                 (qdim,),
                 device="cuda",
                 dtype=dtype,
             )
-
             kv_weight = torch.randn(
                 (kvdim,),
                 device="cuda",
@@ -91,8 +99,8 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
 
 @pytest.mark.fused_q_kv_rmsnorm
 @pytest.mark.skipif(
-    (not torch.cuda.is_available()) or (not _HAS_VLLM_FUSED_Q_KV_RMSNORM),
-    reason=("requires cuda and " "vllm deepseek_v4_ops.fused_q_kv_rmsnorm"),
+    not _HAS_REFERENCE_FUSED_Q_KV_RMSNORM,
+    reason="requires fused_q_kv_rmsnorm reference implementation",
 )
 def test_fused_q_kv_rmsnorm_benchmark():
     FusedQKVRMSNormBenchmark().run()

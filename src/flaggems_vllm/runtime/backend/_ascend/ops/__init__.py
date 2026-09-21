@@ -42,8 +42,16 @@ from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
+from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
+    scatter_conv_state,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.kda_state_gather import gather_kda_state
+from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
+    scatter_kda_state,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -95,4 +103,8 @@ __all__ = [
     "top_k_per_row_prefill",
     "top_k_per_row_decode",
     "kda_gate_cumsum_triton",
+    "gather_kda_state",
+    "scatter_kda_state",
+    "gather_conv_state",
+    "scatter_conv_state",
 ]
