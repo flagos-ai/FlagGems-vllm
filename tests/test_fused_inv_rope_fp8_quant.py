@@ -158,7 +158,7 @@ def native_fused_inv_rope_fp8_quant(
     nope_dim=NOPE_DIM,
     rope_dim=ROPE_DIM,
     quant_group_size=QUANT_GROUP_SIZE,
-    tma_aligned_scales=True,
+    tma_aligned_scales=False,
 ):
     del rope_dim
     half_rope = ROPE_DIM // 2
@@ -209,7 +209,7 @@ def _unfused_inv_rope_fp8_quant(
     nope_dim=NOPE_DIM,
     rope_dim=ROPE_DIM,
     quant_group_size=QUANT_GROUP_SIZE,
-    tma_aligned_scales=True,
+    tma_aligned_scales=False,
 ):
     cos = cos_sin_cache[:, : rope_dim // 2]
     sin = -cos_sin_cache[:, rope_dim // 2 :]
