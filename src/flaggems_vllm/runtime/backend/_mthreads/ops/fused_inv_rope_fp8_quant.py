@@ -157,20 +157,6 @@ def fused_inv_rope_fp8_quant(
         raise ValueError("input shape does not match the group and position counts")
     if cos_sin_cache.shape[1] != rope_dim:
         raise ValueError("cos_sin_cache width must equal rope_dim")
-    if o.shape[0] == 0:
-        d = heads_per_group * 512
-        inner = heads_per_group if tma_aligned_scales else heads_per_group * 4
-        output = torch.empty(
-            (n_groups, 0, d), device=o.device, dtype=torch.float8_e4m3fn
-        )
-        scales = torch.empty(
-            0,
-            device=o.device,
-            dtype=torch.int32 if tma_aligned_scales else torch.float32,
-        )
-        scales = scales.as_strided((n_groups, 0, inner), (0, 1, 0))
-        return output.transpose(0, 1), scales.transpose(0, 1)
-
     tokens, heads, _ = o.shape
     aligned_tokens = triton.cdiv(tokens, 4) * 4
     scale_cols = heads_per_group if tma_aligned_scales else heads_per_group * 4
@@ -187,6 +173,9 @@ def fused_inv_rope_fp8_quant(
         (n_groups, tokens, scale_cols),
         (scale_cols * aligned_tokens, 1, aligned_tokens),
     )
+    if tokens == 0:
+        return output.transpose(0, 1), scales.transpose(0, 1)
+
     # S5000 measurements favor separate heads for short batches and eight-head
     # tiles for prefill, where the smaller grid and shared cache loads help.
     heads_per_program = 8 if tokens >= 128 else 1

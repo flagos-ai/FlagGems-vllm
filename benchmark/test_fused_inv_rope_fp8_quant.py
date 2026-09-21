@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from importlib.metadata import PackageNotFoundError, version
-
 import pytest
 import torch
 import yaml
@@ -138,61 +136,37 @@ def _vllm_fused_inv_rope_fp8_quant(
     )
 
 
-def _baseline_description():
-    if vllm_fused_inv_rope_fp8_quant is None:
-        raise RuntimeError(
-            "The installed vLLM has no fused_inv_rope_fp8_quant baseline"
-        )
-    source = getattr(vllm_fused_inv_rope_fp8_quant, "__module__", "unknown")
-    if source.startswith("flaggems_vllm"):
-        raise RuntimeError("The vLLM baseline was redirected to FlagGems-vllm")
-    try:
-        vllm_version = version("vllm")
-    except PackageNotFoundError:
-        vllm_version = "unknown"
-    return (
-        f"vLLM {vllm_version}: {source}.fused_inv_rope_fp8_quant (packed UE8M0 scales)"
-    )
-
-
 def _validate_baseline(device):
     """Verify the selected baseline's output contract before measuring it."""
-    source = _baseline_description()
-    print(f"fused_inv_rope_fp8_quant baseline: {source}")
+    source = vllm_fused_inv_rope_fp8_quant.__module__
+    if source.startswith("flaggems_vllm"):
+        raise RuntimeError("The vLLM baseline was redirected to FlagGems-vllm")
+    print(f"vLLM baseline: {source}.fused_inv_rope_fp8_quant (packed UE8M0 scales)")
 
     o = torch.ones(1, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
     positions = torch.zeros(1, dtype=torch.int64, device=device)
     cache = _make_cos_sin_cache(1, ROPE_DIM, torch.device(device))
-    try:
-        out, scale = _vllm_fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            cache,
-            1,
-            1,
-            NOPE_DIM,
-            ROPE_DIM,
-            QUANT_GROUP_SIZE,
-            True,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Baseline {source} cannot execute on {device} "
-            f"with packed scales: {exc}"
-        ) from exc
+    out, scale = _vllm_fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cache,
+        1,
+        1,
+        NOPE_DIM,
+        ROPE_DIM,
+        QUANT_GROUP_SIZE,
+        True,
+    )
 
-    if out.dtype != torch.float8_e4m3fn or out.shape != (1, 1, HEAD_DIM):
-        raise RuntimeError(
-            f"Baseline {source} returned shape={tuple(out.shape)}, dtype={out.dtype}; "
-            "expected [1, 1, 512] E4M3FN"
-        )
     # A unit input gives scale 2**-8, whose UE8M0 exponent byte is 119.
-    expected = torch.full_like(scale, 0x77777777)
+    out_float = out.float()
     valid = (
-        scale.shape == (1, 1, 1)
+        out.shape == (1, 1, HEAD_DIM)
+        and out.dtype == torch.float8_e4m3fn
+        and scale.shape == (1, 1, 1)
         and scale.dtype == torch.int32
-        and torch.equal(scale, expected)
-        and torch.equal(out.float(), torch.full_like(out.float(), 256.0))
+        and torch.equal(scale, torch.full_like(scale, 0x77777777))
+        and torch.equal(out_float, torch.full_like(out_float, 256.0))
     )
     if not valid:
         raise RuntimeError(
@@ -237,6 +211,10 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
 
 @pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    vllm_fused_inv_rope_fp8_quant is None,
+    reason="vLLM fused_inv_rope_fp8_quant not installed",
+)
 def test_fused_inv_rope_fp8_quant():
     bench = FusedInvRopeFP8QuantBenchmark(
         op_name="fused_inv_rope_fp8_quant",
