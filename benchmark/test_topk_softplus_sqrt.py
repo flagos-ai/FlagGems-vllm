@@ -113,17 +113,15 @@ _baseline_op = (
     _vllm_topk_softplus_sqrt_wrapper if HAS_VLLM else _torch_topk_softplus_sqrt_ref
 )
 
-# TLE-optimized entry point: same public function, `use_ascend_tle=True`
-# pinned via functools.partial so it drops into the benchmark framework's
-# `gems_op` slot exactly like the plain `topk_softplus_sqrt` callable did
-# in the baseline test. Falls back to the baseline kernel internally
-# (inside topk_softplus_sqrt) if HAS_TLE is False, e.g. off-Ascend --
-# see the module-level skip below to avoid a misleading "0 speedup" run
-# in that case.
+# Explicit entry points for the two Ascend kernels. `use_ascend_tle` is pinned
+# via functools.partial so each callable drops into the benchmark framework's
+# `gems_op` slot unchanged, and so the default (baseline) test below stays
+# pinned to `use_ascend_tle=False` regardless of the function's own default.
 _gems_tle_op = functools.partial(topk_softplus_sqrt, use_ascend_tle=True)
+_gems_baseline_op = functools.partial(topk_softplus_sqrt, use_ascend_tle=False)
 
 
-class TopkSoftplusSqrtTleBenchmark(base.Benchmark):
+class TopkSoftplusSqrtBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "num_tokens, num_experts, topk"
 
     def set_shapes(self, shape_file_path=None):
@@ -168,12 +166,25 @@ class TopkSoftplusSqrtTleBenchmark(base.Benchmark):
 
 
 @pytest.mark.topk_softplus_sqrt
+def test_topk_softplus_sqrt():
+    """Default entry point. Runs whether or not TLE is available."""
+    bench = TopkSoftplusSqrtBenchmark(
+        op_name="topk_softplus_sqrt",
+        torch_op=_baseline_op,
+        gems_op=_gems_baseline_op,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
+
+
+@pytest.mark.topk_softplus_sqrt
 @pytest.mark.skipif(
     not HAS_TLE,
     reason="triton.experimental.tle (Ascend TLE) is not importable in this environment",
 )
 def test_topk_softplus_sqrt_tle():
-    bench = TopkSoftplusSqrtTleBenchmark(
+    """TLE-optimized kernel (use_ascend_tle=True)."""
+    bench = TopkSoftplusSqrtBenchmark(
         op_name="topk_softplus_sqrt_tle",
         torch_op=_baseline_op,
         gems_op=_gems_tle_op,
