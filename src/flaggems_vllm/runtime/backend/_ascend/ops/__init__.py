@@ -54,6 +54,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
     scatter_kda_state,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -110,5 +111,6 @@ __all__ = [
     "scatter_kda_state",
     "gather_conv_state",
     "scatter_conv_state",
+    "paged_scatter_triton",
     "unpack_seq_triton",
 ]
