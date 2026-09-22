@@ -1817,7 +1817,13 @@ def _try_flash_mla_tle(
     dv: int,
     causal: bool,
 ) -> torch.Tensor | None:
-    if _force_triton_flash_mla() or not HAS_TLE_FLASH_MLA:
+    # On hcu/ppu/iluvatar tle is supported but tle.pipe which is necessary for the kernel is not supported
+    # On mthreads there's still some smem problem that's pending fix
+    if (
+        _force_triton_flash_mla()
+        or not HAS_TLE_FLASH_MLA
+        or vendor_name in ("thead", "hygon", "iluvatar", "mthreads")
+    ):
         return None
 
     plan = _get_flash_mla_tle_decode_plan(
@@ -2034,7 +2040,10 @@ def flash_mla(
     o = torch.empty([b * s_q, h_q, dv], dtype=q.dtype, device=device)
 
     major, _ = get_device_capability()
-    if major == 9:
+    if major == 9 and vendor_name == "hygon":
+        BLOCK_H = 64
+        num_stages = 1
+    elif major == 9:
         BLOCK_H = 64
         num_stages = 3
     elif major == 8:
