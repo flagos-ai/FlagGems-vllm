@@ -37,6 +37,14 @@ _FULL_LINEAR_MIN_ELEMENTS = 1 << 20
 _LINEAR_BLOCK_SIZES = (128, 256, 512, 1024, 2048, 4096)
 
 
+def _silu_clamp_tuning_key(value):
+    # Keep composite dtype/shape/stride keys SQL-compatible without changing
+    # the original constexpr arguments used by the kernels.
+    if isinstance(value, (tuple, list)):
+        return repr(value)
+    return value
+
+
 def _use_full_linear_kernel(n_elements):
     return n_elements >= _FULL_LINEAR_MIN_ELEMENTS and any(
         n_elements % block_size == 0 for block_size in _LINEAR_BLOCK_SIZES
@@ -108,7 +116,7 @@ def _silu_clamp_grad_values(
     configs=runtime.get_tuned_config("silu_and_mul_with_clamp_linear"),
     prune_configs_by={"early_config_prune": silu_clamp_early_prune},
     key=["n_elements", "dtype"],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
@@ -143,7 +151,7 @@ def silu_and_mul_with_clamp_linear_kernel(
     configs=runtime.get_tuned_config("silu_and_mul_with_clamp"),
     prune_configs_by={"early_config_prune": silu_clamp_full_early_prune},
     key=["n_elements", "dtype"],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
@@ -170,7 +178,7 @@ def silu_and_mul_with_clamp_linear_full_kernel(
     configs=runtime.get_tuned_config("silu_and_mul_with_clamp"),
     prune_configs_by={"early_config_prune": silu_clamp_early_prune},
     key=["n_elements", "dtype", "n_cols", "X_STRIDES", "Y_STRIDES", "OUT_STRIDES"],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
@@ -207,7 +215,7 @@ def silu_and_mul_with_clamp_2d_kernel(
     configs=runtime.get_tuned_config("silu_and_mul_with_clamp"),
     prune_configs_by={"early_config_prune": silu_clamp_early_prune},
     key=["n_elements", "dtype", "SHAPE", "X_STRIDES", "Y_STRIDES", "OUT_STRIDES"],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
@@ -242,7 +250,7 @@ def silu_and_mul_with_clamp_nd_kernel(
     configs=runtime.get_tuned_config("silu_and_mul_with_clamp_linear"),
     prune_configs_by={"early_config_prune": silu_clamp_early_prune},
     key=["n_elements", "dtype", "NEED_DX", "NEED_DY"],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
@@ -294,7 +302,7 @@ def silu_and_mul_with_clamp_backward_linear_kernel(
         "NEED_DX",
         "NEED_DY",
     ],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
@@ -348,7 +356,7 @@ def silu_and_mul_with_clamp_backward_2d_kernel(
         "NEED_DX",
         "NEED_DY",
     ],
-    strategy="default",
+    strategy=_silu_clamp_tuning_key,
     policy="default",
     warmup=25,
     rep=100,
