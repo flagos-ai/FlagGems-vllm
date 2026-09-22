@@ -39,10 +39,8 @@ def _mthreads_moe_sum_kernel(
     APPLY_ROUTER_WEIGHT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
-    hidden_offsets = (tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(
-        tl.int64
-    )
+    token_idx = tl.program_id(0)
+    hidden_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     hidden_mask = hidden_offsets < hidden_size
 
     input_base = input_ptr + token_idx * TOPK * hidden_size + hidden_offsets

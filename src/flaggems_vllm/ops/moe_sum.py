@@ -46,7 +46,7 @@ def _moe_sum_pair_kernel(
     BLOCK_SIZE: tl.constexpr,
     ELEM_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
+    token_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     hidden_start = block_idx * BLOCK_SIZE
     hidden_offsets = hidden_start + tl.arange(0, BLOCK_SIZE)
@@ -116,7 +116,7 @@ def _moe_sum_mt_kernel(
     block_idx = tl.program_id(0)
     token_idx = tl.program_id(1)
 
-    token_offsets = (token_idx * TOKENS + tl.arange(0, TOKENS)).to(tl.int64)
+    token_offsets = token_idx * TOKENS + tl.arange(0, TOKENS)
     hidden_offsets = block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     hidden_offsets = tl.max_contiguous(tl.multiple_of(hidden_offsets, BLOCK_H), BLOCK_H)
 
@@ -176,7 +176,7 @@ def _moe_sum_general_kernel(
     BLOCK_SIZE: tl.constexpr,
     ELEM_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
+    token_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     hidden_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     hidden_mask = hidden_offsets < hidden_size

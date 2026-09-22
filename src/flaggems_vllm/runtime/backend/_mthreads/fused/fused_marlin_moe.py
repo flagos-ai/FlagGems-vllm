@@ -28,12 +28,8 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.moe_align_block_size import (
+    moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
-    moe_align_block_size_stage1,
-    moe_align_block_size_stage2,
-    moe_align_block_size_stage2_vec,
-    moe_align_block_size_stage3,
-    moe_align_block_size_stage4,
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import moe_sum as _moe_sum
@@ -51,12 +47,6 @@ def _align_routes(ids, bm, experts):
     routes = ids.numel()
     if routes <= 16:
         return moe_align_block_size_singleton(ids, bm)
-    capacity = min(routes + experts * (bm - 1), routes * bm)
-    sorted_ids = torch.empty((capacity,), device=ids.device, dtype=torch.int32)
-    block_experts = torch.empty(
-        (triton.cdiv(capacity, bm),), device=ids.device, dtype=torch.int32
-    )
-    padded = torch.empty((1,), device=ids.device, dtype=torch.int32)
     workspace = torch.empty(
         ((experts + 1) * (experts + 1),), device=ids.device, dtype=torch.int32
     )
@@ -65,39 +55,7 @@ def _align_routes(ids, bm, experts):
     _zero_workspace[(triton.cdiv(workspace.numel(), 256),)](
         workspace, workspace.numel(), 256
     )
-    tokens_per_thread = triton.next_power_of_2(triton.cdiv(routes, experts))
-    moe_align_block_size_stage1[(experts,)](
-        ids,
-        counts,
-        experts,
-        routes,
-        tokens_per_thread,
-        sorted_ids,
-        block_experts,
-        capacity,
-        block_experts.numel(),
-        triton.next_power_of_2(triton.cdiv(capacity, experts)),
-        triton.next_power_of_2(triton.cdiv(block_experts.numel(), experts)),
-    )
-    if experts == triton.next_power_of_2(experts):
-        moe_align_block_size_stage2_vec[(experts,)](counts, experts)
-    else:
-        moe_align_block_size_stage2[(experts,)](counts, experts)
-    moe_align_block_size_stage3[(1,)](
-        padded, counts, cumsum, experts, triton.next_power_of_2(experts), bm
-    )
-    moe_align_block_size_stage4[(experts,)](
-        ids,
-        sorted_ids,
-        block_experts,
-        counts,
-        cumsum,
-        experts,
-        bm,
-        routes,
-        tokens_per_thread,
-    )
-    return sorted_ids, block_experts, padded
+    return moe_align_block_size_no_tle(ids, bm, experts, workspace=(cumsum, counts))
 
 
 @triton.jit
@@ -109,16 +67,17 @@ def _decode_weight(
     k,
     N: tl.constexpr,
     K: tl.constexpr,
-    WE: tl.constexpr,
-    WN: tl.constexpr,
-    WK: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SG: tl.constexpr,
+    STRIDES: tl.constexpr,
     Q: tl.constexpr,
     GROUP: tl.constexpr,
     DTYPE: tl.constexpr,
 ):
+    WE: tl.constexpr = STRIDES[0]
+    WN: tl.constexpr = STRIDES[1]
+    WK: tl.constexpr = STRIDES[2]
+    SE: tl.constexpr = STRIDES[3]
+    SN: tl.constexpr = STRIDES[4]
+    SG: tl.constexpr = STRIDES[5]
     expert = expert.to(tl.int64)
     n = n.to(tl.int64)
     k = k.to(tl.int64)
@@ -163,12 +122,7 @@ def _gemm(
     K: tl.constexpr,
     R: tl.constexpr,
     TOPK: tl.constexpr,
-    WE: tl.constexpr,
-    WN: tl.constexpr,
-    WK: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SG: tl.constexpr,
+    STRIDES: tl.constexpr,
     Q: tl.constexpr,
     GROUP: tl.constexpr,
     FIRST: tl.constexpr,
@@ -204,12 +158,7 @@ def _gemm(
             k[None, :],
             2 * N if FIRST else N,
             K,
-            WE,
-            WN,
-            WK,
-            SE,
-            SN,
-            SG,
+            STRIDES,
             Q,
             GROUP,
             dtype,
@@ -225,12 +174,7 @@ def _gemm(
                 k[None, :],
                 2 * N,
                 K,
-                WE,
-                WN,
-                WK,
-                SE,
-                SN,
-                SG,
+                STRIDES,
                 Q,
                 GROUP,
                 dtype,
@@ -270,12 +214,7 @@ def _gemv(
     K: tl.constexpr,
     R: tl.constexpr,
     TOPK: tl.constexpr,
-    WE: tl.constexpr,
-    WN: tl.constexpr,
-    WK: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SG: tl.constexpr,
+    STRIDES: tl.constexpr,
     Q: tl.constexpr,
     GROUP: tl.constexpr,
     FIRST: tl.constexpr,
@@ -303,12 +242,7 @@ def _gemv(
             k[None, :],
             2 * N if FIRST else N,
             K,
-            WE,
-            WN,
-            WK,
-            SE,
-            SN,
-            SG,
+            STRIDES,
             Q,
             GROUP,
             dtype,
@@ -323,12 +257,7 @@ def _gemv(
                 k[None, :],
                 2 * N,
                 K,
-                WE,
-                WN,
-                WK,
-                SE,
-                SN,
-                SG,
+                STRIDES,
                 Q,
                 GROUP,
                 dtype,
@@ -454,7 +383,7 @@ def fused_marlin_moe(
 ) -> torch.Tensor:
     """Evaluate native INT4/FP8 SwiGLU MoE without quantizing activations."""
     if quant_type_id not in (0, 2):
-        raise NotImplementedError("MUSA Marlin MoE supports INT4 and FP8")
+        raise NotImplementedError("Unsupported quant_type_id: MUSA supports INT4/FP8")
     activation_str = getattr(
         activation, "value", getattr(activation, "name", activation)
     )
@@ -522,24 +451,22 @@ def fused_marlin_moe(
         ):
             if quant_type_id == 2:
                 w = w.view(torch.uint8)
+            prefix = (a, w, s, topk_weights)
+            suffix = (
+                c,
+                nk,
+                kk,
+                r,
+                topk,
+                (*w.stride(), *s.stride()),
+                quant_type_id,
+                group_size,
+                first,
+                apply_router_weight_on_input,
+            )
             if direct:
                 _gemv[lambda meta: (r, triton.cdiv(nk, meta["BN"]))](
-                    a,
-                    w,
-                    s,
-                    topk_weights,
-                    topk_ids,
-                    c,
-                    nk,
-                    kk,
-                    r,
-                    topk,
-                    *w.stride(),
-                    *s.stride(),
-                    quant_type_id,
-                    group_size,
-                    first,
-                    apply_router_weight_on_input,
+                    *prefix, topk_ids, *suffix
                 )
             else:
                 _gemm[
@@ -547,27 +474,7 @@ def fused_marlin_moe(
                         triton.cdiv(routes.numel(), bm),
                         triton.cdiv(nk, meta["BN"]),
                     )
-                ](
-                    a,
-                    w,
-                    s,
-                    topk_weights,
-                    routes,
-                    experts,
-                    padded,
-                    c,
-                    nk,
-                    kk,
-                    r,
-                    topk,
-                    *w.stride(),
-                    *s.stride(),
-                    quant_type_id,
-                    group_size,
-                    first,
-                    apply_router_weight_on_input,
-                    bm,
-                )
+                ](*prefix, routes, experts, padded, *suffix, bm)
         _moe_sum(result, out)
     return out
 

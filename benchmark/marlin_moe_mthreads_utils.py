@@ -122,10 +122,7 @@ def make_inputs(config, dtype, precision, bank):
 
 def _reference(inputs, precision):
     hs, *_, routing, ids = inputs
-    if precision == "int4":
-        w1, w2, s1, s2 = inputs[1:5]
-    else:
-        w1, w2, s1, s2 = inputs[5:9]
+    w1, w2, s1, s2 = inputs[5:9]
     result = torch.zeros(hs.shape, device=hs.device, dtype=torch.float32)
     # Decode independently from production and accumulate both GEMMs in FP32.
     for expert in range(w1.shape[0]):
@@ -163,7 +160,7 @@ def verify_inputs(op_name, config, inputs, precision, candidate, baseline):
 
 def mthreads_input_iter(bench, dtype, precision, candidate, baseline):
     module = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
-    if hasattr(module, "ENABLE_TRITON_MOE") and not module.ENABLE_TRITON_MOE:
+    if not getattr(module, "ENABLE_TRITON_MOE", True):
         raise RuntimeError(
             "The installed MUSA vLLM requires VLLM_MUSA_ENABLE_MOE_TRITON=1"
         )
@@ -187,7 +184,6 @@ def mthreads_input_iter(bench, dtype, precision, candidate, baseline):
     by_geometry = {}
     for config in bench.shapes:
         by_geometry.setdefault(tuple(config[1:]), []).append(config)
-    bank = inputs = None
     for geometry, configs in by_geometry.items():
         bank = inputs = None
         torch_device_fn.empty_cache()
