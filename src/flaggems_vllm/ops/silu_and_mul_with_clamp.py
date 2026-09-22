@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 _FULL_LINEAR_MIN_ELEMENTS = 1 << 20
 _LINEAR_BLOCK_SIZES = (128, 256, 512, 1024, 2048, 4096)
+# Mthreads' torch.fmin/fmax implementation propagates NaNs, while the CUDA
+# implementation follows IEEE fmin/fmax and selects the non-NaN operand.
+_PROPAGATE_MINMAX_NAN = tl.constexpr(runtime.device.vendor_name == "mthreads")
 
 
 def _silu_clamp_tuning_key(value):
@@ -87,9 +90,34 @@ def _strided_offset(linear, SHAPE: tl.constexpr, STRIDES: tl.constexpr):
 
 
 @triton.jit
+def _fmin_nan_propagating(a, b):
+    # ``x != x`` is the portable Triton spelling; some vendor Triton
+    # backends (including the Mthreads one) do not expose ``tl.isnan``.
+    a_nan = a != a
+    b_nan = b != b
+    if _PROPAGATE_MINMAX_NAN:
+        return tl.where(a_nan, a, tl.where(b_nan, b, tl.minimum(a, b)))
+    return tl.where(a_nan, tl.where(b_nan, a, b), tl.where(b_nan, a, tl.minimum(a, b)))
+
+
+@triton.jit
+def _fmax_nan_propagating(a, b):
+    a_nan = a != a
+    b_nan = b != b
+    if _PROPAGATE_MINMAX_NAN:
+        return tl.where(a_nan, a, tl.where(b_nan, b, tl.maximum(a, b)))
+    return tl.where(a_nan, tl.where(b_nan, a, b), tl.where(b_nan, a, tl.maximum(a, b)))
+
+
+@triton.jit
 def _silu_clamp_value(x, y, limit):
-    gate = tl.minimum(x, limit)
-    up = tl.minimum(tl.maximum(y, -limit), limit)
+    # The reference uses torch.fmin/fmax.  Triton's minimum/maximum NaN
+    # behavior is backend-dependent, so spell out the numeric-min/max
+    # selection explicitly.  Keeping the bounds in this order also preserves
+    # torch's behavior for limit < 0 (where min > max and the second clamp
+    # collapses to the upper bound).
+    gate = _fmin_nan_propagating(x, limit)
+    up = _fmin_nan_propagating(_fmax_nan_propagating(y, -limit), limit)
     return tl.fdiv(gate, 1.0 + tl.exp(-gate)) * up
 
 
@@ -97,12 +125,12 @@ def _silu_clamp_value(x, y, limit):
 def _silu_clamp_grad_values(
     x, y, grad, limit, NEED_DX: tl.constexpr, NEED_DY: tl.constexpr
 ):
-    gate = tl.minimum(x, limit)
+    gate = _fmin_nan_propagating(x, limit)
     sig = 1 / (1 + tl.exp(-gate))
     dx = tl.full(x.shape, 0, tl.float32)
     dy = tl.full(x.shape, 0, tl.float32)
     if NEED_DX:
-        up = tl.minimum(tl.maximum(y, -limit), limit)
+        up = _fmin_nan_propagating(_fmax_nan_propagating(y, -limit), limit)
         derivative = sig * (1 + gate * (1 - sig))
         dx = grad * up * derivative * (x <= limit).to(tl.float32)
     if NEED_DY:
