@@ -41,6 +41,9 @@ from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -58,4 +61,5 @@ __all__ = [
     "outplace_fused_experts",
     "persistent_topk",
     "fused_q_kv_rmsnorm",
+    "topk_softplus_sqrt",
 ]
