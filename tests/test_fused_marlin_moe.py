@@ -687,6 +687,48 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
+@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(
+    not (_is_hopper() and _runs_generic_impl()),
+    reason="exercises the generic SM90 INT4 pipelines",
+)
+@pytest.mark.parametrize("num_tokens", [128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w4a16_int4_pipeline_regression(
+    num_tokens, dtype, apply_router_weight_on_input
+):
+    """Cover production shapes that previously selected corrupt SM90 pipelines."""
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
+        num_tokens, 8, 4096, 14336, 2, dtype, flaggems_vllm.device
+    )
+    result = flaggems_vllm.fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_UINT4B8,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    ref = _reference_swiglu_moe(
+        hs,
+        w1_ref,
+        w2_ref,
+        tw,
+        ti,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    assert result.shape == hs.shape and result.dtype == dtype
+    assert torch.isfinite(result).all()
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])

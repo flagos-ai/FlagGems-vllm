@@ -256,6 +256,10 @@ def _select_w4a16_int4_kernel_policy(
     if is_reduced_hopper:
         block_m = _halve_block_m_if_padding_dominates(block_m, M, E, top_k)
 
+    # Wider INT4 token tiles produce corrupt SM90 results with Triton 3.6.
+    if device_info.is_hopper:
+        block_m = min(block_m, 16)
+
     # Full Hopper keeps the fused GEMM1+SiLU path on broadly. Reduced Hopper
     # uses it for tiny decode and larger-token batches, while avoiding the
     # small-mid token range that regressed in H20 sweeps.
@@ -977,7 +981,11 @@ def _w4a16_int4_moe_gemm_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     scale_base = b_scale_ptr + off_experts * stride_bse + offs_bn * stride_bsn
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    # Triton 3.6 corrupts SM90 results with deeper pipelines at BLOCK_SIZE_M=16.
+    # Preserve the existing pipeline for smaller token tiles.
+    for k in tl.range(
+        0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=2 if BLOCK_SIZE_M >= 16 else None
+    ):
         b_packed = tl.load(b_ptrs)
         scale_idx = k * BLOCK_SIZE_K // GROUP_SIZE_K
         scale = tl.load(scale_base + scale_idx * stride_bsg)

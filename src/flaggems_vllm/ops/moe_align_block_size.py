@@ -475,7 +475,7 @@ def moe_align_block_size_stage3(
 
     expert_offsets = tl.arange(0, num_experts_next_power_of_2)
     mask = expert_offsets < num_experts
-    token_cnts = tl.load(tokens_cnts_ptr + off_cnt + expert_offsets, mask=mask)
+    token_cnts = tl.load(tokens_cnts_ptr + off_cnt + expert_offsets, mask=mask, other=0)
     aligned_cnts = tl.cdiv(token_cnts, block_size) * block_size
 
     cumsum_values = tl.cumsum(aligned_cnts, axis=0)

@@ -52,10 +52,11 @@ from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
 
 from . import base
+from .marlin_moe_mthreads_utils import mthreads_input_iter, mthreads_shapes
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name == "hygon":
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -67,7 +68,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
@@ -354,7 +355,15 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             (256, 256, 4096, 2048, 6),
         ]
 
+        if flaggems_vllm.vendor_name == "mthreads":
+            self.shapes = mthreads_shapes(self.shapes, "int4")
+
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "mthreads":
+            yield from mthreads_input_iter(
+                self, cur_dtype, "int4", _gems_call, _vllm_baseline
+            )
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -494,6 +503,21 @@ def _vllm_baseline(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "mthreads":
+        from vllm.model_executor.layers.fused_moe.config import (
+            int4_w4a16_moe_quant_config,
+        )
+
+        return vllm_fused_experts(
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            topk_weights,
+            topk_ids,
+            quant_config=int4_w4a16_moe_quant_config(
+                w1_scale_wna16, w2_scale_wna16, None, None, block_shape=[0, GROUP_SIZE]
+            ),
+        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -532,7 +556,7 @@ def _gems_call(
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name == "hygon"
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
         else gems_fused_marlin_moe
     )
     return gems_op(
@@ -554,7 +578,7 @@ def _gems_call(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
+    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
 )
 def test_fused_marlin_moe_w4a16_int4():
     """

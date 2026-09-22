@@ -487,6 +487,19 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: fused_marlin_moe_w8a16_fp8
+    description: Fused mixture-of-experts computation with E4M3FN weights and 16-bit activations.
+    for:
+      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+
   - id: fused_moe
     description: The generic interface for fused MoE.
     for:

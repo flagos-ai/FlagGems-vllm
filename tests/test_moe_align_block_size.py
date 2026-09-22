@@ -192,7 +192,7 @@ def _verify_expert_level_sorting(
 def _synchronize():
     if flaggems_vllm.vendor_name == "ascend":
         torch.npu.synchronize()
-    elif flaggems_vllm.vendor_name == "sunrise":
+    elif flaggems_vllm.vendor_name in ("sunrise", "mthreads"):
         from flaggems_vllm.runtime import torch_device_fn
 
         torch_device_fn.synchronize()

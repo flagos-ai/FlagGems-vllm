@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+mthreads_marlin_moe_gemm:
+  - META:
+      BN: 64
+      BK: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 32
+      BK: 32
+    num_warps: 4
+    num_stages: 1
+
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 16
@@ -23,3 +35,10 @@ compute_global_topk_indices_and_lens:
       TPP: 8
     num_warps: 4
     num_stages: 2
+
+mthreads_marlin_moe_gemv:
+  - META:
+      BN: 8
+      BK: 256
+    num_warps: 4
+    num_stages: 1
