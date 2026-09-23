@@ -54,6 +54,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_state_gather import gather_kd
 from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
     scatter_kda_state,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
+    glm5_next_kpool_state_compress_and_write_cache_triton as kpool_state_compress,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
@@ -123,4 +126,5 @@ __all__ = [
     "indexer_epilogue",
     "compute_slot_mapping_parallel",
     "unpack_seq_triton",
+    "kpool_state_compress",
 ]
