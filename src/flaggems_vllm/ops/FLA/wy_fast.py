@@ -13,9 +13,9 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
-if has_triton_tle(3, 6, 0):
+if has_triton_tle_attrs(("load",), 3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 

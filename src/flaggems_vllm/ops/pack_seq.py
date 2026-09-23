@@ -80,14 +80,12 @@ def _pack_seq_kernel(
     # that's implementation-defined outside of value 0.
     d_mask = off_d[None, :] < D
     if PAD_IS_UINT8:
-        pad_vals = tl.full([BLOCK_T, BLOCK_D], PAD_VALUE, tl.uint8)
+        pad_val = tl.full((), PAD_VALUE, tl.uint8)
     else:
-        pad_vals = tl.full([BLOCK_T, BLOCK_D], PAD_VALUE, tl.float32)
-    tl.store(out_row_ptr, pad_vals, mask=t_mask[:, None] & d_mask)
+        pad_val = tl.full((), PAD_VALUE, tl.float32)
 
-    # Load & write only where within seq_len
-    x_vals = tl.load(x_row_ptr, mask=valid_row[:, None] & d_mask)
-    tl.store(out_row_ptr, x_vals, mask=valid_row[:, None] & d_mask)
+    x_vals = tl.load(x_row_ptr, mask=valid_row[:, None] & d_mask, other=pad_val)
+    tl.store(out_row_ptr, x_vals, mask=t_mask[:, None] & d_mask)
 
 
 def pack_seq_triton(

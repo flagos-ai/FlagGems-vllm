@@ -22,16 +22,26 @@ import flaggems_vllm
 
 from . import base
 
+# Per-vendor native compute precision: (fp8, int8), per vendor documentation.
+# A device that reports CUDA capability in the Hopper range is not enough: some
+# non-NVIDIA backends report device="cuda" with a Hopper-like capability while
+# their hardware has no native FP8 path. Vendors left unlisted are skipped.
+_OFFICIAL_PRECISION = {
+    "nvidia": (True, True),  # Hopper tensor cores support FP8/FP16 mixed precision
+    "mthreads": (True, True),  # hardware-native FP8 compute
+    "hygon": (False, True),  # only the BW1100 (gfx938) generation has an FP8 path
+    "metax": (False, True),  # no FP8 in the compiler MMA intrinsics
+    "thead": (False, True),  # FP8 is not part of the 810E precision list
+    "ascend": (False, True),
+}
+_SUPPORTS_FP8, _SUPPORTS_INT8 = _OFFICIAL_PRECISION.get(
+    flaggems_vllm.vendor_name, (False, False)
+)
 
-def is_cuda_available():
-    if flaggems_vllm.device != "cuda":
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    sm_version_num = major * 10 + minor
-    return sm_version_num >= 90 and sm_version_num < 100
-
-
-CUDA_AVAILABLE = is_cuda_available()
+# Vendor has native FP8, but this vLLM build lacks the block-wise quant op.
+_FP8_BLOCKWISE_UNSUPPORTED = {
+    "mthreads",  # no _C.per_token_group_fp8_quant
+}
 
 
 try:
@@ -221,8 +231,10 @@ def _gems_fused_moe_fp8_blockwise_wrapper(
 
 @pytest.mark.fused_experts_impl
 @pytest.mark.skipif(
-    not (HAS_VLLM_FUSED_MOE and CUDA_AVAILABLE),
-    reason="requires vLLM and NVIDIA Hopper architecture for FP8 blockwise",
+    not (HAS_VLLM_FUSED_MOE and _SUPPORTS_FP8)
+    or flaggems_vllm.vendor_name in _FP8_BLOCKWISE_UNSUPPORTED,
+    reason="requires vLLM, native FP8 support and the block-wise quant op "
+    "(per vendor documentation and vLLM build)",
 )
 def test_fused_moe_fp8_blockwise():
     """

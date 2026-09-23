@@ -40,12 +40,16 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
+    chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
 )
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
     flash_attn_varlen_opt_func,
+)
+from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
+    flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
@@ -59,6 +63,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
+from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
     fused_experts_impl,
@@ -68,6 +73,7 @@ from flaggems_vllm.ops.fused_moe import (
 )
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
+from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
@@ -157,6 +163,7 @@ __all__ = [
     "beam_search_score_",
     "bincount",
     "bucket_sort_topk",
+    "chunk_kda",
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "combine_topk_swa_indices",
@@ -172,6 +179,7 @@ __all__ = [
     "dswiglu",
     "flash_attention_forward",
     "flash_attn_varlen_func",
+    "flash_attn_varlen_func_w8a8_fp8",
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
@@ -182,12 +190,14 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
+    "fused_marlin_moe",
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
     "geglu",
     "gelu_and_mul",
+    "gemma_rms_norm",
     "grouped_topk",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
@@ -254,3 +264,14 @@ __all__ = [
     "weight_norm_interface",
     "weight_norm_interface_backward",
 ]
+
+# Hygon DCU ports of the upstream W8A8 BMM / INT8 einsum entry points.
+from flaggems_vllm import runtime as _runtime
+
+if _runtime.device.vendor_name == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops import (
+        int8_einsum,
+        w8a8_block_int8_bmm,
+    )
+
+    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]

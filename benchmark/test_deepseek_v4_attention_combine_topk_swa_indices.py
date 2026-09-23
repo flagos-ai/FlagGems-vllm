@@ -17,8 +17,13 @@ import torch
 
 import flaggems_vllm
 
+from . import base
+
+# vLLM >= 0.23 relocated this op to vllm.models.deepseek_v4.common.ops (the
+# definition lives in its .cache_utils submodule); older releases exposed it as
+# vllm.v1.attention.ops.deepseek_v4_ops.
 try:
-    from vllm.v1.attention.ops.deepseek_v4_ops import (
+    from vllm.models.deepseek_v4.common.ops import (
         combine_topk_swa_indices as vllm_combine_topk_swa_indices,
     )
 
@@ -27,7 +32,6 @@ except Exception:
     vllm_combine_topk_swa_indices = None
     _HAS_VLLM_COMBINE_TOPK_SWA_INDICES = False
 
-from . import base
 
 # Bind through the top-level entry rather than the ops submodule: when a vendor
 # ships a specialized implementation, the runtime rebinds it on the package at
@@ -185,7 +189,49 @@ class CombineTopkSwaIndicesBenchmark(base.Benchmark):
             )
 
 
+def _run_benchmark_with_baseline_label(bench, label):
+    """Run ``bench`` with the baseline column renamed to ``label``.
+
+    ``base.BenchmarkResult.__str__`` hard-codes the header "Torch Latency (ms)"
+    for whatever was passed as the baseline op, which would mislabel the vLLM
+    baseline. Same monkey-patch idiom as run_vllm_benchmark() in
+    test_indexer_k_quant_and_cache.py; the replacement keeps the original
+    18-character width so columns stay aligned.
+    """
+    original_str = base.BenchmarkResult.__str__
+
+    def labelled_str(result):
+        return original_str(result).replace("Torch Latency (ms)", label)
+
+    base.BenchmarkResult.__str__ = labelled_str
+    try:
+        bench.run()
+    finally:
+        base.BenchmarkResult.__str__ = original_str
+
+
+# "Torch Latency (ms)" is 18 characters; keep the replacement the same width so
+# the header, the rule line and the data rows stay aligned.
+_VLLM_BASELINE_LABEL = "vLLM  Latency (ms)"
+
+
 @pytest.mark.combine_topk_swa_indices
 @pytest.mark.skipif(not _HAS_DEVICE, reason=f"requires an available {device} device")
 def test_combine_topk_swa_indices_benchmark():
+    if _HAS_VLLM_COMBINE_TOPK_SWA_INDICES:
+        print(
+            "\n[baseline] vLLM's own combine_topk_swa_indices from "
+            "vllm.models.deepseek_v4.common.ops; the speedup column is vs vLLM."
+        )
+        _run_benchmark_with_baseline_label(
+            CombineTopkSwaIndicesBenchmark(), _VLLM_BASELINE_LABEL
+        )
+        return
+
+    # No vLLM op: fall back to the PyTorch reference, and say so -- the table
+    # then keeps its "Torch Latency (ms)" header, which is accurate.
+    print(
+        "\n[baseline] WARNING: vLLM's combine_topk_swa_indices is unavailable; "
+        "the speedup column is vs the PyTorch reference, NOT vs vLLM."
+    )
     CombineTopkSwaIndicesBenchmark().run()

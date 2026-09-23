@@ -35,6 +35,17 @@ try:
 except ImportError:
     HAS_VLLM_FUSED_MARLIN_MOE = False
 
+# vLLM 0.6.2 on Hygon registers no Marlin MoE ops (torch.ops._moe_C is empty),
+# so the Hygon path compares against the native Triton fused_experts kernel.
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        fused_experts as vllm_fused_experts,
+    )
+
+    HAS_VLLM_FUSED_EXPERTS = True
+except ImportError:
+    HAS_VLLM_FUSED_EXPERTS = False
+
 import flaggems_vllm
 
 # FlagGems wrapper under test
@@ -44,7 +55,9 @@ from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_ma
 from . import base
 
 
-def is_cuda_available():
+def is_supported_device():
+    if flaggems_vllm.vendor_name == "hygon":
+        return True
     if flaggems_vllm.device != "cuda":
         return False
     major, minor = torch.cuda.get_device_capability()
@@ -52,7 +65,12 @@ def is_cuda_available():
     return sm_version_num >= 90 and sm_version_num < 100
 
 
-CUDA_AVAILABLE = is_cuda_available()
+SUPPORTED_DEVICE = is_supported_device()
+HAS_REQUIRED_VLLM = (
+    HAS_VLLM_FUSED_EXPERTS
+    if flaggems_vllm.vendor_name == "hygon"
+    else HAS_VLLM_FUSED_MARLIN_MOE
+)
 
 # =============================================================================
 # MXFP4 (FP4 E2M1 + per-32 E8M0) benchmark: FlagGems Triton vs vLLM Marlin.
@@ -62,6 +80,183 @@ MXFP4_GROUP_SIZE = 32
 _E2M1_POS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_MID = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 _E2M1_MAX = 6.0
+
+# -----------------------------------------------------------------------------
+# Hygon path helpers. The Hygon backend consumes plain output-major MXFP4
+# codes with uint8 E8M0 scales; the baseline is vLLM's native BF16 Triton
+# fused_experts running the same decoded weights. Both implementations are
+# checked against a PyTorch fp32 reference on every benchmarked shape.
+# -----------------------------------------------------------------------------
+
+
+def _hygon_reference(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids):
+    """PyTorch SwiGLU MoE ground truth, rounding each GEMM stage into the
+    activation dtype like the Hygon kernel."""
+    dtype = hidden_states.dtype
+    accumulation_dtype = torch.float64 if dtype == torch.float16 else torch.float32
+    m, k = hidden_states.shape
+    topk = topk_ids.shape[1]
+    flat_ids = topk_ids.flatten()
+    flat_weights = topk_weights.flatten()
+    result = torch.zeros((m * topk, k), dtype=dtype, device=hidden_states.device)
+    for expert in range(w1_ref.shape[0]):
+        routes = torch.where(flat_ids == expert)[0]
+        if routes.numel() == 0:
+            continue
+        x = hidden_states[routes // topk].to(accumulation_dtype)
+        gate_up = x @ w1_ref[expert].to(accumulation_dtype).T
+        gate, up = gate_up.to(dtype).float().chunk(2, -1)
+        act = (torch.nn.functional.silu(gate) * up).to(dtype)
+        out = (
+            act.to(accumulation_dtype) @ w2_ref[expert].to(accumulation_dtype).T
+        ).float()
+        result[routes] = (out * flat_weights[routes, None].float()).to(dtype)
+    return result.view(m, topk, k).float().sum(1).to(dtype)
+
+
+def _hygon_relative_errors(actual, expected):
+    delta = actual.float() - expected.float()
+    rms = (
+        delta.square().mean().sqrt()
+        / expected.float().square().mean().sqrt().clamp_min(1e-12)
+    )
+    peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
+    return rms.item(), peak.item()
+
+
+def _hygon_decode_mxfp4(w_q, scales, dtype):
+    """Decode plain-layout MXFP4 codes with uint8 E8M0 scales to activation
+    dtype, one expert at a time to bound scratch memory."""
+    num_experts, out_dim, packed_k = w_q.shape
+    in_dim = packed_k * 2
+    lut = torch.tensor(_E2M1_POS, device=w_q.device)
+    ref = torch.empty((num_experts, out_dim, in_dim), device=w_q.device, dtype=dtype)
+    for expert in range(num_experts):
+        packed = w_q[expert].to(torch.int32)
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(out_dim, in_dim)
+        values = lut[(codes & 7).long()] * torch.where(codes < 8, 1.0, -1.0)
+        exponent = scales[expert].float().repeat_interleave(MXFP4_GROUP_SIZE, dim=-1)
+        ref[expert] = (values * torch.exp2(exponent - 127)).to(dtype)
+    return ref
+
+
+_HYGON_ADDRESS_PATCH = None
+
+
+def _hygon_ensure_vllm_expert_offset_int64(weights):
+    """Process-local 64-bit addressing fix for the installed vLLM 0.6.2 kernel.
+
+    The Triton expert offset in vllm 0.6.2's fused_moe kernel is int32; on
+    gfx936 its generated buffer load also has a 2 GiB resource range, so large
+    expert banks overflow. Patch the JIT source of this benchmark process's
+    kernel only; the installed package is not modified.
+    """
+    global _HYGON_ADDRESS_PATCH
+    if _HYGON_ADDRESS_PATCH is not None and _HYGON_ADDRESS_PATCH["address_patch"]:
+        return _HYGON_ADDRESS_PATCH
+    required = any(
+        sum((size - 1) * stride for size, stride in zip(w.shape, w.stride()))
+        * w.element_size()
+        + w.element_size()
+        >= 2**31 - 2
+        for w in weights
+    )
+    if not required:
+        print("HYGON_VLLM_ADDRESS", dict(address_patch=False), flush=True)
+        return dict(address_patch=False)
+    import hashlib
+    import importlib
+    import importlib.util
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    module = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
+    original = module.fused_moe_kernel.src
+    before = "off_experts = tl.load(expert_ids_ptr + pid_m)"
+    after = before + ".to(tl.int64)"
+    if original.count(before) != 1 or after in original:
+        raise RuntimeError(
+            "Unexpected vLLM source; review the address fix before benchmarking"
+        )
+    patched = original.replace(before, after, 1)
+    patch_dir = tempfile.TemporaryDirectory(prefix="hygon-vllm-address-")
+    path = Path(patch_dir.name) / "reference.py"
+    path.write_text(
+        "import triton\nimport triton.language as tl\n\n@triton.jit\n" + patched
+    )
+    name = "_hygon_vllm_address_reference"
+    spec = importlib.util.spec_from_file_location(name, path)
+    copied = importlib.util.module_from_spec(spec)
+    sys.modules[name] = copied
+    spec.loader.exec_module(copied)
+    module.fused_moe_kernel = copied.fused_moe_kernel
+    # Keep the temporary directory alive for the process lifetime.
+    _hygon_ensure_vllm_expert_offset_int64._patch_dir = patch_dir
+    _HYGON_ADDRESS_PATCH = dict(
+        address_patch=True,
+        original_kernel_sha256=hashlib.sha256(original.encode()).hexdigest(),
+        patched_kernel_sha256=hashlib.sha256(patched.encode()).hexdigest(),
+    )
+    print("HYGON_VLLM_ADDRESS", _HYGON_ADDRESS_PATCH, flush=True)
+    return _HYGON_ADDRESS_PATCH
+
+
+def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
+    """Plain-layout MXFP4 weight bank plus the same weights decoded for the
+    native BF16 fused_experts baseline."""
+    torch.manual_seed(7)
+    device = flaggems_vllm.device
+    w1 = torch.randint(
+        0,
+        256,
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (num_experts, hidden_size, intermediate_size // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w1_scale = torch.randint(
+        121,
+        126,
+        (num_experts, 2 * intermediate_size, hidden_size // MXFP4_GROUP_SIZE),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w2_scale = torch.randint(
+        121,
+        126,
+        (num_experts, hidden_size, intermediate_size // MXFP4_GROUP_SIZE),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w1_bf16 = _hygon_decode_mxfp4(w1, w1_scale, dtype)
+    w2_bf16 = _hygon_decode_mxfp4(w2, w2_scale, dtype)
+    return (w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16)
+
+
+def _hygon_verify(op_name, config, inputs):
+    """Check both implementations against the fp32 reference before timing."""
+    (hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids) = inputs
+    expected = _hygon_reference(hidden_states, w1_bf16, w2_bf16, topk_weights, topk_ids)
+    checks = (
+        ("flaggems", _gems_call_mxfp4(*inputs)),
+        ("vllm", _vllm_baseline_mxfp4(*inputs)),
+    )
+    errors = []
+    for name, output in checks:
+        rms, peak = _hygon_relative_errors(output, expected)
+        assert rms < 0.01 and peak < 0.02, (
+            f"{op_name} {config}: {name} mismatch against fp32 reference "
+            f"(relative_rms={rms}, relative_peak={peak})"
+        )
+        errors.append((name, round(rms, 6), round(peak, 6)))
+    print(f"HYGON_VERIFY {config} {errors}", flush=True)
 
 
 def _quantize_mxfp4_2d(w_2d, group_size):
@@ -152,8 +347,66 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "hygon":
+            yield from self._get_hygon_input_iter(cur_dtype)
+            return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
+
+    def _get_hygon_input_iter(self, dtype):
+        geometry = None
+        weights = None
+        for config in self.shapes:
+            num_tokens, num_experts, hidden_size, intermediate_size, top_k = config
+            if num_tokens * top_k > 16384:
+                # The Hygon kernel allocates route workspaces of O(E * routes).
+                print(
+                    f"Skipping {config}: Hygon fused Marlin MoE supports at "
+                    "most 16384 routes"
+                )
+                continue
+            next_geometry = (num_experts, hidden_size, intermediate_size)
+            if geometry != next_geometry:
+                # Drop the previous geometry's tensors before allocating the new
+                # bank; generator locals keep them alive otherwise.
+                weights = inputs = None
+                w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16 = [None] * 6
+                torch.cuda.empty_cache()
+                weights = _make_hygon_weights(
+                    num_experts, hidden_size, intermediate_size, dtype
+                )
+                _hygon_ensure_vllm_expert_offset_int64([weights[4], weights[5]])
+                geometry = next_geometry
+            w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16 = weights
+            torch.manual_seed(7 + num_tokens)
+            hidden_states = (
+                torch.randn((num_tokens, hidden_size), device=flaggems_vllm.device)
+                * 0.1
+            ).to(dtype)
+            topk_ids = (
+                torch.rand((num_tokens, num_experts), device=flaggems_vllm.device)
+                .topk(top_k, dim=-1)
+                .indices
+            )
+            topk_weights = torch.softmax(
+                torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
+                dim=-1,
+            )
+            inputs = (
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                w1_bf16,
+                w2_bf16,
+                None,
+                None,
+                topk_weights,
+                topk_ids,
+            )
+            _hygon_verify(self.op_name, config, inputs)
+            yield inputs
 
     def _gen(self, config, dtype):
         num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -219,7 +472,16 @@ def _vllm_baseline_mxfp4(
     topk_weights,
     topk_ids,
 ):
-    """Baseline: vLLM's CUDA Marlin fused_marlin_moe (MXFP4)."""
+    """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
+    fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "hygon":
+        return vllm_fused_experts(
+            hidden_states,
+            w1_q_marlin,
+            w2_q_marlin,
+            topk_weights,
+            topk_ids,
+        )
     return vllm_fused_marlin_moe(
         hidden_states=hidden_states,
         w1=w1_q_marlin,
@@ -248,7 +510,12 @@ def _gems_call_mxfp4(
     topk_ids,
 ):
     """FlagGems' Triton MXFP4 fused_marlin_moe."""
-    return gems_fused_marlin_moe(
+    gems_op = (
+        flaggems_vllm.fused_marlin_moe
+        if flaggems_vllm.vendor_name == "hygon"
+        else gems_fused_marlin_moe
+    )
+    return gems_op(
         hidden_states=hidden_states,
         w1=w1_q_fg,
         w2=w2_q_fg,
@@ -265,13 +532,16 @@ def _gems_call_mxfp4(
 
 @pytest.mark.fused_marlin_moe_w4a16_mxfp4
 @pytest.mark.skipif(
-    not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
+    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+@pytest.mark.skipif(
+    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
+)
 def test_fused_marlin_moe_w4a16_mxfp4():
     """
     Benchmark FlagGems MXFP4 fused_marlin_moe (Triton) vs vLLM MXFP4
-    fused_marlin_moe (CUDA Marlin). Both run FP4 E2M1 + per-32 E8M0 W4A16 GEMM.
+    fused_marlin_moe (CUDA Marlin) on Hopper, or vs vLLM native BF16
+    fused_experts on Hygon. Both run FP4 E2M1 + per-32 E8M0 W4A16 GEMM.
     """
     bench = FusedMarlinMoEW4A16MXFP4Benchmark(
         op_name="fused_marlin_moe_w4a16_mxfp4",
