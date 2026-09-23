@@ -21,8 +21,10 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     mhc_split_sinkhorn_torch_ref,
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
+from flaggems_vllm.ops.mhc.mhc_fused_post_pre import mhc_fused_post_pre
 from flaggems_vllm.ops.mhc.mhc_post import mhc_post
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
+from flaggems_vllm.ops.mhc.mhc_prenorm import mhc_prepare_weights
 
 __all__ = [
     "hc_head_fused_kernel",
@@ -30,10 +32,12 @@ __all__ = [
     "hc_split_sinkhorn",
     "mhc_bwd",
     "mhc_bwd_ref",
+    "mhc_fused_post_pre",
     "mhc_post",
     "mhc_post_ref",
     "mhc_pre",
     "mhc_pre_ref",
+    "mhc_prepare_weights",
     "mhc_split_sinkhorn_torch_ref",
     "sinkhorn_forward",
 ]

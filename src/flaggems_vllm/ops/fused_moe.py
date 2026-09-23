@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 import yaml
 
+from flaggems_vllm.ops.fused_moe_ep_decode import _fused_moe_ep_decode
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
@@ -1844,8 +1845,61 @@ def fused_experts_impl(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    *,
+    gemm1_clamp_limit: float | None = None,
+    enable_ep_decode_optimization: bool = False,
+    output: Optional[torch.Tensor] = None,
+    intermediate_cache13: Optional[torch.Tensor] = None,
+    intermediate_cache2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     logger.debug("GEMS FUSED MOE")
+    if not isinstance(enable_ep_decode_optimization, bool):
+        raise TypeError("enable_ep_decode_optimization must be a bool")
+    if enable_ep_decode_optimization is True:
+        return _fused_moe_ep_decode(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            inplace=inplace,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            ocp_mx_scheme=ocp_mx_scheme,
+            per_channel_quant=per_channel_quant,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            output=output,
+            intermediate_cache13=intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+        )
+    if any(
+        buffer is not None
+        for buffer in (output, intermediate_cache13, intermediate_cache2)
+    ):
+        raise NotImplementedError(
+            "caller-owned fused MoE buffers require "
+            "enable_ep_decode_optimization=True"
+        )
+    if gemm1_clamp_limit is not None:
+        raise NotImplementedError(
+            "gemm1_clamp_limit requires enable_ep_decode_optimization=True; "
+            "the legacy path must not silently substitute unclamped SiLU"
+        )
     assert (
         activation == "silu"
     ), f"Only 'silu' activation is supported, got {activation}"
@@ -2206,6 +2260,12 @@ def inplace_fused_experts(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    *,
+    expert_map: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
+    enable_ep_decode_optimization: bool = False,
+    intermediate_cache13: Optional[torch.Tensor] = None,
+    intermediate_cache2: Optional[torch.Tensor] = None,
 ) -> None:
     """
     In-place fused MoE: writes output directly into ``hidden_states``.
@@ -2228,6 +2288,7 @@ def inplace_fused_experts(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
+        expert_map=expert_map,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -2235,6 +2296,10 @@ def inplace_fused_experts(
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        enable_ep_decode_optimization=enable_ep_decode_optimization,
+        intermediate_cache13=intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
     )
 
 
@@ -2259,11 +2324,19 @@ def outplace_fused_experts(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    *,
+    expert_map: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
+    enable_ep_decode_optimization: bool = False,
+    output: Optional[torch.Tensor] = None,
+    intermediate_cache13: Optional[torch.Tensor] = None,
+    intermediate_cache2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Out-of-place fused MoE: allocates and returns a new output tensor.
+    Out-of-place fused MoE: returns a separate output tensor.
 
-    Same semantics as ``fused_experts_impl(..., inplace=False)``.
+    Same semantics as ``fused_experts_impl(..., inplace=False)``. The explicitly
+    enabled EP decode path may reuse caller-owned output and workspaces.
     """
     return fused_experts_impl(
         hidden_states,
@@ -2280,6 +2353,7 @@ def outplace_fused_experts(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
+        expert_map=expert_map,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -2287,4 +2361,9 @@ def outplace_fused_experts(
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        enable_ep_decode_optimization=enable_ep_decode_optimization,
+        output=output,
+        intermediate_cache13=intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
     )

@@ -18,6 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+from flaggems_vllm.utils import libtuner
+
 logger = logging.getLogger(__name__)
 
 
@@ -308,3 +311,143 @@ def moe_sum(
             output_stride[1],
             ELEM_SIZE=elem_size,
         )
+
+
+@triton.jit
+def _moe_sum_ep_kernel(
+    input_ptr,
+    output_ptr,
+    topk_ids_ptr,
+    expert_map_ptr,
+    num_tokens,
+    topk: tl.constexpr,
+    hidden_size: tl.constexpr,
+    num_global_experts: tl.constexpr,
+    local_num_experts: tl.constexpr,
+    input_stride_token,
+    input_stride_topk,
+    input_stride_hidden,
+    output_stride_token,
+    output_stride_hidden,
+    topk_ids_stride_token,
+    topk_ids_stride_topk,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Combine only routes owned by the current expert-parallel rank."""
+    token_idx = tl.program_id(0)
+    hidden_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    hidden_mask = hidden_offsets < hidden_size
+    if token_idx >= num_tokens:
+        return
+
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    input_base = input_ptr + token_idx * input_stride_token
+    ids_base = topk_ids_ptr + token_idx * topk_ids_stride_token
+    for route_idx in tl.static_range(topk):
+        global_expert_raw = tl.load(ids_base + route_idx * topk_ids_stride_topk)
+        valid_global_expert = (global_expert_raw >= 0) & (
+            global_expert_raw < num_global_experts
+        )
+        # Validate at the original integer width. In particular, a large int64
+        # id must not wrap before it is used to address expert_map.
+        safe_global_expert = tl.where(valid_global_expert, global_expert_raw, 0).to(
+            tl.int64
+        )
+        local_expert_raw = tl.load(
+            expert_map_ptr + safe_global_expert,
+            mask=valid_global_expert,
+            other=-1,
+        )
+        local_route = (
+            valid_global_expert
+            & (local_expert_raw >= 0)
+            & (local_expert_raw < local_num_experts)
+        )
+        route_ptr = input_base + route_idx * input_stride_topk
+        route_data = tl.load(
+            route_ptr + hidden_offsets * input_stride_hidden,
+            mask=hidden_mask & local_route,
+            other=0.0,
+        )
+        acc += route_data.to(tl.float32)
+
+    output_ptr_pos = (
+        output_ptr
+        + token_idx * output_stride_token
+        + hidden_offsets * output_stride_hidden
+    )
+    tl.store(output_ptr_pos, acc, mask=hidden_mask)
+
+
+_EP_SUM_FIXED_CONFIGS = {
+    64: (256, 2),
+    96: (512, 2),
+    128: (1024, 4),
+}
+
+_moe_sum_ep_tuned_kernel = libtuner(
+    configs=runtime.get_tuned_config("moe_sum_ep"),
+    key=["num_tokens", "hidden_size", "topk", "local_num_experts"],
+)(_moe_sum_ep_kernel)
+
+
+def _moe_sum_ep(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    local_num_experts: int,
+) -> None:
+    """Sum local EP routes without reading uninitialized remote route rows.
+
+    The M=64/96/128 schedules are fixed-shape, no-libtuner exemptions: they are
+    the measured H20 winners from PR #5623. Other token counts retain the
+    source optimization's small candidate search through ``libtuner``.
+    """
+    logger.debug("GEMS MOE SUM EP")
+    _check_moe_sum_inputs(input, output)
+    num_tokens, topk, hidden_size = input.shape
+    if topk_ids.shape != (num_tokens, topk):
+        raise ValueError(
+            f"topk_ids must have shape {(num_tokens, topk)}, "
+            f"got {tuple(topk_ids.shape)}"
+        )
+    if expert_map.ndim != 1:
+        raise ValueError("expert_map must be one-dimensional")
+
+    input_strides = input.stride()
+    output_strides = output.stride()
+    topk_ids_strides = topk_ids.stride()
+    kernel_args = (
+        input,
+        output,
+        topk_ids,
+        expert_map,
+        num_tokens,
+        topk,
+        hidden_size,
+        expert_map.numel(),
+        local_num_experts,
+        input_strides[0],
+        input_strides[1],
+        input_strides[2],
+        output_strides[0],
+        output_strides[1],
+        topk_ids_strides[0],
+        topk_ids_strides[1],
+    )
+    fixed_config = _EP_SUM_FIXED_CONFIGS.get(num_tokens)
+    if fixed_config is not None:
+        block_size, num_warps = fixed_config
+        grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+        _moe_sum_ep_kernel[grid](
+            *kernel_args,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
+    else:
+        grid = lambda meta: (
+            num_tokens,
+            triton.cdiv(hidden_size, meta["BLOCK_SIZE"]),
+        )
+        _moe_sum_ep_tuned_kernel[grid](*kernel_args)
