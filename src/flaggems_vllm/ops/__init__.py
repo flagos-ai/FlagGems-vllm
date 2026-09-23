@@ -78,6 +78,7 @@ from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.mhc import (
+    MixLayout,
     hc_head_fused_kernel,
     hc_head_fused_kernel_ref,
     mhc_bwd,
@@ -209,6 +210,7 @@ __all__ = [
     "mhc_bwd_ref",
     "mhc_post",
     "mhc_pre",
+    "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
