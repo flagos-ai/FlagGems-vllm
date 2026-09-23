@@ -30,9 +30,13 @@ ProcessChunk).  Only the safe-gate + in-kernel-gate path used by Kimi/GLM is
 implemented; everything else falls back to the AscendC operator.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 RCP_LN2 = tl.constexpr(1.4426950408889634)
 
@@ -112,6 +116,7 @@ def kda_gate_cumsum_triton(
         ``[1, T, H, D]`` fp32 tensor with the chunk-local cumsum of the gate,
         pre-multiplied by ``1 / ln(2)`` for ``chunk_kda_fwd``.
     """
+    logger.debug("GEMS_ASCEND KDA_GATE_CUMSUM")
     assert g.dim() == 4 and g.shape[0] == 1, "g must be [1, T, H, D]"
     _, T, H, D = g.shape
     assert D <= 256, "KDA gate head dim must be <= 256"

@@ -105,3 +105,14 @@ moe_sum_general:
       BLOCK_SIZE: 2048
     num_warps: 8
     num_stages: 3
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK: 64
+      TPP: 8
+    num_warps: 4
+    num_stages: 2

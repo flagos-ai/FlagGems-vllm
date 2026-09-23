@@ -168,12 +168,23 @@ def test_top_k_per_row_prefill_full_vocab(num_rows, vocab_size, top_k):
     ), f"FAIL: num_rows={num_rows}, vocab_size={vocab_size}, top_k={top_k}"
 
 
+def _tle_prefill_available():
+    """Whether TLE prefill is live after one call: a vendor override may turn it
+    on at the first call, after a collection-time skipif has already run."""
+    logits = torch.randn(1, 4096, device=device, dtype=torch.float32)
+    starts = torch.zeros(1, dtype=torch.int32, device=device)
+    ends = torch.full((1,), 4096, dtype=torch.int32, device=device)
+    out = torch.empty((1, 64), dtype=torch.int32, device=device)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, starts, ends, out, 1, logits.stride(0), logits.stride(1), 64
+    )
+    return import_module("flaggems_vllm.ops.top_k_per_row_prefill").HAS_TLE
+
+
 @pytest.mark.top_k_per_row_prefill
-@pytest.mark.skipif(
-    not import_module("flaggems_vllm.ops.top_k_per_row_prefill").HAS_TLE,
-    reason="TLE top_k_per_row_prefill path is unavailable",
-)
 def test_top_k_per_row_prefill_large_vocab_partial_nonzero_range():
+    if not _tle_prefill_available():
+        pytest.skip("TLE top_k_per_row_prefill path is unavailable")
     torch.manual_seed(321)
     num_rows = 2
     vocab_size = 65536

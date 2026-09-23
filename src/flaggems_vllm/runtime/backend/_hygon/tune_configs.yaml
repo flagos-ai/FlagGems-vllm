@@ -106,6 +106,71 @@ moe_sum_general:
     num_warps: 8
     num_stages: 3
 
+bmm:
+  - META:
+      TILE_M: 16
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 32
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 64
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 4
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 64
+      GROUP_M: 4
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 64
+      GROUP_M: 4
+    num_warps: 8
+    num_stages: 3
+
 # The host selects BM consistently for routing and GEMM; BM is an autotune key.
 hygon_marlin_gemm:
   - META:
@@ -160,3 +225,15 @@ hygon_marlin_gemv:
       BK: 256
     num_warps: 8
     num_stages: 1
+
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 1
+    num_stages: 3
+  - META:
+      BLOCK: 128
+      TPP: 8
+    num_warps: 4
+    num_stages: 3
