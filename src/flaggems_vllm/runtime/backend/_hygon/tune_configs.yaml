@@ -105,3 +105,135 @@ moe_sum_general:
       BLOCK_SIZE: 2048
     num_warps: 8
     num_stages: 3
+
+bmm:
+  - META:
+      TILE_M: 16
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 32
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 64
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 4
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 64
+      GROUP_M: 4
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 64
+      GROUP_M: 4
+    num_warps: 8
+    num_stages: 3
+
+# The host selects BM consistently for routing and GEMM; BM is an autotune key.
+hygon_marlin_gemm:
+  - META:
+      BN: 32
+      BK: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 64
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 64
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 64
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 128
+    num_warps: 4
+    num_stages: 1
+
+hygon_marlin_gemv:
+  - META:
+      BN: 8
+      BK: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 16
+      BK: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 16
+      BK: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 32
+      BK: 256
+    num_warps: 8
+    num_stages: 1
+
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 1
+    num_stages: 3
+  - META:
+      BLOCK: 128
+      TPP: 8
+    num_warps: 4
+    num_stages: 3

@@ -54,6 +54,16 @@ except (ImportError, AttributeError, RuntimeError):
     _vllm_top_k_per_row_decode = None
 
 
+def _torch_topk_ref(
+    logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
+):
+    """Pure-PyTorch fallback reference using torch.topk."""
+    seq_len = seq_lens[0].item()
+    valid_logits = logits[:, :seq_len]
+    _, top_idx = torch.topk(valid_logits, top_k, dim=1, largest=True, sorted=False)
+    indices.copy_(top_idx.to(torch.int32))
+
+
 class TopKPerRowDecodeBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "num_rows, vocab_size, next_n, top_k, stride0, stride1"
 
@@ -104,11 +114,11 @@ class TopKPerRowDecodeBenchmark(base.Benchmark):
 
 
 @pytest.mark.top_k_per_row_decode
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
 def test_top_k_per_row_decode():
+    baseline_op = _vllm_top_k_per_row_decode if HAS_VLLM else _torch_topk_ref
     bench = TopKPerRowDecodeBenchmark(
         op_name="top_k_per_row_decode",
-        torch_op=_vllm_top_k_per_row_decode,
+        torch_op=baseline_op,
         gems_op=flaggems_vllm.top_k_per_row_decode,
         dtypes=[torch.float32],
     )

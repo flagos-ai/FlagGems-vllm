@@ -33,8 +33,11 @@ device = flaggems_vllm.device
 _device_module = getattr(torch, device, None)
 _HAS_DEVICE = _device_module is not None and _device_module.is_available()
 
+# vLLM >= 0.23 relocated this op to vllm.models.deepseek_v4.common.ops (the
+# definition lives in its .cache_utils submodule); older releases exposed it as
+# vllm.v1.attention.ops.deepseek_v4_ops.
 try:
-    from vllm.v1.attention.ops.deepseek_v4_ops import (
+    from vllm.models.deepseek_v4.common.ops import (
         combine_topk_swa_indices as vllm_combine_topk_swa_indices,
     )
 
@@ -146,9 +149,8 @@ def test_combine_topk_swa_indices_accuracy(
 
 
 @pytest.mark.skipif(
-    (not _HAS_DEVICE) or (not _HAS_VLLM_COMBINE_TOPK_SWA_INDICES),
-    reason="requires an available device and "
-    "vllm deepseek_v4_ops.combine_topk_swa_indices",
+    not (_HAS_DEVICE and _HAS_VLLM_COMBINE_TOPK_SWA_INDICES),
+    reason=f"requires an available {device} device and vLLM's implementation",
 )
 def test_combine_topk_swa_indices_vllm_accuracy():
     topk_indices = torch.tensor(

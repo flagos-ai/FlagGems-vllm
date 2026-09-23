@@ -16,6 +16,7 @@ import os
 
 # ruff: noqa: I001
 os.environ["FLAGTREE_AABS"] = "0"
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 from itertools import product  # noqa: E402
 

@@ -27,9 +27,21 @@ from flaggems_vllm.ops.FLA.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
 from flaggems_vllm.utils import libentry
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
-if has_triton_tle(3, 6, 0):
+if has_triton_tle_attrs(
+    (
+        "gpu.alloc",
+        "gpu.copy",
+        "gpu.local_ptr",
+        "gpu.smem",
+        "gpu.warp_specialize",
+        "pipe",
+    ),
+    3,
+    6,
+    0,
+):
     try:
         import triton.experimental.tle.language as tle
 
