@@ -21,6 +21,26 @@ import flaggems_vllm
 
 from . import base
 
+# Per-vendor native compute precision: (fp8, int8), per vendor documentation.
+# Vendors left unlisted are skipped rather than assumed to work.
+_OFFICIAL_PRECISION = {
+    "nvidia": (True, True),
+    "mthreads": (True, True),
+    "hygon": (False, True),
+    "metax": (False, True),
+    "thead": (False, True),
+    "ascend": (False, True),
+}
+_SUPPORTS_FP8, _SUPPORTS_INT8 = _OFFICIAL_PRECISION.get(
+    flaggems_vllm.vendor_name, (False, False)
+)
+
+# Vendor has native INT8, but the kernels this benchmark reaches do not run
+# there yet (a kernel-side gap, not a hardware limitation).
+_INT8_UNSUPPORTED = {
+    "mthreads",  # MUSA Triton has no tl.extra.cuda namespace
+}
+
 try:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts_impl as vllm_fused_experts_impl,
@@ -203,7 +223,12 @@ def _gems_fused_moe_int8_wrapper(
 
 
 @pytest.mark.fused_experts_impl
-@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vllm not installed")
+@pytest.mark.skipif(
+    not (HAS_VLLM_FUSED_MOE and _SUPPORTS_INT8)
+    or flaggems_vllm.vendor_name in _INT8_UNSUPPORTED,
+    reason="vLLM not installed, or no native INT8 support / known unsupported "
+    "on this vendor (per vendor documentation)",
+)
 def test_fused_experts_impl_int8():
     """
     Benchmark FlagGems vs vLLM fused_experts_impl with INT8 W8A8 quantization.

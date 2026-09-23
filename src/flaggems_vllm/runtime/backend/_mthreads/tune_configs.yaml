@@ -12,4 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{}
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK: 64
+      TPP: 8
+    num_warps: 4
+    num_stages: 2
