@@ -47,9 +47,9 @@ except ImportError:
 
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
+from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
-from .test_fused_marlin_moe_w4a16_int4 import mthreads_input_iter, mthreads_shapes
 
 
 def is_supported_device():
@@ -299,15 +299,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
             for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
         ]
 
-        if flaggems_vllm.vendor_name == "mthreads":
-            self.shapes = mthreads_shapes(self.shapes, "fp8")
-
     def get_input_iter(self, cur_dtype):
-        if flaggems_vllm.vendor_name == "mthreads":
-            yield from mthreads_input_iter(
-                self, cur_dtype, "fp8", _gems_call_fp8, _vllm_baseline_fp8
-            )
-            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -402,12 +394,25 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         w1_q_fp8, w1_scale_fp8 = _quantize_per_expert_fp8(w1_fp)
         w2_q_fp8, w2_scale_fp8 = _quantize_per_expert_fp8(w2_fp)
-        w1_q_marlin, w1_scale_marlin = _marlin_repack_per_expert_fp8(
-            w1_q_fp8, w1_scale_fp8, dtype
-        )
-        w2_q_marlin, w2_scale_marlin = _marlin_repack_per_expert_fp8(
-            w2_q_fp8, w2_scale_fp8, dtype
-        )
+        if flaggems_vllm.vendor_name == "mthreads":
+            # Reuse the source buffers for the baseline's decoded weights.
+            for quantized, scale, decoded in (
+                (w1_q_fp8, w1_scale_fp8, w1_fp),
+                (w2_q_fp8, w2_scale_fp8, w2_fp),
+            ):
+                for expert in range(num_experts):
+                    values = quantized[expert].float().view(-1, GROUP_SIZE)
+                    values.mul_(scale[expert].float().view(-1, 1))
+                    decoded[expert].copy_(values.view_as(decoded[expert]))
+            w1_q_marlin, w2_q_marlin = w1_fp, w2_fp
+            w1_scale_marlin = w2_scale_marlin = None
+        else:
+            w1_q_marlin, w1_scale_marlin = _marlin_repack_per_expert_fp8(
+                w1_q_fp8, w1_scale_fp8, dtype
+            )
+            w2_q_marlin, w2_scale_marlin = _marlin_repack_per_expert_fp8(
+                w2_q_fp8, w2_scale_fp8, dtype
+            )
         cached = (
             w1_q_marlin,
             w1_scale_marlin,
@@ -420,7 +425,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         self._weight_cache[cache_key] = cached
         del w1_fp, w2_fp
-        torch.cuda.empty_cache()
+        torch_device_fn.empty_cache()
         return cached
 
     def _gen(self, config, dtype):
