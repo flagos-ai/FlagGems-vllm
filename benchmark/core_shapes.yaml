@@ -515,3 +515,9 @@ swiglu:
     - [2560, 2048]
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
+
+fused_inv_rope_int8_quant:
+  shapes:
+    - [1, 8, 1]
+    - [16, 64, 8]
+  shape_desc: "num_tokens, num_heads, n_groups"
