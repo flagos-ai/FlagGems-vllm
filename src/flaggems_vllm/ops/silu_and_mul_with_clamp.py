@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _FULL_LINEAR_MIN_ELEMENTS = 1 << 20
 _LINEAR_BLOCK_SIZES = (128, 256, 512, 1024, 2048, 4096)
+
+
 def _silu_clamp_tuning_key(value):
     # Keep composite dtype/shape/stride keys SQL-compatible without changing
     # the original constexpr arguments used by the kernels.

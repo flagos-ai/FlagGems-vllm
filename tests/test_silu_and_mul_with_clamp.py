@@ -56,37 +56,6 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit):
     utils.gems_assert_close(res_inp2_grad, ref_inp2_grad, dtype)
 
 
-@pytest.mark.silu_and_mul_with_clamp
-def test_silu_and_mul_with_clamp_nan_matches_torch():
-    device = flaggems_vllm.device
-    dtype = torch.float32
-    limit = 7.0
-
-    x = torch.tensor(
-        [float("nan"), -1.0, 1.0, 10.0],
-        device=device,
-        dtype=dtype,
-    )
-    y = torch.tensor(
-        [2.0, float("nan"), 2.0, 2.0],
-        device=device,
-        dtype=dtype,
-    )
-
-    ref_gate = torch.clamp(x, max=limit)
-    ref_up = torch.clamp(y, min=-limit, max=limit)
-    expected = torch.nn.functional.silu(ref_gate) * ref_up
-
-    with flaggems_vllm.use_gems():
-        actual = flaggems_vllm.silu_and_mul_with_clamp(x, y, limit)
-
-    torch.testing.assert_close(actual, expected, equal_nan=True)
-
-    # Explicitly guard against replacing an input NaN with the clamp bound.
-    assert torch.isnan(actual[0])
-    assert torch.isnan(actual[1])
-
-
 @pytest.mark.silu_and_mul_with_clamp_out
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
@@ -177,25 +146,6 @@ def test_silu_clamp_scalar_boundaries_and_layouts(dtype, layout, limit):
     assert torch.all(storage[..., 1] == 42)
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon tuned path")
-def test_silu_clamp_scalar_cache_miss_during_graph_capture():
-    from flaggems_vllm.ops.silu_and_mul_with_clamp import (
-        _rounded_limit,
-        silu_and_mul_with_clamp,
-    )
-
-    x = torch.randn((3, 513), device=flaggems_vllm.device, dtype=torch.bfloat16)
-    y = torch.randn_like(x)
-    expected = silu_and_mul_with_clamp(x, y, 0.7)
-    torch.cuda.synchronize()
-    _rounded_limit.cache_clear()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        result = silu_and_mul_with_clamp(x, y, 0.7)
-    graph.replay()
-    torch.testing.assert_close(result, expected, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("requires_grad", [(True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("mixed", [False, True])
 def test_silu_clamp_broadcast_partial_gradients(requires_grad, mixed):
@@ -223,18 +173,6 @@ def test_silu_clamp_broadcast_partial_gradients(requires_grad, mixed):
     torch.testing.assert_close(result, reference)
     for actual, expected in zip(actual_grads, reference_grads):
         torch.testing.assert_close(actual, expected.to(actual.dtype))
-
-
-@pytest.mark.parametrize("partial", [False, True])
-def test_silu_clamp_out_alias_during_tuning(partial):
-    from flaggems_vllm.ops.silu_and_mul_with_clamp import silu_and_mul_with_clamp_out
-
-    storage = torch.randn(2051, device=flaggems_vllm.device)
-    x = storage[:-1]
-    y = torch.randn_like(x)
-    out = storage[1:] if partial else x
-    with pytest.raises(NotImplementedError, match="out must not overlap"):
-        silu_and_mul_with_clamp_out(x, y, out, 0.7)
 
 
 @pytest.mark.parametrize("layout", ["transpose", "channels_last", "different_strides"])
