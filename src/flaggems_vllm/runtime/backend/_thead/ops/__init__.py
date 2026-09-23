@@ -22,6 +22,9 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 
 __all__ = [
     "fused_experts_impl",
@@ -30,4 +33,5 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "topk_softplus_sqrt",
 ]
