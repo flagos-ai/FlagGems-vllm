@@ -21,6 +21,10 @@ from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_k
 from flaggems_vllm.runtime.backend._mthreads.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_model1 import (
+    can_use_model1_mthreads,
+    sparse_decode_model1_mthreads,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -48,6 +52,8 @@ from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "flash_attn_varlen_func_w8a8_fp8",
+    "can_use_model1_mthreads",
+    "sparse_decode_model1_mthreads",
     "grouped_topk",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
