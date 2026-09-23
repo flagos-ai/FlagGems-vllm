@@ -38,6 +38,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
 )
@@ -46,6 +47,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
+from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
+    indexer_gemm_score,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
     scatter_conv_state,
@@ -59,6 +63,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
     glm5_next_kpool_state_compress_and_write_cache_triton as kpool_state_compress,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
+    kv_rmsnorm_rope_cache,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
+    lightning_indexer,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
@@ -97,6 +107,7 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_experts_impl",
+    "gemma_rms_norm",
     "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
@@ -131,4 +142,7 @@ __all__ = [
     "unpack_seq_triton",
     "kpool_state_compress",
     "group_list_cumsum",
+    "indexer_gemm_score",
+    "kv_rmsnorm_rope_cache",
+    "lightning_indexer",
 ]

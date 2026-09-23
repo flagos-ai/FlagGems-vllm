@@ -49,6 +49,16 @@ try:
         from torch_npu import npu_gemma_rms_norm as baseline_op
 
         HAS_BASELINE_OP = True
+    elif vendor == "mthreads":
+
+        from vllm_musa.jit_kernel.csrc import gemma_rmsnorm
+
+        def baseline_op(x, w, eps=1e-5):
+            out = torch.empty_like(x)
+            gemma_rmsnorm(x, w, eps, out, True)
+            return out
+
+        HAS_BASELINE_OP = True
 except Exception as e:
     print(e)
     HAS_BASELINE_OP = False
