@@ -35,11 +35,6 @@ logger = logging.getLogger(__name__)
 
 _FULL_LINEAR_MIN_ELEMENTS = 1 << 20
 _LINEAR_BLOCK_SIZES = (128, 256, 512, 1024, 2048, 4096)
-# Mthreads' torch.fmin/fmax implementation propagates NaNs, while the CUDA
-# implementation follows IEEE fmin/fmax and selects the non-NaN operand.
-_PROPAGATE_MINMAX_NAN = tl.constexpr(runtime.device.vendor_name == "mthreads")
-
-
 def _silu_clamp_tuning_key(value):
     # Keep composite dtype/shape/stride keys SQL-compatible without changing
     # the original constexpr arguments used by the kernels.
@@ -95,25 +90,26 @@ def _fmin_nan_propagating(a, b):
     # backends (including the Mthreads one) do not expose ``tl.isnan``.
     a_nan = a != a
     b_nan = b != b
-    if _PROPAGATE_MINMAX_NAN:
-        return tl.where(a_nan, a, tl.where(b_nan, b, tl.minimum(a, b)))
-    return tl.where(a_nan, tl.where(b_nan, a, b), tl.where(b_nan, a, tl.minimum(a, b)))
+    # ``torch.clamp`` preserves NaNs in both the input and the bound.  This is
+    # deliberately different from IEEE ``fmin``, which selects the non-NaN
+    # operand when only one argument is NaN.
+    return tl.where(a_nan, a, tl.where(b_nan, b, tl.minimum(a, b)))
 
 
 @triton.jit
 def _fmax_nan_propagating(a, b):
     a_nan = a != a
     b_nan = b != b
-    if _PROPAGATE_MINMAX_NAN:
-        return tl.where(a_nan, a, tl.where(b_nan, b, tl.maximum(a, b)))
-    return tl.where(a_nan, tl.where(b_nan, a, b), tl.where(b_nan, a, tl.maximum(a, b)))
+    # Match ``torch.clamp(..., min=...)`` for NaN values; do not use the
+    # backend's potentially different ``maximum`` NaN behavior directly.
+    return tl.where(a_nan, a, tl.where(b_nan, b, tl.maximum(a, b)))
 
 
 @triton.jit
 def _silu_clamp_value(x, y, limit):
-    # The reference uses torch.fmin/fmax.  Triton's minimum/maximum NaN
-    # behavior is backend-dependent, so spell out the numeric-min/max
-    # selection explicitly.  Keeping the bounds in this order also preserves
+    # The reference uses torch.clamp.  Triton's minimum/maximum NaN behavior
+    # is backend-dependent, so spell out the clamp semantics explicitly.
+    # Keeping the bounds in this order also preserves
     # torch's behavior for limit < 0 (where min > max and the second clamp
     # collapses to the upper bound).
     gate = _fmin_nan_propagating(x, limit)

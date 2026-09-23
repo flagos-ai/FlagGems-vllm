@@ -56,6 +56,37 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit):
     utils.gems_assert_close(res_inp2_grad, ref_inp2_grad, dtype)
 
 
+@pytest.mark.silu_and_mul_with_clamp
+def test_silu_and_mul_with_clamp_nan_matches_torch():
+    device = flaggems_vllm.device
+    dtype = torch.float32
+    limit = 7.0
+
+    x = torch.tensor(
+        [float("nan"), -1.0, 1.0, 10.0],
+        device=device,
+        dtype=dtype,
+    )
+    y = torch.tensor(
+        [2.0, float("nan"), 2.0, 2.0],
+        device=device,
+        dtype=dtype,
+    )
+
+    ref_gate = torch.clamp(x, max=limit)
+    ref_up = torch.clamp(y, min=-limit, max=limit)
+    expected = torch.nn.functional.silu(ref_gate) * ref_up
+
+    with flaggems_vllm.use_gems():
+        actual = flaggems_vllm.silu_and_mul_with_clamp(x, y, limit)
+
+    torch.testing.assert_close(actual, expected, equal_nan=True)
+
+    # Explicitly guard against replacing an input NaN with the clamp bound.
+    assert torch.isnan(actual[0])
+    assert torch.isnan(actual[1])
+
+
 @pytest.mark.silu_and_mul_with_clamp_out
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
@@ -119,12 +150,11 @@ def test_silu_clamp_scalar_boundaries_and_layouts(dtype, layout, limit):
         x, y = x[:0], y[:0]
     x.requires_grad_()
     y.requires_grad_()
-    # Spell out the original FP32 forward and backward, including its NaN
-    # handling (minimum/maximum select the non-NaN operand).
+    # Match the public reference implementation exactly, including its NaN
+    # handling: torch.clamp preserves NaNs in the input and bounds.
     xf, yf = x.float(), y.float()
-    threshold = torch.tensor(rounded, device=x.device, dtype=torch.float32)
-    gate = torch.fmin(xf, threshold)
-    up = torch.fmin(torch.fmax(yf, -threshold), threshold)
+    gate = torch.clamp(xf, max=rounded)
+    up = torch.clamp(yf, min=-rounded, max=rounded)
     ref = (gate / (1 + torch.exp(-gate))) * up
     result = silu_and_mul_with_clamp(x, y, limit)
     torch.testing.assert_close(result, ref.to(dtype), equal_nan=True)
