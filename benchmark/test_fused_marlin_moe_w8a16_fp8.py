@@ -49,7 +49,7 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
 
 from . import base
-from .marlin_moe_mthreads_utils import mthreads_input_iter, mthreads_shapes
+from .test_fused_marlin_moe_w4a16_int4 import mthreads_input_iter, mthreads_shapes
 
 
 def is_supported_device():
