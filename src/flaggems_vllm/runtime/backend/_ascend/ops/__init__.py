@@ -33,6 +33,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
+    fused_add_rms_norm,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -145,4 +148,5 @@ __all__ = [
     "indexer_gemm_score",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
+    "fused_add_rms_norm",
 ]
