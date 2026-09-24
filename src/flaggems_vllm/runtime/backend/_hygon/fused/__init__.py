@@ -22,10 +22,18 @@ from flaggems_vllm.runtime.backend._hygon.fused.fused_marlin_moe import (  # noq
     fused_marlin_moe,
 )
 from flaggems_vllm.runtime.backend._hygon.fused.moe_sum import moe_sum  # noqa: F401
+from flaggems_vllm.runtime.backend._hygon.fused.top_k_per_row_decode import (
+    top_k_per_row_decode,
+)
+from flaggems_vllm.runtime.backend._hygon.fused.top_k_per_row_prefill import (
+    top_k_per_row_prefill,
+)
 
 __all__ = [
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
     "moe_sum",
+    "top_k_per_row_decode",
+    "top_k_per_row_prefill",
 ]
