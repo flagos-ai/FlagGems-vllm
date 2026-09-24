@@ -189,6 +189,75 @@ class CombineTopkSwaIndicesBenchmark(base.Benchmark):
             )
 
 
+def _legacy_hq4_metadata_baseline(
+    topk_indices,
+    query_start_loc,
+    seq_lens,
+    gather_lens,
+    window_size,
+    compress_ratio,
+    topk,
+    M,
+    N,
+    **metadata_options,
+):
+    """Measure the unchanged two-output producer without metadata work."""
+    del metadata_options
+    return combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        compress_ratio,
+        topk,
+        M,
+        N,
+    )
+
+
+class HQ4MetadataProducerBenchmark(base.Benchmark):
+    """Exact C4/W128/K2048 producer active set used by the HQ4 consumer."""
+
+    def __init__(self):
+        super().__init__(
+            "combine_topk_swa_indices_hq4_metadata",
+            _legacy_hq4_metadata_baseline,
+            [torch.int32],
+            gems_op=combine_topk_swa_indices,
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        _ = shape_file_path
+        self.shapes = [64, 128, 512, 1024, 2048, 4096]
+
+    def get_input_iter(self, dtype):
+        _ = dtype
+        for s_q in self.shapes:
+            topk_indices = torch.arange(2048, device="cuda", dtype=torch.int32).repeat(
+                s_q, 1
+            )
+            query_start_loc = torch.tensor([0, s_q], device="cuda", dtype=torch.int32)
+            seq_lens = torch.tensor([4096 + s_q], device="cuda", dtype=torch.int32)
+            gather_lens = torch.tensor([s_q + 127], device="cuda", dtype=torch.int32)
+            yield (
+                topk_indices,
+                query_start_loc,
+                seq_lens,
+                gather_lens,
+                128,
+                4,
+                2048,
+                34944,
+                2048,
+                {
+                    "enable_hq4_sparse_prefill": True,
+                    "return_pair_metadata": True,
+                    "return_quad_metadata": True,
+                },
+            )
+
+
 def _run_benchmark_with_baseline_label(bench, label):
     """Run ``bench`` with the baseline column renamed to ``label``.
 
@@ -235,3 +304,11 @@ def test_combine_topk_swa_indices_benchmark():
         "the speedup column is vs the PyTorch reference, NOT vs vLLM."
     )
     CombineTopkSwaIndicesBenchmark().run()
+
+
+@pytest.mark.combine_topk_swa_indices
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_combine_topk_swa_indices_hq4_metadata_benchmark():
+    # Median latency in ms, lower is better. The speedup column compares the
+    # metadata producer with the unchanged two-output producer.
+    HQ4MetadataProducerBenchmark().run()

@@ -319,6 +319,50 @@ weight_norm_kernel:
       - 512
       - 1024
       - 2048
+
+# Used only by the explicitly enabled fused mHC post-to-pre path.  These are
+# the CUDA-Graph candidates measured for HC=4/H=4096 decode on Hopper.
+mhc_post_hc4:
+  - META:
+      BLOCK_H: 128
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_H: 256
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_H: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_H: 512
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_H: 512
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_H: 1024
+    num_warps: 4
+    num_stages: 1
+
+# Generic token-count tail of the explicitly enabled H20 EP-decode path.
+# M=64/96/128 use separately documented fixed schedules in moe_sum.py.
+moe_sum_ep:
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 3
 add_rms_norm_loop:
   - gen: true
     param_map:

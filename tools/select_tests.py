@@ -91,7 +91,44 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
-    "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
+    "src/flaggems_vllm/ops/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+        "tests/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/fused_moe_ep_decode.py": [
+        "tests/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/fused_moe_ep_m1.py": [
+        "tests/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/moe_sum.py": [
+        "tests/test_moe_sum.py",
+        "tests/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_fused_post_pre.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_optimized_triton_only.py",
+        "tests/test_mhc_prenorm_dispatch.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_post_optimized.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_optimized_triton_only.py",
+        "tests/test_mhc_prenorm_dispatch.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_with_norm.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_optimized_triton_only.py",
+        "tests/test_mhc_prenorm_dispatch.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_prenorm.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_fused_post_pre.py",
+        "tests/test_mhc_optimized_triton_only.py",
+        "tests/test_mhc_prenorm_dispatch.py",
+    ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
@@ -147,12 +184,39 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
+        "benchmark/test_fused_moe_ep_decode.py",
         "benchmark/test_fused_moe_fp8.py",
         "benchmark/test_fused_moe_fp8_blockwise.py",
         "benchmark/test_fused_moe_int4_w4a16.py",
         "benchmark/test_fused_moe_int8.py",
         "benchmark/test_fused_moe_int8_w8a16.py",
         "benchmark/test_fused_moe_w8a16.py",
+    ],
+    "src/flaggems_vllm/ops/fused_moe_ep_decode.py": [
+        "benchmark/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/fused_moe_ep_m1.py": [
+        "benchmark/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/moe_sum.py": [
+        "benchmark/test_moe_sum.py",
+        "benchmark/test_fused_moe_ep_decode.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_fused_post_pre.py": [
+        "benchmark/test_mhc.py",
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_post_optimized.py": [
+        "benchmark/test_mhc.py",
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_with_norm.py": [
+        "benchmark/test_mhc.py",
+        "benchmark/test_mhc_fused_post_pre_perf.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_prenorm.py": [
+        "benchmark/test_mhc.py",
+        "benchmark/test_mhc_fused_post_pre_perf.py",
     ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": [
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",

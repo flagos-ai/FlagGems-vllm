@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -38,6 +39,921 @@ TLE_FLASHMLA_PREFILL_BK = 64
 TLE_FLASHMLA_PREFILL_BH = 64
 TLE_FLASHMLA_PREFILL_PAIR_BLOCKS = 2
 TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS = 4
+
+
+@lru_cache(maxsize=None)
+def _use_quad_gather_pipeline(device: torch.device) -> bool:
+    # Resource/performance validation covers this compiler/device (215040 B),
+    # not an installation requirement. Other versions keep the original BK64.
+    if device.type != "cuda" or device.index is None or triton.__version__ != "3.7.1":
+        return False
+    props = torch.cuda.get_device_properties(device)
+    return (
+        getattr(props, "name", None) == "NVIDIA H20"
+        and getattr(props, "major", None) == 9
+        and getattr(props, "minor", None) == 0
+        and getattr(props, "shared_memory_per_block_optin", 0) >= 215040
+    )
+
+
+# Autotune exemption: this explicitly gated port preserves the source PR's
+# local Triton candidate set for the HQ4 single-row kernel. Pair/quad kernels
+# use the source PR's fixed H20 schedules below, so none of these choices can
+# alter the default HQ64/HQ128 path.
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 64, "BH": 4}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BH": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 128, "BH": 4}, num_warps=8, num_stages=2),
+        triton.Config({"BK": 128, "BH": 8}, num_warps=8, num_stages=3),
+    ],
+    key=[
+        "SQ",
+        "SKV",
+        "TOPK",
+        "HAVE_ATTN_SINK",
+        "HAVE_TOPK_LENGTH",
+        "RETURN_STATS",
+    ],
+)
+@triton.jit
+def triton_flash_mla_sparse_fwd_hq4(
+    q,
+    kv,
+    indices,
+    attn_sink,
+    topk_length,
+    sm_scale: tl.constexpr,
+    output,
+    max_logits,
+    lse,
+    stride_qh,
+    stride_qm,
+    stride_kvn,
+    stride_tm,
+    stride_oh,
+    stride_om,
+    stride_mm,
+    stride_lm,
+    SQ,
+    SKV,
+    TOPK: tl.constexpr,
+    HAVE_ATTN_SINK: tl.constexpr,
+    HAVE_TOPK_LENGTH: tl.constexpr,
+    RETURN_STATS: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+):
+    """Four-head specialization with heads on the MMA N dimension."""
+
+    i_sq = tl.program_id(0).to(tl.int64)
+    offs_h = tl.arange(0, BH)
+    mask_h = offs_h < 4
+    offs_d = tl.arange(0, 256)
+    offs_t = tl.arange(0, BK)
+
+    q_base = q + i_sq * stride_qm
+    indices_base = indices + i_sq * stride_tm
+    output_base = output + i_sq * stride_om
+    q_ptr = q_base + offs_h[:, None] * stride_qh + offs_d[None, :]
+    q_blk0 = tl.load(
+        q_ptr, mask=mask_h[:, None], other=0.0, eviction_policy="evict_first"
+    )
+    q_blk1 = tl.load(
+        q_ptr + 256,
+        mask=mask_h[:, None],
+        other=0.0,
+        eviction_policy="evict_first",
+    )
+
+    max_log = tl.full([BH], float("-inf"), dtype=tl.float32)
+    sum_exp = tl.zeros([BH], dtype=tl.float32)
+    acc0 = tl.zeros([256, BH], dtype=tl.float32)
+    acc1 = tl.zeros([256, BH], dtype=tl.float32)
+
+    topk_len = tl.load(topk_length + i_sq) if HAVE_TOPK_LENGTH else TOPK
+    topk_len = tl.minimum(tl.maximum(topk_len, 0), TOPK)
+    num_k_blocks = tl.cdiv(topk_len, BK)
+    for block_index in range(num_k_blocks):
+        topk_offsets = block_index * BK + offs_t
+        topk_mask = topk_offsets < topk_len
+        kv_ids = tl.load(indices_base + topk_offsets, mask=topk_mask, other=-1)
+        valid_ids = (kv_ids >= 0) & (kv_ids < SKV)
+        safe_kv_ids = tl.where(valid_ids, kv_ids, 0)
+
+        kv_ptr = kv + offs_d[:, None] + safe_kv_ids[None, :] * stride_kvn
+        kv_blk0 = tl.load(kv_ptr, cache_modifier=".cg")
+        kv_blk1 = tl.load(kv_ptr + 256, cache_modifier=".cg")
+
+        # Keeping heads on N wastes only the hardware N=8 minimum.  Putting
+        # four heads on M would execute the M=16 minimum in both dot products.
+        qk_transposed = tl.dot(kv_blk0.trans(), q_blk0.trans(), out_dtype=tl.float32)
+        qk_transposed = tl.dot(
+            kv_blk1.trans(),
+            q_blk1.trans(),
+            qk_transposed,
+            out_dtype=tl.float32,
+        )
+        qk_transposed *= sm_scale
+        qk_transposed = tl.where(
+            valid_ids[:, None] & mask_h[None, :],
+            qk_transposed,
+            float("-inf"),
+        )
+
+        new_max = tl.maximum(max_log, tl.max(qk_transposed, axis=0))
+        max_for_exp = tl.where(new_max == float("-inf"), 0.0, new_max)
+        exp_qk_transposed = tl.math.exp(qk_transposed - max_for_exp[None, :])
+        block_sum = tl.sum(exp_qk_transposed, axis=0)
+        alpha = tl.math.exp(max_log - max_for_exp)
+        sum_exp = sum_exp * alpha + block_sum
+
+        weights = exp_qk_transposed.to(tl.bfloat16)
+        acc0 = tl.dot(
+            kv_blk0,
+            weights,
+            acc0 * alpha[None, :],
+            out_dtype=tl.float32,
+        )
+        acc1 = tl.dot(
+            kv_blk1,
+            weights,
+            acc1 * alpha[None, :],
+            out_dtype=tl.float32,
+        )
+        max_log = new_max
+
+    valid_row = max_log != float("-inf")
+    if RETURN_STATS:
+        max_logits_base = max_logits + i_sq * stride_mm
+        lse_base = lse + i_sq * stride_lm
+        tl.store(max_logits_base + offs_h, max_log, mask=mask_h)
+        original_lse = max_log + tl.math.log(sum_exp)
+        lse_values = tl.where(valid_row, original_lse, float("inf"))
+        tl.store(lse_base + offs_h, lse_values, mask=mask_h)
+
+    if HAVE_ATTN_SINK:
+        sink = tl.load(attn_sink + offs_h, mask=mask_h, other=float("-inf"))
+        denominator = sum_exp + tl.math.exp(sink - max_log)
+    else:
+        denominator = sum_exp
+    denominator = tl.where(valid_row, denominator, 1.0)
+    factor = 1.0 / denominator
+    out_vals0 = tl.where(valid_row[None, :], acc0 * factor[None, :], 0.0)
+    out_vals1 = tl.where(valid_row[None, :], acc1 * factor[None, :], 0.0)
+    output_ptr = output_base + offs_h[:, None] * stride_oh + offs_d[None, :]
+    tl.store(output_ptr, out_vals0.trans().to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(
+        output_ptr + 256,
+        out_vals1.trans().to(tl.bfloat16),
+        mask=mask_h[:, None],
+    )
+
+
+@triton.jit
+def _flash_mla_sparse_hq4_pair(
+    q,
+    kv,
+    indices,
+    attn_sink,
+    topk_length,
+    output,
+    first_row,
+    pair_mode,
+    first_topk_length,
+    stride_qh,
+    stride_qm,
+    stride_kvn,
+    stride_tm,
+    stride_oh,
+    stride_om,
+    SKV,
+    sm_scale: tl.constexpr,
+    WINDOW: tl.constexpr,
+    HAVE_ATTN_SINK: tl.constexpr,
+    PAIR_CACHE_CA: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Evaluate two four-head rows from one small union of their KV IDs."""
+
+    first_length = tl.load(topk_length + first_row)
+    second_length = tl.load(topk_length + first_row + 1)
+    offsets_n = tl.arange(0, 8)
+    query_in_pair = offsets_n // 4
+    head = offsets_n % 4
+    query_row = first_row + query_in_pair
+    column_length = tl.where(query_in_pair == 0, first_length, second_length)
+    is_mode2 = pair_mode == 2
+    is_mode3 = pair_mode == 3
+    is_mode4 = pair_mode == 4
+    second_topk_length = first_topk_length + 1
+    union_length = second_length + tl.where(is_mode2 | is_mode4, 1, 0)
+
+    offsets_d = tl.arange(0, 256)
+    q_ptr = (
+        q
+        + query_row[:, None] * stride_qm
+        + head[:, None] * stride_qh
+        + offsets_d[None, :]
+    )
+    q_blk0 = tl.load(q_ptr, eviction_policy="evict_first")
+    q_blk1 = tl.load(q_ptr + 256, eviction_policy="evict_first")
+
+    offsets_t = tl.arange(0, BK)
+    max_log = tl.full([8], float("-inf"), dtype=tl.float32)
+    sum_exp = tl.zeros([8], dtype=tl.float32)
+    acc0 = tl.zeros([256, 8], dtype=tl.float32)
+    acc1 = tl.zeros([256, 8], dtype=tl.float32)
+
+    for block_index in range(tl.cdiv(union_length, BK)):
+        union_position = block_index * BK + offsets_t
+        union_mask = union_position < union_length
+
+        # Modes 1 and 3 use row 1 directly.  A saturated, unchanged top-k
+        # (mode 2) uses row 0 plus row 1's new window tail.  A saturated,
+        # growing top-k (mode 4) uses row 1 plus row 0's expired window head.
+        mode2_source_row = tl.where(
+            union_position < first_length, first_row, first_row + 1
+        )
+        mode2_source_position = tl.where(
+            union_position < first_length,
+            union_position,
+            first_length - 1,
+        )
+        mode4_source_row = tl.where(
+            union_position == second_topk_length, first_row, first_row + 1
+        )
+        mode4_source_position = tl.where(
+            union_position < second_topk_length,
+            union_position,
+            tl.where(
+                union_position == second_topk_length,
+                first_topk_length,
+                union_position - 1,
+            ),
+        )
+        source_row = tl.where(
+            is_mode2,
+            mode2_source_row,
+            tl.where(is_mode4, mode4_source_row, first_row + 1),
+        )
+        source_position = tl.where(
+            is_mode2,
+            mode2_source_position,
+            tl.where(is_mode4, mode4_source_position, union_position),
+        )
+        kv_ids = tl.load(
+            indices + source_row * stride_tm + source_position,
+            mask=union_mask,
+            other=-1,
+        )
+        valid_ids = union_mask & (kv_ids >= 0) & (kv_ids < SKV)
+        safe_kv_ids = tl.where(valid_ids, kv_ids, 0)
+        kv_ptr = kv + offsets_d[:, None] + safe_kv_ids[None, :] * stride_kvn
+        if PAIR_CACHE_CA:
+            kv_blk0 = tl.load(kv_ptr, cache_modifier=".ca")
+            kv_blk1 = tl.load(kv_ptr + 256, cache_modifier=".ca")
+        else:
+            kv_blk0 = tl.load(kv_ptr, cache_modifier=".cg")
+            kv_blk1 = tl.load(kv_ptr + 256, cache_modifier=".cg")
+
+        scores = tl.dot(kv_blk0.trans(), q_blk0.trans(), out_dtype=tl.float32)
+        scores = tl.dot(kv_blk1.trans(), q_blk1.trans(), scores, out_dtype=tl.float32)
+        scores *= sm_scale
+
+        prefix_mask = union_position[:, None] < column_length[None, :]
+        mode2_mask = tl.where(
+            query_in_pair[None, :] == 0,
+            union_position[:, None] < first_length,
+            union_position[:, None] != first_topk_length,
+        )
+        mode3_first_mask = (
+            (union_position[:, None] < second_length)
+            & (union_position[:, None] != first_topk_length)
+            & (union_position[:, None] != second_length - 1)
+        )
+        mode3_mask = tl.where(
+            query_in_pair[None, :] == 0,
+            mode3_first_mask,
+            union_position[:, None] < second_length,
+        )
+        mode4_first_mask = (union_position[:, None] < first_topk_length) | (
+            (union_position[:, None] >= second_topk_length)
+            & (union_position[:, None] < second_topk_length + WINDOW)
+        )
+        mode4_mask = tl.where(
+            query_in_pair[None, :] == 0,
+            mode4_first_mask,
+            union_position[:, None] != second_topk_length,
+        )
+        pair_mask = tl.where(
+            is_mode2,
+            mode2_mask,
+            tl.where(
+                is_mode3,
+                mode3_mask,
+                tl.where(is_mode4, mode4_mask, prefix_mask),
+            ),
+        )
+        scores = tl.where(valid_ids[:, None] & pair_mask, scores, float("-inf"))
+
+        new_max = tl.maximum(max_log, tl.max(scores, axis=0))
+        max_for_exp = tl.where(new_max == float("-inf"), 0.0, new_max)
+        exp_scores = tl.math.exp(scores - max_for_exp[None, :])
+        alpha = tl.math.exp(max_log - max_for_exp)
+        sum_exp = sum_exp * alpha + tl.sum(exp_scores, axis=0)
+        weights = exp_scores.to(tl.bfloat16)
+        acc0 = tl.dot(
+            kv_blk0,
+            weights,
+            acc0 * alpha[None, :],
+            out_dtype=tl.float32,
+        )
+        acc1 = tl.dot(
+            kv_blk1,
+            weights,
+            acc1 * alpha[None, :],
+            out_dtype=tl.float32,
+        )
+        max_log = new_max
+
+    valid_row = max_log != float("-inf")
+    if HAVE_ATTN_SINK:
+        sink = tl.load(attn_sink + head)
+        denominator = sum_exp + tl.math.exp(sink - max_log)
+    else:
+        denominator = sum_exp
+    denominator = tl.where(valid_row, denominator, 1.0)
+    factor = 1.0 / denominator
+    out_vals0 = tl.where(valid_row[None, :], acc0 * factor[None, :], 0.0)
+    out_vals1 = tl.where(valid_row[None, :], acc1 * factor[None, :], 0.0)
+    output_ptr = (
+        output
+        + query_row[:, None] * stride_om
+        + head[:, None] * stride_oh
+        + offsets_d[None, :]
+    )
+    tl.store(output_ptr, out_vals0.trans().to(tl.bfloat16))
+    tl.store(output_ptr + 256, out_vals1.trans().to(tl.bfloat16))
+
+
+@triton.jit
+def _flash_mla_sparse_hq4_single(
+    q,
+    kv,
+    indices,
+    attn_sink,
+    topk_length,
+    output,
+    row,
+    stride_qh,
+    stride_qm,
+    stride_kvn,
+    stride_tm,
+    stride_oh,
+    stride_om,
+    SKV,
+    sm_scale: tl.constexpr,
+    TOPK: tl.constexpr,
+    HAVE_ATTN_SINK: tl.constexpr,
+    SINGLE_CACHE_CA: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+):
+    """Run the regular four-head path for a work item that cannot be paired."""
+
+    offsets_h = tl.arange(0, BH)
+    mask_h = offsets_h < 4
+    offsets_d = tl.arange(0, 256)
+    q_ptr = q + row * stride_qm + offsets_h[:, None] * stride_qh + offsets_d[None, :]
+    q_blk0 = tl.load(q_ptr, mask=mask_h[:, None], other=0.0)
+    q_blk1 = tl.load(q_ptr + 256, mask=mask_h[:, None], other=0.0)
+
+    raw_length = tl.load(topk_length + row)
+    length = tl.minimum(tl.maximum(raw_length, 0), TOPK)
+    offsets_t = tl.arange(0, BK)
+    max_log = tl.full([BH], float("-inf"), dtype=tl.float32)
+    sum_exp = tl.zeros([BH], dtype=tl.float32)
+    acc0 = tl.zeros([256, BH], dtype=tl.float32)
+    acc1 = tl.zeros([256, BH], dtype=tl.float32)
+
+    for block_index in range(tl.cdiv(length, BK)):
+        positions = block_index * BK + offsets_t
+        token_mask = positions < length
+        kv_ids = tl.load(
+            indices + row * stride_tm + positions,
+            mask=token_mask,
+            other=-1,
+        )
+        valid_ids = token_mask & (kv_ids >= 0) & (kv_ids < SKV)
+        safe_kv_ids = tl.where(valid_ids, kv_ids, 0)
+        kv_ptr = kv + offsets_d[:, None] + safe_kv_ids[None, :] * stride_kvn
+        if SINGLE_CACHE_CA:
+            kv_blk0 = tl.load(kv_ptr, cache_modifier=".ca")
+            kv_blk1 = tl.load(kv_ptr + 256, cache_modifier=".ca")
+        else:
+            kv_blk0 = tl.load(kv_ptr, cache_modifier=".cg")
+            kv_blk1 = tl.load(kv_ptr + 256, cache_modifier=".cg")
+
+        scores = tl.dot(kv_blk0.trans(), q_blk0.trans(), out_dtype=tl.float32)
+        scores = tl.dot(kv_blk1.trans(), q_blk1.trans(), scores, out_dtype=tl.float32)
+        scores *= sm_scale
+        scores = tl.where(valid_ids[:, None] & mask_h[None, :], scores, float("-inf"))
+        new_max = tl.maximum(max_log, tl.max(scores, axis=0))
+        max_for_exp = tl.where(new_max == float("-inf"), 0.0, new_max)
+        exp_scores = tl.math.exp(scores - max_for_exp[None, :])
+        alpha = tl.math.exp(max_log - max_for_exp)
+        sum_exp = sum_exp * alpha + tl.sum(exp_scores, axis=0)
+        weights = exp_scores.to(tl.bfloat16)
+        acc0 = tl.dot(
+            kv_blk0,
+            weights,
+            acc0 * alpha[None, :],
+            out_dtype=tl.float32,
+        )
+        acc1 = tl.dot(
+            kv_blk1,
+            weights,
+            acc1 * alpha[None, :],
+            out_dtype=tl.float32,
+        )
+        max_log = new_max
+
+    valid_row = max_log != float("-inf")
+    if HAVE_ATTN_SINK:
+        sink = tl.load(attn_sink + offsets_h, mask=mask_h, other=float("-inf"))
+        denominator = sum_exp + tl.math.exp(sink - max_log)
+    else:
+        denominator = sum_exp
+    denominator = tl.where(valid_row, denominator, 1.0)
+    factor = 1.0 / denominator
+    out_vals0 = tl.where(valid_row[None, :], acc0 * factor[None, :], 0.0)
+    out_vals1 = tl.where(valid_row[None, :], acc1 * factor[None, :], 0.0)
+    output_ptr = (
+        output + row * stride_om + offsets_h[:, None] * stride_oh + offsets_d[None, :]
+    )
+    tl.store(output_ptr, out_vals0.trans().to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(
+        output_ptr + 256,
+        out_vals1.trans().to(tl.bfloat16),
+        mask=mask_h[:, None],
+    )
+
+
+@triton.jit
+def triton_flash_mla_sparse_fwd_hq4_pair_work_items(
+    q,
+    kv,
+    indices,
+    attn_sink,
+    topk_length,
+    pair_metadata,
+    output,
+    stride_qh,
+    stride_qm,
+    stride_kvn,
+    stride_tm,
+    stride_oh,
+    stride_om,
+    SQ,
+    SKV,
+    sm_scale: tl.constexpr,
+    TOPK: tl.constexpr,
+    WINDOW: tl.constexpr,
+    HAVE_ATTN_SINK: tl.constexpr,
+    PAIR_CACHE_CA: tl.constexpr,
+    SINGLE_CACHE_CA: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+    work_id_override=None,
+):
+    """Select an N=8 pair or an N=4 single path from producer metadata."""
+
+    work_id = tl.program_id(0) if work_id_override is None else work_id_override
+    pair_id = work_id // 2
+    slot = work_id % 2
+    first_row = (pair_id * 2).to(tl.int64)
+    has_second = first_row + 1 < SQ
+    packed_metadata = tl.load(pair_metadata + pair_id)
+    pair_mode = packed_metadata & 7
+    first_topk_length = packed_metadata >> 3
+    first_length = tl.load(topk_length + first_row)
+    second_length = tl.load(topk_length + first_row + 1, mask=has_second, other=0)
+
+    valid_mode1 = (
+        (pair_mode == 1)
+        & has_second
+        & (first_length > 0)
+        & (second_length == first_length + 1)
+        & (second_length <= TOPK)
+        & (first_topk_length >= 0)
+        & (first_length - first_topk_length > 0)
+        & (first_length - first_topk_length < WINDOW)
+    )
+    valid_mode2 = (
+        (pair_mode == 2)
+        & has_second
+        & (first_length >= WINDOW)
+        & (first_length == second_length)
+        & (first_length <= TOPK)
+        & (first_length - first_topk_length == WINDOW)
+    )
+    valid_mode3 = (
+        (pair_mode == 3)
+        & has_second
+        & (first_length > 0)
+        & (second_length == first_length + 2)
+        & (second_length <= TOPK)
+        & (first_topk_length >= 0)
+        & (first_length - first_topk_length > 0)
+        & (first_length - first_topk_length < WINDOW)
+    )
+    valid_mode4 = (
+        (pair_mode == 4)
+        & has_second
+        & (first_length > 0)
+        & (second_length == first_length + 1)
+        & (second_length <= TOPK)
+        & (first_topk_length >= 0)
+        & (first_length - first_topk_length == WINDOW)
+    )
+    is_pair = valid_mode1 | valid_mode2 | valid_mode3 | valid_mode4
+
+    if is_pair:
+        if slot == 0:
+            _flash_mla_sparse_hq4_pair(
+                q,
+                kv,
+                indices,
+                attn_sink,
+                topk_length,
+                output,
+                first_row,
+                pair_mode,
+                first_topk_length,
+                stride_qh,
+                stride_qm,
+                stride_kvn,
+                stride_tm,
+                stride_oh,
+                stride_om,
+                SKV,
+                sm_scale,
+                WINDOW,
+                HAVE_ATTN_SINK,
+                PAIR_CACHE_CA,
+                BK,
+            )
+    else:
+        row = first_row + slot
+        if row < SQ:
+            _flash_mla_sparse_hq4_single(
+                q,
+                kv,
+                indices,
+                attn_sink,
+                topk_length,
+                output,
+                row,
+                stride_qh,
+                stride_qm,
+                stride_kvn,
+                stride_tm,
+                stride_oh,
+                stride_om,
+                SKV,
+                sm_scale,
+                TOPK,
+                HAVE_ATTN_SINK,
+                SINGLE_CACHE_CA,
+                BK,
+                BH,
+            )
+
+
+@triton.jit
+def _flash_mla_sparse_hq4_quad(
+    q,
+    kv,
+    indices,
+    sink,
+    lens,
+    pairs,
+    out,
+    row,
+    stride_qh,
+    stride_qm,
+    stride_kv,
+    stride_i,
+    stride_oh,
+    stride_om,
+    SKV,
+    SCALE: tl.constexpr,
+    W: tl.constexpr,
+    SINK: tl.constexpr,
+    BK: tl.constexpr,
+    GATHER_PIPELINE: tl.constexpr = False,
+):
+    """Reuse one KV union for four queries certified by the index producer."""
+    m0 = tl.load(pairs + row // 2)
+    m1 = tl.load(pairs + row // 2 + 1)
+    p0 = m0 >> 3
+    p1 = p0 + (((m0 & 7) == 3) | ((m0 & 7) == 4)).to(tl.int32)
+    p2 = m1 >> 3
+    p3 = p2 + (((m1 & 7) == 3) | ((m1 & 7) == 4)).to(tl.int32)
+    s0 = tl.load(lens + row) - p0
+    union_len = p3 + s0 + 3
+    swa_base = tl.load(indices + row * stride_i + p0)
+    col = tl.arange(0, 16)
+    qid = col // 4
+    head = col % 4
+    plen = tl.where(qid == 0, p0, tl.where(qid == 1, p1, tl.where(qid == 2, p2, p3)))
+    wstart = tl.maximum(0, s0 + qid - W)
+    wend = s0 + qid
+    # Four 128-wide fragments keep the MMA operands below the register and
+    # shared-memory footprint of two 256-wide fragments at N=16.
+    d = tl.arange(0, 128)
+    t = tl.arange(0, BK)
+    qp = q + (row + qid[:, None]) * stride_qm + head[:, None] * stride_qh + d[None, :]
+    q0 = tl.load(qp)
+    q1 = tl.load(qp + 128)
+    q2 = tl.load(qp + 256)
+    q3 = tl.load(qp + 384)
+    maximum = tl.full((16,), float("-inf"), tl.float32)
+    total = tl.zeros((16,), tl.float32)
+    acc0 = tl.zeros((128, 16), tl.float32)
+    acc1 = tl.zeros((128, 16), tl.float32)
+    acc2 = tl.zeros((128, 16), tl.float32)
+    acc3 = tl.zeros((128, 16), tl.float32)
+    if GATHER_PIPELINE:
+        # Carry only integer addresses, leaving FP32 online-softmax unchanged.
+        pos = t
+        cid = tl.load(
+            indices + (row + 3) * stride_i + pos,
+            mask=(pos < p3) & (union_len > 0),
+            other=0,
+        )
+        kid = tl.where(pos < p3, cid, swa_base + pos - p3)
+        valid = (pos < union_len) & (kid >= 0) & (kid < SKV)
+        kid = tl.where(valid, kid, 0)
+    for block in range(tl.cdiv(union_len, BK)):
+        pos = block * BK + t
+        if not GATHER_PIPELINE:
+            cid = tl.load(indices + (row + 3) * stride_i + pos, mask=pos < p3, other=0)
+            kid = tl.where(pos < p3, cid, swa_base + pos - p3)
+            valid = (pos < union_len) & (kid >= 0) & (kid < SKV)
+            kid = tl.where(valid, kid, 0)
+        kp = kv + d[:, None] + kid[None, :] * stride_kv
+        k0 = tl.load(kp, cache_modifier=".cg")
+        k1 = tl.load(kp + 128, cache_modifier=".cg")
+        k2 = tl.load(kp + 256, cache_modifier=".cg")
+        k3 = tl.load(kp + 384, cache_modifier=".cg")
+        scores = tl.dot(k0.trans(), q0.trans(), out_dtype=tl.float32)
+        scores = tl.dot(k1.trans(), q1.trans(), scores, out_dtype=tl.float32)
+        scores = tl.dot(k2.trans(), q2.trans(), scores, out_dtype=tl.float32)
+        scores = tl.dot(k3.trans(), q3.trans(), scores, out_dtype=tl.float32) * SCALE
+        attend = (pos[:, None] < plen[None, :]) | (
+            (pos[:, None] >= p3 + wstart[None, :]) & (pos[:, None] < p3 + wend[None, :])
+        )
+        scores = tl.where(valid[:, None] & attend, scores, float("-inf"))
+        if GATHER_PIPELINE:
+            # Decode the next gather before this block's max/exp/PV work.
+            next_pos = (block + 1) * BK + t
+            has_next = block + 1 < tl.cdiv(union_len, BK)
+            next_cid = tl.load(
+                indices + (row + 3) * stride_i + next_pos,
+                mask=(next_pos < p3) & has_next,
+                other=0,
+            )
+            next_kid = tl.where(next_pos < p3, next_cid, swa_base + next_pos - p3)
+            next_valid = (next_pos < union_len) & (next_kid >= 0) & (next_kid < SKV)
+            next_kid = tl.where(next_valid, next_kid, 0)
+        updated = tl.maximum(maximum, tl.max(scores, 0))
+        safe = tl.where(updated == float("-inf"), 0.0, updated)
+        weights = tl.exp(scores - safe[None, :])
+        alpha = tl.exp(maximum - safe)
+        total = total * alpha + tl.sum(weights, 0)
+        w = weights.to(tl.bfloat16)
+        acc0 = tl.dot(k0, w, acc0 * alpha[None, :], out_dtype=tl.float32)
+        acc1 = tl.dot(k1, w, acc1 * alpha[None, :], out_dtype=tl.float32)
+        acc2 = tl.dot(k2, w, acc2 * alpha[None, :], out_dtype=tl.float32)
+        acc3 = tl.dot(k3, w, acc3 * alpha[None, :], out_dtype=tl.float32)
+        maximum = updated
+        if GATHER_PIPELINE:
+            kid = next_kid
+            valid = next_valid
+    valid = maximum != float("-inf")
+    if SINK:
+        sink_value = tl.load(sink + head)
+        denom = total + tl.exp(sink_value - maximum)
+    else:
+        denom = total
+    denom = tl.where(valid, denom, 1.0)
+    factor = 1.0 / denom
+    o0 = tl.where(valid[None, :], acc0 * factor[None, :], 0.0)
+    o1 = tl.where(valid[None, :], acc1 * factor[None, :], 0.0)
+    o2 = tl.where(valid[None, :], acc2 * factor[None, :], 0.0)
+    o3 = tl.where(valid[None, :], acc3 * factor[None, :], 0.0)
+    op = out + (row + qid[:, None]) * stride_om + head[:, None] * stride_oh + d[None, :]
+    tl.store(op, o0.trans().to(tl.bfloat16))
+    tl.store(op + 128, o1.trans().to(tl.bfloat16))
+    tl.store(op + 256, o2.trans().to(tl.bfloat16))
+    tl.store(op + 384, o3.trans().to(tl.bfloat16))
+
+
+@triton.jit
+def _hq4_pair_descriptor_is_valid(lens, pairs, pair_id, SQ, TOPK, W):
+    first_row = pair_id * 2
+    has_first = first_row < SQ
+    has_second = first_row + 1 < SQ
+    packed = tl.load(pairs + pair_id, mask=has_first, other=0)
+    mode = packed & 7
+    first_topk = packed >> 3
+    first_length = tl.load(lens + first_row, mask=has_first, other=0)
+    second_length = tl.load(lens + first_row + 1, mask=has_second, other=0)
+    common = (
+        has_second
+        & (first_topk >= 0)
+        & (first_topk <= first_length)
+        & (first_length <= TOPK)
+        & (second_length <= TOPK)
+    )
+    valid_mode1 = (
+        (mode == 1)
+        & (first_length > 0)
+        & (second_length == first_length + 1)
+        & (first_length - first_topk > 0)
+        & (first_length - first_topk < W)
+    )
+    valid_mode2 = (
+        (mode == 2)
+        & (first_length >= W)
+        & (second_length == first_length)
+        & (first_length - first_topk == W)
+    )
+    valid_mode3 = (
+        (mode == 3)
+        & (first_length > 0)
+        & (second_length == first_length + 2)
+        & (first_length - first_topk > 0)
+        & (first_length - first_topk < W)
+    )
+    valid_mode4 = (
+        (mode == 4)
+        & (first_length > 0)
+        & (second_length == first_length + 1)
+        & (first_length - first_topk == W)
+    )
+    return common & (valid_mode1 | valid_mode2 | valid_mode3 | valid_mode4)
+
+
+@triton.jit
+def _hq4_quad_descriptor_is_valid(lens, pairs, quads, group, SQ, TOPK, W):
+    row = group * 4
+    enabled = tl.load(quads + group)
+    pair0_valid = _hq4_pair_descriptor_is_valid(lens, pairs, group * 2, SQ, TOPK, W)
+    pair1_valid = _hq4_pair_descriptor_is_valid(lens, pairs, group * 2 + 1, SQ, TOPK, W)
+    m0 = tl.load(pairs + group * 2, mask=row < SQ, other=0)
+    m1 = tl.load(pairs + group * 2 + 1, mask=row + 2 < SQ, other=0)
+    p0 = m0 >> 3
+    p1 = p0 + (((m0 & 7) == 3) | ((m0 & 7) == 4)).to(tl.int32)
+    p2 = m1 >> 3
+    p3 = p2 + (((m1 & 7) == 3) | ((m1 & 7) == 4)).to(tl.int32)
+    l0 = tl.load(lens + row, mask=row < SQ, other=0)
+    s0 = l0 - p0
+    union_length = p3 + s0 + 3
+    boundary_valid = (p2 >= p1) & (p2 <= p1 + 1)
+    return (
+        (enabled == 1)
+        & (row + 3 < SQ)
+        & pair0_valid
+        & pair1_valid
+        & boundary_valid
+        & (s0 > 0)
+        & (s0 <= W)
+        # Four sliding windows can extend three positions past one row's
+        # logical width; those IDs are generated arithmetically, not loaded
+        # from the row.
+        & (union_length <= TOPK + 3)
+    )
+
+
+@triton.jit
+def triton_flash_mla_sparse_fwd_hq4_quad(
+    q,
+    kv,
+    indices,
+    sink,
+    lens,
+    pairs,
+    quad_metadata,
+    out,
+    stride_qh,
+    stride_qm,
+    stride_kv,
+    stride_i,
+    stride_oh,
+    stride_om,
+    SQ,
+    SKV,
+    SCALE: tl.constexpr,
+    TOPK: tl.constexpr,
+    W: tl.constexpr,
+    SINK: tl.constexpr,
+    BK: tl.constexpr,
+    GATHER_PIPELINE: tl.constexpr = False,
+):
+    group = tl.program_id(0)
+    row = (group * 4).to(tl.int64)
+    descriptor_is_valid = _hq4_quad_descriptor_is_valid(
+        lens, pairs, quad_metadata, group, SQ, TOPK, W
+    )
+    if descriptor_is_valid:
+        _flash_mla_sparse_hq4_quad(
+            q,
+            kv,
+            indices,
+            sink,
+            lens,
+            pairs,
+            out,
+            row,
+            stride_qh,
+            stride_qm,
+            stride_kv,
+            stride_i,
+            stride_oh,
+            stride_om,
+            SKV,
+            SCALE,
+            W,
+            SINK,
+            BK,
+            GATHER_PIPELINE,
+        )
+
+
+@triton.jit
+def triton_flash_mla_sparse_fwd_hq4_quad_fallback(
+    q,
+    kv,
+    indices,
+    sink,
+    lens,
+    pairs,
+    quad_metadata,
+    out,
+    stride_qh,
+    stride_qm,
+    stride_kv,
+    stride_i,
+    stride_oh,
+    stride_om,
+    SQ,
+    SKV,
+    SCALE: tl.constexpr,
+    TOPK: tl.constexpr,
+    W: tl.constexpr,
+    SINK: tl.constexpr,
+    BK: tl.constexpr,
+):
+    work_id = tl.program_id(0)
+    group = work_id // 4
+    descriptor_is_valid = _hq4_quad_descriptor_is_valid(
+        lens, pairs, quad_metadata, group, SQ, TOPK, W
+    )
+    if descriptor_is_valid == 0:
+        triton_flash_mla_sparse_fwd_hq4_pair_work_items(
+            q,
+            kv,
+            indices,
+            sink,
+            lens,
+            pairs,
+            out,
+            stride_qh,
+            stride_qm,
+            stride_kv,
+            stride_i,
+            stride_oh,
+            stride_om,
+            SQ,
+            SKV,
+            SCALE,
+            TOPK,
+            W,
+            SINK,
+            not SINK,
+            SINK,
+            BK,
+            4,
+            work_id_override=work_id,
+        )
+
+
+# The pair/quad schedules above are intentionally fixed. They are the
+# H20-validated schedules from the source optimization and are kept out of the
+# default path by ``enable_hq4_sparse_prefill``.
 
 
 @triton.autotune(
@@ -1042,7 +1958,7 @@ def _set_triton_descriptor_allocator(device: torch.device) -> None:
     triton.set_allocator(alloc_fn)
 
 
-def flash_mla_sparse_fwd(
+def _flash_mla_sparse_fwd_default(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -1204,3 +2120,449 @@ def flash_mla_sparse_fwd(
         topk_length is not None,
     )
     return output, max_logits, lse
+
+
+def _flash_mla_sparse_fwd_hq4_optimized(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    return_stats: bool = True,
+    *,
+    pair_metadata: Optional[torch.Tensor] = None,
+    pair_window_size: int = 0,
+    quad_metadata: Optional[torch.Tensor] = None,
+    max_kv_length: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Sparse attention prefill kernel
+
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16
+        indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
+        sm_scale: float
+        d_v: The dimension of value vectors. Can only be 512
+        attn_sink: optional, [h_q], float32.
+            If attn_sink is provided, when computing output, output will be additionally multiplied by
+            exp(lse) / (exp(lse) + exp(attn_sink)). +-inf in attn_sink will be handled normally (i.e., -inf has no
+            effect, +inf will make corresponding output all zeros).
+            This argument has no effect on lse and max_logits.
+        topk_length: optional, [s_q], int32.
+            If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]],
+            ignoring later k/v tokens (even if provided in indices). In extremely rare cases (topk_length provided,
+            there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token
+            containing NaN), operator output will contain NaN, so please avoid this situation.
+        out: optional pre-allocated output tensor, [s_q, h_q, d_v], bfloat16.
+        return_stats: whether to return max_logits and lse. Set this to False
+            when only the attention output is consumed.
+        pair_metadata: optional packed int32 descriptors emitted by
+            combine_topk_swa_indices. One descriptor covers two adjacent rows;
+            structurally invalid or unsupported descriptors use the regular
+            path. Descriptors must come from the same indices and topk_length
+            tensors and must not be reused after either tensor is changed.
+        pair_window_size: sliding-window width used to create pair_metadata.
+        quad_metadata: optional int32 flags emitted together with pair_metadata
+            by combine_topk_swa_indices(return_quad_metadata=True). Each flag
+            certifies four adjacent queries from one request with exactly
+            matching compressed prefixes and a contiguous sliding window.
+            It must describe the same unmodified indices and topk_length.
+        max_kv_length: optional CPU length hint including compressed and SWA
+            entries. It only selects a quad launch configuration; attention
+            masks and loop bounds always come from the device lengths.
+
+    Returns:
+        (output, max_logits, lse). max_logits and lse are None when
+        return_stats is False.
+        Please refer to tests/ref.py for the precise definitions of these parameters.
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits:  [s_q, h_q], float
+        - lse: [s_q, h_q], float, log-sum-exp of attention scores
+    """
+    assert q.stride(-1) == 1 and kv.stride(-1) == 1 and indices.stride(-1) == 1
+    if type(return_stats) is not bool:
+        raise TypeError("return_stats must be a bool")
+    if type(pair_window_size) is not int:
+        raise TypeError("pair_window_size must be an int")
+    if max_kv_length is not None:
+        if type(max_kv_length) is not int:
+            raise TypeError("max_kv_length must be an int or None")
+        if max_kv_length < 0:
+            raise ValueError("max_kv_length must be non-negative")
+    if pair_metadata is None:
+        if pair_window_size != 0:
+            raise ValueError("pair_window_size requires pair_metadata")
+    elif not isinstance(pair_metadata, torch.Tensor):
+        raise TypeError("pair_metadata must be a torch.Tensor or None")
+    elif pair_window_size <= 0:
+        raise ValueError("pair_window_size must be positive with pair_metadata")
+    assert (
+        q.dtype == torch.bfloat16
+        and kv.dtype == torch.bfloat16
+        and indices.dtype == torch.int32
+    )
+    assert q.device == kv.device and q.device == indices.device
+    SQ, HQ, DQK = q.shape
+    SKV, HKV, _ = kv.shape
+    assert SKV > 0, "kv must contain at least one row"
+
+    assert d_v == 512, "Unsupported d_v"
+    DV = d_v
+
+    assert kv.shape[-1] == DQK
+    _, _, TOPK = indices.shape
+    assert indices.shape == (SQ, HKV, TOPK)
+    if attn_sink is not None:
+        assert attn_sink.is_contiguous()
+        assert attn_sink.dtype == torch.float32
+        assert attn_sink.device == q.device
+        assert attn_sink.shape == (HQ,), "attn_sink error shape"
+    if topk_length is not None:
+        assert topk_length.is_contiguous()
+        assert topk_length.dtype == torch.int32
+        assert topk_length.device == q.device
+        assert topk_length.shape == (SQ,), "topk_length error shape"
+    if pair_metadata is not None:
+        if topk_length is None:
+            raise ValueError("pair_metadata requires topk_length")
+        assert pair_metadata.is_contiguous()
+        assert pair_metadata.dtype == torch.int32
+        assert pair_metadata.device == q.device
+        assert pair_metadata.shape == (triton.cdiv(SQ, 2),), "pair_metadata error shape"
+    if quad_metadata is not None:
+        if not isinstance(quad_metadata, torch.Tensor):
+            raise TypeError("quad_metadata must be a torch.Tensor or None")
+        if pair_metadata is None:
+            raise ValueError("quad_metadata requires pair_metadata")
+        assert quad_metadata.is_contiguous()
+        assert quad_metadata.dtype == torch.int32
+        assert quad_metadata.device == q.device
+        assert quad_metadata.shape == (triton.cdiv(SQ, 4),), "quad_metadata error shape"
+
+    # check from FlashMLA
+    assert HKV == 1, "h_kv is expected to be 1"
+    assert 0 < HQ <= 128, "Unsupported h_q"
+    assert DQK == 576 or DQK == 512, "Unsupported d_qk"
+
+    _ = SKV
+    if out is None:
+        output = torch.empty((SQ, HQ, DV), device=q.device, dtype=q.dtype)
+    else:
+        assert out.shape == (SQ, HQ, DV), "out error shape"
+        assert out.dtype == q.dtype, "out error dtype"
+        assert out.device == q.device, "out error device"
+        assert out.stride(-1) == 1, "out must have a contiguous last dimension"
+        output = out
+    if return_stats:
+        max_logits = torch.empty((SQ, HQ), device=q.device, dtype=torch.float32)
+        lse = torch.empty((SQ, HQ), device=q.device, dtype=torch.float32)
+        max_logits_ptr = max_logits
+        lse_ptr = lse
+        stride_mm = max_logits.stride(0)
+        stride_lm = lse.stride(0)
+    else:
+        max_logits = None
+        lse = None
+        # Triton specializes RETURN_STATS at compile time, so these pointers
+        # and strides are never dereferenced in the no-statistics variant.
+        max_logits_ptr = output
+        lse_ptr = output
+        stride_mm = 0
+        stride_lm = 0
+
+    if (
+        pair_metadata is not None
+        and HQ == 4
+        and DQK == 512
+        and not return_stats
+        and SQ >= 2
+    ):
+        if quad_metadata is not None and SQ >= 4:
+            # Keeping fallback in a separate launch avoids forcing the
+            # four-query kernel to reserve the pair kernel's register layout.
+            # Flags come from the same producer launch as indices and lengths.
+            common = (
+                q,
+                kv,
+                indices,
+                attn_sink,
+                topk_length,
+                pair_metadata,
+                quad_metadata,
+                output,
+                q.stride(1),
+                q.stride(0),
+                kv.stride(0),
+                indices.stride(0),
+                output.stride(1),
+                output.stride(0),
+                SQ,
+                SKV,
+                sm_scale,
+            )
+            block_k = (
+                64
+                if SQ <= 2048 and max_kv_length is not None and max_kv_length > 512
+                else 32
+            )
+            triton_flash_mla_sparse_fwd_hq4_quad[(triton.cdiv(SQ, 4),)](
+                *common,
+                TOPK,
+                pair_window_size,
+                attn_sink is not None,
+                BK=block_k,
+                GATHER_PIPELINE=block_k == 64 and _use_quad_gather_pipeline(q.device),
+                num_warps=4,
+                num_stages=3,
+            )
+            triton_flash_mla_sparse_fwd_hq4_quad_fallback[(SQ,)](
+                *common,
+                TOPK,
+                pair_window_size,
+                attn_sink is not None,
+                BK=64,
+                num_warps=4,
+                num_stages=3,
+            )
+            return output, max_logits, lse
+        pair_cache_ca = attn_sink is None
+        single_cache_ca = attn_sink is not None
+        triton_flash_mla_sparse_fwd_hq4_pair_work_items[(SQ,)](
+            q,
+            kv,
+            indices,
+            attn_sink,
+            topk_length,
+            pair_metadata,
+            output,
+            q.stride(1),
+            q.stride(0),
+            kv.stride(0),
+            indices.stride(0),
+            output.stride(1),
+            output.stride(0),
+            SQ,
+            SKV,
+            sm_scale,
+            TOPK,
+            pair_window_size,
+            attn_sink is not None,
+            pair_cache_ca,
+            single_cache_ca,
+            BK=64,
+            BH=4,
+            num_warps=4,
+            num_stages=3,
+        )
+        return output, max_logits, lse
+
+    if HQ == 4 and DQK == 512:
+        triton_flash_mla_sparse_fwd_hq4[(SQ,)](
+            q,
+            kv,
+            indices,
+            attn_sink,
+            topk_length,
+            sm_scale,
+            output,
+            max_logits_ptr,
+            lse_ptr,
+            q.stride(1),
+            q.stride(0),
+            kv.stride(0),
+            indices.stride(0),
+            output.stride(1),
+            output.stride(0),
+            stride_mm,
+            stride_lm,
+            SQ,
+            SKV,
+            TOPK,
+            attn_sink is not None,
+            topk_length is not None,
+            return_stats,
+        )
+        return output, max_logits, lse
+
+    raise NotImplementedError("the optimized helper only supports HQ4/DQK512")
+
+
+def _tensors_share_storage(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Conservatively detect shared storage without launching a device kernel."""
+    overlaps = getattr(torch._C, "_overlaps", None)
+    if overlaps is not None:
+        return bool(overlaps(first, second))
+    return first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+
+
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    *,
+    enable_hq4_sparse_prefill: bool = False,
+    logical_num_heads: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    return_stats: bool = True,
+    pair_metadata: Optional[torch.Tensor] = None,
+    pair_window_size: int = 0,
+    quad_metadata: Optional[torch.Tensor] = None,
+    max_kv_length: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Run sparse MLA attention, with an explicitly enabled HQ4 specialization.
+
+    The default call is intentionally identical to the existing HQ64/HQ128
+    implementation, including its optional TLE dispatch. The HQ4 path is
+    standard Triton and is selected only when enable_hq4_sparse_prefill is
+    true.
+
+    logical_num_heads=4 permits q to be a view backed by a head-padded
+    allocation, or a tensor whose physical head dimension is larger than
+    four. Only the first four heads are read, and out always has logical shape
+    [SQ, 4, 512]; a strided view into padded output storage is supported.
+
+    Pair and quad descriptors are certificates, not standalone indices. They
+    must be produced by combine_topk_swa_indices for the exact indices and
+    topk_length tensors, on the same stream, and consumed before either tensor
+    is modified. Structurally invalid descriptors fall back to the
+    single/pair Triton path. A stale but structurally valid certificate cannot
+    be detected without repeating the producer comparisons.
+
+    The explicit path is inference-only. Its output storage must not alias any
+    input or metadata tensor because independently scheduled Triton programs
+    may still be reading those tensors while another program writes output.
+    """
+    if type(enable_hq4_sparse_prefill) is not bool:
+        raise TypeError("enable_hq4_sparse_prefill must be a bool")
+
+    uses_hq4_only_argument = (
+        logical_num_heads is not None
+        or out is not None
+        or return_stats is not True
+        or pair_metadata is not None
+        or pair_window_size != 0
+        or quad_metadata is not None
+        or max_kv_length is not None
+    )
+    if not enable_hq4_sparse_prefill:
+        if uses_hq4_only_argument:
+            raise ValueError(
+                "HQ4-only arguments require " "enable_hq4_sparse_prefill=True"
+            )
+        return _flash_mla_sparse_fwd_default(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v,
+            attn_sink,
+            topk_length,
+        )
+
+    if not all(isinstance(value, torch.Tensor) for value in (q, kv, indices)):
+        raise TypeError("q, kv, and indices must be torch.Tensor instances")
+    if q.ndim != 3 or kv.ndim != 3 or indices.ndim != 3:
+        raise ValueError("q, kv, and indices must all be 3D")
+    if logical_num_heads is not None and type(logical_num_heads) is not int:
+        raise TypeError("logical_num_heads must be an int or None")
+    logical_hq = q.shape[1] if logical_num_heads is None else logical_num_heads
+    if logical_hq != 4:
+        raise NotImplementedError(
+            "enable_hq4_sparse_prefill supports exactly four logical heads"
+        )
+    if q.shape[1] < logical_hq:
+        raise ValueError("q has fewer physical heads than logical_num_heads")
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise NotImplementedError("the HQ4 sparse prefill path requires BF16")
+    if indices.dtype != torch.int32:
+        raise ValueError("indices must have dtype torch.int32")
+    if q.stride(-1) != 1 or kv.stride(-1) != 1 or indices.stride(-1) != 1:
+        raise ValueError("q, kv, and indices must have a contiguous last dimension")
+    if d_v != 512 or q.shape[2] != 512 or kv.shape[2] != 512:
+        raise NotImplementedError("the HQ4 sparse prefill path requires DQK=DV=512")
+    if kv.shape[1] != 1:
+        raise NotImplementedError("the HQ4 sparse prefill path requires one KV head")
+    if q.shape[0] <= 0 or kv.shape[0] <= 0 or indices.shape[2] <= 0:
+        raise ValueError("SQ, SKV, and TOPK must all be positive")
+    if indices.shape[:2] != (q.shape[0], 1):
+        raise ValueError("indices must have shape [SQ, 1, TOPK]")
+    for name, value in (
+        ("attn_sink", attn_sink),
+        ("topk_length", topk_length),
+        ("pair_metadata", pair_metadata),
+        ("quad_metadata", quad_metadata),
+    ):
+        if value is not None and not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor or None")
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor or None")
+        if out.shape != (q.shape[0], logical_hq, 512):
+            raise ValueError("out must have logical shape [SQ, 4, 512]")
+        if out.dtype != q.dtype or out.device != q.device:
+            raise ValueError("out must match q's dtype and device")
+        if out.stride(-1) != 1:
+            raise ValueError("out must have a contiguous last dimension")
+    for name, value in (
+        ("q", q),
+        ("kv", kv),
+        ("attn_sink", attn_sink),
+        ("out", out),
+    ):
+        if isinstance(value, torch.Tensor) and value.requires_grad:
+            raise RuntimeError(
+                "enable_hq4_sparse_prefill is inference-only; "
+                f"{name}.requires_grad must be False"
+            )
+    if out is not None:
+        for name, value in (
+            ("q", q),
+            ("kv", kv),
+            ("indices", indices),
+            ("attn_sink", attn_sink),
+            ("topk_length", topk_length),
+            ("pair_metadata", pair_metadata),
+            ("quad_metadata", quad_metadata),
+        ):
+            if isinstance(value, torch.Tensor) and _tensors_share_storage(out, value):
+                raise ValueError(f"out must not share storage with {name}")
+    if pair_metadata is not None:
+        if pair_window_size != 128 or indices.shape[2] != 2176:
+            raise NotImplementedError(
+                "metadata reuse requires W=128 and a 2048+128 index row"
+            )
+        if return_stats:
+            raise ValueError("metadata reuse requires return_stats=False")
+    if quad_metadata is not None and pair_metadata is None:
+        raise ValueError("quad_metadata requires pair_metadata")
+    if max_kv_length is not None and quad_metadata is None:
+        raise ValueError("max_kv_length requires quad_metadata")
+    if q.device.type != "cuda":
+        raise NotImplementedError("the HQ4 sparse prefill path requires CUDA")
+    if q.device != kv.device or q.device != indices.device:
+        raise ValueError("q, kv, and indices must be on the same device")
+
+    q_logical = q[:, :logical_hq, :]
+    return _flash_mla_sparse_fwd_hq4_optimized(
+        q_logical,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink,
+        topk_length,
+        out,
+        return_stats,
+        pair_metadata=pair_metadata,
+        pair_window_size=pair_window_size,
+        quad_metadata=quad_metadata,
+        max_kv_length=max_kv_length,
+    )

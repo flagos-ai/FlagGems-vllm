@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import dataclasses
+import importlib
 import random
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import pytest
@@ -59,6 +61,103 @@ vllm_flash_mla_sparse_fwd, VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON = (
 HAS_VLLM_FLASHMLA_SPARSE = vllm_flash_mla_sparse_fwd is not None
 if not HAS_VLLM_FLASHMLA_SPARSE:
     torch.set_float32_matmul_precision("high")
+
+
+def _has_hq4_cuda() -> bool:
+    if not torch.cuda.is_available() or torch.version.cuda is None:
+        return False
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
+_HAS_HQ4_CUDA = _has_hq4_cuda()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize(
+    "updates,missing,expected",
+    [
+        ({}, None, True),
+        ({"shared_memory_per_block_optin": 215039}, None, False),
+        ({"shared_memory_per_block_optin": 215040}, None, True),
+        ({"name": "NVIDIA H100"}, None, False),
+        ({"major": 8}, None, False),
+        ({"minor": 1}, None, False),
+        ({}, "shared_memory_per_block_optin", False),
+        ({}, "name", False),
+        ({}, "major", False),
+        ({}, "minor", False),
+    ],
+)
+def test_flash_mla_sparse_quad_pipeline_resource_gate(
+    monkeypatch, updates, missing, expected
+):
+    module = importlib.import_module("flaggems_vllm.ops.flashmla_sparse")
+    properties = dict(
+        name="NVIDIA H20", major=9, minor=0, shared_memory_per_block_optin=232448
+    )
+    properties.update(updates)
+    if missing:
+        del properties[missing]
+    monkeypatch.setattr(module.triton, "__version__", "3.7.1")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(**properties),
+    )
+    gate = module._use_quad_gather_pipeline
+    gate.cache_clear()
+    try:
+        assert gate(torch.device("cuda", 0)) is expected
+    finally:
+        gate.cache_clear()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize("version", ["3.7.0", "3.8.0", "3.7.1.dev0"])
+def test_flash_mla_sparse_quad_pipeline_other_compilers(monkeypatch, version):
+    module = importlib.import_module("flaggems_vllm.ops.flashmla_sparse")
+    monkeypatch.setattr(module.triton, "__version__", version)
+
+    def unexpected_query(device):
+        pytest.fail("An unsupported compiler must retain the original schedule")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", unexpected_query)
+    gate = module._use_quad_gather_pipeline
+    gate.cache_clear()
+    try:
+        assert gate(torch.device("cuda", 0)) is False
+    finally:
+        gate.cache_clear()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_flash_mla_sparse_quad_pipeline_device_cache(monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.flashmla_sparse")
+    monkeypatch.setattr(module.triton, "__version__", "3.7.1")
+    queries = []
+
+    def properties(device):
+        queries.append(device)
+        return SimpleNamespace(
+            name="NVIDIA H20",
+            major=9,
+            minor=0,
+            shared_memory_per_block_optin=232448 if device.index == 0 else 163840,
+        )
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    gate = module._use_quad_gather_pipeline
+    gate.cache_clear()
+    try:
+        assert gate(torch.device("cpu")) is False
+        assert gate(torch.device("cuda")) is False
+        assert not queries
+        for _ in range(3):
+            assert gate(torch.device("cuda", 0)) is True
+            assert gate(torch.device("cuda", 1)) is False
+        assert queries == [torch.device("cuda", 0), torch.device("cuda", 1)]
+    finally:
+        gate.cache_clear()
 
 
 @dataclasses.dataclass
@@ -455,3 +554,628 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     torch.testing.assert_close(
         your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
     )
+
+
+def test_flash_mla_sparse_hq4_flag_isolation(monkeypatch):
+    """The default call must remain routed to the pre-existing implementation."""
+    module = importlib.import_module("flaggems_vllm.ops.flashmla_sparse")
+    sentinel = object()
+    seen = []
+
+    def fake_default(*args):
+        seen.append(args)
+        return sentinel
+
+    monkeypatch.setattr(module, "_flash_mla_sparse_fwd_default", fake_default)
+    q = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 512), dtype=torch.bfloat16)
+    indices = torch.empty((1, 1, 128), dtype=torch.int32)
+    assert module.flash_mla_sparse_fwd(q, kv, indices, 1.0) is sentinel
+    assert len(seen) == 1
+
+    with pytest.raises(ValueError, match="enable_hq4_sparse_prefill=True"):
+        module.flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            1.0,
+            out=torch.empty((1, 4, 512), dtype=torch.bfloat16),
+        )
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    "aliased_name",
+    [
+        "q",
+        "kv",
+        "indices",
+        "attn_sink",
+        "topk_length",
+        "pair_metadata",
+        "quad_metadata",
+    ],
+)
+def test_flash_mla_sparse_hq4_rejects_out_storage_alias(monkeypatch, aliased_name):
+    module = importlib.import_module("flaggems_vllm.ops.flashmla_sparse")
+    values = {
+        "q": torch.empty((4, 4, 512), dtype=torch.bfloat16),
+        "kv": torch.empty((8, 1, 512), dtype=torch.bfloat16),
+        "indices": torch.empty((4, 1, 2176), dtype=torch.int32),
+        "attn_sink": torch.empty((4,), dtype=torch.float32),
+        "topk_length": torch.empty((4,), dtype=torch.int32),
+        "pair_metadata": torch.empty((2,), dtype=torch.int32),
+        "quad_metadata": torch.empty((1,), dtype=torch.int32),
+        "out": torch.empty((4, 4, 512), dtype=torch.bfloat16),
+    }
+
+    def fake_overlap(first, second):
+        assert first is values["out"]
+        return second is values[aliased_name]
+
+    monkeypatch.setattr(module, "_tensors_share_storage", fake_overlap)
+    with pytest.raises(ValueError, match=f"storage with {aliased_name}"):
+        module.flash_mla_sparse_fwd(
+            values["q"],
+            values["kv"],
+            values["indices"],
+            1.0,
+            attn_sink=values["attn_sink"],
+            topk_length=values["topk_length"],
+            enable_hq4_sparse_prefill=True,
+            out=values["out"],
+            return_stats=False,
+            pair_metadata=values["pair_metadata"],
+            pair_window_size=128,
+            quad_metadata=values["quad_metadata"],
+            max_kv_length=1280,
+        )
+
+
+def test_flash_mla_sparse_hq4_rejects_real_q_alias():
+    q = torch.empty((1, 4, 512), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 512), dtype=torch.bfloat16)
+    indices = torch.empty((1, 1, 32), dtype=torch.int32)
+    with pytest.raises(ValueError, match="storage with q"):
+        flaggems_vllm.flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            1.0,
+            enable_hq4_sparse_prefill=True,
+            out=q,
+        )
+
+
+@pytest.mark.parametrize("grad_name", ["q", "kv", "attn_sink", "out"])
+def test_flash_mla_sparse_hq4_is_inference_only(grad_name):
+    values = {
+        "q": torch.empty((1, 4, 512), dtype=torch.bfloat16),
+        "kv": torch.empty((1, 1, 512), dtype=torch.bfloat16),
+        "indices": torch.empty((1, 1, 32), dtype=torch.int32),
+        "attn_sink": torch.empty((4,), dtype=torch.float32),
+        "out": torch.empty((1, 4, 512), dtype=torch.bfloat16),
+    }
+    values[grad_name].requires_grad_(True)
+    with pytest.raises(RuntimeError, match=f"{grad_name}.requires_grad"):
+        flaggems_vllm.flash_mla_sparse_fwd(
+            values["q"],
+            values["kv"],
+            values["indices"],
+            1.0,
+            attn_sink=values["attn_sink"],
+            enable_hq4_sparse_prefill=True,
+            out=values["out"],
+        )
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("s_q", [64, 128])
+def test_flash_mla_sparse_hq4_padded_q_and_out(s_q):
+    """Cover common prefill lengths and padded physical head storage."""
+    s_kv, topk = 4096, 128
+    torch.manual_seed(20260923)
+    q_storage = torch.randn((s_q, 64, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    q = q_storage[:, :4]
+    kv = torch.randn((s_kv, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.randint(0, s_kv, (s_q, 1, topk), device="cuda", dtype=torch.int32)
+    topk_length = torch.randint(1, topk + 1, (s_q,), device="cuda", dtype=torch.int32)
+    reference, ref_max, ref_lse = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        s_q,
+        s_kv,
+        4,
+        1,
+        512,
+        topk,
+        q,
+        kv,
+        indices,
+        512**-0.5,
+        512,
+        None,
+        topk_length,
+    )
+
+    output_storage = torch.full(
+        (s_q, 64, 512), 17.0, device="cuda", dtype=torch.bfloat16
+    )
+    out = output_storage[:, :4]
+    untouched = output_storage[:, 4:].clone()
+    output, max_logits, lse = flaggems_vllm.flash_mla_sparse_fwd(
+        q_storage,
+        kv,
+        indices,
+        512**-0.5,
+        topk_length=topk_length,
+        enable_hq4_sparse_prefill=True,
+        logical_num_heads=4,
+        out=out,
+    )
+    assert output is out
+    torch.testing.assert_close(
+        output, reference, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+    )
+    torch.testing.assert_close(
+        max_logits, ref_max, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
+    )
+    torch.testing.assert_close(
+        lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
+    )
+    assert torch.equal(output_storage[:, 4:], untouched)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_mla_sparse_hq4_metadata_and_invalid_descriptor_fallback():
+    """Producer metadata is accurate and malformed quad metadata is safe."""
+    s_q, s_kv = 8, 34944
+    torch.manual_seed(9487)
+    source_topk = torch.arange(2048, device="cuda", dtype=torch.int32).repeat(s_q, 1)
+    query_start = torch.tensor([0, s_q], device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor([4096 + s_q], device="cuda", dtype=torch.int32)
+    gather_lens = torch.tensor([s_q + 127], device="cuda", dtype=torch.int32)
+    indices, lengths, pairs, quads = flaggems_vllm.combine_topk_swa_indices(
+        source_topk,
+        query_start,
+        seq_lens,
+        gather_lens,
+        128,
+        4,
+        2048,
+        34944,
+        2048,
+        enable_hq4_sparse_prefill=True,
+        return_pair_metadata=True,
+        return_quad_metadata=True,
+    )
+    q = torch.randn((s_q, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn((s_kv, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    reference, _, _ = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        s_q,
+        s_kv,
+        4,
+        1,
+        512,
+        indices.shape[-1],
+        q,
+        kv,
+        indices[:, None],
+        512**-0.5,
+        512,
+        None,
+        lengths,
+    )
+
+    def run(pair_descriptors, quad_descriptors):
+        output, max_logits, lse = flaggems_vllm.flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices[:, None],
+            512**-0.5,
+            topk_length=lengths,
+            enable_hq4_sparse_prefill=True,
+            out=torch.empty_like(q),
+            return_stats=False,
+            pair_metadata=pair_descriptors,
+            pair_window_size=128,
+            quad_metadata=quad_descriptors,
+            max_kv_length=1280,
+        )
+        assert max_logits is None and lse is None
+        torch.testing.assert_close(
+            output, reference, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+        )
+
+    run(pairs, quads)
+    bad_pairs = pairs.clone()
+    bad_quads = quads.clone()
+    bad_pairs[0] = 0
+    bad_quads[0] = 1
+    run(bad_pairs, bad_quads)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(
+    not _HAS_HQ4_CUDA,
+    reason="requires an NVIDIA CUDA GPU with native BF16 support",
+)
+@pytest.mark.parametrize("s_q", [512, 1024, 2048, 4096])
+def test_flash_mla_sparse_hq4_benchmark_active_shapes(s_q):
+    """Check the metadata path at every remaining benchmark-active SQ."""
+    torch.manual_seed(16000 + s_q)
+    source_topk = torch.arange(2048, device="cuda", dtype=torch.int32).repeat(s_q, 1)
+    query_start = torch.tensor([0, s_q], device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor([4096 + s_q], device="cuda", dtype=torch.int32)
+    gather_lens = torch.tensor([s_q + 127], device="cuda", dtype=torch.int32)
+    indices, lengths, pairs, quads = flaggems_vllm.combine_topk_swa_indices(
+        source_topk,
+        query_start,
+        seq_lens,
+        gather_lens,
+        128,
+        4,
+        2048,
+        34944,
+        2048,
+        enable_hq4_sparse_prefill=True,
+        return_pair_metadata=True,
+        return_quad_metadata=True,
+    )
+    q = torch.randn((s_q, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn((34944, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    output, max_logits, lse = flaggems_vllm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices[:, None],
+        512**-0.5,
+        topk_length=lengths,
+        enable_hq4_sparse_prefill=True,
+        out=torch.empty_like(q),
+        return_stats=False,
+        pair_metadata=pairs,
+        pair_window_size=128,
+        quad_metadata=quads,
+        max_kv_length=1280,
+    )
+    assert max_logits is None and lse is None
+
+    # A compact independent reference keeps the largest active shape from
+    # materializing the full SQ x 2176 x 512 gathered-KV tensor. Beginning,
+    # middle, and tail rows cover quad groups as well as top-k growth points.
+    sample_rows = sorted(
+        {
+            0,
+            1,
+            2,
+            3,
+            s_q // 2 - 1,
+            s_q // 2,
+            s_q // 2 + 1,
+            s_q - 4,
+            s_q - 3,
+            s_q - 2,
+            s_q - 1,
+        }
+    )
+    row_ids = torch.tensor(sample_rows, device="cuda", dtype=torch.int64)
+    q_sample = q.index_select(0, row_ids)
+    indices_sample = indices.index_select(0, row_ids)[:, None]
+    lengths_sample = lengths.index_select(0, row_ids)
+    reference, _, _ = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        len(sample_rows),
+        kv.shape[0],
+        4,
+        1,
+        512,
+        indices.shape[1],
+        q_sample,
+        kv,
+        indices_sample,
+        512**-0.5,
+        512,
+        None,
+        lengths_sample,
+    )
+    torch.testing.assert_close(
+        output.index_select(0, row_ids),
+        reference,
+        atol=8e-4,
+        rtol=3.01 / 128,
+        equal_nan=False,
+    )
+
+
+def _hq4_sink(kind):
+    if kind == "none":
+        return None
+    if kind == "finite":
+        values = [0.25, -0.75, 1.5, -2.0]
+    else:
+        values = [float("-inf"), float("inf"), 0.5, -0.5]
+    return torch.tensor(values, device="cuda", dtype=torch.float32)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("s_q", [1, 2, 3, 4, 11])
+@pytest.mark.parametrize("sink_kind", ["none", "finite", "infinite"])
+def test_flash_mla_sparse_hq4_single_boundaries(s_q, sink_kind):
+    """Cover clamped lengths, invalid IDs, tails, and sink edge values."""
+    s_kv, topk = 19, 32
+    torch.manual_seed(3100 + s_q)
+    q = torch.randn((s_q, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn((s_kv, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.arange(topk, dtype=torch.int32).remainder(s_kv).repeat(s_q, 1)
+    indices[:, 1] = -1
+    indices[:, 3] = s_kv
+    indices[:, 5] = -2147483648
+    indices[:, 7] = 2147483647
+    indices = indices[:, None].cuda()
+    length_values = [-3, 0, topk + 7, 7, topk]
+    topk_length = torch.tensor(
+        [length_values[row % len(length_values)] for row in range(s_q)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    sink = _hq4_sink(sink_kind)
+    reference, ref_max, ref_lse = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        s_q,
+        s_kv,
+        4,
+        1,
+        512,
+        topk,
+        q,
+        kv,
+        indices,
+        512**-0.5,
+        512,
+        sink,
+        topk_length,
+    )
+    output, max_logits, lse = flaggems_vllm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        512**-0.5,
+        attn_sink=sink,
+        topk_length=topk_length,
+        enable_hq4_sparse_prefill=True,
+    )
+    torch.testing.assert_close(
+        output, reference, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+    )
+    torch.testing.assert_close(
+        max_logits, ref_max, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
+    )
+    torch.testing.assert_close(
+        lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
+    )
+
+
+def _make_hq4_pair_mode_case():
+    rows = [
+        [0, 1, 2] + list(range(100, 105)),
+        [0, 1, 2] + list(range(100, 106)),
+        [3, 4, 5] + list(range(200, 328)),
+        [3, 4, 5] + list(range(201, 329)),
+        [6, 7] + list(range(330, 335)),
+        [6, 7, 8] + list(range(330, 336)),
+        [9, 10] + list(range(350, 478)),
+        [9, 10, 11] + list(range(351, 479)),
+        [12, 13, -1, 512],
+        [15, 16, 17, 18, 19],
+        [-1, 512, -2147483648, 2147483647],
+    ]
+    indices = torch.full((11, 1, 2176), -1, dtype=torch.int32)
+    for row_id, values in enumerate(rows):
+        indices[row_id, 0, : len(values)] = torch.tensor(values, dtype=torch.int32)
+    lengths = torch.tensor([len(values) for values in rows], dtype=torch.int32)
+    pairs = torch.tensor(
+        [
+            (3 << 3) | 1,
+            (3 << 3) | 2,
+            (2 << 3) | 3,
+            (2 << 3) | 4,
+            (3000 << 3) | 7,
+            0,
+        ],
+        dtype=torch.int32,
+    )
+    return indices.cuda(), lengths.cuda(), pairs.cuda()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("sink_kind", ["none", "infinite"])
+def test_flash_mla_sparse_hq4_pair_modes_and_bad_descriptor(sink_kind):
+    torch.manual_seed(3911)
+    indices, lengths, pairs = _make_hq4_pair_mode_case()
+    q = torch.randn((11, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn((512, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    sink = _hq4_sink(sink_kind)
+    reference, _, _ = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        11,
+        512,
+        4,
+        1,
+        512,
+        2176,
+        q,
+        kv,
+        indices,
+        512**-0.5,
+        512,
+        sink,
+        lengths,
+    )
+    output, max_logits, lse = flaggems_vllm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        512**-0.5,
+        attn_sink=sink,
+        topk_length=lengths,
+        enable_hq4_sparse_prefill=True,
+        out=torch.empty_like(q),
+        return_stats=False,
+        pair_metadata=pairs,
+        pair_window_size=128,
+    )
+    assert max_logits is None and lse is None
+    torch.testing.assert_close(
+        output, reference, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+    )
+
+
+def _make_exact_hq4_metadata_case(s_q):
+    source = torch.randperm(2048, device="cuda", dtype=torch.int32).repeat(s_q, 1)
+    query_start = torch.tensor([0, s_q], device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor([4096 + s_q], device="cuda", dtype=torch.int32)
+    gather_lens = torch.tensor([s_q + 127], device="cuda", dtype=torch.int32)
+    metadata = flaggems_vllm.combine_topk_swa_indices(
+        source,
+        query_start,
+        seq_lens,
+        gather_lens,
+        128,
+        4,
+        2048,
+        34944,
+        2048,
+        enable_hq4_sparse_prefill=True,
+        return_pair_metadata=True,
+        return_quad_metadata=True,
+    )
+    return source, query_start, seq_lens, gather_lens, metadata
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("s_q", [1, 2, 3, 4, 11])
+def test_flash_mla_sparse_hq4_pair_quad_tails(s_q):
+    torch.manual_seed(7200 + s_q)
+    _, _, _, _, (indices, lengths, pairs, quads) = _make_exact_hq4_metadata_case(s_q)
+    q = torch.randn((s_q, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn((4096, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    sink = _hq4_sink("infinite")
+    reference, _, _ = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        s_q,
+        4096,
+        4,
+        1,
+        512,
+        2176,
+        q,
+        kv,
+        indices[:, None],
+        512**-0.5,
+        512,
+        sink,
+        lengths,
+    )
+    output, max_logits, lse = flaggems_vllm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices[:, None],
+        512**-0.5,
+        attn_sink=sink,
+        topk_length=lengths,
+        enable_hq4_sparse_prefill=True,
+        out=torch.empty_like(q),
+        return_stats=False,
+        pair_metadata=pairs,
+        pair_window_size=128,
+        quad_metadata=quads,
+        max_kv_length=1280,
+    )
+    assert max_logits is None and lse is None
+    torch.testing.assert_close(
+        output, reference, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+    )
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_mla_sparse_hq4_cuda_graph_regenerates_metadata_same_stream():
+    """Replay observes changed source IDs/lengths because metadata is regenerated."""
+    s_q = 8
+    torch.manual_seed(8128)
+    source, query_start, seq_lens, gather_lens, _ = _make_exact_hq4_metadata_case(s_q)
+    q = torch.randn((s_q, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn((4096, 1, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    out = torch.empty_like(q)
+
+    def run():
+        metadata = flaggems_vllm.combine_topk_swa_indices(
+            source,
+            query_start,
+            seq_lens,
+            gather_lens,
+            128,
+            4,
+            2048,
+            34944,
+            2048,
+            enable_hq4_sparse_prefill=True,
+            return_pair_metadata=True,
+            return_quad_metadata=True,
+        )
+        indices, lengths, pairs, quads = metadata
+        flaggems_vllm.flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices[:, None],
+            512**-0.5,
+            topk_length=lengths,
+            enable_hq4_sparse_prefill=True,
+            out=out,
+            return_stats=False,
+            pair_metadata=pairs,
+            pair_window_size=128,
+            quad_metadata=quads,
+            max_kv_length=1280,
+        )
+        return metadata
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        indices, lengths, pairs, quads = run()
+
+    def check_output():
+        reference, _, _ = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+            s_q,
+            4096,
+            4,
+            1,
+            512,
+            2176,
+            q,
+            kv,
+            indices[:, None],
+            512**-0.5,
+            512,
+            None,
+            lengths,
+        )
+        torch.testing.assert_close(
+            out, reference, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+        )
+
+    graph.replay()
+    check_output()
+    assert quads[0].item() == 1
+
+    # These writes and replay are ordered on the current stream. Changing
+    # source IDs breaks the first quad, while changing sequence metadata also
+    # changes the generated indices and lengths.
+    source[1, 0] = (source[1, 0] + 1) % 2048
+    seq_lens.add_(4)
+    gather_lens.add_(4)
+    graph.replay()
+    check_output()
+    assert quads[0].item() == 0

@@ -19,6 +19,7 @@ from typing import List
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 
@@ -249,6 +250,204 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         yield (q, kv, indices, 0.5, param.d_v, attn_sink, topk_length)
 
 
+def _legacy_hq4_sparse_prefill_baseline(
+    q,
+    kv,
+    indices,
+    sm_scale,
+    d_v=512,
+    attn_sink=None,
+    topk_length=None,
+    **hq4_options,
+):
+    """Measure the current padded-head path with HQ4 options removed."""
+    del hq4_options
+    return flaggems_vllm.flash_mla_sparse_fwd(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+
+
+class HQ4SparsePrefillBenchmark(base.Benchmark):
+    """H20 active set; speedup is legacy padded path / gated HQ4 path."""
+
+    def __init__(self):
+        super().__init__(
+            "flash_mla_sparse_fwd_hq4",
+            _legacy_hq4_sparse_prefill_baseline,
+            [torch.bfloat16],
+            gems_op=flaggems_vllm.flash_mla_sparse_fwd,
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        _ = shape_file_path
+        self.shapes = [64, 128, 512, 1024, 2048, 4096]
+
+    def get_input_iter(self, dtype):
+        for s_q in self.shapes:
+            torch.manual_seed(6015 + s_q)
+            source_topk = torch.arange(2048, device="cuda", dtype=torch.int32).repeat(
+                s_q, 1
+            )
+            query_start = torch.tensor([0, s_q], device="cuda", dtype=torch.int32)
+            seq_lens = torch.tensor([4096 + s_q], device="cuda", dtype=torch.int32)
+            gather_lens = torch.tensor([s_q + 127], device="cuda", dtype=torch.int32)
+            indices, lengths, pairs, quads = flaggems_vllm.combine_topk_swa_indices(
+                source_topk,
+                query_start,
+                seq_lens,
+                gather_lens,
+                128,
+                4,
+                2048,
+                34944,
+                2048,
+                enable_hq4_sparse_prefill=True,
+                return_pair_metadata=True,
+                return_quad_metadata=True,
+            )
+            # The baseline consumes all 64 physical heads. The optimized call
+            # reads only the four logical heads and writes a strided view into
+            # equally padded output storage.
+            q = torch.randn((s_q, 64, 512), device="cuda", dtype=dtype) * 0.1
+            kv = torch.randn((34944, 1, 512), device="cuda", dtype=dtype) * 0.1
+            output_storage = torch.empty((s_q, 64, 512), device="cuda", dtype=dtype)
+            yield (
+                q,
+                kv,
+                indices[:, None],
+                512**-0.5,
+                512,
+                None,
+                lengths,
+                {
+                    "enable_hq4_sparse_prefill": True,
+                    "logical_num_heads": 4,
+                    "out": output_storage[:, :4],
+                    "return_stats": False,
+                    "pair_metadata": pairs,
+                    "pair_window_size": 128,
+                    "quad_metadata": quads,
+                    "max_kv_length": 1280,
+                },
+            )
+
+
+def _legacy_sparse_prefill_end_to_end(
+    source_topk,
+    query_start,
+    seq_lens,
+    gather_lens,
+    q,
+    kv,
+    sm_scale,
+    output_storage,
+):
+    del output_storage
+    indices, lengths = flaggems_vllm.combine_topk_swa_indices(
+        source_topk,
+        query_start,
+        seq_lens,
+        gather_lens,
+        128,
+        4,
+        2048,
+        34944,
+        2048,
+    )
+    return flaggems_vllm.flash_mla_sparse_fwd(
+        q, kv, indices[:, None], sm_scale, 512, None, lengths
+    )
+
+
+def _gated_sparse_prefill_end_to_end(
+    source_topk,
+    query_start,
+    seq_lens,
+    gather_lens,
+    q,
+    kv,
+    sm_scale,
+    output_storage,
+):
+    indices, lengths, pairs, quads = flaggems_vllm.combine_topk_swa_indices(
+        source_topk,
+        query_start,
+        seq_lens,
+        gather_lens,
+        128,
+        4,
+        2048,
+        34944,
+        2048,
+        enable_hq4_sparse_prefill=True,
+        return_pair_metadata=True,
+        return_quad_metadata=True,
+    )
+    return flaggems_vllm.flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices[:, None],
+        sm_scale,
+        512,
+        None,
+        lengths,
+        enable_hq4_sparse_prefill=True,
+        logical_num_heads=4,
+        out=output_storage[:, :4],
+        return_stats=False,
+        pair_metadata=pairs,
+        pair_window_size=128,
+        quad_metadata=quads,
+        max_kv_length=1280,
+    )
+
+
+class HQ4SparsePrefillEndToEndCudaGraphBenchmark(base.Benchmark):
+    """Capture producer and consumer together so metadata cost is included."""
+
+    def __init__(self):
+        super().__init__(
+            "flash_mla_sparse_fwd_hq4_end_to_end_cudagraph",
+            _legacy_sparse_prefill_end_to_end,
+            [torch.bfloat16],
+            gems_op=_gated_sparse_prefill_end_to_end,
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        _ = shape_file_path
+        self.shapes = [1024, 2048, 4096]
+
+    def get_input_iter(self, dtype):
+        for s_q in self.shapes:
+            source_topk = torch.arange(2048, device="cuda", dtype=torch.int32).repeat(
+                s_q, 1
+            )
+            query_start = torch.tensor([0, s_q], device="cuda", dtype=torch.int32)
+            seq_lens = torch.tensor([4096 + s_q], device="cuda", dtype=torch.int32)
+            gather_lens = torch.tensor([s_q + 127], device="cuda", dtype=torch.int32)
+            q = torch.randn((s_q, 64, 512), device="cuda", dtype=dtype) * 0.1
+            kv = torch.randn((34944, 1, 512), device="cuda", dtype=dtype) * 0.1
+            output_storage = torch.empty((s_q, 64, 512), device="cuda", dtype=dtype)
+            yield (
+                source_topk,
+                query_start,
+                seq_lens,
+                gather_lens,
+                q,
+                kv,
+                512**-0.5,
+                output_storage,
+            )
+
+    def get_latency(self, op, *args, **kwargs):
+        fn = lambda: op(*args, **kwargs)
+        return triton.testing.do_bench_cudagraph(
+            fn,
+            rep=base.Config.repetition,
+            return_mode="median",
+        )
+
+
 @pytest.mark.flash_mla_sparse_fwd
 @pytest.mark.skipif(
     not HAS_VLLM_FLASHMLA_SPARSE,
@@ -259,3 +458,19 @@ class FlashmlaSparseBenchmark(base.Benchmark):
 def test_flash_mla_sparse_fwd():
     bench = FlashmlaSparseBenchmark()
     bench.run()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_mla_sparse_fwd_hq4_benchmark():
+    # Metric is median latency in ms; lower is better. Speedup is
+    # legacy-padded latency / explicitly gated HQ4 latency.
+    HQ4SparsePrefillBenchmark().run()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_mla_sparse_fwd_hq4_end_to_end_cudagraph_benchmark():
+    # Includes combine metadata generation and attention in the same captured
+    # graph. Speedup is legacy combine+HQ64 / gated metadata+HQ4.
+    HQ4SparsePrefillEndToEndCudaGraphBenchmark().run()
