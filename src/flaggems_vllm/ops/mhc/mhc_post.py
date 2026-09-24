@@ -25,15 +25,40 @@ Key optimizations (v3):
 - Contiguous layout: stride math removed, enabling LDG.128.
 - All 4 accumulators computed then stored (better ILP).
 - BLOCK_H chosen to evenly divide H when possible (256 divides all targets).
+
+A TLE build variant is auto-selected when the Triton TLE extension is availabe.
+(set env FLAGGEMS_MHC_TLE=0 to force the original kernels)
 """
 
+from __future__ import annotations
+
 import logging
+import os
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
 logger = logging.getLogger(__name__)
+
+# TLE build variant gate (flashmla_sparse style): the *_tle kernels below are
+# auto-selected when Triton TLE is available and enabled (FLAGGEMS_MHC_TLE=0
+# forces the original kernels - the fallback path).
+# ``tle`` is statically opaque (Any): the TLE module has no stubs, and the
+# fallback None assignment would otherwise poison every tle.* use site.
+tle: Any = None
+if has_triton_tle(3, 6, 0):
+    try:
+        from triton.experimental.tle import language as tle
+
+        HAS_TLE_MHC_POST = True
+    except ImportError:
+        HAS_TLE_MHC_POST = False
+else:
+    HAS_TLE_MHC_POST = False
 
 
 @triton.autotune(
@@ -180,6 +205,194 @@ def mhc_post_kernel_generic(
     tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
 
 
+# ---- TLE build variant kernels (auto-selected; FLAGGEMS_MHC_TLE=0 forces the originals) ----
+if HAS_TLE_MHC_POST:
+    # ---- mhc_post kernels: TLE evict-first on once-read streaming loads --------
+
+    @triton.autotune(
+        configs=[
+            # Small BLOCK_H: many programs, good for latency hiding
+            triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=2),
+            # Medium BLOCK_H
+            triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=2),
+            # Large BLOCK_H
+            triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=1),
+        ],
+        key=["H"],
+    )
+    @triton.jit
+    def mhc_post_kernel_hc_mult_4_tle(
+        a_ptr,  # comb_res_mix : (N, 4, 4), float32
+        b_ptr,  # residual     : (N, 4, H), bfloat16
+        c_ptr,  # post_layer_mix: (N, 4),  float32
+        d_ptr,  # x            : (N, H),   bfloat16
+        out_ptr,  # output       : (N, 4, H), bfloat16
+        H: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_h = tl.program_id(1)
+
+        h_off = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = h_off < H
+
+        # ── pointer bases (contiguous layout) ──
+        a_base = pid_n * 16
+        c_base = pid_n * 4
+        b_base = pid_n * 4 * H
+        d_base = pid_n * H
+        out_base = pid_n * 4 * H
+
+        # ── load 20 scalars (L1 cached across h-tiles) ──
+        c0 = tle.load(c_ptr + c_base + 0).to(tl.float32)
+        c1 = tle.load(c_ptr + c_base + 1).to(tl.float32)
+        c2 = tle.load(c_ptr + c_base + 2).to(tl.float32)
+        c3 = tle.load(c_ptr + c_base + 3).to(tl.float32)
+
+        a00 = tle.load(a_ptr + a_base + 0).to(tl.float32)
+        a01 = tle.load(a_ptr + a_base + 1).to(tl.float32)
+        a02 = tle.load(a_ptr + a_base + 2).to(tl.float32)
+        a03 = tle.load(a_ptr + a_base + 3).to(tl.float32)
+        a10 = tle.load(a_ptr + a_base + 4).to(tl.float32)
+        a11 = tle.load(a_ptr + a_base + 5).to(tl.float32)
+        a12 = tle.load(a_ptr + a_base + 6).to(tl.float32)
+        a13 = tle.load(a_ptr + a_base + 7).to(tl.float32)
+        a20 = tle.load(a_ptr + a_base + 8).to(tl.float32)
+        a21 = tle.load(a_ptr + a_base + 9).to(tl.float32)
+        a22 = tle.load(a_ptr + a_base + 10).to(tl.float32)
+        a23 = tle.load(a_ptr + a_base + 11).to(tl.float32)
+        a30 = tle.load(a_ptr + a_base + 12).to(tl.float32)
+        a31 = tle.load(a_ptr + a_base + 13).to(tl.float32)
+        a32 = tle.load(a_ptr + a_base + 14).to(tl.float32)
+        a33 = tle.load(a_ptr + a_base + 15).to(tl.float32)
+
+        # ── load vectors (bf16 → f32) ──
+        d_vals = tle.load(
+            d_ptr + d_base + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b0 = tle.load(
+            b_ptr + b_base + 0 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b1 = tle.load(
+            b_ptr + b_base + 1 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b2 = tle.load(
+            b_ptr + b_base + 2 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b3 = tle.load(
+            b_ptr + b_base + 3 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+
+        # ── compute all 4 output streams ──
+        acc0 = c0 * d_vals + a00 * b0 + a10 * b1 + a20 * b2 + a30 * b3
+        acc1 = c1 * d_vals + a01 * b0 + a11 * b1 + a21 * b2 + a31 * b3
+        acc2 = c2 * d_vals + a02 * b0 + a12 * b1 + a22 * b2 + a32 * b3
+        acc3 = c3 * d_vals + a03 * b0 + a13 * b1 + a23 * b2 + a33 * b3
+
+        # ── store all 4 outputs ──
+        tl.store(out_ptr + out_base + 0 * H + h_off, acc0.to(tl.bfloat16), mask=h_mask)
+        tl.store(out_ptr + out_base + 1 * H + h_off, acc1.to(tl.bfloat16), mask=h_mask)
+        tl.store(out_ptr + out_base + 2 * H + h_off, acc2.to(tl.bfloat16), mask=h_mask)
+        tl.store(out_ptr + out_base + 3 * H + h_off, acc3.to(tl.bfloat16), mask=h_mask)
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
+        ],
+        key=["H", "HC"],
+    )
+    @triton.jit
+    def mhc_post_kernel_generic_tle(
+        a_ptr,  # comb_res_mix : (N, HC, HC), float32
+        b_ptr,  # residual     : (N, HC, H), bfloat16
+        c_ptr,  # post_layer_mix: (N, HC), float32
+        d_ptr,  # x            : (N, H),    bfloat16
+        out_ptr,  # output       : (N, HC, H), bfloat16
+        H: tl.constexpr,
+        HC: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        """Generic mHC post kernel for arbitrary HC.
+
+        Grid: (N, HC, cdiv(H, BLOCK_H)).
+        Each program handles one token × one output-stream(i) × one h-tile.
+        """
+        pid_n = tl.program_id(0)
+        pid_i = tl.program_id(1)
+        pid_h = tl.program_id(2)
+
+        h_off = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = h_off < H
+
+        a_base = pid_n * HC * HC
+        b_base = pid_n * HC * H
+        c_base = pid_n * HC
+        d_base = pid_n * H
+        out_base = pid_n * HC * H + pid_i * H
+
+        d_vals = tle.load(
+            d_ptr + d_base + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        c_i = tle.load(c_ptr + c_base + pid_i).to(tl.float32)
+
+        acc = c_i * d_vals
+        for j in tl.static_range(0, HC):
+            a_ji = tle.load(a_ptr + a_base + j * HC + pid_i).to(tl.float32)
+            b_j = tle.load(
+                b_ptr + b_base + j * H + h_off,
+                mask=h_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            acc += a_ji * b_j
+
+        tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
+
+
+def _can_use_tle_mhc_post(x: torch.Tensor) -> bool:
+    tle_enabled = os.environ.get("FLAGGEMS_MHC_TLE", "1").lower() not in {
+        "0",
+        "off",
+        "no",
+        "false",
+    }
+    if not (HAS_TLE_MHC_POST and tle_enabled):
+        return False
+    return x.device.type in ("cuda", "musa")
+
+
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -206,10 +419,22 @@ def mhc_post(
         comb_res_mix.shape,
     )
 
+    if residual.dtype != torch.bfloat16:
+        raise NotImplementedError("mHC post residual must use bfloat16")
+    if residual.device.type not in ("cuda", "musa"):
+        raise NotImplementedError("mHC post requires CUDA or MUSA tensors")
+
     N, hc, H = residual.shape
-    assert x.shape == (N, H)
-    assert post_layer_mix.shape in ((N, hc, 1), (N, hc))
-    assert comb_res_mix.shape == (N, hc, hc)
+    if x.shape != (N, H):
+        raise ValueError(f"x must have shape ({N}, {H}), got {tuple(x.shape)}")
+    if post_layer_mix.shape not in ((N, hc, 1), (N, hc)):
+        raise ValueError(
+            f"post_layer_mix must have shape ({N}, {hc}, 1), got {tuple(post_layer_mix.shape)}"
+        )
+    if comb_res_mix.shape != (N, hc, hc):
+        raise ValueError(
+            f"comb_res_mix must have shape ({N}, {hc}, {hc}), got {tuple(comb_res_mix.shape)}"
+        )
 
     out = torch.empty_like(residual)
 
@@ -218,12 +443,15 @@ def mhc_post(
     b = residual.contiguous()  # (N, hc, H)
     d = x.contiguous()  # (N, H)
 
+    use_tle = _can_use_tle_mhc_post(x)
+
     if hc == 4:
 
         def grid_specialized(META):
             return (N, triton.cdiv(H, META["BLOCK_H"]))
 
-        mhc_post_kernel_hc_mult_4[grid_specialized](
+        kernel = mhc_post_kernel_hc_mult_4_tle if use_tle else mhc_post_kernel_hc_mult_4
+        kernel[grid_specialized](
             a,
             b,
             c,
@@ -236,7 +464,8 @@ def mhc_post(
         def grid_generic(META):
             return (N, hc, triton.cdiv(H, META["BLOCK_H"]))
 
-        mhc_post_kernel_generic[grid_generic](
+        kernel = mhc_post_kernel_generic_tle if use_tle else mhc_post_kernel_generic
+        kernel[grid_generic](
             a,
             b,
             c,
@@ -246,6 +475,9 @@ def mhc_post(
             HC=hc,
         )
     return out
+
+
+__all__ = ["mhc_post"]
 
 
 def mhc_post_ref(
