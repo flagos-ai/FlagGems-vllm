@@ -44,6 +44,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_scaled_mm
 from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
@@ -68,4 +71,5 @@ __all__ = [
     "fused_add_rms_norm",
     "persistent_topk",
     "w8a8_block_int8_bmm",
+    "topk_softplus_sqrt",
 ]
