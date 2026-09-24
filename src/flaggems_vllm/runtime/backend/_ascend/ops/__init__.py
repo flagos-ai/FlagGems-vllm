@@ -30,6 +30,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     compressor_prepared,
     prepare_compressor_workspace,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
+    cp_gather_indexer_k_quant_cache,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -102,6 +105,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
+    "cp_gather_indexer_k_quant_cache",
     "SUPPORTED_FP8_DTYPE",
     "add_rms_norm",
     "causal_conv1d_fn",

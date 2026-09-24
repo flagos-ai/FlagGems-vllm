@@ -19,9 +19,19 @@ import pytest
 import torch
 from packaging.version import InvalidVersion, Version
 
-from flaggems_vllm.ops import cp_gather_indexer_k_quant_cache
+import flaggems_vllm
 
 from . import base
+
+# Bind the top-level entry: on vendor backends with a specialized
+# implementation (runtime/backend/_<vendor>/ops), this is the vendor version
+# (replaced at import time); elsewhere it is the generic one.
+cp_gather_indexer_k_quant_cache = flaggems_vllm.cp_gather_indexer_k_quant_cache
+
+# "cuda" on NVIDIA / MetaX / Hygon / T-Head, "musa" on MThreads, "npu" on Ascend.
+device = flaggems_vllm.device
+_device_module = getattr(torch, device, None)
+_HAS_DEVICE = _device_module is not None and _device_module.is_available()
 
 _TARGET_VLLM_VERSION = Version("0.20.2")
 _NEXT_VLLM_VERSION = Version("0.21.0")
@@ -44,29 +54,39 @@ def run_vllm_benchmark(bench):
         base.BenchmarkResult.__str__ = original_str
 
 
+def _default_fp8_dtype():
+    if getattr(torch.version, "hip", None) is not None and hasattr(
+        torch, "float8_e4m3fnuz"
+    ):
+        return torch.float8_e4m3fnuz
+    if hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    pytest.skip("float8_e4m3fn is required for cp_gather_indexer_k_quant_cache")
+
+
 def load_vllm_cuda_op_and_fp8_dtype():
+    """Return (vllm_op, fp8_dtype), or (None, fp8_dtype) when the vLLM CUDA
+    custom op is unavailable (e.g. on non-NVIDIA vendor backends)."""
     os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
-    if getattr(torch.version, "cuda", None) is None:
-        pytest.skip("vLLM CUDA custom op requires a CUDA PyTorch build")
-    vllm = pytest.importorskip("vllm")
+    if device != "cuda" or getattr(torch.version, "cuda", None) is None:
+        return None, _default_fp8_dtype()
+    try:
+        import vllm
+        import vllm._custom_ops as ops
+        from vllm.platforms import current_platform
+    except Exception:
+        return None, _default_fp8_dtype()
+
     version = getattr(vllm, "__version__", "0.0.0")
     try:
         parsed = Version(version.split("+", 1)[0])
         if parsed < _TARGET_VLLM_VERSION or parsed >= _NEXT_VLLM_VERSION:
-            pytest.skip(
-                "cp_gather_indexer_k_quant_cache benchmark targets "
-                "vLLM CUDA >= 0.20.2 and < 0.21.0"
-            )
+            return None, _default_fp8_dtype()
     except InvalidVersion:
         pass
-    try:
-        import vllm._custom_ops as ops
-        from vllm.platforms import current_platform
-    except Exception as exc:
-        pytest.skip(f"vLLM CUDA custom ops are unavailable: {exc}")
 
     if not hasattr(ops, "cp_gather_indexer_k_quant_cache"):
-        pytest.skip("vLLM does not provide cp_gather_indexer_k_quant_cache")
+        return None, _default_fp8_dtype()
 
     def vllm_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens):
         ops.cp_gather_indexer_k_quant_cache(
@@ -80,12 +100,51 @@ def load_vllm_cuda_op_and_fp8_dtype():
     return vllm_gather, current_platform.fp8_dtype()
 
 
-def fill_cache_with_valid_fp8(k_cache, fp8_dtype, head_dim, quant_block_size):
+def torch_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens):
+    """Torch baseline for backends without the vLLM CUDA op.
+
+    Assumes every row of dst_k is a valid token (true for the inputs built
+    below), so no device-to-host sync is needed to size the gather.
+    """
+    num_blocks, block_size, _ = kv_cache.shape
+    num_tokens, head_dim = dst_k.shape
+    dst_k_bytes = dst_k.view(torch.uint8)
+    dst_scale_bytes = dst_scale.view(torch.uint8)
+
+    flat_cache = kv_cache.view(num_blocks, -1)
+    cache_values = flat_cache[:, : block_size * head_dim].view(
+        num_blocks, block_size, head_dim
+    )
+    cache_scales = flat_cache[:, block_size * head_dim :].view(
+        num_blocks, block_size, dst_scale_bytes.size(1)
+    )
+
+    cu_seq_lens = cu_seq_lens.long()
+    seq_lens = cu_seq_lens[1:] - cu_seq_lens[:-1]
+    batch_ids = torch.repeat_interleave(
+        torch.arange(seq_lens.numel(), device=kv_cache.device),
+        seq_lens,
+        output_size=num_tokens,
+    )
+    token_offsets = (
+        torch.arange(num_tokens, device=kv_cache.device) - cu_seq_lens[batch_ids]
+    )
+    block_ids = block_table[batch_ids, token_offsets // block_size].long()
+    block_offsets = token_offsets % block_size
+
+    dst_k_bytes.copy_(cache_values[block_ids, block_offsets])
+    dst_scale_bytes.copy_(cache_scales[block_ids, block_offsets])
+
+
+def fill_cache(k_cache, head_dim, quant_block_size):
+    # The op is a byte-exact gather, so value bytes need not be valid fp8;
+    # raw uint8 avoids an fp8 cast kernel some vendor devices lack.
     num_blocks, block_size, _ = k_cache.shape
     num_quant_blocks = head_dim // quant_block_size
+    k_cache.copy_(
+        torch.randint(0, 256, k_cache.shape, dtype=torch.uint8, device=k_cache.device)
+    )
     flat_cache = k_cache.view(num_blocks, -1)
-    value = flat_cache[:, : block_size * head_dim].view(fp8_dtype)
-    value.copy_(torch.randn(value.shape, device=k_cache.device).to(fp8_dtype))
     scales = flat_cache[:, block_size * head_dim :].view(torch.float32)
     scales.copy_(
         torch.rand(
@@ -114,10 +173,10 @@ def make_gather_metadata(batch_size, seq_len, block_size, device):
 
 
 class CpGatherIndexerKQuantCacheBenchmark(base.Benchmark):
-    def __init__(self, vllm_op, fp8_dtype):
+    def __init__(self, baseline_op, fp8_dtype):
         super().__init__(
             op_name="cp_gather_indexer_k_quant_cache",
-            torch_op=vllm_op,
+            torch_op=baseline_op,
             dtypes=[torch.float16],
         )
         self.set_gems(cp_gather_indexer_k_quant_cache)
@@ -130,7 +189,21 @@ class CpGatherIndexerKQuantCacheBenchmark(base.Benchmark):
             (8, 512, 16, 128, 128),
             (16, 1024, 16, 512, 128),
             (32, 1024, 16, 512, 128),
+            # DeepSeek-V3.2-style indexer cache: head_dim 128, block_size 64.
+            (1, 8192, 64, 128, 128),
+            (8, 4096, 64, 128, 128),
+            (64, 1024, 64, 128, 128),
         ]
+
+    def set_more_metrics(self):
+        return ["gbps"]
+
+    def get_gbps(self, args, latency=None):
+        _, k_fp8, k_fp8_scale, block_table, cu_seqlen = args
+        gathered = sum(t.numel() * t.element_size() for t in (k_fp8, k_fp8_scale))
+        metadata = sum(t.numel() * t.element_size() for t in (block_table, cu_seqlen))
+        # Gathered bytes are read from the cache once and written once.
+        return (2 * gathered + metadata) * 1e-9 / (latency * 1e-3)
 
     def get_input_iter(self, dtype):
         del dtype
@@ -157,12 +230,7 @@ class CpGatherIndexerKQuantCacheBenchmark(base.Benchmark):
                 dtype=torch.uint8,
                 device=self.device,
             )
-            fill_cache_with_valid_fp8(
-                k_cache,
-                self.fp8_dtype,
-                head_dim,
-                quant_block_size,
-            )
+            fill_cache(k_cache, head_dim, quant_block_size)
             k_fp8 = torch.empty(
                 num_tokens,
                 head_dim,
@@ -178,9 +246,12 @@ class CpGatherIndexerKQuantCacheBenchmark(base.Benchmark):
             yield k_cache, k_fp8, k_fp8_scale, block_table, cu_seqlen
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _HAS_DEVICE, reason=f"requires an available {device} device")
 @pytest.mark.cp_gather_indexer_k_quant_cache
 def test_cp_gather_indexer_k_quant_cache_benchmark():
     vllm_op, fp8_dtype = load_vllm_cuda_op_and_fp8_dtype()
-    bench = CpGatherIndexerKQuantCacheBenchmark(vllm_op, fp8_dtype)
-    run_vllm_benchmark(bench)
+    if vllm_op is not None:
+        run_vllm_benchmark(CpGatherIndexerKQuantCacheBenchmark(vllm_op, fp8_dtype))
+    else:
+        # No vLLM CUDA op on this backend: compare against the torch baseline.
+        CpGatherIndexerKQuantCacheBenchmark(torch_gather, fp8_dtype).run()
