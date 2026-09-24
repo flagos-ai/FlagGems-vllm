@@ -448,6 +448,32 @@ compute_global_topk_indices_and_lens:
       TPP: 1
     num_warps: 2
     num_stages: 3
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 1
+    num_stages: 2
+  - META:
+      BLOCK: 32
+      TPP: 16
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK: 64
+      TPP: 8
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK: 128
+      TPP: 4
+    num_warps: 1
+    num_stages: 2
+  - META:
+      BLOCK: 128
+      TPP: 8
+    num_warps: 8
+    num_stages: 3
+
 fused_marlin_moe_w4a16_int4:
   - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 4}
     num_warps: 4
@@ -794,3 +820,115 @@ fused_marlin_moe_w8a16_int8_gemv:
       num_warps: 16
       num_stages: 1
     unroll: [1, 2]
+
+silu_and_mul_with_clamp:
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 8
+    num_stages: 1
+
+silu_and_mul_with_clamp_linear:
+  - META:
+      BLOCK_SIZE: 128
+      UNMASKED: false
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 128
+      UNMASKED: false
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+      UNMASKED: false
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+      UNMASKED: false
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+      UNMASKED: false
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+      UNMASKED: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+      UNMASKED: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+      UNMASKED: false
+    num_warps: 8
+    num_stages: 1

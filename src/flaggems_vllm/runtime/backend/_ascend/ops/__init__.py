@@ -38,9 +38,17 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
+from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
+    group_list_cumsum,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
+from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
+    indexer_gemm_score,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
@@ -53,6 +61,17 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_state_gather import gather_kd
 from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
     scatter_kda_state,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
+    glm5_next_kpool_state_compress_and_write_cache_triton as kpool_state_compress,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
+    kv_rmsnorm_rope_cache,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
+    lightning_indexer,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -64,6 +83,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
+    compute_slot_mapping_parallel,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
@@ -74,6 +96,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -81,11 +107,13 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_experts_impl",
+    "gemma_rms_norm",
     "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "qwen4_store_qsa_kv_rows",
     "qwen4_hc_inject_combine",
+    "pack_seq_triton",
     "per_token_group_quant_fp8",
     "ple_state_scatter_",
     "qwen4_qsa_mqa_paged_dot",
@@ -102,9 +130,19 @@ __all__ = [
     "combine_topk_swa_indices",
     "top_k_per_row_prefill",
     "top_k_per_row_decode",
+    "topk_softplus_sqrt",
     "kda_gate_cumsum_triton",
     "gather_kda_state",
     "scatter_kda_state",
     "gather_conv_state",
     "scatter_conv_state",
+    "paged_scatter_triton",
+    "indexer_epilogue",
+    "compute_slot_mapping_parallel",
+    "unpack_seq_triton",
+    "kpool_state_compress",
+    "group_list_cumsum",
+    "indexer_gemm_score",
+    "kv_rmsnorm_rope_cache",
+    "lightning_indexer",
 ]

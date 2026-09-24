@@ -20,12 +20,15 @@ from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_k
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
+from flaggems_vllm.runtime.backend._mthreads.ops.flash_attn_varlen_func_w8a8_fp8 import (
+    flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -41,10 +44,15 @@ from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "fused_inv_rope_fp8_quant",
+    "flash_attn_varlen_func_w8a8_fp8",
+    "gemma_rms_norm",
     "grouped_topk",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
@@ -58,4 +66,5 @@ __all__ = [
     "outplace_fused_experts",
     "persistent_topk",
     "fused_q_kv_rmsnorm",
+    "topk_softplus_sqrt",
 ]

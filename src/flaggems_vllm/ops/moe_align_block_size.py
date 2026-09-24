@@ -475,7 +475,7 @@ def moe_align_block_size_stage3(
 
     expert_offsets = tl.arange(0, num_experts_next_power_of_2)
     mask = expert_offsets < num_experts
-    token_cnts = tl.load(tokens_cnts_ptr + off_cnt + expert_offsets, mask=mask)
+    token_cnts = tl.load(tokens_cnts_ptr + off_cnt + expert_offsets, mask=mask, other=0)
     aligned_cnts = tl.cdiv(token_cnts, block_size) * block_size
 
     cumsum_values = tl.cumsum(aligned_cnts, axis=0)
@@ -524,6 +524,7 @@ def _moe_align_block_size_triton_4stage(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
+    workspace=None,
 ) -> None:
     """Non-TLE 4-stage pipeline.
 
@@ -542,10 +543,15 @@ def _moe_align_block_size_triton_4stage(
 
     # The tensor needs to be padded before calculating IDs,
     # to prevent out-of-bounds address access.
-    cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
-    tokens_cnts = torch.zeros(
-        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
-    )
+    if workspace is None:
+        cumsum = torch.zeros(
+            (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+        )
+        tokens_cnts = torch.zeros(
+            (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
+        )
+    else:
+        cumsum, tokens_cnts = workspace
     num_experts_next_power_of_2 = triton.next_power_of_2(num_experts)
 
     moe_align_block_size_stage1[grid](
@@ -819,6 +825,7 @@ def moe_align_block_size_no_tle(
     num_experts: int,
     expert_map: Optional[torch.Tensor] = None,
     pad_sorted_ids: bool = False,
+    workspace=None,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
     """TLE-free entry point for backends whose compiler cannot legalize the
     TLE cooperative kernels (``tle.distributed_barrier``).
@@ -826,6 +833,9 @@ def moe_align_block_size_no_tle(
     Same semantics as :func:`moe_align_block_size` minus the TLE attempt, so
     vendors import this directly instead of re-implementing the non-TLE
     orchestration in their fused_moe modules.
+
+    ``workspace`` optionally supplies zero-initialized int32 cumsum/count buffers
+    of sizes E+1 and (E+1)*E, allowing callers to initialize them without Torch.
     """
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
@@ -853,6 +863,7 @@ def moe_align_block_size_no_tle(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
+        workspace=workspace,
     )
 
     if expert_map is not None:
