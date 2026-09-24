@@ -24,6 +24,7 @@ from flaggems_vllm.ops.top_k_per_row_prefill import (
     NUM_FILNAL_ITEMS,
     NUM_THREADS_PER_BLOCK,
     SORTING_ALGORITHM_THRESHOLD,
+    _convert_to_uint32,
     _extract_bin_idx,
     _final_select_radix,
     _num_warps,
@@ -47,15 +48,24 @@ else:
     tle = None
     HAS_TLE = False
 
+# FLAGGEMS_MTT_TOPK_PREFILL=0 turns the override off: every call goes to the
+# generic operator.
+_ENABLED = os.environ.get("FLAGGEMS_MTT_TOPK_PREFILL", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
+
 
 # Sample every SSTRIDE-th element for the threshold estimate. 8 leaves ~256
 # samples in the top-k tail (~6% error); 64 left ~32 and missed the
 # [top_k, 2048] window on almost every row.
-SSTRIDE = int(os.environ.get("FLAGGEMS_MTT_PREFILL_SSTRIDE", "8"))
+SSTRIDE = 8
 
 # Shorter rows are fixed-cost dominated and lose with sampling (S5000: vocab
 # 8193 0.875 -> 0.706, vocab 16385 0.765 -> 0.835).
-MIN_SPAN = int(os.environ.get("FLAGGEMS_MTT_PREFILL_MIN_SPAN", "16384"))
+MIN_SPAN = 16384
 
 
 @triton.jit
@@ -154,60 +164,111 @@ def _sampled_prefill(
     thr_c = tl.min(tl.where(cum >= target, bins, NBINS - 1), axis=0)
     thr = thr_c + 1
 
-    # ---- pass 2: collect everything below the threshold -------------------
-    # A count outside [TOPK, NFINAL] means a bad estimate; the retry recomputes
-    # the threshold exactly from a full histogram.
-    for attempt in tl.static_range(0, 2):
-        redo = attempt == 1
-        if (attempt == 0) or (tl.load(cp) < TOPK) or (tl.load(cp) > NFINAL):
-            if redo:
-                for z in tl.range(0, NBINS, BLOCK_SIZE):
-                    tl.store(hp + z + lane, 0)
+    # ---- pass 2: collect everything at or above the threshold -------------
+    # hist doubles as the candidate index buffer from here on
+    for z in tl.range(0, NBINS, BLOCK_SIZE):
+        tl.store(hp + z + lane, 0)
+    tl.store(cp, 0)
+    tl.store(fvp, 0)
+    tl.debug_barrier()
+
+    n_vec = span // (BLOCK_SIZE * VEC)
+    for t in tl.range(0, n_vec):
+        offs = (t * BLOCK_SIZE * VEC + lane * VEC)[:, None] + vec[None, :]
+        x = tl.load(base + offs * stride1)
+        b, _ = _extract_bin_idx(x, True, 0, STEP=0)
+        # Explicit cast: implicit uint32/int32 promotion selects everything.
+        take = b.to(tl.int32) < thr
+        pos = tl.atomic_add(
+            cp + tl.zeros([BLOCK_SIZE, VEC], tl.int32),
+            one2,
+            mask=take,
+            sem="relaxed",
+            scope="cta",
+        )
+        keep = take & (pos < NFINAL)
+        tl.store(hp + pos, offs.to(tl.int32), mask=keep)
+    tail = n_vec * BLOCK_SIZE * VEC
+    for t in tl.range(0, tl.cdiv(span - tail, BLOCK_SIZE)):
+        i = tail + t * BLOCK_SIZE + lane
+        m = i < span
+        x = tl.load(base + i * stride1, mask=m, other=0.0)
+        b, _ = _extract_bin_idx(x, m, 0, STEP=0)
+        take = m & (b.to(tl.int32) < thr)
+        pos = tl.atomic_add(
+            cp + tl.zeros([BLOCK_SIZE], tl.int32),
+            one1,
+            mask=take,
+            sem="relaxed",
+            scope="cta",
+        )
+        keep = take & (pos < NFINAL)
+        tl.store(hp + pos, i.to(tl.int32), mask=keep)
+    tl.debug_barrier()
+
+    # A count outside [TOPK, NFINAL] means the estimate missed. The retry must
+    # NOT re-derive an 11-bit threshold: STEP 0 bins on sign + 5 exponent bits
+    # + the top 5 mantissa bits, so a row inside a band narrower than
+    # magnitude/32 (about 3% relative, away from zero) collapses into one bin
+    # and that threshold admits the whole row again -- the candidate buffer
+    # overflows, whatever was stored first survives, and the exact select below
+    # then answers from an arbitrary subset. The generic operator escapes that
+    # through STEP 1-3, which refine over all 32 bits; this kernel has no STEP
+    # loop, so the retry goes straight to the full 32-bit ordered key, which is
+    # injective on distinct floats.
+    if (tl.load(cp) < TOPK) or (tl.load(cp) > NFINAL):
+        RBINS: tl.constexpr = 256
+        rbins = tl.arange(0, RBINS)
+        n_tiles = tl.cdiv(span, BLOCK_SIZE)
+        desired = tl.zeros((), dtype=tl.uint32)
+        dmask = tl.zeros((), dtype=tl.uint32)
+        k_left = TOPK + 1
+        for dpos in tl.static_range(24, -1, -8):
+            if k_left > 1:
+                tl.store(hp + rbins, tl.zeros([RBINS], tl.int32))
                 tl.debug_barrier()
-                for t in tl.range(0, tl.cdiv(span, BLOCK_SIZE)):
+                for t in tl.range(0, n_tiles):
                     i = t * BLOCK_SIZE + lane
                     m = i < span
-                    b, _ = _extract_bin_idx(
-                        tl.load(base + i * stride1, mask=m, other=0.0),
-                        m,
-                        0,
-                        STEP=0,
+                    k32 = _convert_to_uint32(
+                        tl.load(base + i * stride1, mask=m, other=0.0)
                     )
-                    tl.atomic_add(hp + b, one1, mask=m, sem="relaxed", scope="cta")
+                    d = ((k32 >> dpos) & (RBINS - 1)).to(tl.int32)
+                    tl.atomic_add(
+                        hp + d,
+                        one1,
+                        mask=m & ((k32 & dmask) == desired),
+                        sem="relaxed",
+                        scope="cta",
+                    )
                 tl.debug_barrier()
-                cum2 = tl.cumsum(tl.load(hp + bins), axis=0)
-                thr = tl.min(tl.where(cum2 >= TOPK, bins, NBINS - 1), axis=0) + 1
+                rc = tl.load(hp + rbins)
+                pre = tl.cumsum(rc, axis=0) - rc
+                hit = (pre < k_left) & (pre + rc >= k_left)
+                rb = tl.min(tl.where(hit, rbins, RBINS), axis=0).to(tl.int32)
+                rb = tl.where(rb == RBINS, RBINS - 1, rb)
+                nlt = tl.max(tl.where(rbins == rb, pre, 0), axis=0).to(tl.int32)
+                desired = desired | (rb.to(tl.uint32) << dpos)
+                dmask = dmask | (tl.full((), RBINS - 1, tl.uint32) << dpos)
+                k_left = k_left - nlt
+        thr32 = desired
 
-            # hist doubles as the candidate index buffer from here on
-            for z in tl.range(0, NBINS, BLOCK_SIZE):
-                tl.store(hp + z + lane, 0)
-            tl.store(cp, 0)
-            tl.store(fvp, 0)
-            tl.debug_barrier()
-
-            n_vec = span // (BLOCK_SIZE * VEC)
-            for t in tl.range(0, n_vec):
-                offs = (t * BLOCK_SIZE * VEC + lane * VEC)[:, None] + vec[None, :]
-                x = tl.load(base + offs * stride1)
-                b, _ = _extract_bin_idx(x, True, 0, STEP=0)
-                # Explicit cast: implicit uint32/int32 promotion selects everything.
-                take = b.to(tl.int32) < thr
-                pos = tl.atomic_add(
-                    cp + tl.zeros([BLOCK_SIZE, VEC], tl.int32),
-                    one2,
-                    mask=take,
-                    sem="relaxed",
-                    scope="cta",
-                )
-                keep = take & (pos < NFINAL)
-                tl.store(hp + pos, offs.to(tl.int32), mask=keep)
-            tail = n_vec * BLOCK_SIZE * VEC
-            for t in tl.range(0, tl.cdiv(span - tail, BLOCK_SIZE)):
-                i = tail + t * BLOCK_SIZE + lane
+        for z in tl.range(0, NBINS, BLOCK_SIZE):
+            tl.store(hp + z + lane, 0)
+        tl.store(cp, 0)
+        tl.store(fvp, 0)
+        tl.debug_barrier()
+        # Strictly better than the k-th first, its exact ties after, so a
+        # truncation at NFINAL can only ever drop indistinguishable values.
+        for eq in tl.static_range(2):
+            for t in tl.range(0, n_tiles):
+                i = t * BLOCK_SIZE + lane
                 m = i < span
-                x = tl.load(base + i * stride1, mask=m, other=0.0)
-                b, _ = _extract_bin_idx(x, m, 0, STEP=0)
-                take = m & (b.to(tl.int32) < thr)
+                k32 = _convert_to_uint32(tl.load(base + i * stride1, mask=m, other=0.0))
+                if eq == 0:
+                    take = m & (k32 < thr32)
+                else:
+                    take = m & (k32 == thr32)
                 pos = tl.atomic_add(
                     cp + tl.zeros([BLOCK_SIZE], tl.int32),
                     one1,
@@ -215,8 +276,7 @@ def _sampled_prefill(
                     sem="relaxed",
                     scope="cta",
                 )
-                keep = take & (pos < NFINAL)
-                tl.store(hp + pos, i.to(tl.int32), mask=keep)
+                tl.store(hp + pos, i.to(tl.int32), mask=take & (pos < NFINAL))
             tl.debug_barrier()
 
     # ---- re-read the candidate values -------------------------------------
@@ -264,18 +324,14 @@ def _wide_max_rows():
     """Largest num_rows for which the wide block still fits in one wave."""
     global _WIDE_MAX_ROWS
     if _WIDE_MAX_ROWS is None:
-        override = os.environ.get("FLAGGEMS_MTT_PREFILL_WIDE_MAX_ROWS")
-        if override is not None:
-            _WIDE_MAX_ROWS = int(override)
-        else:
-            try:
-                props = runtime.torch_device_fn.get_device_properties(0)
-                warp = getattr(props, "warp_size", 32) or 32
-                sm = getattr(props, "multi_processor_count", 0)
-                # The crossover was measured on 32-lane warps only.
-                _WIDE_MAX_ROWS = sm if (warp == 32 and sm) else 0
-            except Exception:  # noqa: BLE001 - detection must not break dispatch
-                _WIDE_MAX_ROWS = 0
+        try:
+            props = runtime.torch_device_fn.get_device_properties(0)
+            warp = getattr(props, "warp_size", 32) or 32
+            sm = getattr(props, "multi_processor_count", 0)
+            # The crossover was measured on 32-lane warps only.
+            _WIDE_MAX_ROWS = sm if (warp == 32 and sm) else 0
+        except Exception:  # noqa: BLE001 - detection must not break dispatch
+            _WIDE_MAX_ROWS = 0
     return _WIDE_MAX_ROWS
 
 
@@ -338,7 +394,15 @@ def _can_sample(num_rows, vocab_size, stride1, top_k):
 def top_k_per_row_prefill(
     logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
 ):
-    """Top-K per row for DeepSeek V4 prefill with a sampled threshold."""
+    """Top-K per row for DeepSeek V4 prefill with a sampled threshold.
+
+    FLAGGEMS_MTT_TOPK_PREFILL=0 disables the override; every call then goes to
+    the generic operator.
+    """
+    if not _ENABLED:
+        return _generic_prefill(
+            logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
+        )
     vocab_size = logits.shape[1]
     if not _can_sample(num_rows, vocab_size, stride1, top_k):
         # Rows too short to sample can still use the wide block.
