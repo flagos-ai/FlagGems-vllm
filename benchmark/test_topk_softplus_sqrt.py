@@ -30,7 +30,7 @@ topk_softplus_sqrt = flaggems_vllm.topk_softplus_sqrt
 #
 # HAS_TLE           : this vendor's TLE-optimized kernel is usable here.
 # HAS_TLE_HASH      : the TLE-optimized hash-mode kernel is usable here
-#                     (mthreads / thead, for now).
+#                     (mthreads / thead / hygon, for now).
 # _gems_tle_op      : callable forcing the TLE kernel.
 # _gems_baseline_op : callable forcing the plain Triton kernel.
 # ---------------------------------------------------------------------------
@@ -71,6 +71,17 @@ elif vendor == "thead":
     )
 
     # thead also has a dedicated shared-memory kernel for hash mode.
+    HAS_TLE_HASH = HAS_TLE
+elif vendor == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import HAS_TLE
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_baseline as _gems_baseline_op,
+    )
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_tle as _gems_tle_op,
+    )
+
+    # hygon also has a dedicated shared-memory kernel for hash mode.
     HAS_TLE_HASH = HAS_TLE
 
 try:
@@ -300,7 +311,7 @@ def test_topk_softplus_sqrt_hash():
 @pytest.mark.topk_softplus_sqrt
 @_skip_no_tle_hash
 def test_topk_softplus_sqrt_tle_hash():
-    """TLE-optimized kernel, hash mode (mthreads / thead only)."""
+    """TLE-optimized kernel, hash mode (mthreads / thead / hygon only)."""
     bench = TopkSoftplusSqrtHashBenchmark(
         op_name="topk_softplus_sqrt_tle_hash",
         torch_op=_baseline_op,
