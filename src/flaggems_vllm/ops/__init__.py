@@ -265,7 +265,7 @@ __all__ = [
     "weight_norm_interface_backward",
 ]
 
-# Hygon DCU ports of the upstream W8A8 BMM / INT8 einsum entry points.
+# Backend-only APIs have no implementation on other vendors.
 from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "hygon":
@@ -275,3 +275,10 @@ if _runtime.device.vendor_name == "hygon":
     )
 
     __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]
+
+if _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.fused.attention import (  # noqa: F401
+        flash_attn_varlen_func_w8a8_int8,
+    )
+
+    __all__.append("flash_attn_varlen_func_w8a8_int8")
