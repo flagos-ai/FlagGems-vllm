@@ -95,6 +95,33 @@ ops:
       - Reduction
     stages:
       - stable: '5.0'
+  - id: causal_conv1d_fn
+    description: |
+      Causal depthwise conv1d over variable-length token sequences with
+      continuous batching support, updating the convolution state cache
+      during the forward pass (prefill path, Ascend port of the vLLM operator).
+    for:
+      - causal_conv1d_fn
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: causal_conv1d_update
+    description: |
+      Decode-stage causal conv1d with in-place convolution state update for
+      variable-length accepted tokens (Ascend port of the vLLM operator).
+    for:
+      - causal_conv1d_update
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: bucket_sort_topk
     description: A wrapper of the TLE version and the Triton version bucket-sort topk operation.
     for:
@@ -146,6 +173,23 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: compressor
+    description: |
+      Compressor operator of the Ascend sparse-attention indexer: projects the
+      input with the kv/gate weights, writes kv/score states into the state
+      cache, then applies APE, softmax-weighted reduction, RMSNorm and RoPE
+      over complete compression groups through dedicated prefill and decode
+      paths.
+    for:
+      - _C_ascend.compressor
+    labels:
+      - fused
+      - vLLM
+      - Attention
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: compute_global_topk_indices_and_lens
     description: |
       Converts local top-k sparse attention indices to global KV-cache indices and computes
@@ -566,6 +610,21 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: group_list_cumsum
+    description: |
+      Computes expert token-count offsets (cumsum) for expert-parallel MoE
+      routing. The aclnn cumsum dispatch has no AI_CORE path for integer
+      dtypes on Ascend, so this runs it as a single vector-core program.
+    for:
+      - None
+    labels:
+      - fused
+      - MoE
+      - Reduction
+    kind:
+      - Reduction
+    stages:
+      - alpha: '5.4'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
@@ -608,6 +667,38 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: indexer_epilogue
+    description: |
+      Fused post-topk epilogue for the GLM lightning indexer: expands the
+      selected pool ids to token ids, appends the causal tail and writes the
+      int32 output row directly, replacing a chain of ~10 small torch kernels
+      per call.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+      - DSA
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: indexer_gemm_score
+    description: |
+      GEMM-form scorer for the GLM lightning indexer: gathers each pool tile
+      once per request and multiplies it with a query block via tl.dot,
+      instead of re-reading the whole pool cache once per token row. Small
+      row counts (decode/draft steps) fall back to the matvec kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+      - DSA
+    kind:
+      - LinearAlg
+    stages:
+      - alpha: '5.4'
   - id: indexer_k_quant_and_cache
     description: This is a fused operator that quantizes K tensors and writes them into the FP8 KV cache.
     for:
@@ -645,6 +736,127 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
+  - id: kda_conv_gather
+    description: |
+      Stages the rows used by a batch out of the block-strided Kimi Delta
+      Attention (KDA) short-convolution state cache into a contiguous buffer
+      for the AscendC conv operator, emitting local row indices with PAD
+      markers in a single kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: kda_conv_scatter
+    description: |
+      Restores the staged rows back into the block-strided KDA
+      short-convolution state cache after the AscendC conv operator in one
+      pass, skipping PAD entries inside the kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: kda_gate_cumsum
+    description: |
+      Fused Triton replacement for the AscendC kda_gate_cumsum operator:
+      computes the safe sigmoid gates of Kimi Delta Attention and their
+      in-chunk cumulative sums with one program per (chunk, head) tile
+      instead of one serial block per sequence.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: kda_state_gather
+    description: |
+      Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
+      layout expected by the AscendC chunk operator, zeroing slots without an
+      initial state, with the transpose folded into a single kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: kda_state_scatter
+    description: |
+      Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
+      chunk operator back into the paged [H, V, K] cache layout with the
+      transpose and dtype cast folded into a single kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: kpool_state_compress
+    description: |
+      Fused fast path for the GLM5 Next A3 indexer pre-compress sequence:
+      writes each token's full-resolution k/gate_score row into the paged
+      compressor state cache and compresses completed pools with
+      softmax(gate_score + ape) weighting, all in one launch per sparse layer.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: kv_rmsnorm_rope_cache
+    description: |
+      Fused KV RMSNorm + RoPE + paged-KV cache writeback: splits a fused KV
+      projection, applies RMSNorm to the RMS half and rotary position
+      embedding to the RoPE half, and scatters both into the paged k/ckv
+      caches through the per-token slot index.
+    for:
+      - None
+    labels:
+      - fused
+      - TLE
+      - vLLM
+      - Normalization
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: lightning_indexer
+    description: |
+      TLE implementation of the Ascend paged-attention Lightning Indexer:
+      builds 512-key topk proposals for short-K, single-token long-K and
+      multi-token long-K varlen queries and merges them through a Stage2
+      merge tree, emitting the final topk indices.
+    for:
+      - None
+    labels:
+      - fused
+      - TLE
+      - DSA
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).
@@ -783,6 +995,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: paged_scatter_triton
+    description: |
+      Scatters token rows into paged caches by slot index in a single kernel,
+      skipping invalid slots inside the kernel. Replaces the torch
+      where/zeros_like/scatter_nd sentinel chains with a fixed-grid,
+      ACLGraph-capturable launch.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: per_token_group_quant_fp8
     description: |
       Function to perform per-token-group quantization on an input tensor `x`.
@@ -919,6 +1146,38 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: slot_mapping_triton
+    description: |
+      Parallel slot-mapping computation for paged KV caches: parallelises over
+      (request, token block) instead of launching one program per request,
+      removing the serial token walk on prefill batches with few long requests.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: sparse_attn_sharedkv
+    description: |
+      DeepSeekV4 shared-KV sparse attention in three modes: SWA (sliding
+      window over the recent original KV), CFA (window plus the contiguous
+      compressed KV prefix) and SCFA (window plus the per-query selected
+      compressed KV), with graph-safe decode and chunked-prefill entry points.
+    for:
+      - None
+    labels:
+      - fused
+      - TLE
+      - vLLM
+      - DeepSeekV4
+      - Attention
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: sparse_attn_triton
     description: Sparse attention with attention-sink.
     for:
