@@ -74,6 +74,10 @@ def _runs_quantized_moe():
 
 
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
+_METAX_INT4_ONLY = pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "metax", reason="MetaX override supports UINT4B8 only"
+)
+
 
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
 
@@ -223,6 +227,13 @@ else:
         (16, 256, 4096, 2048, 6),
         (64, 256, 4096, 2048, 6),
     ]
+
+# Exercise short routed batches through the same INT4 test on every vendor.
+INT4_CONFIGS = (
+    FULL_CONFIGS
+    + [(tokens, 128, 128, 256, 6) for tokens in (1, 2, 4, 8)]
+    + [(16, 128, 128, 256, 8)]
+)
 
 GROUP_SIZE = 128
 
@@ -645,7 +656,7 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize("config", FULL_CONFIGS)
+@pytest.mark.parametrize("config", INT4_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input):
@@ -690,6 +701,116 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
+@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("output_mode", ["allocated", "out", "inplace"])
+def test_metax_fused_marlin_moe_int4_output(
+    dtype: torch.dtype, output_mode: str
+) -> None:
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
+        65, 8, 128, 256, 2, dtype, flaggems_vllm.device
+    )
+    reference = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    output = torch.empty_like(hs) if output_mode == "out" else None
+    result = flaggems_vllm.fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_UINT4B8,
+        output=output,
+        inplace=output_mode == "inplace",
+    )
+    expected_alias = hs if output_mode == "inplace" else output
+    if expected_alias is not None:
+        assert result is expected_alias
+    else:
+        assert result is not hs
+    assert compute_max_diff(result.float(), reference) < 0.04
+
+
+@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
+@pytest.mark.parametrize("invalid", ["output_shape", "topk_shape", "topk_dtype"])
+def test_metax_fused_marlin_moe_int4_invalid_shape(invalid: str) -> None:
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
+        1, 8, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    kwargs = dict(output=None)
+    if invalid == "output_shape":
+        kwargs["output"] = torch.empty((1, 129), device=hs.device, dtype=hs.dtype)
+    elif invalid == "topk_shape":
+        ti = ti[:, :1]
+    else:
+        ti = ti.to(torch.float32)
+    with pytest.raises(ValueError):
+        flaggems_vllm.fused_marlin_moe(
+            hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_UINT4B8, **kwargs
+        )
+
+
+@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
+@pytest.mark.parametrize("unsupported", ["bias1", "w1_zeros", "activation"])
+def test_metax_fused_marlin_moe_int4_unsupported(unsupported: str) -> None:
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
+        1, 8, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    kwargs = {
+        unsupported: torch.empty_like(hs) if unsupported != "activation" else "gelu"
+    }
+    args = dict(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=s1,
+        w2_scale=s2,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+    )
+    args.update(kwargs)
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.fused_marlin_moe(**args)
+
+
+@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
+def test_metax_fused_marlin_moe_int4_empty() -> None:
+    device = flaggems_vllm.device
+    hs = torch.empty((0, 128), device=device, dtype=torch.bfloat16)
+    w1 = torch.empty((8, 512, 64), device=device, dtype=torch.uint8)
+    w2 = torch.empty((8, 128, 128), device=device, dtype=torch.uint8)
+    s1 = torch.empty((8, 512, 1), device=device, dtype=hs.dtype)
+    s2 = torch.empty((8, 128, 2), device=device, dtype=hs.dtype)
+    tw = torch.empty((0, 2), device=device, dtype=hs.dtype)
+    ti = torch.empty((0, 2), device=device, dtype=torch.int64)
+    out = torch.empty_like(hs)
+    result = flaggems_vllm.fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_UINT4B8,
+        output=out,
+    )
+    assert result is out and result.shape == (0, 128)
+
+
+@_METAX_INT4_ONLY
 @pytest.mark.parametrize(
     "precision",
     [
@@ -1311,6 +1432,7 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
+@_METAX_INT4_ONLY
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
     reason="MThreads backend does not implement INT8 W8A16",
@@ -1351,6 +1473,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
+@_METAX_INT4_ONLY
 @pytest.mark.fused_marlin_moe_w4a16_mxfp4
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
@@ -1458,6 +1581,7 @@ def test_rejects_fp8_input_dtype():
         )
 
 
+@_METAX_INT4_ONLY
 @pytest.mark.fused_marlin_moe_w8a16_fp8
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
