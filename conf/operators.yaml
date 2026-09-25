@@ -1362,3 +1362,17 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+  - id: flash_mla_with_kvcache_fwd_w8a8_fp8
+    description: |
+      Dense MLA decode with a per-token-scaled FP8 CKV cache on NVIDIA
+      Hopper GPUs.
+    for:
+      - flash_mla_with_kvcache_fwd_w8a8_fp8
+    labels:
+      - fused
+      - Attention
+      - Nvidia
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'

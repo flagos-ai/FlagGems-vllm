@@ -52,6 +52,12 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+    FlashMLAFp8SplitKSchedMeta,
+    flash_mla_with_kvcache_fwd_w8a8_fp8,
+    get_mla_fp8_metadata,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
@@ -155,6 +161,10 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 # isort: on
 
 __all__ = [
+    "FlashMLAFp8SplitKSchedMeta",
+    "flash_mla_with_kvcache_fwd_w8a8_fp8",
+    "get_mla_fp8_metadata",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_fp8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
