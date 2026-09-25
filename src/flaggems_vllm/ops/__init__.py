@@ -52,6 +52,9 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8 import (
+    flash_mla_sparse_fwd_w8a8_fp8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
@@ -183,6 +186,7 @@ __all__ = [
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "flash_mla_sparse_fwd_w8a8_fp8",
     "flash_mla_with_kvcache",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",

@@ -932,3 +932,41 @@ silu_and_mul_with_clamp_linear:
       UNMASKED: false
     num_warps: 8
     num_stages: 1
+
+sparse_fp8_repair:
+  - META: {BLOCK_H: 64, BLOCK_K: 64}
+    num_warps: 8
+    num_stages: 1
+
+
+
+sparse_fp8_warp_specialized:
+  - META: {PRODUCER_REGS: 48}
+    num_warps: 4
+    num_stages: 1
+  - META: {PRODUCER_REGS: 56}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_compact:
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 160}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 168}
+    num_warps: 4
+    num_stages: 1
+
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 224}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 232}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_tile:
+  - META: {BLOCK_K: 64, BLOCK_D: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, BLOCK_D: 256}
+    num_warps: 4
+    num_stages: 1

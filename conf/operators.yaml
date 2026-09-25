@@ -1362,3 +1362,15 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+  - id: flash_mla_sparse_fwd_w8a8_fp8
+    description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and shared key/value.
+    for:
+      - flash_mla_sparse_fwd_w8a8_fp8
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
