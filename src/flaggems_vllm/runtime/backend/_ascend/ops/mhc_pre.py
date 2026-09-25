@@ -55,6 +55,7 @@ _FN_BF16_CACHE: weakref.WeakKeyDictionary[torch.Tensor, tuple[int, torch.Tensor]
     weakref.WeakKeyDictionary()
 )
 
+
 def _get_fn_bf16_cached(fn: torch.Tensor) -> torch.Tensor:
     if fn.requires_grad or torch.is_grad_enabled():
         return fn.to(dtype=torch.bfloat16)
@@ -67,6 +68,7 @@ def _get_fn_bf16_cached(fn: torch.Tensor) -> torch.Tensor:
     fn_bf16 = fn.to(dtype=torch.bfloat16)
     _FN_BF16_CACHE[fn] = (version, fn_bf16)
     return fn_bf16
+
 
 @triton.jit
 def _mhc_pre_fused_kernel_hc_mult_4_impl(
@@ -432,7 +434,6 @@ def _mhc_pre_fused_kernel_hc_mult_4_impl(
         )
 
 
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
@@ -492,7 +493,6 @@ def mhc_pre_fused_kernel_hc_mult_4(
         HC_MULT3,
         BLOCK_H,
     )
-
 
 
 @triton.autotune(
@@ -651,7 +651,6 @@ def mhc_pre_generic_kernel(
         )
 
 
-
 def _validate_inputs(residual, fn, hc_scale, hc_base):
     """Shape/dtype validation. Raises ValueError on any mismatch."""
     if not isinstance(residual, torch.Tensor) or residual.dim() < 3:
@@ -660,16 +659,19 @@ def _validate_inputs(residual, fn, hc_scale, hc_base):
             "{!r}".format(getattr(residual, "shape", residual))
         )
     if residual.dtype != torch.bfloat16:
-        raise ValueError(
-            "residual must be bfloat16, got {}".format(residual.dtype)
-        )
+        raise ValueError("residual must be bfloat16, got {}".format(residual.dtype))
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
 
-    if not isinstance(fn, torch.Tensor) or fn.dim() != 2 or tuple(fn.shape) != (
-        hc_mult3,
-        hc_mult * hidden_size,
+    if (
+        not isinstance(fn, torch.Tensor)
+        or fn.dim() != 2
+        or tuple(fn.shape)
+        != (
+            hc_mult3,
+            hc_mult * hidden_size,
+        )
     ):
         raise ValueError(
             "fn must have shape ({}, {}), got {!r}".format(
@@ -683,9 +685,7 @@ def _validate_inputs(residual, fn, hc_scale, hc_base):
             "hc_scale must have shape (3,), got {}".format(tuple(hc_scale.shape))
         )
     if hc_scale.dtype != torch.float32:
-        raise ValueError(
-            "hc_scale must be float32, got {}".format(hc_scale.dtype)
-        )
+        raise ValueError("hc_scale must be float32, got {}".format(hc_scale.dtype))
     if tuple(hc_base.shape) != (hc_mult3,):
         raise ValueError(
             "hc_base must have shape ({},), got {}".format(
@@ -730,9 +730,7 @@ def npu_mhc_pre(
     """
     if residual.device.type != "npu":
         raise NotImplementedError("npu_mhc_pre requires NPU tensors")
-    hc_mult, hidden_size, hc_mult3 = _validate_inputs(
-        residual, fn, hc_scale, hc_base
-    )
+    hc_mult, hidden_size, hc_mult3 = _validate_inputs(residual, fn, hc_scale, hc_base)
 
     outer_shape = residual.shape[:-2]
     residual_flat = residual.reshape(-1, hc_mult, hidden_size).contiguous()

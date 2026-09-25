@@ -84,6 +84,7 @@ def _common_stages(residual, fn, hc_scale, hc_base, rms_eps):
     comb_logits = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
     return pre_logits, post_logits, comb_logits, residual_flat
 
+
 def _sinkhorn(x, clamp_before, hc_sinkhorn_eps, sinkhorn_repeat):
     if clamp_before:
         x = x.clamp(CLAMP_MIN, CLAMP_MAX)
@@ -93,6 +94,7 @@ def _sinkhorn(x, clamp_before, hc_sinkhorn_eps, sinkhorn_repeat):
         x = x / (x.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
         x = x / (x.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
     return x
+
 
 def mhc_pre_ref_clamped(
     residual,
@@ -149,7 +151,10 @@ def test_npu_mhc_pre_regular_shapes(num_tokens, hc_mult, hidden_size):
     case = "n{}_hc{}_h{}".format(num_tokens, hc_mult, hidden_size)
     data = generate_mhc_pre_data(num_tokens, hc_mult, hidden_size)
     ref_post, ref_comb, ref_hin = mhc_pre_ref_clamped(
-        data["residual"], data["fn"], data["hc_scale"], data["hc_base"],
+        data["residual"],
+        data["fn"],
+        data["hc_scale"],
+        data["hc_base"],
         **MODEL_KWARGS,
     )
     out_post, out_comb, out_hin = flaggems_vllm.npu_mhc_pre(**{**data, **MODEL_KWARGS})
@@ -212,16 +217,15 @@ def test_npu_mhc_pre_shape_validation():
     residual6 = torch.randn(
         (8, hc_mult, hidden), dtype=torch.float32, device=device
     ).bfloat16()
-    fn6 = torch.randn(
-        (hc_mult3, hc_mult * hidden), dtype=torch.float32, device=device
-    ) * 1e-4
+    fn6 = (
+        torch.randn((hc_mult3, hc_mult * hidden), dtype=torch.float32, device=device)
+        * 1e-4
+    )
     scale6 = torch.randn((3,), dtype=torch.float32, device=device) * 0.1
     base6 = torch.randn((hc_mult3,), dtype=torch.float32, device=device) * 0.1
     try:
         ref6 = mhc_pre_ref_clamped(residual6, fn6, scale6, base6, **MODEL_KWARGS)
-        out6 = flaggems_vllm.npu_mhc_pre(
-            residual6, fn6, scale6, base6, **MODEL_KWARGS
-        )
+        out6 = flaggems_vllm.npu_mhc_pre(residual6, fn6, scale6, base6, **MODEL_KWARGS)
         torch.npu.synchronize()
         _assert_close(out6[1], ref6[1], "hc_mult6/comb")
         print("  [PASS] hc_mult=6 accepted and matches reference")
