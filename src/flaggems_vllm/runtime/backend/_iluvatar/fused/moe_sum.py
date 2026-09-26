@@ -18,15 +18,19 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
-
 logger = logging.getLogger(__name__)
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("moe_sum_pair"),
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2),
+    ],
     key=["hidden_size", "topk", "ELEM_SIZE"],
 )
 @triton.jit
@@ -81,9 +85,17 @@ def _iluvatar_moe_sum_pair_kernel(
     )
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("moe_sum_mt"),
+@triton.autotune(
+    configs=[
+        triton.Config({"TOKENS": 8, "BLOCK_H": 128}, num_warps=4, num_stages=3),
+        triton.Config({"TOKENS": 4, "BLOCK_H": 256}, num_warps=4, num_stages=3),
+        triton.Config({"TOKENS": 8, "BLOCK_H": 256}, num_warps=8, num_stages=3),
+        triton.Config({"TOKENS": 2, "BLOCK_H": 256}, num_warps=8, num_stages=3),
+        triton.Config({"TOKENS": 2, "BLOCK_H": 512}, num_warps=8, num_stages=3),
+        triton.Config({"TOKENS": 1, "BLOCK_H": 1024}, num_warps=8, num_stages=3),
+        triton.Config({"TOKENS": 1, "BLOCK_H": 512}, num_warps=8, num_stages=3),
+        triton.Config({"TOKENS": 2, "BLOCK_H": 1024}, num_warps=16, num_stages=3),
+    ],
     key=["hidden_size", "topk", "token_bucket", "ELEM_SIZE"],
 )
 @triton.jit
@@ -136,9 +148,14 @@ def _iluvatar_moe_sum_mt_kernel(
     tl.store(output_ptr_pos, acc.to(output_ptr.dtype.element_ty), mask=mask)
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("moe_sum_general"),
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8, num_stages=3),
+    ],
     key=["hidden_size", "topk", "ELEM_SIZE"],
 )
 @triton.jit
