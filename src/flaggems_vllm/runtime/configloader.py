@@ -433,11 +433,7 @@ class ConfigLoader(object):
                             "BLOCK_K": block_k,
                             "GROUP_X": group_x,
                         },
-                        **(
-                            {"SPLIT_K": split_k}
-                            if op_name.endswith("_splitk")
-                            else {}
-                        ),
+                        **({"SPLIT_K": split_k} if op_name.endswith("_splitk") else {}),
                     ),
                     num_stages=s,
                     num_warps=w,

@@ -165,9 +165,7 @@ def _tle_consumer(
             sb = tl.load(Bs + (pn * BN // GROUP_N) * SBN + scale_it * SBK)
             acc += partial * (sa * sb)[:, None]
         else:
-            sb = tl.load(
-                Bs + (rn // GROUP_N) * SBN + scale_it * SBK, rn < N, other=0
-            )
+            sb = tl.load(Bs + (rn // GROUP_N) * SBN + scale_it * SBK, rn < N, other=0)
             acc += partial * sa[:, None] * sb[None, :]
     tl.store(
         C + rm[:, None] * N + rn[None, :], acc, (rm[:, None] < M) & (rn[None, :] < N)
@@ -240,7 +238,10 @@ def _block_fp8_matmul_tle(
             nv_mma_shared_layout=True,
         )
         b = tle.gpu.alloc(
-            (STAGES, BN, TILE_K), tl.float16, scope=tle.gpu.smem, nv_mma_shared_layout=True
+            (STAGES, BN, TILE_K),
+            tl.float16,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
         )
     else:
         a = tle.gpu.alloc(
@@ -510,10 +511,17 @@ _block_fp8_matmul_narrow_splitk = _make_matmul_entry(
 )
 _block_fp8_matmul_skinny_swap_full = libentry()(
     libtuner(
-        configs=runtime.get_tuned_config("w8a8_block_fp8_matmul_mthreads_skinny_swap_full"),
-        key=_MATMUL_TUNING_KEY, strategy="default", warmup=5, rep=20,
+        configs=runtime.get_tuned_config(
+            "w8a8_block_fp8_matmul_mthreads_skinny_swap_full"
+        ),
+        key=_MATMUL_TUNING_KEY,
+        strategy="default",
+        warmup=5,
+        rep=20,
     )(_block_fp8_matmul_kernel)
 )
+
+
 @libentry()
 @triton.jit
 def _finish_split_k(P, C, SIZE, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr):
@@ -646,8 +654,21 @@ def _block_fp8_gemv(
 
 @triton.jit
 def _narrow_n_gemv_kernel(
-    A, B, As, Bs, C, M, N, K, SAM, SAK, SBN, SBK,
-    SPLITS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    A,
+    B,
+    As,
+    Bs,
+    C,
+    M,
+    N,
+    K,
+    SAM,
+    SAK,
+    SBN,
+    SBK,
+    SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """One program owns one output row and one K split for N<=16."""
     pid = tl.program_id(0)
@@ -663,9 +684,19 @@ def _narrow_n_gemv_kernel(
         kk = tile * BLOCK_K + tl.arange(0, BLOCK_K)
         kg = tile * (BLOCK_K // 128) + tl.arange(0, BLOCK_K // 128)
         av = tl.load(A + row * K + kk, (row < M) & (kk < K), other=0.0).to(tl.float32)
-        sa = tl.load(As + row * SAM + kg * SAK, (row < M) & (kg < tl.cdiv(K, 128)), other=0.0)
-        bv = tl.load(B + nidx[:, None] * K + kk[None, :], (nidx[:, None] < N) & (kk[None, :] < K), other=0.0).to(tl.float32)
-        sb = tl.load(Bs + (nidx[:, None] // 128) * SBN + kg[None, :] * SBK, (nidx[:, None] < N) & (kg[None, :] < tl.cdiv(K, 128)), other=0.0)
+        sa = tl.load(
+            As + row * SAM + kg * SAK, (row < M) & (kg < tl.cdiv(K, 128)), other=0.0
+        )
+        bv = tl.load(
+            B + nidx[:, None] * K + kk[None, :],
+            (nidx[:, None] < N) & (kk[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+        sb = tl.load(
+            Bs + (nidx[:, None] // 128) * SBN + kg[None, :] * SBK,
+            (nidx[:, None] < N) & (kg[None, :] < tl.cdiv(K, 128)),
+            other=0.0,
+        )
         acc += tl.sum(bv * (av * sa)[None, :] * sb, axis=1)
     tl.store(C + split * M * N + row * N + nidx, acc, (row < M) & (nidx < N))
 
@@ -935,7 +966,16 @@ def w8a8_block_fp8_matmul(
             and (m < 2048 or (k <= 128 and n >= 2048))
             # Complete 64-wide rows can use descriptor copies.  For wide,
             # contiguous workloads below M=2048, masked TLE handles ragged rows.
-            and (m % 64 == 0 or m <= 16 or (m < 2048 and n >= 2048 and a_s.is_contiguous() and Bs.is_contiguous()))
+            and (
+                m % 64 == 0
+                or m <= 16
+                or (
+                    m < 2048
+                    and n >= 2048
+                    and a_s.is_contiguous()
+                    and Bs.is_contiguous()
+                )
+            )
             # WS TLE candidates include BN=128, so N must cover the
             # largest unmasked copy tile (BN=128), not merely BN=64.
             and n % 128 == 0
@@ -998,8 +1038,12 @@ def w8a8_block_fp8_matmul(
         # generic matrix split-K path launches oversized 2-D tiles and pays a
         # large partial-tile overhead; use one row and one K split per program.
         if (
-            n <= 16 and m >= 1024 and group_n == 128 and group_k == 128
-            and a.is_contiguous() and B.is_contiguous()
+            n <= 16
+            and m >= 1024
+            and group_n == 128
+            and group_k == 128
+            and a.is_contiguous()
+            and B.is_contiguous()
         ):
             narrow_splits = min(16, max(4, triton.cdiv(k, 256)))
             narrow_bn = triton.next_power_of_2(n)
@@ -1007,18 +1051,32 @@ def w8a8_block_fp8_matmul(
                 (narrow_splits, m, n), dtype=torch.float32, device=A.device
             )
             _narrow_n_gemv_kernel[(m * narrow_splits,)](
-                a, B, a_s, Bs, narrow_partials, m, n, k,
-                a_s.stride(0), a_s.stride(1), Bs.stride(0), Bs.stride(1),
-                SPLITS=narrow_splits, BLOCK_N=narrow_bn, BLOCK_K=128,
+                a,
+                B,
+                a_s,
+                Bs,
+                narrow_partials,
+                m,
+                n,
+                k,
+                a_s.stride(0),
+                a_s.stride(1),
+                Bs.stride(0),
+                Bs.stride(1),
+                SPLITS=narrow_splits,
+                BLOCK_N=narrow_bn,
+                BLOCK_K=128,
             )
             _finish_split_k[(triton.cdiv(m * n, 256),)](
                 narrow_partials, c, m * n, SPLIT_K=narrow_splits, BLOCK=256
             )
             return c
 
-        split_path_requested = wide_split_requested or (
-            m <= 16 and n < 2112 and k >= 2048
-            ) or (n <= 16 and k >= 2048 and m >= 1024)
+        split_path_requested = (
+            wide_split_requested
+            or (m <= 16 and n < 2112 and k >= 2048)
+            or (n <= 16 and k >= 2048 and m >= 1024)
+        )
         swap = not split_path_requested and (m <= 16 or wide_swap_requested)
         split_k = 4 if split_path_requested else 1
         split_path = split_k > 1
