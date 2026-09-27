@@ -16,6 +16,7 @@
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -33,4 +34,5 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "gemma_rms_norm",
 ]
