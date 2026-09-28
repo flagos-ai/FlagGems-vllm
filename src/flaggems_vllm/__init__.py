@@ -16,6 +16,9 @@
 flaggems_vllm - DNN operations implemented with Triton
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
+
 import torch
 
 import flaggems_vllm.ops as _ops_module
@@ -32,9 +35,8 @@ registrar = Register
 current_work_registrar = None
 runtime.replace_customized_ops(globals())
 
-from importlib.metadata import version, PackageNotFoundError
 try:
-    __version__ = version("flaggems_vllm")
+    __version__ = _metadata_version("flaggems_vllm")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
