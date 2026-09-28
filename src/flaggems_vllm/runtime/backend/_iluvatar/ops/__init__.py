@@ -26,6 +26,9 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 
 __all__ = [
     "qwen4_store_qsa_kv_rows",
@@ -35,4 +38,5 @@ __all__ = [
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
     "gemma_rms_norm",
+    "topk_softplus_sqrt",
 ]
