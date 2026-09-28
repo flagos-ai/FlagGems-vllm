@@ -438,9 +438,7 @@ def _block_fp8_matmul_kernel(
             sa = tl.load(As + y * stride_asm + sk * stride_ask, y < M, other=0)
             if BLOCK_X_EFF <= GROUP_N and GROUP_N % BLOCK_X_EFF == 0:
                 sb = tl.load(
-                    Bs
-                    + (px * BLOCK_X_EFF // GROUP_N) * stride_bsn
-                    + sk * stride_bsk
+                    Bs + (px * BLOCK_X_EFF // GROUP_N) * stride_bsn + sk * stride_bsk
                 )
                 acc += partial * (sa * sb)[None, :]
             else:
@@ -1181,9 +1179,7 @@ def w8a8_block_fp8_matmul(
             # Keep Default on the compact curated swap space.  The large
             # expansion-only skinny space is reserved for explicit tuning.
             entry = (
-                _block_fp8_matmul_swap_fixed
-                if fixed_layout
-                else _block_fp8_matmul_swap
+                _block_fp8_matmul_swap_fixed if fixed_layout else _block_fp8_matmul_swap
             )
         else:
             entry = (
