@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools>=64.0", "scikit-build-core>=0.11", "pybind11"]
+requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
 
@@ -61,12 +61,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
-
-[tool.scikit-build]
-build.verbose = true
-logging.level = "INFO"
-wheel.install-dir = "flaggems_vllm"
-build-dir = "build/{cache_tag}"
 
 [tool.black]
 line-length = 88
