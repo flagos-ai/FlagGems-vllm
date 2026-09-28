@@ -19,8 +19,14 @@ import flaggems_vllm
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
 
 from .accuracy_utils import calc_diff
-from .fp8_fp4_quant import quantize_to_mxfp4
-from .test_fp8_fp4_mqa_logits import reference_fp4_mqa_logits
+
+try:
+    from .fp8_fp4_quant import quantize_to_mxfp4
+    from .test_fp8_fp4_mqa_logits import reference_fp4_mqa_logits
+
+    _skip_fp4 = None
+except ImportError as e:
+    _skip_fp4 = f"fp4 quantization/dequantization not available: {e.msg}"
 
 _vendor = flaggems_vllm.vendor_name
 _skip_arch = False
@@ -205,9 +211,12 @@ def _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
     ids=[f"B{b}_N{n}_L{l}" for b, n, l in TEST_SHAPES],
 )
 @pytest.mark.parametrize("use_fp4", [False, True])
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
+    if use_fp4 and _skip_fp4:
+        pytest.skip(_skip_fp4)
+
     torch.manual_seed(0)
     q_packed, q_scale, kv_fp8, weights, context_lens, block_table = _make_inputs(
         batch_size, next_n, avg_kv, use_fp4=use_fp4

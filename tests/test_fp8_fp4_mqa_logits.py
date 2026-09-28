@@ -19,15 +19,21 @@ import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 
 from .accuracy_utils import calc_diff, to_reference
-from .fp8_fp4_quant import (
-    dequantize_mxfp4,
-    per_custom_dims_cast_to_fp8,
-    quantize_to_mxfp4,
-)
 
 _vendor = flaggems_vllm.vendor_name
 _skip_arch = False
 _skip_ref = False
+
+try:
+    from .fp8_fp4_quant import (
+        dequantize_mxfp4,
+        per_custom_dims_cast_to_fp8,
+        quantize_to_mxfp4,
+    )
+
+    _skip_fp4 = None
+except ImportError as e:
+    _skip_fp4 = f"fp4 quantization/dequantization not available: {e.msg}"
 
 if _vendor == "mthreads":
     try:
@@ -131,8 +137,8 @@ def _build_inputs(M, N, device, use_fp4=False):
 
 
 @pytest.mark.fp8_fp4_mqa_logits
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 @pytest.mark.parametrize(
     "M, N",
     DECODE_SHAPES + PREFILL_SHAPES,
@@ -141,6 +147,9 @@ def _build_inputs(M, N, device, use_fp4=False):
 @pytest.mark.parametrize("clean_logits", [True, False])
 @pytest.mark.parametrize("use_fp4", [False, True])
 def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
+    if use_fp4 and _skip_fp4:
+        pytest.skip(_skip_fp4)
+
     q_values, q_scale, k_fp8, k_scale, weights, ks, ke = _build_inputs(
         M, N, device, use_fp4=use_fp4
     )

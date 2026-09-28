@@ -17,14 +17,24 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
-from tests.fp8_fp4_quant import quantize_to_mxfp4
-from tests.test_fp8_fp4_paged_mqa_logits import _ref_paged_mqa
 
 from . import base
 
 _vendor = flaggems_vllm.vendor_name
 _skip_arch = False
 _skip_ref = False
+
+try:
+    from tests.fp8_fp4_quant import quantize_to_mxfp4
+
+    _skip_fp4 = None
+except ImportError as e:
+    _skip_fp4 = f"fp4 quantization/dequantization not available: {e.msg}"
+
+try:
+    from tests.test_fp8_fp4_paged_mqa_logits import _ref_paged_mqa
+except (ImportError, NameError) as e:
+    _skip_ref = f"fp8 reference unavailable: {e}"
 
 if _vendor == "mthreads":
     try:
@@ -219,8 +229,8 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
 
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 def test_fp8_paged_mqa_logits():
     bench = Fp8Fp4PagedMqaLogitsBenchmark(
         op_name="fp8_paged_mqa_logits",
@@ -233,13 +243,16 @@ def test_fp8_paged_mqa_logits():
 
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 @pytest.mark.skipif(
     not _fp4_paged_supported,
     reason="FP4 paged DeepGEMM requires SM120+",
 )
 def test_fp4_paged_mqa_logits():
+    if _skip_fp4:
+        pytest.skip(_skip_fp4)
+
     bench = Fp8Fp4PagedMqaLogitsBenchmark(
         op_name="fp4_paged_mqa_logits",
         torch_op=_baseline_fn,
