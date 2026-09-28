@@ -13,26 +13,26 @@
 # limitations under the License.
 
 import math
+from importlib import import_module
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
-from flaggems_vllm.ops.FLA import chunk_kda
+
+try:
+    chunk_kda = import_module(
+        f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}.FLA"
+    ).chunk_kda
+except ModuleNotFoundError:
+    from flaggems_vllm.ops.FLA import chunk_kda
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 
 
-def _cuda_available() -> bool:
-    return torch.cuda.is_available() and flaggems_vllm.device == "cuda"
-
-
-pytestmark = [
-    pytest.mark.chunk_kda,
-    pytest.mark.skipif(not _cuda_available(), reason="chunk_kda tests require CUDA"),
-]
+pytest.mark.chunk_kda
 
 
 def _naive_kda_lowerbound_gate(
@@ -220,7 +220,7 @@ def _make_inputs(
         "dt_bias": dt_bias,
         "state_v_first": state_v_first,
         "cu_seqlens": cu_seqlens,
-        "chunk_size": 16,
+        "chunk_size": 32 if flaggems_vllm.vendor_name == "mthreads" else 16,
     }
     return (q, k, v, g, beta), kwargs
 

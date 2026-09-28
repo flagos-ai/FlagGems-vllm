@@ -29,11 +29,12 @@ vendor = flaggems_vllm.vendor_name
 #
 # HAS_TLE      : this vendor's TLE-optimized kernel is usable here.
 # HAS_TLE_HASH : the TLE-optimized *hash-mode* kernel is usable here
-#                (mthreads / thead only; ascend's hash path is TLE-agnostic).
+#                (mthreads / thead / hygon only; ascend's hash path is
+#                TLE-agnostic).
 #
-# ascend            : flaggems_vllm.topk_softplus_sqrt(..., use_ascend_tle=...)
-# mthreads, thead   : backend module exposes topk_softplus_sqrt_baseline /
-#                      topk_softplus_sqrt_tle directly.
+# ascend                  : flaggems_vllm.topk_softplus_sqrt(..., use_ascend_tle=...)
+# mthreads, thead, hygon  : backend module exposes topk_softplus_sqrt_baseline /
+#                           topk_softplus_sqrt_tle directly.
 # ---------------------------------------------------------------------------
 HAS_TLE = False
 HAS_TLE_HASH = False
@@ -61,6 +62,16 @@ elif vendor == "thead":
         topk_softplus_sqrt_baseline as _backend_baseline_op,
     )
     from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_tle as _backend_tle_op,
+    )
+
+    HAS_TLE_HASH = HAS_TLE
+elif vendor == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import HAS_TLE
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_baseline as _backend_baseline_op,
+    )
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
         topk_softplus_sqrt_tle as _backend_tle_op,
     )
 
@@ -202,8 +213,8 @@ def test_topk_softplus_sqrt(
     """Test topk_softplus_sqrt in standard mode (with bias) against PyTorch reference.
 
     Runs on any backend with a valid device (CUDA, Ascend NPU, MUSA, T-Head
-    PPU, etc.) — not gated on torch.cuda.is_available(), since that is
-    always False on non-CUDA backends.
+    PPU, Hygon HCU, etc.) — not gated on torch.cuda.is_available(), since
+    that is always False on non-CUDA backends.
     """
     torch.manual_seed(0)
 
@@ -248,7 +259,7 @@ def test_topk_softplus_sqrt_tle(
 ):
     """Dense path with the TLE-optimized kernel forced, against the PyTorch
     reference. Covers ascend's `_fused_topk_kernel_ascend_tle` and the
-    `_fused_topk_kernel_tle` implementations on mthreads and thead.
+    `_fused_topk_kernel_tle` implementations on mthreads, thead and hygon.
     """
     torch.manual_seed(0)
 
@@ -393,8 +404,8 @@ def test_topk_softplus_sqrt_hash(
 def test_topk_softplus_sqrt_tle_hash(
     num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
 ):
-    """Hash path with the TLE kernel forced (mthreads / thead only: ascend's
-    hash path does not have a separate TLE variant).
+    """Hash path with the TLE kernel forced (mthreads / thead / hygon only:
+    ascend's hash path does not have a separate TLE variant).
     """
     torch.manual_seed(0)
 
