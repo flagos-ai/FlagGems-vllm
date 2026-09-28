@@ -26,7 +26,7 @@ _vendor = flaggems_vllm.vendor_name
 _skip_arch = False
 _skip_ref = False
 
-if _vendor == "mthreads":
+if _vendor in ("mthreads", "hygon"):
     from tests.fp8_fp4_quant import per_custom_dims_cast_to_fp8
 elif _vendor == "nvidia":
     try:
@@ -136,8 +136,8 @@ def _gems_wrapper(q, k_fp8, k_scale, weights, ks, ke):
     )
 
 
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 @pytest.mark.fp8_fp4_mqa_logits
 def test_fp8_mqa_logits():
     bench = Fp8Fp4MqaLogitsBenchmark(
@@ -150,8 +150,8 @@ def test_fp8_mqa_logits():
     bench.run()
 
 
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 @pytest.mark.skipif(
     not _fp4_supported,
     reason="FP4 dense DeepGEMM requires SM120+",

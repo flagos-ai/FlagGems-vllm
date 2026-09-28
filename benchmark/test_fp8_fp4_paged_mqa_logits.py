@@ -40,6 +40,9 @@ elif _vendor == "nvidia":
     except ImportError:
         _skip_ref = "requires vLLM with DeepGEMM and FP8 quantization support"
 
+elif _vendor == "hygon":
+    from tests.test_fp8_fp4_paged_mqa_logits import _ref_get_metadata
+
 else:
     _skip_arch = f"unsupported vendor: {_vendor}"
     _skip_ref = f"unsupported vendor: {_vendor}"
@@ -53,7 +56,7 @@ if _vendor == "nvidia":
             _fp4_paged_supported = False
     except Exception:
         pass
-elif _vendor == "mthreads":
+elif _vendor in ("mthreads", "hygon"):
     _fp4_paged_supported = False
 
 
@@ -197,6 +200,8 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = list(BENCH_SHAPES)
+        if _vendor == "hygon":
+            self.shapes = [shape for shape in self.shapes if shape[1] == 1]
 
     def get_input_iter(self, dtype):
         device = self.device
@@ -219,8 +224,8 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
 
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 def test_fp8_paged_mqa_logits():
     bench = Fp8Fp4PagedMqaLogitsBenchmark(
         op_name="fp8_paged_mqa_logits",
@@ -233,8 +238,8 @@ def test_fp8_paged_mqa_logits():
 
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
-@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
-@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
+@pytest.mark.skipif(bool(_skip_arch), reason=_skip_arch or "")
+@pytest.mark.skipif(bool(_skip_ref), reason=_skip_ref or "")
 @pytest.mark.skipif(
     not _fp4_paged_supported,
     reason="FP4 paged DeepGEMM requires SM120+",

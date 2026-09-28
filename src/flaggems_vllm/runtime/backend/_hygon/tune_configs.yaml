@@ -160,3 +160,35 @@ hygon_marlin_gemv:
       BK: 256
     num_warps: 8
     num_stages: 1
+
+fp8_fp4_mqa_logits:
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 64
+      HEAD_BLOCK: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 64
+      HEAD_BLOCK: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      HEAD_BLOCK: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      HEAD_BLOCK: 1
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      HEAD_BLOCK: 2
+    num_warps: 8
+    num_stages: 2
