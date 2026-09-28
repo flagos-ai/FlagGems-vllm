@@ -19,7 +19,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flaggems_vllm"
-version = "0.1.0"
+version = "0.3.0-dev1"
 description = "FlagGems-vllm is a deep neural network function library written in Triton."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.8.0"
