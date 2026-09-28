@@ -269,7 +269,25 @@ def mha_varlan_fwd(
     softcap,
     return_softmax,
     gen,
+    num_splits=0,
 ):
+    is_metax = runtime.device.vendor_name == "metax"
+    if is_metax:
+        if p_dropout != 0 or return_softmax:
+            raise NotImplementedError(
+                "MetaX varlen attention supports inference without dropout"
+            )
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+            launch_attention,
+        )
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+            copy_tensor,
+            fill_tensor,
+            reshape_view_or_copy,
+            view_tensor,
+        )
+    elif num_splits > 0:
+        raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
     CHECK_DEVICE(q), CHECK_DEVICE(k), CHECK_DEVICE(v)
     q_device = q.device
     q_dtype = q.dtype
@@ -331,14 +349,22 @@ def mha_varlan_fwd(
     # check disable swa
     if window_size_left >= max_seqlen_k:
         window_size_left = -1
-    if window_size_right >= max_seqlen_k:
+    if window_size_right >= (max_seqlen_q if is_metax else max_seqlen_k):
         window_size_right = -1
 
     is_local = window_size_left >= 0
+    if is_metax:
+        is_local = is_local or (window_size_right >= 0 and not is_causal)
+        if is_local:
+            if window_size_left < 0:
+                window_size_left = max_seqlen_k
+            if window_size_right < 0:
+                window_size_right = max_seqlen_q
 
     # Optimize all single-query sequences by swapping the query-group and sequence dimensions
     seqlenq_ngroups_swapped = (
         max_seqlen_q == 1
+        and (not is_metax or total_q == batch_size)
         and alibi_slopes is None
         and num_heads > num_heads_k
         and window_size_left < 0
@@ -348,11 +374,19 @@ def mha_varlan_fwd(
     q_groups = num_heads // num_heads_k
     if seqlenq_ngroups_swapped:
         logger.debug("Swapping query groups and sequence dimensions")
-        q = (
-            q.reshape((batch_size, num_heads_k, q_groups, head_size))
-            .transpose(1, 2)
-            .reshape(batch_size * q_groups, num_heads_k, head_size)
-        )
+        if is_metax:
+            q = reshape_view_or_copy(
+                reshape_view_or_copy(
+                    q, (batch_size, num_heads_k, q_groups, head_size)
+                ).transpose(1, 2),
+                (batch_size * q_groups, num_heads_k, head_size),
+            )
+        else:
+            q = (
+                q.reshape((batch_size, num_heads_k, q_groups, head_size))
+                .transpose(1, 2)
+                .reshape(batch_size * q_groups, num_heads_k, head_size)
+            )
         max_seqlen_q = q_groups
         num_heads = num_heads_k
         cu_seqlens_q = None
@@ -462,8 +496,12 @@ def mha_varlan_fwd(
             p = torch.empty((), device=q_device)
 
         if zero_tensors:
-            out.zero_()
-            lse.fill_(float("-inf"))
+            if is_metax:
+                fill_tensor(out, 0.0)
+                fill_tensor(lse, float("-inf"))
+            else:
+                out.zero_()
+                lse.fill_(float("-inf"))
 
         params = fwd_params(
             q,  # q_ptr,
@@ -533,63 +571,89 @@ def mha_varlan_fwd(
             k.stride(0) if is_paged else 0,  # k_page_stride,
         )
 
-        if flaggems_vllm.vendor_name == "iluvatar":
-            params.k_ptr = k.view(k.shape[0], k.shape[1], -1)
-            params.v_ptr = v.view(v.shape[0], v.shape[1], -1)
-        logger.debug("kernel: flash_varlen_fwd")
-        grid = lambda args: (
-            triton.cdiv(max_seqlen_q, args["BLOCK_M"]),
-            batch_size,
-            num_heads,
-        )
-        kernel = flash_varlen_fwd_kernel[grid]
-        args = tuple(getattr(params, k) for k in params.__slots__)
-
-        # We assess which phase the requests are likely to be in and set the config accordingly.
-        total_rows = total_q * num_heads
-        num_sms = torch_device_fn.get_device_properties(
-            flaggems_vllm.device
-        ).multi_processor_count
-        avg_rows_per_sm = total_rows / num_sms
-        avg_rows_per_batch = total_q / batch_size
-        avg_rows_per_cta = min(avg_rows_per_batch, avg_rows_per_sm)
-        # Heuristic: if avg_rows_per_sm >= 128, we are likely in prefill phase.
-        # This is a rough heuristic and may not be accurate for all scenarios.
-        if avg_rows_per_cta > 64:
-            varlen_fwd_config_str = "mha_block_128"
-        elif avg_rows_per_cta > 32:
-            varlen_fwd_config_str = "mha_block_64"
-        elif avg_rows_per_cta > 16:
-            varlen_fwd_config_str = "mha_block_32"
+        if is_metax:
+            launch_attention(params, num_splits=num_splits)
         else:
-            varlen_fwd_config_str = "mha_block_16"
-        if flaggems_vllm.vendor_name == "mthreads":
-            varlen_fwd_config_str = "mha_block_32"
+            if flaggems_vllm.vendor_name == "iluvatar":
+                params.k_ptr = k.view(k.shape[0], k.shape[1], -1)
+                params.v_ptr = v.view(v.shape[0], v.shape[1], -1)
+            logger.debug("kernel: flash_varlen_fwd")
+            grid = lambda args: (
+                triton.cdiv(max_seqlen_q, args["BLOCK_M"]),
+                batch_size,
+                num_heads,
+            )
+            kernel = flash_varlen_fwd_kernel[grid]
+            args = tuple(getattr(params, k) for k in params.__slots__)
 
-        cfg = runtime.get_heuristic_config(varlen_fwd_config_str)
-        cfg_params = {
-            "BLOCK_M": cfg["BLOCK_M"](args),
-            "BLOCK_N": cfg["BLOCK_N"](args),
-            "BLOCK_K": triton.next_power_of_2(head_size),
-            "num_warps": cfg["num_warps"](args),
-            "num_stages": 1 if not is_paged else cfg["num_stages"](args),
-        }
-
-        logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        kernel(*args, **cfg_params)
-
-        if seqlenq_ngroups_swapped:
-            out = out.reshape(
-                batch_size, max_seqlen_q, num_heads_k, head_size
-            ).transpose(1, 2)
-            if out_ is not None:
-                out_.view(batch_size, num_heads_k, max_seqlen_q, head_size).copy_(out)
-                out = out_
+            # We assess which phase the requests are likely to be in and set the config accordingly.
+            total_rows = total_q * num_heads
+            num_sms = torch_device_fn.get_device_properties(
+                flaggems_vllm.device
+            ).multi_processor_count
+            avg_rows_per_sm = total_rows / num_sms
+            avg_rows_per_batch = total_q / batch_size
+            avg_rows_per_cta = min(avg_rows_per_batch, avg_rows_per_sm)
+            # Heuristic: if avg_rows_per_sm >= 128, we are likely in prefill phase.
+            # This is a rough heuristic and may not be accurate for all scenarios.
+            if avg_rows_per_cta > 64:
+                varlen_fwd_config_str = "mha_block_128"
+            elif avg_rows_per_cta > 32:
+                varlen_fwd_config_str = "mha_block_64"
+            elif avg_rows_per_cta > 16:
+                varlen_fwd_config_str = "mha_block_32"
             else:
-                out = out.reshape(batch_size, num_heads_k * max_seqlen_q, head_size)
-            lse = lse.reshape(num_heads_k, batch_size, max_seqlen_q)
-            lse = lse.reshape(num_heads_k * max_seqlen_q, batch_size)
+                varlen_fwd_config_str = "mha_block_16"
+            if flaggems_vllm.vendor_name == "mthreads":
+                varlen_fwd_config_str = "mha_block_32"
 
+            cfg = runtime.get_heuristic_config(varlen_fwd_config_str)
+            cfg_params = {
+                "BLOCK_M": cfg["BLOCK_M"](args),
+                "BLOCK_N": cfg["BLOCK_N"](args),
+                "BLOCK_K": triton.next_power_of_2(head_size),
+                "num_warps": cfg["num_warps"](args),
+                "num_stages": 1 if not is_paged else cfg["num_stages"](args),
+            }
+
+            logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
+            kernel(*args, **cfg_params)
+        if seqlenq_ngroups_swapped:
+            if is_metax:
+                out = reshape_view_or_copy(
+                    out, (batch_size, max_seqlen_q, num_heads_k, head_size)
+                ).transpose(1, 2)
+                if out_ is not None:
+                    copy_tensor(
+                        out,
+                        view_tensor(
+                            out_, (batch_size, num_heads_k, max_seqlen_q, head_size)
+                        ),
+                    )
+                    out = out_
+                else:
+                    out = reshape_view_or_copy(
+                        out, (batch_size, num_heads_k * max_seqlen_q, head_size)
+                    )
+                lse = reshape_view_or_copy(
+                    view_tensor(lse, (num_heads_k, batch_size, max_seqlen_q)).permute(
+                        0, 2, 1
+                    ),
+                    (num_heads_k * max_seqlen_q, batch_size),
+                )
+            else:
+                out = out.reshape(
+                    batch_size, max_seqlen_q, num_heads_k, head_size
+                ).transpose(1, 2)
+                if out_ is not None:
+                    out_.view(batch_size, num_heads_k, max_seqlen_q, head_size).copy_(
+                        out
+                    )
+                    out = out_
+                else:
+                    out = out.reshape(batch_size, num_heads_k * max_seqlen_q, head_size)
+                lse = lse.reshape(num_heads_k, batch_size, max_seqlen_q)
+                lse = lse.reshape(num_heads_k * max_seqlen_q, batch_size)
         unused = torch.empty((), dtype=torch.int64, device=q_device)
     return out, q, k, v, lse, philox_args, unused, p
 

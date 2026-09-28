@@ -78,6 +78,7 @@ from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.mhc import (
+    MixLayout,
     hc_head_fused_kernel,
     hc_head_fused_kernel_ref,
     mhc_bwd,
@@ -209,6 +210,7 @@ __all__ = [
     "mhc_bwd_ref",
     "mhc_post",
     "mhc_pre",
+    "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
@@ -264,3 +266,21 @@ __all__ = [
     "weight_norm_interface",
     "weight_norm_interface_backward",
 ]
+
+# Backend-only APIs have no implementation on other vendors.
+from flaggems_vllm import runtime as _runtime
+
+if _runtime.device.vendor_name == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops import (
+        int8_einsum,
+        w8a8_block_int8_bmm,
+    )
+
+    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]
+
+if _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.fused.attention import (  # noqa: F401
+        flash_attn_varlen_func_w8a8_int8,
+    )
+
+    __all__.append("flash_attn_varlen_func_w8a8_int8")

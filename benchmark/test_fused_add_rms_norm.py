@@ -21,10 +21,12 @@ from . import base, consts
 
 VENDOR = flaggems_vllm.vendor_name
 
-# NVIDIA and Hygon expose fused_add_rms_norm through vLLM custom ops.
+# NVIDIA, Hygon, and T-Head expose fused_add_rms_norm through
+# vLLM custom ops.
 VLLM_NATIVE_VENDORS = {
     "nvidia",
     "hygon",
+    "thead",
 }
 
 
@@ -34,8 +36,16 @@ VLLM_NATIVE_VENDORS = {
 
 if VENDOR in VLLM_NATIVE_VENDORS:
     from vllm import _custom_ops as vendor_ops
+
 elif VENDOR == "mthreads":
     from vllm_musa import _custom_ops as vendor_ops
+
+elif VENDOR == "ascend":
+    import torch_npu
+    from vllm_ascend.utils import enable_custom_op
+
+    vendor_ops = None
+
 else:
     vendor_ops = None
 
@@ -64,8 +74,10 @@ def _get_supported_dtypes():
             if dtype in (torch.float16, torch.bfloat16)
         ]
 
-    # NVIDIA/Hygon native vLLM baseline and the generic PyTorch
-    # reference use the normal benchmark floating-point dtype set.
+    # Ascend 910B / A2 AddRmsNorm supports FP16, BF16 and FP32.
+    #
+    # NVIDIA/Hygon/T-Head native vLLM baseline and the generic PyTorch
+    # reference also use the normal benchmark floating-point dtype set.
     return consts.FLOAT_DTYPES
 
 
@@ -115,7 +127,10 @@ def _torch_reference_op(x, residual, layer_shape, weight, eps):
 
 
 def _vllm_native_op(x, residual, layer_shape, weight, eps):
-    """vLLM native fused_add_rms_norm baseline for NVIDIA and Hygon."""
+    """vLLM native fused_add_rms_norm baseline.
+
+    Used by NVIDIA, Hygon, and T-Head.
+    """
     del layer_shape
 
     vendor_ops.fused_add_rms_norm(
@@ -141,8 +156,49 @@ def _mthreads_vllm_op(x, residual, layer_shape, weight, eps):
         block_x=0,
     )
 
-    # vLLM-MUSA also updates input/residual in-place.
+    # vLLM-MUSA updates input/residual in-place.
     return x
+
+
+def _ascend_vllm_op(x, residual, layer_shape, weight, eps):
+    """vLLM-Ascend fused add RMSNorm baseline.
+
+    This mirrors the residual path used by
+    vllm_ascend.ops.layernorm.AscendRMSNorm.forward_oot().
+
+    vLLM-Ascend 0.23.0 uses:
+
+      1. torch.ops._C_ascend.npu_add_rms_norm_bias
+         when the vLLM-Ascend custom-op library is available;
+
+      2. torch_npu.npu_add_rms_norm
+         as the fallback path.
+
+    Both implementations return the normalized output and the updated
+    residual instead of modifying the original input buffers in-place.
+    """
+    del layer_shape
+
+    if enable_custom_op():
+        out, _, residual_out = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            x,
+            residual,
+            weight,
+            None,
+            eps,
+        )
+    else:
+        out, _, residual_out = torch_npu.npu_add_rms_norm(
+            x,
+            residual,
+            weight,
+            eps,
+        )
+
+    # Return the normalized output. The benchmark only needs the callable
+    # to execute the same fused operator used by vLLM-Ascend.
+    del residual_out
+    return out
 
 
 def _get_baseline_op():
@@ -152,6 +208,9 @@ def _get_baseline_op():
 
     if VENDOR == "mthreads":
         return _mthreads_vllm_op
+
+    if VENDOR == "ascend":
+        return _ascend_vllm_op
 
     return _torch_reference_op
 
@@ -170,20 +229,28 @@ class FusedAddRmsNormBenchmark(base.GenericBenchmarkExcluse1D):
     Hygon:
         vLLM native vs FlagGems-vllm
 
+    T-Head:
+        vLLM native PPU kernel vs FlagGems-vllm
+
     MThreads:
         vLLM-MUSA vs FlagGems-vllm
+
+    Ascend:
+        vLLM-Ascend vs FlagGems-vllm
 
     Other vendors:
         PyTorch reference vs FlagGems-vllm
     """
 
     def get_latency(self, op, *args, **kwargs):
-        """Give each measured implementation independent mutable buffers."""
+        """Give each measured implementation independent input buffers."""
         args = list(args)
 
-        # fused_add_rms_norm modifies input/residual in-place.
-        # Clone outside the timed kernel region so baseline and FlagGems
-        # both start from the same values.
+        # FlagGems fused_add_rms_norm modifies input/residual in-place.
+        #
+        # Clone outside the timed region so the baseline and FlagGems
+        # implementations always start from independent buffers and the
+        # clone overhead is not included in kernel latency.
         args[0] = args[0].clone()
         args[1] = args[1].clone()
 
@@ -230,16 +297,30 @@ def test_fused_add_rms_norm():
             "musa_fused_add_rms_norm",
         ), "vLLM-MUSA musa_fused_add_rms_norm is not available"
 
+    elif VENDOR == "ascend":
+        # vLLM-Ascend uses either its own _C_ascend custom op or the
+        # torch_npu AddRmsNorm implementation.
+        if enable_custom_op():
+            assert hasattr(
+                torch.ops._C_ascend,
+                "npu_add_rms_norm_bias",
+            ), (
+                "vLLM-Ascend custom npu_add_rms_norm_bias " "is not available"
+            )
+        else:
+            assert hasattr(
+                torch_npu,
+                "npu_add_rms_norm",
+            ), "torch_npu.npu_add_rms_norm is not available"
+
     bench = FusedAddRmsNormBenchmark(
         input_fn=_input_fn,
         op_name="fused_add_rms_norm",
-        # GenericBenchmark names this field torch_op, but it represents
-        # the selected baseline implementation here.
+        # GenericBenchmark calls this field torch_op, but here it
+        # represents the vendor-native baseline implementation.
         torch_op=baseline_op,
-        # Top-level FlagGems API selects the vendor-specific backend.
+        # Top-level FlagGems API selects the current vendor backend.
         gems_op=flaggems_vllm.fused_add_rms_norm,
-        # MThreads: FP16/BF16
-        # NVIDIA/Hygon/others: consts.FLOAT_DTYPES
         dtypes=_get_supported_dtypes(),
         is_inplace=True,
     )

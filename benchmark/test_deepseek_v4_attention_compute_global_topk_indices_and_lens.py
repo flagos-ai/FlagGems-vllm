@@ -15,12 +15,13 @@
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm.ops.deepseek_v4_attention_compute_global_topk_indices_and_lens import (
     compute_global_topk_indices_and_lens,
 )
 
 try:
-    from vllm.v1.attention.ops.deepseek_v4_ops import (
+    from vllm.models.deepseek_v4.common.ops import (
         compute_global_topk_indices_and_lens as vllm_compute_global_topk_indices_and_lens,
     )
 
@@ -30,6 +31,12 @@ except Exception:
     _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS = False
 
 from . import base
+
+_device = flaggems_vllm.device
+_device_module = getattr(torch, _device, None)
+_HAS_DEVICE = _device_module is not None and _device_module.is_available()
+if not _HAS_DEVICE:
+    _HAS_DEVICE = bool(flaggems_vllm.runtime.torch_device_fn.device_count())
 
 
 class ComputeGlobalTopkIndicesAndLensBenchmark(base.Benchmark):
@@ -65,16 +72,18 @@ class ComputeGlobalTopkIndicesAndLensBenchmark(base.Benchmark):
                 -1,
                 blocks_per_req * block_size,
                 (num_tokens, topk),
-                device="cuda",
+                device=_device,
                 dtype=torch.int32,
             )
             token_to_req_indices = (
-                torch.arange(num_tokens, device="cuda", dtype=torch.int32) % num_reqs
+                torch.arange(num_tokens, device=_device, dtype=torch.int32) % num_reqs
             )
             block_table = torch.arange(
-                num_reqs * blocks_per_req, device="cuda", dtype=torch.int32
+                num_reqs * blocks_per_req, device=_device, dtype=torch.int32
             ).view(num_reqs, blocks_per_req)
-            is_valid_token = torch.ones((num_tokens,), device="cuda", dtype=torch.int32)
+            is_valid_token = torch.ones(
+                (num_tokens,), device=_device, dtype=torch.int32
+            )
             yield (
                 topk_indices,
                 token_to_req_indices,
@@ -86,9 +95,8 @@ class ComputeGlobalTopkIndicesAndLensBenchmark(base.Benchmark):
 
 @pytest.mark.compute_global_topk_indices_and_lens
 @pytest.mark.skipif(
-    (not torch.cuda.is_available())
-    or (not _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS),
-    reason="requires cuda and vllm deepseek_v4_ops.compute_global_topk_indices_and_lens",
+    (not _HAS_DEVICE) or (not _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS),
+    reason="requires an accelerator and vllm compute_global_topk_indices_and_lens",
 )
 def test_compute_global_topk_indices_and_lens_benchmark():
     ComputeGlobalTopkIndicesAndLensBenchmark().run()

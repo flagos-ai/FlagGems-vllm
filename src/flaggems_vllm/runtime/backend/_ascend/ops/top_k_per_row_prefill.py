@@ -155,6 +155,9 @@ NEG_INF_BITS = tl.constexpr(-8388608)  # 0xFF800000: float("-inf") as int32
 ROWSORT_MAX_VOCAB = 6144  # UB budget: pow2 load buf + 4x sort workspace
 # (measured: 6144 compiles at ~172KB UB; 7000/8192 overflow the 192KB UB)
 ROWSORT_K = 512  # DeepSeek V4 sparse-attention k this route serves
+# Program cap for the row-sort kernel (rows grid-stride past it): keeps the
+# grid near the vector cores once per-block dispatch outweighs one sort.
+ROWSORT_MAX_PROG = 512
 
 # Seg-sort route (medium rows, small batches): fixed-width segment sorts
 # (2048-wide up to 8 segments; 4096-wide beyond that) + a two-level 4-way
@@ -171,6 +174,12 @@ SEGSORT_MAX_ROWS = 64  # latency-bound batches only; throughput crossover
 # capped at 3/4 CAP, and the [TOPK, CAP] route window needs ~4 sigma of
 # headroom on both sides.
 CHUNK_K = 2048
+
+# Batches at or above this many rows launch the fixup/repack tail of the
+# threshold pipeline unconditionally (all of those kernels self-gate per
+# row on the route field).  Below it the host reads fixup_flag once and
+# skips those launches when no row needs fixing.
+FIXUP_NOSYNC_ROWS = 128
 
 
 # ---------------------------------------------------------------------------
@@ -905,7 +914,11 @@ def _ascend_topk_compact_seg_kernel(
     cand_vals_ptr,  # [num_rows, CAP] fp32
     cand_idx_ptr,  # [num_rows, CAP] int32
     totals_ptr,  # [num_rows, 8]
+    row0: tl.constexpr,  # first row this launch covers (row batching, see
+    # host side). constexpr so the common single-launch case (row0=0) folds
+    # into the same codegen as an unbatched launch.
     NSEG: tl.constexpr,  # COMPACT_SEG-element segments per vocab row
+    CN: tl.constexpr,  # programs per row; each loops over NSEG // CN segments
     SB: tl.constexpr,
     CSEG: tl.constexpr,  # == COMPACT_SEG
     CSEG_SUB: tl.constexpr,  # subtiles per CSEG segment
@@ -918,110 +931,117 @@ def _ascend_topk_compact_seg_kernel(
     # (gather_mask_custom_pattern) compact the candidate values and their
     # segment-local positions against the padded K2 mask words; no scalar
     # GM access and no ctz/vgather custom op.
+    # One program covers CN-th of a row's segments and loops over them:
+    # per-block dispatch cost dominates large grids on this stack, so the
+    # grid stays at num_rows * CN instead of num_rows * NSEG.  Skipped
+    # programs fold to an empty segment range rather than an early
+    # return, keeping the body free of extra control-flow scopes.
     pid = tl.program_id(0)
-    row_id = pid // NSEG
-    seg = pid % NSEG
-    totals_ptr += row_id * 8
-    L = tl.load(totals_ptr + 0)
-    if L < 0:
-        return  # short row
-    route = tl.load(totals_ptr + 3)
+    row_id = row0 + pid // CN
+    cb = pid % CN
+    L = tl.load(totals_ptr + row_id * 8 + 0)
+    route = tl.load(totals_ptr + row_id * 8 + 3)
     if REPACK:
-        skip = route != 3  # second pass: re-routed rows only
+        ok = (L >= 0) & (route == 3)  # second pass: re-routed rows only
     else:
-        skip = route == 2  # fixup row
-    if skip:
-        return
+        ok = (L >= 0) & (route != 2)  # live, non-fixup row
     row_start = tl.load(row_starts + row_id)
     row_end = tl.load(row_ends + row_id)
     row_len = row_end - row_start
     nseg_row = tl.cdiv(row_len, CSEG)
-    if seg >= nseg_row:
-        return
-    seg0 = seg * CSEG
-    valid = tl.minimum(row_len - seg0, CSEG)
+    SPC: tl.constexpr = (NSEG + CN - 1) // CN  # segments per chunk
+    s0 = cb * SPC
+    s1 = tl.where(ok, tl.minimum(s0 + SPC, nseg_row), s0)
     x_ptr = logits_ptr + row_id * stride0 + row_start
     lanes = tl.arange(0, CSEG)
-    if valid == CSEG:
-        seg_t = tl.load(x_ptr + seg0 + lanes)
-    else:
-        # Tail segment: masked load keeps the read in-bounds (the valid
-        # window can end before the segment does, esp. the last row).
-        # Values stay RAW here (NaN included): canonicalization to +inf
-        # happens on the candidate loads in sort_final, which touch only
-        # CAP elements per row instead of this full-row scan.
-        seg_t = tl.load(x_ptr + seg0 + lanes, mask=lanes < valid, other=0.0)
-    seg_buf = tle.dsa.to_buffer(seg_t, space=tle.dsa.ascend.UB)
     # Padded mask layout: MASK_BLK words per 64-element subtile, of which
     # vreducev2 reads only the heading 64 bits (src1RepeatStride is in
     # 32-byte blocks).  Subtiles past the valid window are never read:
     # repeat_times covers exactly the valid subtiles.
     PATW: tl.constexpr = CSEG_SUB * MASK_BLK
     ml = tl.arange(0, PATW)
-    nw = tl.cdiv(valid, SUB) * MASK_BLK
-    msk_t = tl.load(
-        mask_ptr + row_id * SB * MASK_BLK + seg * PATW + ml,
-        mask=ml < nw,
-        other=0,
-    )
-    msk_buf = tle.dsa.to_buffer(
-        msk_t.to(tl.uint32, bitcast=True), space=tle.dsa.ascend.UB
-    )
-    # Segment-local candidate positions come from compacting an arange with
-    # the same mask (second vreducev2 call) instead of ctz extraction.
-    ar_buf = tle.dsa.to_buffer(lanes.to(tl.int32), space=tle.dsa.ascend.UB)
-    # Segment base/count from the reduce kernel's exclusive segment bases.
-    if NSEG == 1:
-        base = tl.zeros((), dtype=tl.int32)
-        c = L
-    else:
-        SEG_STRIDE: tl.constexpr = SB // CSEG_SUB
-        base = tl.load(seg_base_ptr + row_id * SEG_STRIDE + seg)
-        nxt = tl.load(
-            seg_base_ptr
-            + row_id * SEG_STRIDE
-            + seg
-            + tl.where(seg + 1 < nseg_row, 1, 0)
-        )
-        c = tl.where(seg + 1 < nseg_row, nxt, L) - base
-    vals = tl.zeros([CAP_SEG], dtype=tl.float32)
-    idxs = tl.zeros([CAP_SEG], dtype=tl.int32)
-    rc1 = tl.zeros([1], dtype=tl.int64)
-    rc2 = tl.zeros([1], dtype=tl.int64)
-    reps = tl.cdiv(valid, SUB)
-    vals, rc1 = tle.dsa.ascend.raw(
-        "gather_mask_custom_pattern",
-        tle.dsa.to_tensor(seg_buf),
-        tle.dsa.to_tensor(msk_buf),
-        True,
-        SUB,
-        1,
-        reps,
-        8,
-        1,
-        out=[vals, rc1],
-    )
-    idxs, rc2 = tle.dsa.ascend.raw(
-        "gather_mask_custom_pattern",
-        tle.dsa.to_tensor(ar_buf),
-        tle.dsa.to_tensor(msk_buf),
-        True,
-        SUB,
-        1,
-        reps,
-        8,
-        1,
-        out=[idxs, rc2],
-    )
     pl = tl.arange(0, CAP_SEG)
-    m = pl < c
-    # Canonicalize NaN -> +inf on the GATHERED candidates (CAP registers,
-    # no extra load): cheaper than canonicalizing the full-row load, and
-    # keeps sort_final's cand load directly feedable to the sort raw op
-    # (a where between that load and to_buffer would force scalar
-    # per-lane materialization of the sort input).
-    tl.store(cand_vals_ptr + row_id * CAP_SEG + base + pl, _nan_as_inf(vals), mask=m)
-    tl.store(cand_idx_ptr + row_id * CAP_SEG + base + pl, idxs + seg0, mask=m)
+    for seg in tl.range(s0, s1):
+        seg0 = seg * CSEG
+        valid = tl.minimum(row_len - seg0, CSEG)
+        if valid == CSEG:
+            seg_t = tl.load(x_ptr + seg0 + lanes)
+        else:
+            # Tail segment: masked load keeps the read in-bounds (the
+            # valid window can end before the segment does, esp. the
+            # last row).  Values stay RAW here (NaN included):
+            # canonicalization to +inf happens on the candidate loads in
+            # sort_final, which touch only CAP elements per row instead
+            # of this full-row scan.
+            seg_t = tl.load(x_ptr + seg0 + lanes, mask=lanes < valid, other=0.0)
+        seg_buf = tle.dsa.to_buffer(seg_t, space=tle.dsa.ascend.UB)
+        msk_t = tl.load(
+            mask_ptr + row_id * SB * MASK_BLK + seg * PATW + ml,
+            mask=ml < tl.cdiv(valid, SUB) * MASK_BLK,
+            other=0,
+        )
+        msk_buf = tle.dsa.to_buffer(
+            msk_t.to(tl.uint32, bitcast=True), space=tle.dsa.ascend.UB
+        )
+        # Segment-local candidate positions come from compacting an arange
+        # with the same mask (second vreducev2 call) instead of ctz
+        # extraction.
+        ar_buf = tle.dsa.to_buffer(lanes.to(tl.int32), space=tle.dsa.ascend.UB)
+        # Segment base/count from the reduce kernel's exclusive segment
+        # bases.
+        if NSEG == 1:
+            base = tl.zeros((), dtype=tl.int32)
+            c = L
+        else:
+            SEG_STRIDE: tl.constexpr = SB // CSEG_SUB
+            base = tl.load(seg_base_ptr + row_id * SEG_STRIDE + seg)
+            nxt = tl.load(
+                seg_base_ptr
+                + row_id * SEG_STRIDE
+                + seg
+                + tl.where(seg + 1 < nseg_row, 1, 0)
+            )
+            c = tl.where(seg + 1 < nseg_row, nxt, L) - base
+        vals = tl.zeros([CAP_SEG], dtype=tl.float32)
+        idxs = tl.zeros([CAP_SEG], dtype=tl.int32)
+        rc1 = tl.zeros([1], dtype=tl.int64)
+        rc2 = tl.zeros([1], dtype=tl.int64)
+        reps = tl.cdiv(valid, SUB)
+        vals, rc1 = tle.dsa.ascend.raw(
+            "gather_mask_custom_pattern",
+            tle.dsa.to_tensor(seg_buf),
+            tle.dsa.to_tensor(msk_buf),
+            True,
+            SUB,
+            1,
+            reps,
+            8,
+            1,
+            out=[vals, rc1],
+        )
+        idxs, rc2 = tle.dsa.ascend.raw(
+            "gather_mask_custom_pattern",
+            tle.dsa.to_tensor(ar_buf),
+            tle.dsa.to_tensor(msk_buf),
+            True,
+            SUB,
+            1,
+            reps,
+            8,
+            1,
+            out=[idxs, rc2],
+        )
+        m = pl < c
+        # Canonicalize NaN -> +inf on the GATHERED candidates (CAP
+        # registers, no extra load): cheaper than canonicalizing the
+        # full-row load, and keeps sort_final's cand load directly
+        # feedable to the sort raw op (a where between that load and
+        # to_buffer would force scalar per-lane materialization of the
+        # sort input).
+        tl.store(
+            cand_vals_ptr + row_id * CAP_SEG + base + pl, _nan_as_inf(vals), mask=m
+        )
+        tl.store(cand_idx_ptr + row_id * CAP_SEG + base + pl, idxs + seg0, mask=m)
 
 
 @triton.jit
@@ -1552,82 +1572,87 @@ def _ascend_topk_row_sort_kernel(
     TMP_SZ: tl.constexpr,
     SORT_IMPL: tl.constexpr,
 ):
-    # One CTA per row: a single exact-width hardware sort over the whole
-    # row, unpack in-kernel, emit TOPK indices.  Sorting the exact VOCAB
-    # (a subview of the pow2 load buffer, so the -inf tail of ragged rows
-    # never widens the sort) costs ~7.5us/CTA at 4-5K wide vs ~2.9us at
-    # 2048 wide, but deletes the segment-merge kernel and the proposal
-    # round-trip — a net win at every benchmarked narrow shape.
+    # One program sorts a strip of rows: a single exact-width hardware sort
+    # over each row, unpack in-kernel, emit TOPK indices.  Sorting the
+    # exact VOCAB (a subview of the pow2 load buffer, so the -inf tail of
+    # ragged rows never widens the sort) costs ~7.5us/CTA at 4-5K wide vs
+    # ~2.9us at 2048 wide, but deletes the segment-merge kernel and the
+    # proposal round-trip — a net win at every benchmarked narrow shape.
+    # Rows share programs (grid-stride) because per-block dispatch costs
+    # more than the sort itself once num_rows outgrows the vector cores.
     # Masked lanes still issue their addresses on this backend, so a row
     # whose pow2 load window reaches past the logits storage would fault.
     # Only the last two rows can over-run (BUFW < 2*VOCAB <= 2*stride0);
     # a tiny pad kernel copies them into a -inf-padded scratch first (a
     # per-lane address clamp would materialize a BUFW-wide vector and
     # overflow UB at BUFW=8192, measured).
-    row_id = tl.program_id(0)
-    row_start = tl.load(row_starts + row_id)
-    row_len = tl.load(row_ends + row_id) - row_start
-    if row_len <= TOPK:
-        # Trivial row: every element wins, emit 0..row_len-1
-        # (row_start-relative), padded with -1.
-        lanes = tl.arange(0, TOPK)
-        tl.store(
-            out_indices_ptr + row_id * TOPK + lanes,
-            tl.where(lanes < row_len, lanes, -1),
-        )
-        return
-    lane = tl.arange(0, BUFW)
-    m = lane < row_len
-    if row_id >= num_rows - pad_rows:
-        # Pointer phis across runtime branches miscompile on this backend
-        # (measured: every row read the scratch slots); the load itself
-        # stays inside the branch so the phi is on the loaded tensor.
-        x = tl.load(
-            pad_ptr + (row_id - (num_rows - pad_rows)) * BUFW + lane,
-            mask=m,
-            other=float("-inf"),
-        )
-    else:
-        x = _nan_as_inf(
-            tl.load(
-                logits_ptr + row_id * stride0 + row_start + lane,
-                mask=m,
-                other=float("-inf"),
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    for row_id in tl.range(pid, num_rows, nprog):
+        row_start = tl.load(row_starts + row_id)
+        row_len = tl.load(row_ends + row_id) - row_start
+        if row_len <= TOPK:
+            # Trivial row: every element wins, emit 0..row_len-1
+            # (row_start-relative), padded with -1.
+            lanes = tl.arange(0, TOPK)
+            tl.store(
+                out_indices_ptr + row_id * TOPK + lanes,
+                tl.where(lanes < row_len, lanes, -1),
             )
-        )
-    src_ub = tle.dsa.to_buffer(x, space=tle.dsa.ascend.UB)
-    tmp = tl.zeros([TMP_SZ], dtype=tl.float32)
-    props = tl.zeros([TOPK * 2], dtype=tl.float32)
-    if VOCAB < BUFW:
-        sub = tle.dsa.subview(src_ub, [0], [VOCAB], [1])
-        props = tle.dsa.ascend.raw(
-            "sort_1d_pack",
-            tle.dsa.to_tensor(sub),
-            tmp,
-            True,
-            TOPK,
-            0,
-            SORT_IMPL,
-            out=props,
-        )
-    else:
-        props = tle.dsa.ascend.raw(
-            "sort_1d_pack",
-            tle.dsa.to_tensor(src_ub),
-            tmp,
-            True,
-            TOPK,
-            0,
-            SORT_IMPL,
-            out=props,
-        )
-    p_ub = tle.dsa.to_buffer(props, space=tle.dsa.ascend.UB)
-    v1 = tl.zeros([TOPK], dtype=tl.float32)
-    i1 = tl.zeros([TOPK], dtype=tl.int32)
-    v1, i1 = tle.dsa.ascend.raw(
-        "unpack_sort", tle.dsa.to_tensor(p_ub), TOPK, out=[v1, i1]
-    )
-    tl.store(out_indices_ptr + row_id * TOPK + tl.arange(0, TOPK), i1)
+        else:
+            lane = tl.arange(0, BUFW)
+            m = lane < row_len
+            if row_id >= num_rows - pad_rows:
+                # Pointer phis across runtime branches miscompile on this
+                # backend (measured: every row read the scratch slots); the
+                # load itself stays inside the branch so the phi is on the
+                # loaded tensor.
+                x = tl.load(
+                    pad_ptr + (row_id - (num_rows - pad_rows)) * BUFW + lane,
+                    mask=m,
+                    other=float("-inf"),
+                )
+            else:
+                x = _nan_as_inf(
+                    tl.load(
+                        logits_ptr + row_id * stride0 + row_start + lane,
+                        mask=m,
+                        other=float("-inf"),
+                    )
+                )
+            src_ub = tle.dsa.to_buffer(x, space=tle.dsa.ascend.UB)
+            tmp = tl.zeros([TMP_SZ], dtype=tl.float32)
+            props = tl.zeros([TOPK * 2], dtype=tl.float32)
+            if VOCAB < BUFW:
+                sub = tle.dsa.subview(src_ub, [0], [VOCAB], [1])
+                props = tle.dsa.ascend.raw(
+                    "sort_1d_pack",
+                    tle.dsa.to_tensor(sub),
+                    tmp,
+                    True,
+                    TOPK,
+                    0,
+                    SORT_IMPL,
+                    out=props,
+                )
+            else:
+                props = tle.dsa.ascend.raw(
+                    "sort_1d_pack",
+                    tle.dsa.to_tensor(src_ub),
+                    tmp,
+                    True,
+                    TOPK,
+                    0,
+                    SORT_IMPL,
+                    out=props,
+                )
+            p_ub = tle.dsa.to_buffer(props, space=tle.dsa.ascend.UB)
+            v1 = tl.zeros([TOPK], dtype=tl.float32)
+            i1 = tl.zeros([TOPK], dtype=tl.int32)
+            v1, i1 = tle.dsa.ascend.raw(
+                "unpack_sort", tle.dsa.to_tensor(p_ub), TOPK, out=[v1, i1]
+            )
+            tl.store(out_indices_ptr + row_id * TOPK + tl.arange(0, TOPK), i1)
 
 
 @triton.jit
@@ -1895,10 +1920,14 @@ def _ascend_topk_densify_kernel(
     # buffer, then the main path runs with stride0=vocab_size, stride1=1.
     row_id = tl.program_id(0)
     cid = tl.program_id(1)
-    offs = cid * BLOCK + tl.arange(0, BLOCK)
-    m = offs < vocab_size
-    x = tl.load(src_ptr + row_id * stride0 + offs * stride1, mask=m)
-    tl.store(dst_ptr + row_id * vocab_size + offs, x, mask=m)
+    nblk = tl.num_programs(1)
+    # Grid is flattened into one hardware-capped coreDim, so wide inputs can
+    # leave some column blocks uncovered; loop them with a grid stride.
+    for cb in tl.range(cid, tl.cdiv(vocab_size, BLOCK), nblk):
+        offs = cb * BLOCK + tl.arange(0, BLOCK)
+        m = offs < vocab_size
+        x = tl.load(src_ptr + row_id * stride0 + offs * stride1, mask=m)
+        tl.store(dst_ptr + row_id * vocab_size + offs, x, mask=m)
 
 
 def _mask_geometry(vocab_size):
@@ -1929,6 +1958,23 @@ def _pack_blocks_per_row(num_rows):
     if num_rows == 1:
         return 32  # fill all 40 vector cores with a single row's chunks
     return 16
+
+
+def _compact_chunks_per_row(num_rows):
+    # Programs per row in the compact kernel (each loops over its share of
+    # the row's COMPACT_SEG segments): keep rows * CN near the 40 vector
+    # cores — per-block dispatch dominates once the grid outgrows them.
+    if num_rows >= 128:
+        return 1
+    if num_rows >= 64:
+        return 2
+    if num_rows >= 16:
+        return 4
+    if num_rows >= 8:
+        return 8
+    if num_rows >= 2:
+        return 16
+    return 64  # single row: one program per segment fills the cores
 
 
 def top_k_per_row_prefill(
@@ -1965,7 +2011,10 @@ def _top_k_per_row_prefill(
         dense = torch.empty(
             (num_rows, vocab_size), device=logits.device, dtype=logits.dtype
         )
-        _ascend_topk_densify_kernel[(num_rows, triton.cdiv(vocab_size, DENSIFY_BLOCK))](
+        # The launcher flattens the grid into one hardware-capped coreDim
+        # (65535); cap the column blocks, the kernel loops with a grid stride.
+        dblk = triton.cdiv(vocab_size, DENSIFY_BLOCK)
+        _ascend_topk_densify_kernel[(num_rows, min(dblk, max(1, 65535 // num_rows)))](
             logits, dense, stride0, stride1, vocab_size, BLOCK=DENSIFY_BLOCK
         )
         logits = dense
@@ -2041,7 +2090,7 @@ def _run_rowsort_route(
         TOPK=top_k,
         BUFW=bufw,
     )
-    _ascend_topk_row_sort_kernel[(num_rows,)](
+    _ascend_topk_row_sort_kernel[(min(num_rows, ROWSORT_MAX_PROG),)](
         logits,
         row_starts,
         row_ends,
@@ -2273,32 +2322,46 @@ def _run_threshold_pipeline(
     )
     # The fixup kernel only runs for rows where BOTH threshold survivor
     # counts missed the [TOPK, CAP] window (degenerate distributions).
-    # Checking on the host saves a kernel launch (~80us on this stack) in
-    # the common case.  The flag is pre-reduced on device (atomic_max in
-    # the reduce kernel), so this is one 4B D2H read with no extra reduce
-    # kernel launch.
-    need_fixup = bool(fixup_flag.item())
+    # Small batches check fixup_flag on the host (one 4B D2H read; the
+    # flag is pre-reduced on device by atomic_max in the reduce kernel)
+    # and skip the fixup/repack launches in the common case.  Large
+    # batches launch them unconditionally instead: the D2H read stalls
+    # the launch queue for a full round trip, while the self-gating
+    # kernels cost nothing for rows that need no fixing.
+    need_fixup = num_rows >= FIXUP_NOSYNC_ROWS or bool(fixup_flag.item())
     # Raw custom-op path: vgather-based compaction + hardware sort.
     nseg = triton.cdiv(vocab_size, COMPACT_SEG)
-    _ascend_topk_compact_seg_kernel[(num_rows * nseg,)](
-        logits,
-        row_starts,
-        row_ends,
-        stride0,
-        masks,
-        seg_base,
-        cand_logits,
-        cand_idx,
-        totals,
-        NSEG=nseg,
-        SB=sb,
-        CSEG=COMPACT_SEG,
-        CSEG_SUB=COMPACT_SEG // SUB,
-        SUB=SUB,
-        TOPK=top_k,
-        CAP_SEG=cap,
-        REPACK=0,
-    )
+
+    def _launch_compact(repack):
+        # The launcher flattens the grid into one coreDim, hardware-capped
+        # at 65535 programs; batch the rows when num_rows * CN exceeds it.
+        cn = _compact_chunks_per_row(num_rows)
+        rows_per_launch = max(1, 65535 // cn)
+        for row0 in range(0, num_rows, rows_per_launch):
+            rows_now = min(rows_per_launch, num_rows - row0)
+            _ascend_topk_compact_seg_kernel[(rows_now * cn,)](
+                logits,
+                row_starts,
+                row_ends,
+                stride0,
+                masks,
+                seg_base,
+                cand_logits,
+                cand_idx,
+                totals,
+                row0,
+                NSEG=nseg,
+                CN=cn,
+                SB=sb,
+                CSEG=COMPACT_SEG,
+                CSEG_SUB=COMPACT_SEG // SUB,
+                SUB=SUB,
+                TOPK=top_k,
+                CAP_SEG=cap,
+                REPACK=repack,
+            )
+
+    _launch_compact(0)
     _ascend_topk_sort_final_kernel[(num_rows,)](
         indices,
         cand_logits,
@@ -2334,11 +2397,30 @@ def _run_threshold_pipeline(
             FINAL=0,
             HI=hi,
         )
-        if int(fixup_flag.item()) == 2:
-            # Re-routed rows: re-run the vectorized pipeline gated on
-            # route==3, then a final fixup pass (FINAL=1) descends any
-            # row that missed the window again (~never).
-            _ascend_topk_pack_kernel[grid_rc](
+        # Re-routed rows (route==3): re-run the vectorized pipeline, then a
+        # final fixup pass (FINAL=1) descends any row that missed the
+        # window again (~never).  Launched unconditionally: every REPACK=1
+        # kernel self-gates per row on route==3, so a second host-side
+        # fixup_flag check is unnecessary.
+        _ascend_topk_pack_kernel[grid_rc](
+            logits,
+            row_starts,
+            row_ends,
+            stride0,
+            masks,
+            cnts,
+            totals,
+            TOPK=top_k,
+            PB=PACK_BLOCK,
+            SB=sb,
+            SUB=SUB,
+            C=pack_c,
+            hi_ptr=hi_arg,
+            REPACK=1,
+            HI=hi,
+        )
+        if stride0 >= PACK_BLOCK:
+            _ascend_topk_pack_tail_dense_kernel[grid_rows](
                 logits,
                 row_starts,
                 row_ends,
@@ -2346,125 +2428,89 @@ def _run_threshold_pipeline(
                 masks,
                 cnts,
                 totals,
-                TOPK=top_k,
                 PB=PACK_BLOCK,
                 SB=sb,
                 SUB=SUB,
-                C=pack_c,
                 hi_ptr=hi_arg,
                 REPACK=1,
                 HI=hi,
             )
-            if stride0 >= PACK_BLOCK:
-                _ascend_topk_pack_tail_dense_kernel[grid_rows](
-                    logits,
-                    row_starts,
-                    row_ends,
-                    stride0,
-                    masks,
-                    cnts,
-                    totals,
-                    PB=PACK_BLOCK,
-                    SB=sb,
-                    SUB=SUB,
-                    hi_ptr=hi_arg,
-                    REPACK=1,
-                    HI=hi,
-                )
-                _ascend_topk_pack_tail_sub_kernel[grid_rows](
-                    logits,
-                    row_starts,
-                    row_ends,
-                    stride0,
-                    masks,
-                    cnts,
-                    totals,
-                    PB=PACK_BLOCK,
-                    SB=sb,
-                    SUB=SUB,
-                    hi_ptr=hi_arg,
-                    REPACK=1,
-                    HI=hi,
-                )
-            else:
-                _ascend_topk_pack_tail_kernel[grid_rows](
-                    logits,
-                    row_starts,
-                    row_ends,
-                    stride0,
-                    masks,
-                    cnts,
-                    totals,
-                    PB=PACK_BLOCK,
-                    SB=sb,
-                    SUB=SUB,
-                    hi_ptr=hi_arg,
-                    REPACK=1,
-                    HI=hi,
-                )
-            _ascend_topk_reduce_seg_kernel[grid_rows](
-                row_starts,
-                row_ends,
-                totals,
-                fixup_flag,
-                cnts,
-                seg_base,
-                TOPK=top_k,
-                SB=sb,
-                SUB=SUB,
-                CSEG_SUB=COMPACT_SEG // SUB,
-                CAP=cap,
-                LOGW_SB=sb.bit_length() - 1,
-                REPACK=1,
-            )
-            _ascend_topk_compact_seg_kernel[(num_rows * nseg,)](
+            _ascend_topk_pack_tail_sub_kernel[grid_rows](
                 logits,
                 row_starts,
                 row_ends,
                 stride0,
                 masks,
-                seg_base,
-                cand_logits,
-                cand_idx,
+                cnts,
                 totals,
-                NSEG=nseg,
+                PB=PACK_BLOCK,
                 SB=sb,
-                CSEG=COMPACT_SEG,
-                CSEG_SUB=COMPACT_SEG // SUB,
                 SUB=SUB,
-                TOPK=top_k,
-                CAP_SEG=cap,
+                hi_ptr=hi_arg,
                 REPACK=1,
+                HI=hi,
             )
-            _ascend_topk_sort_final_kernel[(num_rows,)](
-                indices,
-                cand_logits,
-                cand_idx,
-                totals,
-                out_stride,
-                out_off,
-                TOPK=top_k,
-                CAP=cap,
-                TMP=cap * SORT_TMP_MUL,
-                REPACK=1,
-            )
-            _ascend_topk_fixup_kernel[grid_rows](
+        else:
+            _ascend_topk_pack_tail_kernel[grid_rows](
                 logits,
-                indices,
                 row_starts,
                 row_ends,
                 stride0,
+                masks,
+                cnts,
                 totals,
-                fixup_flag,
-                hi_arg,
-                out_stride,
-                out_off,
-                TOPK=top_k,
-                SCAN_BLOCK=SCAN_BLOCK,
-                CAP=cap,
-                FINAL=1,
+                PB=PACK_BLOCK,
+                SB=sb,
+                SUB=SUB,
+                hi_ptr=hi_arg,
+                REPACK=1,
                 HI=hi,
             )
+        _ascend_topk_reduce_seg_kernel[grid_rows](
+            row_starts,
+            row_ends,
+            totals,
+            fixup_flag,
+            cnts,
+            seg_base,
+            TOPK=top_k,
+            SB=sb,
+            SUB=SUB,
+            CSEG_SUB=COMPACT_SEG // SUB,
+            CAP=cap,
+            LOGW_SB=sb.bit_length() - 1,
+            REPACK=1,
+        )
+        _launch_compact(1)
+        _ascend_topk_sort_final_kernel[(num_rows,)](
+            indices,
+            cand_logits,
+            cand_idx,
+            totals,
+            out_stride,
+            out_off,
+            TOPK=top_k,
+            CAP=cap,
+            TMP=cap * SORT_TMP_MUL,
+            REPACK=1,
+        )
+        _ascend_topk_fixup_kernel[grid_rows](
+            logits,
+            indices,
+            row_starts,
+            row_ends,
+            stride0,
+            totals,
+            fixup_flag,
+            hi_arg,
+            out_stride,
+            out_off,
+            TOPK=top_k,
+            SCAN_BLOCK=SCAN_BLOCK,
+            CAP=cap,
+            FINAL=1,
+            HI=hi,
+        )
 
 
 def _run_chunked_pipeline(

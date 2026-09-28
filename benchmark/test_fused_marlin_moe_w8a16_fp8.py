@@ -47,12 +47,13 @@ except ImportError:
 
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
+from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name == "hygon":
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -64,7 +65,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 GROUP_SIZE = 128
@@ -393,12 +394,25 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         w1_q_fp8, w1_scale_fp8 = _quantize_per_expert_fp8(w1_fp)
         w2_q_fp8, w2_scale_fp8 = _quantize_per_expert_fp8(w2_fp)
-        w1_q_marlin, w1_scale_marlin = _marlin_repack_per_expert_fp8(
-            w1_q_fp8, w1_scale_fp8, dtype
-        )
-        w2_q_marlin, w2_scale_marlin = _marlin_repack_per_expert_fp8(
-            w2_q_fp8, w2_scale_fp8, dtype
-        )
+        if flaggems_vllm.vendor_name == "mthreads":
+            # Reuse the source buffers for the baseline's decoded weights.
+            for quantized, scale, decoded in (
+                (w1_q_fp8, w1_scale_fp8, w1_fp),
+                (w2_q_fp8, w2_scale_fp8, w2_fp),
+            ):
+                for expert in range(num_experts):
+                    values = quantized[expert].float().view(-1, GROUP_SIZE)
+                    values.mul_(scale[expert].float().view(-1, 1))
+                    decoded[expert].copy_(values.view_as(decoded[expert]))
+            w1_q_marlin, w2_q_marlin = w1_fp, w2_fp
+            w1_scale_marlin = w2_scale_marlin = None
+        else:
+            w1_q_marlin, w1_scale_marlin = _marlin_repack_per_expert_fp8(
+                w1_q_fp8, w1_scale_fp8, dtype
+            )
+            w2_q_marlin, w2_scale_marlin = _marlin_repack_per_expert_fp8(
+                w2_q_fp8, w2_scale_fp8, dtype
+            )
         cached = (
             w1_q_marlin,
             w1_scale_marlin,
@@ -411,7 +425,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         self._weight_cache[cache_key] = cached
         del w1_fp, w2_fp
-        torch.cuda.empty_cache()
+        torch_device_fn.empty_cache()
         return cached
 
     def _gen(self, config, dtype):
@@ -468,7 +482,7 @@ def _vllm_baseline_fp8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
-    if flaggems_vllm.vendor_name == "hygon":
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return vllm_fused_experts(
             hidden_states,
             w1_q_marlin,
@@ -505,7 +519,7 @@ def _gems_call_fp8(
 ):
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name == "hygon"
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
         else fused_marlin_moe
     )
     return gems_op(
@@ -522,12 +536,12 @@ def _gems_call_fp8(
     )
 
 
-@pytest.mark.fused_marlin_moe
+@pytest.mark.fused_marlin_moe_w8a16_fp8
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
+    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
 )
 def test_fused_marlin_moe_w8a16_fp8():
     """Compare identical E4M3 weights and per-group-128 scales; on Hygon the

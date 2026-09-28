@@ -14,9 +14,11 @@
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import flaggems_vllm
-from flaggems_vllm.ops import unpack_seq_triton
+from flaggems_vllm import unpack_seq_triton
 
 from . import accuracy_utils as utils
 from . import conftest as cfg
@@ -26,21 +28,28 @@ from . import conftest as cfg
 # =============================================================================
 
 
-def is_fp8_available():
-    if not hasattr(torch, "float8_e4m3fn"):
-        return False
+@triton.jit
+def _fp8_check_kernel(x, y):
+    val = tl.load(x)
+    tl.store(y, val)
 
+
+try:
+    FP8 = torch.float8_e4m3fn
+    x1 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(FP8)
+    y1 = torch.empty([1], dtype=FP8, device=flaggems_vllm.device)
+    _fp8_check_kernel[(1,)](x1, y1)
+    FP8_AVAILABLE = True
+except Exception:
     try:
-        torch.zeros(1, device=flaggems_vllm.device, dtype=torch.float32).to(
-            torch.float8_e4m3fn
-        )
-    except (RuntimeError, TypeError, NotImplementedError):
-        return False
-
-    return True
-
-
-FP8_AVAILABLE = is_fp8_available()
+        FP8 = torch.float8_e5m2
+        x2 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(FP8)
+        y2 = torch.empty([1], dtype=FP8, device=flaggems_vllm.device)
+        _fp8_check_kernel[(1,)](x2, y2)
+        FP8_AVAILABLE = True
+    except Exception:
+        FP8 = None
+        FP8_AVAILABLE = False
 
 
 def _ref_pack_seq(x, lengths, pad_value=-float("inf")):
@@ -218,7 +227,6 @@ def test_unpack_seq_3d_edge_cases(dtype):
     reason="FP8 is not supported on the current device",
 )
 def test_pack_unpack_fp8_roundtrip():
-    FP8 = torch.float8_e4m3fn
     for N, H, D, lengths_list in [
         (6, 8, 4, [3, 3]),
         (10, 4, 8, [2, 4, 4]),
@@ -238,3 +246,24 @@ def test_pack_unpack_fp8_roundtrip():
             rtol=1e-3,
             atol=1e-3,
         )
+
+
+@pytest.mark.unpack_seq_triton
+@pytest.mark.parametrize(
+    "N, H, D, lengths_list",
+    [(6, 8, 4, [3, 3]), (10, 4, 8, [2, 4, 4]), (15, 8, 16, [7, 5, 3])],
+)
+def test_pack_unpack_int8_roundtrip(N, H, D, lengths_list):
+    """INT8 is not formally supported for pack_seq_triton's padding path,
+    but unpack_seq_triton never constructs padding at all -- it only
+    copies valid tokens back out -- so it should round-trip exactly
+    regardless of that gap."""
+    lengths = torch.tensor(lengths_list, dtype=torch.int32, device=flaggems_vllm.device)
+    x = torch.randint(
+        -128, 128, (N, H, D), dtype=torch.int8, device=flaggems_vllm.device
+    )
+    packed = _ref_pack_seq(x, lengths_list, pad_value=0)
+    unpacked = unpack_seq_triton(packed, lengths)
+    assert unpacked.shape == x.shape
+    assert unpacked.dtype == torch.int8
+    assert torch.equal(unpacked, x)

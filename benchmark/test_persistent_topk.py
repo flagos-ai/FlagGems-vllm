@@ -25,6 +25,27 @@ from . import base
 persistent_topk = flaggems_vllm.persistent_topk
 
 device = flaggems_vllm.device
+vendor_name = flaggems_vllm.vendor_name
+
+# Platform workaround (mirrors tests/test_persistent_topk.py): vllm-metax's
+# C++ baseline decode path (TOPK < seq_len <= 8192, histogram_2048_topk) is
+# broken on MetaX (measured on mcoplib 0.4.11 / MACA 3.8.1.3: illegal memory
+# access), so the baseline latency for those shapes is meaningless. Skip them
+# on MetaX.
+BASELINE_BROKEN_MAX_SEQ = 8192 if vendor_name == "metax" else 0
+
+# Real FlagOSTune DeepSeek-V4-Flash shapes (num_rows 33..512, seq_len=262144,
+# max_seq_len=1048576) observed in production persistent_topk calls — the
+# 33..495 row range is missing from the generic shape list. MetaX-only.
+_METAX_EXTRA_SHAPES = [
+    (40, 262144, 1048576),
+    (64, 262144, 1048576),
+    (96, 262144, 1048576),
+    (128, 262144, 1048576),
+    (192, 262144, 1048576),
+    (256, 262144, 1048576),
+    (384, 262144, 1048576),
+]
 
 # The vLLM native op is used as the baseline where available (NVIDIA); on
 # platforms without torch.ops._C.persistent_topk (e.g. Hygon vllm-hcu) the
@@ -32,24 +53,40 @@ device = flaggems_vllm.device
 HAS_VLLM = False
 try:
     import vllm._custom_ops  # noqa: F401
-
-    # `vllm._custom_ops` may import cleanly even when the compiled C++ extension
-    # is missing, in which case the native op raises NotImplementedError at
-    # dispatch time. Probe one tiny call so the benchmark falls back (rather
-    # than errors) when the kernel is not actually available.
-    _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
-    _probe_lengths = torch.tensor([4102], dtype=torch.int32, device="cuda")
-    torch.ops._C.persistent_topk(
-        _probe_logits,
-        _probe_lengths,
-        torch.empty((1, 512), dtype=torch.int32, device="cuda"),
-        torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
-        512,
-        4102,
-    )
-    HAS_VLLM = True
-except (ImportError, AttributeError, NotImplementedError, RuntimeError):
+except ImportError:
     pass
+else:
+    if vendor_name == "metax":
+        # On MetaX the native baseline is provided by mcoplib. Do not run the
+        # tiny functional probe: seq_len <= 8192 is the known-broken decode
+        # path (see BASELINE_BROKEN_MAX_SEQ) and raises an illegal memory
+        # access that can poison the CUDA context. Registration is enough to
+        # mark the baseline available; the broken region is filtered below.
+        try:
+            import mcoplib._C  # noqa: F401
+        except ImportError:
+            pass
+        HAS_VLLM = hasattr(getattr(torch.ops, "_C", None), "persistent_topk")
+    else:
+        # `vllm._custom_ops` may import cleanly even when the compiled C++
+        # extension is missing, in which case the native op raises
+        # NotImplementedError at dispatch time. Probe one tiny call so the
+        # benchmark falls back (rather than errors) when the kernel is not
+        # actually available.
+        try:
+            _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
+            _probe_lengths = torch.tensor([4102], dtype=torch.int32, device="cuda")
+            torch.ops._C.persistent_topk(
+                _probe_logits,
+                _probe_lengths,
+                torch.empty((1, 512), dtype=torch.int32, device="cuda"),
+                torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+                512,
+                4102,
+            )
+            HAS_VLLM = True
+        except (ImportError, AttributeError, NotImplementedError, RuntimeError):
+            pass
 
 STRIDE = 262144
 K = 512
@@ -146,6 +183,13 @@ class PersistentTopKBenchmark(base.Benchmark):
             (496, 1048576),
             (496, 1),
         ]
+        # MetaX: drop shapes whose baseline runs the broken decode path.
+        self.shapes = [s for s in self.shapes if s[1] > BASELINE_BROKEN_MAX_SEQ]
+        self.hetero_shapes = [
+            s for s in self.hetero_shapes if s[1] > BASELINE_BROKEN_MAX_SEQ
+        ]
+        if vendor_name == "metax":
+            self.shapes += _METAX_EXTRA_SHAPES
 
     def get_input_iter(self, dtype):
         for num_rows, seq_len, max_seq_len in self.shapes:

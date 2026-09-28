@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+import flaggems_vllm
 import flaggems_vllm.testing as fg_testing
 from flaggems_vllm.ops.deepseek_v4_attention_compute_global_topk_indices_and_lens import (
     compute_global_topk_indices_and_lens,
@@ -23,7 +24,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_compute_global_topk_indices_and_len
 pytestmark = pytest.mark.compute_global_topk_indices_and_lens
 
 try:
-    from vllm.v1.attention.ops.deepseek_v4_ops import (
+    from vllm.models.deepseek_v4.common.ops import (
         compute_global_topk_indices_and_lens as vllm_compute_global_topk_indices_and_lens,
     )
 
@@ -31,6 +32,12 @@ try:
 except Exception:
     vllm_compute_global_topk_indices_and_lens = None
     _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS = False
+
+device = flaggems_vllm.device
+_device_module = getattr(torch, device, None)
+_HAS_DEVICE = _device_module is not None and _device_module.is_available()
+if not _HAS_DEVICE:
+    _HAS_DEVICE = bool(flaggems_vllm.runtime.torch_device_fn.device_count())
 
 
 @pytest.mark.parametrize(
@@ -58,11 +65,10 @@ except Exception:
         ),
     ],
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires cuda")
+@pytest.mark.skipif(not _HAS_DEVICE, reason="requires an available accelerator")
 def test_compute_global_topk_indices_and_lens_accuracy(
     topk_values, req_values, block_table_values, valid_values, block_size
 ):
-    device = "cuda"
     topk_indices = torch.tensor(topk_values, device=device, dtype=torch.int32)
     token_to_req_indices = torch.tensor(req_values, device=device, dtype=torch.int32)
     block_table = torch.tensor(block_table_values, device=device, dtype=torch.int32)
@@ -99,12 +105,10 @@ def test_compute_global_topk_indices_and_lens_accuracy(
 
 
 @pytest.mark.skipif(
-    (not torch.cuda.is_available())
-    or (not _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS),
-    reason="requires cuda and vllm deepseek_v4_ops.compute_global_topk_indices_and_lens",
+    (not _HAS_DEVICE) or (not _HAS_VLLM_COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS),
+    reason="requires an accelerator and vllm compute_global_topk_indices_and_lens",
 )
 def test_compute_global_topk_indices_and_lens_vllm_accuracy():
-    device = "cuda"
     topk_indices = torch.tensor(
         [[0, 63, 64, 127], [128, -1, 191, 255], [7, 8, -1, -1]],
         device=device,

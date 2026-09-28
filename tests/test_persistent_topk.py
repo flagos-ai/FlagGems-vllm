@@ -28,6 +28,7 @@ from . import conftest as cfg
 persistent_topk = flaggems_vllm.persistent_topk
 
 device = flaggems_vllm.device
+vendor_name = flaggems_vllm.vendor_name
 
 
 def _has_histogram_mask():
@@ -59,16 +60,40 @@ try:
         )
         return indices
 
-    # `vllm._custom_ops` may import cleanly even when the compiled C++ extension
-    # is missing, in which case the native op raises NotImplementedError at
-    # dispatch time. Probe one tiny call so vLLM-dependent tests are skipped
-    # (rather than errored) when the kernel is not actually available.
-    _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
-    _vllm_persistent_topk(_probe_logits, [4102], 4102, 512)
-    HAS_VLLM = True
+    if vendor_name == "metax":
+        # On MetaX the native baseline is provided by mcoplib. Do not run the
+        # tiny functional probe: seq_len <= 8192 is the known-broken decode
+        # path (see BASELINE_BROKEN_MAX_SEQ) and raises an illegal memory
+        # access that can poison the CUDA context. Registration is enough to
+        # mark the baseline available; the broken region is skipped per test.
+        try:
+            import mcoplib._C  # noqa: F401
+        except ImportError:
+            pass
+        HAS_VLLM = hasattr(getattr(torch.ops, "_C", None), "persistent_topk")
+    else:
+        # `vllm._custom_ops` may import cleanly even when the compiled C++
+        # extension is missing, in which case the native op raises
+        # NotImplementedError at dispatch time. Probe one tiny call so
+        # vLLM-dependent tests are skipped (rather than errored) when the
+        # kernel is not actually available.
+        _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
+        _vllm_persistent_topk(_probe_logits, [4102], 4102, 512)
+        HAS_VLLM = True
 except (ImportError, AttributeError, NotImplementedError, RuntimeError):
     HAS_VLLM = False
     _vllm_persistent_topk = None
+
+# Platform workaround: vllm-metax's C++ baseline decode path (TOPK < seq_len <=
+# 8192, histogram_2048_topk) is broken on MetaX hardware. Measured on this
+# stack (mcoplib 0.4.11 / MACA 3.8.1.3): 1024/1055/2048/4102/8192 all raise an
+# illegal memory access, while seq_len <= 512 (trivial path) and > 8192 return
+# correct results (earlier observations also included out-of-range indices; the
+# suspected root cause is 32-wide warp/CUB assumptions in the baseline vs
+# MetaX's 64-wide mccub warps). On MetaX, skip the baseline comparison for that
+# region only; our implementation is still covered by
+# test_persistent_topk_vs_torch against torch.topk.
+BASELINE_BROKEN_MAX_SEQ = 8192 if vendor_name == "metax" else 0
 
 STRIDE = 262144
 K = 512
@@ -164,6 +189,8 @@ def _gems_decode(logits, seq_lens, top_k, max_seq_len=None):
 @pytest.mark.parametrize("data_type", DATA_TYPES)
 @torch.inference_mode()
 def test_persistent_topk_cross_agreement(num_rows, seq_len, max_seq_len, data_type):
+    if seq_len <= BASELINE_BROKEN_MAX_SEQ:
+        pytest.skip("vllm-metax baseline decode path broken on MetaX (seq_len<=8192)")
     seq_lens = [seq_len] * num_rows
     logits = _padded_logits(num_rows, seq_len, data_type)
 

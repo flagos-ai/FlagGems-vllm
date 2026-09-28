@@ -14,9 +14,11 @@
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import flaggems_vllm
-from flaggems_vllm.ops import pack_seq_triton
+from flaggems_vllm import pack_seq_triton
 
 from . import base
 
@@ -36,23 +38,31 @@ except ImportError:
 # =============================================================================
 
 
-def is_fp8_available():
-    if not hasattr(torch, "float8_e4m3fn"):
-        return False
+@triton.jit
+def _fp8_check_kernel(x, y):
+    val = tl.load(x)
+    tl.store(y, val)
 
+
+try:
+    FP8_DTYPE = torch.float8_e4m3fn
+    x1 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(FP8_DTYPE)
+    y1 = torch.empty([1], dtype=FP8_DTYPE, device=flaggems_vllm.device)
+    _fp8_check_kernel[(1,)](x1, y1)
+    FP8_AVAILABLE = True
+except Exception:
     try:
-        torch.zeros(1, device=flaggems_vllm.device, dtype=torch.float32).to(
-            torch.float8_e4m3fn
+        FP8_DTYPE = torch.float8_e5m2
+        x2 = torch.randn(1, dtype=torch.float32, device=flaggems_vllm.device).to(
+            FP8_DTYPE
         )
-    except (RuntimeError, TypeError, NotImplementedError):
-        return False
+        y2 = torch.empty([1], dtype=FP8_DTYPE, device=flaggems_vllm.device)
+        _fp8_check_kernel[(1,)](x2, y2)
+        FP8_AVAILABLE = True
+    except Exception:
+        FP8_DTYPE = None
+        FP8_AVAILABLE = False
 
-    return True
-
-
-FP8_AVAILABLE = is_fp8_available()
-
-FP8_DTYPE = torch.float8_e4m3fn if FP8_AVAILABLE else None
 
 # =============================================================================
 # Benchmark shapes: (N, D, B, lengths_list)
@@ -65,12 +75,18 @@ PACK_BENCH_SHAPES = [
     (2048, 512, 4, [512, 512, 512, 512]),
     (16384, 64, 8, [2048] * 8),
     (1024, 1024, 4, [256] * 4),
+    (2048, 2048, 512, [4] * 512),
+    (4094, 1024, 1024, [4] * 1024),
+    (8192, 1024, 1024, [8] * 1024),
 ]
 
 FP8_BENCH_SHAPES = [
     (512, 64, 5, [64, 128, 64, 128, 128]),
     (4096, 128, 4, [1024, 1024, 1024, 1024]),
     (2048, 512, 4, [512, 512, 512, 512]),
+    (2048, 2048, 512, [4] * 512),
+    (4094, 1024, 1024, [4] * 1024),
+    (8192, 1024, 1024, [8] * 1024),
 ]
 
 
@@ -141,6 +157,35 @@ def test_pack_seq():
     bench.run()
 
 
+# =============================================================================
+# Custom Benchmark class — pack_seq (INT8)
+# =============================================================================
+
+
+class PackSeqINT8Benchmark(base.Benchmark):
+    def __init__(self, op_name, torch_op, dtypes):
+        super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = PACK_BENCH_SHAPES
+
+    def get_input_iter(self, cur_dtype):
+        del cur_dtype
+        for config in self.shapes:
+            yield from self._int8_input_fn(config)
+
+    def _int8_input_fn(self, config):
+        N, D, B, lengths_list = config
+        device = flaggems_vllm.device
+        lengths = torch.tensor(lengths_list, dtype=torch.int32, device=device)
+        x = torch.randint(-128, 128, (N, D), dtype=torch.int8, device=device)
+        # Explicit int pad_value (0) instead of the float default (-inf):
+        # a quantization-style int8 pad, and representative of the
+        # performance-relevant case (correctness edge cases are covered
+        # by tests/test_pack_seq.py instead).
+        yield x, lengths, 0
+
+
 @pytest.mark.pack_seq_triton
 @pytest.mark.skipif(
     not HAS_VLLM,
@@ -155,6 +200,21 @@ def test_pack_seq_fp8():
         op_name="pack_seq_triton",
         torch_op=vllm_pack_seq,
         dtypes=[FP8_DTYPE],
+    )
+    bench.set_gems(pack_seq_triton)
+    bench.run()
+
+
+@pytest.mark.pack_seq_triton
+@pytest.mark.skipif(
+    not HAS_VLLM,
+    reason="requires vLLM to be installed for reference comparison",
+)
+def test_pack_seq_int8():
+    bench = PackSeqINT8Benchmark(
+        op_name="pack_seq_triton",
+        torch_op=vllm_pack_seq,
+        dtypes=[torch.int8],
     )
     bench.set_gems(pack_seq_triton)
     bench.run()

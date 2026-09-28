@@ -45,11 +45,36 @@ try:
 except ImportError:
     TensorDescriptor = None
 
+_TLE_REQUIRED_PRIMITIVES = frozenset(
+    {
+        "load",
+        "pipe",
+        "gpu.alloc",
+        "gpu.copy",
+        "gpu.local_ptr",
+        "gpu.warp_specialize",
+    }
+)
+
+
+def _tle_primitives_available() -> bool:
+    try:
+        from triton._flagtree_backend import get_active_backend_name
+        from triton.experimental.tle import get_supported_primitives
+    except ImportError:
+        return True
+    try:
+        supported = get_supported_primitives(get_active_backend_name())
+    except (ModuleNotFoundError, AttributeError, RuntimeError):
+        return True
+    return _TLE_REQUIRED_PRIMITIVES <= supported
+
+
 if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE_KDA = True
+        HAS_TLE_KDA = _tle_primitives_available()
     except ImportError:
         tle = None
         HAS_TLE_KDA = False

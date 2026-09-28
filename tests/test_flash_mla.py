@@ -27,7 +27,7 @@ vendor_name = flaggems_vllm.vendor_name
 
 
 def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
-    x, y = x.double(), y.double()
+    x, y = x.cpu().double(), y.cpu().double()
     x = x.to(y.device)
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
@@ -95,7 +95,6 @@ def ref_mla(
     return out, lse
 
 
-@pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2817: RuntimeError")
 @pytest.mark.flash_mla
 @pytest.mark.parametrize("seqlen", [1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

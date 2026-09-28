@@ -70,79 +70,105 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     """
 
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
-        # Collecting from qwen/Qwen3-1.7B
-        # --random-input 512 --random-output 2048 --num-prompts 200 --request-rate inf
-        # Format: (cu_seq_lens_q, seqused_k, num_heads, head_size, block_size,
-        # num_blocks, alibi, soft_cap)
-
+        # Collected from Qwen3.6-35B-A3B: six TP1 cases followed by six TP4 cases.
         all_cu_seq_lens_q = [
-            (
-                0,
-                512,
-            ),
-            (
-                0,
-                1,
-                2,
-                72,
-            ),
-            tuple(range(0, 45))
+            # TP1: short prefill (qwen36_tp1_p1024d1024_l0002).
+            (0, 1035),
+            # TP1: batched decode (qwen36_tp1_p1024d1024_l0081).
+            tuple(range(257)),
+            # TP1: mixed short KV (qwen36_tp1_p4096d1024_l0002).
+            (0, 1, 2, 3, 4, 46, 4152, 8258, 12364, 16384),
+            # TP1: mixed long KV (qwen36_tp1_p32768d1024_l0005).
+            (0, 12, 16384),
+            # TP1: short query, long KV (qwen36_tp1_p65536d6144_l0018).
+            (0, 1, 2, 3, 67),
+            # TP1: large query, long KV (qwen36_tp1_p65536d6144_l0005).
+            (0, 16384),
+            # TP4: short prefill (qwen36_tp4_p1024d1024_l0146).
+            (0, 1036),
+            # TP4: batched decode (qwen36_tp4_p1024d1024_l0272).
+            tuple(range(513)),
+            # TP4: mixed short KV (qwen36_tp4_p1024d1024_l0173).
+            tuple(range(17))
             + (
-                105,
-                121,
-                137,
-                153,
-                169,
-                185,
-                201,
-                217,
-                233,
-                249,
-                265,
+                182,
+                1217,
+                2253,
+                3287,
+                4321,
+                5355,
+                6390,
+                7424,
+                8458,
+                9494,
+                10528,
+                11562,
+                12596,
+                13631,
+                14667,
+                15702,
+                16384,
             ),
-            tuple(range(0, 196))
-            + (
-                211,
-                226,
-                240,
-                253,
-                265,
-            ),
+            # TP4: mixed long KV (qwen36_tp4_p65536d6144_l0139).
+            (0, 12, 16384),
+            # TP4: short query, long KV (qwen36_tp4_p32768d1024_l0143).
+            (0, 12),
+            # TP4: large query, long KV (qwen36_tp4_p65536d6144_l0138).
+            (0, 16384),
         ]
         all_seqused_k = [
-            (512,),
+            (1035,),
+            (1,) * 256,
+            (4110, 4108, 4107, 4107, 4106, 4106, 4106, 4106, 4020),
+            (32780, 16372),
+            (65560, 65555, 65550, 65546),
+            (65536,),
+            (1036,),
+            (32,) * 512,
             (
-                1,
-                1,
-                70,
+                1038,
+                1035,
+                1035,
+                1037,
+                1035,
+                1035,
+                1035,
+                1035,
+                1035,
+                1035,
+                1036,
+                1035,
+                1037,
+                1035,
+                1035,
+                1035,
+                1034,
+                1035,
+                1036,
+                1034,
+                1034,
+                1034,
+                1035,
+                1034,
+                1034,
+                1036,
+                1034,
+                1034,
+                1034,
+                1035,
+                1036,
+                1035,
+                682,
             ),
-            (515,) + (514,) * 20 + (513,) * 20 + (512,) * 14,
-            (2333,)
-            + (2331,) * 20
-            + (2330,) * 20
-            + (2329,) * 14
-            + (2328,) * 18
-            + (2327,) * 15
-            + (2326,) * 17
-            + (2325,) * 18
-            + (2324,) * 21
-            + (2323,) * 22
-            + (2322,) * 24
-            + (2321,) * 5
-            + (
-                2320,
-                2319,
-                2318,
-                2317,
-                2316,
-            ),
+            (65548, 16372),
+            (32780,),
+            (65536,),
         ]
+        all_num_heads = [(16, 2)] * 6 + [(4, 1)] * 6
+        all_block_sizes = [32] * 6 + [16] * 6
+        all_num_blocks = [73920] * 6 + [605550, 16896] + [605550] * 4
 
-        num_heads = 16
-        num_heads_k = 8
-        head_dim = 128
-        block_size = 16
-        num_blocks = 2000
+        head_dim = 256
         alibi = False
         soft_cap = None
 
@@ -158,7 +184,19 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
                 alibi,
                 soft_cap,
             )
-            for cu_seq_lens_q, seqused_k in zip(all_cu_seq_lens_q, all_seqused_k)
+            for (
+                cu_seq_lens_q,
+                seqused_k,
+                (num_heads, num_heads_k),
+                block_size,
+                num_blocks,
+            ) in zip(
+                all_cu_seq_lens_q,
+                all_seqused_k,
+                all_num_heads,
+                all_block_sizes,
+                all_num_blocks,
+            )
         ]
 
         self.shapes = all_configs
@@ -342,6 +380,66 @@ def flash_attn_varlen_legacy(*args, **kwargs):
     return result
 
 
+def flash_attn_varlen_metax(*args, **kwargs):
+    """Adapt vLLM arguments to MetaX FlashAttention's paged-KV interface.
+
+    Cumulative-length conversion is included in the baseline timing. The
+    native interface selects its own splits and does not accept ``out``.
+    """
+    (
+        query,
+        key_cache,
+        value_cache,
+        max_query_len,
+        cu_query_lens,
+        max_kv_len,
+        cu_seqlens_k,
+        seqused_k,
+        _,
+        dropout_p,
+        scale,
+        causal,
+        window_size,
+        soft_cap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        block_tables,
+        _,
+        _,
+        *_,
+    ) = args
+
+    if cu_seqlens_k is None:
+        cu_seqlens_k = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=seqused_k.device),
+                torch.cumsum(seqused_k, dim=0),
+            ]
+        ).to(torch.int32)
+
+    from flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        cu_seqlens_k,
+        max_query_len,
+        max_kv_len,
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=tuple(window_size),
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        softcap=float(soft_cap),
+        block_table=block_tables,
+    )
+
+
 @pytest.mark.skipif(
     utils.SkipVersion("vllm", "<0.9"),
     reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
@@ -356,7 +454,9 @@ def flash_attn_varlen_legacy(*args, **kwargs):
 def test_flash_attn_varlen_func(monkeypatch):
     monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
 
-    if vendor_name == "iluvatar":
+    if vendor_name == "metax":
+        flash_attn_varlen_func = flash_attn_varlen_metax
+    elif vendor_name == "iluvatar":
         # iluvatar does not have updated vllm_flash_attn, use conversion wrapper
         flash_attn_varlen_func = flash_attn_varlen_legacy
     else:
