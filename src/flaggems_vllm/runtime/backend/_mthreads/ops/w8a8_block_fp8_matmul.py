@@ -371,15 +371,25 @@ def _block_fp8_matmul_kernel(
     Y_SIZE: tl.constexpr,
     SPLIT_K: tl.constexpr,
     EVEN_K: tl.constexpr,
-    BLOCK_X: tl.constexpr,
-    BLOCK_Y: tl.constexpr,
-    GROUP_X: tl.constexpr,
+    BLOCK_X: tl.constexpr = 0,
+    BLOCK_Y: tl.constexpr = 0,
+    GROUP_X: tl.constexpr = 0,
     BLOCK_K: tl.constexpr = 0,
+    # Matrix-axis meta names used by the shared configuration entries. They
+    # map to the same logical X/Y axes as the generic MThreads parameters.
+    BLOCK_M: tl.constexpr = 0,
+    BLOCK_N: tl.constexpr = 0,
+    GROUP_M: tl.constexpr = 0,
 ):
     # Keep native FP8 dot / Split-K on a matrix tile when AABS shrinks M.
     # An explicit tile expression is opaque to AABS, so retain its small-shape
     # shrink as well as the matrix minimum selected by dispatch.
-    TILE_Y: tl.constexpr = max(MIN_Y, min(BLOCK_Y, Y_SIZE))
+    BLOCK_X_EFF: tl.constexpr = BLOCK_M if BLOCK_M > 0 else BLOCK_X
+    BLOCK_Y_EFF: tl.constexpr = BLOCK_N if BLOCK_N > 0 else BLOCK_Y
+    GROUP_X_EFF: tl.constexpr = (
+        GROUP_M if GROUP_M > 0 else (GROUP_X if GROUP_X > 0 else 1)
+    )
+    TILE_Y: tl.constexpr = max(MIN_Y, min(BLOCK_Y_EFF, Y_SIZE))
     # This tile is a quantization boundary, not an independently tunable axis.
     TILE_K: tl.constexpr = min(GROUP_K, BLOCK_K if BLOCK_K > 0 else 128)
     tl.static_assert(GROUP_K % TILE_K == 0)
@@ -388,13 +398,13 @@ def _block_fp8_matmul_kernel(
     else:
         X, Y = M, N
     pid = tl.program_id(0)
-    num_x, num_y = tl.cdiv(X, BLOCK_X), tl.cdiv(Y, TILE_Y)
-    group = pid // (GROUP_X * num_y)
-    first_x = group * GROUP_X
-    group_x = tl.minimum(num_x - first_x, GROUP_X)
+    num_x, num_y = tl.cdiv(X, BLOCK_X_EFF), tl.cdiv(Y, TILE_Y)
+    group = pid // (GROUP_X_EFF * num_y)
+    first_x = group * GROUP_X_EFF
+    group_x = tl.minimum(num_x - first_x, GROUP_X_EFF)
     px = first_x + pid % group_x
-    py = (pid % (GROUP_X * num_y)) // group_x
-    x = px * BLOCK_X + tl.arange(0, BLOCK_X)
+    py = (pid % (GROUP_X_EFF * num_y)) // group_x
+    x = px * BLOCK_X_EFF + tl.arange(0, BLOCK_X_EFF)
     y = py * TILE_Y + tl.arange(0, TILE_Y)
     rk = tl.arange(0, TILE_K)
     split = tl.program_id(1)
@@ -402,7 +412,7 @@ def _block_fp8_matmul_kernel(
     per_split = tl.cdiv(tiles, SPLIT_K)
     start, end = split * per_split, tl.minimum((split + 1) * per_split, tiles)
 
-    acc = tl.zeros((BLOCK_X, TILE_Y), tl.float32)
+    acc = tl.zeros((BLOCK_X_EFF, TILE_Y), tl.float32)
     for tile in range(start, end):
         kk = tile * TILE_K + rk
         sk = tile * TILE_K // GROUP_K
@@ -426,9 +436,11 @@ def _block_fp8_matmul_kernel(
         partial = tl.dot(lhs, rhs, out_dtype=tl.float32)
         if SWAP_AB:
             sa = tl.load(As + y * stride_asm + sk * stride_ask, y < M, other=0)
-            if BLOCK_X <= GROUP_N and GROUP_N % BLOCK_X == 0:
+            if BLOCK_X_EFF <= GROUP_N and GROUP_N % BLOCK_X_EFF == 0:
                 sb = tl.load(
-                    Bs + (px * BLOCK_X // GROUP_N) * stride_bsn + sk * stride_bsk
+                    Bs
+                    + (px * BLOCK_X_EFF // GROUP_N) * stride_bsn
+                    + sk * stride_bsk
                 )
                 acc += partial * (sa * sb)[None, :]
             else:
@@ -473,12 +485,17 @@ _MATMUL_TUNING_KEY = [
     "MIN_Y",
 ]
 
+# The common benchmark and vLLM path uses contiguous A/B and 128x128 block
+# scales. Keep a smaller shape-only key for those launches. The full key
+# remains available below for strided and non-standard block layouts.
+_FIXED_LAYOUT_TUNING_KEY = ["M", "N", "K", "stride_am", "stride_bk"]
 
-def _make_matmul_entry(config_name, expand_name):
+
+def _make_matmul_entry(config_name, expand_name, key=_MATMUL_TUNING_KEY):
     return libentry()(
         libtuner(
             configs=runtime.get_tuned_config(config_name),
-            key=_MATMUL_TUNING_KEY,
+            key=key,
             strategy="default",
             warmup=5,
             rep=20,
@@ -490,20 +507,44 @@ def _make_matmul_entry(config_name, expand_name):
 
 
 _block_fp8_matmul_general = _make_matmul_entry(
-    "w8a8_block_fp8_matmul_mthreads_general",
-    "w8a8_block_fp8_mthreads_general",
+    "w8a8_block_fp8_general",
+    "w8a8_block_fp8_general",
 )
 _block_fp8_matmul_swap = _make_matmul_entry(
-    "w8a8_block_fp8_matmul_mthreads_swap",
-    "w8a8_block_fp8_mthreads_swap",
+    "w8a8_block_fp8_swap_ab",
+    "w8a8_block_fp8_swap_ab",
 )
 _block_fp8_matmul_shortk = _make_matmul_entry(
-    "w8a8_block_fp8_matmul_mthreads_shortk",
-    "w8a8_block_fp8_mthreads_shortk",
+    "w8a8_block_fp8_short_k256",
+    "w8a8_block_fp8_short_k256",
 )
 _block_fp8_matmul_splitk = _make_matmul_entry(
-    "w8a8_block_fp8_matmul_mthreads_splitk",
-    "w8a8_block_fp8_mthreads_splitk",
+    "w8a8_block_fp8_swap_ab_splitk",
+    "w8a8_block_fp8_swap_ab_splitk",
+)
+
+# Fixed-layout entries use the same specialized Triton body and curated
+# configs, but tune only by matrix shape and the two contiguous strides. The
+# generic entries above remain the fallback for arbitrary layouts.
+_block_fp8_matmul_general_fixed = _make_matmul_entry(
+    "w8a8_block_fp8_general",
+    "w8a8_block_fp8_general",
+    _FIXED_LAYOUT_TUNING_KEY,
+)
+_block_fp8_matmul_swap_fixed = _make_matmul_entry(
+    "w8a8_block_fp8_swap_ab",
+    "w8a8_block_fp8_swap_ab",
+    _FIXED_LAYOUT_TUNING_KEY,
+)
+_block_fp8_matmul_shortk_fixed = _make_matmul_entry(
+    "w8a8_block_fp8_short_k256",
+    "w8a8_block_fp8_short_k256",
+    _FIXED_LAYOUT_TUNING_KEY,
+)
+_block_fp8_matmul_splitk_fixed = _make_matmul_entry(
+    "w8a8_block_fp8_swap_ab_splitk",
+    "w8a8_block_fp8_swap_ab_splitk",
+    _FIXED_LAYOUT_TUNING_KEY,
 )
 _block_fp8_matmul_narrow_splitk = _make_matmul_entry(
     "w8a8_block_fp8_matmul_mthreads_narrow_splitk",
@@ -1100,26 +1141,56 @@ def w8a8_block_fp8_matmul(
         def grid(meta):
             x, y = (n, m) if swap else (m, n)
             split_dim = meta["SPLIT_K"] if split_path else 1
+            # Triton keeps the generic BLOCK_X/BLOCK_Y keys in the launch
+            # metadata even for canonical configs.  Those keys default to 0,
+            # so presence alone cannot distinguish the two config schemas.
+            block_x = meta.get("BLOCK_X", 0) or meta.get("BLOCK_M", 0)
+            block_y = meta.get("BLOCK_Y", 0) or meta.get("BLOCK_N", 0)
             return (
-                triton.cdiv(x, meta["BLOCK_X"])
-                * triton.cdiv(y, max(min_y, min(meta["BLOCK_Y"], y_size))),
+                triton.cdiv(x, block_x)
+                * triton.cdiv(y, max(min_y, min(block_y, y_size))),
                 split_dim,
             )
 
+        fixed_layout = (
+            group_n == 128
+            and group_k == 128
+            and a.is_contiguous()
+            and B.is_contiguous()
+            and a_s.is_contiguous()
+            and Bs.is_contiguous()
+        )
+
         if short_k_requested:
-            entry = _block_fp8_matmul_shortk
+            entry = (
+                _block_fp8_matmul_shortk_fixed
+                if fixed_layout
+                else _block_fp8_matmul_shortk
+            )
         elif split_path:
             entry = (
                 _block_fp8_matmul_narrow_splitk
                 if n <= 16 and m >= 1024
-                else _block_fp8_matmul_splitk
+                else (
+                    _block_fp8_matmul_splitk_fixed
+                    if fixed_layout
+                    else _block_fp8_matmul_splitk
+                )
             )
         elif swap:
             # Keep Default on the compact curated swap space.  The large
             # expansion-only skinny space is reserved for explicit tuning.
-            entry = _block_fp8_matmul_swap
+            entry = (
+                _block_fp8_matmul_swap_fixed
+                if fixed_layout
+                else _block_fp8_matmul_swap
+            )
         else:
-            entry = _block_fp8_matmul_general
+            entry = (
+                _block_fp8_matmul_general_fixed
+                if fixed_layout
+                else _block_fp8_matmul_general
+            )
 
         launch = dict(
             GROUP_N=group_n,

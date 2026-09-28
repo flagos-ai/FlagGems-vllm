@@ -423,31 +423,6 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name.startswith("w8a8_block_fp8_mthreads"):
-            return [
-                triton.Config(
-                    dict(
-                        {
-                            "BLOCK_X": block_x,
-                            "BLOCK_Y": block_y,
-                            "BLOCK_K": block_k,
-                            "GROUP_X": group_x,
-                        },
-                        **({"SPLIT_K": split_k} if op_name.endswith("_splitk") else {}),
-                    ),
-                    num_stages=s,
-                    num_warps=w,
-                    pre_hook=pre_hook,
-                )
-                for block_x in ranges["BLOCK_X"]
-                for block_y in ranges["BLOCK_Y"]
-                for block_k in ranges["BLOCK_K"]
-                for group_x in ranges["GROUP_X"]
-                for split_k in ranges.get("SPLIT_K", [None])
-                for s in ranges["s"]
-                for w in ranges["w"]
-            ]
-
         if op_name == "w8a8_block_fp8_swap_ab":
             return [
                 triton.Config(
@@ -651,21 +626,6 @@ class ConfigLoader(object):
                 "w8a8_block_fp8_matmul",
                 expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
                 yaml_op_name="w8a8_block_fp8_general",
-            ),
-            "w8a8_block_fp8_mthreads": self._build_single_expand_spec(
-                "w8a8_block_fp8_mthreads",
-            ),
-            "w8a8_block_fp8_mthreads_general": self._build_single_expand_spec(
-                "w8a8_block_fp8_mthreads_general",
-            ),
-            "w8a8_block_fp8_mthreads_swap": self._build_single_expand_spec(
-                "w8a8_block_fp8_mthreads_swap",
-            ),
-            "w8a8_block_fp8_mthreads_splitk": self._build_single_expand_spec(
-                "w8a8_block_fp8_mthreads_splitk",
-            ),
-            "w8a8_block_fp8_mthreads_shortk": self._build_single_expand_spec(
-                "w8a8_block_fp8_mthreads_shortk",
             ),
             "w8a8_block_fp8_swap_ab": self._build_single_expand_spec(
                 "w8a8_block_fp8_swap_ab",
