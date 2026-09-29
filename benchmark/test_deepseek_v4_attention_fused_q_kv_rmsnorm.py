@@ -47,6 +47,11 @@ try:
 
             return q_normed, kv_normed
 
+    elif vendor == "iluvatar":
+        from vllm.models.deepseek_v4.common.ops import (
+            fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
+        )
+
     _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = True
 except Exception as e:
     print(e)
@@ -73,7 +78,8 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
             (128, 1536, 512),
             (512, 1536, 512),
             (2048, 1536, 512),
-        (32, 64 * 576, 576), (128, 64 * 576, 576)]
+            (32, 64 * 576, 576),
+            (128, 64 * 576, 576)]
 
     def get_input_iter(self, dtype):
         device = flaggems_vllm.runtime.device.name
