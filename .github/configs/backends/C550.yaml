@@ -25,7 +25,7 @@ runner_labels: c550-flaggems-weekly
 use_container: true
 
 # Container image for this backends
-container_image: harbor.baai.ac.cn/flaggems/metax-flaggems-test-c550-flagtree0.7.0_metax3.6:20260920
+container_image: harbor.baai.ac.cn/flagos-app/vllm0.24.0-metax-maca3.8.1.3:2.2.0-0.3.0
 
 # Container volumes to mount for this backends
 container_volumes:
@@ -51,7 +51,7 @@ container_options: >-
 # GPUs to test for this backends
 test_gpus: "0,1,2,3,4,5,6,7"
 
-# Extra environment variables injected only into the "Run weekly tests" step
+# Extra environment variables injected only into the "Run ops tests" step
 test_env:
   PIP_CACHE_DIR: /root/.cache/pip
   MACA_DIRECT_DISPATCH: 1
@@ -61,4 +61,4 @@ test_env:
 gpu_check_script: tools/gpu_check_metax.sh
 
 # Output base directory for this backends
-output_base_dir: /data/flaggems-vllm/weekly
+output_base_dir: /data/github-outputs

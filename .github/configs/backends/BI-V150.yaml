@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # FlagGems backends Configuration
-# This file defines environment settings for weekly testing
+# This file defines environment settings for ops testing
 name: BI-V150
 vendor: Iluvatar
 
@@ -25,7 +25,7 @@ runner_labels: v150-flaggems-weekly
 use_container: true
 
 # Container image for this backends
-container_image: harbor.baai.ac.cn/flagos-app/vllm0.24.0-iluvatar-corex4.5.0:2.2.0-0.3.0rc2.post2
+container_image: harbor.baai.ac.cn/flagos-app/vllm0.24.0-iluvatar-corex4.5.0:2.2.0-0.3.0
 
 # Container volumes to mount for this backends
 container_volumes:
@@ -72,4 +72,4 @@ test_env:
 gpu_check_script: tools/gpu_check_iluvatar.sh
 
 # Output base directory for this backends
-output_base_dir: /data/flaggems-vllm/weekly
+output_base_dir: /data/github-outputs
