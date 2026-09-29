@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # FlagGems backends Configuration
-# This file defines environment settings for weekly testing
+# This file defines environment settings for ops testing
 name: 910B
 vendor: Ascend
 
@@ -25,7 +25,7 @@ runner_labels: 910b-flaggems-weekly
 use_container: true
 
 # Container image for this backends
-container_image: harbor.baai.ac.cn/flaggems/huawei-flaggems-test-910b-flagtree0.6.1rc1-ascend3.5:202608191554
+container_image: harbor.baai.ac.cn/flagos-app/vllm0.24.0-ascend-cann9.0.0:2.2.0-0.3.0
 
 # Container volumes to mount for this backends
 container_volumes:
@@ -67,4 +67,4 @@ test_env:
 gpu_check_script: tools/gpu_check_ascend.sh
 
 # Output base directory for this backends
-output_base_dir: /data/flaggems-vllm/weekly
+output_base_dir: /data/github-outputs

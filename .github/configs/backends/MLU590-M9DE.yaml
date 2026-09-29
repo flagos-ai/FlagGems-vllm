@@ -25,7 +25,7 @@ runner_labels: mlu590-m9de-flaggems-weekly
 use_container: true
 
 # Container image for this backends
-container_image: harbor.baai.ac.cn/flaggems/cambricon-flaggems-test-mlu590-m9de-triton3-2-1:20260618
+container_image: harbor.baai.ac.cn/flaggems/flaggems-test-cambricon-mlu590-m9de:20260929
 
 # Container volumes to mount for this backends
 container_volumes:
@@ -47,7 +47,7 @@ container_options: >-
 # GPUs to test for this backends
 test_gpus: "0,1,2,3,4,5,6,7"
 
-# Extra environment variables injected only into the "Run weekly tests" step
+# Extra environment variables injected only into the "Run ops tests" step
 test_env:
   PIP_CACHE_DIR: /root/.cache/pip
 
@@ -55,4 +55,4 @@ test_env:
 gpu_check_script: tools/gpu_check_cambricon.sh
 
 # Output base directory for this backends
-output_base_dir: /data/flaggems-vllm/weekly
+output_base_dir: /data/github-outputs
