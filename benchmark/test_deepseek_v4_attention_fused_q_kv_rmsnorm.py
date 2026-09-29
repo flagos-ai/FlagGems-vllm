@@ -78,7 +78,9 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
             (128, 1536, 512),
             (512, 1536, 512),
             (2048, 1536, 512),
-        ] + ([(32, 64 * 576, 576), (128, 64 * 576, 576)] if vendor != "ascend" else [])
+            (32, 64 * 576, 576),
+            (128, 64 * 576, 576),
+        ]
 
     def get_input_iter(self, dtype):
         device = flaggems_vllm.runtime.device.name
