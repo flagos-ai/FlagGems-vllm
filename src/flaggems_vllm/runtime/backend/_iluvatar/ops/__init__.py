@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._iluvatar.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.runtime.backend._iluvatar.ops.causal_conv1d_fn import (
+    causal_conv1d_fn,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.causal_conv1d_update import (
+    causal_conv1d_update,
+)
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -31,11 +38,15 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
 
 __all__ = [
+    "add_rms_norm",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
     "fused_q_kv_rmsnorm",
     "fused_add_rms_norm",
     "qwen4_store_qsa_kv_rows",
@@ -44,6 +55,7 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "swiglu",
     "gemma_rms_norm",
     "topk_softplus_sqrt",
 ]

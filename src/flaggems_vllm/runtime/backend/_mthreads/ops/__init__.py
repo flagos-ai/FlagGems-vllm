@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._mthreads.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.runtime.backend._mthreads.ops.causal_conv1d_fn import (
+    causal_conv1d_fn,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.causal_conv1d_update import (
+    causal_conv1d_update,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -45,6 +52,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -53,6 +61,10 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
 )
 
 __all__ = [
+    "add_rms_norm",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
+    "swiglu",
     "w8a8_block_fp8_matmul",
     "SUPPORTED_FP8_DTYPE",
     "fused_inv_rope_fp8_quant",
