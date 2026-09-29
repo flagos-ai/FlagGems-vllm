@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._mthreads.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -53,6 +54,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
 )
 
 __all__ = [
+    "add_rms_norm",
     "w8a8_block_fp8_matmul",
     "SUPPORTED_FP8_DTYPE",
     "fused_inv_rope_fp8_quant",
