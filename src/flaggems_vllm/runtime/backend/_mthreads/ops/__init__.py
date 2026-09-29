@@ -45,6 +45,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -53,6 +54,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
 )
 
 __all__ = [
+    "swiglu",
     "w8a8_block_fp8_matmul",
     "SUPPORTED_FP8_DTYPE",
     "fused_inv_rope_fp8_quant",
