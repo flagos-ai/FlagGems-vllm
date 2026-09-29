@@ -20,7 +20,14 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 
+# Rows at least this wide take the whole-row kernel when the padded block
+# still fits on-chip; wider rows fall back to the chunked loop kernel.
 _LARGE_N_THRESHOLD = 4096
+
+# Empirical per-core Unified Buffer limit for the whole-row kernel: blocks up
+# to 16384 fp32 elements (64KB) compile and run, 32768 (128KB) overflows UB
+# and fails in bishengir (Ascend910B4).
+_LARGE_N_UB_SAFE_BLOCK = 16384
 
 # Below this token count the single-pass whole-row kernel wins: with a handful
 # of programs the two-pass chunk loop cannot hide its second read.
@@ -60,6 +67,9 @@ _ASCEND_TILE_CONFIGS = [
     triton.Config({"TILE_M": 8, "N_BLOCK": 512}, num_warps=4),
     triton.Config({"TILE_M": 8, "N_BLOCK": 512}, num_warps=8),
     triton.Config({"TILE_M": 8, "N_BLOCK": 1024}, num_warps=4),
+    # ultra-wide rows (pruned in below): fewer chunks -> less static unroll
+    triton.Config({"TILE_M": 1, "N_BLOCK": 2048}, num_warps=4),
+    triton.Config({"TILE_M": 2, "N_BLOCK": 2048}, num_warps=4),
 ]
 
 _ASCEND_LARGE_CONFIGS = [
@@ -69,14 +79,24 @@ _ASCEND_LARGE_CONFIGS = [
 
 
 def _prune_tile_configs(configs, named_args, **kwargs):
-    # The chunk loop covers any row width, so a block wider than the widest
-    # row would only add masked lanes. Keep the 256-wide floor configs so the
-    # list is never empty for rows narrower than 256.
     max_size = max(
         kwargs["Q_SIZE"],
         kwargs["KV_SIZE"],
-        256,
     )
+    if max_size > _LARGE_N_UB_SAFE_BLOCK:
+        # Ultra-wide rows route here because the whole-row kernel would
+        # overflow UB. Keep only chunky blocks: the chunk loop is statically
+        # unrolled, so narrow blocks would explode both compile time and
+        # trip count.
+        return [
+            config
+            for config in configs
+            if config.kwargs["N_BLOCK"] >= 1024
+        ]
+    # The chunk loop covers any row width, so a block wider than the widest
+    # row would only add masked lanes. Keep the 256-wide floor configs so the
+    # list is never empty for rows narrower than 256.
+    max_size = max(max_size, 256)
     return [config for config in configs if config.kwargs["N_BLOCK"] <= max_size]
 
 
@@ -567,9 +587,12 @@ def fused_q_kv_rmsnorm(
 
     q_size = qr.shape[1]
     kv_size = kv.shape[1]
+    max_size = max(q_size, kv_size)
 
-    if q_size >= _LARGE_N_THRESHOLD or kv_size >= _LARGE_N_THRESHOLD:
-        return _fused_q_kv_rmsnorm_large(
+    # The single-pass whole-row kernels are only safe (UB) and fast for
+    # narrow rows and few tokens; the chunked loop kernel handles any width.
+    if qr.shape[0] < _SMALL_TOKENS_THRESHOLD and max_size < _LARGE_N_THRESHOLD:
+        return _fused_q_kv_rmsnorm_small(
             qr,
             kv,
             q_weight,
@@ -577,8 +600,11 @@ def fused_q_kv_rmsnorm(
             eps,
         )
 
-    if qr.shape[0] < _SMALL_TOKENS_THRESHOLD:
-        return _fused_q_kv_rmsnorm_small(
+    if (
+        max_size >= _LARGE_N_THRESHOLD
+        and triton.next_power_of_2(max_size) <= _LARGE_N_UB_SAFE_BLOCK
+    ):
+        return _fused_q_kv_rmsnorm_large(
             qr,
             kv,
             q_weight,
