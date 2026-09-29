@@ -46,13 +46,6 @@ _ASCEND_SMALL_CONFIGS = [
     triton.Config({"TILE_M": 1, "N_BLOCK": 4096}, num_warps=4),
 ]
 
-# Tuned on Ascend NPU for DeepSeek-V4 qnorm shapes (q_size=1536, kv_size=512).
-# The kernel walks the row in N_BLOCK chunks, so N_BLOCK no longer has to
-# cover the whole row: 512-wide rows run with zero masked-lane waste and
-# TILE_M fattens programs for large token counts.
-# Keep this list tight: the autotuner's internal timing and the mspti-based
-# benchmark disagree on narrow blocks, so only configs that are fast under
-# both are listed.
 _ASCEND_TILE_CONFIGS = [
     # narrow-row safety floor (rows <= 256 wide)
     triton.Config({"TILE_M": 1, "N_BLOCK": 256}, num_warps=2),
@@ -84,25 +77,13 @@ def _prune_tile_configs(configs, named_args, **kwargs):
         kwargs["KV_SIZE"],
     )
     if max_size > _LARGE_N_UB_SAFE_BLOCK:
-        # Ultra-wide rows route here because the whole-row kernel would
-        # overflow UB. Keep only chunky blocks: the chunk loop is statically
-        # unrolled, so narrow blocks would explode both compile time and
-        # trip count.
-        return [
-            config
-            for config in configs
-            if config.kwargs["N_BLOCK"] >= 1024
-        ]
-    # The chunk loop covers any row width, so a block wider than the widest
-    # row would only add masked lanes. Keep the 256-wide floor configs so the
-    # list is never empty for rows narrower than 256.
+        return [config for config in configs if config.kwargs["N_BLOCK"] >= 1024]
+
     max_size = max(max_size, 256)
     return [config for config in configs if config.kwargs["N_BLOCK"] <= max_size]
 
 
 def _prune_small_configs(configs, named_args, **kwargs):
-    # The single-pass kernel keeps the whole row in registers, so the block
-    # must be at least as wide as the widest row.
     max_size = max(
         kwargs["Q_SIZE"],
         kwargs["KV_SIZE"],
