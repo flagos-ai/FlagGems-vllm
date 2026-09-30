@@ -12,11 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import pytest
 import torch
 
-# vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
-# the entire benchmark is skipped via the skipif marker below.
+# The plain WNA16 quantizer is available without the CUDA Marlin operator.
+try:
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        quantize_weights,
+    )
+    from vllm.scalar_type import scalar_types
+
+    VLLM_QUANT_TYPE = scalar_types.uint4b8
+    HAS_VLLM_QUANT_UTILS = True
+except ImportError:
+    HAS_VLLM_QUANT_UTILS = False
+
+# Marlin imports are needed only for the NVIDIA baseline.
 try:
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
         fused_marlin_moe as vllm_fused_marlin_moe,
@@ -24,12 +36,7 @@ try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
         marlin_quantize,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
-    )
-    from vllm.scalar_type import scalar_types
 
-    VLLM_QUANT_TYPE = scalar_types.uint4b8
     HAS_VLLM_FUSED_MARLIN_MOE = True
 except ImportError:
     HAS_VLLM_FUSED_MARLIN_MOE = False
@@ -68,11 +75,17 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    if flaggems_vllm.vendor_name == "hygon"
+    else HAS_VLLM_QUANT_UTILS
+    and (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name == "mthreads"
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 
 GROUP_SIZE = 128
+MAX_MEAN_RELATIVE_ERROR = 0.04
 
 # -----------------------------------------------------------------------------
 # Hygon path helpers. The Hygon backend consumes plain output-major uint4b8
@@ -306,15 +319,15 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
 
-    Compares FlagGems' Triton wna16 kernel against vLLM's Marlin CUDA kernel.
-    Both consume per-group-128 GPTQ uint4b8 weights (different packed layouts).
+    Uses the same shapes for vendor-native fused MoE baselines. NVIDIA consumes
+    Marlin-packed weights; the MetaX INT4 path consumes plain UINT4B8 bytes.
     """
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
-        # The three production MoE architectures from profile_fused_marlin_moe.py
+        # The four production MoE architectures from profile_fused_marlin_moe.py
         # over the decode token range (1 .. 256).
         self.shapes = [
             # Mixtral-8x7B
@@ -449,7 +462,11 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         w1_q_wna16, w1_scale_wna16 = _wna16_quantize_per_expert(w1_fp)
         w2_q_wna16, w2_scale_wna16 = _wna16_quantize_per_expert(w2_fp)
 
-        if flaggems_vllm.vendor_name == "mthreads":
+        # Only the CUDA Marlin baseline needs a repacked copy.
+        if flaggems_vllm.vendor_name == "metax":
+            w1_q_marlin = w2_q_marlin = None
+            w1_scale_marlin = w2_scale_marlin = None
+        elif flaggems_vllm.vendor_name == "mthreads":
             # MUSA vLLM consumes the same plain INT4 weights as FlagGems.
             w1_q_marlin, w1_scale_marlin = w1_q_wna16, w1_scale_wna16
             w2_q_marlin, w2_scale_marlin = w2_q_wna16, w2_scale_wna16
@@ -469,7 +486,7 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         # vLLM requires fp32 topk_weights; FlagGems wrapper is dtype-agnostic.
 
         # Both ops get the same tuple; each picks what it needs.
-        yield (
+        inputs = (
             hidden_states,
             w1_q_wna16,
             w2_q_wna16,
@@ -482,6 +499,17 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             topk_weights,
             topk_ids,
         )
+        if flaggems_vllm.vendor_name == "metax":
+            flag_gems_output = self.gems_op(*inputs)
+            vllm_output = self.torch_op(*inputs)
+            relative_error = (
+                (flag_gems_output.float() - vllm_output.float()).abs().mean()
+                / vllm_output.float().abs().mean().clamp_min(1e-12)
+            ).item()
+            assert (
+                relative_error < MAX_MEAN_RELATIVE_ERROR
+            ), f"{config}: relative error={relative_error}"
+        yield inputs
 
 
 def _vllm_baseline(
@@ -552,7 +580,7 @@ def _gems_call(
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads")
         else gems_fused_marlin_moe
     )
     return gems_op(
@@ -570,22 +598,59 @@ def _gems_call(
 
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
-@pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
-)
-@pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
-)
 def test_fused_marlin_moe_w4a16_int4():
-    """
-    Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
-    (CUDA Marlin) on Hopper, or vs vLLM native BF16 fused_experts on Hygon.
-    Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
-    """
-    bench = FusedMarlinMoEW4A16INT4Benchmark(
+    """Compare UINT4B8 against the available vendor-native baseline."""
+    if flaggems_vllm.vendor_name == "metax":
+        vllm_moe = pytest.importorskip(
+            "vllm_metax.model_executor.layers.fused_moe.fused_moe"
+        )
+        if vllm_moe.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
+            pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton INT4")
+        if not vllm_moe.mx_envs.USE_PRECOMPILED_KERNEL:
+            pytest.skip("enable the vLLM-MetaX mcoplib Triton INT4 kernel")
+
+        if not HAS_VLLM_QUANT_UTILS:
+            pytest.skip("vLLM WNA16 quantization utilities are unavailable")
+
+        def _vllm_call(
+            hidden,
+            w1,
+            w2,
+            s1,
+            s2,
+            _w1_marlin,
+            _w2_marlin,
+            _s1_marlin,
+            _s2_marlin,
+            weights,
+            ids,
+        ):
+            return vllm_moe.fused_experts_impl(
+                hidden,
+                w1,
+                w2,
+                weights,
+                ids,
+                inplace=False,
+                use_int4_w4a16=True,
+                w1_scale=s1,
+                w2_scale=s2,
+                block_shape=[0, GROUP_SIZE],
+                global_num_experts=w1.size(0),
+            )
+
+        baseline_op, gems_op = _vllm_call, _gems_call
+    else:
+        if not HAS_REQUIRED_VLLM:
+            pytest.skip("required vLLM baseline is unavailable")
+        if not SUPPORTED_DEVICE:
+            pytest.skip("requires NVIDIA Hopper, Hygon, or Moore Threads")
+        baseline_op, gems_op = _vllm_baseline, _gems_call
+
+    benchmark = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16_int4",
-        torch_op=_vllm_baseline,
+        torch_op=baseline_op,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_call)
-    bench.run()
+    benchmark.set_gems(gems_op)
+    benchmark.run()
