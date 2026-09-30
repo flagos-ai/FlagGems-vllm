@@ -158,9 +158,14 @@ def _ascend_block_int8_einsum_kernel(
     m = pm * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     n = pn * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     k = tl.arange(0, 128).to(tl.int64)
-    # Each column tile is contained in one weight-scale group.
-    tl.static_assert(BLOCK_N <= SCALE_N and SCALE_N % BLOCK_N == 0)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    if BLOCK_N > SCALE_N:
+        tl.static_assert(BLOCK_N % SCALE_N == 0)
+        ng = pn * (BLOCK_N // SCALE_N)
+        ng += tl.arange(0, BLOCK_N // SCALE_N).to(tl.int64)
+        acc = tl.zeros((BLOCK_M, BLOCK_N // SCALE_N, SCALE_N), tl.float32)
+    else:
+        tl.static_assert(SCALE_N % BLOCK_N == 0)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for kb in range(tl.cdiv(R, 128)):
         # Arbitrary input/scale strides can exceed INT32 even on a small tile.
         kb64 = kb.to(tl.int64)
@@ -168,7 +173,6 @@ def _ascend_block_int8_einsum_kernel(
         xp = X + m[:, None] * SX[0] + h * SX[1] + r[None, :] * SX[2]
         yp = Y + h * SY[0] + n[None, :] * SY[1] + r[:, None] * SY[2]
         xsp = XS + m * SXS[0] + h * SXS[1] + kb64 * SXS[2]
-        ysp = YS + h * SYS[0] + (pn * BLOCK_N // SCALE_N) * SYS[1] + kb64 * SYS[2]
         if ALIGNED:
             x = tl.load(xp)
             y = tl.load(yp)
@@ -177,12 +181,28 @@ def _ascend_block_int8_einsum_kernel(
             x = tl.load(xp, (m[:, None] < B) & (r[None, :] < R), other=0)
             y = tl.load(yp, (n[None, :] < D) & (r[:, None] < R), other=0)
             xs = tl.load(xsp, m < B, other=0).to(tl.float32)
-        ys = tl.load(ysp).to(tl.float32)
-        row_scale = xs * ys
+        if BLOCK_N > SCALE_N:
+            # Wider tiles amortize the loop while retaining each group's scale.
+            ys = tl.load(
+                YS + h * SYS[0] + ng * SYS[1] + kb64 * SYS[2],
+                ng < tl.cdiv(D, SCALE_N),
+                other=0,
+            ).to(tl.float32)
+            row_scale = xs[:, None] * ys[None, :]
+        else:
+            ysp = YS + h * SYS[0] + (pn * BLOCK_N // SCALE_N) * SYS[1] + kb64 * SYS[2]
+            ys = tl.load(ysp).to(tl.float32)
+            row_scale = xs * ys
         # A K128 signed INT8 partial fits exactly in INT32. Apply this block's
         # FP32 scales before accumulating the next block in FP32.
         partial = tl.dot(x, y, out_dtype=tl.int32).to(tl.float32)
-        acc = tl.fma(partial, row_scale[:, None], acc)
+        if BLOCK_N > SCALE_N:
+            partial = partial.reshape((BLOCK_M, BLOCK_N // SCALE_N, SCALE_N))
+            acc = tl.fma(partial, row_scale[:, :, None], acc)
+        else:
+            acc = tl.fma(partial, row_scale[:, None], acc)
+    if BLOCK_N > SCALE_N:
+        acc = acc.reshape((BLOCK_M, BLOCK_N))
     output = O + (m[:, None] * H + h) * D + n[None, :]
     if ALIGNED:
         tl.store(output, acc)
@@ -264,9 +284,9 @@ def int8_einsum(
 ) -> torch.Tensor:
     """Compute block-scaled INT8 or floating einsum with FP32 accumulation.
 
-    INT8 column tiles share a scalar weight scale and use up to 256 rows per
-    program. Selected input strides use a per-call INT8 copy into HBR storage;
-    scales keep their original layout. Floating inputs use a local BF16/FP16/FP32
+    INT8 tiles use up to 256 rows, or wider columns for small batches while
+    preserving independent weight-scale groups. Selected input strides use a
+    per-call INT8 copy into HBR storage; scales keep their original layout. Floating inputs use a local BF16/FP16/FP32
     compatibility kernel.
     No-copy batch slices bound the logical launch grid; all device offsets use
     INT64. This backend owns validation, output allocation and zero reduction.
@@ -294,6 +314,15 @@ def int8_einsum(
             else (16 if b < 32 else 32)
         )
         bn = min(block_size[0], 128) if is_int8 else 128
+        if (
+            is_int8
+            and block_size[0] == 128
+            and b <= 32
+            and d >= 512
+            and x.stride(2) == 1
+            and y.stride(2) == 1
+        ):
+            bn = 512
         nn = triton.cdiv(d, bn)
         if nn * h > 32768:
             raise NotImplementedError("too many head/column tiles for an Ascend launch")
@@ -329,6 +358,11 @@ def int8_einsum(
                     ALIGNED=aligned,
                     num_warps=4,
                     num_stages=2 if bm >= 128 else 1,
+                    **(
+                        {"unit_flag": True}
+                        if aligned and bm == 256 and bn == 128
+                        else {}
+                    ),
                 )
             else:
                 _ascend_float_einsum_kernel[grid](
