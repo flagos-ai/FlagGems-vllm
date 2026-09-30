@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,17 +22,20 @@ import torch
 import flaggems_vllm
 
 from . import base, conftest
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 # The upstream FP8 einsum shape grid and quantization structure are shared by
-# the floating and low-precision routes. Hygon DCU quantizes to signed INT8.
-IS_HYGON = flaggems_vllm.vendor_name == "hygon"
-pytestmark = pytest.mark.skipif(not IS_HYGON, reason="Hygon DCU int8_einsum backend")
+# the floating and low-precision routes. Hygon and MetaX quantize to signed INT8.
+IS_SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "metax")
+pytestmark = pytest.mark.skipif(
+    not IS_SUPPORTED_VENDOR, reason="requires Hygon or MetaX int8_einsum"
+)
 EINSUM_LOW_PRECISION_DTYPE = torch.int8
 DEFAULT_BLOCK_SHAPE = (128, 128)
 
 
 def _einsum_low_precision_available():
-    if IS_HYGON:
+    if IS_SUPPORTED_VENDOR:
         return torch.cuda.is_available()
     return False
 
@@ -124,7 +129,7 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
 
 
 class INT8EinsumBenchmark(base.Benchmark):
-    """Benchmark for block-wise INT8 ``bhr,hdr->bhd`` einsum on Hygon DCU."""
+    """Benchmark for block-wise INT8 ``bhr,hdr->bhd`` einsum."""
 
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
 
@@ -133,7 +138,36 @@ class INT8EinsumBenchmark(base.Benchmark):
         self.block_shape = DEFAULT_BLOCK_SHAPE
 
     def set_shapes(self, shape_file_path=None):
-        # (b, h, r, d)
+        default_shape_file = Path(__file__).with_name(self.DEFAULT_SHAPE_FILES)
+        shape_file = (
+            default_shape_file
+            if shape_file_path in (None, self.DEFAULT_SHAPE_FILES)
+            else Path(shape_file_path)
+        )
+        if shape_file.resolve() != default_shape_file.resolve():
+            return super().set_shapes(str(shape_file))
+        if flaggems_vllm.vendor_name == "metax":
+            # Keep the measured contraction without changing the shared shape grid.
+            batches = (
+                1,
+                2,
+                4,
+                *range(8, 257, 8),
+                *range(272, 513, 16),
+                1028,
+                2048,
+                3076,
+                3805,
+                4100,
+                12991,
+                13005,
+                13021,
+                16384,
+            )
+            self.shapes = [(batch, 1, 4096, 1024) for batch in batches]
+            self.shape_desc = "(b, h, r, d)"
+            return
+        # Preserve the historical Hygon workload.
         batches = (1, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, 32768)
         hrd_groups = {
             "flash": (8, 4096, 1024),
@@ -155,6 +189,30 @@ class INT8EinsumBenchmark(base.Benchmark):
         b, h, r = x_data.shape
         d = y_data.shape[1]
         return 2.0 * b * h * r * d
+
+
+class ParallelINT8EinsumBenchmark(ParallelBenchmarkMixin, INT8EinsumBenchmark):
+    """Use the existing benchmark worker scheduling for exported shapes."""
+
+
+def metax_vllm_einsum_bf16(
+    x: torch.Tensor,
+    xs: torch.Tensor | None,
+    y: torch.Tensor,
+    ys: torch.Tensor | None,
+    x_bf16: torch.Tensor,
+    y_bf16: torch.Tensor,
+) -> torch.Tensor:
+    # vllm_metax.utils.deep_gemm.bf16_einsum invokes this native entry point.
+    import deep_gemm
+
+    output = torch.empty(
+        (x_bf16.shape[0], x_bf16.shape[1], y_bf16.shape[1]),
+        dtype=torch.bfloat16,
+        device=x_bf16.device,
+    )
+    deep_gemm.einsum("bhr,hdr->bhd", x_bf16, y_bf16, output)
+    return output
 
 
 def _gems_einsum_precision_wrapper(x, xs, y, ys, x_bf16, y_bf16):
@@ -187,8 +245,21 @@ def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
 def test_perf_int8_einsum(dtype):
     low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
     if low_precision and not _einsum_low_precision_available():
-        pytest.skip("requires Hygon DCU INT8 support")
+        pytest.skip("requires Hygon or MetaX INT8 support")
     op_name = "int8_einsum" if low_precision else "einsum"
+    if flaggems_vllm.vendor_name == "metax":
+        if not low_precision:
+            pytest.skip("MetaX int8_einsum accepts INT8 inputs only")
+        if importlib.util.find_spec("deep_gemm") is None:
+            pytest.skip(
+                "MetaX vLLM BF16 baseline requires the native deep_gemm package"
+            )
+        bench = ParallelINT8EinsumBenchmark(
+            op_name=op_name, torch_op=metax_vllm_einsum_bf16, dtypes=[dtype]
+        )
+        bench.set_gems(_gems_einsum_precision_wrapper)
+        bench.run()
+        return
     baselines = [("torch_bf16", _torch_einsum_bf16_wrapper)]
     if low_precision:
         baselines.append(("flaggems_bf16", _gems_einsum_bf16_wrapper))
