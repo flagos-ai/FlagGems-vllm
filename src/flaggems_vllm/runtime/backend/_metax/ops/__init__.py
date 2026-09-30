@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
+    cp_gather_indexer_k_quant_cache,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -35,6 +38,7 @@ from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_in
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
+    "cp_gather_indexer_k_quant_cache",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "qwen4_store_qsa_kv_rows",
