@@ -260,11 +260,17 @@ def test_perf_int8_einsum(dtype):
         baselines.append(("flaggems_bf16", _gems_einsum_bf16_wrapper))
     elif low_precision and flaggems_vllm.vendor_name == "ascend":
         baselines = [
-            ("vllm_bf16_predequantized", _vllm_einsum_bf16_predequantized_wrapper)
+            ("vllm_bf16_predequantized", _vllm_einsum_bf16_predequantized_wrapper),
+            ("flaggems_bf16", _gems_einsum_bf16_wrapper),
         ]
     for baseline_name, baseline in baselines:
         previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
-        bench = INT8EinsumBenchmark(op_name=op_name, torch_op=baseline, dtypes=[dtype])
+        bench = INT8EinsumBenchmark(
+            op_name=op_name,
+            torch_op=baseline,
+            dtypes=[dtype],
+            preserve_bf16=baseline_name == "flaggems_bf16",
+        )
         bench.set_gems(_gems_einsum_precision_wrapper)
         bench.run()
         # Keep the public operator ID exact; distinguish references as metadata.
@@ -275,29 +281,6 @@ def test_perf_int8_einsum(dtype):
             if baseline_name == "vllm_bf16_predequantized":
                 detail["activation_dequantization"] = "outside_timing"
                 detail["weight_dequantization"] = "outside_timing"
-
-
-if flaggems_vllm.vendor_name == "ascend":
-
-    @pytest.mark.int8_einsum
-    def test_perf_int8_einsum_flaggems_bf16():
-        """Match Hygon's BF16 baseline using this port's floating compatibility path.
-
-        This is not the separate flag_gems.bmm implementation. Both original BF16
-        tensors are retained, and quantization happens outside the measured calls.
-        """
-        op_name = "int8_einsum"
-        previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
-        bench = INT8EinsumBenchmark(
-            op_name=op_name,
-            torch_op=_gems_einsum_bf16_wrapper,
-            dtypes=[EINSUM_LOW_PRECISION_DTYPE],
-            preserve_bf16=True,
-        )
-        bench.set_gems(_gems_einsum_precision_wrapper)
-        bench.run()
-        for detail in conftest.TEST_RESULTS.get(op_name, {}).get("details", [])[
-            previous:
-        ]:
-            detail["baseline"] = "flaggems_bf16"
-            detail["baseline_implementation"] = "int8_einsum_float_compat"
+            elif baseline_name == "flaggems_bf16" and not IS_HYGON:
+                # This is the local floating compatibility path, not flag_gems.bmm.
+                detail["baseline_implementation"] = "int8_einsum_float_compat"

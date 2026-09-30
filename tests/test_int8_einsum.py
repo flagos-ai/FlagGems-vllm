@@ -25,6 +25,10 @@ from benchmark.test_int8_einsum import (
 
 from .conftest import QUICK_MODE
 
+pytestmark = pytest.mark.skipif(
+    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
+)
+
 _EINSUM_BATCHES = (1, 4, 8, 16, 32, 64, 128)
 if not QUICK_MODE:
     _EINSUM_BATCHES += (4096, 8192, 16384, 32768)
@@ -34,9 +38,6 @@ _EINSUM_BLOCK_SHAPES = [
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
-)
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
 def test_accuracy_int8_einsum(shape):
     x, xs, y, ys, xf, yf = _make_block_einsum_inputs(
@@ -76,9 +77,6 @@ def test_accuracy_int8_einsum(shape):
 
 
 @pytest.mark.einsum
-@pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
-)
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_einsum_precision_route(shape, dtype):
@@ -94,9 +92,6 @@ def test_einsum_precision_route(shape, dtype):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
-)
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
 @pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
 def test_int8_einsum_layouts(shape, layout):
@@ -133,9 +128,6 @@ def test_int8_einsum_layouts(shape, layout):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
-)
 @pytest.mark.parametrize("shape", [(0, 2, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)])
 @pytest.mark.parametrize(
     "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
@@ -159,9 +151,6 @@ def test_int8_einsum_empty(shape, dtype):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
-)
 def test_int8_einsum_validation_and_extremes():
     x = torch.full((16, 2, 64), -128, dtype=torch.int8, device=flaggems_vllm.device)
     y = torch.full((2, 32, 64), 127, dtype=torch.int8, device=x.device)
