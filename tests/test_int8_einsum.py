@@ -35,7 +35,7 @@ _EINSUM_BLOCK_SHAPES = [
 
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires Hygon DCU INT8"
+    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
 )
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
 def test_accuracy_int8_einsum(shape):
@@ -48,23 +48,25 @@ def test_accuracy_int8_einsum(shape):
     assert torch.isfinite(out).all()
     rows = torch.linspace(0, b - 1, min(b, 32), device=x.device).long()
     cols = torch.linspace(0, d - 1, min(d, 32), device=x.device).long()
-    kk = torch.arange(r, device=x.device) // 128
-    xd = x[rows].float() * xs[rows][:, :, kk]
-    yd = y[:, cols].float() * ys[:, cols // 128, :][:, :, kk]
+    kk = torch.arange(r) // 128
+    xd = x[rows].cpu().float() * xs[rows].cpu()[:, :, kk]
+    yd = y[:, cols].cpu().float() * ys[:, cols // 128, :].cpu()[:, :, kk]
     ref = torch.einsum("bhr,hdr->bhd", xd, yd)
-    original = torch.einsum("bhr,hdr->bhd", xf[rows].float(), yf[:, cols].float())
-    sampled = out[rows][:, :, cols].float()
+    original = torch.einsum(
+        "bhr,hdr->bhd", xf[rows].cpu().float(), yf[:, cols].cpu().float()
+    )
+    sampled = out[rows][:, :, cols].cpu().float()
     nrms = ((sampled - ref).square().mean() / ref.square().mean()).sqrt().item()
     total = (
         ((sampled - original).square().mean() / original.square().mean()).sqrt().item()
     )
     print(f"shape={shape} dequant_nrms={nrms:.6f} total_nrms={total:.6f}")
-    limit = 0.10 if flaggems_vllm.vendor_name == "hygon" else 0.20
+    limit = 0.10
     assert nrms < limit and total < limit
     # Validate the floating precision route for the same layouts, including
     # the largest interleaved input whose element offsets exceed int32.
     floating = _gems_einsum_bf16_wrapper(xf, None, yf, None, xf, yf)
-    floating_sample = floating[rows][:, :, cols].float()
+    floating_sample = floating[rows][:, :, cols].cpu().float()
     floating_nrms = (
         ((floating_sample - original).square().mean() / original.square().mean())
         .sqrt()
@@ -75,7 +77,7 @@ def test_accuracy_int8_einsum(shape):
 
 @pytest.mark.einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU precision dispatch"
+    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
 )
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -86,13 +88,15 @@ def test_einsum_precision_route(shape, dtype):
     out = flaggems_vllm.int8_einsum(
         "bhr,hdr->bhd", x, None, y, None, output_dtype=dtype
     )
-    ref = torch.einsum("bhr,hdr->bhd", x.float(), y.float())
-    error = ((out.float() - ref).square().mean() / ref.square().mean()).sqrt()
+    ref = torch.einsum("bhr,hdr->bhd", x.cpu().float(), y.cpu().float())
+    error = ((out.cpu().float() - ref).square().mean() / ref.square().mean()).sqrt()
     assert error.item() < 0.01
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
+@pytest.mark.skipif(
+    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
+)
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
 @pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
 def test_int8_einsum_layouts(shape, layout):
@@ -117,17 +121,21 @@ def test_int8_einsum_layouts(shape, layout):
     xs = torch.rand((b, h, (r + 127) // 128), device=x.device) * 0.01
     ys = torch.rand((h, (d + 127) // 128, (r + 127) // 128), device=x.device) * 0.01
     out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
-    kk = torch.arange(r, device=x.device) // 128
-    nn = torch.arange(d, device=x.device) // 128
+    kk = torch.arange(r) // 128
+    nn = torch.arange(d) // 128
     ref = torch.einsum(
-        "bhr,hdr->bhd", x.float() * xs[:, :, kk], y.float() * ys[:, nn, :][:, :, kk]
+        "bhr,hdr->bhd",
+        x.cpu().float() * xs.cpu()[:, :, kk],
+        y.cpu().float() * ys.cpu()[:, nn, :][:, :, kk],
     )
-    nrms = ((out.float() - ref).square().mean() / ref.square().mean()).sqrt()
+    nrms = ((out.cpu().float() - ref).square().mean() / ref.square().mean()).sqrt()
     assert torch.isfinite(out).all() and nrms.item() < 0.10
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
+@pytest.mark.skipif(
+    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
+)
 @pytest.mark.parametrize("shape", [(0, 2, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)])
 @pytest.mark.parametrize(
     "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
@@ -151,7 +159,9 @@ def test_int8_einsum_empty(shape, dtype):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
+@pytest.mark.skipif(
+    not _einsum_low_precision_available(), reason="requires an INT8 einsum backend"
+)
 def test_int8_einsum_validation_and_extremes():
     x = torch.full((16, 2, 64), -128, dtype=torch.int8, device=flaggems_vllm.device)
     y = torch.full((2, 32, 64), 127, dtype=torch.int8, device=x.device)
@@ -159,8 +169,10 @@ def test_int8_einsum_validation_and_extremes():
     xs = torch.full((16, 2, 1), 0.5, device=x.device)
     ys = torch.full((2, 1, 1), 0.25, device=x.device)
     out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
-    ref = (torch.einsum("bhr,hdr->bhd", x.float(), y.float()) * 0.125).bfloat16()
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    ref = (
+        torch.einsum("bhr,hdr->bhd", x.cpu().float(), y.cpu().float()) * 0.125
+    ).bfloat16()
+    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
     with pytest.raises(ValueError, match="equation|supports"):
         flaggems_vllm.int8_einsum("bij,bjk->bik", x, xs, y, ys)
     with pytest.raises(ValueError, match="scale"):

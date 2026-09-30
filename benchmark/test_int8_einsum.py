@@ -21,18 +21,18 @@ import flaggems_vllm
 
 from . import base, conftest
 
-# The upstream FP8 einsum shape grid and quantization structure are shared by
-# the floating and low-precision routes. Hygon DCU quantizes to signed INT8.
+# The floating and quantized routes share the original einsum shape grid.
 IS_HYGON = flaggems_vllm.vendor_name == "hygon"
-pytestmark = pytest.mark.skipif(not IS_HYGON, reason="Hygon DCU int8_einsum backend")
+SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "ascend")
+pytestmark = pytest.mark.skipif(
+    not SUPPORTED_VENDOR, reason="requires an INT8 einsum backend"
+)
 EINSUM_LOW_PRECISION_DTYPE = torch.int8
 DEFAULT_BLOCK_SHAPE = (128, 128)
 
 
 def _einsum_low_precision_available():
-    if IS_HYGON:
-        return torch.cuda.is_available()
-    return False
+    return SUPPORTED_VENDOR and flaggems_vllm.runtime.torch_device_fn.is_available()
 
 
 def _cast_einsum_low_precision(x):
@@ -98,7 +98,7 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
     """Build upstream per-token x and per-block y inputs for bhr,hdr->bhd.
 
     Return x, xs, y, ys and the two original BF16 tensors used by baselines.
-    Hygon DCU quantized inputs are signed INT8.
+    Quantized inputs are signed INT8.
     """
     block_n, block_k = block_shape
     torch.manual_seed(seed)
@@ -124,13 +124,20 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
 
 
 class INT8EinsumBenchmark(base.Benchmark):
-    """Benchmark for block-wise INT8 ``bhr,hdr->bhd`` einsum on Hygon DCU."""
+    """Benchmark block-wise INT8 einsum against explicit BF16 timing boundaries.
+
+    Ascend uses the vLLM BF16 equivalent because its installed model path
+    does not expose this prequantized block-128 INT8 contraction. Activations
+    and weights use the same quantized effective values and are both prepared
+    outside timing. The Hygon baseline groups retain their original behavior.
+    """
 
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
 
-    def __init__(self, op_name, torch_op, dtypes):
+    def __init__(self, op_name, torch_op, dtypes, preserve_bf16=False):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
         self.block_shape = DEFAULT_BLOCK_SHAPE
+        self.preserve_bf16 = preserve_bf16
 
     def set_shapes(self, shape_file_path=None):
         # (b, h, r, d)
@@ -146,9 +153,20 @@ class INT8EinsumBenchmark(base.Benchmark):
     def get_input_iter(self, cur_dtype):
         device = flaggems_vllm.device
         for b, h, r, d in self.shapes:
-            yield _make_block_einsum_inputs(
+            x, xs, y, ys, x_bf16, y_bf16 = _make_block_einsum_inputs(
                 b, h, r, d, self.block_shape, device, cur_dtype
             )
+            if (
+                cur_dtype == EINSUM_LOW_PRECISION_DTYPE
+                and flaggems_vllm.vendor_name == "ascend"
+                and not self.preserve_bf16
+            ):
+                # Release the unquantized activation before preparing the baseline.
+                x_bf16 = None
+                x_bf16 = _dequantize_einsum_activation(x, xs)
+                y_bf16 = _dequantize_einsum_weight(y, ys, self.block_shape)
+                y_bf16 = y_bf16.transpose(1, 2).contiguous()
+            yield x, xs, y, ys, x_bf16, y_bf16
 
     def get_tflops(self, op, *args, **kwargs):
         x_data, _, y_data, _, _, _ = args
@@ -173,6 +191,54 @@ def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
     return flaggems_vllm.int8_einsum("bhr,hdr->bhd", x_bf16, None, y_bf16, None)
 
 
+def _dequantize_einsum_weight(y, ys, block_shape):
+    """Prepare static BF16 weights from the actual INT8 values and scales."""
+    block_n, block_k = block_shape
+    h, d, r = y.shape
+    weight = torch.empty(y.shape, dtype=torch.bfloat16, device=y.device)
+    # Every original benchmark shape is divisible by its 128x128 scale grid.
+    for head in range(h):
+        blocks = y[head].view(d // block_n, block_n, r // block_k, block_k)
+        effective = blocks.float() * ys[head, :, None, :, None]
+        weight[head].copy_(effective.reshape(d, r))
+    return weight
+
+
+def _dequantize_einsum_activation(x, xs, block_k=128):
+    """Prepare BF16 activations without a full-size FP32 intermediate."""
+    b, h, r = x.shape
+    activation = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    batch_chunk = max(1, (1 << 26) // (h * r))
+    for start in range(0, b, batch_chunk):
+        end = min(start + batch_chunk, b)
+        shape = (end - start, h, r // block_k, block_k)
+        blocks = x[start:end].view(shape)
+        torch.mul(
+            blocks,
+            xs[start:end, :, :, None],
+            out=activation[start:end].view(shape),
+        )
+    return activation
+
+
+def _vllm_einsum_bf16_predequantized_wrapper(x, xs, y, ys, x_bf16, y_bf16):
+    """Time only the model contraction on prepared BF16 effective inputs."""
+    import torch_npu
+
+    # vllm_ascend/attention/dsa_v1.py uses this output-projection primitive;
+    # its loader prepares static weights as contiguous [H,R,D].
+    return torch_npu.npu_transpose_batchmatmul(
+        x_bf16,
+        y_bf16,
+        bias=None,
+        scale=None,
+        perm_x1=(1, 0, 2),
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+        batch_split_factor=1,
+    )
+
+
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -187,11 +253,15 @@ def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
 def test_perf_int8_einsum(dtype):
     low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
     if low_precision and not _einsum_low_precision_available():
-        pytest.skip("requires Hygon DCU INT8 support")
+        pytest.skip("requires an INT8 einsum backend")
     op_name = "int8_einsum" if low_precision else "einsum"
     baselines = [("torch_bf16", _torch_einsum_bf16_wrapper)]
-    if low_precision:
+    if low_precision and IS_HYGON:
         baselines.append(("flaggems_bf16", _gems_einsum_bf16_wrapper))
+    elif low_precision and flaggems_vllm.vendor_name == "ascend":
+        baselines = [
+            ("vllm_bf16_predequantized", _vllm_einsum_bf16_predequantized_wrapper)
+        ]
     for baseline_name, baseline in baselines:
         previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
         bench = INT8EinsumBenchmark(op_name=op_name, torch_op=baseline, dtypes=[dtype])
@@ -202,3 +272,32 @@ def test_perf_int8_einsum(dtype):
             previous:
         ]:
             detail["baseline"] = baseline_name
+            if baseline_name == "vllm_bf16_predequantized":
+                detail["activation_dequantization"] = "outside_timing"
+                detail["weight_dequantization"] = "outside_timing"
+
+
+if flaggems_vllm.vendor_name == "ascend":
+
+    @pytest.mark.int8_einsum
+    def test_perf_int8_einsum_flaggems_bf16():
+        """Match Hygon's BF16 baseline using this port's floating compatibility path.
+
+        This is not the separate flag_gems.bmm implementation. Both original BF16
+        tensors are retained, and quantization happens outside the measured calls.
+        """
+        op_name = "int8_einsum"
+        previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
+        bench = INT8EinsumBenchmark(
+            op_name=op_name,
+            torch_op=_gems_einsum_bf16_wrapper,
+            dtypes=[EINSUM_LOW_PRECISION_DTYPE],
+            preserve_bf16=True,
+        )
+        bench.set_gems(_gems_einsum_precision_wrapper)
+        bench.run()
+        for detail in conftest.TEST_RESULTS.get(op_name, {}).get("details", [])[
+            previous:
+        ]:
+            detail["baseline"] = "flaggems_bf16"
+            detail["baseline_implementation"] = "int8_einsum_float_compat"
