@@ -23,6 +23,11 @@ from . import accuracy_utils as utils
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
+IS_HOPPER = (
+    vendor_name == "nvidia"
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 9
+)
 
 
 # Following varlen and paged attn tests are copied from
@@ -196,7 +201,7 @@ def test_flash_attn_varlen_func(
         else:
             alibi_slopes, attn_bias = None, None
 
-        if vendor_name == "cambricon":
+        if vendor_name == "cambricon" or IS_HOPPER:
             output = flaggems_vllm.flash_attn_varlen_func(
                 q=query,
                 k=key_cache,
@@ -211,7 +216,7 @@ def test_flash_attn_varlen_func(
                 block_table=block_tables,
                 softcap=soft_cap if soft_cap is not None else 0,
                 alibi_slopes=alibi_slopes,
-                fa_version=2,
+                fa_version=3 if IS_HOPPER else 2,
             )
         else:
             if optimize_init:
@@ -322,7 +327,7 @@ def test_flash_attn_varlen_func_swap_qg(
             device=device,
         )
 
-        if vendor_name == "cambricon":
+        if vendor_name == "cambricon" or IS_HOPPER:
             output = flaggems_vllm.flash_attn_varlen_func(
                 q=query,
                 k=key_cache,
@@ -336,7 +341,7 @@ def test_flash_attn_varlen_func_swap_qg(
                 window_size=window_size,
                 block_table=block_tables,
                 softcap=soft_cap if soft_cap is not None else 0,
-                fa_version=2,
+                fa_version=3 if IS_HOPPER else 2,
             )
         else:
             output = flaggems_vllm.ops.flash_attn_varlen_func(
