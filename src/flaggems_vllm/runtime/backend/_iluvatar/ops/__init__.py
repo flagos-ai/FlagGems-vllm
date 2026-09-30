@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._iluvatar.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -36,6 +37,7 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
 )
 
 __all__ = [
+    "add_rms_norm",
     "fused_q_kv_rmsnorm",
     "fused_add_rms_norm",
     "qwen4_store_qsa_kv_rows",
