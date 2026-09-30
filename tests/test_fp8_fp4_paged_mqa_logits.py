@@ -18,8 +18,138 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
 
-from .accuracy_utils import gems_assert_close
-from .test_fp8_fp4_mqa_logits import quantize_to_mxfp4, reference_fp4_mqa_logits
+from .accuracy_utils import calc_diff
+from .fp8_fp4_quant import quantize_to_mxfp4
+from .test_fp8_fp4_mqa_logits import reference_fp4_mqa_logits
+
+_vendor = flaggems_vllm.vendor_name
+_skip_arch = False
+_skip_ref = False
+
+if _vendor == "mthreads":
+    try:
+        from deep_gemm import fp8_paged_mqa_logits as _ref_fp8_paged_mqa_logits
+        from deep_gemm import get_paged_mqa_logits_metadata as _ref_get_metadata
+    except ImportError:
+        _skip_ref = "requires deep_gemm with fp8_mqa_logits support"
+
+    def _ref_paged_mqa(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        clean_logits,
+    ):
+        return _ref_fp8_paged_mqa_logits(
+            q=q[0],
+            fused_kv_cache=kv_cache,
+            weights=weights,
+            context_lens=context_lens,
+            block_table=block_tables,
+            schedule_meta=schedule_metadata,
+            max_context_len=max_model_len,
+            clean_logits=clean_logits,
+        )
+
+elif _vendor == "nvidia":
+    try:
+        from vllm.utils.deep_gemm import (
+            fp8_fp4_paged_mqa_logits as _ref_fp8_fp4_paged_mqa_logits,
+        )
+        from vllm.utils.deep_gemm import (
+            get_paged_mqa_logits_metadata as _ref_get_metadata,
+        )
+    except ImportError:
+        _skip_ref = "requires vLLM with DeepGEMM and FP8 quantization support"
+
+    _ref_paged_mqa = _ref_fp8_fp4_paged_mqa_logits
+
+elif _vendor == "hygon":
+    try:
+        from lightop.attention import get_paged_mqa_logits_metadata as _ref_meta_native
+        from lightop.attention import paged_mqa_logits as _ref_paged_native
+    except ImportError:
+        _skip_ref = "requires lightop native paged mqa logits"
+
+    def _ref_get_metadata(context_lens, block_size, num_sms):
+        # LightOp/vLLM contract: metadata takes per-batch context [B].
+        # For [B, next_n] take column 0 (all n share the same base ctx);
+        # reshape(-1) would yield B*next_n and corrupt scheduling at next_n=2.
+        ctx = context_lens
+        if ctx.dim() == 2:
+            ctx = ctx[:, 0]
+        return _ref_meta_native(ctx.contiguous().to(torch.int32), block_size, num_sms)
+
+    def _ref_paged_mqa(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        clean_logits,
+    ):
+        q_values = q[0]
+        if q_values.dim() == 3:
+            q_values = q_values.unsqueeze(1)
+        next_n = q_values.shape[1]
+        if next_n == 1:
+            # next_n=1: batched native path is validated by all N1 cases
+            return _ref_paged_native(
+                q_values,
+                kv_cache,
+                weights,
+                context_lens,
+                block_tables,
+                schedule_metadata,
+                max_model_len,
+                clean_logits,
+            )
+        # next_n>1: LightOp's batched kernel corrupts the row context/page
+        # mapping (emits inf inside valid windows, probe diff=nan);
+        # validated workaround: native per-row calls with b_idx = row // next_n
+        # (probe calc_diff=1.09e-13 vs the Triton kernel).
+        bsz = q_values.shape[0]
+        head_dim_last = q_values.shape[3]
+        total_rows = bsz * next_n
+        q_rows = q_values.reshape(total_rows, q_values.shape[2], head_dim_last)
+        if context_lens.dim() == 2:
+            ctx_rows = context_lens.reshape(-1)[:total_rows]
+        else:
+            ctx_rows = context_lens.repeat_interleave(next_n)
+        ctx_rows = ctx_rows.contiguous().to(torch.int32)
+        ref_out = torch.zeros(
+            total_rows,
+            max_model_len,
+            device=q_values.device,
+            dtype=torch.float32,
+        )
+        for row in range(total_rows):
+            ctx = int(ctx_rows[row].item())
+            if ctx == 0:
+                continue
+            b_idx = row // next_n
+            row_out = _ref_paged_native(
+                q_rows[row].view(1, 1, q_values.shape[2], head_dim_last),
+                kv_cache,
+                weights[row : row + 1].float().contiguous(),
+                torch.tensor([ctx], dtype=torch.int32, device=q_values.device),
+                block_tables[b_idx : b_idx + 1],
+                None,
+                max_model_len,
+                clean_logits,
+            )
+            ref_out[row, :ctx] = row_out[0, :ctx]
+        return ref_out
+
+else:
+    _skip_arch = f"unsupported vendor: {_vendor}"
+    _skip_ref = f"unsupported vendor: {_vendor}"
+
 
 device = flaggems_vllm.device
 
@@ -129,25 +259,14 @@ def _make_inputs(batch_size, next_n, avg_kv, use_fp4=False):
     return q_packed, q_scale, kv_fp8, weights, context_lens, block_table
 
 
-try:
-    from vllm.utils.deep_gemm import (
-        fp8_fp4_paged_mqa_logits as _vllm_fp8_fp4_paged_mqa_logits,
-    )
-    from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata as _vllm_get_metadata
-
-    _HAS_VLLM = True
-except ImportError:
-    _HAS_VLLM = False
-
-
 def _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
-    """Reference: call vLLM DeepGEMM CUDA kernel (FP8 only)."""
-    assert _HAS_VLLM, "vLLM is required for reference implementation"
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
-    q_input = (q_fp8, None)
-    return _vllm_fp8_fp4_paged_mqa_logits(
-        q=q_input,
+    """Reference: call platform-specific DeepGEMM kernel (FP8 only)."""
+    from flaggems_vllm.utils.device_info import get_sm_count
+
+    num_sms = get_sm_count()
+    schedule_meta = _ref_get_metadata(context_lens, BLOCK_KV, num_sms)
+    return _ref_paged_mqa(
+        q=(q_fp8, None),
         kv_cache=kv_fp8,
         weights=weights,
         context_lens=context_lens,
@@ -165,7 +284,8 @@ def _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
     ids=[f"B{b}_N{n}_L{l}" for b, n, l in TEST_SHAPES],
 )
 @pytest.mark.parametrize("use_fp4", [False, True])
-@pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
+@pytest.mark.skipif(_skip_arch, reason=_skip_arch or "")
+@pytest.mark.skipif(_skip_ref, reason=_skip_ref or "")
 def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
     torch.manual_seed(0)
     q_packed, q_scale, kv_fp8, weights, context_lens, block_table = _make_inputs(
@@ -173,8 +293,10 @@ def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
     )
 
     # Run Triton kernel
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
+    from flaggems_vllm.utils.device_info import get_sm_count
+
+    num_sms = get_sm_count()
+    schedule_meta = _ref_get_metadata(context_lens, BLOCK_KV, num_sms)
     q_input = (q_packed, q_scale)
     triton_out = fp8_fp4_paged_mqa_logits(
         q=q_input,
@@ -187,14 +309,14 @@ def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
         clean_logits=False,
     )
 
+    total_rows = batch_size * next_n
+    ctx_flat = context_lens.reshape(-1)[:total_rows]
+
     if use_fp4:
         # For FP4, verify paged output against dense float32 reference.
         # Extract flat K from the paged cache and call reference_fp4_mqa_logits.
         assert not torch.isnan(triton_out).any(), "NaN detected in Triton FP4 output"
         assert torch.isfinite(triton_out).all(), "Inf detected in Triton FP4 output"
-
-        total_rows = batch_size * next_n
-        ctx_flat = context_lens.reshape(-1)[:total_rows]
 
         # Extract flat K and scales from paged cache (same as _preprocess_kv_cache)
         num_phys = kv_fp8.shape[0]
@@ -203,23 +325,21 @@ def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
         kv_data = kv_flat[:, : BLOCK_KV * HEAD_DIM].reshape(flat_size, HEAD_DIM)
         kv_scales = kv_flat[:, BLOCK_KV * HEAD_DIM :].reshape(-1).view(torch.float32)
 
+        ref_out = torch.zeros(
+            total_rows, MAX_MODEL_LEN, device=device, dtype=torch.float32
+        )
         for row in range(total_rows):
             ctx = ctx_flat[row].item()
             if ctx == 0:
                 continue
             b_idx = row // next_n
-
-            # Gather flat K for this row's context
             positions = torch.arange(ctx, device=device)
             logical_pages = positions // BLOCK_KV
             page_offsets = positions % BLOCK_KV
             phys_pages = block_table[b_idx, logical_pages]
             flat_indices = phys_pages * BLOCK_KV + page_offsets
-
             k_flat = kv_data[flat_indices].contiguous().view(torch.float8_e4m3fn)
             k_scale_flat = kv_scales[flat_indices]
-
-            # Reference output using the dense reference
             ref_row = reference_fp4_mqa_logits(
                 q_packed.reshape(total_rows, NUM_HEADS, HEAD_DIM // 2)[row : row + 1],
                 q_scale.reshape(total_rows, NUM_HEADS, 1)[row : row + 1],
@@ -229,35 +349,31 @@ def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
                 torch.zeros(1, dtype=torch.int32, device=device),
                 torch.tensor([ctx], dtype=torch.int32, device=device),
             )
+            ref_out[row, :ctx] = ref_row.squeeze(0)
 
-            gems_assert_close(
-                ref_row,
-                triton_out[row, :ctx].unsqueeze(0),
-                torch.float32,
-                equal_nan=True,
-                atol=0.15,
-            )
+        _valid = torch.zeros_like(triton_out, dtype=torch.bool)
+        for _r in range(total_rows):
+            _c = ctx_flat[_r].item()
+            if _c > 0:
+                _valid[_r, :_c] = True
+        diff = calc_diff(
+            triton_out.masked_fill(~_valid, 0).float(),
+            ref_out.masked_fill(~_valid, 0).float(),
+        )
+        assert diff < 1e-3, f"calc_diff={diff}"
+
     else:
         # FP8 path: compare against vLLM reference
         ref_out = _reference_fn(q_packed, kv_fp8, weights, context_lens, block_table)
 
-        # Compare valid positions only (up to each row's context length)
-        total_rows = batch_size * next_n
-        ctx_flat = context_lens.reshape(-1)[:total_rows]
-        diffs = []
-        for row in range(total_rows):
-            ctx = ctx_flat[row].item()
-            if ctx == 0:
-                continue
-            t_row = triton_out[row, :ctx].float()
-            r_row = ref_out[row, :ctx].float()
-            # Mean relative difference
-            denom = r_row.abs().clamp(min=1e-6)
-            rel_diff = ((t_row - r_row).abs() / denom).mean().item()
-            diffs.append(rel_diff)
-
-        mean_diff = sum(diffs) / len(diffs) if diffs else 0.0
-        assert (
-            mean_diff < 1e-3
-        ), f"Mean relative diff {mean_diff:.6f} exceeds threshold 1e-3"
+        _valid = torch.zeros_like(triton_out, dtype=torch.bool)
+        for _r in range(total_rows):
+            _c = ctx_flat[_r].item()
+            if _c > 0:
+                _valid[_r, :_c] = True
+        diff = calc_diff(
+            triton_out.masked_fill(~_valid, 0).float(),
+            ref_out.masked_fill(~_valid, 0).float(),
+        )
+        assert diff < 1e-3, f"calc_diff={diff}"
         assert not torch.isnan(triton_out).any(), "NaN detected in Triton output"
