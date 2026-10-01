@@ -2,7 +2,9 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-
+from flaggems_vllm.runtime.backend._metax.fused.attention import (
+    flash_attn_varlen_func_w8a8_int8,
+)
 from flaggems_vllm.runtime.backend._metax.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -25,4 +27,5 @@ __all__ = [
     "chunk_gated_delta_rule_fwd",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "flash_attn_varlen_func_w8a8_int8",
 ]

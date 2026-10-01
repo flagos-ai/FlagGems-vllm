@@ -1279,13 +1279,23 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    if q.dtype == torch.int8 and runtime.device.vendor_name in ("hygon", "thead"):
+    if q.dtype == torch.int8 and runtime.device.vendor_name in (
+        "hygon",
+        "thead",
+        "metax",
+    ):
         if runtime.device.vendor_name == "hygon":
             from flaggems_vllm.runtime.backend._hygon.fused import (
                 attention as hygon_attention,
             )
 
             specialized_attention = hygon_attention.flash_attn_varlen_func_w8a8_int8
+        elif runtime.device.vendor_name == "metax":
+            from flaggems_vllm.runtime.backend._metax.fused import (
+                attention as metax_attention,
+            )
+
+            specialized_attention = metax_attention.flash_attn_varlen_func_w8a8_int8
         else:
             from flaggems_vllm.runtime.backend._thead.fused import (
                 attention as thead_attention,

@@ -14,6 +14,7 @@
 
 import inspect
 from functools import wraps
+from itertools import accumulate
 from typing import Any, List, Optional
 
 import pytest
@@ -22,8 +23,10 @@ import torch
 import flaggems_vllm
 
 from . import base, utils
+from .conftest import Config
 
 vendor_name = flaggems_vllm.vendor_name
+DESCALE_BLOCK = 128
 
 
 def _with_supported_kwargs(op):
@@ -69,7 +72,45 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     benchmark for flash_attn_varlen_func
     """
 
+    @staticmethod
+    def int8_shapes():
+        # vllm/benchmarks/attention_benchmarks/configs/standard_attention.yaml
+        # Each group is (request count, query length, total KV length).
+        # Keep all 18 workloads in both core and comprehensive modes.
+        workloads = [
+            ((1, 512, 512),),
+            ((1, 2048, 2048),),
+            ((1, 4096, 4096),),
+            ((1, 8192, 8192),),
+            ((8, 1, 1024),),
+            ((16, 1, 2048),),
+            ((32, 1, 1024),),
+            ((64, 1, 4096),),
+            ((2, 2048, 2048), (8, 1, 1024)),
+            ((4, 1024, 1024), (16, 1, 2048)),
+            ((2, 4096, 4096), (32, 1, 1024)),
+            ((16, 2, 1024),),
+            ((16, 4, 1024),),
+            ((16, 8, 1024),),
+            ((32, 4, 2048),),
+            ((8, 8, 4096),),
+            ((1, 1024, 2048),),
+            ((2, 1024, 4096),),
+        ]
+        shapes = []
+        for groups in workloads:
+            qlens = tuple(q for count, q, kv in groups for _ in range(count))
+            klens = tuple(kv for count, q, kv in groups for _ in range(count))
+            cuq = (0, *accumulate(qlens))
+            num_blocks = len(klens) * ((max(klens) + 15) // 16)
+            shapes.append((cuq, klens, 32, 8, 128, 16, num_blocks, False, None))
+
+        return shapes
+
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
+        if self.to_bench_dtypes == [torch.int8]:
+            self.shapes = self.int8_shapes()
+            return
         # Collected from Qwen3.6-35B-A3B: six TP1 cases followed by six TP4 cases.
         all_cu_seq_lens_q = [
             # TP1: short prefill (qwen36_tp1_p1024d1024_l0002).
@@ -202,8 +243,31 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
         self.shapes = all_configs
 
     def get_input_iter(self, dtype):
-        for config in self.shapes:
-            yield self.flash_attn_varlen_input_fn(config, dtype, self.device)
+        if dtype != torch.int8:
+            for config in self.shapes:
+                yield self.flash_attn_varlen_input_fn(config, dtype, self.device)
+            return
+
+        torch.manual_seed(0)
+        shapes = (
+            self.shapes if self.to_bench_dtypes == [torch.int8] else self.int8_shapes()
+        )
+        for config in shapes:
+            bf16_args = list(
+                self.flash_attn_varlen_input_fn(config, torch.bfloat16, self.device)
+            )
+            # Native FA2 needs cumulative lengths even for a paged cache.
+            bf16_args[6] = torch.tensor(
+                (0, *accumulate(config[1])), dtype=torch.int32, device=self.device
+            )
+            bf16_args, int8_args, reference_args = prepare_int8_inputs(bf16_args)
+            torch.testing.assert_close(
+                self.gems_op(bf16_args, int8_args),
+                self.torch_op(reference_args, int8_args),
+                atol=0.03,
+                rtol=0.03,
+            )
+            yield bf16_args, int8_args
 
     def flash_attn_varlen_input_fn(self, config, dtype, device):
         """Input function for flash attention varlen benchmark"""
@@ -315,6 +379,54 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
         )
 
 
+def prepare_int8_inputs(bf16_args):
+    bf16_args = list(bf16_args)
+    q, k, v = bf16_args[:3]
+    batch = bf16_args[4].numel() - 1
+    # Match vLLM's sequential cache blocks, including unused shorter-request slots.
+    bf16_args[17] = torch.arange(
+        k.shape[0], dtype=torch.int32, device=k.device
+    ).reshape(batch, -1)
+    quantized, descales, dequantized = [], [], []
+    for tensor, max_len in ((q, bf16_args[3]), (k, bf16_args[5]), (v, bf16_args[5])):
+        # Broadcast head scales keep shared physical pages consistent across requests.
+        axes = tuple(i for i in range(tensor.ndim) if i != tensor.ndim - 2)
+        scale = tensor.float().abs().amax(axes).clamp_min(1e-8) / 127
+        quant = (
+            (tensor.float() / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+        )
+        quantized.append(quant)
+        dequantized.append((quant.float() * scale[:, None]).to(q.dtype))
+        descales.append(
+            scale[None, :, None].expand(
+                batch, tensor.shape[-2], -(-max_len // DESCALE_BLOCK)
+            )
+        )
+    int8_args = list(bf16_args)
+    int8_args[:3] = quantized
+    int8_args[6] = None
+    int8_args[19] = torch.empty_like(q)
+    int8_args[-1] = dict(
+        bf16_args[-1],
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+        scheduler_metadata=None,
+        fa_version=2,
+    )
+    reference_args = (*dequantized, *bf16_args[3:])
+    return tuple(bf16_args), tuple(int8_args), reference_args
+
+
+def flash_attn_varlen_gems(*args, **kwargs):
+    if len(args) == 2:
+        _, int8_args = args
+        return flaggems_vllm.ops.flash_attn_varlen_func(
+            *int8_args[:-1], **int8_args[-1]
+        )
+    return flaggems_vllm.ops.flash_attn_varlen_func(*args, **kwargs)
+
+
 def flash_attn_varlen_legacy(*args, **kwargs):
     """
     Compatibility wrapper for running old flash_attn_varlen_func.
@@ -383,9 +495,15 @@ def flash_attn_varlen_legacy(*args, **kwargs):
 def flash_attn_varlen_metax(*args, **kwargs):
     """Adapt vLLM arguments to MetaX FlashAttention's paged-KV interface.
 
-    Cumulative-length conversion is included in the baseline timing. The
-    native interface selects its own splits and does not accept ``out``.
+    The INT8 benchmark prepares cumulative lengths before timing. Floating-point
+    workloads retain their existing timed conversion. Native FA2 chooses splits.
     """
+    if len(args) == 2:
+        baseline_args, _ = args
+        from vllm_metax.v1.attention.backends.fa_utils import flash_attn_varlen_func
+    else:
+        baseline_args = args
+        from flash_attn import flash_attn_varlen_func
     (
         query,
         key_cache,
@@ -408,7 +526,7 @@ def flash_attn_varlen_metax(*args, **kwargs):
         _,
         _,
         *_,
-    ) = args
+    ) = baseline_args
 
     if cu_seqlens_k is None:
         cu_seqlens_k = torch.cat(
@@ -417,8 +535,6 @@ def flash_attn_varlen_metax(*args, **kwargs):
                 torch.cumsum(seqused_k, dim=0),
             ]
         ).to(torch.int32)
-
-    from flash_attn import flash_attn_varlen_func
 
     return flash_attn_varlen_func(
         query,
@@ -451,7 +567,19 @@ def flash_attn_varlen_metax(*args, **kwargs):
 @pytest.mark.skipif(vendor_name == "hygon", reason="#2816: RuntimeError")
 @pytest.mark.skipif(vendor_name == "cambricon", reason="#2886: TypeError")
 @pytest.mark.flash_attn_varlen_func
-def test_flash_attn_varlen_func(monkeypatch):
+@pytest.mark.parametrize(
+    "input_dtype",
+    [pytest.param(None, id="floating")]
+    + ([pytest.param(torch.int8, id="int8")] if vendor_name == "metax" else []),
+)
+def test_flash_attn_varlen_func(monkeypatch, input_dtype):
+    if input_dtype is None:
+        dtypes = [torch.float16, torch.bfloat16]
+    else:
+        if Config.user_desired_dtypes and input_dtype not in Config.user_desired_dtypes:
+            pytest.skip("INT8 benchmark excluded by --dtypes")
+        pytest.importorskip("vllm_metax.v1.attention.backends.fa_utils")
+        dtypes = [input_dtype]
     monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
 
     if vendor_name == "metax":
@@ -467,7 +595,11 @@ def test_flash_attn_varlen_func(monkeypatch):
     bench = FlashAttnVarlenBenchmark(
         op_name="flash_attn_varlen_func",
         torch_op=flash_attn_varlen_func,
-        gems_op=flaggems_vllm.ops.flash_attn_varlen_func,
-        dtypes=[torch.float16, torch.bfloat16],
+        gems_op=(
+            flash_attn_varlen_gems
+            if vendor_name == "metax"
+            else flaggems_vllm.ops.flash_attn_varlen_func
+        ),
+        dtypes=dtypes,
     )
     bench.run()

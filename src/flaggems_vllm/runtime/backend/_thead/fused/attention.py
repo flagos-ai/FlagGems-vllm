@@ -216,6 +216,7 @@ def _flash_int8_fwd(
     FOLD: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    TRANSPOSE_DOT: tl.constexpr = False,
 ):
     program_tile = tl.program_id(2) if REORDER_CAUSAL else tl.program_id(0)
     tile, batch, head = (
@@ -374,7 +375,12 @@ def _flash_int8_fwd(
                     descale_block = start * phase_blocks[mask_phase] // DESCALE_BLOCK
                     ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
                     vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
-                    scores = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32)
+                    if TRANSPOSE_DOT:
+                        scores = tl.trans(
+                            tl.dot(tl.trans(k), tl.trans(q), out_dtype=tl.int32)
+                        ).to(tl.float32)
+                    else:
+                        scores = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32)
                     if HALF_PV and not COMPACT and CAP <= 0 and not HAS_ALIBI:
                         scores = scores * (q_scale * ks)[:, None]
                     else:
@@ -437,7 +443,25 @@ def _flash_int8_fwd(
                     else:
                         v = tl.load(V + v_row[:, None] + kv_head * hv + d[None, :])
                     if HALF_PV:
-                        if vs2 == 0:
+                        if TRANSPOSE_DOT:
+                            if vs2 == 0:
+                                acc = tl.trans(
+                                    tl.dot(
+                                        tl.trans(v.to(tl.float16)),
+                                        tl.trans(p.to(tl.float16)),
+                                        tl.trans(acc * alpha[:, None]),
+                                    )
+                                )
+                            else:
+                                partial = tl.trans(
+                                    tl.dot(
+                                        tl.trans(v.to(tl.float16)),
+                                        tl.trans(p.to(tl.float16)),
+                                        out_dtype=tl.float32,
+                                    )
+                                )
+                                acc = acc * alpha[:, None] + partial * vs
+                        elif vs2 == 0:
                             if BM >= 128:
                                 # Rescale before materializing P to shorten large-tile live ranges.
                                 acc = acc * alpha[:, None]
@@ -454,7 +478,36 @@ def _flash_int8_fwd(
                             )
                             acc = acc * alpha[:, None] + partial * vs
                     else:
-                        if PRECISE_PV:
+                        if TRANSPOSE_DOT:
+                            if PRECISE_PV:
+                                high = tl.dot(
+                                    tl.trans(v), tl.trans(p_hi), out_dtype=tl.int32
+                                )
+                                partial = tl.trans(
+                                    tl.dot(
+                                        tl.trans(v),
+                                        tl.trans(p_lo),
+                                        high << 8,
+                                        out_dtype=tl.int32,
+                                    )
+                                ).to(tl.float32)
+                            else:
+                                correction = tl.dot(
+                                    tl.trans(v),
+                                    tl.full(
+                                        (phase_blocks[mask_phase], BM), -128, tl.int8
+                                    ),
+                                    out_dtype=tl.int32,
+                                )
+                                partial = tl.trans(
+                                    tl.dot(
+                                        tl.trans(v),
+                                        tl.trans(p_int8),
+                                        -correction,
+                                        out_dtype=tl.int32,
+                                    )
+                                ).to(tl.float32)
+                        elif PRECISE_PV:
                             # phase_blocks[mask_phase] <= 128 keeps the combined INT32 result in range.
                             high = tl.dot(p_hi, v, out_dtype=tl.int32)
                             partial = tl.dot(p_lo, v, high << 8, out_dtype=tl.int32).to(
