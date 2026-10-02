@@ -270,7 +270,12 @@ __all__ = [
 # Backend-only APIs have no implementation on other vendors.
 from flaggems_vllm import runtime as _runtime
 
-if _runtime.device.vendor_name == "hygon":
+if _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend.ops.int8_einsum import int8_einsum
+
+    __all__.append("int8_einsum")
+
+elif _runtime.device.vendor_name == "hygon":
     from flaggems_vllm.runtime.backend._hygon.fused import attention as hygon_attention
     from flaggems_vllm.runtime.backend._hygon.ops import (
         int8_einsum,
