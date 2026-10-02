@@ -18,6 +18,15 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 
+try:
+    import triton.experimental.tle as tle
+    from triton.experimental.tle.language.dsa.ascend.custom_ops import (
+        data_copy_gm_to_l1_nd2nz_int8 as _nd2nz_primitive,
+    )
+except ImportError:
+    _nd2nz_primitive = None
+    tle = None
+
 
 @triton.jit
 def _ascend_float_einsum_kernel(
@@ -131,6 +140,26 @@ def _pack_int8_x(x):
 
 
 @triton.jit
+def _load_int8_nd2nz(P, ROWS: tl.constexpr, ROW_STRIDE: tl.constexpr):
+    source = tl.make_block_ptr(
+        P, (ROWS, 128), (ROW_STRIDE, 1), (0, 0), (ROWS, 128), (1, 0)
+    )
+    return tle.dsa.ascend.raw(
+        "data_copy_gm_to_l1_nd2nz_int8",
+        source,
+        1,
+        ROWS,
+        128,
+        0,
+        ROW_STRIDE,
+        ROWS,
+        1,
+        1,
+        out=tl.full((ROWS, 128), 0, tl.int8),
+    )
+
+
+@triton.jit
 def _ascend_block_int8_einsum_kernel(
     X,
     XS,
@@ -149,6 +178,7 @@ def _ascend_block_int8_einsum_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ALIGNED: tl.constexpr,
+    USE_ND2NZ: tl.constexpr = False,
 ):
     h = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0)
@@ -174,8 +204,20 @@ def _ascend_block_int8_einsum_kernel(
         yp = Y + h * SY[0] + n[None, :] * SY[1] + r[:, None] * SY[2]
         xsp = XS + m * SXS[0] + h * SXS[1] + kb64 * SXS[2]
         if ALIGNED:
-            x = tl.load(xp)
-            y = tl.load(yp)
+            if USE_ND2NZ:
+                x = _load_int8_nd2nz(
+                    X + pm * BLOCK_M * SX[0] + h * SX[1] + kb64 * 128,
+                    BLOCK_M,
+                    SX[0],
+                )
+                y = _load_int8_nd2nz(
+                    Y + h * SY[0] + pn * BLOCK_N * SY[1] + kb64 * 128,
+                    BLOCK_N,
+                    SY[1],
+                ).T
+            else:
+                x = tl.load(xp)
+                y = tl.load(yp)
             xs = tl.load(xsp).to(tl.float32)
         else:
             x = tl.load(xp, (m[:, None] < B) & (r[None, :] < R), other=0)
@@ -329,6 +371,20 @@ def int8_einsum(
         # Packing amortizes for wide row strides once at least 16 rows are used.
         if is_int8 and b >= 16 and x.stride(0) >= 65536 and x.stride(2) == 1:
             x = _pack_int8_x(x)
+        # Native ND2NZ benefits the larger row tiles. The 32-byte layout gate
+        # bounds the validated fast path; other layouts retain Triton loads.
+        native_layout = (
+            is_int8
+            and _nd2nz_primitive is not None
+            and bm >= 128
+            and bn == 128
+            and x.stride(2) == y.stride(2) == 1
+            and 0 < x.stride(0) <= 65535
+            and 0 < y.stride(1) <= 65535
+            and x.data_ptr() % 32 == y.data_ptr() % 32 == 0
+            and x.stride(0) % 32 == x.stride(1) % 32 == 0
+            and y.stride(0) % 32 == y.stride(1) % 32 == 0
+        )
         chunk_b = (32768 // (nn * h)) * bm
         for start in range(0, b, chunk_b):
             end = min(start + chunk_b, b)
@@ -338,6 +394,14 @@ def int8_einsum(
             if is_int8:
                 xsc = xs[start:end]
                 aligned = (end - start) % bm == 0 and d % bn == 0 and r % 128 == 0
+                use_nd2nz = aligned and native_layout
+                options = {}
+                if aligned and bm == 256 and bn == 128:
+                    options["unit_flag"] = True
+                if use_nd2nz:
+                    # CANN 9.1's newer mixed-core pass misinfers the memory
+                    # space of MTE2 custom outputs; use its supported old pass.
+                    options["enable_legacy_insert_load_store_for_mix_cv"] = True
                 _ascend_block_int8_einsum_kernel[grid](
                     xc,
                     xsc,
@@ -356,13 +420,10 @@ def int8_einsum(
                     BLOCK_M=bm,
                     BLOCK_N=bn,
                     ALIGNED=aligned,
+                    USE_ND2NZ=use_nd2nz,
                     num_warps=4,
                     num_stages=2 if bm >= 128 else 1,
-                    **(
-                        {"unit_flag": True}
-                        if aligned and bm == 256 and bn == 128
-                        else {}
-                    ),
+                    **options,
                 )
             else:
                 _ascend_float_einsum_kernel[grid](
