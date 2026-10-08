@@ -77,7 +77,7 @@ try:
         # NotImplementedError at dispatch time. Probe one tiny call so
         # vLLM-dependent tests are skipped (rather than errored) when the
         # kernel is not actually available.
-        _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
+        _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device=device)
         _vllm_persistent_topk(_probe_logits, [4102], 4102, 512)
         HAS_VLLM = True
 except (ImportError, AttributeError, NotImplementedError, RuntimeError):

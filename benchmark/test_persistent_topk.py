@@ -74,13 +74,13 @@ else:
         # benchmark falls back (rather than errors) when the kernel is not
         # actually available.
         try:
-            _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
-            _probe_lengths = torch.tensor([4102], dtype=torch.int32, device="cuda")
+            _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device=device)
+            _probe_lengths = torch.tensor([4102], dtype=torch.int32, device=device)
             torch.ops._C.persistent_topk(
                 _probe_logits,
                 _probe_lengths,
-                torch.empty((1, 512), dtype=torch.int32, device="cuda"),
-                torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+                torch.empty((1, 512), dtype=torch.int32, device=device),
+                torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=device),
                 512,
                 4102,
             )
