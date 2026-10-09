@@ -1,0 +1,113 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: rule-check
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rule-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Derive changed operators
+        id: derive
+        run: |
+          python3 tools/ci_checks/derive_changed_operators.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
+
+      - name: Check operators.yaml
+        id: check-operators-yaml
+        if: steps.derive.outputs.has_changes == 'true'
+        continue-on-error: true
+        run: |
+          python3 tools/ci_checks/check_operators_yaml.py \
+            --operators '${{ steps.derive.outputs.changed_operators }}'
+
+      - name: Check __init__.py exports
+        id: check-init-exports
+        continue-on-error: true
+        run: python3 tools/ci_checks/check_init_exports.py
+
+      - name: Check operator test files and markers
+        id: check-operator-markers
+        if: steps.derive.outputs.has_changes == 'true'
+        continue-on-error: true
+        run: |
+          python3 tools/ci_checks/check_operator_markers.py \
+            --operators '${{ steps.derive.outputs.changed_operators }}'
+
+      - name: Check aten operator names
+        id: check-aten-operators
+        if: steps.derive.outputs.has_changes == 'true'
+        continue-on-error: true
+        run: |
+          python3 tools/ci_checks/check_aten_operators.py \
+            --operators '${{ steps.derive.outputs.changed_operators }}'
+
+      # --- Warning-only checks ---
+      # These emit ::warning annotations but always exit 0, so they don't
+      # need continue-on-error.
+
+      - name: Check benchmark coverage
+        if: steps.derive.outputs.has_changes == 'true'
+        run: |
+          python3 tools/ci_checks/check_performance_reference.py \
+            --operators '${{ steps.derive.outputs.changed_operators }}'
+
+      - name: Verify required checks passed
+        if: always()
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          failed=0
+          for step_id in check-operators-yaml check-init-exports check-operator-markers check-aten-operators; do
+            result=$(echo "$STEPS_JSON" | jq -r --arg id "$step_id" '.[$id].outcome // "skipped"')
+            echo "$step_id: $result"
+            if [ "$result" = "failure" ]; then
+              failed=1
+            fi
+          done
+          if [ "$failed" != "0" ]; then
+            echo "::error::One or more required checks failed"
+            exit 1
+          fi
