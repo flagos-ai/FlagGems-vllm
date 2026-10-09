@@ -774,6 +774,17 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
+  - id: int8_einsum
+    description: Block-scaled INT8 bhr,hdr->bhd contraction with per-token-group activation scales.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: kda_conv_gather
     description: |
       Stages the rows used by a batch out of the block-strided Kimi Delta
