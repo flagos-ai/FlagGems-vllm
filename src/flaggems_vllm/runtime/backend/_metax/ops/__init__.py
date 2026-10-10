@@ -20,6 +20,10 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
+    fused_recurrent_gated_delta_rule_fwd,
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -58,4 +62,6 @@ __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "fused_recurrent_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
 ]
