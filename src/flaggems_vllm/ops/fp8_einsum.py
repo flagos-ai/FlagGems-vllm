@@ -28,7 +28,7 @@ def fp8_einsum(
     *,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Compute block-scaled FP8 ``bhr,hdr->bhd`` on NVIDIA Hopper.
+    """Compute block-scaled FP8 ``bhr,hdr->bhd`` on NVIDIA Hopper or MThreads PH1.
 
     ``x[b,h,r]`` and ``y[h,d,r]`` contain E4M3 data. FP32 scales have shapes
     ``xs[b,h,r/128]`` and ``ys[h,d/128,r/128]``. The reduction and output
@@ -49,10 +49,12 @@ def fp8_einsum(
         raise ValueError("inputs must be strided rank-3 tensors")
     if any(t.device != x.device for t in inputs):
         raise ValueError("all inputs must be on the same device")
-    if x.device.type != "cuda" or torch.version.hip is not None:
-        raise NotImplementedError("fp8_einsum requires an NVIDIA Hopper GPU")
-    if torch.cuda.get_device_capability(x.device)[0] != 9:
-        raise NotImplementedError("fp8_einsum requires an NVIDIA Hopper GPU")
+    on_musa = x.device.type == "musa"
+    if not on_musa:
+        if x.device.type != "cuda" or torch.version.hip is not None:
+            raise NotImplementedError("fp8_einsum requires an NVIDIA Hopper GPU")
+        if torch.cuda.get_device_capability(x.device)[0] != 9:
+            raise NotImplementedError("fp8_einsum requires an NVIDIA Hopper GPU")
     if x.dtype != torch.float8_e4m3fn or y.dtype != torch.float8_e4m3fn:
         raise NotImplementedError("x and y must have dtype float8_e4m3fn")
     if xs.dtype != torch.float32 or ys.dtype != torch.float32:
@@ -99,9 +101,14 @@ def fp8_einsum(
     if out.numel() == 0:
         return out
 
-    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.w8a8_block_fp8_bmm import (
-        w8a8_block_fp8_bmm,
-    )
+    if on_musa:
+        from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
+            w8a8_block_fp8_bmm,
+        )
+    else:
+        from flaggems_vllm.runtime.backend._nvidia.hopper.ops.w8a8_block_fp8_bmm import (
+            w8a8_block_fp8_bmm,
+        )
 
     w8a8_block_fp8_bmm(
         x.permute(1, 0, 2),
