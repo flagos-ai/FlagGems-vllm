@@ -47,7 +47,7 @@ try:
 
             return q_normed, kv_normed
 
-    elif vendor == "iluvatar":
+    elif vendor == "iluvatar" or vendor == "thead":
         from vllm.models.deepseek_v4.common.ops import (
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
