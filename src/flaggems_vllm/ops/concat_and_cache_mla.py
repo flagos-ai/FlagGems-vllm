@@ -115,6 +115,23 @@ class ConcatAndCacheMla(torch.autograd.Function):
         kv_cache_dtype: str,
         scale: torch.Tensor,
     ):
+        if kv_cache.ndim == 4 and kv_cache.shape[2] == 1:
+            kv_cache = kv_cache.squeeze(2)
+        if kv_c.ndim != 2 or k_pe.ndim != 2 or kv_cache.ndim != 3:
+            raise ValueError("MLA cache expects KV[N,D], RoPE[N,R] and paged [B,P,D+R]")
+        if k_pe.shape[0] != kv_c.shape[0] or slot_mapping.shape != (kv_c.shape[0],):
+            raise ValueError("MLA cache inputs need one slot per token")
+        if k_pe.dtype != kv_c.dtype or slot_mapping.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("MLA cache input dtype mismatch")
+        if kv_cache.shape[-1] != kv_c.shape[-1] + k_pe.shape[-1] or any(
+            t.stride(-1) != 1 for t in (kv_c, k_pe, kv_cache, slot_mapping)
+        ):
+            raise ValueError(
+                "MLA cache requires matching contiguous feature dimensions"
+            )
         if kv_cache_dtype != "auto" and kv_cache.dtype != torch.uint8:
             raise ValueError("For FP8 kv_cache must be uint8 dtype")
         if kv_cache_dtype == "auto" and kv_cache.dtype != kv_c.dtype:
@@ -138,18 +155,19 @@ class ConcatAndCacheMla(torch.autograd.Function):
 
         # make sure `scale` is a scalar tensor
         if scale.numel() != 1:
-            scale = scale.view(1)
+            raise ValueError("MLA cache scale must be scalar")
 
-        # make sure all tensors are on the same device
         device = kv_c.device
-        k_pe = k_pe.to(device)
-        kv_cache = kv_cache.to(device)
-        slot_mapping = slot_mapping.to(device)
-        scale = scale.to(device)
+        if any(t.device != device for t in (k_pe, kv_cache, slot_mapping, scale)):
+            raise ValueError("MLA cache tensors must share the input device")
+        if num_tokens == 0:
+            return None
 
         # configure kernel launch
         grid = (num_tokens,)
-        BLOCK_SIZE = min(kv_lora_rank, 512)
+        if kv_lora_rank == 0:
+            raise NotImplementedError("MLA cache requires a positive latent dimension")
+        BLOCK_SIZE = triton.next_power_of_2(min(kv_lora_rank, 512))
 
         assert kv_cache.dim() == 3, "kv_cache must be a 3D tensor"
         assert (

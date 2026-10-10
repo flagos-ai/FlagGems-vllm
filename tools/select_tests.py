@@ -83,6 +83,38 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/ops/kda_bounded.py": [
+        "tests/test_kda_bounded.py",
+        "tests/test_glm5_numerics.py",
+    ],
+    "src/flaggems_vllm/ops/kda64.py": ["tests/test_kda_bounded.py"],
+    "src/flaggems_vllm/ops/causal_conv1d.py": [
+        "tests/test_causal_conv1d.py",
+        "tests/test_glm5_numerics.py",
+    ],
+    "src/flaggems_vllm/ops/data_movement.py": [
+        "tests/test_data_movement.py",
+        "tests/test_glm_state_rows.py",
+    ],
+    "src/flaggems_vllm/ops/kpool.py": [
+        "tests/test_kpool.py",
+        "tests/test_glm5_numerics.py",
+    ],
+    "src/flaggems_vllm/ops/fp8_fp4_mqa_logits.py": [
+        "tests/test_fp8_fp4_mqa_logits.py",
+        "tests/test_indexer_scale_contract.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_with_norm.py",
+    ],
+    "src/flaggems_vllm/ops/mhc_with_norm.py": [
+        "tests/test_mhc_with_norm.py",
+    ],
+    "src/flaggems_vllm/ops/flashmla_sparse.py": [
+        "tests/test_flash_mla_sparse_fwd.py",
+        "tests/test_glm_state_rows.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -103,7 +135,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
-    "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
@@ -146,6 +177,19 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/ops/kda_bounded.py": ["benchmark/test_kda_bounded_perf.py"],
+    "src/flaggems_vllm/ops/kda64.py": ["benchmark/test_kda_bounded_perf.py"],
+    "src/flaggems_vllm/ops/causal_conv1d.py": ["benchmark/test_glm5_ops_perf.py"],
+    "src/flaggems_vllm/ops/data_movement.py": [
+        "benchmark/test_glm5_ops_perf.py",
+        "benchmark/test_glm5_cache_perf.py",
+    ],
+    "src/flaggems_vllm/ops/kpool.py": [
+        "benchmark/test_glm5_ops_perf.py",
+        "benchmark/test_glm5_cache_perf.py",
+    ],
+    "src/flaggems_vllm/ops/paged_mqa.py": ["benchmark/test_glm5_cache_perf.py"],
+    "src/flaggems_vllm/ops/mhc_with_norm.py": ["benchmark/test_glm5_ops_perf.py"],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],

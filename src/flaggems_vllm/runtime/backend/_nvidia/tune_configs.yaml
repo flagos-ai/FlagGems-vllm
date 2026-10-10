@@ -932,3 +932,48 @@ silu_and_mul_with_clamp_linear:
       UNMASKED: false
     num_warps: 8
     num_stages: 1
+
+# Pure output kernels; mutation/state kernels keep a single original launch.
+glm_data_copy:
+  - META: {BLOCK: 256}
+    num_warps: 4
+  - META: {BLOCK: 512}
+    num_warps: 4
+kpool_fwht:
+  - META: {BLOCK_R: 16}
+    num_warps: 2
+  - META: {BLOCK_R: 32}
+    num_warps: 2
+  - META: {BLOCK_R: 64}
+    num_warps: 4
+kpool_hadamard:
+  - META: {}
+    num_warps: 1
+  - META: {}
+    num_warps: 2
+  - META: {}
+    num_warps: 4
+kda_safe_gate:
+  - META: {BLOCK: 256}
+    num_warps: 4
+  - META: {BLOCK: 512}
+    num_warps: 4
+mhc_rms_norm:
+  - META: {}
+    num_warps: 4
+  - META: {}
+    num_warps: 8
+
+kda_safe_gate_cumsum:
+  - META: {BD: 32}
+    num_warps: 2
+  - META: {BD: 32}
+    num_warps: 4
+  - META: {BD: 32}
+    num_warps: 8
+  - META: {BD: 64}
+    num_warps: 2
+  - META: {BD: 64}
+    num_warps: 4
+  - META: {BD: 64}
+    num_warps: 8

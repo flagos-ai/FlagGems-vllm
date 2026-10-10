@@ -155,6 +155,40 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 
 # isort: on
 
+from flaggems_vllm.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from flaggems_vllm.ops.data_movement import (
+    concat_mla_q,
+    concat_query,
+    contiguous_copy,
+    copy_to,
+    gather_rows,
+    gather_state_rows,
+    pad_attention_heads,
+    scatter_decode_tokens,
+    scatter_state_rows,
+    zero_state_rows,
+)
+from flaggems_vllm.ops.kda_bounded import (
+    chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
+    recurrent_kda,
+    safe_kda_gate,
+    safe_kda_gate_chunk_cumsum,
+)
+from flaggems_vllm.ops.kpool import (
+    fwht128_quant_fp8,
+    hadamard128,
+    kpool_compress_and_write_cache,
+    kpool_decode_update_and_maybe_write_cache_batched,
+    kpool_seed_tail_cache,
+)
+from flaggems_vllm.ops.mhc_with_norm import (
+    mhc_fused_post_pre_with_norm,
+    mhc_pre_with_norm,
+    mhc_rms_norm,
+)
+from flaggems_vllm.ops.paged_mqa import paged_mqa_logits
+
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
@@ -265,6 +299,32 @@ __all__ = [
     "weight_norm",
     "weight_norm_interface",
     "weight_norm_interface_backward",
+    "fwht128_quant_fp8",
+    "kpool_compress_and_write_cache",
+    "kpool_seed_tail_cache",
+    "kpool_decode_update_and_maybe_write_cache_batched",
+    "paged_mqa_logits",
+    "gather_rows",
+    "scatter_decode_tokens",
+    "safe_kda_gate",
+    "recurrent_kda",
+    "fused_recurrent_kda",
+    "chunk_kda_with_safe_gate",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
+    "mhc_rms_norm",
+    "mhc_pre_with_norm",
+    "mhc_fused_post_pre_with_norm",
+    "concat_mla_q",
+    "concat_query",
+    "pad_attention_heads",
+    "contiguous_copy",
+    "hadamard128",
+    "safe_kda_gate_chunk_cumsum",
+    "gather_state_rows",
+    "scatter_state_rows",
+    "zero_state_rows",
+    "copy_to",
 ]
 
 # Backend-only APIs have no implementation on other vendors.
