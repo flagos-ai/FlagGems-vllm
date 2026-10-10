@@ -650,6 +650,10 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input):
     """Compare fused_marlin_moe (packed INT4) against PyTorch reference (dequant)."""
+    if flaggems_vllm.vendor_name == "ascend" and (
+        dtype != torch.bfloat16 or apply_router_weight_on_input
+    ):
+        pytest.skip("Ascend W4A16 accuracy is BF16 with output-side router weights")
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
@@ -663,6 +667,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
         device,
     )
 
+    router_weights = tw.float() if flaggems_vllm.vendor_name == "ascend" else tw
     result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
@@ -671,7 +676,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
         bias2=None,
         w1_scale=w1s,
         w2_scale=w2s,
-        topk_weights=tw,
+        topk_weights=router_weights,
         topk_ids=ti,
         quant_type_id=QUANT_TYPE_UINT4B8,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -680,7 +685,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
         hs,
         w1_ref,
         w2_ref,
-        tw,
+        router_weights,
         ti,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )

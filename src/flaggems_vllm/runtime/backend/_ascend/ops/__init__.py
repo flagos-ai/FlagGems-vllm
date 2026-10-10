@@ -42,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
+    fused_marlin_moe,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -117,6 +120,7 @@ __all__ = [
     "add_rms_norm",
     "causal_conv1d_fn",
     "causal_conv1d_update",
+    "fused_marlin_moe",
     "fused_experts_impl",
     "fused_inv_rope_int8_quant",
     "gemma_rms_norm",
