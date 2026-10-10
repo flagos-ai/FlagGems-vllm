@@ -13,8 +13,9 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._enflame.ops.causal_conv1d_fn import causal_conv1d_fn
 from flaggems_vllm.runtime.backend._enflame.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["causal_conv1d_fn", "scaled_int8_quant"]
