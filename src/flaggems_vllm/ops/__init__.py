@@ -194,6 +194,7 @@ __all__ = [
     "fused_marlin_moe",
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
+    "fused_marlin_moe",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
     "geglu",
