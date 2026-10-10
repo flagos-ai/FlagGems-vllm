@@ -88,6 +88,17 @@ from flaggems_vllm.ops.mhc import (
     sinkhorn_forward,
 )
 from flaggems_vllm.ops.qwen4 import (
+    ple_gate_norm,
+    ple_gate_norm_,
+    ple_prefill_short_conv_,
+    qsa_compress_groups_with_ratio,
+    qsa_compress_norm_mrope_store_groups,
+    qsa_mqa_paged,
+    qsa_sparse_paged_attention,
+    qsa_sparse_split_count,
+    qsa_store_cache_rows,
+    qsa_store_kv_cache_rows,
+    qwen4_hc_combine_norm,
     ple_state_gather,
     ple_state_scatter_,
     qwen4_compress_norm_mrope_store_groups,
@@ -156,6 +167,17 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 # isort: on
 
 __all__ = [
+    "qwen4_hc_combine_norm",
+    "ple_gate_norm_",
+    "ple_gate_norm",
+    "ple_prefill_short_conv_",
+    "qsa_mqa_paged",
+    "qsa_store_cache_rows",
+    "qsa_store_kv_cache_rows",
+    "qsa_compress_groups_with_ratio",
+    "qsa_compress_norm_mrope_store_groups",
+    "qsa_sparse_paged_attention",
+    "qsa_sparse_split_count",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
