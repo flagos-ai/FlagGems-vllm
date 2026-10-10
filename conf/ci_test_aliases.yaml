@@ -1,0 +1,33 @@
+# Operator test aliases for FlagGems-vllm
+#
+# Maps operator IDs to their actual test file names when the standard
+# naming convention (tests/test_<id>.py) does not apply.
+#
+# Format:
+#   <operator_id>: <test_file_stem>  (without tests/ prefix and .py suffix)
+#
+# For subdirectory tests, use the relative path from tests/:
+#   chunk_kda: test_FLA/test_chunk_kda
+
+# --- Subpackage operators (FLA/) ---
+chunk_gated_delta_rule_fwd: test_FLA/test_chunk_gated_delta_rule_fwd
+chunk_kda: test_FLA/test_chunk_kda
+
+# --- MHC operators (tested in test_mhc_ops.py) ---
+hc_head_fused_kernel: test_mhc_ops
+hc_split_sinkhorn_forward: test_mhc_ops
+mhc_bwd: test_mhc_ops
+mhc_post: test_mhc_ops
+mhc_pre: test_mhc_ops
+
+# --- Inplace / _out variants sharing test with base ---
+beam_search_score_: test_beam_search_score
+mul_: test_mul
+silu_and_mul_out: test_silu_and_mul
+silu_and_mul_with_clamp_out: test_silu_and_mul_with_clamp
+weight_norm_interface_backward: test_weight_norm_interface
+
+# --- Alternative naming ---
+act_quant_triton: test_quant
+flash_attn_varlen_opt_func: test_flash_attn_varlen_func
+moe_align_block_size_triton: test_moe_align_block_size
