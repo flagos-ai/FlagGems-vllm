@@ -15,12 +15,14 @@
 import dataclasses
 import math
 import random
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import HAS_TLE
+from tests.accuracy_utils import gems_assert_close
 
 from . import base
 
@@ -41,6 +43,10 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import (
 )
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
+)
+
+HAS_FP8_MLA = (
+    HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
 )
 
 FP8_MAX = 448.0
@@ -184,20 +190,156 @@ def _triton_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs
     )
 
 
+# BF16-default combinations in Meituan's unchanged upstream test main.
+DENSE_FP8_UPSTREAM_SHAPES = [
+    (batch, query_length, length, heads, varlen)
+    for batch in [128]
+    for length in [4096, 8192, 16384]
+    for heads in [16, 32, 64, 128]
+    for query_length in [1, 2]
+    for varlen in [False, True]
+]
+DENSE_FP8_HANDLES = {}
+
+
+class DenseFP8Inputs(NamedTuple):
+    q_nope: torch.Tensor
+    q_rope: torch.Tensor
+    k_nope: torch.Tensor
+    k_rope: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    block_table: torch.Tensor
+    lengths: torch.Tensor
+    value_dim: int
+    cuda_metadata: torch.Tensor
+    cuda_splits: torch.Tensor
+    host_lengths: tuple[int, ...]
+
+
+def make_dense_fp8_input(shape: tuple) -> DenseFP8Inputs:
+    from flash_mla_fp8 import get_mla_metadata
+
+    batch, query_length, mean_length, heads, varlen = shape
+    torch.manual_seed(0)
+    lengths = [mean_length] * batch
+    if varlen:
+        # Replay the upstream main's single seeded length stream for independent cases.
+        generator = random.Random(0)
+        for upstream_shape in DENSE_FP8_UPSTREAM_SHAPES:
+            source_batch, source_queries, source_mean, _, source_varlen = upstream_shape
+            if not source_varlen:
+                continue
+            lengths = [
+                max(
+                    int(generator.normalvariate(source_mean, source_mean / 2)),
+                    source_queries,
+                )
+                for _ in range(source_batch)
+            ]
+            if upstream_shape == tuple(shape):
+                break
+        else:
+            raise ValueError(
+                "FP8 benchmark shape must be from the upstream test matrix"
+            )
+    padded_length = math.ceil(max(lengths) / 256) * 256
+    gpu_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    query = torch.randn(
+        batch, query_length, heads, 576, dtype=torch.bfloat16, device="cuda"
+    )
+    table = torch.arange(
+        batch * padded_length // 64, dtype=torch.int32, device="cuda"
+    ).view(batch, padded_length // 64)
+    cache = torch.randn(table.numel(), 64, 1, 576, dtype=torch.bfloat16, device="cuda")
+    for row, length in enumerate(lengths):
+        cache.view(batch, padded_length, 1, 576)[row, length:] = float("nan")
+    query_scale = query[..., :512].float().abs().amax(-1, keepdim=True) / 448.0
+    query_nope = (query[..., :512].float() / query_scale).to(torch.float8_e4m3fn)
+    query_rope = (query[..., 512:].float() / query_scale).to(torch.bfloat16)
+    cache_scale = cache[..., :512].float().abs().amax(-1, keepdim=True) / 448.0
+    cache_nope = (cache[..., :512].float() / cache_scale).to(torch.float8_e4m3fn)
+    cache_rope = (cache[..., 512:].float() / cache_scale).to(torch.bfloat16)
+    metadata, splits = get_mla_metadata(gpu_lengths, query_length * heads, 1)
+    return DenseFP8Inputs(
+        query_nope,
+        query_rope,
+        cache_nope,
+        cache_rope,
+        query_scale,
+        cache_scale,
+        table,
+        gpu_lengths,
+        512,
+        metadata,
+        splits,
+        tuple(lengths),
+    )
+
+
+def run_cuda_dense_fp8(inputs: DenseFP8Inputs):
+    from flash_mla_fp8 import flash_mla_ckv_fp8_per_token
+
+    return flash_mla_ckv_fp8_per_token(*inputs[:11], causal=True)
+
+
+def run_gems_dense_fp8(inputs: DenseFP8Inputs):
+    key = (inputs.q_nope.data_ptr(), inputs.k_nope.data_ptr())
+    prepared = DENSE_FP8_HANDLES.get(key)
+    if prepared is None:
+        DENSE_FP8_HANDLES.clear()
+        handle, (output, lse) = (
+            flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+                *inputs[:9],
+                causal=True,
+                initial_cache_seqlens=inputs.host_lengths,
+                max_cache_seqlens=inputs.host_lengths,
+            )
+        )
+        prepared = (handle, output, lse)
+        DENSE_FP8_HANDLES[key] = prepared
+    handle, output, lse = prepared
+    return handle(out=output, lse=lse)
+
+
+def assert_dense_fp8_close(output, reference):
+    # Upstream cal_diff uses a 5% relative norm criterion on output and LSE.
+    relative = torch.linalg.vector_norm(
+        output.float() - reference.float()
+    ) / torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
+    gems_assert_close(relative, torch.zeros_like(relative), torch.float32, atol=0.05)
+
+
 class FlashMLAWithKVCacheBenchmark(base.Benchmark):
-    def __init__(self):
+    def __init__(self, operator="flash_mla_with_kvcache"):
+        self.is_fp8_query = operator == "flash_mla_with_kvcache_fwd_w8a8_fp8"
         super().__init__(
-            "flash_mla_with_kvcache",
+            operator,
             _cuda_wrapper,
             [torch.bfloat16],
         )
-        self.set_gems(_triton_wrapper)
+        if self.is_fp8_query:
+            self.torch_op = run_cuda_dense_fp8
+            self.set_gems(run_gems_dense_fp8)
+        else:
+            self.set_gems(_triton_wrapper)
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = []
+        if self.is_fp8_query:
+            base.Benchmark.set_shapes(self, shape_file_path)
+        else:
+            self.shapes = []
 
     def get_input_iter(self, dtype):
-        _ = dtype
+        if self.is_fp8_query:
+            for shape in self.shapes:
+                inputs = make_dense_fp8_input(shape)
+                expected, expected_lse = run_cuda_dense_fp8(inputs)
+                output, lse = run_gems_dense_fp8(inputs)
+                assert_dense_fp8_close(output, expected)
+                assert_dense_fp8_close(lse, expected_lse)
+                yield (inputs,)
+            return
         for param in self.get_performance_test_params():
             yield from self.make_input(param)
 
@@ -396,8 +538,21 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
         yield (q, k_cache, block_table, cache_seqlens, d_v, kwargs)
 
 
-@pytest.mark.flash_mla_with_kvcache
-@pytest.mark.skipif(not HAS_CUDA_FLASHMLA, reason="vLLM FlashMLA not installed")
-def test_flash_mla_with_kvcache():
-    bench = FlashMLAWithKVCacheBenchmark()
-    bench.run()
+@pytest.mark.parametrize(
+    "operator",
+    [
+        pytest.param(
+            "flash_mla_with_kvcache", marks=pytest.mark.flash_mla_with_kvcache
+        ),
+        pytest.param(
+            "flash_mla_with_kvcache_fwd_w8a8_fp8",
+            marks=pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8,
+        ),
+    ],
+)
+def test_flash_mla_with_kvcache(operator):
+    if operator == "flash_mla_with_kvcache_fwd_w8a8_fp8" and not HAS_FP8_MLA:
+        pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
+    if operator == "flash_mla_with_kvcache" and not HAS_CUDA_FLASHMLA:
+        pytest.skip("vLLM CUDA FlashMLA is required")
+    FlashMLAWithKVCacheBenchmark(operator).run()
