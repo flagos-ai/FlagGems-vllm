@@ -20,7 +20,8 @@ import triton
 
 import flaggems_vllm
 
-from . import base
+from . import base, consts
+from .conftest import Config
 
 vendor_name = flaggems_vllm.vendor_name
 
@@ -30,6 +31,22 @@ class FlashMLABenchmark(base.GenericBenchmark):
         # self.shapes is a list of tuples, each containing three elements:
         # (batch, num_heads, seq_len, head_size).
         return []
+
+    def get_latency(self, op, *args, **kwargs):
+        """Ascend-only timing: ascend's stock do_bench_npu averages per-kernel rows
+        of a CANN profiler CSV, which cannot time the multi-kernel python-loop
+        reference. The classic triton do_bench times whole calls with device events,
+        duration warmup and per-run L2 clearing - the same path non-ascend vendors
+        take in base.py. Other vendors fall through to the stock path."""
+        if vendor_name == "ascend" and Config.mode == consts.BenchMode.KERNEL:
+            fn = lambda: op(*args, **kwargs)
+            return triton.testing.do_bench(
+                fn,
+                warmup=Config.warm_up,
+                rep=Config.repetition,
+                return_mode="median",
+            )
+        return super().get_latency(op, *args, **kwargs)
 
 
 @pytest.mark.skipif(vendor_name == "hygon", reason="#2890: RuntimeError")
