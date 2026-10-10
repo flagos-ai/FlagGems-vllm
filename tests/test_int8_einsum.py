@@ -35,7 +35,7 @@ _EINSUM_BLOCK_SHAPES = [
 
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires Hygon or MetaX INT8"
+    not _einsum_low_precision_available(), reason="requires Hygon, MetaX or PPU INT8"
 )
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
 def test_accuracy_int8_einsum(shape):
@@ -77,8 +77,8 @@ def test_accuracy_int8_einsum(shape):
 
 @pytest.mark.einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "hygon",
-    reason="Hygon precision dispatch",
+    flaggems_vllm.vendor_name not in ("hygon", "thead"),
+    reason="Hygon DCU or PPU precision dispatch",
 )
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -97,7 +97,8 @@ def test_einsum_precision_route(shape, dtype):
 
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("hygon", "metax"), reason="Hygon or MetaX INT8"
+    flaggems_vllm.vendor_name not in ("hygon", "metax", "thead"),
+    reason="Hygon, MetaX or PPU INT8",
 )
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
 @pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
@@ -135,7 +136,8 @@ def test_int8_einsum_layouts(shape, layout):
 
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("hygon", "metax"), reason="Hygon or MetaX INT8"
+    flaggems_vllm.vendor_name not in ("hygon", "metax", "thead"),
+    reason="Hygon, MetaX or PPU INT8",
 )
 @pytest.mark.parametrize(
     "shape", [(0, 2, 128, 32), (3, 0, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)]
@@ -168,7 +170,8 @@ def test_int8_einsum_empty(shape, dtype):
 
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("hygon", "metax"), reason="Hygon or MetaX INT8"
+    flaggems_vllm.vendor_name not in ("hygon", "metax", "thead"),
+    reason="Hygon, MetaX or PPU INT8",
 )
 def test_int8_einsum_validation_and_extremes():
     x = torch.full((16, 2, 64), -128, dtype=torch.int8, device=flaggems_vllm.device)
@@ -185,3 +188,74 @@ def test_int8_einsum_validation_and_extremes():
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, None, y, ys)
     with pytest.raises(TypeError, match="matching"):
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y.float(), ys)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"),
+    reason="Hygon DCU or PPU W8A8 interface",
+)
+@pytest.mark.parametrize("shape", [(3, 2, 129, 33), (128, 2, 256, 128)])
+@pytest.mark.parametrize(
+    "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
+)
+@pytest.mark.parametrize("provide_output", [False, True])
+def test_w8a8_block_int8_bmm_interface(shape, dtype, provide_output):
+    b, h, k, n = shape
+    x, xs, y, ys, xf, yf = _make_block_einsum_inputs(
+        b,
+        h,
+        k,
+        n,
+        (128, 128),
+        flaggems_vllm.device,
+        torch.int8 if dtype == torch.int8 else torch.bfloat16,
+    )
+    if dtype != torch.int8:
+        x, y = x.to(dtype), y.to(dtype)
+    # Match PR #3297: y/ys retain [B,N,K]/[B,N-block,K-block].
+    x = x.permute(1, 0, 2)
+    xs = xs.permute(1, 0, 2) if xs is not None else None
+    z = (
+        torch.empty((b, h, n), dtype=torch.float32, device=x.device).permute(1, 0, 2)
+        if provide_output
+        else None
+    )
+    result = flaggems_vllm.w8a8_block_int8_bmm(
+        x, y, xs, ys, block_size=[128, 128], z=z, output_dtype=torch.float32
+    )
+    if provide_output:
+        assert result is z
+    assert result.shape == (h, b, n) and result.dtype == torch.float32
+    if dtype == torch.int8:
+        kk = torch.arange(k, device=x.device) // 128
+        nn = torch.arange(n, device=x.device) // 128
+        ref = torch.bmm(
+            x.float() * xs[:, :, kk],
+            (y.float() * ys[:, nn, :][:, :, kk]).transpose(1, 2),
+        )
+    else:
+        ref = torch.bmm(x.float(), y.float().transpose(1, 2))
+    nrms = ((result - ref).square().mean() / ref.square().mean()).sqrt()
+    assert torch.isfinite(result).all() and nrms.item() < (
+        0.10 if dtype == torch.int8 else 0.01
+    )
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"),
+    reason="Hygon DCU or PPU W8A8 interface",
+)
+def test_w8a8_block_int8_bmm_output_validation():
+    x = torch.ones((2, 3, 128), dtype=torch.int8, device=flaggems_vllm.device)
+    y = torch.ones((2, 128, 128), dtype=torch.int8, device=x.device)
+    xs = torch.ones((2, 3, 1), device=x.device)
+    ys = torch.ones((2, 1, 1), device=x.device)
+    with pytest.raises(ValueError, match="shape"):
+        flaggems_vllm.w8a8_block_int8_bmm(x, y, xs.transpose(1, 2), ys)
+    z = torch.empty((2, 3, 128), dtype=torch.float32, device=x.device)
+    with pytest.raises(ValueError, match="dtype"):
+        flaggems_vllm.w8a8_block_int8_bmm(x, y, xs, ys, z=z)
+    with pytest.raises(ValueError, match="scale"):
+        flaggems_vllm.w8a8_block_int8_bmm(x.bfloat16(), y.bfloat16(), xs, ys)
