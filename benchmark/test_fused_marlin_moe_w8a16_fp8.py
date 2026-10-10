@@ -15,6 +15,8 @@
 import pytest
 import torch
 
+import flaggems_vllm
+
 try:
     import vllm._custom_ops as vllm_ops
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
@@ -36,24 +38,30 @@ except ImportError:
 
 # vLLM 0.6.2 on Hygon registers no Marlin MoE ops (torch.ops._moe_C is empty),
 # so the Hygon path compares against the native Triton fused_experts kernel.
+# vLLM-MetaX 0.23's fused_experts wrapper reads a quant config field vLLM
+# no longer has, so MetaX calls outplace_fused_experts.
 try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts as vllm_fused_experts,
-    )
+    if flaggems_vllm.vendor_name == "metax":
+        from vllm_metax.model_executor.layers.fused_moe.fused_moe import (
+            outplace_fused_experts as vllm_fused_experts,
+        )
+    else:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts as vllm_fused_experts,
+        )
 
     HAS_VLLM_FUSED_EXPERTS = True
 except ImportError:
     HAS_VLLM_FUSED_EXPERTS = False
 
-import flaggems_vllm
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -65,7 +73,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 GROUP_SIZE = 128
@@ -394,7 +402,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         w1_q_fp8, w1_scale_fp8 = _quantize_per_expert_fp8(w1_fp)
         w2_q_fp8, w2_scale_fp8 = _quantize_per_expert_fp8(w2_fp)
-        if flaggems_vllm.vendor_name == "mthreads":
+        if flaggems_vllm.vendor_name in ("metax", "mthreads"):
             # Reuse the source buffers for the baseline's decoded weights.
             for quantized, scale, decoded in (
                 (w1_q_fp8, w1_scale_fp8, w1_fp),
@@ -482,7 +490,7 @@ def _vllm_baseline_fp8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads"):
         return vllm_fused_experts(
             hidden_states,
             w1_q_marlin,
@@ -517,12 +525,7 @@ def _gems_call_fp8(
     topk_weights,
     topk_ids,
 ):
-    gems_op = (
-        flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-        else fused_marlin_moe
-    )
-    return gems_op(
+    return flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
         quant_type_id=QUANT_TYPE_FP8_E4M3,

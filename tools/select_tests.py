@@ -221,6 +221,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_marlin_moe.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4.py",
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
