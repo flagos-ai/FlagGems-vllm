@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import os
 import random
 from typing import List, Optional, Tuple
 
@@ -20,12 +21,21 @@ import pytest
 import torch
 
 import flaggems_vllm
+from benchmark.test_flash_mla_sparse_fwd import (
+    HAS_FP8_MLA,
+    assert_sparse_fixture_close,
+    flashmla_reference,
+    quantize_sparse_fp8_fixture,
+    run_sparse_fp8_fixture,
+)
 
 random.seed(42)
 
 
 def _get_vllm_flashmla_sparse_reference():
-    """Return vLLM's sparse FlashMLA op only when its extension is usable."""
+    """Return the official vLLM CUDA BF16 sparse MLA reference."""
+    if os.environ.get("FLAGGEMS_FLASHMLA_REFERENCE_PATH"):
+        return flashmla_reference().flash_mla_sparse_fwd, None
     try:
         from vllm.v1.attention.ops import flashmla
     except Exception as error:
@@ -399,12 +409,27 @@ def test_flashmla_sparse(param):
     flaggems_vllm.testing.assert_close(your_lse, ref_lse, torch.float32, atol=1e-4)
 
 
-@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize(
+    "operator",
+    [
+        pytest.param("flash_mla_sparse_fwd", marks=pytest.mark.flash_mla_sparse_fwd),
+        pytest.param(
+            "flash_mla_sparse_fwd_w8a8_fp8",
+            marks=pytest.mark.flash_mla_sparse_fwd_w8a8_fp8,
+        ),
+    ],
+)
 @pytest.mark.parametrize(
     "param", FlashmlaSparseTestKit.get_correctness_test_params_flashmla()
 )
-def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
+def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param, operator):
     """Sparse MLA forward propagation test from FlashMLA"""
+    is_fp8_query = operator == "flash_mla_sparse_fwd_w8a8_fp8"
+    if is_fp8_query:
+        if not HAS_FP8_MLA:
+            pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
+        if not HAS_VLLM_FLASHMLA_SPARSE:
+            raise RuntimeError("Official vLLM CUDA SparseMLA baseline is required")
     # Create input
     q, kv, indices, attn_sink, topk_length = FlashmlaSparseTestKit.make_input_flashmla(
         param
@@ -436,22 +461,31 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
             topk_length,
         )
 
-    # Your operator implementation
-    your_output, your_max_logbits, your_lse = flaggems_vllm.flash_mla_sparse_fwd(
-        q, kv, indices, sm_scale, param.d_v, attn_sink, topk_length
-    )
+    if is_fp8_query:
+        packed = quantize_sparse_fp8_fixture(
+            q, kv, indices, sm_scale, param.d_v, attn_sink, topk_length
+        )
+        fp8_output, fp8_lse = run_sparse_fp8_fixture(*packed)
+        assert_sparse_fixture_close(
+            fp8_output[:, 0], fp8_lse[:, :, 0], ref_output, ref_lse
+        )
+    else:
+        # Your operator implementation
+        your_output, your_max_logbits, your_lse = flaggems_vllm.flash_mla_sparse_fwd(
+            q, kv, indices, sm_scale, param.d_v, attn_sink, topk_length
+        )
 
-    # Accuracy comparison
-    torch.testing.assert_close(
-        your_output, ref_output, atol=8e-4, rtol=3.01 / 128, equal_nan=False
-    )  # cos_diff_tol=7e-6
-    torch.testing.assert_close(
-        your_max_logbits,
-        ref_max_logbits,
-        atol=1e-6,
-        rtol=2.01 / 65536,
-        equal_nan=False,
-    )
-    torch.testing.assert_close(
-        your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
-    )
+        # Accuracy comparison
+        torch.testing.assert_close(
+            your_output, ref_output, atol=8e-4, rtol=3.01 / 128, equal_nan=False
+        )  # cos_diff_tol=7e-6
+        torch.testing.assert_close(
+            your_max_logbits,
+            ref_max_logbits,
+            atol=1e-6,
+            rtol=2.01 / 65536,
+            equal_nan=False,
+        )
+        torch.testing.assert_close(
+            your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
+        )
