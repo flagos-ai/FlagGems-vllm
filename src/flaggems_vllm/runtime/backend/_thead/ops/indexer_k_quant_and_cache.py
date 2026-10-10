@@ -20,25 +20,19 @@ import triton
 import triton.language as tl
 
 
-def _get_fp8_dtype() -> torch.dtype:
-    try:
-        from vllm.platforms import current_platform
-
-        return current_platform.fp8_dtype()
-    except ImportError:
-        pass
-
-    if getattr(torch.version, "hip", None) is not None and hasattr(
-        torch, "float8_e4m3fnuz"
-    ):
-        return torch.float8_e4m3fnuz
-    if hasattr(torch, "float8_e4m3fn"):
-        return torch.float8_e4m3fn
-    raise RuntimeError("float8_e4m3fn is required for indexer_k_quant_and_cache")
-
-
-def _is_fp8_fnuz(dtype: torch.dtype) -> bool:
-    return hasattr(torch, "float8_e4m3fnuz") and dtype == torch.float8_e4m3fnuz
+# Token from FlagGems-vllm/src/flaggems_vllm/runtime/backend/_ascend/ops/per_token_group_quant_fp8.py
+@triton.jit
+def _f32_to_fp8_e4m3fn(y):
+    b = y.to(tl.int32, bitcast=True)
+    a = b & 0x7FFFFFFF
+    t = a - 0x3C000000
+    t += 0x0007FFFF + ((t >> 20) & 1)
+    r_norm = t >> 20
+    r_sub = (a.to(tl.float32, bitcast=True) * 512.0 + 8388608.0).to(
+        tl.int32, bitcast=True
+    ) - 0x4B000000
+    r = tl.where(a >= 0x3C800000, r_norm, r_sub)
+    return (r | ((b >> 24) & 0x80)).to(tl.uint8)
 
 
 @triton.autotune(
@@ -62,7 +56,6 @@ def _indexer_k_quant_and_cache_kernel(
     num_quant_blocks,
     head_dim: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
-    IS_FNUZ: tl.constexpr,
     USE_UE8M0: tl.constexpr,
     NUM_TOKENS_PAD: tl.constexpr,
 ):
@@ -85,15 +78,12 @@ def _indexer_k_quant_and_cache_kernel(
 
     val = tl.load(src_ptr + offsets, mask=mask, other=0.0)
     amax = tl.max(tl.abs(val).to(tl.float32), axis=1)
-    if IS_FNUZ:
-        scale = tl.maximum(1e-4, amax) / 224.0
-    else:
-        scale = tl.maximum(1e-4, amax) / 448.0
+    scale = tl.maximum(1e-4, amax) / 448.0
 
     if USE_UE8M0:
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
 
-    fp8_val = (val.to(tl.float32) / scale[:, None]).to(kv_cache_ptr.type.element_ty)
+    fp8_val = _f32_to_fp8_e4m3fn(val.to(tl.float32) / scale[:, None])
     dst_ptr = kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
     tl.store(dst_ptr + offsets, fp8_val, mask=mask)
 
@@ -123,8 +113,9 @@ def indexer_k_quant_and_cache(
     num_quant_blocks = head_dim // quant_block_size
 
     kv_cache_flat = kv_cache.view(num_blocks, -1)
-    fp8_dtype = _get_fp8_dtype()
-    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(fp8_dtype)
+    # replace torch.float8_e4m3fn with torch.uint8 to avoid the following CompilationError:
+    #     "type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')"
+    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(torch.uint8)
     kv_cache_scale = kv_cache_flat[:, block_size * head_dim :].view(torch.float32)
     num_tokens_pad = triton.next_power_of_2(num_tokens)
     _indexer_k_quant_and_cache_kernel[(num_tokens, triton.cdiv(num_quant_blocks, 4))](
@@ -138,7 +129,6 @@ def indexer_k_quant_and_cache(
         num_quant_blocks,
         head_dim,
         quant_block_size,
-        IS_FNUZ=_is_fp8_fnuz(fp8_dtype),
         USE_UE8M0=scale_fmt == "ue8m0",
         NUM_TOKENS_PAD=num_tokens_pad,
     )
