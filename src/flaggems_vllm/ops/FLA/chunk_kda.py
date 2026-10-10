@@ -2990,10 +2990,8 @@ def _validate_chunk_kda_inputs(
         raise ValueError(f"g must have shape {(B, T, HV, K)}, got {tuple(g.shape)}")
     if beta.shape != (B, T, HV):
         raise ValueError(f"beta must have shape {(B, T, HV)}, got {tuple(beta.shape)}")
-    if K not in (64, 128, 192, 256):
-        raise ValueError(
-            f"chunk_kda TLE path requires K in {{64, 128, 192, 256}}, got {K}"
-        )
+    if K not in (64, 128, 256):
+        raise ValueError(f"chunk_kda TLE path requires K in {{64, 128, 256}}, got {K}")
     if V <= 0:
         raise ValueError(f"chunk_kda TLE path requires V > 0, got {V}")
     if HV < H or HV % H != 0:

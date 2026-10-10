@@ -16,12 +16,11 @@
 
 Two forward paths with identical semantics share one public entry, ``chunk_kda``:
 
-* TLE path (``chunk_kda_fwd_infer``): TMA-accelerated,
-  warp-specialized fused kernels for the wider supported input set.
+* TLE path (``hygon_chunk_kda_fwd_infer``): TLE-optimized kernels.
 * Triton fallback (``chunk_kda_fwd_infer_triton``): portable plain-Triton
   kernels shared verbatim with ``flaggems_vllm.ops.FLA.chunk_kda``.
 
-``chunk_kda`` validates inputs first, then dispatches: generic TLE when
+``chunk_kda`` validates inputs first, then dispatches: TLE when
 available, and Triton otherwise. Set ``FLAGGEMS_CHUNK_KDA_BACKEND`` to
 ``tle`` or ``triton`` to force a backend; the default is ``auto``.
 """
@@ -95,7 +94,7 @@ def _allocate_triton_workspace(size: int, _alignment: int, _stream) -> torch.Ten
 
 
 # =============================================================================
-# TLE path (fused, TMA + warp-specialized) -- default when available
+# TLE path -- default when available
 # =============================================================================
 
 if HAS_TLE_KDA:
@@ -332,12 +331,10 @@ if HAS_TLE_KDA:
         NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
         grid = (NT, B * HV)
 
-        # Pad the workspace T dimension so TMA descriptors can read full BT tiles.
-        T_padded = NT * BT
-        g_out = torch.empty(B, T_padded, HV, K, device=q.device, dtype=torch.float32)
-        ws = torch.empty(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
-        Aqk = torch.empty(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
-        Akk = torch.zeros(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
+        g_out = torch.empty(B, T_len, HV, K, device=q.device, dtype=torch.float32)
+        ws = torch.empty(B, T_len, HV, 3 * K, device=q.device, dtype=q.dtype)
+        Aqk = torch.empty(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
+        Akk = torch.zeros(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
 
         _hygon_kda_fwd_intra_kernel[grid](
             q=q,

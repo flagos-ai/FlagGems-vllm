@@ -16,7 +16,7 @@
 
 Two forward paths with identical semantics share one public entry, ``chunk_kda``:
 
-* TLE path (``iluvatar_chunk_kda_fwd_infer``): TLE-optimized kernels.
+* TLE path (``thead_chunk_kda_fwd_infer``): TLE-optimized kernels.
 * Triton fallback (``chunk_kda_fwd_infer_triton``): portable plain-Triton
   kernels shared verbatim with ``flaggems_vllm.ops.FLA.chunk_kda``.
 
@@ -106,17 +106,14 @@ if HAS_TLE_KDA:
     )
     @triton.autotune(
         configs=[
-            triton.Config(
-                {}, num_warps=num_warps, num_stages=num_stages, maxnreg=maxnreg
-            )
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4, 8]
             for num_stages in [2, 4, 8]
-            for maxnreg in [None, 32, 64, 72]
         ],
         key=["H", "HV", "K", "BT"],
     )
     @triton.jit(do_not_specialize=["T"])
-    def _iluvatar_kda_fwd_intra_kernel(
+    def _thead_kda_fwd_intra_kernel(
         q,
         k,
         g,
@@ -183,8 +180,8 @@ if HAS_TLE_KDA:
         p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, 0), (BT, K), (1, 0))
         p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT, 0), (BT, K), (1, 0))
         p_g = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_t * BT, 0), (BT, K), (1, 0))
-        b_q = tle.load(p_q, boundary_check=(0, 1), is_async=True)
-        b_k = tle.load(p_k, boundary_check=(0, 1), is_async=True)
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
         tl.store(q_sp, b_q)
         tl.store(k_sp, b_k)
 
@@ -194,7 +191,7 @@ if HAS_TLE_KDA:
         b_q_rstd = 1.0 / tl.sqrt(tl.sum(b_qf * b_qf, 1) + l2norm_eps)
         b_k_rstd = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + l2norm_eps)
 
-        b_g = tle.load(p_g, boundary_check=(0, 1), is_async=True).to(tl.float32)
+        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
         b_A = exp2(tl.load(A_log + i_hv).to(tl.float32) * g_scale)
         p_dt = tl.make_block_ptr(dt_bias + i_hv * K, (K,), (1,), (0,), (K,), (0,))
         b_bias = tl.load(p_dt, boundary_check=(0,)).to(tl.float32)
@@ -312,7 +309,7 @@ if HAS_TLE_KDA:
         )
         tl.store(p_kg, b_kg_val.to(ws.dtype.element_ty), boundary_check=(0, 1))
 
-    def _iluvatar_kda_fwd_intra(
+    def _thead_kda_fwd_intra(
         q,
         k,
         g,
@@ -339,7 +336,7 @@ if HAS_TLE_KDA:
         Aqk = torch.empty(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
         Akk = torch.zeros(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
 
-        _iluvatar_kda_fwd_intra_kernel[grid](
+        _thead_kda_fwd_intra_kernel[grid](
             q=q,
             k=k,
             g=g,
@@ -384,7 +381,7 @@ if HAS_TLE_KDA:
         key=["HV", "K", "V", "BT"],
     )
     @triton.jit(do_not_specialize=["T"])
-    def _iluvatar_kda_fwd_state_output_kernel(
+    def _thead_kda_fwd_state_output_kernel(
         kg,
         v,
         beta,
@@ -813,7 +810,7 @@ if HAS_TLE_KDA:
                         p_ht4, b_h4.to(p_ht4.dtype.element_ty), boundary_check=(0, 1)
                     )
 
-    def _iluvatar_kda_fwd_state_output(
+    def _thead_kda_fwd_state_output(
         kg: torch.Tensor,
         v: torch.Tensor,
         beta: torch.Tensor,
@@ -862,7 +859,7 @@ if HAS_TLE_KDA:
         )
 
         grid = lambda meta: (triton.cdiv(V, meta["BV"]), N * HV)
-        _iluvatar_kda_fwd_state_output_kernel[grid](
+        _thead_kda_fwd_state_output_kernel[grid](
             kg=kg,
             v=v,
             beta=beta,
@@ -886,7 +883,7 @@ if HAS_TLE_KDA:
         return o, final_state
 
 
-def iluvatar_chunk_kda_fwd_infer(
+def thead_chunk_kda_fwd_infer(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -913,7 +910,7 @@ def iluvatar_chunk_kda_fwd_infer(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
-    ws, Aqk, Akk, g_cumsum = _iluvatar_kda_fwd_intra(
+    ws, Aqk, Akk, g_cumsum = _thead_kda_fwd_intra(
         q=q,
         k=k,
         g=g,
@@ -928,7 +925,7 @@ def iluvatar_chunk_kda_fwd_infer(
     )
 
     K = q.shape[-1]
-    return _iluvatar_kda_fwd_state_output(
+    return _thead_kda_fwd_state_output(
         kg=ws[:, :, :, 2 * K :],
         v=v,
         beta=beta,
@@ -1005,7 +1002,7 @@ def chunk_kda(
         raise RuntimeError(f"{_BACKEND_ENV}=tle requires Triton TLE >= 3.6.0")
 
     if backend in {"auto", "tle"} and HAS_TLE_KDA:
-        return iluvatar_chunk_kda_fwd_infer(
+        return thead_chunk_kda_fwd_infer(
             q=q,
             k=k,
             v=v,
