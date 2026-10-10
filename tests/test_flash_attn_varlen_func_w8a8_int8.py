@@ -21,12 +21,14 @@ import torch
 import flaggems_vllm
 
 DESCALE_BLOCK = 128
+# LSE comparisons need a full FP32 reference matmul.
+torch.backends.cuda.matmul.allow_tf32 = False
 
 pytestmark = [
     pytest.mark.flash_attn_varlen_func_w8a8_int8,
     pytest.mark.skipif(
-        flaggems_vllm.vendor_name not in ("hygon", "thead"),
-        reason="Hygon/PPU-only API",
+        flaggems_vllm.vendor_name not in ("hygon", "thead", "metax"),
+        reason="INT8 attention backend unavailable",
     ),
 ]
 
@@ -256,7 +258,7 @@ def test_export_signature_and_empty():
         flaggems_vllm.flash_attn_varlen_func
     )
     assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
-    backend = "_hygon" if flaggems_vllm.vendor_name == "hygon" else "_thead"
+    backend = "_" + flaggems_vllm.vendor_name
     assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
     assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
     q = torch.empty((0, 4, 64), device="cuda", dtype=torch.int8)

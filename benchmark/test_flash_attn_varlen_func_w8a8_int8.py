@@ -85,9 +85,20 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
         return tuple(args)
 
     def get_input_iter(self, dtype):
+        if vendor_name == "metax":
+            torch.manual_seed(0)
         for bf16_args in super().get_input_iter(dtype):
             q, k, v = bf16_args[:3]
             batch = bf16_args[4].numel() - 1
+            if vendor_name == "metax":
+                # vLLM prepares cumulative KV lengths before attention timing.
+                bf16_args = list(bf16_args)
+                bf16_args[6] = torch.cat(
+                    (
+                        bf16_args[4].new_zeros(1),
+                        bf16_args[7].cumsum(0, dtype=torch.int32),
+                    )
+                )
             if vendor_name == "thead":
                 # vLLM creates scheduler metadata before attention. Exclude its
                 # creation and input quantization from both timed calls.
@@ -129,6 +140,8 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
                     )
                 )
             int8_args = list(bf16_args)
+            if vendor_name == "metax":
+                int8_args[6] = None
             int8_args[:3] = quantized
             int8_args[19] = torch.empty_like(q)
             backend_kwargs = (
@@ -161,6 +174,25 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
 
 
 def _varlen_bf16_baseline(bf16_args, int8_args):
+    if vendor_name == "metax":
+        from vllm_metax.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+        return flash_attn_varlen_func(
+            *bf16_args[:3],
+            bf16_args[4],
+            bf16_args[6],
+            bf16_args[3],
+            bf16_args[5],
+            dropout_p=bf16_args[9],
+            softmax_scale=bf16_args[10],
+            causal=bf16_args[11],
+            window_size=tuple(bf16_args[12]),
+            softcap=float(bf16_args[13]),
+            alibi_slopes=bf16_args[14],
+            deterministic=bf16_args[15],
+            return_attn_probs=bf16_args[16],
+            block_table=bf16_args[17],
+        )
     return flaggems_vllm.flash_attn_varlen_func(*bf16_args[:-1], **bf16_args[-1])
 
 
@@ -176,7 +208,10 @@ def _varlen_int8(bf16_args, int8_args):
     return flaggems_vllm.flash_attn_varlen_func(*int8_args[:-1], **int8_args[-1])
 
 
-@pytest.mark.skipif(vendor_name not in ("hygon", "thead"), reason="Hygon/PPU-only API")
+@pytest.mark.skipif(
+    vendor_name not in ("hygon", "thead", "metax"),
+    reason="INT8 attention backend unavailable",
+)
 @pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_flash_attn_varlen_func_w8a8_int8():
     if vendor_name == "thead":
@@ -184,6 +219,9 @@ def test_flash_attn_varlen_func_w8a8_int8():
             pytest.skip("PPU vLLM FA3 is unavailable")
         print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")
         baseline = _varlen_fa3_baseline
+    elif vendor_name == "metax":
+        print("Baseline: vLLM-MetaX BF16 FA2; metadata and quantization excluded.")
+        baseline = _varlen_bf16_baseline
     else:
         print(
             "Baseline: FlagGems-vllm BF16; input quantization is excluded from timing."
