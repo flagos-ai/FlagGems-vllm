@@ -20,6 +20,7 @@ from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_s
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
+from flaggems_vllm.ops.concat_mla_q import concat_mla_q
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -170,6 +171,7 @@ __all__ = [
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
     "concat_and_cache_mla",
+    "concat_mla_q",
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",
     "cutlass_scaled_mm",

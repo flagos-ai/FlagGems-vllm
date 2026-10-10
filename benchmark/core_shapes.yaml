@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+concat_mla_q:
+  shapes:
+    - [1, 64, 512, 64]
+    - [7, 64, 512, 64]
+    - [128, 64, 512, 64]
+    - [8192, 64, 512, 64]
+  shape_desc: "tokens, heads, nope_width, rope_width"
+
 fp8_einsum:
   shapes:
     - [1, 8, 4096, 1024]

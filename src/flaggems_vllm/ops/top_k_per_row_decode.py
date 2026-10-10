@@ -27,6 +27,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.utils.tle_capabilities import supports_topk_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 _LAUNCH_GEOMETRY = None
@@ -76,13 +77,32 @@ if has_triton_tle(3, 6, 0) and _vendor_tle_enabled():
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE = True
+        HAS_TLE = supports_topk_tle(tle)
+        if not HAS_TLE:
+            # Triton's dependency walk also visits disabled TLE branches.
+            tle = None
     except ImportError:
         tle = None
         HAS_TLE = False
 else:
     tle = None
     HAS_TLE = False
+
+
+# A disabled constexpr branch still participates in Triton's dependency walk.
+# Keep the scan helper defined without referencing a missing optional symbol.
+if HAS_TLE:
+
+    @triton.jit
+    def _exclusive_cumsum(counts):
+        return tle.cumsum(counts, axis=0, reverse=False)
+
+else:
+
+    @triton.jit
+    def _exclusive_cumsum(counts):
+        total = tl.sum(counts)
+        return total - tl.cumsum(counts, axis=0, reverse=True), total
 
 
 logger = logging.getLogger(__name__)
@@ -477,7 +497,7 @@ def _process_histogram_step(
             bins = round_idx * BLOCK_SIZE + lane
             counts = tl.load(s_histogram_ptr + bins)
             if HAS_TLE:
-                prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
+                prefix_sum, counts_total = _exclusive_cumsum(counts)
             else:
                 counts_total = tl.sum(counts)
                 prefix_sum = counts_total - tl.cumsum(counts, axis=0, reverse=True)
@@ -780,7 +800,7 @@ def _final_select_radix(
 
                 tl.debug_barrier()
                 counts = tl.load(radix_count_vec_ptr)
-                prefix_sum, _ = tle.cumsum(counts, axis=0, reverse=False)
+                prefix_sum, _ = _exclusive_cumsum(counts)
                 next_prefix_sum = prefix_sum + counts
                 threshold_mask = (prefix_sum < k_to_find) & (
                     next_prefix_sum >= k_to_find
