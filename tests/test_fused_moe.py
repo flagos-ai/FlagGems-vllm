@@ -5,7 +5,14 @@ import importlib
 import pytest
 import torch
 
-moe = importlib.import_module("flaggems_vllm.ops.fused_moe")
+import flaggems_vllm
+
+# Resolve the fused_moe module that is actually live on this backend. The
+# top-level package runs runtime.replace_customized_ops(), which swaps in the
+# vendor specialization under runtime/backend/_<vendor>/ops/ when one exists.
+# Importing "flaggems_vllm.ops.fused_moe" directly would bypass that dispatch
+# and always test the generic implementation, leaving the vendor path uncovered.
+moe = importlib.import_module(flaggems_vllm.fused_experts_impl.__module__)
 pytestmark = [
     pytest.mark.fused_moe,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
