@@ -86,6 +86,7 @@ def run_case(num_tokens, num_heads, n_groups, seed=0, scale=1.0):
     return quantized.cpu(), quant_scale.cpu(), ref_q, ref_scale, merged
 
 
+@pytest.mark.fused_inv_rope_int8_quant
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 128])
 @pytest.mark.parametrize("num_heads,n_groups", [(32, 4), (64, 8), (128, 8)])
 @pytest.mark.parametrize("seed", [0, 42])
@@ -98,6 +99,7 @@ def test_fused_inv_rope_int8_quant(num_tokens, num_heads, n_groups, seed):
     torch.testing.assert_close(quant_scale, ref_scale, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.fused_inv_rope_int8_quant
 def test_output_layout():
     num_tokens, num_heads, n_groups = 7, 64, 8
     heads_per_group = num_heads // n_groups
@@ -120,6 +122,7 @@ def test_output_layout():
     assert quantized[:, 0, :].is_contiguous()
 
 
+@pytest.mark.fused_inv_rope_int8_quant
 def test_identity_rope_matches_passthrough():
     num_tokens, num_heads, n_groups = 8, 64, 8
     heads_per_group = num_heads // n_groups
@@ -143,6 +146,7 @@ def test_identity_rope_matches_passthrough():
     torch.testing.assert_close(quant_scale.cpu(), ref_scale, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.fused_inv_rope_int8_quant
 def test_large_values_stay_in_int8_range():
     quantized, quant_scale, _, _, merged = run_case(8, 64, 8, scale=1000.0)
     assert quantized.min() >= -128 and quantized.max() <= 127
@@ -154,6 +158,7 @@ def test_large_values_stay_in_int8_range():
     assert torch.le(abs_err, limit).all()
 
 
+@pytest.mark.fused_inv_rope_int8_quant
 def test_empty_tokens():
     device = flaggems_vllm.device
     values = torch.empty((0, 8, HEAD_DIM), dtype=torch.bfloat16, device=device)
@@ -166,6 +171,7 @@ def test_empty_tokens():
     assert quant_scale.shape == (0, 1, 8 * HEAD_DIM // QUANT_GROUP_SIZE)
 
 
+@pytest.mark.fused_inv_rope_int8_quant
 @pytest.mark.parametrize("strided_input", ["positions", "cache"])
 def test_rejects_strided_indices_or_cache(strided_input):
     device = flaggems_vllm.device

@@ -23,17 +23,29 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._metax.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
-from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
+    w8a8_block_int8_bmm,
+)
+from flaggems_vllm.utils import triton_version_utils
+
+# A missing optional TLE extension must not disable the independent INT8 ops.
+if triton_version_utils.has_triton_tle():
+    from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
+else:
+    from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "int8_einsum",
+    "w8a8_block_int8_bmm",
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
     "persistent_topk",
