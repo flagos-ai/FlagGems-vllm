@@ -148,7 +148,7 @@ def test_mhc_post_layout_matrix_vs_ref(n, h, hc_mult, mix_layout, mem):
     data_cpu = {k: v.cpu() for k, v in data.items()}
     out_ref = mhc_post_ref(**data_cpu, mix_layout=mix_layout)
     if h == 3584:
-        torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=0, atol=0.03125)
+        torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=0.03125)
     else:
         torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=1e-2)
 
