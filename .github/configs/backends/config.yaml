@@ -31,11 +31,11 @@ backends:
   PPU-ZW810E:
     enabled: true
   MLU590-M9DE:
-    enabled: true
+    enabled: false
   P800:
     enabled: true
   W7900D:
-    enabled: true
+    enabled: false
   TX8110:
     enabled: false
   S60:
