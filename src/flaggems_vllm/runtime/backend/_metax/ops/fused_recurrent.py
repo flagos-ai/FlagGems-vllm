@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
-def fused_recurrent_gated_delta_rule_fwd_sp_for_qwen3_next_kernel(
+def fused_recurrent_gated_delta_rule_strided_fwd_kernel(
     q,
     k,
     v,
@@ -577,7 +577,7 @@ def fused_recurrent_gated_delta_rule_fwd(
             V,
         )
         if T <= 64:
-            fused_recurrent_gated_delta_rule_fwd_sp_for_qwen3_next_kernel[grid](
+            fused_recurrent_gated_delta_rule_strided_fwd_kernel[grid](
                 q=q,
                 k=k,
                 v=v,
