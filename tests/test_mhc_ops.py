@@ -97,6 +97,16 @@ MHC_POST_LAYOUT_CONFIGS = [
     (256, 3584, 4),
 ] + list(product([4096], [1280, 2560, 7168], [2, 4]))
 
+# npu-only: exercise the generic (HC != 4) kernel at small N. Grids like
+# (8, 2, 28) = 448 programs stay far below the NPU 65,535-program launch
+# cap, so these pass with or without any autotune pruning.
+if flaggems_vllm.device == "npu":
+    MHC_POST_LAYOUT_CONFIGS += [
+        (8, 3584, 2),
+        (256, 3584, 2),
+        (8, 1280, 2),
+    ]
+
 
 def make_mhc_post_mix_in_form(
     comb_res_mix: torch.Tensor, mix_layout, mem: str
