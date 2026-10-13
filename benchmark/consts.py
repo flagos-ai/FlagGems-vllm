@@ -435,14 +435,15 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
         # flash_mla 的 [B,S_q,H_q,D,seqlen]）或字符串键（如 t1_e8_h4096...），
         # 与第一个张量 shape 不一致。改用「全部张量 shape 的多重集合」签名回退
         # 匹配——与采集器 config.inputs 对称、两边口径一致。
-        rec, matched_key = _match_by_signature(
-            base_data, op_name, dtype, shape_detail
-        )
+        rec, matched_key = _match_by_signature(base_data, op_name, dtype, shape_detail)
         if rec is not None:
             return rec, None
         # 仍未命中：区分「该 shape 签名在 baseline 不存在」与「shape 在但 dtype
         # 缺」两种原因，给出精确诊断。
-        if str(first_shape) in shapes and shapes[str(first_shape)].get(str(dtype)) is None:
+        if (
+            str(first_shape) in shapes
+            and shapes[str(first_shape)].get(str(dtype)) is None
+        ):
             return None, (
                 f"算子 '{op_name}' shape {first_shape} 在 baseline 中没有 "
                 f"对应的 dtype {dtype}"
@@ -491,8 +492,7 @@ def _chip_matches(chip_name, device_name):
     return chip_name.lower() in device_name.lower()
 
 
-def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype,
-                          self_chip=None):
+def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=None):
     """Return this chip's hardware scaling factor (chip_peak / reference_peak)
     for the resource that bottlenecks the baseline record, or None.
 
@@ -518,8 +518,9 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype,
             return None
         # Prefer the candidate whose chip model matches this device; only when a
         # single vendor chip exists do we accept it without a model match.
-        chip = next((c for c in candidates
-                     if _chip_matches(c.get("chip"), self_chip)), None)
+        chip = next(
+            (c for c in candidates if _chip_matches(c.get("chip"), self_chip)), None
+        )
         if chip is None:
             chip = candidates[0] if len(candidates) == 1 else None
         if chip is None:

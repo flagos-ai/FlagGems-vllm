@@ -39,8 +39,8 @@ from .attri_util import (
     OperationAttribute,
     check_metric_dependencies,
 )
-from .consts import lookup_base_record_ex, lookup_scaling_factor
 from .conftest import Config, emit_record_logger
+from .consts import lookup_base_record_ex, lookup_scaling_factor
 
 torch_backend_device = flaggems_vllm.runtime.torch_backend_device
 torch_device_fn = flaggems_vllm.runtime.torch_device_fn

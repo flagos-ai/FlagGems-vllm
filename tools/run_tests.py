@@ -445,7 +445,11 @@ def _read_cann_version():
     """
     roots = [
         os.environ.get(v)
-        for v in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_TOOLKIT_LATEST_HOME")
+        for v in (
+            "ASCEND_HOME_PATH",
+            "ASCEND_TOOLKIT_HOME",
+            "ASCEND_TOOLKIT_LATEST_HOME",
+        )
     ]
     roots.append("/usr/local/Ascend/ascend-toolkit/latest")
     for root in filter(None, roots):
@@ -521,9 +525,9 @@ def _probe_sdk():
     # (display name, regex capturing the SDK version from the torch suffix)
     SDK_SUFFIX = (
         ("COREX", r"corex\.?(\d+\.\d+\.\d+)"),  # iluvatar: 4.5.0.20260804 -> 4.5.0
-        ("METAX", r"metax(\d+\.\d+\.\d+)"),      # metax:    3.8.1.0       -> 3.8.1
-        ("MUSA", r"musa(\d+\.\d+\.\d+)"),        # mthreads: 5.2.0
-        ("DTK", r"dtk(\d+)"),                     # hygon:    2604
+        ("METAX", r"metax(\d+\.\d+\.\d+)"),  # metax:    3.8.1.0       -> 3.8.1
+        ("MUSA", r"musa(\d+\.\d+\.\d+)"),  # mthreads: 5.2.0
+        ("DTK", r"dtk(\d+)"),  # hygon:    2604
     )
     for sdk_name, pat in SDK_SUFFIX:
         m = re.search(pat, full)
