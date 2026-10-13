@@ -25,7 +25,6 @@ from . import base, conftest
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 # Hygon, MetaX, and Ascend use signed INT8 inputs with block-wise scales.
-IS_HYGON = flaggems_vllm.vendor_name == "hygon"
 IS_SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "metax", "ascend")
 pytestmark = pytest.mark.skipif(
     not IS_SUPPORTED_VENDOR, reason="requires an INT8 einsum backend"
@@ -127,20 +126,17 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
 
 
 class INT8EinsumBenchmark(base.Benchmark):
-    """Benchmark block-wise INT8 einsum against explicit BF16 timing boundaries.
+    """Compare block-wise INT8 einsum with vendor-specific BF16 baselines.
 
-    Ascend uses the vLLM BF16 equivalent because its installed model path
-    does not expose this prequantized block-128 INT8 contraction. Activations
-    and weights use the same quantized effective values and are both prepared
-    outside timing. The Hygon baseline groups retain their original behavior.
+    Ascend prepares effective BF16 activations and weights outside timing for
+    the torch_npu primitive used by vLLM-Ascend.
     """
 
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
 
-    def __init__(self, op_name, torch_op, dtypes, preserve_bf16=False):
+    def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
         self.block_shape = DEFAULT_BLOCK_SHAPE
-        self.preserve_bf16 = preserve_bf16
 
     def set_shapes(self, shape_file_path=None):
         default_shape_file = Path(__file__).with_name(self.DEFAULT_SHAPE_FILES)
@@ -191,7 +187,7 @@ class INT8EinsumBenchmark(base.Benchmark):
             if (
                 cur_dtype == EINSUM_LOW_PRECISION_DTYPE
                 and flaggems_vllm.vendor_name == "ascend"
-                and not self.preserve_bf16
+                and self.torch_op is _vllm_einsum_bf16_predequantized_wrapper
             ):
                 # Release the unquantized activation before preparing the baseline.
                 x_bf16 = None
@@ -325,7 +321,7 @@ def test_perf_int8_einsum(dtype):
         bench.run()
         return
     baselines = [("torch_bf16", _torch_einsum_bf16_wrapper)]
-    if low_precision and IS_HYGON:
+    if low_precision and flaggems_vllm.vendor_name == "hygon":
         baselines.append(("flaggems_bf16", _gems_einsum_bf16_wrapper))
     elif low_precision and flaggems_vllm.vendor_name == "ascend":
         baselines = [
@@ -334,12 +330,7 @@ def test_perf_int8_einsum(dtype):
         ]
     for baseline_name, baseline in baselines:
         previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
-        bench = INT8EinsumBenchmark(
-            op_name=op_name,
-            torch_op=baseline,
-            dtypes=[dtype],
-            preserve_bf16=baseline_name == "flaggems_bf16",
-        )
+        bench = INT8EinsumBenchmark(op_name=op_name, torch_op=baseline, dtypes=[dtype])
         bench.set_gems(_gems_einsum_precision_wrapper)
         bench.run()
         # Keep the public operator ID exact; distinguish references as metadata.
@@ -350,6 +341,9 @@ def test_perf_int8_einsum(dtype):
             if baseline_name == "vllm_bf16_predequantized":
                 detail["activation_dequantization"] = "outside_timing"
                 detail["weight_dequantization"] = "outside_timing"
-            elif baseline_name == "flaggems_bf16" and not IS_HYGON:
+            elif (
+                baseline_name == "flaggems_bf16"
+                and flaggems_vllm.vendor_name == "ascend"
+            ):
                 # This is the local floating compatibility path, not flag_gems.bmm.
                 detail["baseline_implementation"] = "int8_einsum_float_compat"

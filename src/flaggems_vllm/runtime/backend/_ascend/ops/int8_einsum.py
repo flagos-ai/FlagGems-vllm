@@ -252,7 +252,7 @@ def _ascend_block_int8_einsum_kernel(
         tl.store(output, acc, (m[:, None] < B) & (n[None, :] < D))
 
 
-def _prepare_int8_einsum(
+def int8_einsum(
     equation: str,
     x: torch.Tensor,
     xs: torch.Tensor | None,
@@ -261,7 +261,13 @@ def _prepare_int8_einsum(
     block_size=(128, 128),
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Validate the Ascend inference contract and allocate its contiguous output."""
+    """Compute block-scaled INT8 or floating einsum with FP32 accumulation.
+
+    INT8 inputs use K128 block scales and optional per-call activation packing.
+    Floating inputs use the local BF16/FP16/FP32 compatibility kernel.
+    """
+    if x.device.type != "npu":
+        raise NotImplementedError("the Ascend int8_einsum path requires NPU inputs")
     if equation != "bhr,hdr->bhd":
         raise ValueError("int8_einsum only supports 'bhr,hdr->bhd'")
     if x.ndim != 3 or y.ndim != 3:
@@ -312,35 +318,9 @@ def _prepare_int8_einsum(
             "floating int8_einsum inputs must not have quantization scales"
         )
 
-    return torch.empty((b, h, d), device=x.device, dtype=output_dtype)
-
-
-def int8_einsum(
-    equation: str,
-    x: torch.Tensor,
-    xs: torch.Tensor | None,
-    y: torch.Tensor,
-    ys: torch.Tensor | None,
-    block_size=(128, 128),
-    output_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Compute block-scaled INT8 or floating einsum with FP32 accumulation.
-
-    INT8 tiles use up to 256 rows, or wider columns for small batches while
-    preserving independent weight-scale groups. Selected input strides use a
-    per-call INT8 copy into HBR storage; scales keep their original layout. Floating inputs use a local BF16/FP16/FP32
-    compatibility kernel.
-    No-copy batch slices bound the logical launch grid; all device offsets use
-    INT64. This backend owns validation, output allocation and zero reduction.
-    """
-    if x.device.type != "npu":
-        raise NotImplementedError("the Ascend int8_einsum path requires NPU inputs")
-    out = _prepare_int8_einsum(equation, x, xs, y, ys, block_size, output_dtype)
+    out = torch.empty((b, h, d), device=x.device, dtype=output_dtype)
     if out.numel() == 0:
         return out
-    b, h, r = x.shape
-    d = y.shape[1]
-    is_int8 = x.dtype == torch.int8
     with torch_device_fn.device(x.device):
         if r == 0:
             flat = out.view(-1)
@@ -355,10 +335,10 @@ def int8_einsum(
             if is_int8
             else (16 if b < 32 else 32)
         )
-        bn = min(block_size[0], 128) if is_int8 else 128
+        bn = min(sn, 128) if is_int8 else 128
         if (
             is_int8
-            and block_size[0] == 128
+            and sn == 128
             and b <= 32
             and d >= 512
             and x.stride(2) == 1
@@ -416,7 +396,7 @@ def int8_einsum(
                     xsc.stride(),
                     y.stride(),
                     ys.stride(),
-                    block_size[0],
+                    sn,
                     BLOCK_M=bm,
                     BLOCK_N=bn,
                     ALIGNED=aligned,
