@@ -50,8 +50,18 @@ if HAS_TLE:
         HAS_TLE_MODEL1 = True
     except ImportError:
         HAS_TLE_MODEL1 = False
+    try:
+        from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_model1 import (
+            can_use_model1_thead,
+            sparse_decode_model1_thead,
+        )
+
+        HAS_TLE_MODEL1_THEAD = True
+    except ImportError:
+        HAS_TLE_MODEL1_THEAD = False
 else:
     HAS_TLE_MODEL1 = False
+    HAS_TLE_MODEL1_THEAD = False
 
 
 # TLE constants for decode
@@ -1076,6 +1086,7 @@ def flash_mla_with_kvcache(
             k_cache.shape[1],
             softmax_scale,
             is_fp8_kvcache,
+            sched_meta,
         )
     else:
         assert (
@@ -1143,6 +1154,7 @@ def _sparse_decode_dispatch(
     page_block_size,
     softmax_scale,
     is_fp8_kvcache,
+    sched_meta=None,
 ):
     """Launch sparse decode kernel."""
     BH = 64
@@ -1152,6 +1164,35 @@ def _sparse_decode_dispatch(
     skv = kv.shape[0] * page_block_size
 
     if head_dim_k == 512:
+        # MODEL1 fast path for T-Head PPU (FlagTree TLE). It keeps its tile
+        # schedule in sched_meta and reuses it on later calls.
+        if HAS_TLE_MODEL1_THEAD and can_use_model1_thead(
+            q,
+            kv,
+            indices,
+            out,
+            lse,
+            extra_kv,
+            extra_indices,
+            topk_length,
+            extra_topk_length,
+        ):
+            sparse_decode_model1_thead(
+                q,
+                kv,
+                indices,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                extra_kv=extra_kv,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                out=out,
+                lse=lse,
+                sm_scale=softmax_scale,
+                sched_meta=sched_meta,
+            )
+            return
+
         # Warp-specialized MODEL1 fast path (FlagTree TLE, sm90). Falls back
         # to the portable kernel below when the layout is unsupported.
         if HAS_TLE_MODEL1 and can_use_model1_tle(
