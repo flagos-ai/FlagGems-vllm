@@ -29,6 +29,14 @@ EXTRA_INT_DTYPES = [torch.int8, torch.uint8, torch.int64]
 
 
 def get_fp8_dtype():
+    # MThreads exposes FP8 dtypes through the torch namespace, but does not
+    # implement CUDA's device-capability query.
+    if flaggems_vllm.device == "musa":
+        for name in ("float8_e4m3fn", "float8_e5m2"):
+            if hasattr(torch, name):
+                return getattr(torch, name)
+        return None
+
     if flaggems_vllm.device != "cuda" or not torch.cuda.is_available():
         return None
 
@@ -43,7 +51,8 @@ def get_fp8_dtype():
     return None
 
 
-FP8_DTYPES = [get_fp8_dtype()]
+_fp8_dtype = get_fp8_dtype()
+FP8_DTYPES = [_fp8_dtype] if _fp8_dtype is not None else []
 
 DEFAULT_WARMUP_TIME = 1000
 DEFAULT_ITER_TIME = 100

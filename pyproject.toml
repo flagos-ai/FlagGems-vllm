@@ -13,13 +13,13 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools>=64.0", "scikit-build-core>=0.11", "pybind11"]
+requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
 
 [project]
 name = "flaggems_vllm"
-version = "0.1.0"
+version = "0.3.0-dev1"
 description = "FlagGems-vllm is a deep neural network function library written in Triton."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.8.0"
@@ -60,12 +60,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
-
-[tool.scikit-build]
-build.verbose = true
-logging.level = "INFO"
-wheel.install-dir = "flaggems_vllm"
-build-dir = "build/{cache_tag}"
 
 [tool.black]
 line-length = 88

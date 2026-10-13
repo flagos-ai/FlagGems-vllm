@@ -19,27 +19,44 @@ import flaggems_vllm
 
 from . import base
 
-_IS_MTHREADS = flaggems_vllm.vendor_name == "mthreads"
+vendor = flaggems_vllm.vendor_name
 
-if _IS_MTHREADS:
-    try:
+try:
+    if vendor == "mthreads":
         from vllm_musa import _custom_ops as vendor_ops
 
         reference_fused_q_kv_rmsnorm = vendor_ops.deepseek_v4_fused_q_kv_rmsnorm
-        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = True
-    except (ImportError, AttributeError):
-        reference_fused_q_kv_rmsnorm = None
-        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = False
-else:
-    try:
+    elif vendor == "nvidia":
         from vllm.v1.attention.ops.deepseek_v4_ops import (
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
+    elif vendor == "ascend":
+        import torchair
+        from torchair.configs.compiler_config import CompilerConfig
 
-        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = True
-    except (ImportError, AttributeError):
-        reference_fused_q_kv_rmsnorm = None
-        _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = False
+        config = CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+
+        @torch.compile(backend=npu_backend, dynamic=False)
+        def reference_fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps=1e-6):
+            q_var = qr.pow(2).mean(-1, keepdim=True)
+            q_normed = qr * torch.rsqrt(q_var + eps) * q_weight
+
+            kv_var = kv.pow(2).mean(-1, keepdim=True)
+            kv_normed = kv * torch.rsqrt(kv_var + eps) * kv_weight
+
+            return q_normed, kv_normed
+
+    elif vendor == "iluvatar":
+        from vllm.models.deepseek_v4.common.ops import (
+            fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
+        )
+
+    _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = True
+except Exception as e:
+    print(e)
+    reference_fused_q_kv_rmsnorm = None
+    _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = False
 
 
 class FusedQKVRMSNormBenchmark(base.Benchmark):
@@ -61,30 +78,29 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
             (128, 1536, 512),
             (512, 1536, 512),
             (2048, 1536, 512),
-            (32, 64 * 576, 576),
-            (128, 64 * 576, 576),
-        ]
+        ] + ([(32, 64 * 576, 576), (128, 64 * 576, 576)] if vendor != "ascend" else [])
 
     def get_input_iter(self, dtype):
+        device = flaggems_vllm.runtime.device.name
         for tokens, qdim, kvdim in self.shapes:
             qr = torch.randn(
                 (tokens, qdim),
-                device="cuda",
+                device=device,
                 dtype=dtype,
             )
             kv = torch.randn(
                 (tokens, kvdim),
-                device="cuda",
+                device=device,
                 dtype=dtype,
             )
             q_weight = torch.randn(
                 (qdim,),
-                device="cuda",
+                device=device,
                 dtype=dtype,
             )
             kv_weight = torch.randn(
                 (kvdim,),
-                device="cuda",
+                device=device,
                 dtype=dtype,
             )
 

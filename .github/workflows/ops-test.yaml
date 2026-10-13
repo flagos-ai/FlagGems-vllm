@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Operator test workflow
+# Full-range operator test workflow
 #
 #
 # Main config: .github/configs/backends/config.yaml
 # Per-backend config: .github/configs/backends/<NAME>.yaml
-# vendors: Nvidia,MThreads,KunLunXin,Iluvatar,Ascend,Hygon,Metax,THead,Cambricon,AMD
+# vendors: Nvidia,MThreads,KunLunXin,Iluvatar,Ascend,Hygon,Metax,THead,Cambricon,AMD,TsingMicro,Enflame
 name: ops-test
 
 permissions:
   contents: read
+
+env:
+  TZ: Asia/Shanghai
 
 on:
   workflow_dispatch:
@@ -47,10 +50,6 @@ on:
         required: false
         default: ''
 
-  # schedule:
-  #   # Disabled for now; run this workflow through workflow_dispatch only.
-  #   - cron: '30 13 * * 3,6'
-
 defaults:
   run:
     shell: bash
@@ -74,12 +73,12 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || 'main' }}
 
       - id: get-date
-        run: echo "DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+        run: echo "DATE=$(date '+%Y-%m-%d')" >> "$GITHUB_OUTPUT"
 
       - id: build-matrix
         shell: python3 {0}
         env:
-          # Optional workflow_dispatch inputs; empty when omitted.
+          # Optional workflow_dispatch inputs; empty for default runs.
           BRANCH_INPUT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || '' }}
           VENDORS_INPUT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.vendors || '' }}
           OPS_INPUT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ops || '' }}
@@ -139,23 +138,24 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix_container) }}
     concurrency:
-      group: weekly-test-${{ matrix.name }}
+      group: ops-test-${{ matrix.name }}
       cancel-in-progress: true
     runs-on: ${{ matrix.runner_labels }}
     # Whole-job timeout, evaluated per vendor. This is the ONLY timeout for the
-    # test run: the "Run weekly tests" step has no step-level timeout, so it is
+    # test run: the "Run ops tests" step has no step-level timeout, so it is
     # bounded solely by this value (a step-level timeout can never extend a step
     # beyond its enclosing job, and omitting it avoids configuring the limit
-    # twice). Ascend (910B) runs the full operator suite in ~15h so it gets 24h.
+    # twice). Keep the full operator suite bounded to 4h per backend.
     # Self-hosted runners have no hard 6h cap, so these values are honoured.
-    timeout-minutes: 1440
+    timeout-minutes: 240
     container:
       image: ${{ matrix.container_image }}
       options: ${{ matrix.container_options }}
       volumes: ${{ matrix.container_volumes }}
     env:
       DATE: ${{ needs.prepare.outputs.date }}
-      OUTPUT_DIR: ${{ matrix.output_base_dir }}/${{ needs.prepare.outputs.date }}/logs_results_${{ needs.prepare.outputs.date }}
+      REPOSITORY_NAME: ${{ github.event.repository.name }}
+      OUTPUT_DIR: ${{ matrix.output_base_dir }}/${{ github.event.repository.name }}/${{ needs.prepare.outputs.date }}/logs_results_${{ needs.prepare.outputs.date }}
     steps:
       - id: checkout-attempt-1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -273,26 +273,41 @@ jobs:
         shell: bash --login -e -o pipefail {0}
         run: |
           echo "[GPU check] Running GPU availability check script: ${{ matrix.gpu_check_script }}"
-          GPU_OUTPUT=$(bash ${{ matrix.gpu_check_script }})
+          if [ "${{ matrix.force_test_gpus }}" = "true" ]; then
+            # Best-effort run: this backend only uses the script output for
+            # logging/inspection, so a non-zero exit here must not fail the job.
+            GPU_OUTPUT=$(bash ${{ matrix.gpu_check_script }} || true)
+          else
+            GPU_OUTPUT=$(bash ${{ matrix.gpu_check_script }})
+          fi
           echo "[GPU check] GPU availability check output:"
           echo "$GPU_OUTPUT"
-          AVAILABLE_GPUS=$(echo "$GPU_OUTPUT" | grep "^Available GPUs:" | cut -d: -f2 | tr -d ' ')
+          if [ "${{ matrix.force_test_gpus }}" = "true" ]; then
+            # This backend deliberately pins the GPUs under test to the
+            # configured test_gpus list (e.g. only the first N cards on a host
+            # that exposes more). Ignore the gpu_check result and use test_gpus.
+            AVAILABLE_GPUS="${{ matrix.test_gpus }}"
+            echo "[GPU check] force_test_gpus=true -> using configured test_gpus"
+          else
+            AVAILABLE_GPUS=$(echo "$GPU_OUTPUT" | grep "^Available GPUs:" | cut -d: -f2 | tr -d ' ')
+          fi
           echo "[GPU check] Available GPUs: ${AVAILABLE_GPUS}"
           echo "AVAILABLE_GPUS=${AVAILABLE_GPUS}" >> $GITHUB_ENV
 
-      # Run weekly tests.
+      # Run ops tests.
       # OPS is provided by the prepare job: "all" (scheduled runs or an empty
       # "ops" input) runs every operator stage via --stages all; otherwise it
       # runs only the selected operators via --ops <list>.
-      - name: Run weekly tests
+      - name: Run ops tests
         env: ${{ fromJSON(matrix.test_env) }}
         shell: bash --login -e -o pipefail {0}
         run: |
-          echo "[Run weekly tests] Running on backend: ${{ matrix.name }} (vendor: ${{ matrix.vendor }})"
-          echo "[Run weekly tests] Test output directory: ${OUTPUT_DIR}"
-          echo "[Run weekly tests] Test GPUs: ${AVAILABLE_GPUS}"
-          echo "[Run weekly tests] Test date: ${DATE}"
-          echo "[Run weekly tests] Test ops: ${{ needs.prepare.outputs.ops }}"
+          echo "[Run ops tests] Running on backend: ${{ matrix.name }} (vendor: ${{ matrix.vendor }})"
+          echo "[Run ops tests] Test output directory: ${OUTPUT_DIR}"
+          echo "[Run ops tests] Test GPUs: ${AVAILABLE_GPUS}"
+          echo "[Run ops tests] Test date: ${DATE}"
+          echo "[Run ops tests] Test ops: ${{ needs.prepare.outputs.ops }}"
+          mkdir -p "${OUTPUT_DIR}"
           # remove cache to avoid potential issues with stale files
           rm -rf ~/.triton/cache && rm -rf ~/.flaggems
           # run tests with specified GPUs and output directory
@@ -302,7 +317,16 @@ jobs:
           # printenv | grep -viE '^(https?_proxy|all_proxy)=' || true
           OPS="${{ needs.prepare.outputs.ops }}"
           if [ "${OPS}" = "all" ]; then
-            OP_ARGS="--stages all"
+            if [ "${{ matrix.vendor }}" = "Enflame" ]; then
+              OP_LIST_FILE="/data/flaggems/ops_list.txt"
+              if [ ! -f "${OP_LIST_FILE}" ]; then
+                echo "[Run ops tests] ERROR: Enflame op list file not found: ${OP_LIST_FILE}"
+                exit 1
+              fi
+              OP_ARGS="--op-list-file ${OP_LIST_FILE}"
+            else
+              OP_ARGS="--stages all"
+            fi
           else
             OP_ARGS="--ops ${OPS}"
           fi
@@ -319,14 +343,15 @@ jobs:
 
       - name: Package results
         run: |
-          ARCHIVE="${{ matrix.output_base_dir }}/weekly-${{ matrix.name }}-${DATE}.tar.gz"
+          ARCHIVE="${{ matrix.output_base_dir }}/${REPOSITORY_NAME}/${REPOSITORY_NAME}-${{ matrix.name }}-${DATE}.tar.gz"
+          mkdir -p "${OUTPUT_DIR}" "$(dirname "${ARCHIVE}")"
           tar -czf "${ARCHIVE}" -C "$(dirname "${OUTPUT_DIR}")" "$(basename "${OUTPUT_DIR}")"
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       # - name: Upload artifact
       #   uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       #   with:
-      #     name: weekly-${{ matrix.name }}-${{ needs.prepare.outputs.date }}
+      #     name: ops-test-${{ matrix.name }}-${{ needs.prepare.outputs.date }}
       #     path: ${{ env.ARCHIVE }}
 
       - name: Publish results to op-monitor
@@ -374,15 +399,16 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix_native) }}
     concurrency:
-      group: weekly-test-${{ matrix.name }}
+      group: ops-test-${{ matrix.name }}
       cancel-in-progress: true
     runs-on: ${{ matrix.runner_labels }}
-    # See test-container: single per-vendor, job-level timeout (Ascend 24h,
-    # others 18h); the "Run weekly tests" step has no step-level timeout.
-    timeout-minutes: 1080
+    # See test-container: single per-vendor, job-level 4h timeout; the
+    # "Run ops tests" step has no step-level timeout.
+    timeout-minutes: 240
     env:
       DATE: ${{ needs.prepare.outputs.date }}
-      OUTPUT_DIR: ${{ matrix.output_base_dir }}/${{ needs.prepare.outputs.date }}/logs_results_${{ needs.prepare.outputs.date }}
+      REPOSITORY_NAME: ${{ github.event.repository.name }}
+      OUTPUT_DIR: ${{ matrix.output_base_dir }}/${{ github.event.repository.name }}/${{ needs.prepare.outputs.date }}/logs_results_${{ needs.prepare.outputs.date }}
     steps:
       - id: checkout-attempt-1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -423,31 +449,55 @@ jobs:
         shell: bash --login -e -o pipefail {0}
         run: |
           echo "[GPU check] Running GPU availability check script: ${{ matrix.gpu_check_script }}"
-          GPU_OUTPUT=$(bash ${{ matrix.gpu_check_script }})
+          if [ "${{ matrix.force_test_gpus }}" = "true" ]; then
+            # Best-effort run: this backend only uses the script output for
+            # logging/inspection, so a non-zero exit here must not fail the job.
+            GPU_OUTPUT=$(bash ${{ matrix.gpu_check_script }} || true)
+          else
+            GPU_OUTPUT=$(bash ${{ matrix.gpu_check_script }})
+          fi
           echo "[GPU check] GPU availability check output:"
           echo "$GPU_OUTPUT"
-          AVAILABLE_GPUS=$(echo "$GPU_OUTPUT" | grep "^Available GPUs:" | cut -d: -f2 | tr -d ' ')
+          if [ "${{ matrix.force_test_gpus }}" = "true" ]; then
+            # This backend deliberately pins the GPUs under test to the
+            # configured test_gpus list (e.g. only the first N cards on a host
+            # that exposes more). Ignore the gpu_check result and use test_gpus.
+            AVAILABLE_GPUS="${{ matrix.test_gpus }}"
+            echo "[GPU check] force_test_gpus=true -> using configured test_gpus"
+          else
+            AVAILABLE_GPUS=$(echo "$GPU_OUTPUT" | grep "^Available GPUs:" | cut -d: -f2 | tr -d ' ')
+          fi
           echo "[GPU check] Available GPUs: ${AVAILABLE_GPUS}"
           echo "AVAILABLE_GPUS=${AVAILABLE_GPUS}" >> $GITHUB_ENV
 
-      # Run weekly tests.
+      # Run ops tests.
       # OPS is provided by the prepare job: "all" (scheduled runs or an empty
       # "ops" input) runs every operator stage via --stages all; otherwise it
       # runs only the selected operators via --ops <list>.
-      - name: Run weekly tests
+      - name: Run ops tests
         env: ${{ fromJSON(matrix.test_env) }}
         run: |
-          echo "[Run weekly tests] Running on backend: ${{ matrix.name }} (vendor: ${{ matrix.vendor }})"
-          echo "[Run weekly tests] Test output directory: ${OUTPUT_DIR}"
-          echo "[Run weekly tests] Test GPUs: ${AVAILABLE_GPUS}"
-          echo "[Run weekly tests] Test date: ${DATE}"
-          echo "[Run weekly tests] Test ops: ${{ needs.prepare.outputs.ops }}"
+          echo "[Run ops tests] Running on backend: ${{ matrix.name }} (vendor: ${{ matrix.vendor }})"
+          echo "[Run ops tests] Test output directory: ${OUTPUT_DIR}"
+          echo "[Run ops tests] Test GPUs: ${AVAILABLE_GPUS}"
+          echo "[Run ops tests] Test date: ${DATE}"
+          echo "[Run ops tests] Test ops: ${{ needs.prepare.outputs.ops }}"
+          mkdir -p "${OUTPUT_DIR}"
           # remove cache to avoid potential issues with stale files
           rm -rf ~/.triton/cache && rm -rf ~/.flaggems
           # run tests with specified GPUs and output directory
           OPS="${{ needs.prepare.outputs.ops }}"
           if [ "${OPS}" = "all" ]; then
-            OP_ARGS="--stages all"
+            if [ "${{ matrix.vendor }}" = "Enflame" ]; then
+              OP_LIST_FILE="/data/flaggems/ops_list.txt"
+              if [ ! -f "${OP_LIST_FILE}" ]; then
+                echo "[Run ops tests] ERROR: Enflame op list file not found: ${OP_LIST_FILE}"
+                exit 1
+              fi
+              OP_ARGS="--op-list-file ${OP_LIST_FILE}"
+            else
+              OP_ARGS="--stages all"
+            fi
           else
             OP_ARGS="--ops ${OPS}"
           fi
@@ -464,14 +514,15 @@ jobs:
 
       - name: Package results
         run: |
-          ARCHIVE="${{ matrix.output_base_dir }}/weekly-${{ matrix.name }}-${DATE}.tar.gz"
+          ARCHIVE="${{ matrix.output_base_dir }}/${REPOSITORY_NAME}/${REPOSITORY_NAME}-${{ matrix.name }}-${DATE}.tar.gz"
+          mkdir -p "${OUTPUT_DIR}" "$(dirname "${ARCHIVE}")"
           tar -czf "${ARCHIVE}" -C "$(dirname "${OUTPUT_DIR}")" "$(basename "${OUTPUT_DIR}")"
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       # - name: Upload artifact
       #   uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       #   with:
-      #     name: weekly-${{ matrix.name }}-${{ needs.prepare.outputs.date }}
+      #     name: ops-test-${{ matrix.name }}-${{ needs.prepare.outputs.date }}
       #     path: ${{ env.ARCHIVE }}
 
       - name: Publish results to op-monitor

@@ -78,6 +78,7 @@ from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.mhc import (
+    MixLayout,
     hc_head_fused_kernel,
     hc_head_fused_kernel_ref,
     mhc_bwd,
@@ -154,7 +155,22 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 
 # isort: on
 
+from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
+from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
+    fused_minimax_m3_qknorm_rope_kv_insert,
+)
+from flaggems_vllm.ops.topk_sigmoid import topk_sigmoid
+from flaggems_vllm.ops.vit_attention import (
+    vision_flash_attn_varlen,
+    vit_flash_attn_wrapper,
+)
+
 __all__ = [
+    "fp32_router_gemm",
+    "topk_sigmoid",
+    "fused_minimax_m3_qknorm_rope_kv_insert",
+    "vit_flash_attn_wrapper",
+    "vision_flash_attn_varlen",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -209,6 +225,7 @@ __all__ = [
     "mhc_bwd_ref",
     "mhc_post",
     "mhc_pre",
+    "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
@@ -265,13 +282,25 @@ __all__ = [
     "weight_norm_interface_backward",
 ]
 
-# Hygon DCU ports of the upstream W8A8 BMM / INT8 einsum entry points.
+# Backend-only APIs have no implementation on other vendors.
 from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.fused import attention as hygon_attention
     from flaggems_vllm.runtime.backend._hygon.ops import (
         int8_einsum,
         w8a8_block_int8_bmm,
     )
 
-    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]
+    flash_attn_varlen_func_w8a8_int8 = hygon_attention.flash_attn_varlen_func_w8a8_int8
+    __all__ += [
+        "flash_attn_varlen_func_w8a8_int8",
+        "int8_einsum",
+        "w8a8_block_int8_bmm",
+    ]
+
+if _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.fused import attention as thead_attention
+
+    flash_attn_varlen_func_w8a8_int8 = thead_attention.flash_attn_varlen_func_w8a8_int8
+    __all__.append("flash_attn_varlen_func_w8a8_int8")

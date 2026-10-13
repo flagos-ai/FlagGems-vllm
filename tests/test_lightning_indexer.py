@@ -35,9 +35,14 @@ _IS_ASCEND = (
     and torch.npu.is_available()
 )
 _LIGHTNING_INDEXER = getattr(flaggems_vllm, "lightning_indexer", None)
-_LIGHTNING_INDEXER_MODULE = importlib.import_module(
-    "flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer"
-)
+try:
+    _LIGHTNING_INDEXER_MODULE = importlib.import_module(
+        "flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer"
+    )
+except ImportError:
+    # triton.language.extra.cann only exists in Ascend's Triton build, so the
+    # module cannot be imported (and so cannot be collected) elsewhere.
+    _LIGHTNING_INDEXER_MODULE = None
 
 pytestmark = [
     pytest.mark.lightning_indexer,

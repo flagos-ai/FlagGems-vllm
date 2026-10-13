@@ -237,3 +237,23 @@ compute_global_topk_indices_and_lens:
       TPP: 8
     num_warps: 4
     num_stages: 3
+
+dequantize_and_gather_k_cache:
+  - META:
+      num_workers: 128
+    num_warps: 2
+  - META:
+      num_workers: 256
+    num_warps: 2
+  - META:
+      num_workers: 512
+    num_warps: 2
+  - META:
+      num_workers: 1024
+    num_warps: 2
+  - META:
+      num_workers: 2048
+    num_warps: 2
+  - META:
+      num_workers: 4096
+    num_warps: 2

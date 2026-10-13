@@ -235,6 +235,46 @@ def test_logits_diff_in_8LSBits():
 
 
 @pytest.mark.top_k_per_row_decode
+def test_logits_in_a_narrow_band():
+    """A row inside a band narrower than the 11-bit key's own resolution.
+
+    The radix algorithm's STEP-0 key is sign + 5 exponent bits + the top 5
+    mantissa bits, so within one binade it resolves magnitude/32 -- 0.25 here.
+    A row drawn from [10.0, 10.2) therefore maps to a SINGLE bin, and an
+    implementation whose only guard is "an overflow can drop nothing but what
+    shares the k-th element's key" drops the answer, because every element
+    shares it.
+
+    test_logits_diff_in_8LSBits builds the same collapse, but at magnitude
+    1.125, where one ULP is 1.2e-7 and the resulting error lands just inside
+    allclose(atol=1e-6, rtol=1e-6) -- it passes by about 10%. Here the values
+    are far enough apart for the comparison to see it.
+    """
+    torch.manual_seed(42)
+    num_rows = 1
+    next_n = 1
+    vocab_size = 262144
+    top_k = 512
+
+    logits = 10.0 + 0.2 * torch.rand(
+        num_rows, vocab_size, dtype=torch.float32, device=device
+    )
+    seq_lens = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
+    indices = torch.zeros(num_rows, top_k, dtype=torch.int32, device=device)
+    s0, s1 = logits.stride(0), logits.stride(1)
+
+    logits_ref = logits.clone()
+    indices_ref = torch.zeros_like(indices)
+
+    flaggems_vllm.top_k_per_row_decode(
+        logits, next_n, seq_lens, indices, num_rows, s0, s1, top_k
+    )
+    _torch_topk_ref(logits_ref, next_n, seq_lens, indices_ref, num_rows, s0, s1, top_k)
+
+    assert check_topk_values_match(logits, indices, indices_ref, top_k)
+
+
+@pytest.mark.top_k_per_row_decode
 @pytest.mark.skipif(not HAS_VLLM, reason="vLLM is not installed")
 @pytest.mark.parametrize(
     "vocab_size, top_k", [(129280, 1024), (32768, 512), (4096, 64)]

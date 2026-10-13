@@ -1019,7 +1019,14 @@ class ParallelW8A8BlockFP8MatmulBenchmark(
         return BlasBenchmark.set_more_shapes(self)
 
     def should_forward_parallel_dtype(self, dtype_name):
-        if Config.user_desired_dtypes is None and dtype_name.startswith("fp8"):
+        # FP8 names come from torch as ``float8_e4m3fn``/``float8_e5m2``.
+        # They are not accepted by the generic --dtypes CLI choices, while
+        # this benchmark already owns the supported list in consts.FP8_DTYPES.
+        # Do not forward the implicit FP8 dtype to worker pytest processes;
+        # let the operator benchmark select its FP8 dtype directly.
+        if Config.user_desired_dtypes is None and (
+            dtype_name.startswith("fp8") or dtype_name.startswith("float8")
+        ):
             return False
         return True
 

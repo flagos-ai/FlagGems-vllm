@@ -45,11 +45,36 @@ try:
 except ImportError:
     TensorDescriptor = None
 
+_TLE_REQUIRED_PRIMITIVES = frozenset(
+    {
+        "load",
+        "pipe",
+        "gpu.alloc",
+        "gpu.copy",
+        "gpu.local_ptr",
+        "gpu.warp_specialize",
+    }
+)
+
+
+def _tle_primitives_available() -> bool:
+    try:
+        from triton._flagtree_backend import get_active_backend_name
+        from triton.experimental.tle import get_supported_primitives
+    except ImportError:
+        return True
+    try:
+        supported = get_supported_primitives(get_active_backend_name())
+    except (ModuleNotFoundError, AttributeError, RuntimeError):
+        return True
+    return _TLE_REQUIRED_PRIMITIVES <= supported
+
+
 if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE_KDA = True
+        HAS_TLE_KDA = _tle_primitives_available()
     except ImportError:
         tle = None
         HAS_TLE_KDA = False
@@ -2965,10 +2990,8 @@ def _validate_chunk_kda_inputs(
         raise ValueError(f"g must have shape {(B, T, HV, K)}, got {tuple(g.shape)}")
     if beta.shape != (B, T, HV):
         raise ValueError(f"beta must have shape {(B, T, HV)}, got {tuple(beta.shape)}")
-    if K not in (64, 128, 192, 256):
-        raise ValueError(
-            f"chunk_kda TLE path requires K in {{64, 128, 192, 256}}, got {K}"
-        )
+    if K not in (64, 128, 256):
+        raise ValueError(f"chunk_kda TLE path requires K in {{64, 128, 256}}, got {K}")
     if V <= 0:
         raise ValueError(f"chunk_kda TLE path requires V > 0, got {V}")
     if HV < H or HV % H != 0:
