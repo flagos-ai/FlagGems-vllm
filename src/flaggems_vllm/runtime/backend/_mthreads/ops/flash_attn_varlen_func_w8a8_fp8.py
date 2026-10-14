@@ -19,9 +19,18 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     _flash_attn_varlen_func_w8a8_fp8,
+    fwd_params,
     mha_varlan_fwd,
 )
 from flaggems_vllm.runtime import torch_device_fn
+
+from ._flash_attn_varlen_fp8_tle import (
+    HAS_TLE,
+    flash_varlen_fwd_kernel_tle,
+    pad_fp8_qkv,
+)
+
+_FWD_PARAM_INDEX = {name: i for i, name in enumerate(fwd_params.__slots__)}
 
 
 @triton.jit
@@ -85,7 +94,42 @@ def _normalize_varlen_window(
     return is_causal, is_local, window_size_left, window_size_right
 
 
-def _get_varlen_fwd_config(args, head_size, use_varlen_split_d, is_paged, *_):
+def _fits_varlen_tle_indexing(args, head_size):
+    # The copy and attention kernels use signed 32-bit element offsets.
+    # Padding may exceed that range even when the original input fits.
+    index_max = (1 << 31) - 1
+    padded_d = triton.cdiv(head_size, 16) * 16
+    if any(
+        tensor.shape[0] * tensor.shape[1] * padded_d - 1 > index_max
+        for tensor in args[:3]
+    ):
+        return False
+    for tensor in args[:4]:
+        if (
+            tensor.numel()
+            and sum(
+                (size - 1) * stride
+                for size, stride in zip(tensor.shape, tensor.stride())
+            )
+            > index_max
+        ):
+            return False
+    return True
+
+
+def _get_varlen_fwd_config(
+    args,
+    head_size,
+    use_varlen_split_d,
+    is_paged,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    is_alibi,
+    is_softcap,
+    is_dropout,
+    *_,
+):
     cfg = runtime.get_heuristic_config("mha_block_32")
     cfg_params = {
         "BLOCK_M": cfg["BLOCK_M"](args),
@@ -100,6 +144,36 @@ def _get_varlen_fwd_config(args, head_size, use_varlen_split_d, is_paged, *_):
     }
     if head_size not in (64, 128) and not is_paged:
         cfg_params.update(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=1)
+    if (
+        HAS_TLE
+        and not is_paged
+        and not is_dropout
+        and not is_alibi
+        and not is_softcap
+        and args[0].dtype == torch.float8_e4m3fn
+        and torch_device_fn.get_device_capability(args[0].device) == (3, 1)
+        and _fits_varlen_tle_indexing(args, head_size)
+    ):
+        # Stage FP8 operands directly in shared memory for native SQMMA.
+        # E5M2 and paged KV retain the common Triton implementation.
+        cfg_params["kernel"] = flash_varlen_fwd_kernel_tle
+        cfg_params.update(BLOCK_M=32, BLOCK_N=64, num_warps=4, num_stages=1)
+        if head_size >= 128:
+            cfg_params["BLOCK_D"] = 128
+        if head_size > 128:
+            cfg_params.update(BLOCK_M=64, num_warps=8)
+        if head_size % 16:
+            # A byte-copy kernel pads the physical head stride and zeros its
+            # tail. Logical dimensions, descales and the output stay intact.
+            padded = pad_fp8_qkv(*args[:3])
+            prepared = list(args)
+            for name, tensor in zip(("q", "k", "v"), padded):
+                prepared[_FWD_PARAM_INDEX[f"{name}_ptr"]] = tensor
+                prepared[_FWD_PARAM_INDEX[f"{name}_row_stride"]] = tensor.stride(0)
+                prepared[_FWD_PARAM_INDEX[f"{name}_head_stride"]] = tensor.stride(1)
+            cfg_params["args"] = tuple(prepared)
+            cfg_params["PADDED_D"] = triton.cdiv(head_size, 16) * 16
+        cfg_params["SPLIT_D"] = head_size > cfg_params["BLOCK_D"]
     return cfg_params
 
 
