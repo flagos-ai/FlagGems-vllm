@@ -172,6 +172,23 @@ def pwarn(msg, **kwargs):
     print(f"{YELLOW}[WARN]{NC} {msg}", flush=True, **kwargs)
 
 
+def resolve_base_data_path(path):
+    """Resolve a baseline path passed by CI to a file pytest can open later."""
+    if not path:
+        return None
+
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    for root in (ROOT, ROOT / "tools"):
+        resolved = root / candidate
+        if resolved.is_file():
+            return str(resolved)
+
+    return path
+
+
 def ensure_dir(p):
     p.mkdir(parents=True, exist_ok=True)
     # set directory permissions to 755/0o755 (drwxr-xr-x)
@@ -1473,7 +1490,7 @@ def main():
     OPTS = parser.parse_args()
     CFG.dump_output = OPTS.dump_output
     CFG.start = OPTS.start
-    CFG.base_data = OPTS.base_data
+    CFG.base_data = resolve_base_data_path(OPTS.base_data)
 
     # Apply color mode (IS_TTY controls cursor-based footer, USE_COLORS controls ANSI colors)
     global USE_COLORS, RED, GREEN, YELLOW, CYAN, DIM, NC
