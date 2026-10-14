@@ -335,7 +335,7 @@ jobs:
             --gpus "${AVAILABLE_GPUS}" \
             ${OP_ARGS} \
             --dump-output \
-            --base-data op_vllm_perf_baseline.json \
+            --base-data tools/op_vllm_perf_baseline.json \
             --output-dir "${OUTPUT_DIR}"
           # process the test results to generate summary files
           python3 tools/add_labels.py ${OUTPUT_DIR}
@@ -524,7 +524,7 @@ jobs:
             --gpus "${AVAILABLE_GPUS}" \
             ${OP_ARGS} \
             --dump-output \
-            --base-data op_vllm_perf_baseline.json \
+            --base-data tools/op_vllm_perf_baseline.json \
             --output-dir "${OUTPUT_DIR}"
           # process the test results to generate summary files
           python3 tools/add_labels.py ${OUTPUT_DIR}
