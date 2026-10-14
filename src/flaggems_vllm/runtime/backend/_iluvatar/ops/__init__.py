@@ -36,14 +36,14 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
 )
 
 __all__ = [
-    "fused_q_kv_rmsnorm",
     "fused_add_rms_norm",
-    "qwen4_store_qsa_kv_rows",
-    "qwen4_hc_inject_combine",
-    "ple_state_scatter_",
-    "qwen4_qsa_mqa_paged_dot",
-    "qwen4_compress_norm_mrope_store_groups",
-    "scaled_int8_quant",
+    "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
+    "ple_state_scatter_",
+    "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
+    "scaled_int8_quant",
     "topk_softplus_sqrt",
 ]
