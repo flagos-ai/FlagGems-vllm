@@ -95,22 +95,21 @@ def _normalize_varlen_window(
 
 
 def _fits_varlen_tle_indexing(args, head_size):
-    # The copy and attention kernels use signed 32-bit element offsets.
+    # Copy lengths, scalar strides and element offsets must fit signed int32.
     # Padding may exceed that range even when the original input fits.
     index_max = (1 << 31) - 1
     padded_d = triton.cdiv(head_size, 16) * 16
     if any(
-        tensor.shape[0] * tensor.shape[1] * padded_d - 1 > index_max
-        for tensor in args[:3]
+        tensor.shape[0] * tensor.shape[1] * padded_d > index_max for tensor in args[:3]
     ):
         return False
     for tensor in args[:4]:
+        strides = tensor.stride()
+        if max(strides[:2]) > index_max:
+            return False
         if (
             tensor.numel()
-            and sum(
-                (size - 1) * stride
-                for size, stride in zip(tensor.shape, tensor.stride())
-            )
+            and sum((size - 1) * stride for size, stride in zip(tensor.shape, strides))
             > index_max
         ):
             return False
