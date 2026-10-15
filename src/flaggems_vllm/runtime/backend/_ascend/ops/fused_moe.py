@@ -220,6 +220,19 @@ def try_get_optimal_moe_config(
     M: int,
     block_shape: list[int] | None = None,
 ) -> dict[str, int]:
+    # Local tuning override for on-server sweeps (do NOT commit to the PR
+    # branch): force the tile config via "BM,BN,BK,GROUP_M,num_warps,num_stages".
+    force_cfg = os.environ.get("MOE_FORCE_CFG")
+    if force_cfg:
+        bm, bn, bk, gm, nw, ns = (int(v) for v in force_cfg.split(","))
+        return {
+            "BLOCK_SIZE_M": bm,
+            "BLOCK_SIZE_N": bn,
+            "BLOCK_SIZE_K": bk,
+            "GROUP_SIZE_M": gm,
+            "num_warps": nw,
+            "num_stages": ns,
+        }
     # First try to load optimal config from the embedded table
     E, _, N = w2_shape
     if dtype == "int4_w4a16":
@@ -1451,7 +1464,9 @@ def _moe_align_count_kernel(
     cnt = 0
     for start in range(0, numel, BLOCK_TOKENS):
         token_offs = start + offs
-        ids = tl.load(topk_ids_ptr + token_offs, mask=token_offs < numel, other=-1)
+        ids = tl.load(topk_ids_ptr + token_offs, mask=token_offs < numel, other=-1).to(
+            tl.int32
+        )
         cnt += tl.sum((ids == expert).to(tl.int32), axis=0)
     tl.store(counts_ptr + expert, cnt)
 
@@ -1558,7 +1573,9 @@ def _moe_align_scatter_kernel(
     rank = 0
     for start in range(0, numel, BLOCK_TOKENS):
         token_offs = start + offs
-        ids = tl.load(topk_ids_ptr + token_offs, mask=token_offs < numel, other=-1)
+        ids = tl.load(topk_ids_ptr + token_offs, mask=token_offs < numel, other=-1).to(
+            tl.int32
+        )
         match = ids == expert
         pos = tl.cumsum(match.to(tl.int32), axis=0) - 1 + rank
         tl.store(
@@ -1681,71 +1698,89 @@ def _moe_gather_a_kernel(
     w_ptr,
     a_sorted_ptr,
     sorted_token_ids_ptr,
+    EM,
     num_valid,
     stride_am,
     stride_ak,
     K,
     top_k: tl.constexpr,
     APPLY_WEIGHT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Gather rows of A into routing-sorted (PADDED) order.
 
     Rows cover the full padded range [0, EM); padding rows (flat id >=
-    num_valid) are left unwritten and are masked out in the GEMM.
+    num_valid) are zero-filled so the GEMM's K loop can load A completely
+    unmasked (a row mask in the hot loop roughly halves cube throughput on
+    triton-ascend).
     a_sorted[pos] = a[sorted_token_ids[pos] // top_k]  (optionally * weight)
+
+    Each program handles a BLOCK_M x BLOCK_N tile: one row per program is
+    launch/latency-bound (measured 611us for EM=3968, K=7168 with aiv_vec
+    at 1.3% -- neither pipe is busy); tiling rows amortises the per-block
+    overhead over BLOCK_M row copies.
     """
     pid = tl.program_id(0)
     num_blocks_n = tl.cdiv(K, BLOCK_N)
-    row = pid // num_blocks_n
+    mb = pid // num_blocks_n
     nb = pid % num_blocks_n
 
-    flat_id = tl.load(sorted_token_ids_ptr + row)
-    valid = flat_id < num_valid
+    rows = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+    in_range = rows < EM
+    flat_id = tl.load(sorted_token_ids_ptr + rows, mask=in_range, other=-1)
+    valid = in_range & (flat_id >= 0) & (flat_id < num_valid)
     src_row = tl.where(valid, flat_id // top_k, 0).to(tl.int64)
 
     offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < K
-    # Load only for valid rows; padding rows get zeros so the GEMM's K loop
-    # can load A completely unmasked (a row mask in the hot loop roughly
-    # halves cube throughput on triton-ascend).
     val = tl.load(
-        a_ptr + src_row * stride_am + offs_n * stride_ak,
-        mask=n_mask & valid,
+        a_ptr + src_row[:, None] * stride_am + offs_n[None, :] * stride_ak,
+        mask=valid[:, None] & n_mask[None, :],
         other=0.0,
     )
     if APPLY_WEIGHT:
         w = tl.load(w_ptr + tl.where(valid, flat_id, 0), mask=valid, other=0.0)
-        val = (val.to(tl.float32) * w.to(tl.float32)).to(val.dtype)
-    tl.store(a_sorted_ptr + row.to(tl.int64) * K + offs_n, val, mask=n_mask)
+        val = (val.to(tl.float32) * w.to(tl.float32)[:, None]).to(val.dtype)
+    tl.store(
+        a_sorted_ptr + rows.to(tl.int64)[:, None] * K + offs_n[None, :],
+        val,
+        mask=in_range[:, None] & n_mask[None, :],
+    )
 
 
 @triton.jit
 def _moe_silu_mul_kernel(
     x_ptr,
     out_ptr,
+    R,
     D,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """out[row] = silu(x[row, :D]) * x[row, D:2D] for x of shape (R, 2D).
 
-    Fast-path replacement for the generic pointwise_dynamic silu: one wide
-    vector load per operand, fp32 math.
+    Fast-path replacement for the generic pointwise_dynamic silu: wide
+    vector loads per operand, fp32 math. Each program covers a
+    BLOCK_M x BLOCK_N tile (one row per program is launch/latency-bound).
     """
     pid = tl.program_id(0)
     num_blocks_n = tl.cdiv(D, BLOCK_N)
-    row = pid // num_blocks_n
+    mb = pid // num_blocks_n
     nb = pid % num_blocks_n
+    rows = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+    r_mask = rows < R
     offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < D
-    base = x_ptr + row.to(tl.int64) * (2 * D)
-    gate = tl.load(base + offs_n, mask=n_mask, other=0.0).to(tl.float32)
-    up = tl.load(base + D + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    mask = r_mask[:, None] & n_mask[None, :]
+    base = x_ptr + rows.to(tl.int64)[:, None] * (2 * D)
+    gate = tl.load(base + offs_n[None, :], mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(base + D + offs_n[None, :], mask=mask, other=0.0).to(tl.float32)
     res = gate * tl.sigmoid(gate) * up
     tl.store(
-        out_ptr + row.to(tl.int64) * D + offs_n,
+        out_ptr + rows.to(tl.int64)[:, None] * D + offs_n[None, :],
         res.to(out_ptr.dtype.element_ty),
-        mask=n_mask,
+        mask=mask,
     )
 
 
@@ -1758,6 +1793,12 @@ _MOE_PERSISTENT_PROGS = 20
 # 2x unroll of the K loop in the persistent GEMM (non-fused path only).
 # Measured ~+3% on the repro kernel.
 _MOE_UNROLL_K = tl.constexpr(True)
+
+# Local tuning knob (do NOT commit to the PR branch): rotate each tile's K
+# loop start by pid_m (idea from flagos-ai/FlagGems#6325's grouped_matmul),
+# so programs sharing an expert's B matrix don't all demand the same K-slice
+# at the same time.
+_MOE_K_ROTATE = tl.constexpr(os.environ.get("MOE_K_ROTATE", "0") == "1")
 
 
 @triton.jit
@@ -1791,6 +1832,7 @@ def _fused_moe_gemm_persistent_kernel(
     compute_type: tl.constexpr,
     IDX64: tl.constexpr,
     UNROLL_K: tl.constexpr,
+    K_ROTATE: tl.constexpr,
 ):
     """Persistent grouped GEMM: the grid is capped at
     the AIC core count (20 on 910B4) and each program walks the (m, n) tiles
@@ -1841,24 +1883,55 @@ def _fused_moe_gemm_persistent_kernel(
             accumulator_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         k_total = K
         if FUSE_SILU:
-            # fused path untouched (UB pressure already high with two B tiles)
-            for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-                k_remaining = k_total - k * BLOCK_SIZE_K
-                if EVEN_K:
-                    a = tl.load(a_ptrs)
-                    b = tl.load(b_ptrs)
-                    b_up = tl.load(b_ptrs_up)
-                else:
-                    a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
-                    b = tl.load(b_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
-                    b_up = tl.load(
-                        b_ptrs_up, mask=offs_k[None, :] < k_remaining, other=0.0
+            if K_ROTATE:
+                # K-rotation experiment (working copy only): start each tile's
+                # K loop at a pid_m-dependent phase so programs sharing an
+                # expert's B don't all demand the same K-slice at once.
+                # Absolute addressing per iteration (no incremental pointers).
+                num_iters = tl.cdiv(K, BLOCK_SIZE_K)
+                for kk in range(0, num_iters):
+                    k = (kk + pid_m) % num_iters
+                    k_remaining = k_total - k * BLOCK_SIZE_K
+                    a = tl.load(
+                        a_ptrs + k * BLOCK_SIZE_K * stride_ak,
+                        mask=offs_k[None, :] < k_remaining,
+                        other=0.0,
                     )
-                accumulator = tl.dot(a, tl.trans(b), acc=accumulator)
-                accumulator_up = tl.dot(a, tl.trans(b_up), acc=accumulator_up)
-                a_ptrs += BLOCK_SIZE_K * stride_ak
-                b_ptrs += BLOCK_SIZE_K * stride_bk
-                b_ptrs_up += BLOCK_SIZE_K * stride_bk
+                    b = tl.load(
+                        b_ptrs + k * BLOCK_SIZE_K * stride_bk,
+                        mask=offs_k[None, :] < k_remaining,
+                        other=0.0,
+                    )
+                    b_up = tl.load(
+                        b_ptrs_up + k * BLOCK_SIZE_K * stride_bk,
+                        mask=offs_k[None, :] < k_remaining,
+                        other=0.0,
+                    )
+                    accumulator = tl.dot(a, tl.trans(b), acc=accumulator)
+                    accumulator_up = tl.dot(a, tl.trans(b_up), acc=accumulator_up)
+            else:
+                # fused path untouched (UB pressure already high with two B tiles)
+                for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+                    k_remaining = k_total - k * BLOCK_SIZE_K
+                    if EVEN_K:
+                        a = tl.load(a_ptrs)
+                        b = tl.load(b_ptrs)
+                        b_up = tl.load(b_ptrs_up)
+                    else:
+                        a = tl.load(
+                            a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0
+                        )
+                        b = tl.load(
+                            b_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0
+                        )
+                        b_up = tl.load(
+                            b_ptrs_up, mask=offs_k[None, :] < k_remaining, other=0.0
+                        )
+                    accumulator = tl.dot(a, tl.trans(b), acc=accumulator)
+                    accumulator_up = tl.dot(a, tl.trans(b_up), acc=accumulator_up)
+                    a_ptrs += BLOCK_SIZE_K * stride_ak
+                    b_ptrs += BLOCK_SIZE_K * stride_bk
+                    b_ptrs_up += BLOCK_SIZE_K * stride_bk
         elif UNROLL_K:
             # 2x unrolled K loop: two A/B tiles per iteration. Uses ceil
             # pairs so the odd remainder is covered by the last pair's
@@ -1867,27 +1940,58 @@ def _fused_moe_gemm_persistent_kernel(
             # TritonToLinalgIncubated pass on some shapes.
             num_iters = tl.cdiv(K, BLOCK_SIZE_K)
             num_pairs = (num_iters + 1) // 2
-            a_p = a_ptrs
-            b_p = b_ptrs
-            for _p in range(0, num_pairs):
-                kr1 = k_total - _p * (2 * BLOCK_SIZE_K)
-                kr2 = kr1 - BLOCK_SIZE_K
-                a1 = tl.load(a_p, mask=offs_k[None, :] < kr1, other=0.0)
-                b1 = tl.load(b_p, mask=offs_k[None, :] < kr1, other=0.0)
-                a2 = tl.load(
-                    a_p + BLOCK_SIZE_K * stride_ak,
-                    mask=offs_k[None, :] < kr2,
-                    other=0.0,
-                )
-                b2 = tl.load(
-                    b_p + BLOCK_SIZE_K * stride_bk,
-                    mask=offs_k[None, :] < kr2,
-                    other=0.0,
-                )
-                accumulator = tl.dot(a1, tl.trans(b1), acc=accumulator)
-                accumulator = tl.dot(a2, tl.trans(b2), acc=accumulator)
-                a_p += 2 * BLOCK_SIZE_K * stride_ak
-                b_p += 2 * BLOCK_SIZE_K * stride_bk
+            if K_ROTATE:
+                # K-rotation experiment (working copy only): rotate the pair
+                # order by pid_m (absolute addressing per pair).
+                rot = pid_m % num_pairs
+                for _p in range(0, num_pairs):
+                    p = (_p + rot) % num_pairs
+                    kr1 = k_total - p * (2 * BLOCK_SIZE_K)
+                    kr2 = kr1 - BLOCK_SIZE_K
+                    a1 = tl.load(
+                        a_ptrs + p * (2 * BLOCK_SIZE_K) * stride_ak,
+                        mask=offs_k[None, :] < kr1,
+                        other=0.0,
+                    )
+                    b1 = tl.load(
+                        b_ptrs + p * (2 * BLOCK_SIZE_K) * stride_bk,
+                        mask=offs_k[None, :] < kr1,
+                        other=0.0,
+                    )
+                    a2 = tl.load(
+                        a_ptrs + (p * 2 + 1) * BLOCK_SIZE_K * stride_ak,
+                        mask=offs_k[None, :] < kr2,
+                        other=0.0,
+                    )
+                    b2 = tl.load(
+                        b_ptrs + (p * 2 + 1) * BLOCK_SIZE_K * stride_bk,
+                        mask=offs_k[None, :] < kr2,
+                        other=0.0,
+                    )
+                    accumulator = tl.dot(a1, tl.trans(b1), acc=accumulator)
+                    accumulator = tl.dot(a2, tl.trans(b2), acc=accumulator)
+            else:
+                a_p = a_ptrs
+                b_p = b_ptrs
+                for _p in range(0, num_pairs):
+                    kr1 = k_total - _p * (2 * BLOCK_SIZE_K)
+                    kr2 = kr1 - BLOCK_SIZE_K
+                    a1 = tl.load(a_p, mask=offs_k[None, :] < kr1, other=0.0)
+                    b1 = tl.load(b_p, mask=offs_k[None, :] < kr1, other=0.0)
+                    a2 = tl.load(
+                        a_p + BLOCK_SIZE_K * stride_ak,
+                        mask=offs_k[None, :] < kr2,
+                        other=0.0,
+                    )
+                    b2 = tl.load(
+                        b_p + BLOCK_SIZE_K * stride_bk,
+                        mask=offs_k[None, :] < kr2,
+                        other=0.0,
+                    )
+                    accumulator = tl.dot(a1, tl.trans(b1), acc=accumulator)
+                    accumulator = tl.dot(a2, tl.trans(b2), acc=accumulator)
+                    a_p += 2 * BLOCK_SIZE_K * stride_ak
+                    b_p += 2 * BLOCK_SIZE_K * stride_bk
         else:
             for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
                 k_remaining = k_total - k * BLOCK_SIZE_K
@@ -1924,33 +2028,47 @@ def _moe_unsort_sum_kernel(
     inv_perm_ptr,
     w_sorted_ptr,
     out_ptr,
+    num_tokens,
     K,
     top_k: tl.constexpr,
     APPLY_WEIGHT: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """out[m] = sum_j w[pos_j] * c_sorted[pos_j], pos_j = inv_perm[m*top_k+j]
 
     (fp32 accumulation; w_sorted multiply only when APPLY_WEIGHT).
+
+    Each program reduces a BLOCK_T x BLOCK_N tile of tokens: one token per
+    program makes the grid launch/latency-bound (same pattern as the
+    gather_a tiling fix).
     """
     pid = tl.program_id(0)
     num_blocks_n = tl.cdiv(K, BLOCK_N)
-    token = pid // num_blocks_n
+    tb = pid // num_blocks_n
     nb = pid % num_blocks_n
+    tokens = tb * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = tokens < num_tokens
     offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < K
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_T, BLOCK_N), dtype=tl.float32)
     for j in tl.static_range(top_k):
-        pos = tl.load(inv_perm_ptr + token * top_k + j).to(tl.int64)
-        v = tl.load(c_ptr + pos * K + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        pos = tl.load(inv_perm_ptr + tokens * top_k + j, mask=t_mask, other=0).to(
+            tl.int64
+        )
+        v = tl.load(
+            c_ptr + pos[:, None] * K + offs_n[None, :],
+            mask=t_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
         if APPLY_WEIGHT:
-            w = tl.load(w_sorted_ptr + pos).to(tl.float32)
-            v = v * w
+            w = tl.load(w_sorted_ptr + pos, mask=t_mask, other=0.0).to(tl.float32)
+            v = v * w[:, None]
         acc += v
     tl.store(
-        out_ptr + token.to(tl.int64) * K + offs_n,
+        out_ptr + tokens.to(tl.int64)[:, None] * K + offs_n[None, :],
         acc.to(out_ptr.dtype.element_ty),
-        mask=n_mask,
+        mask=t_mask[:, None] & n_mask[None, :],
     )
 
 
@@ -2024,6 +2142,7 @@ def _probe_gemm_kernel(cfg, n, k, n_out, fuse_silu, dtype, compute_type, device)
         compute_type=compute_type,
         IDX64=False,
         UNROLL_K=_MOE_UNROLL_K,
+        K_ROTATE=_MOE_K_ROTATE,
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
     )
@@ -2097,7 +2216,7 @@ def _moe_align_naive_kernel(
 
     offs = pid * BLOCK_FILL + offs_fill
     in_e = offs < numel
-    ids = tl.load(topk_ids_ptr + offs, mask=in_e, other=0)
+    ids = tl.load(topk_ids_ptr + offs, mask=in_e, other=0).to(tl.int32)
     tl.store(expert_ids_ptr + offs, ids, mask=in_e)
     tl.store(sorted_token_ids_ptr + offs * block_size, offs.to(tl.int32), mask=in_e)
     wv = tl.load(w_ptr + offs, mask=in_e, other=0.0)
@@ -2174,7 +2293,7 @@ def _moe_align_small_kernel(
     """
     offs_t = tl.arange(0, BLOCK_TOKENS)
     tmask = offs_t < numel
-    ids = tl.load(topk_ids_ptr + offs_t, mask=tmask, other=-1)
+    ids = tl.load(topk_ids_ptr + offs_t, mask=tmask, other=-1).to(tl.int32)
 
     offs_fill = tl.arange(0, BLOCK_FILL)
     for start in range(0, numel_sorted_token_ids, BLOCK_FILL):
@@ -2258,7 +2377,7 @@ def _moe_align_pcount_kernel(
     reads the full allocated range and would fault on uninitialized slots."""
     e = tl.program_id(0)
     offs = tl.arange(0, BLOCK_V)
-    ids = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=-1)
+    ids = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=-1).to(tl.int32)
     cnt = tl.sum((ids == e).to(tl.int32), axis=0)
     tl.store(counts_ptr + e, cnt)
 
@@ -2328,7 +2447,7 @@ def _moe_align_pscatter_kernel(
     e = tl.program_id(0)
     offs = tl.arange(0, BLOCK_V)
     vmask = offs < numel
-    ids = tl.load(topk_ids_ptr + offs, mask=vmask, other=-1)
+    ids = tl.load(topk_ids_ptr + offs, mask=vmask, other=-1).to(tl.int32)
     match = (ids == e) & vmask
     base = tl.load(row_start_ptr + e)
     pos = tl.cumsum(match.to(tl.int32), axis=0) - 1 + base
@@ -2412,7 +2531,10 @@ def _moe_align_chunkcount_kernel(
     chunk_counts[c][e] = pairs of chunk c targeting expert e."""
     c = tl.program_id(0)
     offs = c * BLOCK_C + tl.arange(0, BLOCK_C)
-    ids = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=-1)
+    # topk_ids arrives as int64 (torch.topk); narrowing to int32 before the
+    # compare loop is ~14x faster on vector cores (measured: 1049us -> 74us
+    # per call at numel=4096, E=256).
+    ids = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=-1).to(tl.int32)
     for e0 in range(0, num_experts, BLOCK_E):
         offs_e = e0 + tl.arange(0, BLOCK_E)
         cnt = tl.sum((ids[:, None] == offs_e[None, :]).to(tl.int32), axis=0)
@@ -2523,7 +2645,7 @@ def _moe_align_chunkscatter_kernel(
     c = tl.program_id(0)
     offs = c * BLOCK_C + tl.arange(0, BLOCK_C)
     valid = offs < numel
-    ids = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
+    ids = tl.load(topk_ids_ptr + offs, mask=valid, other=0).to(tl.int32)
     kv = ids.to(tl.float32) * 4096.0 + tl.arange(0, BLOCK_C).to(tl.float32)
     kv = tl.where(valid, kv, 1e30)
     if _HAS_CANN_EXT:
@@ -2724,14 +2846,14 @@ def _fused_experts_fast(
             EM = sorted_token_ids.numel()
             w_sorted = torch.empty(EM, device=device, dtype=topk_weights.dtype)
             inv_perm = torch.empty(num_valid, device=device, dtype=torch.int32)
-            _moe_side_tables_kernel[(triton.cdiv(EM, 4096),)](
+            _moe_side_tables_kernel[(triton.cdiv(EM, 512),)](
                 sorted_token_ids,
                 curr_topk_weights,
                 w_sorted,
                 inv_perm,
                 EM,
                 num_valid,
-                BLOCK=4096,
+                BLOCK=512,
             )
         else:
             # large num_valid: chunked counting sort (no upper limit; also
@@ -2749,31 +2871,36 @@ def _fused_experts_fast(
             EM = sorted_token_ids.numel()
             w_sorted = torch.empty(EM, device=device, dtype=topk_weights.dtype)
             inv_perm = torch.empty(num_valid, device=device, dtype=torch.int32)
-            _moe_side_tables_kernel[(triton.cdiv(EM, 4096),)](
+            _moe_side_tables_kernel[(triton.cdiv(EM, 512),)](
                 sorted_token_ids,
                 curr_topk_weights,
                 w_sorted,
                 inv_perm,
                 EM,
                 num_valid,
-                BLOCK=4096,
+                BLOCK=512,
             )
 
         a1_sorted = torch.empty(EM, K1, device=device, dtype=dtype)
-        BLOCK_N = 4096
-        grid = (EM * triton.cdiv(K1, BLOCK_N),)
+        # 16x1024 bf16 tile = 32KB; the APPLY_WEIGHT fp32 conversion doubles
+        # the live set and 16x2048 overflows UB (1573376 > 1572864 bits).
+        GATHER_BM = 16
+        GATHER_BN = 1024
+        grid = (triton.cdiv(EM, GATHER_BM) * triton.cdiv(K1, GATHER_BN),)
         _moe_gather_a_kernel[grid](
             curr_hidden_states,
             curr_topk_weights,
             a1_sorted,
             sorted_token_ids,
+            EM,
             num_valid,
             curr_hidden_states.stride(0),
             curr_hidden_states.stride(1),
             K1,
             top_k=top_k_num,
             APPLY_WEIGHT=apply_router_weight_on_input,
-            BLOCK_N=BLOCK_N,
+            BLOCK_M=GATHER_BM,
+            BLOCK_N=GATHER_BN,
         )
 
         def _gemm(a, b, c, w, mul_weight, fuse_silu=False, cfg=None):
@@ -2821,6 +2948,7 @@ def _fused_experts_fast(
                 compute_type=compute_type,
                 IDX64=idx64,
                 UNROLL_K=_MOE_UNROLL_K,
+                K_ROTATE=_MOE_K_ROTATE,
                 num_warps=cfg["num_warps"],
                 num_stages=cfg["num_stages"],
             )
@@ -2858,8 +2986,10 @@ def _fused_experts_fast(
             if not fuse_ok or fuse_key in _FUSE_SILU_FAILED_CONFIGS:
                 cache1 = torch.empty(EM, N, device=device, dtype=dtype)
                 _gemm(a1_sorted, w1, cache1, None, False)
-                grid = (EM * triton.cdiv(act_dim, 2048),)
-                _moe_silu_mul_kernel[grid](cache1, cache2, act_dim, BLOCK_N=2048)
+                grid = (triton.cdiv(EM, 8) * triton.cdiv(act_dim, 1024),)
+                _moe_silu_mul_kernel[grid](
+                    cache1, cache2, EM, act_dim, BLOCK_M=8, BLOCK_N=1024
+                )
         else:
             cache1 = torch.empty(EM, N, device=device, dtype=dtype)
             _gemm(a1_sorted, w1, cache1, None, False)
@@ -2872,18 +3002,21 @@ def _fused_experts_fast(
 
         # unsort + sum over topk
         out_chunk = out_hidden_states[begin_chunk_idx:end_chunk_idx]
+        UNSORT_BT = 8
         BLOCK_OUT = 1024
-        grid = (tokens_in_chunk * triton.cdiv(K2, BLOCK_OUT),)
+        grid = (triton.cdiv(tokens_in_chunk, UNSORT_BT) * triton.cdiv(K2, BLOCK_OUT),)
         _moe_unsort_sum_kernel[grid](
             cache3,
             inv_perm,
             w_sorted,
             out_chunk,
+            tokens_in_chunk,
             K2,
             top_k=top_k_num,
             # GEMM2 already multiplied the router weight in (tl.dot
             # epilogue), so the unsort+sum reduction never applies it.
             APPLY_WEIGHT=False,
+            BLOCK_T=UNSORT_BT,
             BLOCK_N=BLOCK_OUT,
         )
     return out_hidden_states
