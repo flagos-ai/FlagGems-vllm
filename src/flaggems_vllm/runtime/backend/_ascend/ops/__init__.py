@@ -35,6 +35,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_top
 )
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
