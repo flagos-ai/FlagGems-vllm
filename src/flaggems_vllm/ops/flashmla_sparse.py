@@ -19,13 +19,14 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.tle_capabilities import supports_sparse_mla_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE_FLASHMLA_SPARSE = True
+        HAS_TLE_FLASHMLA_SPARSE = supports_sparse_mla_tle(tle)
     except ImportError:
         tle = None
         HAS_TLE_FLASHMLA_SPARSE = False

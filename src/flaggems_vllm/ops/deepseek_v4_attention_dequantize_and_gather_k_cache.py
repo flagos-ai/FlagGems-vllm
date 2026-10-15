@@ -18,11 +18,23 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.utils import libentry, libtuner
 
 
 def _default_scale_slots(nope_dim: int) -> int:
     return triton.cdiv(nope_dim, 64) + (1 if nope_dim % 64 == 0 else 0)
+
+
+def _stat_total(gather_lens, num_reqs: int) -> int:
+    """Total tokens to gather: the tuner key for the work size."""
+    return num_reqs if gather_lens is None else int(gather_lens.shape[-1]) * num_reqs
+
+
+def _stat_max(gather_lens) -> int:
+    """Largest per-request gather length: the tuner key for the parallelism shape."""
+    return 0 if gather_lens is None else int(gather_lens.shape[-1])
 
 
 def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
@@ -35,6 +47,12 @@ def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"k_cache must be 2D or 3D, got shape={tuple(k_cache.shape)}")
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("dequantize_and_gather_k_cache"),
+    key=["num_tokens", "max_gather_len"],
+    strategy=["log", "log"],
+)
 @triton.jit
 def _dequantize_and_gather_k_cache_kernel(
     out_ptr,
@@ -57,6 +75,8 @@ def _dequantize_and_gather_k_cache_kernel(
     num_workers: tl.constexpr,
     n_quant_blocks: tl.constexpr,
     HAVE_GATHER_LENS: tl.constexpr,
+    num_tokens: tl.constexpr,
+    max_gather_len: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     worker_idx = tl.program_id(1)
@@ -166,9 +186,10 @@ def dequantize_and_gather_k_cache(
             token_data_size=token_data_size,
             cache_block_stride=k_cache_2d.stride(0),
             output_dim=output_dim,
-            num_workers=num_workers,
             n_quant_blocks=n_quant_blocks,
             HAVE_GATHER_LENS=gather_lens is not None,
+            num_tokens=_stat_total(gather_lens, num_reqs),
+            max_gather_len=_stat_max(gather_lens),
         )
 
 

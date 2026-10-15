@@ -65,12 +65,58 @@ _GENERIC_AUTOTUNE_CONFIG = [
     triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
     triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=1),
+    # Large BLOCK_H: keeps the NPU launch grid under the device program
+    # limit for wide grids (N x HC x cdiv(H, BLOCK_H)), e.g. the only
+    # fitting config for n=4096, hc=2, H=7168.
+    triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=1),
 ]
+
+
+# The ascend launcher rejects a launch whose total program count exceeds the
+# device limit: prune them, and do nothing on other devices
+_NPU_MAX_PROGRAMS = 65535
+
+
+def _npu_grid_prune(configs, nargs, **kwargs):
+    """``prune_configs_by['early_config_prune']`` hook: drop configs whose
+    launch grid would exceed the NPU program-count limit."""
+    grid_fn = kwargs.get("grid")
+    if grid_fn is None:
+        return configs
+    device = next(
+        (v.device for v in nargs.values() if isinstance(v, torch.Tensor)), None
+    )
+    if device is None or device.type != "npu":
+        return configs
+
+    def _programs(cfg):
+        try:
+            prods = 1
+            for dim in grid_fn(cfg.kwargs):
+                prods *= int(dim)
+            return prods
+        except Exception:
+            return None
+
+    keep = [
+        c
+        for c in configs
+        if (prods := _programs(c)) is None or prods <= _NPU_MAX_PROGRAMS
+    ]
+    if keep:
+        return keep
+    # Never prune to an empty list: fall back to the smallest grid.
+    scored = [c for c in configs if _programs(c) is not None]
+    if not scored:
+        return configs
+    return [min(scored, key=_programs)]
 
 
 @triton.autotune(
     configs=_HC_MULT4_AUTOTUNE_CONFIG,
     key=["H"],
+    prune_configs_by={"early_config_prune": _npu_grid_prune},
 )
 @triton.jit
 def mhc_post_kernel_hc_mult_4(
@@ -145,6 +191,7 @@ def mhc_post_kernel_hc_mult_4(
 @triton.autotune(
     configs=_GENERIC_AUTOTUNE_CONFIG,
     key=["H", "HC"],
+    prune_configs_by={"early_config_prune": _npu_grid_prune},
 )
 @triton.jit
 def mhc_post_kernel_generic(
@@ -192,6 +239,7 @@ def mhc_post_kernel_generic(
 @triton.autotune(
     configs=_HC_MULT4_AUTOTUNE_CONFIG,
     key=["H"],
+    prune_configs_by={"early_config_prune": _npu_grid_prune},
 )
 @triton.jit
 def mhc_post_kernel_hc_mult_4_strided(
@@ -269,6 +317,7 @@ def mhc_post_kernel_hc_mult_4_strided(
 @triton.autotune(
     configs=_GENERIC_AUTOTUNE_CONFIG,
     key=["H", "HC"],
+    prune_configs_by={"early_config_prune": _npu_grid_prune},
 )
 @triton.jit
 def mhc_post_kernel_generic_strided(
@@ -385,8 +434,8 @@ def mhc_post(
         )
     if residual.dtype != torch.bfloat16:
         raise NotImplementedError("mHC post residual must use bfloat16")
-    if residual.device.type not in ("cuda", "musa"):
-        raise NotImplementedError("mHC post requires CUDA or MUSA tensors")
+    if residual.device.type not in ("cuda", "musa", "npu"):
+        raise NotImplementedError("mHC post requires CUDA, MUSA or NPU tensors")
 
     N, hc, H = residual.shape
     if x.shape != (N, H):
