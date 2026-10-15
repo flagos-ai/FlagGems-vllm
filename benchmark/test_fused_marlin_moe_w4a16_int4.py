@@ -24,9 +24,6 @@ try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
         marlin_quantize,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
-    )
     from vllm.scalar_type import scalar_types
 
     VLLM_QUANT_TYPE = scalar_types.uint4b8
@@ -269,9 +266,15 @@ def _wna16_quantize_per_expert(w_fp):
     scales = torch.empty(
         E, out_dim, in_dim // GROUP_SIZE, device=w_fp.device, dtype=w_fp.dtype
     )
+    # Plain INT4 quantization does not require the optional Marlin module.
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        quantize_weights,
+    )
+    from vllm.scalar_type import scalar_types
+
     for e in range(E):
         _, q_e, sc_e, _ = quantize_weights(
-            w_fp[e].T, VLLM_QUANT_TYPE, GROUP_SIZE, False, False
+            w_fp[e].T, scalar_types.uint4b8, GROUP_SIZE, False, False
         )
         q_e = q_e.T.contiguous().to(torch.uint8)
         sc_e = sc_e.T

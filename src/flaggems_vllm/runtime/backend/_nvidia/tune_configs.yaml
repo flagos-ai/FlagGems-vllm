@@ -932,3 +932,17 @@ silu_and_mul_with_clamp_linear:
       UNMASKED: false
     num_warps: 8
     num_stages: 1
+
+concat_mla_q:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 8
+    num_stages: 1

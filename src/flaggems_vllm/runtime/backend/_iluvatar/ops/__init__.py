@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
+from flaggems_vllm.runtime.backend._iluvatar.ops.fused_add_rms_norm import (
+    fused_add_rms_norm,
 )
 from flaggems_vllm.runtime.backend._iluvatar.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._iluvatar.ops.hyperconnection import (
@@ -31,12 +36,14 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
 )
 
 __all__ = [
-    "qwen4_store_qsa_kv_rows",
-    "qwen4_hc_inject_combine",
-    "ple_state_scatter_",
-    "qwen4_qsa_mqa_paged_dot",
-    "qwen4_compress_norm_mrope_store_groups",
-    "scaled_int8_quant",
+    "fused_add_rms_norm",
+    "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
+    "ple_state_scatter_",
+    "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
+    "scaled_int8_quant",
     "topk_softplus_sqrt",
 ]
