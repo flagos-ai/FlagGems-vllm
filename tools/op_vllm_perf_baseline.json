@@ -3844,6 +3844,19 @@
                 ],
                 "dtype": "torch.bfloat16"
               },
+              "A_log": {
+                "shape": [
+                  96
+                ],
+                "dtype": "torch.float32"
+              },
+              "dt_bias": {
+                "shape": [
+                  96,
+                  128
+                ],
+                "dtype": "torch.float32"
+              },
               "scale": 0.08838834764831843
             },
             "outputs": {
@@ -3876,15 +3889,15 @@
               ]
             }
           },
-          "T_us": 4486.060187930152,
-          "latency_ms": 4.4860601879301525,
+          "T_us": 4496.496768224807,
+          "latency_ms": 4.496496768224807,
           "F_cuda": 29818355712.0,
           "F_tensor": 115964116992.0,
-          "B_mem": 8997118000.0,
-          "U_cuda": 11.452577923076923,
-          "U_tensor": 2.3830803846153845,
-          "U_mem": 68.76257292307693,
-          "U_bottle_neck": 68.76257292307693,
+          "B_mem": 8998295000.0,
+          "U_cuda": 11.448741692307692,
+          "U_tensor": 2.3866366153846155,
+          "U_mem": 68.8344913076923,
+          "U_bottle_neck": 68.8344913076923,
           "bottle_neck_unit": "mem",
           "num_kernels": 13,
           "per_kernel": [
@@ -3892,143 +3905,143 @@
               "name": "l2norm_fwd_kernel2",
               "F_cuda": 352321536.0,
               "F_tensor": 0.0,
-              "B_mem": 381753000.0,
-              "U_cuda": 6.679583,
+              "B_mem": 381521000.0,
+              "U_cuda": 6.608579,
               "U_tensor": 0.0,
-              "U_mem": 87.348934,
-              "T_us": 130.45991269092147
+              "U_mem": 86.818359,
+              "T_us": 131.42362601410233
             },
             {
               "name": "l2norm_fwd_kernel2",
               "F_cuda": 352321536.0,
               "F_tensor": 0.0,
-              "B_mem": 381754000.0,
-              "U_cuda": 6.57905,
+              "B_mem": 381955000.0,
+              "U_cuda": 6.636622,
               "U_tensor": 0.0,
-              "U_mem": 86.428987,
-              "T_us": 131.8365448984576
+              "U_mem": 87.068919,
+              "T_us": 131.16706451871121
             },
             {
               "name": "chunk_local_cumsum_vector_kernel",
               "F_cuda": 12884901888.0,
               "F_tensor": 0.0,
-              "B_mem": 582917000.0,
-              "U_cuda": 52.452884,
+              "B_mem": 583177000.0,
+              "U_cuda": 52.442064,
               "U_tensor": 0.0,
-              "U_mem": 46.312844,
-              "T_us": 375.6605191448521
+              "U_mem": 46.386625,
+              "T_us": 375.89466093491785
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::AUnaryFunctor<float, float, float, binary_internal::MulFunctor<float>>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 100663296.0,
               "F_tensor": 0.0,
-              "B_mem": 784894000.0,
-              "U_cuda": 2.298135,
+              "B_mem": 784909000.0,
+              "U_cuda": 2.293902,
               "U_tensor": 0.0,
-              "U_mem": 89.325408,
-              "T_us": 262.26444288687816
+              "U_mem": 89.216473,
+              "T_us": 263.039673149748
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<float>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 179033000.0,
-              "U_cuda": 2.737323,
+              "B_mem": 179070000.0,
+              "U_cuda": 2.761983,
               "U_tensor": 0.0,
-              "U_mem": 86.381793,
-              "T_us": 61.88441993412299
+              "U_mem": 87.180066,
+              "T_us": 61.44647814617375
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<float>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 179067000.0,
-              "U_cuda": 2.767209,
+              "U_cuda": 2.779345,
               "U_tensor": 0.0,
-              "U_mem": 87.3165,
-              "T_us": 61.21211118160536
+              "U_mem": 87.652253,
+              "T_us": 61.09370609001096
             },
             {
               "name": "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
               "F_cuda": 1075838976.0,
               "F_tensor": 0.0,
-              "B_mem": 906739000.0,
-              "U_cuda": 12.781021,
-              "U_tensor": 5.898933,
-              "U_mem": 53.343248,
-              "T_us": 507.3369905308055
+              "B_mem": 906694000.0,
+              "U_cuda": 12.782712,
+              "U_tensor": 5.899713,
+              "U_mem": 53.389099,
+              "T_us": 507.7672695659547
             },
             {
               "name": "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra",
               "F_cuda": 11123294208.0,
               "F_tensor": 0.0,
-              "B_mem": 948469000.0,
-              "U_cuda": 32.502079,
+              "B_mem": 948514000.0,
+              "U_cuda": 32.443843,
               "U_tensor": 0.0,
-              "U_mem": 33.695944,
-              "T_us": 840.0657936220317
+              "U_mem": 33.621417,
+              "T_us": 843.4459160983141
             },
             {
               "name": "void at::vectorized_elementwise_kernel<8, at::FillFunctor<c10::BFloat16>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 77825000.0,
-              "U_cuda": 4.72849,
+              "B_mem": 78021000.0,
+              "U_cuda": 4.716749,
               "U_tensor": 0.0,
-              "U_mem": 72.96539,
-              "T_us": 31.886643690836262
+              "U_mem": 73.003938,
+              "T_us": 32.00604655004249
             },
             {
               "name": "merge_16x16_to_64x64_inverse_kernel",
               "F_cuda": 2816999424.0,
               "F_tensor": 0.0,
-              "B_mem": 194184000.0,
-              "U_cuda": 13.708053,
-              "U_tensor": 0.042972,
-              "U_mem": 13.232161,
-              "T_us": 437.99314491398684
+              "B_mem": 194482000.0,
+              "U_cuda": 13.705832,
+              "U_tensor": 0.042965,
+              "U_mem": 13.251762,
+              "T_us": 438.81636767959054
             },
             {
               "name": "recompute_w_u_fwd_kernel",
               "F_cuda": 405798912.0,
               "F_tensor": 25769803776.0,
-              "B_mem": 1505820000.0,
-              "U_cuda": 4.541827,
-              "U_tensor": 4.926728,
-              "U_mem": 83.908519,
-              "T_us": 535.6059728390469
+              "B_mem": 1505780000.0,
+              "U_cuda": 4.53659,
+              "U_tensor": 4.921047,
+              "U_mem": 83.50511,
+              "T_us": 539.0998421905955
             },
             {
               "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
               "F_cuda": 504889344.0,
               "F_tensor": 51539607552.0,
-              "B_mem": 1205287000.0,
-              "U_cuda": 3.622552,
-              "U_tensor": 10.073728,
-              "U_mem": 69.067527,
-              "T_us": 520.8471949861598
+              "B_mem": 1205892000.0,
+              "U_cuda": 3.616906,
+              "U_tensor": 10.058028,
+              "U_mem": 68.992414,
+              "T_us": 522.5516257378681
             },
             {
               "name": "chunk_gla_fwd_kernel_o",
               "F_cuda": 201326592.0,
               "F_tensor": 38654705664.0,
-              "B_mem": 1669376000.0,
-              "U_cuda": 3.485307,
-              "U_tensor": 10.037684,
-              "U_mem": 84.586193,
-              "T_us": 589.0064966104475
+              "B_mem": 1669213000.0,
+              "U_cuda": 3.508515,
+              "U_tensor": 10.104523,
+              "U_mem": 84.761952,
+              "T_us": 588.7444915487775
             }
           ],
           "flops_cuda_core": 29818355712.0,
           "flops_tensor_core": 115964116992.0,
-          "memory_bytes": 8997118000.0,
-          "util_cuda_core": 0.11452577923076923,
-          "util_tensor_core": 0.023830803846153846,
-          "util_memory_bw": 0.6876257292307693,
+          "memory_bytes": 8998295000.0,
+          "util_cuda_core": 0.11448741692307692,
+          "util_tensor_core": 0.023866366153846155,
+          "util_memory_bw": 0.688344913076923,
           "bottleneck": "memory_bw",
-          "bottleneck_util": 0.6876257292307693,
+          "bottleneck_util": 0.688344913076923,
           "cuda_flops": 29818355712.0,
-          "sm_utilization": 0.23706054307692306,
+          "sm_utilization": 0.2370533623076923,
           "report_path": "ncu_reports/chunk_kda_1x8192x96x128x1_bfloat16.ncu-repz"
         }
       },
@@ -4089,6 +4102,25 @@
                 ],
                 "dtype": "torch.bfloat16"
               },
+              "A_log": {
+                "shape": [
+                  96
+                ],
+                "dtype": "torch.float32"
+              },
+              "dt_bias": {
+                "shape": [
+                  96,
+                  128
+                ],
+                "dtype": "torch.float32"
+              },
+              "cu_seqlens": {
+                "shape": [
+                  7
+                ],
+                "dtype": "torch.int64"
+              },
               "scale": 0.08838834764831843
             },
             "outputs": {
@@ -4126,15 +4158,15 @@
               ]
             }
           },
-          "T_us": 4507.571856180827,
-          "latency_ms": 4.507571856180827,
+          "T_us": 4522.579828898112,
+          "latency_ms": 4.522579828898112,
           "F_cuda": 30189579776.0,
           "F_tensor": 118682025984.0,
-          "B_mem": 8996015000.0,
-          "U_cuda": 6.459834826086956,
-          "U_tensor": 1.2442390869565216,
-          "U_mem": 38.93730734782609,
-          "U_bottle_neck": 38.93730734782609,
+          "B_mem": 8994170000.0,
+          "U_cuda": 6.459052913043478,
+          "U_tensor": 1.2559549565217392,
+          "U_mem": 39.10291665217391,
+          "U_bottle_neck": 39.10291665217391,
           "bottle_neck_unit": "mem",
           "num_kernels": 23,
           "per_kernel": [
@@ -4142,243 +4174,243 @@
               "name": "l2norm_fwd_kernel2",
               "F_cuda": 352321536.0,
               "F_tensor": 0.0,
-              "B_mem": 381856000.0,
-              "U_cuda": 6.657838,
+              "B_mem": 381534000.0,
+              "U_cuda": 6.666468,
               "U_tensor": 0.0,
-              "U_mem": 87.384123,
-              "T_us": 129.61750108626563
+              "U_mem": 87.576273,
+              "T_us": 130.10885134023255
             },
             {
               "name": "l2norm_fwd_kernel2",
               "F_cuda": 352321536.0,
               "F_tensor": 0.0,
-              "B_mem": 381870000.0,
-              "U_cuda": 6.608901,
+              "B_mem": 381930000.0,
+              "U_cuda": 6.618631,
               "U_tensor": 0.0,
-              "U_mem": 86.846821,
-              "T_us": 130.41270047943289
+              "U_mem": 87.116944,
+              "T_us": 130.90961975074603
             },
             {
               "name": "void at::unrolled_elementwise_kernel<at::CUDAFunctor_add<long>, std::array<char *, 3>, 4, TrivialOffsetCalculator<2, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, memory::LoadWithoutCast, memory::StoreWithoutCast>(int, T1, T2, T4, T5, T6, T7)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 4000.0,
-              "U_cuda": 0.005878,
+              "U_cuda": 0.006433,
               "U_tensor": 0.0,
-              "U_mem": 0.048428,
-              "T_us": 2.7036779367687305
+              "U_mem": 0.050201,
+              "T_us": 2.4983974408021017
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006448,
+              "U_cuda": 0.006977,
               "U_tensor": 0.0,
-              "U_mem": 0.065732,
-              "T_us": 2.799101863948803
+              "U_mem": 0.067903,
+              "T_us": 2.6265203864842612
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.00595,
+              "U_cuda": 0.007019,
               "U_tensor": 0.0,
-              "U_mem": 0.057964,
-              "T_us": 3.02175769403564
+              "U_mem": 0.068978,
+              "T_us": 2.594489650063721
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::BUnaryFunctor<long, long, long, binary_internal::div_floor_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(long, long) (instance 1)]>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 28000.0,
-              "U_cuda": 0.005805,
+              "U_cuda": 0.006055,
               "U_tensor": 0.0,
-              "U_mem": 0.257464,
-              "T_us": 3.2444135241224763
+              "U_mem": 0.266588,
+              "T_us": 3.1710429056334375
             },
             {
               "name": "chunk_local_cumsum_vector_kernel",
               "F_cuda": 13186891776.0,
               "F_tensor": 0.0,
-              "B_mem": 583163000.0,
-              "U_cuda": 49.827555,
+              "B_mem": 582970000.0,
+              "U_cuda": 49.676942,
               "U_tensor": 0.0,
-              "U_mem": 42.91472,
-              "T_us": 402.9434365057209
+              "U_mem": 42.886498,
+              "T_us": 405.89349192108
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::AUnaryFunctor<float, float, float, binary_internal::MulFunctor<float>>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 100663296.0,
               "F_tensor": 0.0,
-              "B_mem": 784790000.0,
-              "U_cuda": 2.298631,
+              "B_mem": 784786000.0,
+              "U_cuda": 2.297419,
               "U_tensor": 0.0,
-              "U_mem": 89.395643,
-              "T_us": 260.3800892986921
+              "U_mem": 89.368965,
+              "T_us": 262.23563907495907
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<float>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 178794000.0,
-              "U_cuda": 2.73062,
+              "B_mem": 178806000.0,
+              "U_cuda": 2.782501,
               "U_tensor": 0.0,
-              "U_mem": 86.04234,
-              "T_us": 61.643856958327056
+              "U_mem": 87.705935,
+              "T_us": 60.92246067186664
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<float>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 179079000.0,
-              "U_cuda": 2.750602,
+              "B_mem": 178808000.0,
+              "U_cuda": 2.75917,
               "U_tensor": 0.0,
-              "U_mem": 86.815925,
-              "T_us": 61.19854529815338
+              "U_mem": 86.95014,
+              "T_us": 61.43495245459527
             },
             {
               "name": "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
               "F_cuda": 1073037312.0,
               "F_tensor": 0.0,
-              "B_mem": 903430000.0,
-              "U_cuda": 14.290874,
-              "U_tensor": 5.81974,
-              "U_mem": 52.617732,
-              "T_us": 509.15026745714204
+              "B_mem": 903135000.0,
+              "U_cuda": 14.312683,
+              "U_tensor": 5.828621,
+              "U_mem": 52.715328,
+              "T_us": 511.5949221088611
             },
             {
               "name": "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra",
               "F_cuda": 11123589120.0,
               "F_tensor": 0.0,
-              "B_mem": 946525000.0,
-              "U_cuda": 31.839814,
+              "B_mem": 945964000.0,
+              "U_cuda": 31.721815,
               "U_tensor": 0.0,
-              "U_mem": 32.899193,
-              "T_us": 853.121716965578
+              "U_mem": 32.797788,
+              "T_us": 861.2104101390528
             },
             {
               "name": "void at::vectorized_elementwise_kernel<8, at::FillFunctor<c10::BFloat16>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 78066000.0,
-              "U_cuda": 4.725461,
+              "B_mem": 77687000.0,
+              "U_cuda": 4.726952,
               "U_tensor": 0.0,
-              "U_mem": 73.107739,
-              "T_us": 31.680743823784184
+              "U_mem": 72.830908,
+              "T_us": 31.902613474857606
             },
             {
               "name": "merge_16x16_to_64x64_inverse_kernel",
               "F_cuda": 2854849536.0,
               "F_tensor": 0.0,
-              "B_mem": 193815000.0,
-              "U_cuda": 13.740776,
-              "U_tensor": 0.042866,
-              "U_mem": 13.100329,
-              "T_us": 438.69560122252153
+              "B_mem": 193813000.0,
+              "U_cuda": 13.777516,
+              "U_tensor": 0.04298,
+              "U_mem": 13.135558,
+              "T_us": 440.58277946452455
             },
             {
               "name": "recompute_w_u_fwd_kernel",
               "F_cuda": 415309824.0,
               "F_tensor": 26373783552.0,
-              "B_mem": 1507228000.0,
-              "U_cuda": 4.814162,
-              "U_tensor": 4.989577,
-              "U_mem": 83.182757,
-              "T_us": 537.3321339509902
+              "B_mem": 1506548000.0,
+              "U_cuda": 4.827403,
+              "U_tensor": 5.0033,
+              "U_mem": 83.284579,
+              "T_us": 540.1663389959826
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006249,
+              "U_cuda": 0.007026,
               "U_tensor": 0.0,
-              "U_mem": 0.060911,
-              "T_us": 2.894525791128876
+              "U_mem": 0.068193,
+              "T_us": 2.594489650063721
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006454,
+              "U_cuda": 0.006756,
               "U_tensor": 0.0,
-              "U_mem": 0.065789,
-              "T_us": 2.799101863948803
+              "U_mem": 0.065759,
+              "T_us": 2.690581859325341
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::BUnaryFunctor<long, long, long, binary_internal::div_floor_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(long, long) (instance 1)]>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 28000.0,
-              "U_cuda": 0.005622,
+              "U_cuda": 0.005992,
               "U_tensor": 0.0,
-              "U_mem": 0.245991,
-              "T_us": 3.3716454270292404
+              "U_mem": 0.263672,
+              "T_us": 3.1710429056334375
             },
             {
               "name": "void at::<unnamed>::CatArrayBatchedCopy_alignedK_contig<at::<unnamed>::OpaqueType<8>, unsigned int, 1, 128, 1, 16>(T1 *, at::<unnamed>::CatArrInputTensorMetadata<T1, T2, T4, T5>, at::<unnamed>::TensorSizeStride<T2, 4>, int, T2)",
               "F_cuda": 512.0,
               "F_tensor": 0.0,
               "B_mem": 5000.0,
-              "U_cuda": 0.001135,
-              "U_tensor": 0.000505,
-              "U_mem": 0.045363,
-              "T_us": 3.0535656697623312
+              "U_cuda": 0.001315,
+              "U_tensor": 0.000584,
+              "U_mem": 0.052228,
+              "T_us": 2.6265203864842612
             },
             {
               "name": "void at_cuda_detail::DeviceScanInitKernel<at_cuda_detail::ScanTileState<long, 1>>(T1, int)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 3000.0,
-              "U_cuda": 0.0009,
+              "U_cuda": 0.000952,
               "U_tensor": 0.0,
-              "U_mem": 0.036184,
-              "T_us": 2.385598179501821
+              "U_mem": 0.038194,
+              "T_us": 2.242151549437784
             },
             {
               "name": "void at_cuda_detail::DeviceScanKernel<at_cuda_detail::policy_hub<long, long, long, unsigned int, std::plus<long>>::Policy1000, const long *, long *, at_cuda_detail::ScanTileState<long, 1>, std::plus<long>, at_cuda_detail::NullType, unsigned int, long, 0, at_cuda_detail::NullType>(T2, T3, T4, int, T5, T6, T7)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 25000.0,
-              "U_cuda": 0.006778,
+              "U_cuda": 0.006872,
               "U_tensor": 0.0,
-              "U_mem": 0.231308,
-              "T_us": 3.2762214998491674
+              "U_mem": 0.234375,
+              "T_us": 3.2671351148950563
             },
             {
               "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
               "F_cuda": 524550144.0,
               "F_tensor": 52747567104.0,
-              "B_mem": 1261589000.0,
-              "U_cuda": 3.941849,
-              "U_tensor": 10.526244,
-              "U_mem": 73.856842,
-              "T_us": 506.54201344755336
+              "B_mem": 1262350000.0,
+              "U_cuda": 4.028756,
+              "U_tensor": 10.758319,
+              "U_mem": 75.36814,
+              "T_us": 500.09588773388737
             },
             {
               "name": "chunk_gla_fwd_kernel_o",
               "F_cuda": 206045184.0,
               "F_tensor": 39560675328.0,
-              "B_mem": 1615693000.0,
-              "U_cuda": 4.297899,
-              "U_tensor": 7.238567,
-              "U_mem": 86.278771,
-              "T_us": 555.3036402365705
+              "B_mem": 1615722000.0,
+              "U_cuda": 4.306564,
+              "U_tensor": 7.25316,
+              "U_mem": 86.453936,
+              "T_us": 558.0394899186439
             }
           ],
           "flops_cuda_core": 30189579776.0,
           "flops_tensor_core": 118682025984.0,
-          "memory_bytes": 8996015000.0,
-          "util_cuda_core": 0.06459834826086956,
-          "util_tensor_core": 0.012442390869565216,
-          "util_memory_bw": 0.38937307347826094,
+          "memory_bytes": 8994170000.0,
+          "util_cuda_core": 0.06459052913043478,
+          "util_tensor_core": 0.012559549565217392,
+          "util_memory_bw": 0.3910291665217391,
           "bottleneck": "memory_bw",
-          "bottleneck_util": 0.38937307347826094,
+          "bottleneck_util": 0.3910291665217391,
           "cuda_flops": 30189579776.0,
-          "sm_utilization": 0.13327517347826087,
+          "sm_utilization": 0.13341878956521738,
           "report_path": "ncu_reports/chunk_kda_1x8192x96x128x6_bfloat16.ncu-repz"
         }
       },
@@ -4439,6 +4471,25 @@
                 ],
                 "dtype": "torch.bfloat16"
               },
+              "A_log": {
+                "shape": [
+                  96
+                ],
+                "dtype": "torch.float32"
+              },
+              "dt_bias": {
+                "shape": [
+                  96,
+                  128
+                ],
+                "dtype": "torch.float32"
+              },
+              "cu_seqlens": {
+                "shape": [
+                  9
+                ],
+                "dtype": "torch.int64"
+              },
               "scale": 0.08838834764831843
             },
             "outputs": {
@@ -4478,15 +4529,15 @@
               ]
             }
           },
-          "T_us": 4467.481931050618,
-          "latency_ms": 4.467481931050618,
+          "T_us": 4473.686899457659,
+          "latency_ms": 4.473686899457659,
           "F_cuda": 29829366272.0,
           "F_tensor": 115964116992.0,
-          "B_mem": 8995525000.0,
-          "U_cuda": 6.460669695652174,
-          "U_tensor": 1.252627043478261,
-          "U_mem": 39.27359447826087,
-          "U_bottle_neck": 39.27359447826087,
+          "B_mem": 9000069000.0,
+          "U_cuda": 6.475993565217392,
+          "U_tensor": 1.2588442608695651,
+          "U_mem": 39.32809995652174,
+          "U_bottle_neck": 39.32809995652174,
           "bottle_neck_unit": "mem",
           "num_kernels": 23,
           "per_kernel": [
@@ -4494,243 +4545,243 @@
               "name": "l2norm_fwd_kernel2",
               "F_cuda": 352321536.0,
               "F_tensor": 0.0,
-              "B_mem": 381596000.0,
-              "U_cuda": 6.662909,
+              "B_mem": 381937000.0,
+              "U_cuda": 6.692634,
               "U_tensor": 0.0,
-              "U_mem": 87.485269,
-              "T_us": 129.86940340221054
+              "U_mem": 87.309281,
+              "T_us": 130.47547074473425
             },
             {
               "name": "l2norm_fwd_kernel2",
               "F_cuda": 352321536.0,
               "F_tensor": 0.0,
-              "B_mem": 381819000.0,
-              "U_cuda": 6.600661,
+              "B_mem": 381778000.0,
+              "U_cuda": 6.662972,
               "U_tensor": 0.0,
-              "U_mem": 86.707443,
-              "T_us": 131.08283770987813
+              "U_mem": 87.569876,
+              "T_us": 130.02765103636796
             },
             {
               "name": "void at::unrolled_elementwise_kernel<at::CUDAFunctor_add<long>, std::array<char *, 3>, 4, TrivialOffsetCalculator<2, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, memory::LoadWithoutCast, memory::StoreWithoutCast>(int, T1, T2, T4, T5, T6, T7)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 4000.0,
-              "U_cuda": 0.006125,
+              "U_cuda": 0.005824,
               "U_tensor": 0.0,
-              "U_mem": 0.047985,
-              "T_us": 2.5865310242387642
+              "U_mem": 0.048164,
+              "T_us": 2.750892494250342
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006439,
+              "U_cuda": 0.0069,
               "U_tensor": 0.0,
-              "U_mem": 0.062938,
-              "T_us": 2.810058396703843
+              "U_mem": 0.067743,
+              "T_us": 2.6549311281718424
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006443,
+              "U_cuda": 0.006991,
               "U_tensor": 0.0,
-              "U_mem": 0.0628,
-              "T_us": 2.841990878484568
+              "U_mem": 0.068193,
+              "T_us": 2.590956884119509
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::BUnaryFunctor<long, long, long, binary_internal::div_floor_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(long, long) (instance 1)]>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 28000.0,
-              "U_cuda": 0.005768,
+              "U_cuda": 0.005967,
               "U_tensor": 0.0,
-              "U_mem": 0.254768,
-              "T_us": 3.289045623414725
+              "U_mem": 0.260116,
+              "T_us": 3.198712202616677
             },
             {
               "name": "chunk_local_cumsum_vector_kernel",
               "F_cuda": 12884901888.0,
               "F_tensor": 0.0,
-              "B_mem": 582930000.0,
-              "U_cuda": 49.331018,
+              "B_mem": 583132000.0,
+              "U_cuda": 49.557036,
               "U_tensor": 0.0,
-              "U_mem": 43.45345,
-              "T_us": 399.3476171497529
+              "U_mem": 43.53706,
+              "T_us": 399.39120561871835
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::AUnaryFunctor<float, float, float, binary_internal::MulFunctor<float>>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 100663296.0,
               "F_tensor": 0.0,
-              "B_mem": 784326000.0,
-              "U_cuda": 2.307202,
+              "B_mem": 784799000.0,
+              "U_cuda": 2.291482,
               "U_tensor": 0.0,
-              "U_mem": 89.665416,
-              "T_us": 260.40938892181634
+              "U_mem": 89.094541,
+              "T_us": 262.7102332009077
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<float>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 178954000.0,
-              "U_cuda": 2.753467,
+              "B_mem": 178861000.0,
+              "U_cuda": 2.778866,
               "U_tensor": 0.0,
-              "U_mem": 86.872788,
-              "T_us": 61.374229982554375
+              "U_mem": 87.611226,
+              "T_us": 60.93546745984771
             },
             {
               "name": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<float>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 178803000.0,
-              "U_cuda": 2.766433,
+              "B_mem": 179001000.0,
+              "U_cuda": 2.742172,
               "U_tensor": 0.0,
-              "U_mem": 87.166658,
-              "T_us": 61.086837646527854
+              "U_mem": 86.502994,
+              "T_us": 61.735145510501866
             },
             {
               "name": "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
               "F_cuda": 1075838976.0,
               "F_tensor": 0.0,
-              "B_mem": 906414000.0,
-              "U_cuda": 14.270364,
-              "U_tensor": 5.813105,
-              "U_mem": 52.737661,
-              "T_us": 511.65415557256443
+              "B_mem": 906654000.0,
+              "U_cuda": 14.313937,
+              "U_tensor": 5.830854,
+              "U_mem": 52.570442,
+              "T_us": 514.3209350587356
             },
             {
               "name": "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra",
               "F_cuda": 11123294208.0,
               "F_tensor": 0.0,
-              "B_mem": 945425000.0,
-              "U_cuda": 32.259247,
+              "B_mem": 947490000.0,
+              "U_cuda": 32.196694,
               "U_tensor": 0.0,
-              "U_mem": 33.306671,
-              "T_us": 844.9973328815578
+              "U_mem": 33.318174,
+              "T_us": 847.9786049136812
             },
             {
               "name": "void at::vectorized_elementwise_kernel<8, at::FillFunctor<c10::BFloat16>, std::array<char *, 1>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
-              "B_mem": 77678000.0,
-              "U_cuda": 4.723336,
+              "B_mem": 78024000.0,
+              "U_cuda": 4.725997,
               "U_tensor": 0.0,
-              "U_mem": 72.743815,
-              "T_us": 31.836684335383307
+              "U_mem": 73.130135,
+              "T_us": 31.859173538062105
             },
             {
               "name": "merge_16x16_to_64x64_inverse_kernel",
               "F_cuda": 2816999424.0,
               "F_tensor": 0.0,
-              "B_mem": 194523000.0,
-              "U_cuda": 13.720088,
-              "U_tensor": 0.042959,
-              "U_mem": 13.250854,
-              "T_us": 437.02794565100896
+              "B_mem": 194445000.0,
+              "U_cuda": 13.716826,
+              "U_tensor": 0.042949,
+              "U_mem": 13.246238,
+              "T_us": 437.7437649280923
             },
             {
               "name": "recompute_w_u_fwd_kernel",
               "F_cuda": 405798912.0,
               "F_tensor": 25769803776.0,
-              "B_mem": 1507010000.0,
-              "U_cuda": 4.72444,
-              "U_tensor": 4.896585,
-              "U_mem": 83.4524,
-              "T_us": 537.5833307785135
+              "B_mem": 1506983000.0,
+              "U_cuda": 4.732636,
+              "U_tensor": 4.90508,
+              "U_mem": 83.483846,
+              "T_us": 538.2792894563345
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006538,
+              "U_cuda": 0.006838,
               "U_tensor": 0.0,
-              "U_mem": 0.066905,
-              "T_us": 2.778125914923117
+              "U_mem": 0.067142,
+              "T_us": 2.6549311281718424
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::CUDAFunctorOnSelf_add<long>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 6000.0,
-              "U_cuda": 0.006403,
+              "U_cuda": 0.006824,
               "U_tensor": 0.0,
-              "U_mem": 0.062938,
-              "T_us": 2.841990878484568
+              "U_mem": 0.066736,
+              "T_us": 2.686918250198009
             },
             {
               "name": "void at::vectorized_elementwise_kernel<2, at::BUnaryFunctor<long, long, long, binary_internal::div_floor_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(long, long) (instance 1)]>, std::array<char *, 2>>(int, T2, T3)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 28000.0,
-              "U_cuda": 0.005958,
+              "U_cuda": 0.005856,
               "U_tensor": 0.0,
-              "U_mem": 0.260015,
-              "T_us": 3.193248178072549
+              "U_mem": 0.25607,
+              "T_us": 3.2626864466690106
             },
             {
               "name": "void at::<unnamed>::CatArrayBatchedCopy_alignedK_contig<at::<unnamed>::OpaqueType<8>, unsigned int, 1, 128, 1, 16>(T1 *, at::<unnamed>::CatArrInputTensorMetadata<T1, T2, T4, T5>, at::<unnamed>::TensorSizeStride<T2, 4>, int, T2)",
               "F_cuda": 512.0,
               "F_tensor": 0.0,
               "B_mem": 4000.0,
-              "U_cuda": 0.001233,
-              "U_tensor": 0.000548,
-              "U_mem": 0.04386,
-              "T_us": 2.810058396703843
+              "U_cuda": 0.001293,
+              "U_tensor": 0.000575,
+              "U_mem": 0.045704,
+              "T_us": 2.686918250198009
             },
             {
               "name": "void at_cuda_detail::DeviceScanInitKernel<at_cuda_detail::ScanTileState<long, 1>>(T1, int)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 3000.0,
-              "U_cuda": 0.000903,
+              "U_cuda": 0.000925,
               "U_tensor": 0.0,
-              "U_mem": 0.035845,
-              "T_us": 2.3630036517736857
+              "U_mem": 0.036686,
+              "T_us": 2.3350599079101744
             },
             {
               "name": "void at_cuda_detail::DeviceScanKernel<at_cuda_detail::policy_hub<long, long, long, unsigned int, std::plus<long>>::Policy1000, const long *, long *, at_cuda_detail::ScanTileState<long, 1>, std::plus<long>, at_cuda_detail::NullType, unsigned int, long, 0, at_cuda_detail::NullType>(T2, T3, T4, int, T5, T6, T7)",
               "F_cuda": 0.0,
               "F_tensor": 0.0,
               "B_mem": 26000.0,
-              "U_cuda": 0.006686,
+              "U_cuda": 0.006483,
               "U_tensor": 0.0,
-              "U_mem": 0.230203,
-              "T_us": 3.3529105869761757
+              "U_mem": 0.223214,
+              "T_us": 3.4546091788260114
             },
             {
               "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
               "F_cuda": 515899392.0,
               "F_tensor": 51539607552.0,
-              "B_mem": 1269913000.0,
-              "U_cuda": 4.192502,
-              "U_tensor": 10.930927,
-              "U_mem": 78.889885,
-              "T_us": 479.21075408334735
+              "B_mem": 1270564000.0,
+              "U_cuda": 4.211392,
+              "U_tensor": 10.980179,
+              "U_mem": 79.118004,
+              "T_us": 478.8472167317166
             },
             {
               "name": "chunk_gla_fwd_kernel_o",
               "F_cuda": 201326592.0,
               "F_tensor": 38654705664.0,
-              "B_mem": 1606017000.0,
-              "U_cuda": 4.23124,
-              "U_tensor": 7.126298,
-              "U_mem": 86.432106,
-              "T_us": 553.1344494057269
+              "B_mem": 1606284000.0,
+              "U_cuda": 4.271307,
+              "U_tensor": 7.193781,
+              "U_mem": 86.914714,
+              "T_us": 551.1061253888273
             }
           ],
           "flops_cuda_core": 29829366272.0,
           "flops_tensor_core": 115964116992.0,
-          "memory_bytes": 8995525000.0,
-          "util_cuda_core": 0.06460669695652174,
-          "util_tensor_core": 0.01252627043478261,
-          "util_memory_bw": 0.3927359447826087,
+          "memory_bytes": 9000069000.0,
+          "util_cuda_core": 0.06475993565217392,
+          "util_tensor_core": 0.012588442608695651,
+          "util_memory_bw": 0.3932809995652174,
           "bottleneck": "memory_bw",
-          "bottleneck_util": 0.3927359447826087,
+          "bottleneck_util": 0.3932809995652174,
           "cuda_flops": 29829366272.0,
-          "sm_utilization": 0.1335608447826087,
+          "sm_utilization": 0.13385174826086957,
           "report_path": "ncu_reports/chunk_kda_1x8192x96x128x8_bfloat16.ncu-repz"
         }
       }
