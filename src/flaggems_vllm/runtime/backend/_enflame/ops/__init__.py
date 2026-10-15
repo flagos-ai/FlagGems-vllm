@@ -16,5 +16,6 @@
 from flaggems_vllm.runtime.backend._enflame.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._enflame.ops.swiglu import swiglu
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["swiglu", "scaled_int8_quant"]
