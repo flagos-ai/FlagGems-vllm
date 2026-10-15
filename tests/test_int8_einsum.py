@@ -80,8 +80,8 @@ def test_accuracy_int8_einsum(shape):
 
 @pytest.mark.einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("hygon", "ascend"),
-    reason="Hygon or Ascend precision dispatch",
+    flaggems_vllm.vendor_name not in ("hygon", "thead", "ascend"),
+    reason="Hygon, PPU or Ascend precision dispatch",
 )
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

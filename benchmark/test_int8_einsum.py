@@ -24,8 +24,8 @@ import flaggems_vllm
 from . import base, conftest
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
-# Hygon, MetaX, and Ascend use signed INT8 inputs with block-wise scales.
-IS_SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "metax", "ascend")
+# Hygon, MetaX, PPU, and Ascend use signed INT8 inputs with block-wise scales.
+IS_SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "metax", "thead", "ascend")
 pytestmark = pytest.mark.skipif(
     not IS_SUPPORTED_VENDOR, reason="requires an INT8 einsum backend"
 )
@@ -168,7 +168,7 @@ class INT8EinsumBenchmark(base.Benchmark):
             self.shapes = [(batch, 1, 4096, 1024) for batch in batches]
             self.shape_desc = "(b, h, r, d)"
             return
-        # Preserve the shared Hygon and Ascend workload.
+        # Preserve the shared Hygon, PPU, and Ascend workload.
         batches = (1, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, 32768)
         hrd_groups = {
             "flash": (8, 4096, 1024),

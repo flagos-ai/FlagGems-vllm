@@ -166,11 +166,6 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
-    "fp32_router_gemm",
-    "topk_sigmoid",
-    "fused_minimax_m3_qknorm_rope_kv_insert",
-    "vit_flash_attn_wrapper",
-    "vision_flash_attn_varlen",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -179,9 +174,9 @@ __all__ = [
     "beam_search_score_",
     "bincount",
     "bucket_sort_topk",
-    "chunk_kda",
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
+    "chunk_kda",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
     "concat_and_cache_mla",
@@ -200,15 +195,17 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "fp32_router_gemm",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
     "fp8_fp4_paged_mqa_logits",
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
-    "fused_marlin_moe",
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
+    "fused_marlin_moe",
+    "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
     "geglu",
@@ -236,14 +233,14 @@ __all__ = [
     "mv",
     "outer",
     "outplace_fused_experts",
-    "ple_state_gather",
-    "ple_state_scatter_",
+    "pack_seq_triton",
     "parallel_nsa",
     "parallel_nsa_compression",
-    "pack_seq_triton",
     "per_token_group_quant_fp8",
     "permute_copy",
     "persistent_topk",
+    "ple_state_gather",
+    "ple_state_scatter_",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_grouped_gemma_rmsnorm",
     "qwen4_hc_gate_reduce",
@@ -272,11 +269,14 @@ __all__ = [
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "topk_sigmoid",
     "topk_softmax",
     "topk_softplus_sqrt",
     "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",
+    "vision_flash_attn_varlen",
+    "vit_flash_attn_wrapper",
     "weight_norm",
     "weight_norm_interface",
     "weight_norm_interface_backward",
@@ -304,8 +304,16 @@ elif _runtime.device.vendor_name == "hygon":
         "w8a8_block_int8_bmm",
     ]
 
-if _runtime.device.vendor_name == "thead":
+elif _runtime.device.vendor_name == "thead":
     from flaggems_vllm.runtime.backend._thead.fused import attention as thead_attention
+    from flaggems_vllm.runtime.backend._thead.ops import (
+        int8_einsum,
+        w8a8_block_int8_bmm,
+    )
 
     flash_attn_varlen_func_w8a8_int8 = thead_attention.flash_attn_varlen_func_w8a8_int8
-    __all__.append("flash_attn_varlen_func_w8a8_int8")
+    __all__ += [
+        "flash_attn_varlen_func_w8a8_int8",
+        "int8_einsum",
+        "w8a8_block_int8_bmm",
+    ]
