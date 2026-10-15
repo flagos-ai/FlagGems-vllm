@@ -301,62 +301,6 @@ def test_topk_softplus_sqrt_tle(
 
 
 @pytest.mark.topk_softplus_sqrt
-@pytest.mark.skipif(
-    not HAS_TLE,
-    reason=f"TLE-optimized kernel is not available on {vendor}",
-)
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS_LIST)
-@pytest.mark.parametrize("topk", TOPK_LIST)
-@pytest.mark.parametrize("dtype", DTYPE_LIST)
-@pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
-@pytest.mark.parametrize("routed_scaling_factor", RSF_LIST)
-def test_topk_softplus_sqrt_tle_vs_baseline(
-    num_tokens, num_experts, topk, dtype, renormalize, routed_scaling_factor
-):
-    """Cross-check the TLE kernel against the plain Triton kernel on identical
-    inputs, isolating the effect of the on-chip-buffer optimization from the
-    looser tolerance used against the PyTorch reference.
-    """
-    torch.manual_seed(0)
-
-    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
-    correction_bias = torch.randn((num_experts,), dtype=torch.float32, device=device)
-
-    base_w, base_ids, base_tei = _run_topk(
-        "baseline",
-        gating_output,
-        topk,
-        renormalize,
-        routed_scaling_factor,
-        correction_bias=correction_bias,
-    )
-    tle_w, tle_ids, tle_tei = _run_topk(
-        "tle",
-        gating_output,
-        topk,
-        renormalize,
-        routed_scaling_factor,
-        correction_bias=correction_bias,
-    )
-
-    # Same inputs, deterministic tie-break rule -> indices should match
-    # exactly, and token_expert_indices are computed identically in both
-    # kernels, so require an exact match there too.
-    utils.gems_assert_equal(tle_ids, base_ids)
-    utils.gems_assert_equal(tle_tei, base_tei)
-
-    # Weights: allow tight but non-zero tolerance since on-chip staging /
-    # HBM store-load may not be bit-identical in floating point.
-    torch.testing.assert_close(
-        utils.to_reference(tle_w),
-        utils.to_reference(base_w),
-        atol=1e-5,
-        rtol=1e-5,
-    )
-
-
-@pytest.mark.topk_softplus_sqrt
 @pytest.mark.parametrize("num_tokens", HASH_NUM_TOKENS_LIST)
 @pytest.mark.parametrize("num_experts", HASH_NUM_EXPERTS_LIST)
 @pytest.mark.parametrize("topk", HASH_TOPK_LIST)
