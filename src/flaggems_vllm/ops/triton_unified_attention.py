@@ -153,7 +153,8 @@ def _paged_attn_fwd(
         bt_ptrs = (
             block_table_ptr + pid_seq * stride_bt_seq + logical_blocks * stride_bt_blk
         )
-        phys_blocks = tl.load(bt_ptrs, mask=tile_mask, other=0)
+        # Hybrid KV caches may have physical-page element offsets beyond int32.
+        phys_blocks = tl.load(bt_ptrs, mask=tile_mask, other=0).to(tl.int64)
 
         # Load K transposed: [HEAD_SIZE_PADDED, TILE_KV] for direct Q @ K
         k_ptrs = (
