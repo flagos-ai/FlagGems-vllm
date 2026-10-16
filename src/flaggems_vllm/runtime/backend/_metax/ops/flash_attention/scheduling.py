@@ -263,6 +263,19 @@ class MetaXAttentionScheduler:
             <= MetaXAttentionScheduler.SPLIT_KV_SHORT_Q_MAX
             and (max_seqlen_k >= MetaXAttentionScheduler.SPLIT_KV_LONG_K_MIN)
         )
+        # A single-token GQA decode can pack query heads into the row axis.
+        # The API has removed cu_seqlens_q and made Q/KV head counts equal.
+        # Use one 16-row tile for 5..16 packed heads rather than rejecting
+        # this decode shape at the ordinary four-query Split-KV limit.
+        swapped_short_decode = (
+            seqlenq_ngroups_swapped
+            and is_seqused_k
+            and head_size == 256
+            and 4 < max_seqlen_q <= 16
+            and total_q == batch_size * max_seqlen_q
+            and num_heads == num_heads_k
+            and max_seqlen_k > 16
+        )
         split_kv_capable = (
             is_bfloat16
             and is_paged
@@ -270,6 +283,7 @@ class MetaXAttentionScheduler:
             and (
                 0 < max_seqlen_q <= MetaXAttentionScheduler.SPLIT_KV_BLOCK_M
                 or short_q_long_kv
+                or swapped_short_decode
             )
             and (max_seqlen_k >= 0)
             and (total_q > 0)
@@ -286,7 +300,7 @@ class MetaXAttentionScheduler:
         )
         split_kv_block_m = (
             MetaXAttentionScheduler.SPLIT_KV_SHORT_Q_BLOCK_M
-            if short_q_long_kv
+            if short_q_long_kv or swapped_short_decode
             else MetaXAttentionScheduler.SPLIT_KV_BLOCK_M
         )
         split_kv_block_n = (

@@ -83,6 +83,14 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/scheduling.py": [
+        "tests/test_metax_flash_attention_scheduler.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/splitkv.py": [
+        "tests/test_metax_flash_attention_scheduler.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -149,6 +157,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/scheduling.py": [
+        "benchmark/test_metax_flash_attention_decode.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/splitkv.py": [
+        "benchmark/test_metax_flash_attention_decode.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],

@@ -573,13 +573,21 @@ def launch_splitkv(
         device=original_out.device,
     )
 
-    try:
-        params.o_ptr = out_splits
-        params.softmax_lse_ptr = lse_splits
-        args = tuple(getattr(params, key) for key in params.__slots__)
-    finally:
-        params.o_ptr = original_out
-        params.softmax_lse_ptr = original_lse
+    # Partial results use a new contiguous FP32 layout. In particular,
+    # single-request GQA head/sequence swapping can leave the caller's output
+    # as a strided view; its strides must not index these temporary buffers.
+    # Keep the original output strides for the merge and avoid mutating params.
+    partial_args = {
+        "o_ptr": out_splits,
+        "softmax_lse_ptr": lse_splits,
+        "o_row_stride": num_heads * head_size,
+        "o_head_stride": head_size,
+        "o_batch_stride": max_seqlen_q * num_heads * head_size,
+    }
+    args = tuple(
+        partial_args[key] if key in partial_args else getattr(params, key)
+        for key in params.__slots__
+    )
 
     cfg_params = {
         "BLOCK_M": block_m,
