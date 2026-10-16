@@ -12,166 +12,230 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Performance benchmark for triton_unified_attention."""
+"""Performance benchmark for triton_unified_attention.
+
+Follows the repo benchmark convention (``base.Benchmark`` with a torch
+baseline and a gems op) so it participates in ``--level`` / ``--mode`` /
+``--record`` and reports ``SpeedUp = latency_torch / latency_gems``.
+
+The baseline is a pure-torch paged-attention reference (no vLLM op), matching
+the correctness test's ``ref_paged_attn``.
+"""
 
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 
-BENCH_CONFIGS = [
-    # Decode: B=1, KV=1024, GQA 32:8, head_size=128
-    {
-        "num_seqs": 1,
-        "query_lens": [1],
-        "context_lens": [1023],
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Decode: B=8, KV=4096, GQA 32:8
-    {
-        "num_seqs": 8,
-        "query_lens": [1] * 8,
-        "context_lens": [4095] * 8,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Decode: B=64, KV=4096, GQA 32:8
-    {
-        "num_seqs": 64,
-        "query_lens": [1] * 64,
-        "context_lens": [4095] * 64,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Prefill: B=4, Q=128, GQA 32:8
-    {
-        "num_seqs": 4,
-        "query_lens": [128] * 4,
-        "context_lens": [0] * 4,
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-    # Prefill: B=1, Q=512, KV=3584, GQA 32:8
-    {
-        "num_seqs": 1,
-        "query_lens": [512],
-        "context_lens": [3584],
-        "num_query_heads": 32,
-        "num_kv_heads": 8,
-        "head_size": 128,
-        "block_size": 16,
-        "causal": True,
-        "softcap": 0.0,
-    },
-]
+from . import base
+
+vendor_name = flaggems_vllm.vendor_name
 
 
-def _make_inputs(config, device="cuda"):
-    dtype = torch.bfloat16
-    num_seqs = config["num_seqs"]
-    query_lens = config["query_lens"]
-    context_lens = config["context_lens"]
-    num_query_heads = config["num_query_heads"]
-    num_kv_heads = config["num_kv_heads"]
-    head_size = config["head_size"]
-    block_size = config["block_size"]
+def _ref_paged_attn(
+    query,
+    key_cache,
+    value_cache,
+    query_lens,
+    kv_lens,
+    block_tables,
+    scale,
+    soft_cap,
+):
+    """Pure-torch paged attention reference (causal + softcap + GQA)."""
+    num_seqs = len(query_lens)
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+    block_tables_cpu = block_tables.cpu().numpy()
 
-    total_q_tokens = sum(query_lens)
-    max_seqlen_q = max(query_lens)
-    seqused_k_list = [c + ql for c, ql in zip(context_lens, query_lens)]
-    max_seqlen_k = max(seqused_k_list)
+    outputs = []
+    start_idx = 0
+    for i in range(num_seqs):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        q = query[start_idx : start_idx + query_len].float() * scale
 
-    cu_seqlens_q_list = [0]
-    for ql in query_lens:
-        cu_seqlens_q_list.append(cu_seqlens_q_list[-1] + ql)
-    cu_seqlens_q = torch.tensor(cu_seqlens_q_list, dtype=torch.int32, device=device)
-    seqused_k = torch.tensor(seqused_k_list, dtype=torch.int32, device=device)
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_indices = block_tables_cpu[i, :num_kv_blocks]
 
-    max_blocks_per_seq = max(
-        (sl + block_size - 1) // block_size for sl in seqused_k_list
-    )
-    block_table = torch.zeros(
-        (num_seqs, max_blocks_per_seq), dtype=torch.int32, device=device
-    )
-    physical_block_id = 0
-    for i, sl in enumerate(seqused_k_list):
-        num_blocks_for_seq = (sl + block_size - 1) // block_size
-        for b in range(num_blocks_for_seq):
-            block_table[i, b] = physical_block_id
-            physical_block_id += 1
-    total_physical_blocks = physical_block_id
+        k = key_cache[block_indices].view(-1, num_kv_heads, head_size).float()[:kv_len]
+        v = (
+            value_cache[block_indices]
+            .view(-1, num_kv_heads, head_size)
+            .float()[:kv_len]
+        )
 
-    k_cache = torch.randn(
-        total_physical_blocks,
-        block_size,
-        num_kv_heads,
-        head_size,
-        dtype=dtype,
-        device=device,
-    )
-    v_cache = torch.randn(
-        total_physical_blocks,
-        block_size,
-        num_kv_heads,
-        head_size,
-        dtype=dtype,
-        device=device,
-    )
-    q = torch.randn(
-        total_q_tokens, num_query_heads, head_size, dtype=dtype, device=device
-    )
-    out = torch.empty(
-        total_q_tokens, num_query_heads, head_size, dtype=dtype, device=device
-    )
+        if q.shape[1] != k.shape[1]:
+            repeats = q.shape[1] // k.shape[1]
+            k = torch.repeat_interleave(k, repeats, dim=1)
+            v = torch.repeat_interleave(v, repeats, dim=1)
 
-    softmax_scale = 1.0 / (head_size**0.5)
-    return (
+        attn = torch.einsum("qhd,khd->hqk", q, k)
+        if soft_cap and soft_cap > 0:
+            attn = soft_cap * torch.tanh(attn / soft_cap)
+
+        context_len = kv_len - query_len
+        q_pos = torch.arange(query_len, device=query.device) + context_len
+        kv_pos = torch.arange(kv_len, device=query.device)
+        attn.masked_fill_(
+            (kv_pos[None, :] > q_pos[:, None]).unsqueeze(0), float("-inf")
+        )
+
+        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        outputs.append(torch.einsum("hqk,khd->qhd", attn, v).to(query.dtype))
+        start_idx += query_len
+
+    return torch.cat(outputs, dim=0)
+
+
+# Unified positional signature shared by torch_op and gems_op so the
+# base.Benchmark harness can call both with the same argument tuple.
+def _torch_op(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    max_seqlen_k,
+    scale,
+    block_table,
+    softcap,
+    query_lens,
+    kv_lens,
+):
+    return _ref_paged_attn(q, k, v, query_lens, kv_lens, block_table, scale, softcap)
+
+
+def _gems_op(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    max_seqlen_k,
+    scale,
+    block_table,
+    softcap,
+    query_lens,
+    kv_lens,
+):
+    return triton_unified_attention(
         q,
-        k_cache,
-        v_cache,
+        k,
+        v,
         out,
         cu_seqlens_q,
         max_seqlen_q,
         seqused_k,
         max_seqlen_k,
-        softmax_scale,
-        config["causal"],
+        scale,
+        True,
         (-1, -1),
         block_table,
-        config["softcap"],
+        softcap,
         None,
         None,
         None,
     )
 
 
-@pytest.mark.parametrize("config", BENCH_CONFIGS)
-def test_triton_unified_attention_perf(config, benchmark):
-    inputs = _make_inputs(config)
+class TritonUnifiedAttentionBenchmark(base.Benchmark):
+    """Benchmark for triton_unified_attention (paged, causal, GQA)."""
 
-    # warmup
-    triton_unified_attention(*inputs)
-    torch.cuda.synchronize()
+    # (query_lens, kv_lens, num_query_heads, num_kv_heads, head_size,
+    #  block_size, softcap)
+    CONFIGS = [
+        # Decode: B=1, KV=1024, GQA 32:8
+        ([1], [1024], 32, 8, 128, 16, 0.0),
+        # Decode: B=8, KV=4096, GQA 32:8
+        ([1] * 8, [4096] * 8, 32, 8, 128, 16, 0.0),
+        # Decode: B=64, KV=4096, GQA 32:8
+        ([1] * 64, [4096] * 64, 32, 8, 128, 16, 0.0),
+        # Prefill: B=4, Q=128, GQA 32:8
+        ([128] * 4, [128] * 4, 32, 8, 128, 16, 0.0),
+        # Prefill: B=1, Q=512, KV=4096, GQA 32:8
+        ([512], [4096], 32, 8, 128, 16, 0.0),
+        # Decode with softcap
+        ([1] * 8, [2048] * 8, 32, 8, 128, 16, 30.0),
+    ]
 
-    def run():
-        triton_unified_attention(*inputs)
-        torch.cuda.synchronize()
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = self.CONFIGS
 
-    benchmark(run)
+    def get_input_iter(self, dtype):
+        for config in self.shapes:
+            yield self._build_inputs(config, dtype, self.device)
+
+    def _build_inputs(self, config, dtype, device):
+        (
+            query_lens,
+            kv_lens,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            softcap,
+        ) = config
+        num_seqs = len(query_lens)
+        total_q = sum(query_lens)
+        max_q = max(query_lens)
+        max_k = max(kv_lens)
+
+        cu_seqlens_q = torch.tensor(
+            [0] + torch.tensor(query_lens).cumsum(0).tolist(),
+            dtype=torch.int32,
+            device=device,
+        )
+        seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+
+        max_blocks = max((kv + block_size - 1) // block_size for kv in kv_lens)
+        block_table = torch.zeros(
+            (num_seqs, max_blocks), dtype=torch.int32, device=device
+        )
+        phys = 0
+        for i, kv in enumerate(kv_lens):
+            for b in range((kv + block_size - 1) // block_size):
+                block_table[i, b] = phys
+                phys += 1
+
+        q = torch.randn(total_q, num_query_heads, head_size, dtype=dtype, device=device)
+        k = torch.randn(
+            phys, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+        )
+        v = torch.randn(
+            phys, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+        )
+        out = torch.empty_like(q)
+        scale = head_size**-0.5
+
+        return (
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            max_q,
+            seqused_k,
+            max_k,
+            scale,
+            block_table,
+            float(softcap),
+            query_lens,
+            kv_lens,
+        )
+
+
+@pytest.mark.skipif(vendor_name == "cambricon", reason="tl.dot layout unsupported")
+@pytest.mark.triton_unified_attention
+def test_triton_unified_attention_perf():
+    bench = TritonUnifiedAttentionBenchmark(
+        op_name="triton_unified_attention",
+        torch_op=_torch_op,
+        gems_op=_gems_op,
+        dtypes=[torch.bfloat16, torch.float16],
+    )
+    bench.run()

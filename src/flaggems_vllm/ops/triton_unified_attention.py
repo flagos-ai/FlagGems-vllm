@@ -224,6 +224,74 @@ def _paged_attn_fwd(
     )
 
 
+def _reject_unsupported(
+    *,
+    window_size,
+    q_descale,
+    k_descale,
+    v_descale,
+    seq_threshold_3D,
+    alibi_slopes,
+    output_scale,
+    qq_bias,
+    sinks,
+    mm_prefix_range,
+    rswa_window,
+    kv_quant_mode,
+    k_scale_cache,
+    v_scale_cache,
+    chunk_lookback,
+    use_td,
+    causal,
+):
+    """Raise NotImplementedError for any vLLM feature this kernel omits.
+
+    The kernel implements only the causal + softcap + GQA paged-attention
+    subset. Rather than silently ignoring an unsupported argument (which
+    would return a numerically wrong result), fail loudly.
+    """
+    if window_size is not None and tuple(window_size) != (-1, -1):
+        raise NotImplementedError(
+            f"sliding window is not supported (window_size={window_size}); "
+            "only window_size=(-1, -1) is allowed"
+        )
+    if q_descale is not None or k_descale is not None or v_descale is not None:
+        raise NotImplementedError("FP8 q/k/v descale is not supported")
+    if isinstance(causal, torch.Tensor):
+        raise NotImplementedError(
+            "per-sequence causal (causal as a tensor) is not supported; " "pass a bool"
+        )
+    if seq_threshold_3D is not None:
+        raise NotImplementedError("3D segmented softmax is not supported")
+    if alibi_slopes is not None:
+        raise NotImplementedError("alibi slopes are not supported")
+    if output_scale is not None:
+        raise NotImplementedError("FP8 output_scale is not supported")
+    if qq_bias is not None:
+        raise NotImplementedError("qq_bias is not supported")
+    if sinks is not None:
+        raise NotImplementedError("attention sinks are not supported")
+    if mm_prefix_range is not None:
+        raise NotImplementedError("mm_prefix_range is not supported")
+    if rswa_window is not None:
+        raise NotImplementedError("R-SWA is not supported")
+    if kv_quant_mode is not None and str(
+        getattr(kv_quant_mode, "name", kv_quant_mode)
+    ) not in (
+        "NONE",
+        "0",
+    ):
+        raise NotImplementedError(
+            f"KV cache quantization is not supported (kv_quant_mode={kv_quant_mode})"
+        )
+    if k_scale_cache is not None or v_scale_cache is not None:
+        raise NotImplementedError("per-token-head KV scale caches are not supported")
+    if chunk_lookback is not None and chunk_lookback != -1:
+        raise NotImplementedError("chunked attention is not supported")
+    if use_td:
+        raise NotImplementedError("tensor-descriptor loads (use_td) are not supported")
+
+
 def triton_unified_attention(
     q,  # [total_tokens, num_query_heads, head_size]
     k,  # [num_blocks, block_size, num_kv_heads, head_size]
@@ -235,14 +303,64 @@ def triton_unified_attention(
     max_seqlen_k,  # int
     softmax_scale,  # float
     causal,  # bool
-    window_size,  # (int, int)
+    window_size,  # (int, int); (-1, -1) disables the sliding window
     block_table,  # [num_seqs, max_blocks_per_seq]
     softcap,  # float
-    q_descale,  # None
-    k_descale,  # None
-    v_descale,  # None
+    q_descale,  # None (FP8 descale unsupported)
+    k_descale,  # None (FP8 descale unsupported)
+    v_descale,  # None (FP8 descale unsupported)
+    # ---- Optional keyword arguments mirroring vLLM's unified_attention ----
+    # This leaner kernel implements only the causal + softcap + GQA subset.
+    # Every argument below is accepted so callers can use vLLM's keyword API
+    # unchanged, but activating an unsupported feature raises
+    # NotImplementedError rather than silently returning a wrong result.
+    seq_threshold_3D=None,
+    num_par_softmax_segments=None,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
+    alibi_slopes=None,
+    output_scale=None,
+    qq_bias=None,
+    sinks=None,
+    mm_prefix_range=None,
+    rswa_prefix_lens=None,
+    rswa_window=None,
+    use_alibi_sqrt=False,
+    kv_quant_mode=None,
+    k_scale_cache=None,
+    v_scale_cache=None,
+    chunk_lookback=-1,
+    use_td=False,
+    mm_prefix_clamp_sliding_window=False,
 ):
-    """Paged attention with GQA, causal mask, and optional softcap."""
+    """Paged attention with GQA, causal mask, and optional softcap.
+
+    The signature mirrors vLLM's ``unified_attention`` so this optimized
+    kernel is a drop-in replacement for the feature subset it supports.
+    Unsupported features raise ``NotImplementedError`` — this kernel never
+    falls back to a slower path or silently ignores an argument.
+    """
+    _reject_unsupported(
+        window_size=window_size,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        seq_threshold_3D=seq_threshold_3D,
+        alibi_slopes=alibi_slopes,
+        output_scale=output_scale,
+        qq_bias=qq_bias,
+        sinks=sinks,
+        mm_prefix_range=mm_prefix_range,
+        rswa_window=rswa_window,
+        kv_quant_mode=kv_quant_mode,
+        k_scale_cache=k_scale_cache,
+        v_scale_cache=v_scale_cache,
+        chunk_lookback=chunk_lookback,
+        use_td=use_td,
+        causal=causal,
+    )
+
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
     head_size = q.shape[2]
