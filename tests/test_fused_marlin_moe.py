@@ -696,8 +696,8 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
         pytest.param(
             "int8",
             marks=pytest.mark.skipif(
-                flaggems_vllm.vendor_name == "mthreads",
-                reason="MThreads backend does not implement INT8 W8A16",
+                flaggems_vllm.vendor_name in ("metax", "mthreads"),
+                reason="MetaX and MThreads backends do not implement INT8 W8A16",
             ),
         ),
         "fp8",
@@ -1312,8 +1312,8 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement INT8 W8A16",
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement INT8 W8A16",
 )
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
@@ -1353,8 +1353,8 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
 
 @pytest.mark.fused_marlin_moe_w4a16_mxfp4
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement MXFP4 W4A16",
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement MXFP4 W4A16",
 )
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", FULL_CONFIGS)
