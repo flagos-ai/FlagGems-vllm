@@ -1250,6 +1250,412 @@ def qwen4_compress_norm_mrope_store_groups(
     )
 
 
+def _validate_mqa(q: torch.Tensor) -> None:
+    if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
+        raise ValueError("QSA query must be [rows, heads, head_dim]")
+
+
+def _use_qsa_mqa_dot(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
+    """Gate the portable dot path where it wins without hurting single-row decode."""
+
+    return (
+        q.shape[0] >= 8
+        and q.shape[1:] == (4, 128)
+        and q.dtype == torch.bfloat16
+        and k_cache.dtype == torch.bfloat16
+    )
+
+
+def qsa_mqa_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+    num_columns: int | None = None,
+    score_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute QSA scores directly from a paged compressed-key cache."""
+
+    _validate_mqa(q)
+    if not _is_triton_device(q):
+        raise NotImplementedError(
+            "paged QSA scoring requires an accelerator Triton backend"
+        )
+    if k_cache.ndim != 4 or k_cache.shape[2] != 1:
+        raise ValueError("QSA cache must be [pages, page_size, 1, head_dim]")
+    if k_cache.shape[3] != q.shape[2]:
+        raise ValueError("QSA query and cache dimensions must match")
+    if page_table.ndim != 2:
+        raise ValueError("QSA page table must be two-dimensional")
+    if q.shape[0] and (not all(k_cache.shape[:2]) or not all(page_table.shape)):
+        raise ValueError("QSA paged scoring cache and page table must be nonempty")
+    if token_to_req.shape != (q.shape[0],):
+        raise ValueError("QSA request mapping must match query rows")
+    if query_positions.shape != (q.shape[0],):
+        raise ValueError("QSA query positions must match query rows")
+    if sequence_lengths.shape != (page_table.shape[0],):
+        raise ValueError("QSA sequence lengths must match page-table requests")
+    if compress_ratio <= 0:
+        raise ValueError("QSA compression ratio must be positive")
+    score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
+    if score_divisor <= 0:
+        raise ValueError("QSA score scale must be positive")
+
+    capacity = page_table.shape[1] * k_cache.shape[1]
+    columns = capacity if num_columns is None else num_columns
+    if columns < 0:
+        raise ValueError("QSA score width must be non-negative")
+    logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    if not q.shape[0] or not columns:
+        return logits, visible_blocks
+    block_n = 32
+    use_dot = _use_qsa_mqa_dot(q, k_cache)
+    kernel = _qsa_mqa_paged_dot_kernel if use_dot else _qsa_mqa_paged_kernel
+    dot_kwargs = {"BLOCK_H": 16, "num_stages": 2} if use_dot else {}
+    kernel[(q.shape[0], triton.cdiv(columns, block_n))](
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        visible_blocks,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(3),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        q.shape[0],
+        columns,
+        k_cache.shape[0],
+        page_table.shape[0],
+        float(score_divisor),
+        PAGE_SIZE=k_cache.shape[1],
+        PAGE_TABLE_WIDTH=page_table.shape[1],
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=block_n,
+        BLOCK_D=triton.next_power_of_2(q.shape[2]),
+        COMPRESS_RATIO=compress_ratio,
+        num_warps=4,
+        **dot_kwargs,
+    )
+    return logits, visible_blocks
+
+
+def qsa_store_cache_rows(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Store fixed-width rows in a QSA cache without boolean indexing."""
+
+    if not _is_triton_device(cache):
+        raise NotImplementedError(
+            "QSA cache stores require an accelerator Triton backend"
+        )
+    if cache.ndim != 4 or cache.shape[2] != 1:
+        raise ValueError("QSA cache must be [pages, page_size, 1, width]")
+    if not all(cache.shape):
+        raise ValueError("QSA cache dimensions must be nonzero")
+    if rows.ndim == 3:
+        if rows.shape[1] != 1:
+            raise ValueError("QSA cache rows must have one head")
+        rows = rows[:, 0]
+    if rows.shape != (slot_mapping.numel(), cache.shape[3]):
+        raise ValueError("QSA cache rows and slots have incompatible shapes")
+    if not rows.shape[0]:
+        return
+    _store_qsa_rows_kernel[(rows.shape[0],)](
+        cache,
+        slot_mapping,
+        rows,
+        cache.stride(0),
+        cache.stride(1),
+        cache.stride(3),
+        rows.stride(0),
+        rows.stride(1),
+        rows.shape[0],
+        cache.shape[0],
+        PAGE_SIZE=cache.shape[1],
+        WIDTH=cache.shape[3],
+        BLOCK_D=triton.next_power_of_2(cache.shape[3]),
+        num_warps=4,
+    )
+
+
+def qsa_store_kv_cache_rows(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    """Store paired K/V rows with one cross-vendor Triton launch."""
+
+    if not _is_triton_device(k_cache):
+        raise NotImplementedError(
+            "QSA K/V cache stores require an accelerator Triton backend"
+        )
+    if (
+        k_cache.ndim != 4
+        or v_cache.shape != k_cache.shape
+        or key.ndim != 3
+        or value.shape != key.shape
+    ):
+        raise ValueError("QSA K/V cache store received invalid tensor shapes")
+    if key.shape != (slot_mapping.numel(), k_cache.shape[2], k_cache.shape[3]):
+        raise ValueError("QSA K/V rows and cache geometry are incompatible")
+    if key.dtype != k_cache.dtype or value.dtype != v_cache.dtype:
+        raise ValueError("QSA K/V rows and caches must have matching dtypes")
+    if not all(k_cache.shape):
+        raise ValueError("QSA K/V cache dimensions must be nonzero")
+    if not key.shape[0]:
+        return
+    _store_qsa_kv_rows_kernel[(key.shape[0], key.shape[1])](
+        k_cache,
+        v_cache,
+        slot_mapping,
+        key,
+        value,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        key.shape[0],
+        k_cache.shape[0],
+        PAGE_SIZE=k_cache.shape[1],
+        NUM_HEADS=key.shape[1],
+        HEAD_DIM=key.shape[2],
+        BLOCK_D=triton.next_power_of_2(key.shape[2]),
+        num_warps=4,
+    )
+
+
+def qsa_compress_groups_with_ratio(
+    raw_cache: torch.Tensor,
+    raw_block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    compress_ratio: int,
+    rope_cache: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pool raw-key groups and load their packed or derived positions."""
+
+    if not _is_triton_device(raw_cache):
+        raise NotImplementedError(
+            "QSA compression requires an accelerator Triton backend"
+        )
+    rows = token_to_req.numel()
+    if compress_ratio <= 0:
+        raise ValueError("QSA compression ratio must be positive")
+    if logical_positions.shape != (rows,) or compressed_slots.shape != (rows,):
+        raise ValueError("QSA compression metadata must match token rows")
+    if raw_cache.ndim != 4 or raw_cache.shape[2] != 1:
+        raise ValueError("QSA raw cache has an invalid shape")
+    if raw_block_table.ndim != 2:
+        raise ValueError("QSA raw compression block table must be rank two")
+    if rope_cache is not None and (
+        rope_cache.ndim != 4
+        or rope_cache.shape[:3] != raw_cache.shape[:3]
+        or rope_cache.shape[3] != 3
+        or rope_cache.dtype != torch.int64
+    ):
+        raise ValueError("QSA packed position view has an invalid shape or dtype")
+    if rows and (not all(raw_cache.shape) or not all(raw_block_table.shape)):
+        raise ValueError("QSA raw cache and block table must be nonempty")
+    pooled = torch.empty(
+        (rows, 1, raw_cache.shape[3]), dtype=raw_cache.dtype, device=raw_cache.device
+    )
+    first_positions = torch.empty((rows, 3), dtype=torch.int64, device=raw_cache.device)
+    if not rows:
+        return pooled, first_positions
+    if rope_cache is None:
+        rope_cache = raw_cache
+        load_rope_positions = False
+    else:
+        load_rope_positions = True
+    _compress_qsa_groups_kernel[(rows,)](
+        raw_cache,
+        rope_cache,
+        raw_block_table,
+        raw_block_table,
+        token_to_req,
+        logical_positions,
+        compressed_slots,
+        pooled,
+        first_positions,
+        raw_cache.stride(0),
+        raw_cache.stride(1),
+        raw_cache.stride(3),
+        rope_cache.stride(0),
+        rope_cache.stride(1),
+        rope_cache.stride(3),
+        raw_block_table.stride(0),
+        raw_block_table.stride(1),
+        raw_block_table.stride(0),
+        raw_block_table.stride(1),
+        pooled.stride(0),
+        pooled.stride(2),
+        first_positions.stride(0),
+        first_positions.stride(1),
+        rows,
+        raw_cache.shape[0],
+        rope_cache.shape[0],
+        raw_block_table.shape[0],
+        raw_block_table.shape[0],
+        RAW_PAGE_SIZE=raw_cache.shape[1],
+        RAW_TABLE_WIDTH=raw_block_table.shape[1],
+        ROPE_PAGE_SIZE=rope_cache.shape[1],
+        ROPE_TABLE_WIDTH=raw_block_table.shape[1],
+        COMPRESS_RATIO=compress_ratio,
+        HEAD_DIM=raw_cache.shape[3],
+        LOAD_ROPE_POSITIONS=load_rope_positions,
+        BLOCK_D=triton.next_power_of_2(raw_cache.shape[3]),
+        num_warps=4,
+    )
+    return pooled, first_positions
+
+
+def qsa_compress_norm_mrope_store_groups(
+    raw_cache: torch.Tensor,
+    raw_block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    compress_ratio: int,
+    norm_eps: float,
+    rotary_dim: int,
+    mrope_section: tuple[int, int, int],
+    mrope_interleaved: bool,
+    rope_cache: torch.Tensor | None = None,
+) -> None:
+    """Fuse QSA compression, Gemma norm, Neox MRoPE, and cache insert."""
+
+    if not _is_triton_device(raw_cache):
+        raise NotImplementedError("fused QSA compression requires accelerator Triton")
+    rows = token_to_req.numel()
+    if raw_cache.ndim != 4 or raw_cache.shape[2] != 1 or not all(raw_cache.shape):
+        raise ValueError("fused QSA compression received an invalid raw cache")
+    head_dim = raw_cache.shape[3]
+    if head_dim != 128 or rotary_dim != 64:
+        raise ValueError("fused QSA compression requires head_dim=128, rotary_dim=64")
+    if (
+        compressed_cache.ndim != 4
+        or compressed_cache.shape[2:] != (1, head_dim)
+        or not all(compressed_cache.shape)
+        or compressed_cache.device != raw_cache.device
+        or compressed_cache.dtype != raw_cache.dtype
+    ):
+        raise ValueError("fused QSA compressed cache must match the raw key width")
+    if raw_block_table.ndim != 2 or not all(raw_block_table.shape):
+        raise ValueError("fused QSA compression requires a nonempty block table")
+    if logical_positions.shape != (rows,) or compressed_slots.shape != (rows,):
+        raise ValueError("fused QSA compression metadata must match token rows")
+    if (
+        norm_weight.shape != (head_dim,)
+        or norm_weight.dtype != raw_cache.dtype
+        or norm_weight.device != raw_cache.device
+        or norm_weight.stride(0) != 1
+    ):
+        raise ValueError("fused QSA compression norm weight is incompatible")
+    if (
+        cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[1] != rotary_dim
+        or not cos_sin_cache.shape[0]
+        or cos_sin_cache.device != raw_cache.device
+        or cos_sin_cache.dtype != raw_cache.dtype
+    ):
+        raise ValueError("fused QSA compression received an invalid RoPE cache")
+    if sum(mrope_section) != rotary_dim // 2:
+        raise ValueError("fused QSA MRoPE sections must cover half the rotary dim")
+    if compress_ratio <= 0 or norm_eps <= 0:
+        raise ValueError("fused QSA compression ratio and epsilon must be positive")
+    if rope_cache is not None and (
+        rope_cache.ndim != 4
+        or rope_cache.shape[:3] != raw_cache.shape[:3]
+        or rope_cache.shape[3] != 3
+        or rope_cache.dtype != torch.int64
+        or rope_cache.device != raw_cache.device
+    ):
+        raise ValueError("fused QSA packed MRoPE cache is invalid")
+    if not rows:
+        return
+    if rope_cache is None:
+        rope_cache = raw_cache
+        load_mrope_positions = False
+    else:
+        load_mrope_positions = True
+    _compress_norm_mrope_store_qsa_groups_kernel[(rows,)](
+        raw_cache,
+        rope_cache,
+        raw_block_table,
+        token_to_req,
+        logical_positions,
+        compressed_slots,
+        norm_weight,
+        cos_sin_cache,
+        compressed_cache,
+        raw_cache.stride(0),
+        raw_cache.stride(1),
+        raw_cache.stride(3),
+        rope_cache.stride(0),
+        rope_cache.stride(1),
+        rope_cache.stride(3),
+        raw_block_table.stride(0),
+        raw_block_table.stride(1),
+        cos_sin_cache.stride(0),
+        cos_sin_cache.stride(1),
+        compressed_cache.stride(0),
+        compressed_cache.stride(1),
+        compressed_cache.stride(3),
+        rows,
+        raw_cache.shape[0],
+        rope_cache.shape[0],
+        compressed_cache.shape[0],
+        raw_block_table.shape[0],
+        cos_sin_cache.shape[0],
+        float(norm_eps),
+        RAW_PAGE_SIZE=raw_cache.shape[1],
+        RAW_TABLE_WIDTH=raw_block_table.shape[1],
+        ROPE_PAGE_SIZE=rope_cache.shape[1],
+        COMPRESSED_PAGE_SIZE=compressed_cache.shape[1],
+        COMPRESS_RATIO=compress_ratio,
+        HEAD_DIM=head_dim,
+        ROTARY_DIM=rotary_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        MROPE_SECTION_T=mrope_section[0],
+        MROPE_SECTION_H=mrope_section[1],
+        MROPE_SECTION_W=mrope_section[2],
+        MROPE_INTERLEAVED=mrope_interleaved,
+        LOAD_MROPE_POSITIONS=load_mrope_positions,
+        num_warps=4,
+    )
+
+
 __all__ = [
     "QWEN4_VENDOR_QSA_SOURCE",
     "_compress_qsa_groups_kernel",
@@ -1264,4 +1670,9 @@ __all__ = [
     "qwen4_vendor_compress_qsa_groups",
     "qwen4_vendor_qsa_mqa_paged",
     "qwen4_vendor_store_qsa_rows",
+    "qsa_mqa_paged",
+    "qsa_store_cache_rows",
+    "qsa_store_kv_cache_rows",
+    "qsa_compress_groups_with_ratio",
+    "qsa_compress_norm_mrope_store_groups",
 ]
