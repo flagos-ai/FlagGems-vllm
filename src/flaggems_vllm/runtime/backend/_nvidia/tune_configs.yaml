@@ -933,6 +933,64 @@ silu_and_mul_with_clamp_linear:
     num_warps: 8
     num_stages: 1
 
+sparse_fp8_repair:
+  - META: {BLOCK_H: 64, BLOCK_K: 64, REPAIR_GROUP: 8}
+    num_warps: 8
+    num_stages: 1
+
+sparse_fp8_short:
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 256}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 32, BLOCK_K: 128, VALUE_DIM: 256}
+    num_warps: 8
+    num_stages: 1
+
+
+
+sparse_fp8_warp_specialized:
+  - META: {PRODUCER_REGS: 48, PRODUCER_WARPS: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {PRODUCER_REGS: 56, PRODUCER_WARPS: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {PRODUCER_REGS: 32, PRODUCER_WARPS: 8}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_compact:
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 160}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 168}
+    num_warps: 4
+    num_stages: 1
+
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 224}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 232}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_tile:
+  - META: {BLOCK_K: 64, BLOCK_D: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, BLOCK_D: 256}
+    num_warps: 4
+    num_stages: 1
+
 # Pure output kernels; mutation/state kernels keep a single original launch.
 glm_data_copy:
   - META: {BLOCK: 256}
