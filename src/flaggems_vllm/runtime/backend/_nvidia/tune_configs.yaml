@@ -1003,3 +1003,11 @@ concat_mla_q:
   - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
+
+flash_mla_fp8_copy_table:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
