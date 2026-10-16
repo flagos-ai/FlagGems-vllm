@@ -13,6 +13,13 @@ from flaggems_vllm.runtime import device as runtime_device
 
 _QSA_SPLIT_ALLOWED = (1, 2, 4, 8, 16, 32)
 
+# MetaX (MACA/FlagTree) note: MACAMmaEncodingAttr::composeSharedLayoutForOperand
+# asserts on the MMA dot tile shape; BLOCK_M=8 trips it with
+# `shape_judge && "tn and tk not meet conditon"`, then make_ttgir dies with
+# "PassManager::run failed".  TP8 gives group_size=3, so the power-of-two
+# rounding below lands on 8 -- raise the floor to 16.
+_QSA_MIN_BLOCK_M = 16
+
 
 def qsa_sparse_triton_launch_config(
     device: torch.device,
@@ -532,7 +539,7 @@ def _qsa_sparse_paged_attention_split(
 
     scale = q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale
     group_size = q.shape[1] // k_cache.shape[2]
-    block_m = max(8, triton.next_power_of_2(group_size))
+    block_m = max(_QSA_MIN_BLOCK_M, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
     block_n, num_warps, num_stages = qsa_sparse_triton_launch_config(q.device)
     split_topk = triton.cdiv(logical_indices.shape[1], num_splits)
@@ -676,11 +683,9 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
-    # Triton accepts an 8-row dot tile on the supported accelerator backend.
-    # TP8 executes three Q heads per replicated KV head, so a minimum of 16
-    # spends most of the M tile on padding.  Eight retains Triton's matrix-dot
-    # lowering while reducing that waste and is neutral to the device vendor.
-    block_m = max(8, triton.next_power_of_2(group_size))
+    # TP8 executes three Q heads per replicated KV head.  On MetaX the MMA
+    # dot tile cannot be narrower than _QSA_MIN_BLOCK_M (see that constant).
+    block_m = max(_QSA_MIN_BLOCK_M, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
     block_n, num_warps, num_stages = qsa_sparse_triton_launch_config(q.device)
     num_splits = split_workspace[0].shape[2] if split_workspace is not None else 1
