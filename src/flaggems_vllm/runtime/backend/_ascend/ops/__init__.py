@@ -59,6 +59,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_e
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
     indexer_gemm_score,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
     scatter_conv_state,
@@ -133,6 +134,7 @@ __all__ = [
     "indexer_epilogue",
     "indexer_gemm_score",
     "inplace_fused_experts",
+    "int8_einsum",
     "kda_gate_cumsum_triton",
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
