@@ -132,6 +132,8 @@ class Benchmark:
         self.is_backward = is_backward
         self.is_inplace = is_inplace
         self._input_iter = None
+        # Baseline sub-entry for kanban operators that merge several precisions.
+        self.base_variant = None
 
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
@@ -470,6 +472,7 @@ class Benchmark:
                             self.op_name,
                             dtype,
                             metric.shape_detail,
+                            self.base_variant,
                         )
                         base_ms = base_rec.get("latency_ms") if base_rec else None
                         if base_ms is not None:

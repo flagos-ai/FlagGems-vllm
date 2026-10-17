@@ -33,7 +33,7 @@ _EINSUM_BLOCK_SHAPES = [
 ]
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.skipif(
     not _einsum_low_precision_available(), reason="requires Hygon, MetaX or PPU INT8"
 )
@@ -95,7 +95,7 @@ def test_einsum_precision_route(shape, dtype):
     assert error.item() < 0.01
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name not in ("hygon", "metax", "thead"),
     reason="Hygon, MetaX or PPU INT8",
@@ -134,7 +134,7 @@ def test_int8_einsum_layouts(shape, layout):
     assert torch.isfinite(out).all() and nrms.item() < 0.10
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name not in ("hygon", "metax", "thead"),
     reason="Hygon, MetaX or PPU INT8",
@@ -168,7 +168,7 @@ def test_int8_einsum_empty(shape, dtype):
     assert torch.count_nonzero(out) == 0
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name not in ("hygon", "metax", "thead"),
     reason="Hygon, MetaX or PPU INT8",
