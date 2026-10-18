@@ -21,6 +21,7 @@ import pickle
 import subprocess
 import sys
 import tempfile
+from dataclasses import asdict
 from typing import Generator
 
 import pytest
@@ -29,7 +30,7 @@ import yaml
 
 import flaggems_vllm
 from benchmark.base import Benchmark, GenericBenchmark2DOnly
-from benchmark.conftest import Config, emit_record_logger
+from benchmark.conftest import Config, emit_record_logger, update_result
 from benchmark.consts import (
     COMPLEX_DTYPES,
     DEFAULT_METRICS,
@@ -933,6 +934,7 @@ class ParallelBenchmarkMixin:
                 result=metrics,
             )
             print(result)
+            update_result(self.op_name, asdict(result))
             emit_record_logger(result.to_json())
             if os.environ.get(PARALLEL_RESULT_FILE_ENV):
                 with open(os.environ[PARALLEL_RESULT_FILE_ENV], "wb") as result_file:

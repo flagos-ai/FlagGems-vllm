@@ -183,7 +183,7 @@ def pytest_addoption(parser):
             for ele in consts.FLOAT_DTYPES
             + consts.INT_DTYPES
             + consts.BOOL_DTYPES
-            + [torch.cfloat]
+            + [torch.int8, torch.cfloat]
         ],
         help=(
             "Specify the data types for benchmarks. "

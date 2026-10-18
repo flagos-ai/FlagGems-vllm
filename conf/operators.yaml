@@ -1431,3 +1431,14 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+  - id: bmm_w8a8_int8
+    description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
+    for:
+      - bmm_w8a8_int8
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
