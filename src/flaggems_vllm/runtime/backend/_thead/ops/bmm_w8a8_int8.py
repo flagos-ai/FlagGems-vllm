@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
+    _prepare_out as prepare_out,
+)
 from flaggems_vllm.utils import libentry
 
 # Reuse the MM body so INT8 AIU lowering and scaling stay identical across APIs.
@@ -105,26 +108,14 @@ def bmm_w8a8_int8(
         raise NotImplementedError("reduction may overflow signed INT32 accumulation")
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("output dtype must be bfloat16, float16 or float32")
-    if out is None:
-        out = torch.empty(
-            (batch, rows, columns), device=activation.device, dtype=out_dtype
-        )
-    elif (
-        out.shape != (batch, rows, columns)
-        or out.dtype != out_dtype
-        or out.device != activation.device
-        or not out.is_contiguous()
-        or out.requires_grad
+    if out is not None and (not out.is_contiguous() or out.requires_grad):
+        raise ValueError("out must be contiguous and must not require gradients")
+    out = prepare_out(out, (batch, rows, columns), out_dtype, activation.device)
+    if out.numel() and any(
+        out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+        for tensor in (activation, weight, activation_scale, weight_scale)
     ):
-        raise ValueError(
-            "out must be contiguous [B,M,N] with matching device and dtype"
-        )
-    else:
-        if out.numel() and any(
-            out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
-            for tensor in (activation, weight, activation_scale, weight_scale)
-        ):
-            raise ValueError("out must not share storage with an input")
+        raise ValueError("out must not share storage with an input")
     if out.numel() == 0:
         return out
     if reduction == 0:
