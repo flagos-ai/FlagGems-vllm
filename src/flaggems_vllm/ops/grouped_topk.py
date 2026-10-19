@@ -18,8 +18,12 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.utils import tl_extra_shim
+
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+_materialized_sigmoid_exp2 = tl_extra_shim.exp2
 
 
 def backend_tle_enabled():
@@ -548,6 +552,92 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
 
 
+@triton.jit
+def _single_group_sigmoid_topk(
+    S,
+    B,
+    V,
+    I,
+    E: tl.constexpr,
+    STRIDE: tl.constexpr,
+    RENORM: tl.constexpr,
+    FACTOR: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SORT: tl.constexpr,
+):
+    token = tl.program_id(0)
+    e = tl.arange(0, BLOCK)
+    scored = tl.load(S + token * STRIDE + e, e < E, -float("inf"))
+    scored = (
+        1.0
+        / (
+            1.0
+            + _materialized_sigmoid_exp2(-scored.to(tl.float32) * 1.4426950408889634)
+        )
+    ).to(S.dtype.element_ty)
+    bias = tl.load(B + e, e < E, 0.0).to(S.dtype.element_ty)
+    native = scored + bias
+    selection = tl.where(e < E, native.to(tl.float32), -float("inf"))
+    max1 = tl.max(selection, 0)
+    tied = (selection == max1) & (e < E)
+    count = tl.sum(tied.to(tl.int32), 0)
+    max2 = tl.max(tl.where(tied & (count == 1), -float("inf"), selection), 0)
+    group = (max1 + max2).to(S.dtype.element_ty).to(tl.float32)
+    proceed = (group == group) & (group != float("inf")) & (group != -float("inf"))
+    pos = tl.arange(0, 16)
+    vals = tl.full((16,), 0.0, tl.float32)
+    idxs = tl.full((16,), 0, tl.int32)
+    # When fewer than 16 finite selections exist, preserve native repeated-max behavior.
+    finite = tl.sum(
+        (
+            (selection == selection)
+            & (selection != float("inf"))
+            & (selection != -float("inf"))
+            & (e < E)
+        ).to(tl.int32),
+        0,
+    )
+    no_nan = tl.sum((selection != selection).to(tl.int32), 0) == 0
+    if SORT and finite >= 16 and no_nan:
+        bits = tl.where(selection == 0.0, 0, selection.to(tl.uint32, bitcast=True))
+        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000).to(
+            tl.uint32
+        )
+        key = (ordered.to(tl.uint64) << 32) | (BLOCK - e).to(tl.uint64)
+        top = tl.topk(key, 16)
+        idxs = (BLOCK - (top & 0xFFFFFFFF)).to(tl.int32)
+        raw = tl.load(S + token * STRIDE + idxs, idxs < E, -float("inf")).to(tl.float32)
+        vals = (
+            (1.0 / (1.0 + _materialized_sigmoid_exp2(-raw * 1.4426950408889634)))
+            .to(S.dtype.element_ty)
+            .to(tl.float32)
+        )
+    else:
+        for j in range(16):
+            value = tl.max(selection, 0)
+            idx = tl.min(tl.where(selection == value, e, E + 1), 0)
+            raw = tl.load(S + token * STRIDE + idx, idx < E, -float("inf")).to(
+                tl.float32
+            )
+            v = tl.where(
+                idx < E,
+                (1.0 / (1.0 + _materialized_sigmoid_exp2(-raw * 1.4426950408889634)))
+                .to(S.dtype.element_ty)
+                .to(tl.float32),
+                -float("inf"),
+            )
+            vals = tl.where(pos == j, v, vals)
+            idxs = tl.where(pos == j, idx, idxs)
+            selection = tl.where(e == idx, -float("inf"), selection)
+    if RENORM:
+        scale = FACTOR / (tl.sum(vals, 0) + 1e-20)
+    else:
+        scale = FACTOR
+    vals = vals * scale
+    tl.store(V + token * 16 + pos, tl.where(proceed, vals, 1.0 / 16))
+    tl.store(I + token * 16 + pos, tl.where(proceed, idxs, pos))
+
+
 def grouped_topk(
     scores: torch.Tensor,
     n_group: int,
@@ -557,6 +647,8 @@ def grouped_topk(
     routed_scaling_factor: float,
     bias: torch.Tensor,
     scoring_func: int = 0,
+    *,
+    sigmoid_mode: str = "native",
 ):
     logger.debug("GEMS GROUPED TOPK")
     if scores.ndim != 2:
@@ -570,6 +662,54 @@ def grouped_topk(
         raise ValueError("topk should be smaller than or equal to 32 for now")
     if scoring_func not in (0, 1):
         raise ValueError("scoring_func must be 0 (none) or 1 (sigmoid)")
+
+    # This explicit contract preserves FP32 sigmoid -> input dtype -> bias
+    # rounding. The default tanh-based route remains unchanged.
+    if sigmoid_mode == "fp32_then_input":
+        if (
+            runtime.device.vendor_name == "metax"
+            and scoring_func == 1
+            and n_group == topk_group == 1
+            and topk == 16
+            and renormalize
+            and routed_scaling_factor == 1.0
+            and num_experts == 896
+            and 1 <= num_tokens <= 4096
+            and scores.dtype in (torch.float32, torch.bfloat16)
+            and bias.dtype in (torch.float32, torch.bfloat16)
+            and scores.is_cuda
+            and bias.device == scores.device
+            and scores.stride(1) == 1
+            and bias.numel() == 896
+            and bias.is_contiguous()
+        ):
+            values = torch.empty(
+                (num_tokens, 16), dtype=torch.float32, device=scores.device
+            )
+            indices = torch.empty(
+                (num_tokens, 16), dtype=torch.int32, device=scores.device
+            )
+            _single_group_sigmoid_topk[(num_tokens,)](
+                scores,
+                bias,
+                values,
+                indices,
+                896,
+                scores.stride(0),
+                True,
+                1.0,
+                1024,
+                True,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+            return values, indices
+        raise NotImplementedError(
+            "fp32_then_input is qualified on MetaX for group1/E896/top16, "
+            "renormalization with scale 1, FP32/BF16 and 1..4096 rows"
+        )
+    if sigmoid_mode != "native":
+        raise ValueError(f"Unknown sigmoid materialization: {sigmoid_mode}")
 
     if bias.ndim != 1:
         bias = bias.flatten()
