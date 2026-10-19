@@ -40,7 +40,6 @@ packing, so value magnitudes must stay inside the FP16 range for full accuracy.
 from __future__ import annotations
 
 import math
-from functools import lru_cache
 from typing import Callable, Optional, Sequence
 
 import torch
@@ -50,6 +49,8 @@ import triton.language as tl
 import triton.language.extra.cann.extension as cann_ext
 from triton.language.extra.cann import libdevice as cann_libdevice
 from triton.runtime.libentry import libentry
+
+from ..device import get_device_core_counts
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -653,31 +654,13 @@ def _validate_sparse_attn_sharedkv_inputs(
         raise ValueError(f"metadata must contain {_METADATA_SIZE} int32 elements.")
 
 
-_NUM_CORES_FALLBACK = 24
-
-
-@lru_cache(maxsize=3)
 def get_num_cores(op_type: str = "vector") -> int:
-    """Return the physical NPU core count used by Triton-Ascend launches.
-
-    Query the device limit through the same torch_npu API the other Ascend
-    ops use; fall back to the Ascend 910B default when it is unavailable.
-    """
-    assert op_type in [
-        "vector",
-        "cube",
-        "mix",
-    ], f"op_type {op_type} must in ['vector', 'cube', 'mix']."
-    try:
-        import torch_npu  # noqa: F401
-
-        device = torch.npu.current_device()
-        torch.npu.set_device(device)
-        limits = torch.npu.get_device_limit(device)
-    except (ImportError, AttributeError, KeyError, TypeError, RuntimeError):
-        return _NUM_CORES_FALLBACK
-    key = "vector_core_num" if op_type == "vector" else "cube_core_num"
-    return limits[key] or _NUM_CORES_FALLBACK
+    """Return physical cores for the current device without a device-stale cache."""
+    assert op_type in ("vector", "cube", "mix"), f"Unsupported core type: {op_type}"
+    num_cube_cores, num_vector_cores = get_device_core_counts(
+        torch.npu.current_device()
+    )
+    return num_vector_cores if op_type == "vector" else num_cube_cores
 
 
 def _prefill_launch_options(*, multibuffer: bool, unit_flag: bool) -> dict[str, object]:
