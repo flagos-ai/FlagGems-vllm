@@ -12,37 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from importlib.util import find_spec
+"""Opt-in pytest plugin for tests using vLLM-Ascend custom-op references.
+
+From the repository root:
+    python -m pytest -p tests.ascend_custom_ops tests/test_sparse_flash_attention.py
+
+Do not load this plugin from conftest.py: pytest must register it before loading
+initial conftests, whose FlagGems imports can initialize the device runtime.
+"""
+
+import pytest
 
 
-def initialize_ascend_custom_ops():
-    """Load available vLLM-Ascend references before FlagGems queries the NPU.
-
-    CANN discovers vendor implementations during device initialization. Loading
-    vLLM only inside a test can leave its registered op using a built-in CANN
-    implementation. vLLM owns vendor setup; no installation path is required here.
-    """
-    vendor = next(
-        (
-            os.environ[key].lower()
-            for key in (
-                "GEMS_VENDOR",
-                "FLAGGEMS_VENDOR",
-                "GEMS_BACKEND",
-                "FLAGGEMS_BACKEND",
-            )
-            if key in os.environ
-        ),
-        None,
-    )
-    if "PPU_SDK" in os.environ or vendor not in (None, "ascend"):
-        return
-    if find_spec("torch_npu") is None or find_spec("vllm_ascend") is None:
-        return
-
-    from vllm_ascend.utils import enable_custom_op
-
-    # Unsupported devices may return False; individual reference tests retain
-    # their existing failure/skip policy rather than requiring ops for all tests.
-    enable_custom_op()
+@pytest.hookimpl(tryfirst=True)
+def pytest_load_initial_conftests():
+    """Let vLLM configure its vendor ops before CANN device initialization."""
+    try:
+        from vllm_ascend.utils import enable_custom_op
+    except ImportError as exc:
+        raise pytest.UsageError(
+            "The tests.ascend_custom_ops plugin requires Torch-NPU and vLLM-Ascend"
+        ) from exc
+    if not enable_custom_op():
+        raise pytest.UsageError(
+            "The installed vLLM-Ascend custom ops could not be enabled on this device"
+        )
