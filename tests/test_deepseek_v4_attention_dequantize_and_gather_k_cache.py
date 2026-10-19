@@ -233,3 +233,81 @@ def test_dequantize_and_gather_k_cache_vllm_accuracy():
     )
 
     fg_testing.assert_close(actual, expected, dtype=torch.bfloat16, equal_nan=True)
+
+
+@pytest.mark.parametrize("layout", ["2d", "3d", "page_padding", "inner_stride"])
+@pytest.mark.parametrize("block_size", [64, 256])
+@pytest.mark.parametrize("gather_mode", ["suffix", "all", "empty"])
+@pytest.mark.skipif(not _OP_RUNS, reason="requires an E4M3-casting backend")
+def test_strided_gather_cached_call(layout, block_size, gather_mode):
+    # Physical pages contain packed data followed by a scale plane, not
+    # independent interleaved token records.
+    batch, length, offset = 2, 513, 3
+    nope, rope, scales = 448, 64, 8
+    page_bytes = block_size * 584
+    blocks_per_seq = (length + block_size - 1) // block_size
+    pages = batch * blocks_per_seq
+    values = (
+        torch.arange(pages * block_size).reshape(pages, block_size, 1) % 17
+    ).float() / 8
+    fp8 = values.expand(pages, block_size, nope).to(torch.float8_e4m3fn)
+    rope_values = (values + 1).expand(pages, block_size, rope).to(torch.bfloat16)
+    raw = torch.zeros((pages, page_bytes), dtype=torch.uint8)
+    payload = raw[:, : block_size * 576].view(pages, block_size, 576)
+    payload[:, :, :nope] = fp8.view(torch.uint8)
+    payload[:, :, nope:] = rope_values.view(torch.uint8)
+    raw[:, block_size * 576 :] = 127
+    if layout == "2d":
+        cache = raw.to(flaggems_vllm.device)
+    elif layout == "3d":
+        cache = raw.view(pages, block_size, 584).to(flaggems_vllm.device)
+    elif layout == "page_padding":
+        storage = torch.zeros(
+            (pages, page_bytes + 64), dtype=torch.uint8, device=flaggems_vllm.device
+        )
+        storage[:, :page_bytes].copy_(raw)
+        cache = storage[:, :page_bytes].view(pages, block_size, 584)
+    else:
+        storage = torch.zeros(
+            (pages, block_size, 1168), dtype=torch.uint8, device=flaggems_vllm.device
+        )
+        cache = storage[:, :, ::2]
+        cache.copy_(raw.view(pages, block_size, 584))
+    lens_cpu = torch.tensor([length, length - 3], dtype=torch.int32)
+    gather_cpu = (
+        None
+        if gather_mode == "all"
+        else torch.tensor(
+            [129, 257] if gather_mode == "suffix" else [0, 0], dtype=torch.int32
+        )
+    )
+    table_cpu = torch.arange(pages - 1, -1, -1, dtype=torch.int32).view(batch, -1)
+    expected = torch.full((batch, length + offset, 528), -77, dtype=torch.bfloat16)
+    rows = torch.cat((fp8.float().to(torch.bfloat16), rope_values), -1)
+    for b in range(batch):
+        count = int(lens_cpu[b]) if gather_cpu is None else int(gather_cpu[b])
+        for i in range(count):
+            pos = int(lens_cpu[b]) - count + i
+            expected[b, offset + i, :512] = rows[
+                table_cpu[b, pos // block_size], pos % block_size
+            ]
+    out = torch.empty_like(expected, device=flaggems_vllm.device)
+    lens = lens_cpu.to(out.device)
+    gather = None if gather_cpu is None else gather_cpu.to(out.device)
+    table = table_cpu.to(out.device)
+    kwargs = dict(nope_dim=nope, rope_dim=rope, scale_slots=scales)
+    call = lambda: flaggems_vllm.dequantize_and_gather_k_cache(
+        out, cache, lens, gather, table, block_size, offset, **kwargs
+    )
+    call()  # Tune first: earlier configs must not hide missed stores.
+    out.fill_(-77)
+    call()
+    assert torch.equal(out.cpu().view(torch.uint8), expected.view(torch.uint8))
+    if layout == "page_padding":
+        from flaggems_vllm.ops.deepseek_v4_attention_dequantize_and_gather_k_cache import (
+            _as_cache_2d,
+        )
+
+        flat = _as_cache_2d(cache)
+        assert flat.data_ptr() == cache.data_ptr()
+        assert flat.stride(0) == cache.stride(0)

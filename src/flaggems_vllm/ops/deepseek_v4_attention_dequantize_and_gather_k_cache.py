@@ -27,21 +27,15 @@ def _default_scale_slots(nope_dim: int) -> int:
     return triton.cdiv(nope_dim, 64) + (1 if nope_dim % 64 == 0 else 0)
 
 
-def _stat_total(gather_lens, num_reqs: int) -> int:
-    """Total tokens to gather: the tuner key for the work size."""
-    return num_reqs if gather_lens is None else int(gather_lens.shape[-1]) * num_reqs
-
-
-def _stat_max(gather_lens) -> int:
-    """Largest per-request gather length: the tuner key for the parallelism shape."""
-    return 0 if gather_lens is None else int(gather_lens.shape[-1])
-
-
 def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
     if k_cache.ndim == 2:
         return k_cache
     if k_cache.ndim == 3:
-        if k_cache.is_contiguous():
+        # A cache page may have trailing allocator padding. Its two inner
+        # dimensions can still be flattened without copying: the kernel already
+        # uses stride(0) to find each physical page. Keep the original fallback
+        # for layouts whose inner dimensions cannot form a no-copy view.
+        if k_cache.stride(2) == 1 and k_cache.stride(1) == k_cache.shape[2]:
             return k_cache.view(k_cache.shape[0], -1)
         return k_cache.contiguous().view(k_cache.shape[0], -1)
     raise ValueError(f"k_cache must be 2D or 3D, got shape={tuple(k_cache.shape)}")
@@ -166,9 +160,15 @@ def dequantize_and_gather_k_cache(
     k_cache_2d = _as_cache_2d(k_cache)
     token_data_size = nope_dim + rope_dim * 2
     num_reqs = seq_lens.shape[0]
-    num_workers = 128
+    if num_reqs == 0:
+        return
+    # Output capacity is a metadata-only upper bound; do not synchronize
+    # device length tensors. Batch size alone cannot distinguish short/long rows.
+    max_gather_len = max(1, out.shape[1] - offset)
+    num_tokens = num_reqs * max_gather_len
+    grid = lambda meta: (num_reqs, meta["num_workers"])
     with torch_device_fn.device(out.device):
-        _dequantize_and_gather_k_cache_kernel[(num_reqs, num_workers)](
+        _dequantize_and_gather_k_cache_kernel[grid](
             out,
             out.stride(0),
             out.stride(1),
@@ -188,8 +188,8 @@ def dequantize_and_gather_k_cache(
             output_dim=output_dim,
             n_quant_blocks=n_quant_blocks,
             HAVE_GATHER_LENS=gather_lens is not None,
-            num_tokens=_stat_total(gather_lens, num_reqs),
-            max_gather_len=_stat_max(gather_lens),
+            num_tokens=num_tokens,
+            max_gather_len=max_gather_len,
         )
 
 
