@@ -20,12 +20,11 @@ Only supports sm90 (Hopper) architecture.
 
 import dataclasses
 import os
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -867,9 +866,16 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    *,
+    dense_decode_backend: Optional[Callable[..., bool]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Triton implementation of flash_mla_with_kvcache.
+
+    dense_decode_backend optionally handles the dense path using the provided
+    output and LSE buffers. Return True after writing both buffers, or False
+    to use the native dispatcher. Exceptions propagate; sparse paths and the
+    default backend are unchanged.
     Functionally equivalent to the CUDA implementation.
 
     Returns:
@@ -1113,6 +1119,7 @@ def flash_mla_with_kvcache(
             k_cache.shape[1],
             softmax_scale,
             causal,
+            dense_decode_backend=dense_decode_backend,
         )
 
     return out, lse
@@ -1320,8 +1327,20 @@ def _dense_decode_dispatch(
     page_block_size,
     softmax_scale,
     causal,
+    dense_decode_backend=None,
 ):
     """Launch dense decode kernel."""
+    if dense_decode_backend is not None and dense_decode_backend(
+        q,
+        kv_cache,
+        block_table,
+        cache_seqlens,
+        out,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    ):
+        return
     BLOCK_H = 64
     num_head_blocks = (num_heads_q + BLOCK_H - 1) // BLOCK_H
 
