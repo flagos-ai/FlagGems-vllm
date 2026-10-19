@@ -20,15 +20,10 @@ import pytest
 import torch
 import yaml
 
-from tests.ascend_custom_ops import initialize_ascend_custom_ops
+import flaggems_vllm
+from flaggems_vllm.runtime import torch_device_fn
 
-initialize_ascend_custom_ops()
-
-# isort: split
-import flaggems_vllm  # noqa: E402
-from flaggems_vllm.runtime import torch_device_fn  # noqa: E402
-
-from . import consts  # noqa: E402
+from . import consts
 
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
