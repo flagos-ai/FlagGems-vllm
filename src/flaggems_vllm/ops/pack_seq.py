@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.ops.data_movement import contiguous_copy
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,8 @@ def pack_seq_triton(
     pad_value: float | int = -float("inf"),
     block_t: int = 64,
     block_d: int = 64,
+    *,
+    max_length: int | None = None,
 ) -> torch.Tensor:
     logger.debug("GEMS PACK_SEQ_TRITON")
     is_uint8 = x.dtype == torch.uint8
@@ -115,7 +121,7 @@ def pack_seq_triton(
         x_reshaped = x
 
     B = lengths.numel()
-    Lmax = int(lengths.max().item())
+    Lmax = int(lengths.max().item()) if max_length is None else max_length
 
     out = torch.empty((B, Lmax, D), device=x.device, dtype=x.dtype)
     num_warps = 4
@@ -129,7 +135,7 @@ def pack_seq_triton(
     _pack_seq_kernel[grid](
         x_reshaped,
         out,
-        lengths.int(),
+        contiguous_copy(lengths, torch.int32),
         N,
         D,
         Lmax,

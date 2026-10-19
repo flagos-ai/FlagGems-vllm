@@ -47,6 +47,23 @@ def test_concat_mla_q_matches_reference(dtype, shape, broadcast, strided):
 
 @gpu
 @pytest.mark.concat_mla_q
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("broadcast", [False, True])
+@pytest.mark.parametrize("tokens", [0, 7])
+def test_zero_rope_with_strided_output(dtype, broadcast, tokens):
+    qn = torch.randn(tokens, 4, 18, dtype=dtype, device="cuda")[..., ::2]
+    qr = torch.empty(tokens, 1 if broadcast else 4, 0, dtype=dtype, device="cuda")
+    backing = torch.full((tokens, 4, 18), 123, dtype=dtype, device="cuda")
+    out = backing[..., ::2]
+    before = qn.clone()
+    assert flaggems_vllm.concat_mla_q(qn, qr, out) is None
+    torch.testing.assert_close(out, before, rtol=0, atol=0)
+    torch.testing.assert_close(qn, before, rtol=0, atol=0)
+    assert torch.all(backing[..., 1::2] == 123)
+
+
+@gpu
+@pytest.mark.concat_mla_q
 def test_empty_and_nonfinite_values():
     qn = torch.empty(0, 4, 3, device="cuda")
     qr = torch.empty(0, 1, 5, device="cuda")
