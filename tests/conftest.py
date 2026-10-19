@@ -24,7 +24,12 @@ import pytest
 # import torch  # noqa: F401
 import yaml
 
-import flaggems_vllm
+from tests.ascend_custom_ops import initialize_ascend_custom_ops
+
+initialize_ascend_custom_ops()
+
+# isort: split
+import flaggems_vllm  # noqa: E402
 
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
