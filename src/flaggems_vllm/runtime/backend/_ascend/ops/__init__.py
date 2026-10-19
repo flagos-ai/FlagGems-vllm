@@ -113,6 +113,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention import (
+    sparse_flash_attention,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
     top_k_per_row_decode,
@@ -174,6 +177,7 @@ __all__ = [
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
     "sparse_attn_sharedkv",
+    "sparse_flash_attention",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
     "top_k_per_row_decode",
