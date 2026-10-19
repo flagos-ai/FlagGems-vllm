@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
 
 if has_triton_tle(3, 6, 0):
@@ -819,6 +820,137 @@ def moe_align_block_size_small_grouped(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
+@triton.jit
+def _small_route_alignment_impl(
+    IDS,
+    SORTED,
+    EXPERTS,
+    TOTAL,
+    R: tl.constexpr,
+    E: tl.constexpr,
+    BM: tl.constexpr,
+    B: tl.constexpr,
+    EB: tl.constexpr,
+):
+    r = tl.arange(0, B)
+    raw = tl.load(IDS + r, r < R, EB - 1).to(tl.int32)
+    counts = tl.histogram(raw, EB)
+    e = tl.arange(0, EB)
+    # Masked sort lanes were loaded into the last histogram bin.
+    # Unlike the original E896 adapter, E1024 has no out-of-range spare bin.
+    if E == EB:
+        counts = tl.where(e == EB - 1, counts - (B - R), counts)
+    counts = tl.where(e < E, counts, 0)
+    padded = tl.cdiv(counts, BM) * BM
+    raw_end = tl.cumsum(counts, 0)
+    pad_end = tl.cumsum(padded, 0)
+    raw_start = raw_end - counts
+    pad_start = pad_end - padded
+    total = tl.sum(padded, 0)
+    tl.store(TOTAL, total)
+    # Stable expert then route order. Sentinel keys sort behind all valid routes.
+    key = tl.where(r < R, raw * B + r, 0x7FFFFFFF)
+    key = tl.sort(key, descending=False)
+    owner = tl.minimum(key // B, EB - 1)
+    route = key % B
+    position = r - tl.gather(raw_start, owner, 0)
+    destination = tl.gather(pad_start, owner, 0) + position
+    tl.store(SORTED + destination, route, r < R)
+    tl.store(EXPERTS + destination // BM, owner, (r < R) & (position % BM == 0))
+    # Padding tails are disjoint from valid destinations; no clear/scatter race.
+    for j in range(BM - 1):
+        p = pad_start + counts + j
+        tl.store(SORTED + p, R, (e < E) & (j < padded - counts))
+    return total
+
+
+@triton.jit
+def _moe_align_small_routes_compact(
+    IDS,
+    SORTED,
+    EXPERTS,
+    TOTAL,
+    R: tl.constexpr,
+    E: tl.constexpr,
+    BM: tl.constexpr,
+    B: tl.constexpr,
+    EB: tl.constexpr,
+):
+    """Caller-owned compact buffers; entries beyond the valid prefix are undefined."""
+    _small_route_alignment_impl(IDS, SORTED, EXPERTS, TOTAL, R, E, BM, B, EB)
+
+
+@triton.jit
+def _moe_align_small_routes(
+    IDS,
+    SORTED,
+    EXPERTS,
+    TOTAL,
+    R: tl.constexpr,
+    E: tl.constexpr,
+    BM: tl.constexpr,
+    B: tl.constexpr,
+    EB: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    EXPERT_CAPACITY: tl.constexpr,
+):
+    total = _small_route_alignment_impl(IDS, SORTED, EXPERTS, TOTAL, R, E, BM, B, EB)
+    e = tl.arange(0, EB)
+    # Preserve the complete allocating API, including initialized unused tails.
+    # These addresses are disjoint from the valid/padded prefix above.
+    for base in range(tl.cdiv(CAPACITY, 1024)):
+        tail = base * 1024 + tl.arange(0, 1024)
+        tl.store(SORTED + tail, R, (tail >= total) & (tail < CAPACITY))
+    tl.store(EXPERTS + e, -1, (e >= total // BM) & (e < EXPERT_CAPACITY))
+
+
+def _small_routes_eligible(topk_ids, block_size, num_experts, expert_map, workspace):
+    return (
+        runtime.device.vendor_name == "metax"
+        and num_experts == 1024
+        and block_size == 16
+        and expert_map is None
+        and workspace is None
+        and topk_ids.ndim == 2
+        and topk_ids.shape[1] == 16
+        and 2 <= topk_ids.shape[0] <= 64
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+    )
+
+
+def _align_small_routes(topk_ids, block_size, num_experts, pad_sorted_ids):
+    routes = topk_ids.numel()
+    capacity = routes + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        capacity = triton.cdiv(capacity, block_size) * block_size
+    if routes < num_experts:
+        capacity = min(routes * block_size, capacity)
+    sorted_ids = torch.empty(capacity, dtype=torch.int32, device=topk_ids.device)
+    expert_ids = torch.empty(
+        triton.cdiv(capacity, block_size), dtype=torch.int32, device=topk_ids.device
+    )
+    total = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    # Existing C550-qualified histogram/sort geometry. No global tuner changes.
+    _moe_align_small_routes[(1,)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        total,
+        routes,
+        num_experts,
+        block_size,
+        triton.next_power_of_2(routes),
+        triton.next_power_of_2(num_experts),
+        capacity,
+        expert_ids.numel(),
+        num_warps=4,
+        num_stages=1,
+    )
+    return sorted_ids, expert_ids, total
+
+
 def moe_align_block_size_no_tle(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -837,16 +969,19 @@ def moe_align_block_size_no_tle(
     ``workspace`` optionally supplies zero-initialized int32 cumsum/count buffers
     of sizes E+1 and (E+1)*E, allowing callers to initialize them without Torch.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    num_routes = topk_ids.numel()
+    if 32 <= num_routes <= 1024 and _small_routes_eligible(
+        topk_ids, block_size, num_experts, expert_map, workspace
+    ):
+        return _align_small_routes(topk_ids, block_size, num_experts, pad_sorted_ids)
+    max_num_tokens_padded = num_routes + num_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-    if topk_ids.numel() < num_experts:
+    if num_routes < num_experts:
         # Small-batch tightening (same as vLLM): otherwise the
         # (numel + E*(block_size-1)) bound inflates the sorted/expert buffers
         # and the per-block masks of stage1/stage4.
-        max_num_tokens_padded = min(
-            topk_ids.numel() * block_size, max_num_tokens_padded
-        )
+        max_num_tokens_padded = min(num_routes * block_size, max_num_tokens_padded)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )

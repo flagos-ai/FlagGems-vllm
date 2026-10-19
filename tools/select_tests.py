@@ -83,6 +83,10 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/ops/moe_align_block_size.py": [
+        "tests/test_moe_align_block_size.py",
+        "tests/test_moe_align_small_routes.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "tests/test_hyperconnection.py",
@@ -261,6 +265,7 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/moe_align_block_size.py": [
         "benchmark/test_moe_align_block_size_triton.py",
+        "benchmark/test_moe_align_small_routes_perf.py",
     ],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
