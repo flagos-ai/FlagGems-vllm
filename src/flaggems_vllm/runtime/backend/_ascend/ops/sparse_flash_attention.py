@@ -27,7 +27,7 @@ import triton.experimental.tle as tle
 import triton.language as tl
 from triton.language.extra.cann.extension import sort as ascend_sort
 
-from ..device import get_device_core_counts
+from flaggems_vllm.runtime.backend._ascend.device import get_device_core_counts
 
 INT32_MAX = 2**31 - 1
 # Triton requires constexpr globals; keep host comparisons as plain Python ints.

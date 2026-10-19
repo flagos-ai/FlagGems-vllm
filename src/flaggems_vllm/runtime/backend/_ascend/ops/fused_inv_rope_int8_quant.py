@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from functools import lru_cache
 from typing import Tuple
 
 import torch
@@ -39,15 +40,14 @@ except ModuleNotFoundError:
     tle = _MissingTLE()
 import triton.language as tl
 
-from ..device import get_device_core_counts
-
 logger = logging.getLogger(__name__)
 
 _INT8_ABS_MAX = 127.0
 
 
+@lru_cache(maxsize=8)
 def vector_core_count(device_index: int) -> int:
-    return get_device_core_counts(device_index)[1]
+    return int(torch.npu.get_device_limit(device_index)["vector_core_num"])
 
 
 def is_positive_power_of_two(value: int) -> bool:

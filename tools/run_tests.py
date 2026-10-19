@@ -595,7 +595,7 @@ def probe_env():
     _probe_sdk()
 
 
-def get_env(gpu_ids):
+def get_env(gpu_ids, op=None):
     env = os.environ.copy()
     vendor = ENV_INFO.get("flaggems_vllm", {}).get("vendor", "")
 
@@ -622,6 +622,18 @@ def get_env(gpu_ids):
         env_vars = ["CUDA_VISIBLE_DEVICES"]
     for var in env_vars:
         env[var] = gpu_ids
+    if vendor == "ascend" and op == "sparse_flash_attention":
+        # Reference vendor ops must load before pytest's initial conftests.
+        # Enable the plugin only for this operator's child processes.
+        plugin = "tests.ascend_custom_ops"
+        plugins = [name for name in env.get("PYTEST_PLUGINS", "").split(",") if name]
+        if plugin not in plugins:
+            plugins.append(plugin)
+        env["PYTEST_PLUGINS"] = ",".join(plugins)
+        # Workers invoke pytest from tests/ or benchmark/, before pytest has
+        # added the repository root for importing the tests package.
+        pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(ROOT) + (os.pathsep + pythonpath if pythonpath else "")
     return env
 
 
@@ -883,7 +895,7 @@ def parse_perf_data(op, result_file):
 
 def run_accuracy_q(gpu_id, op):
     """Run accuracy test for one op. Returns result dict."""
-    env = get_env(str(gpu_id))
+    env = get_env(str(gpu_id), op)
 
     base = f'pytest -m "{op}" --record json --output accuracy_{op}.json'
     if op not in CFG.skip_cpu_tests:
@@ -940,7 +952,7 @@ def run_accuracy_q(gpu_id, op):
 
 def run_benchmark_q(gpu_id, op):
     """Run benchmark for one op. Returns result dict."""
-    env = get_env(str(gpu_id))
+    env = get_env(str(gpu_id), op)
 
     benchmark_dir = ROOT / "benchmark"
     result_file = benchmark_dir / f"benchmark_{op}.json"
