@@ -510,6 +510,7 @@ def _qsa_sparse_paged_attention_split(
     softmax_scale: float | None,
     out: torch.Tensor,
     gate: torch.Tensor | None,
+    min_block_m: int = 8,
 ) -> torch.Tensor:
     """Run graph-safe split-TopK sparse attention with caller-owned partials."""
 
@@ -532,7 +533,7 @@ def _qsa_sparse_paged_attention_split(
 
     scale = q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale
     group_size = q.shape[1] // k_cache.shape[2]
-    block_m = max(8, triton.next_power_of_2(group_size))
+    block_m = max(min_block_m, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
     block_n, num_warps, num_stages = qsa_sparse_triton_launch_config(q.device)
     split_topk = triton.cdiv(logical_indices.shape[1], num_splits)
@@ -625,7 +626,7 @@ def _qsa_sparse_paged_attention_split(
     return out
 
 
-def qsa_sparse_paged_attention(
+def _qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -636,6 +637,8 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
     split_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    *,
+    min_block_m: int = 8,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches.
 
@@ -676,11 +679,8 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
-    # Triton accepts an 8-row dot tile on the supported accelerator backend.
-    # TP8 executes three Q heads per replicated KV head, so a minimum of 16
-    # spends most of the M tile on padding.  Eight retains Triton's matrix-dot
-    # lowering while reducing that waste and is neutral to the device vendor.
-    block_m = max(8, triton.next_power_of_2(group_size))
+    # Vendor wrappers may raise the dot-tile floor without duplicating kernels.
+    block_m = max(min_block_m, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
     block_n, num_warps, num_stages = qsa_sparse_triton_launch_config(q.device)
     num_splits = split_workspace[0].shape[2] if split_workspace is not None else 1
@@ -697,6 +697,7 @@ def qsa_sparse_paged_attention(
             softmax_scale=scale,
             out=out,
             gate=gate,
+            min_block_m=min_block_m,
         )
     _qsa_sparse_paged_gqa_kernel[(q.shape[0], k_cache.shape[2])](
         q,
@@ -747,6 +748,33 @@ def qsa_sparse_paged_attention(
         num_stages=num_stages,
     )
     return out
+
+
+def qsa_sparse_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+    split_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Run paged sparse QSA with the generic eight-row minimum dot tile."""
+    return _qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        softmax_scale,
+        out,
+        gate,
+        split_workspace,
+    )
 
 
 __all__ = ["qsa_sparse_paged_attention", "qsa_sparse_split_count"]

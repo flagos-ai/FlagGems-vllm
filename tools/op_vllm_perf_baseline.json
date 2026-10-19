@@ -10129,7 +10129,9 @@
       }
     }
   },
-  "flash_attn_varlen_func_w8a8_fp8": {
+  "flash_attn_varlen_func_w8a8": {
+    "variants": {
+      "fp8": {
     "native_api": "ops.flash_attn_varlen_func_w8a8_fp8",
     "shapes": {
       "[512, 1, 16, 128, 512]": {
@@ -12233,8 +12235,8 @@
         }
       }
     }
-  },
-  "flash_attn_varlen_func_w8a8_int8": {
+      },
+      "int8": {
     "native_api": "ops.flash_attn_varlen_func_w8a8_int8",
     "shapes": {
       "[512, 1, 32, 128, 512]": {
@@ -14498,6 +14500,8 @@
           "sm_utilization": 0.43907869,
           "report_path": "ncu_reports/flash_attn_varlen_func_w8a8_int8_2048x2x32x128x4096_bfloat16.ncu-repz"
         }
+      }
+    }
       }
     }
   },
@@ -22942,7 +22946,9 @@
       }
     }
   },
-  "fused_marlin_moe_w4a16_int4": {
+  "fused_marlin_moe_w4a16": {
+    "variants": {
+      "int4": {
     "native_api": "ops.fused_marlin_moe_w4a16_int4",
     "shapes": {
       "t1_e8_h4096_i14336_topk2": {
@@ -24786,8 +24792,8 @@
         }
       }
     }
-  },
-  "fused_marlin_moe_w4a16_mxfp4": {
+      },
+      "mxfp4": {
     "native_api": "ops.fused_marlin_moe_w4a16_mxfp4",
     "shapes": {
       "t1_e8_h4096_i14336_topk2": {
@@ -24879,6 +24885,8 @@
           "sm_utilization": 0.0,
           "report_path": null
         }
+      }
+    }
       }
     }
   },

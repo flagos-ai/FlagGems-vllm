@@ -643,12 +643,7 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
     return ref
 
 
-@pytest.mark.fused_marlin_moe_w4a16_int4
-@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize("config", FULL_CONFIGS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
-def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input):
+def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     """Compare fused_marlin_moe (packed INT4) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -1311,14 +1306,7 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement INT8 W8A16",
-)
-@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize("config", W8A16_CONFIGS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_w8a16_int8(config, dtype):
+def _check_w8a16_int8(config, dtype):
     """Compare fused_marlin_moe (unpacked INT8) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -1351,15 +1339,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
-@pytest.mark.fused_marlin_moe_w4a16_mxfp4
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement MXFP4 W4A16",
-)
-@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize("config", FULL_CONFIGS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_w4a16_mxfp4(config, dtype):
+def _check_w4a16_mxfp4(config, dtype):
     """Compare fused_marlin_moe (MXFP4) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -1458,11 +1438,7 @@ def test_rejects_fp8_input_dtype():
         )
 
 
-@pytest.mark.fused_marlin_moe_w8a16_fp8
-@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize("config", W8A16_CONFIGS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_w8a16_fp8(config, dtype):
+def _check_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -1491,3 +1467,76 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
     torch_device_fn.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+# -----------------------------------------------------------------------------
+# Kanban operator entries. QA selects tests by operator mark, so every weight
+# precision of one kanban operator is a parametrize entry under that mark. Each
+# precision keeps the platform skips it had as a standalone test.
+# -----------------------------------------------------------------------------
+_DTYPES = [torch.bfloat16, torch.float16]
+
+_MTHREADS_NO_MXFP4 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="MThreads backend does not implement MXFP4 W4A16",
+)
+_MTHREADS_NO_INT8 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="MThreads backend does not implement INT8 W8A16",
+)
+
+
+def _cases(precision, configs, with_router_weight_on_input=False, marks=()):
+    cases = []
+    flags = [False, True] if with_router_weight_on_input else [None]
+    for flag in flags:
+        for di, dtype in enumerate(_DTYPES):
+            for ci, config in enumerate(configs):
+                parts = [precision]
+                if flag is not None:
+                    parts.append(str(flag))
+                parts += [f"dtype{di}", f"config{ci}"]
+                cases.append(
+                    pytest.param(
+                        precision,
+                        config,
+                        dtype,
+                        flag,
+                        marks=marks,
+                        id="-".join(parts),
+                    )
+                )
+    return cases
+
+
+_W4A16_CASES = _cases("int4", FULL_CONFIGS, with_router_weight_on_input=True) + _cases(
+    "mxfp4", FULL_CONFIGS, marks=_MTHREADS_NO_MXFP4
+)
+
+_W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
+    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
+@pytest.mark.parametrize(
+    "precision, config, dtype, apply_router_weight_on_input", _W4A16_CASES
+)
+def test_fused_marlin_moe_w4a16(precision, config, dtype, apply_router_weight_on_input):
+    """fused_marlin_moe W4A16: GPTQ INT4 and MXFP4 weights."""
+    if precision == "int4":
+        _check_w4a16_int4(config, dtype, apply_router_weight_on_input)
+    else:
+        _check_w4a16_mxfp4(config, dtype)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
+@pytest.mark.parametrize("precision, config, dtype, _unused", _W8A16_CASES)
+def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
+    """fused_marlin_moe W8A16: FP8 and INT8 weights."""
+    if precision == "fp8":
+        _check_w8a16_fp8(config, dtype)
+    else:
+        _check_w8a16_int8(config, dtype)

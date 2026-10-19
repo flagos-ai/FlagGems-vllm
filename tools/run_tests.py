@@ -814,6 +814,9 @@ def parse_perf_data(op, result_file):
             compared = res.get("compared_speedup", None)
             if compared is not None:
                 speedup = compared
+            # Latency-only records (no reference implementation on this
+            # machine) carry speedup=None. Keep the None per shape and leave it
+            # out of the mean instead of counting it as 0.
             details[shape]["speedup"] = speedup
             miss = res.get("base_miss_reason", None)
             if miss:
@@ -821,14 +824,23 @@ def parse_perf_data(op, result_file):
                 if miss not in seen_reasons:
                     seen_reasons.add(miss)
                     base_miss_reasons.append(miss)
-            count += 1
-            total += speedup
+            if isinstance(speedup, (int, float)):
+                count += 1
+                total += speedup
 
-        if details:
+        if count:
             bench_res[dtype] = {
                 "result": "OK",
                 "details": details,
                 "speedup": total / count,
+            }
+        elif details:
+            # Only latency was measured (no valid speedup for any shape):
+            # report Unknown with the latency details and no speedup.
+            bench_res[dtype] = {
+                "result": "Unknown",
+                "details": details,
+                "speedup": None,
             }
         else:
             bench_res[dtype] = {
