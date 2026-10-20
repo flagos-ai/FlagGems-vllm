@@ -13,6 +13,9 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -34,6 +37,7 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
 
 __all__ = [
     "fused_experts_impl",
+    "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",
