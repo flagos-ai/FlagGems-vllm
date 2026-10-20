@@ -494,10 +494,9 @@ def _prepare_out(out, shape, dtype, device):
         out.shape != shape
         or out.dtype != dtype
         or out.device != device
-        or (
-            out.numel() != 0
-            and (out.stride(2) != 1 or out.stride(0) <= 0 or out.stride(1) <= 0)
-        )
+        or out.stride(2) != 1
+        or out.stride(0) <= 0
+        or out.stride(1) <= 0
     ):
         raise ValueError(
             "z must have matching shape, dtype, device and unit column stride"

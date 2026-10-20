@@ -110,6 +110,14 @@ def bmm_w8a8_int8(
         raise TypeError("output dtype must be bfloat16, float16 or float32")
     if out is not None and (not out.is_contiguous() or out.requires_grad):
         raise ValueError("out must be contiguous and must not require gradients")
+    if out is not None and out.numel() == 0:
+        if (
+            out.shape != (batch, rows, columns)
+            or out.dtype != out_dtype
+            or out.device != activation.device
+        ):
+            raise ValueError("out must have matching shape, dtype and device")
+        return out
     out = prepare_out(out, (batch, rows, columns), out_dtype, activation.device)
     if out.numel() and any(
         out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
