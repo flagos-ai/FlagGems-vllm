@@ -87,6 +87,14 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "tests/test_bmm_w8a8.py"
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/direct.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "tests/test_hyperconnection.py",
@@ -199,6 +207,14 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "benchmark/bmm_w8a8_shapes.yaml": ["benchmark/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "benchmark/test_bmm_w8a8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+        "benchmark/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/direct.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+        "benchmark/test_flash_attn_varlen_func.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["benchmark/test_ple_conv.py"],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
