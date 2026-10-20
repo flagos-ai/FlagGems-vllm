@@ -17,6 +17,7 @@ from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
+from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
@@ -221,6 +222,7 @@ __all__ = [
     "apply_rotary_pos_emb",
     "beam_search_score",
     "beam_search_score_",
+    "bf16_paged_mqa_logits",
     "bincount",
     "bucket_sort_topk",
     "causal_conv1d_fn",
