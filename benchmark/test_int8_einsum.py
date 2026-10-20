@@ -194,6 +194,9 @@ class INT8EinsumBenchmark(base.Benchmark):
 class ParallelINT8EinsumBenchmark(ParallelBenchmarkMixin, INT8EinsumBenchmark):
     """Use the existing benchmark worker scheduling for exported shapes."""
 
+    # MetaX fp8_einsum has no single-process benchmark; record its results.
+    RECORD_PARALLEL_RESULTS = True
+
 
 def metax_vllm_einsum_bf16(
     x: torch.Tensor,
@@ -238,7 +241,7 @@ def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
         pytest.param(
             EINSUM_LOW_PRECISION_DTYPE,
             id="int8",
-            marks=pytest.mark.int8_einsum,
+            marks=pytest.mark.fp8_einsum,
         ),
     ],
 )
@@ -246,7 +249,7 @@ def test_perf_int8_einsum(dtype):
     low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
     if low_precision and not _einsum_low_precision_available():
         pytest.skip("requires Hygon, MetaX or PPU INT8 support")
-    op_name = "int8_einsum" if low_precision else "einsum"
+    op_name = "fp8_einsum" if low_precision else "einsum"
     if flaggems_vllm.vendor_name == "metax":
         if not low_precision:
             pytest.skip("MetaX int8_einsum accepts INT8 inputs only")

@@ -177,7 +177,7 @@ def _varlen_int8(bf16_args, int8_args):
 
 
 @pytest.mark.skipif(vendor_name not in ("hygon", "thead"), reason="Hygon/PPU-only API")
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
+@pytest.mark.flash_attn_varlen_func_w8a8
 def test_flash_attn_varlen_func_w8a8_int8():
     if vendor_name == "thead":
         if vllm_flash_attn_varlen_func is None or not is_fa_version_supported(3):
@@ -190,9 +190,10 @@ def test_flash_attn_varlen_func_w8a8_int8():
         )
         baseline = _varlen_bf16_baseline
     bench = FlashAttnVarlenInt8Benchmark(
-        op_name="flash_attn_varlen_func_w8a8_int8",
+        op_name="flash_attn_varlen_func_w8a8",
         torch_op=baseline,
         gems_op=_varlen_int8,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "int8"
     bench.run()

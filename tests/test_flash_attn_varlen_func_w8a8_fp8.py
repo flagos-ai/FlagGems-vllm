@@ -378,13 +378,13 @@ def _check_w8a8_head_dim(
     _assert_w8a8_attention_close(actual, expected)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 def test_flash_attn_varlen_func_w8a8_fp8_signature():
     assert inspect.signature(w8a8_varlen) == inspect.signature(fa2_varlen)
     assert flaggems_vllm.flash_attn_varlen_func_w8a8_fp8 is w8a8_varlen
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -419,7 +419,7 @@ def test_flash_attn_varlen_func_w8a8_fp8(
     _assert_w8a8_attention_close(result, expected)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -465,7 +465,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_all_head_dims(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -497,7 +497,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_head_dim_strides(head_size, dtype, layo
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -523,7 +523,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_head_dim_long_sequences(head_size, caus
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -549,7 +549,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_head_dim_short_kv(head_size, kv_len):
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -604,7 +604,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_uniform_lse(
     torch.testing.assert_close(lse, expected_lse, rtol=1.0e-2, atol=5.0e-2)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -684,7 +684,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ragged(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -789,7 +789,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size, fp8_dtype, dtype
     _assert_w8a8_lse_close(result, lse, expected_lse, q_lengths, kv_lengths, causal)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -869,7 +869,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_unsupported_inputs():
         )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -891,7 +891,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_invalid_head_dim(head_size):
         )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -914,7 +914,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_mismatched_head_dims():
         w8a8_varlen(q, torch.empty_like(q), k, 1, cu_seqlens, 1, cu_seqlens)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -1066,7 +1066,7 @@ def _check_ordinary_paged_shapes(
     _assert_w8a8_attention_close(result, expected)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA GQA coverage")
 @pytest.mark.skipif(
@@ -1104,7 +1104,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ordinary_paged_shapes(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA GQA coverage")
 @pytest.mark.skipif(
@@ -1125,7 +1125,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ordinary_single_query_shapes(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA window coverage")
 @pytest.mark.skipif(
@@ -1176,7 +1176,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_one_sided_windows(window_size, long_que
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA GQA scale coverage")
 @pytest.mark.skipif(

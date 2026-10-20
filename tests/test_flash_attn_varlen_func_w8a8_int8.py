@@ -23,7 +23,7 @@ import flaggems_vllm
 DESCALE_BLOCK = 128
 
 pytestmark = [
-    pytest.mark.flash_attn_varlen_func_w8a8_int8,
+    pytest.mark.flash_attn_varlen_func_w8a8,
     pytest.mark.skipif(
         flaggems_vllm.vendor_name not in ("hygon", "thead"),
         reason="Hygon/PPU-only API",

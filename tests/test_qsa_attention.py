@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import math
 
 import pytest
 import torch
 
-from flaggems_vllm.ops.qwen4 import qsa_attention as ops
+import flaggems_vllm as ops
+from flaggems_vllm.ops.qwen4 import qsa_attention as generic_ops
 
 from . import conftest as cfg
 
@@ -19,6 +22,7 @@ pytestmark = [
 
 
 def _load_qsa_ops():
+    # Exercise the selected vendor implementation, not just the generic module.
     return ops
 
 
@@ -293,6 +297,94 @@ def test_sparse_graph_replay_changes_inputs():
     expected = torch.empty_like(case["q"])
     _run(ops, case, expected)
     _assert_split_error(out, expected)
+
+
+class _LaunchRecorder:
+    """Record launch metadata without executing an accelerator kernel."""
+
+    def __init__(self, launches):
+        self.launches = launches
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.launches.append((grid, kwargs))
+
+        return launch
+
+
+@pytest.mark.parametrize("group", [3, 16, 17, 32])
+@pytest.mark.parametrize("splits", [1, 2])
+@pytest.mark.parametrize("vendor", [False, True])
+def test_qsa_tile_floor(monkeypatch, group, splits, vendor):
+    if vendor:
+        if ops.vendor_name != "thead":
+            pytest.skip("PPU specialization requires the thead backend")
+        function = ops.qsa_sparse_paged_attention
+    else:
+        function = generic_ops.qsa_sparse_paged_attention
+    launches = []
+    monkeypatch.setattr(generic_ops, "_is_triton_device", lambda tensor: True)
+    monkeypatch.setattr(
+        generic_ops, "qsa_sparse_triton_launch_config", lambda device: (16, 4, 2)
+    )
+    for name in (
+        "_qsa_sparse_paged_gqa_kernel",
+        "_qsa_sparse_paged_gqa_split_kernel",
+        "_qsa_sparse_paged_gqa_split_reduce_kernel",
+    ):
+        monkeypatch.setattr(generic_ops, name, _LaunchRecorder(launches))
+    query = torch.empty((1, group, 256), dtype=torch.bfloat16, device="cpu")
+    cache = torch.empty((2, 16, 1, 256), dtype=query.dtype, device="cpu")
+    indices = torch.empty((1, 17), dtype=torch.int32, device="cpu")
+    table = torch.empty((1, 2), dtype=torch.int32, device="cpu")
+    requests = torch.empty((1,), dtype=torch.int32, device="cpu")
+    out = torch.empty_like(query)
+    workspace = None
+    if splits > 1:
+        workspace = (
+            torch.empty((1, group, splits, 256), dtype=torch.float32, device="cpu"),
+            torch.empty((1, group, splits), dtype=torch.float32, device="cpu"),
+            torch.empty((1, group, splits), dtype=torch.float32, device="cpu"),
+        )
+    result = function(
+        query,
+        cache,
+        cache,
+        indices,
+        table,
+        requests,
+        out=out,
+        split_workspace=workspace,
+    )
+    assert result is out
+    expected_m = max(16 if vendor else 8, 1 << (group - 1).bit_length())
+    assert launches[0][1]["BLOCK_M"] == expected_m
+    assert len(launches) == (2 if splits > 1 else 1)
+
+
+def test_qsa_vendor_export_and_abi():
+    assert inspect.signature(ops.qsa_sparse_paged_attention) == inspect.signature(
+        generic_ops.qsa_sparse_paged_attention
+    )
+    if ops.vendor_name == "thead":
+        backend = importlib.import_module(
+            "flaggems_vllm.runtime.backend._thead.fused.qsa_attention"
+        )
+        assert ops.qsa_sparse_paged_attention is backend.qsa_sparse_paged_attention
+
+
+def test_qsa_cpu_remains_unsupported():
+    query = torch.empty((1, 3, 256), dtype=torch.bfloat16, device="cpu")
+    cache = torch.empty((1, 16, 1, 256), dtype=query.dtype, device="cpu")
+    with pytest.raises(NotImplementedError, match="accelerator"):
+        ops.qsa_sparse_paged_attention(
+            query,
+            cache,
+            cache,
+            torch.zeros((1, 1), dtype=torch.int32, device="cpu"),
+            torch.zeros((1, 1), dtype=torch.int32, device="cpu"),
+            torch.zeros((1,), dtype=torch.int32, device="cpu"),
+        )
 
 
 def _strided_request_mapping(case):

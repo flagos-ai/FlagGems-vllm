@@ -505,6 +505,9 @@ def _parallel_device_label():
 
 class ParallelBenchmarkMixin:
     SHAPE_CONFIG_KEYS = ()
+    # Record the merged metrics in --record json. Opt-in so ops whose kanban
+    # number comes from a dedicated single-process benchmark keep that source.
+    RECORD_PARALLEL_RESULTS = False
 
     def set_more_shapes(self):
         if os.environ.get(PARALLEL_WORKER_ENV):
@@ -934,7 +937,12 @@ class ParallelBenchmarkMixin:
                 result=metrics,
             )
             print(result)
-            update_result(self.op_name, asdict(result))
+            if self.RECORD_PARALLEL_RESULTS and not os.environ.get(
+                PARALLEL_RESULT_FILE_ENV
+            ):
+                # Main process of an opted-in benchmark: record the merged
+                # metrics like a single-process benchmark (--record json).
+                update_result(self.op_name, asdict(result))
             emit_record_logger(result.to_json())
             if os.environ.get(PARALLEL_RESULT_FILE_ENV):
                 with open(os.environ[PARALLEL_RESULT_FILE_ENV], "wb") as result_file:

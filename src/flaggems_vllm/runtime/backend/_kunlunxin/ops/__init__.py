@@ -13,8 +13,9 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._kunlunxin.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._kunlunxin.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["mhc_pre", "scaled_int8_quant"]

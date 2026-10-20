@@ -137,6 +137,7 @@ class ChannelInt8BmmBenchmark(ParallelBenchmarkMixin, TritonScaledMMBenchmark):
     """Compare prequantized INT8 BMM with vLLM MLA's native BF16 torch.bmm path."""
 
     DEFAULT_SHAPE_DESC = "B, M, N, K"
+    RECORD_PARALLEL_RESULTS = True
     set_shapes = base.Benchmark.set_shapes
 
     def get_latency(self, op, *args, **kwargs):
