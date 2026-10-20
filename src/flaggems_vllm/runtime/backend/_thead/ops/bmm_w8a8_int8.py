@@ -128,6 +128,27 @@ def bmm_w8a8_int8(
                 out=out[index],
             )
         return out
+    if (batch, rows, columns, reduction) == (1, 1, 1024, 4096):
+        # A single row cannot amortize the padded MMA tile; reuse the MM GEMV.
+        with torch_device_fn.device(activation.device):
+            scaled_mm_module._mm_w8a8_vector_kernel[(triton.cdiv(columns, 2),)](
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                out,
+                None,
+                columns,
+                reduction,
+                True,
+                BLOCK_R=2,
+                BLOCK_K=reduction,
+                A_SCALAR=True,
+                B_SCALAR=False,
+                HAS_BIAS=False,
+                num_warps=4,
+            )
+        return out
     block_m, block_n, block_k, warps, stages, group_m = scaled_mm_module._pick_tiles(
         rows, columns, reduction
     )
