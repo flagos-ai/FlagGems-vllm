@@ -191,7 +191,7 @@ requires_channel_int8_bmm = pytest.mark.skipif(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("scale_rank", [2, 3])
 @pytest.mark.parametrize("use_out", [False, True])
-@pytest.mark.bmm_w8a8_int8
+@pytest.mark.bmm_w8a8
 @requires_channel_int8_bmm
 def test_channel_int8_bmm(shape, dtype, scale_rank, use_out):
     torch.manual_seed(0)
@@ -243,7 +243,7 @@ def test_channel_int8_bmm(shape, dtype, scale_rank, use_out):
 @pytest.mark.parametrize(
     "shape", [(0, 5, 7, 32), (2, 0, 7, 32), (2, 5, 0, 32), (2, 5, 7, 0)]
 )
-@pytest.mark.bmm_w8a8_int8
+@pytest.mark.bmm_w8a8
 @requires_channel_int8_bmm
 def test_channel_int8_bmm_empty(shape, use_out):
     batch, rows, columns, reduction = shape
@@ -274,7 +274,7 @@ def test_channel_int8_bmm_empty(shape, use_out):
 @pytest.mark.parametrize(
     "invalid_input", ["batch", "weight_layout", "scale_shape", "scale_dtype"]
 )
-@pytest.mark.bmm_w8a8_int8
+@pytest.mark.bmm_w8a8
 @requires_channel_int8_bmm
 def test_channel_int8_bmm_input_contract(invalid_input):
     activation = torch.empty((2, 8, 16), device=flaggems_vllm.device, dtype=torch.int8)

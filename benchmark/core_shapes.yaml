@@ -524,7 +524,7 @@ swiglu:
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
 
-bmm_w8a8_int8:
+bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]
     - [2, 64, 128, 256]

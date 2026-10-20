@@ -174,14 +174,14 @@ class ChannelInt8BmmBenchmark(ParallelBenchmarkMixin, TritonScaledMMBenchmark):
             )
 
 
-@pytest.mark.bmm_w8a8_int8
+@pytest.mark.bmm_w8a8
 @pytest.mark.skipif(
     "bmm_w8a8_int8" not in vars(flaggems_vllm),
     reason="backend does not export channel-wise INT8 BMM",
 )
 def test_perf_bmm_w8a8_int8():
     bench = ChannelInt8BmmBenchmark(
-        op_name="bmm_w8a8_int8", torch_op=torch.bmm, dtypes=[torch.int8]
+        op_name="bmm_w8a8", torch_op=torch.bmm, dtypes=[torch.int8]
     )
     bench.set_gems(flaggems_vllm.bmm_w8a8_int8)
     bench.run()
