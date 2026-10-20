@@ -7,10 +7,9 @@ import pytest
 import torch
 
 import flaggems_vllm
-from benchmark.test_bmm_w8a8 import BMM_WORKLOAD_SHAPES, make_channel_int8_bmm_inputs
+from benchmark.test_bmm_w8a8 import make_channel_int8_bmm_inputs
 
 from .accuracy_utils import gems_assert_close
-from .conftest import QUICK_MODE
 
 CONTRACT_SHAPES = [
     (1, 1, 1, 1),
@@ -19,20 +18,6 @@ CONTRACT_SHAPES = [
     (2, 129, 17, 257),
     (1, 1, 1024, 4096),
 ]
-WORKLOAD_SHAPES = BMM_WORKLOAD_SHAPES[:]
-if QUICK_MODE:
-    WORKLOAD_SHAPES = [
-        shape
-        for shape in WORKLOAD_SHAPES
-        if shape
-        in (
-            (1, 448, 7168, 256),
-            (1, 1, 1024, 4096),
-            (1, 13021, 1024, 4096),
-            (8, 16, 1024, 4096),
-            (16, 32, 1024, 7168),
-        )
-    ]
 BMM_CASES = list(
     product(
         CONTRACT_SHAPES,
@@ -40,11 +25,7 @@ BMM_CASES = list(
         (2, 3),
         (False, True),
     )
-) + [
-    (shape, torch.bfloat16, 2, False)
-    for shape in WORKLOAD_SHAPES
-    if shape not in CONTRACT_SHAPES
-]
+)
 
 
 requires_channel_int8_bmm = pytest.mark.skipif(
