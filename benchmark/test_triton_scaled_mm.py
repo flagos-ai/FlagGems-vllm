@@ -133,25 +133,17 @@ def test_triton_scaled_mm_benchmark():
     bench.run()
 
 
-def vllm_channel_int8_bmm(activation, weight, activation_scale, weight_scale):
-    if not HAS_VLLM:
-        raise RuntimeError("vLLM triton_scaled_mm is required for the INT8 baseline")
-    # vLLM exposes scaled MM; independent batch slices require no layout copies.
-    return [
-        vllm_triton_scaled_mm(
-            activation[index],
-            weight[index],
-            activation_scale[index, :, None],
-            weight_scale[index, :, None],
-            torch.bfloat16,
-        )
-        for index in range(activation.shape[0])
-    ]
-
-
 class ChannelInt8BmmBenchmark(ParallelBenchmarkMixin, TritonScaledMMBenchmark):
+    """Compare prequantized INT8 BMM with vLLM MLA's native BF16 torch.bmm path."""
+
     DEFAULT_SHAPE_DESC = "B, M, N, K"
     set_shapes = base.Benchmark.set_shapes
+
+    def get_latency(self, op, *args, **kwargs):
+        if op is torch.bmm:
+            return super().get_latency(op, *args[4:], **kwargs)
+        else:
+            return super().get_latency(op, *args[:4], **kwargs)
 
     def get_input_iter(self, dtype):
         for batch, rows, columns, reduction in self.shapes:
@@ -164,7 +156,21 @@ class ChannelInt8BmmBenchmark(ParallelBenchmarkMixin, TritonScaledMMBenchmark):
             ).transpose(1, 2)
             activation_scale = torch.rand((batch, rows), device=self.device) / 127
             weight_scale = torch.rand((batch, columns), device=self.device) / 127
-            yield activation, weight, activation_scale, weight_scale
+            # Both timed APIs receive prepared inputs; conversion is outside timing.
+            baseline_activation = (
+                activation.float() * activation_scale[:, :, None]
+            ).to(torch.bfloat16)
+            baseline_weight = (
+                weight.transpose(1, 2).float() * weight_scale[:, :, None]
+            ).to(torch.bfloat16)
+            yield (
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                baseline_activation,
+                baseline_weight.transpose(1, 2),
+            )
 
 
 @pytest.mark.bmm_w8a8_int8
@@ -174,7 +180,7 @@ class ChannelInt8BmmBenchmark(ParallelBenchmarkMixin, TritonScaledMMBenchmark):
 )
 def test_perf_bmm_w8a8_int8():
     bench = ChannelInt8BmmBenchmark(
-        op_name="bmm_w8a8_int8", torch_op=vllm_channel_int8_bmm, dtypes=[torch.int8]
+        op_name="bmm_w8a8_int8", torch_op=torch.bmm, dtypes=[torch.int8]
     )
     bench.set_gems(flaggems_vllm.bmm_w8a8_int8)
     bench.run()
