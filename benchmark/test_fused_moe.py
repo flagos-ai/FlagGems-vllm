@@ -25,6 +25,7 @@ try:
     if flaggems_vllm.vendor_name == "ascend":
         # vLLM's vanilla Triton fused_moe is CUDA-only; on Ascend use the
         # vendor (vllm-ascend) implementation as the baseline instead.
+        import torch_npu
         from vllm_ascend.ops.fused_moe.moe_mlp import (
             unquant_apply_mlp as _ascend_unquant_apply_mlp,
         )
@@ -101,6 +102,7 @@ class FusedMoEBenchmark(base.Benchmark):
             yield from self._fused_moe_input_fn(config, cur_dtype)
 
     def _fused_moe_input_fn(self, config, dtype):
+        torch.manual_seed(42)
         num_tokens, num_experts, hidden_size, intermediate_size, topk = config
         device = flaggems_vllm.device
 
@@ -157,25 +159,33 @@ def _vllm_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids):
         num_tokens, hidden_size = hidden_states.shape
         topk = topk_ids.shape[1]
         num_experts = w1.shape[0]
-        flat_ids = topk_ids.reshape(-1).long()
-        # argsort on int64 falls back to the (very slow / hanging) AiCpu
-        # engine on Ascend; expert ids are small so sort as float32 on AiCore.
-        order = torch.argsort(flat_ids.float())
-        expanded = hidden_states.repeat_interleave(topk, dim=0)[order]
-        group_list = torch.bincount(flat_ids, minlength=num_experts)
+        (expanded_x, expanded_row_idx, expert_token_cumsum_or_count, _) = (
+            torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids.int(),
+                scale=None,
+                offset=None,
+                active_num=num_tokens * topk,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                quant_mode=-1,
+                active_expert_range=[0, num_experts],
+                row_idx_type=0,
+            )
+        )
+        b = torch.empty_like(topk_weights.reshape(-1))
+        b[expanded_row_idx] = topk_weights.reshape(-1)
         out_sorted = _ascend_unquant_apply_mlp(
-            expanded,
+            expanded_x,
             w1,
             w2,
-            group_list,
+            expert_token_cumsum_or_count,
             activation="silu",
-            topk_scales=topk_weights.reshape(-1)[order]
-            .unsqueeze(-1)
-            .to(expanded.dtype),
+            topk_scales=b.unsqueeze(-1).to(expanded_x.dtype),
             need_trans=True,
         )
-        out = torch.empty_like(out_sorted)
-        out[order] = out_sorted
+        out = out_sorted[expanded_row_idx]
         return out.view(num_tokens, topk, hidden_size).sum(dim=1)
     kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(

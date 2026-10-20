@@ -75,6 +75,7 @@ def _grouped_matmul_nd_kernel(
     C,
     group_list,
     GROUPS: tl.constexpr,
+    TRANS_B: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
     GROUP_LIST_TYPE: tl.constexpr,
@@ -118,7 +119,10 @@ def _grouped_matmul_nd_kernel(
             offsets_k = offsets_k.to(tl.int64)
             group_base = group_idx.to(tl.int64) * K * N
             a_base = A + offsets_m[:, None] * K + offsets_k[None, :]
-            b_base = B + group_base + offsets_k[:, None] * N + offsets_n[None, :]
+            if not TRANS_B:
+                b_base = B + group_base + offsets_k[:, None] * N + offsets_n[None, :]
+            else:
+                b_base = B + group_base + offsets_n[:, None] * K + offsets_k[None, :]
             mask_m = offsets_m < group_end
             mask_n = offsets_n < N
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -131,14 +135,21 @@ def _grouped_matmul_nd_kernel(
                     mask=mask_m[:, None] and mask_k[None, :],
                     other=0.0,
                 )
-                b = tl.load(
-                    b_base + rotated_k * BLOCK_K * N,
-                    mask=mask_k[:, None] and mask_n[None, :],
-                    other=0.0,
-                )
+                if not TRANS_B:
+                    b = tl.load(
+                        b_base + rotated_k * BLOCK_K * N,
+                        mask=mask_k[:, None] and mask_n[None, :],
+                        other=0.0,
+                    )
+                else:
+                    b = tl.load(
+                        b_base + rotated_k * BLOCK_K,
+                        mask=mask_n[:, None] and mask_k[None, :],
+                        other=0.0,
+                    )
                 al.compile_hint(a, "dot_pad_only_k")
                 al.compile_hint(b, "dot_pad_only_k")
-                accumulator = tl.dot(a, b, accumulator)
+                accumulator = tl.dot(a, tl.trans(b) if TRANS_B else b, accumulator)
 
             output = C + offsets_m[:, None] * N + offsets_n[None, :]
             tl.store(
@@ -267,6 +278,7 @@ def grouped_matmul(
     weight: torch.Tensor,
     group_list: torch.Tensor,
     group_list_type: int = 0,
+    trans_weight: bool = False,
 ) -> torch.Tensor:
     """Compute ``Y[group] = X[group] @ Weight[group]`` on Ascend.
 
@@ -275,7 +287,10 @@ def grouped_matmul(
     """
     if weight.ndim != 3:
         raise ValueError("weight must have shape [G, K, N]")
-    groups, weight_k, n = weight.shape
+    if not trans_weight:
+        groups, weight_k, n = weight.shape
+    else:
+        groups, n, weight_k = weight.shape
     _validate_common(x, group_list, groups, group_list_type)
     m, k = x.shape
     if k <= 0 or n <= 0:
@@ -295,7 +310,7 @@ def grouped_matmul(
 
     with torch_device_fn.device(x.device):
         num_cores = _get_aic_core_num(x.device.index)
-        if use_weight_major_panel:
+        if use_weight_major_panel and not trans_weight:
             _grouped_matmul_panel_kernel[(num_cores,)](
                 x,
                 weight,
@@ -323,6 +338,7 @@ def grouped_matmul(
                 output,
                 group_list,
                 GROUPS=groups,
+                TRANS_B=trans_weight,
                 N=n,
                 K=k,
                 GROUP_LIST_TYPE=group_list_type,
