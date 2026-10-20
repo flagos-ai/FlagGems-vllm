@@ -15,9 +15,10 @@
 import logging
 import math
 
+import torch
 import triton
 import triton.language as tl
-
+from flaggems_vllm.ops._memory_overlap import tensor_ranges_overlap
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 from flaggems_vllm.utils import triton_lang_extension as ext
@@ -48,7 +49,13 @@ def fused_add_rms_norm_kernel(
     N,
     eps,
     BLOCK_SIZE: tl.constexpr,
+    GEMMA: tl.constexpr = False,
+    GEMMA_N: tl.constexpr = 0,
+    GEMMA_EPS: tl.constexpr = 0.0,
 ):
+    if GEMMA:
+        N = GEMMA_N
+        eps = GEMMA_EPS
     if tl.constexpr(input_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
         input_ptr.dtype.element_ty == tl.bfloat16
     ):
@@ -83,8 +90,12 @@ def fused_add_rms_norm_kernel(
         mask=mask,
     )
 
-    var = tl.sum(x * x / N, axis=0)
-    rrms = 1.0 / tl.sqrt(var + eps)
+    if GEMMA:
+        var = tl.sum(x * x, axis=0) / N
+        rrms = tl.rsqrt(var + eps)
+    else:
+        var = tl.sum(x * x / N, axis=0)
+        rrms = 1.0 / tl.sqrt(var + eps)
 
     w = tl.load(
         w_ptr + cols,
@@ -92,7 +103,10 @@ def fused_add_rms_norm_kernel(
         other=0.0,
     )
 
-    y = (x * rrms * w).to(cdtype)
+    if GEMMA:
+        y = (x * rrms) * (1.0 + w.to(tl.float32))
+    else:
+        y = (x * rrms * w).to(cdtype)
 
     tl.store(
         input_ptr + cols * in_stride_c,
@@ -249,7 +263,66 @@ def _prefer_whole_row(N):
     return False
 
 
-def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
+def _gemma_residual(x, residual, normalized_shape, weight, eps):
+    if x.device.type != "cuda" or x.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ):
+        raise NotImplementedError("Gemma residual mode requires CUDA BF16/FP16/FP32")
+    if len(normalized_shape) != 1 or x.shape[-1] != normalized_shape[0]:
+        raise ValueError("Gemma residual mode normalizes the last dimension")
+    n = x.shape[-1]
+    if n <= 0 or triton.next_power_of_2(n) > _WHOLE_ROW_SAFE_N:
+        raise NotImplementedError("Gemma residual mode requires 1 <= N <= 16384")
+    if (
+        residual.shape != x.shape
+        or residual.dtype != x.dtype
+        or residual.device != x.device
+    ):
+        raise ValueError("Residual must match input")
+    if weight.shape != (n,) or weight.device != x.device or not weight.is_contiguous():
+        raise ValueError("Invalid Gemma weight")
+    if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise NotImplementedError("Unsupported Gemma weight dtype")
+    if not math.isfinite(float(eps)) or eps < 0:
+        raise ValueError("eps must be finite and nonnegative")
+
+    def matrix(t):
+        if t.ndim == 2 and t.stride(-1) == 1:
+            return t
+        if t.is_contiguous():
+            return t.view(-1, n)
+        raise NotImplementedError(
+            "Gemma residual requires viewable rows and unit column stride"
+        )
+
+    a, r = matrix(x), matrix(residual)
+    if not a.numel():
+        return x, residual
+    if tensor_ranges_overlap(x, residual):
+        raise ValueError("Input and residual must not alias")
+    with torch_device_fn.device(x.device):
+        fused_add_rms_norm_kernel[(a.shape[0],)](
+            a,
+            r,
+            weight,
+            a.stride(0),
+            1,
+            r.stride(0),
+            1,
+            n,
+            eps,
+            BLOCK_SIZE=triton.next_power_of_2(n),
+            GEMMA=True,
+            GEMMA_N=n,
+            GEMMA_EPS=float(eps),
+            num_warps=4,
+        )
+    return x, residual
+
+
+def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5, *, gemma=False):
     """Fused residual addition + RMSNorm, in-place.
 
     Dispatch:
@@ -265,6 +338,10 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
       D) N > 32768
            -> Single-CTA tiled.
     """
+    if not isinstance(gemma, bool):
+        raise TypeError("gemma must be a bool")
+    if gemma:
+        return _gemma_residual(x, residual, normalized_shape, weight, eps)
     logger.debug(
         "GEMS FUSED_ADD_RMS_NORM FORWARD, "
         "[input shape]: %s, [residual shape]: %s, [weight shape]: %s",

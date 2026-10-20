@@ -250,7 +250,11 @@ def _min_vec_elems(dtype: torch.dtype, vec_bytes: int = 16) -> int:
 def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
+    *,
+    reduction: str = "native",
 ):
+    if reduction not in ("native", "sequential"):
+        raise ValueError("Unknown expert reduction order")
     logger.debug("GEMS MOE SUM")
     _check_moe_sum_inputs(input, output)
     num_tokens, topk, hidden_size = input.shape
@@ -258,6 +262,23 @@ def moe_sum(
     input_stride = input.stride()
     output_stride = output.stride()
     elem_size = input.element_size()
+
+    if reduction == "sequential":
+        grid = lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_SIZE"]))
+        _moe_sum_general_kernel[grid](
+            input,
+            output,
+            num_tokens,
+            topk,
+            hidden_size,
+            input_stride[0],
+            input_stride[1],
+            input_stride[2],
+            output_stride[0],
+            output_stride[1],
+            ELEM_SIZE=elem_size,
+        )
+        return
 
     vec_ok = hidden_size % _min_vec_elems(input.dtype, vec_bytes=16) == 0
     contiguous = input.is_contiguous() and output.is_contiguous()
