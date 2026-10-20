@@ -18,6 +18,10 @@ from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # no
 from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.flash_mla_with_kvcache_model1 import (
+    can_use_model1_hygon,
+    sparse_decode_model1_hygon,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
@@ -68,6 +72,8 @@ __all__ = [
     "scaled_int8_quant",
     "triton_scaled_mm",
     "fused_q_kv_rmsnorm",
+    "can_use_model1_hygon",
+    "sparse_decode_model1_hygon",
     "fused_add_rms_norm",
     "persistent_topk",
     "w8a8_block_int8_bmm",
