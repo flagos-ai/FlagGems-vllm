@@ -516,6 +516,7 @@ def _get_config_dtype_str(
     dtype: Optional[torch.dtype] = None,
     use_fp8_w8a8: bool = False,
     use_fp8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     ocp_mx_scheme: str | None = None,
@@ -525,6 +526,10 @@ def _get_config_dtype_str(
         return "fp8_w8a8"
     elif use_fp8_w8a16:
         return "fp8_w8a16"
+    elif use_int8_w8a8:
+        # Floating input activations are quantized inside fused_experts_impl.
+        # Do not select plain-half GEMM paths, which do not apply INT8 scales.
+        return "int8_w8a8"
     elif use_int8_w8a16:
         return "int8_w8a16"
     elif use_int4_w4a16:
@@ -2260,6 +2265,7 @@ def fused_experts_impl(
 
     config_dtype = _get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         ocp_mx_scheme=ocp_mx_scheme,
