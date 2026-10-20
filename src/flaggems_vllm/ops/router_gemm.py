@@ -17,7 +17,6 @@ import logging
 import torch
 import triton
 import triton.language as tl
-
 from flaggems_vllm.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
@@ -41,6 +40,7 @@ def _router_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    CAST_INPUT_FP32: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     grid_m = tl.cdiv(M, BLOCK_M)
@@ -64,6 +64,8 @@ def _router_gemm_kernel(
             mask=(offs_m[:, None] < M) & (k_idxs[None, :] < K),
             other=0.0,
         )
+        if CAST_INPUT_FP32:
+            a = a.to(tl.float32)
         b = tl.load(
             B + k_idxs[:, None] * stride_bk + offs_n[None, :] * stride_bn,
             mask=(k_idxs[:, None] < K) & (offs_n[None, :] < N),

@@ -3,14 +3,15 @@
 
 Import before torch.compile / CUDA graph warmup. BF16 activations are converted
 to FP32 on load; router weights and returned logits stay FP32. No bias is
-applied here. Unsupported dimensions or larger batches are explicitly rejected.
+applied here. The additional MetaX BF16 M8192 prefill path avoids a full FP32 input
+materialization. Other unsupported dimensions/batches remain rejected.
 """
 
 import torch
 import triton
 import triton.language as tl
-
-from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.ops.router_gemm import _router_gemm_kernel
+from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import libentry
 
 
@@ -21,6 +22,46 @@ def supports_fp32_router_gemm(hidden_size, num_experts, input_dtype, weight_dtyp
         and input_dtype in (torch.bfloat16, torch.float32)
         and weight_dtype == torch.float32
     )
+
+
+def _is_metax_prefill(input, router_weight):
+    return (
+        device.vendor_name == "metax"
+        and input.shape == (8192, 6144)
+        and router_weight.shape == (128, 6144)
+        and input.dtype == torch.bfloat16
+        and router_weight.dtype == torch.float32
+        and input.is_contiguous()
+        and router_weight.is_contiguous()
+        and not (input.requires_grad or router_weight.requires_grad)
+    )
+
+
+def _launch_metax_prefill(input, router_weight):
+    output = torch.empty((8192, 128), dtype=torch.float32, device=input.device)
+    with torch_device_fn.device(input.device):
+        _router_gemm_kernel[(128 * 2,)](
+            input,
+            router_weight,
+            output,
+            8192,
+            128,
+            6144,
+            input.stride(0),
+            input.stride(1),
+            router_weight.stride(1),
+            router_weight.stride(0),
+            output.stride(0),
+            output.stride(1),
+            BLOCK_M=64,
+            BLOCK_N=64,
+            BLOCK_K=32,
+            GROUP_M=128,
+            CAST_INPUT_FP32=True,
+            num_warps=4,
+            num_stages=4,
+        )
+    return output
 
 
 def _check(input, router_weight):
@@ -37,8 +78,10 @@ def _check(input, router_weight):
             "FP32 router GEMM supports MiniMax-M3 [M,6144] input in BF16/FP32 "
             "and [128,6144] FP32 weight"
         )
-    if input.shape[0] > 32:
-        raise NotImplementedError("FP32 router specialization supports M<=32")
+    if input.shape[0] > 32 and not _is_metax_prefill(input, router_weight):
+        raise NotImplementedError(
+            "FP32 router supports M<=32, plus contiguous MetaX BF16 M8192"
+        )
 
 
 @libentry()
@@ -113,8 +156,11 @@ def _fp32_router_gemm_op(
         return torch.empty(
             (0, router_weight.shape[0]), dtype=torch.float32, device=input.device
         )
-    # Fixed launch metadata; no runtime tuning or unordered atomic reductions.
+    # _check has already validated the additional prefill shape.
     m = input.shape[0]
+    if m == 8192:
+        return _launch_metax_prefill(input, router_weight)
+    # Fixed launch metadata; no runtime tuning or unordered atomic reductions.
     if m == 1:
         block_m, block_k = 1, 256
     elif input.dtype == torch.float32:
