@@ -138,3 +138,92 @@ def test_per_token_group_quant_fp8(
     ref_out_fp32 = _fp8_to_float32(ref_out)
 
     assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_reorder_guard(monkeypatch):
+    from types import SimpleNamespace
+
+    from flaggems_vllm.ops import _per_token_group_quant_fp8_reorder as reorder
+
+    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", True)
+    monkeypatch.setattr(reorder, "_is_h20", lambda index: True)
+    x = SimpleNamespace(
+        device=SimpleNamespace(type="cuda", index=0),
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(2048, 13824),
+        is_contiguous=lambda: True,
+    )
+    args = (512, torch.float8_e4m3fn, 1e-10, False, False)
+    assert reorder.can_use_group_reorder(x, *args)
+    for field, value in [
+        ("dtype", torch.float32),
+        ("ndim", 3),
+        ("shape", (1024, 13824)),
+        ("shape", (2048, 4096)),
+        ("device", SimpleNamespace(type="cpu", index=None)),
+        ("is_contiguous", lambda: False),
+    ]:
+        original = getattr(x, field)
+        setattr(x, field, value)
+        assert not reorder.can_use_group_reorder(x, *args)
+        setattr(x, field, original)
+    for options in [
+        (128, torch.float8_e4m3fn, 1e-10, False, False),
+        (512, torch.float8_e5m2, 1e-10, False, False),
+        (512, torch.float8_e4m3fn, 1e-6, False, False),
+        (512, torch.float8_e4m3fn, 1e-10, True, False),
+        (512, torch.float8_e4m3fn, 1e-10, False, True),
+    ]:
+        assert not reorder.can_use_group_reorder(x, *options)
+    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", False)
+    assert not reorder.can_use_group_reorder(x, *args)
+    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", True)
+    monkeypatch.setattr(reorder, "_is_h20", lambda index: False)
+    assert not reorder.can_use_group_reorder(x, *args)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+def test_per_token_group_quant_fp8_reorder_large(num_tokens):
+    from flaggems_vllm.ops import _per_token_group_quant_fp8_reorder as reorder
+
+    torch.manual_seed(0)
+    x = torch.rand(
+        (num_tokens, 13824), dtype=torch.bfloat16, device=flaggems_vllm.device
+    )
+    if not reorder.can_use_group_reorder(
+        x, 512, torch.float8_e4m3fn, 1e-10, False, False
+    ):
+        pytest.skip("requires the qualified H20 FlagTree reorder path")
+    expected_q, expected_s = native_per_token_group_quant_fp8(x, 512)
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    utils.gems_assert_close(s, expected_s, dtype=torch.float32)
+    assert s.stride() == expected_s.stride()
+    assert torch.allclose(q.float(), expected_q.float(), rtol=0.15)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("special", [False, True])
+def test_per_token_group_quant_fp8_reorder_tail(special):
+    from flaggems_vllm.ops import _per_token_group_quant_fp8_reorder as reorder
+
+    torch.manual_seed(0)
+    x = torch.randn((7, 1536), dtype=torch.bfloat16, device=flaggems_vllm.device)
+    if not reorder._HAS_LOAD_REORDER or x.device.type != "cuda":
+        pytest.skip("requires FlagTree reorder")
+    if not reorder._is_h20(x.device.index):
+        pytest.skip("requires H20")
+    if special:
+        x.view(-1)[0] = float("nan")
+        x.view(-1)[512:1024] = float("inf")
+        x.view(-1)[1024:1536] = -float("inf")
+        x.view(-1)[1536:2048] = 0.0
+    # This shape stays on the unchanged public fallback and leaves a partial
+    # group tile. Compare bytes to preserve NaN and signed-zero behavior too.
+    expected_q, expected_s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    for enabled in (False, True):
+        q, s = reorder.quantize_group_tiles(x, 512, reorder=enabled)
+        assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+        torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
