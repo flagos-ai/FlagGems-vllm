@@ -1,0 +1,317 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Triton implementation of iHC (independent Hyper-Connections) pre operator.
+
+Baseline port of the vLLM HY V4 implementation
+(vllm/models/hy_v4/nvidia/triton_ihc.py), adapted to FlagGems-vllm
+conventions. iHC is the *independent* variant of Hyper-Connections: unlike mHC
+there is no Sinkhorn and no n x n cross-stream mixing matrix -- each residual
+channel gets a single scalar sigmoid gate.
+
+Computed, for input x of shape [num_tokens, hc_mult, hidden_size]:
+    x_flat = x.flatten(1)                                  # [N, hc*d]
+    r      = rsqrt(mean(x_flat^2, -1) + norm_eps)          # [N, 1]
+    mixes  = (x_flat @ weight.T) * r                       # [N, 2*hc]
+    H_pre  = sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + hc_eps
+    H_post = magnitude * sigmoid(mixes[:, hc:] * scale[1] + base[hc:]) + hc_eps
+    y[n,:] = sum_i H_pre[n, i] * x[n, i, :]                # [N, d]
+Returns (y, H_post): the pre-gated channel reduction and the post gates that
+HYV4HCPostLayer consumes.
+
+Two-stage design:
+  stage1: per-token fp32 reduction over hc*d producing mix[N, 2*hc] (w-projection)
+          and sqrsum[N]. M-blocked (one program owns BLOCK_M tokens, x read once
+          per K-chunk and reused for sqrsum + all 2*hc FMAs) with a TLE-pipelined
+          K loop; a K-split grid (fp32 atomic combine) kicks in for small N.
+  stage2: mix + sqrsum -> rms, pre/post sigmoid gates, post store, and the
+          pre-gated channel sum y[n, :] = sum_i pre[n, i] * x[n, i, :].
+"""
+
+import torch
+import triton
+import triton.language as tl
+from triton.experimental.tle import language as tle
+
+# stage1 (w-projection + sqrsum) tile; stage2 (gates + channel sum) tile.
+_BLOCK_K = 128
+_BLOCK_D = 1024
+_BLOCK_M = 8
+_NUM_WARPS = 1
+_NUM_STAGES = 3
+# Fill the H20 (~132 SMs): only K-split stage1 when token-blocks are too few.
+_MIN_PROGRAMS = 512
+
+
+# stage1 computes, in fp32, the w-projection mix[N, 2*hc] and the row sqrsum[N].
+# One program owns BLOCK_M tokens; x is loaded once per K-chunk and reused for
+# sqrsum plus all 2*hc weight-row FMAs (register-resident), removing the eager /
+# baseline 2*hc-fold L1 re-read of x -- the measured L1TEX bottleneck. The K loop
+# is software-pipelined with TLE (tle.range + async tle.load), prefetching the
+# next x chunk while the current one accumulates. fp32 accumulation keeps the
+# post gate bit-accurate (no tensor cores); tl.dot in bf16/tf32 would blow the
+# 2e-5 gate tolerance at K = hc*hidden.
+#
+# One grid axis for the token blocks, one (NSPLIT-wide) for an optional K-split:
+# with NSPLIT == 1 each program owns a whole row and plain-stores the result;
+# with NSPLIT > 1 (small N, too few token-blocks to fill the GPU) each program
+# covers a K-chunk and fp32-atomic-adds its partial into mix / sqrsum.
+@triton.jit
+def _ihc_pre_stage1(
+    x_ptr,
+    weight_ptr,
+    sumsq_ptr,
+    mix_ptr,
+    N,
+    K_TOTAL: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    m_off = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_off < N
+    CHUNK: tl.constexpr = K_TOTAL // NSPLIT
+    k_start = tl.program_id(1) * CHUNK
+
+    acc_ss = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accs = ()
+    for _j in tl.static_range(TWO_HC):
+        accs = accs + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
+
+    x_base = x_ptr + m_off[:, None] * K_TOTAL
+    for kk in tle.range(0, CHUNK, BLOCK_K, num_stages=NUM_STAGES):
+        k_off = k_start + kk + tl.arange(0, BLOCK_K)
+        k_mask = k_off < K_TOTAL
+        x = tle.load(
+            x_base + k_off[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+            is_async=True,
+        ).to(tl.float32)
+        acc_ss += tl.sum(x * x, axis=1)
+        new_accs = ()
+        for j in tl.static_range(TWO_HC):
+            wj = tl.load(weight_ptr + j * K_TOTAL + k_off, mask=k_mask, other=0.0)
+            new_accs = new_accs + (accs[j] + tl.sum(x * wj[None, :], axis=1),)
+        accs = new_accs
+
+    if NSPLIT == 1:
+        tl.store(sumsq_ptr + m_off, acc_ss, mask=m_mask)
+        for j in tl.static_range(TWO_HC):
+            tl.store(mix_ptr + m_off * TWO_HC + j, accs[j], mask=m_mask)
+    else:
+        tl.atomic_add(sumsq_ptr + m_off, acc_ss, mask=m_mask)
+        for j in tl.static_range(TWO_HC):
+            tl.atomic_add(mix_ptr + m_off * TWO_HC + j, accs[j], mask=m_mask)
+
+
+# stage2 reads the fp32 mix[N, 2*hc] and sqrsum[N] from stage1, forms the pre /
+# post sigmoid gates, stores the post gate, and emits the pre-gated channel sum
+# y[n, :] = sum_i pre[n, i] * x[n, i, :].
+@triton.jit
+def _ihc_pre_stage2(
+    x_ptr,
+    mix_ptr,
+    sumsq_ptr,
+    scale_ptr,
+    base_ptr,
+    output_ptr,
+    post_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    K_TOTAL: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    HC_POW2: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    MAGNITUDE: tl.constexpr,
+    NORM_EPS: tl.constexpr,
+    HC_EPS: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    hidden_block_idx = tl.program_id(1)
+    hc_idx = tl.arange(0, HC_POW2)
+    hc_mask = hc_idx < HC_MULT
+
+    sum_squares = tl.load(sumsq_ptr + token_idx)
+    mix_row = mix_ptr + token_idx * TWO_HC
+    pre_mix = tl.load(mix_row + hc_idx, mask=hc_mask, other=0.0)
+    post_mix = tl.load(mix_row + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
+
+    reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
+    pre_scale = tl.load(scale_ptr)
+    post_scale = tl.load(scale_ptr + 1)
+    pre_base = tl.load(base_ptr + hc_idx, mask=hc_mask, other=0.0)
+    post_base = tl.load(base_ptr + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
+    pre = tl.sigmoid(pre_mix * reciprocal_rms * pre_scale + pre_base) + HC_EPS
+
+    if hidden_block_idx == 0:
+        post = (
+            MAGNITUDE * tl.sigmoid(post_mix * reciprocal_rms * post_scale + post_base)
+            + HC_EPS
+        )
+        tl.store(
+            post_ptr + token_idx * HC_MULT + hc_idx,
+            post,
+            mask=hc_mask,
+        )
+
+    hidden_offsets = hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    hidden_mask = hidden_offsets < HIDDEN_SIZE
+    x_row = x_ptr + token_idx * K_TOTAL
+    output = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for channel_idx in tl.static_range(HC_MULT):
+        channel = tl.load(
+            x_row + channel_idx * HIDDEN_SIZE + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        channel_gate = tl.sum(tl.where(hc_idx == channel_idx, pre, 0.0), axis=0)
+        output += channel_gate * channel
+
+    tl.store(
+        output_ptr + token_idx * HIDDEN_SIZE + hidden_offsets,
+        output.to(output_ptr.dtype.element_ty),
+        mask=hidden_mask,
+    )
+
+
+def ihc_pre(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iHC pre: reduce the hc channels and produce the post gates.
+
+    Args:
+        x: [num_tokens, hc_mult, hidden_size], float16/bfloat16.
+        weight: [2*hc_mult, hc_mult*hidden_size], float32 (kept out of fp8).
+        scale: [2], float32 -- (pre_scale, post_scale).
+        base: [2*hc_mult], float32 -- pre bias then post bias.
+        magnitude: scalar multiplier on the post gate.
+        hc_eps: epsilon added to both gates.
+        norm_eps: epsilon inside the rsqrt.
+
+    Returns:
+        (y, post): y is [num_tokens, hidden_size] (x.dtype), post is
+        [num_tokens, hc_mult] (float32).
+    """
+    assert x.dim() == 3, "x must be [num_tokens, hc_mult, hidden_size]"
+    assert x.is_cuda and weight.is_cuda and scale.is_cuda and base.is_cuda
+    assert weight.dtype == torch.float32
+    assert scale.dtype == torch.float32 and base.dtype == torch.float32
+
+    x = x.contiguous()
+    assert weight.is_contiguous()
+    scale = scale.contiguous()
+    base = base.contiguous()
+    num_tokens, hc_mult, hidden_size = x.shape
+    k_total = hc_mult * hidden_size
+    assert weight.shape == (2 * hc_mult, k_total)
+    assert scale.shape == (2,)
+    assert base.shape == (2 * hc_mult,)
+
+    if num_tokens == 0:
+        return (
+            torch.empty((0, hidden_size), dtype=x.dtype, device=x.device),
+            torch.empty((0, hc_mult), dtype=torch.float32, device=x.device),
+        )
+
+    output = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=x.device)
+    post = torch.empty((num_tokens, hc_mult), dtype=torch.float32, device=x.device)
+    hc_pow2 = triton.next_power_of_2(hc_mult)
+    two_hc = 2 * hc_mult
+    x_flat = x.reshape(num_tokens, k_total)
+
+    # stage1: fp32 mix[N, 2*hc] + sqrsum[N]. K-split only when token-blocks alone
+    # cannot fill the GPU; otherwise the single-pass M-block grid already has
+    # enough programs and splitting just adds the atomic-combine tax.
+    grid_m = triton.cdiv(num_tokens, _BLOCK_M)
+    nsplit = 1
+    while (
+        grid_m * nsplit * 2 <= _MIN_PROGRAMS
+        and k_total % (nsplit * 2 * _BLOCK_K) == 0
+    ):
+        nsplit *= 2
+
+    # NSPLIT > 1 accumulates with atomic_add, so the outputs must start zeroed.
+    alloc = torch.empty if nsplit == 1 else torch.zeros
+    sumsq = alloc(num_tokens, dtype=torch.float32, device=x.device)
+    mix = alloc(num_tokens, two_hc, dtype=torch.float32, device=x.device)
+    _ihc_pre_stage1[(grid_m, nsplit)](
+        x_flat,
+        weight,
+        sumsq,
+        mix,
+        num_tokens,
+        K_TOTAL=k_total,
+        TWO_HC=two_hc,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_K=_BLOCK_K,
+        NSPLIT=nsplit,
+        NUM_STAGES=_NUM_STAGES,
+        num_warps=_NUM_WARPS,
+        enable_fp_fusion=False,
+    )
+
+    _ihc_pre_stage2[(num_tokens, triton.cdiv(hidden_size, _BLOCK_D))](
+        x,
+        mix,
+        sumsq,
+        scale,
+        base,
+        output,
+        post,
+        HIDDEN_SIZE=hidden_size,
+        K_TOTAL=k_total,
+        HC_MULT=hc_mult,
+        HC_POW2=hc_pow2,
+        TWO_HC=two_hc,
+        BLOCK_D=_BLOCK_D,
+        MAGNITUDE=magnitude,
+        NORM_EPS=norm_eps,
+        HC_EPS=hc_eps,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return output, post
+
+
+def ihc_pre_ref(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch reference (test/benchmark only; never imported by production)."""
+    import torch.nn.functional as F
+
+    num_tokens, hc_mult, hidden_size = x.shape
+    x_flat = x.flatten(1).float()
+    reciprocal_rms = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(x_flat, weight) * reciprocal_rms
+    pre = torch.sigmoid(mixes[:, :hc_mult] * scale[0] + base[:hc_mult])
+    post = torch.sigmoid(mixes[:, hc_mult:] * scale[1] + base[hc_mult:])
+    pre = pre + hc_eps
+    post = magnitude * post + hc_eps
+    output = torch.sum(pre.unsqueeze(-1) * x.float(), dim=1)
+    return output.to(x.dtype).reshape(num_tokens, hidden_size), post
