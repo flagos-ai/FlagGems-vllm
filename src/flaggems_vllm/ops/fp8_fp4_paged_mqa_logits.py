@@ -40,6 +40,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Pre-Hopper Triton backends (e.g. MetaX MACA) do not lower FP8 x FP8
+# tl.dot; their FMA fallback asserts on mixed element types. FP8 -> FP16
+# is exact, so the IEEE fp16 MMA path stays numerically equivalent.
+_FP8_DOT_NEEDS_FP16 = tl.constexpr(get_device_capability() < (9, 0))
+
 # =============================================================================
 # TLE (TMA + WGMMA) fast path — purely additive. The baseline below is left
 # byte-for-byte untouched; the fast path only fires inside its measured win
@@ -194,7 +199,12 @@ def _mqa_logits_kernel(
                 dots = tl.dot(q_f16, tl.trans(kv_fp16))
             else:
                 kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
-                dots = tl.dot(q_fp8, tl.trans(kv_fp8))
+                if _FP8_DOT_NEEDS_FP16:
+                    dots = tl.dot(
+                        q_fp8.to(tl.float16), tl.trans(kv_fp8).to(tl.float16)
+                    )
+                else:
+                    dots = tl.dot(q_fp8, tl.trans(kv_fp8))
 
             # Coalesced scale load: [block_size] float32
             if PAGED_KV:
