@@ -37,7 +37,7 @@ QWEN4_VENDOR_QSA_PREPARE_SOURCE = {
         "requests; "
         "launch wrapped in a metadata-keyed cache."
     ),
-    "role": "shipped implementation of qwen_qsa_prepare",
+    "role": "shipped implementation of qsa_prepare",
 }
 
 
@@ -702,7 +702,7 @@ def _qsa_prepare_kernel(
                     tl.store(tail + 2, pos_w.to(tl.int64)[:, None], mask=d2)
 
 
-def _qwen_qsa_prepare_uncached(
+def _qsa_prepare_uncached(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
@@ -905,7 +905,7 @@ def _qwen_qsa_prepare_uncached(
 _HOST_CACHE: dict = {}
 
 
-def qwen_qsa_prepare(
+def qsa_prepare(
     q,
     k,
     positions,
@@ -1014,40 +1014,38 @@ def qwen_qsa_prepare(
         compiled = _HOST_CACHE[(cache_key, "ck")]
         compiled[(grid0, 1, 1)](*direct_args)
         return main_q_out, main_gate_out
-    (main_q_out, main_gate_out, direct_args, grid0, compiled) = (
-        _qwen_qsa_prepare_uncached(
-            q,
-            k,
-            positions,
-            cos_sin_cache,
-            q_norm_weight,
-            k_norm_weight,
-            eps,
-            q_out,
-            state_cache,
-            state_slots,
-            state_block_table,
-            query_start_loc,
-            logical_positions,
-            compressed_cache,
-            compressed_slots,
-            k_work_metadata,
-            compress_ratio=compress_ratio,
-            mrope_section=mrope_section,
-            rope_pos_offset=rope_pos_offset,
-            main_qkv=main_qkv,
-            main_q_norm_weight=main_q_norm_weight,
-            main_k_norm_weight=main_k_norm_weight,
-            main_eps=main_eps,
-            main_kv_cache=main_kv_cache,
-            main_slot_mapping=main_slot_mapping,
-            main_k_scale=main_k_scale,
-            main_v_scale=main_v_scale,
-        )
+    (main_q_out, main_gate_out, direct_args, grid0, compiled) = _qsa_prepare_uncached(
+        q,
+        k,
+        positions,
+        cos_sin_cache,
+        q_norm_weight,
+        k_norm_weight,
+        eps,
+        q_out,
+        state_cache,
+        state_slots,
+        state_block_table,
+        query_start_loc,
+        logical_positions,
+        compressed_cache,
+        compressed_slots,
+        k_work_metadata,
+        compress_ratio=compress_ratio,
+        mrope_section=mrope_section,
+        rope_pos_offset=rope_pos_offset,
+        main_qkv=main_qkv,
+        main_q_norm_weight=main_q_norm_weight,
+        main_k_norm_weight=main_k_norm_weight,
+        main_eps=main_eps,
+        main_kv_cache=main_kv_cache,
+        main_slot_mapping=main_slot_mapping,
+        main_k_scale=main_k_scale,
+        main_v_scale=main_v_scale,
     )
     _HOST_CACHE[cache_key] = (direct_args, grid0)
     _HOST_CACHE[(cache_key, "ck")] = compiled
     return main_q_out, main_gate_out
 
 
-__all__ = ["qwen_qsa_prepare"]
+__all__ = ["qsa_prepare"]

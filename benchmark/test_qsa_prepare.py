@@ -24,8 +24,8 @@ import torch
 from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import qsa_prepare as vllm_qsa_prepare
 
 import flaggems_vllm
-from flaggems_vllm.ops.qwen4.qsa_prepare import qwen_qsa_prepare
-from tests.test_qwen4_qsa_prepare import (
+from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
+from tests.test_qsa_prepare import (
     COMPRESS_RATIO,
     HEAD_DIM,
     MROPE_SECTION,
@@ -141,14 +141,14 @@ def _input_fn(shape, dtype, device):
 
 
 @pytest.mark.qwen4_qsa_prepare
-def test_qwen_qsa_prepare():
+def test_qsa_prepare():
     """The shipped kernel against the upstream implementation."""
 
     bench = Qwen4QsaPrepareBenchmark(
         input_fn=_input_fn,
-        op_name="qwen_qsa_prepare",
+        op_name="qsa_prepare",
         torch_op=vllm_qsa_prepare,
-        gems_op=qwen_qsa_prepare,
+        gems_op=qsa_prepare,
         dtypes=[torch.bfloat16],
     )
     bench.run()

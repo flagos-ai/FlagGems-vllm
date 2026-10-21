@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flaggems_vllm.ops.qwen4.qsa_prepare import qwen_qsa_prepare
+from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
 
 # ------------------------------------------------------------------ constants
 HEAD_DIM = 128
@@ -556,7 +556,7 @@ class QsaPrepareCase:
 
     def run_kernel(self):
         outputs = self.outputs()
-        main_q_out, main_gate_out = qwen_qsa_prepare(
+        main_q_out, main_gate_out = qsa_prepare(
             *self._launch_args(outputs),
             compress_ratio=COMPRESS_RATIO,
             mrope_section=MROPE_SECTION if self.mrope else None,
@@ -801,7 +801,7 @@ def _case(mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype
     "mrope,is_2d_positions,cache_rope_positions,state_size,batch", CASES
 )
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_qwen_qsa_prepare_matches_torch_reference(
+def test_qsa_prepare_matches_torch_reference(
     mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype
 ) -> None:
     case = _case(mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype)
@@ -813,7 +813,7 @@ def test_qwen_qsa_prepare_matches_torch_reference(
     "mrope,is_2d_positions,cache_rope_positions,state_size,batch", CASES
 )
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_qwen_qsa_prepare_matches_vllm(
+def test_qsa_prepare_matches_vllm(
     mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype
 ) -> None:
     """Cross-check the port against vLLM's own operator, when it is importable."""
