@@ -6,10 +6,6 @@ import pytest
 import torch
 
 moe = importlib.import_module("flaggems_vllm.ops.fused_moe")
-pytestmark = [
-    pytest.mark.fused_moe,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-]
 
 
 def literal_oai(x):
@@ -24,6 +20,8 @@ def literal_quant(x):
     return (x.float() / scale).round().clamp(-128, 127).to(torch.int8), scale
 
 
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 384), (1, 127), (7, 384), (32, 768), (64, 6144)])
 def test_quant_and_oai_quant(dtype, shape, monkeypatch):
@@ -53,6 +51,8 @@ def test_quant_and_oai_quant(dtype, shape, monkeypatch):
     torch.testing.assert_close(s, refs, rtol=0, atol=0)
 
 
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_quant_nan_halfway_graph(monkeypatch):
     monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
     x = torch.tensor(
@@ -74,6 +74,8 @@ def test_quant_nan_halfway_graph(monkeypatch):
     torch.testing.assert_close(s, rs, rtol=0, atol=0)
 
 
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_oai_parameter_validation():
     x = torch.randn((2, 768), device="cuda", dtype=torch.bfloat16)
     out = torch.empty((2, 384), device="cuda", dtype=torch.bfloat16)
@@ -90,6 +92,8 @@ def test_oai_parameter_validation():
         )
 
 
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("m,i", [(1, 384), (7, 768), (32, 1536)])
 @pytest.mark.parametrize("mode", ["off", "quant_oai"])
@@ -169,6 +173,8 @@ def test_w8a8_oai_experts(dtype, m, i, mode, monkeypatch):
     )
 
 
+@pytest.mark.fused_moe
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_quant_full_and_mixed_dispatch():
     import flag_gems
 
