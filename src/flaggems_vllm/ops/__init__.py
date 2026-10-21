@@ -65,6 +65,9 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_allreduce_rms_norm import (
+    fused_allreduce_rms_norm,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -261,6 +264,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits",
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
+    "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
