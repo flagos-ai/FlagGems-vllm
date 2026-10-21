@@ -120,6 +120,31 @@ class FlashmlaSparseBenchmark(base.Benchmark):
                 TestParam(4096, s_kv, 1024, h_q=128, d_qk=512, have_attn_sink=True)
                 for s_kv in [8192, 32768, 49152, 65536]
             ]
+            # DeepSeek-V4-Flash prefill (production calls, SQ values within 2% merged)
+            + [
+                TestParam(s_q, s_kv, topk, h_q=64, d_qk=512, have_attn_sink=True)
+                for s_q, s_kv, topk in [
+                    (4, 66048, 128),
+                    (4, 1114624, 640),
+                    (4, 98816, 8320),
+                    (9, 1114624, 640),
+                    (9, 98816, 8320),
+                    (1028, 66048, 128),
+                    (1028, 1114624, 640),
+                    (1028, 98816, 8320),
+                    (4112, 66048, 128),
+                    (4112, 1114624, 640),
+                    (4112, 98816, 8320),
+                    (16384, 66048, 128),
+                    (16384, 1114624, 640),
+                    (16384, 98816, 8320),
+                ]
+            ]
+            # GLM-5.2 prefill (production calls, SQ values within 2% merged)
+            + [
+                TestParam(s_q, 361344, 2048, h_q=64, d_qk=576)
+                for s_q in [64, 449, 512, 3586, 11264, 12356, 16384]
+            ]
         )
         return cases
 
