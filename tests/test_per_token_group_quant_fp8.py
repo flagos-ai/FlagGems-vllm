@@ -227,3 +227,93 @@ def test_per_token_group_quant_fp8_reorder_tail(special):
         q, s = reorder.quantize_group_tiles(x, 512, reorder=enabled)
         assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
         torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_h20_block_guard(monkeypatch):
+    from types import SimpleNamespace
+
+    from flaggems_vllm.ops import _per_token_group_quant_fp8_reorder as reorder
+
+    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", True)
+    monkeypatch.setattr(reorder, "_is_h20", lambda index: True)
+    x = SimpleNamespace(
+        device=SimpleNamespace(type="cuda", index=0),
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(7, 512),
+        is_contiguous=lambda: True,
+    )
+    get_config = reorder.get_h20_block_config
+    for (m, k, group, ue), config in reorder._H20_BLOCK_CONFIGS.items():
+        x.shape = (m, k)
+        assert get_config(x, group, torch.float8_e4m3fn, 1e-10, False, ue) == config
+    x.shape = (7, 512)
+    args = (512, torch.float8_e4m3fn, 1e-10, False, False)
+    for field, value in [
+        ("dtype", torch.float32),
+        ("ndim", 3),
+        ("shape", (8, 512)),
+        ("device", SimpleNamespace(type="cpu", index=None)),
+        ("is_contiguous", lambda: False),
+    ]:
+        original = getattr(x, field)
+        setattr(x, field, value)
+        assert get_config(x, *args) is None
+        setattr(x, field, original)
+    assert get_config(x, 512, torch.float8_e5m2, 1e-10, False, False) is None
+    assert get_config(x, 512, torch.float8_e4m3fn, 1e-6, False, False) is None
+    assert get_config(x, 512, torch.float8_e4m3fn, 1e-10, True, False) is None
+    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", False)
+    assert get_config(x, *args) is None
+    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", True)
+    monkeypatch.setattr(reorder, "_is_h20", lambda index: False)
+    assert get_config(x, *args) is None
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize(
+    "shape,group_size",
+    [
+        ((7, 512), 512),
+        ((7, 4096), 256),
+        ((83, 512), 64),
+        ((2048, 4096), 256),
+        ((2048, 13824), 512),
+    ],
+)
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_per_token_group_quant_fp8_h20_block_special(
+    shape, group_size, scale_ue8m0, monkeypatch
+):
+    from flaggems_vllm.ops import _per_token_group_quant_fp8_reorder as reorder
+
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    if (
+        reorder.get_h20_block_config(
+            x, group_size, torch.float8_e4m3fn, 1e-10, False, scale_ue8m0
+        )
+        is None
+    ):
+        pytest.skip("requires the qualified H20 block path")
+    flat = x.view(-1)
+    flat[0] = float("nan")
+    flat[group_size : 2 * group_size] = float("inf")
+    flat[2 * group_size : 3 * group_size] = -float("inf")
+    flat[3 * group_size : 4 * group_size] = 0.0
+    # Compare to the original device kernel with the exact same contract.
+    with monkeypatch.context() as patch:
+        patch.setitem(
+            flaggems_vllm.per_token_group_quant_fp8.__globals__,
+            "get_h20_block_config",
+            lambda *args: None,
+        )
+        expected_q, expected_s = flaggems_vllm.per_token_group_quant_fp8(
+            x, group_size, scale_ue8m0=scale_ue8m0
+        )
+    q, s = flaggems_vllm.per_token_group_quant_fp8(
+        x, group_size, scale_ue8m0=scale_ue8m0
+    )
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
