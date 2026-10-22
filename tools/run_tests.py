@@ -172,6 +172,23 @@ def pwarn(msg, **kwargs):
     print(f"{YELLOW}[WARN]{NC} {msg}", flush=True, **kwargs)
 
 
+def resolve_base_data_path(path):
+    """Resolve a baseline path passed by CI to a file pytest can open later."""
+    if not path:
+        return None
+
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    for root in (ROOT, ROOT / "tools"):
+        resolved = root / candidate
+        if resolved.is_file():
+            return str(resolved)
+
+    return path
+
+
 def ensure_dir(p):
     p.mkdir(parents=True, exist_ok=True)
     # set directory permissions to 755/0o755 (drwxr-xr-x)
@@ -797,6 +814,9 @@ def parse_perf_data(op, result_file):
             compared = res.get("compared_speedup", None)
             if compared is not None:
                 speedup = compared
+            # Latency-only records (no reference implementation on this
+            # machine) carry speedup=None. Keep the None per shape and leave it
+            # out of the mean instead of counting it as 0.
             details[shape]["speedup"] = speedup
             miss = res.get("base_miss_reason", None)
             if miss:
@@ -804,14 +824,23 @@ def parse_perf_data(op, result_file):
                 if miss not in seen_reasons:
                     seen_reasons.add(miss)
                     base_miss_reasons.append(miss)
-            count += 1
-            total += speedup
+            if isinstance(speedup, (int, float)):
+                count += 1
+                total += speedup
 
-        if details:
+        if count:
             bench_res[dtype] = {
                 "result": "OK",
                 "details": details,
                 "speedup": total / count,
+            }
+        elif details:
+            # Only latency was measured (no valid speedup for any shape):
+            # report Unknown with the latency details and no speedup.
+            bench_res[dtype] = {
+                "result": "Unknown",
+                "details": details,
+                "speedup": None,
             }
         else:
             bench_res[dtype] = {
@@ -1473,7 +1502,7 @@ def main():
     OPTS = parser.parse_args()
     CFG.dump_output = OPTS.dump_output
     CFG.start = OPTS.start
-    CFG.base_data = OPTS.base_data
+    CFG.base_data = resolve_base_data_path(OPTS.base_data)
 
     # Apply color mode (IS_TTY controls cursor-based footer, USE_COLORS controls ANSI colors)
     global USE_COLORS, RED, GREEN, YELLOW, CYAN, DIM, NC

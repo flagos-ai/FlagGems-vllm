@@ -21,12 +21,14 @@ import torch
 import flaggems_vllm
 
 DESCALE_BLOCK = 128
+# LSE comparisons need a full FP32 reference matmul.
+torch.backends.cuda.matmul.allow_tf32 = False
 
 pytestmark = [
-    pytest.mark.flash_attn_varlen_func_w8a8_int8,
+    pytest.mark.flash_attn_varlen_func_w8a8,
     pytest.mark.skipif(
-        flaggems_vllm.vendor_name not in ("hygon", "thead"),
-        reason="Hygon/PPU-only API",
+        flaggems_vllm.vendor_name not in ("hygon", "thead", "metax"),
+        reason="INT8 attention backend unavailable",
     ),
 ]
 
@@ -114,6 +116,10 @@ def _run_case(
     broadcast_scales=False,
     extra_cache_pages=0,
     max_query_bound=None,
+    max_key_bound=None,
+    metax_kwargs=None,
+    page_size=16,
+    return_lse=True,
 ):
     q, qs, qr, cuq = _inputs(qlens, heads, dim, broadcast_scales)
     k, ks, kr, cuk = _inputs(klens, kvheads, dim, broadcast_scales)
@@ -124,7 +130,6 @@ def _run_case(
     vr = -vr * 1.7
     kwargs = dict(cu_seqlens_k=cuk)
     if paged:
-        page_size = 16
         pages = (max(klens) + page_size - 1) // page_size
         table = (
             torch.randperm(len(klens) * pages, device="cuda")
@@ -177,28 +182,31 @@ def _run_case(
         qs, ks, vs = [
             x.transpose(1, 2).contiguous().transpose(1, 2) for x in (qs, ks, vs)
         ]
-    result, lse = flaggems_vllm.flash_attn_varlen_func(
+    actual = flaggems_vllm.flash_attn_varlen_func(
         q,
         k,
         v,
         max(qlens) if max_query_bound is None else max_query_bound,
         cuq,
-        max(klens),
+        max(klens) if max_key_bound is None else max_key_bound,
         **kwargs,
         q_descale=qs,
         k_descale=ks,
         v_descale=vs,
         causal=causal,
-        return_softmax_lse=True,
+        return_softmax_lse=return_lse,
         out=out,
         window_size=window,
         softcap=cap,
         alibi_slopes=alibi,
+        **(metax_kwargs or {}),
     )
+    result, lse = actual if return_lse else (actual, None)
     ref, ref_lse = _reference(qr, kr, vr, qlens, klens, causal, window, cap, alibi)
     assert result is out
     torch.testing.assert_close(result.float(), ref, atol=0.025, rtol=0.025)
-    torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
+    if return_lse:
+        torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
     return qr, kr, vr, cuq, cuk, result
 
 
@@ -256,7 +264,7 @@ def test_export_signature_and_empty():
         flaggems_vllm.flash_attn_varlen_func
     )
     assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
-    backend = "_hygon" if flaggems_vllm.vendor_name == "hygon" else "_thead"
+    backend = "_" + flaggems_vllm.vendor_name
     assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
     assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
     q = torch.empty((0, 4, 64), device="cuda", dtype=torch.int8)
@@ -271,7 +279,13 @@ def test_export_signature_and_empty():
     [
         dict(dropout_p=0.1),
         dict(return_attn_probs=True),
-        dict(num_splits=1),
+        pytest.param(
+            dict(num_splits=1),
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name == "metax",
+                reason="MetaX supports explicit split scheduling",
+            ),
+        ),
         dict(cp_world_size=2),
         dict(fa_version=3),
     ],
@@ -841,4 +855,258 @@ def test_folded_causal_prefill_partial_query_tiles(query_length, dtype):
         paged=True,
         causal=True,
         dtype=dtype,
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize("num_splits", [0, 1, 3, 32])
+@pytest.mark.parametrize("causal", [False, True])
+def test_metax_gqa256_scheduling(heads, kvheads, num_splits, causal):
+    metadata = torch.full((9,), 17, dtype=torch.int32, device="cuda")
+    _run_case(
+        [1, 3, 0],
+        [257, 129, 0],
+        dim=256,
+        heads=heads,
+        kvheads=kvheads,
+        paged=True,
+        page_size=32 if heads == 16 else 16,
+        causal=causal,
+        metax_kwargs=dict(num_splits=num_splits, scheduler_metadata=metadata),
+    )
+    assert torch.all(metadata == 17)
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("paged", [False, True])
+def test_metax_gqa256_prefill(dtype, paged):
+    _run_case(
+        [1025, 3],
+        [2057, 19],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=paged,
+        causal=True,
+        dtype=dtype,
+        strided=True,
+        metax_kwargs=dict(num_splits=3),
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal):
+    # Cross both the 64-row query tile and the 128-token scale boundaries.
+    # Include an empty request and a partial final KV tile in the same batch.
+    _run_case(
+        [31, 1025, 0],
+        [137, 2057, 0],
+        dim=256,
+        heads=heads,
+        kvheads=kvheads,
+        paged=True,
+        page_size=32 if heads == 16 else 16,
+        causal=causal,
+        strided=True,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.parametrize("kv_length", [2047, 2048])
+@pytest.mark.parametrize("query_bound", [1023, 1024])
+def test_metax_gqa256_schedule_boundary(kv_length, query_bound):
+    _run_case(
+        [33, 129],
+        [137, kv_length],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+        max_query_bound=query_bound,
+    )
+
+
+@pytest.mark.parametrize("missing", [None, "cu_seqlens_q_value_2", "seqused_k_value_1"])
+def test_real_shape_reader_preserves_sequence_metadata(missing):
+    from tools.benchmark_metax_int8_real_shapes import read_captured_shape
+
+    fields = dict(
+        cu_seqlens_q_dim0=3,
+        cu_seqlens_q_value_count=3,
+        seqused_k_value_count=2,
+        cu_seqlens_q_value_0=0,
+        cu_seqlens_q_value_1=1,
+        cu_seqlens_q_value_2=133,
+        seqused_k_value_0=300,
+        seqused_k_value_1=201,
+        q_dim0=133,
+        max_seqlen_q=132,
+        max_seqlen_k=500,
+        k_dim0=40,
+        k_dim1=16,
+        block_table_dim1=32,
+    )
+    if missing:
+        fields.pop(missing)
+    entry = dict(labels=",".join(fields), shape=list(fields.values()))
+    if missing:
+        with pytest.raises(ValueError, match="Incomplete captured"):
+            read_captured_shape(entry)
+    else:
+        _, qlens, klens, pages = read_captured_shape(entry)
+        assert qlens == [1, 132]
+        assert klens == [300, 201]  # Neither request uses the max-K bound of 500.
+        assert pages == [19, 13]
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.parametrize(
+    "num_splits,error",
+    [(-1, ValueError), (33, ValueError), (True, TypeError), (1.5, TypeError)],
+)
+def test_metax_invalid_splits(num_splits, error):
+    q = torch.empty((1, 4, 256), device="cuda", dtype=torch.int8)
+    cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    with pytest.raises(error, match="num_splits"):
+        flaggems_vllm.flash_attn_varlen_func(
+            q, q, q, 1, cu, 1, cu, num_splits=num_splits
+        )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.parametrize("dim,kvheads,qlen", [(256, 1, 1), (128, 2, 129)])
+def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
+    # Real TP4 pool extent: 605550 pages. Each page has 4096 INT8 elements,
+    # so addresses above page 524287 require multiplication in int64. D128
+    # exercises the shared packing kernel; D256 exercises direct addressing.
+    if torch.cuda.mem_get_info()[0] < 7 * 1024**3:
+        pytest.skip("large physical cache regression requires 7 GiB free")
+    q, qs, qr, cuq = _inputs([qlen], 4, dim)
+    k, ks, kr, _ = _inputs([129], kvheads, dim)
+    v, vs, vr, _ = _inputs([129], kvheads, dim)
+    v, vr = -v, -vr
+    pool, page, used_pages = 605550, 16, 9
+    kc = torch.empty((pool, page, kvheads, dim), device="cuda", dtype=torch.int8)
+    vc = torch.empty_like(kc)
+    table = torch.arange(pool - used_pages, pool, device="cuda", dtype=torch.int32)[
+        None
+    ]
+    for i in range(used_pages):
+        n = min(page, 129 - i * page)
+        kc[pool - used_pages + i, :n] = k[i * page : i * page + n]
+        vc[pool - used_pages + i, :n] = v[i * page : i * page + n]
+    used = torch.tensor([129], device="cuda", dtype=torch.int32)
+    ref, ref_lse = _reference(qr, kr, vr, [qlen], [129], True)
+    for entry in (
+        flaggems_vllm.flash_attn_varlen_func,
+        flaggems_vllm.flash_attn_varlen_func_w8a8_int8,
+    ):
+        out, lse = entry(
+            q,
+            kc,
+            vc,
+            qlen,
+            cuq,
+            129,
+            seqused_k=used,
+            block_table=table,
+            q_descale=qs,
+            k_descale=ks,
+            v_descale=vs,
+            causal=True,
+            return_softmax_lse=True,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=0.025, rtol=0.025)
+        torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.parametrize(
+    "window,cap,with_alibi",
+    [((64, 0), 0.0, False), ((-1, -1), 20.0, False), ((-1, -1), 0.0, True)],
+)
+def test_metax_gqa256_split_score_modifiers(window, cap, with_alibi):
+    alibi = torch.linspace(0.01, 0.04, 4, device="cuda") if with_alibi else None
+    _run_case(
+        [1025, 3, 0],
+        [2057, 129, 0],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+        window=window,
+        cap=cap,
+        alibi=alibi,
+        metax_kwargs=dict(num_splits=3),
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.parametrize("kind", ["dtype", "rank", "stride"])
+def test_metax_invalid_scheduler_metadata(kind):
+    q = torch.empty((1, 4, 256), device="cuda", dtype=torch.int8)
+    cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    if kind == "dtype":
+        metadata = torch.zeros(9, device="cuda", dtype=torch.float32)
+    elif kind == "rank":
+        metadata = torch.zeros((3, 3), device="cuda", dtype=torch.int32)
+    else:
+        metadata = torch.zeros(18, device="cuda", dtype=torch.int32)[::2]
+    with pytest.raises(ValueError, match="scheduler_metadata"):
+        flaggems_vllm.flash_attn_varlen_func(
+            q, q, q, 1, cu, 1, cu, scheduler_metadata=metadata
+        )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("splits", [1, 32])
+def test_metax_d256_single_key_mixed_lengths(
+    paged, dtype, heads, kvheads, return_lse, splits
+):
+    # Exercise unit-weight requests beside empty and general attention requests.
+    # Padded KV capacity and explicit splits exercise empty partials.
+    _run_case(
+        [1, 1, 0, 1, 1],
+        [1, 32, 0, 0, 1],
+        dim=256,
+        heads=heads,
+        kvheads=kvheads,
+        paged=paged,
+        dtype=dtype,
+        strided=True,
+        causal=True,
+        window=(0, 0),
+        cap=3.0,
+        max_query_bound=1,
+        max_key_bound=73728,
+        return_lse=return_lse,
+        metax_kwargs={"num_splits": splits},
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.parametrize("batch", [17, 64])
+def test_metax_d256_large_batch_packing(batch):
+    _run_case(
+        [1025] * 4 + [1] * (batch - 5) + [0],
+        [2057] * 4 + [1] * (batch - 5) + [0],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+        broadcast_scales=False,
+        strided=True,
     )

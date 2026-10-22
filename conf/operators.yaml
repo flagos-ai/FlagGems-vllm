@@ -84,6 +84,20 @@ ops:
       - Math
     stages:
       - alpha: '5.4'
+  - id: bf16_paged_mqa_logits
+    description: |
+      Compute multi-head weighted ReLU attention logits on paged BF16 KV cache.
+      Uses shape-specialized Triton kernels for H=32 and H=64 with
+      zero-constexpr dispatch for decode-phase inference.
+    for:
+      - bf16_paged_mqa_logits
+    labels:
+      - fused
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: bincount
     description: Count the frequency of each value in an array of non-negative integers.
     for:
@@ -96,6 +110,17 @@ ops:
       - Reduction
     stages:
       - stable: '5.0'
+  - id: bmm_w8a8
+    description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
+    for:
+      - bmm_w8a8_int8
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
   - id: bucket_sort_topk
     description: A wrapper of the TLE version and the Triton version bucket-sort topk
       operation.
@@ -352,31 +377,20 @@ ops:
     stages:
       - stable: '3.1'
     cpp: '4.0'
-  - id: flash_attn_varlen_func_w8a8_fp8
+  - id: flash_attn_varlen_func_w8a8
     description: |
-      Compute variable-length FlashAttention-2 on NVIDIA Hopper or newer and
-      Moore Threads MUSA with block-wise FP8 query, key, and value tensors,
-      per-block descales, and FP16/BF16 output.
-    for:
-      - None
-    labels:
-      - NoCPU
-      - Attention
-      - FlashAttention
-      - Quantization
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: flash_attn_varlen_func_w8a8_int8
-    description: Hygon DCU and PPU INT8 Q/K/V variable-length attention with per-128-token
-      descales and FP16/BF16 output.
+      W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
+      FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
+      and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
+      Hygon DCU, PPU, and MetaX).
     for:
       - flash_attn_varlen_func_w8a8_int8
     labels:
+      - NoCPU
       - fused
       - Attention
       - FlashAttention
+      - Quantization
     kind:
       - NeuralNetwork
     stages:
@@ -432,7 +446,10 @@ ops:
     stages:
       - alpha: '5.4'
   - id: fp8_einsum
-    description: Block-scaled FP8 bhr,hdr->bhd contraction on NVIDIA Hopper.
+    description: |
+      Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
+      vLLM DeepGEMM fp8_einsum) and INT8 with per-token-group activation scales
+      (Hygon, MetaX, PPU).
     for:
       - vllm.utils.deep_gemm.fp8_einsum
     labels:
@@ -441,6 +458,7 @@ ops:
       - DeepSeekV4
     kind:
       - NeuralNetwork
+      - Quantization
     stages:
       - alpha: '5.4'
   - id: fp8_fp4_mqa_logits
@@ -529,7 +547,9 @@ ops:
     stages:
       - beta: '5.4'
   - id: fused_inv_rope_fp8_quant
-    description: Apply inverse RoPE and group-wise FP8 quantization to attention output.
+    description: |
+      Apply inverse RoPE and group-wise quantization to attention output.
+      Precisions: FP8 and INT8 (Ascend NPU).
     for:
       - vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant
     labels:
@@ -541,23 +561,10 @@ ops:
       - Quantization
     stages:
       - beta: '5.4'
-  - id: fused_inv_rope_int8_quant
-    description: Apply inverse RoPE and group-wise INT8 quantization to attention
-      output.
-    for:
-      - None
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - Quantization
-    stages:
-      - beta: '5.4'
-  - id: fused_marlin_moe_w4a16_int4
-    description: Fused mixture-of-experts computation with GPTQ INT4 weights and 16-bit
-      activations.
+  - id: fused_marlin_moe_w4a16
+    description: |
+      Fused mixture-of-experts computation with 4-bit weights and 16-bit
+      activations. Precisions: GPTQ INT4 (uint4b8) and MXFP4.
     for:
       - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
     labels:
@@ -568,9 +575,10 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
-  - id: fused_marlin_moe_w4a16_mxfp4
-    description: Fused mixture-of-experts computation with MXFP4 weights and 16-bit
-      activations.
+  - id: fused_marlin_moe_w8a16
+    description: |
+      Fused mixture-of-experts computation with 8-bit weights and 16-bit
+      activations. Precisions: FP8 (E4M3) and INT8 (uint8b128).
     for:
       - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
     labels:
@@ -788,17 +796,6 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
-  - id: int8_einsum
-    description: Block-scaled INT8 bhr,hdr->bhd contraction with per-token-group activation scales.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Quantization
-    stages:
-      - alpha: '5.4'
   - id: kda_conv_gather
     description: |
       Stages the rows used by a batch out of the block-strided Kimi Delta

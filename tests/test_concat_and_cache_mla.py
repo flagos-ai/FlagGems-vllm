@@ -141,3 +141,57 @@ def test_concat_and_cache_mla(
             torch.testing.assert_close(result_temp, expected_temp, atol=0.001, rtol=0.1)
         else:
             utils.gems_assert_close(kv_cache, ref_kv_cache, kv_cache.dtype)
+
+
+@pytest.mark.concat_and_cache_mla
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float])
+@pytest.mark.parametrize("tokens", [0, 1, 4])
+@pytest.mark.parametrize("rope_stride", [(0, 0), (1536, 1), (9, 17)])
+@pytest.mark.parametrize("singleton_head", [False, True])
+@torch.inference_mode()
+def test_empty_rope_strides(dtype, tokens, rope_stride, singleton_head):
+    # Match the zero-stride empty RoPE emitted by Inductor, and also allow other
+    # unused strides. The latent slice retains its larger parent row stride.
+    kv_c = torch.randn(tokens, 1536, dtype=dtype, device=device)[:, -512:]
+    k_pe = torch.empty_strided((tokens, 0), rope_stride, dtype=dtype, device=device)
+    slots = torch.tensor([3, -1, 6, 0][:tokens], dtype=torch.int64, device=device)
+    cache = torch.full((3, 4, 512), -17, dtype=dtype, device=device)
+    expected = cache.clone()
+    for row, slot in enumerate(slots.tolist()):
+        if slot >= 0:
+            expected.view(-1, 512)[slot].copy_(kv_c[row])
+    cache_view = cache.unsqueeze(2) if singleton_head else cache
+    flaggems_vllm.concat_and_cache_mla(
+        kv_c, k_pe, cache_view, slots, "auto", torch.ones((), device=device)
+    )
+    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+@pytest.mark.concat_and_cache_mla
+@pytest.mark.parametrize("strided_input", ["kv", "rope", "cache", "slots"])
+@torch.inference_mode()
+def test_nonempty_feature_stride_rejected(strided_input):
+    kv_c = torch.randn(4, 512, dtype=torch.bfloat16, device=device)
+    k_pe = torch.randn(4, 64, dtype=kv_c.dtype, device=device)
+    cache = torch.full((3, 4, 576), -17, dtype=kv_c.dtype, device=device)
+    slots = torch.tensor([3, -1, 6, 0], dtype=torch.int64, device=device)
+    if strided_input == "kv":
+        kv_c = torch.empty_strided(
+            kv_c.shape, (1024, 2), dtype=kv_c.dtype, device=device
+        )
+    elif strided_input == "rope":
+        k_pe = torch.empty_strided(
+            k_pe.shape, (128, 2), dtype=k_pe.dtype, device=device
+        )
+    elif strided_input == "cache":
+        cache = torch.full((3, 4, 1152), -17, dtype=kv_c.dtype, device=device)[..., ::2]
+    else:
+        slots = torch.tensor(
+            [3, 0, -1, 0, 6, 0, 0, 0], dtype=slots.dtype, device=device
+        )[::2]
+    before = cache.clone()
+    with pytest.raises(ValueError, match="matching contiguous feature dimensions"):
+        flaggems_vllm.concat_and_cache_mla(
+            kv_c, k_pe, cache, slots, "auto", torch.ones((), device=device)
+        )
+    torch.testing.assert_close(cache, before, rtol=0, atol=0)

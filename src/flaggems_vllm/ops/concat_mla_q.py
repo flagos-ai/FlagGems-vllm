@@ -62,8 +62,8 @@ def _validate_inputs(ql_nope, q_pe, q_out):
         raise ValueError("concat_mla_q requires rank-3 tensors")
     tokens, heads, nope = ql_nope.shape
     rope = q_pe.shape[-1]
-    if heads <= 0 or nope <= 0 or rope <= 0:
-        raise ValueError("concat_mla_q requires positive head count and widths")
+    if heads <= 0 or nope <= 0:
+        raise ValueError("concat_mla_q requires positive head count and nope width")
     if q_pe.shape[:2] not in ((tokens, heads), (tokens, 1)):
         raise ValueError("concat_mla_q rope token/head dimensions do not match")
     if q_out.shape != (tokens, heads, nope + rope):
@@ -98,8 +98,9 @@ def concat_mla_q(
 ) -> None:
     """Write ``[ql_nope, q_pe]`` into q_out, broadcasting one rope head.
 
-    Inputs and output may be strided. Output aliasing is rejected before any
-    launch. This is an inference-only data copy, with no dtype conversion.
+    Inputs and output may be strided; zero-width rope is supported. Output
+    aliasing is rejected before any launch. This is an inference-only data copy,
+    with no dtype conversion.
     """
     _validate_inputs(ql_nope, q_pe, q_out)
     if not q_out.numel():

@@ -13,8 +13,12 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._kunlunxin.ops.bf16_paged_mqa_logits import (
+    bf16_paged_mqa_logits,
+)
+from flaggems_vllm.runtime.backend._kunlunxin.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._kunlunxin.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["bf16_paged_mqa_logits", "mhc_pre", "scaled_int8_quant"]

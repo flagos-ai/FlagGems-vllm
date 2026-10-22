@@ -343,14 +343,28 @@ def _base_scalars_from_config(cfg):
 _SIG_INDEX_CACHE = {}
 
 
-def _build_signature_index(base_data, op_name):
+def _resolve_op_entry(base_data, op_name, variant=None):
+    """Return the baseline entry for ``op_name``.
+
+    A kanban operator may merge several weight precisions under one name (e.g.
+    fused_marlin_moe_w4a16 = INT4 + MXFP4). Their shapes and tensor signatures
+    are identical, so the entry keeps one sub-entry per precision under
+    ``variants`` and the benchmark selects it with ``variant``.
+    """
+    op_entry = base_data.get(op_name)
+    if variant is not None and isinstance(op_entry, dict) and "variants" in op_entry:
+        return op_entry["variants"].get(variant)
+    return op_entry
+
+
+def _build_signature_index(base_data, op_name, variant=None):
     """为某算子构建 {dtype: {tensor_sig: [shape_key,...]}} 索引（带缓存）。"""
-    cache_key = (id(base_data), op_name)
+    cache_key = (id(base_data), op_name, variant)
     cached = _SIG_INDEX_CACHE.get(cache_key)
     if cached is not None:
         return cached
     index = {}
-    op_entry = base_data.get(op_name) or {}
+    op_entry = _resolve_op_entry(base_data, op_name, variant) or {}
     for shape_key, per_dtype in op_entry.get("shapes", {}).items():
         if not isinstance(per_dtype, dict):
             continue
@@ -365,7 +379,7 @@ def _build_signature_index(base_data, op_name):
     return index
 
 
-def _match_by_signature(base_data, op_name, dtype, shape_detail):
+def _match_by_signature(base_data, op_name, dtype, shape_detail, variant=None):
     """张量签名回退匹配：返回 (record, matched_shape_key) 或 (None, None)。
 
     直接用 str(first_shape) 匹配失败时调用。按「所有张量 shape 的多重集合」在
@@ -373,7 +387,7 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail):
     标量集合做二次判别。仍无法唯一定位则放弃（返回 None），由调用方按原逻辑报
     未匹配，绝不臆测。
     """
-    index = _build_signature_index(base_data, op_name)
+    index = _build_signature_index(base_data, op_name, variant)
     per_dtype = index.get(str(dtype))
     if not per_dtype:
         return None, None
@@ -381,7 +395,7 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail):
     keys = per_dtype.get(sig)
     if not keys:
         return None, None
-    op_shapes = base_data[op_name]["shapes"]
+    op_shapes = _resolve_op_entry(base_data, op_name, variant)["shapes"]
     if len(keys) == 1:
         return op_shapes[keys[0]].get(str(dtype)), keys[0]
     # 张量签名碰撞：用标量集合二次判别。
@@ -397,7 +411,7 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail):
     return None, None
 
 
-def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
+def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None):
     """Look up the NVIDIA baseline record, three levels deep:
     op_name -> shape -> dtype. Returns a (record, miss_reason) tuple:
 
@@ -414,7 +428,7 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
     Ops whose shape cannot be expressed this way simply won't match.
     """
     try:
-        op_entry = base_data.get(op_name)
+        op_entry = _resolve_op_entry(base_data, op_name, variant)
         if not op_entry:
             return None, f"baseline 中没有算子 '{op_name}'"
         shapes = op_entry.get("shapes", {})
@@ -435,7 +449,9 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
         # flash_mla 的 [B,S_q,H_q,D,seqlen]）或字符串键（如 t1_e8_h4096...），
         # 与第一个张量 shape 不一致。改用「全部张量 shape 的多重集合」签名回退
         # 匹配——与采集器 config.inputs 对称、两边口径一致。
-        rec, matched_key = _match_by_signature(base_data, op_name, dtype, shape_detail)
+        rec, matched_key = _match_by_signature(
+            base_data, op_name, dtype, shape_detail, variant
+        )
         if rec is not None:
             return rec, None
         # 仍未命中：区分「该 shape 签名在 baseline 不存在」与「shape 在但 dtype
@@ -456,12 +472,12 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
         return None, f"baseline 查找 '{op_name}' 时出错: {e}"
 
 
-def lookup_base_record(base_data, op_name, dtype, shape_detail):
+def lookup_base_record(base_data, op_name, dtype, shape_detail, variant=None):
     """Backward-compatible wrapper: returns just the record dict, or None.
 
     Prefer lookup_base_record_ex when the miss reason is needed.
     """
-    rec, _ = lookup_base_record_ex(base_data, op_name, dtype, shape_detail)
+    rec, _ = lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant)
     return rec
 
 
