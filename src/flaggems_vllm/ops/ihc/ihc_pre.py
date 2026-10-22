@@ -42,7 +42,6 @@ Two-stage design:
 import torch
 import triton
 import triton.language as tl
-from triton.experimental.tle import language as tle
 
 # stage1 (w-projection + sqrsum) tile; stage2 (gates + channel sum) tile.
 _BLOCK_K = 128
@@ -58,10 +57,9 @@ _MIN_PROGRAMS = 512
 # One program owns BLOCK_M tokens; x is loaded once per K-chunk and reused for
 # sqrsum plus all 2*hc weight-row FMAs (register-resident), removing the eager /
 # baseline 2*hc-fold L1 re-read of x -- the measured L1TEX bottleneck. The K loop
-# is software-pipelined with TLE (tle.range + async tle.load), prefetching the
-# next x chunk while the current one accumulates. fp32 accumulation keeps the
-# post gate bit-accurate (no tensor cores); tl.dot in bf16/tf32 would blow the
-# 2e-5 gate tolerance at K = hc*hidden.
+# uses tl.range software pipelining (num_stages) to prefetch the next x chunk.
+# fp32 accumulation keeps the post gate bit-accurate (no tensor cores); tl.dot in
+# bf16/tf32 would blow the 2e-5 gate tolerance at K = hc*hidden.
 #
 # One grid axis for the token blocks, one (NSPLIT-wide) for an optional K-split:
 # with NSPLIT == 1 each program owns a whole row and plain-stores the result;
@@ -92,14 +90,13 @@ def _ihc_pre_stage1(
         accs = accs + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
 
     x_base = x_ptr + m_off[:, None] * K_TOTAL
-    for kk in tle.range(0, CHUNK, BLOCK_K, num_stages=NUM_STAGES):
+    for kk in tl.range(0, CHUNK, BLOCK_K, num_stages=NUM_STAGES):
         k_off = k_start + kk + tl.arange(0, BLOCK_K)
         k_mask = k_off < K_TOTAL
-        x = tle.load(
+        x = tl.load(
             x_base + k_off[None, :],
             mask=m_mask[:, None] & k_mask[None, :],
             other=0.0,
-            is_async=True,
         ).to(tl.float32)
         acc_ss += tl.sum(x * x, axis=1)
         new_accs = ()
