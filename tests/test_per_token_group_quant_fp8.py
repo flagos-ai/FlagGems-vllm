@@ -141,257 +141,98 @@ def test_per_token_group_quant_fp8(
 
 
 @pytest.mark.per_token_group_quant_fp8
-def test_per_token_group_quant_fp8_reorder_guard(monkeypatch):
-    from types import SimpleNamespace
+@pytest.mark.parametrize("has_reorder", [False, True])
+def test_per_token_group_quant_fp8_reorder_schedule(monkeypatch, has_reorder):
+    import importlib
 
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_reorder as reorder,
-    )
-
-    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", True)
-    monkeypatch.setattr(reorder, "_is_h20", lambda index: True)
-    x = SimpleNamespace(
-        device=SimpleNamespace(type="cuda", index=0),
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(2048, 13824),
-        is_contiguous=lambda: True,
-    )
-    args = (512, torch.float8_e4m3fn, 1e-10, False, False)
-    assert reorder.can_use_group_reorder(x, *args)
-    for field, value in [
-        ("dtype", torch.float32),
-        ("ndim", 3),
-        ("shape", (1024, 13824)),
-        ("shape", (2048, 4096)),
-        ("device", SimpleNamespace(type="cpu", index=None)),
-        ("is_contiguous", lambda: False),
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", has_reorder)
+    for total, group, ue in [
+        (7, 512, False),
+        (112, 256, True),
+        (664, 64, False),
+        (32768, 256, True),
+        (55296, 512, False),
+        (55296, 512, True),
     ]:
-        original = getattr(x, field)
-        setattr(x, field, value)
-        assert not reorder.can_use_group_reorder(x, *args)
-        setattr(x, field, original)
-    for options in [
-        (128, torch.float8_e4m3fn, 1e-10, False, False),
-        (512, torch.float8_e5m2, 1e-10, False, False),
-        (512, torch.float8_e4m3fn, 1e-6, False, False),
-        (512, torch.float8_e4m3fn, 1e-10, True, False),
-        (512, torch.float8_e4m3fn, 1e-10, False, True),
-    ]:
-        assert not reorder.can_use_group_reorder(x, *options)
-    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", False)
-    assert not reorder.can_use_group_reorder(x, *args)
-    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", True)
-    monkeypatch.setattr(reorder, "_is_h20", lambda index: False)
-    assert not reorder.can_use_group_reorder(x, *args)
+        groups, steps, warps = op._contiguous_group_config(total, group, ue)
+        assert groups > 0 and warps in (1, 4)
+        assert steps in ((1, 2, 4) if has_reorder else (1,))
+        if has_reorder and not (group == 256 and ue and total >= 128):
+            assert steps > 1
 
 
 @pytest.mark.per_token_group_quant_fp8
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-def test_per_token_group_quant_fp8_reorder_large(num_tokens):
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_reorder as reorder,
-    )
+def test_per_token_group_quant_fp8_without_reorder(monkeypatch):
+    import importlib
 
+    import triton.language as tl
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", False)
+    monkeypatch.setattr(op, "tle", tl)
     torch.manual_seed(0)
-    x = torch.rand(
-        (num_tokens, 13824), dtype=torch.bfloat16, device=flaggems_vllm.device
-    )
-    if not reorder.can_use_group_reorder(
-        x, 512, torch.float8_e4m3fn, 1e-10, False, False
-    ):
-        pytest.skip("requires the qualified H20 FlagTree reorder path")
+    x = torch.rand((7, 512), dtype=torch.bfloat16, device=flaggems_vllm.device)
     expected_q, expected_s = native_per_token_group_quant_fp8(x, 512)
     q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
     utils.gems_assert_close(s, expected_s, dtype=torch.float32)
-    assert s.stride() == expected_s.stride()
-    assert torch.allclose(q.float(), expected_q.float(), rtol=0.15)
-
-
-@pytest.mark.per_token_group_quant_fp8
-@pytest.mark.parametrize("special", [False, True])
-def test_per_token_group_quant_fp8_reorder_tail(special):
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_reorder as reorder,
-    )
-
-    torch.manual_seed(0)
-    x = torch.randn((7, 1536), dtype=torch.bfloat16, device=flaggems_vllm.device)
-    if not reorder._HAS_LOAD_REORDER or x.device.type != "cuda":
-        pytest.skip("requires FlagTree reorder")
-    if not reorder._is_h20(x.device.index):
-        pytest.skip("requires H20")
-    if special:
-        x.view(-1)[0] = float("nan")
-        x.view(-1)[512:1024] = float("inf")
-        x.view(-1)[1024:1536] = -float("inf")
-        x.view(-1)[1536:2048] = 0.0
-    # This shape stays on the unchanged public fallback and leaves a partial
-    # group tile. Compare bytes to preserve NaN and signed-zero behavior too.
-    expected_q, expected_s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
-    for enabled in (False, True):
-        q, s = reorder.quantize_group_tiles(x, 512, reorder=enabled)
-        assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
-        torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
-
-
-@pytest.mark.per_token_group_quant_fp8
-def test_per_token_group_quant_fp8_h20_block_guard(monkeypatch):
-    from types import SimpleNamespace
-
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_block as block,
-    )
-
-    monkeypatch.setattr(block, "_is_h20", lambda index: True)
-    x = SimpleNamespace(
-        device=SimpleNamespace(type="cuda", index=0),
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(7, 512),
-        is_contiguous=lambda: True,
-    )
-    get_config = block.get_h20_block_config
-    for (m, k, group, ue), config in block._H20_BLOCK_CONFIGS.items():
-        x.shape = (m, k)
-        assert get_config(x, group, torch.float8_e4m3fn, 1e-10, False, ue) == config
-    x.shape = (7, 512)
-    args = (512, torch.float8_e4m3fn, 1e-10, False, False)
-    for field, value in [
-        ("dtype", torch.float32),
-        ("ndim", 3),
-        ("shape", (8, 512)),
-        ("device", SimpleNamespace(type="cpu", index=None)),
-        ("is_contiguous", lambda: False),
-    ]:
-        original = getattr(x, field)
-        setattr(x, field, value)
-        assert get_config(x, *args) is None
-        setattr(x, field, original)
-    assert get_config(x, 512, torch.float8_e5m2, 1e-10, False, False) is None
-    assert get_config(x, 512, torch.float8_e4m3fn, 1e-6, False, False) is None
-    assert get_config(x, 512, torch.float8_e4m3fn, 1e-10, True, False) is None
-    monkeypatch.setattr(block, "_is_h20", lambda index: False)
-    assert get_config(x, *args) is None
-
-
-@pytest.mark.per_token_group_quant_fp8
-def test_per_token_group_quant_fp8_block_without_reorder(monkeypatch):
-    import builtins
-    import importlib
-    from types import SimpleNamespace
-
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_block as block,
-    )
-
-    dispatcher = importlib.import_module(
-        "flaggems_vllm.runtime.backend._nvidia.ops.per_token_group_quant_fp8"
-    )
-    monkeypatch.setattr(block, "_is_h20", lambda index: True)
-    x = SimpleNamespace(
-        device=SimpleNamespace(type="cuda", index=0),
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(7, 512),
-        stride=lambda dim: 1,
-        is_contiguous=lambda: True,
-    )
-    expected = object()
-    monkeypatch.setattr(dispatcher, "quantize_group_block", lambda *a, **k: expected)
-    original_import = builtins.__import__
-
-    def import_without_reorder(name, *args, **kwargs):
-        if "_per_token_group_quant_fp8_reorder" in name or name.startswith(
-            "triton.experimental.tle"
-        ):
-            raise ImportError("reorder/TLE deliberately unavailable")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", import_without_reorder)
-    assert dispatcher.per_token_group_quant_fp8(x, 512) is expected
-
-
-@pytest.mark.per_token_group_quant_fp8
-def test_per_token_group_quant_fp8_nvidia_dispatch(monkeypatch):
-    import importlib
-    from types import SimpleNamespace
-
-    from flaggems_vllm.ops.per_token_group_quant_fp8 import (
-        per_token_group_quant_fp8 as generic,
-    )
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_reorder as reorder,
-    )
-
-    dispatcher = importlib.import_module(
-        "flaggems_vllm.runtime.backend._nvidia.ops.per_token_group_quant_fp8"
-    )
-    if flaggems_vllm.vendor_name == "nvidia":
-        assert (
-            flaggems_vllm.per_token_group_quant_fp8
-            is dispatcher.per_token_group_quant_fp8
-        )
-    assert dispatcher._generic_per_token_group_quant_fp8 is generic
-    monkeypatch.setattr(reorder, "_HAS_LOAD_REORDER", False)
-    x = SimpleNamespace(shape=(2048, 13824), stride=lambda dim: 1)
-    expected = object()
-    calls = []
-
-    def fallback(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
-
-    monkeypatch.setattr(dispatcher, "get_h20_block_config", lambda *args: None)
-    monkeypatch.setattr(dispatcher, "_generic_per_token_group_quant_fp8", fallback)
-    assert dispatcher.per_token_group_quant_fp8(x, 512) is expected
-    assert calls == [
-        (
-            (x, 512),
-            dict(eps=1e-10, dtype=None, column_major_scales=False, scale_ue8m0=False),
-        )
-    ]
+    assert torch.allclose(_fp8_to_float32(q), _fp8_to_float32(expected_q), rtol=0.15)
 
 
 @pytest.mark.per_token_group_quant_fp8
 @pytest.mark.parametrize(
     "shape,group_size",
-    [
-        ((7, 512), 512),
-        ((7, 4096), 256),
-        ((83, 512), 64),
-        ((2048, 4096), 256),
-        ((2048, 13824), 512),
-    ],
+    [((7, 512), 512), ((83, 512), 64), ((257, 512), 256), ((129, 3584), 512)],
 )
 @pytest.mark.parametrize("scale_ue8m0", [False, True])
-def test_per_token_group_quant_fp8_h20_block_special(shape, group_size, scale_ue8m0):
-    from flaggems_vllm.runtime.backend._nvidia.ops import (
-        _per_token_group_quant_fp8_block as block,
-    )
+def test_per_token_group_quant_fp8_reorder_special(shape, group_size, scale_ue8m0):
+    import importlib
 
+    import triton
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    if not op._HAS_LOAD_REORDER:
+        pytest.skip("compiler does not expose load reorder")
     torch.manual_seed(0)
     x = torch.randn(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
-    if (
-        block.get_h20_block_config(
-            x, group_size, torch.float8_e4m3fn, 1e-10, False, scale_ue8m0
-        )
-        is None
-    ):
-        pytest.skip("requires the qualified H20 block path")
     flat = x.view(-1)
     flat[0] = float("nan")
     flat[group_size : 2 * group_size] = float("inf")
     flat[2 * group_size : 3 * group_size] = -float("inf")
     flat[3 * group_size : 4 * group_size] = 0.0
-    # Compare to the original device kernel with the exact same contract.
-    from flaggems_vllm.ops.per_token_group_quant_fp8 import (
-        per_token_group_quant_fp8 as generic,
+    expected_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    expected_s = torch.empty(
+        (shape[0], shape[1] // group_size), device=x.device, dtype=torch.float32
     )
-
-    expected_q, expected_s = generic(x, group_size, scale_ue8m0=scale_ue8m0)
+    # This scalar kernel is unchanged from upstream, including dynamic clamp
+    # bounds. It is an independent device oracle for special values and tails.
+    op._per_token_group_quant_fp8[(x.numel() // group_size,)](
+        x,
+        expected_q,
+        expected_s,
+        group_size,
+        shape[1],
+        x.stride(0),
+        1e-10,
+        -448.0,
+        448.0,
+        scale_ue8m0,
+        BLOCK=triton.next_power_of_2(group_size),
+        num_warps=min(max(triton.next_power_of_2(group_size) // 256, 1), 8),
+        num_stages=1,
+    )
     q, s = flaggems_vllm.per_token_group_quant_fp8(
         x, group_size, scale_ue8m0=scale_ue8m0
     )
     assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
     torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("shape", [(0, 512), (7, 0)])
+def test_per_token_group_quant_fp8_empty(shape):
+    x = torch.empty(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    assert q.shape == x.shape and q.device == x.device and q.numel() == 0
+    assert s.shape == (shape[0], shape[1] // 512) and s.dtype == torch.float32
+    assert s.device == x.device and s.numel() == 0
