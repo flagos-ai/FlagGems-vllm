@@ -19,12 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops._per_token_group_quant_fp8_reorder import (
-    can_use_group_reorder,
-    get_h20_block_config,
-    quantize_group_block,
-    quantize_group_tiles,
-)
 from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
 
 if kernel_supports_fp8_e4m3():
@@ -244,24 +238,6 @@ def per_token_group_quant_fp8(
         f"by `group_size` {group_size}"
     )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
-
-    if group_size == 512 and can_use_group_reorder(
-        x, group_size, fp8_dtype, eps, column_major_scales, scale_ue8m0
-    ):
-        return quantize_group_tiles(x, group_size, eps=eps)
-
-    block_config = get_h20_block_config(
-        x, group_size, fp8_dtype, eps, column_major_scales, scale_ue8m0
-    )
-    if block_config is not None:
-        rows, block_warps = block_config
-        return quantize_group_block(
-            x,
-            group_size,
-            scale_ue8m0=scale_ue8m0,
-            rows=rows,
-            num_warps=block_warps,
-        )
 
     finfo = torch.finfo(fp8_dtype)
     fp8_min = finfo.min

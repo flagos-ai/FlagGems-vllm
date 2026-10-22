@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Independent group tiles for the optional FlagTree load-reorder path."""
+"""Optional NVIDIA four-step load-reorder schedule for the existing operator."""
 
 import inspect
-from functools import lru_cache
 
 import torch
 import triton
 import triton.language as tl
+
+from ._per_token_group_quant_fp8_common import _clamp_like_upstream, _is_h20
 
 try:
     import triton.experimental.tle.language as tle
@@ -37,11 +38,6 @@ def _supports_load_reorder():
 
 
 _HAS_LOAD_REORDER = _supports_load_reorder()
-
-
-@lru_cache(maxsize=None)
-def _is_h20(device_index):
-    return torch.cuda.get_device_name(device_index) in ("NVIDIA H20", "NVIDIA H20-3e")
 
 
 def can_use_group_reorder(
@@ -63,21 +59,6 @@ def can_use_group_reorder(
         and not scale_ue8m0
         and x.is_contiguous()
         and _is_h20(x.device.index)
-    )
-
-
-@triton.jit
-def _clamp_like_upstream(value):
-    # A symmetric constant clip can map NaNs to the upper bound. Upstream's
-    # runtime-bound max/min instead maps them to the lower bound; retain that
-    # sequence explicitly, including for Inf/Inf during normalization.
-    return tl.inline_asm_elementwise(
-        "max.f32 $0, $1, 0fC3E00000; min.f32 $0, $0, 0f43E00000;",
-        constraints="=f,f",
-        args=[value],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
     )
 
 
@@ -189,96 +170,6 @@ def quantize_group_tiles(
         COLUMN_MAJOR=column_major_scales,
         UE8M0=scale_ue8m0,
         REORDER=reorder,
-        num_warps=num_warps,
-        num_stages=1,
-    )
-    return q, s
-
-
-# Fixed schedules qualified with the native H20 BF16 CUDA Graph benchmark.
-# Keep the compiler and semantic guards explicit; online tuning would change
-# the configuration used by the same-program timing and reorder comparisons.
-_H20_BLOCK_CONFIGS = {
-    (7, 512, 512, False): (1, 1),
-    (7, 512, 512, True): (1, 1),
-    (7, 4096, 256, False): (1, 1),
-    (7, 4096, 256, True): (1, 1),
-    (83, 512, 64, False): (8, 1),
-    (83, 512, 64, True): (8, 1),
-    (2048, 4096, 256, False): (8, 1),
-    (2048, 4096, 256, True): (16, 4),
-    (2048, 13824, 512, True): (8, 4),
-    (4096, 13824, 512, True): (16, 4),
-    (8192, 13824, 512, True): (16, 4),
-}
-
-
-def get_h20_block_config(
-    x, group_size, fp8_dtype, eps, column_major_scales, scale_ue8m0
-):
-    if (
-        not _HAS_LOAD_REORDER
-        or x.device.type != "cuda"
-        or x.dtype != torch.bfloat16
-        or fp8_dtype != torch.float8_e4m3fn
-        or x.ndim != 2
-        or eps != 1e-10
-        or column_major_scales
-        or not isinstance(scale_ue8m0, bool)
-        or not x.is_contiguous()
-    ):
-        return None
-    config = _H20_BLOCK_CONFIGS.get((x.shape[0], x.shape[1], group_size, scale_ue8m0))
-    if config is None or not _is_h20(x.device.index):
-        return None
-    return config
-
-
-@triton.jit
-def _quantize_block(
-    X,
-    Q,
-    S,
-    TOTAL: tl.constexpr,
-    GROUP: tl.constexpr,
-    BLOCK: tl.constexpr,
-    ROWS: tl.constexpr,
-    UE: tl.constexpr,
-):
-    groups = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    cols = tl.arange(0, BLOCK)
-    if TOTAL % ROWS == 0:
-        valid = tl.full((ROWS,), True, tl.int1)
-    else:
-        valid = groups < TOTAL
-    offsets = groups[:, None] * GROUP + cols[None, :]
-    values = tl.load(X + offsets, valid[:, None] & (cols[None, :] < GROUP), other=0).to(
-        tl.float32
-    )
-    maximum = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-10)
-    scale = maximum * (1.0 / 448.0)
-    if UE:
-        scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1e-10))))
-    q = _clamp_like_upstream(values / scale[:, None]).to(Q.dtype.element_ty)
-    tl.store(Q + offsets, q, valid[:, None] & (cols[None, :] < GROUP))
-    tl.store(S + groups, scale, valid)
-
-
-def quantize_group_block(x, group_size, *, scale_ue8m0, rows, num_warps):
-    """Qualified tile path; its gains are separate from load reorder."""
-    q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = torch.empty(
-        (x.shape[0], x.shape[1] // group_size), device=x.device, dtype=torch.float32
-    )
-    _quantize_block[(triton.cdiv(x.numel() // group_size, rows),)](
-        x,
-        q,
-        s,
-        TOTAL=x.numel() // group_size,
-        GROUP=group_size,
-        BLOCK=triton.next_power_of_2(group_size),
-        ROWS=rows,
-        UE=scale_ue8m0,
         num_warps=num_warps,
         num_stages=1,
     )
