@@ -24,7 +24,7 @@ import torch
 from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import qsa_prepare as vllm_qsa_prepare
 
 import flaggems_vllm
-from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
+from flaggems_vllm import qsa_prepare
 from tests.test_qsa_prepare import (
     COMPRESS_RATIO,
     HEAD_DIM,

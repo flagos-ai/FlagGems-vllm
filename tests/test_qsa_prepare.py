@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
+from flaggems_vllm import qsa_prepare
 
 # ------------------------------------------------------------------ constants
 HEAD_DIM = 128
