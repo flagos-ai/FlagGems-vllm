@@ -36,10 +36,8 @@ from . import base
 
 # Prefer vLLM's iHC Triton kernels as the baseline; fall back to the torch ref.
 try:
-    from vllm.models.hy_v4.nvidia.triton_ihc import (
-        triton_ihc_post as _vllm_ihc_post,
-        triton_ihc_pre as _vllm_ihc_pre,
-    )
+    from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_post as _vllm_ihc_post
+    from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_pre as _vllm_ihc_pre
 
     HAS_VLLM = True
     _pre_base = _vllm_ihc_pre

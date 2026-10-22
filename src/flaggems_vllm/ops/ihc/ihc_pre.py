@@ -52,6 +52,25 @@ _NUM_STAGES = 3
 # Fill the H20 (~132 SMs): only K-split stage1 when token-blocks are too few.
 _MIN_PROGRAMS = 512
 
+# Token count below which the decode-shaped path is used. The M-blocked stage1
+# amortizes the weight rows across BLOCK_M tokens, which only pays off once
+# there are enough token-blocks to fill the GPU; below that it starves (measured
+# up to 2.5x slower than vLLM at a single token). The decode path instead splits
+# K finely, loads the 2*hc weight rows as one 2D tile, and folds the partial
+# reduction into stage2 so the whole op costs two kernel launches instead of
+# three -- at decode sizes a launch is ~4.5us, i.e. 20-40% of the total.
+_DECODE_N_THRESHOLD = 256
+# BLOCK_K for the decode stage1, by token count: tiny batches need K cut finely
+# to expose enough programs, larger ones prefer fewer, wider chunks.
+_DECODE_BLOCK_K = ((2, 128), (16, 256), (64, 512), (None, 1024))
+
+
+def _decode_block_k(num_tokens: int) -> int:
+    for limit, block_k in _DECODE_BLOCK_K:
+        if limit is None or num_tokens < limit:
+            return block_k
+    return _DECODE_BLOCK_K[-1][1]
+
 
 # stage1 computes, in fp32, the w-projection mix[N, 2*hc] and the row sqrsum[N].
 # One program owns BLOCK_M tokens; x is loaded once per K-chunk and reused for
@@ -113,6 +132,45 @@ def _ihc_pre_stage1(
         tl.atomic_add(sumsq_ptr + m_off, acc_ss, mask=m_mask)
         for j in tl.static_range(TWO_HC):
             tl.atomic_add(mix_ptr + m_off * TWO_HC + j, accs[j], mask=m_mask)
+
+
+# Decode-shaped stage1: one program per (token, K-chunk). With few tokens there
+# is no weight reuse to win, so the goal is simply to expose enough programs and
+# keep each one cheap. The 2*hc weight rows are fetched as a single
+# [2*hc, BLOCK_K] tile and reduced along K in one vectorized step, rather than
+# looping the rows one at a time. Each program owns one partial slot, so no
+# atomics are needed; _ihc_pre_stage2_decode folds the slot reduction in.
+@triton.jit
+def _ihc_pre_stage1_decode(
+    x_ptr,
+    weight_ptr,
+    partial_ptr,
+    K_TOTAL: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    PARTIAL_STRIDE: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    split_idx = tl.program_id(1)
+    k_off = split_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_off < K_TOTAL
+
+    x = tl.load(
+        x_ptr + token_idx * K_TOTAL + k_off,
+        mask=k_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    j = tl.arange(0, TWO_HC)
+    weight = tl.load(
+        weight_ptr + j[:, None] * K_TOTAL + k_off[None, :],
+        mask=k_mask[None, :],
+        other=0.0,
+    )
+    partial = partial_ptr + (token_idx * NUM_SPLITS + split_idx) * PARTIAL_STRIDE
+    tl.store(partial, tl.sum(x * x, axis=0))
+    tl.store(partial + 1 + j, tl.sum(weight * x[None, :], axis=1))
 
 
 # stage2 reads the fp32 mix[N, 2*hc] and sqrsum[N] from stage1, forms the pre /
@@ -185,6 +243,88 @@ def _ihc_pre_stage2(
     )
 
 
+# Decode stage2: same gating and channel sum as above, but it reduces the
+# partial slots written by _ihc_pre_stage1_decode itself instead of reading a
+# pre-reduced mix / sqrsum. That keeps the decode path at two kernel launches;
+# a separate reduction kernel would add a third, which costs ~4.5us and is a
+# large fraction of the total at these sizes.
+@triton.jit
+def _ihc_pre_stage2_decode(
+    x_ptr,
+    partial_ptr,
+    scale_ptr,
+    base_ptr,
+    output_ptr,
+    post_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    K_TOTAL: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    HC_POW2: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    PARTIAL_STRIDE: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    MAGNITUDE: tl.constexpr,
+    NORM_EPS: tl.constexpr,
+    HC_EPS: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    hidden_block_idx = tl.program_id(1)
+    hc_idx = tl.arange(0, HC_POW2)
+    hc_mask = hc_idx < HC_MULT
+
+    split_idx = tl.arange(0, BLOCK_S)
+    split_mask = split_idx < NUM_SPLITS
+    slots = partial_ptr + token_idx * NUM_SPLITS * PARTIAL_STRIDE
+    slots = slots + split_idx * PARTIAL_STRIDE
+    sum_squares = tl.sum(tl.load(slots, mask=split_mask, other=0.0), axis=0)
+    j = tl.arange(0, TWO_HC)
+    mixes = tl.sum(
+        tl.load(slots[:, None] + 1 + j[None, :], mask=split_mask[:, None], other=0.0),
+        axis=0,
+    )
+    pre_mix = tl.sum(
+        tl.where(j[None, :] == hc_idx[:, None], mixes[None, :], 0.0), axis=1
+    )
+    post_mix = tl.sum(
+        tl.where(j[None, :] == (hc_idx[:, None] + HC_MULT), mixes[None, :], 0.0), axis=1
+    )
+
+    reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
+    pre_scale = tl.load(scale_ptr)
+    post_scale = tl.load(scale_ptr + 1)
+    pre_base = tl.load(base_ptr + hc_idx, mask=hc_mask, other=0.0)
+    post_base = tl.load(base_ptr + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
+    pre = tl.sigmoid(pre_mix * reciprocal_rms * pre_scale + pre_base) + HC_EPS
+
+    if hidden_block_idx == 0:
+        post = (
+            MAGNITUDE * tl.sigmoid(post_mix * reciprocal_rms * post_scale + post_base)
+            + HC_EPS
+        )
+        tl.store(post_ptr + token_idx * HC_MULT + hc_idx, post, mask=hc_mask)
+
+    hidden_offsets = hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    hidden_mask = hidden_offsets < HIDDEN_SIZE
+    x_row = x_ptr + token_idx * K_TOTAL
+    output = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for channel_idx in tl.static_range(HC_MULT):
+        channel = tl.load(
+            x_row + channel_idx * HIDDEN_SIZE + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        channel_gate = tl.sum(tl.where(hc_idx == channel_idx, pre, 0.0), axis=0)
+        output += channel_gate * channel
+
+    tl.store(
+        output_ptr + token_idx * HIDDEN_SIZE + hidden_offsets,
+        output.to(output_ptr.dtype.element_ty),
+        mask=hidden_mask,
+    )
+
+
 def ihc_pre(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -236,14 +376,59 @@ def ihc_pre(
     two_hc = 2 * hc_mult
     x_flat = x.reshape(num_tokens, k_total)
 
+    if num_tokens < _DECODE_N_THRESHOLD:
+        # Decode shapes: fine K-split + fused reduction, two launches total.
+        block_k = _decode_block_k(num_tokens)
+        num_splits = triton.cdiv(k_total, block_k)
+        partial_stride = 1 + two_hc
+        partial = torch.empty(
+            (num_tokens, num_splits, partial_stride),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        _ihc_pre_stage1_decode[(num_tokens, num_splits)](
+            x_flat,
+            weight,
+            partial,
+            K_TOTAL=k_total,
+            TWO_HC=two_hc,
+            NUM_SPLITS=num_splits,
+            BLOCK_K=block_k,
+            PARTIAL_STRIDE=partial_stride,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+        _ihc_pre_stage2_decode[(num_tokens, triton.cdiv(hidden_size, _BLOCK_D))](
+            x,
+            partial,
+            scale,
+            base,
+            output,
+            post,
+            HIDDEN_SIZE=hidden_size,
+            K_TOTAL=k_total,
+            HC_MULT=hc_mult,
+            HC_POW2=hc_pow2,
+            TWO_HC=two_hc,
+            NUM_SPLITS=num_splits,
+            PARTIAL_STRIDE=partial_stride,
+            BLOCK_S=triton.next_power_of_2(num_splits),
+            BLOCK_D=_BLOCK_D,
+            MAGNITUDE=magnitude,
+            NORM_EPS=norm_eps,
+            HC_EPS=hc_eps,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        return output, post
+
     # stage1: fp32 mix[N, 2*hc] + sqrsum[N]. K-split only when token-blocks alone
     # cannot fill the GPU; otherwise the single-pass M-block grid already has
     # enough programs and splitting just adds the atomic-combine tax.
     grid_m = triton.cdiv(num_tokens, _BLOCK_M)
     nsplit = 1
     while (
-        grid_m * nsplit * 2 <= _MIN_PROGRAMS
-        and k_total % (nsplit * 2 * _BLOCK_K) == 0
+        grid_m * nsplit * 2 <= _MIN_PROGRAMS and k_total % (nsplit * 2 * _BLOCK_K) == 0
     ):
         nsplit *= 2
 

@@ -106,9 +106,7 @@ def ihc_post(
     assert post.shape == (num_tokens, hc_mult)
 
     if num_tokens == 0:
-        return torch.empty(
-            (0, hc_mult, hidden_size), dtype=x.dtype, device=x.device
-        )
+        return torch.empty((0, hc_mult, hidden_size), dtype=x.dtype, device=x.device)
 
     output = torch.empty(
         (num_tokens, hc_mult, hidden_size), dtype=x.dtype, device=x.device
@@ -134,6 +132,6 @@ def ihc_post_ref(
     post: torch.Tensor,
 ) -> torch.Tensor:
     """PyTorch reference (test/benchmark only; never imported by production)."""
-    return (
-        post.float().unsqueeze(-1) * x.float().unsqueeze(-2) + residual.float()
-    ).to(x.dtype)
+    return (post.float().unsqueeze(-1) * x.float().unsqueeze(-2) + residual.float()).to(
+        x.dtype
+    )
