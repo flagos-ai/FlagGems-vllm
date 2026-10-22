@@ -232,12 +232,8 @@ class FlashmlaSparseTestKit:
             for have_attn_sink in [True, False]
             for have_topk_length in [True, False]
         ]
-        return cases
-
-    @staticmethod
-    def get_correctness_test_params_dsv4():
-        """DeepSeek-V4-Flash prefill: TOPK-split, small head-block, 8- and 16-warp paths."""
-        cases = [
+        # DeepSeek-V4-Flash prefill: TOPK split, small head blocks, 8 and 16 warps
+        cases += [
             Flashmla_Sparse_Test_Param(
                 s_q,
                 s_kv,
@@ -251,12 +247,8 @@ class FlashmlaSparseTestKit:
             for s_kv, topk in [(592, 128), (2048, 640), (16384, 8320)]
             for have_topk_length in [True, False]
         ]
-        return cases
-
-    @staticmethod
-    def get_correctness_test_params_glm5():
-        """GLM-5.2 prefill, most frequent calls (no attn_sink / topk_length)."""
-        cases = [
+        # GLM-5.2 prefill, most frequent calls (no attn_sink / topk_length)
+        cases += [
             Flashmla_Sparse_Test_Param(s_q, 361344, 2048, h_q=64, d_qk=576)
             for s_q in [64, 449]
         ]
@@ -430,10 +422,7 @@ def test_flashmla_sparse(param):
 
 @pytest.mark.flash_mla_sparse_fwd
 @pytest.mark.parametrize(
-    "param",
-    FlashmlaSparseTestKit.get_correctness_test_params_flashmla()
-    + FlashmlaSparseTestKit.get_correctness_test_params_dsv4()
-    + FlashmlaSparseTestKit.get_correctness_test_params_glm5(),
+    "param", FlashmlaSparseTestKit.get_correctness_test_params_flashmla()
 )
 def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     """Sparse MLA forward propagation test from FlashMLA"""
