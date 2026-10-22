@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Performance of the Qwen4 QSA fused prepare operator.
+"""Performance of the QSA fused prepare operator.
 
 The baseline is the upstream vLLM operator, driven with identical inputs.
 """
@@ -90,7 +90,7 @@ SHAPES = [
 ]
 
 
-class Qwen4QsaPrepareBenchmark(base.GenericBenchmark):
+class QsaPrepareBenchmark(base.GenericBenchmark):
     """Use the common runner with the QSA prepare batch layouts."""
 
     def set_shapes(self, shape_file_path=None):
@@ -140,11 +140,11 @@ def _input_fn(shape, dtype, device):
     )
 
 
-@pytest.mark.qwen4_qsa_prepare
+@pytest.mark.qsa_prepare
 def test_qsa_prepare():
     """The shipped kernel against the upstream implementation."""
 
-    bench = Qwen4QsaPrepareBenchmark(
+    bench = QsaPrepareBenchmark(
         input_fn=_input_fn,
         op_name="qsa_prepare",
         torch_op=vllm_qsa_prepare,
@@ -156,5 +156,5 @@ def test_qsa_prepare():
 
 pytestmark = pytest.mark.skipif(
     flaggems_vllm.device == "cpu" or not torch.cuda.is_available(),
-    reason="Qwen4 QSA prepare benchmark requires an accelerator",
+    reason="QSA prepare benchmark requires an accelerator",
 )

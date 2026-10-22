@@ -12,33 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused QSA prepare kernel for Qwen4Exp, forked from vLLM's implementation.
-
-The upstream revision this started from, and what was changed since, are
-recorded in ``QWEN4_VENDOR_QSA_PREPARE_SOURCE`` below.
-"""
+"""Fused QSA prepare kernel for Qwen4Exp."""
 
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-
-QWEN4_VENDOR_QSA_PREPARE_SOURCE = {
-    "repository": "https://github.com/vllm-project/vllm",
-    "release": "0.31.1rc1.dev371",
-    "base_commit": "df6c7ad03194a3051a197d57ca4a94e4a063014e",
-    "path": "vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py",
-    "sha256": "22049c20b85fea0d38fe03175de36acc02edc55802ae89efafef2dffdc813187",
-    "adaptation": (
-        "Triton import standalone rather than from vllm.triton_utils; "
-        "main-attention path tiles tokens; "
-        "state-ring commit vectorized, with a scalar form for single-token "
-        "requests; "
-        "launch wrapped in a metadata-keyed cache."
-    ),
-    "role": "shipped implementation of qsa_prepare",
-}
 
 
 @triton.jit

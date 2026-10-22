@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness tests for the Qwen4 QSA fused prepare operator."""
+"""Correctness tests for the QSA fused prepare operator."""
 
 from __future__ import annotations
 
@@ -796,7 +796,7 @@ def _case(mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype
 
 
 # ------------------------------------------------------------------ tests
-@pytest.mark.qwen4_qsa_prepare
+@pytest.mark.qsa_prepare
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,batch", CASES
 )
@@ -808,7 +808,7 @@ def test_qsa_prepare_matches_torch_reference(
     _assert_matches(case.run_kernel(), case.run_reference())
 
 
-@pytest.mark.qwen4_qsa_prepare
+@pytest.mark.qsa_prepare
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,batch", CASES
 )
