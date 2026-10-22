@@ -98,40 +98,57 @@ def _ihc_pre_stage1(
     NSPLIT: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    m_off = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = m_off < N
-    CHUNK: tl.constexpr = K_TOTAL // NSPLIT
-    k_start = tl.program_id(1) * CHUNK
+    token_block_idx = tl.program_id(0).to(tl.int64)
+    split_idx = tl.program_id(1)
 
-    acc_ss = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    accs = ()
-    for _j in tl.static_range(TWO_HC):
-        accs = accs + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
+    m_off = token_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_off < N
+
+    CHUNK: tl.constexpr = K_TOTAL // NSPLIT
+    k_start = split_idx * CHUNK
+
+    # One accumulator per projection row, plus one for the row sqrsum. Triton
+    # has no mutable list, so the running values are carried in a tuple that is
+    # rebuilt each iteration.
+    sum_squares = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    mixes = ()
+    for _ in tl.static_range(TWO_HC):
+        mixes = mixes + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
 
     x_base = x_ptr + m_off[:, None] * K_TOTAL
-    for kk in tl.range(0, CHUNK, BLOCK_K, num_stages=NUM_STAGES):
-        k_off = k_start + kk + tl.arange(0, BLOCK_K)
+    for k_offset in tl.range(0, CHUNK, BLOCK_K, num_stages=NUM_STAGES):
+        k_off = k_start + k_offset + tl.arange(0, BLOCK_K)
         k_mask = k_off < K_TOTAL
+
         x = tl.load(
             x_base + k_off[None, :],
             mask=m_mask[:, None] & k_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        acc_ss += tl.sum(x * x, axis=1)
-        new_accs = ()
-        for j in tl.static_range(TWO_HC):
-            wj = tl.load(weight_ptr + j * K_TOTAL + k_off, mask=k_mask, other=0.0)
-            new_accs = new_accs + (accs[j] + tl.sum(x * wj[None, :], axis=1),)
-        accs = new_accs
 
+        sum_squares += tl.sum(x * x, axis=1)
+
+        # Reuse the x tile just loaded for every projection row.
+        next_mixes = ()
+        for j in tl.static_range(TWO_HC):
+            weight_row = tl.load(
+                weight_ptr + j * K_TOTAL + k_off, mask=k_mask, other=0.0
+            )
+            contribution = tl.sum(x * weight_row[None, :], axis=1)
+            next_mixes = next_mixes + (mixes[j] + contribution,)
+        mixes = next_mixes
+
+    mix_ptrs = mix_ptr + m_off * TWO_HC
     if NSPLIT == 1:
-        tl.store(sumsq_ptr + m_off, acc_ss, mask=m_mask)
+        # This program owns the whole row, so a plain store is enough.
+        tl.store(sumsq_ptr + m_off, sum_squares, mask=m_mask)
         for j in tl.static_range(TWO_HC):
-            tl.store(mix_ptr + m_off * TWO_HC + j, accs[j], mask=m_mask)
+            tl.store(mix_ptrs + j, mixes[j], mask=m_mask)
     else:
-        tl.atomic_add(sumsq_ptr + m_off, acc_ss, mask=m_mask)
+        # The row is split across programs; combine with fp32 atomics.
+        tl.atomic_add(sumsq_ptr + m_off, sum_squares, mask=m_mask)
         for j in tl.static_range(TWO_HC):
-            tl.atomic_add(mix_ptr + m_off * TWO_HC + j, accs[j], mask=m_mask)
+            tl.atomic_add(mix_ptrs + j, mixes[j], mask=m_mask)
 
 
 # Decode-shaped stage1: one program per (token, K-chunk). With few tokens there
@@ -162,15 +179,21 @@ def _ihc_pre_stage1_decode(
         other=0.0,
     ).to(tl.float32)
 
-    j = tl.arange(0, TWO_HC)
+    sum_squares = tl.sum(x * x, axis=0)
+
+    # All 2*hc weight rows as one tile, so the projection is a single reduction
+    # along K instead of one pass per row.
+    mix_idx = tl.arange(0, TWO_HC)
     weight = tl.load(
-        weight_ptr + j[:, None] * K_TOTAL + k_off[None, :],
+        weight_ptr + mix_idx[:, None] * K_TOTAL + k_off[None, :],
         mask=k_mask[None, :],
         other=0.0,
     )
+    mixes = tl.sum(weight * x[None, :], axis=1)
+
     partial = partial_ptr + (token_idx * NUM_SPLITS + split_idx) * PARTIAL_STRIDE
-    tl.store(partial, tl.sum(x * x, axis=0))
-    tl.store(partial + 1 + j, tl.sum(weight * x[None, :], axis=1))
+    tl.store(partial, sum_squares)
+    tl.store(partial + 1 + mix_idx, mixes)
 
 
 # stage2 reads the fp32 mix[N, 2*hc] and sqrsum[N] from stage1, forms the pre /
@@ -276,20 +299,24 @@ def _ihc_pre_stage2_decode(
 
     split_idx = tl.arange(0, BLOCK_S)
     split_mask = split_idx < NUM_SPLITS
-    slots = partial_ptr + token_idx * NUM_SPLITS * PARTIAL_STRIDE
-    slots = slots + split_idx * PARTIAL_STRIDE
-    sum_squares = tl.sum(tl.load(slots, mask=split_mask, other=0.0), axis=0)
-    j = tl.arange(0, TWO_HC)
-    mixes = tl.sum(
-        tl.load(slots[:, None] + 1 + j[None, :], mask=split_mask[:, None], other=0.0),
-        axis=0,
-    )
-    pre_mix = tl.sum(
-        tl.where(j[None, :] == hc_idx[:, None], mixes[None, :], 0.0), axis=1
-    )
-    post_mix = tl.sum(
-        tl.where(j[None, :] == (hc_idx[:, None] + HC_MULT), mixes[None, :], 0.0), axis=1
-    )
+    partial_row = partial_ptr + token_idx * NUM_SPLITS * PARTIAL_STRIDE
+    slot_ptrs = partial_row + split_idx * PARTIAL_STRIDE
+
+    # Slot layout is [sqrsum, mix[0 .. 2*hc-1]]; reduce over the split axis.
+    sqrsum_parts = tl.load(slot_ptrs, mask=split_mask, other=0.0)
+    sum_squares = tl.sum(sqrsum_parts, axis=0)
+
+    mix_idx = tl.arange(0, TWO_HC)
+    mix_ptrs = slot_ptrs[:, None] + 1 + mix_idx[None, :]
+    mix_parts = tl.load(mix_ptrs, mask=split_mask[:, None], other=0.0)
+    mixes = tl.sum(mix_parts, axis=0)
+
+    # Split the reduced row into the pre gates' logits (first hc entries) and
+    # the post gates' (next hc).
+    is_pre = mix_idx[None, :] == hc_idx[:, None]
+    is_post = mix_idx[None, :] == (hc_idx[:, None] + HC_MULT)
+    pre_mix = tl.sum(tl.where(is_pre, mixes[None, :], 0.0), axis=1)
+    post_mix = tl.sum(tl.where(is_post, mixes[None, :], 0.0), axis=1)
 
     reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
     pre_scale = tl.load(scale_ptr)
