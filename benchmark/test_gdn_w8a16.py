@@ -83,7 +83,6 @@ class GdnW8A16Benchmark(Benchmark):
 
     def get_input_iter(self, cur_dtype):
         for n, t, h, hv, key_dim, value_dim in self.shapes:
-            print(f"gdn_w8a16 shape N={n} T={t} H={h} HV={hv}", flush=True)
             if key_dim != 128 or value_dim != 128:
                 raise ValueError("This benchmark covers K=V=128")
             torch.manual_seed(42)

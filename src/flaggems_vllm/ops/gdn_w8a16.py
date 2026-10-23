@@ -56,7 +56,6 @@ def _store_dynamic_fp8_state(
     mask_state,
     mask_v,
     ACTIVATION_TYPE: tl.constexpr,
-    STREAM_STATE_STORE: tl.constexpr,
     LOW_PRECISION_AMAX: tl.constexpr,
 ):
     # One scale per V channel. The reciprocal is scalar per channel, avoiding a
@@ -77,15 +76,7 @@ def _store_dynamic_fp8_state(
     )
 
     tl.store(state_scale + scale_offsets, channel_scale, mask=mask_v)
-    if STREAM_STATE_STORE:
-        tl.store(
-            state_fp8 + state_offsets,
-            quantized,
-            mask=mask_state,
-            cache_modifier=".cs",
-        )
-    else:
-        tl.store(state_fp8 + state_offsets, quantized, mask=mask_state)
+    tl.store(state_fp8 + state_offsets, quantized, mask=mask_state)
 
 
 @triton.jit
@@ -205,15 +196,19 @@ def _gdn_step(
 
 @libentry()
 @triton.jit
-def _quantize_gdn_state_fp8_kernel(
+def _convert_state_kernel(
     state,
     state_fp8,
     state_scale,
+    state_indices,
+    stride_indices: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     HV: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    QUANTIZE: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
     USE_3D_GRID: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
@@ -225,188 +220,82 @@ def _quantize_gdn_state_fp8_kernel(
     if USE_INT64_OFFSETS:
         i_sh = i_sh.to(tl.int64)
 
-    o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    mask = (o_k[:, None] < K) & (o_v[None, :] < V)
-    offsets = i_sh * K * V + o_k[:, None] * V + o_v[None, :]
-    values = tl.load(state + offsets, mask=mask, other=0.0).to(tl.float32)
-    scale_offsets = i_sh * V + o_v
-    _store_dynamic_fp8_state(
-        values,
-        state_fp8,
-        state_scale,
-        offsets,
-        scale_offsets,
-        mask,
-        o_v < V,
-        ACTIVATION_TYPE=state.dtype.element_ty,
-        STREAM_STATE_STORE=False,
-        LOW_PRECISION_AMAX=False,
-    )
-
-
-@libentry()
-@triton.jit
-def _dequantize_gdn_state_fp8_kernel(
-    state_fp8,
-    state_scale,
-    state,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    HV: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_3D_GRID: tl.constexpr,
-    USE_INT64_OFFSETS: tl.constexpr,
-):
-    i_v = tl.program_id(0)
-    if USE_3D_GRID:
-        i_sh = tl.program_id(2) * HV + tl.program_id(1)
-    else:
-        i_sh = tl.program_id(1)
-    if USE_INT64_OFFSETS:
-        i_sh = i_sh.to(tl.int64)
-
-    o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    mask = (o_k[:, None] < K) & (o_v[None, :] < V)
-    offsets = i_sh * K * V + o_k[:, None] * V + o_v[None, :]
-    scale_offsets = i_sh * V + o_v
-    values = _load_dynamic_fp8_state(
-        state_fp8,
-        state_scale,
-        offsets,
-        scale_offsets,
-        mask,
-        o_v < V,
-        ACTIVATION_TYPE=state.dtype.element_ty,
-    )
-    tl.store(state + offsets, values.to(state.dtype.element_ty), mask=mask)
-
-
-@libentry()
-@triton.jit
-def _dequantize_indexed_gdn_state_fp8_kernel(
-    state_fp8,
-    state_scale,
-    state,
-    state_indices,
-    stride_state_s: tl.constexpr,
-    stride_state_h: tl.constexpr,
-    stride_state_k: tl.constexpr,
-    stride_state_v: tl.constexpr,
-    stride_scale_s: tl.constexpr,
-    stride_scale_h: tl.constexpr,
-    stride_scale_v: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_STATE_INDICES: tl.constexpr,
-):
-    i_v = tl.program_id(0)
-    i_nh = tl.program_id(1)
-    i_n = i_nh // HV
-    i_hv = i_nh % HV
     if USE_STATE_INDICES:
-        state_index = tl.load(state_indices + i_n).to(tl.int64)
+        state_index = tl.load(state_indices + (i_sh // HV) * stride_indices).to(
+            tl.int64
+        )
+        if QUANTIZE:
+            if state_index < 0:
+                return
+        valid_state = state_index >= 0
+        fp8_row = tl.where(valid_state, state_index, 0) * HV + i_sh % HV
     else:
-        state_index = i_n
-    valid_state = state_index >= 0
-    state_index = tl.where(valid_state, state_index, 0)
-
-    o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_state = mask_k[:, None] & mask_v[None, :] & valid_state
-    source_offsets = (
-        state_index * stride_state_s
-        + i_hv * stride_state_h
-        + o_k[:, None] * stride_state_k
-        + o_v[None, :] * stride_state_v
-    )
-    scale_offsets = (
-        state_index * stride_scale_s + i_hv * stride_scale_h + o_v * stride_scale_v
-    )
-    values = _load_dynamic_fp8_state(
-        state_fp8,
-        state_scale,
-        source_offsets,
-        scale_offsets,
-        mask_state,
-        mask_v & valid_state,
-        ACTIVATION_TYPE=state.dtype.element_ty,
-    )
-    output_offsets = i_nh * K * V + o_k[:, None] * V + o_v[None, :]
-    tl.store(
-        state + output_offsets,
-        values.to(state.dtype.element_ty),
-        mask=mask_k[:, None] & mask_v[None, :],
-    )
-
-
-@libentry()
-@triton.jit
-def _quantize_indexed_gdn_state_fp8_kernel(
-    state,
-    state_fp8,
-    state_scale,
-    state_indices,
-    stride_state_s: tl.constexpr,
-    stride_state_h: tl.constexpr,
-    stride_state_k: tl.constexpr,
-    stride_state_v: tl.constexpr,
-    stride_scale_s: tl.constexpr,
-    stride_scale_h: tl.constexpr,
-    stride_scale_v: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_STATE_INDICES: tl.constexpr,
-):
-    i_v = tl.program_id(0)
-    i_nh = tl.program_id(1)
-    i_n = i_nh // HV
-    i_hv = i_nh % HV
-    if USE_STATE_INDICES:
-        state_index = tl.load(state_indices + i_n).to(tl.int64)
-        if state_index < 0:
-            return
-    else:
-        state_index = i_n
+        fp8_row = i_sh
+        valid_state = True
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
     mask_v = o_v < V
     mask_state = mask_k[:, None] & mask_v[None, :]
-    source_offsets = i_nh * K * V + o_k[:, None] * V + o_v[None, :]
-    output_offsets = (
-        state_index * stride_state_s
-        + i_hv * stride_state_h
-        + o_k[:, None] * stride_state_k
-        + o_v[None, :] * stride_state_v
-    )
-    scale_offsets = (
-        state_index * stride_scale_s + i_hv * stride_scale_h + o_v * stride_scale_v
-    )
-    values = tl.load(state + source_offsets, mask=mask_state, other=0.0).to(tl.float32)
-    _store_dynamic_fp8_state(
-        values,
-        state_fp8,
-        state_scale,
-        output_offsets,
-        scale_offsets,
-        mask_state,
-        mask_v,
-        ACTIVATION_TYPE=state.dtype.element_ty,
-        STREAM_STATE_STORE=False,
-        LOW_PRECISION_AMAX=False,
-    )
+    tile_offsets = o_k[:, None] * V + o_v[None, :]
+    state_offsets = i_sh * K * V + tile_offsets
+    fp8_offsets = fp8_row * K * V + tile_offsets
+    scale_offsets = fp8_row * V + o_v
+    if QUANTIZE:
+        values = tl.load(state + state_offsets, mask=mask_state, other=0.0).to(
+            tl.float32
+        )
+        _store_dynamic_fp8_state(
+            values,
+            state_fp8,
+            state_scale,
+            fp8_offsets,
+            scale_offsets,
+            mask_state,
+            mask_v,
+            ACTIVATION_TYPE=state.dtype.element_ty,
+            LOW_PRECISION_AMAX=False,
+        )
+    else:
+        values = _load_dynamic_fp8_state(
+            state_fp8,
+            state_scale,
+            fp8_offsets,
+            scale_offsets,
+            mask_state & valid_state,
+            mask_v & valid_state,
+            ACTIVATION_TYPE=state.dtype.element_ty,
+        )
+        tl.store(
+            state + state_offsets, values.to(state.dtype.element_ty), mask=mask_state
+        )
+
+
+@triton.jit
+def _load_state_slots(
+    state_indices,
+    num_accepted_tokens,
+    i_n,
+    stride_indices_seq: tl.constexpr,
+    stride_indices_tok: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
+    USE_SPEC_DECODING: tl.constexpr,
+    INDEX_TYPE: tl.constexpr,
+):
+    if USE_STATE_INDICES:
+        output_offset = i_n * stride_indices_seq
+        output_index = tl.load(state_indices + output_offset).to(INDEX_TYPE)
+        if USE_SPEC_DECODING:
+            accepted_offset = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+            initial_offset = output_offset + accepted_offset * stride_indices_tok
+            initial_index = tl.load(state_indices + initial_offset).to(INDEX_TYPE)
+        else:
+            initial_index = output_index
+    else:
+        initial_index = i_n
+        output_index = i_n
+    return initial_index, output_index
 
 
 @triton.jit
@@ -516,7 +405,6 @@ def _gdn_decode_value_tile(
         mask_state & output_state_valid,
         mask_v & output_state_valid,
         ACTIVATION_TYPE=v.dtype.element_ty,
-        STREAM_STATE_STORE=False,
         LOW_PRECISION_AMAX=LOW_PRECISION_AMAX,
     )
 
@@ -597,46 +485,21 @@ def _fused_recurrent_gated_delta_rule_grouped_w8a16_fp8_kernel(
         i_b = i_n
         i_t = 0
 
+    initial_state_index, output_state_index = _load_state_slots(
+        state_indices,
+        num_accepted_tokens,
+        i_n,
+        stride_indices_seq,
+        stride_indices_tok,
+        USE_STATE_INDICES,
+        USE_SPEC_DECODING,
+        INDEX_TYPE=tl.int32 if N >= 128 else tl.int64,
+    )
     if USE_STATE_INDICES:
-        output_index_offset = i_n * stride_indices_seq
-        if N >= 128:
-            output_state_index = tl.load(state_indices + output_index_offset).to(
-                tl.int32
-            )
-            if USE_SPEC_DECODING:
-                initial_token_offset = (
-                    tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
-                )
-                initial_index_offset = (
-                    i_n * stride_indices_seq + initial_token_offset * stride_indices_tok
-                )
-                initial_state_index = tl.load(state_indices + initial_index_offset).to(
-                    tl.int32
-                )
-            else:
-                initial_state_index = output_state_index
-        else:
-            output_state_index = tl.load(state_indices + output_index_offset).to(
-                tl.int64
-            )
-            if USE_SPEC_DECODING:
-                initial_token_offset = (
-                    tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
-                )
-                initial_index_offset = (
-                    i_n * stride_indices_seq + initial_token_offset * stride_indices_tok
-                )
-                initial_state_index = tl.load(state_indices + initial_index_offset).to(
-                    tl.int64
-                )
-            else:
-                initial_state_index = output_state_index
         if initial_state_index < 0:
             return
         output_state_valid = output_state_index >= 0
     else:
-        initial_state_index = i_n
-        output_state_index = i_n
         output_state_valid = True
 
     o_k = tl.arange(0, BK)
@@ -787,46 +650,21 @@ def _fused_recurrent_gated_delta_rule_w8a16_fp8_kernel(
         i_b = i_n
         i_t = 0
 
+    initial_state_index, output_state_index = _load_state_slots(
+        state_indices,
+        num_accepted_tokens,
+        i_n,
+        stride_indices_seq,
+        stride_indices_tok,
+        USE_STATE_INDICES,
+        USE_SPEC_DECODING,
+        INDEX_TYPE=tl.int32 if N >= 128 else tl.int64,
+    )
     if USE_STATE_INDICES:
-        output_index_offset = i_n * stride_indices_seq
-        if N >= 128:
-            output_state_index = tl.load(state_indices + output_index_offset).to(
-                tl.int32
-            )
-            if USE_SPEC_DECODING:
-                initial_token_offset = (
-                    tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
-                )
-                initial_index_offset = (
-                    i_n * stride_indices_seq + initial_token_offset * stride_indices_tok
-                )
-                initial_state_index = tl.load(state_indices + initial_index_offset).to(
-                    tl.int32
-                )
-            else:
-                initial_state_index = output_state_index
-        else:
-            output_state_index = tl.load(state_indices + output_index_offset).to(
-                tl.int64
-            )
-            if USE_SPEC_DECODING:
-                initial_token_offset = (
-                    tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
-                )
-                initial_index_offset = (
-                    i_n * stride_indices_seq + initial_token_offset * stride_indices_tok
-                )
-                initial_state_index = tl.load(state_indices + initial_index_offset).to(
-                    tl.int64
-                )
-            else:
-                initial_state_index = output_state_index
         if initial_state_index < 0:
             return
         output_state_valid = output_state_index >= 0
     else:
-        initial_state_index = i_n
-        output_state_index = i_n
         output_state_valid = True
 
     o_k = tl.arange(0, BK)
@@ -942,7 +780,6 @@ def _fused_recurrent_gated_delta_rule_w8a16_fp8_kernel(
         mask_state & output_state_valid,
         mask_v & output_state_valid,
         ACTIVATION_TYPE=q.dtype.element_ty,
-        STREAM_STATE_STORE=False,
         LOW_PRECISION_AMAX=LOW_PRECISION_AMAX,
     )
 
@@ -1146,7 +983,6 @@ def _fused_recurrent_gated_delta_rule_sequence_w8a16_fp8_kernel(
                 mask_state & output_state_valid,
                 mask_v & output_state_valid,
                 ACTIVATION_TYPE=q.dtype.element_ty,
-                STREAM_STATE_STORE=False,
                 LOW_PRECISION_AMAX=LOW_PRECISION_AMAX,
             )
 
@@ -1160,9 +996,44 @@ def _fused_recurrent_gated_delta_rule_sequence_w8a16_fp8_kernel(
             mask_state,
             mask_v,
             ACTIVATION_TYPE=q.dtype.element_ty,
-            STREAM_STATE_STORE=False,
             LOW_PRECISION_AMAX=LOW_PRECISION_AMAX,
         )
+
+
+def _convert_state(
+    state: torch.Tensor,
+    state_fp8: torch.Tensor,
+    state_scale: torch.Tensor,
+    *,
+    quantize: bool,
+    state_indices: torch.Tensor | None = None,
+) -> None:
+    S, HV, K, V = state.shape
+    use_3d_grid = S * HV > 65535
+    grid = (
+        (triton.cdiv(V, _STATE_BLOCK_V), HV, S)
+        if use_3d_grid
+        else (triton.cdiv(V, _STATE_BLOCK_V), S * HV)
+    )
+    _convert_state_kernel[grid](
+        state,
+        state_fp8,
+        state_scale,
+        state_indices,
+        stride_indices=0 if state_indices is None else state_indices.stride(0),
+        K=K,
+        V=V,
+        HV=HV,
+        BK=triton.next_power_of_2(K),
+        BV=_STATE_BLOCK_V,
+        QUANTIZE=quantize,
+        USE_STATE_INDICES=state_indices is not None,
+        USE_3D_GRID=use_3d_grid,
+        USE_INT64_OFFSETS=state_indices is not None
+        or max(state.numel(), state_fp8.numel()) >= 2**31,
+        num_warps=4,
+        num_stages=1,
+    )
 
 
 def quantize_gdn_state_fp8(
@@ -1178,29 +1049,10 @@ def quantize_gdn_state_fp8(
     if not hasattr(torch, "float8_e4m3fn"):
         raise RuntimeError("FP8 E4M3 is not available")
 
-    S, HV, K, V = state.shape
+    S, HV, _, V = state.shape
     state_fp8 = torch.empty(state.shape, device=state.device, dtype=torch.float8_e4m3fn)
     state_scale = torch.empty((S, HV, V), device=state.device, dtype=torch.float32)
-    use_3d_grid = S * HV > 65535
-    grid = (
-        (triton.cdiv(V, _STATE_BLOCK_V), HV, S)
-        if use_3d_grid
-        else (triton.cdiv(V, _STATE_BLOCK_V), S * HV)
-    )
-    _quantize_gdn_state_fp8_kernel[grid](
-        state,
-        state_fp8,
-        state_scale,
-        K=K,
-        V=V,
-        HV=HV,
-        BK=triton.next_power_of_2(K),
-        BV=_STATE_BLOCK_V,
-        USE_3D_GRID=use_3d_grid,
-        USE_INT64_OFFSETS=state.numel() >= 2**31,
-        num_warps=4,
-        num_stages=1,
-    )
+    _convert_state(state, state_fp8, state_scale, quantize=True)
     return state_fp8, state_scale
 
 
@@ -1212,7 +1064,7 @@ def dequantize_gdn_state_fp8(
     """Dequantize a per-channel scaled native FP8 E4M3 GDN state."""
     if state_fp8.ndim != 4 or not state_fp8.is_contiguous():
         raise ValueError("state_fp8 must be a contiguous [S, HV, K, V] tensor")
-    S, HV, K, V = state_fp8.shape
+    S, HV, _, V = state_fp8.shape
     if (
         state_scale.dtype != torch.float32
         or not state_scale.is_contiguous()
@@ -1220,26 +1072,7 @@ def dequantize_gdn_state_fp8(
     ):
         raise ValueError("state_scale must be contiguous FP32 with shape [S, HV, V]")
     state = torch.empty(state_fp8.shape, device=state_fp8.device, dtype=output_dtype)
-    use_3d_grid = S * HV > 65535
-    grid = (
-        (triton.cdiv(V, _STATE_BLOCK_V), HV, S)
-        if use_3d_grid
-        else (triton.cdiv(V, _STATE_BLOCK_V), S * HV)
-    )
-    _dequantize_gdn_state_fp8_kernel[grid](
-        state_fp8,
-        state_scale,
-        state,
-        K=K,
-        V=V,
-        HV=HV,
-        BK=triton.next_power_of_2(K),
-        BV=_STATE_BLOCK_V,
-        USE_3D_GRID=use_3d_grid,
-        USE_INT64_OFFSETS=state_fp8.numel() >= 2**31,
-        num_warps=4,
-        num_stages=1,
-    )
+    _convert_state(state, state_fp8, state_scale, quantize=False)
     return state
 
 
@@ -1280,30 +1113,13 @@ def _chunk_prefill_gated_delta_rule_w8a16_fp8(
     HV, V = v.shape[2:]
     N = B if cu_seqlens is None else cu_seqlens.numel() - 1
     BK = triton.next_power_of_2(K)
-    BV = min(_STATE_BLOCK_V, triton.next_power_of_2(V))
-    use_state_indices = ssm_state_indices is not None
-
     initial_state = torch.empty((N, HV, K, V), device=q.device, dtype=q.dtype)
-    _dequantize_indexed_gdn_state_fp8_kernel[(triton.cdiv(V, BV), N * HV)](
+    _convert_state(
+        initial_state,
         state_fp8,
         state_scale,
-        initial_state,
-        ssm_state_indices,
-        stride_state_s=state_fp8.stride(0),
-        stride_state_h=state_fp8.stride(1),
-        stride_state_k=state_fp8.stride(2),
-        stride_state_v=state_fp8.stride(3),
-        stride_scale_s=state_scale.stride(0),
-        stride_scale_h=state_scale.stride(1),
-        stride_scale_v=state_scale.stride(2),
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        USE_STATE_INDICES=use_state_indices,
-        num_warps=4,
-        num_stages=1,
+        quantize=False,
+        state_indices=ssm_state_indices,
     )
 
     q_normalized = torch.empty(q.shape, device=q.device, dtype=q.dtype)
@@ -1342,26 +1158,12 @@ def _chunk_prefill_gated_delta_rule_w8a16_fp8(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
     )
-    _quantize_indexed_gdn_state_fp8_kernel[(triton.cdiv(V, BV), N * HV)](
+    _convert_state(
         final_state,
         state_fp8,
         state_scale,
-        ssm_state_indices,
-        stride_state_s=state_fp8.stride(0),
-        stride_state_h=state_fp8.stride(1),
-        stride_state_k=state_fp8.stride(2),
-        stride_state_v=state_fp8.stride(3),
-        stride_scale_s=state_scale.stride(0),
-        stride_scale_h=state_scale.stride(1),
-        stride_scale_v=state_scale.stride(2),
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        USE_STATE_INDICES=use_state_indices,
-        num_warps=4,
-        num_stages=1,
+        quantize=True,
+        state_indices=ssm_state_indices,
     )
     return output, state_fp8, state_scale
 
@@ -1427,9 +1229,8 @@ def gdn_w8a16(
 
     use_packed_input = cu_seqlens is not None
     N = B if cu_seqlens is None else cu_seqlens.numel() - 1
-    if use_packed_input:
-        if B != 1:
-            raise ValueError("packed input requires shape [1, total_tokens, ...]")
+    if use_packed_input and B != 1:
+        raise ValueError("packed input requires shape [1, total_tokens, ...]")
 
     if state_fp8.dtype != torch.float8_e4m3fn:
         raise ValueError("state_fp8 must have dtype torch.float8_e4m3fn")
@@ -1450,19 +1251,15 @@ def gdn_w8a16(
             torch.int64,
         ):
             raise ValueError("ssm_state_indices must be an integer tensor on q.device")
-        if ssm_state_indices.ndim == 1:
-            if ssm_state_indices.shape[0] != N:
-                raise ValueError("ssm_state_indices must contain one row per sequence")
-            stride_indices_seq = ssm_state_indices.stride(0)
-            stride_indices_tok = 0
-            use_per_token_state_indices = False
-        elif ssm_state_indices.ndim == 2:
-            if ssm_state_indices.shape[0] != N:
-                raise ValueError("ssm_state_indices must contain one row per sequence")
-            stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
-            use_per_token_state_indices = True
-        else:
+        if ssm_state_indices.ndim not in (1, 2):
             raise ValueError("ssm_state_indices must be a 1D or 2D tensor")
+        if ssm_state_indices.shape[0] != N:
+            raise ValueError("ssm_state_indices must contain one row per sequence")
+        use_per_token_state_indices = ssm_state_indices.ndim == 2
+        stride_indices_seq = ssm_state_indices.stride(0)
+        stride_indices_tok = (
+            ssm_state_indices.stride(1) if use_per_token_state_indices else 0
+        )
     if num_accepted_tokens is not None:
         if ssm_state_indices is None or ssm_state_indices.ndim != 2:
             raise ValueError(
@@ -1638,25 +1435,6 @@ def gdn_w8a16(
     use_tma_load = (
         N >= 1024 and K == 128 and V == 128 and other_offsets_safe and is_tma_supported
     )
-    if use_tma_load:
-        tma_grid = (num_v_tiles, HV, N) if use_3d_decode_grid else (num_v_tiles, N * HV)
-        _set_tma_descriptor_allocator(q.device)
-        _fused_recurrent_gated_delta_rule_w8a16_fp8_kernel[tma_grid](
-            **kernel_args,
-            S=state_fp8.shape[0],
-            BV=block_v,
-            USE_3D_GRID=use_3d_decode_grid,
-            USE_TMA_LOAD=True,
-            USE_INT64_STATE_OFFSETS=not state_offsets_safe,
-            LOW_PRECISION_AMAX=N >= 128,
-            FP32_STATE_PRODUCTS=use_fp32_products,
-            FP32_UPDATE_PRODUCTS=use_fp32_products,
-            N=N,
-            num_warps=1,
-            num_stages=1,
-        )
-        return o, state_fp8, state_scale
-
     if not other_offsets_safe:
         _fused_recurrent_gated_delta_rule_sequence_w8a16_fp8_kernel[
             (num_v_tiles, N * HV)
@@ -1673,17 +1451,15 @@ def gdn_w8a16(
         )
         return o, state_fp8, state_scale
 
-    decode_grid = (
-        (triton.cdiv(V, block_v), HV, N)
-        if use_3d_decode_grid
-        else (triton.cdiv(V, block_v), N * HV)
-    )
+    if use_tma_load:
+        _set_tma_descriptor_allocator(q.device)
+    decode_grid = (num_v_tiles, HV, N) if use_3d_decode_grid else (num_v_tiles, N * HV)
     _fused_recurrent_gated_delta_rule_w8a16_fp8_kernel[decode_grid](
         **kernel_args,
         S=state_fp8.shape[0],
         BV=block_v,
         USE_3D_GRID=use_3d_decode_grid,
-        USE_TMA_LOAD=False,
+        USE_TMA_LOAD=use_tma_load,
         USE_INT64_STATE_OFFSETS=not state_offsets_safe,
         LOW_PRECISION_AMAX=N >= 128,
         FP32_STATE_PRODUCTS=use_fp32_products,

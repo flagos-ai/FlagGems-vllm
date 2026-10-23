@@ -132,17 +132,22 @@ def test_gdn_w8a16_accuracy(h, hv, n, t):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("packed", [False, True])
-def test_gdn_w8a16_nonzero_state(dtype, packed):
+@pytest.mark.parametrize("n,t", [(3, 4), (2, 192)])
+def test_gdn_w8a16_nonzero_state(dtype, packed, n, t):
     torch.manual_seed(43)
-    n, t, h, hv = 3, 4, 2, 6
-    q, k, v, g, beta, cu, indices = make_inputs(n, t, h, hv, dtype, packed)
+    h, hv = 2, 6
+    q, k, v, g, beta, cu, _ = make_inputs(n, t, h, hv, dtype, packed)
     # Strided q/k exercise recurrent address calculations.
     q = torch.stack((q, q), dim=-1)[..., 0]
     k = torch.stack((k, k), dim=-1)[..., 0]
-    initial = 0.02 * torch.randn(n, hv, 128, 128, device=q.device, dtype=dtype)
+    initial = 0.02 * torch.randn(2 * n, hv, 128, 128, device=q.device, dtype=dtype)
+    # Permuted, strided slots must select state and scale together in both paths.
+    indices = torch.arange(2 * n - 1, -1, -1, device=q.device, dtype=torch.int64)[::2]
     fp8, scales = quantize_gdn_state_fp8(initial)
     initial = dequantize_gdn_state_fp8(fp8, scales, output_dtype=dtype)
-    expected, expected_state = reference(q, k, v, g, beta, initial, n, t)
+    expected, updated_state = reference(q, k, v, g, beta, initial[indices], n, t)
+    expected_state = initial.float().clone()
+    expected_state[indices] = updated_state
     actual, _, _ = flaggems_vllm.gdn_w8a16(
         q,
         k,
