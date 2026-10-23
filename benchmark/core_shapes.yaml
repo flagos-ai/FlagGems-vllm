@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+grouped_gemm_w8a8:
+  shapes:
+    - [45, 512, 6144, 257]
+    - [45, 6144, 256, 257]
+  shape_desc: "M,N,K,E"
+
 concat_mla_q:
   shapes:
     - [1, 64, 512, 64]

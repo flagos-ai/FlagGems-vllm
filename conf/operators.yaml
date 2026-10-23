@@ -684,6 +684,17 @@ ops:
       - Reduction
     stages:
       - alpha: '5.4'
+  - id: grouped_gemm_w8a8
+    description: Per-channel INT8 grouped NT GEMM with unpadded rows and BF16 output.
+    for:
+      - sglang.grouped_gemm_nt_i8i8bf16_nopad
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - MoE
+    stages:
+      - alpha: '5.4'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
