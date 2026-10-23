@@ -530,3 +530,12 @@ bmm_w8a8:
     - [2, 64, 128, 256]
     - [4, 129, 17, 257]
   shape_desc: "B, M, N, K"
+
+sparse_flash_attention:
+  shapes:
+    - [1, 2560, 2560]
+    - [4, 6400, 2560]
+    - [8, 48000, 2560]
+    - [16, 48000, 2560]
+    - [16, 48000, 48000]
+  shape_desc: "batch, capacity_per_request, valid_kv_length; H=128, D=512+64, topk=2048"

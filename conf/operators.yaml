@@ -1267,6 +1267,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: sparse_flash_attention
+    description: |
+      Ascend shared-KV MLA with the vLLM-Ascend SFA interface and tuple outputs.
+      FP16/BF16, BSND/TND and paged caches, block sparsity and right-down causal
+      masking; dimensions 512+64. value must alias key; forward inference only.
+    for:
+      - _C_ascend.npu_sparse_flash_attention
+    labels:
+      - fused
+      - vLLM
+      - Ascend
+    kind:
+      - DSA
+    stages:
+      - alpha: '0.1.0'
   - id: sparse_mla_fwd_interface
     description: |
       A generic interface for sparse MLA (Multi-head Latent Attention) for DeepSeek v3/v3.2.
