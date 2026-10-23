@@ -12,368 +12,2003 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optimized fused MoE kernel for Ascend 910B.
+"""Fused MoE kernel for Ascend"""
 
-This module provides an Ascend-optimized implementation of the fused MoE
-(Mixture of Experts) operator, designed for vLLM inference workloads.
-The kernel performs expert routing, GEMM operations, and activation fusion
-with optimizations tailored for Ascend NPU architecture.
 
-[KernelGen] This kernel was generated and optimized using automated kernel
-generation and tuning infrastructure.
-"""
-
-from __future__ import annotations
-
-from typing import Optional
+import functools
+import logging
+import os
+from enum import Enum
+from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
+import torch_npu
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
+import yaml
+
+from flaggems_vllm.ops.mul import mul_
+from flaggems_vllm.runtime.backend._ascend.fused.moe_sum import moe_sum
+from flaggems_vllm.runtime.backend._ascend.ops.grouped_matmul import grouped_matmul
+from flaggems_vllm.utils import pointwise_dynamic
+
+logger = logging.getLogger(__name__)
+
+# OCP MX quantization helpers (requires amd-quark)
+
+OCP_MX_BLOCK_SIZE = 32
 
 
-@triton.jit
-def _route_kernel(
-    topk_ids_ptr,
-    topk_w_ptr,
-    sorted_tokens_ptr,
-    sorted_w_ptr,
-    sorted_route_ptr,
-    count_ptr,
-    ROWS: tl.constexpr,
-    ROWS_P2: tl.constexpr,
-    E: tl.constexpr,
-    topk: tl.constexpr,
-):
-    """Scan-based expert routing: row i=(t,r) gets packed position offset_e + rank.
+@functools.lru_cache(maxsize=1)
+def get_embedded_moe_configs():
+    config_path = os.path.join(
+        os.path.dirname(__file__), "..", "utils", "configs", "fused_moe_config.yaml"
+    )
+    if not os.path.exists(config_path):
+        return {}, {}
+    with open(config_path, "r") as f:
+        # JSON keys are strings, values are dicts where keys are M and values are configs
+        data = yaml.safe_load(f)
 
-    Packed order: expert-major, within-expert by original (t,r) index.
-    ROWS is a power of two, so the ids tile is exactly ROWS lanes (no
-    overrun past the caller's topk_ids allocation). Sorted arrays are padded
-    to ROWS_P2 so later tile loads stay in-bounds.
+        fallback = data.get("_FALLBACK", {})
+
+        # We need to convert the innermost keys (which are stringified integers for M) back to integers.
+        # Ensure we map the lists back to config dicts.
+        keys_order = [
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_N",
+            "BLOCK_SIZE_K",
+            "GROUP_SIZE_M",
+            "num_warps",
+            "num_stages",
+        ]
+        parsed_data = {}
+        for dev, configs in data.items():
+            if dev == "_FALLBACK":
+                continue
+            parsed_data[dev] = {}
+            for k, m_dict in configs.items():
+                parsed_dict = {}
+                for m, v in m_dict.items():
+                    if isinstance(v, list):
+                        parsed_dict[int(m)] = dict(zip(keys_order, v))
+                    else:
+                        parsed_dict[int(m)] = v
+                parsed_data[dev][k] = parsed_dict
+
+        return parsed_data, fallback
+
+
+def dequant_mxfp4(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    float_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize MXFP4 tensor via quark.torch.kernel.mx.dq_mxfp4."""
+    try:
+        from quark.torch.kernel import mx
+    except ImportError as err:
+        raise ImportError("amd-quark is required for MX-FP4") from err
+
+    return mx.dq_mxfp4(x, scale, float_dtype)
+
+
+def dequant_mxfp6(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    float_dtype: torch.dtype,
+    quant_dtype: str,
+) -> torch.Tensor:
+    """Dequantize MXFP6 tensor via quark hw_emulation."""
+    try:
+        from quark.torch.kernel.hw_emulation.hw_emulation_interface import (
+            dequantize_fp4_fp6_per_group,
+        )
+        from quark.torch.utils.pack import create_pack_method
+    except ImportError as err:
+        raise ImportError("amd-quark is required for MX-FP6") from err
+
+    pack_method = create_pack_method(None, dtype=quant_dtype)
+    unpacked_x = pack_method.unpack(x, reorder=False)
+
+    scale = 2 ** (scale.view(torch.uint8).to(torch.int16) - 127).to(float_dtype)
+
+    return dequantize_fp4_fp6_per_group(
+        unpacked_x,
+        scale,
+        axis=-1,
+        group_size=OCP_MX_BLOCK_SIZE,
+        quant_dtype=quant_dtype,
+    ).to(float_dtype)
+
+
+# Activation quantization helpers
+
+
+@functools.lru_cache(maxsize=1)
+def _get_device_name() -> str:
+    """Return the normalised CUDA device name (spaces replaced by underscores).
+
+    Matches the naming convention used by vLLM for its per-device config files.
+    H800 falls back to H100_80GB_HBM3 (same SM 9.0 architecture).
     """
-    pid = tl.program_id(0)
-    offs = tl.arange(0, ROWS)
-    ids = tl.load(topk_ids_ptr + offs).to(tl.int32)
-    e = tl.load(topk_ids_ptr + pid).to(tl.int32)
-    w = tl.load(topk_w_ptr + pid)
-    rank = tl.sum(((ids == e) & (offs < pid)).to(tl.int32))
-    offset = tl.sum((ids < e).to(tl.int32))
-    count_e = tl.sum((ids == e).to(tl.int32))
-    pos = offset + rank
-    tl.store(count_ptr + e, count_e)
-    tl.store(sorted_tokens_ptr + pos, (pid // topk).to(tl.int32))
-    tl.store(sorted_w_ptr + pos, w)
-    tl.store(sorted_route_ptr + pos, pid.to(tl.int32))
+    name = torch.npu.get_device_name().replace(" ", "_")
+    # Normalise the H200 product family to a single key, following vLLM.
+    if "H200" in name.split("_"):
+        name = "NVIDIA_H200"
+    # H800 has the same SM 9.0 as H100; use H100 configs as fallback.
+    embedded_configs, fallback_mapping = get_embedded_moe_configs()
+    if name in embedded_configs:
+        return name
+    # Fallback mapping for devices whose tuning profiles are equivalent.
+    fallback = fallback_mapping.get(name)
+    if fallback and fallback in embedded_configs:
+        logger.info(
+            "GEMS_ASCEND Device %s not in config table, falling back to %s",
+            name,
+            fallback,
+        )
+        return fallback
+    return name
 
 
-@triton.jit
-def _pack_kernel(
-    src_ptr,
-    dst_ptr,
-    idx_ptr,
-    ROWS,
-    K,
-    K_TILE: tl.constexpr,
-):
-    """Pack rows: dst[p, :] = src[idx[p], :] for p < ROWS, zero otherwise.
-
-    dst is (ROWS_P2, K). K_TILE divides K, tiles are exact. The idx load is a
-    masked scalar (masked lanes read row 0), so all addresses are in-bounds.
+def get_moe_configs(
+    E: int,
+    N: int,
+    dtype: str | None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+) -> dict[int, Any] | None:
     """
-    p = tl.program_id(0)
-    offs = tl.arange(0, K_TILE)
-    base_d = p.to(tl.int64) * K
-    valid = p < ROWS
-    t = tl.load(idx_ptr + p, mask=valid, other=0).to(tl.int64)
-    for k0 in range(0, K, K_TILE):
-        v = tl.load(src_ptr + t * K + k0 + offs)
-        tl.store(dst_ptr + base_d + k0 + offs, v, mask=valid)
+    Return optimized configurations for the fused MoE kernel.
 
-
-@triton.jit
-def _hq_kernel(
-    x_ptr,
-    q_ptr,
-    K,
-    COMPUTE_DTYPE: tl.constexpr,
-    K_TILE: tl.constexpr,
-):
-    """Per-row int8 fake quantization: q = round(clamp(x/scale, -128, 127)) * scale.
-
-    scale = max|x| / 127 per row. K_TILE divides K, so every tile is exact and
-    all loads/stores are unmasked (no out-of-range DMA).
+    Looks up pre-tuned configs from the embedded table (ported from vLLM)
+    for the current GPU device. Returns None if no matching config is found.
     """
-    pid = tl.program_id(0)
-    offs = tl.arange(0, K_TILE)
-    base = pid.to(tl.int64) * K
-    amax = tl.zeros((), dtype=tl.float32) - 1.0
-    for k0 in range(0, K, K_TILE):
-        v = tl.load(x_ptr + base + k0 + offs).to(tl.float32)
-        amax = tl.maximum(amax, tl.max(tl.abs(v)))
-    sc = tl.maximum(amax, 1e-10) / 127.0
-    for k0 in range(0, K, K_TILE):
-        v = tl.load(x_ptr + base + k0 + offs).to(tl.float32)
-        q = tl.floor(tl.minimum(tl.maximum(v / sc, -128.0), 127.0) + 0.5) * sc
-        tl.store(q_ptr + base + k0 + offs, q.to(COMPUTE_DTYPE))
+    device_name = _get_device_name()
+    embedded_configs, _ = get_embedded_moe_configs()
+    device_table = embedded_configs.get(device_name)
+    if device_table is None:
+        logger.warning(
+            "GEMS_ASCEND No embedded MoE configs for device %s. Will use default config.",
+            device_name,
+        )
+        return None
+
+    _block_n = block_n if block_n else 0
+    _block_k = block_k if block_k else 0
+    key = f"{E},{N},{dtype},{_block_n},{_block_k}"
+    configs = device_table.get(key)
+    if configs is not None:
+        logger.info(
+            "GEMS_ASCEND Using embedded MoE config for device=%s, key=%s",
+            device_name,
+            key,
+        )
+        return configs
+    logger.warning(
+        "GEMS_ASCEND No embedded MoE config for device=%s, key=%s. Will use default config.",
+        device_name,
+        key,
+    )
+    return None
+
+
+def try_get_optimal_moe_config(
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    top_k: int,
+    dtype: str | None,
+    M: int,
+    block_shape: list[int] | None = None,
+) -> dict[str, int]:
+    # First try to load optimal config from the embedded table
+    E, _, N = w2_shape
+    if dtype == "int4_w4a16":
+        N = N * 2
+    block_n = block_shape[0] if block_shape else 0
+    block_k = block_shape[1] if block_shape else 0
+    configs = get_moe_configs(E, N, dtype, block_n, block_k)
+
+    if configs:
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    else:
+        config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
+    return config
+
+
+def _get_config_quant_dtype(
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    ocp_mx_scheme: str | None,
+) -> None | torch.dtype | str:
+    """Map quantization flags to the corresponding dtype."""
+    if use_fp8_w8a8:
+        return torch.float8_e4m3fn
+    elif use_int8_w8a8:
+        return torch.int8
+    elif ocp_mx_scheme == "w_mxfp4_a_mxfp4":
+        return "mxfp4"
+    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e3m2", "w_mxfp6_e3m2_a_mxfp6_e3m2"}:
+        return "mxfp6_e3m2"
+    elif ocp_mx_scheme in {"w_mxfp4_a_mxfp6_e2m3", "w_mxfp6_e2m3_a_mxfp6_e2m3"}:
+        return "mxfp6_e2m3"
+    elif ocp_mx_scheme in {"w_mxfp4", "w_mxfp6_e3m2", "w_mxfp6_e2m3"}:
+        return torch.bfloat16
+    elif ocp_mx_scheme in {"w_mxfp4_a_fp8", "w_mxfp6_e3m2_a_fp8", "w_mxfp6_e2m3_a_fp8"}:
+        return torch.float8_e4m3fn
+
+    return None
+
+
+def get_moe_wna16_block_config(
+    config: dict[str, int],
+    use_moe_wna16_cuda: bool,
+    num_valid_tokens: int,
+    size_k: int,
+    size_n: int,
+    num_experts: int,
+    group_size: int,
+    real_top_k: int,
+    block_size_m: int,
+):
+    if "BLOCK_SIZE_N" in config and "BLOCK_SIZE_K" in config:
+        return {}
+    if not use_moe_wna16_cuda:
+        if num_valid_tokens // real_top_k == 1:
+            return {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64}
+        else:
+            return {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}
+    else:
+        block_size_n = 128
+        block_size_k = 128
+        if block_size_k <= group_size:
+            block_size_k = group_size
+
+        num_n_blocks = size_k // block_size_k
+        num_k_blocks = size_n // block_size_k
+        num_m_blocks = (
+            num_valid_tokens + block_size_m - 1
+        ) / block_size_m + num_experts
+        if num_valid_tokens // real_top_k <= block_size_m:
+            num_m_blocks = min(num_m_blocks, num_valid_tokens)
+        num_blocks = num_m_blocks * num_n_blocks * num_k_blocks
+
+        if size_k % 256 == 0 and num_blocks >= 256 and block_size_k < 256:
+            block_size_k = 256
+            num_blocks = num_blocks // (256 // block_size_k)
+
+        if (
+            num_m_blocks <= 16
+            and size_k % (block_size_k * 2) == 0
+            and size_k % (block_size_k * 2) == 0
+            and block_size_k <= 512
+            and num_blocks >= 512
+        ):
+            block_size_k = block_size_k * 2
+            num_blocks = num_blocks // 2
+
+        if num_blocks > 1024:
+            block_size_n = 256
+            num_n_blocks = num_n_blocks // 2
+            num_blocks = num_blocks // 2
+
+        if size_n <= 1024 and num_blocks >= 1024:
+            block_size_n = 1024
+
+        block_size_k = _ensure_block_size_k_divisible(size_k, block_size_k, group_size)
+
+        return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
+
+
+def get_default_config(
+    M: int,
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: str | None,
+    block_shape: list[int] | None = None,
+) -> dict[str, int]:
+    """Default Triton config for fused MoE kernel.
+
+    Heuristic selection aligned with vLLM v0.17.0 defaults, tuned on H20/H100.
+    Key insight: for high-expert-count MoE (e.g. DeepSeek-V3 E=256), each
+    expert sees very few tokens, so small BLOCK_SIZE_M (16) is critical.
+    """
+    if dtype == "fp8_w8a8" and block_shape is not None:
+        config = {
+            "BLOCK_SIZE_M": 16 if M <= 64 else 64,
+            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_K": block_shape[1],
+            "GROUP_SIZE_M": 1 if M <= 16 else 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    else:
+        # tokens_per_expert drives block_m. Float division: integer division
+        # truncates to 0 on decode-scale inputs (M < E), silently
+        # misclassifying the shape into the wrong ladder branch.
+        tokens_per_expert = M / max(E, 1)
+
+        # BM=16 for decode-scale routing (< ~1 token per expert): the GEMM is
+        # B-streaming bound there, and smaller BM directly cuts padded-row
+        # waste (every non-empty expert costs BM rows of compute regardless
+        # of its token count). Measured tl.dot cube caps on Ascend910B4-1
+        # (perf_gemm_micro.py, bf16): BM=16 ~16, BM=64 ~41, BM=128 ~96-105;
+        # BM=256 fails to compile. BN=256 + 8 warps > BN=128 + 4 warps.
+        if tokens_per_expert < 1:
+            block_m = 16
+        elif tokens_per_expert <= 16:
+            block_m = 64
+        else:
+            block_m = 128
+
+        if N >= 2048:
+            block_n = 256
+            num_warps = 8
+            # BK=256 is the current best on HBM-bound large shapes (512B
+            # contiguous bursts; gemm1 16.3 -> 14.8 ms on DSv3 TP8). Only
+            # safe with BM=64; BM=128 caps at BK=128 (measured on Mixtral
+            # 512-token: gemm1 4.3 -> 2.9 ms, and it just fits L0C).
+            block_k = 256 if block_m == 64 else 128
+        else:
+            # BK=64 in this branch overflows UB on small-N shapes
+            # (measured: needs 198KB > 192KB UB on (8,4,64,128,2)).
+            block_n = 128
+            block_k = 32
+            num_warps = 4
+
+        # BK>=64 is safe again on large-N shapes now that B tiles are loaded
+        # in the natural direction (the old 'vsel' compiler failure was tied
+        # to the transposed-B pattern). fp8 blockwise keeps its own block_k
+        # above.
+
+        if tokens_per_expert > 128:
+            group_m = 16
+        elif tokens_per_expert > 32:
+            group_m = 8
+        else:
+            group_m = 1
+
+        num_stages = 2
+
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
+            "GROUP_SIZE_M": group_m,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    return config
+
+
+def _get_config_dtype_str(
+    dtype: Optional[torch.dtype] = None,
+    use_fp8_w8a8: bool = False,
+    use_fp8_w8a16: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    ocp_mx_scheme: str | None = None,
+) -> str | None:
+    """Return dtype string for kernel config lookup."""
+    if use_fp8_w8a8:
+        return "fp8_w8a8"
+    elif use_fp8_w8a16:
+        return "fp8_w8a16"
+    elif use_int8_w8a16:
+        return "int8_w8a16"
+    elif use_int4_w4a16:
+        return "int4_w4a16"
+    elif ocp_mx_scheme is not None:
+        return None
+    elif dtype == torch.float:
+        return "float32"
+    return None
+
+
+# MoE activation enum
+
+
+class MoEActivation(Enum):
+    """Activation functions for MoE layers."""
+
+    # Gated: gate * activation(up), input [..., 2*d] -> output [..., d]
+    SILU = "silu"
+    GELU = "gelu"
+    RELU2 = "relu2"
+    SWIGLUOAI = "swigluoai"
+    SWIGLUSTEP = "swiglustep"
+
+    # Non-gated: input [..., d] -> output [..., d]
+    SILU_NO_MUL = "silu_no_mul"
+    GELU_NO_MUL = "gelu_no_mul"
+    RELU2_NO_MUL = "relu2_no_mul"
+
+    @property
+    def is_gated(self) -> bool:
+        return not self.value.endswith("_no_mul")
+
+    def without_mul(self) -> "MoEActivation":
+        """Return the non-gated variant."""
+        _without_mul: dict[MoEActivation, MoEActivation] = {
+            MoEActivation.SILU: MoEActivation.SILU_NO_MUL,
+            MoEActivation.GELU: MoEActivation.GELU_NO_MUL,
+            MoEActivation.RELU2: MoEActivation.RELU2_NO_MUL,
+        }
+        return _without_mul.get(self, self)
+
+    @classmethod
+    def from_str(cls, s: str) -> "MoEActivation":
+        for member in cls:
+            if member.value == s:
+                return member
+        valid = [m.value for m in cls]
+        raise ValueError(f"Unknown MoE activation: {s!r}. Valid activations: {valid}")
+
+    @staticmethod
+    def adjust_N_for_activation(N: int, activation: "MoEActivation") -> int:
+        """Return N for non-gated, N // 2 for gated activations."""
+        return N if not activation.is_gated else N // 2
+
+
+def apply_moe_activation(
+    activation: MoEActivation,
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> torch.Tensor:
+    """Apply MoE activation (pure PyTorch / FlagGems Triton)."""
+    assert input.dim() == 2, "Input must be 2D"
+    assert output.dim() == 2, "Output must be 2D"
+    if activation.is_gated:
+        assert output.size(-1) * 2 == input.size(
+            -1
+        ), f"{activation.value} expects 2x ratio: {output.size(-1) * 2} vs {input.size(-1)}"
+    else:
+        assert output.size(-1) == input.size(
+            -1
+        ), f"{activation.value} expects equal sizes: {output.size(-1)} vs {input.size(-1)}"
+
+    if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
+        N = output.size(-1)
+        x, y = input[:, :N], input[:, N:]
+        _silu_and_mul_kernel(x, y, out0=output)
+    elif activation == MoEActivation.GELU:
+        N = output.size(-1)
+        gate, up = input[:, :N], input[:, N:]
+        output.copy_(F.gelu(gate) * up)
+    elif activation == MoEActivation.SWIGLUSTEP:
+        N = output.size(-1)
+        gate, up = input[:, :N], input[:, N:]
+        output.copy_(torch.sigmoid(gate) * up)
+    elif activation == MoEActivation.RELU2:
+        N = output.size(-1)
+        gate, up = input[:, :N], input[:, N:]
+        output.copy_(F.relu(gate).square() * up)
+
+    elif activation == MoEActivation.SILU_NO_MUL:
+        output.copy_(F.silu(input))
+    elif activation == MoEActivation.GELU_NO_MUL:
+        output.copy_(F.gelu(input))
+    elif activation == MoEActivation.RELU2_NO_MUL:
+        F.relu(input, inplace=True)
+        torch.square(input, out=output)
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+    return output
+
+
+def _fp8_quantize(
+    A: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    per_act_token: bool,
+    block_shape: Optional[list[int]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 E4M3 quantization: per-tensor, per-token, or block-wise."""
+    fp8_dtype = torch.float8_e4m3fn
+    finfo = torch.finfo(fp8_dtype)
+    fp8_max = finfo.max
+    fp8_min = finfo.min
+    eps = 1e-10
+
+    if block_shape is not None:
+        assert not per_act_token
+        assert len(block_shape) == 2
+        block_k = block_shape[1]
+        assert A.size(-1) % block_k == 0
+        orig_shape = A.shape
+        A_flat = A.reshape(-1, A.size(-1))
+        M, K = A_flat.shape
+        A_groups = A_flat.reshape(M * (K // block_k), block_k)
+        amax = (
+            A_groups.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
+        )
+        scale = amax / fp8_max
+        A_q = (A_groups.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+        A_q = A_q.reshape(orig_shape)
+        scale = scale.reshape(M, K // block_k)
+        return A_q, scale
+
+    elif per_act_token:
+        A_flat = A.reshape(-1, A.size(-1))
+        amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
+        scale = amax / fp8_max
+        min_scale = torch.tensor(
+            1.0 / (fp8_max * 512.0), dtype=torch.float32, device=A.device
+        )
+        scale = scale.clamp(min=min_scale)
+        A_q = (A_flat.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+        A_q = A_q.reshape(A.shape)
+        scale = scale.reshape(A.shape[:-1] + (1,))
+        return A_q, scale
+
+    else:
+        if A_scale is not None:
+            scale = (
+                A_scale.float().view(1, 1) if A_scale.numel() == 1 else A_scale.float()
+            )
+            A_q = (A.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+            return A_q, A_scale
+        else:
+            amax = A.abs().amax().clamp(min=eps).to(torch.float32)
+            scale = amax / fp8_max
+            iscale = 1.0 / scale
+            A_q = (A.float() * iscale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+            return A_q, scale.view(1)
+
+
+def _int8_quantize(
+    A: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    per_act_token: bool,
+    block_shape: Optional[list[int]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """INT8 quantization: per-tensor, per-token, or block-wise."""
+    iinfo = torch.iinfo(torch.int8)
+    int8_max = iinfo.max
+    int8_min = iinfo.min
+    eps = 1e-10
+
+    if block_shape is not None:
+        assert not per_act_token
+        assert len(block_shape) == 2
+        block_k = block_shape[1]
+        assert A.size(-1) % block_k == 0
+        orig_shape = A.shape
+        A_flat = A.reshape(-1, A.size(-1))
+        M, K = A_flat.shape
+        A_groups = A_flat.reshape(M * (K // block_k), block_k)
+        amax = (
+            A_groups.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
+        )
+        scale = amax / int8_max
+        A_q = (
+            (A_groups.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
+        )
+        A_q = A_q.reshape(orig_shape)
+        scale = scale.reshape(M, K // block_k)
+        return A_q, scale
+
+    elif per_act_token:
+        A_flat = A.reshape(-1, A.size(-1))
+        amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
+        scale = amax / int8_max
+        A_q = (A_flat.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
+        A_q = A_q.reshape(A.shape)
+        scale = scale.reshape(A.shape[:-1] + (1,))
+        return A_q, scale
+
+    else:
+        assert A_scale is not None, "int8 per-tensor requires A_scale"
+        scale = A_scale.float().view(1, 1) if A_scale.numel() == 1 else A_scale.float()
+        A_q = (A.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
+        return A_q, A_scale
+
+
+def moe_kernel_quantize_input(
+    A: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    quant_dtype: None | torch.dtype | str,
+    per_act_token_quant: bool,
+    block_shape: Optional[list[int]] = None,
+    ocp_mx_scheme: str | None = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Quantize MoE input activations before GEMM."""
+    if ocp_mx_scheme is not None:
+        if ocp_mx_scheme in {"w_mxfp4", "w_mxfp4_a_mxfp4"}:
+            pass
+        elif ocp_mx_scheme.endswith("a_fp8"):
+            qA, qA_scale = _fp8_quantize(A, A_scale, per_act_token=False)
+            A = (qA.float() * qA_scale.float()).to(A.dtype)
+            return A, None
+
+    if quant_dtype is None:
+        return A, A_scale
+    elif quant_dtype == torch.float8_e4m3fn:
+        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+    elif quant_dtype == torch.int8:
+        return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
+    else:
+        return A, A_scale
+
+
+def _ensure_block_size_k_divisible(
+    size_k: int, block_size_k: int, group_size: int
+) -> int:
+    """Find largest block_size_k that divides size_k and is divisible by group_size."""
+    if size_k % block_size_k == 0 and block_size_k % group_size == 0:
+        return block_size_k
+
+    max_search = min(block_size_k, size_k)
+    start = (max_search // group_size) * group_size
+    for candidate in range(start, group_size - 1, -group_size):
+        if size_k % candidate == 0:
+            return candidate
+
+    if size_k % group_size == 0:
+        return group_size
+
+    return size_k
+
+
+@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
+@triton.jit
+def _silu_and_mul_kernel(x, y):
+    x_fp32 = x.to(tl.float32)
+    x_silu = tl.fdiv(x_fp32, (1.0 + tl.exp(-x_fp32)))
+    return x_silu * y
 
 
 @triton.jit
-def _dequant_w_kernel(
-    w_ptr,
-    scale_ptr,
-    out_ptr,
+def write_zeros_to_output(
+    c_ptr,
+    stride_cm,
+    stride_cn,
+    pid_n,
     N,
-    K,
-    count_ptr,
-    E: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
+    offs_token,
+    token_mask,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    compute_type,
 ):
-    """Dequantize int8 weights with per-channel scale to COMPUTE dtype.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
-    Skips experts with zero routed rows. BLOCK_N=64 and BLOCK_K=64 divide
-    every workload N/K, so all loads/stores are unmasked.
-    """
-    e = tl.program_id(0)
-    n_tile = tl.program_id(1)
-    if tl.load(count_ptr + e) == 0:
+
+@triton.jit
+def fused_moe_kernel_gptq_awq(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    b_zp_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bze,
+    stride_bzk,
+    stride_bzn,
+    block_k_diviable: tl.constexpr,
+    group_size: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_int4_w4a16: tl.constexpr,
+    use_int8_w8a16: tl.constexpr,
+):
+    """Fused MoE kernel for GPTQ/AWQ (WNA16) quantized weights."""
+    # Map pid to C block (grouped ordering for L2 reuse)
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Create pointers for first blocks of A and B
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    n0 = n_tile * BLOCK_N
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    base = e.to(tl.int64) * N * K
-    s = tl.load(scale_ptr + e.to(tl.int64) * N + n0 + offs_n).to(tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        w8 = tl.load(
-            w_ptr
-            + base
-            + (k0 + offs_k)[:, None].to(tl.int64)
-            + (n0 + offs_n)[None, :].to(tl.int64) * K
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    # Cast to int64 to prevent overflow in stride*offset products
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        # -----------------------------------------------------------
+        # Write back zeros to the output when the expert is not
+        # in the current expert parallel rank.
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
         )
-        wf = w8.to(tl.float32) * s[None, :]
-        tl.store(
-            out_ptr
-            + base
-            + (k0 + offs_k)[:, None].to(tl.int64)
-            + (n0 + offs_n)[None, :].to(tl.int64) * K,
-            wf.to(COMPUTE_DTYPE),
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    if use_int4_w4a16:
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] // 2) * stride_bk
+            + offs_bn[None, :] * stride_bn
         )
+        b_shifter = (offs_k[:, None] % 2) * 4
+    elif use_int8_w8a16:
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+
+    if not has_zp and use_int4_w4a16:
+        b_zp_num = 8
+    if not has_zp and use_int8_w8a16:
+        b_zp_num = 128
+    elif has_zp and use_int4_w4a16:
+        b_zp_shifter = (offs_bn[None, :] % 2) * 4
+
+    # Accumulate C block in fp32
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        if not block_k_diviable:
+            k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+            k_other = 0.0
+        else:
+            k_mask = None
+            k_other = None
+
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
+        b = tl.load(b_ptrs)
+        if use_int4_w4a16:
+            b = (b >> b_shifter) & 0xF
+
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+        )
+        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        b_scale = b_scale.to(tl.float32)
+
+        if has_zp and use_int4_w4a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 2) * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = (b_zp >> b_zp_shifter) & 0xF
+            b_zp = b_zp.to(tl.float32)
+        elif has_zp and use_int8_w8a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + offs_bn[None, :] * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = b_zp.to(tl.float32)
+
+        if has_zp:
+            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        else:
+            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        if use_int4_w4a16:
+            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+        else:
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    # Write back output
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit
-def _gemm1_kernel(
-    pack_ptr,
-    w1_ptr,
-    inter_ptr,
-    count_ptr,
-    sorted_w_ptr,
-    K,
+def fused_moe_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_bias_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
     N,
-    E: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    E_P2: tl.constexpr,
-    APPLY_W_ON_INPUT: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bbe,  # bias expert stride
+    stride_bbn,  # bias N stride
+    # Block size for block-wise quantization
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    naive_block_assignment: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
+    use_int8_w8a16: tl.constexpr,
+    per_channel_quant: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    EVEN_N: tl.constexpr,
 ):
-    """GEMM1: packed rows [offset_e, offset_e+count_e) @ w1[e][n, :].
+    """Fused MoE kernel: token × expert GEMM with quantization support."""
+    # Map pid to C block (grouped ordering for L2 reuse)
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
-    w1[e] is [N, K] (N = 2*intermediate). All dot-loop A rows are affine in
-    the tile offset (packed input). count is padded to E_P2 and sorted_w is
-    padded to 128 rows, so every masked tile load stays in-bounds.
-    """
-    e = tl.program_id(0)
-    n_tile = tl.program_id(1)
-    n0 = n_tile * BLOCK_N
-    offs_n = tl.arange(0, BLOCK_N)
-    n_mask = offs_n < (N - n0)
-    offs_e = tl.arange(0, E_P2)
-    counts = tl.load(count_ptr + offs_e)
-    count_e = tl.load(count_ptr + e)
-    offset_e = tl.sum((offs_e < e).to(tl.int32) * counts)
-    m_offs = tl.arange(0, BLOCK_M)
-    k_offs = tl.arange(0, BLOCK_K)
-    w1_base = w1_ptr + e.to(tl.int64) * N * K
-    for m0 in range(0, count_e, BLOCK_M):
-        offs_m = m0 + m_offs
-        m_mask = offs_m < count_e
-        prow = offset_e + offs_m
-        wgt = tl.load(sorted_w_ptr + prow, mask=m_mask, other=0.0)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k0 in range(0, K, BLOCK_K):
+    # Create pointers for first blocks of A and B
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    if not naive_block_assignment:
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    else:
+        offs_token = tl.where(
+            offs == 0,
+            pid_m,  # first element = pid_m
+            num_valid_tokens,  # remaining elements = constant
+        )
+    offs_token = offs_token.to(tl.int64)  # prevent int32 overflow
+
+    token_mask = offs_token < num_valid_tokens
+
+    offs_token = tl.where(token_mask, offs_token, 0)
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        # Expert not in current EP rank, write zeros
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    if EVEN_N:
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    else:
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    # Load B tiles in the natural (N, K) direction and transpose in-register:
+    # on triton-ascend, tl.dot only lowers to the cube unit when the B tile
+    # is loaded along its contiguous axis -- the transposed-tile pattern
+    # scalarizes the whole GEMM (~0.1 TFLOPS vs ~100 TFLOPS, measured with
+    # perf_gemm_micro.py on Ascend910B4-1).
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk)
+    )
+    if use_int8_w8a16:
+        b_scale_ptrs = (
+            b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+        )
+        b_scale = tl.load(b_scale_ptrs)
+
+    if use_fp8_w8a8 or use_int8_w8a8:
+        if group_k > 0 and group_n > 0:  # block-wise
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
+        elif per_channel_quant:  # channel-wise
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        else:  # tensor-wise
+            a_scale = tl.load(a_scale_ptr)
+            b_scale = tl.load(b_scale_ptr + off_experts)
+    if HAS_BIAS:
+        bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn * stride_bbn
+        bias = tl.load(bias_ptrs, mask=(offs_bn < N), other=0.0)
+    # Accumulate C block in fp32
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    k_total = K
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Pre-compute remaining K for this iteration
+        k_offset = k * BLOCK_SIZE_K
+        k_remaining = k_total - k_offset
+        # Use other=0.0 for proper tail block handling - compatible with all batch sizes
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
             a = tl.load(
-                pack_ptr + prow[:, None].to(tl.int64) * K + k0 + k_offs[None, :],
-                mask=m_mask[:, None],
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
                 other=0.0,
             )
-            if APPLY_W_ON_INPUT:
-                a = (a.to(tl.float32) * wgt[:, None]).to(COMPUTE_DTYPE)
-            b = tl.load(
-                w1_base
-                + (k0 + k_offs)[:, None].to(tl.int64)
-                + (n0 + offs_n)[None, :].to(tl.int64) * K,
-                mask=n_mask[None, :],
-                other=0.0,
-            ).to(COMPUTE_DTYPE)
-            acc = tl.dot(a, b, acc=acc)
-        out = acc.to(COMPUTE_DTYPE)
-        tl.store(
-            inter_ptr
-            + prow[:, None].to(tl.int64) * N
-            + (n0 + offs_n)[None, :].to(tl.int64),
-            out,
-            mask=m_mask[:, None] & n_mask[None, :],
+            b = tl.load(b_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        if use_int8_w8a16:
+            accumulator = tl.dot(a, tl.trans(b).to(compute_type), acc=accumulator)
+        elif use_fp8_w8a8 or use_int8_w8a8:
+            if group_k > 0 and group_n > 0:
+                k_start = k * BLOCK_SIZE_K
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+
+                accumulator += (
+                    tl.dot(a, tl.trans(b)) * a_scale[:, None] * b_scale[None, :]
+                )
+            else:
+                if use_fp8_w8a8:
+                    accumulator = tl.dot(a, tl.trans(b), acc=accumulator)
+                else:
+                    accumulator += tl.dot(a, tl.trans(b))
+        else:
+            accumulator += tl.dot(a, tl.trans(b))
+        # Update pointers for next iteration
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Dequantization
+    if use_int8_w8a16:
+        accumulator = accumulator * b_scale
+    elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
+        accumulator = accumulator * a_scale * b_scale
+
+    if HAS_BIAS:
+        accumulator += bias[None, :]
+
+    # Router weight multiplication (must be in fp32)
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(
+            topk_weights_ptr + offs_token,
+            mask=token_mask,
+            other=0,
+        )
+        accumulator *= moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+
+    # Write back output
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    if EVEN_N:
+        c_mask = token_mask[:, None]
+    else:
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def invoke_fused_moe_wna16_triton_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None,
+):
+    assert B_scale is not None and B_scale.ndim == 3
+    assert B_zp is None or B_zp.ndim == 3
+    assert block_shape is not None and block_shape[0] == 0
+
+    M = A.size(0)
+    num_tokens = M * top_k
+
+    EM = sorted_token_ids.size(0)
+    if A.size(0) < config["BLOCK_SIZE_M"]:
+        # optimize for small batch_size.
+        # We assume that top_ids of each token is unique,
+        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
+        # and we can skip some invalid blocks.
+        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+    )
+    config = config.copy()
+    config.update(
+        get_moe_wna16_block_config(
+            config=config,
+            use_moe_wna16_cuda=False,
+            num_valid_tokens=num_tokens,
+            size_k=A.size(1),
+            size_n=B.size(1),
+            num_experts=B.size(1),
+            group_size=block_shape[1],
+            real_top_k=top_k,
+            block_size_m=config["BLOCK_SIZE_M"],
+        )
+    )
+
+    fused_moe_kernel_gptq_awq[grid](
+        A,
+        B,
+        C,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.size(1),
+        A.size(1),
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        B_scale.stride(0),
+        B_scale.stride(2),
+        B_scale.stride(1),
+        B_zp.stride(0) if B_zp is not None else 0,
+        B_zp.stride(2) if B_zp is not None else 0,
+        B_zp.stride(1) if B_zp is not None else 0,
+        block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
+        group_size=block_shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        has_zp=B_zp is not None,
+        use_int4_w4a16=use_int4_w4a16,
+        use_int8_w8a16=use_int8_w8a16,
+        **config,
+    )
+
+
+def invoke_fused_moe_triton_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    B_scale: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
+    block_shape: Optional[list[int]] = None,
+    B_bias: torch.Tensor | None = None,
+) -> None:
+    """Launch the fused_moe_kernel Triton kernel."""
+    assert topk_weights is not None or not mul_routed_weight
+    assert topk_weights is None or topk_weights.stride(1) == 1
+    assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+
+    if use_fp8_w8a8 or use_int8_w8a8:
+        assert B_scale is not None
+        assert block_shape is None or triton.cdiv(
+            B.size(-2), block_shape[0]
+        ) == B_scale.size(-2)
+        assert block_shape is None or triton.cdiv(
+            B.size(-1), block_shape[1]
+        ) == B_scale.size(-1)
+    elif use_int8_w8a16 or use_int4_w4a16:
+        assert B_scale is not None
+        assert block_shape is None or block_shape[0] == 0
+    else:
+        assert A_scale is None
+        assert B_scale is None
+
+    M = A.size(0)
+    num_tokens = M * top_k
+    if sorted_token_ids is not None:
+        EM = sorted_token_ids.size(0)
+        if A.size(0) < config["BLOCK_SIZE_M"]:
+            EM = min(
+                sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"]
+            )
+    else:
+        EM = num_tokens * config["BLOCK_SIZE_M"]
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+    )
+    HAS_BIAS = B_bias is not None
+
+    config = config.copy()
+    # The legacy kernel carries more live buffers than the lean fast-path
+    # GEMM (scale handling, both mask patterns, ...). The fast-path tile
+    # sizes (BN=256, BK=128) overflow UB here -- and note the w8a16/w4a16
+    # callers dequantize weights and CLEAR their quant flags before
+    # dispatching, so this guard must be unconditional. Clamp to the
+    # empirically safe envelope, then shrink stages to fit UB.
+    config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
+    config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 32)
+    config["num_warps"] = min(config["num_warps"], 4)
+    UB_LIMIT = 196608  # 192KB
+    ub_per_stage = (
+        config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_K"] * 2
+        + config["BLOCK_SIZE_K"] * config["BLOCK_SIZE_N"] * 2
+        + config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_N"] * 4
+    )
+    while (
+        config["num_stages"] > 1
+        and ub_per_stage * config["num_stages"] > UB_LIMIT * 0.7
+    ):
+        config["num_stages"] -= 1
+    config["SPLIT_K"] = 1
+    BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+    if block_shape is not None:
+        BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
+
+    # When K/N divide evenly by the block sizes, drop the tail masks and the
+    # `% N` address wraparound from the hot loop: on triton-ascend they block
+    # vectorized/DMA lowering of the loads and stores (scalar fallback).
+    EVEN_K = (B.size(2) % BLOCK_SIZE_K) == 0
+    EVEN_N = (B.size(1) % config["BLOCK_SIZE_N"]) == 0
+
+    fused_moe_kernel[grid](
+        A,
+        B,
+        C,
+        B_bias,
+        A_scale,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.size(1),  # N
+        B.size(2),  # K
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_bias.stride(0) if B_bias is not None else 0,
+        B_bias.stride(1) if B_bias is not None else 0,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        per_channel_quant=per_channel_quant,
+        naive_block_assignment=(sorted_token_ids is None),
+        HAS_BIAS=HAS_BIAS,
+        EVEN_K=EVEN_K,
+        EVEN_N=EVEN_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        **config,
+    )
+
+
+def dispatch_fused_moe_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    B_scale: Optional[torch.Tensor],
+    B_zp: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    block_shape: Optional[list[int]] = None,
+    B_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """Dispatch to the appropriate fused MoE kernel based on quantization flags."""
+    assert topk_weights is not None or not mul_routed_weight
+    assert topk_weights is None or topk_weights.stride(1) == 1
+    assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+
+    # M = A.size(0)
+    # num_tokens = M * top_k
+
+    if False:
+        # TODO: Other precision-specific implementations
+        # use_fp8_w8a8,
+        # use_int8_w8a8,
+        # use_int8_w8a16,
+        # use_int4_w4a16,
+        pass
+    if (use_int8_w8a16 or use_int4_w4a16) and (
+        block_shape is not None and block_shape[1] > 0
+    ):
+        assert B_bias is None
+        invoke_fused_moe_wna16_triton_kernel(
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            config,
+            compute_type,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            block_shape,
+        )
+    else:
+        invoke_fused_moe_triton_kernel(
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            config,
+            compute_type,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            per_channel_quant,
+            block_shape,
+            B_bias,
         )
 
 
-@triton.jit
-def _act_kernel(
-    inter_ptr,
-    act_ptr,
-    K2,
-    COMPUTE_DTYPE: tl.constexpr,
-    K_TILE: tl.constexpr,
-):
-    """Fused SiLU: act[j] = silu(gate[j]) * up[j].
+# ---------------------------------------------------------------------------
+# Ascend-local moe_align_block_size replacement.
+#
+# The shared 4-stage Triton implementation in
+# flaggems_vllm.ops.moe_align_block_size miscompiles on
+# triton-ascend: its stage4 computes the scatter rank with atomic_add followed
+# by a dependent load of the same address, which yields wrong ranks -- most
+# tokens are never scattered (silently dropped), and out-of-bounds ranks
+# corrupt neighbouring tensors or kill the device with "DDR address of the
+# MTE instruction is out of range". The three kernels below use no atomics at
+# all: each expert owns a private, non-overlapping output region, so every
+# store is race-free and deterministic.
+# ---------------------------------------------------------------------------
 
-    Gate and up are each contiguous (K_TILE,) runs inside the row
-    [gate(intermediate) | up(intermediate)] layout, so the loop body is two
-    contiguous 1D loads + one contiguous store. K_TILE divides K2 so tiles are
-    exact and no masks are needed. (The former (K_TILE,2) pair-stride tile
-    generated per-row 4-byte DMA transactions and ran at ~3ms; this structure
-    runs at ~0.12ms for the benchmark K2=14336.)
+
+@triton.jit
+def _moe_align_count_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    numel,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    """One program per expert: count tokens routed to this expert."""
+    expert = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_TOKENS)
+    cnt = 0
+    for start in range(0, numel, BLOCK_TOKENS):
+        token_offs = start + offs
+        ids = tl.load(topk_ids_ptr + token_offs, mask=token_offs < numel, other=-1).to(
+            tl.int32
+        )
+        cnt += tl.sum((ids == expert).to(tl.int32), axis=0)
+    tl.store(counts_ptr + expert, cnt)
+
+
+@triton.jit
+def _moe_align_meta_kernel(
+    counts_ptr,
+    expert_offsets_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_pad_ptr,
+    expert_map_ptr,
+    num_experts,
+    block_size,
+    numel,
+    numel_sorted_token_ids,
+    numel_expert_ids,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_FILL: tl.constexpr,
+    VECTORIZE_META: tl.constexpr = False,
+    BLOCK_E: tl.constexpr = 256,
+    BLOCK_B: tl.constexpr = 32,
+):
+    """Single program: buffer init, aligned expert offsets and expert_ids.
+
+    Fills sorted_token_ids with the padding marker (numel), zeroes
+    expert_ids, then assigns each expert its aligned region and stamps the
+    per-block expert ids. Runs before the scatter kernel on the same stream.
+    """
+    offs_fill = tl.arange(0, BLOCK_FILL)
+    for start in range(0, numel_sorted_token_ids, BLOCK_FILL):
+        fill_offs = start + offs_fill
+        tl.store(
+            sorted_token_ids_ptr + fill_offs,
+            numel,
+            mask=fill_offs < numel_sorted_token_ids,
+        )
+    for start in range(0, numel_expert_ids, BLOCK_FILL):
+        fill_offs = start + offs_fill
+        tl.store(expert_ids_ptr + fill_offs, 0, mask=fill_offs < numel_expert_ids)
+
+    base = 0
+    tl.store(expert_offsets_ptr, 0)
+    if VECTORIZE_META:
+        # Vectorized path: all experts at once (no per-expert serial loop --
+        # that loop costs ~1ms at E=256). counts -> aligned -> inclusive
+        # cumsum in registers, offsets stored in one shot.
+        offs_e = tl.arange(0, BLOCK_E)
+        emask = offs_e < num_experts
+        cnts = tl.load(counts_ptr + offs_e, mask=emask, other=0)
+        aligned = tl.cdiv(cnts, block_size) * block_size
+        cum = tl.cumsum(aligned, axis=0)
+        starts = cum - aligned
+        tl.store(expert_offsets_ptr + 1 + offs_e, cum, mask=emask)
+        total = tl.sum(aligned, axis=0)
+        tl.store(num_tokens_post_pad_ptr, total)
+
+        # expert_ids stamping: for each output block b, its expert is the
+        # last e with starts[e] <= b*block_size. Chunked 2D compare+sum
+        # (expert_map applied at store time).
+        offs_b = tl.arange(0, BLOCK_B)
+        for start in range(0, numel_expert_ids, BLOCK_B):
+            blk = start + offs_b
+            bmask = blk < numel_expert_ids
+            blk_start = blk * block_size
+            # count of experts whose region starts at or before this block
+            exp_idx = (
+                tl.sum((starts[None, :] <= blk_start[:, None]).to(tl.int32), axis=1) - 1
+            )
+            in_region = bmask & (blk_start < total)
+            if HAS_EXPERT_MAP:
+                exp_idx = tl.load(expert_map_ptr + exp_idx, mask=in_region, other=0)
+            tl.store(expert_ids_ptr + blk, exp_idx, mask=in_region)
+    else:
+        for e in range(num_experts):
+            cnt = tl.load(counts_ptr + e)
+            aligned = tl.cdiv(cnt, block_size) * block_size
+            for i in range(base, base + aligned, block_size):
+                ei = e
+                if HAS_EXPERT_MAP:
+                    ei = tl.load(expert_map_ptr + e)
+                tl.store(expert_ids_ptr + i // block_size, ei)
+            base += aligned
+            tl.store(expert_offsets_ptr + 1 + e, base)
+        tl.store(num_tokens_post_pad_ptr, base)
+
+
+@triton.jit
+def _moe_align_scatter_kernel(
+    topk_ids_ptr,
+    sorted_token_ids_ptr,
+    expert_offsets_ptr,
+    numel,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    """One program per expert: scatter my tokens into my private region.
+
+    Regions are disjoint by construction, so no atomics are needed; the
+    running rank is a plain per-program scalar carried across chunks.
+    """
+    expert = tl.program_id(0)
+    base = tl.load(expert_offsets_ptr + expert)
+    offs = tl.arange(0, BLOCK_TOKENS)
+    rank = 0
+    for start in range(0, numel, BLOCK_TOKENS):
+        token_offs = start + offs
+        ids = tl.load(topk_ids_ptr + token_offs, mask=token_offs < numel, other=-1).to(
+            tl.int32
+        )
+        match = ids == expert
+        pos = tl.cumsum(match.to(tl.int32), axis=0) - 1 + rank
+        tl.store(
+            sorted_token_ids_ptr + base + pos,
+            token_offs.to(tl.int32),
+            mask=match,
+        )
+        rank += tl.sum(match.to(tl.int32), axis=0)
+
+
+def _moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: Optional[torch.Tensor] = None,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Ascend-local drop-in replacement for moe_align_block_size.
+
+    Same output contract: tokens grouped by expert with each region padded
+    up to a multiple of block_size, padding slots hold numel, trailing
+    expert_ids blocks hold 0, expert_map (EP) is applied to expert_ids.
+    """
+    numel = topk_ids.numel()
+    device = topk_ids.device
+    max_num_tokens_padded = numel + num_experts * (block_size - 1)
+    sorted_token_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
+    counts = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    expert_offsets = torch.empty((num_experts + 1,), dtype=torch.int32, device=device)
+
+    BLOCK_TOKENS = 2048
+    BLOCK_FILL = 4096
+    _moe_align_count_kernel[(num_experts,)](
+        topk_ids, counts, numel, BLOCK_TOKENS=BLOCK_TOKENS
+    )
+    _moe_align_meta_kernel[(1,)](
+        counts,
+        expert_offsets,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map,
+        num_experts,
+        block_size,
+        numel,
+        max_num_tokens_padded,
+        max_num_m_blocks,
+        HAS_EXPERT_MAP=expert_map is not None,
+        BLOCK_FILL=BLOCK_FILL,
+        VECTORIZE_META=True,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+        BLOCK_B=32,
+    )
+    _moe_align_scatter_kernel[(num_experts,)](
+        topk_ids,
+        sorted_token_ids,
+        expert_offsets,
+        numel,
+        BLOCK_TOKENS=BLOCK_TOKENS,
+    )
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+@triton.jit
+def _moe_side_tables_kernel(
+    sorted_token_ids_ptr,
+    w_ptr,
+    w_sorted_ptr,
+    inv_perm_ptr,
+    EM,
+    num_valid,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    """Build w_sorted and inv_perm with vector masked stores only.
+
+    w_sorted[pos] = topk_weights_flat[sorted_token_ids[pos]]   (valid rows)
+    inv_perm[sorted_token_ids[pos]] = pos                      (valid rows)
     """
     pid = tl.program_id(0)
-    offs = tl.arange(0, K_TILE)
-    base = pid.to(tl.int64) * (2 * K2)
-    for k0 in range(0, K2, K_TILE):
-        g = tl.load(inter_ptr + base + k0 + offs).to(tl.float32)
-        u = tl.load(inter_ptr + base + K2 + k0 + offs).to(tl.float32)
-        act = tl.sigmoid(g) * g * u
-        tl.store(
-            act_ptr + pid.to(tl.int64) * K2 + k0 + offs,
-            act.to(COMPUTE_DTYPE),
-        )
+    BLOCK: tl.constexpr = 32
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for i in tl.range(tl.cdiv(row_len, BLOCK)):
+        row_start = pid * PER_CORE_ROWS + i * BLOCK
+        offs = row_start + tl.arange(0, BLOCK)
+        in_range = offs < EM
+        flat = tl.load(sorted_token_ids_ptr + offs, mask=in_range, other=-1)
+        valid = in_range & (flat >= 0) & (flat < num_valid)
+        flat_safe = tl.where(valid, flat, 0)
+        w = tl.load(w_ptr + flat_safe, mask=valid, other=0.0)
+        tl.store(w_sorted_ptr + offs, w, mask=valid)
+        tl.store(inv_perm_ptr + flat_safe, offs.to(tl.int32), mask=valid)
 
 
 @triton.jit
-def _gemm2_kernel(
-    w2_ptr,
-    act_ptr,
-    inter_ptr,
-    out2_ptr,
-    sorted_route_ptr,
-    sorted_w_ptr,
-    count_ptr,
-    N2,
-    K2,
-    E: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+def _moe_gather_a_kernel(
+    a_ptr,
+    w_ptr,
+    a_sorted_ptr,
+    sorted_token_ids_ptr,
+    stride_am,
+    stride_ak,
+    K,
+    top_k: tl.constexpr,
+    APPLY_WEIGHT: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    E_P2: tl.constexpr,
-    FUSE_SILU: tl.constexpr,
-    APPLY_W_ON_INPUT: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
 ):
-    """GEMM2: out2[route, n] = w_r * act @ w2[e][n, :].
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for i in tl.range(row_len):
+        row = pid * PER_CORE_ROWS + i
+        flat_id = tl.load(sorted_token_ids_ptr + row)
+        src_row = (flat_id // top_k).to(tl.int64)
+        val = tl.load(
+            a_ptr + src_row * stride_am + offs * stride_ak, mask=offs < K, other=0.0
+        )
+        if APPLY_WEIGHT:
+            w = tl.load(w_ptr + flat_id)
+            val = (val.to(tl.float32) * w.to(tl.float32)).to(val.dtype)
+        tl.store(a_sorted_ptr + row.to(tl.int64) * K + offs, val, mask=offs < K)
 
-    When FUSE_SILU, the A operand is computed in-loop from inter rows
-    [gate(intermediate) | up(intermediate)] (packed expert order): two
-    contiguous 1D loads + fp32 silu, cast to COMPUTE before the dot - identical
-    rounding to the separate act kernel. Otherwise A is read from act_ptr.
-    All dot-loop A rows are affine in the tile offset; count is padded to E_P2
-    and sorted arrays are padded to 128 rows, so every masked tile load stays
-    in-bounds.
-    """
-    e = tl.program_id(0)
-    n_tile = tl.program_id(1)
-    n0 = n_tile * BLOCK_N
-    offs_n = tl.arange(0, BLOCK_N)
-    n_mask = offs_n < (N2 - n0)
-    offs_e = tl.arange(0, E_P2)
-    counts = tl.load(count_ptr + offs_e)
-    count_e = tl.load(count_ptr + e)
-    offset_e = tl.sum((offs_e < e).to(tl.int32) * counts)
-    m_offs = tl.arange(0, BLOCK_M)
-    k_offs = tl.arange(0, BLOCK_K)
-    w2_base = w2_ptr + e.to(tl.int64) * N2 * K2
-    for m0 in range(0, count_e, BLOCK_M):
-        offs_m = m0 + m_offs
-        m_mask = offs_m < count_e
-        prow = offset_e + offs_m
-        route = tl.load(sorted_route_ptr + prow, mask=m_mask, other=0)
-        wgt = tl.load(sorted_w_ptr + prow, mask=m_mask, other=0.0)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k0 in range(0, K2, BLOCK_K):
-            if FUSE_SILU:
-                g = tl.load(
-                    inter_ptr
-                    + prow[:, None].to(tl.int64) * (2 * K2)
-                    + k0
-                    + k_offs[None, :],
-                    mask=m_mask[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                u = tl.load(
-                    inter_ptr
-                    + prow[:, None].to(tl.int64) * (2 * K2)
-                    + K2
-                    + k0
-                    + k_offs[None, :],
-                    mask=m_mask[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                act = tl.sigmoid(g) * g * u
-                a = act.to(COMPUTE_DTYPE)
-            else:
-                a = tl.load(
-                    act_ptr + prow[:, None].to(tl.int64) * K2 + k0 + k_offs[None, :],
-                    mask=m_mask[:, None],
-                    other=0.0,
-                )
-            b = tl.load(
-                w2_base
-                + (k0 + k_offs)[:, None].to(tl.int64)
-                + (n0 + offs_n)[None, :].to(tl.int64) * K2,
-                mask=n_mask[None, :],
-                other=0.0,
-            ).to(COMPUTE_DTYPE)
-            acc = tl.dot(a, b, acc=acc)
-        if not APPLY_W_ON_INPUT:
-            acc = acc * wgt[:, None]
-        out = acc.to(COMPUTE_DTYPE)
+
+@triton.jit
+def _moe_silu_mul_kernel(
+    x_ptr,
+    topk_scales_ptr,
+    out_ptr,
+    D,
+    D_PAD: tl.constexpr,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, D_PAD)
+    mask = offs < D
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for i in tl.range(row_len):
+        row = pid * PER_CORE_ROWS + i
+        base = x_ptr + row.to(tl.int64) * (2 * D)
+        gate = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(base + D + offs, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(topk_scales_ptr + row)
+        res = gate * tl.sigmoid(gate) * up * scale
         tl.store(
-            out2_ptr
-            + route[:, None].to(tl.int64) * N2
-            + (n0 + offs_n)[None, :].to(tl.int64),
-            out,
-            mask=m_mask[:, None] & n_mask[None, :],
+            out_ptr + row.to(tl.int64) * D + offs,
+            res.to(out_ptr.dtype.element_ty),
+            mask=mask,
         )
 
 
 @triton.jit
-def _reduce_kernel(
-    out2_ptr,
+def _moe_unsort_sum_kernel(
+    c_ptr,
+    inv_perm_ptr,
     out_ptr,
-    N2,
-    topk: tl.constexpr,
-    N_TILE: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
-    OUT_DTYPE: tl.constexpr,
+    K,
+    top_k: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    t = tl.program_id(0)
-    offs = tl.arange(0, N_TILE)
-    base = t.to(tl.int64) * topk * N2
-    for n0 in range(0, N2, N_TILE):
-        acc = tl.zeros((N_TILE,), dtype=tl.float32)
-        for r in tl.static_range(0, topk):
-            v = tl.load(out2_ptr + base + r * N2 + n0 + offs)
-            acc += v.to(tl.float32)
-        tl.store(out_ptr + t.to(tl.int64) * N2 + n0 + offs, acc.to(OUT_DTYPE))
+    """out[m] = sum_j w[pos_j] * c_sorted[pos_j], pos_j = inv_perm[m*top_k+j]
+
+    (fp32 accumulation; w_sorted multiply only when APPLY_WEIGHT).
+    """
+    pid = tl.program_id(0)
+    num_blocks_n = tl.cdiv(K, BLOCK_N)
+    token = pid // num_blocks_n
+    nb = pid % num_blocks_n
+    offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < K
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for j in tl.static_range(top_k):
+        pos = tl.load(inv_perm_ptr + token * top_k + j).to(tl.int64)
+        v = tl.load(c_ptr + pos * K + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        acc += v
+    tl.store(
+        out_ptr + token.to(tl.int64) * K + offs_n,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=n_mask,
+    )
+
+
+@triton.jit
+def _moe_align_chunkcount_kernel(
+    topk_ids_ptr,
+    chunk_counts_ptr,
+    numel,
+    num_experts,
+    NUM_EXPERTS_PAD: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Pass 1 of the chunked counting sort: one program per id-chunk,
+    chunk_counts[c][e] = pairs of chunk c targeting expert e."""
+    c = tl.program_id(0)
+    offs = c * BLOCK_C + tl.arange(0, BLOCK_C)
+    e_offs = tl.arange(0, NUM_EXPERTS_PAD)
+    ids = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=NUM_EXPERTS_PAD).to(
+        tl.int32
+    )
+    # histogram with `mask=offs < numel` is not supported yet on ascend
+    hist = tl.histogram(ids, NUM_EXPERTS_PAD)
+    hist = tl.where(
+        e_offs == 0, hist - BLOCK_C + tl.sum((offs < numel).to(tl.int32)), hist
+    )
+    tl.store(
+        chunk_counts_ptr + c * num_experts + e_offs, hist, mask=e_offs < num_experts
+    )
+
+
+@triton.jit
+def _moe_align_chunkmeta_kernel(
+    chunk_counts_ptr,
+    counts_ptr,
+    row_start_ptr,
+    chunk_offs_ptr,
+    num_experts,
+    num_chunks,
+    BLOCK_E: tl.constexpr,
+):
+    """Pass 2 (single program): marker pre-fill, totals + padded row starts,
+    block table, and chunk_offs[c][e] = padded region start of e plus the
+    exclusive cumsum of counts over previous chunks."""
+    offs_e = tl.arange(0, BLOCK_E)
+    emask = offs_e < num_experts
+    counts = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for c in range(0, num_chunks):
+        counts += tl.load(
+            chunk_counts_ptr + c * num_experts + offs_e, mask=emask, other=0
+        )
+    tl.store(counts_ptr + offs_e, counts, mask=emask)
+
+    row_start = tl.cumsum(counts, axis=0) - counts
+    tl.store(row_start_ptr + offs_e, row_start, mask=emask)
+
+    running = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for c in range(0, num_chunks):
+        tl.store(
+            chunk_offs_ptr + c * num_experts + offs_e, row_start + running, mask=emask
+        )
+        running += tl.load(
+            chunk_counts_ptr + c * num_experts + offs_e, mask=emask, other=0
+        )
+
+
+@triton.jit
+def _moe_keyed_add(x, y):
+    # associative_scan combine for packed (key << 12 | count): sums counts
+    # while keys match, resets on a key change (flagtree routing pattern).
+    # 0x7FFFF000 keeps bits 12-30 (our keys stay < 2^28); 0xFFFFF000 would
+    # overflow int32.
+    key_mask: tl.constexpr = 0x7FFFF000
+    kx = x & key_mask
+    ky = y & key_mask
+    z = tl.where(kx == ky, x + y - kx, y)
+    return z
+
+
+@triton.jit
+def _moe_align_chunkscatter_kernel(
+    topk_ids_ptr,
+    sorted_token_ids_ptr,
+    chunk_offs_ptr,
+    numel,
+    num_experts,
+    BLOCK_C: tl.constexpr,
+):
+    """Pass 3: one program per id-chunk. Sort the chunk's fp32 keys
+    (expert * 4096 + local_index), derive local ranks via a keyed run-length
+    scan, then store at chunk_offs[c][e] + rank. All 1D ops; the sort is
+    small (BLOCK_C elements), unlike the reverted single-program full sort."""
+    c = tl.program_id(0)
+    offs = c * BLOCK_C + tl.arange(0, BLOCK_C)
+    valid = offs < numel
+    ids = tl.load(topk_ids_ptr + offs, mask=valid, other=0).to(tl.int32)
+    kv = ids.to(tl.float32) * 4096.0 + tl.arange(0, BLOCK_C).to(tl.float32)
+    kv = tl.where(valid, kv, 1e30)
+    kv = al.sort(kv, dim=0)
+    kv_i = tl.where(valid, kv, 0.0).to(tl.int32)
+    s_e = kv_i >> 12
+    s_local = kv_i & 4095
+    # local rank of this pair inside its expert group within the chunk
+    x = (kv_i & 0x7FFFF000) | 1
+    run = tl.associative_scan(x, 0, _moe_keyed_add)
+    local_rank = (run - 1) & 4095
+    base = tl.load(chunk_offs_ptr + c * num_experts + s_e, mask=valid, other=0)
+    tl.store(
+        sorted_token_ids_ptr + base + local_rank,
+        (c * BLOCK_C + s_local).to(tl.int32),
+        mask=valid,
+    )
+
+
+def _moe_align_parallel(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    numel = topk_ids.numel()
+    device = topk_ids.device
+    sorted_token_ids = torch.empty((numel,), dtype=torch.int32, device=device)
+    counts = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    row_start = torch.empty((num_experts,), dtype=torch.int32, device=device)
+
+    BLOCK_C = 256
+    num_chunks = triton.cdiv(numel, BLOCK_C)
+    chunk_counts = torch.empty(
+        (num_chunks * num_experts,), dtype=torch.int32, device=device
+    )
+    chunk_offs = torch.empty(
+        (num_chunks * num_experts,), dtype=torch.int32, device=device
+    )
+
+    num_experts_pad = triton.next_power_of_2(num_experts)
+    _moe_align_chunkcount_kernel[(num_chunks,)](
+        topk_ids,
+        chunk_counts,
+        numel,
+        num_experts,
+        NUM_EXPERTS_PAD=num_experts_pad,
+        BLOCK_C=BLOCK_C,
+    )
+    _moe_align_chunkmeta_kernel[(1,)](
+        chunk_counts,
+        counts,
+        row_start,
+        chunk_offs,
+        num_experts,
+        num_chunks,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+    )
+    _moe_align_chunkscatter_kernel[(num_chunks,)](
+        topk_ids,
+        sorted_token_ids,
+        chunk_offs,
+        numel,
+        num_experts,
+        BLOCK_C=BLOCK_C,
+    )
+    return sorted_token_ids, counts
+
+
+def _fused_experts_fast(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool,
+    activation_enum: "MoEActivation",
+    apply_router_weight_on_input: bool,
+    compute_type,
+) -> torch.Tensor:
+    """Unquantized fast path: gather-sort -> GEMM1 -> act -> GEMM2 -> unsort+sum."""
+    vector_core_num = torch_npu.npu.get_device_properties(
+        hidden_states.device.index
+    ).vector_core_num
+    num_tokens = hidden_states.size(0)
+    E, N, K1 = w1.size()
+    K2 = w2.size(1)
+    top_k_num = topk_ids.size(1)
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    CHUNK_SIZE: int = 16 * 1024
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (
+            chunk * CHUNK_SIZE,
+            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+        )
+        tokens_in_chunk = end_chunk_idx - begin_chunk_idx
+        if tokens_in_chunk == 0:
+            break
+
+        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+        num_valid = tokens_in_chunk * top_k_num
+
+        (
+            sorted_token_ids,
+            expert_ids,
+        ) = _moe_align_parallel(
+            curr_topk_ids,
+            E,
+        )
+        EM = sorted_token_ids.numel()
+        w_sorted = torch.empty(EM, device=device, dtype=topk_weights.dtype)
+        inv_perm = torch.empty(num_valid, device=device, dtype=torch.int32)
+        per_core_rows = (EM + vector_core_num - 1) // vector_core_num
+        need_core_num = (EM + per_core_rows - 1) // per_core_rows
+        last_core_rows = (
+            per_core_rows if EM % per_core_rows == 0 else EM % per_core_rows
+        )
+        _moe_side_tables_kernel[(need_core_num,)](
+            sorted_token_ids,
+            curr_topk_weights,
+            w_sorted,
+            inv_perm,
+            EM,
+            num_valid,
+            PER_CORE_ROWS=per_core_rows,
+            LAST_CORE_ROWS=last_core_rows,
+        )
+        a1_sorted = torch.empty(EM, K1, device=device, dtype=dtype)
+        _moe_gather_a_kernel[(need_core_num,)](
+            curr_hidden_states,
+            curr_topk_weights,
+            a1_sorted,
+            sorted_token_ids,
+            curr_hidden_states.stride(0),
+            curr_hidden_states.stride(1),
+            K1,
+            top_k=top_k_num,
+            APPLY_WEIGHT=apply_router_weight_on_input,
+            BLOCK_N=triton.next_power_of_2(K1),
+            PER_CORE_ROWS=per_core_rows,
+            LAST_CORE_ROWS=last_core_rows,
+        )
+        act_dim = MoEActivation.adjust_N_for_activation(N, activation_enum)
+        # GEMM1: (EM, K1) x w1 -> (EM, act_dim)
+        cache1 = grouped_matmul(
+            a1_sorted, w1, group_list=expert_ids, group_list_type=1, trans_weight=True
+        )
+        # apply activation and topk_scales
+        cache2 = torch.empty(EM, act_dim, device=device, dtype=dtype)
+        if activation_enum == MoEActivation.SILU:
+            _moe_silu_mul_kernel[(need_core_num,)](
+                cache1,
+                w_sorted,
+                cache2,
+                act_dim,
+                D_PAD=triton.next_power_of_2(act_dim),
+                PER_CORE_ROWS=per_core_rows,
+                LAST_CORE_ROWS=last_core_rows,
+            )
+        else:
+            apply_moe_activation(activation_enum, cache2, cache1)
+            mul_(cache2, w_sorted.unsqueeze(-1).to(dtype))
+        # GEMM2: (EM, act_dim) x w2 -> (EM, K2)
+        cache3 = grouped_matmul(
+            cache2, w2, group_list=expert_ids, group_list_type=1, trans_weight=True
+        )
+        # unsort + sum over topk
+        out_chunk = out_hidden_states[begin_chunk_idx:end_chunk_idx]
+        BLOCK_OUT = 1024
+        grid = (tokens_in_chunk * triton.cdiv(K2, BLOCK_OUT),)
+        _moe_unsort_sum_kernel[grid](
+            cache3,
+            inv_perm,
+            out_chunk,
+            K2,
+            top_k=top_k_num,
+            BLOCK_N=BLOCK_OUT,
+        )
+    return out_hidden_states
 
 
 def fused_experts_impl(
@@ -392,260 +2027,314 @@ def fused_experts_impl(
     ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
+    expert_map: torch.Tensor | None = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Ascend-optimized fused MoE implementation.
+    logger.debug("GEMS_ASCEND FUSED_MOE")
+    if hasattr(activation, "value"):
+        activation = activation.value
+    assert (
+        activation == "silu"
+    ), f"Only 'silu' activation is supported, got {activation}"
 
-    This function overrides the default fused_experts_impl when imported on Ascend hardware.
+    activation_enum = MoEActivation.from_str(activation)
 
-    This implementation uses a simplified routing and tiling strategy optimized
-    for Ascend 910B NPU architecture. It supports INT8 quantization and fused
-    SiLU activation.
-
-    Constraints:
-    - Only supports 'silu' activation
-    - expert_map must be None (no expert parallelism)
-    - Only INT8 w8a8/w8a16 quantization supported (no FP8 or MX schemes)
-    - No bias support
-    - Batch size * topk must be power of 2 and <= 128
-
-    Args:
-        hidden_states: Input tensor [M, K]
-        w1: First expert weight [E, N, K] where N = 2*intermediate
-        w2: Second expert weight [E, N2, K2]
-        topk_weights: Router weights [M, topk]
-        topk_ids: Expert indices [M, topk]
-        inplace: Whether to write output in-place to hidden_states
-        activation: Activation function (only 'silu' supported)
-        apply_router_weight_on_input: Apply router weight before or after GEMM
-        use_int8_w8a8: Use INT8 w8a8 quantization
-        use_int8_w8a16: Use INT8 w8a16 quantization
-        per_channel_quant: Use per-channel quantization
-        w1_scale: Scale for w1 weights [E, N]
-        w2_scale: Scale for w2 weights [E, N2]
-        Other args: Not supported on Ascend, must be None/False
-
-    Returns:
-        Output tensor [M, N2] (same as hidden_states if inplace=True)
-    """
-    assert activation == "silu"
-    assert ocp_mx_scheme is None
-    assert expert_map is None
-    assert w1_zp is None and w2_zp is None
-    assert a1_scale is None and a2_scale is None
-    assert block_shape is None
-    assert w1_bias is None and w2_bias is None
-    assert not use_fp8_w8a8, "fp8 w8a8 not supported"
-    assert sum((use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)) <= 1
-
-    M, K = hidden_states.shape
-    E = w1.shape[0]
-    N = w1.shape[1]  # 2 * intermediate
-    N2 = w2.shape[1]  # hidden output dim
-    K2 = w2.shape[2]  # intermediate dim
-    topk = topk_ids.shape[1]
-    ROWS = M * topk
-    ROWS_P2 = 128
-    assert ROWS <= ROWS_P2 and (ROWS & (ROWS - 1)) == 0, "ROWS must be pow2 <= 128"
-    assert global_num_experts in (-1, E)
-    assert hidden_states.is_contiguous()
-    assert w1.is_contiguous() and w2.is_contiguous()
-    assert topk_ids.is_contiguous() and topk_weights.is_contiguous()
-
-    quant = use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
-    if quant:
-        assert per_channel_quant
-        assert w1_scale is not None and w2_scale is not None
-        assert w1_scale.is_contiguous() and w2_scale.is_contiguous()
+    # Check constraints
+    if use_int4_w4a16:
+        # INT4 stored unpacked in INT8 containers (full K dim)
+        assert hidden_states.size(1) == w1.size(
+            2
+        ), f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
+    elif ocp_mx_scheme is not None:
+        if ocp_mx_scheme.startswith("w_mxfp4"):
+            assert hidden_states.size(1) == w1.size(2) * 2, "hidden size mismatch"
+        elif ocp_mx_scheme.startswith("w_mxfp6"):
+            assert (
+                hidden_states.size(1) == (w1.size(2) * 4) // 3
+            ), "hidden size mismatch"
+        else:
+            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
     else:
-        assert not per_channel_quant
+        assert hidden_states.size(1) == w1.size(
+            2
+        ), f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
 
-    device = hidden_states.device
+    assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    num_tokens = hidden_states.size(0)
+    E, N, _ = w1.size()
+    K = w2.size(1)
+    if global_num_experts == -1:
+        global_num_experts = E
+    top_k_num = topk_ids.size(1)
+
+    CHUNK_SIZE: int = 16 * 1024
+    M = min(num_tokens, CHUNK_SIZE)
+
+    config_dtype = _get_config_dtype_str(
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        ocp_mx_scheme=ocp_mx_scheme,
+        dtype=hidden_states.dtype,
+    )
+
+    quant_dtype = _get_config_quant_dtype(
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        ocp_mx_scheme=ocp_mx_scheme,
+    )
+
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w1.size(),
+        w2.size(),
+        top_k_num,
+        config_dtype,
+        block_shape=block_shape,
+    )
+
+    config = get_config_func(M)
+
+    # cache1 and cache3 share memory (non-overlapping lifetime)
+    cache13 = torch.empty(
+        M * top_k_num * max(N, K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
+    intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
+
+    # cache2 needs separate memory (concurrent with cache1)
+    activation_out_dim = MoEActivation.adjust_N_for_activation(N, activation_enum)
+    intermediate_cache2 = torch.empty(
+        (M * top_k_num, activation_out_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
     if hidden_states.dtype == torch.bfloat16:
-        COMPUTE: tl.dtype = tl.bfloat16
+        compute_type = tl.bfloat16
     elif hidden_states.dtype == torch.float16:
-        COMPUTE = tl.float16
+        compute_type = tl.float16
+    elif hidden_states.dtype == torch.float32:
+        compute_type = tl.float32
     else:
-        raise ValueError(f"unsupported hidden dtype {hidden_states.dtype}")
+        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-    out = hidden_states if inplace else torch.empty_like(hidden_states)
-
-    sorted_tokens = torch.empty((ROWS_P2,), device=device, dtype=torch.int32)
-    sorted_route = torch.empty((ROWS_P2,), device=device, dtype=torch.int32)
-    sorted_w = torch.empty((ROWS_P2,), device=device, dtype=hidden_states.dtype)
-    count = torch.zeros((16,), device=device, dtype=torch.int32)
-    pack_h = torch.zeros((ROWS_P2, K), device=device, dtype=hidden_states.dtype)
-    inter = torch.zeros((ROWS_P2, 2 * K2), device=device, dtype=hidden_states.dtype)
-    actbuf = torch.zeros((ROWS_P2, K2), device=device, dtype=hidden_states.dtype)
-    out2 = torch.zeros((ROWS_P2, N2), device=device, dtype=hidden_states.dtype)
-
-    w1dq = w2dq = None
-    hq = aq = None
-    if quant:
-        w1dq = torch.empty((E, N, K), device=device, dtype=hidden_states.dtype)
-        w2dq = torch.empty((E, N2, K2), device=device, dtype=hidden_states.dtype)
-    if use_int8_w8a8:
-        hq = torch.zeros((ROWS_P2, K), device=device, dtype=hidden_states.dtype)
-        aq = torch.zeros((ROWS_P2, K2), device=device, dtype=hidden_states.dtype)
-
-    BLOCK_M, BLOCK_N = 32, 256
-    for t in (256, 128, 64):
-        if K % t == 0:
-            BLOCK_K1 = t
-            break
-    else:
-        BLOCK_K1 = 64
-    for t in (256, 128, 64):
-        if K2 % t == 0:
-            BLOCK_K2 = t
-            break
-    else:
-        BLOCK_K2 = 64
-    E_P2 = 16
-    for t in (2048, 1024, 512, 256, 128, 64):
-        if K % t == 0:
-            KTILE_K = t
-            break
-    else:
-        KTILE_K = 64
-    for t in (2048, 1024, 512, 256, 128, 64):
-        if K2 % t == 0:
-            KTILE_K2 = t
-            break
-    else:
-        KTILE_K2 = 64
-    for t in (1024, 512, 256, 128, 64):
-        if N2 % t == 0:
-            NTILE_N2 = t
-            break
-    else:
-        NTILE_N2 = 64
-
-    _route_kernel[(ROWS,)](
-        topk_ids,
-        topk_weights,
-        sorted_tokens,
-        sorted_w,
-        sorted_route,
-        count,
-        ROWS=ROWS,
-        ROWS_P2=ROWS_P2,
-        E=E,
-        topk=topk,
+    # Fast path: unquantized, no EP map -> gather-sort + all-affine GEMMs.
+    # (gathering A rows through sorted_token_ids inside the GEMM kernel
+    # prevents triton-ascend from lowering tl.dot to the cube unit, so the
+    # legacy kernel path below is only kept for quantized/EP cases.)
+    no_quant = not (
+        use_fp8_w8a8
+        or use_int8_w8a8
+        or use_int8_w8a16
+        or use_int4_w4a16
+        or ocp_mx_scheme is not None
+        or block_shape is not None
     )
-
-    if quant:
-        _dequant_w_kernel[(E, triton.cdiv(N, 64))](
+    if no_quant and expert_map is None and w1_bias is None and w2_bias is None:
+        return _fused_experts_fast(
+            hidden_states,
             w1,
-            w1_scale,
-            w1dq,
-            N,
-            K,
-            count,
-            E=E,
-            BLOCK_N=64,
-            BLOCK_K=64,
-            COMPUTE_DTYPE=COMPUTE,
-        )
-        _dequant_w_kernel[(E, triton.cdiv(N2, 64))](
             w2,
+            topk_weights,
+            topk_ids,
+            inplace,
+            activation_enum,
+            apply_router_weight_on_input,
+            compute_type,
+        )
+
+    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    if ocp_mx_scheme is not None:
+        # Dequantize OCP MX weights (TODO: skip on platforms with native MX)
+        if ocp_mx_scheme.startswith("w_mxfp4"):
+            w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
+            w1_scale = None
+            w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
+            w2_scale = None
+        elif ocp_mx_scheme.startswith("w_mxfp6_e3m2"):
+            w1 = dequant_mxfp6(
+                w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
+            )
+            w1_scale = None
+            w2 = dequant_mxfp6(
+                w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
+            )
+            w2_scale = None
+        elif ocp_mx_scheme.startswith("w_mxfp6_e2m3"):
+            w1 = dequant_mxfp6(
+                w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
+            )
+            w1_scale = None
+            w2 = dequant_mxfp6(
+                w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
+            )
+            w2_scale = None
+        else:
+            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
+
+    # Dequant INT8/INT4 weights (Triton can't do mixed-dtype dot)
+    if use_int8_w8a16 or use_int4_w4a16:
+        w1 = w1.to(hidden_states.dtype) * w1_scale.unsqueeze(-1).to(hidden_states.dtype)
+        w1_scale = None
+        w2 = w2.to(hidden_states.dtype) * w2_scale.unsqueeze(-1).to(hidden_states.dtype)
+        w2_scale = None
+        use_int8_w8a16 = False
+        use_int4_w4a16 = False
+
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (
+            chunk * CHUNK_SIZE,
+            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+        )
+        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+        tokens_in_chunk, _ = curr_hidden_states.size()
+
+        if tokens_in_chunk == 0:
+            break
+
+        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+            # Adjust cache size for last chunk
+            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+            intermediate_cache2 = intermediate_cache2[
+                : tokens_in_chunk * topk_ids.size(1)
+            ]
+            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+            config = get_config_func(tokens_in_chunk)
+
+        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+        qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
+            A=curr_hidden_states,
+            A_scale=a1_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+            ocp_mx_scheme=ocp_mx_scheme,
+        )
+
+        SPARSITY_FACTOR = 4
+        # For small tokens (< 32), always use naive assignment to skip alignment overhead
+        use_naive_small = tokens_in_chunk < 32
+        naive_block_assignment = use_naive_small or (
+            expert_map is None
+            and tokens_in_chunk * top_k_num * SPARSITY_FACTOR <= global_num_experts
+            and not (
+                (use_int8_w8a16 or use_int4_w4a16)
+                and block_shape is not None
+                and block_shape[1] > 0
+            )
+        )
+        # FIXME(ascend): the naive path makes fused_moe_kernel emit select-based
+        # offs_token/masks that crash triton-ascend's DiscreteMaskAccessConversion
+        # pass (MLIRCompilationError: PassManager::run failed). Force the
+        # moe_align_block_size path until the compiler issue is resolved.
+        naive_block_assignment = False
+
+        if not naive_block_assignment:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                _moe_align_block_size(
+                    curr_topk_ids,
+                    config["BLOCK_SIZE_M"],
+                    global_num_experts,
+                    expert_map,
+                )
+            )
+        else:
+            max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
+            expert_ids = curr_topk_ids.view(-1)
+            num_tokens_post_padded = torch.empty(
+                (1), dtype=torch.int32, device=topk_ids.device
+            )
+            num_tokens_post_padded.fill_(max_num_tokens_padded)
+            sorted_token_ids = None
+
+        dispatch_fused_moe_kernel(
+            qcurr_hidden_states,
+            w1,
+            intermediate_cache1,
+            a1q_scale,
+            w1_scale,
+            w1_zp,
+            curr_topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            top_k_num,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=w1_bias,
+        )
+
+        apply_moe_activation(
+            activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
+
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            A=intermediate_cache2,
+            A_scale=a2_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+            ocp_mx_scheme=ocp_mx_scheme,
+        )
+
+        if expert_map is not None:
+            intermediate_cache3.zero_()
+
+        dispatch_fused_moe_kernel(
+            qintermediate_cache2,
+            w2,
+            intermediate_cache3,
+            a2q_scale,
             w2_scale,
-            w2dq,
-            N2,
-            K2,
-            count,
-            E=E,
-            BLOCK_N=64,
-            BLOCK_K=64,
-            COMPUTE_DTYPE=COMPUTE,
+            w2_zp,
+            curr_topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=w2_bias,
         )
 
-    _pack_kernel[(ROWS_P2,)](
-        hidden_states,
-        pack_h,
-        sorted_tokens,
-        ROWS,
-        K,
-        K_TILE=KTILE_K,
-    )
-
-    gemm1_a = pack_h
-    if use_int8_w8a8:
-        _hq_kernel[(ROWS_P2,)](pack_h, hq, K, COMPUTE_DTYPE=COMPUTE, K_TILE=KTILE_K)
-        gemm1_a = hq
-
-    _gemm1_kernel[(E, triton.cdiv(N, BLOCK_N))](
-        gemm1_a,
-        w1dq if quant else w1,
-        inter,
-        count,
-        sorted_w,
-        K,
-        N,
-        E=E,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K1,
-        E_P2=E_P2,
-        APPLY_W_ON_INPUT=apply_router_weight_on_input,
-        COMPUTE_DTYPE=COMPUTE,
-    )
-
-    fuse_silu = not use_int8_w8a8
-    if fuse_silu:
-        # SiLU fused into gemm2 epilogue: no act kernel or actbuf needed.
-        gemm2_a = actbuf  # unused placeholder (keeps signature simple)
-    else:
-        _act_kernel[(ROWS_P2,)](
-            inter,
-            actbuf,
-            K2,
-            COMPUTE_DTYPE=COMPUTE,
-            K_TILE=KTILE_K2,
+        moe_sum(
+            intermediate_cache3.view(*intermediate_cache3.size()),
+            out_hidden_states[begin_chunk_idx:end_chunk_idx],
         )
-        _hq_kernel[(ROWS_P2,)](actbuf, aq, K2, COMPUTE_DTYPE=COMPUTE, K_TILE=KTILE_K2)
-        gemm2_a = aq
 
-    _gemm2_kernel[(E, triton.cdiv(N2, BLOCK_N))](
-        w2dq if quant else w2,
-        gemm2_a,
-        inter,
-        out2,
-        sorted_route,
-        sorted_w,
-        count,
-        N2,
-        K2,
-        E=E,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K2,
-        E_P2=E_P2,
-        FUSE_SILU=fuse_silu,
-        APPLY_W_ON_INPUT=apply_router_weight_on_input,
-        COMPUTE_DTYPE=COMPUTE,
-    )
-
-    _reduce_kernel[(M,)](
-        out2,
-        out,
-        N2,
-        topk=topk,
-        N_TILE=NTILE_N2,
-        COMPUTE_DTYPE=COMPUTE,
-        OUT_DTYPE=COMPUTE,
-    )
-
-    return out
+    return out_hidden_states
 
 
 def inplace_fused_experts(
