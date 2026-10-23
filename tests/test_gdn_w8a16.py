@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.ops.gdn_w8a16 import dequantize_gdn_state_fp8, quantize_gdn_state_fp8
 from tests import conftest as cfg
 
 pytestmark = [
@@ -40,6 +41,19 @@ PREFILL_NT = [
 SHAPES = [(n, 1) for n in DECODE_N] + PREFILL_NT
 if cfg.QUICK_MODE:
     SHAPES = [(1, 1), (32, 1), (128, 1), (1, 8), (2, 192)]
+
+
+def test_gdn_w8a16_registration():
+    import flaggems_vllm.ops as ops
+
+    assert "gdn_w8a16" in ops.__all__
+    assert flaggems_vllm.gdn_w8a16 is ops.gdn_w8a16
+    entries = [entry for entry in flaggems_vllm._FULL_CONFIG if entry[0] == "gdn_w8a16"]
+    assert entries == [("gdn_w8a16", flaggems_vllm.gdn_w8a16)]
+    assert flaggems_vllm.FULL_CONFIG_BY_FUNC["gdn_w8a16"] == entries
+    registered_names = {entry[0] for entry in flaggems_vllm._FULL_CONFIG}
+    assert "quantize_gdn_state_fp8" not in registered_names
+    assert "dequantize_gdn_state_fp8" not in registered_names
 
 
 def make_inputs(n, t, h, hv, dtype, packed=True):
@@ -94,7 +108,7 @@ def test_gdn_w8a16_accuracy(h, hv, n, t):
     torch.manual_seed(42)
     q, k, v, g, beta, cu, indices = make_inputs(n, t, h, hv, torch.bfloat16)
     initial = torch.zeros(n, hv, 128, 128, device=q.device, dtype=q.dtype)
-    fp8, scales = flaggems_vllm.quantize_gdn_state_fp8(initial)
+    fp8, scales = quantize_gdn_state_fp8(initial)
     expected, expected_state = reference(q, k, v, g, beta, initial, n, t)
     actual, returned_fp8, returned_scale = flaggems_vllm.gdn_w8a16(
         q,
@@ -111,7 +125,7 @@ def test_gdn_w8a16_accuracy(h, hv, n, t):
         max_sequence_length=t,
     )
     assert returned_fp8 is fp8 and returned_scale is scales
-    restored = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales)
+    restored = dequantize_gdn_state_fp8(fp8, scales)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-3, rtol=5e-2)
     torch.testing.assert_close(restored, expected_state, atol=2e-2, rtol=0.25)
 
@@ -126,8 +140,8 @@ def test_gdn_w8a16_nonzero_state(dtype, packed):
     q = torch.stack((q, q), dim=-1)[..., 0]
     k = torch.stack((k, k), dim=-1)[..., 0]
     initial = 0.02 * torch.randn(n, hv, 128, 128, device=q.device, dtype=dtype)
-    fp8, scales = flaggems_vllm.quantize_gdn_state_fp8(initial)
-    initial = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales, output_dtype=dtype)
+    fp8, scales = quantize_gdn_state_fp8(initial)
+    initial = dequantize_gdn_state_fp8(fp8, scales, output_dtype=dtype)
     expected, expected_state = reference(q, k, v, g, beta, initial, n, t)
     actual, _, _ = flaggems_vllm.gdn_w8a16(
         q,
@@ -143,7 +157,7 @@ def test_gdn_w8a16_nonzero_state(dtype, packed):
         use_qk_l2norm_in_kernel=True,
         max_sequence_length=t,
     )
-    restored = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales)
+    restored = dequantize_gdn_state_fp8(fp8, scales)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-3, rtol=5e-2)
     torch.testing.assert_close(restored, expected_state, atol=2e-2, rtol=0.25)
 
@@ -158,9 +172,9 @@ def test_gdn_w8a16_speculative(n, t):
     initial = 0.02 * torch.randn(
         n * slots, hv, 128, 128, device=q.device, dtype=q.dtype
     )
-    fp8, scales = flaggems_vllm.quantize_gdn_state_fp8(initial)
+    fp8, scales = quantize_gdn_state_fp8(initial)
     before_fp8, before_scale = fp8.view(torch.uint8).clone(), scales.clone()
-    initial = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales, output_dtype=q.dtype)
+    initial = dequantize_gdn_state_fp8(fp8, scales, output_dtype=q.dtype)
     expected = torch.empty_like(v)
     expected_state = initial.float().clone()
     for seq in range(n):
@@ -194,7 +208,7 @@ def test_gdn_w8a16_speculative(n, t):
         use_qk_l2norm_in_kernel=True,
         max_sequence_length=t,
     )
-    restored = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales)
+    restored = dequantize_gdn_state_fp8(fp8, scales)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-3, rtol=5e-2)
     torch.testing.assert_close(restored, expected_state, atol=2e-2, rtol=0.25)
     written = torch.zeros(n * slots, device=q.device, dtype=torch.bool)
@@ -206,7 +220,7 @@ def test_gdn_w8a16_speculative(n, t):
 def test_gdn_w8a16_empty_and_invalid():
     q, k, v, g, beta, cu, indices = make_inputs(2, 1, 2, 4, torch.bfloat16)
     state = torch.zeros(2, 4, 128, 128, device=q.device, dtype=q.dtype)
-    fp8, scales = flaggems_vllm.quantize_gdn_state_fp8(state)
+    fp8, scales = quantize_gdn_state_fp8(state)
     with pytest.raises(ValueError, match="2D per-token"):
         flaggems_vllm.gdn_w8a16(
             q,
@@ -238,8 +252,8 @@ def test_gdn_w8a16_variable_lengths_and_padding():
     torch.manual_seed(45)
     q, k, v, g, beta, _, _ = make_inputs(1, 5, 2, 4, torch.bfloat16)
     initial = 0.02 * torch.randn(3, 4, 128, 128, device=q.device, dtype=q.dtype)
-    fp8, scales = flaggems_vllm.quantize_gdn_state_fp8(initial)
-    initial = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales, output_dtype=q.dtype)
+    fp8, scales = quantize_gdn_state_fp8(initial)
+    initial = dequantize_gdn_state_fp8(fp8, scales, output_dtype=q.dtype)
     cu = torch.tensor([0, 0, 1, 5, 5], device=q.device, dtype=torch.int32)
     indices = torch.tensor([2, 1, 0, -1], device=q.device, dtype=torch.int32)
     expected = torch.empty_like(v)
@@ -271,7 +285,7 @@ def test_gdn_w8a16_variable_lengths_and_padding():
         use_qk_l2norm_in_kernel=True,
         max_sequence_length=4,
     )
-    restored = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scales)
+    restored = dequantize_gdn_state_fp8(fp8, scales)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-3, rtol=5e-2)
     torch.testing.assert_close(restored, expected_state, atol=2e-2, rtol=0.25)
 
@@ -282,8 +296,8 @@ def test_gdn_w8a16_dynamic_scale_range():
     state = (
         torch.randn(2, 4, 128, 128, device=amplitude.device) * amplitude
     ).bfloat16()
-    fp8, scale = flaggems_vllm.quantize_gdn_state_fp8(state)
-    restored = flaggems_vllm.dequantize_gdn_state_fp8(fp8, scale)
+    fp8, scale = quantize_gdn_state_fp8(state)
+    restored = dequantize_gdn_state_fp8(fp8, scale)
     error = (restored - state.float()).abs() / state.float().abs().amax(2, keepdim=True)
     assert error.max().item() < 0.08
     assert error.mean().item() < 0.02

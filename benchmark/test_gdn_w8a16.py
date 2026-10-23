@@ -8,6 +8,7 @@ import torch
 
 import flaggems_vllm
 from benchmark.base import Benchmark
+from flaggems_vllm.ops.gdn_w8a16 import quantize_gdn_state_fp8
 
 
 def _vllm_bf16(q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t):
@@ -99,7 +100,7 @@ class GdnW8A16Benchmark(Benchmark):
             state = torch.zeros(
                 n + 1, hv, key_dim, value_dim, device=device, dtype=cur_dtype
             )
-            state_fp8, state_scale = flaggems_vllm.quantize_gdn_state_fp8(state)
+            state_fp8, state_scale = quantize_gdn_state_fp8(state)
             cu = torch.arange(0, n * t + 1, t, device=device, dtype=torch.int32)
             indices = (
                 torch.arange(1, n + 1, device=device, dtype=torch.int64)[:, None]
