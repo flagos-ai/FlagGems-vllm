@@ -46,6 +46,11 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
 )
+from flaggems_vllm.ops.gdn_w8a16 import (
+    dequantize_gdn_state_fp8,
+    gdn_w8a16,
+    quantize_gdn_state_fp8,
+)
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -246,6 +251,9 @@ __all__ = [
     "cross_entropy_loss",
     "cutlass_scaled_mm",
     "dequantize_and_gather_k_cache",
+    "dequantize_gdn_state_fp8",
+    "gdn_w8a16",
+    "quantize_gdn_state_fp8",
     "dgeglu",
     "dispatch_fused_moe_kernel",
     "dreglu",
