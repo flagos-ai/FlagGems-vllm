@@ -18,8 +18,8 @@ Three forward paths with identical semantics share one public entry, ``chunk_kda
 
 * Strict TLE path (``chunk_kda_fwd_infer_strict_tle``): optimized for the
   production KDA shape and its narrower input constraints.
-* Generic TLE path (``chunk_kda_fwd_infer``): TMA-accelerated,
-  warp-specialized fused kernels for the wider supported input set.
+* Generic TLE path (``chunk_kda_fwd_infer``): fused TLE kernels for the
+  wider supported input set.
 * Triton fallback (``chunk_kda_fwd_infer_triton``): portable plain-Triton
   kernels used when TLE is unavailable (e.g. CI).
 
@@ -39,11 +39,6 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-
-try:
-    from triton.tools.tensor_descriptor import TensorDescriptor
-except ImportError:
-    TensorDescriptor = None
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -95,10 +90,6 @@ def exp2(x):
 _FP16_DOT_PRECISION = tl.constexpr("ieee")
 
 
-def _allocate_triton_workspace(size: int, _alignment: int, _stream) -> torch.Tensor:
-    return torch.empty(size, device="musa", dtype=torch.int8)
-
-
 _KDA_INTRA_CONFIGS = [
     triton.Config({}, num_warps=num_warps, num_stages=num_stages)
     for num_warps in [4, 8]
@@ -106,7 +97,75 @@ _KDA_INTRA_CONFIGS = [
 ]
 
 # =============================================================================
-# TLE path (fused, TMA + warp-specialized) -- default when available
+# Shared state+output (kernel2) config tuning
+# =============================================================================
+#
+# @triton.autotune is deliberately not used for these kernels: it ranks
+# configs by standalone kernel2 latency, which promotes the bimodal BV=64
+# config on small grids. Configs are therefore tuned manually on first use,
+# ranked by full kernel1+kernel2 pipeline latency, and cached per shape key.
+
+_KDA_SO_CANDIDATES = [
+    (BV, num_warps, num_stages)
+    for BV in (32, 64, 128)
+    for num_warps in (2, 4, 8)
+    for num_stages in (2, 4)
+]
+_KDA_SO_BEST = {}
+
+
+def _kda_so_candidates(V: int) -> list:
+    max_bv = max(32, triton.next_power_of_2(V))
+    return [cfg for cfg in _KDA_SO_CANDIDATES if cfg[0] <= max_bv]
+
+
+def _kda_tune_state_output(launch, candidates):
+    """Two-stage config tuning on the live launch callable.
+
+    Stage 1 times every candidate for a few reps (compile failures are
+    skipped); stage 2 re-times the top 3 finalists for many reps. Long-run
+    means are required because some configs are bimodal in-pipeline (e.g.
+    BV=64 on small grids): a short lucky run would otherwise promote a config
+    that is slow half the time in production, and near-tied configs cannot be
+    separated by noisy short runs either.
+    """
+
+    def time_cfg(cfg, reps):
+        launch(*cfg)  # compile
+        launch(*cfg)  # warm up
+        torch.musa.synchronize()
+        start = torch.musa.Event(enable_timing=True)
+        end = torch.musa.Event(enable_timing=True)
+        start.record()
+        for _ in range(reps):
+            launch(*cfg)
+        end.record()
+        torch.musa.synchronize()
+        return start.elapsed_time(end)
+
+    scored, first_err = [], None
+    for cfg in candidates:
+        try:
+            scored.append((time_cfg(cfg, 4), cfg))
+        except Exception as exc:
+            if first_err is None:
+                first_err = exc
+    if not scored:
+        raise RuntimeError(
+            "no valid config for the KDA state+output kernel"
+        ) from first_err
+    scored.sort(key=lambda x: x[0])
+
+    best_cfg, best_ms = None, float("inf")
+    for _, cfg in scored[:3]:
+        ms = time_cfg(cfg, 20)
+        if ms < best_ms:
+            best_cfg, best_ms = cfg, ms
+    return best_cfg
+
+
+# =============================================================================
+# Generic TLE path (fused intra + plain state/output kernels)
 # =============================================================================
 
 if HAS_TLE_KDA:
@@ -337,13 +396,11 @@ if HAS_TLE_KDA:
 
         T_padded = NT * BT
         g_last = torch.empty(B * NT, HV, K, device=q.device, dtype=torch.float32)
-        if cu_seqlens is not None or T_len % BT != 0:
-            _alloc = torch.zeros
-        else:
-            _alloc = torch.empty
-        ws = _alloc(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
-        Aqk = _alloc(B, HV, NT, BT, BT, device=q.device, dtype=q.dtype)
-        Akk = _alloc(B, HV, NT, BT, BT, device=q.device, dtype=q.dtype)
+        # Aqk/Akk are fully written for every tile and padded ws rows are
+        # masked out by the state+output kernel, so zero-init is unneeded.
+        ws = torch.empty(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
+        Aqk = torch.empty(B, HV, NT, BT, BT, device=q.device, dtype=q.dtype)
+        Akk = torch.empty(B, HV, NT, BT, BT, device=q.device, dtype=q.dtype)
 
         _musa_kda_fwd_intra_kernel[grid](
             q=q,
@@ -375,137 +432,85 @@ if HAS_TLE_KDA:
     # Kernel 2: state propagation + output
     # -----------------------------------------------------------------------------
 
-    @triton.jit
-    def _musa_kda_state_output_load_producer(
-        writer,
-        ws_desc,
-        v_ptr,
-        beta_ptr,
-        gk_desc,
-        Aqk_desc,
-        Akk_desc,
-        K,
-        T,
-        HV: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        NT,
-        i_v,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
-        IS_VARLEN: tl.constexpr,
-        NT_TOTAL,
-        state_row_start,
-        chunk_start,
-        i_h,
-    ):
-        for i_t in tl.range(NT):
-            slot = writer.acquire(i_t)
-
-            ws_row = i_t * BT
-            ws_col = 0
-            A_row = i_t * BT
-            A_col = 0
-            gk_row = i_t
-            gk_col = 0
-            if USE_HOST_DESCRIPTORS:
-                ws_row += state_row_start
-                ws_col = i_h * 3 * K
-                if IS_VARLEN:
-                    A_row = (i_h * NT_TOTAL + chunk_start) * BT + i_t * BT
-                else:
-                    A_row = state_row_start * HV + i_h * NT * BT + i_t * BT
-                gk_row += chunk_start
-                gk_col = i_h * K
-
-            ws_row = ws_row.to(tl.int32)
-            ws_col = ws_col.to(tl.int32)
-            A_row = A_row.to(tl.int32)
-            A_col = A_col.to(tl.int32)
-            gk_row = gk_row.to(tl.int32)
-            gk_col = gk_col.to(tl.int32)
-
-            tle.gpu.copy(ws_desc, slot.w1, [BT, 64], [ws_row, ws_col])
-            tle.gpu.copy(ws_desc, slot.qg1, [BT, 64], [ws_row, ws_col + K])
-            tle.gpu.copy(ws_desc, slot.kg1, [BT, 64], [ws_row, ws_col + 2 * K])
-            tle.gpu.copy(Aqk_desc, slot.Aqk, [BT, BT], [A_row, A_col])
-            tle.gpu.copy(Akk_desc, slot.Akk, [BT, BT], [A_row, A_col])
-            tle.gpu.copy(gk_desc, slot.gk1, [1, 64], [gk_row, gk_col])
-            if K > 64:
-                tle.gpu.copy(ws_desc, slot.w2, [BT, 64], [ws_row, ws_col + 64])
-                tle.gpu.copy(ws_desc, slot.qg2, [BT, 64], [ws_row, ws_col + K + 64])
-                tle.gpu.copy(ws_desc, slot.kg2, [BT, 64], [ws_row, ws_col + 2 * K + 64])
-                tle.gpu.copy(gk_desc, slot.gk2, [1, 64], [gk_row, gk_col + 64])
-            if K > 128:
-                tle.gpu.copy(ws_desc, slot.w3, [BT, 64], [ws_row, ws_col + 128])
-                tle.gpu.copy(ws_desc, slot.qg3, [BT, 64], [ws_row, ws_col + K + 128])
-                tle.gpu.copy(
-                    ws_desc, slot.kg3, [BT, 64], [ws_row, ws_col + 2 * K + 128]
-                )
-                tle.gpu.copy(gk_desc, slot.gk3, [1, 64], [gk_row, gk_col + 128])
-            if K > 192:
-                tle.gpu.copy(ws_desc, slot.w4, [BT, 64], [ws_row, ws_col + 192])
-                tle.gpu.copy(ws_desc, slot.qg4, [BT, 64], [ws_row, ws_col + K + 192])
-                tle.gpu.copy(
-                    ws_desc, slot.kg4, [BT, 64], [ws_row, ws_col + 2 * K + 192]
-                )
-                tle.gpu.copy(gk_desc, slot.gk4, [1, 64], [gk_row, gk_col + 192])
-
-            m_tok = (i_t * BT + tl.arange(0, BT)) < T
-            m_v = (i_v * BV + tl.arange(0, BV)) < V
-            v_off = (i_t * BT + tl.arange(0, BT))[:, None].to(tl.int64) * (HV * V) + (
-                i_v * BV + tl.arange(0, BV)
-            )[None, :]
-            b_v_raw = tl.load(
-                v_ptr + v_off, mask=m_tok[:, None] & m_v[None, :], other=0.0
-            )
-            b_beta = tl.load(
-                beta_ptr + (i_t * BT + tl.arange(0, BT)) * HV,
-                mask=m_tok,
-                other=0.0,
-            )
-            b_beta_f = tl.sigmoid(b_beta.to(tl.float32))
-            b_vb = (b_v_raw.to(tl.float32) * b_beta_f[:, None]).to(b_v_raw.dtype)
-            tl.store(tle.gpu.local_ptr(slot.vb), b_vb)
-
-            writer.commit(i_t)
-
-    @triton.jit
-    def _musa_kda_state_output_mma_consumer(
-        load_reader,
-        o_ptr,
+    @triton.heuristics(
+        {
+            "USE_INITIAL_STATE": lambda args: args["h0"].numel() > 1,
+            "STORE_FINAL_STATE": lambda args: args["ht"].numel() > 1,
+            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        }
+    )
+    @triton.jit(do_not_specialize=["T"])
+    def _musa_kda_fwd_state_output_kernel(
+        v,
+        beta,
+        gk,
+        Aqk,
+        Akk,
+        o,
+        ws,
         h0,
         ht,
+        cu_seqlens,
+        chunk_offsets,
         scale,
-        i_v,
-        i_nh,
         T,
+        NT_TOTAL,
         HV: tl.constexpr,
         K: tl.constexpr,
         V: tl.constexpr,
         BT: tl.constexpr,
         BV: tl.constexpr,
-        NT,
-        kg_dtype: tl.constexpr,
+        STATE_V_FIRST: tl.constexpr,
         USE_INITIAL_STATE: tl.constexpr,
         STORE_FINAL_STATE: tl.constexpr,
-        STATE_V_FIRST: tl.constexpr,
+        IS_VARLEN: tl.constexpr,
     ):
-        m_v = (i_v * BV + tl.arange(0, BV)) < V
+        i_v, i_nh = tl.program_id(0), tl.program_id(1)
 
-        # Initial state.
+        # The K dimension is processed in fixed 64-wide blocks below.
+        tl.static_assert(K % 64 == 0 and 0 < K and K <= 256)
+
+        if IS_VARLEN:
+            i_n = i_nh // HV
+            i_h = i_nh % HV
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T = (eos - bos).to(tl.int32)
+            NT = tl.cdiv(T, BT)
+            chunk_start = tl.load(chunk_offsets + i_n).to(tl.int32)
+            state_row_start = bos
+            a_base = (i_h * NT_TOTAL + chunk_start).to(tl.int64) * (BT * BT)
+        else:
+            i_n = i_nh // HV
+            i_h = i_nh % HV
+            bos = i_n.to(tl.int64) * T
+            NT = tl.cdiv(T, BT)
+            chunk_start = i_n * NT
+            state_row_start = i_n.to(tl.int64) * NT * BT
+            a_base = ((i_n * HV + i_h) * NT_TOTAL).to(tl.int64) * (BT * BT)
+
+        o_i = tl.arange(0, BT)
+        o_k = tl.arange(0, 64)
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = o_v < V
+
+        kg_dtype: tl.constexpr = ws.dtype.element_ty
+
+        # Recurrent state: one [64, BV] fp32 tile per 64-wide K block.
         if USE_INITIAL_STATE:
             if STATE_V_FIRST:
-                hk_off = (i_v * BV + tl.arange(0, BV))[:, None].to(
-                    tl.int64
-                ) * K + tl.arange(0, 64)[None, :]
+                hk_off = o_v[:, None].to(tl.int64) * K + o_k[None, :]
                 b_h1 = tl.trans(
-                    tl.load(h0 + i_nh * K * V + hk_off, mask=m_v[:, None], other=0.0)
+                    tl.load(
+                        h0 + i_nh.to(tl.int64) * K * V + hk_off,
+                        mask=m_v[:, None],
+                        other=0.0,
+                    )
                 ).to(tl.float32)
                 if K > 64:
                     b_h2 = tl.trans(
                         tl.load(
-                            h0 + i_nh * K * V + 64 + hk_off,
+                            h0 + i_nh.to(tl.int64) * K * V + 64 + hk_off,
                             mask=m_v[:, None],
                             other=0.0,
                         )
@@ -513,7 +518,7 @@ if HAS_TLE_KDA:
                 if K > 128:
                     b_h3 = tl.trans(
                         tl.load(
-                            h0 + i_nh * K * V + 128 + hk_off,
+                            h0 + i_nh.to(tl.int64) * K * V + 128 + hk_off,
                             mask=m_v[:, None],
                             other=0.0,
                         )
@@ -521,34 +526,33 @@ if HAS_TLE_KDA:
                 if K > 192:
                     b_h4 = tl.trans(
                         tl.load(
-                            h0 + i_nh * K * V + 192 + hk_off,
+                            h0 + i_nh.to(tl.int64) * K * V + 192 + hk_off,
                             mask=m_v[:, None],
                             other=0.0,
                         )
                     ).to(tl.float32)
             else:
-                hk_off = (
-                    tl.arange(0, 64)[:, None].to(tl.int64) * V
-                    + (i_v * BV + tl.arange(0, BV))[None, :]
-                )
+                hk_off = o_k[:, None].to(tl.int64) * V + o_v[None, :]
                 b_h1 = tl.load(
-                    h0 + i_nh * K * V + hk_off, mask=m_v[None, :], other=0.0
+                    h0 + i_nh.to(tl.int64) * K * V + hk_off,
+                    mask=m_v[None, :],
+                    other=0.0,
                 ).to(tl.float32)
                 if K > 64:
                     b_h2 = tl.load(
-                        h0 + i_nh * K * V + 64 * V + hk_off,
+                        h0 + i_nh.to(tl.int64) * K * V + 64 * V + hk_off,
                         mask=m_v[None, :],
                         other=0.0,
                     ).to(tl.float32)
                 if K > 128:
                     b_h3 = tl.load(
-                        h0 + i_nh * K * V + 128 * V + hk_off,
+                        h0 + i_nh.to(tl.int64) * K * V + 128 * V + hk_off,
                         mask=m_v[None, :],
                         other=0.0,
                     ).to(tl.float32)
                 if K > 192:
                     b_h4 = tl.load(
-                        h0 + i_nh * K * V + 192 * V + hk_off,
+                        h0 + i_nh.to(tl.int64) * K * V + 192 * V + hk_off,
                         mask=m_v[None, :],
                         other=0.0,
                     ).to(tl.float32)
@@ -562,34 +566,58 @@ if HAS_TLE_KDA:
                 b_h4 = tl.zeros([64, BV], dtype=tl.float32)
 
         # Sequential recurrence across chunks.
-        for i_t in tl.range(NT):
-            wait = load_reader.wait(i_t)
-            slot = wait.slot
+        for i_t in range(NT):
+            token_start = i_t * BT
+            m_rows = (token_start + o_i) < T
+            m_tv = m_rows[:, None] & m_v[None, :]
 
-            b_w1 = tl.load(tle.gpu.local_ptr(slot.w1))
-            b_vb = tl.load(tle.gpu.local_ptr(slot.vb))
-            b_qg1 = tl.load(tle.gpu.local_ptr(slot.qg1))
-            b_kg1 = tl.load(tle.gpu.local_ptr(slot.kg1))
-            b_Aqk = tl.load(tle.gpu.local_ptr(slot.Aqk))
-            b_Akk = tl.load(tle.gpu.local_ptr(slot.Akk))
-            b_gk1 = tl.load(tle.gpu.local_ptr(slot.gk1)).reshape([64])
+            # ws rows are padded token positions; columns pack w|qg|kg.
+            ws_row = (state_row_start + token_start + o_i)[:, None].to(tl.int64) * (
+                HV * 3 * K
+            ) + i_h * 3 * K
+            b_w1 = tl.load(ws + ws_row + o_k[None, :])
+            b_qg1 = tl.load(ws + ws_row + K + o_k[None, :])
+            b_kg1 = tl.load(ws + ws_row + 2 * K + o_k[None, :])
             if K > 64:
-                b_w2 = tl.load(tle.gpu.local_ptr(slot.w2))
-                b_qg2 = tl.load(tle.gpu.local_ptr(slot.qg2))
-                b_kg2 = tl.load(tle.gpu.local_ptr(slot.kg2))
-                b_gk2 = tl.load(tle.gpu.local_ptr(slot.gk2)).reshape([64])
+                b_w2 = tl.load(ws + ws_row + 64 + o_k[None, :])
+                b_qg2 = tl.load(ws + ws_row + K + 64 + o_k[None, :])
+                b_kg2 = tl.load(ws + ws_row + 2 * K + 64 + o_k[None, :])
             if K > 128:
-                b_w3 = tl.load(tle.gpu.local_ptr(slot.w3))
-                b_qg3 = tl.load(tle.gpu.local_ptr(slot.qg3))
-                b_kg3 = tl.load(tle.gpu.local_ptr(slot.kg3))
-                b_gk3 = tl.load(tle.gpu.local_ptr(slot.gk3)).reshape([64])
+                b_w3 = tl.load(ws + ws_row + 128 + o_k[None, :])
+                b_qg3 = tl.load(ws + ws_row + K + 128 + o_k[None, :])
+                b_kg3 = tl.load(ws + ws_row + 2 * K + 128 + o_k[None, :])
             if K > 192:
-                b_w4 = tl.load(tle.gpu.local_ptr(slot.w4))
-                b_qg4 = tl.load(tle.gpu.local_ptr(slot.qg4))
-                b_kg4 = tl.load(tle.gpu.local_ptr(slot.kg4))
-                b_gk4 = tl.load(tle.gpu.local_ptr(slot.gk4)).reshape([64])
+                b_w4 = tl.load(ws + ws_row + 192 + o_k[None, :])
+                b_qg4 = tl.load(ws + ws_row + K + 192 + o_k[None, :])
+                b_kg4 = tl.load(ws + ws_row + 2 * K + 192 + o_k[None, :])
 
-            m_rows = (i_t * BT + tl.arange(0, BT)) < T
+            a_off = a_base + i_t * (BT * BT) + o_i[:, None] * BT + o_i[None, :]
+            b_Aqk = tl.load(Aqk + a_off)
+            b_Akk = tl.load(Akk + a_off)
+
+            gk_off = ((chunk_start + i_t) * HV + i_h).to(tl.int64) * K
+            b_gk1 = tl.load(gk + gk_off + o_k)
+            if K > 64:
+                b_gk2 = tl.load(gk + gk_off + 64 + o_k)
+            if K > 128:
+                b_gk3 = tl.load(gk + gk_off + 128 + o_k)
+            if K > 192:
+                b_gk4 = tl.load(gk + gk_off + 192 + o_k)
+
+            v_off = ((bos + token_start + o_i)[:, None] * HV + i_h).to(
+                tl.int64
+            ) * V + o_v[None, :]
+            b_v_raw = tl.load(v + v_off, mask=m_tv, other=0.0)
+            b_beta = tl.load(
+                beta + ((bos + token_start + o_i) * HV + i_h).to(tl.int64),
+                mask=m_rows,
+                other=0.0,
+            )
+            # v * sigmoid(beta), rounded to the input dtype.
+            b_vb = (
+                b_v_raw.to(tl.float32) * tl.sigmoid(b_beta.to(tl.float32))[:, None]
+            ).to(b_v_raw.dtype)
+
             b_w1 = tl.where(m_rows[:, None], b_w1, 0)
             b_qg1 = tl.where(m_rows[:, None], b_qg1, 0)
             b_kg1 = tl.where(m_rows[:, None], b_kg1, 0)
@@ -614,7 +642,7 @@ if HAS_TLE_KDA:
             if K > 192:
                 b_h4_bf = b_h4.to(kg_dtype)
 
-            # v_new = Akk_inv @ (v*beta - w @ h)
+            # v_new = Akk @ (v*beta - w @ h)
             b_kh = tl.dot(b_w1, b_h1_bf).to(tl.float32)
             if K > 64:
                 b_kh += tl.dot(b_w2, b_h2_bf).to(tl.float32)
@@ -637,16 +665,7 @@ if HAS_TLE_KDA:
             b_v_cast = b_v.to(kg_dtype)
             b_o += tl.dot(b_Aqk, b_v_cast).to(tl.float32)
 
-            o_off = (i_t * BT + tl.arange(0, BT))[:, None].to(tl.int64) * (HV * V) + (
-                i_v * BV + tl.arange(0, BV)
-            )[None, :]
-            tl.store(
-                o_ptr + o_off,
-                b_o.to(o_ptr.dtype.element_ty),
-                mask=m_rows[:, None] & m_v[None, :],
-            )
-
-            load_reader.release(i_t)
+            tl.store(o + v_off, b_o.to(o.dtype.element_ty), mask=m_tv)
 
             # state decay + update: h = h * exp2(gk_last) + kg^T @ v_new
             b_h1 = b_h1 * exp2(b_gk1)[:, None] + tl.dot(tl.trans(b_kg1), b_v_cast).to(
@@ -668,357 +687,55 @@ if HAS_TLE_KDA:
         # Final state.
         if STORE_FINAL_STATE:
             if STATE_V_FIRST:
-                hk_off = (i_v * BV + tl.arange(0, BV))[:, None].to(
-                    tl.int64
-                ) * K + tl.arange(0, 64)[None, :]
+                hk_off = o_v[:, None].to(tl.int64) * K + o_k[None, :]
                 tl.store(
-                    ht + i_nh * K * V + hk_off,
+                    ht + i_nh.to(tl.int64) * K * V + hk_off,
                     tl.trans(b_h1).to(ht.dtype.element_ty),
                     mask=m_v[:, None],
                 )
                 if K > 64:
                     tl.store(
-                        ht + i_nh * K * V + 64 + hk_off,
+                        ht + i_nh.to(tl.int64) * K * V + 64 + hk_off,
                         tl.trans(b_h2).to(ht.dtype.element_ty),
                         mask=m_v[:, None],
                     )
                 if K > 128:
                     tl.store(
-                        ht + i_nh * K * V + 128 + hk_off,
+                        ht + i_nh.to(tl.int64) * K * V + 128 + hk_off,
                         tl.trans(b_h3).to(ht.dtype.element_ty),
                         mask=m_v[:, None],
                     )
                 if K > 192:
                     tl.store(
-                        ht + i_nh * K * V + 192 + hk_off,
+                        ht + i_nh.to(tl.int64) * K * V + 192 + hk_off,
                         tl.trans(b_h4).to(ht.dtype.element_ty),
                         mask=m_v[:, None],
                     )
             else:
-                hk_off = (
-                    tl.arange(0, 64)[:, None].to(tl.int64) * V
-                    + (i_v * BV + tl.arange(0, BV))[None, :]
-                )
+                hk_off = o_k[:, None].to(tl.int64) * V + o_v[None, :]
                 tl.store(
-                    ht + i_nh * K * V + hk_off,
+                    ht + i_nh.to(tl.int64) * K * V + hk_off,
                     b_h1.to(ht.dtype.element_ty),
                     mask=m_v[None, :],
                 )
                 if K > 64:
                     tl.store(
-                        ht + i_nh * K * V + 64 * V + hk_off,
+                        ht + i_nh.to(tl.int64) * K * V + 64 * V + hk_off,
                         b_h2.to(ht.dtype.element_ty),
                         mask=m_v[None, :],
                     )
                 if K > 128:
                     tl.store(
-                        ht + i_nh * K * V + 128 * V + hk_off,
+                        ht + i_nh.to(tl.int64) * K * V + 128 * V + hk_off,
                         b_h3.to(ht.dtype.element_ty),
                         mask=m_v[None, :],
                     )
                 if K > 192:
                     tl.store(
-                        ht + i_nh * K * V + 192 * V + hk_off,
+                        ht + i_nh.to(tl.int64) * K * V + 192 * V + hk_off,
                         b_h4.to(ht.dtype.element_ty),
                         mask=m_v[None, :],
                     )
-
-    PIPE_STAGES = tl.constexpr(3)
-
-    @triton.heuristics(
-        {
-            "USE_INITIAL_STATE": lambda args: args["h0"].numel() > 1,
-            "STORE_FINAL_STATE": lambda args: args["ht"].numel() > 1,
-            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-            "BV": lambda args: min(128, triton.next_power_of_2(args["V"])),
-        }
-    )
-    @triton.jit(do_not_specialize=["T"])
-    def _musa_kda_fwd_state_output_kernel(
-        v,
-        beta,
-        gk,
-        Aqk,
-        Akk,
-        o,
-        ws,
-        h0,
-        ht,
-        ws_host_desc,
-        gk_host_desc,
-        Aqk_host_desc,
-        Akk_host_desc,
-        cu_seqlens,
-        chunk_offsets,
-        scale,
-        T,
-        NT_TOTAL,
-        HV: tl.constexpr,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
-        USE_INITIAL_STATE: tl.constexpr,
-        STORE_FINAL_STATE: tl.constexpr,
-        IS_VARLEN: tl.constexpr,
-        STATE_V_FIRST: tl.constexpr,
-    ):
-        i_v, i_nh = tl.program_id(0), tl.program_id(1)
-
-        if IS_VARLEN:
-            i_n = i_nh // HV
-            i_h = i_nh % HV
-            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
-            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-            T = (eos - bos).to(tl.int32)
-            NT = tl.cdiv(T, BT)
-            chunk_start = tl.load(chunk_offsets + i_n).to(tl.int32)
-        else:
-            i_n = i_nh // HV
-            i_h = i_nh % HV
-            bos = i_n.to(tl.int64) * T
-            NT = tl.cdiv(T, BT)
-            chunk_start = i_n * NT
-
-        v += (bos * HV + i_h) * V
-        beta += bos * HV + i_h
-        gk += (chunk_start * HV + i_h).to(tl.int64) * K
-        o += (bos * HV + i_h) * V
-        ws_base = ws + (bos * HV + i_h) * 3 * K
-
-        if IS_VARLEN:
-            state_row_start = bos
-        else:
-            state_row_start = i_n.to(tl.int64) * NT * BT
-        if USE_HOST_DESCRIPTORS:
-            ws_desc = ws_host_desc
-            gk_desc = gk_host_desc
-            Aqk_desc = Aqk_host_desc
-            Akk_desc = Akk_host_desc
-        else:
-            if IS_VARLEN:
-                a_chunk = (i_h * NT_TOTAL + chunk_start) * BT * BT
-            else:
-                a_chunk = (i_n * HV + i_h) * NT_TOTAL * BT * BT
-            Aqk += a_chunk.to(tl.int64)
-            Akk += a_chunk.to(tl.int64)
-            ws_desc = tl.make_tensor_descriptor(
-                ws_base,
-                shape=[T, 3 * K],
-                strides=[HV * 3 * K, 1],
-                block_shape=[BT, 64],
-            )
-            gk_desc = tl.make_tensor_descriptor(
-                gk, shape=[NT, K], strides=[HV * K, 1], block_shape=[1, 64]
-            )
-            Aqk_desc = tl.make_tensor_descriptor(
-                Aqk,
-                shape=[NT * BT, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-            Akk_desc = tl.make_tensor_descriptor(
-                Akk,
-                shape=[NT * BT, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-
-        # Allocate only the K blocks needed by this specialization.
-        w1_smem = tle.gpu.alloc(
-            [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-        )
-        vb_smem = tle.gpu.alloc(
-            [PIPE_STAGES, BT, BV], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-        )
-        qg1_smem = tle.gpu.alloc(
-            [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-        )
-        kg1_smem = tle.gpu.alloc(
-            [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-        )
-        Aqk_smem = tle.gpu.alloc(
-            [PIPE_STAGES, BT, BT], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-        )
-        Akk_smem = tle.gpu.alloc(
-            [PIPE_STAGES, BT, BT], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-        )
-        gk1_smem = tle.gpu.alloc(
-            [PIPE_STAGES, 1, 64], dtype=tl.float32, scope=tle.gpu.smem
-        )
-        if K > 64:
-            w2_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            qg2_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            kg2_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            gk2_smem = tle.gpu.alloc(
-                [PIPE_STAGES, 1, 64], dtype=tl.float32, scope=tle.gpu.smem
-            )
-        if K > 128:
-            w3_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            qg3_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            kg3_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            gk3_smem = tle.gpu.alloc(
-                [PIPE_STAGES, 1, 64], dtype=tl.float32, scope=tle.gpu.smem
-            )
-        if K > 192:
-            w4_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            qg4_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            kg4_smem = tle.gpu.alloc(
-                [PIPE_STAGES, BT, 64], dtype=ws.dtype.element_ty, scope=tle.gpu.smem
-            )
-            gk4_smem = tle.gpu.alloc(
-                [PIPE_STAGES, 1, 64], dtype=tl.float32, scope=tle.gpu.smem
-            )
-
-        # Build pipe slots that match the allocated blocks.
-        if K <= 64:
-            load_pipe = tle.pipe(
-                capacity=PIPE_STAGES,
-                scope="cta",
-                name="kda_load",
-                w1=w1_smem,
-                vb=vb_smem,
-                qg1=qg1_smem,
-                kg1=kg1_smem,
-                Aqk=Aqk_smem,
-                Akk=Akk_smem,
-                gk1=gk1_smem,
-            )
-        elif K <= 128:
-            load_pipe = tle.pipe(
-                capacity=PIPE_STAGES,
-                scope="cta",
-                name="kda_load",
-                w1=w1_smem,
-                w2=w2_smem,
-                vb=vb_smem,
-                qg1=qg1_smem,
-                qg2=qg2_smem,
-                kg1=kg1_smem,
-                kg2=kg2_smem,
-                Aqk=Aqk_smem,
-                Akk=Akk_smem,
-                gk1=gk1_smem,
-                gk2=gk2_smem,
-            )
-        elif K <= 192:
-            load_pipe = tle.pipe(
-                capacity=PIPE_STAGES,
-                scope="cta",
-                name="kda_load",
-                w1=w1_smem,
-                w2=w2_smem,
-                w3=w3_smem,
-                vb=vb_smem,
-                qg1=qg1_smem,
-                qg2=qg2_smem,
-                qg3=qg3_smem,
-                kg1=kg1_smem,
-                kg2=kg2_smem,
-                kg3=kg3_smem,
-                Aqk=Aqk_smem,
-                Akk=Akk_smem,
-                gk1=gk1_smem,
-                gk2=gk2_smem,
-                gk3=gk3_smem,
-            )
-        else:
-            load_pipe = tle.pipe(
-                capacity=PIPE_STAGES,
-                scope="cta",
-                name="kda_load",
-                w1=w1_smem,
-                w2=w2_smem,
-                w3=w3_smem,
-                w4=w4_smem,
-                vb=vb_smem,
-                qg1=qg1_smem,
-                qg2=qg2_smem,
-                qg3=qg3_smem,
-                qg4=qg4_smem,
-                kg1=kg1_smem,
-                kg2=kg2_smem,
-                kg3=kg3_smem,
-                kg4=kg4_smem,
-                Aqk=Aqk_smem,
-                Akk=Akk_smem,
-                gk1=gk1_smem,
-                gk2=gk2_smem,
-                gk3=gk3_smem,
-                gk4=gk4_smem,
-            )
-        tle.gpu.warp_specialize(
-            [
-                (
-                    _musa_kda_state_output_mma_consumer,
-                    (
-                        load_pipe.reader(),
-                        o,
-                        h0,
-                        ht,
-                        scale,
-                        i_v,
-                        i_nh,
-                        T,
-                        HV,
-                        K,
-                        V,
-                        BT,
-                        BV,
-                        NT,
-                        ws.dtype.element_ty,
-                        USE_INITIAL_STATE,
-                        STORE_FINAL_STATE,
-                        STATE_V_FIRST,
-                    ),
-                ),
-                (
-                    _musa_kda_state_output_load_producer,
-                    (
-                        load_pipe.writer(),
-                        ws_desc,
-                        v,
-                        beta,
-                        gk_desc,
-                        Aqk_desc,
-                        Akk_desc,
-                        K,
-                        T,
-                        HV,
-                        V,
-                        BT,
-                        BV,
-                        NT,
-                        i_v,
-                        USE_HOST_DESCRIPTORS,
-                        IS_VARLEN,
-                        NT_TOTAL,
-                        state_row_start,
-                        chunk_start,
-                        i_h,
-                    ),
-                ),
-            ],
-            [4],
-            [64],
-        )
 
     def _musa_kda_fwd_state_output(
         v: torch.Tensor,
@@ -1033,6 +750,7 @@ if HAS_TLE_KDA:
         state_v_first: bool = True,
         cu_seqlens: torch.LongTensor | None = None,
         chunk_size: int = 32,
+        _pinned_cfg: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, _, HV, packed_K = ws.shape
         K = packed_K // 3
@@ -1070,69 +788,58 @@ if HAS_TLE_KDA:
             else ws.new_empty(1, dtype=torch.float32)
         )
 
-        use_host_descriptors = TensorDescriptor is not None
-        if use_host_descriptors:
-            NT_total = ws.shape[1] // BT
-            descriptor_rows = B * HV * NT_total * BT
-            ws_desc_arg = TensorDescriptor(
-                ws,
-                shape=[descriptor_rows, HV * 3 * K],
-                strides=[HV * 3 * K, 1],
-                block_shape=[BT, 64],
+        def _launch(BV: int, num_warps: int, num_stages: int) -> None:
+            _musa_kda_fwd_state_output_kernel[(triton.cdiv(V, BV), N * HV)](
+                v=v,
+                beta=beta,
+                gk=gk,
+                Aqk=Aqk,
+                Akk=Akk,
+                o=o,
+                ws=ws,
+                h0=h0_arg,
+                ht=ht_arg,
+                cu_seqlens=cu_seqlens,
+                chunk_offsets=chunk_offsets,
+                scale=scale,
+                T=T_actual,
+                NT_TOTAL=ws.shape[1] // BT,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                BV=BV,
+                STATE_V_FIRST=state_v_first,
+                num_warps=num_warps,
+                num_stages=num_stages,
             )
-            gk_desc_arg = TensorDescriptor(
-                gk,
-                shape=[gk.shape[0], HV * K],
-                strides=[HV * K, 1],
-                block_shape=[1, 64],
-            )
-            Aqk_desc_arg = TensorDescriptor(
-                Aqk,
-                shape=[descriptor_rows, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-            Akk_desc_arg = TensorDescriptor(
-                Akk,
-                shape=[descriptor_rows, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-        else:
-            ws_desc_arg = ws
-            gk_desc_arg = gk
-            Aqk_desc_arg = Aqk
-            Akk_desc_arg = Akk
 
-        BV = min(128, triton.next_power_of_2(V))
-        grid = (triton.cdiv(V, BV), N * HV)
-        _musa_kda_fwd_state_output_kernel[grid](
-            v=v,
-            beta=beta,
-            gk=gk,
-            Aqk=Aqk,
-            Akk=Akk,
-            o=o,
-            ws=ws,
-            h0=h0_arg,
-            ht=ht_arg,
-            ws_host_desc=ws_desc_arg,
-            gk_host_desc=gk_desc_arg,
-            Aqk_host_desc=Aqk_desc_arg,
-            Akk_host_desc=Akk_desc_arg,
-            cu_seqlens=cu_seqlens,
-            chunk_offsets=chunk_offsets,
-            scale=scale,
-            T=T_actual,
-            NT_TOTAL=ws.shape[1] // BT,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=BT,
-            STATE_V_FIRST=state_v_first,
-            USE_HOST_DESCRIPTORS=use_host_descriptors,
-            num_warps=4,
+        if _pinned_cfg is not None:
+            # Config chosen by in-pipeline tuning at the wrapper level; this
+            # is the metric that matters (standalone kernel2 timing misses
+            # scheduling/L2 effects that only appear after kernel1 runs).
+            _launch(*_pinned_cfg)
+            return o, final_state
+
+        # Standalone fallback: reached only when kernel2 is launched without
+        # the wrapper (e.g. profiling).
+        tune_key = (
+            "solo",
+            HV,
+            K,
+            V,
+            BT,
+            v.dtype,
+            state_v_first,
+            cu_seqlens is not None,
+            h0_arg.numel() > 1,
+            ht_arg.numel() > 1,
         )
+        cfg = _KDA_SO_BEST.get(tune_key)
+        if cfg is None:
+            cfg = _kda_tune_state_output(_launch, _kda_so_candidates(V))
+            _KDA_SO_BEST[tune_key] = cfg
+        _launch(*cfg)
 
         return o, final_state
 
@@ -1156,8 +863,6 @@ def musa_chunk_kda_fwd_infer(
     dt_bias: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    triton.set_allocator(_allocate_triton_workspace)
-
     if scale is None:
         scale = q.shape[-1] ** -0.5
 
@@ -1178,6 +883,59 @@ def musa_chunk_kda_fwd_infer(
         dt_bias=dt_bias,
     )
 
+    # In-pipeline config tuning for kernel2. Standalone kernel2 timing picks
+    # configs that can be bimodal once kernel1 has just written the workspace
+    # (e.g. BV=64 on small grids), so candidates are ranked by full
+    # kernel1+kernel2 pipeline latency instead.
+    pipe_key = (
+        "pipe",
+        q.shape[2],
+        q.shape[3],
+        v.shape[-1],
+        chunk_size,
+        q.dtype,
+        state_v_first,
+        cu_seqlens is not None,
+        initial_state is not None,
+        bool(output_final_state),
+    )
+    pinned_cfg = _KDA_SO_BEST.get(pipe_key)
+    if pinned_cfg is None:
+        candidates = _kda_so_candidates(v.shape[-1])
+
+        def run_once(*cfg):
+            ws_r, Aqk_r, Akk_r, g_last_r = _musa_kda_fwd_intra(
+                q=q,
+                k=k,
+                g=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_size=chunk_size,
+                lower_bound=lower_bound,
+                A_log=A_log,
+                dt_bias=dt_bias,
+            )
+            _musa_kda_fwd_state_output(
+                v=v,
+                beta=beta,
+                Akk=Akk_r,
+                gk=g_last_r,
+                Aqk=Aqk_r,
+                ws=ws_r,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                state_v_first=state_v_first,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                _pinned_cfg=cfg,
+            )
+
+        pinned_cfg = _kda_tune_state_output(run_once, candidates)
+        _KDA_SO_BEST[pipe_key] = pinned_cfg
+
     return _musa_kda_fwd_state_output(
         v=v,
         beta=beta,
@@ -1191,6 +949,7 @@ def musa_chunk_kda_fwd_infer(
         state_v_first=state_v_first,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        _pinned_cfg=pinned_cfg,
     )
 
 
@@ -1525,10 +1284,8 @@ if HAS_STRICT_TLE_KDA:
 
         T_padded = NT * BT
         g_last = torch.empty(B * NT, HV, K, device=q.device, dtype=torch.float32)
-        if cu_seqlens is not None or T_len % BT != 0:
-            _alloc = torch.zeros
-        else:
-            _alloc = torch.empty
+
+        _alloc = torch.empty
         ws = _alloc(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
         Aqk = _alloc(B, HV, NT, BT, BT, device=q.device, dtype=q.dtype)
         Akk = _alloc(B, HV, NT, BT, BT, device=q.device, dtype=q.dtype)
@@ -1559,155 +1316,9 @@ if HAS_STRICT_TLE_KDA:
         )
         return ws, Aqk, Akk, g_last
 
-    @triton.jit
-    def _musa_strict_kda_state_output_load_producer(
-        writer,
-        ws_desc,
-        v_ptr,
-        beta_ptr,
-        gk_desc,
-        Aqk_desc,
-        Akk_desc,
-        K: tl.constexpr,
-        T,
-        HV: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        NT,
-        i_v,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
-        IS_VARLEN: tl.constexpr,
-        NT_TOTAL,
-        state_row_start,
-        chunk_start,
-        i_h,
-    ):
-        for i_t in tl.range(NT):
-            slot = writer.acquire(i_t)
-
-            ws_row = i_t * BT
-            ws_col = 0
-            A_row = i_t * BT
-            A_col = 0
-            gk_row = i_t
-            gk_col = 0
-            if USE_HOST_DESCRIPTORS:
-                ws_row += state_row_start
-                ws_col = i_h * 3 * K
-                if IS_VARLEN:
-                    A_row = (i_h * NT_TOTAL + chunk_start) * BT + i_t * BT
-                else:
-                    A_row = state_row_start * HV + i_h * NT * BT + i_t * BT
-                gk_row += chunk_start
-                gk_col = i_h * K
-
-            ws_row = ws_row.to(tl.int32)
-            ws_col = ws_col.to(tl.int32)
-            A_row = A_row.to(tl.int32)
-            A_col = A_col.to(tl.int32)
-            gk_row = gk_row.to(tl.int32)
-            gk_col = gk_col.to(tl.int32)
-
-            tle.gpu.copy(ws_desc, slot.w, [BT, K], [ws_row, ws_col])
-            tle.gpu.copy(ws_desc, slot.qg, [BT, K], [ws_row, ws_col + K])
-            tle.gpu.copy(ws_desc, slot.kg, [BT, K], [ws_row, ws_col + 2 * K])
-            tle.gpu.copy(Aqk_desc, slot.Aqk, [BT, BT], [A_row, A_col])
-            tle.gpu.copy(Akk_desc, slot.Akk, [BT, BT], [A_row, A_col])
-            tle.gpu.copy(gk_desc, slot.gk, [1, K], [gk_row, gk_col])
-
-            m_tok = (i_t * BT + tl.arange(0, BT)) < T
-            v_off = (i_t * BT + tl.arange(0, BT))[:, None].to(tl.int64) * (HV * V) + (
-                i_v * BV + tl.arange(0, BV)
-            )[None, :]
-            b_v_raw = tl.load(v_ptr + v_off, mask=m_tok[:, None], other=0.0)
-            b_beta = tl.load(
-                beta_ptr + (i_t * BT + tl.arange(0, BT)) * HV,
-                mask=m_tok,
-                other=0.0,
-            )
-            b_beta_f = tl.sigmoid(b_beta.to(tl.float32))
-            b_v = (b_v_raw.to(tl.float32) * b_beta_f[:, None]).to(b_v_raw.dtype)
-            tl.store(tle.gpu.local_ptr(slot.v), b_v)
-
-            writer.commit(i_t)
-
-    @triton.jit
-    def _musa_strict_kda_state_output_mma_consumer(
-        load_reader,
-        o_ptr,
-        h0,
-        ht,
-        scale,
-        i_v,
-        i_nh,
-        T,
-        HV: tl.constexpr,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        BT: tl.constexpr,
-        BV: tl.constexpr,
-        NT,
-        USE_INITIAL_STATE: tl.constexpr,
-        STORE_FINAL_STATE: tl.constexpr,
-    ):
-        state_dtype: tl.constexpr = tl.bfloat16
-        if USE_INITIAL_STATE:
-            hk_off = (i_v * BV + tl.arange(0, BV))[:, None].to(
-                tl.int64
-            ) * K + tl.arange(0, K)[None, :]
-            b_h = tl.trans(tl.load(h0 + i_nh * K * V + hk_off)).to(tl.float32)
-        else:
-            b_h = tl.zeros([K, BV], dtype=tl.float32)
-
-        for i_t in tl.range(NT):
-            wait = load_reader.wait(i_t)
-            slot = wait.slot
-
-            b_w = tl.load(tle.gpu.local_ptr(slot.w))
-            b_v_raw = tl.load(tle.gpu.local_ptr(slot.v))
-            b_qg = tl.load(tle.gpu.local_ptr(slot.qg))
-            b_kg = tl.load(tle.gpu.local_ptr(slot.kg))
-            b_Aqk = tl.load(tle.gpu.local_ptr(slot.Aqk))
-            b_Akk = tl.load(tle.gpu.local_ptr(slot.Akk))
-            b_gk = tl.load(tle.gpu.local_ptr(slot.gk)).reshape([K])
-
-            m_rows = (i_t * BT + tl.arange(0, BT)) < T
-            b_w = tl.where(m_rows[:, None], b_w, 0)
-            b_qg = tl.where(m_rows[:, None], b_qg, 0)
-            b_kg = tl.where(m_rows[:, None], b_kg, 0)
-
-            b_h_bf = b_h.to(state_dtype)
-
-            b_kh = tl.dot(b_w, b_h_bf).to(tl.float32)
-            b_diff = b_v_raw.to(tl.float32) - b_kh
-            b_v = tl.dot(b_Akk, b_diff.to(state_dtype)).to(tl.float32)
-
-            b_qh = tl.dot(b_qg, b_h_bf).to(tl.float32)
-            b_o = scale * b_qh
-            b_v_cast = b_v.to(state_dtype)
-            b_o += tl.dot(b_Aqk, b_v_cast).to(tl.float32)
-
-            o_off = (i_t * BT + tl.arange(0, BT))[:, None].to(tl.int64) * (HV * V) + (
-                i_v * BV + tl.arange(0, BV)
-            )[None, :]
-            tl.store(
-                o_ptr + o_off, b_o.to(o_ptr.dtype.element_ty), mask=m_rows[:, None]
-            )
-
-            load_reader.release(i_t)
-
-            b_h = b_h * exp2(b_gk)[:, None] + tl.dot(tl.trans(b_kg), b_v_cast).to(
-                tl.float32
-            )
-
-        if STORE_FINAL_STATE:
-            hk_off = (i_v * BV + tl.arange(0, BV))[:, None].to(
-                tl.int64
-            ) * K + tl.arange(0, K)[None, :]
-            tl.store(ht + i_nh * K * V + hk_off, tl.trans(b_h).to(ht.dtype.element_ty))
-
-    STRICT_PIPE_STAGES = tl.constexpr(3)
+    # -------------------------------------------------------------------------
+    # Kernel 2: state propagation + output
+    # -------------------------------------------------------------------------
 
     @triton.heuristics(
         {
@@ -1727,10 +1338,6 @@ if HAS_STRICT_TLE_KDA:
         ws,
         h0,
         ht,
-        ws_host_desc,
-        gk_host_desc,
-        Aqk_host_desc,
-        Akk_host_desc,
         cu_seqlens,
         chunk_offsets,
         scale,
@@ -1741,12 +1348,14 @@ if HAS_STRICT_TLE_KDA:
         V: tl.constexpr,
         BT: tl.constexpr,
         BV: tl.constexpr,
-        USE_HOST_DESCRIPTORS: tl.constexpr,
         USE_INITIAL_STATE: tl.constexpr,
         STORE_FINAL_STATE: tl.constexpr,
         IS_VARLEN: tl.constexpr,
     ):
         i_v, i_nh = tl.program_id(0), tl.program_id(1)
+
+        # K is split into two fixed 64-wide halves below.
+        tl.static_assert(K == 128, "plain strict state_output kernel assumes K=128")
 
         if IS_VARLEN:
             i_n = i_nh // HV
@@ -1756,144 +1365,105 @@ if HAS_STRICT_TLE_KDA:
             T = (eos - bos).to(tl.int32)
             NT = tl.cdiv(T, BT)
             chunk_start = tl.load(chunk_offsets + i_n).to(tl.int32)
+            state_row_start = bos
+            a_base = (i_h * NT_TOTAL + chunk_start).to(tl.int64) * (BT * BT)
         else:
             i_n = i_nh // HV
             i_h = i_nh % HV
             bos = i_n.to(tl.int64) * T
             NT = tl.cdiv(T, BT)
             chunk_start = i_n * NT
-
-        v += (bos * HV + i_h) * V
-        beta += bos * HV + i_h
-        gk += (chunk_start * HV + i_h).to(tl.int64) * K
-        o += (bos * HV + i_h) * V
-        ws_base = ws + (bos * HV + i_h) * 3 * K
-
-        if IS_VARLEN:
-            state_row_start = bos.to(tl.int64)
-        else:
             state_row_start = i_n.to(tl.int64) * NT * BT
-        if USE_HOST_DESCRIPTORS:
-            ws_desc = ws_host_desc
-            gk_desc = gk_host_desc
-            Aqk_desc = Aqk_host_desc
-            Akk_desc = Akk_host_desc
+            a_base = ((i_n * HV + i_h) * NT_TOTAL).to(tl.int64) * (BT * BT)
+
+        o_i = tl.arange(0, BT)
+        o_k1 = tl.arange(0, 64)
+        o_k2 = 64 + tl.arange(0, 64)
+        o_v = i_v * BV + tl.arange(0, BV)
+
+        # The recurrent state is kept as two [64, BV] fp32 halves (matching the
+        # block shape the Triton fallback autotunes to) instead of one
+        # [K, BV] tile, to cut register pressure and shrink dot shapes.
+        hk_off1 = o_v[:, None].to(tl.int64) * K + o_k1[None, :]
+        hk_off2 = o_v[:, None].to(tl.int64) * K + o_k2[None, :]
+        if USE_INITIAL_STATE:
+            b_h1 = tl.trans(tl.load(h0 + i_nh.to(tl.int64) * K * V + hk_off1)).to(
+                tl.float32
+            )
+            b_h2 = tl.trans(tl.load(h0 + i_nh.to(tl.int64) * K * V + hk_off2)).to(
+                tl.float32
+            )
         else:
-            if IS_VARLEN:
-                a_chunk = (i_h * NT_TOTAL + chunk_start) * BT * BT
-            else:
-                a_chunk = (i_n * HV + i_h) * NT_TOTAL * BT * BT
-            Aqk += a_chunk.to(tl.int64)
-            Akk += a_chunk.to(tl.int64)
-            ws_desc = tl.make_tensor_descriptor(
-                ws_base,
-                shape=[T, 3 * K],
-                strides=[HV * 3 * K, 1],
-                block_shape=[BT, K],
-            )
-            gk_desc = tl.make_tensor_descriptor(
-                gk, shape=[NT, K], strides=[HV * K, 1], block_shape=[1, K]
-            )
-            Aqk_desc = tl.make_tensor_descriptor(
-                Aqk,
-                shape=[NT * BT, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-            Akk_desc = tl.make_tensor_descriptor(
-                Akk,
-                shape=[NT * BT, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
+            b_h1 = tl.zeros([64, BV], dtype=tl.float32)
+            b_h2 = tl.zeros([64, BV], dtype=tl.float32)
 
-        w_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, K], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        v_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BV], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        qg_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, K], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        kg_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, K], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        Aqk_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BT], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        Akk_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, BT, BT], dtype=tl.bfloat16, scope=tle.gpu.smem
-        )
-        gk_smem = tle.gpu.alloc(
-            [STRICT_PIPE_STAGES, 1, K], dtype=tl.float32, scope=tle.gpu.smem
-        )
+        for i_t in range(NT):
+            token_start = i_t * BT
+            m_rows = (token_start + o_i) < T
 
-        load_pipe = tle.pipe(
-            capacity=STRICT_PIPE_STAGES,
-            scope="cta",
-            name="kda_load",
-            w=w_smem,
-            v=v_smem,
-            qg=qg_smem,
-            kg=kg_smem,
-            Aqk=Aqk_smem,
-            Akk=Akk_smem,
-            gk=gk_smem,
-        )
-        tle.gpu.warp_specialize(
-            [
-                (
-                    _musa_strict_kda_state_output_mma_consumer,
-                    (
-                        load_pipe.reader(),
-                        o,
-                        h0,
-                        ht,
-                        scale,
-                        i_v,
-                        i_nh,
-                        T,
-                        HV,
-                        K,
-                        V,
-                        BT,
-                        BV,
-                        NT,
-                        USE_INITIAL_STATE,
-                        STORE_FINAL_STATE,
-                    ),
-                ),
-                (
-                    _musa_strict_kda_state_output_load_producer,
-                    (
-                        load_pipe.writer(),
-                        ws_desc,
-                        v,
-                        beta,
-                        gk_desc,
-                        Aqk_desc,
-                        Akk_desc,
-                        K,
-                        T,
-                        HV,
-                        V,
-                        BT,
-                        BV,
-                        NT,
-                        i_v,
-                        USE_HOST_DESCRIPTORS,
-                        IS_VARLEN,
-                        NT_TOTAL,
-                        state_row_start,
-                        chunk_start,
-                        i_h,
-                    ),
-                ),
-            ],
-            [4],
-            [64],
-        )
+            # ws rows are padded token positions; columns pack w|qg|kg.
+            ws_row = (state_row_start + token_start + o_i)[:, None].to(tl.int64) * (
+                HV * 3 * K
+            ) + i_h * 3 * K
+            b_w1 = tl.load(ws + ws_row + o_k1[None, :])
+            b_w2 = tl.load(ws + ws_row + o_k2[None, :])
+            b_qg1 = tl.load(ws + ws_row + K + o_k1[None, :])
+            b_qg2 = tl.load(ws + ws_row + K + o_k2[None, :])
+            b_kg1 = tl.load(ws + ws_row + 2 * K + o_k1[None, :])
+            b_kg2 = tl.load(ws + ws_row + 2 * K + o_k2[None, :])
+
+            a_off = a_base + i_t * (BT * BT) + o_i[:, None] * BT + o_i[None, :]
+            b_Aqk = tl.load(Aqk + a_off)
+            b_Akk = tl.load(Akk + a_off)
+
+            gk_off = ((chunk_start + i_t) * HV + i_h).to(tl.int64) * K
+            b_gk1 = tl.load(gk + gk_off + o_k1)
+            b_gk2 = tl.load(gk + gk_off + o_k2)
+
+            v_off = ((bos + token_start + o_i)[:, None] * HV + i_h).to(
+                tl.int64
+            ) * V + o_v[None, :]
+            b_v_raw = tl.load(v + v_off, mask=m_rows[:, None], other=0.0)
+            b_beta = tl.load(
+                beta + ((bos + token_start + o_i) * HV + i_h).to(tl.int64),
+                mask=m_rows,
+                other=0.0,
+            )
+            # Match the ws producer: v * sigmoid(beta) rounded to input dtype.
+            b_vb = (
+                b_v_raw.to(tl.float32) * tl.sigmoid(b_beta.to(tl.float32))[:, None]
+            ).to(b_v_raw.dtype)
+
+            b_w1 = tl.where(m_rows[:, None], b_w1, 0)
+            b_w2 = tl.where(m_rows[:, None], b_w2, 0)
+            b_qg1 = tl.where(m_rows[:, None], b_qg1, 0)
+            b_qg2 = tl.where(m_rows[:, None], b_qg2, 0)
+            b_kg1 = tl.where(m_rows[:, None], b_kg1, 0)
+            b_kg2 = tl.where(m_rows[:, None], b_kg2, 0)
+
+            b_h1_bf = b_h1.to(tl.bfloat16)
+            b_h2_bf = b_h2.to(tl.bfloat16)
+            b_kh = tl.dot(b_w1, b_h1_bf) + tl.dot(b_w2, b_h2_bf)
+            b_diff = b_vb.to(tl.float32) - b_kh
+            b_v = tl.dot(b_Akk, b_diff.to(tl.bfloat16))
+            b_qh = tl.dot(b_qg1, b_h1_bf) + tl.dot(b_qg2, b_h2_bf)
+            b_o = scale * b_qh + tl.dot(b_Aqk, b_v.to(tl.bfloat16))
+
+            tl.store(o + v_off, b_o.to(o.dtype.element_ty), mask=m_rows[:, None])
+
+            b_v16 = b_v.to(tl.bfloat16)
+            b_h1 = b_h1 * exp2(b_gk1)[:, None] + tl.dot(tl.trans(b_kg1), b_v16)
+            b_h2 = b_h2 * exp2(b_gk2)[:, None] + tl.dot(tl.trans(b_kg2), b_v16)
+
+        if STORE_FINAL_STATE:
+            tl.store(
+                ht + i_nh.to(tl.int64) * K * V + hk_off1,
+                tl.trans(b_h1).to(ht.dtype.element_ty),
+            )
+            tl.store(
+                ht + i_nh.to(tl.int64) * K * V + hk_off2,
+                tl.trans(b_h2).to(ht.dtype.element_ty),
+            )
 
     def _musa_strict_kda_fwd_state_output(
         v: torch.Tensor,
@@ -1907,6 +1477,7 @@ if HAS_STRICT_TLE_KDA:
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         chunk_size: int = 32,
+        _pinned_cfg: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, _, HV, packed_K = ws.shape
         K = packed_K // 3
@@ -1938,67 +1509,55 @@ if HAS_STRICT_TLE_KDA:
             else ws.new_empty(1, dtype=torch.float32)
         )
 
-        use_host_descriptors = TensorDescriptor is not None
-        if use_host_descriptors:
-            NT_total = ws.shape[1] // BT
-            descriptor_rows = B * HV * NT_total * BT
-            ws_desc_arg = TensorDescriptor(
-                ws,
-                shape=[descriptor_rows, HV * 3 * K],
-                strides=[HV * 3 * K, 1],
-                block_shape=[BT, K],
+        def _launch(BV: int, num_warps: int, num_stages: int) -> None:
+            _musa_strict_kda_fwd_state_output_kernel[(triton.cdiv(V, BV), N * HV)](
+                v=v,
+                beta=beta,
+                gk=gk,
+                Aqk=Aqk,
+                Akk=Akk,
+                o=o,
+                ws=ws,
+                h0=h0_arg,
+                ht=ht_arg,
+                cu_seqlens=cu_seqlens,
+                chunk_offsets=chunk_offsets,
+                scale=scale,
+                T=T_actual,
+                NT_TOTAL=ws.shape[1] // BT,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                BV=BV,
+                num_warps=num_warps,
+                num_stages=num_stages,
             )
-            gk_desc_arg = TensorDescriptor(
-                gk,
-                shape=[gk.shape[0], HV * K],
-                strides=[HV * K, 1],
-                block_shape=[1, K],
-            )
-            Aqk_desc_arg = TensorDescriptor(
-                Aqk,
-                shape=[descriptor_rows, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-            Akk_desc_arg = TensorDescriptor(
-                Akk,
-                shape=[descriptor_rows, BT],
-                strides=[BT, 1],
-                block_shape=[BT, BT],
-            )
-        else:
-            ws_desc_arg = ws
-            gk_desc_arg = gk
-            Aqk_desc_arg = Aqk
-            Akk_desc_arg = Akk
 
-        _musa_strict_kda_fwd_state_output_kernel[(1, N * HV)](
-            v=v,
-            beta=beta,
-            gk=gk,
-            Aqk=Aqk,
-            Akk=Akk,
-            o=o,
-            ws=ws,
-            h0=h0_arg,
-            ht=ht_arg,
-            ws_host_desc=ws_desc_arg,
-            gk_host_desc=gk_desc_arg,
-            Aqk_host_desc=Aqk_desc_arg,
-            Akk_host_desc=Akk_desc_arg,
-            cu_seqlens=cu_seqlens,
-            chunk_offsets=chunk_offsets,
-            scale=scale,
-            T=T_actual,
-            NT_TOTAL=ws.shape[1] // BT,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=BT,
-            BV=128,
-            USE_HOST_DESCRIPTORS=use_host_descriptors,
-            num_warps=4,
+        if _pinned_cfg is not None:
+            # Config chosen by in-pipeline tuning at the wrapper level; this
+            # is the metric that matters (standalone kernel2 timing misses
+            # scheduling/L2 effects that only appear after kernel1 runs).
+            _launch(*_pinned_cfg)
+            return o, final_state
+
+        # Standalone fallback: reached only when kernel2 is launched without
+        # the wrapper.
+        tune_key = (
+            "strict-solo",
+            HV,
+            K,
+            V,
+            BT,
+            cu_seqlens is not None,
+            h0_arg.numel() > 1,
+            ht_arg.numel() > 1,
         )
+        cfg = _KDA_SO_BEST.get(tune_key)
+        if cfg is None:
+            cfg = _kda_tune_state_output(_launch, _kda_so_candidates(V))
+            _KDA_SO_BEST[tune_key] = cfg
+        _launch(*cfg)
 
         return o, final_state
 
@@ -2043,8 +1602,6 @@ def musa_chunk_kda_fwd_infer_strict_tle(
     if reason is not None:
         raise ValueError(reason)
 
-    triton.set_allocator(_allocate_triton_workspace)
-
     if scale is None:
         scale = q.shape[-1] ** -0.5
 
@@ -2065,6 +1622,52 @@ def musa_chunk_kda_fwd_infer_strict_tle(
         dt_bias=dt_bias,
     )
 
+    pipe_key = (
+        "strict-pipe",
+        q.shape[2],
+        q.shape[3],
+        v.shape[-1],
+        chunk_size,
+        cu_seqlens is not None,
+        initial_state is not None,
+        bool(output_final_state),
+    )
+    pinned_cfg = _KDA_SO_BEST.get(pipe_key)
+    if pinned_cfg is None:
+        candidates = _kda_so_candidates(v.shape[-1])
+
+        def run_once(*cfg):
+            ws_r, Aqk_r, Akk_r, g_last_r = _musa_strict_kda_fwd_intra(
+                q=q,
+                k=k,
+                g=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_size=chunk_size,
+                lower_bound=lower_bound,
+                A_log=A_log,
+                dt_bias=dt_bias,
+            )
+            _musa_strict_kda_fwd_state_output(
+                v=v,
+                beta=beta,
+                Akk=Akk_r,
+                gk=g_last_r,
+                Aqk=Aqk_r,
+                ws=ws_r,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                _pinned_cfg=cfg,
+            )
+
+        pinned_cfg = _kda_tune_state_output(run_once, candidates)
+        _KDA_SO_BEST[pipe_key] = pinned_cfg
+
     return _musa_strict_kda_fwd_state_output(
         v=v,
         beta=beta,
@@ -2077,6 +1680,7 @@ def musa_chunk_kda_fwd_infer_strict_tle(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        _pinned_cfg=pinned_cfg,
     )
 
 
@@ -2906,10 +2510,8 @@ def _musa_validate_chunk_kda_inputs(
         raise ValueError(f"g must have shape {(B, T, HV, K)}, got {tuple(g.shape)}")
     if beta.shape != (B, T, HV):
         raise ValueError(f"beta must have shape {(B, T, HV)}, got {tuple(beta.shape)}")
-    if K not in (64, 128, 192, 256):
-        raise ValueError(
-            f"chunk_kda TLE path requires K in {{64, 128, 192, 256}}, got {K}"
-        )
+    if K not in (64, 128, 256):
+        raise ValueError(f"chunk_kda TLE path requires K in {{64, 128, 256}}, got {K}")
     if V <= 0:
         raise ValueError(f"chunk_kda TLE path requires V > 0, got {V}")
     if HV < H or HV % H != 0:
