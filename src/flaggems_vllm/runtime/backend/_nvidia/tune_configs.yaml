@@ -1132,3 +1132,66 @@ concat_mla_q:
   - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
+
+# Integer MMA paths for sparse indexers on Ampere and newer.
+per_token_group_quant_int8_batched:
+  - META: {BLOCK_ROWS: 8}
+    num_warps: 2
+    num_stages: 1
+  - META: {BLOCK_ROWS: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_ROWS: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_ROWS: 32}
+    num_warps: 4
+    num_stages: 1
+int8_mqa_logits_rows:
+  - META: {BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 1
+int8_mqa_logits:
+  - META: {BLOCK_M: 16, BLOCK_N: 64, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 128, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 8, BLOCK_N: 64, HEAD_BLOCK: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 8, BLOCK_N: 128, HEAD_BLOCK: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 64, HEAD_BLOCK: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 128, HEAD_BLOCK: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 64, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_N: 128, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_N: 64, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_N: 128, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 3
+int8_paged_mqa_logits:
+  - META: {BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 1
