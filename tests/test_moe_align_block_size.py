@@ -377,3 +377,98 @@ def test_accuracy_moe_align_block_size_fast_paths(fast_path):
     torch.testing.assert_close(actual[0][:num_tokens], expected[0][:num_tokens])
     torch.testing.assert_close(actual[1][:num_blocks], expected[1][:num_blocks])
     torch.testing.assert_close(actual[2], expected[2])
+
+
+def _check_metax_alignment(ids, block_size, result, num_experts=256, expert_map=None):
+    sorted_ids, expert_ids, total = (t.cpu() for t in result)
+    routes = ids.cpu().flatten().to(torch.int64)
+    counts = torch.bincount(routes, minlength=num_experts)
+    padded = ((counts + block_size - 1) // block_size) * block_size
+    assert total.item() == padded.sum().item()
+    offset = 0
+    for expert, length in enumerate(padded.tolist()):
+        if length == 0:
+            continue
+        want_expert = expert if expert_map is None else expert_map[expert].item()
+        assert torch.all(
+            expert_ids[offset // block_size : (offset + length) // block_size]
+            == want_expert
+        )
+        block = sorted_ids[offset : offset + length]
+        actual_routes = block[block < routes.numel()].sort().values
+        expected_routes = (routes == expert).nonzero().flatten().to(torch.int32)
+        assert torch.equal(actual_routes, expected_routes)
+        assert torch.all(block[block >= routes.numel()] == routes.numel())
+        offset += length
+    assert torch.all(sorted_ids[offset:] == routes.numel())
+    if expert_map is None:
+        assert torch.all(expert_ids[offset // block_size :] == -1)
+
+
+@pytest.mark.moe_align_block_size
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX fast path")
+@pytest.mark.parametrize("tokens", [0, 1, 16, 64, 85, 86, 1024, 4032])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("clustered", [False, True])
+def test_metax_align_allocating(tokens, block_size, dtype, clustered):
+    ids = torch.randint(
+        0,
+        8 if clustered else 256,
+        (tokens, 6),
+        dtype=dtype,
+        device=flaggems_vllm.device,
+    )
+    result = flaggems_vllm.moe_align_block_size_no_tle(ids, block_size, 256)
+    _check_metax_alignment(ids, block_size, result)
+    capacity = tokens * 6 + 256 * (block_size - 1)
+    if tokens * 6 < 256:
+        capacity = min(capacity, tokens * 6 * block_size)
+    assert result[0].numel() == capacity
+
+
+@pytest.mark.moe_align_block_size
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX fast path")
+@pytest.mark.parametrize("experts", [8, 24, 256])
+@pytest.mark.parametrize("pad", [False, True])
+@pytest.mark.parametrize("use_map", [False, True])
+def test_metax_align_generic_contract(experts, pad, use_map):
+    ids = torch.randint(
+        0, experts, (65, 6), dtype=torch.int32, device=flaggems_vllm.device
+    )
+    expert_map = (
+        torch.arange(experts - 1, -1, -1, device=ids.device, dtype=torch.int32)
+        if use_map
+        else None
+    )
+    result = flaggems_vllm.moe_align_block_size_no_tle(
+        ids, 16, experts, expert_map, pad
+    )
+    _check_metax_alignment(
+        ids, 16, result, experts, None if expert_map is None else expert_map.cpu()
+    )
+
+
+@pytest.mark.moe_align_block_size
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX fast path")
+@pytest.mark.parametrize("tokens", [64, 86, 4096])
+def test_metax_align_graph_replay(tokens):
+    ids = torch.randint(
+        0, 256, (tokens, 6), dtype=torch.int32, device=flaggems_vllm.device
+    )
+    fn = flaggems_vllm.moe_align_block_size_no_tle
+    assert fn.__module__.endswith("_metax.ops.moe_align_block_size")
+    fn(ids, 64, 256)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = fn(ids, 64, 256)
+    for active_experts in (256, 8, 1, 256):
+        ids.copy_(
+            torch.randint(
+                0, active_experts, ids.shape, dtype=ids.dtype, device=ids.device
+            )
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_metax_alignment(ids, 64, result)
