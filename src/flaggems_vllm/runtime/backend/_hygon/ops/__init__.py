@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._hygon.ops.bmm_w8a8_int8 import bmm_w8a8_int8
 from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -53,6 +54,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
 )
 
 __all__ = [
+    "bmm_w8a8_int8",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
