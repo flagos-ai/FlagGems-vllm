@@ -477,6 +477,28 @@ gated_activation:
       - 8
     block_n:
       - 1024
+per_token_quant_int8:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        VEC_SIZE: vec_size
+      num_warps: warps
+      num_stages: 1
+    block_m:
+      - 1
+      - 2
+    vec_size:
+      - 4
+      - 8
+      - 16
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+
 scaled_int8_quant_static:
   - gen: true
     param_map:

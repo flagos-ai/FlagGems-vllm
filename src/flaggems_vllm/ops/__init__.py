@@ -140,6 +140,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.ops.per_token_quant_int8 import per_token_quant_int8
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
@@ -314,6 +315,7 @@ __all__ = [
     "parallel_nsa",
     "parallel_nsa_compression",
     "per_token_group_quant_fp8",
+    "per_token_quant_int8",
     "permute_copy",
     "persistent_topk",
     "ple_gate_norm",
