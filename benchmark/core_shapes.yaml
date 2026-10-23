@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+gdn_w8a16:
+  shapes:
+    - [1, 1, 2, 4, 128, 128]
+    - [32, 1, 2, 4, 128, 128]
+    - [128, 1, 2, 6, 128, 128]
+    - [1024, 1, 2, 6, 128, 128]
+    - [8192, 1, 2, 6, 128, 128]
+    - [1, 8, 2, 4, 128, 128]
+    - [2, 192, 2, 6, 128, 128]
+    - [16, 128, 2, 4, 128, 128]
+  shape_desc: "N, T, H, HV, K, V"
+
 concat_mla_q:
   shapes:
     - [1, 64, 512, 64]
