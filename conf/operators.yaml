@@ -628,6 +628,18 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: gdn_w8a16
+    description: Gated delta-rule core forward with precomputed gates and FP32 recurrent
+      state.
+    for:
+    - gdn_w8a16
+    labels:
+    - fused
+    - FLA
+    kind:
+    - Attention
+    stages:
+    - alpha: '5.5'
   - id: geglu
     description: Gaussian Error Gated Linear Unit with GELU activation instead of
       sigmoid function.

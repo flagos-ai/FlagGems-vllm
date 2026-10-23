@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -276,6 +277,7 @@ __all__ = [
     "fwht128_quant_fp8",
     "gather_rows",
     "gather_state_rows",
+    "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
