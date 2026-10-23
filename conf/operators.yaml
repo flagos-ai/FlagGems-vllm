@@ -382,8 +382,9 @@ ops:
       W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
       FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
       and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
-      Hygon DCU, PPU, and MetaX).
+      Hygon DCU, PPU, MetaX, and Ascend).
     for:
+      - flash_attn_varlen_func_w8a8
       - flash_attn_varlen_func_w8a8_int8
     labels:
       - NoCPU

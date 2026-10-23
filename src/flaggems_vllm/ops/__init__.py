@@ -425,3 +425,12 @@ if _runtime.device.vendor_name == "metax":
     )
 
     __all__.append("flash_attn_varlen_func_w8a8_int8")
+
+if _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend.fused import (
+        attention as ascend_attention,
+    )
+
+    flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
+    flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
+    __all__.append("flash_attn_varlen_func_w8a8")
