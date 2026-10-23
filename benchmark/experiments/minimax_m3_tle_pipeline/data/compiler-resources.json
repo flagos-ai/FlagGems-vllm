@@ -1,0 +1,1250 @@
+[
+  {
+    "cache_folder": "2CGSV4IS3PKGMGWCAYZGLGMTFEZX7BIEV2OO67ZVPOW34XLMAATQ",
+    "name": "_split_kernel",
+    "dynamic_shared_bytes": 18432,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 8,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 0,
+      "UTMALDG": 0,
+      "LDL": 2,
+      "STL": 2
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 0,
+      "bf16_wgmma": 0,
+      "fp8_wgmma": 0,
+      "wait": 0,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "2J53RRPZF77XEJ5S4Y6YPZPKDFN6G5DEJTNIBUUWVK6YHFWBHTPQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114924,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "2RFDEOBH6FG4G7ZBV4OFV64OX5RAHF2NHGDVJBP24E2T3SK6HPWA",
+    "name": "_union_span_kernel",
+    "dynamic_shared_bytes": 98308,
+    "num_warps": 8,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 255,
+      "STACK": 8,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 2,
+      "STL": 2
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "37RJBQVNZQLHWT2E62C6FZVRBJXEN3BKM2BXKJW3FQMESP6FJYBA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131308,
+    "num_warps": 12,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "4FGCZ2WCY7XUBN5DHCIHDLXZDWV2IWPLWEMTFONUYBF6ELHJMBKQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 148076,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 104,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 31,
+      "STL": 32
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 7
+    }
+  },
+  {
+    "cache_folder": "53OM3FODUPVS6KPP2YCVNYICSWO3J75OLZE4PYNOXTJCWPZ2TSIQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 115288,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 249,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 5
+    }
+  },
+  {
+    "cache_folder": "5ASASRJUYPLXIE5EMI5UMDRTECEIPTPZIB7KQMFMFH6DQFH2BPDA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "5FSD6GVDZQOBY6OII6A4LYMTKPQZP2YVZ2XSQDGSUD3Z5ZR3GMCQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "62VZMDZNEEQ4Z2MM2NWTKZOCLLI72E47NWS4ESQ6GVQP22NEREQQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 148076,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 104,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 31,
+      "STL": 32
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 7
+    }
+  },
+  {
+    "cache_folder": "7B5GUID35HLECQVPZDZTSQPRCATJFTGV5HSU5LWJI6KLYNUI77BA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 147776,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 25
+    }
+  },
+  {
+    "cache_folder": "AB22YXMXLMYP2HQXJ63BQ2HT2YJTS2U2RHDUAVEXQ2ZZXZ2K5Q7A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 147776,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 25
+    }
+  },
+  {
+    "cache_folder": "BBZL4SNCBSLPLYQG6DUTBGSMQ2W6ZN6NYEELAIXZAQIJ3QVJHS3A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 180508,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "BMCMNVQA7UYSPDL3FWNCX7MRRO6BWDJ2OFH465XWJPRAND4IZAQQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "C6Q5COWKPRXZVRODNL32D2GLVIAHJTTK6EX5TVJTPHA7D6JPBHPQ",
+    "name": "_split_kernel",
+    "dynamic_shared_bytes": 18432,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 8,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 0,
+      "UTMALDG": 0,
+      "LDL": 2,
+      "STL": 2
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 0,
+      "bf16_wgmma": 0,
+      "fp8_wgmma": 0,
+      "wait": 0,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "C6UODBKCNDMS5NTB6GGCMLG4X5UXIFY6H3P4R3E2LK5K7MK5Q7GA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 164144,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 632,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 246,
+      "STL": 276
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 25
+    }
+  },
+  {
+    "cache_folder": "DJ6463K452IFLHYQIGF5FGWZRT3YRI3B5VYSZG6MKK5I43OFW36Q",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131308,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 528,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 242,
+      "STL": 347
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "DUTZKULXK7GNHQLJHOPLSQDTS3QXNVF37X2EBKQZJOK4NUUB5DMA",
+    "name": "_union_span_kernel",
+    "dynamic_shared_bytes": 98308,
+    "num_warps": 8,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 175,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "GKPOKPVRILAJAMWHJVCD3XOT74MER75C47LKLTUXJQ3GS4OVKTQQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 164396,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 254,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 7
+    }
+  },
+  {
+    "cache_folder": "GX6JXIIHVGFFQVWXPQEPCPH2YZFDEO6KTBNWH3TSL56GIQOTX7SA",
+    "name": "_split_kernel",
+    "dynamic_shared_bytes": 18432,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 0,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 0,
+      "bf16_wgmma": 0,
+      "fp8_wgmma": 0,
+      "wait": 0,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "HIRABYQSRZYIOYZA3U2UKR2CSLTWJSDPSMPUDMEOSO7PQGQCWS6Q",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "HRI3P7NJ3ZE457XWYJ26E6U4ZUDKXMT2NNWAWWIA56RYEHMD4LWQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 196876,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 728,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 218,
+      "STL": 258
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "HZ3N2XRZM5VSJKUPLJCIIBGMISR77FUZHU6HZCZIR5WNF6KWW5YQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131608,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 3,
+      "barrier": 5
+    }
+  },
+  {
+    "cache_folder": "IB3JNZW7P7ZZSOVAT6YQSNEJLXJ7KJJNUBYBNLXLKQLEM6CDEWTQ",
+    "name": "_wide_union_sparse_kernel",
+    "dynamic_shared_bytes": 81924,
+    "num_warps": 4,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "J3ZYPM5FUY7GHT4H75O2F2LZU52GUOW44OV7OKGO5BGBDX6T2XNA",
+    "name": "_merge_split_kernel",
+    "dynamic_shared_bytes": 0,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 30,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 0,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 0,
+      "bf16_wgmma": 0,
+      "fp8_wgmma": 0,
+      "wait": 0,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "JIPDQKD4LVW6PSFU3NQHQUFAQW7ZVOQSRPITZ6AGKG2FSNOBR2MQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 180508,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "KPW52NEI7OLNXDFXYTAKUHEZNHR527MZTQEWUAPRBDIU575DPOIQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "LJDV55N2BMQ6U3UEUBQGD2WMEFNMXPEVAA57SNLLJ7Q3I3RBUMUQ",
+    "name": "_wide_union_sparse_kernel",
+    "dynamic_shared_bytes": 81924,
+    "num_warps": 4,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "LVY6YM5XMD7ORKKRL2TFIRNPSLPDUTIWE63YLXUKUFMNQKDZOYJA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131608,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 3,
+      "barrier": 5
+    }
+  },
+  {
+    "cache_folder": "MSPDHLMJCEZXAUQCVUJPWQQYHYENSZ2IL7O5EJXFD6GR2UBRTOTQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 164144,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 624,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 244,
+      "STL": 274
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 25
+    }
+  },
+  {
+    "cache_folder": "NMCE4BX3L7TVNYJ2PNNFRREBFGNB43EYTT63YP4DYEMBD7BPTSGA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 115288,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 249,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 5
+    }
+  },
+  {
+    "cache_folder": "NQW2PCVM5OJMOAEBP47TAIWF7NTFFSJ6KK3C4HZMPLDAMURMHQ3A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 115288,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 249,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 5
+    }
+  },
+  {
+    "cache_folder": "ODN5BATTZZX43PMHV7SZ3JHUK5WG5V4WCNZDNZOISKED7AHNWL2A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "PTYU6AMNA26LYKTCZDEMMKVHZEAALOSMUKMGQKBWCWWH57OQWSJA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131308,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 616,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 235,
+      "STL": 270
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "R3COP7BTT5TD7RFW7Z5DH2TMHNA5QS6PCASVJJBK3FFIJNOVC7NQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 164396,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 254,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 7
+    }
+  },
+  {
+    "cache_folder": "RER3ZQMDSAEYUMT24GV3RLJHCWWJAFJBVSNGAKZWM46Y737ZYJIQ",
+    "name": "_split_kernel",
+    "dynamic_shared_bytes": 18432,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 8,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 0,
+      "UTMALDG": 0,
+      "LDL": 2,
+      "STL": 2
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 0,
+      "bf16_wgmma": 0,
+      "fp8_wgmma": 0,
+      "wait": 0,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "RRHFGCWC3DMKP7Q4GPIS623CPWJGUP3PKZTAN7MUMHYJ63DU4JHA",
+    "name": "_split_kernel",
+    "dynamic_shared_bytes": 18432,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 8,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 0,
+      "UTMALDG": 0,
+      "LDL": 2,
+      "STL": 2
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 0,
+      "bf16_wgmma": 0,
+      "fp8_wgmma": 0,
+      "wait": 0,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "TSGJLLT24O6AMJI775ABMJZ2U65EKLQEK76YTE3OLSWMK4KCYCIQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 148076,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 96,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 30,
+      "STL": 31
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 7
+    }
+  },
+  {
+    "cache_folder": "UM5NQFOJ6BZXEKHZUDCG3QIWQHVHFNCRTGVYSNTKWVZ4A7DCK7HQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 115288,
+    "num_warps": 4,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 249,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 5
+    }
+  },
+  {
+    "cache_folder": "UU2ZYQ5Z55FWH6CFYTPMYQSYAIPWZ236VKMQJE37OQXGTGJ6SC2A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "VTMXQMWJI2PHEWU5G5TRQ6J4HWIMTFT7HXXXSVKXJYHHE4WZIMMQ",
+    "name": "_wide_union_sparse_kernel",
+    "dynamic_shared_bytes": 81924,
+    "num_warps": 4,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "W2ZGCNEVRIUPXTHUZXIE4D7HOUN4QEZED3CHQUYEYIR565Q7UXUA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 180508,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "WQGOJAQOVJ4UVSV3H466H6LF2ACFKY5T3J4C5MRCTJYBKQQIGY6A",
+    "name": "_union_span_kernel",
+    "dynamic_shared_bytes": 98308,
+    "num_warps": 8,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 255,
+      "STACK": 8,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 2,
+      "STL": 2
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "Y4CC7IHUFANYC77ICG4WYPUHN2SM2GYZ32BWBTBUSC5IFB2CRNDA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131308,
+    "num_warps": 12,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 168,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "YC4O7JZF3V6OGRCFXVTXZPBTIVN6N7XQHUH4CIIENBGSDSPFYQMA",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 196876,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 720,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 216,
+      "STL": 256
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "YPPREZI2V4CZYVRQPQV4F7MGRDE4DQI4ZIASWGMAHTJ2RAWHJ32A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 131308,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 616,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 32,
+      "UTMALDG": 2,
+      "LDL": 233,
+      "STL": 268
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 32,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  },
+  {
+    "cache_folder": "YT5A6AOVMLFUMDJFH3IGYJI3BVDKILPLGE5RNVIAA5VQT3FG5TKQ",
+    "name": "_wide_union_sparse_kernel",
+    "dynamic_shared_bytes": 81924,
+    "num_warps": 4,
+    "launch_num_stages": 3,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 0,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 0,
+      "cp_async": 3,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 0
+    }
+  },
+  {
+    "cache_folder": "ZCRM5YQUIGA33BSIFDEG46XSK3C2RUNWQQYD7MQC7VWXH2D7X4HQ",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 147776,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 25
+    }
+  },
+  {
+    "cache_folder": "ZKUZSU5LGC36RCRG66IJF5NA6B4BURXPMZOPANX24GL3O3SK626A",
+    "name": "_union_tle_kernel",
+    "dynamic_shared_bytes": 114940,
+    "num_warps": 8,
+    "launch_num_stages": 1,
+    "resource": {
+      "REG": 255,
+      "STACK": 0,
+      "LOCAL": 0
+    },
+    "sass_instruction_counts": {
+      "HGMMA": 16,
+      "UTMALDG": 2,
+      "LDL": 0,
+      "STL": 0
+    },
+    "ptx_counts": {
+      "tma": 2,
+      "cp_async": 0,
+      "bf16_wgmma": 16,
+      "fp8_wgmma": 0,
+      "wait": 2,
+      "barrier": 17
+    }
+  }
+]
