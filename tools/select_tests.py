@@ -83,6 +83,13 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "tests/test_flash_mla.py",
+        "tests/test_flash_mla_with_kvcache_fwd.py",
+    ],
+    "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
+        "tests/test_flash_mla_with_kvcache_fwd.py",
+    ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "tests/test_bmm_w8a8.py"
@@ -204,6 +211,13 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "benchmark/test_flash_mla.py",
+        "benchmark/test_flash_mla_with_kvcache_fwd.py",
+    ],
+    "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
+        "benchmark/test_flash_mla_with_kvcache_fwd.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "benchmark/test_bmm_w8a8.py"
     ],
