@@ -18,7 +18,7 @@
 Rules:
   1. Each operator in operators.yaml must have a test file: tests/test_<id>.py
      (or a match via ci_test_aliases.yaml, or a file in a tests/ subdirectory)
-  2. Test file must contain at least one function decorated with @pytest.mark.<id>
+  2. Test file must contain a function decorator or module-level pytestmark for id
   3. The marker must be collectible (file must be parseable by AST)
 
 Note: Unlike FlagGems, FlagGems-vllm does NOT skip fused operators. Fused
@@ -120,13 +120,26 @@ def expected_marker(op_id: str, all_op_ids: set) -> str:
 
 
 def check_marker_in_file(filepath: Path, op_id: str) -> bool:
-    """Check if the test file has at least one @pytest.mark.<op_id> decorator."""
+    """Check function decorators and module-level pytestmark assignments."""
     try:
         source = filepath.read_text()
         tree = ast.parse(source)
     except (SyntaxError, UnicodeDecodeError):
         # If we can't parse, assume marker is present (don't block on parse errors)
         return True
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in node.targets
+        ):
+            markers = (
+                node.value.elts
+                if isinstance(node.value, (ast.List, ast.Tuple))
+                else [node.value]
+            )
+            if any(_is_pytest_mark(marker, op_id) for marker in markers):
+                return True
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -138,6 +151,10 @@ def check_marker_in_file(filepath: Path, op_id: str) -> bool:
 
 def _is_pytest_mark(node: ast.expr, marker_name: str) -> bool:
     """Check if a decorator node is @pytest.mark.<marker_name>."""
+    if isinstance(node, ast.IfExp):
+        return _is_pytest_mark(node.body, marker_name) or _is_pytest_mark(
+            node.orelse, marker_name
+        )
     # Pattern: pytest.mark.<name>
     if isinstance(node, ast.Attribute) and node.attr == marker_name:
         # Check it's pytest.mark.<name>

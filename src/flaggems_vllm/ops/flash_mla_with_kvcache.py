@@ -3410,3 +3410,21 @@ if HAS_TLE:
             [4, 4],
             [216, 72],
         )
+
+
+def flash_mla_with_kvcache_fwd_w8a8_int8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_lora: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int = 512,
+    *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    num_splits: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raise NotImplementedError("dense INT8 MLA is not registered for this backend")
