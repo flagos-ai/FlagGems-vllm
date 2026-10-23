@@ -31,10 +31,11 @@ def int8_einsum(
     ys: torch.Tensor | None,
     block_size: tuple[int, int] = (128, 128),
     output_dtype: torch.dtype = torch.bfloat16,
+    per_channel_quant: bool = False,
 ) -> torch.Tensor:
-    """Compute block-scaled INT8 bhr,hdr->bhd on MetaX.
+    """Compute scaled INT8 bhr,hdr->bhd on MetaX.
 
-    Head-to-batch permutations are views; the returned BHD tensor is contiguous.
+    Per-channel scales: xs[B,H] or [B,H,1], ys[H,D] or [H,D,1].
     """
     logger.debug("GEMS_METAX INT8_EINSUM")
     if equation != "bhr,hdr->bhd":
@@ -44,6 +45,11 @@ def int8_einsum(
     b, h, r = x.shape
     if y.shape[0] != h or y.shape[2] != r or x.device != y.device:
         raise ValueError("int8_einsum input shape or device mismatch")
+    if per_channel_quant:
+        if xs is not None and xs.ndim == 2:
+            xs = xs.unsqueeze(-1)
+        if ys is not None and ys.ndim == 2:
+            ys = ys.unsqueeze(-1)
     if xs is not None and xs.ndim != 3:
         raise ValueError("int8_einsum activation scale must have three dimensions")
     z = torch.empty((b, h, y.shape[1]), device=x.device, dtype=output_dtype)
@@ -55,5 +61,6 @@ def int8_einsum(
         block_size=block_size,
         z=z.permute(1, 0, 2),
         output_dtype=output_dtype,
+        per_channel_quant=per_channel_quant,
     )
     return z

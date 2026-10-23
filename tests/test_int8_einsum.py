@@ -22,7 +22,9 @@ from benchmark.test_int8_einsum import (
     _gems_einsum_bf16_wrapper,
     _make_block_einsum_inputs,
 )
+from benchmark.test_int8_einsum_channelwise import make_channel_einsum_inputs
 
+from .accuracy_utils import gems_assert_close
 from .conftest import QUICK_MODE
 
 _EINSUM_BATCHES = (1, 4, 8, 16, 32, 64, 128)
@@ -188,3 +190,22 @@ def test_int8_einsum_validation_and_extremes():
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, None, y, ys)
     with pytest.raises(TypeError, match="matching"):
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y.float(), ys)
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX per-channel INT8 einsum"
+)
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 2, 4096, 33), (3, 2, 129, 33), (128, 2, 512, 128), (8192, 1, 128, 17)],
+)
+def test_int8_einsum_per_channel(shape):
+    x, xs, y, ys, _, _ = make_channel_einsum_inputs(*shape, flaggems_vllm.device)
+    out = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, per_channel_quant=True
+    )
+    ref = torch.einsum(
+        "bhr,hdr->bhd", x.float() * xs.unsqueeze(-1), y.float() * ys.unsqueeze(-1)
+    )
+    gems_assert_close(out, ref, torch.bfloat16)

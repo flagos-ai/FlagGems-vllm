@@ -61,7 +61,8 @@ def prune_wide_scale_configs(configs, named_args, **kwargs):
         "K",
         "BATCH",
         "SPLIT_K",
-        "SCALE_N",
+        "group_n",
+        "per_channel_quant",
         "stride_am",
         "stride_ak",
         "stride_wn",
@@ -88,7 +89,7 @@ def block_int8_bmm_kernel(
     SAS: tl.constexpr,
     SWS: tl.constexpr,
     SO: tl.constexpr,
-    SCALE_N: tl.constexpr,
+    group_n: tl.constexpr,
     SPLIT_K: tl.constexpr,
     BATCH: tl.constexpr,
     stride_am: tl.constexpr,
@@ -96,6 +97,7 @@ def block_int8_bmm_kernel(
     stride_wn: tl.constexpr,
     stride_wk: tl.constexpr,
     USE_INT64: tl.constexpr,
+    per_channel_quant: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -115,7 +117,8 @@ def block_int8_bmm_kernel(
     red = tl.arange(0, 128)
     if USE_INT64:
         red = red.to(tl.int64)
-    scale_column = column_tile * BLOCK_N // SCALE_N
+    if not per_channel_quant:
+        scale_column = column_tile * BLOCK_N // group_n
     is_early_dot: tl.constexpr = (
         M < LARGE_BATCH_SCALE_ROWS and BLOCK_M * BLOCK_N >= EARLY_DOT_MIN_ELEMENTS
     )
@@ -146,63 +149,81 @@ def block_int8_bmm_kernel(
             partial = tl.dot(activation, weight, out_dtype=tl.int32).to(tl.float32)
         else:
             pass
-        if M >= LARGE_BATCH_SCALE_ROWS:
-            # Rank-two scale loads improve MetaX lowering for large row counts.
-            # Only lane zero is loaded; the masked lane is reduced away.
-            scale_lane = tl.arange(0, 2)
-            activation_scale = tl.sum(
-                tl.load(
-                    AS
-                    + batch * SAS[0]
-                    + row[:, None] * SAS[1]
-                    + (scale_group + scale_lane[None, :]) * SAS[2],
-                    (row[:, None] < M)
-                    & (scale_lane[None, :] == 0)
-                    & (group < tl.cdiv(K, 128)),
-                    other=0,
-                ).to(tl.float32),
-                1,
-            )
-        else:
-            activation_scale = tl.load(
-                AS + batch * SAS[0] + row * SAS[1] + scale_group * SAS[2],
-                row < M,
-                other=0,
-            ).to(tl.float32)
-        if SCALE_N % BLOCK_N == 0:
+        if not per_channel_quant:
             if M >= LARGE_BATCH_SCALE_ROWS:
-                weight_scale = tl.sum(
-                    tl.sum(
-                        tl.load(
-                            WS
-                            + batch * SWS[0]
-                            + scale_column * SWS[1]
-                            + (scale_group + scale_lane[None, :]) * SWS[2]
-                            + tl.arange(0, 1)[:, None],
-                            (scale_lane[None, :] == 0) & (group < tl.cdiv(K, 128)),
-                            other=0,
-                        ).to(tl.float32),
-                        1,
-                    ),
-                    0,
+                # Rank-two scale loads improve MetaX lowering for large row counts.
+                # Only lane zero is loaded; the masked lane is reduced away.
+                scale_lane = tl.arange(0, 2)
+                activation_scale = tl.sum(
+                    tl.load(
+                        AS
+                        + batch * SAS[0]
+                        + row[:, None] * SAS[1]
+                        + (scale_group + scale_lane[None, :]) * SAS[2],
+                        (row[:, None] < M)
+                        & (scale_lane[None, :] == 0)
+                        & (group < tl.cdiv(K, 128)),
+                        other=0,
+                    ).to(tl.float32),
+                    1,
                 )
             else:
-                weight_scale = tl.load(
-                    WS + batch * SWS[0] + scale_column * SWS[1] + scale_group * SWS[2]
+                activation_scale = tl.load(
+                    AS + batch * SAS[0] + row * SAS[1] + scale_group * SAS[2],
+                    row < M,
+                    other=0,
                 ).to(tl.float32)
-            scale = (activation_scale * weight_scale)[:, None]
-        else:
-            weight_scale = tl.load(
-                WS + batch * SWS[0] + (col // SCALE_N) * SWS[1] + scale_group * SWS[2],
-                col < N,
-                other=0,
-            ).to(tl.float32)
-            scale = activation_scale[:, None] * weight_scale[None, :]
+            if group_n % BLOCK_N == 0:
+                if M >= LARGE_BATCH_SCALE_ROWS:
+                    weight_scale = tl.sum(
+                        tl.sum(
+                            tl.load(
+                                WS
+                                + batch * SWS[0]
+                                + scale_column * SWS[1]
+                                + (scale_group + scale_lane[None, :]) * SWS[2]
+                                + tl.arange(0, 1)[:, None],
+                                (scale_lane[None, :] == 0) & (group < tl.cdiv(K, 128)),
+                                other=0,
+                            ).to(tl.float32),
+                            1,
+                        ),
+                        0,
+                    )
+                else:
+                    weight_scale = tl.load(
+                        WS
+                        + batch * SWS[0]
+                        + scale_column * SWS[1]
+                        + scale_group * SWS[2]
+                    ).to(tl.float32)
+                scale = (activation_scale * weight_scale)[:, None]
+            else:
+                weight_scale = tl.load(
+                    WS
+                    + batch * SWS[0]
+                    + (col // group_n) * SWS[1]
+                    + scale_group * SWS[2],
+                    col < N,
+                    other=0,
+                ).to(tl.float32)
+                scale = activation_scale[:, None] * weight_scale[None, :]
         if is_early_dot:
             pass
         else:
             partial = tl.dot(activation, weight, out_dtype=tl.int32).to(tl.float32)
-        accumulator = tl.fma(partial, scale, accumulator)
+        if per_channel_quant:
+            accumulator += partial
+        else:
+            accumulator = tl.fma(partial, scale, accumulator)
+    if per_channel_quant:
+        activation_scale = tl.load(
+            AS + batch * SAS[0] + row * SAS[1], row < M, other=0
+        ).to(tl.float32)
+        weight_scale = tl.load(WS + batch * SWS[0] + col * SWS[1], col < N, other=0).to(
+            tl.float32
+        )
+        accumulator *= activation_scale[:, None] * weight_scale[None, :]
     if SPLIT_K == 1:
         pointers = Output + batch * SO[0] + row[:, None] * SO[1] + col[None, :] * SO[2]
     else:
@@ -215,7 +236,7 @@ def block_int8_bmm_kernel(
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("w8a8_block_int8_gemv"),
-    key=["N", "K", "BATCH", "SCALE_N"],
+    key=["N", "K", "BATCH", "group_n", "per_channel_quant"],
 )
 @triton.jit
 def block_int8_gemv_kernel(
@@ -232,11 +253,12 @@ def block_int8_gemv_kernel(
     SAS: tl.constexpr,
     SWS: tl.constexpr,
     SO: tl.constexpr,
-    SCALE_N: tl.constexpr,
+    group_n: tl.constexpr,
     BATCH: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_INT64: tl.constexpr,
+    per_channel_quant: tl.constexpr,
 ):
     head = tl.program_id(2).to(tl.int64)
     row = tl.program_id(1).to(tl.int64)
@@ -262,11 +284,12 @@ def block_int8_gemv_kernel(
         groups < tl.cdiv(K, 128),
         other=0,
     ).to(tl.float32)
+    if per_channel_quant:
+        scale_col = col
+    else:
+        scale_col = col // group_n
     wsc = tl.load(
-        WS
-        + head * SWS[0]
-        + (col[:, None] // SCALE_N) * SWS[1]
-        + groups[None, :] * SWS[2],
+        WS + head * SWS[0] + scale_col[:, None] * SWS[1] + groups[None, :] * SWS[2],
         (col[:, None] < N) & (groups[None, :] < tl.cdiv(K, 128)),
         other=0,
     ).to(tl.float32)
@@ -323,8 +346,9 @@ def w8a8_block_int8_bmm(
     block_size: tuple[int, int] = (128, 128),
     z: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    per_channel_quant: bool = False,
 ) -> torch.Tensor:
-    """Block-scaled INT8 BMM with FP32 accumulation on MetaX."""
+    """Scaled INT8 BMM with FP32 accumulation on MetaX."""
     if x.requires_grad or y.requires_grad or (z is not None and z.requires_grad):
         raise NotImplementedError("W8A8 BMM is forward-only")
     if x.dtype != y.dtype:
@@ -348,19 +372,34 @@ def w8a8_block_int8_bmm(
         raise TypeError("scales must be float32, bfloat16 or float16")
     if len(block_size) != 2 or any(type(v) is not int or v <= 0 for v in block_size):
         raise ValueError("block_size must contain two positive integers")
-    block_n, block_k = block_size
-    if block_k != 128 or block_n < 16 or block_n & (block_n - 1):
-        raise NotImplementedError("requires power-of-two block_n >= 16 and block_k=128")
     batch, rows, reduction = x.shape
     columns = y.shape[1]
     if y.shape != (batch, columns, reduction):
         raise ValueError("W8A8 BMM input shape mismatch")
-    if xs.shape != (batch, rows, triton.cdiv(reduction, block_k)) or ys.shape != (
-        batch,
-        triton.cdiv(columns, block_n),
-        triton.cdiv(reduction, block_k),
-    ):
+    group_n = 0
+    if per_channel_quant:
+        xs_shape = (batch, rows, 1)
+        ys_shape = (batch, columns, 1)
+    else:
+        group_n, group_k = block_size
+        if group_k != 128 or group_n < 16 or group_n & (group_n - 1):
+            raise NotImplementedError(
+                "requires power-of-two block_n >= 16 and block_k=128"
+            )
+        xs_shape = (batch, rows, triton.cdiv(reduction, group_k))
+        ys_shape = (
+            batch,
+            triton.cdiv(columns, group_n),
+            triton.cdiv(reduction, group_k),
+        )
+    if xs.shape != xs_shape or ys.shape != ys_shape:
         raise ValueError("incorrect W8A8 BMM scale shape")
+    if per_channel_quant:
+        # Broadcast scales with a zero K-group stride; no data is copied.
+        groups = triton.cdiv(reduction, 128)
+        xs = xs.expand(batch, rows, groups)
+        ys = ys.expand(batch, columns, groups)
+        tensors = (x, y, xs, ys)
     if output_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("unsupported output dtype")
     if z is None:
@@ -406,10 +445,11 @@ def w8a8_block_int8_bmm(
                 xs.stride(),
                 ys.stride(),
                 z.stride(),
-                block_n,
+                group_n,
                 batch,
                 BLOCK_K=triton.next_power_of_2(reduction),
                 USE_INT64=use_int64,
+                per_channel_quant=per_channel_quant,
             )
             return z
         # Small output grids need additional independent CTAs to cover the C550.
@@ -460,7 +500,7 @@ def w8a8_block_int8_bmm(
             xs.stride(),
             ys.stride(),
             z.stride(),
-            block_n,
+            group_n,
             split_k,
             batch,
             x.stride(1),
@@ -468,6 +508,7 @@ def w8a8_block_int8_bmm(
             y.stride(1),
             y.stride(2),
             USE_INT64=use_int64,
+            per_channel_quant=per_channel_quant,
         )
         if split_k == 1:
             return z

@@ -244,6 +244,11 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
         "benchmark/test_int8_einsum.py",
+        "benchmark/test_int8_einsum_channelwise.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/int8_einsum.py": [
+        "benchmark/test_int8_einsum.py",
+        "benchmark/test_int8_einsum_channelwise.py",
     ],
     "src/flaggems_vllm/ops/attention.py": [
         "benchmark/test_flash_attn_varlen_func.py",
