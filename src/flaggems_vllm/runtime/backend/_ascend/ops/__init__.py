@@ -33,6 +33,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
@@ -128,6 +131,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_inv_rope_int8_quant",
+    "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
     "gemma_rms_norm",
