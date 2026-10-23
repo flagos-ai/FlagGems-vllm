@@ -18,7 +18,7 @@ import math
 import numbers
 import os
 import sys
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any, Optional
 
 import torch
@@ -50,7 +50,52 @@ _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 # Experimental, opt-in W8A8 path.  "quant" changes only the two per-token
 # quantizers; "quant_oai" also fuses OAI activation with the second quantizer.
 # The normal FlagGems path remains the default in this isolated candidate.
+_W8A8_INT32_DOWN = os.environ.get("FLAG_GEMS_W8A8_INT32_DOWN", "0") == "1"
+_W8A8_MOE_TUNING = (
+    os.environ.get("FLAG_GEMS_W8A8_MOE_TUNING", "off").lower() == "tp8_h100"
+)
 _W8A8_QUANT_FUSION_MODE = os.environ.get("FLAG_GEMS_W8A8_QUANT_FUSION", "off").lower()
+
+
+@functools.lru_cache(maxsize=None)
+def _is_w8a8_quant_sm90_device(device_index: int) -> bool:
+    """Cache only immutable hardware metadata, separately for each device."""
+    if torch.version.hip is not None or torch.version.cuda is None:
+        return False
+    return torch.cuda.get_device_capability(device_index) == (9, 0)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_w8a8_tp8_h100_device(device_index: int) -> bool:
+    # _get_device_name() aliases other products to H100 config tables, while
+    # this opt-in profile was measured on the H100 80GB HBM3 product only.
+    return _is_w8a8_quant_sm90_device(device_index) and (
+        torch.cuda.get_device_name(device_index) == "NVIDIA H100 80GB HBM3"
+    )
+
+
+def _supports_w8a8_quant_fusion(A: torch.Tensor) -> bool:
+    # Public dispatch is limited to the measured MiniMax quant1/quant2 widths.
+    # Generic private kernels remain available for boundary regressions.
+    return (
+        A.ndim == 2
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and A.device.type == "cuda"
+        and A.size(0) <= 32768
+        and A.size(1) in (384, 6144)
+        and _is_w8a8_quant_sm90_device(A.device.index)
+    )
+
+
+def _supports_w8a8_native_div_quant_fusion(A: torch.Tensor) -> bool:
+    # This new mixed-dispatch recipe is validated separately from the existing
+    # full-FG/plain-Torch modes. Do not expand it to other products or FP16:
+    # source-dtype epsilon underflows to zero for FP16, changing zero-row NaNs.
+    return (
+        _supports_w8a8_quant_fusion(A)
+        and A.dtype == torch.bfloat16
+        and _is_w8a8_tp8_h100_device(A.device.index)
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -512,6 +557,47 @@ def get_default_config(
     return config
 
 
+def _get_w8a8_tp8_h100_config(tokens: int, gemm_stage: str) -> dict[str, Any] | None:
+    """Measured BF16 E128/H6144/I384/topk4 envelopes: 16..64 and 1024..8192.
+
+    At 16..64 tokens, GEMM1 uses SWAP_AB with its original BLOCK_K=128
+    FP32 partial-sum order; GEMM2 retains the original FP32 path.
+
+    At 1024..8192 tokens, GEMM1 retains the original BLOCK_K=64 FP32
+    accumulation order. GEMM2 requests exact INT32 accumulation for K=384.
+    Both stages share BLOCK_M so one expert alignment remains sufficient.
+    """
+    if 16 <= tokens <= 64:
+        # Sparse decode is dominated by expert-weight reads. Transposing only
+        # GEMM1's MMA layout improves the measured complete chain without
+        # changing its K=128 FP32 partial-sum order or the GEMM2 path.
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+        if gemm_stage == "gemm1":
+            config["SWAP_AB"] = True
+        return config
+    if not 1024 <= tokens <= 8192:
+        return None
+    large = tokens >= 4096
+    config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128 if large or gemm_stage == "gemm2" else 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 4 if large or gemm_stage == "gemm1" else 2,
+        "num_warps": 4,
+        "num_stages": 4 if large else 3,
+    }
+    if gemm_stage == "gemm2":
+        config["INT32_DOWN"] = True
+    return config
+
+
 def _get_config_dtype_str(
     dtype: Optional[torch.dtype] = None,
     use_fp8_w8a8: bool = False,
@@ -519,10 +605,15 @@ def _get_config_dtype_str(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     ocp_mx_scheme: str | None = None,
+    use_int8_w8a8: bool = False,
 ) -> str | None:
     """Return dtype string for kernel config lookup."""
     if use_fp8_w8a8:
         return "fp8_w8a8"
+    elif use_int8_w8a8:
+        # Floating input activations are quantized inside fused_experts_impl.
+        # Do not select plain-half GEMM paths, which do not apply INT8 scales.
+        return "int8_w8a8"
     elif use_fp8_w8a16:
         return "fp8_w8a16"
     elif use_int8_w8a16:
@@ -609,9 +700,14 @@ def _validate_swigluoai_uninterleave_params(
             raise ValueError(
                 f"swigluoai_uninterleave requires a finite scalar {name}, got {value!r}"
             ) from exc
-        if not math.isfinite(converted):
+        # Runtime scalar arguments are passed to Triton as FP32. A finite
+        # Python float can still overflow to infinity at that boundary.
+        if (
+            not math.isfinite(converted)
+            or abs(converted) > torch.finfo(torch.float32).max
+        ):
             raise ValueError(
-                f"swigluoai_uninterleave requires a finite scalar {name}, got {value!r}"
+                f"swigluoai_uninterleave requires a finite FP32 scalar {name}, got {value!r}"
             )
         validated[name] = converted
     if validated["gemm1_clamp_limit"] < 0:
@@ -638,8 +734,10 @@ def _swigluoai_uninterleave_kernel(
     BLOCK_I: tl.constexpr,
 ):
     """Split gate/up layout; compute in FP32 and round on output store."""
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK_I + tl.arange(0, BLOCK_I)
+    # Promote before multiplying: valid tensor strides can exceed int32
+    # offsets even when the logical activation has only a few elements.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1).to(tl.int64) * BLOCK_I + tl.arange(0, BLOCK_I)
     mask = cols < n_inter
     gate = tl.load(
         input_ptr + row * stride_im + cols * stride_in, mask=mask, other=0.0
@@ -649,8 +747,12 @@ def _swigluoai_uninterleave_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    gate = tl.minimum(gate, clamp_limit)
-    up = tl.minimum(tl.maximum(up, -clamp_limit), clamp_limit)
+    gate = tl.minimum(gate, clamp_limit, propagate_nan=tl.PropagateNan.ALL)
+    up = tl.minimum(
+        tl.maximum(up, -clamp_limit, propagate_nan=tl.PropagateNan.ALL),
+        clamp_limit,
+        propagate_nan=tl.PropagateNan.ALL,
+    )
     activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
     tl.store(
         output_ptr + row * stride_om + cols * stride_on,
@@ -841,15 +943,16 @@ def _int8_quantize(
         return A_q, scale
 
     elif per_act_token:
-        if (
-            _W8A8_QUANT_FUSION_MODE in ("quant", "quant_oai")
-            and A.ndim == 2
-            and A.dtype in (torch.bfloat16, torch.float16)
-            and A.device.type in ("cuda", "musa", "xpu")
-            and 0 < A.size(-1) <= 8192
-            and _int8_quant_dispatch_policy() is not None
-        ):
-            return _int8_quantize_per_token_triton(A)
+        if _W8A8_QUANT_FUSION_MODE in (
+            "quant",
+            "quant_oai",
+        ) and _supports_w8a8_quant_fusion(A):
+            recipe = _int8_quant_dispatch_policy()
+            if recipe is not None and (
+                recipe != _Int8QuantRecipe.FG_NATIVE_DIV
+                or _supports_w8a8_native_div_quant_fusion(A)
+            ):
+                return _int8_quantize_per_token_triton(A, _quant_recipe=recipe)
         A_flat = A.reshape(-1, A.size(-1))
         amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
         scale = amax / int8_max
@@ -865,9 +968,43 @@ def _int8_quantize(
         return A_q, A_scale
 
 
-_INT8_QUANT_REQUIRED_FG_KEYS = frozenset(
-    ("abs", "amax", "clamp", "div.Scalar", "div.Tensor", "round")
-)
+class _Int8QuantRecipe(IntEnum):
+    TORCH_ALL = 0
+    FG_ALL = 1
+    FG_NATIVE_DIV = 2
+
+
+_INT8_QUANT_CORE_FG_KEYS = frozenset(("abs", "amax", "clamp", "round"))
+_INT8_QUANT_DIV_FG_KEYS = frozenset(("div.Scalar", "div.Tensor"))
+_INT8_QUANT_REQUIRED_FG_KEYS = _INT8_QUANT_CORE_FG_KEYS | _INT8_QUANT_DIV_FG_KEYS
+
+
+def _native_cuda_int8_quant_div_supported() -> bool:
+    # Source and build validation is intentionally narrow: this pinned Torch
+    # build uses FP64 reciprocal -> FP32 multiply for Tensor/Python-scalar and
+    # precise FP32 division for two CUDA tensors. Missing registrar keys alone
+    # do not prove another library has not overridden the CUDA kernels.
+    if (
+        torch.__version__ != "2.13.0+cu129"
+        or torch.version.git_version != "cf30153c4c131c8164ee7798e5022d810682e2cb"
+        or torch.version.cuda != "12.9"
+        or torch.version.hip is not None
+    ):
+        return False
+    try:
+        tensor_kernel = str(torch.library.get_kernel("aten::div.Tensor", "CUDA"))
+        scalar_kernel = str(torch.library.get_kernel("aten::div.Scalar", "CUDA"))
+    except (AttributeError, RuntimeError, ValueError):
+        return False
+    # Query on every policy resolution. Both registrar membership and operator
+    # registrations can change in place; cache only immutable hardware facts.
+    return tensor_kernel == (
+        "SafeKernelFunction(debug='registered at "
+        "/__w/pytorch/pytorch/build/aten/src/ATen/RegisterCUDA_0.cpp:8338')"
+    ) and scalar_kernel == (
+        "SafeKernelFunction(debug='registered at /__w/pytorch/pytorch/build/"
+        "aten/src/ATen/RegisterCompositeExplicitAutograd_0.cpp:4047')"
+    )
 
 
 def _registrar_has_complete_int8_quant(registrar) -> bool:
@@ -876,15 +1013,27 @@ def _registrar_has_complete_int8_quant(registrar) -> bool:
     return _INT8_QUANT_REQUIRED_FG_KEYS.issubset(set(registrar.get_all_keys()))
 
 
-def _int8_quant_dispatch_policy() -> bool | None:
-    """False=plain Torch, True=full FG chain, None=mixed/unknown fallback."""
+def _int8_quant_dispatch_policy() -> _Int8QuantRecipe | None:
+    """Recognize only the plain, full-FG, or pinned production mixed recipe."""
     package = sys.modules.get("flag_gems")
     registrar = getattr(package, "current_work_registrar", None)
     if registrar is None:
-        return False
+        return _Int8QuantRecipe.TORCH_ALL
     if not hasattr(registrar, "get_all_keys"):
         return None
-    return True if _registrar_has_complete_int8_quant(registrar) else None
+    try:
+        keys = set(registrar.get_all_keys())
+    except (AttributeError, TypeError):
+        return None
+    if _INT8_QUANT_REQUIRED_FG_KEYS.issubset(keys):
+        return _Int8QuantRecipe.FG_ALL
+    if (
+        _INT8_QUANT_CORE_FG_KEYS.issubset(keys)
+        and not (_INT8_QUANT_DIV_FG_KEYS & keys)
+        and _native_cuda_int8_quant_div_supported()
+    ):
+        return _Int8QuantRecipe.FG_NATIVE_DIV
+    return None
 
 
 @triton.jit
@@ -909,7 +1058,11 @@ def _round_to_int8_even(x, FG_DISPATCH: tl.constexpr):
 
 @triton.jit
 def _per_token_int8_values(
-    x, valid, storage_dtype: tl.constexpr, FG_DISPATCH: tl.constexpr
+    x,
+    valid,
+    storage_dtype: tl.constexpr,
+    FG_DISPATCH: tl.constexpr,
+    PRECISE_TENSOR_DIV: tl.constexpr,
 ):
     """Match _int8_quantize's source-dtype amax/clamp and FP32 scale/divide."""
     x = x.to(tl.float32)
@@ -928,12 +1081,13 @@ def _per_token_int8_values(
     # multiplication on this runtime; rounded division differs by one ULP
     # for values such as amax=52 and can flip INT8 half-way decisions.
     scale = amax * tl.full((), 1.0 / 127.0, tl.float32)
-    # FlagGems true_divide uses Triton's default approximate f32 division;
-    # its half-way decisions can differ from PyTorch's rounded division.
-    if FG_DISPATCH:
-        quotient = x / scale
-    else:
+    # Reduction/NaN and division are independent axes. Production excludes
+    # true_divide while retaining FG reduction/round/clamp; only full-FG uses
+    # approximate f32 division with potentially different half-way decisions.
+    if PRECISE_TENSOR_DIV:
         quotient = tl.div_rn(x, scale)
+    else:
+        quotient = x / scale
     return _round_to_int8_even(quotient, FG_DISPATCH), scale
 
 
@@ -946,27 +1100,38 @@ def _int8_quantize_per_token_kernel(
     stride_im: tl.constexpr,
     stride_ik: tl.constexpr,
     FG_DISPATCH: tl.constexpr,
+    PRECISE_TENSOR_DIV: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_K)
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_K).to(tl.int64)
     valid = cols < K
     x = tl.load(input_ptr + row * stride_im + cols * stride_ik, valid, other=0)
-    q, scale = _per_token_int8_values(x, valid, input_ptr.dtype.element_ty, FG_DISPATCH)
+    q, scale = _per_token_int8_values(
+        x, valid, input_ptr.dtype.element_ty, FG_DISPATCH, PRECISE_TENSOR_DIV
+    )
     tl.store(output_ptr + row * K + cols, q, valid)
     tl.store(scale_ptr + row, scale)
 
 
 def _int8_quantize_per_token_triton(
     A: torch.Tensor,
+    *,
+    _quant_recipe: _Int8QuantRecipe | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stride-aware 2D dynamic INT8 quantizer; one program per input row."""
     assert A.ndim == 2 and A.dtype in (torch.bfloat16, torch.float16)
     M, K = A.shape
     assert 0 < K <= 8192
-    fg_dispatch = _int8_quant_dispatch_policy()
-    if fg_dispatch is None:
+    recipe = _int8_quant_dispatch_policy() if _quant_recipe is None else _quant_recipe
+    if not isinstance(recipe, _Int8QuantRecipe):
         raise RuntimeError("Mixed FlagGems quant registration requires original path")
+    if recipe == _Int8QuantRecipe.FG_NATIVE_DIV and not (
+        _supports_w8a8_native_div_quant_fusion(A)
+    ):
+        raise RuntimeError(
+            "Native-div quant fusion requires the guarded H100 BF16 shape"
+        )
     A_q = torch.empty((M, K), device=A.device, dtype=torch.int8)
     scale = torch.empty((M, 1), device=A.device, dtype=torch.float32)
     if M:
@@ -977,7 +1142,8 @@ def _int8_quantize_per_token_triton(
             K,
             A.stride(0),
             A.stride(1),
-            FG_DISPATCH=fg_dispatch,
+            FG_DISPATCH=recipe != _Int8QuantRecipe.TORCH_ALL,
+            PRECISE_TENSOR_DIV=recipe != _Int8QuantRecipe.FG_ALL,
             BLOCK_K=triton.next_power_of_2(K),
             num_warps=4 if K <= 2048 else 8,
         )
@@ -995,14 +1161,15 @@ def _swigluoai_quantize_per_token_kernel(
     stride_ik: tl.constexpr,
     stride_om: tl.constexpr,
     stride_ok: tl.constexpr,
-    alpha: tl.constexpr,
-    beta: tl.constexpr,
-    clamp_limit: tl.constexpr,
+    alpha,
+    beta,
+    clamp_limit,
     FG_DISPATCH: tl.constexpr,
+    PRECISE_TENSOR_DIV: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_K)
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_K).to(tl.int64)
     valid = cols < K
     gate = tl.load(input_ptr + row * stride_im + cols * stride_ik, valid, other=0).to(
         tl.float32
@@ -1010,14 +1177,22 @@ def _swigluoai_quantize_per_token_kernel(
     up = tl.load(
         input_ptr + row * stride_im + (K + cols) * stride_ik, valid, other=0
     ).to(tl.float32)
-    gate = tl.minimum(gate, clamp_limit)
-    up = tl.minimum(tl.maximum(up, -clamp_limit), clamp_limit)
+    gate = tl.minimum(gate, clamp_limit, propagate_nan=tl.PropagateNan.ALL)
+    up = tl.minimum(
+        tl.maximum(up, -clamp_limit, propagate_nan=tl.PropagateNan.ALL),
+        clamp_limit,
+        propagate_nan=tl.PropagateNan.ALL,
+    )
     activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
     # Retain the observable BF16/FP16 workspace rounding before quant2.
     activated = activated.to(activation_ptr.dtype.element_ty)
     tl.store(activation_ptr + row * stride_om + cols * stride_ok, activated, valid)
     q, scale = _per_token_int8_values(
-        activated, valid, activation_ptr.dtype.element_ty, FG_DISPATCH
+        activated,
+        valid,
+        activation_ptr.dtype.element_ty,
+        FG_DISPATCH,
+        PRECISE_TENSOR_DIV,
     )
     tl.store(quant_ptr + row * K + cols, q, valid)
     tl.store(scale_ptr + row, scale)
@@ -1029,17 +1204,29 @@ def _swigluoai_quantize_per_token_triton(
     alpha: float,
     beta: float,
     clamp_limit: float,
+    *,
+    _quant_recipe: _Int8QuantRecipe | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """OAI + quant2, retaining the rounded activation workspace for inspection."""
     assert input.ndim == activation_output.ndim == 2
     assert input.shape == (activation_output.size(0), activation_output.size(1) * 2)
-    assert input.dtype == activation_output.dtype
+    assert (
+        input.dtype == activation_output.dtype
+        and input.device == activation_output.device
+    )
+    alpha, beta, clamp_limit = _validate_swigluoai_uninterleave_params(
+        alpha, beta, clamp_limit
+    )
     assert input.dtype in (torch.bfloat16, torch.float16)
     M, K = activation_output.shape
     assert 0 < K <= 8192
-    fg_dispatch = _int8_quant_dispatch_policy()
-    if fg_dispatch is None:
+    recipe = _int8_quant_dispatch_policy() if _quant_recipe is None else _quant_recipe
+    if not isinstance(recipe, _Int8QuantRecipe):
         raise RuntimeError("Mixed FlagGems quant registration requires original path")
+    if recipe == _Int8QuantRecipe.FG_NATIVE_DIV and not (
+        _supports_w8a8_native_div_quant_fusion(activation_output)
+    ):
+        raise RuntimeError("Native-div OAI fusion requires the guarded H100 BF16 shape")
     q = torch.empty((M, K), device=input.device, dtype=torch.int8)
     scale = torch.empty((M, 1), device=input.device, dtype=torch.float32)
     if M:
@@ -1056,7 +1243,8 @@ def _swigluoai_quantize_per_token_triton(
             alpha,
             beta,
             clamp_limit,
-            FG_DISPATCH=fg_dispatch,
+            FG_DISPATCH=recipe != _Int8QuantRecipe.TORCH_ALL,
+            PRECISE_TENSOR_DIV=recipe != _Int8QuantRecipe.FG_ALL,
             BLOCK_K=triton.next_power_of_2(K),
             num_warps=4 if K <= 2048 else 8,
         )
@@ -2017,6 +2205,12 @@ def invoke_fused_moe_triton_kernel(
 
     swap_AB = config.pop("SWAP_AB", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
+    int32_down = config.pop("INT32_DOWN", False) or _W8A8_INT32_DOWN
+    int32_down = (
+        int32_down
+        and A.device.type == "cuda"
+        and _is_w8a8_quant_sm90_device(A.device.index)
+    )
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
@@ -2058,7 +2252,10 @@ def invoke_fused_moe_triton_kernel(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         INT32_DOWN=(
-            use_int8_w8a8
+            int32_down
+            and use_int8_w8a8
+            and A.dtype == torch.int8
+            and B.dtype == torch.int8
             and block_shape is None
             and B.size(2) <= 1024
             and not FUSE_SILU
@@ -2260,6 +2457,7 @@ def fused_experts_impl(
 
     config_dtype = _get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         ocp_mx_scheme=ocp_mx_scheme,
@@ -2286,6 +2484,28 @@ def fused_experts_impl(
     )
 
     base_config, is_embedded_config = get_moe_config(M)
+    use_w8a8_tp8_tuning = (
+        _W8A8_MOE_TUNING
+        and not is_embedded_config
+        and use_int8_w8a8
+        and per_channel_quant
+        and block_shape is None
+        and ocp_mx_scheme is None
+        and hidden_states.dtype == torch.bfloat16
+        and activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and tuple(w1.shape) == (128, 768, 6144)
+        and tuple(w2.shape) == (128, 6144, 384)
+        and top_k_num == 4
+        and global_num_experts == E
+        and expert_map is None
+        and w1_bias is None
+        and w2_bias is None
+        and not apply_router_weight_on_input
+        and hidden_states.device.type == "cuda"
+        and _is_w8a8_tp8_h100_device(hidden_states.device.index)
+    )
+    if use_w8a8_tp8_tuning:
+        base_config = _get_w8a8_tp8_h100_config(M, "gemm1") or base_config
 
     # cache1 and cache3 share memory (non-overlapping lifetime)
     cache13 = torch.empty(
@@ -2380,6 +2600,10 @@ def fused_experts_impl(
             ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             base_config, is_embedded_config = get_moe_config(tokens_in_chunk)
+            if use_w8a8_tp8_tuning:
+                base_config = (
+                    _get_w8a8_tp8_h100_config(tokens_in_chunk, "gemm1") or base_config
+                )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
@@ -2485,11 +2709,16 @@ def fused_experts_impl(
             and ocp_mx_scheme is None
             and a2_scale is None
             and activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE
-            and intermediate_cache2.dtype in (torch.bfloat16, torch.float16)
-            and intermediate_cache2.device.type in ("cuda", "musa", "xpu")
-            and 0 < activation_out_dim <= 8192
-            and _int8_quant_dispatch_policy() is not None
+            and activation_out_dim == 384
+            and _supports_w8a8_quant_fusion(intermediate_cache2)
         )
+        oai_quant_recipe = None
+        if fused_oai_quant2:
+            oai_quant_recipe = _int8_quant_dispatch_policy()
+            fused_oai_quant2 = oai_quant_recipe is not None and (
+                oai_quant_recipe != _Int8QuantRecipe.FG_NATIVE_DIV
+                or _supports_w8a8_native_div_quant_fusion(intermediate_cache2)
+            )
         if fused_oai_quant2:
             qintermediate_cache2, a2q_scale = _swigluoai_quantize_per_token_triton(
                 intermediate_cache1.view(-1, N),
@@ -2497,6 +2726,7 @@ def fused_experts_impl(
                 gemm1_alpha,
                 gemm1_beta,
                 gemm1_clamp_limit,
+                _quant_recipe=oai_quant_recipe,
             )
         elif not do_fuse_silu:
             apply_moe_activation(
@@ -2524,6 +2754,10 @@ def fused_experts_impl(
 
         # 6. Select GEMM2 config and output buffer/reduction path
         gemm2_config = base_config
+        if use_w8a8_tp8_tuning:
+            gemm2_config = (
+                _get_w8a8_tp8_h100_config(tokens_in_chunk, "gemm2") or base_config
+            )
         if use_half_gemm_fast_paths:
             gemm2_config, _ = get_moe_config(
                 tokens_in_chunk,
@@ -2534,6 +2768,10 @@ def fused_experts_impl(
             not is_embedded_config
             and direct_sum_supported
             and tokens_in_chunk >= MOE_DIRECT_SUM_MIN_TOKENS
+            # Multiple experts would atomically accumulate into the output
+            # dtype in an unspecified order. Keep the fixed-order FP32
+            # moe_sum reduction for top-k > 1, including large prefills.
+            and top_k_num == 1
             and expert_map is None
             and not apply_router_weight_on_input
         )

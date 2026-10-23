@@ -27,7 +27,9 @@ def literal_quant(x):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 384), (1, 127), (7, 384), (32, 768), (64, 6144)])
 def test_quant_and_oai_quant(dtype, shape, monkeypatch):
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
+    monkeypatch.setattr(
+        moe, "_int8_quant_dispatch_policy", lambda: moe._Int8QuantRecipe.TORCH_ALL
+    )
     torch.manual_seed(43)
     x = torch.randn(shape, device="cuda", dtype=dtype) * 8
     q, s = moe._int8_quantize_per_token_triton(x)
@@ -54,7 +56,9 @@ def test_quant_and_oai_quant(dtype, shape, monkeypatch):
 
 
 def test_quant_nan_halfway_graph(monkeypatch):
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
+    monkeypatch.setattr(
+        moe, "_int8_quant_dispatch_policy", lambda: moe._Int8QuantRecipe.TORCH_ALL
+    )
     x = torch.tensor(
         [[0.0, 0.0, 0.0, 0.0], [127.0, 0.5, 1.5, 2.5], [float("nan"), 1.0, -2.0, 3.0]],
         device="cuda",
@@ -95,7 +99,9 @@ def test_oai_parameter_validation():
 @pytest.mark.parametrize("mode", ["off", "quant_oai"])
 def test_w8a8_oai_experts(dtype, m, i, mode, monkeypatch):
     monkeypatch.setattr(moe, "_W8A8_QUANT_FUSION_MODE", mode)
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
+    monkeypatch.setattr(
+        moe, "_int8_quant_dispatch_policy", lambda: moe._Int8QuantRecipe.TORCH_ALL
+    )
     torch.manual_seed(47)
     e, h, k = 4, 128, 2
     x = torch.randn((m, h), device="cuda", dtype=dtype)
@@ -178,11 +184,46 @@ def test_quant_full_and_mixed_dispatch():
         dtype=torch.bfloat16,
     )
     with flag_gems.use_gems(include=["abs", "amax", "clamp", "true_divide", "round"]):
-        assert moe._int8_quant_dispatch_policy() is True
+        assert moe._int8_quant_dispatch_policy() == moe._Int8QuantRecipe.FG_ALL
         q, s = moe._int8_quantize_per_token_triton(x)
         rq, rs = literal_quant(x)
     assert torch.equal(q, rq)
     torch.testing.assert_close(s, rs, rtol=0, atol=0, equal_nan=True)
     with flag_gems.use_gems(include=["abs"]):
         assert moe._int8_quant_dispatch_policy() is None
-    assert moe._int8_quant_dispatch_policy() is False
+    assert moe._int8_quant_dispatch_policy() == moe._Int8QuantRecipe.TORCH_ALL
+
+
+@pytest.mark.parametrize("column", [0, 384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_oai_nan_survives_clamp(column, dtype, monkeypatch):
+    monkeypatch.setattr(
+        moe, "_int8_quant_dispatch_policy", lambda: moe._Int8QuantRecipe.TORCH_ALL
+    )
+    packed = torch.ones((2, 768), device="cuda", dtype=dtype)
+    packed[0, column] = float("nan")
+    activated = torch.empty((2, 384), device="cuda", dtype=dtype)
+    moe._swigluoai_quantize_per_token_triton(packed, activated, 1.702, 1.0, 7.0)
+    expected = literal_oai(packed)
+    torch.testing.assert_close(activated, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.isnan(activated[0, 0])
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("value", [-1e39, 1e39])
+def test_oai_fp32_overflow_rejected_before_tensor_access(index, value):
+    params = [1.702, 1.0, 7.0]
+    params[index] = value
+    # Scalars are checked before even attempting to read a tensor's metadata.
+    with pytest.raises(ValueError, match="finite FP32"):
+        moe.fused_experts_impl(
+            None,
+            None,
+            None,
+            None,
+            None,
+            activation="swigluoai_uninterleave",
+            gemm1_alpha=params[0],
+            gemm1_beta=params[1],
+            gemm1_clamp_limit=params[2],
+        )

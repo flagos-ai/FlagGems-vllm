@@ -162,7 +162,11 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
-    "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
+    "src/flaggems_vllm/ops/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+        "tests/test_fused_moe.py",
+        "tests/test_fused_moe_policy_cpu.py",
+    ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
