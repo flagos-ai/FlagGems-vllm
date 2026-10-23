@@ -691,8 +691,8 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         pytest.param(
             "int8",
             marks=pytest.mark.skipif(
-                flaggems_vllm.vendor_name == "mthreads",
-                reason="MThreads backend does not implement INT8 W8A16",
+                flaggems_vllm.vendor_name in ("metax", "mthreads"),
+                reason="MetaX and MThreads backends do not implement INT8 W8A16",
             ),
         ),
         "fp8",
@@ -1476,13 +1476,13 @@ def _check_w8a16_fp8(config, dtype):
 # -----------------------------------------------------------------------------
 _DTYPES = [torch.bfloat16, torch.float16]
 
-_MTHREADS_NO_MXFP4 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement MXFP4 W4A16",
+NO_MXFP4 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement MXFP4 W4A16",
 )
-_MTHREADS_NO_INT8 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement INT8 W8A16",
+NO_INT8 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement INT8 W8A16",
 )
 
 
@@ -1510,11 +1510,11 @@ def _cases(precision, configs, with_router_weight_on_input=False, marks=()):
 
 
 _W4A16_CASES = _cases("int4", FULL_CONFIGS, with_router_weight_on_input=True) + _cases(
-    "mxfp4", FULL_CONFIGS, marks=_MTHREADS_NO_MXFP4
+    "mxfp4", FULL_CONFIGS, marks=NO_MXFP4
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+    "int8", W8A16_CONFIGS, marks=NO_INT8
 )
 
 

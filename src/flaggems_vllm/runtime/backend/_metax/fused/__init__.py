@@ -9,6 +9,11 @@ from flaggems_vllm.runtime.backend._metax.fused.fused_deepseek_v4_qnorm_rope_kv_
 from flaggems_vllm.runtime.backend._metax.fused.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from flaggems_vllm.runtime.backend._metax.fused.fused_marlin_moe import (
+    fused_marlin_moe,
+    fused_marlin_moe_w4a16_int4,
+    fused_marlin_moe_w8a16_fp8,
+)
 from flaggems_vllm.runtime.backend._metax.fused.gdn_chunk import (
     chunk_gated_delta_rule_fwd,
 )
@@ -22,6 +27,9 @@ from flaggems_vllm.runtime.backend._metax.fused.top_k_per_row_prefill import (
 __all__ = [
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_inv_rope_fp8_quant",
+    "fused_marlin_moe",
+    "fused_marlin_moe_w4a16_int4",
+    "fused_marlin_moe_w8a16_fp8",
     "chunk_gated_delta_rule_fwd",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",

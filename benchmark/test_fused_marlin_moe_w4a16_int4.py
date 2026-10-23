@@ -15,6 +15,8 @@
 import pytest
 import torch
 
+import flaggems_vllm
+
 # vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
 # the entire benchmark is skipped via the skipif marker below.
 try:
@@ -33,27 +35,31 @@ except ImportError:
 
 # vLLM 0.6.2 on Hygon registers no Marlin MoE ops (torch.ops._moe_C is empty),
 # so the Hygon path compares against the native Triton fused_experts kernel.
+# vLLM-MetaX 0.23's fused_experts wrapper reads a quant config field vLLM
+# no longer has, so MetaX calls outplace_fused_experts.
 try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts as vllm_fused_experts,
-    )
+    if flaggems_vllm.vendor_name == "metax":
+        from vllm_metax.model_executor.layers.fused_moe.fused_moe import (
+            outplace_fused_experts as vllm_fused_experts,
+        )
+    else:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts as vllm_fused_experts,
+        )
 
     HAS_VLLM_FUSED_EXPERTS = True
 except ImportError:
     HAS_VLLM_FUSED_EXPERTS = False
 
-import flaggems_vllm
-
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
-from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -65,7 +71,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
@@ -237,10 +243,9 @@ def _hygon_verify(op_name, config, inputs):
     """Check both implementations against the fp32 reference before timing."""
     (hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids) = inputs
     expected = _hygon_reference(hidden_states, w1_bf16, w2_bf16, topk_weights, topk_ids)
-    checks = (
-        ("flaggems", _gems_call(*inputs)),
-        ("vllm", _vllm_baseline(*inputs)),
-    )
+    checks = [("flaggems", _gems_call(*inputs))]
+    if HAS_REQUIRED_VLLM:
+        checks.append(("vllm", _vllm_baseline(*inputs)))
     errors = []
     for name, output in checks:
         rms, peak = _hygon_relative_errors(output, expected)
@@ -266,21 +271,32 @@ def _wna16_quantize_per_expert(w_fp):
     scales = torch.empty(
         E, out_dim, in_dim // GROUP_SIZE, device=w_fp.device, dtype=w_fp.dtype
     )
-    # Plain INT4 quantization does not require the optional Marlin module.
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
-    )
-    from vllm.scalar_type import scalar_types
-
     for e in range(E):
-        _, q_e, sc_e, _ = quantize_weights(
-            w_fp[e].T, scalar_types.uint4b8, GROUP_SIZE, False, False
-        )
-        q_e = q_e.T.contiguous().to(torch.uint8)
-        sc_e = sc_e.T
+        q_e, sc_e = _quantize_uint4b8(w_fp[e])
         w_q[e] = q_e[:, 1::2] * 16 + q_e[:, ::2]
         scales[e] = sc_e
     return w_q, scales
+
+
+def _quantize_uint4b8(w):
+    """
+    Symmetric per-group GPTQ uint4b8 quantization without vLLM.
+
+    Matches vllm quantize_weights(w.T, scalar_types.uint4b8, GROUP_SIZE,
+    zero_points=False): scale = max(|max| / 7, |min| / 8) per group of
+    GROUP_SIZE input channels, codes clamped to [-8, 7] and biased by +8.
+
+    Input  w:      (out_dim, in_dim), bf16/fp16
+    Output codes:  (out_dim, in_dim), uint8 in [0, 15]
+           scales: (out_dim, in_dim // GROUP_SIZE), same dtype as w
+    """
+    out_dim, in_dim = w.shape
+    grouped = w.reshape(out_dim, in_dim // GROUP_SIZE, GROUP_SIZE)
+    max_val = grouped.amax(dim=-1, keepdim=True)
+    min_val = grouped.amin(dim=-1, keepdim=True)
+    scales = torch.maximum((max_val / 7).abs(), (min_val / -8).abs())
+    codes = torch.round(grouped / scales).int().clamp(-8, 7) + 8
+    return codes.reshape(out_dim, in_dim).to(torch.uint8), scales.squeeze(-1)
 
 
 def _marlin_quantize_per_expert(w_fp):
@@ -315,6 +331,9 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+        if not HAS_REQUIRED_VLLM:
+            # Without the vLLM baseline, time the FlagGems kernel only.
+            self.metrics = ["latency"]
 
     def set_shapes(self, shape_file_path=None):
         # The three production MoE architectures from profile_fused_marlin_moe.py
@@ -387,7 +406,8 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
                 weights = _make_hygon_weights(
                     num_experts, hidden_size, intermediate_size, dtype
                 )
-                _hygon_ensure_vllm_expert_offset_int64([weights[4], weights[5]])
+                if HAS_REQUIRED_VLLM:
+                    _hygon_ensure_vllm_expert_offset_int64([weights[4], weights[5]])
                 geometry = next_geometry
             w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16 = weights
             torch.manual_seed(7 + num_tokens)
@@ -452,7 +472,10 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         w1_q_wna16, w1_scale_wna16 = _wna16_quantize_per_expert(w1_fp)
         w2_q_wna16, w2_scale_wna16 = _wna16_quantize_per_expert(w2_fp)
 
-        if flaggems_vllm.vendor_name == "mthreads":
+        if not HAS_REQUIRED_VLLM:
+            # Latency-only run: no baseline weights are needed.
+            w1_q_marlin = w1_scale_marlin = w2_q_marlin = w2_scale_marlin = None
+        elif flaggems_vllm.vendor_name in ("metax", "mthreads"):
             # MUSA vLLM consumes the same plain INT4 weights as FlagGems.
             w1_q_marlin, w1_scale_marlin = w1_q_wna16, w1_scale_wna16
             w2_q_marlin, w2_scale_marlin = w2_q_wna16, w2_scale_wna16
@@ -502,6 +525,18 @@ def _vllm_baseline(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "metax":
+        return vllm_fused_experts(
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            topk_weights,
+            topk_ids,
+            use_int4_w4a16=True,
+            w1_scale=w1_scale_wna16,
+            w2_scale=w2_scale_wna16,
+            block_shape=[0, GROUP_SIZE],
+        )
     if flaggems_vllm.vendor_name == "mthreads":
         from vllm.model_executor.layers.fused_moe.config import (
             int4_w4a16_moe_quant_config,
@@ -553,12 +588,7 @@ def _gems_call(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
-    gems_op = (
-        flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-        else gems_fused_marlin_moe
-    )
-    return gems_op(
+    return flaggems_vllm.fused_marlin_moe(
         hidden_states=hidden_states,
         w1=w1_q_wna16,
         w2=w2_q_wna16,
@@ -574,9 +604,6 @@ def _gems_call(
 
 @pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
-)
-@pytest.mark.skipif(
     not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
 )
 def test_fused_marlin_moe_w4a16_int4():
@@ -585,6 +612,8 @@ def test_fused_marlin_moe_w4a16_int4():
     (CUDA Marlin) on Hopper, or vs vLLM native BF16 fused_experts on Hygon.
     Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
     """
+    if not HAS_REQUIRED_VLLM:
+        print("required vLLM baseline is unavailable; recording latency only")
     bench = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16",
         torch_op=_vllm_baseline,
