@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.triton_lang_helper import assume
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -1955,12 +1956,12 @@ def _per_row_cta_topk_selector(
         & ((vocab_size % BLOCK_SIZE) == 0)
     )
     if assume_aligned:
-        tl.assume(row_start == 0)
-        tl.assume(row_end == vocab_size)
-        tl.assume(stride_xn == 1)
+        assume(row_start == 0)
+        assume(row_end == vocab_size)
+        assume(stride_xn == 1)
         vocab_size = tl.multiple_of(vocab_size, BLOCK_SIZE)
     elif stride_xn == 1:
-        tl.assume(stride_xn == 1)
+        assume(stride_xn == 1)
 
     lane = tl.arange(0, BLOCK_SIZE)
     row_len = row_end - row_start

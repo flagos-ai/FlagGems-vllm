@@ -82,6 +82,43 @@ if major_version == 2:
 FLAGGEMS_DB_URL = os.getenv("FLAGGEMS_DB_URL", None)
 
 
+def _do_bench_with_timer_fallback(kernel_call, *, warmup, rep, quantiles):
+    try:
+        return triton.testing.do_bench(
+            kernel_call, warmup=warmup, rep=rep, quantiles=quantiles
+        )
+    except ZeroDivisionError:
+        if runtime.device.vendor_name != "kunlunxin":
+            raise
+    # Some XPU event timers report zero for short kernels. Measure completed
+    # work with a synchronized wall clock instead of inventing a positive time
+    # or disabling autotuning. This includes launch/synchronization overhead.
+    logger.warning(
+        "XPU event timer returned zero; using synchronized wall-clock tuning"
+    )
+    torch_device_fn.synchronize()
+    deadline = time.perf_counter() + warmup / 1000
+    while time.perf_counter() < deadline:
+        kernel_call()
+        torch_device_fn.synchronize()
+    samples = []
+    deadline = time.perf_counter() + rep / 1000
+    while not samples or time.perf_counter() < deadline:
+        start = time.perf_counter()
+        kernel_call()
+        torch_device_fn.synchronize()
+        samples.append((time.perf_counter() - start) * 1000)
+    samples.sort()
+
+    def percentile(q):
+        position = q * (len(samples) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(samples) - 1)
+        return samples[lower] + (samples[upper] - samples[lower]) * (position - lower)
+
+    return [percentile(q) for q in quantiles]
+
+
 class Cache(object):
     def __init__(
         self, table_name: str, model: PersistantModel, *args, **kwargs
@@ -308,7 +345,7 @@ class LibTuner(triton.runtime.Autotuner):
                 elif warmup is not None or rep is not None:
 
                     def do_bench(kernel_call, quantiles):
-                        return triton.testing.do_bench(
+                        return _do_bench_with_timer_fallback(
                             kernel_call,
                             warmup=warmup if warmup is not None else 25,
                             rep=rep if rep is not None else 100,

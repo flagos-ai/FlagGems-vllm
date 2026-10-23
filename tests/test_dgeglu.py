@@ -57,7 +57,9 @@ def test_dgeglu(shape, dtype):
 
 
 @pytest.mark.dgeglu
-@pytest.mark.parametrize("shape", [(1, 2), (7, 130), (64, 512), (1024, 4096)])
+@pytest.mark.parametrize(
+    "shape", [(1, 2), (3, 254), (2, 3, 512), (7, 130), (64, 512), (1024, 4096)]
+)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_dgeglu_torch_reference(shape, dtype):
     torch.manual_seed(0)

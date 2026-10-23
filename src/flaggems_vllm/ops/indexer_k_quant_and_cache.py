@@ -19,6 +19,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.fp8_storage import encode_e4m3fn
+from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
+
 
 def _get_fp8_dtype() -> torch.dtype:
     try:
@@ -65,6 +68,7 @@ def _indexer_k_quant_and_cache_kernel(
     IS_FNUZ: tl.constexpr,
     USE_UE8M0: tl.constexpr,
     NUM_TOKENS_PAD: tl.constexpr,
+    SOFTWARE_E4M3FN: tl.constexpr = False,
 ):
     tid = tl.program_id(0)
     quant_block_id = tl.program_id(1) * 4
@@ -87,13 +91,20 @@ def _indexer_k_quant_and_cache_kernel(
     amax = tl.max(tl.abs(val).to(tl.float32), axis=1)
     if IS_FNUZ:
         scale = tl.maximum(1e-4, amax) / 224.0
+    elif SOFTWARE_E4M3FN:
+        scale = tl.div_rn(tl.maximum(1e-4, amax), 448.0)
     else:
         scale = tl.maximum(1e-4, amax) / 448.0
 
     if USE_UE8M0:
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
 
-    fp8_val = (val.to(tl.float32) / scale[:, None]).to(kv_cache_ptr.type.element_ty)
+    if SOFTWARE_E4M3FN:
+        normalized = tl.div_rn(val.to(tl.float32), scale[:, None])
+        fp8_val = encode_e4m3fn(normalized)
+    else:
+        normalized = val.to(tl.float32) / scale[:, None]
+        fp8_val = normalized.to(kv_cache_ptr.type.element_ty)
     dst_ptr = kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
     tl.store(dst_ptr + offsets, fp8_val, mask=mask)
 
@@ -124,7 +135,12 @@ def indexer_k_quant_and_cache(
 
     kv_cache_flat = kv_cache.view(num_blocks, -1)
     fp8_dtype = _get_fp8_dtype()
-    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(fp8_dtype)
+    software_e4m3fn = (
+        fp8_dtype == torch.float8_e4m3fn and not kernel_supports_fp8_e4m3()
+    )
+    # An untyped byte view keeps unsupported FP8 types out of the SM80 IR.
+    storage_dtype = torch.uint8 if software_e4m3fn else fp8_dtype
+    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(storage_dtype)
     kv_cache_scale = kv_cache_flat[:, block_size * head_dim :].view(torch.float32)
     num_tokens_pad = triton.next_power_of_2(num_tokens)
     _indexer_k_quant_and_cache_kernel[(num_tokens, triton.cdiv(num_quant_blocks, 4))](
@@ -140,5 +156,6 @@ def indexer_k_quant_and_cache(
         quant_block_size,
         IS_FNUZ=_is_fp8_fnuz(fp8_dtype),
         USE_UE8M0=scale_fmt == "ue8m0",
+        SOFTWARE_E4M3FN=software_e4m3fn,
         NUM_TOKENS_PAD=num_tokens_pad,
     )
