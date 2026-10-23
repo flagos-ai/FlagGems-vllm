@@ -24,6 +24,7 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._metax.ops.grouped_mm_w8a8 import grouped_mm_w8a8
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "grouped_mm_w8a8",
     "inplace_fused_experts",
     "int8_einsum",
     "outplace_fused_experts",

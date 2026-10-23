@@ -684,6 +684,18 @@ ops:
       - Reduction
     stages:
       - alpha: '5.4'
+  - id: grouped_mm_w8a8
+    description: |
+      Unpadded grouped NT GEMM with matching INT8 or E4M3 inputs, FP32 row/column
+      scales and caller-owned BF16 output, using packed expert indices/counts.
+    for:
+      - grouped_mm_w8a8
+    labels:
+      - fused
+    kind:
+      - Matrix
+    stages:
+      - beta: '5.4'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
