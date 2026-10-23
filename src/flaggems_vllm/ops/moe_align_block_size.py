@@ -535,11 +535,13 @@ def _moe_align_block_size_triton_4stage(
     numel_sorted_token_ids = sorted_token_ids.numel()
     numel_expert_ids = expert_ids.numel()
     grid = (num_experts,)
-    tokens_per_thread = triton.next_power_of_2(ceil_div(numel, num_experts))
+    tokens_per_thread = triton.next_power_of_2(max(1, ceil_div(numel, num_experts)))
     block_size_sorted = triton.next_power_of_2(
-        ceil_div(numel_sorted_token_ids, num_experts)
+        max(1, ceil_div(numel_sorted_token_ids, num_experts))
     )
-    block_size_expert = triton.next_power_of_2(ceil_div(numel_expert_ids, num_experts))
+    block_size_expert = triton.next_power_of_2(
+        max(1, ceil_div(numel_expert_ids, num_experts))
+    )
 
     # The tensor needs to be padded before calculating IDs,
     # to prevent out-of-bounds address access.
@@ -606,7 +608,23 @@ def moe_align_block_size_triton(
     numel_expert_ids = expert_ids.numel()
     block_expert_tle = triton.next_power_of_2(num_experts)
 
-    if HAS_TLE and topk_ids.is_cuda and block_expert_tle <= 1024:
+    # Query the current compiler target at dispatch; older TLE versions fall back.
+    is_tle_supported = getattr(tle, "is_tle_supported", None)
+    if (
+        HAS_TLE
+        and topk_ids.is_cuda
+        and block_expert_tle <= 1024
+        and callable(is_tle_supported)
+        and all(
+            is_tle_supported(api)
+            for api in (
+                "device_mesh",
+                "distributed_barrier",
+                "gpu.alloc",
+                "gpu.local_ptr",
+            )
+        )
+    ):
         block_tokens_taf, _ = _pick_tle_atomic_fused_launch_params(numel, num_experts)
         experts_per_shard = ceil_div(num_experts, TLE_CLUSTER_SIZE)
         num_tokens = topk_ids.shape[0] if topk_ids.ndim > 1 else numel
@@ -660,6 +678,7 @@ def moe_align_block_size_triton(
         if (
             num_tokens < TLE_BIG_TOKEN_THRESHOLD_TOKENS
             and _supports_tle_cluster_remote()
+            and all(is_tle_supported(api) for api in ("remote", "shard_id"))
         ):
             try:
                 moe_align_block_size_tle_cluster_fused[(1,)](

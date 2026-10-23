@@ -12,16 +12,244 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.moe_align_block_size import (
+    moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
     moe_align_block_size_small_grouped,
 )
 
 from . import accuracy_utils as utils
+
+
+@pytest.mark.moe_align_block_size_triton
+@pytest.mark.parametrize(
+    "has_tle,is_cuda,num_experts,has_query,unsupported,tle_failure,expected_tle_calls",
+    [
+        (True, True, 512, True, None, False, 2),
+        (True, True, 1024, True, None, False, 2),
+        (True, True, 512, True, "device_mesh", False, 0),
+        (True, True, 512, True, "distributed_barrier", False, 0),
+        (True, True, 512, True, "gpu.alloc", False, 0),
+        (True, True, 512, True, "gpu.local_ptr", False, 0),
+        (True, True, 512, False, None, False, 0),
+        (True, True, 512, True, None, True, 2),
+        (False, True, 512, True, None, False, 0),
+        (True, False, 512, True, None, False, 0),
+        (True, True, 1025, True, None, False, 0),
+    ],
+)
+def test_moe_align_tle_backend_dispatch(
+    monkeypatch,
+    has_tle,
+    is_cuda,
+    num_experts,
+    has_query,
+    unsupported,
+    tle_failure,
+    expected_tle_calls,
+):
+    """Check backend selection without allocating tensors or launching kernels."""
+    module = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
+    calls = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append(self.name)
+                if self.name == "tle" and tle_failure:
+                    raise RuntimeError("ordinary compilation failure")
+
+            return launch
+
+    topk_ids = SimpleNamespace(
+        numel=lambda: 1280,
+        ndim=2,
+        shape=(128, 10),
+        is_cuda=is_cuda,
+        device="cuda" if is_cuda else "cpu",
+    )
+    sorted_ids = SimpleNamespace(numel=lambda: 1280 + num_experts * 15)
+    expert_ids = SimpleNamespace(numel=lambda: (1280 + num_experts * 15) // 16)
+    queries = []
+
+    def is_tle_supported(api):
+        queries.append(api)
+        return api != unsupported
+
+    language = SimpleNamespace()
+    if has_query:
+        language.is_tle_supported = is_tle_supported
+    monkeypatch.setattr(module, "tle", language if has_tle else None)
+    monkeypatch.setattr(module, "HAS_TLE", has_tle)
+    monkeypatch.setattr(module, "_supports_tle_cluster_remote", lambda: False)
+    monkeypatch.setattr(module, "_block_mesh", lambda _: None)
+    monkeypatch.setattr(module, "_pick_tle_atomic_fused_num_blocks", lambda *args: 1)
+    monkeypatch.setattr(module.torch, "zeros", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module, "moe_align_block_size_tle_atomic_fused_coop", Kernel("tle")
+    )
+    for stage in ["stage1", "stage2", "stage2_vec", "stage3", "stage4"]:
+        monkeypatch.setattr(module, f"moe_align_block_size_{stage}", Kernel(stage))
+
+    # Repeated unsupported calls must skip TLE without attempting compilation.
+    for _ in range(2):
+        module.moe_align_block_size_triton(
+            topk_ids, num_experts, 16, sorted_ids, expert_ids, None
+        )
+    assert calls.count("tle") == expected_tle_calls
+    if has_tle and is_cuda and num_experts <= 1024 and has_query:
+        assert queries.count("device_mesh") == 2
+        if unsupported:
+            assert queries.count(unsupported) == 2
+    else:
+        assert queries == []
+    if expected_tle_calls and not tle_failure:
+        assert calls == ["tle", "tle"]
+    else:
+        stages = [
+            "stage1",
+            "stage2_vec" if num_experts & (num_experts - 1) == 0 else "stage2",
+            "stage3",
+            "stage4",
+        ]
+        assert [call for call in calls if call != "tle"] == stages * 2
+
+
+@pytest.mark.moe_align_block_size_triton
+@pytest.mark.parametrize(
+    "unsupported,error,cluster_calls",
+    [
+        ("remote", None, 0),
+        ("shard_id", None, 0),
+        (None, None, 2),
+        (None, "ordinary compilation failure", 2),
+    ],
+)
+def test_moe_align_cluster_capability_is_independent(
+    monkeypatch, unsupported, error, cluster_calls
+):
+    module = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
+    calls = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append(self.name)
+                if self.name == "cluster" and error:
+                    raise RuntimeError(error)
+
+            return launch
+
+    monkeypatch.setattr(module, "HAS_TLE", True)
+    monkeypatch.setattr(
+        module, "tle", SimpleNamespace(is_tle_supported=lambda api: api != unsupported)
+    )
+    monkeypatch.setattr(module, "_supports_tle_cluster_remote", lambda: True)
+    monkeypatch.setattr(module, "_block_mesh", lambda _: None)
+    monkeypatch.setattr(module, "_block_cluster_mesh_8", lambda: None)
+    monkeypatch.setattr(module, "_pick_tle_atomic_fused_num_blocks", lambda *args: 1)
+    monkeypatch.setattr(module.torch, "zeros", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module, "moe_align_block_size_tle_cluster_fused", Kernel("cluster")
+    )
+    monkeypatch.setattr(
+        module, "moe_align_block_size_tle_atomic_fused_coop", Kernel("atomic")
+    )
+    topk = SimpleNamespace(
+        numel=lambda: 1280, shape=(128, 10), ndim=2, is_cuda=True, device="cuda:0"
+    )
+    sorted_ids = SimpleNamespace(numel=lambda: 8960)
+    expert_ids = SimpleNamespace(numel=lambda: 560)
+    for _ in range(2):
+        module.moe_align_block_size_triton(topk, 512, 16, sorted_ids, expert_ids, None)
+    assert calls.count("cluster") == cluster_calls
+    assert calls.count("atomic") == (0 if unsupported is None and error is None else 2)
+
+
+@pytest.mark.moe_align_block_size_triton
+@pytest.mark.parametrize("num_experts", [10, 250, 512])
+@pytest.mark.parametrize(
+    "num_routes,num_sorted,num_blocks",
+    [(0, 0, 0), (0, 150, 9), (1, 16, 1), (1280, 8960, 560)],
+)
+def test_moe_align_nonzero_launch_extents(
+    monkeypatch, num_experts, num_routes, num_sorted, num_blocks
+):
+    """Empty compact buffers must not produce arange(0, 0) launch constants."""
+    module = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append(args)
+
+            return launch
+
+    for stage in ["stage1", "stage2", "stage2_vec", "stage3", "stage4"]:
+        monkeypatch.setattr(module, f"moe_align_block_size_{stage}", Kernel())
+    module._moe_align_block_size_triton_4stage(
+        SimpleNamespace(numel=lambda: num_routes),
+        num_experts,
+        16,
+        SimpleNamespace(numel=lambda: num_sorted),
+        SimpleNamespace(numel=lambda: num_blocks),
+        None,
+        workspace=(None, None),
+    )
+    assert len(calls) == 4
+    extents = [calls[0][4], calls[0][-2], calls[0][-1]]
+    expected = [
+        1 << (max(1, (n + num_experts - 1) // num_experts) - 1).bit_length()
+        for n in [num_routes, num_sorted, num_blocks]
+    ]
+    assert extents == expected
+
+
+@pytest.mark.moe_align_block_size_triton
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA-compatible graph required"
+)
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_experts,block_size", [(10, 16), (512, 64)])
+def test_moe_align_empty_compact_graph(dtype, num_experts, block_size):
+    """Exercise all three zero extents through the existing compact-buffer API."""
+    topk_ids = torch.empty((0, 10), dtype=dtype, device=flaggems_vllm.device)
+
+    def run():
+        return moe_align_block_size_no_tle(topk_ids, block_size, num_experts)
+
+    def check(result):
+        assert result[0].shape == (0,)
+        assert result[1].shape == (0,)
+        assert result[2].shape == (1,)
+        assert all(t.dtype == torch.int32 for t in result)
+        assert all(t.device == topk_ids.device for t in result)
+        assert result[2].item() == 0
+
+    check(run())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    for _ in range(3):
+        result[2].fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(result)
 
 
 # Modified from: https://github.com/vllm-project/vllm/blob/main/tests/kernels/moe/test_moe_align_block_size.py
@@ -207,6 +435,8 @@ def _synchronize():
 @pytest.mark.parametrize(
     "topk_ids_shape",
     [
+        (0, 10),
+        (1, 10),
         (1024, 10),
         (6152, 10),
         (11575, 10),
