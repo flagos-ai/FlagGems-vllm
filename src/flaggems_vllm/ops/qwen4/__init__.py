@@ -47,6 +47,7 @@ from flaggems_vllm.ops.qwen4.qsa_attention import (
     qsa_sparse_paged_attention,
     qsa_sparse_split_count,
 )
+from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
 
 __all__ = [
     "ple_short_conv_",
@@ -77,4 +78,5 @@ __all__ = [
     "qwen4_vendor_compress_qsa_groups",
     "qwen4_vendor_qsa_mqa_paged",
     "qwen4_vendor_store_qsa_rows",
+    "qsa_prepare",
 ]

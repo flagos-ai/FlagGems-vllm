@@ -24,6 +24,11 @@ import flaggems_vllm
 from . import base, utils
 
 vendor_name = flaggems_vllm.vendor_name
+IS_HOPPER = (
+    vendor_name == "nvidia"
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 9
+)
 
 
 def _with_supported_kwargs(op):
@@ -310,7 +315,7 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
                 "cp_world_size": 1,
                 "cp_rank": 0,
                 "cp_tot_seqused_k": None,
-                "fa_version": 2,
+                "fa_version": 3 if IS_HOPPER else 2,
             },
         )
 
@@ -467,7 +472,7 @@ def test_flash_attn_varlen_func(monkeypatch):
     bench = FlashAttnVarlenBenchmark(
         op_name="flash_attn_varlen_func",
         torch_op=flash_attn_varlen_func,
-        gems_op=flaggems_vllm.ops.flash_attn_varlen_func,
+        gems_op=flaggems_vllm.flash_attn_varlen_func,
         dtypes=[torch.float16, torch.bfloat16],
     )
     bench.run()

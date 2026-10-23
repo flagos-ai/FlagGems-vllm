@@ -119,6 +119,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_compress_qsa_groups,
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
+    qsa_prepare,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
@@ -324,6 +325,7 @@ __all__ = [
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_mqa_paged",
+    "qsa_prepare",
     "qsa_sparse_paged_attention",
     "qsa_sparse_split_count",
     "qsa_store_cache_rows",
