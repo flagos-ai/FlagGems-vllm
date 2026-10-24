@@ -936,6 +936,7 @@ class ParallelBenchmarkMixin:
                 mode=Config.mode.value,
                 result=metrics,
             )
+            update_result(self.op_name, asdict(result))
             print(result)
             if self.RECORD_PARALLEL_RESULTS and not os.environ.get(
                 PARALLEL_RESULT_FILE_ENV
