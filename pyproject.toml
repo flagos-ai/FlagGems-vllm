@@ -59,7 +59,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.runtime" = ["*/**/*.yaml", "*/**/*.cu"]
 
 [tool.black]
 line-length = 88
