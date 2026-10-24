@@ -170,9 +170,10 @@ def dequantize_and_gather_k_cache(
     k_cache_2d = _as_cache_2d(k_cache)
     token_data_size = nope_dim + rope_dim * 2
     num_reqs = seq_lens.shape[0]
-    num_workers = 128
+    # num_workers is tuner-owned, so resolve the grid from its meta-parameters.
+    grid = lambda meta: (num_reqs, meta["num_workers"])
     with torch_device_fn.device(out.device):
-        _dequantize_and_gather_k_cache_kernel[(num_reqs, num_workers)](
+        _dequantize_and_gather_k_cache_kernel[grid](
             out,
             out.stride(0),
             out.stride(1),
