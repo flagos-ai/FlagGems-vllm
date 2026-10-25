@@ -16,7 +16,9 @@
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
+from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
@@ -57,6 +59,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.expand_pools_and_append_tail import expand_pools_and_append_tail
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
+
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
@@ -116,6 +119,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_compress_qsa_groups,
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
+    qsa_prepare,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
@@ -219,8 +223,10 @@ __all__ = [
     "add_rms_norm",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
+    "attn_res",
     "beam_search_score",
     "beam_search_score_",
+    "bf16_paged_mqa_logits",
     "bincount",
     "bucket_sort_topk",
     "causal_conv1d_fn",
@@ -319,6 +325,7 @@ __all__ = [
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_mqa_paged",
+    "qsa_prepare",
     "qsa_sparse_paged_attention",
     "qsa_sparse_split_count",
     "qsa_store_cache_rows",
@@ -401,3 +408,20 @@ elif _runtime.device.vendor_name == "thead":
         "int8_einsum",
         "w8a8_block_int8_bmm",
     ]
+
+if _runtime.device.vendor_name == "metax":
+
+    def flash_attn_varlen_func_w8a8_int8(*args, **kwargs):  # noqa: F811
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+            flash_attn_varlen_func_w8a8_int8 as _impl,
+        )
+
+        return _impl(*args, **kwargs)
+
+    # Preserve the public API metadata checked by the existing tests.
+    flash_attn_varlen_func_w8a8_int8.__wrapped__ = flash_attn_varlen_func
+    flash_attn_varlen_func_w8a8_int8.__module__ = (
+        "flaggems_vllm.runtime.backend._metax.ops.flash_attention"
+    )
+
+    __all__.append("flash_attn_varlen_func_w8a8_int8")

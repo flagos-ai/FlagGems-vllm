@@ -37,6 +37,9 @@ def _stat_max(gather_lens) -> int:
     return 0 if gather_lens is None else int(gather_lens.shape[-1])
 
 
+_DEFAULT_TUNE_CONFIGS = [triton.Config({"num_workers": 128})]
+
+
 def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
     if k_cache.ndim == 2:
         return k_cache
@@ -49,7 +52,8 @@ def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("dequantize_and_gather_k_cache"),
+    configs=runtime.get_tuned_config("dequantize_and_gather_k_cache")
+    or _DEFAULT_TUNE_CONFIGS,
     key=["num_tokens", "max_gather_len"],
     strategy=["log", "log"],
 )

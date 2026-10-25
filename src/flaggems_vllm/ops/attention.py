@@ -1279,13 +1279,59 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    if q.dtype == torch.int8 and runtime.device.vendor_name in ("hygon", "thead"):
+    if (
+        type(fa_version) is int
+        and fa_version == 3
+        and runtime.device.vendor_name == "nvidia"
+    ):
+        from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention import (
+            launch_attention,
+        )
+
+        return launch_attention(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            q_v=q_v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_attn_probs=return_attn_probs,
+            return_softmax_lse=return_softmax_lse,
+            block_table=block_table,
+            out=out,
+            num_splits=num_splits,
+            s_aux=s_aux,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqused_k=cp_tot_seqused_k,
+        )
+
+    if q.dtype == torch.int8 and runtime.device.vendor_name in (
+        "hygon",
+        "thead",
+        "metax",
+    ):
         if runtime.device.vendor_name == "hygon":
             from flaggems_vllm.runtime.backend._hygon.fused import (
                 attention as hygon_attention,
             )
 
             specialized_attention = hygon_attention.flash_attn_varlen_func_w8a8_int8
+        elif runtime.device.vendor_name == "metax":
+            from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+                flash_attn_varlen_func_w8a8_int8,
+            )
+
+            specialized_attention = flash_attn_varlen_func_w8a8_int8
         else:
             from flaggems_vllm.runtime.backend._thead.fused import (
                 attention as thead_attention,
