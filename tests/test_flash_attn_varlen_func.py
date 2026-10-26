@@ -162,6 +162,8 @@ def make_paged_kv_cache(
 @pytest.mark.parametrize("alibi", [False, True])
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", [32768, 2048])
+# Hopper runs FA3 for optimize_init=False and the FA2 flash_attn_varlen_opt_func
+# for optimize_init=True, so both implementations stay covered.
 @pytest.mark.parametrize("optimize_init", [False, True])
 @torch.inference_mode()
 def test_flash_attn_varlen_func(
@@ -238,7 +240,7 @@ def test_flash_attn_varlen_func(
         else:
             alibi_slopes, attn_bias = None, None
 
-        if vendor_name == "cambricon" or IS_HOPPER:
+        if vendor_name == "cambricon" or (IS_HOPPER and not optimize_init):
             output = flaggems_vllm.flash_attn_varlen_func(
                 q=query,
                 k=key_cache,
