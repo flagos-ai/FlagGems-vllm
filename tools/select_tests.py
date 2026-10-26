@@ -157,6 +157,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/attention.py": [
         "tests/test_flash_attn_varlen_func.py",
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_scaled_dot_product_attention.py",
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
