@@ -1132,3 +1132,18 @@ concat_mla_q:
   - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
+
+# Bad-words keeps semantic tile selection in its host dispatch.  These
+# candidates are reserved for the libtuner integration and only vary launch
+# resources, so autotuning cannot select a tile that changes the dispatch
+# contract.
+bad_words:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
