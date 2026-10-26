@@ -45,11 +45,14 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ctypes.util
+import faulthandler
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import statistics
@@ -62,14 +65,18 @@ from typing import Any, Callable
 # FlagTree's raw CUDA cache must be private to each worker process. Establish
 # this before importing Triton through the benchmark harness or MegaMoE module.
 _IS_WORKER = "--worker" in sys.argv
+_IS_PPU_WORKER = _IS_WORKER and "--ppu" in sys.argv
 if _IS_WORKER:
-    _local_rank = os.environ.get("LOCAL_RANK", "0")
-    _cache_root = Path(
-        os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache")
+    _local_rank = os.environ.get(
+        "OMPI_COMM_WORLD_LOCAL_RANK" if _IS_PPU_WORKER else "LOCAL_RANK", "0"
     )
-    os.environ["TRITON_CACHE_DIR"] = str(
-        _cache_root.parent / f"{_cache_root.name}-megamoe-rank-{_local_rank}"
-    )
+    if not _IS_PPU_WORKER:
+        _cache_root = Path(
+            os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache")
+        )
+        os.environ["TRITON_CACHE_DIR"] = str(
+            _cache_root.parent / f"{_cache_root.name}-megamoe-rank-{_local_rank}"
+        )
 elif "LOCAL_RANK" in os.environ:
     _cache_root = os.environ.get(
         "FLAGGEMS_MEGAMOE_CACHE_ROOT",
@@ -82,6 +89,8 @@ elif "LOCAL_RANK" in os.environ:
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 if _IS_WORKER:
     torch.cuda.set_device(int(_local_rank))
@@ -469,6 +478,8 @@ class HygonMegaMoEBenchmark(MegaMoEBenchmark):
 
 
 def _active_benchmark():
+    if flaggems_vllm.vendor_name == "thead":
+        return PPUMegaMoEBenchmark()
     if flaggems_vllm.vendor_name == "hygon":
         return HygonMegaMoEBenchmark()
     return MegaMoEBenchmark()
@@ -481,6 +492,15 @@ def test_megamoe():
         return
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
+    if flaggems_vllm.vendor_name == "thead":
+        if not torch.cuda.get_device_name().startswith("PPU"):
+            pytest.skip("requires PPU")
+        benchmark = PPUMegaMoEBenchmark()
+        benchmark.set_shapes(Config.shape_file)
+        if torch.cuda.device_count() < max(shape[-1] for shape in benchmark.shapes):
+            pytest.skip("not enough visible PPUs for the requested EP shapes")
+        benchmark.run()
+        return
     if flaggems_vllm.vendor_name == "hygon":
         architecture = str(
             getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
@@ -494,7 +514,7 @@ def test_megamoe():
         HygonMegaMoEBenchmark().run()
         return
     if flaggems_vllm.vendor_name != "nvidia":
-        pytest.skip("MegaMoE benchmark is available on NVIDIA and Hygon only")
+        pytest.skip("MegaMoE benchmark is available on NVIDIA, Hygon, and PPU only")
     major, _ = torch.cuda.get_device_capability()
     if major != 9:
         pytest.skip(f"requires SM90, got SM{major}0")
@@ -1680,8 +1700,467 @@ def test_megamoe_rank_sample_aggregation_rejects_invalid_input(rank_samples):
         _aggregate_rank_samples(rank_samples)
 
 
+DEFAULT_SHAPES = [
+    (512, 2048, 512, 256, 8, NUM_RANKS),
+    (1024, 2048, 512, 256, 8, NUM_RANKS),
+    (2048, 2048, 512, 256, 8, NUM_RANKS),
+]
+
+
+@dataclass(frozen=True)
+class _PPUBenchmarkConfig:
+    num_ranks: int
+    tokens: int
+    hidden: int
+    intermediate: int
+    num_experts: int
+    topk: int
+    stages: int
+    warmup: int
+    iterations: int
+    timeout: int = DEFAULT_TIMEOUT_S
+    max_recv: int = 512
+    data_dir: Path | None = None
+    ppu: bool = False
+    validate: bool = False
+
+
+class _SailshmemUniqueId(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_int),
+        ("id", ctypes.c_void_p),
+        ("rank", ctypes.c_int),
+        ("world_size", ctypes.c_int),
+    ]
+
+
+class _SailshmemInitArgs(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_int),
+        ("unique_id", _SailshmemUniqueId),
+        ("content", ctypes.c_char * 96),
+    ]
+
+
+class _SailshmemInitAttr(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_int),
+        ("mpi_comm", ctypes.c_void_p),
+        ("args", _SailshmemInitArgs),
+    ]
+
+
+class _StandaloneSailshmem:
+    """Test-side owner of the installed sailSHMEM host ABI, without a C++ shim."""
+
+    def __init__(self, config):
+        self.rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
+        self.world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0"))
+        self.device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(self.device)
+        if self.world_size != config.num_ranks:
+            raise ValueError("MPI world size does not match --num-ranks")
+        self.library = None
+        self.allocations = []
+        self.start_event = None
+        if self.world_size == 1:
+            return
+        name = ctypes.util.find_library("nvshmem_host") or "libnvshmem_host.so"
+        self.library = ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
+        signatures = {
+            "nvshmemx_hostlib_init_attr": (
+                [ctypes.c_uint, ctypes.c_void_p],
+                ctypes.c_int,
+            ),
+            "nvshmem_my_pe": ([], ctypes.c_int),
+            "nvshmem_n_pes": ([], ctypes.c_int),
+            "nvshmem_malloc": ([ctypes.c_size_t], ctypes.c_void_p),
+            "nvshmem_ptr": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_void_p),
+            "nvshmem_free": ([ctypes.c_void_p], None),
+            "nvshmem_barrier_all": ([], None),
+            "nvshmemx_barrier_all_on_stream": ([ctypes.c_void_p], None),
+            "nvshmemx_hostlib_finalize": ([], None),
+        }
+        for symbol, (arguments, result) in signatures.items():
+            function = getattr(self.library, symbol)
+            function.argtypes, function.restype = arguments, result
+        attr = _SailshmemInitAttr()
+        # Version 1 of the installed sailSHMEM host ABI, also used by the SDK bridge.
+        attr.version = (1 << 16) + ctypes.sizeof(attr)
+        attr.args.version = (1 << 16) + ctypes.sizeof(attr.args)
+        attr.args.unique_id.version = (1 << 16) + ctypes.sizeof(attr.args.unique_id)
+        attr.args.unique_id.rank = attr.args.unique_id.world_size = -1
+        status = self.library.nvshmemx_hostlib_init_attr(0, ctypes.byref(attr))
+        if status:
+            raise RuntimeError(f"sailSHMEM initialization failed: {status}")
+        if (self.library.nvshmem_my_pe(), self.library.nvshmem_n_pes()) != (
+            self.rank,
+            self.world_size,
+        ):
+            raise RuntimeError("sailSHMEM rank mapping does not match MPI")
+
+    def allocate(self, sizes):
+        if self.library is None:
+            return None
+        tables = {}
+        for name, size in sizes.items():
+            self.library.nvshmem_barrier_all()
+            pointer = self.library.nvshmem_malloc(size)
+            if not pointer:
+                raise MemoryError(f"sailSHMEM allocation failed: {name} ({size} bytes)")
+            self.allocations.append(pointer)
+            self.library.nvshmem_barrier_all()
+            peers = [
+                (
+                    pointer
+                    if peer == self.rank
+                    else self.library.nvshmem_ptr(pointer, peer)
+                )
+                for peer in range(self.world_size)
+            ]
+            if not all(peers):
+                raise RuntimeError("all EP peers must be directly addressable")
+            tables[name] = torch.tensor(peers, device=self.device, dtype=torch.int64)
+        return tables
+
+    def barrier(self, stream):
+        if self.library is not None:
+            self.library.nvshmemx_barrier_all_on_stream(ctypes.c_void_p(stream))
+        if self.start_event is not None:
+            self.start_event.record(torch.cuda.current_stream(self.device))
+
+    def synchronize(self):
+        torch.cuda.synchronize(self.device)
+        if self.library is not None:
+            self.library.nvshmem_barrier_all()
+
+    def close(self):
+        self.synchronize()
+        if self.library is not None:
+            for pointer in reversed(self.allocations):
+                self.library.nvshmem_free(pointer)
+            self.library.nvshmemx_hostlib_finalize()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.close()
+
+
+def _make_ppu_cpu_inputs(config):
+    """Use the same seeded global inputs on every rank, without external datasets."""
+    generator = torch.Generator().manual_seed(1234)
+    world, t, h, i, e, k = (
+        config.num_ranks,
+        config.tokens,
+        config.hidden,
+        config.intermediate,
+        config.num_experts,
+        config.topk,
+    )
+    return dict(
+        x=torch.randint(-8, 9, (world, t, h), generator=generator, dtype=torch.int8),
+        scales=torch.rand(world, t, 1, generator=generator) * 0.02 + 0.01,
+        ids=torch.topk(
+            torch.randn(world, t, e, generator=generator), k, dim=-1
+        ).indices,
+        router=torch.rand(world, t, k, generator=generator),
+        w1=torch.randint(-8, 9, (e, 2 * i, h), generator=generator, dtype=torch.int8),
+        s1=torch.rand(e, 2 * i, 1, generator=generator) * 0.02 + 0.01,
+        w2=torch.randint(-8, 9, (e, h, i), generator=generator, dtype=torch.int8),
+        s2=torch.rand(e, h, 1, generator=generator) * 0.02 + 0.01,
+    )
+
+
+def _run_ppu_worker(config):
+    from flaggems_vllm.runtime.backend._thead.ops.megamoe import (
+        megamoe,
+        pack_gate_up_rows,
+        peer_buffer_sizes,
+    )
+
+    if config.data_dir is not None:
+        raise ValueError("PPU CI inputs are seeded synthetic tensors; omit --data-dir")
+    cpu = _make_ppu_cpu_inputs(config)
+    with _StandaloneSailshmem(config) as runtime:
+        rank, device = runtime.rank, runtime.device
+        epr = config.num_experts // config.num_ranks
+        local = slice(rank * epr, (rank + 1) * epr)
+        x, scales, ids, router = [
+            cpu[name][rank].to(device) for name in ("x", "scales", "ids", "router")
+        ]
+        w1 = pack_gate_up_rows(cpu["w1"][local].to(device))
+        s1 = pack_gate_up_rows(cpu["s1"][local].to(device))
+        w2, s2 = [cpu[name][local].to(device) for name in ("w2", "s2")]
+        tables = runtime.allocate(
+            peer_buffer_sizes(
+                config.tokens,
+                config.hidden,
+                config.intermediate,
+                config.num_experts,
+                config.topk,
+                config.num_ranks,
+            )
+        )
+
+        def invoke():
+            return megamoe(
+                x,
+                scales,
+                w1,
+                s1,
+                w2,
+                s2,
+                router,
+                ids,
+                rank=rank,
+                num_ranks=config.num_ranks,
+                peer_tables=tables,
+                barrier=runtime.barrier,
+            )
+
+        if config.validate:
+            from tests.test_megamoe import _reference_int8_moe
+
+            actual = invoke()
+            runtime.synchronize()
+            reference = _reference_int8_moe(
+                cpu["x"][rank],
+                cpu["scales"][rank],
+                cpu["w1"],
+                cpu["s1"],
+                cpu["w2"],
+                cpu["s2"],
+                cpu["router"][rank],
+                cpu["ids"][rank],
+            )
+            _assert_relative_l2(actual.cpu(), reference)
+            print(
+                f"MEGAMOE_ACCURACY_PASS rank={rank} world={runtime.world_size}",
+                flush=True,
+            )
+        for _ in range(config.warmup):
+            invoke()
+            runtime.synchronize()
+        samples = []
+        for _ in range(config.iterations):
+            runtime.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            # The API barrier follows all setup kernels and immediately precedes
+            # the persistent kernel. Only that kernel is bracketed by the events.
+            runtime.start_event = start
+            output = invoke()
+            end.record()
+            end.synchronize()
+            runtime.start_event = None
+            samples.append(start.elapsed_time(end) * 1000)
+        assert output.shape == (config.tokens, config.hidden)
+        print(
+            f"MEGAMOE_RESULT scope=kernel rank={rank} world={runtime.world_size} "
+            f"latency_us={sum(samples) / len(samples):.3f}",
+            flush=True,
+        )
+
+
+def _assert_relative_l2(actual, reference):
+    difference = (actual.double() - reference.double()).square().sum()
+    denominator = reference.double().square().sum().clamp_min(1e-30)
+    error = (difference / denominator).sqrt().item()
+    assert error < 0.005, f"relative L2 error {error:.6f} exceeds 0.005"
+
+
+def _run_ppu_benchmark_worker(config):
+    faulthandler.dump_traceback_later(max(1, config.timeout - 10))
+    try:
+        if config.ppu:
+            _run_ppu_worker(config)
+        else:
+            raise ValueError("select --ppu for the PPU INT8 benchmark")
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _parse_rank_latencies(stdout, num_ranks):
+    results = _RESULT.findall(stdout)
+    if len(results) != num_ranks or any(
+        int(world) != num_ranks for _, world, _ in results
+    ):
+        raise RuntimeError(f"expected results for every rank:\n{stdout}")
+    latencies = {int(rank): float(latency) / 1000 for rank, _, latency in results}
+    if set(latencies) != set(range(num_ranks)):
+        raise RuntimeError(f"expected unique results for every rank:\n{stdout}")
+    return tuple(latencies[rank] for rank in range(num_ranks))
+
+
+def _ppu_worker_arguments(config: _PPUBenchmarkConfig) -> list[str]:
+    arguments = [
+        "--worker",
+        "--num-ranks",
+        str(config.num_ranks),
+        "--tokens",
+        str(config.tokens),
+        "--hidden",
+        str(config.hidden),
+        "--intermediate",
+        str(config.intermediate),
+        "--num-experts",
+        str(config.num_experts),
+        "--topk",
+        str(config.topk),
+        "--stages",
+        str(config.stages),
+        "--warmup",
+        str(config.warmup),
+        "--iterations",
+        str(config.iterations),
+        "--max-recv",
+        str(config.max_recv),
+        "--timeout",
+        str(config.timeout),
+    ]
+    if config.ppu:
+        arguments.append("--ppu")
+    if config.validate:
+        arguments.append("--validate")
+    if config.data_dir is not None:
+        arguments.extend(("--data-dir", str(config.data_dir)))
+    return arguments
+
+
+def _launch_ppu_megamoe(config: _PPUBenchmarkConfig) -> float:
+    worker = [
+        sys.executable,
+        "-m",
+        "benchmark.test_megamoe",
+        *_ppu_worker_arguments(config),
+    ]
+    if config.ppu and config.num_ranks > 1:
+        mpirun = shutil.which("mpirun")
+        if mpirun is None:
+            raise RuntimeError("PPU EP requires mpirun on PATH")
+        command = [mpirun, "--bind-to", "none", "-np", str(config.num_ranks)]
+        if os.geteuid() == 0:
+            command.append("--allow-run-as-root")
+        # Select MPI bootstrap explicitly; paths and SDK configuration belong to
+        # the installed environment, not this benchmark or the operator.
+        command += ["-x", "NVSHMEM_BOOTSTRAP=MPI", *worker]
+    elif config.ppu:
+        command = worker
+    else:
+        raise ValueError("select ppu=True for the PPU INT8 benchmark")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = process.communicate(timeout=config.timeout)
+    except BaseException as error:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        stdout, _ = process.communicate()
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise TimeoutError(
+                f"MegaMoE workers timed out after {config.timeout}s:\n{stdout}"
+            ) from error
+        raise
+    if process.returncode:
+        raise RuntimeError(
+            f"MegaMoE workers exited with status {process.returncode}:\n{stdout}"
+        )
+    return max(_parse_rank_latencies(stdout, config.num_ranks))
+
+
+class PPUMegaMoEBenchmark(base.Benchmark):
+    DEFAULT_METRICS = ["latency"]
+    DEFAULT_DTYPES = [torch.int8]
+    DEFAULT_SHAPES = DEFAULT_SHAPES
+    DEFAULT_SHAPE_DESC = "tokens, hidden, intermediate, num_experts, topk, num_ranks"
+
+    def __init__(self):
+        super().__init__(
+            op_name=OP_NAME,
+            torch_op=None,
+            gems_op=_launch_ppu_megamoe,
+            dtypes=self.DEFAULT_DTYPES,
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        super().set_shapes(shape_file_path)
+
+    def get_input_iter(self, dtype):
+        yield from self.shapes
+
+    def get_latency(
+        self,
+        op,
+        tokens,
+        hidden,
+        intermediate,
+        num_experts,
+        topk,
+        num_ranks,
+    ):
+        if Config.mode is not BenchMode.KERNEL:
+            raise ValueError("MegaMoE requires --mode kernel")
+        if any(
+            metric in self.to_bench_metrics for metric in ("latency_base", "speedup")
+        ):
+            raise ValueError(
+                "This harness reports kernel latency; no vLLM speedup baseline is defined"
+            )
+        return op(
+            _PPUBenchmarkConfig(
+                num_ranks=num_ranks,
+                ppu=vendor_name == "thead",
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                num_experts=num_experts,
+                topk=topk,
+                stages=STAGES,
+                warmup=_iteration_count(
+                    "--warmup", Config.warm_up, DEFAULT_WARMUP_TIME, DEFAULT_WARMUP
+                ),
+                iterations=_iteration_count(
+                    "--iter", Config.repetition, DEFAULT_ITER_TIME, DEFAULT_ITERS
+                ),
+            )
+        )
+
+
+def _parse_ppu_worker_config() -> _PPUBenchmarkConfig:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true", required=True)
+    parser.add_argument("--num-ranks", type=int, required=True)
+    parser.add_argument("--tokens", type=int, required=True)
+    parser.add_argument("--hidden", type=int, required=True)
+    parser.add_argument("--intermediate", type=int, required=True)
+    parser.add_argument("--num-experts", type=int, required=True)
+    parser.add_argument("--topk", type=int, required=True)
+    parser.add_argument("--stages", type=int, required=True)
+    parser.add_argument("--warmup", type=int, required=True)
+    parser.add_argument("--iterations", type=int, required=True)
+    parser.add_argument("--max-recv", type=int, required=True)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--ppu", action="store_true")
+    parser.add_argument("--validate", action="store_true")
+    arguments = vars(parser.parse_args())
+    arguments.pop("worker")
+    return _PPUBenchmarkConfig(**arguments)
+
+
 if __name__ == "__main__":
-    if _IS_WORKER:
+    if _IS_PPU_WORKER:
+        _run_ppu_benchmark_worker(_parse_ppu_worker_config())
+    elif _IS_WORKER:
         _run_worker(_parse_worker_config())
     else:
         _main(sys.argv[1:])
