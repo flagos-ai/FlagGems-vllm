@@ -412,12 +412,15 @@ def launch_attention(
         pack_gqa = pack_factor > 1
     else:
         kernel = "long" if workload == "prefill" else "direct"
+        # Short queries stay on direct: a heavy batch of them leaves most
+        # rows of each 128-row persistent tile empty.
         if (
             gqa_ratio == 1
             and plain_scores
             and not is_causal
             and head_dim in (64, 128)
             and population in {"single", "uniform"}
+            and max_seqlen_q >= 64
         ):
             kernel = (
                 "long"
@@ -598,6 +601,7 @@ def launch_attention(
                 batch_size=batch_size,
                 effective_max_q=effective_max_q,
                 effective_num_heads=effective_num_heads,
+                num_sms=num_sms,
                 pack_factor=pack_factor,
                 is_paged=is_paged,
                 paged_prefill=paged_prefill_candidate,

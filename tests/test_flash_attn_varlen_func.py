@@ -647,3 +647,78 @@ def test_flash_attn_varlen_func_large_dense_kv_offset(
         torch.testing.assert_close(
             output[-1], ref_output.to(dtype), atol=2e-2, rtol=1e-2
         )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not IS_HOPPER, reason="FA3 requires Hopper")
+# Non-causal MHA short queries that stay on direct, plus unpacked multi-row
+# queries (MHA and GQA ratio 5) large enough to leave the BM16 decode buckets.
+@pytest.mark.parametrize(
+    "batch_size, query_len, kv_len, num_heads, causal",
+    [
+        (64, 1, 2048, (32, 32), False),
+        (16, 16, 4096, (32, 32), False),
+        (16, 64, 4096, (32, 32), True),
+        (16, 64, 4096, (40, 8), True),
+        (4, 512, 8192, (40, 8), False),
+    ],
+)
+@pytest.mark.parametrize("paged", [False, True])
+@torch.inference_mode()
+def test_flash_attn_varlen_func_fa3_matches_fa2(
+    batch_size: int,
+    query_len: int,
+    kv_len: int,
+    num_heads: Tuple[int, int],
+    causal: bool,
+    paged: bool,
+) -> None:
+    with torch.device(flaggems_vllm.device):
+        utils.init_seed(1234567890)
+
+        num_query_heads, num_kv_heads = num_heads
+        head_size, block_size = 128, 16
+        dtype = torch.bfloat16
+        query = torch.randn(
+            batch_size * query_len, num_query_heads, head_size, dtype=dtype
+        )
+        cu_query_lens = (
+            torch.arange(batch_size + 1, dtype=torch.int32, device=device) * query_len
+        )
+        kwargs = dict(
+            q=query,
+            cu_seqlens_q=cu_query_lens,
+            max_seqlen_q=query_len,
+            max_seqlen_k=kv_len,
+            softmax_scale=head_size**-0.5,
+            causal=causal,
+            return_softmax_lse=True,
+        )
+        if paged:
+            num_blocks = batch_size * kv_len // block_size
+            key = torch.randn(
+                num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+            )
+            block_tables = torch.randperm(num_blocks, device=device).to(torch.int32)
+            kwargs.update(
+                block_table=block_tables.view(batch_size, -1),
+                seqused_k=torch.full(
+                    (batch_size,), kv_len, dtype=torch.int32, device=device
+                ),
+            )
+        else:
+            key = torch.randn(batch_size * kv_len, num_kv_heads, head_size, dtype=dtype)
+            kwargs.update(
+                cu_seqlens_k=torch.arange(
+                    batch_size + 1, dtype=torch.int32, device=device
+                )
+                * kv_len
+            )
+        kwargs.update(k=key, v=torch.randn_like(key))
+
+        output, lse = flaggems_vllm.flash_attn_varlen_func(**kwargs, fa_version=3)
+        ref_output, ref_lse = flaggems_vllm.flash_attn_varlen_func(
+            **kwargs, fa_version=2
+        )
+        torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
