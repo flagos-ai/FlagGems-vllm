@@ -307,8 +307,11 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                     k_base = k_ptr + kv_head * k_head_stride
                     v_base = v_ptr + kv_head * v_head_stride
                 else:
-                    k_base = k_ptr + k_bos * k_row_stride + kv_head * k_head_stride
-                    v_base = v_ptr + k_bos * v_row_stride + kv_head * v_head_stride
+                    # Widen the first-token row before scaling: dense K/V larger
+                    # than 2**31 elements overflow int32 offsets.
+                    k_row = tl.cast(k_bos, tl.int64)
+                    k_base = k_ptr + k_row * k_row_stride + kv_head * k_head_stride
+                    v_base = v_ptr + k_row * v_row_stride + kv_head * v_head_stride
 
                 if USE_TMA_QO:
                     if PACK_GQA:

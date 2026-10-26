@@ -591,3 +591,57 @@ def test_flash_attn_varlen_func_fa3_attention_sink(
         ref_lse = torch.cat(ref_lses, dim=-1)
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
         torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "nvidia", reason="Large dense KV regression")
+@pytest.mark.parametrize("fa_version", [2, 3] if IS_HOPPER else [2])
+# "later_start": the second sequence starts past 2**31 elements of the packed
+# K/V. "within_sequence": a single sequence spans more than 2**31 elements.
+@pytest.mark.parametrize("layout", ["later_start", "within_sequence"])
+@torch.inference_mode()
+def test_flash_attn_varlen_func_large_dense_kv_offset(
+    fa_version: int, layout: str
+) -> None:
+    if torch.cuda.mem_get_info()[0] < 10 * 1024**3:
+        pytest.skip("large dense KV regression requires 10 GiB free")
+    with torch.device(flaggems_vllm.device):
+        num_kv_heads, head_size = 8, 128
+        long_kv_len = 2**31 // (num_kv_heads * head_size) + 64
+        kv_lens = [long_kv_len, 512] if layout == "later_start" else [long_kv_len]
+        dtype = torch.bfloat16
+        scale = head_size**-0.5
+
+        # Only the trailing tokens of the last sequence are non-zero, so the
+        # reference attends over the full last sequence cheaply.
+        key = torch.zeros(sum(kv_lens), num_kv_heads, head_size, dtype=dtype)
+        value = torch.zeros_like(key)
+        key[-512:].normal_()
+        value[-512:].normal_()
+        query = torch.randn(len(kv_lens), num_kv_heads, head_size, dtype=dtype)
+        cu_kv_lens = torch.tensor(
+            [0] + kv_lens, dtype=torch.int32, device=device
+        ).cumsum(dim=0, dtype=torch.int32)
+
+        output = flaggems_vllm.flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=torch.arange(
+                len(kv_lens) + 1, dtype=torch.int32, device=device
+            ),
+            cu_seqlens_k=cu_kv_lens,
+            max_seqlen_q=1,
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=scale,
+            causal=True,
+            fa_version=fa_version,
+        )
+
+        k = key[-kv_lens[-1] :].float()
+        v = value[-kv_lens[-1] :].float()
+        attn = torch.einsum("hd,khd->hk", query[-1].float(), k) * scale
+        ref_output = torch.einsum("hk,khd->hd", torch.softmax(attn, dim=-1), v)
+        torch.testing.assert_close(
+            output[-1], ref_output.to(dtype), atol=2e-2, rtol=1e-2
+        )

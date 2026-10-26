@@ -1468,8 +1468,10 @@ def flash_varlen_fwd_kernel(
             )
         else:
             start_n = n_block * BLOCK_N
-            k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-            v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+            # A dense varlen K/V larger than 2**31 elements overflows int32
+            # first-token offsets, so widen the row index before scaling.
+            k_ptr_seq = k_ptr_base + k_bos.to(tl.int64) * k_row_stride
+            v_ptr_seq = v_ptr_base + k_bos.to(tl.int64) * k_row_stride
             gK = tl.make_block_ptr(
                 base=k_ptr_seq,
                 shape=(k_len, d),
@@ -1564,8 +1566,10 @@ def flash_varlen_fwd_kernel(
             )
         else:
             start_n = n_block * BLOCK_N
-            k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-            v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+            # A dense varlen K/V larger than 2**31 elements overflows int32
+            # first-token offsets, so widen the row index before scaling.
+            k_ptr_seq = k_ptr_base + k_bos.to(tl.int64) * k_row_stride
+            v_ptr_seq = v_ptr_base + k_bos.to(tl.int64) * k_row_stride
             gK = tl.make_block_ptr(
                 base=k_ptr_seq,
                 shape=(k_len, d),
