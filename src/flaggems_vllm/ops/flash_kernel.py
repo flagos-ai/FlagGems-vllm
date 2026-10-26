@@ -1125,12 +1125,13 @@ def flash_fwd_splitkv_combine_kernel(
     BLOCK_K: tl.constexpr,
     q_total,
     MAX_N_SPLITS: tl.constexpr,
+    num_heads,
+    seqlen_q,
 ):
     pid = tl.program_id(0)
     lse_splits_ptr += pid * BLOCK_M
     lse_ptr += pid * BLOCK_M
     out_splits_ptr += pid * BLOCK_M * head_size
-    out_ptr += pid * BLOCK_M * head_size
 
     # Subtracting maximum from each of the split lse's for better numerical stability
     lse_split_offset = (
@@ -1171,8 +1172,20 @@ def flash_fwd_splitkv_combine_kernel(
     out = tl.sum(Zi_Z[:, :, None] * out_splits, 1)
     out = out.to(out_ptr.type.element_ty)
 
-    # Write back output
-    out_offset = tl.arange(0, BLOCK_M)[:, None] * out_s_stride + tl.arange(0, BLOCK_K)
+    # Write back output.
+    # The split buffers flatten [batch, head, query], but `out` is a BSHD view
+    # whose storage order need not follow that flattening. Decode each row into
+    # batch/head/query and use the real output strides.
+    row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    batch = row // (num_heads * seqlen_q)
+    head = (row // seqlen_q) % num_heads
+    query = row % seqlen_q
+    out_offset = (
+        batch[:, None] * out_b_stride
+        + head[:, None] * out_h_stride
+        + query[:, None] * out_s_stride
+        + tl.arange(0, BLOCK_K)[None, :]
+    )
     dmask = tl.arange(0, BLOCK_K) < head_size
     tl.store(out_ptr + out_offset, out, mask=out_mask[:, None] & dmask[None, :])
 
