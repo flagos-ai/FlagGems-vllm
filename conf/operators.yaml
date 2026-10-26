@@ -36,6 +36,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: apply_bad_words
+    description: |
+      Masks logits for tokens that would complete configured bad-word sequences.
+    for:
+      - apply_bad_words
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: apply_repetition_penalties
     description: |
       Modifies logit tensors in place to penalize tokens that have already appeared in the generated sequence.
