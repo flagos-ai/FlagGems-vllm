@@ -29,6 +29,9 @@ from flaggems_vllm.ops.flash_kernel import (
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     tn_compile_scenario,
 )
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.scheduling import (
+    MMA_MIN_BLOCK_M,
+)
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.tn_direct import (
     flash_varlen_fwd_d256_tn_kernel,
 )
@@ -496,7 +499,12 @@ def flash_varlen_splitkv_merge_kernel(
     NUM_SPLITS: tl.constexpr,
     MAX_N_SPLITS: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SELECTION_PTR=None,
+    SKIP_SELECTED: tl.constexpr = False,
 ):
+    if SKIP_SELECTED:
+        if tl.load(SELECTION_PTR) >= 0:
+            return
     q_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     split_idx = tl.arange(0, MAX_N_SPLITS)
@@ -554,7 +562,7 @@ def launch_splitkv(
 
     if not 2 <= num_splits <= 32:
         raise RuntimeError("MetaX Split-KV requires 2 to 32 splits")
-    if (block_m, block_n) not in ((4, 16), (16, 16)):
+    if (block_m, block_n) != (MMA_MIN_BLOCK_M, 16):
         raise RuntimeError("MetaX Split-KV received an invalid tile")
     expected_q_tiles = (max_seqlen_q + block_m - 1) // block_m
     if q_tiles != expected_q_tiles:
@@ -573,13 +581,21 @@ def launch_splitkv(
         device=original_out.device,
     )
 
-    try:
-        params.o_ptr = out_splits
-        params.softmax_lse_ptr = lse_splits
-        args = tuple(getattr(params, key) for key in params.__slots__)
-    finally:
-        params.o_ptr = original_out
-        params.softmax_lse_ptr = original_lse
+    # Partial results use a new contiguous FP32 layout. In particular,
+    # single-request GQA head/sequence swapping can leave the caller's output
+    # as a strided view; its strides must not index these temporary buffers.
+    # Keep the original output strides for the merge and avoid mutating params.
+    partial_args = {
+        "o_ptr": out_splits,
+        "softmax_lse_ptr": lse_splits,
+        "o_row_stride": num_heads * head_size,
+        "o_head_stride": head_size,
+        "o_batch_stride": max_seqlen_q * num_heads * head_size,
+    }
+    args = tuple(
+        partial_args[key] if key in partial_args else getattr(params, key)
+        for key in params.__slots__
+    )
 
     cfg_params = {
         "BLOCK_M": block_m,
@@ -616,10 +632,10 @@ def launch_splitkv(
 
 
 def launch_page16_decode(params, *, batch_size):
-    """Run BM4/N16 MMA without partial buffers or merge."""
+    """Run BM16/N16 MMA without partial buffers or merge."""
     args = tuple(getattr(params, key) for key in params.__slots__)
     cfg = {
-        "BLOCK_M": 4,
+        "BLOCK_M": MMA_MIN_BLOCK_M,
         "BLOCK_N": 16,
         "BLOCK_K": 256,
         "num_warps": 1,
@@ -631,29 +647,73 @@ def launch_page16_decode(params, *, batch_size):
 
 
 def launch_d256_tn_splitkv(
-    params, *, max_seqlen_q, batch_size, num_heads, total_q, num_splits
+    params,
+    *,
+    max_seqlen_q,
+    batch_size,
+    num_heads,
+    total_q,
+    num_splits,
+    block_m=32,
+    block_n=128,
+    _skip_selection_desc=None,
 ):
-    """Run BM32xBN128 PackGQA partials and FP32 merge."""
+    """Run packed partials and FP32 merge with a validated private tile."""
+    skip_desc = _skip_selection_desc
+    packed_decode = (
+        params.seqlenq_ngroups_swapped
+        and max_seqlen_q in (4, 8)
+        and params.h_hk_ratio == 1
+        and num_heads == 1
+    )
     if params.q_ptr.dtype != torch.bfloat16:
         raise ValueError("Async-TN Split-KV requires BF16 Q/K/V")
-    if not params.is_paged or params.block_size != 32 or params.d != 256:
-        raise ValueError("Async-TN Split-KV requires paged D256 with page size 32")
-    if not params.is_causal or params.is_local:
+    page16_short_q = (
+        params.block_size == 16
+        and not packed_decode
+        and num_heads == params.h == params.h_hk_ratio == 4
+        and params.hk == 1
+        and params.is_cu_seqlens_q
+        and params.is_seqused_k
+        and 4 < max_seqlen_q <= 132
+        and batch_size <= 64
+        and total_q <= max_seqlen_q + batch_size - 1
+    )
+    if (
+        not params.is_paged
+        or params.d != 256
+        or not (
+            params.block_size == 32
+            or (params.block_size == 16 and packed_decode and max_seqlen_q == 4)
+            or page16_short_q
+        )
+    ):
+        raise ValueError(
+            "Async-TN Split-KV requires paged D256; page16 requires packed or bounded-short GQA4"
+        )
+    if (not params.is_causal and not packed_decode) or params.is_local:
         raise ValueError("Async-TN Split-KV only supports causal global attention")
     if params.is_dropout or params.is_alibi or params.is_softcap:
         raise ValueError(
             "Async-TN Split-KV does not support optional attention features"
         )
-    if params.cu_seqlens_q_ptr is None:
+    if params.cu_seqlens_q_ptr is None and not packed_decode:
         raise ValueError("Async-TN Split-KV requires varlen Q prefix sums")
     if params.cu_seqlens_k_ptr is None and params.seqused_k_ptr is None:
         raise ValueError("Async-TN Split-KV requires KV lengths")
-    if not 2 <= num_splits <= 32:
-        raise ValueError("Async-TN Split-KV requires 2 to 32 splits")
+    split_limit = 128 if packed_decode else 32
+    if not 2 <= num_splits <= split_limit:
+        raise ValueError(f"Async-TN Split-KV requires 2 to {split_limit} splits")
     if num_heads % params.h_hk_ratio != 0:
         raise ValueError("Async-TN Split-KV received an invalid GQA ratio")
-    block_m = 32
-    block_n = 128
+    if (block_m, block_n) != (32, 128) and not (
+        (block_m, block_n) == (16, 64)
+        and packed_decode
+        and max_seqlen_q == 8
+        and params.block_size == 32
+        and 49 <= batch_size <= 64
+    ):
+        raise ValueError("Unsupported packed-decode tile")
     block_k = 128
     q_tiles = triton.cdiv(max_seqlen_q * params.h_hk_ratio, block_m)
     head_programs = num_heads // params.h_hk_ratio
@@ -670,12 +730,17 @@ def launch_d256_tn_splitkv(
         device=original_out.device,
     )
     grid = (head_programs, batch_size, num_splits * q_tiles)
+    adaptive_page16 = packed_decode and max_seqlen_q == 4 and params.block_size == 16
     cfg = {
         "COMPACT_WORKLIST": False,
+        "SKIP_SELECTED": skip_desc is not None,
+        "PAGE_SIZE": params.block_size,
+        "PAGE16_ADAPTIVE_DECODE": adaptive_page16,
+        "PACKED_DECODE_Q": max_seqlen_q if packed_decode else 0,
         "SPLIT_KV": True,
         "NUM_SPLITS": num_splits,
         "Q_TILES": q_tiles,
-        "GRID_ORDER": 1,
+        "GRID_ORDER": 0 if block_n == 64 else 1,
         "REVERSE_Q_TILES": False,
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
@@ -699,38 +764,94 @@ def launch_d256_tn_splitkv(
         "pipeline_load_num": -1,
         "inner_stages": (0, 0),
     }
+    # Specialize LibEntry on the same scenario used for compilation.
+    cfg["TN_SCENARIO"] = cfg["scenario"]
     logger.debug("Running D256 async-TN Split-KV with config: %s", cfg)
-    partial = flash_varlen_fwd_d256_tn_kernel[grid](
-        params.q_ptr,
-        params.k_ptr,
-        params.v_ptr,
-        out_splits,
-        lse_splits,
-        params.q_row_stride,
-        params.k_row_stride,
-        params.v_row_stride,
-        params.q_head_stride,
-        params.k_head_stride,
-        params.v_head_stride,
-        out_splits.stride(1),
-        out_splits.stride(2),
-        params.scale_softmax,
-        params.scale_softmax_log2,
-        params.cu_seqlens_q_ptr,
-        params.cu_seqlens_k_ptr,
-        params.seqused_k_ptr,
-        params.is_cu_seqlens_k,
-        params.is_seqused_k,
-        num_heads,
-        params.h_hk_ratio,
-        total_q,
-        params.page_table_ptr,
-        params.page_table_batch_stride,
-        params.k_page_stride,
-        params.v_ptr.stride(0),
-        params.page_table_ptr,
-        **cfg,
+    # A BM64 full split and its two complementary BM32 tiles share the same
+    # KV partition. Keep noncontiguous and wide-address inputs on the old path.
+    full_rows = (
+        not packed_decode
+        and max_seqlen_q >= 128
+        and num_heads == params.h_hk_ratio == 8
+        and params.q_row_stride == 2048
+        and params.q_head_stride == 256
+        and "noaddropt" not in cfg["scenario"]
     )
+    for region in [1, 2] if full_rows else [0]:
+        cfg["SPLIT_REGION"] = region
+        cfg["BLOCK_M"] = 64 if region == 1 else block_m
+        cfg["Q_TILES"] = triton.cdiv(max_seqlen_q * params.h_hk_ratio, cfg["BLOCK_M"])
+        if block_n == 64:
+            # Adjacent CTAs process the same request's KV partitions. This
+            # also avoids interleaving padded empty requests between splits.
+            grid = (num_splits * cfg["Q_TILES"], batch_size, head_programs)
+        else:
+            grid = (head_programs, batch_size, num_splits * cfg["Q_TILES"])
+        partial = flash_varlen_fwd_d256_tn_kernel[grid](
+            params.q_ptr,
+            params.k_ptr,
+            params.v_ptr,
+            out_splits,
+            lse_splits,
+            params.q_row_stride,
+            params.k_row_stride,
+            params.v_row_stride,
+            params.q_head_stride,
+            params.k_head_stride,
+            params.v_head_stride,
+            out_splits.stride(1),
+            out_splits.stride(2),
+            params.scale_softmax,
+            params.scale_softmax_log2,
+            params.cu_seqlens_q_ptr,
+            params.cu_seqlens_k_ptr,
+            params.seqused_k_ptr,
+            params.is_cu_seqlens_k,
+            params.is_seqused_k,
+            num_heads,
+            params.h_hk_ratio,
+            total_q,
+            params.page_table_ptr,
+            params.page_table_batch_stride,
+            params.k_page_stride,
+            params.v_ptr.stride(0),
+            skip_desc if skip_desc is not None else params.page_table_ptr,
+            **cfg,
+        )
+    if adaptive_page16:
+        finalize = (
+            _page16_decode_batch_finalize_kernel
+            if batch_size > 128
+            else _page16_decode_finalize_kernel
+        )
+        grid = (batch_size,) if batch_size > 128 else (total_q,)
+        finalize[grid](
+            params.q_ptr,
+            params.k_ptr,
+            params.v_ptr,
+            original_out,
+            original_lse,
+            out_splits,
+            lse_splits,
+            params.seqused_k_ptr,
+            params.page_table_ptr,
+            params.q_row_stride,
+            params.q_head_stride,
+            params.k_row_stride,
+            params.v_row_stride,
+            params.k_page_stride,
+            params.v_ptr.stride(0),
+            params.page_table_batch_stride,
+            params.o_row_stride,
+            params.o_head_stride,
+            total_q,
+            num_splits,
+            triton.next_power_of_2(num_splits),
+            params.scale_softmax,
+            num_warps=4,
+            num_stages=1,
+        )
+        return partial
     merge = flash_varlen_splitkv_merge_kernel[total_q, num_heads]
     merge(
         original_out,
@@ -745,7 +866,474 @@ def launch_d256_tn_splitkv(
         num_splits,
         triton.next_power_of_2(num_splits),
         256,
-        num_warps=1,
+        SELECTION_PTR=skip_desc,
+        SKIP_SELECTED=skip_desc is not None,
+        num_warps=4 if num_splits > 32 else 1,
         num_stages=1,
     )
     return partial
+
+
+@libentry()
+@triton.jit
+def _page16_decode_finalize_kernel(
+    Q,
+    K,
+    V,
+    O,
+    L,
+    PO,
+    PL,
+    USED,
+    T,
+    QR: tl.constexpr,
+    QH: tl.constexpr,
+    KR: tl.constexpr,
+    VR: tl.constexpr,
+    KP: tl.constexpr,
+    VP: tl.constexpr,
+    TS: tl.constexpr,
+    OR: tl.constexpr,
+    OH: tl.constexpr,
+    TOTAL: tl.constexpr,
+    S: tl.constexpr,
+    RS: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    bid = row // 4
+    length = tl.load(USED + bid)
+    d = tl.arange(0, 256)
+    if length <= 32:
+        if length == 0:
+            result = tl.full((256,), 0.0, tl.float32)
+            lse = float("-inf")
+        elif length == 1:
+            page_single = tl.load(T + bid * TS).to(tl.int64)
+            q = tl.load(Q + row * QR + d).to(tl.float32)
+            k = tl.load(K + page_single * KP + d).to(tl.float32)
+            result = tl.load(V + page_single * VP + d).to(tl.float32)
+            lse = tl.sum(q * k, 0) * SCALE
+        else:
+            q = tl.load(Q + row * QR + d).to(tl.float32)
+            n = tl.arange(0, 32)
+            page = tl.load(T + bid * TS + n // 16, n < length, other=0).to(tl.int64)
+            keys = tl.load(
+                K + page[:, None] * KP + n[:, None] % 16 * KR + d[None, :],
+                n[:, None] < length,
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.sum(keys * q[None, :], 1) * SCALE
+            scores = tl.where(n < length, scores, float("-inf"))
+            maximum = tl.max(scores, 0)
+            prob = tl.exp(scores - maximum)
+            den = tl.sum(prob, 0)
+            values = tl.load(
+                V + page[:, None] * VP + n[:, None] % 16 * VR + d[None, :],
+                n[:, None] < length,
+                other=0.0,
+            ).to(tl.float32)
+            result = tl.sum(values * prob[:, None], 0) / den
+            lse = maximum + tl.log(den)
+    else:
+        s = tl.arange(0, RS)
+        lses = tl.load(PL + s * TOTAL + row, s < S, other=float("-inf"))
+        maximum = tl.max(lses, 0)
+        maximum = tl.where(maximum == float("-inf"), 0.0, maximum)
+        weights = tl.exp(lses - maximum)
+        denominator = tl.sum(weights, 0)
+        partial = tl.load(
+            PO + s[:, None] * TOTAL * 256 + row * 256 + d[None, :],
+            s[:, None] < S,
+            other=0.0,
+        )
+        result = tl.sum(partial * weights[:, None], 0) / denominator
+        lse = maximum + tl.log(denominator)
+    tl.store(O + row * OR + d, result.to(O.dtype.element_ty))
+    tl.store(L + row, lse)
+
+
+@libentry()
+@triton.jit
+def _page16_decode_batch_finalize_kernel(
+    Q,
+    K,
+    V,
+    O,
+    L,
+    PO,
+    PL,
+    USED,
+    T,
+    QR: tl.constexpr,
+    QH: tl.constexpr,
+    KR: tl.constexpr,
+    VR: tl.constexpr,
+    KP: tl.constexpr,
+    VP: tl.constexpr,
+    TS: tl.constexpr,
+    OR: tl.constexpr,
+    OH: tl.constexpr,
+    TOTAL: tl.constexpr,
+    S: tl.constexpr,
+    RS: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    length = tl.load(USED + bid)
+    d = tl.arange(0, 256)
+    if length <= 32:
+        h = tl.arange(0, 16)
+        if length == 0:
+            short_o = tl.full((16, 256), 0.0, tl.float32)
+            short_l = tl.full((16,), float("-inf"), tl.float32)
+        elif length == 1:
+            page_one = tl.load(T + bid * TS).to(tl.int64)
+            q_one = tl.load(
+                Q + (bid * 4 + h[:, None]) * QR + d[None, :], h[:, None] < 4, other=0.0
+            ).to(tl.float32)
+            k_one = tl.load(K + page_one * KP + d).to(tl.float32)
+            v_one = tl.load(V + page_one * VP + d).to(tl.float32)
+            short_o = tl.broadcast_to(v_one[None, :], (16, 256))
+            short_l = tl.sum(q_one * k_one[None, :], 1) * SCALE
+        else:
+            n = tl.arange(0, 32)
+            page_many = tl.load(T + bid * TS + n // 16, n < length, other=0).to(
+                tl.int64
+            )
+            q_many = tl.load(
+                Q + (bid * 4 + h[:, None]) * QR + d[None, :], h[:, None] < 4, other=0.0
+            )
+            k_many = tl.load(
+                K + page_many[None, :] * KP + n[None, :] % 16 * KR + d[:, None],
+                n[None, :] < length,
+                other=0.0,
+            )
+            score_many = tl.dot(q_many, k_many) * SCALE
+            score_many = tl.where(n[None, :] < length, score_many, float("-inf"))
+            maximum_many = tl.max(score_many, 1)
+            prob_many = tl.exp(score_many - maximum_many[:, None])
+            denominator_many = tl.sum(prob_many, 1)
+            v_many = tl.load(
+                V + page_many[:, None] * VP + n[:, None] % 16 * VR + d[None, :],
+                n[:, None] < length,
+                other=0.0,
+            )
+            short_o = (
+                tl.dot(prob_many.to(v_many.dtype), v_many) / denominator_many[:, None]
+            )
+            short_l = maximum_many + tl.log(denominator_many)
+        tl.store(
+            O + (bid * 4 + h[:, None]) * OR + d[None, :],
+            short_o.to(O.dtype.element_ty),
+            h[:, None] < 4,
+        )
+        tl.store(L + bid * 4 + h, short_l, h < 4)
+    else:
+        for head in range(4):
+            row = bid * 4 + head
+            s = tl.arange(0, RS)
+            lses = tl.load(PL + s * TOTAL + row, s < S, other=float("-inf"))
+            maximum = tl.max(lses, 0)
+            maximum = tl.where(maximum == float("-inf"), 0.0, maximum)
+            weights = tl.exp(lses - maximum)
+            denominator = tl.sum(weights, 0)
+            partial = tl.load(
+                PO + s[:, None] * TOTAL * 256 + row * 256 + d[None, :],
+                s[:, None] < S,
+                other=0.0,
+            )
+            result = tl.sum(partial * weights[:, None], 0) / denominator
+            lse = maximum + tl.log(denominator)
+            tl.store(O + row * OR + d, result.to(O.dtype.element_ty))
+            tl.store(L + row, lse)
+
+
+@triton.jit(do_not_specialize=["B"])
+def _residual_worklist(
+    CU,
+    WL,
+    B,
+    R: tl.constexpr,
+    UPPER: tl.constexpr,
+    RATIO: tl.constexpr,
+    BM: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    b = tl.arange(0, R)
+    start = tl.load(CU + b, b <= B, other=0)
+    end = tl.load(CU + b + 1, b < B, other=0)
+    tiles = tl.where(b < B, tl.cdiv(tl.maximum(end - start, 0) * RATIO, BM), 0)
+    base = tl.sum(tl.where(b < bid, tiles, 0), 0)
+    count = tl.sum(tl.where(b == bid, tiles, 0), 0)
+    total = tl.sum(tiles, 0)
+    row = tl.arange(0, 128)
+    for offset in tl.range(0, count, 128):
+        task = offset + row
+        tl.store(WL + (base + task) * 2, bid, task < count)
+        tl.store(WL + (base + task) * 2 + 1, task, task < count)
+    if bid == 0:
+        for offset in tl.range(total, UPPER, 128):
+            task = offset + row
+            tl.store(WL + task * 2, -1, task < UPPER)
+            tl.store(WL + task * 2 + 1, 0, task < UPPER)
+
+
+def launch_d256_tn_compact_splitkv(
+    params,
+    *,
+    max_seqlen_q,
+    batch_size,
+    num_heads,
+    total_q,
+    num_splits,
+    block_m=32,
+    block_n=128,
+):
+    """Run packed partials and FP32 merge with a validated private tile."""
+    assert (
+        params.block_size == 32
+        and params.h == params.h_hk_ratio == num_heads == 8
+        and (not params.seqlenq_ngroups_swapped)
+    )
+    packed_decode = (
+        params.seqlenq_ngroups_swapped
+        and max_seqlen_q in (4, 8)
+        and (params.h_hk_ratio == 1)
+        and (num_heads == 1)
+    )
+    if params.q_ptr.dtype != torch.bfloat16:
+        raise ValueError("Async-TN Split-KV requires BF16 Q/K/V")
+    page16_short_q = (
+        params.block_size == 16
+        and (not packed_decode)
+        and (num_heads == params.h == params.h_hk_ratio == 4)
+        and (params.hk == 1)
+        and params.is_cu_seqlens_q
+        and params.is_seqused_k
+        and (4 < max_seqlen_q <= 132)
+        and (batch_size <= 64)
+        and (total_q <= max_seqlen_q + batch_size - 1)
+    )
+    if (
+        not params.is_paged
+        or params.d != 256
+        or (
+            not (
+                params.block_size == 32
+                or (params.block_size == 16 and packed_decode and (max_seqlen_q == 4))
+                or page16_short_q
+            )
+        )
+    ):
+        raise ValueError(
+            "Async-TN Split-KV requires paged D256; page16 requires packed or bounded-short GQA4"
+        )
+    if not params.is_causal and (not packed_decode) or params.is_local:
+        raise ValueError("Async-TN Split-KV only supports causal global attention")
+    if params.is_dropout or params.is_alibi or params.is_softcap:
+        raise ValueError(
+            "Async-TN Split-KV does not support optional attention features"
+        )
+    if params.cu_seqlens_q_ptr is None and (not packed_decode):
+        raise ValueError("Async-TN Split-KV requires varlen Q prefix sums")
+    if params.cu_seqlens_k_ptr is None and params.seqused_k_ptr is None:
+        raise ValueError("Async-TN Split-KV requires KV lengths")
+    split_limit = 128 if packed_decode else 32
+    if not 2 <= num_splits <= split_limit:
+        raise ValueError(f"Async-TN Split-KV requires 2 to {split_limit} splits")
+    if num_heads % params.h_hk_ratio != 0:
+        raise ValueError("Async-TN Split-KV received an invalid GQA ratio")
+    if (block_m, block_n) != (32, 128) and (
+        not (
+            (block_m, block_n) == (16, 64)
+            and packed_decode
+            and (max_seqlen_q == 8)
+            and (params.block_size == 32)
+            and (49 <= batch_size <= 64)
+        )
+    ):
+        raise ValueError("Unsupported packed-decode tile")
+    block_k = 128
+    q_tiles = triton.cdiv(max_seqlen_q * params.h_hk_ratio, block_m)
+    head_programs = num_heads // params.h_hk_ratio
+    original_out = params.o_ptr
+    original_lse = params.softmax_lse_ptr
+    out_splits = torch.empty(
+        (num_splits, total_q, num_heads, 256),
+        dtype=torch.float32,
+        device=original_out.device,
+    )
+    lse_splits = torch.empty(
+        (num_splits, num_heads, total_q),
+        dtype=torch.float32,
+        device=original_out.device,
+    )
+    grid = (head_programs, batch_size, num_splits * q_tiles)
+    adaptive_page16 = packed_decode and max_seqlen_q == 4 and (params.block_size == 16)
+    cfg = {
+        "COMPACT_WORKLIST": False,
+        "PAGE_SIZE": params.block_size,
+        "PAGE16_ADAPTIVE_DECODE": adaptive_page16,
+        "PACKED_DECODE_Q": max_seqlen_q if packed_decode else 0,
+        "SPLIT_KV": True,
+        "NUM_SPLITS": num_splits,
+        "Q_TILES": q_tiles,
+        "GRID_ORDER": 0 if block_n == 64 else 1,
+        "REVERSE_Q_TILES": False,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "QK_BLOCK_K": 64,
+        "FAST_CAUSAL_ALIGNED": False,
+        "num_warps": 4,
+        "num_stages": 4,
+        "pipeline": "cpasync",
+        "scenario": tn_compile_scenario(
+            params.q_ptr,
+            params.k_ptr,
+            params.v_ptr,
+            out_splits,
+            lse_splits,
+            params.page_table_ptr,
+            params.cu_seqlens_q_ptr,
+            params.cu_seqlens_k_ptr,
+            params.seqused_k_ptr,
+        ),
+        "pipeline_load_num": -1,
+        "inner_stages": (0, 0),
+    }
+    cfg["TN_SCENARIO"] = cfg["scenario"]
+    logger.debug("Running D256 async-TN Split-KV with config: %s", cfg)
+    full_rows = (
+        not packed_decode
+        and max_seqlen_q >= 128
+        and (num_heads == params.h_hk_ratio == 8)
+        and (params.q_row_stride == 2048)
+        and (params.q_head_stride == 256)
+        and ("noaddropt" not in cfg["scenario"])
+    )
+    for region in [1, 2] if full_rows else [0]:
+        cfg["SPLIT_REGION"] = region
+        cfg["BLOCK_M"] = 64 if region == 1 else block_m
+        cfg["Q_TILES"] = triton.cdiv(max_seqlen_q * params.h_hk_ratio, cfg["BLOCK_M"])
+        if block_n == 64:
+            grid = (num_splits * cfg["Q_TILES"], batch_size, head_programs)
+        else:
+            grid = (head_programs, batch_size, num_splits * cfg["Q_TILES"])
+        upper = triton.next_power_of_2(
+            triton.cdiv(total_q * params.h_hk_ratio, cfg["BLOCK_M"]) + batch_size
+        )
+        work = torch.empty((upper, 2), dtype=torch.int32, device=params.q_ptr.device)
+        _residual_worklist[batch_size,](
+            params.cu_seqlens_q_ptr,
+            work,
+            batch_size,
+            triton.next_power_of_2(batch_size + 1),
+            upper,
+            params.h_hk_ratio,
+            cfg["BLOCK_M"],
+            num_warps=1,
+        )
+        cfg["COMPACT_WORKLIST"] = True
+        cfg["Q_TILES"] = upper
+        grid = (head_programs, 1, num_splits * upper)
+        partial = flash_varlen_fwd_d256_tn_kernel[grid](
+            params.q_ptr,
+            params.k_ptr,
+            params.v_ptr,
+            out_splits,
+            lse_splits,
+            params.q_row_stride,
+            params.k_row_stride,
+            params.v_row_stride,
+            params.q_head_stride,
+            params.k_head_stride,
+            params.v_head_stride,
+            out_splits.stride(1),
+            out_splits.stride(2),
+            params.scale_softmax,
+            params.scale_softmax_log2,
+            params.cu_seqlens_q_ptr,
+            params.cu_seqlens_k_ptr,
+            params.seqused_k_ptr,
+            params.is_cu_seqlens_k,
+            params.is_seqused_k,
+            num_heads,
+            params.h_hk_ratio,
+            total_q,
+            params.page_table_ptr,
+            params.page_table_batch_stride,
+            params.k_page_stride,
+            params.v_ptr.stride(0),
+            work,
+            **cfg,
+        )
+    merge = _d256_tn_compact_splitkv_merge_kernel[total_q, num_heads]
+    merge(
+        original_out,
+        original_lse,
+        out_splits,
+        lse_splits,
+        params.o_row_stride,
+        params.o_head_stride,
+        total_q,
+        num_heads,
+        256,
+        num_splits,
+        triton.next_power_of_2(num_splits),
+        256,
+        num_warps=4 if num_splits > 32 else 1,
+        num_stages=1,
+    )
+    return partial
+
+
+@libentry()
+@triton.jit(do_not_specialize=["total_q"])
+def _d256_tn_compact_splitkv_merge_kernel(
+    out_ptr,
+    lse_ptr,
+    out_splits_ptr,
+    lse_splits_ptr,
+    o_row_stride,
+    o_head_stride,
+    total_q,
+    h: tl.constexpr,
+    d: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    MAX_N_SPLITS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    q_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    split_idx = tl.arange(0, MAX_N_SPLITS)
+    split_mask = split_idx < NUM_SPLITS
+    lse_offsets = split_idx * h * total_q + head_idx * total_q + q_idx
+    split_lse = tl.load(
+        lse_splits_ptr + lse_offsets, mask=split_mask, other=float("-inf")
+    )
+    valid_lse = split_mask & (split_lse > float("-inf")) & (split_lse < float("inf"))
+    max_lse = tl.max(tl.where(valid_lse, split_lse, float("-inf")), axis=0)
+    has_valid_lse = max_lse > float("-inf")
+    safe_max_lse = tl.where(has_valid_lse, max_lse, 0.0)
+    split_scale = tl.where(valid_lse, tl.exp(split_lse - safe_max_lse), 0.0)
+    scale_sum = tl.sum(split_scale, axis=0)
+    safe_scale_sum = tl.where(has_valid_lse, scale_sum, 1.0)
+    weights = split_scale / safe_scale_sum
+    col = tl.arange(0, BLOCK_K)
+    split_out_offsets = (
+        split_idx[:, None] * total_q * h * d + (q_idx * h + head_idx) * d + col[None, :]
+    )
+    split_out = tl.load(
+        out_splits_ptr + split_out_offsets,
+        mask=split_mask[:, None] & (col[None, :] < d),
+        other=0.0,
+    )
+    out = tl.sum(weights[:, None] * split_out, axis=0)
+    out_offsets = q_idx * o_row_stride + head_idx * o_head_stride + col
+    tl.store(out_ptr + out_offsets, out, mask=col < d)
+    merged_lse = tl.where(
+        has_valid_lse, tl.log(safe_scale_sum) + safe_max_lse, float("-inf")
+    )
+    tl.store(lse_ptr + head_idx * total_q + q_idx, merged_lse)

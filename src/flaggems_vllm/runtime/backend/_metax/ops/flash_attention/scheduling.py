@@ -54,12 +54,18 @@ class MetaXAttentionPlan:
     worklist_block_m: int = 0
     workspace_bytes: int = 0
     allow_split_kv: bool = True
+    tn_packed_decode: bool = False
 
 
 D256_TN_BLOCK_M = 32
 
 
 D256_TN_BLOCK_N = 128
+
+
+# Non-transposed BF16 MMA shared layouts require M >= 16. Narrower
+# tiles abort in make_ttgir before a CUDA graph can be captured.
+MMA_MIN_BLOCK_M = 16
 
 
 class MetaXAttentionScheduler:
@@ -263,6 +269,19 @@ class MetaXAttentionScheduler:
             <= MetaXAttentionScheduler.SPLIT_KV_SHORT_Q_MAX
             and (max_seqlen_k >= MetaXAttentionScheduler.SPLIT_KV_LONG_K_MIN)
         )
+        # A single-token GQA decode can pack query heads into the row axis.
+        # The API has removed cu_seqlens_q and made Q/KV head counts equal.
+        # Use one 16-row tile for 5..16 packed heads rather than rejecting
+        # this decode shape at the ordinary four-query Split-KV limit.
+        swapped_short_decode = (
+            seqlenq_ngroups_swapped
+            and is_seqused_k
+            and head_size == 256
+            and 4 < max_seqlen_q <= 16
+            and total_q == batch_size * max_seqlen_q
+            and num_heads == num_heads_k
+            and max_seqlen_k > 16
+        )
         split_kv_capable = (
             is_bfloat16
             and is_paged
@@ -270,6 +289,7 @@ class MetaXAttentionScheduler:
             and (
                 0 < max_seqlen_q <= MetaXAttentionScheduler.SPLIT_KV_BLOCK_M
                 or short_q_long_kv
+                or swapped_short_decode
             )
             and (max_seqlen_k >= 0)
             and (total_q > 0)
@@ -284,10 +304,13 @@ class MetaXAttentionScheduler:
             and (not is_alibi)
             and (not is_softcap)
         )
-        split_kv_block_m = (
-            MetaXAttentionScheduler.SPLIT_KV_SHORT_Q_BLOCK_M
-            if short_q_long_kv
-            else MetaXAttentionScheduler.SPLIT_KV_BLOCK_M
+        split_kv_block_m = max(
+            (
+                MetaXAttentionScheduler.SPLIT_KV_SHORT_Q_BLOCK_M
+                if short_q_long_kv or swapped_short_decode
+                else MetaXAttentionScheduler.SPLIT_KV_BLOCK_M
+            ),
+            MMA_MIN_BLOCK_M,
         )
         split_kv_block_n = (
             MetaXAttentionScheduler.SPLIT_KV_SHORT_Q_BLOCK_N
@@ -302,6 +325,28 @@ class MetaXAttentionScheduler:
             max_seqlen_k, split_kv_block_n
         )
         selected_splits = 0
+        tn_packed_decode = (
+            split_kv_capable
+            and is_bfloat16
+            and head_size == 256
+            and seqlenq_ngroups_swapped
+            and num_heads == num_heads_k == 1
+            and (
+                (
+                    block_size == 32
+                    and max_seqlen_q == 8
+                    and 1 <= batch_size <= 64
+                    and total_q == batch_size * 8
+                )
+                or (
+                    block_size == 16
+                    and max_seqlen_q == 4
+                    and 1 <= batch_size <= 512
+                    and total_q == batch_size * 4
+                )
+            )
+            and max_seqlen_k >= 32768
+        )
         if num_splits > 1:
             if not split_kv_capable:
                 raise NotImplementedError(
@@ -314,7 +359,42 @@ class MetaXAttentionScheduler:
                     "32 MiB workspace limit"
                 )
         elif num_splits == 0 and split_kv_capable and head_size == 256:
-            if short_q_long_kv:
+            if tn_packed_decode:
+                # Packed decode has one Q tile per request. Larger batches
+                # already provide parallelism and need fewer KV partitions.
+                # This is an internal auto policy; explicit num_splits keeps
+                # its public [0, 32] contract and the workspace stays bounded.
+                if block_size == 16:
+                    if batch_size <= 8:
+                        decode_splits = 128
+                    elif batch_size <= 24:
+                        decode_splits = 64
+                    elif batch_size <= 48:
+                        decode_splits = 32
+                    elif batch_size <= 128:
+                        decode_splits = 16
+                    else:
+                        decode_splits = 2
+                elif batch_size <= 8:
+                    decode_splits = 128
+                elif batch_size <= 24:
+                    decode_splits = 48
+                elif batch_size <= 48:
+                    decode_splits = 32
+                else:
+                    decode_splits = 16
+                selected_splits = min(decode_splits, workspace_split_cap)
+            elif (
+                short_q_long_kv
+                and block_size == 16
+                and num_heads == 4
+                and num_heads_k == 1
+                and max_seqlen_q <= 132
+                and batch_size <= 64
+                and total_q <= max_seqlen_q + batch_size - 1
+            ):
+                selected_splits = min(32, workspace_split_cap)
+            elif short_q_long_kv:
                 selected_splits = min(
                     MetaXAttentionScheduler._ceildiv(
                         split_kv_k_blocks,
@@ -337,6 +417,14 @@ class MetaXAttentionScheduler:
         if selected_splits < 2:
             selected_splits = 0
         split_kv_enabled = selected_splits >= 2
+        if split_kv_enabled and tn_packed_decode:
+            # Large page32 decode batches benefit from the narrower synchronous
+            # MMA tile; small batches retain the Async-TN split configuration.
+            if block_size == 32 and batch_size >= 49:
+                split_kv_block_m, split_kv_block_n = 16, 64
+            else:
+                split_kv_block_m, split_kv_block_n = 32, 128
+            split_kv_q_tiles = 1
         page16_decode_enabled = (
             split_kv_capable
             and not split_kv_enabled
@@ -407,6 +495,7 @@ class MetaXAttentionScheduler:
                 else worklist_workspace_bytes if compact_worklist_enabled else 0
             ),
             allow_split_kv=num_splits != 1,
+            tn_packed_decode=tn_packed_decode and split_kv_enabled,
         )
 
 
@@ -435,9 +524,13 @@ def validate_metax_attention_plan(plan: MetaXAttentionPlan) -> None:
     if split:
         if not plan.allow_split_kv:
             raise RuntimeError("Split-KV is disabled by the attention plan")
-        if not 2 <= plan.max_splits <= 32:
-            raise RuntimeError("Split-KV split count must be in [2, 32]")
-        if (plan.split_kv_block_m, plan.split_kv_block_n) not in ((4, 16), (16, 16)):
+        split_limit = 128 if plan.tn_packed_decode else 32
+        if not 2 <= plan.max_splits <= split_limit:
+            raise RuntimeError(f"Split-KV split count must be in [2, {split_limit}]")
+        valid_tiles = (
+            ((32, 128), (16, 64)) if plan.tn_packed_decode else ((MMA_MIN_BLOCK_M, 16),)
+        )
+        if (plan.split_kv_block_m, plan.split_kv_block_n) not in valid_tiles:
             raise RuntimeError("Split-KV tile configuration is invalid")
         if (
             plan.split_kv_q_tiles <= 0
@@ -453,6 +546,8 @@ def validate_metax_attention_plan(plan: MetaXAttentionPlan) -> None:
         plan.split_kv_q_tiles,
     ) != (1, 0, 0, 0):
         raise RuntimeError("Non-split routes must disable Split-KV metadata")
+    if plan.tn_packed_decode and not split:
+        raise RuntimeError("Packed TN decode requires a Split-KV plan")
     if compact:
         if (
             plan.worklist_task_upper <= 0
