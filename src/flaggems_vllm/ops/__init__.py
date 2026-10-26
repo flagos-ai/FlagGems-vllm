@@ -192,6 +192,12 @@ from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
 from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
     fused_minimax_m3_qknorm_rope_kv_insert,
 )
+from flaggems_vllm.ops.int8_sparse_indexer import (
+    indexer_k_quant_and_cache_int8,
+    int8_mqa_logits,
+    int8_paged_mqa_logits,
+    per_token_group_quant_int8,
+)
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
     fused_recurrent_kda,
@@ -284,8 +290,11 @@ __all__ = [
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "indexer_k_quant_and_cache",
+    "indexer_k_quant_and_cache_int8",
     "inplace_fused_experts",
     "instance_norm",
+    "int8_mqa_logits",
+    "int8_paged_mqa_logits",
     "invoke_fused_moe_triton_kernel",
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
@@ -314,6 +323,7 @@ __all__ = [
     "parallel_nsa",
     "parallel_nsa_compression",
     "per_token_group_quant_fp8",
+    "per_token_group_quant_int8",
     "permute_copy",
     "persistent_topk",
     "ple_gate_norm",

@@ -770,6 +770,17 @@ ops:
       - Quantization
     stages:
       - beta: '5.3'
+  - id: indexer_k_quant_and_cache_int8
+    description: Quantizes sparse-indexer keys into paged INT8 bytes and FP32 scales.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: inplace_fused_experts
     description: This operator writes output directly to `hidden_states`.
     for:
@@ -796,6 +807,28 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
+  - id: int8_mqa_logits
+    description: Computes weighted ReLU MQA logits from INT8 query and gathered keys.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: int8_paged_mqa_logits
+    description: Computes graph-safe weighted ReLU MQA logits from paged INT8 keys.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: kda_conv_gather
     description: |
       Stages the rows used by a batch out of the block-strided Kimi Delta
@@ -1086,6 +1119,17 @@ ops:
     stages:
       - alpha: '4.2'
       - beta: '5.3'
+  - id: per_token_group_quant_int8
+    description: Quantizes finite floating-point rows into symmetric INT8 groups and FP32 scales.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: persistent_topk
     description: |
       vLLM-compatible persistent topk decode. Triton implementation supporting

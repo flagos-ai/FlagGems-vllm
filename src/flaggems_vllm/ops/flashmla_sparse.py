@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.utils.tle_capabilities import supports_sparse_mla_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
@@ -1019,6 +1020,13 @@ def _can_use_tle_flash_mla_sparse_fwd(
     if not (HAS_TLE_FLASHMLA_SPARSE and _flash_mla_sparse_tle_enabled()):
         return False
     if q.device.type != "cuda":
+        return False
+    # The descriptor copies in this TLE path require Hopper TMA. API presence
+    # alone does not make it usable on Ampere/Ada; retain the generic BF16 path.
+    if (
+        runtime.device.vendor_name == "nvidia"
+        and torch.cuda.get_device_capability(q.device)[0] < 9
+    ):
         return False
     SQ, HQ, DQK = q.shape
     _ = SQ

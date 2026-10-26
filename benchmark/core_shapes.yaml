@@ -524,6 +524,20 @@ swiglu:
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
 
+# Symmetric INT8 sparse-indexer contracts (D=128).
+int8_mqa_logits:
+  shapes: [[1, 64, 32], [7, 4096, 32], [128, 4096, 32]]
+  shape_desc: "query rows, key rows, heads"
+int8_paged_mqa_logits:
+  shapes: [[1, 64, 32], [7, 4096, 32], [32, 4096, 32]]
+  shape_desc: "query rows, context capacity, heads"
+per_token_group_quant_int8:
+  shapes: [[1, 128], [32, 128], [4096, 128]]
+  shape_desc: "query rows, head_dim"
+indexer_k_quant_and_cache_int8:
+  shapes: [[64, 128], [256, 128], [4096, 128]]
+  shape_desc: "key rows, head_dim; consecutive full pages"
+
 bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]

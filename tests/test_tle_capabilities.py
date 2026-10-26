@@ -3,26 +3,33 @@
 
 import sys
 from importlib import import_module, util
+from itertools import count
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from triton.runtime import JITFunction
 
 from flaggems_vllm.utils.tle_capabilities import (
     supports_sparse_mla_tle,
     supports_topk_tle,
 )
 
+_module_ids = count()
+
 
 def _language():
     def api(*args, **kwargs):
         raise AssertionError("capability check executed an optional API")
 
+    # Model TLE builtins during the real JIT dependency walk at tuner creation.
+    # Calling one still fails, so capability probing cannot execute the API.
+    api.__triton_builtin__ = True
     return SimpleNamespace(
         cumsum=api,
         pipe=api,
         gpu=SimpleNamespace(
-            alloc=api, local_ptr=api, copy=api, warp_specialize=api, smem=object()
+            alloc=api, local_ptr=api, copy=api, warp_specialize=api, smem="shared"
         ),
     )
 
@@ -68,6 +75,29 @@ def test_non_callable_api_rejects_only_its_consumer(attr):
     assert supports_sparse_mla_tle(language) is (attr != "pipe")
 
 
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize(
+    "capability,expected",
+    [
+        ((8, 0), False),
+        ((8, 6), False),
+        ((8, 9), False),
+        ((9, 0), True),
+        ((10, 0), True),
+    ],
+)
+def test_sparse_mla_tle_requires_tma_hardware(monkeypatch, capability, expected):
+    module = import_module("flaggems_vllm.ops.flashmla_sparse")
+    monkeypatch.setattr(module, "HAS_TLE_FLASHMLA_SPARSE", True)
+    monkeypatch.setattr(module.runtime.device, "vendor_name", "nvidia")
+    monkeypatch.setenv("FLAGGEMS_FLASHMLA_SPARSE_TLE", "1")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    q = SimpleNamespace(device=torch.device("cuda"), shape=(1, 64, 576))
+    kv = SimpleNamespace(shape=(2048, 1, 576))
+    indices = SimpleNamespace(shape=(1, 1, 2048))
+    assert module._can_use_tle_flash_mla_sparse_fwd(q, kv, indices, 512) is expected
+
+
 @pytest.fixture(params=["prefill", "decode"])
 def load_topk_module(request, monkeypatch):
     """Import fresh JIT functions without changing the already loaded operators."""
@@ -81,7 +111,7 @@ def load_topk_module(request, monkeypatch):
         package = ModuleType("triton.experimental.tle")
         package.language = language
         spec = util.spec_from_file_location(
-            f"{original.__name__}_test", original.__file__
+            f"{original.__name__}_test_{next(_module_ids)}", original.__file__
         )
         module = util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, module)
@@ -120,7 +150,10 @@ def test_incomplete_tle_does_not_break_non_tle_cache_key(
     module = load(language)
     assert module.HAS_TLE is False
     # Exercise Triton's real dependency walk, including disabled constexpr branches.
-    assert getattr(module, f"non_tle_top_k_per_row_{phase}").cache_key
+    kernel = getattr(module, f"non_tle_top_k_per_row_{phase}")
+    while not isinstance(kernel, JITFunction):
+        kernel = kernel.fn
+    assert kernel.cache_key
     assert module.tle is None
     assert vars(target) == before
 
