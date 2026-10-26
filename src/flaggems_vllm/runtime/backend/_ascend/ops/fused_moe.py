@@ -1,15 +1,18 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 FlagOS Contributors
 #
-# Adapted from the vLLM project (https://github.com/vllm-project/vllm).
-# Source files under vllm/model_executor/layers/:
-#   fused_moe/fused_moe.py      – Triton kernels, dispatch, fused_experts_impl
-#   fused_moe/activation.py     – MoEActivation enum, apply_moe_activation
-#   fused_moe/utils.py          – _fp8_quantize, _int8_quantize, moe_kernel_quantize_input
-#   fused_moe/config.py         – _get_config_dtype_str
-#   quantization/utils/mxfp4_utils.py   – dequant_mxfp4
-#   quantization/utils/mxfp6_utils.py   – dequant_mxfp6
-#   quantization/utils/ocp_mx_utils.py  – OCP_MX_BLOCK_SIZE
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Fused MoE kernel for Ascend"""
 
 
 import functools
@@ -20,16 +23,18 @@ from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 import yaml
 
 # Using relative imports will cause the module to be not found.
-from flag_gems.runtime.backend._ascend.fused.moe_align_block_size import (
-    moe_align_block_size,
-)
-from flag_gems.runtime.backend._ascend.fused.moe_sum import moe_sum
-from flag_gems.utils import pointwise_dynamic
+from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
+from flaggems_vllm.ops.mul import mul_
+from flaggems_vllm.runtime.backend._ascend.fused.moe_sum import moe_sum
+from flaggems_vllm.runtime.backend._ascend.ops.grouped_matmul import grouped_matmul
+from flaggems_vllm.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -1394,6 +1399,400 @@ def dispatch_fused_moe_kernel(
         )
 
 
+@triton.jit
+def _moe_align_chunkcount_kernel(
+    topk_ids_ptr,
+    chunk_counts_ptr,
+    numel,
+    num_experts,
+    NUM_EXPERTS_PAD: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Pass 1 of the chunked counting sort: one program per id-chunk,
+    chunk_counts[c][e] = pairs of chunk c targeting expert e."""
+    c = tl.program_id(0)
+    offs = c * BLOCK_C + tl.arange(0, BLOCK_C)
+    e_offs = tl.arange(0, NUM_EXPERTS_PAD)
+    ids = tl.load(topk_ids_ptr + offs, mask=offs < numel, other=NUM_EXPERTS_PAD).to(
+        tl.int32
+    )
+    # histogram with `mask=offs < numel` is not supported yet on ascend
+    hist = tl.histogram(ids, NUM_EXPERTS_PAD)
+    hist = tl.where(
+        e_offs == 0, hist - BLOCK_C + tl.sum((offs < numel).to(tl.int32)), hist
+    )
+    tl.store(
+        chunk_counts_ptr + c * num_experts + e_offs, hist, mask=e_offs < num_experts
+    )
+
+
+@triton.jit
+def _moe_align_chunkmeta_kernel(
+    chunk_counts_ptr,
+    counts_ptr,
+    row_start_ptr,
+    chunk_offs_ptr,
+    num_experts,
+    num_chunks,
+    BLOCK_E: tl.constexpr,
+):
+    """Pass 2 (single program): marker pre-fill, totals + padded row starts,
+    block table, and chunk_offs[c][e] = padded region start of e plus the
+    exclusive cumsum of counts over previous chunks."""
+    offs_e = tl.arange(0, BLOCK_E)
+    emask = offs_e < num_experts
+    counts = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for c in range(0, num_chunks):
+        counts += tl.load(
+            chunk_counts_ptr + c * num_experts + offs_e, mask=emask, other=0
+        )
+    tl.store(counts_ptr + offs_e, counts, mask=emask)
+
+    row_start = tl.cumsum(counts, axis=0) - counts
+    tl.store(row_start_ptr + offs_e, row_start, mask=emask)
+
+    running = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for c in range(0, num_chunks):
+        tl.store(
+            chunk_offs_ptr + c * num_experts + offs_e, row_start + running, mask=emask
+        )
+        running += tl.load(
+            chunk_counts_ptr + c * num_experts + offs_e, mask=emask, other=0
+        )
+
+
+@triton.jit
+def _moe_keyed_add(x, y):
+    # associative_scan combine for packed (key << 12 | count): sums counts
+    # while keys match, resets on a key change (flagtree routing pattern).
+    # 0x7FFFF000 keeps bits 12-30 (our keys stay < 2^28); 0xFFFFF000 would
+    # overflow int32.
+    key_mask: tl.constexpr = 0x7FFFF000
+    kx = x & key_mask
+    ky = y & key_mask
+    z = tl.where(kx == ky, x + y - kx, y)
+    return z
+
+
+@triton.jit
+def _moe_align_chunkscatter_kernel(
+    topk_ids_ptr,
+    sorted_token_ids_ptr,
+    chunk_offs_ptr,
+    numel,
+    num_experts,
+    BLOCK_C: tl.constexpr,
+):
+    """Pass 3: one program per id-chunk. Sort the chunk's fp32 keys
+    (expert * 4096 + local_index), derive local ranks via a keyed run-length
+    scan, then store at chunk_offs[c][e] + rank. All 1D ops; the sort is
+    small (BLOCK_C elements), unlike the reverted single-program full sort."""
+    c = tl.program_id(0)
+    offs = c * BLOCK_C + tl.arange(0, BLOCK_C)
+    valid = offs < numel
+    ids = tl.load(topk_ids_ptr + offs, mask=valid, other=0).to(tl.int32)
+    kv = ids.to(tl.float32) * 4096.0 + tl.arange(0, BLOCK_C).to(tl.float32)
+    kv = tl.where(valid, kv, 1e30)
+    kv = al.sort(kv, dim=0)
+    kv_i = tl.where(valid, kv, 0.0).to(tl.int32)
+    s_e = kv_i >> 12
+    s_local = kv_i & 4095
+    # local rank of this pair inside its expert group within the chunk
+    x = (kv_i & 0x7FFFF000) | 1
+    run = tl.associative_scan(x, 0, _moe_keyed_add)
+    local_rank = (run - 1) & 4095
+    base = tl.load(chunk_offs_ptr + c * num_experts + s_e, mask=valid, other=0)
+    tl.store(
+        sorted_token_ids_ptr + base + local_rank,
+        (c * BLOCK_C + s_local).to(tl.int32),
+        mask=valid,
+    )
+
+
+def _moe_align_parallel(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    numel = topk_ids.numel()
+    device = topk_ids.device
+    sorted_token_ids = torch.empty((numel,), dtype=torch.int32, device=device)
+    counts = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    row_start = torch.empty((num_experts,), dtype=torch.int32, device=device)
+
+    BLOCK_C = 256
+    num_chunks = triton.cdiv(numel, BLOCK_C)
+    chunk_counts = torch.empty(
+        (num_chunks * num_experts,), dtype=torch.int32, device=device
+    )
+    chunk_offs = torch.empty(
+        (num_chunks * num_experts,), dtype=torch.int32, device=device
+    )
+
+    num_experts_pad = triton.next_power_of_2(num_experts)
+    _moe_align_chunkcount_kernel[(num_chunks,)](
+        topk_ids,
+        chunk_counts,
+        numel,
+        num_experts,
+        NUM_EXPERTS_PAD=num_experts_pad,
+        BLOCK_C=BLOCK_C,
+    )
+    _moe_align_chunkmeta_kernel[(1,)](
+        chunk_counts,
+        counts,
+        row_start,
+        chunk_offs,
+        num_experts,
+        num_chunks,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+    )
+    _moe_align_chunkscatter_kernel[(num_chunks,)](
+        topk_ids,
+        sorted_token_ids,
+        chunk_offs,
+        numel,
+        num_experts,
+        BLOCK_C=BLOCK_C,
+    )
+    return sorted_token_ids, counts
+
+
+@triton.jit
+def _moe_side_tables_kernel(
+    sorted_token_ids_ptr,
+    w_ptr,
+    w_sorted_ptr,
+    inv_perm_ptr,
+    EM,
+    num_valid,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    """Build w_sorted and inv_perm with vector masked stores only.
+
+    w_sorted[pos] = topk_weights_flat[sorted_token_ids[pos]]   (valid rows)
+    inv_perm[sorted_token_ids[pos]] = pos                      (valid rows)
+    """
+    pid = tl.program_id(0)
+    BLOCK: tl.constexpr = 32
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for i in tl.range(tl.cdiv(row_len, BLOCK)):
+        row_start = pid * PER_CORE_ROWS + i * BLOCK
+        offs = row_start + tl.arange(0, BLOCK)
+        in_range = offs < EM
+        flat = tl.load(sorted_token_ids_ptr + offs, mask=in_range, other=-1)
+        valid = in_range & (flat >= 0) & (flat < num_valid)
+        flat_safe = tl.where(valid, flat, 0)
+        w = tl.load(w_ptr + flat_safe, mask=valid, other=0.0)
+        tl.store(w_sorted_ptr + offs, w, mask=valid)
+        tl.store(inv_perm_ptr + flat_safe, offs.to(tl.int32), mask=valid)
+
+
+@triton.jit
+def _moe_gather_a_kernel(
+    a_ptr,
+    w_ptr,
+    a_sorted_ptr,
+    sorted_token_ids_ptr,
+    stride_am,
+    stride_ak,
+    K,
+    top_k: tl.constexpr,
+    APPLY_WEIGHT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for i in tl.range(row_len):
+        row = pid * PER_CORE_ROWS + i
+        flat_id = tl.load(sorted_token_ids_ptr + row)
+        src_row = (flat_id // top_k).to(tl.int64)
+        val = tl.load(
+            a_ptr + src_row * stride_am + offs * stride_ak, mask=offs < K, other=0.0
+        )
+        if APPLY_WEIGHT:
+            w = tl.load(w_ptr + flat_id)
+            val = (val.to(tl.float32) * w.to(tl.float32)).to(val.dtype)
+        tl.store(a_sorted_ptr + row.to(tl.int64) * K + offs, val, mask=offs < K)
+
+
+@triton.jit
+def _moe_silu_mul_kernel(
+    x_ptr,
+    topk_scales_ptr,
+    out_ptr,
+    D,
+    D_PAD: tl.constexpr,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, D_PAD)
+    mask = offs < D
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for i in tl.range(row_len):
+        row = pid * PER_CORE_ROWS + i
+        base = x_ptr + row.to(tl.int64) * (2 * D)
+        gate = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(base + D + offs, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(topk_scales_ptr + row)
+        res = gate * tl.sigmoid(gate) * up * scale
+        tl.store(
+            out_ptr + row.to(tl.int64) * D + offs,
+            res.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+@triton.jit
+def _moe_unsort_sum_kernel(
+    c_ptr,
+    inv_perm_ptr,
+    out_ptr,
+    K,
+    top_k: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """out[m] = sum_j w[pos_j] * c_sorted[pos_j], pos_j = inv_perm[m*top_k+j]"""
+    pid = tl.program_id(0)
+    num_blocks_n = tl.cdiv(K, BLOCK_N)
+    token = pid // num_blocks_n
+    nb = pid % num_blocks_n
+    offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < K
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for j in tl.static_range(top_k):
+        pos = tl.load(inv_perm_ptr + token * top_k + j).to(tl.int64)
+        v = tl.load(c_ptr + pos * K + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        acc += v
+    tl.store(
+        out_ptr + token.to(tl.int64) * K + offs_n,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=n_mask,
+    )
+
+
+def _fused_experts_fast(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool,
+    activation_enum: "MoEActivation",
+    apply_router_weight_on_input: bool,
+    compute_type,
+) -> torch.Tensor:
+    """Unquantized fast path: gather-sort -> GEMM1 -> act -> GEMM2 -> unsort+sum."""
+    vector_core_num = torch_npu.npu.get_device_properties(
+        hidden_states.device.index
+    ).vector_core_num
+    num_tokens = hidden_states.size(0)
+    E, N, K1 = w1.size()
+    K2 = w2.size(1)
+    top_k_num = topk_ids.size(1)
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    CHUNK_SIZE: int = 16 * 1024
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (
+            chunk * CHUNK_SIZE,
+            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+        )
+        tokens_in_chunk = end_chunk_idx - begin_chunk_idx
+        if tokens_in_chunk == 0:
+            break
+
+        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+        num_valid = tokens_in_chunk * top_k_num
+
+        (
+            sorted_token_ids,
+            expert_ids,
+        ) = _moe_align_parallel(
+            curr_topk_ids,
+            E,
+        )
+        EM = sorted_token_ids.numel()
+        w_sorted = torch.empty(EM, device=device, dtype=topk_weights.dtype)
+        inv_perm = torch.empty(num_valid, device=device, dtype=torch.int32)
+        per_core_rows = (EM + vector_core_num - 1) // vector_core_num
+        need_core_num = (EM + per_core_rows - 1) // per_core_rows
+        last_core_rows = (
+            per_core_rows if EM % per_core_rows == 0 else EM % per_core_rows
+        )
+        _moe_side_tables_kernel[(need_core_num,)](
+            sorted_token_ids,
+            curr_topk_weights,
+            w_sorted,
+            inv_perm,
+            EM,
+            num_valid,
+            PER_CORE_ROWS=per_core_rows,
+            LAST_CORE_ROWS=last_core_rows,
+        )
+        a1_sorted = torch.empty(EM, K1, device=device, dtype=dtype)
+        _moe_gather_a_kernel[(need_core_num,)](
+            curr_hidden_states,
+            curr_topk_weights,
+            a1_sorted,
+            sorted_token_ids,
+            curr_hidden_states.stride(0),
+            curr_hidden_states.stride(1),
+            K1,
+            top_k=top_k_num,
+            APPLY_WEIGHT=apply_router_weight_on_input,
+            BLOCK_N=triton.next_power_of_2(K1),
+            PER_CORE_ROWS=per_core_rows,
+            LAST_CORE_ROWS=last_core_rows,
+        )
+        act_dim = MoEActivation.adjust_N_for_activation(N, activation_enum)
+        # GEMM1: (EM, K1) x w1 -> (EM, act_dim)
+        cache1 = grouped_matmul(
+            a1_sorted, w1, group_list=expert_ids, group_list_type=1, trans_weight=True
+        )
+        # apply activation and topk_scales
+        cache2 = torch.empty(EM, act_dim, device=device, dtype=dtype)
+        if activation_enum == MoEActivation.SILU:
+            _moe_silu_mul_kernel[(need_core_num,)](
+                cache1,
+                w_sorted,
+                cache2,
+                act_dim,
+                D_PAD=triton.next_power_of_2(act_dim),
+                PER_CORE_ROWS=per_core_rows,
+                LAST_CORE_ROWS=last_core_rows,
+            )
+        else:
+            apply_moe_activation(activation_enum, cache2, cache1)
+            mul_(cache2, w_sorted.unsqueeze(-1).to(dtype))
+        # GEMM2: (EM, act_dim) x w2 -> (EM, K2)
+        cache3 = grouped_matmul(
+            cache2, w2, group_list=expert_ids, group_list_type=1, trans_weight=True
+        )
+        # unsort + sum over topk
+        out_chunk = out_hidden_states[begin_chunk_idx:end_chunk_idx]
+        BLOCK_OUT = 1024
+        grid = (tokens_in_chunk * triton.cdiv(K2, BLOCK_OUT),)
+        _moe_unsort_sum_kernel[grid](
+            cache3,
+            inv_perm,
+            out_chunk,
+            K2,
+            top_k=top_k_num,
+            BLOCK_N=BLOCK_OUT,
+        )
+    return out_hidden_states
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1456,6 +1855,40 @@ def fused_experts_impl(
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
+    if hidden_states.dtype == torch.bfloat16:
+        compute_type = tl.bfloat16
+    elif hidden_states.dtype == torch.float16:
+        compute_type = tl.float16
+    elif hidden_states.dtype == torch.float32:
+        compute_type = tl.float32
+    else:
+        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+
+    # Fast path: unquantized, no EP map -> gather-sort + all-affine GEMMs.
+    # (gathering A rows through sorted_token_ids inside the GEMM kernel
+    # prevents triton-ascend from lowering tl.dot to the cube unit, so the
+    # legacy kernel path below is only kept for quantized/EP cases.)
+    no_quant = not (
+        use_fp8_w8a8
+        or use_int8_w8a8
+        or use_int8_w8a16
+        or use_int4_w4a16
+        or ocp_mx_scheme is not None
+        or block_shape is not None
+    )
+    if no_quant and expert_map is None and w1_bias is None and w2_bias is None:
+        return _fused_experts_fast(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            inplace,
+            activation_enum,
+            apply_router_weight_on_input,
+            compute_type,
+        )
+
     num_tokens = hidden_states.size(0)
     E, N, _ = w1.size()
     K = w2.size(1)
@@ -1507,15 +1940,6 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-
-    if hidden_states.dtype == torch.bfloat16:
-        compute_type = tl.bfloat16
-    elif hidden_states.dtype == torch.float16:
-        compute_type = tl.float16
-    elif hidden_states.dtype == torch.float32:
-        compute_type = tl.float32
-    else:
-        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
     out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
 
@@ -1600,13 +2024,19 @@ def fused_experts_impl(
             )
         )
 
+        # FIXME(ascend): the naive path makes fused_moe_kernel emit select-based
+        # offs_token/masks that crash triton-ascend's DiscreteMaskAccessConversion
+        # pass (MLIRCompilationError: PassManager::run failed). Force the
+        # moe_align_block_size path until the compiler issue is resolved.
+        naive_block_assignment = False
+
         if not naive_block_assignment:
             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
                 curr_topk_ids,
                 config["BLOCK_SIZE_M"],
                 global_num_experts,
                 expert_map,
-                # ignore_invalid_experts=True,
+                SUPPORT_ATOMIC_MASK=False,
             )
         else:
             max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
