@@ -414,6 +414,7 @@ def moe_align_block_size_stage1(
     numel_expert_ids: tl.constexpr,
     block_size_sorted: tl.constexpr,
     block_size_expert: tl.constexpr,
+    SUPPORT_ATOMIC_MASK: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -432,7 +433,10 @@ def moe_align_block_size_stage1(
     offsets = start_idx + tl.arange(0, tokens_per_thread)
     mask = offsets < numel
     expert_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
-    tl.atomic_add(tokens_cnts_ptr + off_c + expert_id, 1, mask=mask)
+    if not SUPPORT_ATOMIC_MASK:
+        tl.atomic_add(tokens_cnts_ptr + off_c + expert_id, mask.to(tl.int32))
+    else:
+        tl.atomic_add(tokens_cnts_ptr + off_c + expert_id, 1, mask=mask)
 
 
 @triton.jit
@@ -496,6 +500,7 @@ def moe_align_block_size_stage4(
     block_size: tl.constexpr,
     numel,
     tokens_per_thread: tl.constexpr,
+    SUPPORT_ATOMIC_MASK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     start_idx = tl.load(cumsum_ptr + pid)
@@ -510,9 +515,14 @@ def moe_align_block_size_stage4(
     offset = tl.arange(0, tokens_per_thread) + start_idx
     mask = offset < numel
     expert_id = tl.load(topk_ids_ptr + offset, mask=mask)
-    token_idx_in_expert = tl.atomic_add(
-        tokens_cnts_ptr + off_t + expert_id, 1, mask=mask
-    )
+    if not SUPPORT_ATOMIC_MASK:
+        token_idx_in_expert = tl.atomic_add(
+            tokens_cnts_ptr + off_t + expert_id, mask.to(tl.int32)
+        )
+    else:
+        token_idx_in_expert = tl.atomic_add(
+            tokens_cnts_ptr + off_t + expert_id, 1, mask=mask
+        )
     rank_post_pad = token_idx_in_expert + tl.load(cumsum_ptr + expert_id, mask=mask)
     tl.store(sorted_token_ids_ptr + rank_post_pad, offset, mask=mask)
 
@@ -525,6 +535,7 @@ def _moe_align_block_size_triton_4stage(
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
     workspace=None,
+    SUPPORT_ATOMIC_MASK: bool = True,
 ) -> None:
     """Non-TLE 4-stage pipeline.
 
@@ -566,6 +577,7 @@ def _moe_align_block_size_triton_4stage(
         numel_expert_ids,
         block_size_sorted,
         block_size_expert,
+        SUPPORT_ATOMIC_MASK=SUPPORT_ATOMIC_MASK,
     )
     if num_experts == num_experts_next_power_of_2:
         moe_align_block_size_stage2_vec[grid](tokens_cnts, num_experts)
@@ -589,6 +601,7 @@ def _moe_align_block_size_triton_4stage(
         block_size,
         numel,
         tokens_per_thread,
+        SUPPORT_ATOMIC_MASK=SUPPORT_ATOMIC_MASK,
     )
 
 
@@ -599,6 +612,7 @@ def moe_align_block_size_triton(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
+    SUPPORT_ATOMIC_MASK: bool = True,
 ) -> None:
     logger.debug("GEMS MOE ALIGN BLOCK SIZE")
     numel = topk_ids.numel()
@@ -694,6 +708,7 @@ def moe_align_block_size_triton(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_pad,
+        SUPPORT_ATOMIC_MASK=SUPPORT_ATOMIC_MASK,
     )
 
 
@@ -878,6 +893,7 @@ def moe_align_block_size(
     num_experts: int,
     expert_map: Optional[torch.Tensor] = None,
     pad_sorted_ids: bool = False,
+    SUPPORT_ATOMIC_MASK: bool = True,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
@@ -898,6 +914,7 @@ def moe_align_block_size(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
+        SUPPORT_ATOMIC_MASK=SUPPORT_ATOMIC_MASK,
     )
 
     if expert_map is not None:
