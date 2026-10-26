@@ -1259,7 +1259,6 @@ def load_from_kvcache(
         "seqlen_q_rounded",
         "seqlen_k_rounded",
         "total_q",
-        "k_page_stride",
     ]
 )
 def flash_varlen_fwd_kernel(

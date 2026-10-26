@@ -113,6 +113,43 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+def make_paged_kv_cache(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    layout: str,
+    device: str = device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Non-contiguous K/V caches: "interleaved" takes every other page, so the
+    # page stride is still a multiple of 16; "padded" separates pages by one
+    # element, so the page stride is odd.
+    shape = (num_blocks, block_size, num_kv_heads, head_size)
+    page_numel = block_size * num_kv_heads * head_size
+    if layout == "interleaved":
+        storage_shape = (num_blocks * 2, block_size, num_kv_heads, head_size)
+        key_storage = torch.randn(*storage_shape, dtype=dtype, device=device)
+        value_storage = torch.randn_like(key_storage)
+        key_cache = key_storage[::2][:num_blocks]
+        value_cache = value_storage[::2][:num_blocks]
+    elif layout == "padded":
+        storage_shape = (num_blocks, page_numel + 1)
+        key_storage = torch.randn(*storage_shape, dtype=dtype, device=device)
+        value_storage = torch.randn_like(key_storage)
+        key_cache = key_storage[:, :page_numel].view(shape)
+        value_cache = value_storage[:, :page_numel].view(shape)
+    else:
+        raise ValueError(f"unknown layout {layout}")
+
+    assert key_cache.shape == shape
+    assert value_cache.shape == shape
+    assert key_cache.stride() == value_cache.stride()
+    assert key_cache.stride(-1) == 1
+    assert key_cache.stride(0) != page_numel
+    return key_cache, value_cache
+
+
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
@@ -268,6 +305,95 @@ def test_flash_attn_varlen_func(
         )
 
         msg = f"{torch.max(torch.abs(output - ref_output))}"
+        torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2, msg=msg)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
+@pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("optimize_init", [False, True])
+@pytest.mark.parametrize("layout", ["interleaved", "padded"])
+@torch.inference_mode()
+def test_flash_attn_varlen_func_noncontiguous_kv_cache(
+    dtype: torch.dtype,
+    optimize_init: bool,
+    layout: str,
+) -> None:
+    with torch.device(flaggems_vllm.device):
+        utils.init_seed(1234567890)
+
+        seq_lens = [(1, 1328), (5, 18), (129, 463)]
+        query_lens = [x[0] for x in seq_lens]
+        kv_lens = [x[1] for x in seq_lens]
+        num_seqs = len(seq_lens)
+        num_query_heads = 8
+        num_kv_heads = 2
+        head_size = 128
+        block_size = 32
+        num_blocks = 2048
+        max_query_len = max(query_lens)
+        max_kv_len = max(kv_lens)
+        window_size = (-1, -1)
+        scale = head_size**-0.5
+
+        query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+        key_cache, value_cache = make_paged_kv_cache(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+        )
+        cu_query_lens = torch.tensor(
+            [0] + query_lens, dtype=torch.int32, device=device
+        ).cumsum(dim=0, dtype=torch.int32)
+        seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (num_seqs, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device=device,
+        )
+
+        op = (
+            flaggems_vllm.ops.flash_attn_varlen_opt_func
+            if optimize_init
+            else flaggems_vllm.ops.flash_attn_varlen_func
+        )
+        output = op(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            fa_version=2,
+        )
+
+        ref_output = ref_paged_attn(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=query_lens,
+            kv_lens=kv_lens,
+            block_tables=block_tables,
+            scale=scale,
+        )
+
+        max_diff = torch.max(torch.abs(output - ref_output))
+        msg = f"max_diff={max_diff}, k_stride={key_cache.stride()}"
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2, msg=msg)
 
 
