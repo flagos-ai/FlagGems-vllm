@@ -312,12 +312,17 @@ def test_flash_attn_varlen_func(
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("optimize_init", [False, True])
+# flash_attn_varlen_opt_func only supports fa_version=2.
+@pytest.mark.parametrize(
+    "optimize_init, fa_version",
+    [(False, 2), (True, 2)] + ([(False, 3)] if IS_HOPPER else []),
+)
 @pytest.mark.parametrize("layout", ["interleaved", "padded"])
 @torch.inference_mode()
 def test_flash_attn_varlen_func_noncontiguous_kv_cache(
     dtype: torch.dtype,
     optimize_init: bool,
+    fa_version: int,
     layout: str,
 ) -> None:
     with torch.device(flaggems_vllm.device):
@@ -366,7 +371,7 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
             if optimize_init
             else flaggems_vllm.ops.flash_attn_varlen_func
         )
-        output = op(
+        kwargs = dict(
             q=query,
             k=key_cache,
             v=value_cache,
@@ -379,8 +384,16 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
             window_size=window_size,
             block_table=block_tables,
             softcap=0,
-            fa_version=2,
+            fa_version=fa_version,
         )
+        if fa_version == 3 and layout == "padded":
+            # FA3 addresses paged K/V in whole token rows, so a page stride that
+            # is not a multiple of the token stride must be rejected.
+            with pytest.raises(NotImplementedError, match="page stride"):
+                op(**kwargs)
+            return
+
+        output = op(**kwargs)
 
         ref_output = ref_paged_attn(
             query=query,

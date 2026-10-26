@@ -207,7 +207,13 @@ def launch_attention(
     if is_paged:
         block_size = k.size(1)
         assert block_size >= 16 and block_size & (block_size - 1) == 0
-        assert k.stride(0) % k.stride(1) == 0
+        if k.stride(0) % k.stride(1) != 0:
+            # Paged K/V tiles are addressed in whole token rows (TMA descriptors
+            # and gather indices), which requires a row-aligned page stride.
+            raise NotImplementedError(
+                "TLE FA3 requires the paged KV page stride to be a multiple of "
+                "the token stride; use fa_version=2 for this cache layout"
+            )
         assert (
             block_table.ndim == 2
             and block_table.size(0) == batch_size
