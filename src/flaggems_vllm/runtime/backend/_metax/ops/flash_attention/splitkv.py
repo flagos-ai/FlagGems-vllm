@@ -711,7 +711,7 @@ def launch_d256_tn_splitkv(
         and packed_decode
         and max_seqlen_q == 8
         and params.block_size == 32
-        and 49 <= batch_size <= 64
+        and (3 <= batch_size <= 8 or 49 <= batch_size <= 64)
     ):
         raise ValueError("Unsupported packed-decode tile")
     block_k = 128
@@ -731,6 +731,7 @@ def launch_d256_tn_splitkv(
     )
     grid = (head_programs, batch_size, num_splits * q_tiles)
     adaptive_page16 = packed_decode and max_seqlen_q == 4 and params.block_size == 16
+    split_first = block_n == 64 and batch_size >= 49
     cfg = {
         "COMPACT_WORKLIST": False,
         "SKIP_SELECTED": skip_desc is not None,
@@ -740,7 +741,7 @@ def launch_d256_tn_splitkv(
         "SPLIT_KV": True,
         "NUM_SPLITS": num_splits,
         "Q_TILES": q_tiles,
-        "GRID_ORDER": 0 if block_n == 64 else 1,
+        "GRID_ORDER": 0 if split_first else 1,
         "REVERSE_Q_TILES": False,
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
@@ -781,7 +782,7 @@ def launch_d256_tn_splitkv(
         cfg["SPLIT_REGION"] = region
         cfg["BLOCK_M"] = 64 if region == 1 else block_m
         cfg["Q_TILES"] = triton.cdiv(max_seqlen_q * params.h_hk_ratio, cfg["BLOCK_M"])
-        if block_n == 64:
+        if split_first:
             # Adjacent CTAs process the same request's KV partitions. This
             # also avoids interleaving padded empty requests between splits.
             grid = (num_splits * cfg["Q_TILES"], batch_size, head_programs)
