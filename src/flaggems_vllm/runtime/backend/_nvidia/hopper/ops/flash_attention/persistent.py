@@ -1430,11 +1430,15 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         dtype=tl.float32,
                     )
                     if is_s_aux:
+                        # Without packed GQA query_head is a scalar; broadcast
+                        # the sink so both branches yield a [BM_SPLIT] LSE.
                         if SPLIT_KV:
                             if split_id == 0:
-                                lse = tl.load(s_aux_ptr + query_head).to(tl.float32)
+                                sink = tl.load(s_aux_ptr + query_head)
+                                lse = tl.full([BM_SPLIT], 0.0, tl.float32) + sink
                         else:
-                            lse = tl.load(s_aux_ptr + query_head).to(tl.float32)
+                            sink = tl.load(s_aux_ptr + query_head)
+                            lse = tl.full([BM_SPLIT], 0.0, tl.float32) + sink
 
             if SPLIT_KV:
                 partial_split_stride = h * total_q * d

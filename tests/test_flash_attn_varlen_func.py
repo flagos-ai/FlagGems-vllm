@@ -514,3 +514,80 @@ def test_flash_attn_varlen_func_swap_qg(
         torch.testing.assert_close(
             output, ref_output, atol=2e-2, rtol=1e-2
         ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not IS_HOPPER, reason="FA3 requires Hopper")
+# GQA ratio 1 and 5 are not packed, 4 is packed into one head group.
+@pytest.mark.parametrize("num_heads", [(4, 4), (10, 2), (8, 2)])
+@pytest.mark.parametrize("window_left", [-1, 0])
+@torch.inference_mode()
+def test_flash_attn_varlen_func_fa3_attention_sink(
+    num_heads: Tuple[int, int],
+    window_left: int,
+) -> None:
+    with torch.device(flaggems_vllm.device):
+        utils.init_seed(1234567890)
+
+        query_lens = [256, 64]
+        kv_lens = [2256, 2064]
+        num_query_heads, num_kv_heads = num_heads
+        head_size = 128
+        dtype = torch.bfloat16
+        scale = head_size**-0.5
+
+        query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+        key = torch.randn(sum(kv_lens), num_kv_heads, head_size, dtype=dtype)
+        value = torch.randn_like(key)
+        s_aux = torch.randn(num_query_heads, dtype=torch.bfloat16)
+        cu_query_lens = torch.tensor(
+            [0] + query_lens, dtype=torch.int32, device=device
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_kv_lens = torch.tensor(
+            [0] + kv_lens, dtype=torch.int32, device=device
+        ).cumsum(dim=0, dtype=torch.int32)
+
+        output, lse = flaggems_vllm.flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_query_lens,
+            cu_seqlens_k=cu_kv_lens,
+            max_seqlen_q=max(query_lens),
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=scale,
+            causal=True,
+            window_size=(window_left, -1),
+            s_aux=s_aux,
+            return_softmax_lse=True,
+            fa_version=3,
+        )
+
+        # The sink adds exp(s_aux) to every softmax denominator.
+        ref_outputs, ref_lses = [], []
+        q_start = k_start = 0
+        for query_len, kv_len in zip(query_lens, kv_lens):
+            q = query[q_start : q_start + query_len].float()
+            k = key[k_start : k_start + kv_len].float()
+            v = value[k_start : k_start + kv_len].float()
+            k = torch.repeat_interleave(k, num_query_heads // num_kv_heads, dim=1)
+            v = torch.repeat_interleave(v, num_query_heads // num_kv_heads, dim=1)
+            attn = torch.einsum("qhd,khd->hqk", q, k) * scale
+            q_pos = torch.arange(query_len)[:, None] + kv_len - query_len
+            k_pos = torch.arange(kv_len)[None, :]
+            mask = k_pos > q_pos
+            if window_left >= 0:
+                mask |= k_pos < q_pos - window_left
+            attn.masked_fill_(mask, float("-inf"))
+            sink = s_aux.float()[:, None, None].expand(-1, query_len, 1)
+            attn = torch.cat([attn, sink], dim=-1)
+            probs = torch.softmax(attn, dim=-1)[..., :-1]
+            ref_outputs.append(torch.einsum("hqk,khd->qhd", probs, v))
+            ref_lses.append(torch.logsumexp(attn, dim=-1))
+            q_start += query_len
+            k_start += kv_len
+
+        ref_output = torch.cat(ref_outputs).to(dtype)
+        ref_lse = torch.cat(ref_lses, dim=-1)
+        torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
