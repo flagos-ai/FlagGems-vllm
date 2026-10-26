@@ -34,7 +34,7 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
 from flaggems_vllm.ops.mhc.mhc_post import mhc_post
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
+from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
 
 from . import base
 
@@ -53,7 +53,7 @@ _NATIVE_MHC_POST = {
 }
 
 
-def _get_baseline_op():
+def _get_baseline_mhc_post_op():
     """Vendor-native mhc_post, or None when this vendor ships none."""
     entry = _NATIVE_MHC_POST.get(VENDOR)
     if entry is None:
@@ -66,6 +66,41 @@ def _get_baseline_op():
     if VENDOR == "ascend":
         # npu_mhc_post(residual, h_res, h_out, h_post): mix first, (N, 4) post.
         return lambda x, r, p, m: native(r, m, x, p.squeeze(-1))
+    return native
+
+
+_NATIVE_MHC_PRE = {
+    "nvidia": ("vllm._custom_ops", "mhc_pre"),
+    "hygon": ("aiter", "mhc_pre"),
+    "thead": ("vllm.model_executor.layers.mhc", "mhc_pre"),
+    "mthreads": ("mate", "mhc_pre"),
+    "iluvatar": ("ixformer.inference.functions.deepseek.mhc", "ds4_mhc_pre_v3"),
+}
+
+
+def _get_baseline_mhc_pre_op():
+    """Vendor-native mhc_pre, or None when this vendor ships none."""
+    entry = _NATIVE_MHC_PRE.get(VENDOR)
+    if entry is None:
+        return None
+    module_name, attr = entry
+    try:
+        native = getattr(importlib.import_module(module_name), attr)
+    except (ImportError, AttributeError):
+        return None
+    if module_name == "mate":
+        # mate's trailing parameters are keyword-only and named differently.
+        return lambda x, f, s, b, rms, pre, sink, mult, rep: native(
+            x,
+            f,
+            s,
+            b,
+            rms_eps=rms,
+            mhc_pre_eps=pre,
+            mhc_sinkhorn_eps=sink,
+            mhc_post_mult_value=mult,
+            sinkhorn_repeat=rep,
+        )
     return native
 
 
@@ -106,7 +141,7 @@ class MHCPostBenchmark(base.Benchmark):
 def test_mhc_post():
     bench = MHCPostBenchmark(
         op_name="mhc_post",
-        torch_op=_get_baseline_op(),
+        torch_op=_get_baseline_mhc_post_op(),
         gems_op=mhc_post,
         dtypes=[torch.bfloat16],
     )
@@ -178,7 +213,7 @@ class MHCPreBenchmark(base.Benchmark):
 def test_mhc_pre():
     bench = MHCPreBenchmark(
         op_name="mhc_pre",
-        torch_op=mhc_pre_ref,
+        torch_op=_get_baseline_mhc_pre_op(),
         gems_op=mhc_pre,
         dtypes=[torch.bfloat16],
     )

@@ -241,6 +241,8 @@ _DTYPE_TO_SF_KEY = {
 # factor (Tensor Core vs CUDA Core/vector).
 _BOTTLENECK_TO_SF = {"mem": "bandwidth_gbps", "tensor": "tensor", "cuda": "vector"}
 
+_VENDOR_ALIASES = {"thead": "t-head", "t-head": "thead"}
+
 
 def _first_tensor_shape(shape_detail):
     """Return the first tensor shape found in a record_shapes() result as a
@@ -529,7 +531,8 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
             return None
         if self_chip is None:
             self_chip = _SELF_CHIP
-        candidates = [c for c in sf.get("chips", []) if c.get("vendor") == vendor]
+        aliases = {vendor, _VENDOR_ALIASES.get(vendor, vendor)}
+        candidates = [c for c in sf.get("chips", []) if c.get("vendor") in aliases]
         if not candidates:
             return None
         # Prefer the candidate whose chip model matches this device; only when a
