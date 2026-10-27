@@ -3,7 +3,6 @@
 
 import importlib
 
-import flag_gems
 import torch
 import triton
 import triton.language as tl
@@ -14,9 +13,26 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
 )
 from flaggems_vllm.utils import libentry
 
-# Reuse the MM body so INT8 AIU lowering and scaling stay identical across APIs.
-scaled_mm_module = importlib.import_module(flag_gems.mm_w8a8_int8.__module__)
-scaled_mm_kernel = scaled_mm_module._mm_w8a8_aiu_kernel.fn
+
+def _load_scaled_mm():
+    import flag_gems
+
+    module = importlib.import_module(flag_gems.mm_w8a8_int8.__module__)
+    return module, module._mm_w8a8_aiu_kernel.fn
+
+
+# Lazy init: populated on first call to _ensure_loaded().
+_scaled_mm_module = None
+_scaled_mm_kernel = None
+
+
+def _ensure_loaded():
+    global _scaled_mm_module, _scaled_mm_kernel
+    if _scaled_mm_module is None:
+        _scaled_mm_module, _scaled_mm_kernel = _load_scaled_mm()
+    return _scaled_mm_module, _scaled_mm_kernel
+
+
 MAX_INT32_REDUCTION = (2**31 - 1) // (128 * 128)
 
 
@@ -39,7 +55,7 @@ def bmm_channel_int8_kernel(
     NUM_WARPS: tl.constexpr,
 ):
     batch = tl.program_id(1).to(tl.int64)
-    scaled_mm_kernel(
+    _scaled_mm_kernel(
         activation + batch * M * K,
         weight + batch * N * K,
         activation_scale + batch * M,
@@ -78,6 +94,7 @@ def bmm_w8a8_int8(
     Contiguous FP32 scales have shapes [B,M] / [B,N], optionally [B,M,1]
     / [B,1,N]. Inputs are prequantized; batch broadcasting is unsupported.
     """
+    scaled_mm_module, _ = _ensure_loaded()
     if activation.ndim != 3 or weight.ndim != 3:
         raise ValueError("expected activation[B,M,K] and weight[B,K,N]")
     batch, rows, reduction = activation.shape

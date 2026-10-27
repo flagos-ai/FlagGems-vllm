@@ -26,7 +26,6 @@ from __future__ import annotations
 import logging
 import weakref
 
-import flag_gems
 import torch
 import triton
 import triton.language as tl
@@ -660,6 +659,8 @@ def mhc_pre(
     hc_hidden_size = hc_mult * hidden_size
 
     assert fn.shape == (hc_mult3, hc_hidden_size)
+
+    import flag_gems
 
     bmm_out = getattr(flag_gems, "bmm_out", None)
     if not callable(bmm_out):
