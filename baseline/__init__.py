@@ -58,4 +58,3 @@ Note: build_inputs is called once in the collector's main process and once in
 the NCU subprocess (which re-imports this module by OP_NAME to rebuild inputs),
 so it must be a side-effect-free, repeatably callable pure constructor.
 """
-
