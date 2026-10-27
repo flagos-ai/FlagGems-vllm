@@ -164,8 +164,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             ssm_state_indices,
             use_qk_l2norm_in_kernel,
         )
-    if device.vendor_name == "nvidia":
-        return _packed_decode_nvidia(
+    if device.vendor_name in ("nvidia", "hygon", "thead"):
+        return _packed_decode_gpu(
             mixed_qkv,
             a,
             b,
@@ -326,7 +326,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     return out, initial_state
 
 
-def _packed_decode_nvidia(
+def _packed_decode_gpu(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,

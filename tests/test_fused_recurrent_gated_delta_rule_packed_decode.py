@@ -229,10 +229,11 @@ def test_parallel_multistep_state_updated_once(entry, dtype, shape):
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia", reason="NVIDIA metadata fast path"
+    flaggems_vllm.vendor_name not in ("nvidia", "hygon", "thead"),
+    reason="GPU metadata fast path",
 )
 @pytest.mark.parametrize("entry", ["generic", "top"])
-def test_nvidia_metadata_revalidated(entry):
+def test_gpu_metadata_revalidated(entry):
     # Warm calls must revalidate metadata, rather than cache tensor identity.
     data = _make_inputs(
         (3, 2, 4, 17, 23), torch.float32, torch.float32, flaggems_vllm.device, True
