@@ -19,12 +19,6 @@ OP = "fused_recurrent_gated_delta_rule_packed_decode"
 
 
 class PackedDecodeBenchmark(base.Benchmark):
-    DEFAULT_SHAPES = [(b, 8, 16, 128, 128) for b in (1, 4, 16, 64, 256)] + [
-        (9, 4, 12, 64, 32),
-        (3, 2, 4, 17, 23),
-        (1, 16, 64, 128, 128),
-    ]
-    DEFAULT_SHAPE_DESC = "B, H, HV, K, V"
     DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
     DEFAULT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
