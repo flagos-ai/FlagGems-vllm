@@ -28,11 +28,6 @@ class PackedDecodeBenchmark(base.Benchmark):
         self.repetitions = repetitions
         self._latencies = None
         self.native_reason = None
-        if flaggems_vllm.vendor_name != "nvidia":
-            self.DEFAULT_METRICS = ["latency"]
-            self.native_reason = (
-                "No validated equivalent same-device native packed interface"
-            )
         super().__init__(
             op_name=OP,
             torch_op=None,
@@ -43,17 +38,23 @@ class PackedDecodeBenchmark(base.Benchmark):
         )
 
     def init_user_config(self):
-        super().init_user_config()
         if Config.mode != consts.BenchMode.KERNEL:
             raise ValueError(
                 "Packed decode uses --mode kernel with no-Graph device events."
             )
-        if flaggems_vllm.vendor_name == "nvidia":
+        try:
             from vllm.model_executor.layers.fla.ops.fused_recurrent import (
                 fused_recurrent_gated_delta_rule_packed_decode as native,
             )
-
+        except ImportError as exc:
+            self.torch_op = None
+            self.native_reason = f"Native import unavailable: {exc}"
+            self.metrics = ["latency"]
+        else:
             self.torch_op = native
+            self.native_reason = None
+            self.metrics = self.DEFAULT_METRICS
+        super().init_user_config()
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
