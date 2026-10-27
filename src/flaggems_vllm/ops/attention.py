@@ -1376,6 +1376,8 @@ def flash_attn_varlen_func(
     if is_metax:
         if fa_version != 2:
             raise NotImplementedError("MetaX varlen attention supports fa_version=2")
+        if q.dtype == torch.float32 and any(x.requires_grad for x in (q, k, v)):
+            raise NotImplementedError("MetaX fp32 attention is forward-only")
         if dropout_p != 0:
             raise NotImplementedError("MetaX varlen attention supports dropout_p=0")
         if return_attn_probs:

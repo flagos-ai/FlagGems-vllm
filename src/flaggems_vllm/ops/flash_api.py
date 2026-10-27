@@ -291,10 +291,61 @@ def mha_varlan_fwd(
     CHECK_DEVICE(q), CHECK_DEVICE(k), CHECK_DEVICE(v)
     q_device = q.device
     q_dtype = q.dtype
-    assert q_dtype in (
+    is_metax_fp32 = is_metax and q_dtype == torch.float32
+    assert is_metax_fp32 or q_dtype in (
         torch.float16,
         torch.bfloat16,
-    ), "FlashAttention only support fp16 and bf16 data type"
+    ), "FlashAttention requires fp16/bf16, or fp32 on MetaX"
+    if is_metax_fp32:
+        # Extend the existing MetaX direct kernel for packed encoder inference.
+        # Other FlashAttention features retain their existing half-precision paths.
+        if (
+            page_table is not None
+            or seqused_k is not None
+            or alibi_slopes is not None
+            or is_causal
+            or window_size_left != -1
+            or window_size_right != -1
+            or softcap != 0
+            or num_splits != 0
+        ):
+            raise NotImplementedError(
+                "MetaX fp32 attention supports non-paged, non-causal full attention "
+                "without ALiBi, softcap, seqused_k or split-KV"
+            )
+        if any(x.requires_grad for x in (q, k, v)):
+            raise NotImplementedError("MetaX fp32 attention is forward-only")
+        if any(x.ndim != 3 for x in (q, k, v)):
+            raise ValueError("MetaX fp32 Q/K/V must have shape [tokens, heads, dim]")
+        if q.shape[-1] not in (16, 32, 64, 128, 256):
+            raise NotImplementedError(
+                "MetaX fp32 head dimension must be 16/32/64/128/256"
+            )
+        if k.shape[-1] != q.shape[-1] or k.shape != v.shape:
+            raise ValueError("MetaX fp32 Q/K/V have incompatible dimensions")
+        if q.shape[1] <= 0 or k.shape[1] <= 0 or q.shape[1] % k.shape[1]:
+            raise ValueError("KV heads must divide the positive number of query heads")
+        if out is not None:
+            # Non-overlapping token-major output strides; input layouts may differ.
+            if (
+                out.ndim != 3
+                or out.device != q.device
+                or out.shape != q.shape
+                or out.stride(-1) != 1
+                or out.stride(1) < out.shape[2]
+                or out.stride(0) < out.shape[1] * out.stride(1)
+            ):
+                raise ValueError(
+                    "MetaX fp32 out must be a non-overlapping token-major tensor"
+                )
+            if (
+                any(
+                    out.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+                    for x in (q, k, v)
+                )
+                and out.numel()
+            ):
+                raise ValueError("MetaX fp32 out must not alias Q/K/V")
     assert q_dtype == k.dtype
     assert q_dtype == v.dtype
     assert q.stride(-1) == 1, "Input tensor must have contiguous last dimension"
@@ -363,7 +414,8 @@ def mha_varlan_fwd(
 
     # Optimize all single-query sequences by swapping the query-group and sequence dimensions
     seqlenq_ngroups_swapped = (
-        max_seqlen_q == 1
+        not is_metax_fp32
+        and max_seqlen_q == 1
         and (not is_metax or total_q == batch_size)
         and alibi_slopes is None
         and num_heads > num_heads_k
