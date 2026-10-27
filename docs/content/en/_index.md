@@ -16,7 +16,7 @@ FlagGems-vllm focuses on operators that accelerate large language model (LLM) in
 - **RoPE and normalization fusions**: `fused_add_rms_norm`, `fused_inv_rope_fp8_quant`, `apply_rotary_pos_emb`
 - **Model-specific kernels**: Qwen4, DeepSeek-v4, RWKV operators
 
-FlagGems-vllm is supported by the OpenAI Triton compiler (for NVIDIA and AMD) and [FlagTree compiler](https://github.com/flagos-ai/flagtree/) for different AI hardware platforms (18 backend vendors supported).
+FlagGems-vllm is supported by the OpenAI Triton compiler (for NVIDIA and AMD) and [FlagTree compiler](https://github.com/flagos-ai/flagtree/) for different AI hardware platforms (17 backend vendors supported).
 
 ## Relationship with FlagGems and vllm-plugin-fl
 
@@ -30,20 +30,20 @@ The three repositories work together in the FlagOS ecosystem:
 
 ## Supported Operators
 
-FlagGems-vllm provides **102 operators** optimized for vLLM inference, including:
+FlagGems-vllm provides **105 operators** (with 157 exported ops) optimized for vLLM inference, including:
 
 - MoE routing and computation
 - Flash Attention variants (standard, variable-length, MLA)
 - Quantization (FP8, FP4, INT8)
 - Fused normalization + RoPE
 - Activation functions (GELU, SwiGLU, GeGLU)
-- Model-specific operators (Qwen4, DeepSeek-v4, RWKV)
+- Model-specific operators (Qwen4, DeepSeek-v4, RWKV, M3)
 
 See the [operator reference](/FlagGems-vllm/references/operators/) for the complete list.
 
 ## Supported Backends
 
-FlagGems-vllm supports **18 hardware backends**:
+FlagGems-vllm supports **17 hardware backends**:
 
 - NVIDIA (default, with Ampere/Hopper architecture-specific tuning)
 - AMD

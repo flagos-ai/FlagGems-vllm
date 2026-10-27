@@ -53,7 +53,7 @@ See [backend development guide](backend/).
 
 Steps:
 1. Create `src/flaggems_vllm/runtime/backend/_<vendor>/`
-2. Add device detection in `runtime/device_finder.py`
+2. Register vendor in `runtime/common.py` and configure detection in `runtime/backend/device_finder.py`
 3. Test core operators on target hardware
 4. Add CI configuration (if possible)
 

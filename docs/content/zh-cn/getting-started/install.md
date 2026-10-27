@@ -210,7 +210,7 @@ pip install -e '.[test]'
 
 ## 下一步
 
-- [基础用法](/FlagGems-vllm/usage/basic/)
-- [与 vllm-plugin-fl 集成](/FlagGems-vllm/usage/vllm-plugin/)
-- [运行测试](/FlagGems-vllm/testing/unittest/)
-- [运行基准测试](/FlagGems-vllm/performance/benchmark/)
+- [基础用法](/FlagGems-vllm/zh-cn/usage/basic/)
+- [与 vllm-plugin-fl 集成](/FlagGems-vllm/zh-cn/usage/vllm-plugin/)
+- [运行测试](/FlagGems-vllm/zh-cn/testing/unittest/)
+- [运行基准测试](/FlagGems-vllm/zh-cn/performance/benchmark/)

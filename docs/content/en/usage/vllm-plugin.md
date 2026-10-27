@@ -157,6 +157,6 @@ If performance is slower than expected:
 
 ## Next Steps
 
-- [Selective operator enablement](../selective/)
-- [Non-NVIDIA backend configuration](../non-nvidia/)
+- [Selective operator enablement](/FlagGems-vllm/usage/selective/)
+- [Non-NVIDIA backend configuration](/FlagGems-vllm/usage/non-nvidia/)
 - [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)

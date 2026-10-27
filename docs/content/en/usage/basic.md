@@ -48,10 +48,13 @@ output = flaggems_vllm.fused_add_rms_norm(hidden, residual, weight, eps=1e-6)
 
 ## Operator Discovery
 
-List all available operators:
+List all available operators (requires `enable()` to be called first to populate the registrar):
 
 ```python
 import flaggems_vllm
+
+# Enable operators to inspect registered ops
+flaggems_vllm.enable()
 
 # Get all registered operator names
 ops = flaggems_vllm.all_registered_ops()

@@ -46,23 +46,17 @@ mkdir src/flaggems_vllm/runtime/backend/_myvendor
 touch src/flaggems_vllm/runtime/backend/_myvendor/__init__.py
 ```
 
-### Step 2: Add Device Detection
+### Step 2: Register Vendor and Add Device Detection
 
-Edit `src/flaggems_vllm/runtime/device_finder.py`:
+1. Register vendor information in `src/flaggems_vllm/runtime/common.py`:
+   - Add `VendorInfo` (vendor name, device name, dispatch key, features like bf16/fp64 support)
+   - Add entry to `_VENDOR_TORCH_ATTR` or shell check scripts in `tools/`
+
+2. If needed, customize detection in `src/flaggems_vllm/runtime/backend/device_finder.py`:
 
 ```python
-def detect_vendor():
-    # Existing detection logic...
-
-    # Add your backend
-    try:
-        import myvendor_torch  # Vendor's PyTorch extension
-        if myvendor_torch.is_available():
-            return "myvendor"
-    except ImportError:
-        pass
-
-    return "nvidia"  # default
+# DeviceDetector detects vendor from environment variable DNN_VENDOR,
+# vendor check scripts, or PyTorch device modules.
 ```
 
 ### Step 3: Implement Backend Module

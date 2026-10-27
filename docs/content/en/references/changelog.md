@@ -13,8 +13,8 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 
 ### Features
 
-- **102 operators** optimized for vLLM inference scenarios
-- **18 backend vendors** supported (NVIDIA, AMD, Ascend, Hygon, Iluvatar, and more)
+- **105 operators** (157 exported ops) optimized for vLLM inference scenarios
+- **17 backend vendors** supported (NVIDIA, AMD, Ascend, Hygon, Iluvatar, and more)
 - **MoE operators**: `moe_align_block_size`, `grouped_topk`, `fused_experts_impl`, `moe_sum`
 - **Flash Attention**: `flash_attention_forward`, `flash_attn_varlen_func`, `flash_mla`, `triton_unified_attention`
 - **Quantization**: FP8, INT8, FP4 operators for activation and weight quantization

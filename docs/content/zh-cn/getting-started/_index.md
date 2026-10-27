@@ -43,5 +43,5 @@ print("✓ moe_align_block_size 工作正常!")
 ## 下一步
 
 - [安装详情](install/)
-- [基础用法](/FlagGems-vllm/usage/basic/)
-- [与 vllm-plugin-fl 集成](/FlagGems-vllm/usage/vllm-plugin/)
+- [基础用法](/FlagGems-vllm/zh-cn/usage/basic/)
+- [与 vllm-plugin-fl 集成](/FlagGems-vllm/zh-cn/usage/vllm-plugin/)

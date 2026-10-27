@@ -42,7 +42,8 @@ import flaggems_vllm
 # Direct call
 result = flaggems_vllm.moe_align_block_size(topk_ids, block_size, num_experts)
 
-# Check availability
+# Enable operators to inspect registered ops
+flaggems_vllm.enable()
 ops = flaggems_vllm.all_registered_ops()
 print(f"Available: {len(ops)} operators")
 ```

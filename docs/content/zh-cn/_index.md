@@ -14,9 +14,9 @@ FlagGems-vllm 专注于加速大语言模型(LLM)在 vLLM 中的推理，包括:
 - **融合注意力算子**: `flash_attention_forward`、`flash_attn_varlen_func`、`triton_unified_attention`
 - **量化算子**: `per_token_group_quant_fp8`、`scaled_int8_quant`、`fp8_fp4_mqa_logits`
 - **RoPE 和归一化融合**: `fused_add_rms_norm`、`fused_inv_rope_fp8_quant`、`apply_rotary_pos_emb`
-- **模型专用算子**: Qwen4、DeepSeek-v4、RWKV 算子
+- **模型专用算子**: Qwen4、DeepSeek-v4、RWKV、M3 算子
 
-FlagGems-vllm 支持 OpenAI Triton 编译器(NVIDIA 和 AMD)以及 [FlagTree 编译器](https://github.com/flagos-ai/flagtree/)(支持 18 个硬件后端)。
+FlagGems-vllm 支持 OpenAI Triton 编译器(NVIDIA 和 AMD)以及 [FlagTree 编译器](https://github.com/flagos-ai/flagtree/)(支持 17 个硬件后端)。
 
 ## 与 FlagGems 和 vllm-plugin-fl 的关系
 
@@ -30,20 +30,20 @@ FlagGems-vllm 支持 OpenAI Triton 编译器(NVIDIA 和 AMD)以及 [FlagTree 编
 
 ## 支持的算子
 
-FlagGems-vllm 提供 **102 个算子**,针对 vLLM 推理场景优化,包括:
+FlagGems-vllm 提供 **105 个算子**（157 个导出项）,针对 vLLM 推理场景优化,包括:
 
 - MoE 路由和计算
 - Flash Attention 变体(标准、变长、MLA)
 - 量化(FP8、FP4、INT8)
 - 融合归一化 + RoPE
 - 激活函数(GELU、SwiGLU、GeGLU)
-- 模型专用算子(Qwen4、DeepSeek-v4、RWKV)
+- 模型专用算子(Qwen4、DeepSeek-v4、RWKV、M3)
 
-查看[算子参考](/FlagGems-vllm/references/operators/)获取完整列表。
+查看[算子参考](/FlagGems-vllm/zh-cn/references/operators/)获取完整列表。
 
 ## 支持的硬件后端
 
-FlagGems-vllm 支持 **18 个硬件后端**:
+FlagGems-vllm 支持 **17 个硬件后端**:
 
 - NVIDIA(默认,针对 Ampere/Hopper 架构优化)
 - AMD
@@ -53,19 +53,20 @@ FlagGems-vllm 支持 **18 个硬件后端**:
 - 海光
 - 天数智芯
 - 昆仑芯(百度)
-- 墨芯
+- 沐曦
 - 摩尔线程
-- 等等...
+- AIPU、ARM、壁仞、进芯、日升、平头哥、青藤微
 
 根据检测到的硬件自动选择后端,也可以通过 `DNN_VENDOR` 环境变量控制。
 
 ## 快速开始
 
-- [安装指南](/FlagGems-vllm/getting-started/)
-- [基础用法](/FlagGems-vllm/usage/basic/)
-- [算子列表](/FlagGems-vllm/references/operators/)
-- [性能基准](/FlagGems-vllm/performance/)
-- [贡献指南](/FlagGems-vllm/contribution/)
+- [安装指南](/FlagGems-vllm/zh-cn/getting-started/)
+- [基础用法](/FlagGems-vllm/zh-cn/usage/basic/)
+- [算子列表](/FlagGems-vllm/zh-cn/references/operators/)
+- [M3 算子支持](/FlagGems-vllm/zh-cn/references/m3-support/)
+- [性能基准](/FlagGems-vllm/zh-cn/performance/)
+- [贡献指南](/FlagGems-vllm/zh-cn/contribution/)
 
 ## 快速示例
 
