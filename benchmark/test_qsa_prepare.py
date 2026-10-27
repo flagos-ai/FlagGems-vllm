@@ -14,14 +14,15 @@
 
 """Performance of the QSA fused prepare operator.
 
-The baseline is the upstream vLLM operator, driven with identical inputs.
+The baseline is the upstream vLLM operator, driven with identical inputs.  It
+only exists in the NVIDIA build today; elsewhere the benchmark still runs and
+reports the frozen-baseline ratio instead of a local speedup.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import qsa_prepare as vllm_qsa_prepare
 
 import flaggems_vllm
 from flaggems_vllm import qsa_prepare
@@ -33,6 +34,24 @@ from tests.test_qsa_prepare import (
 )
 
 from . import base
+
+VENDOR = flaggems_vllm.vendor_name
+# Only the NVIDIA build ships an upstream qwen4_exp implementation today.
+VLLM_NATIVE_VENDORS = {"nvidia"}
+
+if VENDOR in VLLM_NATIVE_VENDORS:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
+        qsa_prepare as _vllm_native_qsa_prepare,
+    )
+
+
+def _get_baseline_op():
+    """Return the vendor-native implementation, or None when there is none."""
+
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        return _vllm_native_qsa_prepare
+    return None
+
 
 # Each entry is a batch scenario, not a tensor size: _input_fn expands one entry
 # into about two dozen operands whose shapes are unrelated to each other, from
@@ -98,8 +117,26 @@ class QsaPrepareBenchmark(base.GenericBenchmark):
         self.shapes = list(SHAPES)
         self.shape_desc = "seq_lens / query_lens / history_lens"
 
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            # No vendor-native kernel on this platform: timing it would raise,
+            # and a gems-vs-gems ratio says nothing. compared_speedup is still
+            # produced from the frozen baseline outside this metric list.
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in ("latency_base", "speedup")
+            ]
+
     def record_shapes(self, *args, **kwargs):
-        """Report the batch layout rather than every operand."""
+        """Report the batch layout rather than every operand.
+
+        The tensor shapes stay as torch.Size on purpose: the frozen-baseline
+        lookup matches on the multiset of shapes found here, and the seven
+        T=16384 layouts share their first two tensors, so state_cache (it carries
+        num_requests) and main_kv_cache are what make every entry unique.
+        """
 
         query = args[0]
         state_cache = args[8]
@@ -107,8 +144,10 @@ class QsaPrepareBenchmark(base.GenericBenchmark):
         reported = {
             "requests": int(state_cache.shape[0]),
             "tokens": int(query.shape[0]),
-            "query": list(query.shape),
-            "main_qkv": list(kwargs["main_qkv"].shape),
+            "query": query.shape,
+            "state_cache": state_cache.shape,
+            "main_qkv": kwargs["main_qkv"].shape,
+            "main_kv_cache": kv_cache.shape,
         }
         if int(state_cache.shape[1]) != 4:
             reported["state_size"] = int(state_cache.shape[1])
@@ -147,7 +186,7 @@ def test_qsa_prepare():
     bench = QsaPrepareBenchmark(
         input_fn=_input_fn,
         op_name="qsa_prepare",
-        torch_op=vllm_qsa_prepare,
+        torch_op=_get_baseline_op(),
         gems_op=qsa_prepare,
         dtypes=[torch.bfloat16],
     )
