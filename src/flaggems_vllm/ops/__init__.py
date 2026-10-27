@@ -218,7 +218,12 @@ from flaggems_vllm.ops.vit_attention import (
     vit_flash_attn_wrapper,
 )
 
+from .fused_recurrent_gated_delta_rule_packed_decode import (
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
+
 __all__ = [
+    "fused_recurrent_gated_delta_rule_packed_decode",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",

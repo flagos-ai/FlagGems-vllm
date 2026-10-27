@@ -13,6 +13,14 @@
 # limitations under the License.
 
 ops:
+  - id: fused_recurrent_gated_delta_rule_packed_decode
+    description: vLLM 0.24.0 packed single-token gated delta rule decode.
+    for:
+      - fused_recurrent_gated_delta_rule_packed_decode
+    labels:
+      - fused
+    kind:
+      - FLA
   - id: act_quant_triton
     description: This is a fused operator.
     for:
