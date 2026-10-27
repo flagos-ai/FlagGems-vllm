@@ -153,3 +153,23 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: true
       STAGGER_KV: false
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+      - 8
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+    stages:
+      - 1
