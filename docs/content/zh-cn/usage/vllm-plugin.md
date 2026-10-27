@@ -20,8 +20,8 @@ vllm-plugin-fl (插件层)
     └─→ flaggems_vllm.<op>()      (vLLM 专用融合内核)
 ```
 
-- **FlagGems**：提供通用的 PyTorch 基础算子替换，注册到 PyTorch dispatch。
-- **FlagGems-vllm**：提供针对 vLLM 场景特化的融合算子，由插件层显式导入调用。
+- **FlagGems**：提供通用的 PyTorch 基础算子替换，注册到 PyTorch dispatch。同时作为 FlagGems-vllm 的核心底层依赖，支撑其部分特化内核的内部算子调用。
+- **FlagGems-vllm**：依赖 FlagGems，提供针对 vLLM 场景特化的融合算子，由插件层显式导入调用。
 - **vllm-plugin-fl**：统筹调度两层算子，将它们挂接到 vLLM 对应的模型执行路径。
 
 ## 安装步骤
@@ -127,6 +127,6 @@ pip show vllm-plugin-fl
 
 ## 下一步
 
-- [选择性启用算子](/FlagGems-vllm/zh-cn/usage/selective/)
-- [非 NVIDIA 后端配置](/FlagGems-vllm/zh-cn/usage/non-nvidia/)
-- [运行性能基准评测](/FlagGems-vllm/zh-cn/performance/benchmark/)
+- [选择性启用算子](selective.md)
+- [非 NVIDIA 后端配置](non-nvidia.md)
+- [运行性能基准评测](../performance/benchmark.md)

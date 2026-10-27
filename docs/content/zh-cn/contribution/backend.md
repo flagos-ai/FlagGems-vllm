@@ -102,6 +102,6 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
 
 ## 下一步
 
-- [贡献指南概述](/FlagGems-vllm/zh-cn/contribution/overview/)
-- [算子开发协议](/FlagGems-vllm/zh-cn/contribution/workflow/)
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
+- [贡献指南概述](overview.md)
+- [算子开发协议](workflow.md)
+- [单元测试指南](../testing/unittest.md)

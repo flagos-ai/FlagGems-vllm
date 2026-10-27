@@ -121,7 +121,7 @@ vllm-plugin-fl leverages both FlagGems and FlagGems-vllm for performance:
 - **General ops** (matmul, layernorm, softmax): Handled by FlagGems
 - **vLLM-specific fusions**: Handled by FlagGems-vllm (grouped_topk, moe_align_block_size, flash_attention_forward, etc.)
 
-Expected speedups vary by model and hardware. See [performance benchmarks](/FlagGems-vllm/performance/) for details.
+Expected speedups vary by model and hardware. See [performance benchmarks](../performance/_index.md) for details.
 
 ## Troubleshooting
 
@@ -157,6 +157,6 @@ If performance is slower than expected:
 
 ## Next Steps
 
-- [Selective operator enablement](/FlagGems-vllm/usage/selective/)
-- [Non-NVIDIA backend configuration](/FlagGems-vllm/usage/non-nvidia/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Selective operator enablement](selective.md)
+- [Non-NVIDIA backend configuration](non-nvidia.md)
+- [Performance benchmarking](../performance/benchmark.md)

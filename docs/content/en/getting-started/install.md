@@ -15,6 +15,17 @@ Install build tools before installing FlagGems-vllm:
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 ```
 
+### FlagGems Dependency
+
+**FlagGems-vllm depends on FlagGems**. Several FlagGems-vllm operators invoke general FlagGems operators internally. Install FlagGems before installing FlagGems-vllm:
+
+```bash
+git clone https://github.com/flagos-ai/FlagGems.git
+cd FlagGems
+pip install --no-build-isolation -e .
+cd ..
+```
+
 ### PyTorch
 
 Install a PyTorch build compatible with your target accelerator **before** installing FlagGems-vllm. FlagGems-vllm does not reinstall PyTorch automatically.
@@ -210,7 +221,7 @@ pip install -e '.[test]'
 
 ## Next Steps
 
-- [Basic usage patterns](/FlagGems-vllm/usage/basic/)
-- [Integration with vllm-plugin-fl](/FlagGems-vllm/usage/vllm-plugin/)
-- [Running tests](/FlagGems-vllm/testing/unittest/)
-- [Running benchmarks](/FlagGems-vllm/performance/benchmark/)
+- [Basic usage patterns](../usage/basic.md)
+- [Integration with vllm-plugin-fl](../usage/vllm-plugin.md)
+- [Running tests](../testing/unittest.md)
+- [Running benchmarks](../performance/benchmark.md)

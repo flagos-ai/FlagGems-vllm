@@ -145,7 +145,7 @@ Mandatory operator development protocol with hard gates (G0–G7):
 
 ## Next Steps
 
-- [Operator development protocol](/FlagGems-vllm/contribution/workflow/)
-- [Contributing guide](/FlagGems-vllm/contribution/overview/)
-- [M3 Operator Support](/FlagGems-vllm/references/m3-support/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Operator development protocol](../contribution/workflow.md)
+- [Contributing guide](../contribution/overview.md)
+- [M3 Operator Support](m3-support.md)
+- [Testing guide](../testing/unittest.md)

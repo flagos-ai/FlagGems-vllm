@@ -291,6 +291,6 @@ The protocol is written in Chinese but is the authoritative source for all opera
 ## Next Steps
 
 - [Read workflow.md](https://github.com/flagos-ai/FlagGems-vllm/blob/main/workflow.md)
-- [Contribution overview](overview/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Benchmark guide](/FlagGems-vllm/performance/benchmark/)
+- [Contribution overview](overview.md)
+- [Testing guide](../testing/unittest.md)
+- [Benchmark guide](../performance/benchmark.md)

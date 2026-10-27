@@ -70,6 +70,6 @@ export FLAG_GEMS_W8A8_QUANT_FUSION=quant
 
 ## 相关链接
 
-- [算子列表](/FlagGems-vllm/zh-cn/references/operators/)
-- [项目结构](/FlagGems-vllm/zh-cn/references/project-structure/)
-- [基准测试结果](/FlagGems-vllm/zh-cn/performance/results/)
+- [算子列表](operators.md)
+- [项目结构](project-structure.md)
+- [基准测试结果](../performance/results.md)

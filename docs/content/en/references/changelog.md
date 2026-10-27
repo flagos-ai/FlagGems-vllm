@@ -43,7 +43,7 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 
 ### Known Issues
 
-- Some operators are in alpha/beta stage (see [operator list](/FlagGems-vllm/references/operators/))
+- Some operators are in alpha/beta stage (see [operator list](operators.md))
 - Non-NVIDIA backends have less mature autotune configs
 - C++ extension build requires manual `USE_C_EXTENSION=1` flag
 
@@ -59,7 +59,7 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 
 ## Contributing
 
-See the [contribution guide](/FlagGems-vllm/contribution/) for how to contribute to FlagGems-vllm.
+See the [contribution guide](../contribution/_index.md) for how to contribute to FlagGems-vllm.
 
 ## Version Scheme
 

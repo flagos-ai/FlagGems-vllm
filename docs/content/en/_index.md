@@ -22,11 +22,11 @@ FlagGems-vllm is supported by the OpenAI Triton compiler (for NVIDIA and AMD) an
 
 The three repositories work together in the FlagOS ecosystem:
 
-- **[FlagGems](https://github.com/flagos-ai/FlagGems)**: General-purpose operator library providing PyTorch operator replacements via `flag_gems.enable()` and `flag_gems.use_gems()`
-- **FlagGems-vllm** (this project): vLLM-specific fused kernels exposed through the `flaggems_vllm` package
-- **[vllm-plugin-fl](https://github.com/flagos-ai/vllm-plugin-fl)**: vLLM plugin layer that calls `flag_gems.enable()` for general ops and imports `flaggems_vllm.<operator>()` for vLLM fused kernels
+- **[FlagGems](https://github.com/flagos-ai/FlagGems)**: General-purpose operator library providing PyTorch operator replacements via `flag_gems.enable()` and `flag_gems.use_gems()`. **FlagGems-vllm depends on FlagGems, and several FlagGems-vllm operators invoke FlagGems operators internally**.
+- **FlagGems-vllm** (this project): Specialized and fused operator library optimized for vLLM inference scenarios, exposed through the `flaggems_vllm` package.
+- **[vllm-plugin-fl](https://github.com/flagos-ai/vllm-plugin-fl)**: vLLM plugin layer that calls `flag_gems.enable()` for general ops and imports `flaggems_vllm.<operator>()` for vLLM fused kernels.
 
-**Call flow**: `vLLM → vllm-plugin-fl → flag_gems.enable() + flaggems_vllm.<op>()`
+**Call flow**: `vLLM → vllm-plugin-fl → flag_gems.enable() + flaggems_vllm.<op>()` (with certain `flaggems_vllm.<op>()` internally invoking `flag_gems` operators).
 
 ## Supported Operators
 
@@ -39,7 +39,7 @@ FlagGems-vllm provides **105 operators** (with 157 exported ops) optimized for v
 - Activation functions (GELU, SwiGLU, GeGLU)
 - Model-specific operators (Qwen4, DeepSeek-v4, RWKV, M3)
 
-See the [operator reference](/FlagGems-vllm/references/operators/) for the complete list.
+See the [operator reference](references/operators.md) for the complete list.
 
 ## Supported Backends
 
@@ -61,17 +61,21 @@ Backend selection is automatic based on the detected hardware, or can be control
 
 ## Next Steps
 
-- [Get started with installation](/FlagGems-vllm/getting-started/)
-- [Learn basic usage patterns](/FlagGems-vllm/usage/basic/)
-- [Review operator list](/FlagGems-vllm/references/operators/)
-- [Check performance benchmarks](/FlagGems-vllm/performance/)
-- [Contribute new operators](/FlagGems-vllm/contribution/)
+- [Get started with installation](getting-started/_index.md)
+- [Learn basic usage patterns](usage/basic.md)
+- [Review operator list](references/operators.md)
+- [Check performance benchmarks](performance/_index.md)
+- [Contribute new operators](contribution/_index.md)
 
 ## Quick Example
 
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# Enable FlagGems general operators
+flag_gems.enable()
 
 # MoE token routing and alignment
 num_tokens = 128

@@ -19,8 +19,8 @@ bookCollapseSection: true
 
 ## 开始
 
-1. 阅读[算子开发协议](workflow/)
-2. 查看[贡献概述](overview/)
+1. 阅读[算子开发协议](workflow.md)
+2. 查看[贡献概述](overview.md)
 3. 搭建开发环境
 4. 按照协议进行修改
 5. 提交 pull request
@@ -80,11 +80,11 @@ pre-commit run --all-files
 
 ## 主题
 
-- [概述](overview/) - 贡献指南和约定
-- [工作流协议](workflow/) - 算子开发协议
-- [后端开发](backend/) - 添加新硬件后端
+- [概述](overview.md) - 贡献指南和约定
+- [工作流协议](workflow.md) - 算子开发协议
+- [后端开发](backend.md) - 添加新硬件后端
 
 ## 下一步
 
-- [贡献概述](overview/)
-- [算子开发协议](workflow/)
+- [贡献概述](overview.md)
+- [算子开发协议](workflow.md)

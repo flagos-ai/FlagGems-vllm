@@ -43,7 +43,7 @@ weight: 10
 
 ### 3. 贡献异构硬件后端
 
-详见[后端开发指南](/FlagGems-vllm/zh-cn/contribution/backend/)。
+详见[后端开发指南](backend.md)。
 
 ## 代码规范与格式化
 
@@ -119,6 +119,6 @@ PyTorch 计算仅允许在 `tests/`、`benchmark/` 以及显式声明的 Referen
 
 ## 下一步
 
-- [算子开发协议](/FlagGems-vllm/zh-cn/contribution/workflow/)
-- [后端开发指南](/FlagGems-vllm/zh-cn/contribution/backend/)
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
+- [算子开发协议](workflow.md)
+- [后端开发指南](backend.md)
+- [单元测试指南](../testing/unittest.md)

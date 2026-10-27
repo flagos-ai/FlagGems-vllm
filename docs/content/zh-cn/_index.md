@@ -22,11 +22,11 @@ FlagGems-vllm 支持 OpenAI Triton 编译器(NVIDIA 和 AMD)以及 [FlagTree 编
 
 三个仓库在 FlagOS 生态系统中协同工作:
 
-- **[FlagGems](https://github.com/flagos-ai/FlagGems)**: 通用算子库,通过 `flag_gems.enable()` 和 `flag_gems.use_gems()` 提供 PyTorch 算子替换
-- **FlagGems-vllm**(本项目): vLLM 专用融合算子,通过 `flaggems_vllm` 包导出
-- **[vllm-plugin-fl](https://github.com/flagos-ai/vllm-plugin-fl)**: vLLM 插件层,调用 `flag_gems.enable()` 启用通用算子,显式导入 `flaggems_vllm.<operator>()` 使用 vLLM 融合算子
+- **[FlagGems](https://github.com/flagos-ai/FlagGems)**: 通用算子库，通过 `flag_gems.enable()` 和 `flag_gems.use_gems()` 提供 PyTorch 算子替换。**FlagGems-vllm 依赖 FlagGems，部分特化算子在底层执行时会直接调用 FlagGems 中的通用算子**。
+- **FlagGems-vllm**(本项目): 针对 vLLM 推理场景优化的特化与融合算子库，通过 `flaggems_vllm` 包导出。
+- **[vllm-plugin-fl](https://github.com/flagos-ai/vllm-plugin-fl)**: vLLM 插件层，调用 `flag_gems.enable()` 启用通用算子，显式导入 `flaggems_vllm.<operator>()` 使用 vLLM 融合算子。
 
-**调用流程**: `vLLM → vllm-plugin-fl → flag_gems.enable() + flaggems_vllm.<op>()`
+**调用流程**: `vLLM → vllm-plugin-fl → flag_gems.enable() + flaggems_vllm.<op>()` (其中部分 `flaggems_vllm.<op>()` 亦会调用 `flag_gems` 内置算子)。
 
 ## 支持的算子
 
@@ -39,7 +39,7 @@ FlagGems-vllm 提供 **105 个算子**（157 个导出项）,针对 vLLM 推理�
 - 激活函数(GELU、SwiGLU、GeGLU)
 - 模型专用算子(Qwen4、DeepSeek-v4、RWKV、M3)
 
-查看[算子参考](/FlagGems-vllm/zh-cn/references/operators/)获取完整列表。
+查看[算子参考](references/operators.md)获取完整列表。
 
 ## 支持的硬件后端
 
@@ -61,18 +61,22 @@ FlagGems-vllm 支持 **17 个硬件后端**:
 
 ## 快速开始
 
-- [安装指南](/FlagGems-vllm/zh-cn/getting-started/)
-- [基础用法](/FlagGems-vllm/zh-cn/usage/basic/)
-- [算子列表](/FlagGems-vllm/zh-cn/references/operators/)
-- [M3 算子支持](/FlagGems-vllm/zh-cn/references/m3-support/)
-- [性能基准](/FlagGems-vllm/zh-cn/performance/)
-- [贡献指南](/FlagGems-vllm/zh-cn/contribution/)
+- [安装指南](getting-started/_index.md)
+- [基础用法](usage/basic.md)
+- [算子列表](references/operators.md)
+- [M3 算子支持](references/m3-support.md)
+- [性能基准](performance/_index.md)
+- [贡献指南](contribution/_index.md)
 
 ## 快速示例
 
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# 启用 FlagGems 算子（FlagGems-vllm 部分算子依赖其底层算子支持）
+flag_gems.enable()
 
 # MoE token 路由和对齐
 num_tokens = 128

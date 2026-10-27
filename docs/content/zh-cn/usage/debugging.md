@@ -109,6 +109,6 @@ ncu --set full python test_script.py
 
 ## 下一步
 
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
-- [性能基准测试](/FlagGems-vllm/zh-cn/performance/benchmark/)
-- [算子开发规范协议](/FlagGems-vllm/zh-cn/contribution/workflow/)
+- [单元测试指南](../testing/unittest.md)
+- [性能基准测试](../performance/benchmark.md)
+- [算子开发规范协议](../contribution/workflow.md)

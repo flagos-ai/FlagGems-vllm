@@ -260,6 +260,6 @@ def test_my_new_op(shape, dtype):
 
 ## Next Steps
 
-- [Coverage reporting](/FlagGems-vllm/testing/coverage/)
-- [Benchmark guide](/FlagGems-vllm/performance/benchmark/)
-- [Contribution guide](/FlagGems-vllm/contribution/overview/)
+- [Coverage reporting](coverage.md)
+- [Benchmark guide](../performance/benchmark.md)
+- [Contribution guide](../contribution/overview.md)

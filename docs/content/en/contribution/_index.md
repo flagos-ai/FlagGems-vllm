@@ -19,8 +19,8 @@ Welcome! Contributions to FlagGems-vllm are highly appreciated.
 
 ## Getting Started
 
-1. Read the [operator development protocol](workflow/)
-2. Review the [contribution overview](overview/)
+1. Read the [operator development protocol](workflow.md)
+2. Review the [contribution overview](overview.md)
 3. Set up your development environment
 4. Make your changes following the protocol
 5. Submit a pull request
@@ -80,11 +80,11 @@ Tests must pass with `--quick` and full modes.
 
 ## Topics
 
-- [Overview](overview/) - Contribution guidelines and conventions
-- [Workflow Protocol](workflow/) - Operator development protocol
-- [Backend Development](backend/) - Adding new hardware backends
+- [Overview](overview.md) - Contribution guidelines and conventions
+- [Workflow Protocol](workflow.md) - Operator development protocol
+- [Backend Development](backend.md) - Adding new hardware backends
 
 ## Next Steps
 
-- [Contribution overview](overview/)
-- [Operator development protocol](workflow/)
+- [Contribution overview](overview.md)
+- [Operator development protocol](workflow.md)

@@ -43,7 +43,7 @@ FlagGems-vllm 作为独立 vLLM 算子库的首发版本。
 
 ### 已知问题
 
-- 部分算子仍处于 alpha/beta 阶段（详见[算子列表](/FlagGems-vllm/zh-cn/references/operators/)）
+- 部分算子仍处于 alpha/beta 阶段（详见[算子列表](operators.md)）
 - 非 NVIDIA 后端的自动调优配置仍在持续完善
 - 编译 C++ 扩展需要显式开启 `USE_C_EXTENSION=1`
 
@@ -59,7 +59,7 @@ FlagGems-vllm 作为独立 vLLM 算子库的首发版本。
 
 ## 参与贡献
 
-参考[贡献指南](/FlagGems-vllm/zh-cn/contribution/)了解如何向 FlagGems-vllm 提交代码。
+参考[贡献指南](../contribution/_index.md)了解如何向 FlagGems-vllm 提交代码。
 
 ## 版本规范
 

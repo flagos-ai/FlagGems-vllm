@@ -170,5 +170,5 @@ Benchmarks run in CI for changed operators:
 
 ## Next Steps
 
-- [View benchmark results](results/)
-- [Contribute benchmarks](/FlagGems-vllm/contribution/overview/)
+- [View benchmark results](results.md)
+- [Contribute benchmarks](../contribution/overview.md)

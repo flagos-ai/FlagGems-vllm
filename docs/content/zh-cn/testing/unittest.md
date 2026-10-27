@@ -111,6 +111,6 @@ def test_grouped_topk(shape, dtype):
 
 ## 下一步
 
-- [测试覆盖率](/FlagGems-vllm/zh-cn/testing/coverage/)
-- [基准测试指南](/FlagGems-vllm/zh-cn/performance/benchmark/)
-- [贡献指南概述](/FlagGems-vllm/zh-cn/contribution/overview/)
+- [测试覆盖率](coverage.md)
+- [基准测试指南](../performance/benchmark.md)
+- [贡献指南概述](../contribution/overview.md)

@@ -107,6 +107,6 @@ SpeedUp = 基线耗时 (latency_torch_baseline) / FlagGems-vllm 算子耗时 (la
 
 ## 下一步
 
-- [查看基准测试结果](/FlagGems-vllm/zh-cn/performance/results/)
-- [M3 算子支持评测](/FlagGems-vllm/zh-cn/references/m3-support/)
-- [贡献基准测试代码](/FlagGems-vllm/zh-cn/contribution/overview/)
+- [查看基准测试结果](results.md)
+- [M3 算子支持评测](../references/m3-support.md)
+- [贡献基准测试代码](../contribution/overview.md)

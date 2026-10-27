@@ -75,6 +75,6 @@ FlagGems-vllm 算子开发必须严格遵循仓库根目录下 `workflow.md` 规
 ## 下一步
 
 - [阅读根目录 workflow.md 原始规范](https://github.com/flagos-ai/FlagGems-vllm/blob/main/workflow.md)
-- [贡献指南概述](/FlagGems-vllm/zh-cn/contribution/overview/)
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
-- [基准测试指南](/FlagGems-vllm/zh-cn/performance/benchmark/)
+- [贡献指南概述](overview.md)
+- [单元测试指南](../testing/unittest.md)
+- [基准测试指南](../performance/benchmark.md)

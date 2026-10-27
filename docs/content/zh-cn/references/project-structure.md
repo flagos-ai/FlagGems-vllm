@@ -145,7 +145,7 @@ tools/
 
 ## 下一步
 
-- [算子开发协议](/FlagGems-vllm/zh-cn/contribution/workflow/)
-- [贡献指南概述](/FlagGems-vllm/zh-cn/contribution/overview/)
-- [M3 算子支持](/FlagGems-vllm/zh-cn/references/m3-support/)
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
+- [算子开发协议](../contribution/workflow.md)
+- [贡献指南概述](../contribution/overview.md)
+- [M3 算子支持](m3-support.md)
+- [单元测试指南](../testing/unittest.md)

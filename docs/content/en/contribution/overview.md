@@ -49,7 +49,7 @@ Required:
 
 ### Adding Backend Support
 
-See [backend development guide](backend/).
+See [backend development guide](backend.md).
 
 Steps:
 1. Create `src/flaggems_vllm/runtime/backend/_<vendor>/`
@@ -280,6 +280,6 @@ By contributing to FlagGems-vllm, you agree that your contributions will be lice
 
 ## Next Steps
 
-- [Operator development protocol](workflow/)
-- [Backend development guide](backend/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Operator development protocol](workflow.md)
+- [Backend development guide](backend.md)
+- [Testing guide](../testing/unittest.md)

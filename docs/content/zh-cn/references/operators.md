@@ -34,15 +34,19 @@ FlagGems-vllm 算子的完整列表与元数据，来源于 `conf/operators.yaml
 
 ## 使用方式
 
-所有算子均可直接从 `flaggems_vllm` 导入调用：
+FlagGems-vllm 依赖 FlagGems，部分算子在底层执行时会调用 FlagGems 中的算子。算子可直接从 `flaggems_vllm` 导入调用，推荐配合 `flag_gems.enable()` 获得完整的算子运行时支持：
 
 ```python
+import flag_gems
 import flaggems_vllm
 
-# 直接调用
+# 1. 启用 FlagGems 算子（提供底层基础算子与通用调度支持）
+flag_gems.enable()
+
+# 2. 直接调用 FlagGems-vllm 特化算子
 result = flaggems_vllm.moe_align_block_size(topk_ids, block_size, num_experts)
 
-# 启用算子后查看已注册的算子列表
+# 3. 启用 FlagGems-vllm 调度并查看已注册的算子列表
 flaggems_vllm.enable()
 ops = flaggems_vllm.all_registered_ops()
 print(f"当前已注册: {len(ops)} 个算子")
@@ -50,6 +54,6 @@ print(f"当前已注册: {len(ops)} 个算子")
 
 ## 下一步
 
-- [基础用法](/FlagGems-vllm/zh-cn/usage/basic/)
-- [M3 算子支持](/FlagGems-vllm/zh-cn/references/m3-support/)
+- [基础用法](../usage/basic.md)
+- [M3 算子支持](m3-support.md)
 - [算子源码仓库](https://github.com/flagos-ai/FlagGems-vllm/tree/main/src/flaggems_vllm/ops)

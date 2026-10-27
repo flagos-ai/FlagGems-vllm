@@ -295,6 +295,6 @@ PR checklist:
 
 ## Next Steps
 
-- [Contribution overview](/FlagGems-vllm/contribution/overview/)
-- [Operator development protocol](/FlagGems-vllm/contribution/workflow/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Contribution overview](overview.md)
+- [Operator development protocol](workflow.md)
+- [Testing guide](../testing/unittest.md)

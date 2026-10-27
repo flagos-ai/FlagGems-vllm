@@ -5,15 +5,25 @@ weight: 10
 
 # 基础用法
 
-FlagGems-vllm 提供了可直接调用的高性能算子，同时也支持通过类似 FlagGems 的全局启用 API 进行 PyTorch 调度分发。
+FlagGems-vllm 提供了面向 vLLM 大模型推理的高性能特化算子。**FlagGems-vllm 依赖 FlagGems**，当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的算子。
+
+## 依赖 FlagGems 与调用机制
+
+- **前置依赖**：在使用 FlagGems-vllm 前，必须在环境中安装 `flag_gems`。
+- **内部算子调用**：部分 FlagGems-vllm 算子（如多头计算 `mhc_pre`、特定后端矩阵乘 `bmm_w8a8_int8`、缓存写入 `reshape_and_cache_flash` 等）在实现中会直接调用 `flag_gems` 提供的算子（如 `flag_gems.bmm_out`、`flag_gems.mm_w8a8_int8`、`torch.ops.flag_gems.*`）。
+- **推荐初始化方式**：在使用 FlagGems-vllm 算子前，建议同时导入 `flag_gems` 并调用 `flag_gems.enable()`，以确保底层调用的通用算子能够正常分发并发挥最佳性能。
 
 ## 直接调用算子
 
-所有算子均可直接从 `flaggems_vllm` 包导入调用：
+所有特化算子均可直接从 `flaggems_vllm` 包导入调用。推荐的使用模式如下：
 
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# 推荐：启用 FlagGems 通用算子，为 FlagGems-vllm 底层调用的算子提供完整运行时支持
+flag_gems.enable()
 
 # 1. MoE Token 对齐
 topk_ids = torch.randint(0, 16, (128, 2), device='cuda', dtype=torch.int32)
@@ -70,18 +80,24 @@ print(f"注册键数: {len(keys)}")
 
 FlagGems-vllm 提供了与 FlagGems 一致的启用接口：
 
-### `enable()`
+### `enable()` 与 `flag_gems.enable()`
 
-全局启用所有 FlagGems-vllm 算子：
+在大多数场景下，FlagGems-vllm 的算子是显式直接调用的。但由于部分算子底层依赖 FlagGems，且模型中通常包含大量通用的基础算子，标准用法是：
+
+1. **调用 `flag_gems.enable()`**：为环境注册通用的 PyTorch/Triton 算子，并激活 FlagGems-vllm 内部调用所需的基础算子能力；
+2. **直接调用 `flaggems_vllm.<op>()`**：执行针对 vLLM 推理特化的融合内核；
+3. **调用 `flaggems_vllm.enable()`（可选）**：将 FlagGems-vllm 的算子进一步注册到 PyTorch dispatch 调度表中。
 
 ```python
+import flag_gems
 import flaggems_vllm
 
-flaggems_vllm.enable()
-# 此时 FlagGems-vllm 算子已注册进 PyTorch 调度机制
-```
+# 1. 启用 FlagGems 算子（必需/推荐）
+flag_gems.enable()
 
-**提示**: 在 FlagGems-vllm 中通常直接显式调用算子即可；通用的 PyTorch 基础算子替换建议使用 `flag_gems.enable()`。
+# 2. 全局启用 FlagGems-vllm 调度（可选）
+flaggems_vllm.enable()
+```
 
 ### `only_enable()`
 
@@ -158,7 +174,7 @@ FlagGems-vllm 算子主要分为以下几类：
 - `rwkv_*` - RWKV 系列算子
 - M3 系列算子（`fp32_router_gemm`, `topk_sigmoid` 等）
 
-详见[算子列表](/FlagGems-vllm/zh-cn/references/operators/)。
+详见[算子列表](../references/operators.md)。
 
 ## 异常处理与无回退规则
 
@@ -174,7 +190,7 @@ except NotImplementedError as e:
 
 ## 下一步
 
-- [vLLM 插件集成](/FlagGems-vllm/zh-cn/usage/vllm-plugin/)
-- [选择性启用](/FlagGems-vllm/zh-cn/usage/selective/)
-- [调试与日志](/FlagGems-vllm/zh-cn/usage/debugging/)
-- [运行基准测试](/FlagGems-vllm/zh-cn/performance/benchmark/)
+- [vLLM 插件集成](vllm-plugin.md)
+- [选择性启用](selective.md)
+- [调试与日志](debugging.md)
+- [运行基准测试](../performance/benchmark.md)

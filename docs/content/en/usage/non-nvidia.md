@@ -186,10 +186,10 @@ To add a new backend:
 3. Test core operators on target hardware
 4. Submit PR with test results
 
-See the [backend development guide](/FlagGems-vllm/contribution/backend/) for details.
+See the [backend development guide](../contribution/backend.md) for details.
 
 ## Next Steps
 
-- [Backend development guide](/FlagGems-vllm/contribution/backend/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Backend development guide](../contribution/backend.md)
+- [Testing guide](../testing/unittest.md)
+- [Performance benchmarking](../performance/benchmark.md)

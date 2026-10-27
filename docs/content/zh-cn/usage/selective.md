@@ -107,6 +107,6 @@ flaggems_vllm.only_enable(include=STABLE_OPS)
 
 ## 下一步
 
-- [基础用法](/FlagGems-vllm/zh-cn/usage/basic/)
-- [调试与日志](/FlagGems-vllm/zh-cn/usage/debugging/)
-- [运行性能基准评测](/FlagGems-vllm/zh-cn/performance/benchmark/)
+- [基础用法](basic.md)
+- [调试与日志](debugging.md)
+- [运行性能基准评测](../performance/benchmark.md)

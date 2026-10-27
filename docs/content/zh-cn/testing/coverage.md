@@ -59,5 +59,5 @@ def test_my_op(shape, dtype):
 
 ## 下一步
 
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
-- [贡献指南概述](/FlagGems-vllm/zh-cn/contribution/overview/)
+- [单元测试指南](unittest.md)
+- [贡献指南概述](../contribution/overview.md)

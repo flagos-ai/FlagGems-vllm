@@ -82,6 +82,6 @@ References are explicit in JSON:
 
 ## Related Links
 
-- [Operator List](/FlagGems-vllm/references/operators/)
-- [Project Structure](/FlagGems-vllm/references/project-structure/)
-- [Benchmark Results](/FlagGems-vllm/performance/results/)
+- [Operator List](operators.md)
+- [Project Structure](project-structure.md)
+- [Benchmark Results](../performance/results.md)

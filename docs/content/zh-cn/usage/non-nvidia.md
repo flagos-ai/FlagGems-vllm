@@ -139,6 +139,6 @@ except ImportError:
 
 ## 下一步
 
-- [后端开发指南](/FlagGems-vllm/zh-cn/contribution/backend/)
-- [单元测试指南](/FlagGems-vllm/zh-cn/testing/unittest/)
-- [性能基准测试](/FlagGems-vllm/zh-cn/performance/benchmark/)
+- [后端开发指南](../contribution/backend.md)
+- [单元测试指南](../testing/unittest.md)
+- [性能基准测试](../performance/benchmark.md)
