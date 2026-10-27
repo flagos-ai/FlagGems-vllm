@@ -1,686 +1,332 @@
-# This file contains code copied from the flash-linear-attention project.
-# The original source code was licensed under the MIT license and included
-# the following copyright notice:
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
-import logging
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FlagOS Contributors
+# Retains the recurrent formulation from flash-linear-attention (MIT):
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
+"""Stride-aware recurrent GDN with vLLM's value-major state cache."""
+import math
 
 import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.FLA.triton_ops_helper import exp
-
-logger = logging.getLogger(__name__)
+from flaggems_vllm import runtime
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
-        "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
-    }
-)
-@triton.jit(do_not_specialize=["N", "T"])
-# This kernel is specialized for Qwen3-Next model.
-# It requires modifications to the calling logic for Qwen3-Next:
-# Refer to the rearrange_mixed_qkv logic in the benchmark, where setting contiguous=False
-# can provide a certain performance boost by avoiding unnecessary contiguous operations.
-def fused_recurrent_gated_delta_rule_fwd_sp_for_qwen3_next_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
-    cu_seqlens,
-    ssm_state_indices,
-    num_accepted_tokens,
+@triton.jit
+def _recurrent_gdn_kernel(
+    Q,
+    Kp,
+    Vp,
+    G,
+    Beta,
+    State,
+    Out,
+    Final,
+    Cu,
+    Indices,
+    Accepted,
     scale,
-    N: tl.int64,
-    T: tl.int64,
-    # stride_q_b: tl.int64,
-    stride_q_t: tl.int64,
-    stride_q_h: tl.int64,
-    stride_q_k: tl.int64,
-    # stride_k_b: tl.int64,
-    stride_k_t: tl.int64,
-    stride_k_h: tl.int64,
-    stride_k_k: tl.int64,
-    # stride_v_b: tl.int64,
-    stride_v_t: tl.int64,
-    stride_v_hv: tl.int64,
-    stride_v_v: tl.int64,
-    B: tl.constexpr,
+    T: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    POOL: tl.constexpr,
+    QS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    GS: tl.constexpr,
+    BS: tl.constexpr,
+    SS: tl.constexpr,
+    IX: tl.constexpr,
+    WIDTH: tl.constexpr,
+    VARLEN: tl.constexpr,
+    INDEXED: tl.constexpr,
+    TABLE: tl.constexpr,
+    SPEC: tl.constexpr,
+    INITIAL: tl.constexpr,
+    INPLACE: tl.constexpr,
+    VECTOR_BETA: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    HAS_G: tl.constexpr,
+    HAS_BETA: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    stride_init_state_token: tl.constexpr,
-    stride_final_state_token: tl.constexpr,
-    stride_indices_seq: tl.constexpr,
-    stride_indices_tok: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    INPLACE_FINAL_STATE: tl.constexpr,
-    IS_BETA_HEADWISE: tl.constexpr,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    IS_CONTINUOUS_BATCHING: tl.constexpr,
-    IS_SPEC_DECODING: tl.constexpr,
 ):
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
-    if IS_VARLEN:
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int64),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+    pid = tl.program_id(0)
+    nv = tl.cdiv(V, BV)
+    iv = pid % nv
+    nh = pid // nv
+    n, hv = nh // HV, nh % HV
+    h = hv // (HV // H)
+    if VARLEN:
+        start = tl.load(Cu + n).to(tl.int64)
+        end = tl.load(Cu + n + 1).to(tl.int64)
+        batch = 0
+    else:
+        start, end = 0, T
+        batch = n
+    rk = tl.arange(0, BK)
+    rv = iv * BV + tl.arange(0, BV)
+    mask = (rv[:, None] < V) & (rk[None, :] < K)
+    slot = n.to(tl.int64)
+    valid = True
+    if INDEXED:
+        col = 0
+        if SPEC:
+            col = tl.load(Accepted + n).to(tl.int64) - 1
+        valid = (col >= 0) & (col < WIDTH)
+        slot = tl.load(Indices + n * IX[0] + col * IX[1], mask=valid, other=0).to(
+            tl.int64
         )
-        all = T
-        T = eos - bos
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        all = B * T
-
-    if T == 0:
-        # no tokens to process for this sequence
-        return
-
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-
-    p_q = q + bos * stride_q_t + i_h * stride_q_h + o_k * stride_q_k
-    p_k = k + bos * stride_k_t + i_h * stride_k_h + o_k * stride_k_k
-    p_v = v + bos * stride_v_t + i_hv * stride_v_hv + o_v * stride_v_v
-    if IS_BETA_HEADWISE:
-        p_beta = beta + (bos * HV + i_hv) * V + o_v
-    else:
-        p_beta = beta + bos * HV + i_hv
-
-    p_g = g + bos * HV + i_hv
-
-    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
-
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        if IS_CONTINUOUS_BATCHING:
-            if IS_SPEC_DECODING:
-                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+        valid = valid & (slot > 0) & (slot < POOL)
+    state_offsets = hv * SS[1] + rv[:, None] * SS[2] + rk[None, :] * SS[3]
+    acc = tl.full((BV, BK), 0, tl.float32)
+    if INITIAL:
+        acc = tl.load(
+            State + slot * SS[0] + state_offsets, mask=mask & valid, other=0
+        ).to(tl.float32)
+    for t in range(start, end):
+        q = tl.load(
+            Q + batch * QS[0] + t * QS[1] + h * QS[2] + rk * QS[3], rk < K, 0
+        ).to(tl.float32)
+        k = tl.load(
+            Kp + batch * KS[0] + t * KS[1] + h * KS[2] + rk * KS[3], rk < K, 0
+        ).to(tl.float32)
+        v = tl.load(
+            Vp + batch * VS[0] + t * VS[1] + hv * VS[2] + rv * VS[3], rv < V, 0
+        ).to(tl.float32)
+        if NORMALIZE:
+            q = q / tl.sqrt(tl.sum(q * q, 0) + 1.0e-6)
+            k = k / tl.sqrt(tl.sum(k * k, 0) + 1.0e-6)
+        q *= scale
+        if HAS_G:
+            g = tl.load(G + batch * GS[0] + t * GS[1] + hv * GS[2]).to(tl.float32)
+            acc *= tl.exp(g)
+        delta = v - tl.sum(acc * k[None, :], 1)
+        if HAS_BETA:
+            bp = Beta + batch * BS[0] + t * BS[1] + hv * BS[2]
+            if VECTOR_BETA:
+                beta = tl.load(bp + rv * BS[3], rv < V, 0).to(tl.float32)
             else:
-                i_t = 0
-            p_h0 = (
-                h0
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                    tl.int64
-                )
-                * stride_init_state_token
-            )
-        else:
-            p_h0 = h0 + bos * HV * K * V
-        p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-
-    for i_t in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q *= scale
-        # [BK, BV]
-        b_g = tl.load(p_g).to(tl.float32)
-        b_h *= exp(b_g)
-        # [BV]
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        b_v *= b_beta
-        # [BK, BV]
-        b_h += b_k[:, None] * b_v[None, :]
-        # [BV]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-        # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
-            p_ht = (
-                ht
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                    tl.int64
-                )
-                * stride_final_state_token
-            )
-        else:
-            p_ht = ht + (bos + i_t) * stride_final_state_token
-        p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-
-        p_q += stride_q_t
-        p_k += stride_k_t
-        p_v += stride_v_t
-        p_o += HV * V
-        p_g += HV
-        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
-
-
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
-        "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
-    }
-)
-@triton.jit(do_not_specialize=["N", "T"])
-def fused_recurrent_gated_delta_rule_fwd_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
-    cu_seqlens,
-    ssm_state_indices,
-    num_accepted_tokens,
-    scale,
-    N: tl.int64,  # num of sequences
-    T: tl.int64,  # num of tokens
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    stride_init_state_token: tl.constexpr,
-    stride_final_state_token: tl.constexpr,
-    stride_indices_seq: tl.constexpr,
-    stride_indices_tok: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
-    INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
-    IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    IS_CONTINUOUS_BATCHING: tl.constexpr,
-    IS_SPEC_DECODING: tl.constexpr,
-    IS_KDA: tl.constexpr,
-):
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
-    if IS_VARLEN:
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int64),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
-        )
-        all = T
-        T = eos - bos
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        all = B * T
-
-    if T == 0:
-        # no tokens to process for this sequence
-        return
-
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-    if IS_BETA_HEADWISE:
-        p_beta = beta + (bos * HV + i_hv) * V + o_v
-    else:
-        p_beta = beta + bos * HV + i_hv
-
-    if not IS_KDA:
-        p_g = g + bos * HV + i_hv
-    else:
-        p_gk = g + (bos * HV + i_hv) * K + o_k
-
-    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
-
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        if IS_CONTINUOUS_BATCHING:
-            if IS_SPEC_DECODING:
-                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+                beta = tl.load(bp).to(tl.float32)
+            delta *= beta
+        acc += delta[:, None] * k[None, :]
+        out = tl.sum(acc * q[None, :], 1)
+        token = batch * T + t
+        tl.store(Out + (token * HV + hv) * V + rv, tl.where(valid, out, 0), rv < V)
+        if INPLACE:
+            dest = slot
+            store = valid
+            if TABLE:
+                final_col = t - start
+                dest = tl.load(
+                    Indices + n * IX[0] + final_col * IX[1], final_col < WIDTH, 0
+                ).to(tl.int64)
+                store = store & (dest > 0) & (dest < POOL) & (final_col < WIDTH)
             else:
-                i_t = 0
-            p_h0 = (
-                h0
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                    tl.int64
-                )
-                * stride_init_state_token
-            )
+                store = store & (t == end - 1)
+            tl.store(Final + dest * SS[0] + state_offsets, acc, mask & store)
         else:
-            p_h0 = h0 + bos * HV * K * V
-        p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-
-    for i_t in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
-        # [BK, BV]
-        if not IS_KDA:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= exp(b_g)
-        else:
-            b_gk = tl.load(p_gk).to(tl.float32)
-            b_h *= exp(b_gk[:, None])
-        # [BV]
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        b_v *= b_beta
-        # [BK, BV]
-        b_h += b_k[:, None] * b_v[None, :]
-        # [BV]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-        # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
-            p_ht = (
-                ht
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                    tl.int64
-                )
-                * stride_final_state_token
-            )
-        else:
-            p_ht = ht + (bos + i_t) * stride_final_state_token
-        p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-
-        p_q += H * K
-        p_k += H * K
-        p_o += HV * V
-        p_v += HV * V
-        if not IS_KDA:
-            p_g += HV
-        else:
-            p_gk += HV * K
-        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
-
-
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
-        "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
-    }
-)
-@triton.jit(do_not_specialize=["N", "T"])
-def fused_recurrent_gated_delta_rule_large_t_fwd_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
-    cu_seqlens,
-    ssm_state_indices,
-    num_accepted_tokens,
-    scale,
-    N: tl.int64,  # num of sequences
-    T: tl.int64,  # num of tokens
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    stride_init_state_token: tl.constexpr,
-    stride_final_state_token: tl.constexpr,
-    stride_indices_seq: tl.constexpr,
-    stride_indices_tok: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
-    INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
-    IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    IS_CONTINUOUS_BATCHING: tl.constexpr,
-    IS_SPEC_DECODING: tl.constexpr,
-    IS_KDA: tl.constexpr,
-):
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
-    if IS_VARLEN:
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int64),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
-        )
-        all = T
-        T = eos - bos
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        all = B * T
-
-    if T == 0:
-        # no tokens to process for this sequence
-        return
-
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-    if IS_BETA_HEADWISE:
-        p_beta = beta + (bos * HV + i_hv) * V + o_v
-    else:
-        p_beta = beta + bos * HV + i_hv
-
-    if not IS_KDA:
-        p_g = g + bos * HV + i_hv
-    else:
-        p_gk = g + (bos * HV + i_hv) * K + o_k
-
-    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
-
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_v[:, None] & mask_k[None, :]
-
-    b_h = tl.zeros([BV, BK], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        if IS_CONTINUOUS_BATCHING:
-            if IS_SPEC_DECODING:
-                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
-            else:
-                i_t = 0
-            # Load state index and check for PAD_SLOT_ID (-1)
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
-            # Skip if state index is invalid (PAD_SLOT_ID = -1)
-            if state_idx < 0:
-                return
-            p_h0 = h0 + state_idx * stride_init_state_token
-        else:
-            p_h0 = h0 + bos * HV * V * K
-        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-
-    for i_t in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
-        # [BV, BK]
-        if not IS_KDA:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= exp(b_g)
-        else:
-            b_gk = tl.load(p_gk).to(tl.float32)
-            b_h *= exp(b_gk[None, :])
-        # [BV]
-        b_v -= tl.sum(b_h * b_k[None, :], 1)
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        b_v *= b_beta
-        # [BV, BK]
-        b_h += b_v[:, None] * b_k[None, :]
-        # [BV]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-        # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
-            # Load state index and check for PAD_SLOT_ID (-1)
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
-            # Only store if state index is valid (not PAD_SLOT_ID)
-            if final_state_idx >= 0:
-                p_ht = ht + final_state_idx * stride_final_state_token
-                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-        else:
-            p_ht = ht + (bos + i_t) * stride_final_state_token
-            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-
-        p_q += H * K
-        p_k += H * K
-        p_o += HV * V
-        p_v += HV * V
-        if not IS_KDA:
-            p_g += HV
-        else:
-            p_gk += HV * K
-        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
+            offsets = ((token * HV + hv) * V + rv[:, None]) * K + rk[None, :]
+            tl.store(Final + offsets, tl.where(valid, acc, 0), mask)
 
 
 def fused_recurrent_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    inplace_final_state: bool = True,
-    cu_seqlens: torch.LongTensor | None = None,
-    ssm_state_indices: torch.Tensor | None = None,
-    num_accepted_tokens: torch.Tensor | None = None,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    logger.debug("GEMS FUSED RECURRENT GATED DELTA RULE FWD")
-    B, T, H, K, V = *k.shape, v.shape[-1]
-    HV = v.shape[2]
-    N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
-    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
-    assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
-    qkv_contiguous = (
-        (q.stride(0) == q.stride(1) + q.stride(2))
-        and (k.stride(0) == k.stride(1) + k.stride(2))
-        and (v.stride(0) == v.stride(1) + v.stride(2))
-    )
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    initial_state,
+    inplace_final_state=True,
+    cu_seqlens=None,
+    ssm_state_indices=None,
+    num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False,
+):
+    """Return output and state in [pool, HV, V, K] layout.
 
-    o = q.new_empty(NK, *v.shape)
-    if inplace_final_state:
-        final_state = initial_state
+    A 1D index maps each sequence to one cache slot (last-state writeback).
+    A 2D index table stores each token's intermediate state, as required by
+    speculative decoding; accepted counts select the initial table column.
+    Initial slots <=0 or >=pool and invalid accepted columns produce zeros
+    without updating the cache. Invalid destination slots suppress that write.
+    Writable slots across sequences must be disjoint.
+    Without indices, cache slots are sequence-major. Out-of-place mode returns
+    every token state as [B*T, HV, V, K] and never modifies initial_state.
+    cu_seqlens must be monotone, start at zero and end at T. Index-table width
+    must cover each sequence. These device metadata are caller preconditions.
+    """
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
+        raise ValueError("q/k must have identical [B,T,H,K] shapes; v must be rank 4")
+    B, T, H, K = q.shape
+    HV, V = v.shape[-2:]
+    if v.shape[:2] != (B, T) or min(H, HV, K, V) <= 0 or HV % H:
+        raise ValueError("Invalid GVA dimensions")
+    if K > 256:
+        raise NotImplementedError("Recurrent GDN supports K <= 256")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise NotImplementedError("Recurrent GDN supports FP16, BF16 and FP32")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("q/k/v must have the same dtype")
+    if scale is None:
+        scale = K**-0.5
+    if not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be finite and positive")
+    if cu_seqlens is not None:
+        if B != 1 or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 1:
+            raise ValueError("Packed varlen requires B=1 and cu_seqlens[N+1]")
+        if not cu_seqlens.is_contiguous() or cu_seqlens.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("cu_seqlens must be contiguous int32/int64")
+        N = cu_seqlens.numel() - 1
     else:
-        final_state = q.new_empty(T, HV, K, V, dtype=initial_state.dtype)
-
-    stride_init_state_token = initial_state.stride(0)
-    stride_final_state_token = final_state.stride(0)
-
-    if ssm_state_indices is None:
-        stride_indices_seq, stride_indices_tok = 1, 1
-    elif ssm_state_indices.ndim == 1:
-        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
+        N = B
+    if inplace_final_state and initial_state is None:
+        raise ValueError("In-place mode requires initial_state")
+    if initial_state is not None:
+        if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, V, K):
+            raise ValueError("initial_state must use [pool, HV, V, K] layout")
+        if initial_state.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError("Unsupported state dtype")
+        if any(s <= 0 for s in initial_state.stride()):
+            raise ValueError("State must have positive non-overlapping strides")
+        ordered = sorted(zip(initial_state.stride(), initial_state.shape))
+        extent = 1
+        for stride, size in ordered:
+            if size > 1 and stride < extent:
+                raise ValueError("Overlapping state is unsupported")
+            extent = max(extent, stride * size)
+        pool, ss = initial_state.shape[0], initial_state.stride()
+        if ssm_state_indices is None and pool < N:
+            raise ValueError("State pool is smaller than the sequence count")
     else:
-        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
-
-    grid = (NK, NV, N * HV)
-    if qkv_contiguous:
-        fused_recurrent_gated_delta_rule_fwd_kernel[grid](
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            o=o,
-            h0=initial_state,
-            ht=final_state,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            scale=scale,
-            N=N,
-            T=T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            stride_init_state_token=stride_init_state_token,
-            stride_final_state_token=stride_final_state_token,
-            stride_indices_seq=stride_indices_seq,
-            stride_indices_tok=stride_indices_tok,
-            IS_BETA_HEADWISE=beta.ndim == v.ndim,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            INPLACE_FINAL_STATE=inplace_final_state,
-            IS_KDA=False,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    else:
-        logger.debug(
-            "GEMS fused_recurrent_gated_delta_rule_fwd, "
-            "[q.shape]: %s, [q.stride]: %s, "
-            "[k.shape]: %s, [k.stride]: %s, "
-            "[v.shape]: %s, [v.stride]: %s, "
-            "[g.shape]: %s, [beta.shape]: %s, [initial_state.shape]: %s, "
-            "[cu_seqlens.shape]: %s, N: %s, T: %s, B: %s, H: %s, HV: %s, K: %s, V: %s",
-            q.shape,
-            q.stride(),
-            k.shape,
-            k.stride(),
-            v.shape,
-            v.stride(),
-            g.shape,
-            beta.shape,
-            initial_state.shape,
-            cu_seqlens.shape,
-            N,
-            T,
-            B,
-            H,
-            HV,
-            K,
-            V,
-        )
-        if T <= 64:
-            fused_recurrent_gated_delta_rule_fwd_sp_for_qwen3_next_kernel[grid](
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                o=o,
-                h0=initial_state,
-                ht=final_state,
-                cu_seqlens=cu_seqlens,
-                ssm_state_indices=ssm_state_indices,
-                num_accepted_tokens=num_accepted_tokens,
-                scale=scale,
-                N=N,
-                T=T,
-                B=B,
-                H=H,
-                HV=HV,
-                K=K,
-                V=V,
-                BK=BK,
-                BV=BV,
-                stride_init_state_token=stride_init_state_token,
-                stride_final_state_token=stride_final_state_token,
-                stride_indices_seq=stride_indices_seq,
-                stride_indices_tok=stride_indices_tok,
-                # stride_q_b=q.stride(0),
-                stride_q_t=q.stride(1),
-                stride_q_h=q.stride(2),
-                stride_q_k=q.stride(3),
-                # stride_k_b=k.stride(0),
-                stride_k_t=k.stride(1),
-                stride_k_h=k.stride(2),
-                stride_k_k=k.stride(3),
-                # stride_v_b=v.stride(0),
-                stride_v_t=v.stride(1),
-                stride_v_hv=v.stride(2),
-                stride_v_v=v.stride(3),
-                IS_BETA_HEADWISE=beta.ndim == v.ndim,
-                USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-                INPLACE_FINAL_STATE=inplace_final_state,
-                IS_SPEC_DECODING=num_accepted_tokens is not None,
-                IS_CONTINUOUS_BATCHING=ssm_state_indices is not None,
-                IS_VARLEN=cu_seqlens is not None,
-                USE_INITIAL_STATE=initial_state is not None,
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
+        pool, ss = N, (HV * V * K, V * K, K, 1)
+    ix, width = (0, 0), 1
+    if ssm_state_indices is not None:
+        if initial_state is None:
+            raise ValueError("Indexed mode requires an initial state pool")
+        if ssm_state_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("State indices must be int32/int64")
+        if ssm_state_indices.ndim not in (1, 2) or ssm_state_indices.shape[0] != N:
+            raise ValueError("State indices must have shape [N] or [N,width]")
+        if ssm_state_indices.ndim == 2:
+            width = ssm_state_indices.shape[1]
+            if width == 0:
+                raise ValueError("State table cannot have zero width")
+            ix = ssm_state_indices.stride()
         else:
-            fused_recurrent_gated_delta_rule_large_t_fwd_kernel[grid](
-                q=q.contiguous(),
-                k=k.contiguous(),
-                v=v.contiguous(),
-                g=g.contiguous(),
-                beta=beta.contiguous(),
-                o=o,
-                h0=initial_state,
-                ht=final_state,
-                cu_seqlens=cu_seqlens,
-                ssm_state_indices=ssm_state_indices,
-                num_accepted_tokens=num_accepted_tokens,
-                scale=scale,
-                N=N,
-                T=T,
-                B=B,
-                H=H,
-                HV=HV,
-                K=K,
-                V=V,
-                BK=BK,
-                BV=BV,
-                stride_init_state_token=stride_init_state_token,
-                stride_final_state_token=stride_final_state_token,
-                stride_indices_seq=stride_indices_seq,
-                stride_indices_tok=stride_indices_tok,
-                IS_BETA_HEADWISE=beta.ndim == v.ndim,
-                USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-                INPLACE_FINAL_STATE=inplace_final_state,
-                IS_KDA=False,
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
-    o = o.squeeze(0)
-    return o, final_state
+            ix = (ssm_state_indices.stride(0), 0)
+    if num_accepted_tokens is not None:
+        if ssm_state_indices is None or ssm_state_indices.ndim != 2:
+            raise ValueError("Accepted-token counts require a 2D state table")
+        if (
+            num_accepted_tokens.shape != (N,)
+            or not num_accepted_tokens.is_contiguous()
+            or num_accepted_tokens.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("Accepted-token counts must be contiguous int32/int64 [N]")
+    if g is not None and g.shape != (B, T, HV):
+        raise ValueError("g must have shape [B,T,HV]")
+    if beta is not None and beta.shape not in ((B, T, HV), (B, T, HV, V)):
+        raise ValueError("beta must have shape [B,T,HV] or [B,T,HV,V]")
+    for tensor in (
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+    ):
+        if tensor is not None and tensor.device != q.device:
+            raise ValueError("All inputs must be on the same device")
+    for tensor in (g, beta):
+        if tensor is not None and tensor.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError("g/beta must be floating point")
+    o = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    final = (
+        initial_state
+        if inplace_final_state
+        else torch.empty(
+            (B * T, HV, V, K),
+            dtype=initial_state.dtype if initial_state is not None else torch.float32,
+            device=q.device,
+        )
+    )
+    if B * T == 0:
+        return o, final
+    if N == 0:
+        raise ValueError("Nonempty input requires at least one sequence")
+    # No-autotune exemption: replaying this kernel mutates its state pool.
+    # Tile experiments must restore state outside timing, never in production.
+    bv = 8 if runtime.device.vendor_name == "ascend" else 16
+    bs = beta.stride() if beta is not None else (0, 0, 0)
+    if len(bs) == 3:
+        bs = (*bs, 0)
+    total = N * HV * triton.cdiv(V, bv)
+    grid, kernel, extra = (total,), _recurrent_gdn_kernel, {}
+    if runtime.device.vendor_name == "ascend":
+        from flaggems_vllm.runtime.backend._ascend.ops.fused_recurrent import (
+            _aivector_core_count,
+        )
+        from flaggems_vllm.runtime.backend._ascend.ops.fused_recurrent import (
+            _recurrent_gdn_kernel as ascend_kernel,
+        )
+
+        grid = (min(total, 32, _aivector_core_count(q.device.index)),)
+        kernel, extra = ascend_kernel, {"TOTAL": total}
+    kernel[grid](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        o,
+        final,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+        scale,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool,
+        q.stride(),
+        k.stride(),
+        v.stride(),
+        g.stride() if g is not None else (0, 0, 0),
+        bs,
+        ss,
+        ix,
+        width,
+        cu_seqlens is not None,
+        ssm_state_indices is not None,
+        ssm_state_indices is not None and ssm_state_indices.ndim == 2,
+        num_accepted_tokens is not None,
+        initial_state is not None,
+        inplace_final_state,
+        beta is not None and beta.ndim == 4,
+        use_qk_l2norm_in_kernel,
+        g is not None,
+        beta is not None,
+        triton.next_power_of_2(K),
+        bv,
+        num_warps=1,
+        num_stages=1,
+        enable_fp_fusion=False,
+        **extra,
+    )
+    return o, final

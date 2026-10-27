@@ -173,6 +173,15 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/fused_recurrent.py": [
+        "tests/test_FLA/test_fused_recurrent_gated_delta_rule.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/fused_recurrent.py": [
+        "tests/test_FLA/test_fused_recurrent_gated_delta_rule.py",
+    ],
+    "tests/gdn_reference.py": [
+        "tests/test_FLA/test_fused_recurrent_gated_delta_rule.py",
+    ],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
         "tests/test_FLA/test_chunk_gated_delta_rule.py",
     ],
@@ -299,6 +308,12 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/moe_align_block_size.py": [
         "benchmark/test_moe_align_block_size_triton.py",
+    ],
+    "src/flaggems_vllm/ops/FLA/fused_recurrent.py": [
+        "benchmark/test_FLA/test_fused_recurrent_gated_delta_rule_perf.py",
+    ],
+    "tests/gdn_reference.py": [
+        "benchmark/test_FLA/test_fused_recurrent_gated_delta_rule_perf.py",
     ],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
