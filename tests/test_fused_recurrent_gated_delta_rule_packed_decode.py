@@ -19,7 +19,7 @@ SHAPES = [
 ]
 
 
-def make_inputs(shape, dtype, state_dtype, device, strided=False, invalid=True):
+def _make_inputs(shape, dtype, state_dtype, device, strided=False, invalid=True):
     B, H, HV, K, V = shape
     gen = torch.Generator().manual_seed(20261026)
 
@@ -51,7 +51,7 @@ def make_inputs(shape, dtype, state_dtype, device, strided=False, invalid=True):
     )
 
 
-def reference(inputs, normalize=False):
+def _reference(inputs, normalize=False):
     """Independent FP32 CPU math, including the old beta rounding boundary."""
     mixed = inputs["mixed_qkv"].detach().cpu().float()
     state = inputs["initial_state"].detach().cpu().clone()
@@ -84,7 +84,7 @@ def reference(inputs, normalize=False):
     return out, state
 
 
-def assert_result(inputs, expected, dtype):
+def _assert_result(inputs, expected, dtype):
     atol, rtol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 1e-2)
     torch.testing.assert_close(inputs["out"].cpu(), expected[0], atol=atol, rtol=rtol)
     torch.testing.assert_close(
@@ -98,31 +98,31 @@ def assert_result(inputs, expected, dtype):
 @pytest.mark.parametrize("fp32_state", [False, True])
 @pytest.mark.parametrize("normalize,strided", [(False, False), (True, True)])
 def test_packed_decode(entry, shape, dtype, fp32_state, normalize, strided):
-    data = make_inputs(
+    data = _make_inputs(
         shape,
         dtype,
         torch.float32 if fp32_state else dtype,
         flaggems_vllm.device,
         strided,
     )
-    expected = reference(data, normalize)
+    expected = _reference(data, normalize)
     fn = getattr(flaggems_vllm.ops if entry == "generic" else flaggems_vllm, OP)
     result = fn(**data, use_qk_l2norm_in_kernel=normalize)
     assert result[0] is data["out"] and result[1] is data["initial_state"]
-    assert_result(data, expected, dtype)
+    _assert_result(data, expected, dtype)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_multistep_and_beta_rounding(dtype):
-    data = make_inputs((3, 1, 2, 17, 23), dtype, torch.float32, flaggems_vllm.device)
+    data = _make_inputs((3, 1, 2, 17, 23), dtype, torch.float32, flaggems_vllm.device)
     ref_data = dict(data)
     ref_data["initial_state"] = data["initial_state"].cpu().clone()
     for _ in range(8):
-        expected = reference(ref_data, True)
+        expected = _reference(ref_data, True)
         ref_data["initial_state"] = expected[1]
         getattr(flaggems_vllm.ops, OP)(**data, use_qk_l2norm_in_kernel=True)
-        assert_result(data, expected, dtype)
-    tiny = make_inputs((1, 1, 1, 1, 1), dtype, torch.float32, flaggems_vllm.device)
+        _assert_result(data, expected, dtype)
+    tiny = _make_inputs((1, 1, 1, 1, 1), dtype, torch.float32, flaggems_vllm.device)
     tiny["mixed_qkv"].fill_(1)
     tiny["initial_state"].zero_()
     tiny["b"].fill_(0.5)
@@ -136,7 +136,7 @@ def test_multistep_and_beta_rounding(dtype):
     values = torch.tensor(
         [-30.0, -18.0, -17.0, -16.0, -10.0, -1.0, 0.0, 0.5, 1.0, 10.0, 30.0]
     )
-    wide = make_inputs(
+    wide = _make_inputs(
         (len(values), 1, 1, 1, 1),
         dtype,
         torch.float32,
@@ -156,12 +156,12 @@ def test_multistep_and_beta_rounding(dtype):
 
 def test_empty_and_metadata_errors():
     fn = getattr(flaggems_vllm.ops, OP)
-    data = make_inputs(
+    data = _make_inputs(
         (0, 1, 1, 8, 8), torch.float32, torch.float32, flaggems_vllm.device
     )
     result = fn(**data)
     assert result[0] is data["out"] and result[1] is data["initial_state"]
-    data = make_inputs(
+    data = _make_inputs(
         (1, 1, 1, 8, 8), torch.float32, torch.float32, flaggems_vllm.device
     )
     for key, value in [
@@ -186,18 +186,18 @@ def test_native_vllm(dtype, strided):
         fused_recurrent_gated_delta_rule_packed_decode as native,
     )
 
-    data = make_inputs(
+    data = _make_inputs(
         (9, 4, 12, 128, 128), dtype, torch.float32, flaggems_vllm.device, strided
     )
     state0 = data["initial_state"].clone()
-    expected = reference(data, True)
+    expected = _reference(data, True)
     native(**data, use_qk_l2norm_in_kernel=True)
-    assert_result(data, expected, dtype)
+    _assert_result(data, expected, dtype)
     native_out = data["out"].clone()
     native_state = data["initial_state"].clone()
     data["initial_state"].copy_(state0)
     getattr(flaggems_vllm.ops, OP)(**data, use_qk_l2norm_in_kernel=True)
-    assert_result(data, (native_out.cpu(), native_state.cpu()), dtype)
+    _assert_result(data, (native_out.cpu(), native_state.cpu()), dtype)
 
 
 @pytest.mark.parametrize("entry", ["generic", "top"])
@@ -207,7 +207,7 @@ def test_parallel_multistep_state_updated_once(entry, dtype, shape):
     # 108/256 logical tasks exceed Ascend 910B1's 48 Vector cores. Task zero
     # must remain valid: invalid first rows can hide duplicate execution.
     before = os.environ.get("TRITON_ALL_BLOCKS_PARALLEL")
-    data = make_inputs(
+    data = _make_inputs(
         shape, dtype, torch.float32, flaggems_vllm.device, strided=True, invalid=False
     )
     ref_data = dict(data)
@@ -220,11 +220,11 @@ def test_parallel_multistep_state_updated_once(entry, dtype, shape):
 
         assert getattr(flaggems_vllm, OP) is specialized
     for _ in range(4):
-        expected = reference(ref_data, True)
+        expected = _reference(ref_data, True)
         ref_data["initial_state"] = expected[1]
         result = fn(**data, use_qk_l2norm_in_kernel=True)
         assert result[0] is data["out"] and result[1] is data["initial_state"]
-        assert_result(data, expected, dtype)
+        _assert_result(data, expected, dtype)
         assert os.environ.get("TRITON_ALL_BLOCKS_PARALLEL") == before
 
 
@@ -234,14 +234,14 @@ def test_parallel_multistep_state_updated_once(entry, dtype, shape):
 @pytest.mark.parametrize("entry", ["generic", "top"])
 def test_nvidia_metadata_revalidated(entry):
     # Warm calls must revalidate metadata, rather than cache tensor identity.
-    data = make_inputs(
+    data = _make_inputs(
         (3, 2, 4, 17, 23), torch.float32, torch.float32, flaggems_vllm.device, True
     )
     fn = getattr(flaggems_vllm.ops if entry == "generic" else flaggems_vllm, OP)
     initial = data["initial_state"].clone()
-    expected = reference(data, True)
+    expected = _reference(data, True)
     fn(**data, use_qk_l2norm_in_kernel=True)
-    assert_result(data, expected, torch.float32)
+    _assert_result(data, expected, torch.float32)
     for key, value in [
         ("mixed_qkv", data["mixed_qkv"][:, :-1]),
         ("mixed_qkv", data["mixed_qkv"].double()),
@@ -264,4 +264,4 @@ def test_nvidia_metadata_revalidated(entry):
     data["out"].unsqueeze_(1)
     data["initial_state"].copy_(initial)
     fn(**data, use_qk_l2norm_in_kernel=True)
-    assert_result(data, expected, torch.float32)
+    _assert_result(data, expected, torch.float32)
