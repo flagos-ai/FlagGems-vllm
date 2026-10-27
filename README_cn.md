@@ -34,7 +34,7 @@ FlagGems-vllm 是一个使用 OpenAI 推出的 [Triton 编程语言](https://git
 
 三个仓库在 FlagOS 生态中协同配合，但分工不同：
 
-- **FlagGems**：通用 FlagGems 算子库。提供通用的 PyTorch/Triton 算子替换，并通过 `flag_gems.enable()` / `flag_gems.use_gems()` 将算子注册到 PyTorch dispatch。
+- **FlagGems**：通用 FlagGems 算子库。提供通用的 PyTorch/Triton 算子替换，并通过 `flag_gems.enable()` / `flag_gems.use_gems()` 将算子注册到 PyTorch dispatch。**FlagGems-vllm 依赖 FlagGems**，当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的算子。
 - **FlagGems-vllm**（本项目）：聚焦 vLLM 推理场景的特化与融合算子库。通过 `flaggems_vllm` Python 包导出算子，例如 `flaggems_vllm.grouped_topk`、`flaggems_vllm.fused_experts_impl` 和 `flaggems_vllm.moe_align_block_size`。
 - **vllm-plugin-fl**：vLLM 插件层。通过导入 FlagGems 并调用 `flag_gems.enable()` 作为全局通用算子后端；对于未挂接在 PyTorch dispatch 上的 vLLM 专用融合内核，则显式导入并调用 FlagGems-vllm 提供的算子。
 
@@ -44,10 +44,10 @@ FlagGems-vllm 是一个使用 OpenAI 推出的 [Triton 编程语言](https://git
 vLLM
 	-> vllm-plugin-fl
 			-> flag_gems.enable() 注册通用 FlagGems 算子
-			-> flaggems_vllm.<operator>() 调用 vLLM 专用融合算子
+			-> flaggems_vllm.<operator>() 调用 vLLM 专用融合算子 (部分内部调用 flag_gems 算子)
 ```
 
-因此，`FlagGems` 与 `FlagGems-vllm` 互为补充：`FlagGems` 负责通用算子底座，而 `FlagGems-vllm` 负责 vLLM 特化内核以及供给 `vllm-plugin-fl` 使用的兼容性测试与性能评测。
+因此，`FlagGems-vllm` 建立在 `FlagGems` 之上：`FlagGems` 提供通用算子底座与部分底层核函数，而 `FlagGems-vllm` 提供 vLLM 特化内核以及供给 `vllm-plugin-fl` 使用的兼容性测试与性能评测。
 
 ## 快速安装
 
@@ -108,9 +108,15 @@ export VLLM_PLUGINS=fl
 
 ## 使用示例
 
+由于 FlagGems-vllm 依赖 FlagGems 且部分算子在底层调用 FlagGems 算子，推荐在使用 FlagGems-vllm 算子时先调用 `flag_gems.enable()` 初始化全局算子分发支持：
+
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# 推荐：启用 FlagGems 通用算子
+flag_gems.enable()
 
 # 构造 MoE 路由所需的 topk_ids
 num_tokens = 128

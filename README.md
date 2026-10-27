@@ -18,7 +18,7 @@ FlagGems-vllm is a high-performance deep learning operator library implemented u
 
 The three repositories are used together but have different responsibilities:
 
-- **FlagGems**: the general-purpose FlagGems operator library. It provides common PyTorch/Triton operator replacements and exposes `flag_gems.enable()` / `flag_gems.use_gems()` to register operators into PyTorch dispatch.
+- **FlagGems**: the general-purpose FlagGems operator library. It provides common PyTorch/Triton operator replacements and exposes `flag_gems.enable()` / `flag_gems.use_gems()` to register operators into PyTorch dispatch. **FlagGems-vllm depends on FlagGems**, and currently some FlagGems-vllm operators invoke operators from FlagGems internally.
 - **FlagGems-vllm**: this repository. It contains vLLM-scenario operator implementations and tests/benchmarks that are aligned with the corresponding FlagGems implementations where the same operator exists. It exposes operators through the `flaggems_vllm` Python package, for example `flaggems_vllm.grouped_topk`, `flaggems_vllm.fused_experts_impl`, and `flaggems_vllm.moe_align_block_size`.
 - **vllm-plugin-fl**: the vLLM plugin layer. It uses FlagGems as the global operator backend by importing FlagGems and calling `flag_gems.enable()`. For vLLM-specific fused kernels that are not enabled through PyTorch dispatch, it explicitly imports and calls operators from FlagGems-vllm.
 
@@ -28,10 +28,10 @@ In a typical vLLM plugin environment, the call flow is:
 vLLM
 	-> vllm-plugin-fl
 			-> flag_gems.enable() for general FlagGems operator registration
-			-> flaggems_vllm.<operator>() for vLLM-specific fused operators
+			-> flaggems_vllm.<operator>() for vLLM-specific fused operators (some calling flag_gems operators internally)
 ```
 
-This means `FlagGems` and `FlagGems-vllm` are complementary: `FlagGems` provides the common operator backend, while `FlagGems-vllm` provides vLLM-oriented kernels and compatibility tests/benchmarks used by `vllm-plugin-fl`.
+This means `FlagGems-vllm` builds on top of `FlagGems`: `FlagGems` provides the common operator foundation and internal utility operators, while `FlagGems-vllm` provides vLLM-oriented kernels and compatibility tests/benchmarks used by `vllm-plugin-fl`.
 
 ## Quick Installation
 ### Install Dependencies
@@ -91,9 +91,15 @@ export VLLM_PLUGINS=fl
 
 ## Usage Example
 
+Since FlagGems-vllm depends on FlagGems and some operators invoke FlagGems kernels internally, it is recommended to call `flag_gems.enable()` before using FlagGems-vllm:
+
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# Recommended: enable FlagGems general operators
+flag_gems.enable()
 
 # Prepare a simple topk_ids tensor for MoE routing
 num_tokens = 128
