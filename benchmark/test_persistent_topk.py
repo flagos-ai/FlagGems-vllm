@@ -14,10 +14,11 @@
 
 """Benchmark FlagGems-vllm persistent_topk against the vLLM native kernel.
 
-Only NVIDIA and MetaX vLLM builds ship persistent_topk; other vendors skip the
-benchmark until a native implementation exists there. There is deliberately no
-torch.topk reference: a torch-built baseline is not a meaningful performance
-reference, and compared_speedup comes from the frozen H800 data instead.
+Only NVIDIA and MetaX vLLM builds ship a native persistent_topk. On the other
+vendors the Gems kernel is timed on its own: the Torch and Gems speedup columns
+stay N/A and only the vs-baseline ratio from --base-data is reported. There is
+deliberately no torch.topk reference: a torch-built baseline is not a
+meaningful performance reference.
 
 Every shape is (num_rows, seq_len, max_seq_len, stride): seq_len is the length
 the kernel scans, max_seq_len is the value it receives, stride is the width of
@@ -188,10 +189,23 @@ class PersistentTopKBenchmark(base.GenericBenchmarkExcluse1D):
         mcoplib native vs FlagGems-vllm
 
     Other vendors:
-        not benchmarked yet, there is no native implementation
+        gems kernel only; baseline columns stay N/A
     """
 
     DEFAULT_SHAPE_DESC = "num_rows, seq_len, max_seq_len, stride"
+
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            # No vendor-native kernel on this platform: timing it would raise,
+            # and a gems-vs-gems ratio says nothing. Keep the latency metric and
+            # drop the two baseline ones; compared_speedup is computed from the
+            # frozen data outside this list.
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in ("latency_base", "speedup")
+            ]
 
     def set_shapes(self, shape_file_path=None):
         """Shape list, kept in sync with baseline/persistent_topk.py::grid()."""
@@ -205,10 +219,6 @@ class PersistentTopKBenchmark(base.GenericBenchmarkExcluse1D):
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    VENDOR not in VLLM_NATIVE_VENDORS,
-    reason="persistent_topk has no vLLM native implementation on this vendor",
-)
 @pytest.mark.persistent_topk
 def test_persistent_topk():
     baseline_op = _get_baseline_op()
