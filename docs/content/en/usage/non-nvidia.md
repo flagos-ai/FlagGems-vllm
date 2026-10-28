@@ -18,7 +18,7 @@ FlagGems-vllm supports **17 hardware backends** (NVIDIA plus 16 non-NVIDIA backe
 - **Kunlunxin** (Baidu): XPU series
 - **MetaX**: C-series accelerators
 - **Moore Threads**: MTT GPUs
-- **AIPU**, **ARM**, **Biren**, **SpaceMIT**, **Sunrise**, **T-Head**, **Tsingmicro**
+- **AIPU**, **ARM**, **Biren**, **SpacemiT**, **Sunrise**, **T-Head**, **Tsingmicro**
 
 See `src/flaggems_vllm/runtime/backend/` for the complete list.
 

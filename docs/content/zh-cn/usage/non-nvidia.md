@@ -18,7 +18,7 @@ FlagGems-vllm 具备出色的硬件异构扩展能力，共支持 **17 个硬件
 - **昆仑芯 (Kunlunxin)**: XPU 系列加速卡
 - **沐曦 (MetaX)**: 曦云 C 系列 GPU
 - **摩尔线程 (Moore Threads)**: MTT 系列 GPU
-- **AIPU**, **ARM**, **壁仞 (Biren)**, **进迭时空 (SpaceMIT)**, **曦望 (Sunrise)**, **平头哥 (T-Head)**, **清微智能 (Tsingmicro)**
+- **AIPU**, **ARM**, **壁仞 (Biren)**, **进迭时空 (SpacemiT)**, **曦望 (Sunrise)**, **平头哥 (T-Head)**, **清微智能 (Tsingmicro)**
 
 完整支持列表参见 `src/flaggems_vllm/runtime/backend/`。
 
