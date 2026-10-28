@@ -68,6 +68,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
+    "qsa_prepare",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",

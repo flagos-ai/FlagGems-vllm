@@ -63,6 +63,7 @@ __all__ = [
     "persistent_topk",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
+    "qsa_prepare",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",
