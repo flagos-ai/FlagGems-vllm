@@ -37,7 +37,7 @@ FlagGems-vllm provides **105 operators** (with 157 exported ops) optimized for v
 - Quantization (FP8, FP4, INT8)
 - Fused normalization + RoPE
 - Activation functions (GELU, SwiGLU, GeGLU)
-- Model-specific operators (Qwen4, DeepSeek-v4, RWKV, M3)
+- Model-specific operators (Qwen4, DeepSeek-v4, RWKV, MiniMax M3)
 
 See the [operator reference](references/operators.md) for the complete list.
 

@@ -1,9 +1,9 @@
 ---
-title: M3 Operator Support
+title: MiniMax M3 Support
 weight: 15
 ---
 
-# M3 Inference Operator Support and Quantization Fusion
+# MiniMax M3 Support and Quantization Fusion
 
 This document details operator support contracts, quantization fusion, validation, and performance benchmarks for MiniMax M3 model inference workloads.
 

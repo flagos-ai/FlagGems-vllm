@@ -147,5 +147,5 @@ Mandatory operator development protocol with hard gates (G0–G7):
 
 - [Operator development protocol](../contribution/workflow.md)
 - [Contributing guide](../contribution/overview.md)
-- [M3 Operator Support](m3-support.md)
+- [MiniMax M3 Support](m3-support.md)
 - [Testing guide](../testing/unittest.md)
