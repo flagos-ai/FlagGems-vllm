@@ -759,7 +759,7 @@ def _qsa_prepare_uncached(
     if num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
     else:
-        TILE_T_Q, TILE_H_Q = 2, 4
+        TILE_T_Q, TILE_H_Q = 8, 2
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
     # Token tiling pays off once the grid is large enough to be

@@ -270,8 +270,6 @@ def _qsa_prepare_kernel(
             else:
                 out = (token * MAIN_HQ + head) * MAIN_D
                 _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
-                gate = tl.load(src + MAIN_D + dims)
-                tl.store(main_gate_out_ptr + out + dims, gate)
             return
         else:
             # one (Q or KV) head. RoPE covers the first D // 2 dims, the width of the
@@ -358,8 +356,6 @@ def _qsa_prepare_kernel(
             else:
                 out_row = (tok * MAIN_HQ + head)[:, None] * MAIN_D
                 _store_rotated_tiled(main_q_out_ptr + out_row, y, o1, o2, None, m2)
-                gate = tl.load(src + MAIN_D + dims[None, :], mask=m2, other=0.0)
-                tl.store(main_gate_out_ptr + out_row + dims[None, :], gate, mask=m2)
             return
     # K work occupies the first programs; the remaining programs tile Q. This
     # keeps both paths in one launch while leaving their register shapes
@@ -724,7 +720,13 @@ def _qsa_prepare_uncached(
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
-    main_gate_out = torch.empty_like(main_q_out)
+    # ``main_qkv`` already holds the gate channel right after each Q head, so the
+    # gate output aliases it instead of being copied through global memory.
+    main_gate_out = main_qkv.as_strided(
+        (num_tokens, num_main_q_heads, main_head_dim),
+        (main_qkv.stride(0), 2 * main_head_dim, 1),
+        main_head_dim,
+    )
     if num_tokens == 0:
         return main_q_out, main_gate_out, None, None, None
     num_q_heads, head_dim = q_out.shape[1:]
@@ -930,7 +932,13 @@ def qsa_prepare(
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
-    main_gate_out = torch.empty_like(main_q_out)
+    # ``main_qkv`` already holds the gate channel right after each Q head, so the
+    # gate output aliases it instead of being copied through global memory.
+    main_gate_out = main_qkv.as_strided(
+        (num_tokens, num_main_q_heads, main_head_dim),
+        (main_qkv.stride(0), 2 * main_head_dim, 1),
+        main_head_dim,
+    )
     if num_tokens == 0:
         return main_q_out, main_gate_out
     cache_key = (
