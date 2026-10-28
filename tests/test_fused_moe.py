@@ -187,3 +187,73 @@ def test_quant_full_and_mixed_dispatch():
     with flag_gems.use_gems(include=["abs"]):
         assert moe._int8_quant_dispatch_policy() is None
     assert moe._int8_quant_dispatch_policy() is False
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("model_rows", [1, 4, 64])
+@torch.inference_mode()
+def test_hy4_e23_clamped_silu_quant_math_graph(model_rows, monkeypatch):
+    rows, width = model_rows * 8, 2048
+    generator = torch.Generator(device="cpu").manual_seed(2026)
+    packed_cpu = (torch.randn(rows, width * 2, generator=generator) * 4).bfloat16()
+    packed = packed_cpu.cuda()
+    expected_activation = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+    activation = torch.empty_like(expected_activation)
+    spec = moe._int8_quant_dispatch_spec()
+    if spec is None:
+        pytest.skip("current registrar signature is outside the supported contract")
+    monkeypatch.setattr(moe, "_W8A8_QUANT_FUSION_MODE", "off")
+    moe.apply_moe_activation(
+        moe.MoEActivation.SILU,
+        expected_activation,
+        packed,
+        gemm1_clamp_limit=10.0,
+    )
+    expected_q, expected_scale = moe._int8_quantize(
+        expected_activation, None, True, None
+    )
+    q, scale = moe._swigluoai_quantize_per_token_triton(
+        packed, activation, 1.0, 0.0, 10.0, _silu=True, _validated_spec=spec
+    )
+    assert torch.equal(activation, expected_activation)
+    assert torch.equal(q, expected_q)
+    assert torch.equal(scale, expected_scale)
+    gate, up = packed_cpu.float().chunk(2, dim=-1)
+    gate, up = gate.clamp(max=10.0), up.clamp(-10.0, 10.0)
+    gold = (gate / (1.0 + torch.exp(-gate)) * up).bfloat16()
+    torch.testing.assert_close(activation.cpu(), gold, rtol=0.01, atol=0.03125)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        moe._swigluoai_quantize_per_token_triton(
+            packed, activation, 1.0, 0.0, 10.0, _silu=True, _validated_spec=spec
+        )
+        with torch.cuda.graph(graph, stream=stream):
+            graph_q, graph_scale = moe._swigluoai_quantize_per_token_triton(
+                packed, activation, 1.0, 0.0, 10.0, _silu=True, _validated_spec=spec
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    packed_cpu.neg_()
+    packed.copy_(packed_cpu)
+    moe.apply_moe_activation(
+        moe.MoEActivation.SILU,
+        expected_activation,
+        packed,
+        gemm1_clamp_limit=10.0,
+    )
+    expected_q, expected_scale = moe._int8_quantize(
+        expected_activation, None, True, None
+    )
+    gate, up = packed_cpu.float().chunk(2, dim=-1)
+    gate, up = gate.clamp(max=10.0), up.clamp(-10.0, 10.0)
+    gold = (gate / (1.0 + torch.exp(-gate)) * up).bfloat16()
+    activation.fill_(17)
+    graph_q.fill_(17)
+    graph_scale.fill_(17)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(activation, expected_activation)
+    torch.testing.assert_close(activation.cpu(), gold, rtol=0.01, atol=0.03125)
+    assert torch.equal(graph_q, expected_q)
+    assert torch.equal(graph_scale, expected_scale)

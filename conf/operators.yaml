@@ -244,6 +244,17 @@ ops:
       - Attention
     stages:
       - beta: '3.0'
+  - id: concat_pad_mla_q_and_sink
+    description: Concatenate BF16 MLA query components and pad heads and FP32 sinks.
+    for:
+      - concat_pad_mla_q_and_sink
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: cp_gather_indexer_k_quant_cache
     description: This is a fused operator that gathers FP8 K cache values and scales.
     for:
@@ -727,6 +738,17 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: ihc_post_pre
+    description: Fuse BF16 iHC residual scatter with the following pre reduction.
+    for:
+      - ihc_post_pre
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: indexer_epilogue
     description: |
       Fused post-topk epilogue for the GLM lightning indexer: expands the
@@ -797,6 +819,17 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
+  - id: int8_scaled_mm_decode
+    description: SM90 INT8 output projection with exact per-token/channel scaling.
+    for:
+      - int8_scaled_mm_decode
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
   - id: kda_conv_gather
     description: |
       Stages the rows used by a batch out of the block-strided Kimi Delta
@@ -986,6 +1019,17 @@ ops:
       - MoE
     stages:
       - stable: '4.2'
+  - id: mrope_strided_cache
+    description: Apply adjacent-pair M-RoPE directly to gapped BF16 rotary views.
+    for:
+      - mrope_strided_cache
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: mul
     description: Multiplies `input` by `other`.
     for:
@@ -1008,6 +1052,17 @@ ops:
       - Math
     stages:
       - stable: '2.2'
+  - id: mul_scaled_int8_quant
+    description: Fuse BF16 product rounding with symmetric per-token INT8 quantization.
+    for:
+      - mul_scaled_int8_quant
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: mv
     description: Performs a matrix-vector product of the matrix `input` and the vector
       `vec`.

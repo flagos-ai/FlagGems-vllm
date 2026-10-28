@@ -221,6 +221,50 @@ PY
 
 If a model and vLLM runtime are available, run a small vLLM offline inference from the `vllm-plugin-fl` repository examples, for example `examples/offline_inference.py`.
 
+### Explicit inference APIs
+
+These NVIDIA CUDA APIs are explicit calls and do not install model hooks or
+ATen registrations. Unsupported metadata raises before launch; callers retain
+ownership of framework selection, request metadata and workspace lifetime.
+
+| API | Supported contract |
+| --- | --- |
+| `ihc_post_pre` | BF16 residual scatter and next iHC pre reduction at hidden 6144, HC=4, M=0..1024; materialize the BF16 residual before the FP32 reduction. |
+| `mul_scaled_int8_quant` | BF16 row-major product, preserving BF16 rounding before per-row signed INT8 quantization; optional disjoint output buffers. |
+| `int8_scaled_mm_decode` | SM90 INT8 projection at M=1..64, K=1024, N=6144; FP32 channel scaling precedes row scaling, then BF16 output. |
+| `concat_pad_mla_q_and_sink` | Raw-bit BF16 query concatenation and head padding; pad FP32 sinks with negative infinity into caller-owned outputs. |
+| `mrope_strided_cache` | Adjacent-pair BF16 M-RoPE on gapped Q heads, T<=1024, H=4/32, rotary width 64; preserve native Q allocation and K-view behavior. |
+
+The existing `fused_moe` API also accepts clamped SiLU and the explicit
+`quant_silu` mode of its existing `FLAG_GEMS_W8A8_QUANT_FUSION` setting. It retains
+the BF16 activation workspace and the live quantization registrar's division
+semantics. Ordinary routing continues to use the current-main `grouped_topk`.
+Request-ID, slot and sampled-token preparation remain framework responsibilities.
+
+Fixed-schedule exemptions preserve the iHC reduction tree, SM90 projection,
+concat transport, M-RoPE and MoE schedules. Multiply/quantization reuses
+`scaled_int8_quant_dynamic_single` restricted to four warps and one stage.
+The finite functional tests and matching `benchmark/test_*_perf.py` entry points
+require the installed CUDA environment. The installed public wheel at
+`ead30f59a34869f12b4837147fbb425581e47280` passed seven existing selected cases
+on H100/SM90 with Torch 2.13.0+cu129 and Triton 3.6.0: one shape for each of the
+five direct APIs, both shared-matmul scale orders, and the private clamped-SiLU/INT8
+component (no skips). The selected ordinary graphs retain owners and refresh
+inputs/outputs. That R54 run checked the public `fused_experts_impl` identity
+and the private SiLU/quantization component.
+
+A later run of the same public wheel exercised the full `quant_silu` routing,
+two GEMMs, quantization and sum chain on two synthetic BF16 fixtures:
+M=208/256, hidden=6144, intermediate=2048, E=16 and topK=8. Under an independent CPU
+reference for the declared CUDA FP32 reciprocal-multiply scale contract, all ten
+eager, warmup and ordinary A/B/A graph outputs matched bytes. The earlier direct
+CPU scalar-division reference failures remain recorded separately. Only that
+reference scale expression changed; the kernel and original BF16 tolerances
+(atol=0.004/rtol=0.016) did not. These are representative component checks, not
+all-parameter, TP/EP, checkpoint/full-model or performance qualification. Other
+parameters and framework integration remain open. Historical component timings
+remain separately scoped in the pull request; this run adds no benchmark.
+
 ### Notes
 
 - `--collect-only` is recommended first to quickly check import and test discovery.

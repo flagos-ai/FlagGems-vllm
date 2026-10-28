@@ -245,6 +245,7 @@ __all__ = [
     "compute_global_topk_indices_and_lens",
     "concat_and_cache_mla",
     "concat_mla_q",
+    "concat_pad_mla_q_and_sink",
     "concat_query",
     "contiguous_copy",
     "copy_to",
@@ -290,12 +291,14 @@ __all__ = [
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "ihc_post",
+    "ihc_post_pre",
     "ihc_post_ref",
     "ihc_pre",
     "ihc_pre_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
+    "int8_scaled_mm_decode",
     "invoke_fused_moe_triton_kernel",
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
@@ -313,8 +316,10 @@ __all__ = [
     "moe_align_block_size_triton",
     "moe_sum",
     "mrope",
+    "mrope_strided_cache",
     "mul",
     "mul_",
+    "mul_scaled_int8_quant",
     "mv",
     "outer",
     "outplace_fused_experts",
@@ -390,6 +395,33 @@ __all__ = [
 
 # Backend-only APIs have no implementation on other vendors.
 from flaggems_vllm import runtime as _runtime
+
+# These archived numerical contracts are qualified on NVIDIA CUDA only.
+if _runtime.device.vendor_name == "nvidia":
+    from flaggems_vllm.ops.concat_pad_mla_q_and_sink import concat_pad_mla_q_and_sink
+    from flaggems_vllm.ops.ihc_post_pre import ihc_post_pre
+    from flaggems_vllm.ops.int8_scaled_mm_decode import int8_scaled_mm_decode
+    from flaggems_vllm.ops.mrope_strided_cache import mrope_strided_cache
+    from flaggems_vllm.ops.mul_scaled_int8_quant import mul_scaled_int8_quant
+else:
+
+    def mrope_strided_cache(*args, **kwargs):
+        raise NotImplementedError(
+            "Hy4-preview mrope_strided_cache requires NVIDIA CUDA"
+        )
+
+    def concat_pad_mla_q_and_sink(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview concat/pad requires NVIDIA CUDA")
+
+    def int8_scaled_mm_decode(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview INT8 decode requires NVIDIA SM90 CUDA")
+
+    def ihc_post_pre(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview IHC post/pre requires NVIDIA CUDA")
+
+    def mul_scaled_int8_quant(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview mul/INT8 requires NVIDIA CUDA")
+
 
 if _runtime.device.vendor_name == "hygon":
     from flaggems_vllm.runtime.backend._hygon.fused import attention as hygon_attention
