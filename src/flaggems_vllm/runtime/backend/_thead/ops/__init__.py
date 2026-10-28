@@ -38,6 +38,7 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -48,6 +49,7 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_bloc
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
+    "qsa_prepare",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
