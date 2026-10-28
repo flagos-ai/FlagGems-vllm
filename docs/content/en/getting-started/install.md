@@ -157,6 +157,13 @@ PYTHONPATH=src pytest -q tests --quick
 PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
 ```
 
+### Notes
+
+- `--collect-only` is recommended first to quickly check import and test discovery.
+- Use `--quick` for fast functional validation when supported by the test.
+- Use `--level core --iter 1 --warmup 1` for fast benchmark smoke tests.
+- Full benchmark runs can take a long time and should be reserved for performance validation.
+
 ## Backend Selection
 
 FlagGems-vllm auto-detects the hardware backend. To override:

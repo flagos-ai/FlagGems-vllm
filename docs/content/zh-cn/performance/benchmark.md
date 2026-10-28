@@ -25,6 +25,15 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
     --level core --iter 1 --warmup 1
 ```
 
+针对特定算子进行聚焦性能评测：
+
+```bash
+PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py::test_moe_align_block_size_triton \
+    --level core --iter 1 --warmup 1
+PYTHONPATH=src pytest -q benchmark/test_fused_inv_rope_fp8_quant.py \
+    --level core --iter 1 --warmup 1
+```
+
 ## 基准测试常用选项
 
 基准测试选项在 `benchmark/conftest.py` 中统一定义：

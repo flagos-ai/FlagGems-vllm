@@ -31,7 +31,7 @@ bookCollapseSection: true
 
 关键要求:
 - **NO_TORCH_COMPUTE_FALLBACK**: 生产代码不得使用 torch 计算算子
-- **编码前表格**: 项目真相、torch 对齐契约、实现路径
+- **编码前设计表**: 工程基线、Torch 对齐规范、实现路径设计
 - **自动调优必需**: NVIDIA 后端必须有调优配置
 - **标准代码落点**: `src/flaggems_vllm/ops/<op>.py`、`tests/test_<op>.py`、`benchmark/test_<op>.py`
 - **验收标准**: 核心形状的加速比 ≥ 0.9

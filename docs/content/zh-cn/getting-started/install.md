@@ -157,6 +157,13 @@ PYTHONPATH=src pytest -q tests --quick
 PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
 ```
 
+### 注意事项
+
+- 建议首先运行 `--collect-only`，快速确认模块导入与测试发现是否正常。
+- 算子支持时优先使用 `--quick` 进行快速功能验证。
+- 基准评测冒烟可使用 `--level core --iter 1 --warmup 1`。
+- 全量基准测试耗时较长，建议仅在正式性能验证时执行。
+
 ## 后端选择
 
 FlagGems-vllm 自动检测硬件后端。要覆盖:

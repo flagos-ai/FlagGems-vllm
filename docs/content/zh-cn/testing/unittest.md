@@ -42,6 +42,9 @@ PYTHONPATH=src pytest -v tests/test_grouped_topk.py
 
 # 测试 MoE Token 对齐算子
 PYTHONPATH=src pytest -v tests/test_moe_align_block_size.py
+
+# 快速验证特定融合算子
+PYTHONPATH=src pytest -q tests/test_fused_inv_rope_fp8_quant.py --quick
 ```
 
 ### 查看详细输出与日志

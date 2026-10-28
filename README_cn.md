@@ -18,10 +18,7 @@
 
 ## 介绍
 
-FlagGems-vllm 是 [FlagOS](https://flagos.io/) 的一部分。
-FlagGems-vllm 是一个面向多种芯片后端的高性能算子库，它提供了常见 vLLM 算子的高性能实现，支持多种主流模型的高性能推理及部署。
-
-FlagGems-vllm 是一个使用 OpenAI 推出的 [Triton 编程语言](https://github.com/openai/triton) 实现的高性能深度学习算子库。
+FlagGems-vllm 是 [FlagOS](https://flagos.io/) 的一部分，是一个使用 OpenAI 推出的 [Triton 编程语言](https://github.com/openai/triton) 实现、面向多种芯片后端的高性能算子库。它提供了常见 vLLM 算子的高性能实现，支持多种主流模型的高性能推理及部署。
 
 ## 特性
 
@@ -49,110 +46,30 @@ vLLM
 
 因此，`FlagGems-vllm` 建立在 `FlagGems` 之上：`FlagGems` 提供通用算子底座与部分底层核函数，而 `FlagGems-vllm` 提供 vLLM 特化内核以及供给 `vllm-plugin-fl` 使用的兼容性测试与性能评测。
 
-## 快速安装
+## 快速上手
 
-### 安装依赖
+### 快速安装
 
 ```shell
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
-```
-
-在安装 FlagGems-vllm 之前，请先安装与目标加速卡兼容的 PyTorch。与 FlagGems 一致，PyTorch 由底层环境管理，FlagGems-vllm 不会重复安装 PyTorch。
-
-### 安装 FlagGems-vllm
-
-```shell
-git clone https://github.com/flagos-ai/FlagGems-vllm.git
-cd FlagGems-vllm
-pip install .
-```
-
-开发模式下建议使用可编辑模式安装：
-
-```shell
 pip install --no-build-isolation -e .
 ```
 
-若需运行测试套件，可一并安装测试依赖：
+完整安装流程（包含测试依赖安装、环境引导脚本 `tools/setup.sh` 以及与 FlagGems、vllm-plugin-fl 协同安装等），请参阅[安装指南](docs/content/zh-cn/getting-started/install.md)。
 
-```shell
-pip install -e '.[test]'
-```
+### 使用示例
 
-### 与 FlagGems 和 vllm-plugin-fl 协同安装
-
-验证完整插件栈时，请按以下顺序安装：
-
-```shell
-# 1. 安装 FlagGems
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-
-# 2. 安装 FlagGems-vllm
-git clone https://github.com/flagos-ai/FlagGems-vllm.git
-cd FlagGems-vllm
-pip install --no-build-isolation -e .
-
-# 3. 安装 vllm-plugin-fl
-git clone https://github.com/flagos-ai/vllm-plugin-fl.git
-cd vllm-plugin-fl
-pip install --no-build-isolation -e .
-```
-
-当环境中安装了多个 vLLM 插件时，显式指定启用 FlagOS 插件：
-
-```shell
-export VLLM_PLUGINS=fl
-```
-
-## 使用示例
-
-由于 FlagGems-vllm 依赖 FlagGems 且部分算子在底层调用 FlagGems 算子，推荐在使用 FlagGems-vllm 算子时先调用 `flag_gems.enable()` 初始化全局算子分发支持：
+由于 FlagGems-vllm 依赖 FlagGems 且部分算子在底层调用 FlagGems 算子，推荐在使用 FlagGems-vllm 算子前先调用 `flag_gems.enable()`：
 
 ```python
 import torch
 import flag_gems
 import flaggems_vllm
 
-# 推荐：启用 FlagGems 通用算子
+# 启用 FlagGems 通用算子
 flag_gems.enable()
 
-# 构造 MoE 路由所需的 topk_ids
-num_tokens = 128
-topk = 2
-num_experts = 16
-block_size = 32
-
-topk_ids = torch.randint(
-	low=0,
-	high=num_experts,
-	size=(num_tokens, topk),
-	device='cuda',
-	dtype=torch.int32,
-)
-
-# 按 expert 和 block_size 对 token 做对齐
-sorted_ids, expert_ids, num_tokens_post_pad = flaggems_vllm.ops.moe_align_block_size(
-	topk_ids=topk_ids,
-	block_size=block_size,
-	num_experts=num_experts,
-)
-
-print(sorted_ids.shape, expert_ids.shape, num_tokens_post_pad)
-```
-
-### 与 FlagGems 配合使用
-
-`vllm-plugin-fl` 会启用 FlagGems 通用后端，同时支持直接调用 FlagGems-vllm 算子。最小冒烟验证如下：
-
-```python
-import torch
-import flag_gems
-import flaggems_vllm
-
-flag_gems.enable()
-
+# 调用 FlagGems-vllm 融合算子
 scores = torch.randn((8, 16), device="cuda", dtype=torch.float32)
 bias = torch.randn((16,), device="cuda", dtype=torch.float32)
 
@@ -166,86 +83,23 @@ topk_weights, topk_ids = flaggems_vllm.grouped_topk(
 	bias=bias,
 	scoring_func=0,
 )
-
 print(topk_weights.shape, topk_ids.shape)
 ```
 
-## 测试与基准测试快速上手
+更多算子示例（如 `moe_align_block_size`、`flash_attention_forward` 和 `fused_add_rms_norm` 等），请参阅[基础用法](docs/content/zh-cn/usage/basic.md)。
 
-以下命令可用于安装后的快速功能验证。大多数测试与基准评测需要支持的加速卡运行环境、厂商定制 PyTorch、配套 Triton 编译器以及 vLLM 相关依赖。
+## 文档指引
 
-### 导入冒烟测试
+更多详细内容与操作指引已整理至 [docs](docs/) 目录：
 
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src python - <<'PY'
-import torch
-import flaggems_vllm
-from flaggems_vllm import runtime
+- 📖 **起步与安装**: [安装指南](docs/content/zh-cn/getting-started/install.md)
+- 🚀 **使用方法**: [基础用法](docs/content/zh-cn/usage/basic.md) | [vLLM 插件集成](docs/content/zh-cn/usage/vllm-plugin.md) | [选择性启用](docs/content/zh-cn/usage/selective.md)
+- 🔧 **硬件后端**: [非 NVIDIA 硬件支持](docs/content/zh-cn/usage/non-nvidia.md)
+- 🧪 **测试验证**: [单元测试指南](docs/content/zh-cn/testing/unittest.md) | [覆盖率统计](docs/content/zh-cn/testing/coverage.md)
+- ⚡ **基准测试**: [运行性能基准测试](docs/content/zh-cn/performance/benchmark.md) | [评测结果](docs/content/zh-cn/performance/results.md)
+- 📋 **参考信息**: [支持算子列表](docs/content/zh-cn/references/operators.md) | [M3 算子支持](docs/content/zh-cn/references/m3-support.md) | [项目结构规范](docs/content/zh-cn/references/project-structure.md)
+- 🤝 **贡献指南**: [贡献概述](docs/content/zh-cn/contribution/overview.md) | [开发协议规范](docs/content/zh-cn/contribution/workflow.md)
 
-print('torch:', torch.__version__)
-print('vendor:', flaggems_vllm.vendor_name)
-print('flaggems_vllm device:', flaggems_vllm.device)
-print('device count:', runtime.device.device_count)
-print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
-PY
-```
-
-### 运行功能测试
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests --collect-only
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests --quick
-```
-
-运行单个目标算子测试：
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests/test_grouped_topk.py
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests/test_fused_inv_rope_fp8_quant.py --quick
-```
-
-### 运行性能基准测试
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark --collect-only
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark/test_moe_align_block_size_triton.py::test_moe_align_block_size_triton --level core --iter 1 --warmup 1
-```
-
-运行 vLLM 特化算子的针对性评测：
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark/test_grouped_topk.py --level core --iter 1 --warmup 1
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark/test_fused_inv_rope_fp8_quant.py --level core --iter 1 --warmup 1
-```
-
-### 使用 vllm-plugin-fl 进行全链路验证
-
-在完成 `FlagGems`、`FlagGems-vllm` 和 `vllm-plugin-fl` 安装后，验证插件能否正常导入且 FlagGems-vllm 算子可用：
-
-```shell
-export VLLM_PLUGINS=fl
-python - <<'PY'
-import flag_gems
-import flaggems_vllm
-
-flag_gems.enable()
-print('FlagGems enabled')
-print('FlagGems-vllm grouped_topk available:', callable(flaggems_vllm.grouped_topk))
-PY
-```
-
-如果具备模型权重与 vLLM 运行环境，可直接运行 `vllm-plugin-fl` 仓库中的离线推理示例，如 `examples/offline_inference.py`。
-
-### 注意事项
-
-- 建议首先运行 `--collect-only`，快速确认模块导入与测试发现是否正常。
-- 算子支持时优先使用 `--quick` 进行快速功能验证。
-- 基准评测冒烟可使用 `--level core --iter 1 --warmup 1`。
-- 全量基准测试耗时较长，建议仅在正式性能验证时执行。
+## 开源协议
 
 本项目采用 [Apache (Version 2.0) License](./LICENSE) 开源协议。

@@ -21,7 +21,7 @@ Guidelines for contributing to FlagGems-vllm.
 
 Steps:
 1. Verify the operator is needed for vLLM scenarios (not in FlagGems)
-2. Create three pre-coding tables (project truth, torch contract, implementation paths)
+2. Create three pre-coding design tables (engineering baseline, torch alignment specification, implementation path design)
 3. Implement host dispatch + Triton kernels
 4. Add autotune integration (NVIDIA backend required)
 5. Write functional tests (`tests/test_<op>.py`)
