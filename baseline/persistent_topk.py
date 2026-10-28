@@ -42,28 +42,35 @@ WORKSPACE_BYTES = 1 << 20
 # FlagGems-vllm counterpart, and before it existed these shapes all ran on
 # persistent_topk, so the small-batch rows are kept deliberately.
 _HOMO_SHAPES = [
-    # DeepSeek-V4.1-Flash, stride == max_seq_len (compress_ratio scales both).
-    # 4k context, ratio 1
+    # (num_rows, seq_len, max_seq_len, stride) -- mirrors benchmark set_shapes().
+    #
+    # Batches with num_rows <= 64 go to cooperative_topk under vLLM's auto policy;
+    # persistent_topk covers the larger ones. cooperative_topk is newer, has no
+    # FlagGems-vllm counterpart, and before it existed these shapes all ran on
+    # persistent_topk, so the small-batch rows are kept deliberately.
+    # DeepSeek-V4.1-Flash, 1k context: p1024d1024 run filtered by the
+    # serving-start sentinel (11,136 real calls, num_rows 67-508); seq_len is the
+    # p50 of each ratio class (1044 / 522), stride == max_seq_len.
+    (67, 1044, 65536, 65536),
+    (128, 1044, 65536, 65536),
+    (256, 1044, 65536, 65536),
+    (508, 1044, 65536, 65536),
+    (67, 522, 32768, 32768),
+    (128, 522, 32768, 32768),
+    (256, 522, 32768, 32768),
+    (508, 522, 32768, 32768),
+    # DeepSeek-V4.1-Flash, 4k context (ratio 1 / ratio 2).
     (16, 4096, 65536, 65536),
-    (64, 4096, 65536, 65536),
     (125, 4096, 65536, 65536),
-    # 32k context, ratio 1
-    (3, 32769, 65536, 65536),
-    (7, 32769, 65536, 65536),
-    # 4k context, ratio 2
-    (8, 2048, 32768, 32768),
     (48, 2048, 32768, 32768),
-    (96, 2048, 32768, 32768),
     (120, 2048, 32768, 32768),
-    # 32k context, ratio 2
+    # DeepSeek-V4.1-Flash, 32k context.
+    (3, 32769, 65536, 65536),
     (5, 16384, 32768, 32768),
     # DeepSeek-V4-Flash: fixed 262144-wide buffer, seq_len == max_seq_len.
     (12, 4105, 4105, 262144),
-    (16, 4106, 4106, 262144),
-    (20, 4107, 4107, 262144),
     (24, 4108, 4108, 262144),
     (10, 1055, 1055, 262144),
-    (2, 1034, 1034, 262144),
     (1, 32773, 32773, 262144),
 ]
 

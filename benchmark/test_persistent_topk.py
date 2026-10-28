@@ -75,30 +75,33 @@ _HOMO_SHAPES = [
     # Whether one will be written is undecided, so the small-batch rows are
     # kept - they are the workload this operator owns whenever cooperative_topk
     # is unavailable, rather than a pinned-backend corner case.
-    # DeepSeek-V4.1-Flash (num_rows, seq_len, max_seq_len, stride); here the
-    # layer's compress_ratio scales both lengths, so stride == max_seq_len.
-    # 4k context, ratio 1 (42.7% of recorded calls)
+    # DeepSeek-V4.1-Flash, 1k context: the closest thing to production we have,
+    # taken from a p1024d1024 run (prompt 1024, concurrency 512, 3 rounds)
+    # filtered by the serving-start sentinel - 11,136 real calls over
+    # num_rows 67-508. seq_len is the p50 of each ratio class (1044 for ratio
+    # 1, 522 for ratio 2); stride == max_seq_len because compress_ratio scales
+    # both.
+    (67, 1044, 65536, 65536),
+    (128, 1044, 65536, 65536),
+    (256, 1044, 65536, 65536),
+    (508, 1044, 65536, 65536),
+    (67, 522, 32768, 32768),
+    (128, 522, 32768, 32768),
+    (256, 522, 32768, 32768),
+    (508, 522, 32768, 32768),
+    # DeepSeek-V4.1-Flash, 4k context, one batch pair per ratio class.
     (16, 4096, 65536, 65536),
-    (64, 4096, 65536, 65536),
     (125, 4096, 65536, 65536),
-    # 32k context, ratio 1 (19.8%)
-    (3, 32769, 65536, 65536),
-    (7, 32769, 65536, 65536),
-    # 4k context, ratio 2 (25.6%)
-    (8, 2048, 32768, 32768),
     (48, 2048, 32768, 32768),
-    (96, 2048, 32768, 32768),
     (120, 2048, 32768, 32768),
-    # 32k context, ratio 2 (11.9%)
+    # DeepSeek-V4.1-Flash, 32k context, one row per ratio class.
+    (3, 32769, 65536, 65536),
     (5, 16384, 32768, 32768),
     # DeepSeek-V4-Flash keeps a 262144-wide buffer and passes the real context;
     # 4k dominates its traffic (78.8%), then ~1k (15.1%) and 32k (6.1%).
     (12, 4105, 4105, 262144),
-    (16, 4106, 4106, 262144),
-    (20, 4107, 4107, 262144),
     (24, 4108, 4108, 262144),
     (10, 1055, 1055, 262144),
-    (2, 1034, 1034, 262144),
     (1, 32773, 32773, 262144),
 ]
 
