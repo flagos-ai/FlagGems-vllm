@@ -38,11 +38,10 @@ SWIGLU_LIMIT = 7.0
 
 
 def packed_input_fn(shape, dtype, device):
-    """Generate packed input with twice the configured gate/up width."""
-    if not shape:
-        shape = (1,)
-    packed_shape = (*shape[:-1], shape[-1] * 2)
-    yield utils.generate_tensor_input(packed_shape, dtype, device),
+    """Treat the configured shape as the full packed input shape (..., 2 * d)."""
+    if not shape or shape[-1] <= 0 or shape[-1] % 2:
+        return
+    yield utils.generate_tensor_input(shape, dtype, device),
 
 
 @contextmanager

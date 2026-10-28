@@ -64,18 +64,17 @@ def vllm_silu_and_mul_with_clamp_cls():
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("limit", SILU_AND_MUL_WITH_CLAMP_LIMITS)
 def test_silu_and_mul_with_clamp(shape, dtype, limit, vllm_silu_and_mul_with_clamp_cls):
-    if not shape:
-        pytest.skip("vLLM SiluAndMulWithClamp requires a non-scalar input")
-    inp1 = torch.randn(
+    if not shape or shape[-1] <= 0 or shape[-1] % 2:
+        pytest.skip("vLLM requires a packed input with a positive even last dimension")
+    packed = torch.randn(
         shape, dtype=dtype, device=flaggems_vllm.device, requires_grad=True
     )
-    inp2 = torch.randn(
-        shape, dtype=dtype, device=flaggems_vllm.device, requires_grad=True
-    )
+    d = packed.shape[-1] // 2
+    inp1 = packed[..., :d]
+    inp2 = packed[..., d:]
     ref_inp1 = utils.to_reference(inp1, True)
     ref_inp2 = utils.to_reference(inp2, True)
 
-    vllm_inp = torch.cat((inp1.detach(), inp2.detach()), dim=-1)
     with _vllm_custom_op_config():
         vllm_op = vllm_silu_and_mul_with_clamp_cls(swiglu_limit=limit).to(
             flaggems_vllm.device
@@ -83,7 +82,7 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit, vllm_silu_and_mul_with_cla
         # OOT platforms may dispatch __call__ to forward_native. Explicitly
         # select the fused baseline, including platforms using PrivateUse1.
         vllm_op.op = torch.ops._C.silu_and_mul_with_clamp
-        vllm_out = vllm_op.forward_cuda(vllm_inp)
+        vllm_out = utils.to_reference(vllm_op.forward_cuda(packed.detach()))
     # Use vLLM's differentiable reference for backward, not its fused kernel.
     ref_out = vllm_op.forward_native(torch.cat((ref_inp1, ref_inp2), dim=-1))
     with flaggems_vllm.use_gems():
@@ -114,18 +113,19 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit, vllm_silu_and_mul_with_cla
 def test_silu_and_mul_with_clamp_out(
     shape, dtype, limit, vllm_silu_and_mul_with_clamp_cls
 ):
-    if not shape:
-        pytest.skip("vLLM SiluAndMulWithClamp requires a non-scalar input")
-    inp1 = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
-    inp2 = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
+    if not shape or shape[-1] <= 0 or shape[-1] % 2:
+        pytest.skip("vLLM requires a packed input with a positive even last dimension")
+    packed = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
+    d = packed.shape[-1] // 2
+    inp1 = packed[..., :d]
+    inp2 = packed[..., d:]
 
-    vllm_inp = torch.cat((inp1, inp2), dim=-1)
     with _vllm_custom_op_config():
         vllm_op = vllm_silu_and_mul_with_clamp_cls(swiglu_limit=limit).to(
             flaggems_vllm.device
         )
         vllm_op.op = torch.ops._C.silu_and_mul_with_clamp
-        vllm_out = vllm_op.forward_cuda(vllm_inp)
+        vllm_out = utils.to_reference(vllm_op.forward_cuda(packed))
 
     out = torch.empty_like(inp1)
     with flaggems_vllm.use_gems():
