@@ -280,7 +280,7 @@ def config(binding, dtype):
             "key": [num_tokens, HEAD_DIM],
             "positions": g["positions_shape"],
             "cos_sin_cache": [COS_SIN_ROWS, HEAD_DIM // 2],
-            "query_norm_weight": [QUERY_HEADS * HEAD_DIM],
+            "query_norm_weight": [HEAD_DIM],
             "key_norm_weight": [HEAD_DIM],
             "norm_eps": NORM_EPS,
             "state_slots": [num_tokens],
