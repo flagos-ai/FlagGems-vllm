@@ -20,23 +20,6 @@ import torch
 import triton
 import triton.language as tl
 
-QWEN4_VENDOR_QSA_PREPARE_SOURCE = {
-    "repository": "https://github.com/vllm-project/vllm",
-    "release": "0.31.1rc1.dev371",
-    "base_commit": "df6c7ad03194a3051a197d57ca4a94e4a063014e",
-    "path": "vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py",
-    "sha256": "22049c20b85fea0d38fe03175de36acc02edc55802ae89efafef2dffdc813187",
-    "adaptation": (
-        "Triton import standalone rather than from vllm.triton_utils; "
-        "main-attention path tiles tokens; "
-        "state-ring commit vectorized, with a scalar form for single-token "
-        "requests; "
-        "launch wrapped in a metadata-keyed cache; "
-        "main-attention launch geometry tuned for MTT S-series."
-    ),
-    "role": "Mthreads-specialized implementation of qsa_prepare",
-}
-
 
 @triton.jit
 def _norm_rope(
@@ -777,10 +760,7 @@ def _qsa_prepare_uncached(
         TILE_T_Q, TILE_H_Q = 4, 4
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
-    # MUSA: four warps hide memory latency and eight rows per program cut the
-    # CTA count. Sixteen rows or eight warps are slower. Below 4096 tokens the
-    # scalar row kernel wins because the masked 2D tile costs more than the
-    # programs it saves.
+    # Eight rows per program with four warps once the grid is large enough.
     if num_tokens >= 4096:
         MAIN_TILE_T = 8
         main_num_warps = 4
