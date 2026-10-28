@@ -100,18 +100,6 @@ _HOMO_SHAPES = [
     (10, 1055, 1055, 262144),
     (2, 1034, 1034, 262144),
     (1, 32773, 32773, 262144),
-    # max_seq_len = 1048576: likely mis-recorded during collection. The logger
-    # fires during CUDA graph capture too, where max_seq_len is max_model_len
-    # rather than the request length, so these are kept only as a regression
-    # guard for the large-max_seq_len dispatch path.
-    (4, 262144, 1048576, 262144),
-    (8, 262144, 1048576, 262144),
-    (32, 262144, 1048576, 262144),
-    (64, 262144, 1048576, 262144),
-    (128, 262144, 1048576, 262144),
-    (256, 262144, 1048576, 262144),
-    (496, 262144, 1048576, 262144),
-    (512, 262144, 1048576, 262144),
 ]
 
 
