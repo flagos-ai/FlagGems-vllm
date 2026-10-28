@@ -193,7 +193,10 @@ def test_qsa_prepare():
     bench.run()
 
 
+# ``flaggems_vllm.device`` already names the active accelerator ("cuda", "musa",
+# "npu", ...), so a CUDA-specific probe would skip the whole module on every
+# other backend.
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.device == "cpu" or not torch.cuda.is_available(),
+    flaggems_vllm.device == "cpu",
     reason="QSA prepare benchmark requires an accelerator",
 )
