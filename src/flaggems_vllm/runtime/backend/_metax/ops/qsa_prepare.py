@@ -202,11 +202,11 @@ def _qsa_prepare_kernel(
     MAIN_PAGE_SIZE: tl.constexpr,
     MAIN_TILE_T: tl.constexpr,
     DECODE_ONLY: tl.constexpr,
+    MODE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
-    if pid >= num_index_work:
-        main_pid = pid - num_index_work
+    if MODE == 1:
+        main_pid = pid
         HALF: tl.constexpr = D // 4
         if MAIN_TILE_T == 1:
             # Main attention: one program per (token, Q or KV head) after the
@@ -352,330 +352,365 @@ def _qsa_prepare_kernel(
                 out_row = (tok * MAIN_HQ + head)[:, None] * MAIN_D
                 _store_rotated_tiled(main_q_out_ptr + out_row, y, o1, o2, None, m2)
             return
-    # K work occupies the first programs; the remaining programs tile Q. This
-    # keeps both paths in one launch while leaving their register shapes
-    # independent.
-    if pid >= num_k_work:
-        q_pid = pid - num_k_work
-        num_head_tiles: tl.constexpr = tl.cdiv(HQ, TILE_H_Q)
-        token_tile = q_pid // num_head_tiles
-        head_tile = q_pid % num_head_tiles
-        tokens = (token_tile * TILE_T_Q + tl.arange(0, TILE_T_Q)).to(tl.int64)
-        heads = head_tile * TILE_H_Q + tl.arange(0, TILE_H_Q)
-        valid_tokens = tokens < num_tokens
-        valid_heads = heads < HQ
-        dims = tl.arange(0, D)
-        mask = valid_tokens[:, None, None] & valid_heads[None, :, None]
-        x = tl.load(
-            q_ptr
-            + tokens[:, None, None] * q_stride_token
-            + heads[None, :, None] * D
-            + dims[None, None, :],
-            mask=mask,
-            other=0.0,
-        )
-        pos_t = tl.load(pos_ptr + tokens * pos_stride_token, mask=valid_tokens, other=0)
-        if IS_2D_POSITIONS:
-            pos_h = tl.load(
-                pos_ptr + pos_stride_axis + tokens * pos_stride_token,
-                mask=valid_tokens,
-                other=0,
-            )
-            pos_w = tl.load(
-                pos_ptr + 2 * pos_stride_axis + tokens * pos_stride_token,
-                mask=valid_tokens,
-                other=0,
-            )
-        else:
-            pos_h = pos_t
-            pos_w = pos_t
-        y = _norm_rope(
-            x,
-            pos_t,
-            pos_h,
-            pos_w,
-            cos_sin_ptr,
-            D // 2,
-            q_norm_weight_ptr,
-            eps,
-            IS_2D_POSITIONS,
-            MROPE_H,
-            MROPE_W,
-        )
-        tl.store(
-            q_out_ptr
-            + tokens[:, None, None] * q_out_stride_token
-            + heads[None, :, None] * q_out_stride_head
-            + dims[None, None, :],
-            y,
-            mask=mask,
-        )
-
-    if pid < num_k_work:
-        # One work item owns one completed compression group. Work item zero
-        # additionally commits the request's current raw-K suffix below.
-        work_metadata = tl.load(k_work_metadata_ptr + pid * 2 + tl.arange(0, 2))
-        request, work_in_request = tl.split(work_metadata)
-        if request < 0:
-            return
-
-        query_start = tl.load(query_start_loc_ptr + request)
-        query_end = tl.load(query_start_loc_ptr + request + 1)
-        query_len = query_end - query_start
-        chunk_end = tl.load(logical_positions_ptr + query_end - 1)
-        chunk_start = chunk_end - query_len + 1
-        num_groups = (chunk_end + 1) // COMPRESS_RATIO - chunk_start // COMPRESS_RATIO
-        dims = tl.arange(0, D)
-
-        if work_in_request < num_groups:
-            first_boundary = (
-                (chunk_start + COMPRESS_RATIO) // COMPRESS_RATIO
-            ) * COMPRESS_RATIO - 1
-            end_position = first_boundary + work_in_request * COMPRESS_RATIO
-            boundary_token = query_start + end_position - chunk_start
-            valid_token = (
-                (boundary_token >= query_start)
-                & (boundary_token < query_end)
-                & (boundary_token < num_tokens)
-            )
-            compressed_slot = tl.load(
-                compressed_slots_ptr + boundary_token,
-                mask=valid_token,
-                other=-1,
-            )
-            valid = (
-                valid_token
-                & (compressed_slot >= 0)
-                & (compressed_slot < num_compressed_blocks * COMP_PAGE_SIZE)
-            )
-            state_block = tl.load(state_table_ptr + request * state_table_stride_req)
-            state_block_valid = (state_block >= 0) & (state_block < num_state_blocks)
-            safe_state_block = tl.maximum(state_block, 0).to(tl.int64)
-            group_offsets = tl.arange(0, COMPRESS_RATIO)
-            source_positions = end_position - (COMPRESS_RATIO - 1) + group_offsets
-            source_in_chunk = source_positions >= chunk_start
-            source_tokens = query_start + source_positions - chunk_start
-            source_tokens_valid = (
-                (source_tokens >= query_start)
-                & (source_tokens < query_end)
-                & (source_tokens < num_tokens)
-            )
-            current_base = (
-                k_ptr
-                + tl.maximum(source_tokens, 0).to(tl.int64)[:, None] * k_stride_token
-            )
-            cached_base = (
-                state_cache_ptr
-                + safe_state_block * state_cache_stride_block
-                + (source_positions % STATE_SIZE)[:, None] * state_cache_stride_token
-            )
-            # Only the first completed group can cross the chunk boundary. Select
-            # historical rows from the ring without issuing two masked loads.
-            source_base = tl.where(source_in_chunk[:, None], current_base, cached_base)
-            # Pointer selection obscures alignment from Triton's analysis.
-            source_base = tl.multiple_of(source_base, (8, 8))
-            source_valid = tl.where(
-                source_in_chunk, source_tokens_valid, state_block_valid
-            )
-            source = tl.load(
-                source_base + dims[None, :],
-                mask=valid & source_valid[:, None],
+    if MODE == 0:
+        # K work occupies the first programs; the remaining programs tile Q. This
+        # keeps both paths in one launch while leaving their register shapes
+        # independent.
+        if pid >= num_k_work:
+            q_pid = pid - num_k_work
+            num_head_tiles: tl.constexpr = tl.cdiv(HQ, TILE_H_Q)
+            token_tile = q_pid // num_head_tiles
+            head_tile = q_pid % num_head_tiles
+            tokens = (token_tile * TILE_T_Q + tl.arange(0, TILE_T_Q)).to(tl.int64)
+            heads = head_tile * TILE_H_Q + tl.arange(0, TILE_H_Q)
+            valid_tokens = tokens < num_tokens
+            valid_heads = heads < HQ
+            dims = tl.arange(0, D)
+            mask = valid_tokens[:, None, None] & valid_heads[None, :, None]
+            x = tl.load(
+                q_ptr
+                + tokens[:, None, None] * q_stride_token
+                + heads[None, :, None] * D
+                + dims[None, None, :],
+                mask=mask,
                 other=0.0,
-            ).to(tl.float32)
-            # Match the unfused path's BF16 pooled tensor before RMSNorm.
-            pooled = (
-                (tl.sum(source, axis=0) / COMPRESS_RATIO).to(tl.bfloat16).to(tl.float32)
             )
-
-            first_position = end_position - (COMPRESS_RATIO - 1)
-            if CACHE_HAS_ROPE_POS:
-                # RoPE uses the first token in the pooled group. Its exact MRoPE
-                # coordinates may live in this chunk or the raw-state ring.
-                first_in_chunk = first_position >= chunk_start
-                first_token = query_start + first_position - chunk_start
-                first_token_valid = (
-                    (first_token >= query_start)
-                    & (first_token < query_end)
-                    & (first_token < num_tokens)
-                )
-                safe_first_token = tl.maximum(first_token, 0)
-                load_current_position = first_in_chunk & first_token_valid
-                first_pos_t = tl.load(
-                    pos_ptr + safe_first_token * pos_stride_token,
-                    mask=load_current_position,
+            pos_t = tl.load(
+                pos_ptr + tokens * pos_stride_token, mask=valid_tokens, other=0
+            )
+            if IS_2D_POSITIONS:
+                pos_h = tl.load(
+                    pos_ptr + pos_stride_axis + tokens * pos_stride_token,
+                    mask=valid_tokens,
                     other=0,
                 )
-                if IS_2D_POSITIONS:
-                    first_pos_h = tl.load(
-                        pos_ptr + pos_stride_axis + safe_first_token * pos_stride_token,
-                        mask=load_current_position,
-                        other=0,
-                    )
-                    first_pos_w = tl.load(
-                        pos_ptr
-                        + 2 * pos_stride_axis
-                        + safe_first_token * pos_stride_token,
-                        mask=load_current_position,
-                        other=0,
-                    )
-                else:
-                    first_pos_h = first_pos_t
-                    first_pos_w = first_pos_t
-                tail = (
-                    state_cache_ptr
-                    + safe_state_block * state_cache_stride_block
-                    + (first_position % STATE_SIZE) * state_cache_stride_token
-                    + D
-                ).to(tl.pointer_type(tl.int64))
-                load_cached_position = ~first_in_chunk & state_block_valid
-                cached_pos_t = tl.load(tail, mask=load_cached_position, other=0)
-                cached_pos_h = tl.load(tail + 1, mask=load_cached_position, other=0)
-                cached_pos_w = tl.load(tail + 2, mask=load_cached_position, other=0)
-                pos_t = tl.where(first_in_chunk, first_pos_t.to(tl.int64), cached_pos_t)
-                pos_h = tl.where(first_in_chunk, first_pos_h.to(tl.int64), cached_pos_h)
-                pos_w = tl.where(first_in_chunk, first_pos_w.to(tl.int64), cached_pos_w)
+                pos_w = tl.load(
+                    pos_ptr + 2 * pos_stride_axis + tokens * pos_stride_token,
+                    mask=valid_tokens,
+                    other=0,
+                )
             else:
-                pos_t = first_position
-                pos_h = first_position
-                pos_w = first_position
+                pos_h = pos_t
+                pos_w = pos_t
             y = _norm_rope(
-                tl.reshape(pooled, (1, 1, D)),
-                pos_t + tl.arange(0, 1),
-                pos_h + tl.arange(0, 1),
-                pos_w + tl.arange(0, 1),
+                x,
+                pos_t,
+                pos_h,
+                pos_w,
                 cos_sin_ptr,
                 D // 2,
-                k_norm_weight_ptr,
+                q_norm_weight_ptr,
                 eps,
-                IS_K_MROPE,
+                IS_2D_POSITIONS,
                 MROPE_H,
                 MROPE_W,
             )
-            compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
-            compressed_row = compressed_slot % COMP_PAGE_SIZE
             tl.store(
-                compressed_cache_ptr
-                + compressed_block * compressed_cache_stride_block
-                + compressed_row * compressed_cache_stride_token
-                + dims,
-                tl.reshape(y, (D,)),
-                mask=valid,
+                q_out_ptr
+                + tokens[:, None, None] * q_out_stride_token
+                + heads[None, :, None] * q_out_stride_head
+                + dims[None, None, :],
+                y,
+                mask=mask,
             )
 
-        if work_in_request == 0:
-            # This CTA may have just read historical rows from the circular buffer.
-            # Keep every lane past those loads before overwriting the same ring.
-            tl.debug_barrier()
-            # One CTA per request commits only the suffix retained by the ring.
-            if DECODE_ONLY:
-                # Every request contributes exactly one token here, so the commit is
-                # a single row: move it as a [D] vector instead of a
-                # [STATE_SIZE, D] tile whose other rows are all masked off. The
-                # masked rows still issue their loads and stores, which is most of
-                # the commit's cost when only one row is live.
-                token = (query_end - 1).to(tl.int64)
+        if pid < num_k_work:
+            # One work item owns one completed compression group. Work item zero
+            # additionally commits the request's current raw-K suffix below.
+            work_metadata = tl.load(k_work_metadata_ptr + pid * 2 + tl.arange(0, 2))
+            request, work_in_request = tl.split(work_metadata)
+            if request < 0:
+                return
+
+            query_start = tl.load(query_start_loc_ptr + request)
+            query_end = tl.load(query_start_loc_ptr + request + 1)
+            query_len = query_end - query_start
+            chunk_end = tl.load(logical_positions_ptr + query_end - 1)
+            chunk_start = chunk_end - query_len + 1
+            num_groups = (
+                chunk_end + 1
+            ) // COMPRESS_RATIO - chunk_start // COMPRESS_RATIO
+            dims = tl.arange(0, D)
+
+            if work_in_request < num_groups:
+                first_boundary = (
+                    (chunk_start + COMPRESS_RATIO) // COMPRESS_RATIO
+                ) * COMPRESS_RATIO - 1
+                end_position = first_boundary + work_in_request * COMPRESS_RATIO
+                boundary_token = query_start + end_position - chunk_start
                 valid_token = (
-                    (token >= query_start) & (token < query_end) & (token < num_tokens)
+                    (boundary_token >= query_start)
+                    & (boundary_token < query_end)
+                    & (boundary_token < num_tokens)
                 )
-                slot = tl.load(state_slots_ptr + token, mask=valid_token, other=-1)
-                valid_slot = (
-                    valid_token & (slot >= 0) & (slot < num_state_blocks * STATE_SIZE)
+                compressed_slot = tl.load(
+                    compressed_slots_ptr + boundary_token,
+                    mask=valid_token,
+                    other=-1,
                 )
-                safe_slot = tl.maximum(slot, 0)
-                block_idx = (safe_slot // STATE_SIZE).to(tl.int64)
-                ring_idx = safe_slot % STATE_SIZE
-                state_row = (
+                valid = (
+                    valid_token
+                    & (compressed_slot >= 0)
+                    & (compressed_slot < num_compressed_blocks * COMP_PAGE_SIZE)
+                )
+                state_block = tl.load(
+                    state_table_ptr + request * state_table_stride_req
+                )
+                state_block_valid = (state_block >= 0) & (
+                    state_block < num_state_blocks
+                )
+                safe_state_block = tl.maximum(state_block, 0).to(tl.int64)
+                group_offsets = tl.arange(0, COMPRESS_RATIO)
+                source_positions = end_position - (COMPRESS_RATIO - 1) + group_offsets
+                source_in_chunk = source_positions >= chunk_start
+                source_tokens = query_start + source_positions - chunk_start
+                source_tokens_valid = (
+                    (source_tokens >= query_start)
+                    & (source_tokens < query_end)
+                    & (source_tokens < num_tokens)
+                )
+                current_base = (
+                    k_ptr
+                    + tl.maximum(source_tokens, 0).to(tl.int64)[:, None]
+                    * k_stride_token
+                )
+                cached_base = (
                     state_cache_ptr
-                    + block_idx * state_cache_stride_block
-                    + ring_idx * state_cache_stride_token
+                    + safe_state_block * state_cache_stride_block
+                    + (source_positions % STATE_SIZE)[:, None]
+                    * state_cache_stride_token
                 )
-                safe_token = tl.maximum(token, 0)
-                k = tl.load(
-                    k_ptr + safe_token * k_stride_token + dims,
-                    mask=valid_slot,
+                # Only the first completed group can cross the chunk boundary. Select
+                # historical rows from the ring without issuing two masked loads.
+                source_base = tl.where(
+                    source_in_chunk[:, None], current_base, cached_base
+                )
+                # Pointer selection obscures alignment from Triton's analysis.
+                source_base = tl.multiple_of(source_base, (8, 8))
+                source_valid = tl.where(
+                    source_in_chunk, source_tokens_valid, state_block_valid
+                )
+                source = tl.load(
+                    source_base + dims[None, :],
+                    mask=valid & source_valid[:, None],
                     other=0.0,
+                ).to(tl.float32)
+                # Match the unfused path's BF16 pooled tensor before RMSNorm.
+                pooled = (
+                    (tl.sum(source, axis=0) / COMPRESS_RATIO)
+                    .to(tl.bfloat16)
+                    .to(tl.float32)
                 )
-                tl.store(state_row + dims, k, mask=valid_slot)
+
+                first_position = end_position - (COMPRESS_RATIO - 1)
                 if CACHE_HAS_ROPE_POS:
-                    pos_t = tl.load(
-                        pos_ptr + safe_token * pos_stride_token,
-                        mask=valid_slot,
+                    # RoPE uses the first token in the pooled group. Its exact MRoPE
+                    # coordinates may live in this chunk or the raw-state ring.
+                    first_in_chunk = first_position >= chunk_start
+                    first_token = query_start + first_position - chunk_start
+                    first_token_valid = (
+                        (first_token >= query_start)
+                        & (first_token < query_end)
+                        & (first_token < num_tokens)
+                    )
+                    safe_first_token = tl.maximum(first_token, 0)
+                    load_current_position = first_in_chunk & first_token_valid
+                    first_pos_t = tl.load(
+                        pos_ptr + safe_first_token * pos_stride_token,
+                        mask=load_current_position,
                         other=0,
                     )
                     if IS_2D_POSITIONS:
-                        pos_h = tl.load(
-                            pos_ptr + pos_stride_axis + safe_token * pos_stride_token,
-                            mask=valid_slot,
+                        first_pos_h = tl.load(
+                            pos_ptr
+                            + pos_stride_axis
+                            + safe_first_token * pos_stride_token,
+                            mask=load_current_position,
                             other=0,
                         )
-                        pos_w = tl.load(
+                        first_pos_w = tl.load(
                             pos_ptr
                             + 2 * pos_stride_axis
-                            + safe_token * pos_stride_token,
-                            mask=valid_slot,
+                            + safe_first_token * pos_stride_token,
+                            mask=load_current_position,
                             other=0,
                         )
                     else:
-                        pos_h = pos_t
-                        pos_w = pos_t
-                    tail = (state_row + D).to(tl.pointer_type(tl.int64))
-                    tl.store(tail, pos_t.to(tl.int64), mask=valid_slot)
-                    tl.store(tail + 1, pos_h.to(tl.int64), mask=valid_slot)
-                    tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
-            else:
-                num_state_rows = tl.minimum(query_len, STATE_SIZE)
-                rows = tl.arange(0, STATE_SIZE)
-                rmask = rows < num_state_rows
-                tokens = (query_end - num_state_rows + rows).to(tl.int64)
-                valid_token = (
-                    (tokens >= query_start)
-                    & (tokens < query_end)
-                    & (tokens < num_tokens)
-                )
-                slot = tl.load(
-                    state_slots_ptr + tokens, mask=rmask & valid_token, other=-1
-                )
-                valid_slot = (
-                    valid_token & (slot >= 0) & (slot < num_state_blocks * STATE_SIZE)
-                )
-                safe_slot = tl.maximum(slot, 0)
-                block_idx = (safe_slot // STATE_SIZE).to(tl.int64)
-                ring_idx = safe_slot % STATE_SIZE
-                state_row = (
-                    state_cache_ptr
-                    + block_idx[:, None] * state_cache_stride_block
-                    + ring_idx[:, None] * state_cache_stride_token
-                )
-                d2 = (rmask & valid_slot)[:, None]
-                src = k_ptr + tl.maximum(tokens, 0)[:, None] * k_stride_token
-                k = tl.load(src + dims[None, :], mask=d2, other=0.0)
-                tl.store(state_row + dims[None, :], k, mask=d2)
-                if CACHE_HAS_ROPE_POS:
-                    smask = rmask & valid_slot
-                    safe_tokens = tl.maximum(tokens, 0)
-                    pos_t = tl.load(
-                        pos_ptr + safe_tokens * pos_stride_token, mask=smask, other=0
+                        first_pos_h = first_pos_t
+                        first_pos_w = first_pos_t
+                    tail = (
+                        state_cache_ptr
+                        + safe_state_block * state_cache_stride_block
+                        + (first_position % STATE_SIZE) * state_cache_stride_token
+                        + D
+                    ).to(tl.pointer_type(tl.int64))
+                    load_cached_position = ~first_in_chunk & state_block_valid
+                    cached_pos_t = tl.load(tail, mask=load_cached_position, other=0)
+                    cached_pos_h = tl.load(tail + 1, mask=load_cached_position, other=0)
+                    cached_pos_w = tl.load(tail + 2, mask=load_cached_position, other=0)
+                    pos_t = tl.where(
+                        first_in_chunk, first_pos_t.to(tl.int64), cached_pos_t
                     )
-                    if IS_2D_POSITIONS:
-                        pos_h = tl.load(
-                            pos_ptr + pos_stride_axis + safe_tokens * pos_stride_token,
+                    pos_h = tl.where(
+                        first_in_chunk, first_pos_h.to(tl.int64), cached_pos_h
+                    )
+                    pos_w = tl.where(
+                        first_in_chunk, first_pos_w.to(tl.int64), cached_pos_w
+                    )
+                else:
+                    pos_t = first_position
+                    pos_h = first_position
+                    pos_w = first_position
+                y = _norm_rope(
+                    tl.reshape(pooled, (1, 1, D)),
+                    pos_t + tl.arange(0, 1),
+                    pos_h + tl.arange(0, 1),
+                    pos_w + tl.arange(0, 1),
+                    cos_sin_ptr,
+                    D // 2,
+                    k_norm_weight_ptr,
+                    eps,
+                    IS_K_MROPE,
+                    MROPE_H,
+                    MROPE_W,
+                )
+                compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
+                compressed_row = compressed_slot % COMP_PAGE_SIZE
+                tl.store(
+                    compressed_cache_ptr
+                    + compressed_block * compressed_cache_stride_block
+                    + compressed_row * compressed_cache_stride_token
+                    + dims,
+                    tl.reshape(y, (D,)),
+                    mask=valid,
+                )
+
+            if work_in_request == 0:
+                # This CTA may have just read historical rows from the circular buffer.
+                # Keep every lane past those loads before overwriting the same ring.
+                tl.debug_barrier()
+                # One CTA per request commits only the suffix retained by the ring.
+                if DECODE_ONLY:
+                    # Every request contributes exactly one token here, so the commit is
+                    # a single row: move it as a [D] vector instead of a
+                    # [STATE_SIZE, D] tile whose other rows are all masked off. The
+                    # masked rows still issue their loads and stores, which is most of
+                    # the commit's cost when only one row is live.
+                    token = (query_end - 1).to(tl.int64)
+                    valid_token = (
+                        (token >= query_start)
+                        & (token < query_end)
+                        & (token < num_tokens)
+                    )
+                    slot = tl.load(state_slots_ptr + token, mask=valid_token, other=-1)
+                    valid_slot = (
+                        valid_token
+                        & (slot >= 0)
+                        & (slot < num_state_blocks * STATE_SIZE)
+                    )
+                    safe_slot = tl.maximum(slot, 0)
+                    block_idx = (safe_slot // STATE_SIZE).to(tl.int64)
+                    ring_idx = safe_slot % STATE_SIZE
+                    state_row = (
+                        state_cache_ptr
+                        + block_idx * state_cache_stride_block
+                        + ring_idx * state_cache_stride_token
+                    )
+                    safe_token = tl.maximum(token, 0)
+                    k = tl.load(
+                        k_ptr + safe_token * k_stride_token + dims,
+                        mask=valid_slot,
+                        other=0.0,
+                    )
+                    tl.store(state_row + dims, k, mask=valid_slot)
+                    if CACHE_HAS_ROPE_POS:
+                        pos_t = tl.load(
+                            pos_ptr + safe_token * pos_stride_token,
+                            mask=valid_slot,
+                            other=0,
+                        )
+                        if IS_2D_POSITIONS:
+                            pos_h = tl.load(
+                                pos_ptr
+                                + pos_stride_axis
+                                + safe_token * pos_stride_token,
+                                mask=valid_slot,
+                                other=0,
+                            )
+                            pos_w = tl.load(
+                                pos_ptr
+                                + 2 * pos_stride_axis
+                                + safe_token * pos_stride_token,
+                                mask=valid_slot,
+                                other=0,
+                            )
+                        else:
+                            pos_h = pos_t
+                            pos_w = pos_t
+                        tail = (state_row + D).to(tl.pointer_type(tl.int64))
+                        tl.store(tail, pos_t.to(tl.int64), mask=valid_slot)
+                        tl.store(tail + 1, pos_h.to(tl.int64), mask=valid_slot)
+                        tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
+                else:
+                    num_state_rows = tl.minimum(query_len, STATE_SIZE)
+                    rows = tl.arange(0, STATE_SIZE)
+                    rmask = rows < num_state_rows
+                    tokens = (query_end - num_state_rows + rows).to(tl.int64)
+                    valid_token = (
+                        (tokens >= query_start)
+                        & (tokens < query_end)
+                        & (tokens < num_tokens)
+                    )
+                    slot = tl.load(
+                        state_slots_ptr + tokens, mask=rmask & valid_token, other=-1
+                    )
+                    valid_slot = (
+                        valid_token
+                        & (slot >= 0)
+                        & (slot < num_state_blocks * STATE_SIZE)
+                    )
+                    safe_slot = tl.maximum(slot, 0)
+                    block_idx = (safe_slot // STATE_SIZE).to(tl.int64)
+                    ring_idx = safe_slot % STATE_SIZE
+                    state_row = (
+                        state_cache_ptr
+                        + block_idx[:, None] * state_cache_stride_block
+                        + ring_idx[:, None] * state_cache_stride_token
+                    )
+                    d2 = (rmask & valid_slot)[:, None]
+                    src = k_ptr + tl.maximum(tokens, 0)[:, None] * k_stride_token
+                    k = tl.load(src + dims[None, :], mask=d2, other=0.0)
+                    tl.store(state_row + dims[None, :], k, mask=d2)
+                    if CACHE_HAS_ROPE_POS:
+                        smask = rmask & valid_slot
+                        safe_tokens = tl.maximum(tokens, 0)
+                        pos_t = tl.load(
+                            pos_ptr + safe_tokens * pos_stride_token,
                             mask=smask,
                             other=0,
                         )
-                        pos_w = tl.load(
-                            pos_ptr
-                            + 2 * pos_stride_axis
-                            + safe_tokens * pos_stride_token,
-                            mask=smask,
-                            other=0,
-                        )
-                    else:
-                        pos_h = pos_t
-                        pos_w = pos_t
-                    tail = (state_row + D).to(tl.pointer_type(tl.int64))
-                    tl.store(tail, pos_t.to(tl.int64)[:, None], mask=d2)
-                    tl.store(tail + 1, pos_h.to(tl.int64)[:, None], mask=d2)
-                    tl.store(tail + 2, pos_w.to(tl.int64)[:, None], mask=d2)
+                        if IS_2D_POSITIONS:
+                            pos_h = tl.load(
+                                pos_ptr
+                                + pos_stride_axis
+                                + safe_tokens * pos_stride_token,
+                                mask=smask,
+                                other=0,
+                            )
+                            pos_w = tl.load(
+                                pos_ptr
+                                + 2 * pos_stride_axis
+                                + safe_tokens * pos_stride_token,
+                                mask=smask,
+                                other=0,
+                            )
+                        else:
+                            pos_h = pos_t
+                            pos_w = pos_t
+                        tail = (state_row + D).to(tl.pointer_type(tl.int64))
+                        tl.store(tail, pos_t.to(tl.int64)[:, None], mask=d2)
+                        tl.store(tail + 1, pos_h.to(tl.int64)[:, None], mask=d2)
+                        tl.store(tail + 2, pos_w.to(tl.int64)[:, None], mask=d2)
 
 
 def _qsa_prepare_uncached(
@@ -759,7 +794,7 @@ def _qsa_prepare_uncached(
     if num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
     else:
-        TILE_T_Q, TILE_H_Q = 8, 2
+        TILE_T_Q, TILE_H_Q = 4, 2
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
     # Token tiling pays off once the grid is large enough to be
@@ -842,7 +877,8 @@ def _qsa_prepare_uncached(
         DECODE_ONLY=decode_only,
         num_warps=2,
     )
-    grid0 = num_k_work + num_q_work + num_main_work
+    grid_index = num_k_work + num_q_work
+    grid_main = num_main_work
     direct_args = tuple(
         (
             *launch_pos,
@@ -880,8 +916,21 @@ def _qsa_prepare_uncached(
             decode_only,
         )
     )
-    compiled = _qsa_prepare_kernel[(grid0,)](*launch_pos, **launch_kw)
-    return (main_q_out, main_gate_out, direct_args, grid0, compiled)
+    ck_index = _qsa_prepare_kernel[(grid_index,)](
+        *launch_pos, **dict(launch_kw, MODE=0, num_warps=1)
+    )
+    ck_main = _qsa_prepare_kernel[(grid_main,)](
+        *launch_pos, **dict(launch_kw, MODE=1, num_warps=2)
+    )
+    return (
+        main_q_out,
+        main_gate_out,
+        direct_args,
+        grid_index,
+        grid_main,
+        ck_index,
+        ck_main,
+    )
 
 
 _HOST_CACHE: dict = {}
@@ -993,14 +1042,23 @@ def qsa_prepare(
     )
     cached = _HOST_CACHE.get(cache_key)
     if cached is not None:
-        direct_args, grid0 = cached
-        direct_args = list(direct_args)
-        direct_args[48] = main_q_out
-        direct_args[49] = main_gate_out
-        compiled = _HOST_CACHE[(cache_key, "ck")]
-        compiled[(grid0, 1, 1)](*direct_args)
+        direct_args, grid_index, grid_main = cached
+        args = list(direct_args)
+        args[48] = main_q_out
+        args[49] = main_gate_out
+        ck_index, ck_main = _HOST_CACHE[(cache_key, "ck")]
+        ck_index[(grid_index, 1, 1)](*(args + [0]))
+        ck_main[(grid_main, 1, 1)](*(args + [1]))
         return main_q_out, main_gate_out
-    (main_q_out, main_gate_out, direct_args, grid0, compiled) = _qsa_prepare_uncached(
+    (
+        main_q_out,
+        main_gate_out,
+        direct_args,
+        grid_index,
+        grid_main,
+        ck_index,
+        ck_main,
+    ) = _qsa_prepare_uncached(
         q,
         k,
         positions,
@@ -1029,8 +1087,8 @@ def qsa_prepare(
         main_k_scale=main_k_scale,
         main_v_scale=main_v_scale,
     )
-    _HOST_CACHE[cache_key] = (direct_args, grid0)
-    _HOST_CACHE[(cache_key, "ck")] = compiled
+    _HOST_CACHE[cache_key] = (direct_args, grid_index, grid_main)
+    _HOST_CACHE[(cache_key, "ck")] = (ck_index, ck_main)
     return main_q_out, main_gate_out
 
 
