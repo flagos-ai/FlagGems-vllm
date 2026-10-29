@@ -19,8 +19,8 @@ bookCollapseSection: true
 
 ## 开始
 
-1. 阅读[算子开发协议](workflow/)
-2. 查看[贡献概述](overview/)
+1. 阅读[算子开发协议](workflow.md)
+2. 查看[贡献概述](overview.md)
 3. 搭建开发环境
 4. 按照协议进行修改
 5. 提交 pull request
@@ -31,7 +31,7 @@ bookCollapseSection: true
 
 关键要求:
 - **NO_TORCH_COMPUTE_FALLBACK**: 生产代码不得使用 torch 计算算子
-- **编码前表格**: 项目真相、torch 对齐契约、实现路径
+- **编码前设计表**: 工程基线、Torch 对齐规范、实现路径设计
 - **自动调优必需**: NVIDIA 后端必须有调优配置
 - **标准代码落点**: `src/flaggems_vllm/ops/<op>.py`、`tests/test_<op>.py`、`benchmark/test_<op>.py`
 - **验收标准**: 核心形状的加速比 ≥ 0.9
@@ -80,11 +80,11 @@ pre-commit run --all-files
 
 ## 主题
 
-- [概述](overview/) - 贡献指南和约定
-- [工作流协议](workflow/) - 算子开发协议
-- [后端开发](backend/) - 添加新硬件后端
+- [概述](overview.md) - 贡献指南和约定
+- [工作流协议](workflow.md) - 算子开发协议
+- [后端开发](backend.md) - 添加新硬件后端
 
 ## 下一步
 
-- [贡献概述](overview/)
-- [算子开发协议](workflow/)
+- [贡献概述](overview.md)
+- [算子开发协议](workflow.md)

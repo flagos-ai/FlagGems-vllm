@@ -20,8 +20,8 @@ vllm-plugin-fl (plugin layer)
     └─→ flaggems_vllm.<op>()      (vLLM-specific fused kernels)
 ```
 
-**FlagGems** provides general operator replacements registered into PyTorch dispatch.
-**FlagGems-vllm** provides vLLM-specific fused operators called explicitly by the plugin.
+**FlagGems** provides general operator replacements registered into PyTorch dispatch, and acts as a core prerequisite for FlagGems-vllm by providing underlying operator implementations.
+**FlagGems-vllm** depends on FlagGems and provides vLLM-specific fused operators called explicitly by the plugin.
 **vllm-plugin-fl** orchestrates both layers.
 
 ## Installation
@@ -121,7 +121,7 @@ vllm-plugin-fl leverages both FlagGems and FlagGems-vllm for performance:
 - **General ops** (matmul, layernorm, softmax): Handled by FlagGems
 - **vLLM-specific fusions**: Handled by FlagGems-vllm (grouped_topk, moe_align_block_size, flash_attention_forward, etc.)
 
-Expected speedups vary by model and hardware. See [performance benchmarks](/FlagGems-vllm/performance/) for details.
+Expected speedups vary by model and hardware. See [performance benchmarks](../performance/_index.md) for details.
 
 ## Troubleshooting
 
@@ -157,6 +157,6 @@ If performance is slower than expected:
 
 ## Next Steps
 
-- [Selective operator enablement](../selective/)
-- [Non-NVIDIA backend configuration](../non-nvidia/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Selective operator enablement](selective.md)
+- [Non-NVIDIA backend configuration](non-nvidia.md)
+- [Performance benchmarking](../performance/benchmark.md)

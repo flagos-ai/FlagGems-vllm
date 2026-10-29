@@ -47,6 +47,7 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_fwd_intra_token_parallel,
     fused_recurrent_gated_delta_rule_fwd,
 )
+from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -67,6 +68,9 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_allreduce_rms_norm import (
+    fused_allreduce_rms_norm,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -272,6 +276,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits",
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
+    "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
@@ -284,6 +289,7 @@ __all__ = [
     "fwht128_quant_fp8",
     "gather_rows",
     "gather_state_rows",
+    "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",

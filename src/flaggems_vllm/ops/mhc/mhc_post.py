@@ -36,7 +36,6 @@ import logging
 import torch
 import triton
 import triton.language as tl
-from triton._flagtree_backend import FLAGTREE_BACKEND
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +385,8 @@ def mhc_post(
         _aabs = triton.knobs.autotuning.adjust_block_size
         triton.knobs.autotuning.adjust_block_size = False
         try:
+            from triton._flagtree_backend import FLAGTREE_BACKEND
+
             if FLAGTREE_BACKEND == "ppu":
                 # PPU: same ABI, vendor-shaped launch (one CTA per token).
                 from flaggems_vllm.runtime.backend._thead.ops.mhc_post import (

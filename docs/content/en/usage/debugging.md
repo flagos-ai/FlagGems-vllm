@@ -259,6 +259,6 @@ If you're stuck:
 
 ## Next Steps
 
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
-- [Contribution guide](/FlagGems-vllm/contribution/overview/)
+- [Testing guide](../testing/unittest.md)
+- [Performance benchmarking](../performance/benchmark.md)
+- [Contribution guide](../contribution/overview.md)
