@@ -147,23 +147,6 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     a stateful operation. Configuration experiments use externally restored
     state and no-Graph timing (see the accompanying benchmark).
     """
-    if device.vendor_name == "ascend":
-        from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_gated_delta_rule_packed_decode import (
-            fused_recurrent_gated_delta_rule_packed_decode as ascend_decode,
-        )
-
-        return ascend_decode(
-            mixed_qkv,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            scale,
-            initial_state,
-            out,
-            ssm_state_indices,
-            use_qk_l2norm_in_kernel,
-        )
     if device.vendor_name in ("nvidia", "hygon", "thead"):
         return _packed_decode_gpu(
             mixed_qkv,

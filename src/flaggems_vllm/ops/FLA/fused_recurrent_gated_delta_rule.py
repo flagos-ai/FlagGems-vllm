@@ -9,8 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-
 
 @triton.jit
 def _recurrent_gdn_kernel(
@@ -159,25 +157,6 @@ def fused_recurrent_gated_delta_rule_fwd(
     cu_seqlens must be monotone, start at zero and end at T. Index-table width
     must cover each sequence. These device metadata are caller preconditions.
     """
-    if runtime.device.vendor_name == "ascend":
-        from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_gated_delta_rule import (
-            fused_recurrent_gated_delta_rule_fwd as ascend_recurrent,
-        )
-
-        return ascend_recurrent(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            initial_state,
-            inplace_final_state,
-            cu_seqlens,
-            ssm_state_indices,
-            num_accepted_tokens,
-            use_qk_l2norm_in_kernel,
-        )
     if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
         raise ValueError("q/k must have identical [B,T,H,K] shapes; v must be rank 4")
     B, T, H, K = q.shape

@@ -271,3 +271,17 @@ def test_gpu_metadata_revalidated(entry):
     data["initial_state"].copy_(initial)
     fn(**data, use_qk_l2norm_in_kernel=True)
     _assert_result(data, expected, torch.float32)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FLA binding check"
+)
+def test_ascend_package_entry_binding():
+    from flaggems_vllm.ops import FLA
+    from flaggems_vllm.runtime.backend._ascend import FLA as ascend_fla
+
+    expected = ascend_fla.fused_recurrent_gated_delta_rule_packed_decode
+    assert FLA.fused_recurrent_gated_delta_rule_packed_decode is expected
+    assert flaggems_vllm.ops.fused_recurrent_gated_delta_rule_packed_decode is expected
+    assert flaggems_vllm.fused_recurrent_gated_delta_rule_packed_decode is expected
