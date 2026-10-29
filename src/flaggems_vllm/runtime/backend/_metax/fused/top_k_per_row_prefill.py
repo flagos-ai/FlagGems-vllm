@@ -78,10 +78,12 @@ def _final_select_rank(
         pos = sort_chunk * BLOCK_SIZE + lane
         valid = pos < final_cnt
         logit_i = tl.load(s_final_logits_ptr + pos, mask=valid, other=0)
+        key_i = _generic._convert_to_uint32(logit_i)
         out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
         for j in tl.range(0, final_cnt):
             logit_j = tl.load(s_final_logits_ptr + j)
-            better = (logit_i < logit_j) | ((logit_i == logit_j) & (pos < j))
+            key_j = _generic._convert_to_uint32(logit_j)
+            better = (key_i > key_j) | ((key_i == key_j) & (pos < j))
             out_rank = out_rank + (valid & better).to(tl.int32)
         dst_pos = base_idx + out_rank
         take = valid & (dst_pos < TOPK)
