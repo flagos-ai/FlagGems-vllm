@@ -1,0 +1,12 @@
+{
+  "precursor_sha256": "c770bc11d5de800c6d52cf36518e5e9834df3ceb5c7d3ad19545f96f45e9e6dd",
+  "port_sha256": "34a92179d079519bb26a20e46b32a3d0b665521d6bd3b2de83615a1273ef0db0",
+  "ast_equivalent_after_only_import_namespace_and_log_message_normalization": true,
+  "namespace_changes": [
+    "flag_gems.fused.{moe_align_block_size,moe_sum} -> flaggems_vllm.ops",
+    "flag_gems.runtime/utils -> flaggems_vllm.runtime/utils",
+    "lazy per_token_group_quant_fp8 import -> flaggems_vllm.ops"
+  ],
+  "gpu_port_status": "NOT_RUN; eight GPUs reserved for formal E2E ablations",
+  "source_verification_scope": "AST equality is not a target-repository GPU numerical or dependency verification"
+}

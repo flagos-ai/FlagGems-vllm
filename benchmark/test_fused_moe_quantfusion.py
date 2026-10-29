@@ -17,7 +17,7 @@ class OperatorBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:]
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [(1, 6144), (64, 6144), (4096, 6144), (5089, 768), (8192, 768)]
+        self.shapes = [(1, 6144), (64, 6144), (4096, 6144), (5089, 384), (8192, 384)]
         self.shape_desc = "synthetic operator dimensions"
 
     def get_input_iter(self, dtype):
