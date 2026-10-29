@@ -126,6 +126,6 @@ pip show vllm-plugin-fl
 
 ## 下一步
 
-- [选择性启用算子](selective.md)
+- [基础用法](basic.md)
 - [非 NVIDIA 后端配置](non-nvidia.md)
 - [运行性能基准评测](../performance/benchmark.md)

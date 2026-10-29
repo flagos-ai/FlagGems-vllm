@@ -93,7 +93,7 @@ Call flow: `vLLM -> vllm-plugin-fl -> flag_gems.enable() + flaggems_vllm.<op>()`
 
 ```
 src/flaggems_vllm/
-  __init__.py              # top-level exports, enable()/only_enable()/use_gems()
+  __init__.py              # top-level public operator exports
   config.py                # enable/exclude config resolution, C-extension detection
   ops/                     # operator implementations (one file per op, mostly)
     __init__.py            # re-exports every public op + __all__
@@ -242,9 +242,9 @@ acceptance/delivery format. Key rules an agent MUST honor:
    | Functional test | `tests/test_<op>.py` |
    | Performance benchmark | `benchmark/test_<op>.py` |
    | Op export | `src/flaggems_vllm/ops/__init__.py` (import + `__all__`) |
-   | Top-level registration | `src/flaggems_vllm/__init__.py` |
+   | Top-level export | `src/flaggems_vllm/__init__.py` |
 
-   An op is not "done" until it is exported, registered, and documented in `conf/operators.yaml`.
+   An op is not "done" until it is exported and documented in `conf/operators.yaml`.
 
 3. **Autotune is not optional.** Any kernel exposing perf params (`BLOCK_*`,
    `TILE_*`, `num_warps`, `num_stages`, `num_ctas`, ...) should, on the NVIDIA

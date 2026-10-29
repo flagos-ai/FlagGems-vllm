@@ -41,7 +41,7 @@ AI 不能跳过以下 gate。
 | G1 工程基线 | editable/read-only、build、validation、benchmark、active set、autotune、profiler 已冻结 | 不允许比较性能 |
 | G2 vLLM 规范 | dtype matrix、shape、layout、promotion、边界语义、unsupported scope 已明确（不要求对齐 PyTorch） | 不允许实现 |
 | G3 路径设计 | fast/special/general/unsupported/external-library path 已定义；无 torch compute fallback | 不允许写 kernel |
-| G4 实现集成 | operators.yaml、ops、tune config、test、benchmark、导出、注册已完成或说明不需要 | 不允许验收 |
+| G4 实现集成 | operators.yaml、ops、tune config、test、benchmark、导出已完成或说明不需要 | 不允许验收 |
 | G5 功能测试 | 功能测试通过，含 dtype、边界、unsupported path | 立即修复或回滚 |
 | G6 性能验收 | benchmark active set 达标，或触发 deep_opt | 未达标必须进入 `deep_opt.md` |
 | G7 交付 | 结果、风险、autotune、fallback/unsupported、deep opt 结论完整 | 不得宣称完成 |
@@ -111,7 +111,7 @@ PY
 | 功能测试 | `tests/test_<op>.py` |
 | 性能测试 | `benchmark/test_<op>.py` |
 | ops 导出 | `src/flaggems_vllm/ops/__init__.py` |
-| 顶层注册 | `src/flaggems_vllm/__init__.py` |
+| 顶层导出 | `src/flaggems_vllm/__init__.py` |
 
 `tune_configs.yaml` 不是后置可选项。凡是 kernel 暴露 `BLOCK_*`、`TILE_*`、`GROUP_*`、`SPLIT_*`、`UNROLL`、`num_warps`、`num_stages`、`num_ctas` 等性能参数，NVIDIA backend 默认必须通过 `runtime.get_tuned_config("<op_or_path>")` + `@libtuner(...)` 接入。豁免必须在交付结论中写明。
 
@@ -188,12 +188,12 @@ NVIDIA backend 检查项：
 必须完成或明确不需要：
 
 1. `src/flaggems_vllm/ops/__init__.py` 导出。
-2. `src/flaggems_vllm/__init__.py` 注册。
+2. `src/flaggems_vllm/__init__.py` 顶层导出。
 3. `tune_configs.yaml` 配置。
 4. `tests/test_<op>.py`。
 5. `benchmark/test_<op>.py`。
 
-缺少导出或注册，算子视为未接入完成。
+缺少导出，算子视为未接入完成。
 
 ## 5. 功能测试要求
 

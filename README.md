@@ -77,7 +77,7 @@ For more examples (such as `moe_align_block_size`, `flash_attention_forward`, an
 Comprehensive documentation is available in the [docs](docs/) directory:
 
 - 📖 **Getting Started**: [Installation Guide](docs/content/en/getting-started/install.md)
-- 🚀 **Usage**: [Basic Usage](docs/content/en/usage/basic.md) | [vLLM Plugin Integration](docs/content/en/usage/vllm-plugin.md) | [Selective Enablement](docs/content/en/usage/selective.md)
+- 🚀 **Usage**: [Basic Usage](docs/content/en/usage/basic.md) | [vLLM Plugin Integration](docs/content/en/usage/vllm-plugin.md)
 - 🔧 **Hardware Backends**: [Non-NVIDIA Hardware Support](docs/content/en/usage/non-nvidia.md)
 - 🧪 **Testing**: [Unit Testing Guide](docs/content/en/testing/unittest.md) | [Coverage](docs/content/en/testing/coverage.md)
 - ⚡ **Benchmarking**: [Running Benchmarks](docs/content/en/performance/benchmark.md) | [Performance Results](docs/content/en/performance/results.md)

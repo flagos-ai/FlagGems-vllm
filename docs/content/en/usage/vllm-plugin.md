@@ -156,6 +156,6 @@ If performance is slower than expected:
 
 ## Next Steps
 
-- [Selective operator enablement](selective.md)
+- [Basic usage patterns](basic.md)
 - [Non-NVIDIA backend configuration](non-nvidia.md)
 - [Performance benchmarking](../performance/benchmark.md)

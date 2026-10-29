@@ -46,9 +46,8 @@ flag_gems.enable()
 # 2. Direct call to FlagGems-vllm operator
 result = flaggems_vllm.moe_align_block_size(topk_ids, block_size, num_experts)
 
-# 3. Enable FlagGems-vllm dispatch to inspect registered ops
-flaggems_vllm.enable()
-ops = flaggems_vllm.all_registered_ops()
+# 3. Inspect all exported operators
+ops = flaggems_vllm.ops.__all__
 print(f"Available: {len(ops)} operators")
 ```
 

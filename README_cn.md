@@ -93,7 +93,7 @@ print(topk_weights.shape, topk_ids.shape)
 更多详细内容与操作指引已整理至 [docs](docs/) 目录：
 
 - 📖 **起步与安装**: [安装指南](docs/content/zh-cn/getting-started/install.md)
-- 🚀 **使用方法**: [基础用法](docs/content/zh-cn/usage/basic.md) | [vLLM 插件集成](docs/content/zh-cn/usage/vllm-plugin.md) | [选择性启用](docs/content/zh-cn/usage/selective.md)
+- 🚀 **使用方法**: [基础用法](docs/content/zh-cn/usage/basic.md) | [vLLM 插件集成](docs/content/zh-cn/usage/vllm-plugin.md)
 - 🔧 **硬件后端**: [非 NVIDIA 硬件支持](docs/content/zh-cn/usage/non-nvidia.md)
 - 🧪 **测试验证**: [单元测试指南](docs/content/zh-cn/testing/unittest.md) | [覆盖率统计](docs/content/zh-cn/testing/coverage.md)
 - ⚡ **基准测试**: [运行性能基准测试](docs/content/zh-cn/performance/benchmark.md) | [评测结果](docs/content/zh-cn/performance/results.md)

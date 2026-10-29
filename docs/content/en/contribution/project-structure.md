@@ -12,7 +12,7 @@ FlagGems-vllm repository organization.
 ```
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python package
-│   ├── __init__.py         # Top-level exports, enable()/use_gems()
+│   ├── __init__.py         # Top-level exports and public operator APIs
 │   ├── config.py           # Configuration, C extension detection
 │   ├── ops/                # Operator implementations
 │   ├── runtime/            # Backend, device, autotune config

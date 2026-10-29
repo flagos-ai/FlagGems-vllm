@@ -109,9 +109,9 @@ Before developing a new operator, check `conf/operators.yaml` to ensure it does 
    - Decorate host dispatch with `@libentry()` and validate tensor shapes, strides, dtypes, and devices;
    - **Strictly adhere to the NO_TORCH_COMPUTE_FALLBACK rule** (see next section): memory operators (`torch.empty`, `torch.zeros`, etc.) and creation/copy operators (`contiguous`, `clone`, `copy_`, etc.) are allowed; calling FlagGems operators is allowed; calling PyTorch operators to implement computation is forbidden;
    - Raise explicit `NotImplementedError` for unsupported shapes or dtypes.
-3. **Export and register public APIs**:
+3. **Export public APIs**:
    - Import the operator and add it to `__all__` in `src/flaggems_vllm/ops/__init__.py`;
-   - Export and register at top level in `src/flaggems_vllm/__init__.py`.
+   - Export at top level in `src/flaggems_vllm/__init__.py`.
 4. **Autotune configuration (`src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml`)**:
    - Any kernel exposing performance parameters (`BLOCK_*`, `num_warps`, `num_stages`, etc.) must provide tuned configurations in `tune_configs.yaml`;
    - Integrate autotuning with `@libtuner(configs=..., key=[...], strategy=[...])`.
@@ -135,8 +135,8 @@ Before developing a new operator, check `conf/operators.yaml` to ensure it does 
 | Functional Unit Test | `tests/test_<op>.py` | Accuracy and edge tests with `@pytest.mark.<op>` |
 | Performance Benchmark | `benchmark/test_<op>.py` | Benchmark evaluation script |
 | Core Benchmark Shapes | `benchmark/core_shapes.yaml` | List of primary shapes for acceptance |
-| Internal Module Export | `src/flaggems_vllm/ops/__init__.py` | Export and register to `__all__` |
-| Package-level Export | `src/flaggems_vllm/__init__.py` | Top-level public package export |
+| Internal Module Export | `src/flaggems_vllm/ops/__init__.py` | Export and add to `__all__` |
+| Package-level Export | `src/flaggems_vllm/__init__.py` | Top-level direct public package export |
 
 ## 6. NO_TORCH_COMPUTE_FALLBACK Rule {#host-dispatch-conventions}
 

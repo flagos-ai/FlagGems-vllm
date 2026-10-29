@@ -12,7 +12,7 @@ FlagGems-vllm 仓库组织与模块架构。
 ```
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python 核心包
-│   ├── __init__.py         # 顶层导出、enable()/use_gems()
+│   ├── __init__.py         # 顶层导出与公开算子暴露
 │   ├── config.py           # 配置与 C 扩展检测
 │   ├── ops/                # 算子实现
 │   ├── runtime/            # 后端管理、设备检测、自动调优配置

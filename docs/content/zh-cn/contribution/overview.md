@@ -109,9 +109,9 @@ FlagGems-vllm 在 `conf/operators.yaml` 中维护所有算子的元数据清单�
    - 使用 `@libentry()` 修饰入口函数，做好输入张量形状、步长、数据类型与设备校验；
    - **严格遵守 NO_TORCH_COMPUTE_FALLBACK 规范**：允许调用 PyTorch 内存算子（`torch.empty`、`torch.zeros` 等）以及创建/拷贝算子（`contiguous`、`clone`、`copy_` 等），允许调用 FlagGems 算子，禁止调用 PyTorch 算子实现计算功能；
    - 不支持的形状或数据类型必须显式抛出 `NotImplementedError`，严禁静默回退。
-3. **公共接口导出与注册**：
+3. **公共接口导出**：
    - 在 `src/flaggems_vllm/ops/__init__.py` 中导入该算子并加入 `__all__` 列表；
-   - 在 `src/flaggems_vllm/__init__.py` 中完成顶层导出与注册。
+   - 在 `src/flaggems_vllm/__init__.py` 中完成顶层包导出。
 4. **自动调优配置 (`src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml`)**：
    - 凡是暴露 `BLOCK_*`、`num_warps`、`num_stages` 等性能参数的算子，必须在 `tune_configs.yaml` 中提供候选参数空间；
    - 在 Triton 内核函数上使用 `@libtuner(configs=..., key=[...], strategy=[...])` 装饰器接入。
@@ -135,8 +135,8 @@ FlagGems-vllm 在 `conf/operators.yaml` 中维护所有算子的元数据清单�
 | 功能单元测试 | `tests/test_<op>.py` | 正确性与边界测试（带 `@pytest.mark.<op>`） |
 | 性能基准测试 | `benchmark/test_<op>.py` | 性能评测脚本 |
 | 核心测试形状 | `benchmark/core_shapes.yaml` | 评测的核心输入形状列表 |
-| 模块导出 | `src/flaggems_vllm/ops/__init__.py` | 模块内部导出并注册到 `__all__` |
-| 顶层注册 | `src/flaggems_vllm/__init__.py` | 包级别对外公开接口导出 |
+| 模块导出 | `src/flaggems_vllm/ops/__init__.py` | 模块内部导出并加入 `__all__` |
+| 顶层导出 | `src/flaggems_vllm/__init__.py` | 包级别对外公开接口直接导出 |
 
 ## 6. 严禁 PyTorch 计算回退规则 (NO_TORCH_COMPUTE_FALLBACK) {#host-dispatch-conventions}
 
