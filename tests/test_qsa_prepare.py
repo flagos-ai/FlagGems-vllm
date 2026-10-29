@@ -71,8 +71,8 @@ DECODE_BATCH = ([512] * 16, [1] * 16, [8] * 16)
 # an OpenAI server, 16384 for offline throughput.
 #
 # A loaded server decodes with every slot busy, which is also when the scalar ring
-# commit and the main-attention tiling meet: 1024 tokens is exactly MAIN_TILE_T's
-# threshold, so DECODE_MAX is the only layout combining the two.
+# commit and the main-attention tiling meet: 1024 tokens is exactly the generic
+# kernel's MAIN_TILE_T threshold, so DECODE_MAX is the only layout combining them.
 DECODE_DEEP = ([512] * 512, [1] * 512, [8] * 512)
 DECODE_MAX = ([512] * 1024, [1] * 1024, [8] * 1024)
 # The ceilings the benchmark's last rows carry: 1010 + 14 = 1024 sequences, which
