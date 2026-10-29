@@ -5,17 +5,27 @@ weight: 10
 
 # Basic Usage
 
-FlagGems-vllm provides operators that can be called directly or used with FlagGems' global enablement API.
+FlagGems-vllm provides optimized operators designed for vLLM inference workloads. **FlagGems-vllm depends on FlagGems**, and currently some FlagGems-vllm operators invoke FlagGems operators internally.
+
+## Dependency on FlagGems and Execution Flow
+
+- **Prerequisite**: Ensure `flag_gems` is installed in your environment before installing or running FlagGems-vllm.
+- **Internal Operator Invocation**: Several FlagGems-vllm operators (such as multi-head computation `mhc_pre`, backend-specific quantized matrix multiplications `bmm_w8a8_int8`, and cache writers `reshape_and_cache_flash`) invoke FlagGems operators (e.g., `flag_gems.bmm_out`, `flag_gems.mm_w8a8_int8`, `torch.ops.flag_gems.*`) during execution.
+- **Recommended Usage Pattern**: Call `flag_gems.enable()` prior to executing workloads with FlagGems-vllm to initialize FlagGems' operator registration and ensure proper dispatch.
 
 ## Direct Operator Invocation
 
-All operators are exported from the `flaggems_vllm` package:
+All operators are exported from the `flaggems_vllm` package. The recommended invocation pattern is:
 
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
 
-# MoE token alignment
+# Recommended: Enable FlagGems general operator replacement and internal dispatch
+flag_gems.enable()
+
+# 1. MoE token alignment
 topk_ids = torch.randint(0, 16, (128, 2), device='cuda', dtype=torch.int32)
 sorted_ids, expert_ids, num_tokens = flaggems_vllm.moe_align_block_size(
     topk_ids=topk_ids,
@@ -23,7 +33,7 @@ sorted_ids, expert_ids, num_tokens = flaggems_vllm.moe_align_block_size(
     num_experts=16,
 )
 
-# Grouped topk for MoE routing
+# 2. Grouped topk for MoE routing
 scores = torch.randn((8, 16), device="cuda", dtype=torch.float32)
 topk_weights, topk_ids = flaggems_vllm.grouped_topk(
     scores,
@@ -33,13 +43,13 @@ topk_weights, topk_ids = flaggems_vllm.grouped_topk(
     renormalize=True,
 )
 
-# Flash attention
+# 3. Flash attention
 q = torch.randn((2, 8, 128, 64), device='cuda', dtype=torch.float16)
 k = torch.randn((2, 8, 128, 64), device='cuda', dtype=torch.float16)
 v = torch.randn((2, 8, 128, 64), device='cuda', dtype=torch.float16)
 output = flaggems_vllm.flash_attention_forward(q, k, v, causal=True)
 
-# Fused add + RMS norm
+# 4. Fused add + RMS norm
 hidden = torch.randn((128, 4096), device='cuda', dtype=torch.float16)
 residual = torch.randn((128, 4096), device='cuda', dtype=torch.float16)
 weight = torch.randn((4096,), device='cuda', dtype=torch.float16)
@@ -48,10 +58,13 @@ output = flaggems_vllm.fused_add_rms_norm(hidden, residual, weight, eps=1e-6)
 
 ## Operator Discovery
 
-List all available operators:
+List all available operators (requires `enable()` to be called first to populate the registrar):
 
 ```python
 import flaggems_vllm
+
+# Enable operators to inspect registered ops
+flaggems_vllm.enable()
 
 # Get all registered operator names
 ops = flaggems_vllm.all_registered_ops()
@@ -67,18 +80,24 @@ print(f"Registration keys: {len(keys)}")
 
 FlagGems-vllm provides the same enablement API as FlagGems for consistent usage patterns:
 
-### `enable()`
+### `enable()` and `flag_gems.enable()`
 
-Enable all FlagGems-vllm operators globally:
+FlagGems-vllm operators are typically invoked directly. However, because some operators depend on FlagGems internally and inference models utilize standard general operations, the standard practice is:
+
+1. **Call `flag_gems.enable()`**: Registers general PyTorch/Triton operator replacements and activates underlying kernels needed by FlagGems-vllm;
+2. **Call `flaggems_vllm.<op>()`**: Directly executes vLLM-specialized fused kernels;
+3. **Call `flaggems_vllm.enable()` (Optional)**: Further registers FlagGems-vllm operators into the PyTorch dispatch table.
 
 ```python
+import flag_gems
 import flaggems_vllm
 
-flaggems_vllm.enable()
-# Now FlagGems-vllm operators are registered for PyTorch dispatch
-```
+# 1. Enable FlagGems general operators (required / recommended)
+flag_gems.enable()
 
-**Note**: This is rarely needed for FlagGems-vllm since most operators are called directly. Use `flag_gems.enable()` for general PyTorch operator replacement.
+# 2. Optionally register FlagGems-vllm dispatch
+flaggems_vllm.enable()
+```
 
 ### `only_enable()`
 
@@ -154,7 +173,7 @@ FlagGems-vllm operators fall into these categories:
 - `stage_deepseek_v4_*` - DeepSeek-v4 operators
 - `rwkv_*` - RWKV model operators
 
-See the [operator reference](/FlagGems-vllm/references/operators/) for the complete list.
+See the [operator reference](../references/operators.md) for the complete list.
 
 ## Error Handling
 
@@ -172,7 +191,7 @@ This is by design (see `NO_TORCH_COMPUTE_FALLBACK` in the contribution guide).
 
 ## Next Steps
 
-- [vLLM plugin integration](vllm-plugin/)
-- [Selective operator enablement](selective/)
-- [Debugging and logging](debugging/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [vLLM plugin integration](vllm-plugin.md)
+- [Selective operator enablement](selective.md)
+- [Debugging and logging](debugging.md)
+- [Performance benchmarking](../performance/benchmark.md)

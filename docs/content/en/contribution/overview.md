@@ -21,7 +21,7 @@ Guidelines for contributing to FlagGems-vllm.
 
 Steps:
 1. Verify the operator is needed for vLLM scenarios (not in FlagGems)
-2. Create three pre-coding tables (project truth, torch contract, implementation paths)
+2. Create three pre-coding design tables (engineering baseline, torch alignment specification, implementation path design)
 3. Implement host dispatch + Triton kernels
 4. Add autotune integration (NVIDIA backend required)
 5. Write functional tests (`tests/test_<op>.py`)
@@ -49,11 +49,11 @@ Required:
 
 ### Adding Backend Support
 
-See [backend development guide](backend/).
+See [backend development guide](backend.md).
 
 Steps:
 1. Create `src/flaggems_vllm/runtime/backend/_<vendor>/`
-2. Add device detection in `runtime/device_finder.py`
+2. Register vendor in `runtime/common.py` and configure detection in `runtime/backend/device_finder.py`
 3. Test core operators on target hardware
 4. Add CI configuration (if possible)
 
@@ -280,6 +280,6 @@ By contributing to FlagGems-vllm, you agree that your contributions will be lice
 
 ## Next Steps
 
-- [Operator development protocol](workflow/)
-- [Backend development guide](backend/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Operator development protocol](workflow.md)
+- [Backend development guide](backend.md)
+- [Testing guide](../testing/unittest.md)

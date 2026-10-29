@@ -5,7 +5,7 @@ weight: 40
 
 # Running on Non-NVIDIA Backends
 
-FlagGems-vllm supports **18 hardware backends** beyond NVIDIA GPUs.
+FlagGems-vllm supports **17 hardware backends** (NVIDIA plus 16 non-NVIDIA backends).
 
 ## Supported Backends
 
@@ -18,7 +18,7 @@ FlagGems-vllm supports **18 hardware backends** beyond NVIDIA GPUs.
 - **Kunlunxin** (Baidu): XPU series
 - **MetaX**: C-series accelerators
 - **Moore Threads**: MTT GPUs
-- And more...
+- **AIPU**, **ARM**, **Biren**, **SpacemiT**, **Sunrise**, **T-Head**, **Tsingmicro**
 
 See `src/flaggems_vllm/runtime/backend/` for the complete list.
 
@@ -182,14 +182,14 @@ Some operators may not work on all backends:
 To add a new backend:
 
 1. Create `src/flaggems_vllm/runtime/backend/_<vendor>/`
-2. Add device detection in `runtime/device_finder.py`
+2. Add device detection in `src/flaggems_vllm/runtime/backend/device_finder.py`
 3. Test core operators on target hardware
 4. Submit PR with test results
 
-See the [backend development guide](../contribution/backend/) for details.
+See the [backend development guide](../contribution/backend.md) for details.
 
 ## Next Steps
 
-- [Backend development guide](/FlagGems-vllm/contribution/backend/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Backend development guide](../contribution/backend.md)
+- [Testing guide](../testing/unittest.md)
+- [Performance benchmarking](../performance/benchmark.md)

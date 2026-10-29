@@ -131,6 +131,6 @@ print(f"Registered dispatch keys: {len(all_keys)}")
 
 ## Next Steps
 
-- [Basic usage patterns](basic/)
-- [Debugging and logging](debugging/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Basic usage patterns](basic.md)
+- [Debugging and logging](debugging.md)
+- [Performance benchmarking](../performance/benchmark.md)

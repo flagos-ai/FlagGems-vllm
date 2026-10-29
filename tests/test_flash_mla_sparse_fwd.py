@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import inspect
 import random
 from typing import List, Optional, Tuple
 
@@ -230,6 +231,26 @@ class FlashmlaSparseTestKit:
             ]
             for have_attn_sink in [True, False]
             for have_topk_length in [True, False]
+        ]
+        # DeepSeek-V4-Flash prefill: TOPK split, small head blocks, 8 and 16 warps
+        cases += [
+            Flashmla_Sparse_Test_Param(
+                s_q,
+                s_kv,
+                topk,
+                h_q=64,
+                d_qk=512,
+                have_attn_sink=True,
+                have_topk_length=have_topk_length,
+            )
+            for s_q in [4, 9, 16, 40]
+            for s_kv, topk in [(592, 128), (2048, 640), (16384, 8320)]
+            for have_topk_length in [True, False]
+        ]
+        # GLM-5.2 prefill, most frequent calls (no attn_sink / topk_length)
+        cases += [
+            Flashmla_Sparse_Test_Param(s_q, 361344, 2048, h_q=64, d_qk=576)
+            for s_q in [64, 449]
         ]
         return cases
 
@@ -455,3 +476,23 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     torch.testing.assert_close(
         your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
     )
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_flash_mla_sparse_vendor_export_and_abi():
+    from flaggems_vllm.ops import flashmla_sparse as generic
+
+    op = flaggems_vllm.flash_mla_sparse_fwd
+    assert inspect.signature(op) == inspect.signature(generic.flash_mla_sparse_fwd)
+    assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
+    if flaggems_vllm.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.fused import flashmla_sparse
+
+        assert op is flashmla_sparse.flash_mla_sparse_fwd
+        # no query tokens: empty outputs, no launch
+        q = torch.empty((0, 64, 512), dtype=torch.bfloat16, device=flaggems_vllm.device)
+        kv = torch.empty((16, 1, 512), dtype=torch.bfloat16, device=q.device)
+        indices = torch.empty((0, 1, 128), dtype=torch.int32, device=q.device)
+        out, max_logits, lse = op(q, kv, indices, 512**-0.5)
+        assert out.shape == (0, 64, 512) and out.dtype == torch.bfloat16
+        assert max_logits.shape == (0, 64) and lse.shape == (0, 64)

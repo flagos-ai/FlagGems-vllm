@@ -19,7 +19,10 @@ import triton
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import fill_tensor
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+    fill_tensor,
+    tn_compile_scenario,
+)
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.direct import (
     flash_varlen_int8_fwd_kernel,
     launch_direct,
@@ -68,6 +71,7 @@ def launch_metax_attention(
     total_q,
     head_size,
     is_paged,
+    _skip_selection_desc=None,
 ):
     """Validate a plan and dispatch through the selected family adapter."""
     validate_metax_attention_plan(plan)
@@ -76,16 +80,67 @@ def launch_metax_attention(
     if plan.family is MetaXKernelFamily.PAGE16_DECODE:
         return launch_page16_decode(params, batch_size=batch_size)
     if plan.family is MetaXKernelFamily.SPLIT_KV:
+        packed_decode = (
+            params.seqlenq_ngroups_swapped
+            and max_seqlen_q in (4, 8)
+            and params.h_hk_ratio == 1
+            and num_heads == num_heads_k == 1
+        )
+        page16_short_q = (
+            params.block_size == 16
+            and num_heads == 4
+            and num_heads_k == 1
+            and params.h_hk_ratio == 4
+            and params.is_cu_seqlens_q
+            and params.is_seqused_k
+            and 4 < max_seqlen_q <= 132
+            and batch_size <= 64
+            and total_q <= max_seqlen_q + batch_size - 1
+        )
         use_d256_tn_splitkv = (
             is_paged
             and params.q_ptr.dtype == torch.bfloat16
             and (head_size == 256)
-            and (params.block_size == 32)
-            and (params.h_hk_ratio == 8)
+            and (
+                params.block_size == 32
+                or (params.block_size == 16 and packed_decode and max_seqlen_q == 4)
+                or page16_short_q
+            )
+            and (params.h_hk_ratio == 8 or packed_decode or page16_short_q)
             and (1 < max_seqlen_q <= D256_TN_SPLITKV_MAX_Q)
-            and (total_q <= D256_TN_SPLITKV_MAX_TOTAL_Q)
+            and (
+                page16_short_q
+                or total_q <= D256_TN_SPLITKV_MAX_TOTAL_Q
+                or (
+                    packed_decode
+                    and batch_size <= (512 if params.block_size == 16 else 64)
+                    and total_q == batch_size * max_seqlen_q
+                )
+                or (
+                    not packed_decode
+                    and num_heads == 8
+                    and num_heads_k == 1
+                    and batch_size <= 64
+                    and total_q <= max_seqlen_q + batch_size - 1
+                    # Extend sparse short mixed batches without widening the
+                    # unqualified >4 GiB specialization. Existing routes keep
+                    # their original address handling.
+                    and "noaddropt"
+                    not in tn_compile_scenario(
+                        params.q_ptr,
+                        params.k_ptr,
+                        params.v_ptr,
+                        params.o_ptr,
+                        params.softmax_lse_ptr,
+                        params.page_table_ptr,
+                        params.cu_seqlens_q_ptr,
+                        params.cu_seqlens_k_ptr,
+                        params.seqused_k_ptr,
+                    )
+                )
+            )
             and (max_seqlen_k >= D256_TN_SPLITKV_MIN_K)
-            and params.is_causal
+            and (params.is_causal or packed_decode)
             and (not params.is_local)
             and (not params.is_dropout)
             and (not params.is_alibi)
@@ -99,6 +154,9 @@ def launch_metax_attention(
                 num_heads=num_heads,
                 total_q=total_q,
                 num_splits=plan.max_splits,
+                block_m=plan.split_kv_block_m if packed_decode else 32,
+                block_n=plan.split_kv_block_n if packed_decode else 128,
+                _skip_selection_desc=_skip_selection_desc,
             )
         return launch_splitkv(
             params,
@@ -196,8 +254,25 @@ def launch_metax_attention(
     raise RuntimeError(f"unsupported MetaX attention family: {plan.family.value}")
 
 
-def launch_attention(params, *, num_splits=0):
+def launch_attention(
+    params, *, num_splits=0, _skip_single_prefill=False, _skip_selection_desc=None
+):
     """Plan and launch C550 attention after common API input preparation."""
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attention.contiguous_splitkv import (
+        can_use_contiguous_splitkv,
+        launch_contiguous_splitkv,
+    )
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attention.single_prefill import (
+        can_use_tp2_single_prefill,
+        launch_tp2_single_prefill,
+    )
+
+    if not _skip_single_prefill and can_use_contiguous_splitkv(params, num_splits):
+        return launch_contiguous_splitkv(params, fallback=launch_attention)
+    if not _skip_single_prefill and can_use_tp2_single_prefill(params, num_splits):
+        return launch_tp2_single_prefill(
+            params, num_splits=num_splits, fallback=launch_attention
+        )
     plan = MetaXAttentionScheduler.build(
         is_bfloat16=params.q_ptr.dtype is torch.bfloat16,
         is_paged=params.is_paged,
@@ -230,6 +305,7 @@ def launch_attention(params, *, num_splits=0):
         total_q=params.total_q,
         head_size=params.d,
         is_paged=params.is_paged,
+        _skip_selection_desc=_skip_selection_desc,
     )
 
 

@@ -133,6 +133,29 @@ def test_complete_tle_remains_enabled(load_topk_module):
     assert module.tle is language
 
 
+def test_attn_res_missing_tle_load_uses_non_tle_cache_key(monkeypatch):
+    original = import_module("flaggems_vllm.ops.attn_res")
+    version_utils = import_module("flaggems_vllm.utils.triton_version_utils")
+    experimental = import_module("triton.experimental")
+    language = _language()
+    package = ModuleType("triton.experimental.tle")
+    package.language = language
+    spec = util.spec_from_file_location(f"{original.__name__}_test", original.__file__)
+    module = util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    monkeypatch.setattr(version_utils, "_triton_version_at_least", lambda *args: True)
+
+    with monkeypatch.context() as import_patch:
+        import_patch.setattr(experimental, "tle", package, raising=False)
+        import_patch.setitem(sys.modules, package.__name__, package)
+        import_patch.setitem(sys.modules, f"{package.__name__}.language", language)
+        spec.loader.exec_module(module)
+
+    assert module._HAS_TLE_LOAD is False
+    assert module.tle is None
+    assert module._attn_res_post_kernel.cache_key
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_incomplete_tle_topk_matches_reference(load_topk_module):
     phase, load = load_topk_module

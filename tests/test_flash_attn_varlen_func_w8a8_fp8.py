@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import inspect
 import math
 
@@ -602,6 +603,82 @@ def test_flash_attn_varlen_func_w8a8_fp8_uniform_lse(
     )
     _assert_w8a8_attention_close(result, expected)
     torch.testing.assert_close(lse, expected_lse, rtol=1.0e-2, atol=5.0e-2)
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
+@pytest.mark.skipif(
+    not torch_device_fn.is_available(), reason="Accelerator is not available"
+)
+@pytest.mark.skipif(
+    vendor_name not in ("nvidia", "mthreads"), reason="Requires NVIDIA or Moore Threads"
+)
+@pytest.mark.skipif(
+    not _supports_fp8_backend(),
+    reason="Requires NVIDIA Hopper or newer, or Moore Threads",
+)
+@pytest.mark.skipif(
+    getattr(torch, "float8_e4m3fn", None) is None,
+    reason="FP8 is not available",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_func_w8a8_fp8_uniform_splitkv(monkeypatch, dtype):
+    """Uniform packed batches reuse the dense mha_fwd, whose split-KV combine
+    writes into the BSHD view of `out`. Only the device SM count is overridden
+    so that the split choice is deterministic. D64 is the only head size that
+    takes this path (D128 uses split-D instead).
+    """
+    utils.init_seed(1234567890)
+    batch, num_heads, seq_len, head_size = 1, 4, 1024, 64
+    module = importlib.import_module(
+        "flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8"
+    )
+    tasks = (
+        batch
+        * num_heads
+        * triton.cdiv(seq_len, module.block_m_splitkv_heuristic(head_size))
+    )
+    get_properties = module.torch_device_fn.get_device_properties
+
+    class DeviceProperties:
+        # Force at least two KV splits without depending on the device SM count.
+        multi_processor_count = tasks * 2
+
+        def __init__(self, properties):
+            self.properties = properties
+
+        def __getattr__(self, name):
+            return getattr(self.properties, name)
+
+    monkeypatch.setattr(
+        module.torch_device_fn,
+        "get_device_properties",
+        lambda *args, **kwargs: DeviceProperties(get_properties(*args, **kwargs)),
+    )
+
+    observed_splits = []
+    original = module.flash_fwd_splitkv_combine_kernel
+
+    class ObserveCombine:
+        def __getitem__(self, grid):
+            def run(**kwargs):
+                observed_splits.append(kwargs["n_splits"])
+                return original[grid](**kwargs)
+
+            return run
+
+    monkeypatch.setattr(module, "flash_fwd_splitkv_combine_kernel", ObserveCombine())
+
+    lengths = [seq_len] * batch
+    q, k, v = _make_packed_inputs(lengths, lengths, num_heads, head_size, dtype)
+    scale = 1.0 / math.sqrt(head_size)
+    result, (ref_q, ref_k, ref_v), cu_q, cu_k = _run_w8a8_varlen(
+        q, k, v, lengths, lengths, scale, False
+    )
+    assert observed_splits and all(n > 1 for n in observed_splits)
+
+    expected = _fa2_varlen_reference(ref_q, ref_k, ref_v, cu_q, cu_k, scale, False)
+    _assert_w8a8_attention_close(result, expected)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
