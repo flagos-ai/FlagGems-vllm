@@ -160,6 +160,7 @@ from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
 from flaggems_vllm.ops.scaled_int8_quant import scaled_int8_quant
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
+from flaggems_vllm.ops.situ_and_mul import situ_and_mul
 from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
     silu_and_mul_with_clamp_out,
@@ -371,6 +372,7 @@ __all__ = [
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
     "sinkhorn_forward",
+    "situ_and_mul",
     "skip_layer_norm",
     "sparse_attn_triton",
     "stage_deepseek_v4_mega_moe_inputs",
