@@ -1,0 +1,16 @@
+{
+  "source": "frozen-compiler-evidence/_wide_union_sparse_kernel.ttgir",
+  "sha256": "4cee919128d6afba2224264a7a4a25f8c637cfab76caee75192b57db10c605fb",
+  "evidence": {
+    "scaled_PV_C_line": 963,
+    "QK_wait_line": 921,
+    "PV_commit_line": 964,
+    "next_page_copy_lines": [
+      979,
+      982,
+      994
+    ],
+    "PV_wait_line": 995
+  },
+  "finding": "PV uses scaled prior accumulator as WGMMA C. Next-page async copies occur after PV commit and before wait. PV waits before loop yield; no evidence of PV_i/QK_i+1 overlap in this compiled wide kernel."
+}

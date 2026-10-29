@@ -1,0 +1,846 @@
+{
+  "status": "PASS_OFFLINE_VERIFICATION",
+  "gpu": "H100 80GB HBM3 SM90",
+  "q": 8192,
+  "seq": 16384,
+  "ncu_reports": 20,
+  "ncu_actions": 45,
+  "timed_wrapper_invocations": 14400,
+  "timings": [
+    {
+      "receipt": "fa85-bf16-contig-q8192-timing.json",
+      "configuration": {
+        "arm": "fa85",
+        "mode": "contig",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "bf16",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 249.66399371623993,
+      "candidate_graph_us": 619.5520162582397,
+      "graph_speedup": 0.4029750322242124
+    },
+    {
+      "receipt": "fa85-bf16-correlated8-q8192-timing.json",
+      "configuration": {
+        "arm": "fa85",
+        "mode": "correlated8",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "bf16",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 1570.1600313186646,
+      "candidate_graph_us": 926.4320135116577,
+      "graph_speedup": 1.6948464738032356
+    },
+    {
+      "receipt": "fa85-bf16-scattered-q8192-timing.json",
+      "configuration": {
+        "arm": "fa85",
+        "mode": "scattered",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "bf16",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 1419.4400310516357,
+      "candidate_graph_us": 981.3919961452484,
+      "graph_speedup": 1.446353787912445
+    },
+    {
+      "receipt": "fa85-fp8-contig-q8192-timing.json",
+      "status": "NUMERICAL_REJECTION",
+      "check": {
+        "bitwise": false,
+        "max_abs": 0.015625,
+        "rms": 0.0009756673825904727,
+        "different_elements": 7805481,
+        "finite": true,
+        "tolerance_vs_frozen_baseline": {
+          "pass_": false,
+          "max_abs": 0.015625,
+          "rms": 0.0009756673825904727,
+          "failures": 641,
+          "atol": 0.004,
+          "rtol": 0.04
+        }
+      }
+    },
+    {
+      "receipt": "fa85-fp8-correlated8-q8192-timing.json",
+      "status": "NUMERICAL_REJECTION",
+      "check": {
+        "bitwise": false,
+        "max_abs": 0.0126953125,
+        "rms": 0.0009644791716709733,
+        "different_elements": 7806542,
+        "finite": true,
+        "tolerance_vs_frozen_baseline": {
+          "pass_": false,
+          "max_abs": 0.0126953125,
+          "rms": 0.0009644791716709733,
+          "failures": 645,
+          "atol": 0.004,
+          "rtol": 0.04
+        }
+      }
+    },
+    {
+      "receipt": "fa85-fp8-scattered-q8192-timing.json",
+      "status": "NUMERICAL_REJECTION",
+      "check": {
+        "bitwise": false,
+        "max_abs": 0.0126953125,
+        "rms": 0.0009642018703743815,
+        "different_elements": 7805067,
+        "finite": true,
+        "tolerance_vs_frozen_baseline": {
+          "pass_": false,
+          "max_abs": 0.0126953125,
+          "rms": 0.0009642018703743815,
+          "failures": 534,
+          "atol": 0.004,
+          "rtol": 0.04
+        }
+      }
+    },
+    {
+      "receipt": "nows2-fp8-contig-q8192-timing.json",
+      "configuration": {
+        "arm": "nows2",
+        "mode": "contig",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 317.82400608062744,
+      "candidate_graph_us": 514.8960053920746,
+      "graph_speedup": 0.617258636214542
+    },
+    {
+      "receipt": "nows2-fp8-correlated8-q8192-timing.json",
+      "configuration": {
+        "arm": "nows2",
+        "mode": "correlated8",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 630.3199827671051,
+      "candidate_graph_us": 835.1039886474609,
+      "graph_speedup": 0.754780232564779
+    },
+    {
+      "receipt": "nows2-fp8-scattered-q8192-timing.json",
+      "configuration": {
+        "arm": "nows2",
+        "mode": "scattered",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 1493.7600493431091,
+      "candidate_graph_us": 1555.5360317230225,
+      "graph_speedup": 0.960286370022888
+    },
+    {
+      "receipt": "nows3-fp8-contig-q8192-timing.json",
+      "configuration": {
+        "arm": "nows3",
+        "mode": "contig",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 317.82400608062744,
+      "candidate_graph_us": 529.312014579773,
+      "graph_speedup": 0.6004473681424966
+    },
+    {
+      "receipt": "nows3-fp8-correlated8-q8192-timing.json",
+      "configuration": {
+        "arm": "nows3",
+        "mode": "correlated8",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 627.6479959487915,
+      "candidate_graph_us": 1056.3520193099976,
+      "graph_speedup": 0.594165566473539
+    },
+    {
+      "receipt": "nows3-fp8-scattered-q8192-timing.json",
+      "configuration": {
+        "arm": "nows3",
+        "mode": "scattered",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 1490.7200336456299,
+      "candidate_graph_us": 2475.872039794922,
+      "graph_speedup": 0.6020989815649387
+    },
+    {
+      "receipt": "ws2-fp8-contig-q8192-timing.json",
+      "configuration": {
+        "arm": "ws2",
+        "mode": "contig",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 318.7200129032135,
+      "candidate_graph_us": 645.2639997005463,
+      "graph_speedup": 0.4939373853974883
+    },
+    {
+      "receipt": "ws2-fp8-correlated8-q8192-timing.json",
+      "configuration": {
+        "arm": "ws2",
+        "mode": "correlated8",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 629.1519999504089,
+      "candidate_graph_us": 1124.400019645691,
+      "graph_speedup": 0.5595446362128851
+    },
+    {
+      "receipt": "ws2-fp8-scattered-q8192-timing.json",
+      "configuration": {
+        "arm": "ws2",
+        "mode": "scattered",
+        "q": 8192,
+        "seq": 16384,
+        "storage": "fp8",
+        "bench": true
+      },
+      "status": "PASS_UNINSTRUMENTED_TIMING",
+      "baseline_graph_us": 1490.8480048179626,
+      "candidate_graph_us": 2332.832098007202,
+      "graph_speedup": 0.6390721415791151
+    }
+  ],
+  "kernel_profiles": [
+    {
+      "tag": "baseline-bf16-contig",
+      "kernel": "_union_span_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 234.656,
+      "occupancy_pct": 12.47956920845569,
+      "sm_throughput_pct": 32.24232290016179,
+      "tensor_active_pct": 30.438383018508702,
+      "dram_active_pct": 5.0311347824275625,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 164868,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-bf16-contig",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 14.88,
+      "occupancy_pct": 11.855308635388138,
+      "sm_throughput_pct": 11.159675606889282,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.000515166501813386,
+      "registers_per_thread": 212,
+      "shared_bytes_per_block": 37888,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-contig",
+      "kernel": "_union_span_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 303.392,
+      "occupancy_pct": 12.48431115877371,
+      "sm_throughput_pct": 36.772818549846676,
+      "tensor_active_pct": 24.22376046816677,
+      "dram_active_pct": 3.484959241538189,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 99332,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-contig",
+      "kernel": "_wide_union_sparse_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 4.352,
+      "occupancy_pct": 11.411389948377531,
+      "sm_throughput_pct": 4.246224372081783,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.001775568181818182,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 82948,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-contig",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.976,
+      "occupancy_pct": 15.619763281393361,
+      "sm_throughput_pct": 15.18740602276934,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.002099193909538737,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-correlated8",
+      "kernel": "_union_span_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 280.768,
+      "occupancy_pct": 12.48691899356033,
+      "sm_throughput_pct": 7.410754177224272,
+      "tensor_active_pct": 4.879663988308158,
+      "dram_active_pct": 0.2559464223537604,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 99332,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-correlated8",
+      "kernel": "_wide_union_sparse_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 329.92,
+      "occupancy_pct": 11.791859319734352,
+      "sm_throughput_pct": 51.18348331272548,
+      "tensor_active_pct": 20.12980596112613,
+      "dram_active_pct": 3.0034526754762823,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 82948,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-correlated8",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.944,
+      "occupancy_pct": 15.562370121938345,
+      "sm_throughput_pct": 15.20187687470169,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0007000448028673836,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-scattered",
+      "kernel": "_union_span_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 9.728,
+      "occupancy_pct": 12.417158390950696,
+      "sm_throughput_pct": 15.764383295935957,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 1.94802135678392,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 99332,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-scattered",
+      "kernel": "_wide_union_sparse_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 1457.344,
+      "occupancy_pct": 11.80461939451284,
+      "sm_throughput_pct": 54.50438712308029,
+      "tensor_active_pct": 21.510309324825265,
+      "dram_active_pct": 0.745441256367862,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 82948,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "baseline-fp8-scattered",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 11.072,
+      "occupancy_pct": 15.72287777617242,
+      "sm_throughput_pct": 15.194301584349782,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.004161118508655126,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "fa85-bf16-contig",
+      "kernel": "_gqa_sparse_fwd_tle_upstream_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 618.08,
+      "occupancy_pct": 36.37459775113578,
+      "sm_throughput_pct": 47.97255889063952,
+      "tensor_active_pct": 11.247366569985386,
+      "dram_active_pct": 2.025751719911434,
+      "registers_per_thread": 48,
+      "shared_bytes_per_block": 37024,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-contig",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 499.072,
+      "occupancy_pct": 12.468553959523113,
+      "sm_throughput_pct": 23.068300082185072,
+      "tensor_active_pct": 14.478712544804633,
+      "dram_active_pct": 2.07923746449907,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 132632,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-contig",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 4.352,
+      "occupancy_pct": 11.461262832613004,
+      "sm_throughput_pct": 3.923145674058443,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 249,
+      "shared_bytes_per_block": 116312,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-contig",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 11.008,
+      "occupancy_pct": 15.822027499127076,
+      "sm_throughput_pct": 15.138147131724686,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0006953716065865599,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-correlated8",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 469.888,
+      "occupancy_pct": 12.477675747487746,
+      "sm_throughput_pct": 4.714770967340556,
+      "tensor_active_pct": 2.8880006818116155,
+      "dram_active_pct": 0.1574526731849386,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 132632,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-correlated8",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 343.776,
+      "occupancy_pct": 11.784209605886518,
+      "sm_throughput_pct": 52.82130272427541,
+      "tensor_active_pct": 19.256336894766626,
+      "dram_active_pct": 2.723544362292052,
+      "registers_per_thread": 249,
+      "shared_bytes_per_block": 116312,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-correlated8",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.976,
+      "occupancy_pct": 15.59515631224125,
+      "sm_throughput_pct": 15.167918212869635,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-scattered",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 9.568,
+      "occupancy_pct": 12.274972770434859,
+      "sm_throughput_pct": 15.600492823824268,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 1.951121794871795,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 132632,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-scattered",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 1530.688,
+      "occupancy_pct": 11.823033603899047,
+      "sm_throughput_pct": 55.107149477628724,
+      "tensor_active_pct": 20.539653982776247,
+      "dram_active_pct": 0.6847035120041637,
+      "registers_per_thread": 249,
+      "shared_bytes_per_block": 116312,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows2-fp8-scattered",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 11.008,
+      "occupancy_pct": 15.743789788516505,
+      "sm_throughput_pct": 15.210828091083531,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-contig",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 510.368,
+      "occupancy_pct": 12.47368606031101,
+      "sm_throughput_pct": 23.12630655023716,
+      "tensor_active_pct": 14.156811699174785,
+      "dram_active_pct": 2.0334363297673663,
+      "registers_per_thread": 254,
+      "shared_bytes_per_block": 165420,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-contig",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 6.112,
+      "occupancy_pct": 5.9564526745374815,
+      "sm_throughput_pct": 2.8352070066042128,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 149100,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-contig",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 11.04,
+      "occupancy_pct": 15.83429070323487,
+      "sm_throughput_pct": 15.200801988198881,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0006944444444444445,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-correlated8",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 480.576,
+      "occupancy_pct": 12.481062068461263,
+      "sm_throughput_pct": 4.698867587205489,
+      "tensor_active_pct": 2.8123135211683548,
+      "dram_active_pct": 0.14150223759153785,
+      "registers_per_thread": 254,
+      "shared_bytes_per_block": 165420,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-correlated8",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 558.4,
+      "occupancy_pct": 6.242640535326743,
+      "sm_throughput_pct": 33.47337285427738,
+      "tensor_active_pct": 11.995538968917785,
+      "dram_active_pct": 1.6370454247078903,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 149100,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-correlated8",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.976,
+      "occupancy_pct": 15.733000749187518,
+      "sm_throughput_pct": 15.177522832084186,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-scattered",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 9.696,
+      "occupancy_pct": 12.300536884476168,
+      "sm_throughput_pct": 15.58334805738707,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 1.9255771182141046,
+      "registers_per_thread": 254,
+      "shared_bytes_per_block": 165420,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-scattered",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 2444.0,
+      "occupancy_pct": 6.2486389479132605,
+      "sm_throughput_pct": 35.611386401796814,
+      "tensor_active_pct": 13.044656284592811,
+      "dram_active_pct": 0.42167405255042967,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 149100,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "nows3-fp8-scattered",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.976,
+      "occupancy_pct": 15.60555307147799,
+      "sm_throughput_pct": 15.196210302022042,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-contig",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 620.16,
+      "occupancy_pct": 12.496754314261151,
+      "sm_throughput_pct": 20.421603122651657,
+      "tensor_active_pct": 11.512454155230667,
+      "dram_active_pct": 3.3077688458052568,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 132332,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-contig",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 7.456,
+      "occupancy_pct": 11.249187990696594,
+      "sm_throughput_pct": 8.065630584025199,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.00102880658436214,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 115964,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-contig",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 11.072,
+      "occupancy_pct": 15.79608099628724,
+      "sm_throughput_pct": 15.190826374554145,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-correlated8",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 593.696,
+      "occupancy_pct": 12.476049680536958,
+      "sm_throughput_pct": 4.1754767591623665,
+      "tensor_active_pct": 2.3321399472732507,
+      "dram_active_pct": 0.26935164204170087,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 132332,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-correlated8",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 514.016,
+      "occupancy_pct": 12.493620508917159,
+      "sm_throughput_pct": 36.55376808417493,
+      "tensor_active_pct": 13.064482201416913,
+      "dram_active_pct": 1.8015177807359513,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 115964,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-correlated8",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.976,
+      "occupancy_pct": 15.520211048677538,
+      "sm_throughput_pct": 15.192984488384958,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-scattered",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 9.216,
+      "occupancy_pct": 12.039762320914736,
+      "sm_throughput_pct": 11.508338743907046,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 1.1012300531914894,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 132332,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-scattered",
+      "kernel": "_union_tle_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 2296.288,
+      "occupancy_pct": 12.498675139977163,
+      "sm_throughput_pct": 37.99425525264161,
+      "tensor_active_pct": 13.87052539730126,
+      "dram_active_pct": 0.4581945449514728,
+      "registers_per_thread": 255,
+      "shared_bytes_per_block": 115964,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    },
+    {
+      "tag": "ws2-fp8-scattered",
+      "kernel": "_split_kernel",
+      "gpu": "H100 SM90",
+      "ncu_latency_us": 10.976,
+      "occupancy_pct": 15.539901695468568,
+      "sm_throughput_pct": 15.182280879163724,
+      "tensor_active_pct": 0.0,
+      "dram_active_pct": 0.0013950892857142857,
+      "registers_per_thread": 168,
+      "shared_bytes_per_block": 19456,
+      "scope": "Profiler replay of this kernel, not whole-wrapper benchmark latency"
+    }
+  ],
+  "findings": {
+    "bf16_compact_fa85_over_union_l2_read_sectors": 9.384408356423638,
+    "fp8_compact_baseline_local_bytes": 2097152.0,
+    "fp8_compact_ws2_local_bytes": 1381007360.0,
+    "fp8_wide_nows2_local_bytes": 0.0,
+    "fp8_wide_nows3_local_bytes": 1271217152.0
+  },
+  "oracle_checks": [
+    {
+      "mode": "contig",
+      "storage": "fp8",
+      "baseline_vs_literal": {
+        "pass_": true,
+        "max_abs": 0.0009312331676483154,
+        "rms": 8.37720072013326e-05,
+        "failures": 0,
+        "atol": 0.004,
+        "rtol": 0.04
+      },
+      "fa85_vs_literal": {
+        "pass_": false,
+        "max_abs": 0.015480980277061462,
+        "rms": 0.0009720484376884997,
+        "failures": 635,
+        "atol": 0.004,
+        "rtol": 0.04
+      }
+    },
+    {
+      "mode": "correlated8",
+      "storage": "fp8",
+      "baseline_vs_literal": {
+        "pass_": true,
+        "max_abs": 0.0009743869304656982,
+        "rms": 8.270627586171031e-05,
+        "failures": 0,
+        "atol": 0.004,
+        "rtol": 0.04
+      },
+      "fa85_vs_literal": {
+        "pass_": false,
+        "max_abs": 0.012767724692821503,
+        "rms": 0.000960838224273175,
+        "failures": 632,
+        "atol": 0.004,
+        "rtol": 0.04
+      }
+    },
+    {
+      "mode": "scattered",
+      "storage": "fp8",
+      "baseline_vs_literal": {
+        "pass_": true,
+        "max_abs": 0.0008794963359832764,
+        "rms": 8.274332503788173e-05,
+        "failures": 0,
+        "atol": 0.004,
+        "rtol": 0.04
+      },
+      "fa85_vs_literal": {
+        "pass_": false,
+        "max_abs": 0.012350291013717651,
+        "rms": 0.0009606600506231189,
+        "failures": 525,
+        "atol": 0.004,
+        "rtol": 0.04
+      }
+    },
+    {
+      "mode": "contig",
+      "storage": "bf16",
+      "baseline_vs_literal": {
+        "pass_": true,
+        "max_abs": 0.0009312331676483154,
+        "rms": 8.37720072013326e-05,
+        "failures": 0,
+        "atol": 0.004,
+        "rtol": 0.04
+      },
+      "fa85_vs_literal": {
+        "pass_": true,
+        "max_abs": 0.0009312331676483154,
+        "rms": 8.365835674339905e-05,
+        "failures": 0,
+        "atol": 0.004,
+        "rtol": 0.04
+      }
+    }
+  ]
+}

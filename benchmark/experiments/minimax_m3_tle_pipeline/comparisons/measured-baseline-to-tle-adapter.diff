@@ -1,0 +1,88 @@
+--- a/measured/reference/baseline.py
++++ b/measured/src/attention_candidate.py
+@@ -1803,3 +1803,85 @@
+         "decode_policy=%s prefill_min_q=%d spec_bf16_qk=%s int8_fallback=%s", decode_on, prefill_on, arm,
+         [(lim, a, c) for lim, a, c in DECODE_POLICY], PREFILL_MIN_Q, _SPEC_BF16_QK, _INT8_FALLBACK)
+     return True
++
++
++# ---- Isolated 2026-10-23 true TLE/TMA ring experiment. No production edits. ----
++from triton.tools.tensor_descriptor import TensorDescriptor as _TensorDescriptor
++from tle_pipeline import _union_tle_kernel
++
++_FROZEN_UNION = attn_union_span
++_FROZEN_WIDE = attn_union_sparse_wide
++PIPE_STAGES = 2
++PIPE_COMPACT_WARPS = 4
++PIPE_WARP_SPECIALIZE = True
++PIPE_PRODUCER_CONVERT = False
++PIPE_ENABLE_COMPACT = True
++PIPE_ENABLE_WIDE = True
++_PIPE_DISPATCH = {'compact': 0, 'wide': 0, 'fallback': 0}
++
++
++def pipeline_guard(q, kv_cache, topk_idx, num_kv_heads, output, k_scale, v_scale):
++    """Metadata-only narrow capability guard; no synchronizing tensor reads."""
++    return (not _INT8_FALLBACK and num_kv_heads == 1 and q.shape[1:] == (8, 128)
++            and _auto_supported(q, kv_cache, topk_idx, num_kv_heads, output, k_scale, v_scale)
++            and kv_cache.is_contiguous() and kv_cache.stride(-1) == 1
++            and kv_cache.stride(-2) == 256 and kv_cache.data_ptr() % 16 == 0)
++
++
++def _launch_pipeline(q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens,
++                     prefix_lens, max_query_len, num_kv_heads, sm_scale, output,
++                     k_scale, v_scale, *, block_q, auto_span, auto_flags,
++                     parent_flags=None, parent_block_q=0):
++    assert PIPE_STAGES in (2, 3)
++    batch=cu_seqlens_q.shape[0]-1
++    q2,o2=q.view(-1,128),output.view(-1,128)
++    k_arg,v_arg,has_scale=_scale_arg(k_scale,v_scale,output)
++    # Full adjacent K/V row span; no packing, allocator override, or device readback.
++    desc=_TensorDescriptor(kv_cache, shape=[kv_cache.shape[0]*128,256],
++                           strides=[256,1],block_shape=[128,128] if PIPE_WARP_SPECIALIZE else [128,256])
++    s0,s1,s2,s3=_kv_strides(kv_cache)
++    return _union_tle_kernel[(triton.cdiv(max_query_len,block_q),1,batch)](
++        q2,kv_cache,desc,topk_idx,o2,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++        k_arg,v_arg,8,128,16,sm_scale,8,
++        q2.stride(0),s0,s1,s2,s3,topk_idx.stride(0),topk_idx.stride(1),topk_idx.stride(2),block_table.stride(0),
++        BLOCK_Q=block_q,BLOCK_K=128,BLOCK_D=128,TOPK=16,QH=8,SPAN=32,
++        HAS_SCALE=has_scale,D_POW2=True,INT8_QK=False,
++        auto_flags_ptr=auto_flags,AUTO_SPAN=auto_span,stride_bt_k=block_table.stride(1),
++        SPARSE_WALK=parent_block_q>0,parent_flags_ptr=parent_flags,
++        PARENT_BLOCK_Q=parent_block_q,PARENT_TILES=triton.cdiv(max_query_len,parent_block_q) if parent_block_q else 0,
++        PIPE_STAGES=PIPE_STAGES,WARP_SPECIALIZE=PIPE_WARP_SPECIALIZE,PRODUCER_CONVERT=PIPE_PRODUCER_CONVERT,num_warps=4 if parent_block_q else PIPE_COMPACT_WARPS,num_stages=1)
++
++
++@torch.no_grad()
++def attn_union_span(q,kv_cache,topk_idx,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++                    max_query_len,num_kv_heads,sm_scale,output,
++                    k_scale=None,v_scale=None,block_q=16,num_warps=UNION_NUM_WARPS,
++                    num_stages=UNION_NUM_STAGES,span=UNION_SPAN,auto_flags=None,auto_span=0):
++    if (PIPE_ENABLE_COMPACT and block_q in (8,16) and span==32 and auto_span in (32,64)
++            and auto_flags is not None
++            and pipeline_guard(q,kv_cache,topk_idx,num_kv_heads,output,k_scale,v_scale)):
++        _PIPE_DISPATCH['compact']+=1
++        return _launch_pipeline(q,kv_cache,topk_idx,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++                max_query_len,num_kv_heads,sm_scale,output,k_scale,v_scale,
++                block_q=block_q,auto_span=auto_span,auto_flags=auto_flags)
++    _PIPE_DISPATCH['fallback']+=1
++    return _FROZEN_UNION(q,kv_cache,topk_idx,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++            max_query_len,num_kv_heads,sm_scale,output,k_scale=k_scale,v_scale=v_scale,
++            block_q=block_q,num_warps=num_warps,num_stages=num_stages,span=span,
++            auto_flags=auto_flags,auto_span=auto_span)
++
++
++@torch.no_grad()
++def attn_union_sparse_wide(q,kv_cache,topk_idx,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++            max_query_len,num_kv_heads,sm_scale,output,*,parent_flags,wide_flags,
++            parent_block_q=16,k_scale=None,v_scale=None):
++    if (PIPE_ENABLE_WIDE and parent_block_q==16 and kv_cache.dtype==torch.float8_e4m3fn
++            and pipeline_guard(q,kv_cache,topk_idx,num_kv_heads,output,k_scale,v_scale)):
++        _PIPE_DISPATCH['wide']+=1
++        return _launch_pipeline(q,kv_cache,topk_idx,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++                max_query_len,num_kv_heads,sm_scale,output,k_scale,v_scale,
++                block_q=8,auto_span=128,auto_flags=wide_flags,parent_flags=parent_flags,parent_block_q=16)
++    _PIPE_DISPATCH['fallback']+=1
++    return _FROZEN_WIDE(q,kv_cache,topk_idx,block_table,cu_seqlens_q,seq_lens,prefix_lens,
++            max_query_len,num_kv_heads,sm_scale,output,parent_flags=parent_flags,wide_flags=wide_flags,
++            parent_block_q=parent_block_q,k_scale=k_scale,v_scale=v_scale)

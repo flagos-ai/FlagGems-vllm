@@ -1,0 +1,438 @@
+{
+  "identity": {
+    "command_line": [
+      "scripts/gate.py",
+      "--quick",
+      "--compact-warps",
+      "8",
+      "--out",
+      "smoke-ws8-s2.json"
+    ],
+    "torch": "2.13.0+cu129",
+    "cuda": "12.9",
+    "triton": "3.6.0",
+    "triton_file": "/opt/flagtree/triton/__init__.py",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "capability": [
+      9,
+      0
+    ],
+    "sources": {
+      "src/tle_pipeline.py": "243b2cc54481d9926f9358219cd64835cc6058f4144ace1ada3c1084c801cef4",
+      "src/attention_candidate.py": "4196b9d582b7db460f728b3acb4e539e924d405b57e2d64c01f67b036bbd1b0f",
+      "src/tle_nows.py": "60a4857529857fcc341ac80ced1eda7f153590d35ccad2cacd591327d50f2ae7",
+      "reference/native_sparse_attn.py": "5db5d5e692044e54bb57418cbb7dcf5c9cc94f789eaccf128eec6fa8df86d967",
+      "reference/baseline.py": "1ab42fc298abf8a950d02ac5204869ed0f2eeade5185b17b58416e1be845a789",
+      "scripts/offline_compile.py": "f1ffa46609733b4b6aa6c813c0a7a92312e066bce582190216eea5cda32cc5ec",
+      "scripts/experiment_variants.py": "5770a3a74d66c019f0263726ac517a1119e6a585383a879a858d01c3c504afb9",
+      "scripts/harness.py": "83df93b98fd342f913cabc3a9ff5f7e6884b6234fa4c6c7dd7586d20a0ac5447",
+      "scripts/gate.py": "29971b8b8928025d7a2be07d76e4089027833ea89ac18523f383807785039d50",
+      "scripts/bench.py": "6551c8fffc7e7138e4c8054a45024baa326a4953e60d355a7824a94037fefa15",
+      "scripts/sanitizer_case.py": "f2f53a9a7ef4008436d2770e7855da081c908ba632a31c8555476349e6756566"
+    }
+  },
+  "configuration": {
+    "no_ws": false,
+    "producer_convert": false,
+    "stages": 2,
+    "compact_warps": 8,
+    "quick": true,
+    "graphs_only": false,
+    "no_graphs": false,
+    "out": "smoke-ws8-s2.json"
+  },
+  "stages": 2,
+  "cases": [
+    {
+      "q": 8192,
+      "seq": 16384,
+      "mode": "contig",
+      "d": 128,
+      "hkv": 1,
+      "batch": 1,
+      "dtype": "fp8",
+      "check": {
+        "bitwise": true,
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "different_elements": 0,
+        "finite": true,
+        "redzone": true,
+        "deterministic_10": true,
+        "literal_candidate": {
+          "pass_": true,
+          "max_abs": 0.0006885379552841187,
+          "rms": 8.596316183684394e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "literal_baseline": {
+          "pass_": true,
+          "max_abs": 0.0006885379552841187,
+          "rms": 8.596316183684394e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "native": {
+          "pass_": true,
+          "max_abs": 0.0009765625,
+          "rms": 4.929080205329228e-06,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "pass_": true
+      }
+    },
+    {
+      "q": 8192,
+      "seq": 16384,
+      "mode": "correlated8",
+      "d": 128,
+      "hkv": 1,
+      "batch": 1,
+      "dtype": "fp8",
+      "check": {
+        "bitwise": true,
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "different_elements": 0,
+        "finite": true,
+        "redzone": true,
+        "deterministic_10": true,
+        "literal_candidate": {
+          "pass_": true,
+          "max_abs": 0.0006599277257919312,
+          "rms": 8.487928425893188e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "literal_baseline": {
+          "pass_": true,
+          "max_abs": 0.0006599277257919312,
+          "rms": 8.487928425893188e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "native": {
+          "pass_": true,
+          "max_abs": 0.0009765625,
+          "rms": 4.923164851788897e-06,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "pass_": true
+      }
+    },
+    {
+      "q": 8153,
+      "seq": 16384,
+      "mode": "scattered",
+      "d": 128,
+      "hkv": 1,
+      "batch": 1,
+      "dtype": "fp8",
+      "check": {
+        "bitwise": true,
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "different_elements": 0,
+        "finite": true,
+        "redzone": true,
+        "deterministic_10": true,
+        "literal_candidate": {
+          "pass_": true,
+          "max_abs": 0.0006452351808547974,
+          "rms": 8.462679397780448e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "literal_baseline": {
+          "pass_": true,
+          "max_abs": 0.0006452351808547974,
+          "rms": 8.462679397780448e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "native": {
+          "pass_": true,
+          "max_abs": 0.0009765625,
+          "rms": 4.768713552039117e-06,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "pass_": true
+      }
+    }
+  ],
+  "graph": [
+    {
+      "pass_": true,
+      "phases": [
+        {
+          "phase": "A",
+          "active_tokens": 8153,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "B",
+          "active_tokens": 8146,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "A_restore",
+          "active_tokens": 8153,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "empty",
+          "active_tokens": 8140,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "A_restore2",
+          "active_tokens": 8153,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        }
+      ],
+      "stress_replays_per_graph": 100,
+      "stress_unchanged": true,
+      "distinct_flag_workspaces": true,
+      "streams": [
+        780811776,
+        781409376
+      ]
+    },
+    {
+      "pass_": true,
+      "phases": [
+        {
+          "phase": "A",
+          "active_tokens": 8153,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "B",
+          "active_tokens": 8146,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "A_restore",
+          "active_tokens": 8153,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "empty",
+          "active_tokens": 8140,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        },
+        {
+          "phase": "A_restore2",
+          "active_tokens": 8153,
+          "checks": [
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            },
+            {
+              "bitwise": true,
+              "max_abs": 0.0,
+              "rms": 0.0,
+              "different_elements": 0,
+              "finite": true,
+              "redzone": true
+            }
+          ],
+          "restored_bitwise": true
+        }
+      ],
+      "stress_replays_per_graph": 100,
+      "stress_unchanged": true,
+      "distinct_flag_workspaces": true,
+      "streams": [
+        790304128,
+        782314128
+      ]
+    }
+  ],
+  "status": "PASS",
+  "dispatch": {
+    "compact": 49,
+    "wide": 49,
+    "fallback": 0
+  }
+}
