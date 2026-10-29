@@ -119,8 +119,23 @@ class ConcatAndCacheMla(torch.autograd.Function):
             kv_cache = kv_cache.squeeze(2)
         if kv_c.ndim != 2 or k_pe.ndim != 2 or kv_cache.ndim != 3:
             raise ValueError("MLA cache expects KV[N,D], RoPE[N,R] and paged [B,P,D+R]")
-        if k_pe.shape[0] != kv_c.shape[0] or slot_mapping.shape != (kv_c.shape[0],):
-            raise ValueError("MLA cache inputs need one slot per token")
+        # CUDA-graph replay keeps the KV input padded to the captured batch
+        # size while ``slot_mapping`` carries only the real tokens (observed on
+        # MetaX C550: kv_c=(16, 512), slot_mapping=(11,)). The kernel walks
+        # ``slot_mapping`` -- grid and all indexing use its length -- and skips
+        # negative entries, so a longer ``kv_c`` is safe; the reverse would
+        # read rows that do not exist.
+        if (
+            k_pe.shape[0] != kv_c.shape[0]
+            or slot_mapping.ndim != 1
+            or slot_mapping.shape[0] > kv_c.shape[0]
+        ):
+            raise ValueError(
+                "MLA cache inputs need one slot per token: "
+                f"kv_c={tuple(kv_c.shape)}, k_pe={tuple(k_pe.shape)}, "
+                f"slot_mapping={tuple(slot_mapping.shape)}, "
+                f"kv_cache={tuple(kv_cache.shape)}"
+            )
         if k_pe.dtype != kv_c.dtype or slot_mapping.dtype not in (
             torch.int32,
             torch.int64,
