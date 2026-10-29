@@ -15,7 +15,7 @@
 """Opt-in pytest plugin for tests using vLLM-Ascend custom-op references.
 
 From the repository root:
-    python -m pytest -p tests.ascend_custom_ops tests/test_sparse_flash_attention.py
+    python -m pytest -p tools.ascend.pytest_custom_ops tests/test_sparse_flash_attention.py
 
 Do not load this plugin from conftest.py: pytest must register it before loading
 initial conftests, whose FlagGems imports can initialize the device runtime.
@@ -25,13 +25,16 @@ import pytest
 
 
 @pytest.hookimpl(tryfirst=True)
-def pytest_load_initial_conftests():
+def pytest_load_initial_conftests(early_config):
     """Let vLLM configure its vendor ops before CANN device initialization."""
+    early_config.addinivalue_line(
+        "markers", "glm: GLM-family attention and model regression workloads"
+    )
     try:
         from vllm_ascend.utils import enable_custom_op
     except ImportError as exc:
         raise pytest.UsageError(
-            "The tests.ascend_custom_ops plugin requires Torch-NPU and vLLM-Ascend"
+            "The tools.ascend.pytest_custom_ops plugin requires Torch-NPU and vLLM-Ascend"
         ) from exc
     if not enable_custom_op():
         raise pytest.UsageError(
