@@ -41,21 +41,6 @@ else:
     tle = None
     _HAS_TLE_LOAD = False
 
-# Resolve optional CUDA APIs before JIT dependency hashing, which also visits
-# constexpr branches that are disabled on non-CUDA backends.
-try:
-    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
-except ImportError:
-
-    @triton.jit
-    def gdc_wait():
-        tl.static_assert(False, "attn_res PDL requires CUDA GDC support")
-
-    @triton.jit
-    def gdc_launch_dependents():
-        tl.static_assert(False, "attn_res PDL requires CUDA GDC support")
-
-
 _MAX_BLOCKS = 8
 _PERSISTENT_CTA_COUNT_PER_SM = 2
 _MIN_TOKENS_FOR_PERSISTENT_LOOP = 256
@@ -680,7 +665,7 @@ def _execute_attn_res_steps(
     )
 
     if ENABLE_PDL:
-        gdc_launch_dependents()
+        tl.extra.cuda.gdc_launch_dependents()
 
     _normalize_and_store_output(
         output_norm_weight_ptr,
@@ -746,7 +731,7 @@ def _attn_res_post_kernel(
     hidden_mask = hidden_offsets < HIDDEN_SIZE
 
     if launch_pdl:
-        gdc_wait()
+        tl.extra.cuda.gdc_wait()
 
     unused_prefix = tl.zeros((HIDDEN_TILE_SIZE,), tl.float32)
     unused_norm_qk_weight = tl.zeros((HIDDEN_TILE_SIZE,), tl.float32)
@@ -778,7 +763,7 @@ def _attn_res_post_kernel(
     )
 
     if launch_pdl:
-        gdc_launch_dependents()
+        tl.extra.cuda.gdc_launch_dependents()
 
     _normalize_and_store_output(
         output_norm_weight_ptr,
@@ -891,7 +876,7 @@ def _attn_res_fixed_config_kernel(
             )
     else:
         if launch_pdl:
-            gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
         _execute_attn_res_steps(
             prefix_ptr,
