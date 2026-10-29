@@ -548,3 +548,28 @@ bmm_w8a8:
     - [2, 64, 128, 256]
     - [4, 129, 17, 257]
   shape_desc: "B, M, N, K"
+
+qsa_sparse_paged_attention:
+  shapes:
+    # From Qwen3.8-Flash-Next-FP8 production captures.
+    - [1, 6, 1, 784, false, 1, true, 88, 2712]
+    - [16, 6, 1, 784, false, 16, true, 88, 512]
+    - [32, 6, 1, 784, false, 32, true, 88, 2712]
+    - [40, 6, 1, 784, false, 40, true, 88, 512]
+    - [64, 6, 1, 784, false, 64, true, 88, 512]
+    - [72, 6, 1, 784, false, 72, true, 88, 2712]
+    - [128, 6, 1, 784, false, 128, true, 88, 512]
+    - [136, 6, 1, 784, false, 136, true, 88, 512]
+    - [272, 6, 1, 784, false, 272, true, 88, 512]
+    - [336, 6, 1, 784, false, 336, true, 88, 512]
+    - [512, 6, 1, 784, false, 512, true, 88, 2712]
+    - [902, 6, 1, 784, true, 451, true, 88, 2712]
+    - [2369, 6, 1, 784, true, 54, true, 88, 2712]
+    - [6177, 6, 1, 784, true, 57, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 1, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 16, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 30, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 31, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 57, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 2048, true, 88, 2712]
+  shape_desc: "T, Hq, Hkv, page_size, prefill_config, requests, fp8, pages_per_req, pool_blocks"

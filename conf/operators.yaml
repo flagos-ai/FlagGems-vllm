@@ -1119,6 +1119,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: qsa_sparse_paged_attention
+    description: |
+      Computes sparse grouped-query attention over paged BF16 or FP8 KV caches
+      using packed token indices, with fused output gating.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.qsa.qsa_sparse_paged_attention
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: reglu
     description: |
       Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of the sigmoid function for gating.

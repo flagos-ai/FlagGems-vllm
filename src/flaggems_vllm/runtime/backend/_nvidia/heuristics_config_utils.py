@@ -19,6 +19,94 @@ _MIN_TILE_N = 64
 _MAX_TILE_N_PER_ROW = 4096
 _MAX_ONE_TILE_N = 2048
 
+# ---------------------------------------------------------------------------
+# QSA sparse paged attention: split-count and launch-config policies.
+#
+# The split tables hold the TARGET split count (before clamping by the
+# selection tile count), keyed on base_programs = num_rows * num_kv_heads.
+# The launch-config policy returns (BLOCK_N, num_warps, num_stages), primarily
+# bucketed on next_pow2(num_rows), in the style of the upstream port's config
+# tables. Split counts and launch values are static NVIDIA policies; introduce
+# per-device tables when needed.
+# ---------------------------------------------------------------------------
+
+_INF = 1 << 62
+
+_QSA_BF16_SPLITS = ((32, 64), (256, 2), (512, 4), (_INF, 1))
+_QSA_FP8_SPLITS = (
+    (24, 64),
+    (32, 16),
+    (64, 8),
+    (128, 4),
+    (256, 8),
+    (384, 4),
+    (2048, 2),
+    (_INF, 1),
+)
+
+
+def qsa_sparse_num_splits_heur(args):
+    """Target split count for qsa_sparse_paged_attention (host-side policy).
+
+    args: num_rows, num_kv_heads, is_fp8 (use_prefill_config currently has no
+    effect under the single NVIDIA policy). The result is clamped against the
+    selection tile count by the op.
+    """
+    base_programs = args["num_rows"] * args["num_kv_heads"]
+    table = _QSA_FP8_SPLITS if args["is_fp8"] else _QSA_BF16_SPLITS
+    for upper_bound, splits in table:
+        if base_programs <= upper_bound:
+            return splits
+    return 1
+
+
+def qsa_sparse_launch_config_heur(args):
+    """(BLOCK_N, num_warps, num_stages) for the qsa main kernel.
+
+    args: num_rows, num_splits, group_size, is_fp8. Unseen combinations fall
+    through to conservative mid-size tiles.
+    """
+    t_bucket = triton.next_power_of_2(args["num_rows"])
+    num_splits = args["num_splits"]
+    group_size = args["group_size"]
+    if args["is_fp8"]:
+        if num_splits == 1:
+            if group_size >= 12:
+                return 32, 4, 2
+            if t_bucket == 4096:
+                return 64, 2, 1
+            return 32, 1, 1
+        if num_splits >= 33:
+            if t_bucket <= 8:
+                return 64, 8, 3
+            return 64, 8, 1
+        if group_size < 12 and args["num_rows"] in (64, 128):
+            return 128, 4, 1
+        # Mid split counts: small buckets favour narrower tiles.
+        if t_bucket <= 128 and group_size < 12:
+            return 32, 4, 2
+        if t_bucket >= 512 and group_size < 12:
+            return 32, 1, 1
+        return 128, 4, 1
+    if num_splits == 1:
+        if t_bucket <= 32:
+            return 64, 8, 2
+        if group_size >= 12:
+            return 64, 2, 3
+        return 128, 4, 2
+    if num_splits == 2:
+        if t_bucket <= 8:
+            return 32, 4, 1
+        return 128, 4, 2
+    if num_splits == 4:
+        if group_size >= 6:
+            return 64, 4, 2
+        return 32, 4, 3
+    # Decode: many splits (33 after the op's split clamp).
+    if t_bucket <= 8:
+        return 64, 8, 1
+    return 64, 8, 2
+
 
 def simple_elementwise_blocksize_heur(args):
     return 1024
@@ -450,6 +538,10 @@ HEURISTICS_CONFIGS = {
         "TILE_N": mean_heur_tile_n_non_inner,
         "ONE_TILE_PER_CTA": mean_heur_one_tile_per_cta,
         "num_warps": softmax_heur_num_warps_non_inner,
+    },
+    "qsa_sparse_paged_attention": {
+        "NUM_SPLITS": qsa_sparse_num_splits_heur,
+        "LAUNCH_CONFIG": qsa_sparse_launch_config_heur,
     },
     "softmax_inner": {
         "TILE_N": softmax_heur_tile_n_inner,

@@ -43,11 +43,10 @@ from flaggems_vllm.ops.qwen4.qsa import (
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
 )
-from flaggems_vllm.ops.qwen4.qsa_attention import (
-    qsa_sparse_paged_attention,
-    qsa_sparse_split_count,
-)
 from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
+from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (
+    qsa_sparse_paged_attention,
+)
 
 __all__ = [
     "ple_short_conv_",
@@ -61,7 +60,6 @@ __all__ = [
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_sparse_paged_attention",
-    "qsa_sparse_split_count",
     "can_use_hc_combine_norm_triton",
     "can_use_ple_gate_norm_triton",
     "can_use_ple_prefill_conv_triton",
