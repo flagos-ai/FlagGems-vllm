@@ -153,3 +153,60 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: true
       STAGGER_KV: false
+
+per_token_quant_int8:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        VEC_SIZE: vec_size
+        ROW_TILES: row_tiles
+        CONTIGUOUS_ROWS: contiguous_rows
+        REDUCE_GROUP: reduce_group
+        QUANT_PARTS: 1
+      num_warps: warps
+      num_stages: 1
+    block_m:
+      - 1
+      - 2
+    row_tiles:
+      - 1
+      - 2
+    contiguous_rows:
+      - false
+      - true
+    reduce_group:
+      - 0
+      - 4
+      - 8
+      - 16
+    vec_size:
+      - 4
+      - 8
+      - 16
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: 1
+        VEC_SIZE: 8
+        ROW_TILES: 1
+        CONTIGUOUS_ROWS: false
+        REDUCE_GROUP: 8
+        QUANT_PARTS: parts
+      num_warps: warps
+      num_stages: 1
+    parts:
+      - 2
+      - 4
+      - 8
+      - 16
+    warps:
+      - 4
+      - 8
+      - 16
