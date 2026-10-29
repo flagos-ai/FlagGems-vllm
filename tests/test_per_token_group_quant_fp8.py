@@ -113,3 +113,133 @@ def test_per_token_group_quant_fp8(num_tokens, d, dtype, group_size, seed, scale
     ref_out_fp32 = _fp8_to_float32(ref_out)
 
     assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
+
+
+def _require_generic_group_quant_fp8(*, require_fp8=False):
+    import importlib
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    if flaggems_vllm.per_token_group_quant_fp8 is not op.per_token_group_quant_fp8:
+        pytest.skip("backend uses its own per-token group quantization implementation")
+    if require_fp8 and op.SUPPORTED_FP8_DTYPE != torch.float8_e4m3fn:
+        pytest.skip("generic FP8 e4m3fn conversion is unavailable")
+    return op
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_generic_contract_guard(monkeypatch):
+    import importlib
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    monkeypatch.setattr(
+        flaggems_vllm, "per_token_group_quant_fp8", op.per_token_group_quant_fp8
+    )
+    monkeypatch.setattr(op, "SUPPORTED_FP8_DTYPE", torch.float8_e4m3fn)
+    assert _require_generic_group_quant_fp8(require_fp8=True) is op
+
+    monkeypatch.setattr(op, "SUPPORTED_FP8_DTYPE", torch.float32)
+    assert _require_generic_group_quant_fp8() is op
+    with pytest.raises(pytest.skip.Exception, match="conversion is unavailable"):
+        _require_generic_group_quant_fp8(require_fp8=True)
+
+    monkeypatch.setattr(
+        flaggems_vllm, "per_token_group_quant_fp8", lambda *a, **k: None
+    )
+    for require_fp8 in (False, True):
+        with pytest.raises(pytest.skip.Exception, match="backend uses its own"):
+            _require_generic_group_quant_fp8(require_fp8=require_fp8)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("has_reorder", [False, True])
+def test_per_token_group_quant_fp8_reorder_schedule(monkeypatch, has_reorder):
+    import importlib
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", has_reorder)
+    for total, group, ue in [
+        (7, 512, False),
+        (112, 256, True),
+        (664, 64, False),
+        (32768, 256, True),
+        (55296, 512, False),
+        (55296, 512, True),
+    ]:
+        groups, steps, warps = op._contiguous_group_config(total, group, ue)
+        assert groups > 0 and warps in (1, 4)
+        assert steps in ((1, 2, 4) if has_reorder else (1,))
+        if has_reorder and not (group == 256 and ue and total >= 128):
+            assert steps > 1
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_without_reorder(monkeypatch):
+    import triton.language as tl
+
+    op = _require_generic_group_quant_fp8(require_fp8=True)
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", False)
+    monkeypatch.setattr(op, "tle", tl)
+    torch.manual_seed(0)
+    x = torch.rand((7, 512), dtype=torch.bfloat16, device=flaggems_vllm.device)
+    expected_q, expected_s = native_per_token_group_quant_fp8(x, 512)
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    utils.gems_assert_close(s, expected_s, dtype=torch.float32)
+    assert torch.allclose(_fp8_to_float32(q), _fp8_to_float32(expected_q), rtol=0.15)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize(
+    "shape,group_size",
+    [((7, 512), 512), ((83, 512), 64), ((257, 512), 256), ((129, 3584), 512)],
+)
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_per_token_group_quant_fp8_reorder_special(shape, group_size, scale_ue8m0):
+    import triton
+
+    op = _require_generic_group_quant_fp8(require_fp8=True)
+    if not op._HAS_LOAD_REORDER:
+        pytest.skip("compiler does not expose load reorder")
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    flat = x.view(-1)
+    flat[0] = float("nan")
+    flat[group_size : 2 * group_size] = float("inf")
+    flat[2 * group_size : 3 * group_size] = -float("inf")
+    flat[3 * group_size : 4 * group_size] = 0.0
+    expected_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    expected_s = torch.empty(
+        (shape[0], shape[1] // group_size), device=x.device, dtype=torch.float32
+    )
+    # This scalar kernel is unchanged from upstream, including dynamic clamp
+    # bounds. It is an independent device oracle for special values and tails.
+    op._per_token_group_quant_fp8[(x.numel() // group_size,)](
+        x,
+        expected_q,
+        expected_s,
+        group_size,
+        shape[1],
+        x.stride(0),
+        1e-10,
+        -448.0,
+        448.0,
+        scale_ue8m0,
+        BLOCK=triton.next_power_of_2(group_size),
+        num_warps=min(max(triton.next_power_of_2(group_size) // 256, 1), 8),
+        num_stages=1,
+    )
+    q, s = flaggems_vllm.per_token_group_quant_fp8(
+        x, group_size, scale_ue8m0=scale_ue8m0
+    )
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("shape", [(0, 512), (7, 0)])
+def test_per_token_group_quant_fp8_empty(shape):
+    _require_generic_group_quant_fp8()
+    x = torch.empty(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    assert q.shape == x.shape and q.device == x.device and q.numel() == 0
+    assert s.shape == (shape[0], shape[1] // 512) and s.dtype == torch.float32
+    assert s.device == x.device and s.numel() == 0
