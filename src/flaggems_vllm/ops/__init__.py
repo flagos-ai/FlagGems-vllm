@@ -23,6 +23,7 @@ from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -250,6 +251,7 @@ __all__ = [
     "concat_mla_q",
     "concat_query",
     "contiguous_copy",
+    "cooperative_topk",
     "copy_to",
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",

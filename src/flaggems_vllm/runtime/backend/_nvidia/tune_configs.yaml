@@ -12,6 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+cooperative_topk_small:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_histogram:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 4096
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_scatter:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 4096
+    num_warps: 8
+    num_stages: 1
+
 w8a8_block_fp8_bmm:
   - gen: true
     param_map:

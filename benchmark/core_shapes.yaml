@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+cooperative_topk: &cooperative_topk_shapes
+  shapes:
+    - [1, 127, 512]
+    - [4, 4097, 512]
+    - [16, 16383, 1024]
+    - [16, 16384, 1024]
+    - [16, 16385, 1024]
+    - [4, 65539, 2048]
+    - [1, 262144, 512]
+    - [64, 262144, 2048]
+    - [1, 1048576, 1024]
+  shape_desc: "rows, width, k"
+
+# Keep the native-vLLM comparison on exactly the same workloads.
+cooperative_topk_vllm:
+  <<: *cooperative_topk_shapes
+
 concat_mla_q:
   shapes:
     - [1, 64, 512, 64]
