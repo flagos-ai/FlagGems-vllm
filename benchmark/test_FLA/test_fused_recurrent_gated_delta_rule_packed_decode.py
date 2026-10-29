@@ -12,14 +12,14 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.runtime import torch_device_fn
 
-from . import base, consts
-from .conftest import Config
+from benchmark import base, consts
+from benchmark.conftest import Config
 
 OP = "fused_recurrent_gated_delta_rule_packed_decode"
 
 
 class PackedDecodeBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+    DEFAULT_SHAPE_FILES = str(Path(__file__).resolve().parents[1] / "core_shapes.yaml")
     DEFAULT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
     def __init__(self, entry, warmup=5, repetitions=25):
