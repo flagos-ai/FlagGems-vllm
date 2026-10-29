@@ -10,10 +10,9 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.runtime import torch_device_fn
-
 from benchmark import base, consts
 from benchmark.conftest import Config
+from flaggems_vllm.runtime import torch_device_fn
 
 OP = "fused_recurrent_gated_delta_rule_packed_decode"
 
