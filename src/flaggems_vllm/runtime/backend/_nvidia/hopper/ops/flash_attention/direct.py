@@ -166,6 +166,7 @@ def flash_varlen_fwd_v3_tle_direct_kernel(
     TUNING_Q=0,
     DECODE_SHAPE_BUCKET=(),
     DECODE_POLICY_VERSION: tl.constexpr = 0,
+    INDEX_INT64: tl.constexpr = False,
 ):
     if MAX_SPLITS > 1:
         m_block = tl.program_id(0)
@@ -293,8 +294,10 @@ def flash_varlen_fwd_v3_tle_direct_kernel(
                     block_shape=[1, BLOCK_N, HEAD_DIM_PADDED],
                 )
         else:
-            k_base = k_ptr + k_bos * k_row_stride + kv_head * k_head_stride
-            v_base = v_ptr + k_bos * v_row_stride + kv_head * v_head_stride
+            # Dense K/V larger than 2**31 elements overflow int32 row offsets.
+            k_row = tl.cast(k_bos, tl.int64) if INDEX_INT64 else k_bos
+            k_base = k_ptr + k_row * k_row_stride + kv_head * k_head_stride
+            v_base = v_ptr + k_row * v_row_stride + kv_head * v_head_stride
 
         d_idx = tl.arange(0, HEAD_DIM_PADDED)
         if PACK_GQA:
@@ -380,7 +383,7 @@ def flash_varlen_fwd_v3_tle_direct_kernel(
                 )
                 bK = tl.trans(k_tile)
             else:
-                cache_idx = col_idx
+                cache_idx = col_idx.to(tl.int64) if INDEX_INT64 else col_idx
                 bK = tl.load(
                     k_base + cache_idx[None, :] * k_row_stride + d_idx[:, None],
                     mask=(d_idx[:, None] < d) & kv_mask[None, :],
@@ -468,7 +471,7 @@ def flash_varlen_fwd_v3_tle_direct_kernel(
                 )
                 bK = tl.trans(k_tile)
             else:
-                cache_idx = col_idx
+                cache_idx = col_idx.to(tl.int64) if INDEX_INT64 else col_idx
                 bK = tl.load(
                     k_base + cache_idx[None, :] * k_row_stride + d_idx[:, None],
                     mask=d_idx[:, None] < d,
@@ -566,6 +569,7 @@ def launch_direct(
     batch_size,
     effective_max_q,
     effective_num_heads,
+    num_sms,
     pack_factor,
     is_paged,
     paged_prefill,
@@ -582,12 +586,15 @@ def launch_direct(
     gqa_decode=False,
     fused_split_kv=False,
     split_counter=None,
+    index_int64=False,
 ):
     """Launch the direct family using its private grid and shape bucket."""
     batch_first_grid, single_kv_tile, shape_bucket = direct_launch_plan(
         max_seqlen_k=max_seqlen_k,
         batch_size=batch_size,
         effective_max_q=effective_max_q,
+        effective_num_heads=effective_num_heads,
+        num_sms=num_sms,
         is_paged=is_paged,
         paged_prefill=paged_prefill,
         pack_gqa=pack_gqa,
@@ -649,4 +656,5 @@ def launch_direct(
         TUNING_Q=0 if gqa_decode else total_q,
         DECODE_SHAPE_BUCKET=decode_shape_bucket,
         DECODE_POLICY_VERSION=DIRECT_DECODE_POLICY_VERSION if gqa_decode else 0,
+        INDEX_INT64=index_int64,
     )

@@ -49,6 +49,7 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.scheduling
 from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.split_combine import (
     combine_persistent_split_kv,
 )
+from flaggems_vllm.utils.shape_utils import can_use_int32_index
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +208,13 @@ def launch_attention(
     if is_paged:
         block_size = k.size(1)
         assert block_size >= 16 and block_size & (block_size - 1) == 0
-        assert k.stride(0) % k.stride(1) == 0
+        if k.stride(0) % k.stride(1) != 0:
+            # Paged K/V tiles are addressed in whole token rows (TMA descriptors
+            # and gather indices), which requires a row-aligned page stride.
+            raise NotImplementedError(
+                "TLE FA3 requires the paged KV page stride to be a multiple of "
+                "the token stride; use fa_version=2 for this cache layout"
+            )
         assert (
             block_table.ndim == 2
             and block_table.size(0) == batch_size
@@ -405,12 +412,15 @@ def launch_attention(
         pack_gqa = pack_factor > 1
     else:
         kernel = "long" if workload == "prefill" else "direct"
+        # Short queries stay on direct: a heavy batch of them leaves most
+        # rows of each 128-row persistent tile empty.
         if (
             gqa_ratio == 1
             and plain_scores
             and not is_causal
             and head_dim in (64, 128)
             and population in {"single", "uniform"}
+            and max_seqlen_q >= 64
         ):
             kernel = (
                 "long"
@@ -485,6 +495,11 @@ def launch_attention(
         # Reuse the otherwise-unused K batch-stride lane for the physical page
         # stride, supporting both NHD and HND cache allocations.
         k_batch_stride = k.stride(0)
+    # Widen dense K/V row offsets only when the cache exceeds the int32 span;
+    # 64-bit index math costs a few percent on direct kernels.
+    index_int64 = not is_paged and not (
+        can_use_int32_index(k) and can_use_int32_index(v)
+    )
 
     with torch_device_fn.device(q_device):
         if out is None:
@@ -586,6 +601,7 @@ def launch_attention(
                 batch_size=batch_size,
                 effective_max_q=effective_max_q,
                 effective_num_heads=effective_num_heads,
+                num_sms=num_sms,
                 pack_factor=pack_factor,
                 is_paged=is_paged,
                 paged_prefill=paged_prefill_candidate,
@@ -602,6 +618,7 @@ def launch_attention(
                 gqa_decode=gqa_decode,
                 fused_split_kv=fused_split_kv,
                 split_counter=scheduler_counter,
+                index_int64=index_int64,
             )
         else:
             paged_prefill_profile = paged_d256_prefill and not split_kv

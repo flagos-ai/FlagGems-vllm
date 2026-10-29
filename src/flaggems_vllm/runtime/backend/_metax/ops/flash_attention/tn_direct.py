@@ -79,6 +79,9 @@ def flash_varlen_fwd_d256_tn_kernel(
     FAST_CAUSAL_ALIGNED: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    TN_SCENARIO: tl.constexpr,
+    SPLIT_REGION: tl.constexpr = 0,
+    PACKED_DECODE_Q: tl.constexpr = 0,
     BULK_TAIL: tl.constexpr = False,
     TAIL_ROWS: tl.constexpr = 0,
     TAIL_UNALIGNED_ONLY: tl.constexpr = False,
@@ -88,13 +91,28 @@ def flash_varlen_fwd_d256_tn_kernel(
     FALLBACK_FOR_FAST: tl.constexpr = False,
     fast_q_len=0,
     fast_k_len=0,
+    PAGE16_ADAPTIVE_DECODE: tl.constexpr = False,
+    SKIP_SELECTED: tl.constexpr = False,
 ):
+    if SKIP_SELECTED:
+        if tl.load(worklist_ptr) >= 0:
+            return
     tl.static_assert(
-        BLOCK_K == 128 and QK_BLOCK_K == 64 and (BLOCK_N == 128),
-        "D256 TN requires QK BK64, PV D128, BN128",
+        BLOCK_K == 128
+        and QK_BLOCK_K == 64
+        and (
+            BLOCK_N == 128
+            or (
+                BLOCK_N == 64
+                and BLOCK_M == 16
+                and PACKED_DECODE_Q == 8
+                and PAGE_SIZE == 32
+            )
+        ),
+        "D256 requires BK64/PV128; BN64 is reserved for packed page32 decode",
     )
     tl.static_assert(
-        (not SPLIT_KV) | (not COMPACT_WORKLIST) & (NUM_SPLITS > 1),
+        (not SPLIT_KV) | (NUM_SPLITS > 1),
         "Async-TN Split-KV requires a rectangular multi-split grid",
     )
     tl.static_assert(
@@ -116,12 +134,12 @@ def flash_varlen_fwd_d256_tn_kernel(
             task_pid = tl.num_programs(0) - 1 - task_pid
     hid = head_pid
     if COMPACT_WORKLIST:
-        descriptor_offset = task_pid * 2
+        descriptor_offset = (task_pid % Q_TILES if SPLIT_KV else task_pid) * 2
         bid = tl.load(worklist_ptr + descriptor_offset).to(tl.int32)
         if bid < 0:
             return
         m_block = tl.load(worklist_ptr + descriptor_offset + 1).to(tl.int32)
-        split_id = 0
+        split_id = task_pid // Q_TILES if SPLIT_KV else 0
     elif SPLIT_KV:
         bid = rectangular_bid
         split_id = task_pid // Q_TILES
@@ -130,9 +148,15 @@ def flash_varlen_fwd_d256_tn_kernel(
         bid = rectangular_bid
         m_block = task_pid
         split_id = 0
-    q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
-    q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
-    q_len = q_eos - q_bos
+    if PACKED_DECODE_Q:
+        # The public API packs a single query's GQA heads into uniform rows.
+        # All rows attend to the same complete KV sequence, not causal offsets.
+        q_bos = bid * PACKED_DECODE_Q
+        q_len = PACKED_DECODE_Q
+    else:
+        q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
+        q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
+        q_len = q_eos - q_bos
     effective_q_len = q_len * HEAD_RATIO
     if m_block * BLOCK_M >= effective_q_len:
         return
@@ -143,6 +167,9 @@ def flash_varlen_fwd_d256_tn_kernel(
         k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
         k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
         k_len = k_eos - k_bos
+    if PAGE16_ADAPTIVE_DECODE:
+        if k_len <= 32:
+            return
     if FALLBACK_FOR_FAST:
         # Exactly one of this kernel and fast owns the request on every replay.
         if q_bos == 0 and q_len == fast_q_len and k_len == fast_k_len:
@@ -183,6 +210,11 @@ def flash_varlen_fwd_d256_tn_kernel(
     query_head = hid * HEAD_RATIO + packed_row % HEAD_RATIO
     kv_head = hid
     q_block_end = tl.cdiv((m_block + 1) * BLOCK_M, HEAD_RATIO)
+    if SPLIT_REGION:
+        # The BM64 owner and both BM32 fallback tiles must partition KV at
+        # exactly the same group end, including on subsequent graph replays.
+        group_start = m_block * BLOCK_M // 64 * 64 // HEAD_RATIO
+        q_block_end = group_start + 64 // HEAD_RATIO
     if BULK_TAIL:
         bulk_q_end = (m_block * BLOCK_M // 64 + 1) * (64 // HEAD_RATIO)
         bulk_valid = (
@@ -193,9 +225,12 @@ def flash_varlen_fwd_d256_tn_kernel(
         if bulk_valid:
             return
     n_block_min = 0
-    n_block_max = min(
-        tl.cdiv(k_len, BLOCK_N), tl.cdiv(q_block_end + k_len - q_len, BLOCK_N)
-    )
+    if PACKED_DECODE_Q:
+        n_block_max = tl.cdiv(k_len, BLOCK_N)
+    else:
+        n_block_max = min(
+            tl.cdiv(k_len, BLOCK_N), tl.cdiv(q_block_end + k_len - q_len, BLOCK_N)
+        )
     if SPLIT_KV:
         span_blocks = max(n_block_max - n_block_min, 0)
         blocks_per_split = tl.cdiv(span_blocks, NUM_SPLITS)
@@ -203,7 +238,26 @@ def flash_varlen_fwd_d256_tn_kernel(
         split_block_max = min(n_block_max, split_block_min + blocks_per_split)
         n_block_min = split_block_min
         n_block_max = split_block_max
-    if FAST_CAUSAL_ALIGNED:
+    if SPLIT_REGION:
+        tl.static_assert(SPLIT_REGION == 1 or SPLIT_REGION == 2)
+        tl.static_assert(
+            SPLIT_KV and not PACKED_DECODE_Q and not BULK_TAIL and not PREFIX_ONLY
+        )
+        q_first = group_start
+        complete = (
+            (q_block_end <= q_len)
+            & (n_block_max * BLOCK_N <= k_len)
+            & (n_block_max * BLOCK_N <= q_first + k_len - q_len + 1)
+        )
+        if SPLIT_REGION == 1:
+            if not complete:
+                return
+        else:
+            if complete:
+                return
+    if SPLIT_REGION == 1:
+        n_masking_steps = 0
+    elif FAST_CAUSAL_ALIGNED or PACKED_DECODE_Q:
         n_masking_steps = min(n_block_max - n_block_min, 1)
     else:
         n_masking_steps = min(n_block_max - n_block_min, tl.cdiv(BLOCK_M, BLOCK_N) + 1)
@@ -235,19 +289,26 @@ def flash_varlen_fwd_d256_tn_kernel(
         )
         k_cache_offset = page_id * k_page_stride + page_offset * k_row_stride
         scores_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
-        q_tile_ptr = (
-            q_base
-            + row_idx[None, :] * q_row_stride
-            + query_head[None, :] * q_head_stride
-            + qk_d_idx[:, None]
-        )
+        if SPLIT_REGION == 1:
+            tl.static_assert(NUM_HEADS == 8 and HEAD_RATIO == 8)
+            q_tile_ptr = q_base + packed_row[None, :] * 256 + qk_d_idx[:, None]
+        else:
+            q_tile_ptr = (
+                q_base
+                + row_idx[None, :] * q_row_stride
+                + query_head[None, :] * q_head_stride
+                + qk_d_idx[:, None]
+            )
         k_tile_ptr = k_base + qk_d_idx[None, :] + k_cache_offset[:, None]
         for _d_block in tl.range(0, 256 // QK_BLOCK_K):
             if FAST_CAUSAL_ALIGNED:
                 k_tile = tl.load(k_tile_ptr)
             else:
                 k_tile = tl.load(k_tile_ptr, mask=col_idx[:, None] < k_len, other=0.0)
-            q_tile = tl.load(q_tile_ptr, mask=row_idx[None, :] < q_len, other=0.0)
+            if SPLIT_REGION == 1:
+                q_tile = tl.load(q_tile_ptr)
+            else:
+                q_tile = tl.load(q_tile_ptr, mask=row_idx[None, :] < q_len, other=0.0)
             scores_t = tl.dot(k_tile, q_tile, scores_t)
             q_tile_ptr += QK_BLOCK_K
             k_tile_ptr += QK_BLOCK_K
@@ -261,7 +322,7 @@ def flash_varlen_fwd_d256_tn_kernel(
             0,
             0,
             is_even_mn=False,
-            is_causal=True,
+            is_causal=not PACKED_DECODE_Q,
             is_local=False,
         )
         v_cache_offset = page_id * v_page_stride + page_offset * v_row_stride
@@ -309,16 +370,23 @@ def flash_varlen_fwd_d256_tn_kernel(
         )
         k_cache_offset = page_id * k_page_stride + page_offset * k_row_stride
         scores_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
-        q_tile_ptr = (
-            q_base
-            + row_idx[None, :] * q_row_stride
-            + query_head[None, :] * q_head_stride
-            + qk_d_idx[:, None]
-        )
+        if SPLIT_REGION == 1:
+            tl.static_assert(NUM_HEADS == 8 and HEAD_RATIO == 8)
+            q_tile_ptr = q_base + packed_row[None, :] * 256 + qk_d_idx[:, None]
+        else:
+            q_tile_ptr = (
+                q_base
+                + row_idx[None, :] * q_row_stride
+                + query_head[None, :] * q_head_stride
+                + qk_d_idx[:, None]
+            )
         k_tile_ptr = k_base + qk_d_idx[None, :] + k_cache_offset[:, None]
         for _d_block in tl.range(0, 256 // QK_BLOCK_K):
             k_tile = tl.load(k_tile_ptr)
-            q_tile = tl.load(q_tile_ptr, mask=row_idx[None, :] < q_len, other=0.0)
+            if SPLIT_REGION == 1:
+                q_tile = tl.load(q_tile_ptr)
+            else:
+                q_tile = tl.load(q_tile_ptr, mask=row_idx[None, :] < q_len, other=0.0)
             scores_t = tl.dot(k_tile, q_tile, scores_t)
             q_tile_ptr += QK_BLOCK_K
             k_tile_ptr += QK_BLOCK_K
@@ -339,21 +407,25 @@ def flash_varlen_fwd_d256_tn_kernel(
         v1 = tl.load(v_base + v_cache_offset[:, None] + (BLOCK_K + d_idx)[None, :])
         acc1 = tl.dot(tl.trans(v1), tl.trans(probabilities), acc1)
         pass
-    o_mask = row_idx[:, None] < q_valid_len
-    o0_ptr = (
-        o_base
-        + row_idx[:, None] * o_row_stride
-        + query_head[:, None] * o_head_stride
-        + output_d_offset
-        + d_idx[None, :]
-    )
-    o1_ptr = (
-        o_base
-        + row_idx[:, None] * o_row_stride
-        + query_head[:, None] * o_head_stride
-        + BLOCK_K
-        + d_idx[None, :]
-    )
+    o_mask = True if SPLIT_REGION == 1 else row_idx[:, None] < q_valid_len
+    if SPLIT_REGION == 1:
+        o0_ptr = o_base + packed_row[:, None] * 256 + d_idx[None, :]
+        o1_ptr = o0_ptr + BLOCK_K
+    else:
+        o0_ptr = (
+            o_base
+            + row_idx[:, None] * o_row_stride
+            + query_head[:, None] * o_head_stride
+            + output_d_offset
+            + d_idx[None, :]
+        )
+        o1_ptr = (
+            o_base
+            + row_idx[:, None] * o_row_stride
+            + query_head[:, None] * o_head_stride
+            + BLOCK_K
+            + d_idx[None, :]
+        )
     lse = tl.where(
         (row_sum == 0) | (row_sum != row_sum),
         float("-inf"),
@@ -364,7 +436,7 @@ def flash_varlen_fwd_d256_tn_kernel(
     acc1_f32 = tl.trans(acc1) * inv_sum[:, None]
     tl.store(o0_ptr, acc0_f32.to(o_ptr.type.element_ty), mask=o_mask)
     tl.store(o1_ptr, acc1_f32.to(o_ptr.type.element_ty), mask=o_mask)
-    lse_mask = row_idx < q_valid_len
+    lse_mask = True if SPLIT_REGION == 1 else row_idx < q_valid_len
     tl.store(
         softmax_lse_ptr + query_head * output_total_q + output_q_bos + row_idx,
         lse,
@@ -448,6 +520,8 @@ def _launch_d256_tn_base(
         "pipeline_load_num": -1,
         "inner_stages": (0, 0),
     }
+    # Specialize LibEntry on the same scenario used for compilation.
+    cfg["TN_SCENARIO"] = cfg["scenario"]
     logger.debug("Running D256 async-TN Direct kernel with config: %s", cfg)
     return flash_varlen_fwd_d256_tn_kernel[grid](
         params.q_ptr,
@@ -737,6 +811,7 @@ def flash_varlen_fwd_d256_tn_bulk_kernel(
     FAST_CAUSAL_ALIGNED: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    TN_SCENARIO: tl.constexpr,
     PEEL_Q: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 32,
     SHORT_SOFTMAX: tl.constexpr = False,
@@ -1098,6 +1173,8 @@ def launch_d256_tn_direct_bulk(
         "pipeline_load_num": -1,
         "inner_stages": (0, 0),
     }
+    # Specialize LibEntry on the same scenario used for compilation.
+    cfg["TN_SCENARIO"] = cfg["scenario"]
     logger.debug("Running D256 async-TN Direct kernel with config: %s", cfg)
     return flash_varlen_fwd_d256_tn_bulk_kernel[grid](
         params.q_ptr,
@@ -1175,6 +1252,8 @@ def flash_varlen_fwd_d256_tn_fast_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     PACK_GROUP: tl.constexpr,
+    TN_SCENARIO: tl.constexpr,
+    TP2_FIRST_TILE: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 32,
     MASK_K_TAIL: tl.constexpr = True,
 ):
@@ -1247,75 +1326,88 @@ def flash_varlen_fwd_d256_tn_fast_kernel(
     row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     qk_d_idx = tl.arange(0, QK_BLOCK_K)
     n_block = n_block_max - 1
-    for _ in tl.range(0, n_masking_steps):
-        start_n = n_block * BLOCK_N
-        (col_idx, page_id, page_offset) = paged_tile_coords(
-            start_n,
-            k_len,
-            page_table_ptr,
-            BLOCK_N=BLOCK_N,
-            BOUNDARY_CHECK=True,
-            PAGE_SIZE=PAGE_SIZE,
-        )
-        k_cache_offset = page_id * k_page_stride + page_offset * k_row_stride
-        scores_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
-        q_tile_ptr = (
-            q_base
-            + row_idx[None, :] * q_row_stride
-            + query_head[None, :] * q_head_stride
-            + qk_d_idx[:, None]
-        )
-        k_tile_ptr = k_base + qk_d_idx[None, :] + k_cache_offset[:, None]
-        for _d_block in tl.range(0, 256 // QK_BLOCK_K):
-            k_tile = tl.load(k_tile_ptr)
-            q_tile = tl.load(q_tile_ptr, mask=row_idx[None, :] < q_len, other=0.0)
-            scores_t = tl.dot(k_tile, q_tile, scores_t)
-            q_tile_ptr += QK_BLOCK_K
-            k_tile_ptr += QK_BLOCK_K
-        scores = tl.trans(scores_t)
-        scores = apply_mask(
-            scores,
-            col_idx,
-            row_idx,
-            q_len,
-            k_len,
-            0,
-            0,
-            is_even_mn=False,
-            is_causal=True,
-            is_local=False,
-        )
-        v_cache_offset = page_id * v_page_stride + page_offset * v_row_stride
-        if PAGE_SIZE == 16 or MASK_K_TAIL:
-            v0 = tl.load(
-                v_base + v_cache_offset[:, None] + d_idx[None, :],
-                mask=col_idx[:, None] < k_len,
-                other=0.0,
+    # The first masked tile initializes the accumulators. The TP2 long
+    # prefill specialization exposes its one-iteration bound to the compiler.
+    for _ in tl.range(0, 1 if TP2_FIRST_TILE else n_masking_steps):
+        if (not TP2_FIRST_TILE) or n_masking_steps > 0:
+            start_n = n_block * BLOCK_N
+            (col_idx, page_id, page_offset) = paged_tile_coords(
+                start_n,
+                k_len,
+                page_table_ptr,
+                BLOCK_N=BLOCK_N,
+                BOUNDARY_CHECK=True,
+                PAGE_SIZE=PAGE_SIZE,
             )
-        else:
-            v0 = tl.load(v_base + v_cache_offset[:, None] + d_idx[None, :])
-        (acc_scale, probabilities, row_max, row_sum) = scaled_online_softmax_stats(
-            scores,
-            row_max,
-            row_sum,
-            scale_softmax_log2=scale_softmax_log2,
-            IS_BORDER=True,
-        )
-        probabilities = probabilities.to(v_ptr.type.element_ty)
-        acc0 = acc0 * acc_scale[None, :]
-        acc0 = tl.dot(tl.trans(v0), tl.trans(probabilities), acc0)
-        acc1 = acc1 * acc_scale[None, :]
-        if PAGE_SIZE == 16 or MASK_K_TAIL:
-            v1 = tl.load(
-                v_base + v_cache_offset[:, None] + (BLOCK_K + d_idx)[None, :],
-                mask=col_idx[:, None] < k_len,
-                other=0.0,
+            k_cache_offset = page_id * k_page_stride + page_offset * k_row_stride
+            scores_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+            q_tile_ptr = (
+                q_base
+                + row_idx[None, :] * q_row_stride
+                + query_head[None, :] * q_head_stride
+                + qk_d_idx[:, None]
             )
-        else:
-            v1 = tl.load(v_base + v_cache_offset[:, None] + (BLOCK_K + d_idx)[None, :])
-        acc1 = tl.dot(tl.trans(v1), tl.trans(probabilities), acc1)
-        pass
-        n_block -= 1
+            k_tile_ptr = k_base + qk_d_idx[None, :] + k_cache_offset[:, None]
+            for _d_block in tl.range(0, 256 // QK_BLOCK_K):
+                k_tile = tl.load(k_tile_ptr)
+                q_tile = tl.load(q_tile_ptr, mask=row_idx[None, :] < q_len, other=0.0)
+                scores_t = tl.dot(k_tile, q_tile, scores_t)
+                q_tile_ptr += QK_BLOCK_K
+                k_tile_ptr += QK_BLOCK_K
+            scores = tl.trans(scores_t)
+            scores = apply_mask(
+                scores,
+                col_idx,
+                row_idx,
+                q_len,
+                k_len,
+                0,
+                0,
+                is_even_mn=False,
+                is_causal=True,
+                is_local=False,
+            )
+            v_cache_offset = page_id * v_page_stride + page_offset * v_row_stride
+            if PAGE_SIZE == 16 or MASK_K_TAIL:
+                v0 = tl.load(
+                    v_base + v_cache_offset[:, None] + d_idx[None, :],
+                    mask=col_idx[:, None] < k_len,
+                    other=0.0,
+                )
+            else:
+                v0 = tl.load(v_base + v_cache_offset[:, None] + d_idx[None, :])
+            (acc_scale, probabilities, row_max, row_sum) = scaled_online_softmax_stats(
+                scores,
+                row_max,
+                row_sum,
+                scale_softmax_log2=scale_softmax_log2,
+                IS_BORDER=True,
+            )
+            probabilities = probabilities.to(v_ptr.type.element_ty)
+            if not TP2_FIRST_TILE:
+                acc0 = acc0 * acc_scale[None, :]
+            if TP2_FIRST_TILE:
+                acc0 = tl.dot(tl.trans(v0), tl.trans(probabilities))
+            else:
+                acc0 = tl.dot(tl.trans(v0), tl.trans(probabilities), acc0)
+            if not TP2_FIRST_TILE:
+                acc1 = acc1 * acc_scale[None, :]
+            if PAGE_SIZE == 16 or MASK_K_TAIL:
+                v1 = tl.load(
+                    v_base + v_cache_offset[:, None] + (BLOCK_K + d_idx)[None, :],
+                    mask=col_idx[:, None] < k_len,
+                    other=0.0,
+                )
+            else:
+                v1 = tl.load(
+                    v_base + v_cache_offset[:, None] + (BLOCK_K + d_idx)[None, :]
+                )
+            if TP2_FIRST_TILE:
+                acc1 = tl.dot(tl.trans(v1), tl.trans(probabilities))
+            else:
+                acc1 = tl.dot(tl.trans(v1), tl.trans(probabilities), acc1)
+            pass
+            n_block -= 1
     main_start = n_block_max - n_masking_steps - 1
     for n_block in tl.range(main_start, n_block_min - 1, step=-1):
         start_n = n_block * BLOCK_N
@@ -1455,6 +1547,15 @@ def launch_d256_tn_direct_fast(
         "pipeline_load_num": -1,
         "inner_stages": (0, 0),
     }
+    # Specialize LibEntry on the same scenario used for compilation.
+    cfg["TN_SCENARIO"] = cfg["scenario"]
+    cfg["TP2_FIRST_TILE"] = (
+        params.h == 8
+        and params.hk == 1
+        and params.block_size == 32
+        and long_fast
+        and "noaddropt" not in cfg["scenario"]
+    )
     logger.debug("Running D256 async-TN Direct kernel with config: %s", cfg)
     fast_result = flash_varlen_fwd_d256_tn_fast_kernel[grid](
         params.q_ptr,

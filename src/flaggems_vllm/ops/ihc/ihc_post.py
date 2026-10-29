@@ -30,7 +30,22 @@ import torch
 import triton
 import triton.language as tl
 
-_BLOCK_D = 1024
+# All hc channels of one BLOCK_D hidden slice are handled as a single
+# [HC_POW2, BLOCK_D] tile, so the hc residual loads and output stores issue as
+# one 2D access each instead of a static_range of per-channel accesses. The op
+# is pure streaming (18*N*D bytes at hc=4), so at small N it is latency-bound
+# and the wider access window is what hides memory latency; at large N it still
+# wins slightly by sustaining a better access pattern.
+#
+# BLOCK_D=512 / num_warps=4 measured best at every token count on H20
+# (D=6144, hc=4, bf16): 1.30x at N=1, 1.26x at N=8, 1.16x at N=64, 1.11x at
+# N=256, 1.06x at N=1024, 1.05x at N=4096, 1.04x at N=8192 versus the previous
+# BLOCK_D=1024 / num_warps=4 per-channel loop. A narrower tile kept winning even
+# at N=8192 (98304 blocks), so no per-N config split is needed; num_warps was
+# flat within +-1% across 1/2/4/8. Hence the fixed config (no autotune), as in
+# ihc_pre.
+_BLOCK_D = 512
+_NUM_WARPS = 4
 
 
 @triton.jit
@@ -43,38 +58,43 @@ def _ihc_post_kernel(
     HC_MULT: tl.constexpr,
     HC_POW2: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    EVEN_D: tl.constexpr,
+    EVEN_HC: tl.constexpr,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
-    hidden_block_idx = tl.program_id(1)
-    hc_idx = tl.arange(0, HC_POW2)
-    hc_mask = hc_idx < HC_MULT
-    post = tl.load(
-        post_ptr + token_idx * HC_MULT + hc_idx,
-        mask=hc_mask,
-        other=0.0,
-    )
+    # D-major grid: consecutive programs walk contiguous hidden offsets inside a
+    # token rather than striding hc*D apart across tokens.
+    hidden_block_idx = tl.program_id(0)
+    token_idx = tl.program_id(1).to(tl.int64)
 
-    hidden_offsets = hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
-    hidden_mask = hidden_offsets < HIDDEN_SIZE
-    x = tl.load(
-        x_ptr + token_idx * HIDDEN_SIZE + hidden_offsets,
-        mask=hidden_mask,
-        other=0.0,
-    ).to(tl.float32)
-    residual_row = residual_ptr + token_idx * HC_MULT * HIDDEN_SIZE
-    output_row = output_ptr + token_idx * HC_MULT * HIDDEN_SIZE
-    for channel_idx in tl.static_range(HC_MULT):
-        residual = tl.load(
-            residual_row + channel_idx * HIDDEN_SIZE + hidden_offsets,
+    hc_idx = tl.arange(0, HC_POW2)[:, None]
+    hidden_offsets = (hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D))[None, :]
+    # post[n, i] broadcast over the hidden axis: [HC_POW2, 1] * [1, BLOCK_D].
+    gate_ptr = post_ptr + token_idx * HC_MULT + hc_idx
+    if EVEN_HC:
+        gate = tl.load(gate_ptr)
+    else:
+        gate = tl.load(gate_ptr, mask=hc_idx < HC_MULT, other=0.0)
+
+    offsets = token_idx * HC_MULT * HIDDEN_SIZE + hc_idx * HIDDEN_SIZE + hidden_offsets
+    if EVEN_D and EVEN_HC:
+        x = tl.load(x_ptr + token_idx * HIDDEN_SIZE + hidden_offsets).to(tl.float32)
+        residual = tl.load(residual_ptr + offsets).to(tl.float32)
+        output = gate * x + residual
+        tl.store(output_ptr + offsets, output.to(output_ptr.dtype.element_ty))
+    else:
+        hidden_mask = hidden_offsets < HIDDEN_SIZE
+        mask = hidden_mask if EVEN_HC else (hc_idx < HC_MULT) & hidden_mask
+        x = tl.load(
+            x_ptr + token_idx * HIDDEN_SIZE + hidden_offsets,
             mask=hidden_mask,
             other=0.0,
         ).to(tl.float32)
-        channel_gate = tl.sum(tl.where(hc_idx == channel_idx, post, 0.0), axis=0)
-        output = channel_gate * x + residual
+        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        output = gate * x + residual
         tl.store(
-            output_row + channel_idx * HIDDEN_SIZE + hidden_offsets,
+            output_ptr + offsets,
             output.to(output_ptr.dtype.element_ty),
-            mask=hidden_mask,
+            mask=mask,
         )
 
 
@@ -111,16 +131,21 @@ def ihc_post(
     output = torch.empty(
         (num_tokens, hc_mult, hidden_size), dtype=x.dtype, device=x.device
     )
-    _ihc_post_kernel[(num_tokens, triton.cdiv(hidden_size, _BLOCK_D))](
+    hc_pow2 = triton.next_power_of_2(hc_mult)
+    # enable_fp_fusion=False keeps the fp32 mul and add unfused, so the result
+    # is bitwise identical to the reference (the accuracy test is zero-tolerance).
+    _ihc_post_kernel[(triton.cdiv(hidden_size, _BLOCK_D), num_tokens)](
         x,
         residual,
         post,
         output,
         HIDDEN_SIZE=hidden_size,
         HC_MULT=hc_mult,
-        HC_POW2=triton.next_power_of_2(hc_mult),
+        HC_POW2=hc_pow2,
         BLOCK_D=_BLOCK_D,
-        num_warps=4,
+        EVEN_D=(hidden_size % _BLOCK_D == 0),
+        EVEN_HC=(hc_pow2 == hc_mult),
+        num_warps=_NUM_WARPS,
         enable_fp_fusion=False,
     )
     return output

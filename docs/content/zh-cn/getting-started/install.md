@@ -15,6 +15,17 @@ weight: 20
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 ```
 
+### FlagGems 依赖
+
+**FlagGems-vllm 依赖 FlagGems**。当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的通用算子。在安装 FlagGems-vllm 之前，请先安装 FlagGems：
+
+```bash
+git clone https://github.com/flagos-ai/FlagGems.git
+cd FlagGems
+pip install --no-build-isolation -e .
+cd ..
+```
+
 ### PyTorch
 
 在安装 FlagGems-vllm **之前**,先安装与目标加速器兼容的 PyTorch。FlagGems-vllm 不会自动重新安装 PyTorch。
@@ -146,6 +157,13 @@ PYTHONPATH=src pytest -q tests --quick
 PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
 ```
 
+### 注意事项
+
+- 建议首先运行 `--collect-only`，快速确认模块导入与测试发现是否正常。
+- 算子支持时优先使用 `--quick` 进行快速功能验证。
+- 基准评测冒烟可使用 `--level core --iter 1 --warmup 1`。
+- 全量基准测试耗时较长，建议仅在正式性能验证时执行。
+
 ## 后端选择
 
 FlagGems-vllm 自动检测硬件后端。要覆盖:
@@ -210,7 +228,7 @@ pip install -e '.[test]'
 
 ## 下一步
 
-- [基础用法](/FlagGems-vllm/usage/basic/)
-- [与 vllm-plugin-fl 集成](/FlagGems-vllm/usage/vllm-plugin/)
-- [运行测试](/FlagGems-vllm/testing/unittest/)
-- [运行基准测试](/FlagGems-vllm/performance/benchmark/)
+- [基础用法](../usage/basic.md)
+- [与 vllm-plugin-fl 集成](../usage/vllm-plugin.md)
+- [运行测试](../testing/unittest.md)
+- [运行基准测试](../performance/benchmark.md)
