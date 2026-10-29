@@ -4,7 +4,6 @@ import torch
 
 import flaggems_vllm as gems
 
-pytestmark = pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -110,6 +109,7 @@ def check(args, bt, out_dtype, lengths=None, indexed=False, scale=0.37):
         ((1, 129, 1, 256), 128),
     ],
 )
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_fixed(dtype, out_dtype, shape, bt):
     check(inputs(*shape, dtype, bt), bt, out_dtype)
 
@@ -117,6 +117,7 @@ def test_fixed(dtype, out_dtype, shape, bt):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("indexed", [False, True])
 @pytest.mark.parametrize("lengths", [[0, 1, 17, 0, 65], [32, 32], [1, 1, 1]])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_packed(dtype, indexed, lengths):
     check(
         inputs(1, sum(lengths), 2, 65, dtype, 32, lengths),
@@ -129,6 +130,7 @@ def test_packed(dtype, indexed, lengths):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("gate", ["zero", "offset", "strong"])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_gate_extremes(dtype, gate):
     check(inputs(1, 65, 2, 64, dtype, 64, gate=gate), 64, torch.float32)
 
@@ -136,6 +138,7 @@ def test_gate_extremes(dtype, gate):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("gate", ["normal", "offset", "strong"])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_long_path(dtype, packed, gate):
     lengths = [0, 17, 496] if packed else None
     args = inputs(1, 513, 2, 65, dtype, 64, lengths, gate)
@@ -145,6 +148,7 @@ def test_long_path(dtype, packed, gate):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("gate_dtype", DTYPES)
 @pytest.mark.parametrize("beta_dtype", DTYPES)
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_auxiliary_dtypes(dtype, gate_dtype, beta_dtype):
     q, k, g, beta = inputs(1, 33, 2, 31, dtype, 32)
     check(
@@ -156,12 +160,14 @@ def test_auxiliary_dtypes(dtype, gate_dtype, beta_dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("bt", [16, 32, 64, 128])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_long_batch_and_chunk_size(dtype, bt):
     check(inputs(2, 513, 1, 128, dtype, bt), bt, torch.float32)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("value", [0.0, 1.0, -1.0])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_beta_rows(dtype, value):
     q, k, g, beta = inputs(1, 17, 2, 16, dtype, 16)
     beta.fill_(value)
@@ -169,6 +175,7 @@ def test_beta_rows(dtype, value):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_nonfinite_query(dtype):
     args = inputs(1, 17, 1, 1, dtype, 16)
     args[0][0, 0, 0, 0] = float("nan")
@@ -183,17 +190,20 @@ def test_nonfinite_query(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("gate", ["normal", "offset", "strong"])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_dense_packed_path(dtype, gate):
     lengths = [0, 17, 496]
     args = inputs(1, 513, 16, 65, dtype, 64, lengths, gate)
     check(args, 64, torch.float32, lengths, indexed=True)
 
 
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_dense_batch_path():
     check(inputs(2, 513, 8, 128, torch.float32, 64), 64, torch.float32)
 
 
 @pytest.mark.parametrize("name", ["scale", "chunk_size"])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_tensor_scalar_rejected(name):
     args = inputs(1, 1, 1, 16, torch.float16, 64)
     value = torch.tensor(64, device=gems.device)
@@ -201,6 +211,7 @@ def test_tensor_scalar_rejected(name):
         gems.chunk_kda_scaled_dot_kkt_fwd(*args, **{name: value})
 
 
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_defaults_and_scalars():
     args = inputs(1, 17, 2, 64, torch.float16, 64)
     got = gems.chunk_kda_scaled_dot_kkt_fwd(*args)
@@ -210,6 +221,7 @@ def test_defaults_and_scalars():
     check(args, 64, torch.float32, scale=0.0)
 
 
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_partial_indices_and_empty():
     args = inputs(1, 65, 1, 16, torch.float32, 32)
     cu = torch.tensor([0, 65], device=gems.device, dtype=torch.int32)
@@ -231,6 +243,7 @@ def test_partial_indices_and_empty():
 
 
 @pytest.mark.parametrize("bad", ["gate", "beta", "chunk", "shape", "stride", "grad"])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_unsupported(bad):
     args = list(inputs(1, 17, 2, 64, torch.float16, 64))
     kw = {}
@@ -250,6 +263,7 @@ def test_unsupported(bad):
         gems.chunk_kda_scaled_dot_kkt_fwd(*args, **kw)
 
 
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_export():
     op = gems.chunk_kda_scaled_dot_kkt_fwd
     assert op is gems.ops.chunk_kda_scaled_dot_kkt_fwd
@@ -258,6 +272,7 @@ def test_export():
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("ci", [[[1, 1]], [[0, 0], [1, 2]], [[1, 0], [1, 7]]])
+@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_dense_partial_indices(dtype, ci):
     lengths = [17, 496]
     args = inputs(1, 513, 16, 65, dtype, 64, lengths)
