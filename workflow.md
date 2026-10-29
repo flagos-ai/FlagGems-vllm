@@ -20,6 +20,9 @@
 
 本文档规定 AI 在本仓库中开发算子的执行顺序、必须输出的表、代码落点、测试/benchmark 要求、deep optimization 触发条件和最终交付格式。
 
+> **仓库定位说明**：
+> 本仓库存放 vLLM 仓库的特化与融合算子，**不接受通用 PyTorch 算子**（通用 PyTorch 算子请向 [FlagGems](https://github.com/flagos-ai/FlagGems) 提交）。因此，在本仓库中开发算子**不需要对齐 PyTorch** 原生算子，对标对象为 vLLM 现有原生算子、C++/CUDA 扩展或模型推理参考实现。
+
 本文档不解释每类算子的高级优化技巧；这些内容在 `optimization.md` 和 `deep_opt.md` 中。
 
 阅读顺序固定：
@@ -34,11 +37,11 @@ AI 不能跳过以下 gate。
 
 | Gate | 通过条件 | 失败处理 |
 | --- | --- | --- |
-| G0 任务输入 | 当前任务输入只需包含 `torch` API 和官方参考链接/版本 | 用户不再补其他字段；AI 自行补齐其余任务事实，不能直接写代码 |
+| G0 任务输入 | 当前任务输入只需包含 vLLM 算子名、层定义或参考链接/版本 | 用户不再补其他字段；AI 自行补齐其余任务事实，不能直接写代码 |
 | G1 工程基线 | editable/read-only、build、validation、benchmark、active set、autotune、profiler 已冻结 | 不允许比较性能 |
-| G2 `torch` 契约 | dtype matrix、shape、layout、promotion、边界语义、unsupported scope 已写清 | 不允许实现 |
+| G2 vLLM 契约 | dtype matrix、shape、layout、promotion、边界语义、unsupported scope 已写清（不要求对齐 PyTorch） | 不允许实现 |
 | G3 路径设计 | fast/special/general/unsupported/external-library path 已定义；无 torch compute fallback | 不允许写 kernel |
-| G4 实现集成 | ops、tune config、test、benchmark、导出、注册已完成或说明不需要 | 不允许验收 |
+| G4 实现集成 | operators.yaml、ops、tune config、test、benchmark、导出、注册已完成或说明不需要 | 不允许验收 |
 | G5 功能测试 | 功能测试通过，含 dtype、边界、unsupported path | 立即修复或回滚 |
 | G6 性能验收 | benchmark active set 达标，或触发 deep_opt | 未达标必须进入 `deep_opt.md` |
 | G7 交付 | 结果、风险、autotune、fallback/unsupported、deep opt 结论完整 | 不得宣称完成 |
@@ -102,10 +105,11 @@ PY
 
 | 目的 | 路径 |
 | --- | --- |
+| 算子元数据 | `conf/operators.yaml` |
 | 算子实现 | `src/flaggems_vllm/ops/<op>.py` |
 | NVIDIA autotune 配置 | `src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml` |
 | 功能测试 | `tests/test_<op>.py` |
-| 性能测试 | `benchmark/test_<op>_perf.py` |
+| 性能测试 | `benchmark/test_<op>.py` |
 | ops 导出 | `src/flaggems_vllm/ops/__init__.py` |
 | 顶层注册 | `src/flaggems_vllm/__init__.py` |
 
@@ -132,20 +136,21 @@ PY
 | Autotune | libtuner 配置名、key/strategy、候选参数、`tune_configs.yaml` 更新计划或豁免 |
 | Fallback policy | 默认 `NO_TORCH_COMPUTE_FALLBACK`；任何例外必须列出 |
 
-### 4.2 `torch` 对齐规范表
+### 4.2 vLLM 对齐规范表
+
+> **说明**：本仓库存放 vLLM 仓库算子，不接受通用 PyTorch 算子，因此无需对齐 PyTorch。对标对象为 vLLM 现有原生算子、C++/CUDA 扩展或模型推理参考实现。
 
 | 字段 | 内容 |
 | --- | --- |
-| Torch API | 对应 `torch` API、版本、官方文档/源码参考 |
+| vLLM API / 参考实现 | 对应 vLLM 算子名、CUDA 扩展、源码链接或模型层定义 |
 | Device/backend | 目标 device/backend |
 | Input contract | shape、rank、dtype、device、stride/layout、合法范围 |
 | Output contract | shape、dtype、device、alias、`out=` 或 in-place 边界 |
-| Dtype matrix | 目标 device 上 `torch` 已支持的 dtype 集合 |
+| Dtype matrix | 目标推理场景或模型所需的 dtype 集合（如 FP16、BF16、FP8 等） |
 | Promotion/acc dtype | type promotion、accumulate dtype、输出 dtype |
-| Semantics | broadcast、NaN/Inf、signed zero、complex/int/bool、deterministic、异常 |
-| Autograd | forward-only、backward、sparse grad、deterministic 或未覆盖说明 |
-| Unsupported scope | 本阶段明确不覆盖的路径与处理方式 |
-| Reference-only torch use | 哪些测试/benchmark 会调用 torch；确认生产路径不调用 |
+| Semantics | NaN/Inf、数值精度、边界维度、特殊值处理 |
+| Unsupported scope | 本阶段明确不覆盖的路径与处理方式（显式抛出 `NotImplementedError`） |
+| Reference-only use | 哪些测试/benchmark 会调用参考实现；确认生产路径不调用 |
 
 ### 4.3 实现路径设计表
 
@@ -166,13 +171,13 @@ PY
 
 1. 读取本文件当前任务输入。
 2. 阅读 `optimization.md`。
-3. 阅读 `torch` 对应算子的官方文档和目标版本行为。
+3. 阅读 vLLM 对应算子源码、模型层实现或官方参考（无需查阅 PyTorch ATen）。
 4. 检查仓库内相近算子、测试、benchmark 和 libtuner 接入方式。
 5. 冻结工程基线表。
 
-### Step 2. 冻结 `torch` 对齐规范表
+### Step 2. 冻结 vLLM 对齐规范表
 
-必须先写出 dtype matrix、shape/output rules、promotion、NaN/Inf、异常、autograd、unsupported scope。
+必须先写出 dtype matrix、shape/output rules、promotion、NaN/Inf、异常、unsupported scope。
 
 如果无法确认某个事实，写“未知 + 假设 + 验证方式”。不能把未知语义留到实现后再补。
 
@@ -276,8 +281,8 @@ python -m pytest -v -s benchmark/test_<op>_perf.py
 
 benchmark 必须包含：
 
-- `torch` baseline。
-- FlagDNN 实现。
+- vLLM 原生 baseline 或参考实现。
+- FlagGems-vllm 实现。
 - 小 shape、热点 shape、奇异 shape、大 shape。
 - 算子关键维度 sweep，例如 M/N/K、reduce dim、embedding dim、window、index 分布。
 - active set、metric、unit、direction、aggregation。
@@ -288,7 +293,7 @@ benchmark 必须包含：
 SpeedUp = latency_base / latency
 ```
 
-其中 `latency_base` 为 torch baseline，`latency` 为 FlagDNN 实现。
+其中 `latency_base` 为 baseline 耗时（如 vLLM 原生实现耗时），`latency` 为 FlagGems-vllm 实现耗时。
 
 验收默认规则：
 
@@ -415,16 +420,16 @@ AI 默认补齐规则：
 | --- | --- |
 | Target backend/device | 从仓库、测试环境和当前 backend 推断；若无额外信息，默认按 CUDA/NVIDIA 路径处理。 |
 | Performance target | 使用本文档性能验收标准；关键 active shape 默认要求 `SpeedUp >= 0.9`。 |
-| Workload hints | 用户未提供时，由 AI 根据 `torch` 语义、仓库 benchmark 风格和算子家族自动设计 active set。 |
-| Training/autograd | 由 AI 查阅 `torch` 文档和目标任务语义后判断；无法确认时先实现 forward，并把 backward/autograd 边界写入风险，不向用户追问。 |
+| Workload hints | 用户未提供时，由 AI 根据 vLLM 语义、模型层需求、仓库 benchmark 风格和算子家族自动设计 active set。 |
+| Training/autograd | 由 AI 查阅 vLLM 源码和目标推理任务语义后判断；本项目专注于前向推理，默认实现 forward。 |
 | Fallback policy | 固定为 `NO_TORCH_COMPUTE_FALLBACK`。生产实现、dispatch、helper 和 fallback 中禁止使用 `torch` 计算路径补洞。 |
 | Allowed external-library path | 默认 `none`；只有仓库已有机制或项目明确批准时，才允许非 torch 外部库路径。 |
 | Unsupported scope | 由 AI 根据语义复杂度、设备能力和工程风险显式判定；不支持的路径必须报错或标注 unsupported，不能静默走 torch fallback。 |
 
 AI 自主补齐要求：
 
-- 查阅官方文档、源码和目标版本行为，恢复完整函数签名、默认参数和语义。
-- 确认目标 device/backend 上 `torch` 对应算子的实际 dtype 支持矩阵。
+- 查阅 vLLM 官方文档、源码与模型实现，恢复完整函数签名、默认参数和语义。
+- 确认目标 device/backend 上 vLLM 对应算子或模型的实际 dtype 支持矩阵（无需对齐 PyTorch）。
 - 梳理 shape、rank、stride/layout、promotion、alias、`out=`、in-place、autograd、deterministic。
 - 梳理 empty、非法输入、NaN/Inf、signed zero、integer/complex/bool 等边界行为。
 - 完成 workload 分型，识别 fast path、special path、general path、unsupported path 和必要的 external-library path。

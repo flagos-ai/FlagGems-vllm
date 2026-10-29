@@ -129,7 +129,7 @@ tools/
 ## Development Protocol (`workflow.md`)
 
 Mandatory operator development protocol with hard gates (G0–G7):
-- Pre-coding design tables (engineering baseline, torch alignment specification, implementation path design)
+- Pre-coding design tables (engineering baseline, vLLM alignment specification, implementation path design)
 - NO_TORCH_COMPUTE_FALLBACK rule
 - Autotune requirements
 - Testing and performance acceptance criteria

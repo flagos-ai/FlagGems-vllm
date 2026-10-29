@@ -3,83 +3,93 @@ title: 算子开发协议
 weight: 20
 ---
 
+<!--
+ Copyright 2026 FlagOS Contributors
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ -->
+
 # 算子开发协议规范
 
-FlagGems-vllm 算子开发必须严格遵循仓库根目录下 `workflow.md` 规定的开发流程与硬性门禁（G0–G7）。
+FlagGems-vllm 算子开发必须严格遵循仓库根目录下 `workflow.md` 规定的开发流程与硬性门禁（G0–G7）。有关新算子交付要求、文件落点、以及 `NO_TORCH_COMPUTE_FALLBACK` 规范，请参阅[贡献概述](overview.md)。
 
 ## 门禁概览 (G0–G7)
 
-- **G0**: 任务明确与协议知情
-- **G1**: 严格执行 `NO_TORCH_COMPUTE_FALLBACK` 验证
-- **G2**: 编码前三张设计表填写完毕（工程基线、Torch 对齐规范、实现路径设计）
-- **G3**: Host 调度函数与边界校验设计
-- **G4**: 自动调优（Autotune）集成接入
-- **G5**: 内核代码与辅助工具完整实现
-- **G6**: 功能单元测试全量通过
-- **G7**: 性能验收达标（核心形状加速比 SpeedUp ≥ 0.9）
+所有算子新增与修改任务必须通过以下硬性门禁：
 
-## 关键核心规则
+- **G0（任务知情）**：明确算子任务范围，确认属于 vLLM 场景特化/融合算子，知情并承诺遵守开发协议；
+- **G1（无 Torch 计算回退）**：严格执行 `NO_TORCH_COMPUTE_FALLBACK` 验证，生产路径除内存分配算子（`empty`、`zeros` 等）与创建/拷贝算子（`contiguous`、`clone`、`copy_` 等）外，严禁调用任何 PyTorch 计算算子；
+- **G2（编码前三张设计表）**：在编写任何实现前，必须先填写并记录工程基线表、vLLM 对齐规范表与实现路径设计表；
+- **G3（Host 调度与边界防御）**：设计 Host 调度函数，明确参数校验、数据类型分支、设备检查及不支持情况的 `NotImplementedError` 抛出；
+- **G4（自动调优集成）**：凡包含可调参数的算子，必须在 NVIDIA 后端提供预调优配置并接入 `@libtuner`；
+- **G5（完整实现）**：完成 Host 入口、Triton JIT 内核与公共导出（`ops/__init__.py` 及 `flaggems_vllm/__init__.py`）；
+- **G6（功能测试通过）**：`tests/test_<op>.py` 在 `--quick` 与全量测试模式下均 100% 通过；
+- **G7（性能验收达标）**：`benchmark/test_<op>.py` 评测核心形状加速比达到 **SpeedUp ≥ 0.9**。
 
-### 1. 严禁 PyTorch 计算回退 (NO_TORCH_COMPUTE_FALLBACK)
+## 编码前三张设计表
 
-**生产内核执行路径允许调用 PyTorch 框架中的 `torch.empty`、`torch.zeros` 等内存算子以及 `contiguous`、`clone`、`copy_` 等创建或拷贝算子，除此之外严禁调用任何 PyTorch 算子实现计算功能。可以调用 FlagGems 的算子。**
+在编写任何算子实现代码之前，必须先梳理并记录以下三张设计表：
 
-- **禁止项**：除内存与创建/拷贝算子外，禁止调用任何 PyTorch 算子实现计算功能，如 `torch.matmul`, `torch.sum`, `torch.softmax`, `tensor.to()` 等；
-- **允许项**：
-  - 允许调用 PyTorch 框架中的内存算子（如 `torch.empty`、`torch.empty_like`、`torch.zeros`、`torch.zeros_like`、`torch.empty_strided` 等）；
-  - 允许调用创建或拷贝算子（如 `tensor.contiguous()`、`tensor.clone()`、`tensor.copy_()` 等）；
-  - 允许调用 FlagGems (`flag_gems`) 的算子；
-  - 允许读取元数据（`.shape`, `.stride`, `.dtype`, `.device`）与真正零拷贝的 view 操作；
-  - 允许 Triton 内核发射；
-- **不支持路径**：必须显式 `raise NotImplementedError(...)`，绝不能静默调用 PyTorch 计算算子作为退路。
+### 1. 工程基线表
 
-### 2. 编码前三张设计表
+| 字段 | 内容要求 |
+| --- | --- |
+| 算子名称与 ID | 算子 API 名称，与 `conf/operators.yaml` 中的 `id` 保持一致 |
+| 函数签名 | 完整的入参与返回值定义 |
+| vLLM 上下文 | 调用的模型架构与层（如 DeepSeek-V3 MoE、PagedAttention 等） |
+| 依赖关系 | 是否依赖 FlagGems 算子或外部扩展 |
+| 目标硬件后端 | 默认 NVIDIA，或特定异构硬件后端 |
+| 性能验收目标 | 关键核心形状加速比默认 `SpeedUp >= 0.9` |
 
-在编写任何实现代码之前，必须先梳理并记录以下三张设计表：
+### 2. vLLM 对齐规范表
 
-1. **工程基线表**：算子名称、函数签名、vLLM 上下文调用环境、输入输出规格、性能预期；
-2. **Torch 对齐规范表**：对标基准行为、浮点容差（rtol/atol）、特殊值（空张量、NaN、Inf、边界维度）；
-3. **实现路径设计表**：不同形状/类型的工作负载分类、调度分支策略、不支持情况的处理。
+> [!NOTE]
+> 本仓库存放 vLLM 仓库算子，不接受通用 PyTorch 算子，因此无需对齐 PyTorch 原生算子，对标对象为 vLLM 现有原生算子、C++/CUDA 扩展或模型推理参考实现。
 
-### 3. 自动调优 (Autotune) 规范
+| 字段 | 内容要求 |
+| --- | --- |
+| 对标基准实现 | 对齐的 vLLM 原生 C++/CUDA 扩展、Triton 实现或模型算法参考 |
+| 浮点容差要求 | 明确 FP32/FP16/BF16/FP8 的 `rtol` 和 `atol` 容差阈值 |
+| 边界与特殊值 | 空张量、极端大维度、NaN、Inf、边界维度的处理规则 |
+| 布局与连续性 | 支持的连续性与步长要求（非连续张量可使用 `contiguous()`） |
 
-凡是暴露 `BLOCK_*`、`num_warps`、`num_stages` 等参数的算子，NVIDIA 后端必须接入自动调优：
-- 在 `src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml` 配置参数空间；
-- 在 Triton 内核上使用 `@libtuner(configs=..., key=[...], strategy=[...])` 装饰器。
+### 3. 实现路径设计表
 
-### 4. 标准代码落点
+| 字段 | 内容要求 |
+| --- | --- |
+| 工作负载分类 | 区分 Prefill 阶段、Decode 阶段或特定批量大小的处理分支 |
+| 内核架构策略 | 单内核完成融合计算，或组合调用 FlagGems 算子 |
+| 自动调优参数 | 暴露的 `BLOCK_*`、`num_warps`、`num_stages` 参数空间候选值 |
+| 不支持范围 | 不支持的形状、数据类型或后端，显式抛出 `NotImplementedError` |
 
-| 职责 | 落点路径 |
-|---------|------|
-| 算子实现 | `src/flaggems_vllm/ops/<op>.py` |
-| 功能测试 | `tests/test_<op>.py` |
-| 性能测试 | `benchmark/test_<op>.py` |
-| 元数据录入 | `conf/operators.yaml` |
-| 模块导出 | `src/flaggems_vllm/ops/__init__.py` 与 `flaggems_vllm/__init__.py` |
-| 自动调优配置 | `src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml` |
+## 静态审计规范
 
-## 标准开发流程
+在提交 PR 之前，建议运行静态检查脚本审计生产代码路径：
 
-### 步骤 1：明确需求并阅读协议
-阅读 `workflow.md`，参考相似算子的实现风格。
+```bash
+python - <<'PY'
+from pathlib import Path
+op = '<op>'
+p = Path(f'src/flaggems_vllm/ops/{op}.py')
+if p.exists():
+    text = p.read_text()
+    suspicious = [pat for pat in ['torch.matmul', 'torch.sum', 'torch.softmax', 'torch.nn.functional', 'torch.ops.aten', '.to('] if pat in text]
+    print(f"Audit {p}: suspicious calls = {suspicious}")
+PY
+```
 
-### 步骤 2：明确规范并填写三张设计表
-确定输入输出规格、对齐容差与不支持边界。
+## 相关链接
 
-### 步骤 3：编写 Host 调度函数与 Triton 内核
-- 使用 `@libentry()` 修饰 Host 入口；
-- 编写 `@triton.jit` 内核；
-- 接入 `@libtuner()`。
-
-### 步骤 4：功能测试验证
-在 `tests/test_<op>.py` 中添加参数化测试，确保 `--quick` 和常规模式均通过。
-
-### 步骤 5：性能基准评测
-在 `benchmark/test_<op>.py` 中编写评测用例，并在 `benchmark/core_shapes.yaml` 录入典型形状。确保 NVIDIA H100 上的加速比达到 **SpeedUp ≥ 0.9**。
-
-## 下一步
-
-- [阅读根目录 workflow.md 原始规范](https://github.com/flagos-ai/FlagGems-vllm/blob/main/workflow.md)
-- [贡献指南概述](overview.md)
-- [单元测试指南](../testing/unittest.md)
-- [基准测试指南](../performance/benchmark.md)
+- [贡献概述](overview.md)：新算子交付要求、`conf/operators.yaml` 元数据管理、编码规则
+- [根目录 workflow.md 协议完整定义](https://github.com/flagos-ai/FlagGems-vllm/blob/main/workflow.md)
+- [硬件后端开发指南](backend.md)

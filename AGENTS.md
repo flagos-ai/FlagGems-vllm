@@ -185,7 +185,7 @@ Benchmark options (from `benchmark/conftest.py`): `--level
 `--record`/`--output` (JSON default `benchmark_result.json`). Shapes come from
 `benchmark/core_shapes.yaml`.
 
-SpeedUp convention: `SpeedUp = latency_torch_baseline / latency_flaggems`.
+SpeedUp convention: `SpeedUp = latency_vllm_baseline / latency_flaggems`.
 Acceptance target for key shapes is `SpeedUp >= 0.9`.
 
 ## Code style & linting
@@ -210,7 +210,13 @@ Note the two line-length numbers: black formats to 88, flake8 only errors above
 ## Operator development protocol — READ `workflow.md` FIRST
 
 `workflow.md` is the **mandatory execution protocol** for adding or modifying an
-operator. It defines hard gates (G0–G7), the required pre-coding tables, and
+operator. This repository hosts specialized and fused operators for the vLLM
+repository and **does not accept general PyTorch operators**; therefore, operators
+do not need to align with PyTorch (general PyTorch ops belong in FlagGems).
+Operators align directly with vLLM operators, native CUDA/C++ kernels, or model
+reference implementations.
+
+It defines hard gates (G0–G7), the required pre-coding tables, and
 acceptance/delivery format. Key rules an agent MUST honor:
 
 1. **No torch compute fallback** (`NO_TORCH_COMPUTE_FALLBACK = true`).
@@ -230,6 +236,7 @@ acceptance/delivery format. Key rules an agent MUST honor:
 
    | Purpose | Path |
    | --- | --- |
+   | Operator metadata | `conf/operators.yaml` |
    | Operator implementation | `src/flaggems_vllm/ops/<op>.py` |
    | NVIDIA autotune config | `src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml` |
    | Functional test | `tests/test_<op>.py` |
@@ -237,7 +244,7 @@ acceptance/delivery format. Key rules an agent MUST honor:
    | Op export | `src/flaggems_vllm/ops/__init__.py` (import + `__all__`) |
    | Top-level registration | `src/flaggems_vllm/__init__.py` |
 
-   An op is not "done" until it is both exported and registered.
+   An op is not "done" until it is exported, registered, and documented in `conf/operators.yaml`.
 
 3. **Autotune is not optional.** Any kernel exposing perf params (`BLOCK_*`,
    `TILE_*`, `num_warps`, `num_stages`, `num_ctas`, ...) should, on the NVIDIA
