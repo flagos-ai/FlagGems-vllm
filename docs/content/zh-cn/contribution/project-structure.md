@@ -1,6 +1,6 @@
 ---
 title: 项目结构
-weight: 20
+weight: 40
 ---
 
 # 项目结构
@@ -144,7 +144,8 @@ tools/
 
 ## 下一步
 
-- [算子开发协议](../contribution/workflow.md)
-- [贡献指南概述](../contribution/overview.md)
-- [M3 算子支持](m3-support.md)
+- [贡献指南概述](overview.md)
+- [算子开发协议](workflow.md)
+- [硬件后端开发指南](backend.md)
+- [MiniMax M3 算子支持](../references/minimax-m3-support.md)
 - [单元测试指南](../testing/unittest.md)

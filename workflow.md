@@ -39,7 +39,7 @@ AI 不能跳过以下 gate。
 | --- | --- | --- |
 | G0 任务输入 | 当前任务输入只需包含 vLLM 算子名、层定义或参考链接/版本 | 用户不再补其他字段；AI 自行补齐其余任务事实，不能直接写代码 |
 | G1 工程基线 | editable/read-only、build、validation、benchmark、active set、autotune、profiler 已冻结 | 不允许比较性能 |
-| G2 vLLM 契约 | dtype matrix、shape、layout、promotion、边界语义、unsupported scope 已明确（不要求对齐 PyTorch） | 不允许实现 |
+| G2 vLLM 规范 | dtype matrix、shape、layout、promotion、边界语义、unsupported scope 已明确（不要求对齐 PyTorch） | 不允许实现 |
 | G3 路径设计 | fast/special/general/unsupported/external-library path 已定义；无 torch compute fallback | 不允许写 kernel |
 | G4 实现集成 | operators.yaml、ops、tune config、test、benchmark、导出、注册已完成或说明不需要 | 不允许验收 |
 | G5 功能测试 | 功能测试通过，含 dtype、边界、unsupported path | 立即修复或回滚 |
@@ -126,7 +126,7 @@ PY
 3. 阅读 vLLM 对应算子源码、模型层实现或官方参考（无需查阅 PyTorch ATen）。
 4. 检查仓库内相近算子、测试、benchmark 和 libtuner 接入方式。
 
-### Step 2. 明确 vLLM 算子契约
+### Step 2. 明确 vLLM 算子接口规范与约束
 
 必须先明确 dtype matrix、shape/output rules、promotion、NaN/Inf、异常、unsupported scope。
 
@@ -343,7 +343,7 @@ profiler 不可用时，必须写明限制，并至少提供替代证据：dispa
 Operator delivery summary:
 - Op: vLLM API / FlagGems API
 - Status: complete / limited / unsupported / needs deep_opt
-- Contract: dtype matrix, output rules, key semantics
+- Specification: dtype matrix, output rules, key semantics
 - Paths: fast / special / general / unsupported / external-library
 - No torch compute fallback audit: pass/fail, suspicious calls and resolution
 - Autotune: config names, keys, candidate parameters, no-autotune exemptions

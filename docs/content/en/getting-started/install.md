@@ -137,53 +137,14 @@ print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
 "
 ```
 
-### Run Quick Tests
+### Run Smoke Tests
+
+Verify test discovery and basic module import:
 
 ```bash
 cd FlagGems-vllm
 PYTHONPATH=src pytest -q tests --collect-only
 PYTHONPATH=src pytest -q tests --quick
-```
-
-### Run a Benchmark Smoke Test
-
-```bash
-PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
-```
-
-### Notes
-
-- `--collect-only` is recommended first to quickly check import and test discovery.
-- Use `--quick` for fast functional validation when supported by the test.
-- Use `--level core --iter 1 --warmup 1` for fast benchmark smoke tests.
-- Full benchmark runs can take a long time and should be reserved for performance validation.
-
-## Backend Selection
-
-FlagGems-vllm auto-detects the hardware backend. To override:
-
-```bash
-export DNN_VENDOR=nvidia  # or amd, ascend, hygon, etc.
-```
-
-Available backends: `nvidia`, `amd`, `ascend`, `cambricon`, `enflame`, `hygon`, `iluvatar`, `kunlunxin`, `metax`, `mthreads`, and more (18 total).
-
-## C++ Extension
-
-FlagGems-vllm includes optional C++ operators compiled via pybind11. These are built automatically if the required dependencies are present.
-
-To enable C++ operators at runtime:
-
-```bash
-export USE_C_EXTENSION=1
-```
-
-Check if C++ extension is available:
-
-```python
-import flaggems_vllm
-print(flaggems_vllm.config.has_c_extension)
-print(flaggems_vllm.config.use_c_extension)
 ```
 
 ## Troubleshooting

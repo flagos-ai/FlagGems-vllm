@@ -29,7 +29,7 @@ All operator addition and modification tasks must satisfy the following hard gat
 
 - **G0 (Task Clarity & Protocol Acknowledgment)**: Clarify task scope, confirm the operator belongs to vLLM-specific fused kernels, and commit to following the protocol;
 - **G1 (Engineering Baseline & Environment)**: Freeze build and test commands, validation set, and benchmark environment;
-- **G2 (vLLM Operator Contract)**: Clarify dtype matrix, shape, layout, promotion, boundary semantics, and unsupported scope (aligning with vLLM native kernels or model references, no PyTorch alignment required);
+- **G2 (vLLM Operator Specification)**: Clarify dtype matrix, shape, layout, promotion, boundary semantics, and unsupported scope (aligning with vLLM native kernels or model references, no PyTorch alignment required);
 - **G3 (Path Design & Host Dispatch)**: Define fast/special/general/unsupported paths, design host dispatch and defensive checks, strictly obeying `NO_TORCH_COMPUTE_FALLBACK`;
 - **G4 (Implementation & Integration)**: Complete metadata registration (`conf/operators.yaml`), host dispatch and Triton JIT kernels, autotune configuration (`tune_configs.yaml`), tests, and public exports;
 - **G5 (Functional Tests Pass)**: `tests/test_<op>.py` passes 100% in both `--quick` and full test modes;

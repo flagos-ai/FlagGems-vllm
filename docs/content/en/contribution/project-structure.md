@@ -1,6 +1,6 @@
 ---
 title: Project Structure
-weight: 20
+weight: 40
 ---
 
 # Project Structure
@@ -144,7 +144,8 @@ Mandatory operator development protocol with hard gates (G0–G7):
 
 ## Next Steps
 
-- [Operator development protocol](../contribution/workflow.md)
-- [Contributing guide](../contribution/overview.md)
-- [MiniMax M3 Support](m3-support.md)
-- [Testing guide](../testing/unittest.md)
+- [Contributing Guide](overview.md)
+- [Operator Development Protocol](workflow.md)
+- [Backend Development Guide](backend.md)
+- [MiniMax M3 Support](../references/minimax-m3-support.md)
+- [Testing Guide](../testing/unittest.md)

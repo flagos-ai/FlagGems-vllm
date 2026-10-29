@@ -81,8 +81,8 @@ Comprehensive documentation is available in the [docs](docs/) directory:
 - 🔧 **Hardware Backends**: [Non-NVIDIA Hardware Support](docs/content/en/usage/non-nvidia.md)
 - 🧪 **Testing**: [Unit Testing Guide](docs/content/en/testing/unittest.md) | [Coverage](docs/content/en/testing/coverage.md)
 - ⚡ **Benchmarking**: [Running Benchmarks](docs/content/en/performance/benchmark.md) | [Performance Results](docs/content/en/performance/results.md)
-- 📋 **References**: [Supported Operators](docs/content/en/references/operators.md) | [MiniMax M3 Support](docs/content/en/references/m3-support.md) | [Project Structure](docs/content/en/references/project-structure.md)
-- 🤝 **Contributing**: [Contribution Overview](docs/content/en/contribution/overview.md) | [Development Workflow](docs/content/en/contribution/workflow.md)
+- 📋 **References**: [Supported Operators](docs/content/en/references/operators.md) | [MiniMax M3 Support](docs/content/en/references/minimax-m3-support.md)
+- 🤝 **Contributing**: [Contribution Overview](docs/content/en/contribution/overview.md) | [Development Workflow](docs/content/en/contribution/workflow.md) | [Project Structure](docs/content/en/contribution/project-structure.md)
 
 ## License
 

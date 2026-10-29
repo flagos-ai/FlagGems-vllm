@@ -134,6 +134,27 @@ print(f"Device: {flaggems_vllm.device}")        # e.g., 'cuda'
 print(f"Device count: {runtime.device.device_count}")
 ```
 
+For multi-backend selection and environment variables, see [Non-NVIDIA Backends](non-nvidia.md).
+
+## C++ Native Extensions Configuration
+
+FlagGems-vllm includes optional C++ operators compiled via pybind11. If dependencies are satisfied during build, they are compiled automatically.
+
+Enable C++ operators at runtime via an environment variable:
+
+```bash
+export USE_C_EXTENSION=1
+```
+
+Check C++ extension status:
+
+```python
+import flaggems_vllm
+
+print("C++ extension available:", flaggems_vllm.config.has_c_extension)
+print("C++ extension enabled:", flaggems_vllm.config.use_c_extension)
+```
+
 ## Operator Categories
 
 FlagGems-vllm operators fall into these categories:

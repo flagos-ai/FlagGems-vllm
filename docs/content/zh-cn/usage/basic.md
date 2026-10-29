@@ -134,6 +134,27 @@ print(f"设备名称: {flaggems_vllm.device}")        # 例如 'cuda'
 print(f"设备数量: {runtime.device.device_count}")
 ```
 
+多后端详细配置与环境变量选择请参阅[非 NVIDIA 硬件平台](non-nvidia.md)。
+
+## C++ 原生扩展配置
+
+FlagGems-vllm 包含通过 pybind11 编译的可选 C++ 扩展算子。如果构建时所需依赖就绪，会自动编译生成。
+
+运行时可通过环境变量控制是否启用 C++ 算子：
+
+```bash
+export USE_C_EXTENSION=1
+```
+
+检查 C++ 扩展状态：
+
+```python
+import flaggems_vllm
+
+print("C++ 扩展可用:", flaggems_vllm.config.has_c_extension)
+print("当前启用 C++ 扩展:", flaggems_vllm.config.use_c_extension)
+```
+
 ## 算子分类概览
 
 FlagGems-vllm 算子主要分为以下几类：

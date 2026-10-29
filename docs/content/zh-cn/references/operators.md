@@ -55,5 +55,5 @@ print(f"当前已注册: {len(ops)} 个算子")
 ## 下一步
 
 - [基础用法](../usage/basic.md)
-- [M3 算子支持](m3-support.md)
+- [MiniMax M3 算子支持](minimax-m3-support.md)
 - [算子源码仓库](https://github.com/flagos-ai/FlagGems-vllm/tree/main/src/flaggems_vllm/ops)

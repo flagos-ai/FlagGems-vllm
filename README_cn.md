@@ -97,8 +97,8 @@ print(topk_weights.shape, topk_ids.shape)
 - 🔧 **硬件后端**: [非 NVIDIA 硬件支持](docs/content/zh-cn/usage/non-nvidia.md)
 - 🧪 **测试验证**: [单元测试指南](docs/content/zh-cn/testing/unittest.md) | [覆盖率统计](docs/content/zh-cn/testing/coverage.md)
 - ⚡ **基准测试**: [运行性能基准测试](docs/content/zh-cn/performance/benchmark.md) | [评测结果](docs/content/zh-cn/performance/results.md)
-- 📋 **参考信息**: [支持算子列表](docs/content/zh-cn/references/operators.md) | [MiniMax M3 算子支持](docs/content/zh-cn/references/m3-support.md) | [项目结构规范](docs/content/zh-cn/references/project-structure.md)
-- 🤝 **贡献指南**: [贡献概述](docs/content/zh-cn/contribution/overview.md) | [开发协议规范](docs/content/zh-cn/contribution/workflow.md)
+- 📋 **参考信息**: [支持算子列表](docs/content/zh-cn/references/operators.md) | [MiniMax M3 算子支持](docs/content/zh-cn/references/minimax-m3-support.md)
+- 🤝 **贡献指南**: [贡献概述](docs/content/zh-cn/contribution/overview.md) | [开发协议规范](docs/content/zh-cn/contribution/workflow.md) | [项目结构规范](docs/content/zh-cn/contribution/project-structure.md)
 
 ## 开源协议
 

@@ -29,7 +29,7 @@ FlagGems-vllm 算子开发必须严格遵循仓库根目录下 `workflow.md` 规
 
 - **G0（任务知情）**：明确算子任务范围，确认属于 vLLM 场景特化/融合算子，知情并承诺遵守开发协议；
 - **G1（工程基线与环境）**：冻结构建、测试命令、测试集与评测环境；
-- **G2（vLLM 算子契约）**：明确 dtype matrix、shape、layout、promotion、边界语义与 unsupported scope（对标 vLLM 原生算子或模型参考，不要求对齐 PyTorch）；
+- **G2（vLLM 算子接口规范）**：明确 dtype matrix、shape、layout、promotion、边界语义与 unsupported scope（对标 vLLM 原生算子或模型参考，不要求对齐 PyTorch）；
 - **G3（路径设计与 Host 调度）**：定义 fast/special/general/unsupported 路径，设计 Host 调度与边界防御，严格遵守 `NO_TORCH_COMPUTE_FALLBACK`；
 - **G4（实现与集成）**：完成元数据登记（`conf/operators.yaml`）、Host 调度与 Triton JIT 内核实现、自动调优配置（`tune_configs.yaml`）、测试与公共导出；
 - **G5（功能测试通过）**：`tests/test_<op>.py` 在 `--quick` 与全量测试模式下均 100% 通过；

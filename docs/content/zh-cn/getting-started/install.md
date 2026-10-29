@@ -137,53 +137,14 @@ print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
 "
 ```
 
-### 运行快速测试
+### 运行冒烟测试
+
+建议运行 pytest 收集检查以确认测试套件与模块导入正常：
 
 ```bash
 cd FlagGems-vllm
 PYTHONPATH=src pytest -q tests --collect-only
 PYTHONPATH=src pytest -q tests --quick
-```
-
-### 运行基准测试冒烟
-
-```bash
-PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
-```
-
-### 注意事项
-
-- 建议首先运行 `--collect-only`，快速确认模块导入与测试发现是否正常。
-- 算子支持时优先使用 `--quick` 进行快速功能验证。
-- 基准评测冒烟可使用 `--level core --iter 1 --warmup 1`。
-- 全量基准测试耗时较长，建议仅在正式性能验证时执行。
-
-## 后端选择
-
-FlagGems-vllm 自动检测硬件后端。要覆盖:
-
-```bash
-export DNN_VENDOR=nvidia  # 或 amd、ascend、hygon 等
-```
-
-可用后端: `nvidia`、`amd`、`ascend`、`cambricon`、`enflame`、`hygon`、`iluvatar`、`kunlunxin`、`metax`、`mthreads` 等(共 18 个)。
-
-## C++ 扩展
-
-FlagGems-vllm 包含通过 pybind11 编译的可选 C++ 算子。如果所需依赖存在,会自动构建。
-
-运行时启用 C++ 算子:
-
-```bash
-export USE_C_EXTENSION=1
-```
-
-检查 C++ 扩展是否可用:
-
-```python
-import flaggems_vllm
-print(flaggems_vllm.config.has_c_extension)
-print(flaggems_vllm.config.use_c_extension)
 ```
 
 ## 故障排除
