@@ -55,22 +55,17 @@ AI 不能跳过以下 gate。
 - 可组合出目标语义的其他 `torch.<op>`。
 - `torch.nn.functional.*`。
 - `torch.ops.aten.*`。
-- 会发射计算、拷贝、类型转换或 layout conversion kernel 的 `Tensor` 方法，例如 `matmul`、`sum`、`max`、`contiguous`、`clone`、`copy_`、`to`。
+- 会发射计算或类型转换 kernel 的 `Tensor` 方法，例如 `matmul`、`sum`、`max`、`to`。
 
-允许范围仅限：
+允许范围：
 
 - 元信息读取：shape、stride、dtype、device、layout。
-- 未初始化输出分配：`torch.empty`、`torch.empty_like`、`torch.empty_strided`。
+- 内存算子分配：允许调用 PyTorch 框架中的 `torch.empty`、`torch.empty_like`、`torch.empty_strided`、`torch.zeros`、`torch.zeros_like` 等内存算子。
+- 创建与拷贝算子：允许调用 `contiguous`、`clone`、`copy_` 等创建或拷贝算子。
 - 确认可不触发数据移动的 view/metadata 操作。
+- 允许调用 FlagGems (`flag_gems`) 的算子。
 
-若某路径暂不自研，必须采用：
-
-- 显式 `NotImplementedError`。
-- 项目已有非 torch kernel/runtime。
-- 项目明确批准的外部库接口。
-- 收缩自研覆盖面。
-
-不能用 `torch` 补洞。
+除此之外，禁止调用任何 torch 算子实现计算功能。
 
 ### 2.2 静态审计要求
 

@@ -24,16 +24,18 @@ The protocol defines **hard gates (G0–G7)** that must be passed when adding or
 
 ### 1. NO_TORCH_COMPUTE_FALLBACK
 
-**Production code paths must NOT use torch compute operations.**
+**Production code paths allow calling PyTorch memory operators like `torch.empty` and `torch.zeros` as well as creation or copy operators like `contiguous`, `clone`, and `copy_`, but otherwise forbid calling torch operators for computation. Calling FlagGems operators is allowed.**
 
 Forbidden in production code:
-- `torch.matmul`, `torch.sum`, `torch.softmax` (compute ops)
-- `tensor.contiguous()`, `tensor.to()`, `tensor.copy_()` (memory kernels)
-- Any operation that launches a PyTorch/ATen kernel
+- Calling torch compute operators: `torch.matmul`, `torch.sum`, `torch.softmax`, etc.
+- `tensor.to()` (type conversion kernels)
+- Any PyTorch operation that launches compute kernels
 
 Allowed:
-- Metadata reads: `tensor.shape`, `tensor.dtype`, `tensor.device`
-- Uninitialized allocation: `torch.empty_like()`
+- PyTorch memory operators: `torch.empty`, `torch.empty_like`, `torch.zeros`, `torch.zeros_like`, `torch.empty_strided`
+- Creation and copy operators: `tensor.contiguous()`, `tensor.clone()`, `tensor.copy_()`
+- Calling FlagGems (`flag_gems`) operators
+- Metadata reads: `tensor.shape`, `tensor.stride`, `tensor.dtype`, `tensor.device`
 - True no-copy views: `tensor.view()`
 - Triton kernel launches
 

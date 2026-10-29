@@ -30,7 +30,7 @@ bookCollapseSection: true
 **必读**: 在添加或修改算子之前阅读 `workflow.md`。
 
 关键要求:
-- **NO_TORCH_COMPUTE_FALLBACK**: 生产代码不得使用 torch 计算算子
+- **NO_TORCH_COMPUTE_FALLBACK**: 生产代码允许调用 PyTorch 框架中的 `torch.empty`、`torch.zeros` 等内存算子以及 `contiguous`、`clone`、`copy_` 等创建或拷贝算子，除此之外禁止调用 torch 算子实现计算功能；可以调用 FlagGems 的算子
 - **编码前设计表**: 工程基线、Torch 对齐规范、实现路径设计
 - **自动调优必需**: NVIDIA 后端必须有调优配置
 - **标准代码落点**: `src/flaggems_vllm/ops/<op>.py`、`tests/test_<op>.py`、`benchmark/test_<op>.py`

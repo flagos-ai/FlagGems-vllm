@@ -22,11 +22,16 @@ FlagGems-vllm 算子开发必须严格遵循仓库根目录下 `workflow.md` 规
 
 ### 1. 严禁 PyTorch 计算回退 (NO_TORCH_COMPUTE_FALLBACK)
 
-**生产内核执行路径严禁调用任何 PyTorch 计算算子与内存拷贝算子。**
+**生产内核执行路径允许调用 PyTorch 框架中的 `torch.empty`、`torch.zeros` 等内存算子以及 `contiguous`、`clone`、`copy_` 等创建或拷贝算子，除此之外严禁调用任何 PyTorch 算子实现计算功能。可以调用 FlagGems 的算子。**
 
-- **禁止项**：`torch.matmul`, `torch.sum`, `torch.softmax`, `tensor.contiguous()`, `tensor.to()`, `tensor.copy_()` 等；
-- **允许项**：读取元数据（`.shape`, `.dtype`, `.device`）、未初始化分配（`torch.empty_like()`）、真正零拷贝的 view、以及 Triton 内核发射；
-- **不支持路径**：必须显式 `raise NotImplementedError(...)`，绝不能静默调用 PyTorch 计算作为退路。
+- **禁止项**：除内存与创建/拷贝算子外，禁止调用任何 PyTorch 算子实现计算功能，如 `torch.matmul`, `torch.sum`, `torch.softmax`, `tensor.to()` 等；
+- **允许项**：
+  - 允许调用 PyTorch 框架中的内存算子（如 `torch.empty`、`torch.empty_like`、`torch.zeros`、`torch.zeros_like`、`torch.empty_strided` 等）；
+  - 允许调用创建或拷贝算子（如 `tensor.contiguous()`、`tensor.clone()`、`tensor.copy_()` 等）；
+  - 允许调用 FlagGems (`flag_gems`) 的算子；
+  - 允许读取元数据（`.shape`, `.stride`, `.dtype`, `.device`）与真正零拷贝的 view 操作；
+  - 允许 Triton 内核发射；
+- **不支持路径**：必须显式 `raise NotImplementedError(...)`，绝不能静默调用 PyTorch 计算算子作为退路。
 
 ### 2. 编码前三张设计表
 

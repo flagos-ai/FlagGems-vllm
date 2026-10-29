@@ -30,7 +30,7 @@ Welcome! Contributions to FlagGems-vllm are highly appreciated.
 **MANDATORY**: Read `workflow.md` before adding or modifying operators.
 
 Key requirements:
-- **NO_TORCH_COMPUTE_FALLBACK**: Production code must not use torch compute ops
+- **NO_TORCH_COMPUTE_FALLBACK**: Memory operators like `torch.empty` and `torch.zeros` as well as creation/copy operators like `contiguous`, `clone`, and `copy_` are allowed; otherwise, calling torch operators for computation is forbidden. Calling FlagGems operators is allowed.
 - **Pre-coding design tables**: Engineering baseline, torch alignment specification, implementation path design
 - **Autotune required**: NVIDIA backend must have tuned configs
 - **Standard code drops**: `src/flaggems_vllm/ops/<op>.py`, `tests/test_<op>.py`, `benchmark/test_<op>.py`

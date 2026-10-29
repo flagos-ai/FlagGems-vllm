@@ -32,7 +32,7 @@ weight: 10
 **验收标准**：
 - 单元测试在 `--quick` 和全量模式下均通过；
 - NVIDIA H100 核心形状下 **SpeedUp ≥ 0.9**；
-- 严格遵循 `NO_TORCH_COMPUTE_FALLBACK` 规则。
+- 严格遵循 `NO_TORCH_COMPUTE_FALLBACK` 规则（允许调用 `torch.empty`、`torch.zeros` 等内存算子以及 `contiguous`、`clone`、`copy_` 等创建或拷贝算子，除此之外禁止调用 torch 算子实现计算功能，可以调用 FlagGems 算子）。
 
 ### 2. 优化既有算子
 
@@ -73,37 +73,55 @@ pre-commit run --all-files
 
 ## 严禁 PyTorch 计算回退规则 (NO_TORCH_COMPUTE_FALLBACK)
 
-**生产内核执行路径严禁调用任何 PyTorch 计算算子。**
+**生产内核执行路径允许调用 PyTorch 框架中的 `torch.empty`、`torch.zeros` 等内存算子以及 `contiguous`、`clone`、`copy_` 等创建或拷贝算子，除此之外禁止调用 torch 算子实现计算功能。可以调用 FlagGems 的算子。**
 
-### 严禁调用
-
-```python
-# ❌ 生产路径严禁以下操作
-def my_operator(x):
-    return torch.matmul(x, x.T)  # ❌ 产生 PyTorch 计算内核
-    return x.sum(dim=-1)          # ❌ 产生计算
-    return x.contiguous()         # ❌ 触发内存拷贝内核
-    return x.to(torch.float32)    # ❌ 触发类型转换内核
-```
+- **允许 PyTorch 内存与创建/拷贝算子**：允许调用 PyTorch 框架中的 `torch.empty`、`torch.empty_like`、`torch.zeros`、`torch.zeros_like`、`torch.empty_strided` 等内存分配算子，以及 `tensor.contiguous()`、`tensor.clone()`、`tensor.copy_()` 等创建或拷贝算子；
+- **允许调用 FlagGems 算子**：可以调用 FlagGems (`flag_gems`) 库中已有的高性能算子（如通用矩阵乘法、逐元素计算等）；
+- **元数据与视图操作**：允许读取元数据（`.shape`, `.stride`, `.dtype`, `.device` 等）以及真正零拷贝的 view 操作；
+- **禁止 PyTorch 计算算子**：除上述内存/创建/拷贝算子、元数据与视图操作外，禁止调用任何 PyTorch 算子实现计算功能（如 `torch.matmul`、`torch.sum`、`torch.softmax` 等）；
+- **不支持配置的处理**：遇到不支持的形状或类型应显式抛出 `NotImplementedError`，绝不能静默调用 PyTorch 算子进行回退计算。
 
 ### 允许调用
 
 ```python
 # ✓ 允许的操作
-def my_operator(x):
+import flag_gems
+import torch
+
+def my_operator(x, weight):
     # 元数据读取:
     shape = x.shape              # ✓
     dtype = x.dtype              # ✓
     device = x.device            # ✓
 
-    # 未初始化张量分配:
+    # 允许调用 PyTorch 内存算子 (torch.empty, torch.zeros 等):
     output = torch.empty_like(x) # ✓
+    buf = torch.zeros((shape[0], 64), dtype=dtype, device=device) # ✓
+
+    # 允许调用创建或拷贝算子 (contiguous, clone, copy_ 等):
+    x_contig = x.contiguous()    # ✓
+    cloned = x.clone()           # ✓
+    output.copy_(cloned)         # ✓
 
     # 零拷贝 view:
     view = x.view(new_shape)     # ✓
 
+    # 允许调用 FlagGems 算子:
+    gemm_out = flag_gems.mm(x, weight)  # ✓
+
     # Triton 内核发射:
     triton_kernel[grid](x, ...)  # ✓
+```
+
+### 严禁调用
+
+```python
+# ❌ 生产路径严禁调用 PyTorch 算子实现计算功能
+def my_operator(x):
+    return torch.matmul(x, x.T)  # ❌ 禁止调用 PyTorch 计算算子
+    return x.sum(dim=-1)          # ❌ 禁止调用 PyTorch 计算算子
+    return torch.softmax(x, dim=-1) # ❌ 禁止调用 PyTorch 计算算子
+    return x.to(torch.float32)    # ❌ 触发类型转换内核
 ```
 
 ### 不支持配置的处理

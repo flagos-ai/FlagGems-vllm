@@ -32,7 +32,7 @@ Steps:
 **Acceptance criteria**:
 - Tests pass in `--quick` and full modes
 - SpeedUp ≥ 0.9 on core shapes (NVIDIA H100)
-- NO_TORCH_COMPUTE_FALLBACK rule followed
+- NO_TORCH_COMPUTE_FALLBACK rule followed (memory operators such as `torch.empty` and `torch.zeros` and creation/copy operators such as `contiguous`, `clone`, and `copy_` are allowed; otherwise, calling torch operators for computation is forbidden; FlagGems operators are allowed)
 
 ### Optimizing an Existing Operator
 
@@ -184,38 +184,56 @@ Acceptance: **SpeedUp ≥ 0.9** on core shapes (NVIDIA H100).
 
 ## NO_TORCH_COMPUTE_FALLBACK Rule
 
-**Critical**: Production code paths must NOT use torch compute operations.
+**Critical**: Production code paths allow calling memory operators such as `torch.empty` and `torch.zeros` as well as creation or copy operators such as `contiguous`, `clone`, and `copy_` from the PyTorch framework, but otherwise forbid calling torch operators to implement computational functions. Calling FlagGems operators is allowed.
 
-### Forbidden
-
-```python
-# ❌ FORBIDDEN in production paths
-def my_operator(x):
-    # These emit torch kernels:
-    return torch.matmul(x, x.T)  # ❌
-    return x.sum(dim=-1)          # ❌
-    return x.contiguous()         # ❌ (memory copy)
-    return x.to(torch.float32)    # ❌ (cast kernel)
-```
+- **Allowed PyTorch Memory & Creation/Copy Operators**: Calling memory operators from PyTorch such as `torch.empty`, `torch.empty_like`, `torch.zeros`, `torch.zeros_like`, `torch.empty_strided`, etc., and creation/copy operators such as `tensor.contiguous()`, `tensor.clone()`, `tensor.copy_()` is allowed.
+- **Allowed FlagGems Operators**: Calling operators from FlagGems (`flag_gems`) is allowed.
+- **Metadata and Views**: Reading tensor metadata (`.shape`, `.stride`, `.dtype`, `.device`) and true no-copy views are allowed.
+- **Forbidden Torch Compute Operators**: Except for memory/creation/copy operators, metadata, and views, calling PyTorch operators to implement computation is strictly prohibited (e.g., `torch.matmul`, `torch.sum`, `torch.softmax`, or cast methods like `tensor.to()`).
+- **Unsupported Configurations**: When encountering unsupported shapes or dtypes, explicitly raise `NotImplementedError`, never silently fall back to torch compute.
 
 ### Allowed
 
 ```python
 # ✓ ALLOWED
-def my_operator(x):
+import flag_gems
+import torch
+
+def my_operator(x, weight):
     # Metadata reads:
     shape = x.shape              # ✓
     dtype = x.dtype              # ✓
     device = x.device            # ✓
 
-    # Uninitialized allocation:
+    # Allowed PyTorch memory operators (torch.empty, torch.zeros, etc.):
     output = torch.empty_like(x) # ✓
+    buf = torch.zeros((shape[0], 64), dtype=dtype, device=device) # ✓
+
+    # Allowed creation / copy operators (contiguous, clone, copy_, etc.):
+    x_contig = x.contiguous()    # ✓
+    cloned = x.clone()           # ✓
+    output.copy_(cloned)         # ✓
 
     # True no-copy views:
     view = x.view(new_shape)     # ✓
 
+    # Calling FlagGems operators:
+    gemm_out = flag_gems.mm(x, weight)  # ✓
+
     # Triton kernel launch:
     triton_kernel[grid](x, ...)  # ✓
+```
+
+### Forbidden
+
+```python
+# ❌ FORBIDDEN in production paths (torch compute ops)
+def my_operator(x):
+    # Calling PyTorch operators for computation is forbidden:
+    return torch.matmul(x, x.T)  # ❌
+    return x.sum(dim=-1)          # ❌
+    return torch.softmax(x, dim=-1) # ❌
+    return x.to(torch.float32)    # ❌ (cast kernel)
 ```
 
 ### Unsupported Paths

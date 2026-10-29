@@ -214,13 +214,15 @@ operator. It defines hard gates (G0–G7), the required pre-coding tables, and
 acceptance/delivery format. Key rules an agent MUST honor:
 
 1. **No torch compute fallback** (`NO_TORCH_COMPUTE_FALLBACK = true`).
-   Production paths (impl, host dispatch, helpers, fallback, unsupported) must
-   **not** use `torch` compute/copy/cast ops (`torch.<op>`,
-   `torch.nn.functional.*`, `torch.ops.aten.*`, or `Tensor` methods that emit
-   kernels like `matmul`, `sum`, `contiguous`, `clone`, `copy_`, `to`).
-   Allowed: metadata reads (shape/stride/dtype/device), uninitialized allocation
-   (`torch.empty*`), and true no-copy views. Unsupported paths must raise
-   `NotImplementedError`, never silently fall back to torch.
+   Production paths (impl, host dispatch, helpers, fallback, unsupported) allow
+   calling memory operators in PyTorch (`torch.empty*`, `torch.zeros*`), creation
+   and copy operators (`contiguous`, `clone`, `copy_`), metadata reads
+   (shape/stride/dtype/device), and true no-copy views. Calling FlagGems
+   (`flag_gems`) operators is allowed. Otherwise, calling `torch` compute/cast
+   ops (`torch.<op>`, `torch.nn.functional.*`, `torch.ops.aten.*`, or `Tensor`
+   methods that emit kernels like `matmul`, `sum`, `to`) to implement computation
+   is strictly forbidden. Unsupported paths must raise `NotImplementedError`,
+   never silently fall back to torch.
    `torch` reference implementations are allowed **only** in tests/benchmarks,
    and must never be imported by production code.
 
