@@ -15,6 +15,10 @@
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_model1 import (
+    can_use_model1_metax,
+    sparse_decode_model1_metax,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -48,6 +52,7 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "can_use_model1_metax",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
@@ -62,6 +67,7 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
+    "sparse_decode_model1_metax",
     "SUPPORTED_FP8_DTYPE",
     "w8a8_block_int8_bmm",
 ]
