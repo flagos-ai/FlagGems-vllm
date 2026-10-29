@@ -17,13 +17,10 @@ pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 
 ### FlagGems Dependency
 
-**FlagGems-vllm depends on FlagGems**. Several FlagGems-vllm operators invoke general FlagGems operators internally. Install FlagGems before installing FlagGems-vllm:
+**FlagGems-vllm depends on FlagGems**. Several FlagGems-vllm operators invoke general FlagGems operators internally. Before installing FlagGems-vllm, install `flag-gems==5.4.0` via pip (hosted at [FlagOS PyPI repository](https://resource.flagos.net/#browse/browse:flagos-pypi-hosted:flag-gems%2F5.4.0)):
 
 ```bash
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 ```
 
 ### PyTorch
@@ -101,11 +98,8 @@ DNN_VENDOR=amd source tools/setup.sh
 For the full FlagOS vLLM plugin stack, install in this order:
 
 ```bash
-# 1. Install FlagGems (general operator backend)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+# 1. Install FlagGems (general operator backend, version 5.4.0)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. Install FlagGems-vllm (vLLM-specific operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git

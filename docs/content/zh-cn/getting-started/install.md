@@ -17,13 +17,10 @@ pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 
 ### FlagGems 依赖
 
-**FlagGems-vllm 依赖 FlagGems**。当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的通用算子。在安装 FlagGems-vllm 之前，请先安装 FlagGems：
+**FlagGems-vllm 依赖 FlagGems**。当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的通用算子。在安装 FlagGems-vllm 之前，请通过 pip 安装 `flag-gems==5.4.0`（源为 [FlagOS PyPI 镜像源](https://resource.flagos.net/#browse/browse:flagos-pypi-hosted:flag-gems%2F5.4.0)）：
 
 ```bash
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 ```
 
 ### PyTorch
@@ -101,11 +98,8 @@ DNN_VENDOR=amd source tools/setup.sh
 完整的 FlagOS vLLM 插件栈需按以下顺序安装:
 
 ```bash
-# 1. 安装 FlagGems (通用算子后端)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+# 1. 安装 FlagGems (通用算子后端，5.4.0 版本)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. 安装 FlagGems-vllm (vLLM 专用算子)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
