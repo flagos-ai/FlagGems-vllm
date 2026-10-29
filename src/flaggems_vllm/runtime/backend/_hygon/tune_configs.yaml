@@ -257,3 +257,66 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+per_token_quant_int8:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: 1
+        VEC_SIZE: vec_size
+        ROW_TILES: 1
+        CONTIGUOUS_ROWS: false
+        REDUCE_GROUP: 0
+        QUANT_PARTS: 1
+      num_warps: warps
+      num_stages: 1
+    vec_size:
+      - 8
+      - 16
+    warps:
+      - 1
+      - 2
+      - 8
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: 1
+        VEC_SIZE: 16
+        ROW_TILES: 1
+        CONTIGUOUS_ROWS: false
+        REDUCE_GROUP: 8
+        QUANT_PARTS: 1
+      num_warps: warps
+      num_stages: 1
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: 1
+        VEC_SIZE: 16
+        ROW_TILES: 2
+        CONTIGUOUS_ROWS: false
+        REDUCE_GROUP: 0
+        QUANT_PARTS: 1
+      num_warps: 2
+      num_stages: 1
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: 1
+        VEC_SIZE: 8
+        ROW_TILES: 1
+        CONTIGUOUS_ROWS: false
+        REDUCE_GROUP: 8
+        QUANT_PARTS: quant_parts
+      num_warps: 4
+      num_stages: 1
+    quant_parts:
+      - 2
+      - 4
+      - 8
+      - 16
