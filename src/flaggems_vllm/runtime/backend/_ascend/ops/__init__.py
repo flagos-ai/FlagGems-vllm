@@ -118,7 +118,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
-    "fused_recurrent_gated_delta_rule_packed_decode",
     "add_rms_norm",
     "build_compressor_metadata",
     "causal_conv1d_fn",
@@ -132,6 +131,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_inv_rope_int8_quant",
+    "fused_recurrent_gated_delta_rule_packed_decode",
     "gather_conv_state",
     "gather_kda_state",
     "gemma_rms_norm",

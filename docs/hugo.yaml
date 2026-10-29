@@ -106,4 +106,5 @@ params:
   BookSearch: false   # search is using flexsearch, enable later
   BookTheme: "auto"
   BookToC: true
+  BookPortableLinks: true
   BookLastChangeLink: 'https://github.com/flagos-ai/FlagGems-vllm/commit/{{ .GitInfo.Hash }}'

@@ -13,14 +13,6 @@
 # limitations under the License.
 
 ops:
-  - id: fused_recurrent_gated_delta_rule_packed_decode
-    description: vLLM 0.24.0 packed single-token gated delta rule decode.
-    for:
-      - fused_recurrent_gated_delta_rule_packed_decode
-    labels:
-      - fused
-    kind:
-      - FLA
   - id: act_quant_triton
     description: This is a fused operator.
     for:
@@ -390,8 +382,9 @@ ops:
       W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
       FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
       and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
-      Hygon DCU, PPU, and MetaX).
+      Hygon DCU, PPU, MetaX, and Ascend).
     for:
+      - flash_attn_varlen_func_w8a8
       - flash_attn_varlen_func_w8a8_int8
     labels:
       - NoCPU
@@ -636,6 +629,33 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: fused_recurrent_gated_delta_rule_packed_decode
+    description: vLLM 0.24.0 packed single-token gated delta rule decode.
+    for:
+      - fused_recurrent_gated_delta_rule_packed_decode
+    labels:
+      - fused
+    kind:
+      - FLA
+    stages:
+      - alpha: '5.4'
+  - id: gdn_w8a16
+    description: |
+      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 state,
+      per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
+      Supports decode, prefill and speculative state-slot updates.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+      - Attention
+      - Quantization
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: geglu
     description: Gaussian Error Gated Linear Unit with GELU activation instead of
       sigmoid function.

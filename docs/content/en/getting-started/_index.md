@@ -12,13 +12,14 @@ This section covers installation, setup, and basic usage of FlagGems-vllm.
 
 - Python ≥ 3.8 (CI uses 3.11/3.12)
 - PyTorch ≥ 2.6.0
+- **FlagGems** (required dependency; some FlagGems-vllm operators invoke FlagGems operators internally)
 - Triton or FlagTree compiler
 - CUDA-capable GPU (for NVIDIA backend) or other supported accelerator
 - vLLM (optional, for integration testing)
 
 ## Installation
 
-See the [installation guide](install/) for detailed instructions.
+See the [installation guide](install.md) for detailed instructions.
 
 ## Quick Start
 
@@ -26,7 +27,11 @@ After installation, verify FlagGems-vllm is working:
 
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# Enable FlagGems
+flag_gems.enable()
 
 print(f"FlagGems-vllm version: {flaggems_vllm.__version__}")
 print(f"Vendor: {flaggems_vllm.vendor_name}")
@@ -42,6 +47,6 @@ print("✓ moe_align_block_size works!")
 
 ## Next Steps
 
-- [Installation details](install/)
-- [Basic usage patterns](/FlagGems-vllm/usage/basic/)
-- [Integration with vllm-plugin-fl](/FlagGems-vllm/usage/vllm-plugin/)
+- [Installation details](install.md)
+- [Basic usage patterns](../usage/basic.md)
+- [Integration with vllm-plugin-fl](../usage/vllm-plugin.md)

@@ -804,20 +804,42 @@ def parse_perf_data(op, result_file):
             details.setdefault(shape, {})
             details[shape]["base"] = res.get("latency_base", 0.0)
             details[shape]["gems"] = res.get("latency", 0.0)
-            # "speedup" defaults to the gems-vs-torch ratio measured on this
-            # machine. When --base-data matched this op/shape/dtype, overwrite
-            # it in place with the baseline comparison (vs Base) so summary.json
-            # carries that value directly in the same field. On a miss, keep the
-            # measured ratio unchanged and only record why the baseline was
-            # skipped.
-            speedup = res.get("speedup", 0.0)
+            # Two ratios may be present: "speedup" is the on-machine
+            # gems-vs-torch ratio (always computed), "compared_speedup" is the
+            # vs-baseline ratio (only when --base-data matched this
+            # op/shape/dtype). summary.json reports a single value per shape; how
+            # we pick between the two is controlled by CFG.speedup_source:
+            #   - "speedup" (default): prefer the on-machine ratio, fall back to
+            #     compared_speedup only when speedup is missing.
+            #   - "compared_speedup": prefer the vs-baseline ratio, fall back to
+            #     the on-machine ratio when compared_speedup is missing.
+            # Without --base-data, compared_speedup is always None, so only the
+            # on-machine speedup is available regardless of the option.
+            # "origin" names the on-machine gems-vs-torch ratio (res["speedup"]);
+            # "nv_baseline" names the vs-baseline ratio (res["compared_speedup"],
+            # only present when --base-data matched). CFG.speedup_source picks
+            # which one to prefer; the other is a fallback. speedup_source below
+            # records the source actually used after fallback, so each shape says
+            # where its number came from.
+            measured = res.get("speedup", 0.0)
             compared = res.get("compared_speedup", None)
-            if compared is not None:
-                speedup = compared
+            if getattr(CFG, "speedup_source", "origin") == "nv_baseline":
+                if compared is not None:
+                    speedup, used = compared, "nv_baseline"
+                else:
+                    speedup, used = measured, "origin"
+            else:
+                if measured is not None:
+                    speedup, used = measured, "origin"
+                else:
+                    speedup, used = compared, "nv_baseline"
             # Latency-only records (no reference implementation on this
             # machine) carry speedup=None. Keep the None per shape and leave it
-            # out of the mean instead of counting it as 0.
+            # out of the mean instead of counting it as 0; its source is unknown.
+            if speedup is None:
+                used = None
             details[shape]["speedup"] = speedup
+            details[shape]["speedup_source"] = used
             miss = res.get("base_miss_reason", None)
             if miss:
                 details[shape]["base_miss_reason"] = miss
@@ -1494,6 +1516,20 @@ def main():
         ),
     )
     parser.add_argument(
+        "--speedup-source",
+        choices=["origin", "nv_baseline"],
+        default="nv_baseline",
+        help=(
+            "Which ratio summary.json reports per shape when --base-data is set. "
+            "'origin' (default): prefer the on-machine gems-vs-torch speedup and "
+            "fall back to the vs-baseline ratio only when the on-machine one is "
+            "absent. 'nv_baseline': prefer the vs-baseline ratio and fall back to "
+            "the on-machine speedup. Without --base-data only the on-machine ratio "
+            "exists, so this option has no effect. Each shape's "
+            "'speedup_source' field records the source actually used."
+        ),
+    )
+    parser.add_argument(
         "--color",
         choices=["auto", "always", "never"],
         default="auto",
@@ -1503,6 +1539,7 @@ def main():
     CFG.dump_output = OPTS.dump_output
     CFG.start = OPTS.start
     CFG.base_data = resolve_base_data_path(OPTS.base_data)
+    CFG.speedup_source = OPTS.speedup_source
 
     # Apply color mode (IS_TTY controls cursor-based footer, USE_COLORS controls ANSI colors)
     global USE_COLORS, RED, GREEN, YELLOW, CYAN, DIM, NC

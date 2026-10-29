@@ -8,7 +8,6 @@ import torch
 import flaggems_vllm
 
 OP = "fused_recurrent_gated_delta_rule_packed_decode"
-pytestmark = pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHAPES = [
     (1, 1, 1, 1, 1),
@@ -97,6 +96,7 @@ def _assert_result(inputs, expected, dtype):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("fp32_state", [False, True])
 @pytest.mark.parametrize("normalize,strided", [(False, False), (True, True)])
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 def test_packed_decode(entry, shape, dtype, fp32_state, normalize, strided):
     data = _make_inputs(
         shape,
@@ -113,6 +113,7 @@ def test_packed_decode(entry, shape, dtype, fp32_state, normalize, strided):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 def test_multistep_and_beta_rounding(dtype):
     data = _make_inputs((3, 1, 2, 17, 23), dtype, torch.float32, flaggems_vllm.device)
     ref_data = dict(data)
@@ -154,6 +155,7 @@ def test_multistep_and_beta_rounding(dtype):
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
 
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 def test_empty_and_metadata_errors():
     fn = getattr(flaggems_vllm.ops, OP)
     data = _make_inputs(
@@ -181,6 +183,7 @@ def test_empty_and_metadata_errors():
 )
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 def test_native_vllm(dtype, strided):
     from vllm.model_executor.layers.fla.ops.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode as native,
@@ -203,6 +206,7 @@ def test_native_vllm(dtype, strided):
 @pytest.mark.parametrize("entry", ["generic", "top"])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", [(9, 4, 12, 64, 32), (1, 16, 64, 128, 128)])
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 def test_parallel_multistep_state_updated_once(entry, dtype, shape):
     # 108/256 logical tasks exceed Ascend 910B1's 48 Vector cores. Task zero
     # must remain valid: invalid first rows can hide duplicate execution.
@@ -233,6 +237,7 @@ def test_parallel_multistep_state_updated_once(entry, dtype, shape):
     reason="GPU metadata fast path",
 )
 @pytest.mark.parametrize("entry", ["generic", "top"])
+@pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
 def test_gpu_metadata_revalidated(entry):
     # Warm calls must revalidate metadata, rather than cache tensor identity.
     data = _make_inputs(

@@ -35,7 +35,7 @@ AI 不能跳过以下 gate。
 | Gate | 通过条件 | 失败处理 |
 | --- | --- | --- |
 | G0 任务输入 | 当前任务输入只需包含 `torch` API 和官方参考链接/版本 | 用户不再补其他字段；AI 自行补齐其余任务事实，不能直接写代码 |
-| G1 项目真相 | editable/read-only、build、validation、benchmark、active set、autotune、profiler 已冻结 | 不允许比较性能 |
+| G1 工程基线 | editable/read-only、build、validation、benchmark、active set、autotune、profiler 已冻结 | 不允许比较性能 |
 | G2 `torch` 契约 | dtype matrix、shape、layout、promotion、边界语义、unsupported scope 已写清 | 不允许实现 |
 | G3 路径设计 | fast/special/general/unsupported/external-library path 已定义；无 torch compute fallback | 不允许写 kernel |
 | G4 实现集成 | ops、tune config、test、benchmark、导出、注册已完成或说明不需要 | 不允许验收 |
@@ -118,9 +118,9 @@ PY
 
 ## 4. 编码前必须输出三张表
 
-进入实现前，AI 必须输出以下三张表。未知项写“未知 + 当前假设”，不能省略。
+进入实现前，AI 必须输出以下三张设计规格表。未知项写“未知 + 当前假设”，不能省略。
 
-### 4.1 项目真相表
+### 4.1 工程基线表
 
 | 字段 | 内容 |
 | --- | --- |
@@ -137,7 +137,7 @@ PY
 | Autotune | libtuner 配置名、key/strategy、候选参数、`tune_configs.yaml` 更新计划或豁免 |
 | Fallback policy | 默认 `NO_TORCH_COMPUTE_FALLBACK`；任何例外必须列出 |
 
-### 4.2 `torch` 对齐契约
+### 4.2 `torch` 对齐规范表
 
 | 字段 | 内容 |
 | --- | --- |
@@ -152,7 +152,7 @@ PY
 | Unsupported scope | 本阶段明确不覆盖的路径与处理方式 |
 | Reference-only torch use | 哪些测试/benchmark 会调用 torch；确认生产路径不调用 |
 
-### 4.3 实现路径表
+### 4.3 实现路径设计表
 
 | 路径 | 触发条件 | 实现方式 | Autotune/config | 测试 | Benchmark | 风险 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -173,9 +173,9 @@ PY
 2. 阅读 `optimization.md`。
 3. 阅读 `torch` 对应算子的官方文档和目标版本行为。
 4. 检查仓库内相近算子、测试、benchmark 和 libtuner 接入方式。
-5. 冻结项目真相表。
+5. 冻结工程基线表。
 
-### Step 2. 冻结 `torch` 对齐契约
+### Step 2. 冻结 `torch` 对齐规范表
 
 必须先写出 dtype matrix、shape/output rules、promotion、NaN/Inf、异常、autograd、unsupported scope。
 

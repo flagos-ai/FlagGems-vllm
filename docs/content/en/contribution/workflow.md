@@ -13,7 +13,7 @@ The protocol defines **hard gates (G0–G7)** that must be passed when adding or
 
 - **G0**: Task clarity and protocol acknowledgment
 - **G1**: NO_TORCH_COMPUTE_FALLBACK verification
-- **G2**: Pre-coding tables completed
+- **G2**: Pre-coding design tables completed (Engineering Baseline, Torch Alignment Specification, Implementation Path Design)
 - **G3**: Host dispatch design
 - **G4**: Autotune integration
 - **G5**: Implementation complete
@@ -39,21 +39,21 @@ Allowed:
 
 Unsupported configurations must raise `NotImplementedError`, not fall back to torch.
 
-### 2. Pre-Coding Tables
+### 2. Pre-Coding Design Tables
 
-Before writing code, create three tables:
+Before writing code, create three design tables:
 
-#### Project Truth Table
+#### Engineering Baseline Table
 - Operator name, torch signature, vLLM usage context
 - Input/output specs (shapes, dtypes, devices)
 - Performance targets
 
-#### Torch Contract Table
+#### Torch Alignment Specification Table
 - What torch reference behavior to match
 - Tolerance specifications (rtol, atol)
 - Edge cases (empty, NaN, inf)
 
-#### Implementation Path Table
+#### Implementation Path Design Table
 - Workload classification (shape/dtype/device)
 - Routing strategy
 - Unsupported paths (raise NotImplementedError)
@@ -291,6 +291,6 @@ The protocol is written in Chinese but is the authoritative source for all opera
 ## Next Steps
 
 - [Read workflow.md](https://github.com/flagos-ai/FlagGems-vllm/blob/main/workflow.md)
-- [Contribution overview](overview/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Benchmark guide](/FlagGems-vllm/performance/benchmark/)
+- [Contribution overview](overview.md)
+- [Testing guide](../testing/unittest.md)
+- [Benchmark guide](../performance/benchmark.md)

@@ -23,6 +23,17 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+gdn_w8a16:
+  shapes:
+    - [1, 1, 2, 4, 128, 128]
+    - [32, 1, 2, 4, 128, 128]
+    - [128, 1, 2, 6, 128, 128]
+    - [1024, 1, 2, 6, 128, 128]
+    - [8192, 1, 2, 6, 128, 128]
+    - [1, 8, 2, 4, 128, 128]
+    - [2, 192, 2, 6, 128, 128]
+    - [16, 128, 2, 4, 128, 128]
+  shape_desc: "N, T, H, HV, K, V"
 
 concat_mla_q:
   shapes:
@@ -535,6 +546,12 @@ swiglu:
     - [2560, 2048]
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
+
+fused_allreduce_rms_norm:
+  shapes:
+    - [6, 6144]
+    - [138, 6144]
+  shape_desc: "M, H"
 
 bmm_w8a8:
   shapes:
