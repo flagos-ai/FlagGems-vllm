@@ -6,7 +6,12 @@ from flaggems_vllm.ops.FLA.bwd_preprocess import parallel_attn_bwd_preprocess
 from flaggems_vllm.ops.FLA.chunk import chunk_gated_delta_rule_fwd
 from flaggems_vllm.ops.FLA.chunk_gdn2 import chunk_gdn2
 from flaggems_vllm.ops.FLA.chunk_kda import chunk_kda
-from flaggems_vllm.ops.FLA.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
+from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
+    fused_recurrent_gated_delta_rule_fwd,
+)
+from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule_packed_decode import (
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
 from flaggems_vllm.ops.FLA.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -23,6 +28,7 @@ __all__ = [
     "chunk_gdn2",
     "chunk_kda",
     "fused_recurrent_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
     "log",
     "parallel_attn_bwd_preprocess",
     "parallel_nsa",

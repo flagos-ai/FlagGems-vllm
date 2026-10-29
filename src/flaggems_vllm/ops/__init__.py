@@ -45,6 +45,7 @@ from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
     chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
+    fused_recurrent_gated_delta_rule_packed_decode,
 )
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
@@ -283,6 +284,7 @@ __all__ = [
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gather_rows",

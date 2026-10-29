@@ -618,7 +618,9 @@ ops:
       - beta: '5.3'
   - id: fused_recurrent_gated_delta_rule_fwd
     description: |
-      The forward case for `fused_recurrent_gated_delta_rule` used in Flash Linear Attention (FLA).
+      Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
+      variable-length sequences and speculative-decoding state tables.
+      Supports FP16/BF16/FP32; non-inplace mode returns per-token states.
     for:
       - fused_recurrent_gated_delta_rule_fwd
     labels:
@@ -629,6 +631,16 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: fused_recurrent_gated_delta_rule_packed_decode
+    description: vLLM 0.24.0 packed single-token gated delta rule decode.
+    for:
+      - fused_recurrent_gated_delta_rule_packed_decode
+    labels:
+      - fused
+    kind:
+      - FLA
+    stages:
+      - alpha: '5.4'
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 state,

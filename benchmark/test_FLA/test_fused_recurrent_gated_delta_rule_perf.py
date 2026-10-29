@@ -1,191 +1,155 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""No-Graph, reset-outside-event recurrent GDN benchmark with independent oracle."""
+import importlib
+import importlib.util
+import inspect
+import json
+import os
+import statistics
+from pathlib import Path
 
 import pytest
 import torch
 
-import flaggems_vllm
-from benchmark.base import Benchmark
+import flaggems_vllm as gems
+from flaggems_vllm.runtime import torch_device_fn
+from tests.test_FLA.test_fused_recurrent_gated_delta_rule import (
+    assert_result,
+    build,
+    reference,
+)
 
-try:
-    from vllm.model_executor.layers.fla.ops import (
-        fused_recurrent_gated_delta_rule as base_fused_recurrent_gated_delta_rule,
-    )
-
-    VLLM_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency guard
-    base_fused_recurrent_gated_delta_rule = None
-    VLLM_AVAILABLE = False
-
-
-def rearrange_mixed_qkv(
-    mixed_qkv,
-    key_dim,
-    value_dim,
-    head_k_dim,
-    head_v_dim,
-    tp_size=1,
-    contiguous=True,
-):
-    query, key, value = torch.split(
-        mixed_qkv,
-        [
-            key_dim // tp_size,
-            key_dim // tp_size,
-            value_dim // tp_size,
-        ],
-        dim=-1,
-    )
-    query = query.view(1, query.shape[0], -1, head_k_dim)
-    key = key.view(1, key.shape[0], -1, head_k_dim)
-    value = value.view(1, value.shape[0], -1, head_v_dim)
-    if contiguous:
-        return query.contiguous(), key.contiguous(), value.contiguous()
-    else:
-        return query, key, value
+PERF_CASES = [
+    ("decode1", [1], 4, 8, 128, 128, "index", True, False),
+    ("decode16", [1] * 16, 4, 8, 128, 128, "index", True, False),
+    ("decode64", [1] * 64, 4, 8, 128, 128, "index", True, False),
+    ("decode256", [1] * 256, 4, 8, 128, 128, "index", True, False),
+    ("strided", [1] * 16, 4, 8, 128, 128, "index", True, True),
+    ("mtp", [4] * 8, 4, 8, 128, 128, "spec", True, False),
+    ("ragged", [1, 3, 2, 4], 2, 4, 64, 32, "table", True, True),
+    ("tail", [1] * 3, 2, 4, 17, 23, "index", True, True),
+]
 
 
-class FusedRecurrentGatedDeltaRuleBenchmark(Benchmark):
-    DEFAULT_DTYPES = [torch.bfloat16]
-
-    def __init__(self, qkv_contiguous: bool, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.qkv_contiguous = qkv_contiguous
-
-    def set_more_shapes(self):
-        # Test the full set of sequence lengths we saw from the runtime prints
-        return [
-            (1,),
-            (2,),
-            (4,),
-            (8,),
-            (16,),
-            (24,),
-            (32,),
-            (40,),
-            (48,),
-            (56,),
-            (72,),
-            (80,),
-            (88,),
-            (96,),
-            (104,),
-            (112,),
-            (120,),
-            (128,),
-            (136,),
-            (144,),
-            (152,),
-            (160,),
-            (168,),
-            (176,),
-            (192,),
-            (200,),
-            (208,),
-            (216,),
-            (224,),
-            (232,),
-            (240,),
-            (248,),
-            (272,),
-            (288,),
-            (304,),
-            (320,),
-            (336,),
-            (352,),
-            (368,),
-            (384,),
-            (400,),
-            (416,),
-            (432,),
-            (448,),
-            (464,),
-            (480,),
-            (496,),
-        ]
-
-    def get_input_iter(self, cur_dtype):
-        for (T,) in self.shapes:
-            yield self._build_inputs(T, cur_dtype)
-
-    def _build_inputs(self, T: int, dtype: torch.dtype):
-        device = flaggems_vllm.device
-        B = 1
-        H, HV, K, V = 16, 32, 128, 128
-        tp_size = 4
-        key_dim = H * K
-        value_dim = HV * V
-
-        assert key_dim % tp_size == 0 and value_dim % tp_size == 0
-
-        mixed_qkv_dim = (2 * key_dim + value_dim) // tp_size
-        total_tokens = B * T
-        mixed_qkv = torch.randn(
-            (total_tokens, mixed_qkv_dim), device=device, dtype=dtype
-        )
-
-        q, k, v = rearrange_mixed_qkv(
-            mixed_qkv,
-            key_dim=key_dim,
-            value_dim=value_dim,
-            head_k_dim=K,
-            head_v_dim=V,
-            tp_size=tp_size,
-            contiguous=self.qkv_contiguous,
-        )
-
-        HV_local = v.shape[2]
-        g = torch.nn.functional.logsigmoid(
-            torch.randn((B, T, HV_local), device=device, dtype=dtype)
-        )
-        beta = torch.rand(B, T, HV_local, device=device, dtype=dtype).sigmoid()
-        cu_seqlens = torch.arange(T + 1, device=device, dtype=torch.long)
-        initial_state = torch.zeros((1024, HV_local, K, V), device=device, dtype=dtype)
-        ssm_state_indices = torch.zeros(T, device=device, dtype=torch.long)
-        scale = 0.08838834764831845
-
-        # positional args follow fused_recurrent_gated_delta_rule_fwd signature
-        return (
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            initial_state,
-            True,
-            cu_seqlens,
-            ssm_state_indices,
-            None,
-            True,
-        )
-
-
-def _torch_op_wrapper(*args, **kwargs):
-    if VLLM_AVAILABLE:
-        return base_fused_recurrent_gated_delta_rule(*args, **kwargs)
-    return flaggems_vllm.ops_recurrent_gated_delta_rule_fwd(*args, **kwargs)
+def _measure(fn, data, state0):
+    for _ in range(5):
+        data["initial_state"].copy_(state0)
+        fn(**data)
+    torch_device_fn.synchronize()
+    samples = []
+    for _ in range(25):
+        data["initial_state"].copy_(state0)
+        torch_device_fn.synchronize()
+        start = torch_device_fn.Event(enable_timing=True)
+        end = torch_device_fn.Event(enable_timing=True)
+        start.record()
+        fn(**data)
+        end.record()
+        torch_device_fn.synchronize()
+        samples.append(start.elapsed_time(end))
+    return samples
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
-@pytest.mark.parametrize("qkv_contiguous", [False])
-def test_perf_fused_recurrent_gated_delta_rule(qkv_contiguous):
-    bench = FusedRecurrentGatedDeltaRuleBenchmark(
-        qkv_contiguous,
-        op_name="fused_recurrent_gated_delta_rule",
-        torch_op=_torch_op_wrapper,
+@pytest.mark.parametrize("case", PERF_CASES, ids=[c[0] for c in PERF_CASES])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("entry", ["generic", "top"])
+def test_perf_fused_recurrent_gated_delta_rule(case, dtype, entry):
+    data = build(case, dtype, gems.device)
+    state0 = data["initial_state"].clone()
+    expected = reference(data)
+    candidate = getattr(
+        gems.ops if entry == "generic" else gems, "fused_recurrent_gated_delta_rule_fwd"
     )
-    bench.set_gems(flaggems_vllm.ops_recurrent_gated_delta_rule_fwd)
-    bench.run()
+    row = dict(
+        case=case[0],
+        dtype=str(dtype),
+        entry=entry,
+        backend=gems.vendor_name,
+        graph=False,
+        unit="ms",
+        protocol="device-event-reset-outside-5warmup-25sample-median",
+        config={
+            k: (
+                dict(shape=list(v.shape), stride=list(v.stride()), dtype=str(v.dtype))
+                if isinstance(v, torch.Tensor)
+                else v
+            )
+            for k, v in data.items()
+        },
+        candidate_accuracy="NOT_RUN",
+        native_accuracy="NOT_RUN",
+        before_accuracy="NOT_RUN",
+    )
+    functions = {"gems": candidate}
+    try:
+        module = importlib.import_module(
+            "vllm.model_executor.layers.fla.ops.fused_recurrent"
+        )
+        native = module.fused_recurrent_gated_delta_rule
+        assert native is not candidate
+        row["native_file"] = inspect.getfile(native)
+        row["native_module"] = native.__module__
+        indices = data["ssm_state_indices"]
+        if indices.ndim == 2 and indices.stride(1) != 1:
+            # vLLM 0.24 reads table + row*stride(0) + token, ignoring
+            # stride(1). This caused device illegal accesses in the native
+            # baseline; retain the case, but never launch that unsafe path.
+            row["native_accuracy"] = "NOT_RUN"
+            row["native_error"] = (
+                "Unsupported token stride: native ignores stride_indices_tok; observed device illegal access"
+            )
+        else:
+            functions["native"] = native
+    except Exception as exc:
+        row["native_error"] = repr(exc)
+    before = os.environ.get("GDN_BEFORE")
+    if (
+        before
+        and entry == "generic"
+        and case[0] in ("decode1", "decode16", "decode64", "decode256")
+    ):
+        spec = importlib.util.spec_from_file_location("gdn_before", before)
+        old = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(old)
+        functions["before"] = old.fused_recurrent_gated_delta_rule_fwd
+    # Alternating per-case order avoids always warming one implementation first.
+    if case[0] in ("decode16", "decode256", "mtp", "tail"):
+        functions = dict(reversed(list(functions.items())))
+    candidate_error = None
+    for name, fn in functions.items():
+        data["initial_state"].copy_(state0)
+        key = "candidate_accuracy" if name == "gems" else name + "_accuracy"
+        try:
+            result = fn(**data)
+            assert_result(result, expected, dtype)
+            row[key] = "PASS"
+        except Exception as exc:
+            row[key] = "FAIL"
+            row[name + "_error"] = repr(exc)
+            if name == "gems":
+                candidate_error = exc
+        try:
+            # Invalid numerical results remain diagnostic, never valid scores.
+            values = _measure(fn, data, state0)
+            row[name + "_samples_ms"] = values
+            row[name + "_ms"] = statistics.median(values)
+        except Exception as exc:
+            row[name + "_timing_error"] = repr(exc)
+    if (
+        row["candidate_accuracy"] == "PASS"
+        and row["native_accuracy"] == "PASS"
+        and row.get("native_ms", 0) > 0
+        and row.get("gems_ms", 0) > 0
+    ):
+        row["native_speedup"] = row["native_ms"] / row["gems_ms"]
+        row["selected_source"] = "native"
+    else:
+        row["selected_source"] = None
+    target = os.environ.get("GDN_RESULTS")
+    if target:
+        with Path(target).open("a") as f:
+            f.write(json.dumps(row) + "\n")
+    if candidate_error is not None:
+        raise candidate_error
