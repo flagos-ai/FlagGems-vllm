@@ -26,7 +26,7 @@ try:
         from vllm_musa import _custom_ops as vendor_ops
 
         reference_fused_q_kv_rmsnorm = vendor_ops.deepseek_v4_fused_q_kv_rmsnorm
-    elif vendor in ["nvidia", "hygon"]:
+    elif vendor == "nvidia" or vendor == "hygon":
         from vllm.v1.attention.ops.deepseek_v4_ops import (
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
