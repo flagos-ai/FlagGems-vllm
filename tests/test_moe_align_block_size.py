@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 
@@ -377,3 +379,103 @@ def test_accuracy_moe_align_block_size_fast_paths(fast_path):
     torch.testing.assert_close(actual[0][:num_tokens], expected[0][:num_tokens])
     torch.testing.assert_close(actual[1][:num_blocks], expected[1][:num_blocks])
     torch.testing.assert_close(actual[2], expected[2])
+
+
+METAX_MOE_ALIGN_CASES = [
+    (1, 16),
+    (2, 16),
+    (7, 32),
+    (8, 32),
+    (31, 64),
+    (32, 64),
+    (63, 64),
+    (64, 64),
+    (127, 128),
+    (128, 128),
+    (1023, 128),
+    (1024, 128),
+    (2048, 128),
+]
+
+
+def _check_metax_moe_alignment(ids, block, outputs):
+    source = ids.cpu().reshape(-1).to(torch.int64)
+    sorted_ids, expert_ids, total = [t.cpu() for t in outputs]
+    n = source.numel()
+    counts = torch.bincount(source, minlength=512)
+    blocks = (counts + block - 1) // block
+    expected_total = int(blocks.sum()) * block
+    assert total.item() == expected_total
+    expected_experts = torch.repeat_interleave(
+        torch.arange(512, dtype=torch.int32), blocks
+    )
+    assert torch.equal(expert_ids[: expected_experts.numel()], expected_experts)
+    assert torch.all(expert_ids[expected_experts.numel() :] == -1)
+    positions = sorted_ids[:expected_total].to(torch.int64)
+    valid = positions < n
+    assert torch.all(positions >= 0) and torch.all(positions <= n)
+    assert torch.equal(torch.sort(positions[valid]).values, torch.arange(n))
+    if n:
+        assigned = torch.repeat_interleave(expected_experts, block).to(torch.int64)
+        assert torch.equal(source[positions[valid]], assigned[valid])
+    assert torch.all(sorted_ids[expected_total:] == n)
+
+
+@pytest.mark.moe_align_block_size_triton
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch regression"
+)
+@pytest.mark.parametrize("shape_block", METAX_MOE_ALIGN_CASES)
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("concentrated", [False, True])
+def test_metax_moe_align_inplace_dispatch_and_graph(
+    shape_block, dtype, concentrated, monkeypatch
+):
+    m = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
+    attempted = []
+
+    class Forbidden:
+        def __getitem__(self, key):
+            attempted.append(key)
+            raise AssertionError("Unsupported TLE route must not be attempted")
+
+    monkeypatch.setattr(m, "moe_align_block_size_tle_atomic_fused_coop", Forbidden())
+    monkeypatch.setattr(m, "moe_align_block_size_tle_cluster_fused", Forbidden())
+    rows, block = shape_block
+    ids = torch.randint(0, 512, (rows, 10), device="cuda", dtype=dtype)
+    if concentrated:
+        ids.remainder_(3)
+    capacity = ids.numel() + 512 * (block - 1)
+    if ids.numel() < 512:
+        capacity = min(capacity, ids.numel() * block)
+    outputs = (
+        torch.empty(capacity, device="cuda", dtype=torch.int32),
+        torch.empty((capacity + block - 1) // block, device="cuda", dtype=torch.int32),
+        torch.empty(1, device="cuda", dtype=torch.int32),
+    )
+
+    def run():
+        return flaggems_vllm.moe_align_block_size_triton(ids, 512, block, *outputs)
+
+    for _ in range(2):
+        run()
+    _check_metax_moe_alignment(ids, block, outputs)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for shift in [1, 17, 509]:
+        ids.copy_(
+            (
+                torch.arange(rows * 10, device="cuda", dtype=dtype).reshape(rows, 10)
+                + shift
+            )
+            % (3 if concentrated else 512)
+        )
+        graph.replay()
+        _check_metax_moe_alignment(ids, block, outputs)
+    assert attempted == []
