@@ -40,14 +40,9 @@ weight: 10
 
 ## 2. 设备隔离与可见性 {#device-visibility}
 
-在多人共享的加速卡节点上运行单元测试或性能测试时，建议指定特定设备运行。FlagGems-vllm 依赖各后端厂商的可见性环境变量来完成设备隔离。可见性变量必须在进程启动**之前**设置：
+在多人共享的加速卡节点上运行单元测试或性能测试时，建议指定特定设备运行。FlagGems-vllm 依赖各后端厂商的可见性环境变量来完成设备隔离，可见性变量必须在进程启动**之前**设置。
 
-| 后端 | 厂商名 | 环境变量 | 说明 |
-| --- | --- | --- | --- |
-| NVIDIA | `nvidia` | `CUDA_VISIBLE_DEVICES` | 如 `CUDA_VISIBLE_DEVICES=0 pytest tests/` |
-| AMD | `amd` | `HIP_VISIBLE_DEVICES` | 如 `HIP_VISIBLE_DEVICES=0 pytest tests/` |
-| 昇腾 (Ascend) | `ascend` | `ASCEND_RT_VISIBLE_DEVICES` | 如 `ASCEND_RT_VISIBLE_DEVICES=0 pytest tests/` |
-| 摩尔线程 (Moore Threads) | `mthreads` | `MUSA_VISIBLE_DEVICES` | 如 `MUSA_VISIBLE_DEVICES=0 pytest tests/` |
+各硬件后端对应的可见性环境变量配置与详细说明，请参阅 FlagGems 官方文档：[设备隔离与可见性](https://flagos-ai.github.io/FlagGems/zh-cn/contribution/device-visibility/)。
 
 ## 3. 算子命名规范 {#operator-naming-conventions}
 
@@ -55,7 +50,7 @@ FlagGems-vllm 专为存放 vLLM 仓库的特化与融合算子而设立，**不�
 
 - 采用 `snake_case` 命名风格（例如 `grouped_topk`、`moe_align_block_size`、`fused_inv_rope_fp8_quant`）；
 - 算子名称直接保持与 vLLM 现有算子 API 或模型层命名一致；
-- 算子名称不得以前缀下划线开头（除非为显式私有实现或 in-place 算子）；
+- 算子名称不得以下划线开头（算子名称需与测试采用的自定义 marker 严格对应，由于 pytest marker 规则的限制，不允许包含前缀下划线）；
 - 算子名称中不得包含点号；
 - 测试文件与基准测试文件命名必须与算子保持一致（`tests/test_<op>.py`、`benchmark/test_<op>.py`）。
 

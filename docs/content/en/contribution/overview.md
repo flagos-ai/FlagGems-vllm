@@ -40,14 +40,9 @@ In pull requests, contributors should describe what changed and why. Please also
 
 ## 2. Device Isolation and Visibility {#device-visibility}
 
-On a node shared by multiple users or GPUs, you usually want a test or benchmark run to use only a subset of the available devices. FlagGems-vllm relies on each backend vendor's visibility environment variable to do the isolation. Visibility variables must be set **before** the process starts:
+On a node shared by multiple users or GPUs, you usually want a test or benchmark run to use only a subset of the available devices. FlagGems-vllm relies on each backend vendor's visibility environment variable to do the isolation. Visibility variables must be set **before** the process starts.
 
-| Backend | Vendor name | Variable | Example |
-| --- | --- | --- | --- |
-| NVIDIA | `nvidia` | `CUDA_VISIBLE_DEVICES` | `CUDA_VISIBLE_DEVICES=0 pytest tests/` |
-| AMD | `amd` | `HIP_VISIBLE_DEVICES` | `HIP_VISIBLE_DEVICES=0 pytest tests/` |
-| Ascend | `ascend` | `ASCEND_RT_VISIBLE_DEVICES` | `ASCEND_RT_VISIBLE_DEVICES=0 pytest tests/` |
-| Moore Threads | `mthreads` | `MUSA_VISIBLE_DEVICES` | `MUSA_VISIBLE_DEVICES=0 pytest tests/` |
+For the list of visibility environment variables and details across different hardware backends, please refer to the FlagGems documentation: [Device Isolation and Visibility](https://flagos-ai.github.io/FlagGems/en/contribution/device-visibility/) (or Chinese: [设备隔离与可见性](https://flagos-ai.github.io/FlagGems/zh-cn/contribution/device-visibility/)).
 
 ## 3. Operator Naming Conventions {#operator-naming-conventions}
 
@@ -55,7 +50,7 @@ FlagGems-vllm specifically hosts specialized and fused operators for the vLLM re
 
 - Use `snake_case` naming style (e.g., `grouped_topk`, `moe_align_block_size`, `fused_inv_rope_fp8_quant`);
 - Keep names consistent with vLLM operator APIs or model layer naming;
-- Operator names cannot start with an underscore (unless explicitly marked as a private implementation or in-place variant);
+- Operator names cannot start with an underscore (as operator names correspond directly to custom pytest markers, which cannot begin with an underscore due to pytest marker rules);
 - Operator names must not contain dots;
 - Functional test and benchmark filenames must strictly match the operator name (`tests/test_<op>.py`, `benchmark/test_<op>.py`).
 
