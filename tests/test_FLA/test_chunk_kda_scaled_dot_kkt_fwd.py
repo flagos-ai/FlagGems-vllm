@@ -267,6 +267,7 @@ def test_unsupported(bad):
 def test_export():
     op = gems.chunk_kda_scaled_dot_kkt_fwd
     assert op is gems.ops.chunk_kda_scaled_dot_kkt_fwd
+    assert op is gems.ops.FLA.chunk_kda_scaled_dot_kkt_fwd
     assert ("chunk_kda_scaled_dot_kkt_fwd", op) in gems._FULL_CONFIG
 
 

@@ -15,7 +15,7 @@ from flaggems_vllm.runtime import torch_device_fn
 
 spec = importlib.util.spec_from_file_location(
     "kda_kkt_workload",
-    Path(__file__).parents[1] / "baseline/chunk_kda_scaled_dot_kkt_fwd.py",
+    Path(__file__).resolve().parents[2] / "baseline/chunk_kda_scaled_dot_kkt_fwd.py",
 )
 workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
