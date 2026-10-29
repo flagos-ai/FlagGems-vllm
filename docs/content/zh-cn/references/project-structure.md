@@ -129,7 +129,6 @@ tools/
 ## 开发协议规范 (`workflow.md`)
 
 强制性算子开发协议规范，设有严格的门禁（G0–G7）：
-- 编码前三张设计表（工程基线、vLLM 对齐规范、实现路径设计）
 - NO_TORCH_COMPUTE_FALLBACK 无 PyTorch 计算回退规则
 - 自动调优要求
 - 测试与性能验收标准

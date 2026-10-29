@@ -129,8 +129,6 @@ FlagGems-vllm 在 `conf/operators.yaml` 中维护所有算子的元数据清单�
    - 在 `benchmark/test_<op>.py` 中编写基准测试用例；
    - 在 `benchmark/core_shapes.yaml` 录入典型核心形状；
    - **性能验收标准**：在 NVIDIA H100 等目标设备上，核心形状的加速比达到 **SpeedUp ≥ 0.9**。
-7. **设计表记录与协议遵从**：
-   - 必须遵循仓库根目录 `workflow.md`，在编码前梳理并记录三张设计表（工程基线表、vLLM 对齐规范表、实现路径设计表）。
 
 ### 标准文件落点清单
 
@@ -251,4 +249,4 @@ pre-commit run --all-files
 
 ## 10. 算子开发协议规范 {#development-protocol}
 
-算子开发与优化必须严格遵从仓库根目录的 `workflow.md` 执行协议（硬门禁 G0–G7 与三张设计表）。详见[算子开发协议规范](workflow.md)。
+算子开发与优化必须遵从仓库根目录的 `workflow.md` 执行协议。详见[算子开发协议规范](workflow.md)。

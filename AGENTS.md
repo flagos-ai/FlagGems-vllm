@@ -216,7 +216,7 @@ do not need to align with PyTorch (general PyTorch ops belong in FlagGems).
 Operators align directly with vLLM operators, native CUDA/C++ kernels, or model
 reference implementations.
 
-It defines hard gates (G0–G7), the required pre-coding tables, and
+It defines hard gates (G0–G7) and the
 acceptance/delivery format. Key rules an agent MUST honor:
 
 1. **No torch compute fallback** (`NO_TORCH_COMPUTE_FALLBACK = true`).

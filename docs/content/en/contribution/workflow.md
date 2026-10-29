@@ -28,49 +28,13 @@ FlagGems-vllm follows a strict operator development protocol defined in `workflo
 All operator addition and modification tasks must satisfy the following hard gates:
 
 - **G0 (Task Clarity & Protocol Acknowledgment)**: Clarify task scope, confirm the operator belongs to vLLM-specific fused kernels, and commit to following the protocol;
-- **G1 (NO_TORCH_COMPUTE_FALLBACK Verification)**: Production paths allow calling memory operators (`empty`, `zeros`, etc.) and creation/copy operators (`contiguous`, `clone`, `copy_`, etc.), but strictly forbid calling PyTorch operators to implement computation;
-- **G2 (Pre-coding Design Tables)**: Before writing code, complete the Engineering Baseline, vLLM Alignment Specification, and Implementation Path Design tables;
-- **G3 (Host Dispatch & Boundary Checks)**: Implement host dispatch with strict shape, stride, dtype, and device validation, explicitly raising `NotImplementedError` for unsupported cases;
-- **G4 (Autotune Integration)**: Any operator with performance parameters must provide tuned configurations in NVIDIA backend and integrate with `@libtuner`;
-- **G5 (Implementation Complete)**: Implement host dispatch, `@triton.jit` kernels, and public exports (`ops/__init__.py` and `flaggems_vllm/__init__.py`);
-- **G6 (Functional Tests Pass)**: `tests/test_<op>.py` passes 100% in both `--quick` and full test modes;
-- **G7 (Performance Acceptance)**: Core shape benchmarks in `benchmark/test_<op>.py` achieve **SpeedUp ≥ 0.9**.
-
-## Pre-Coding Design Tables
-
-Before implementing an operator, contributors must complete and record three design tables:
-
-### 1. Engineering Baseline Table
-
-| Field | Requirements |
-| --- | --- |
-| Operator Name & ID | Operator API name, matching `id` in `conf/operators.yaml` |
-| Function Signature | Complete input parameters and return type specification |
-| vLLM Context | Target model architecture and layer (e.g. DeepSeek-V3 MoE, PagedAttention) |
-| Dependencies | Internal dependencies (FlagGems operators) or external libraries |
-| Target Backend | Default NVIDIA, or specific heterogeneous hardware backends |
-| Performance Target | Acceptance criterion: core shape SpeedUp `SpeedUp >= 0.9` |
-
-### 2. vLLM Alignment Specification Table
-
-> [!NOTE]
-> FlagGems-vllm stores vLLM operators and does not accept general PyTorch operators; therefore, alignment with PyTorch is not required. Operators align against vLLM native C++/CUDA extensions, Triton kernels, or model reference implementations.
-
-| Field | Requirements |
-| --- | --- |
-| Reference Baseline | vLLM native C++/CUDA extension, Triton kernel, or model reference implementation |
-| Floating-Point Tolerance | Explicit `rtol` and `atol` thresholds for FP32/FP16/BF16/FP8 |
-| Edge Cases & Special Values | Handling for empty tensors, extreme dimensions, NaN, Inf |
-| Layout & Contiguity | Supported strides and memory layout (contiguous can be ensured via `contiguous()`) |
-
-### 3. Implementation Path Design Table
-
-| Field | Requirements |
-| --- | --- |
-| Workload Classification | Branching logic for Prefill vs Decode phases or batch size tiers |
-| Kernel Architecture Strategy | Single fused Triton kernel or composition with FlagGems operators |
-| Autotune Search Space | Candidate space for `BLOCK_*`, `num_warps`, `num_stages` |
-| Unsupported Scope | Explicit conditions raising `NotImplementedError` |
+- **G1 (Engineering Baseline & Environment)**: Freeze build and test commands, validation set, and benchmark environment;
+- **G2 (vLLM Operator Contract)**: Clarify dtype matrix, shape, layout, promotion, boundary semantics, and unsupported scope (aligning with vLLM native kernels or model references, no PyTorch alignment required);
+- **G3 (Path Design & Host Dispatch)**: Define fast/special/general/unsupported paths, design host dispatch and defensive checks, strictly obeying `NO_TORCH_COMPUTE_FALLBACK`;
+- **G4 (Implementation & Integration)**: Complete metadata registration (`conf/operators.yaml`), host dispatch and Triton JIT kernels, autotune configuration (`tune_configs.yaml`), tests, and public exports;
+- **G5 (Functional Tests Pass)**: `tests/test_<op>.py` passes 100% in both `--quick` and full test modes;
+- **G6 (Performance Acceptance)**: Core shape benchmarks in `benchmark/test_<op>.py` achieve **SpeedUp ≥ 0.9**;
+- **G7 (Complete Delivery)**: Output delivery summary detailing paths, autotune configuration, test results, and residual risks.
 
 ## Static Audit Requirements
 

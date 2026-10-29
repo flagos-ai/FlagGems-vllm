@@ -129,8 +129,6 @@ Before developing a new operator, check `conf/operators.yaml` to ensure it does 
    - Add benchmark test cases in `benchmark/test_<op>.py`;
    - Record representative core shapes in `benchmark/core_shapes.yaml`;
    - **Performance target**: Achieve **SpeedUp ≥ 0.9** on target devices (e.g., NVIDIA H100) for core shapes.
-7. **Design tables and protocol compliance**:
-   - Follow `workflow.md` at the repo root and document the three pre-coding design tables (Engineering Baseline, vLLM Alignment Specification, Implementation Path Design).
 
 ### Standard File Drop Points
 
@@ -252,4 +250,4 @@ Add performance benchmarks in `benchmark/test_<op>.py`:
 
 ## 10. Operator Development Protocol {#development-protocol}
 
-Operator implementation and modifications must adhere to the mandatory protocol defined in `workflow.md` (gates G0–G7 and pre-coding design tables). See [Operator Development Protocol](workflow.md).
+Operator implementation and modifications must adhere to the mandatory protocol defined in `workflow.md` (quality gates G0–G6). See [Operator Development Protocol](workflow.md).
