@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged MLA decode: dispatch, sparse distributions and address safety."""
+"""Paged MLA: decode/prefill, sparse distributions and address safety."""
 
 import importlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -23,11 +24,14 @@ import torch
 import flaggems_vllm
 from tests.sparse_flash_attention_utils import (
     CASES,
+    GLM_CASES,
+    GLM_PHASES,
     MODES,
     contract_cpu_reference,
     cpu_reference,
     load_vllm_sfa,
     make_contract_inputs,
+    make_glm_inputs,
     make_inputs,
     vllm_reference,
 )
@@ -96,9 +100,14 @@ def test_sparse_flash_attention_mutated_inputs_and_workspace_reuse(batch):
 
 
 @pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize(
+    "heads", [pytest.param(4, marks=pytest.mark.glm), 128], ids=["h4", "h128"]
+)
 @torch.inference_mode()
-def test_sparse_flash_attention_large_physical_offset(batch):
+def test_sparse_flash_attention_large_physical_offset(batch, heads):
     inputs = make_inputs((batch, 2560, 2560), "duplicates", flaggems_vllm.device)
+    inputs["query"] = inputs["query"][:, :heads].contiguous()
+    inputs["query_rope"] = inputs["query_rope"][:, :heads].contiguous()
     # The last page starts at element 2**31; only its 128 rows are accessed.
     inputs["key"] = torch.empty(
         (32769, 128, 1, 512), dtype=torch.float16, device=flaggems_vllm.device
@@ -328,34 +337,7 @@ CONTRACT_CASES = (
 @torch.inference_mode()
 def test_sparse_flash_attention_vllm_contract(config):
     inputs = make_contract_inputs(flaggems_vllm.device, **config)
-    actual = flaggems_vllm.sparse_flash_attention(**inputs)
-    assert isinstance(actual, tuple) and len(actual) == 3
-    expected = contract_cpu_reference(inputs)
-    reference = load_vllm_sfa()(**inputs)
-    assert (
-        actual[0].shape == inputs["query"].shape
-        and actual[0].dtype == inputs["query"].dtype
-    )
-    for result in (actual[0], reference[0]):
-        torch.testing.assert_close(
-            result.float().cpu(), expected[0], atol=0.01, rtol=0.01, equal_nan=False
-        )
-    torch.testing.assert_close(
-        actual[0], reference[0], atol=0.01, rtol=0.01, equal_nan=False
-    )
-    for i in (1, 2):
-        assert (
-            actual[i].dtype == torch.float32 and actual[i].shape == reference[i].shape
-        )
-        if inputs["return_softmax_lse"]:
-            torch.testing.assert_close(
-                actual[i].cpu(), expected[i], atol=0.01, rtol=0.01, equal_nan=False
-            )
-            torch.testing.assert_close(
-                reference[i].cpu(), expected[i], atol=0.01, rtol=0.01, equal_nan=False
-            )
-        else:
-            assert actual[i].shape == (0,)
+    _assert_sfa_contract(inputs)
 
 
 def test_sparse_flash_attention_signature_matches_vllm():
@@ -502,10 +484,7 @@ def test_sparse_flash_attention_strided_native_rows(axis_pair):
             inputs["sparse_indices"][0].fill_(-1)
         if phase == 2:
             inputs["actual_seq_lengths_kv"].fill_(1024)
-        actual = flaggems_vllm.sparse_flash_attention(**inputs)
-        expected = load_vllm_sfa()(**inputs)
-        for a, b in zip(actual, expected):
-            torch.testing.assert_close(a, b, atol=0.01, rtol=0.01, equal_nan=False)
+        _assert_sfa_contract(inputs)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -525,7 +504,212 @@ def test_sparse_flash_attention_long_selection_updates(dtype):
             inputs["sparse_indices"].copy_(saved.flip(-1))
         elif phase == 3:
             inputs["actual_seq_lengths_kv"].fill_(1024)
-        actual = flaggems_vllm.sparse_flash_attention(**inputs)
-        expected = load_vllm_sfa()(**inputs)
-        for a, b in zip(actual, expected):
-            torch.testing.assert_close(a, b, atol=0.01, rtol=0.01, equal_nan=False)
+        _assert_sfa_contract(inputs)
+
+
+@pytest.mark.glm
+@pytest.mark.sparse_flash_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("phase", GLM_PHASES)
+@pytest.mark.parametrize("case", GLM_CASES, ids=lambda case: case.name)
+@torch.inference_mode()
+def test_sparse_flash_attention_glm_accuracy(case, phase, dtype):
+    inputs = make_glm_inputs(case, phase, flaggems_vllm.device, dtype)
+    actual = flaggems_vllm.sparse_flash_attention(**inputs)[0]
+    expected = vllm_reference(inputs)
+    assert inputs["value"] is inputs["key"]
+    assert actual.shape == inputs["query"].shape
+    assert actual.dtype == dtype and actual.device == inputs["query"].device
+    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01, equal_nan=False)
+
+
+def _assert_sfa_contract(inputs):
+    actual = flaggems_vllm.sparse_flash_attention(**inputs)
+    # Native paged statistics depend on which vendor implementation was loaded.
+    # Compare its attention output and check our statistics against the
+    # independent FP32 formula, including when paged native stats are unavailable.
+    return_stats = inputs.get("return_softmax_lse", False)
+    native_stats = return_stats and inputs["layout_kv"] != "PA_BSND"
+    reference = load_vllm_sfa()(**dict(inputs, return_softmax_lse=native_stats))
+    expected = contract_cpu_reference(
+        dict(inputs, sparse_block_size=inputs.get("sparse_block_size", 1))
+    )
+    assert isinstance(actual, tuple) and len(actual) == 3
+    assert actual[0].shape == inputs["query"].shape
+    assert actual[0].dtype == inputs["query"].dtype
+    torch.testing.assert_close(
+        actual[0], reference[0], atol=0.01, rtol=0.01, equal_nan=False
+    )
+    torch.testing.assert_close(
+        reference[0].float().cpu(), expected[0], atol=0.01, rtol=0.01, equal_nan=False
+    )
+    for index, (result, cpu) in enumerate(zip(actual, expected)):
+        assert result.device == inputs["query"].device
+        if index:
+            assert result.dtype == torch.float32
+            if not return_stats:
+                assert result.shape == reference[index].shape == (0,)
+                continue
+        assert result.shape == cpu.shape
+        torch.testing.assert_close(
+            result.float().cpu(), cpu, atol=0.01, rtol=0.01, equal_nan=False
+        )
+        if index and native_stats:
+            torch.testing.assert_close(
+                reference[index].float().cpu(),
+                cpu,
+                atol=0.01,
+                rtol=0.01,
+                equal_nan=False,
+            )
+
+
+GLM_CONTRACT_CASES = [
+    dict(heads=1, page_size=48, num_sparse_blocks=256, qlens=(1,), klens=(701,)),
+    dict(heads=2, page_size=48, num_sparse_blocks=257, qlens=(2,), klens=(701,)),
+    dict(heads=4, page_size=128, num_sparse_blocks=2048, qlens=(3,), klens=(4099,)),
+    dict(
+        heads=4,
+        page_size=128,
+        num_sparse_blocks=2048,
+        qlens=(0, 2, 0, 3),
+        klens=(4099, 4113, 0, 4201),
+    ),
+    dict(
+        heads=4,
+        page_size=128,
+        num_sparse_blocks=2048,
+        qlens=(7, 9),
+        klens=(4099, 4107),
+    ),
+    dict(
+        heads=4,
+        page_size=128,
+        num_sparse_blocks=2048,
+        query_layout="BSND",
+        qlens=(2, 3),
+        klens=(4099, 4113),
+    ),
+    dict(heads=8, page_size=128, num_sparse_blocks=2048, qlens=(1,), klens=(4099,)),
+    dict(heads=16, page_size=128, num_sparse_blocks=2048, qlens=(3,), klens=(4099,)),
+    dict(heads=32, page_size=64, num_sparse_blocks=2051, qlens=(4,), klens=(4113,)),
+    dict(heads=64, page_size=128, num_sparse_blocks=2048, qlens=(5,), klens=(4101,)),
+]
+
+
+@pytest.mark.glm
+@pytest.mark.sparse_flash_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "config",
+    GLM_CONTRACT_CASES,
+    ids=lambda config: (
+        f"h{config['heads']}-t{sum(config['qlens'])}-"
+        f"{config.get('query_layout', 'TND').lower()}"
+    ),
+)
+@torch.inference_mode()
+def test_sparse_flash_attention_glm_causal_padding_and_stats(config, dtype):
+    inputs = make_contract_inputs(
+        flaggems_vllm.device, **config, dtype=dtype, mode=3, return_softmax_stats=True
+    )
+    inputs["scale_value"] = 1.0 / math.sqrt(576)
+    _assert_sfa_contract(inputs)
+    inputs["sparse_indices"][..., -17:] = -1
+    inputs["sparse_indices"][-1].fill_(-1)
+    _assert_sfa_contract(inputs)
+
+
+@pytest.mark.glm
+@pytest.mark.sparse_flash_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("qlens", [(8, 9), (22, 23)], ids=["t17", "t45"])
+@torch.inference_mode()
+def test_sparse_flash_attention_glm_large_query_updates(dtype, qlens):
+    # T17 crosses the small-query boundary; T45 gives each of the 20 Cube
+    # cores two or three queries, exercising pipeline state reuse and tails.
+    # The requests have different page tables and KV lengths.
+    num_tokens = sum(qlens)
+    inputs = make_contract_inputs(
+        flaggems_vllm.device,
+        dtype=dtype,
+        heads=64,
+        page_size=128,
+        num_sparse_blocks=2048,
+        qlens=qlens,
+        klens=(2560, 2573),
+        mode=0,
+        return_softmax_stats=True,
+    )
+    inputs["scale_value"] = 1.0 / math.sqrt(576)
+    saved_indices = inputs["sparse_indices"].clone()
+    _assert_sfa_contract(inputs)
+
+    # Reuse every allocation while changing full selections to causal,
+    # partially padded and entirely padded selections.
+    inputs["sparse_mode"] = 3
+    inputs["sparse_indices"][..., -17:] = -1
+    inputs["sparse_indices"][0].fill_(-1)
+    _assert_sfa_contract(inputs)
+
+    inputs["query"].add_(0.015625)
+    inputs["query_rope"].sub_(0.03125)
+    inputs["key"].add_(0.0625)
+    inputs["key_rope"].sub_(0.015625)
+    inputs["block_table"].copy_(inputs["block_table"].roll(1, 1))
+    inputs["actual_seq_lengths_query"].copy_(
+        torch.tensor([3, num_tokens], dtype=torch.int32, device=flaggems_vllm.device)
+    )
+    inputs["actual_seq_lengths_kv"].copy_(
+        torch.tensor([1024, 0], dtype=torch.int32, device=flaggems_vllm.device)
+    )
+    _assert_sfa_contract(inputs)
+
+    # Return to full selections after masked execution, catching stale
+    # prepared indices, query metadata, and unreinitialized pipeline state.
+    inputs["sparse_mode"] = 0
+    inputs["sparse_indices"].copy_(saved_indices)
+    inputs["actual_seq_lengths_query"].copy_(
+        torch.tensor(
+            [qlens[0], num_tokens], dtype=torch.int32, device=flaggems_vllm.device
+        )
+    )
+    inputs["actual_seq_lengths_kv"].copy_(
+        torch.tensor([2560, 2573], dtype=torch.int32, device=flaggems_vllm.device)
+    )
+    _assert_sfa_contract(inputs)
+
+
+@pytest.mark.glm
+@pytest.mark.sparse_flash_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@torch.inference_mode()
+def test_sparse_flash_attention_glm_selection_tail(dtype):
+    inputs = make_contract_inputs(
+        flaggems_vllm.device,
+        dtype=dtype,
+        heads=32,
+        page_size=64,
+        num_sparse_blocks=2051,
+        qlens=(1,),
+        klens=(4160,),
+        mode=0,
+        return_softmax_stats=True,
+    )
+    # All entries are valid and distinct. Make the irregular tail dominate
+    # attention so truncating the last three entries cannot pass tolerance.
+    inputs["sparse_indices"][..., :2048] = torch.arange(
+        2048, dtype=torch.int32, device=flaggems_vllm.device
+    )
+    tail = torch.tensor(
+        [2050, 3000, 4159], dtype=torch.int64, device=flaggems_vllm.device
+    )
+    inputs["sparse_indices"][..., -3:] = tail.int()
+    inputs["query"].fill_(1)
+    inputs["query_rope"].zero_()
+    inputs["key"].zero_()
+    inputs["key_rope"].zero_()
+    physical = inputs["block_table"][0, tail // 64].long() * 64 + tail % 64
+    inputs["key"].view(-1, 512)[physical] = 0.5
+    inputs["scale_value"] = 1.0 / math.sqrt(576)
+    _assert_sfa_contract(inputs)

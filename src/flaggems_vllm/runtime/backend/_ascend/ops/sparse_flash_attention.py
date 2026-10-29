@@ -76,6 +76,15 @@ SOFTMAX_STATE_ROWS = SOFTMAX_ALPHA_STATE_BASE + NUM_PIPELINE_SLOTS
 PV_SYNC_EVENT_BASE = NUM_PIPELINE_SLOTS
 COMBINE_TWO_SPLITS = 2
 
+# Ascend schedules coordinate Cube and Vector stages explicitly. These fixed
+# schedules are validated on 910B; they do not modify NVIDIA autotune configs.
+SMALL_QUERY_MAX_TOKENS = 16
+SMALL_QUERY_HEAD_BLOCK = 16
+SMALL_QUERY_KV_BLOCK = 256
+SMALL_QUERY_MIN_SPARSE_ENTRIES = 256
+SMALL_QUERY_MAX_SPARSE_ENTRIES = 4096
+SMALL_PIPELINE_VECTOR_HEADS = 8
+
 # Existing fixed scheduling choices; their optimality is not established here.
 # The original commit couples the >=16-token choices; no threshold sweep
 # is recorded. Preserve the existing schedule instead of claiming a hardware rule.
@@ -582,6 +591,375 @@ def _sfa_general(
                 tl.where(softmax_sum > 0, softmax_sum, empty_row_softmax_sum),
                 head_indices < NUM_QUERY_HEADS,
             )
+
+
+@triton.jit
+def _sfa_small_gather(
+    KV,
+    KEY_ROPE,
+    SPARSE_INDICES,
+    BLOCK_TABLE,
+    GATHERED_KV,
+    GATHERED_KEY_ROPE,
+    ADDITIVE_ATTENTION_MASK,
+    KV_END_EXCLUSIVE,
+    QUERY_LENGTHS,
+    KV_LENGTHS,
+    NUM_SPARSE_BLOCKS: tl.constexpr,
+    PADDED_SPARSE_BLOCKS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_QUERY_TOKENS: tl.constexpr,
+    NUM_REQUESTS: tl.constexpr,
+    QUERY_SEQ_CAPACITY: tl.constexpr,
+    QUERY_IS_TND: tl.constexpr,
+    HAS_QUERY_LENGTHS: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    PAGES_PER_REQUEST: tl.constexpr,
+    GATHER_BLOCK_ROWS: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+    KV_ACCESS_SPEC: tl.constexpr = None,
+    KEY_ROPE_ACCESS_SPEC: tl.constexpr = None,
+):
+    MASKED_GATHER_BLOCK_ROWS: tl.constexpr = (
+        TL_WIDE_OFFSET_GATHER_ROWS
+        if GATHER_BLOCK_ROWS == TL_WIDE_OFFSET_GATHER_ROWS
+        else TL_MASKED_GATHER_ROWS
+    )
+    program_id = tl.program_id(0)
+    for token_idx in range(NUM_QUERY_TOKENS):
+        query_token_idx = token_idx.to(tl.int64)
+        request_idx, kv_end_exclusive, _ = _sfa_query_meta(
+            query_token_idx,
+            QUERY_LENGTHS,
+            KV_LENGTHS,
+            NUM_REQUESTS,
+            QUERY_SEQ_CAPACITY,
+            0,
+            QUERY_IS_TND,
+            False,
+            HAS_QUERY_LENGTHS,
+            True,
+            CAUSAL,
+        )
+        page_table_indices = tl.arange(0, triton.next_power_of_2(PAGES_PER_REQUEST))
+        request_page_table = tl.load(
+            BLOCK_TABLE + request_idx * PAGES_PER_REQUEST + page_table_indices,
+            mask=page_table_indices < PAGES_PER_REQUEST,
+            other=0,
+        )
+        if program_id == 0:
+            tl.store(KV_END_EXCLUSIVE + query_token_idx, kv_end_exclusive)
+        first_gather_block = (
+            program_id
+            + NUM_CORES
+            - (token_idx * (PADDED_SPARSE_BLOCKS // GATHER_BLOCK_ROWS)) % NUM_CORES
+        ) % NUM_CORES
+        for gather_block_idx in range(
+            first_gather_block, PADDED_SPARSE_BLOCKS // GATHER_BLOCK_ROWS, NUM_CORES
+        ):
+            sparse_positions = gather_block_idx * GATHER_BLOCK_ROWS + tl.arange(
+                0, GATHER_BLOCK_ROWS
+            )
+            logical_kv_indices = tl.load(
+                SPARSE_INDICES + query_token_idx * NUM_SPARSE_BLOCKS + sparse_positions,
+                sparse_positions < NUM_SPARSE_BLOCKS,
+                other=-1,
+            )
+            valid_kv_mask = (
+                (logical_kv_indices >= 0)
+                & (logical_kv_indices < kv_end_exclusive)
+                & (sparse_positions < kv_end_exclusive)
+            )
+            valid_kv_mask &= logical_kv_indices // PAGE_SIZE < PAGES_PER_REQUEST
+            tl.store(
+                ADDITIVE_ATTENTION_MASK
+                + query_token_idx * PADDED_SPARSE_BLOCKS
+                + sparse_positions,
+                tl.where(valid_kv_mask, 0.0, float("-inf")),
+            )
+            logical_kv_indices = tl.where(valid_kv_mask, logical_kv_indices, 0)
+            # Preserve int32 page-ID bits through float32 gather; this is
+            # not a numeric cast. The original lowering rationale is unverified.
+            physical_page_ids = tl.gather(
+                request_page_table.to(tl.float32, bitcast=True),
+                logical_kv_indices // PAGE_SIZE,
+                0,
+            ).to(tl.int32, bitcast=True)
+            physical_row_indices = (
+                physical_page_ids.to(tl.int64) * PAGE_SIZE
+                + logical_kv_indices % PAGE_SIZE
+            )
+            kv_columns = tl.arange(0, TL_KV_DIM)
+            rope_columns = tl.arange(0, TL_ROPE_DIM)
+            if tl.sum(valid_kv_mask.to(tl.int32), 0) == GATHER_BLOCK_ROWS:
+                kv_tile = _sfa_load_cache_rowblock(
+                    KV, physical_row_indices, kv_columns, TL_KV_DIM, KV_ACCESS_SPEC
+                )
+                key_rope_tile = _sfa_load_cache_rowblock(
+                    KEY_ROPE,
+                    physical_row_indices,
+                    rope_columns,
+                    TL_ROPE_DIM,
+                    KEY_ROPE_ACCESS_SPEC,
+                )
+                tl.store(
+                    GATHERED_KV
+                    + (
+                        query_token_idx * PADDED_SPARSE_BLOCKS
+                        + sparse_positions[:, None]
+                    )
+                    * TL_KV_DIM
+                    + kv_columns[None, :],
+                    kv_tile,
+                )
+                tl.store(
+                    GATHERED_KEY_ROPE
+                    + (
+                        query_token_idx * PADDED_SPARSE_BLOCKS
+                        + sparse_positions[:, None]
+                    )
+                    * TL_ROPE_DIM
+                    + rope_columns[None, :],
+                    key_rope_tile,
+                )
+
+            else:
+                for subblock_idx in range(
+                    GATHER_BLOCK_ROWS // MASKED_GATHER_BLOCK_ROWS
+                ):
+                    subblock_sparse_positions = (
+                        gather_block_idx * GATHER_BLOCK_ROWS
+                        + subblock_idx * MASKED_GATHER_BLOCK_ROWS
+                        + tl.arange(0, MASKED_GATHER_BLOCK_ROWS)
+                    )
+                    subblock_logical_kv_indices = tl.load(
+                        SPARSE_INDICES
+                        + query_token_idx * NUM_SPARSE_BLOCKS
+                        + subblock_sparse_positions,
+                        subblock_sparse_positions < NUM_SPARSE_BLOCKS,
+                        other=-1,
+                    )
+                    subblock_valid_kv_mask = (
+                        (subblock_logical_kv_indices >= 0)
+                        & (subblock_logical_kv_indices < kv_end_exclusive)
+                        & (subblock_sparse_positions < kv_end_exclusive)
+                    )
+                    subblock_valid_kv_mask &= (
+                        subblock_logical_kv_indices // PAGE_SIZE < PAGES_PER_REQUEST
+                    )
+                    subblock_logical_kv_indices = tl.where(
+                        subblock_valid_kv_mask, subblock_logical_kv_indices, 0
+                    )
+                    # Preserve int32 page-ID bits through float32 gather; this is
+                    # not a numeric cast. The original lowering rationale is unverified.
+                    subblock_physical_page_ids = tl.gather(
+                        request_page_table.to(tl.float32, bitcast=True),
+                        subblock_logical_kv_indices // PAGE_SIZE,
+                        0,
+                    ).to(tl.int32, bitcast=True)
+                    subblock_physical_row_indices = (
+                        subblock_physical_page_ids.to(tl.int64) * PAGE_SIZE
+                        + subblock_logical_kv_indices % PAGE_SIZE
+                    )
+                    subblock_kv_tile = _sfa_load_cache_rowblock(
+                        KV,
+                        subblock_physical_row_indices,
+                        kv_columns,
+                        TL_KV_DIM,
+                        KV_ACCESS_SPEC,
+                        subblock_valid_kv_mask,
+                    )
+                    tl.store(
+                        GATHERED_KV
+                        + (
+                            query_token_idx * PADDED_SPARSE_BLOCKS
+                            + subblock_sparse_positions[:, None]
+                        )
+                        * TL_KV_DIM
+                        + kv_columns[None, :],
+                        subblock_kv_tile,
+                    )
+                    subblock_key_rope_tile = _sfa_load_cache_rowblock(
+                        KEY_ROPE,
+                        subblock_physical_row_indices,
+                        rope_columns,
+                        TL_ROPE_DIM,
+                        KEY_ROPE_ACCESS_SPEC,
+                        subblock_valid_kv_mask,
+                    )
+                    tl.store(
+                        GATHERED_KEY_ROPE
+                        + (
+                            query_token_idx * PADDED_SPARSE_BLOCKS
+                            + subblock_sparse_positions[:, None]
+                        )
+                        * TL_ROPE_DIM
+                        + rope_columns[None, :],
+                        subblock_key_rope_tile,
+                    )
+
+
+@triton.jit
+def _sfa_small_attention(
+    QUERY,
+    QUERY_ROPE,
+    GATHERED_KV,
+    GATHERED_KEY_ROPE,
+    MASK,
+    PARTIAL_OUT,
+    PARTIAL_MAX,
+    PARTIAL_SUM,
+    NUM_QUERY_TOKENS: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    PADDED_SPARSE_BLOCKS: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    KV_BLOCK: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+    SOFTMAX_SCALE: tl.constexpr,
+):
+    HEAD_GROUPS: tl.constexpr = triton.cdiv(NUM_QUERY_HEADS, HEAD_BLOCK)
+    NUM_KV_BLOCKS: tl.constexpr = PADDED_SPARSE_BLOCKS // KV_BLOCK
+    for task in range(
+        tl.program_id(0), NUM_QUERY_TOKENS * HEAD_GROUPS * NUM_SPLITS, NUM_CORES
+    ):
+        split = task % NUM_SPLITS
+        hg = (task // NUM_SPLITS) % HEAD_GROUPS
+        token = (task // (NUM_SPLITS * HEAD_GROUPS)).to(tl.int64)
+        heads = hg * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+        cols = tl.arange(0, TL_KV_DIM)
+        q = tl.load(
+            QUERY
+            + (token * NUM_QUERY_HEADS + heads[:, None]) * TL_KV_DIM
+            + cols[None, :],
+            heads[:, None] < NUM_QUERY_HEADS,
+            other=0,
+        )
+        qr = tl.load(
+            QUERY_ROPE
+            + (token * NUM_QUERY_HEADS + heads[:, None]) * TL_ROPE_DIM
+            + tl.arange(0, TL_ROPE_DIM)[None, :],
+            heads[:, None] < NUM_QUERY_HEADS,
+            other=0,
+        )
+        sm = tl.full((HEAD_BLOCK,), TL_VLLM_FINITE_SOFTMAX_SENTINEL, tl.float32)
+        ss = tl.zeros((HEAD_BLOCK,), tl.float32)
+        acc = tl.zeros((HEAD_BLOCK, TL_KV_DIM), tl.float32)
+        for block in range(split, NUM_KV_BLOCKS, NUM_SPLITS):
+            k = tl.load(
+                tl.make_block_ptr(
+                    GATHERED_KV + token * PADDED_SPARSE_BLOCKS * TL_KV_DIM,
+                    (PADDED_SPARSE_BLOCKS, TL_KV_DIM),
+                    (TL_KV_DIM, 1),
+                    (block * KV_BLOCK, 0),
+                    (KV_BLOCK, TL_KV_DIM),
+                    (1, 0),
+                )
+            )
+            kr = tl.load(
+                tl.make_block_ptr(
+                    GATHERED_KEY_ROPE + token * PADDED_SPARSE_BLOCKS * TL_ROPE_DIM,
+                    (PADDED_SPARSE_BLOCKS, TL_ROPE_DIM),
+                    (TL_ROPE_DIM, 1),
+                    (block * KV_BLOCK, 0),
+                    (KV_BLOCK, TL_ROPE_DIM),
+                    (1, 0),
+                )
+            )
+            score = tl.dot(q, tl.trans(k))
+            score = tl.dot(qr, tl.trans(kr), score) * SOFTMAX_SCALE
+            valid = (
+                tl.load(
+                    MASK
+                    + token * PADDED_SPARSE_BLOCKS
+                    + block * KV_BLOCK
+                    + tl.arange(0, KV_BLOCK)
+                )
+                == 0
+            )
+            score = tl.where(valid[None, :], score, float("-inf"))
+            sm_next = tl.maximum(sm, tl.max(score, 1))
+            alpha = tl.exp(sm - sm_next)
+            p = tl.exp(score - sm_next[:, None])
+            ss = ss * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(GATHERED_KV.dtype.element_ty), k)
+            sm = sm_next
+        partial_row = (token * NUM_SPLITS + split) * NUM_QUERY_HEADS + heads
+        tl.store(
+            PARTIAL_OUT + partial_row[:, None] * TL_KV_DIM + cols[None, :],
+            acc,
+            heads[:, None] < NUM_QUERY_HEADS,
+        )
+        tl.store(PARTIAL_MAX + partial_row, sm, heads < NUM_QUERY_HEADS)
+        tl.store(PARTIAL_SUM + partial_row, ss, heads < NUM_QUERY_HEADS)
+
+
+@triton.jit
+def _sfa_small_combine(
+    PARTIAL_OUT,
+    PARTIAL_MAX,
+    PARTIAL_SUM,
+    OUT,
+    MAX_OUT,
+    SUM_OUT,
+    KV_END,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_SPARSE_BLOCKS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    RETURN_STATS: tl.constexpr,
+):
+    GROUPS: tl.constexpr = triton.cdiv(NUM_QUERY_HEADS, HEAD_BLOCK)
+    token = tl.program_id(0) // GROUPS
+    hg = tl.program_id(0) % GROUPS
+    heads = hg * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    cols = tl.arange(0, TL_KV_DIM)
+    sm = tl.full((HEAD_BLOCK,), TL_VLLM_FINITE_SOFTMAX_SENTINEL, tl.float32)
+    for split in range(NUM_SPLITS):
+        row = (token * NUM_SPLITS + split) * NUM_QUERY_HEADS + heads
+        part_max = tl.load(
+            PARTIAL_MAX + row,
+            heads < NUM_QUERY_HEADS,
+            other=TL_VLLM_FINITE_SOFTMAX_SENTINEL,
+        )
+        sm = tl.maximum(sm, part_max)
+    acc = tl.zeros((HEAD_BLOCK, TL_KV_DIM), tl.float32)
+    ss = tl.zeros((HEAD_BLOCK,), tl.float32)
+    for split in range(NUM_SPLITS):
+        row = (token * NUM_SPLITS + split) * NUM_QUERY_HEADS + heads
+        part_max = tl.load(
+            PARTIAL_MAX + row,
+            heads < NUM_QUERY_HEADS,
+            other=TL_VLLM_FINITE_SOFTMAX_SENTINEL,
+        )
+        part_sum = tl.load(PARTIAL_SUM + row, heads < NUM_QUERY_HEADS, other=0)
+        part_out = tl.load(
+            PARTIAL_OUT + row[:, None] * TL_KV_DIM + cols[None, :],
+            heads[:, None] < NUM_QUERY_HEADS,
+            other=0,
+        )
+        alpha = tl.exp(part_max - sm)
+        ss += part_sum * alpha
+        acc += part_out * alpha[:, None]
+    tl.store(
+        OUT + (token * NUM_QUERY_HEADS + heads[:, None]) * TL_KV_DIM + cols[None, :],
+        acc / tl.where(ss > 0, ss, 1.0)[:, None],
+        heads[:, None] < NUM_QUERY_HEADS,
+    )
+    if RETURN_STATS:
+        kv_end = tl.load(KV_END + token)
+        tl.store(
+            MAX_OUT + token * NUM_QUERY_HEADS + heads,
+            tl.where(
+                ss > 0, sm, tl.where(kv_end > 0, TL_VLLM_FINITE_SOFTMAX_SENTINEL, 0.0)
+            ),
+            heads < NUM_QUERY_HEADS,
+        )
+        tl.store(
+            SUM_OUT + token * NUM_QUERY_HEADS + heads,
+            tl.where(ss > 0, ss, tl.minimum(NUM_SPARSE_BLOCKS, kv_end).to(tl.float32)),
+            heads < NUM_QUERY_HEADS,
+        )
 
 
 @triton.jit
@@ -1158,6 +1536,9 @@ def _sfa_prepare_strided_indices(
 @triton.jit
 def _sfa_pipeline(
     QUERY,
+    ACTUAL_QUERY_HEADS: tl.constexpr,
+    PIPELINE_HEADS: tl.constexpr,
+    CROSS_QUERY_PIPELINE: tl.constexpr,
     QUERY_ROPE,
     KV,
     KEY_ROPE,
@@ -1209,7 +1590,10 @@ def _sfa_pipeline(
 ):
     # Three generations overlap gather/QK, softmax/PV and output update.
     # Each producer signals after its stores; the consumer waits before loads.
-    # tick+2 drains the pipeline before the same program reuses its workspace.
+    # The ordinary schedule drains after each query. The cross-query schedule
+    # drains once per core, keeping gather/QK, softmax/PV and output busy across
+    # query boundaries. Each stage reads its own query's metadata. Two state
+    # buffers isolate the next query's softmax from the current query's output.
     # Prepared indices address physical storage rows; otherwise indices name
     # logical KV rows. Keep both inputs separate from the query-length tensor.
     if USE_PREPARED_PHYSICAL_INDICES:
@@ -1220,60 +1604,92 @@ def _sfa_pipeline(
     vector_subcore_id = 0
     if NUM_VECTOR_SUBCORES == TL_VECTOR_SUBCORES_PER_CUBE:
         vector_subcore_id = tle.dsa.ascend.sub_vec_id()
-    for task_idx in range(program_id, NUM_QUERY_TOKENS * NUM_KV_SPLITS, NUM_CORES):
-        query_token_idx = (task_idx // NUM_KV_SPLITS).to(tl.int64)
-        kv_split_idx = task_idx % NUM_KV_SPLITS
-        if USE_PREPARED_PHYSICAL_INDICES:
-            packed_query_meta = tl.load(PACKED_QUERY_META + query_token_idx).to(
-                tl.uint32
-            )
-            kv_end_exclusive = (packed_query_meta >> 1).to(tl.int32)
-            all_sparse_entries_valid = (packed_query_meta & 1) != 0
+    BLOCKS_PER_QUERY: tl.constexpr = NUM_SPARSE_BLOCKS // KV_BLOCK_ROWS // NUM_KV_SPLITS
+    if CROSS_QUERY_PIPELINE:
+        tl.static_assert(USE_PREPARED_PHYSICAL_INDICES)
+        tl.static_assert(NUM_KV_SPLITS == 1)
+        num_query_tasks = tl.cdiv(NUM_QUERY_TOKENS - program_id, NUM_CORES)
+        total_blocks = num_query_tasks * BLOCKS_PER_QUERY
+    else:
+        total_blocks = BLOCKS_PER_QUERY
+    for task_idx in range(
+        program_id,
+        program_id + 1 if CROSS_QUERY_PIPELINE else NUM_QUERY_TOKENS * NUM_KV_SPLITS,
+        NUM_CORES,
+    ):
+        if CROSS_QUERY_PIPELINE:
+            kv_split_idx = 0
         else:
-            request_idx, kv_end_exclusive, _ = _sfa_query_meta(
-                query_token_idx,
-                QUERY_LENGTHS,
-                KV_LENGTHS,
-                NUM_REQUESTS,
-                QUERY_SEQ_CAPACITY,
-                0,
-                QUERY_IS_TND,
-                False,
-                HAS_QUERY_LENGTHS,
-                True,
-                CAUSAL,
-            )
-            selection_positions = tl.arange(0, TL_FAST_SPARSE_ENTRIES)
-            logical_indices_to_check = tl.load(
-                selected_row_indices
-                + query_token_idx * TL_FAST_SPARSE_ENTRIES
-                + selection_positions
-            )
-            all_sparse_entries_valid = (
-                (kv_end_exclusive >= TL_FAST_SPARSE_ENTRIES)
-                & (tl.min(logical_indices_to_check, 0) >= 0)
-                & (tl.max(logical_indices_to_check, 0) < kv_end_exclusive)
-                & (tl.max(logical_indices_to_check, 0) // PAGE_SIZE < PAGES_PER_REQUEST)
-            )
-        if not USE_PREPARED_PHYSICAL_INDICES:
-            page_table_indices = tl.arange(0, triton.next_power_of_2(PAGES_PER_REQUEST))
-            request_page_table = tl.load(
-                BLOCK_TABLE + request_idx * PAGES_PER_REQUEST + page_table_indices,
-                mask=page_table_indices < PAGES_PER_REQUEST,
-                other=0,
-            )
-        for pipeline_tick in range(
-            NUM_SPARSE_BLOCKS // KV_BLOCK_ROWS // NUM_KV_SPLITS + TL_OUTPUT_STAGE_LAG
-        ):
+            query_token_idx = (task_idx // NUM_KV_SPLITS).to(tl.int64)
+            kv_split_idx = task_idx % NUM_KV_SPLITS
+            if USE_PREPARED_PHYSICAL_INDICES:
+                packed_query_meta = tl.load(PACKED_QUERY_META + query_token_idx).to(
+                    tl.uint32
+                )
+                kv_end_exclusive = (packed_query_meta >> 1).to(tl.int32)
+                all_sparse_entries_valid = (packed_query_meta & 1) != 0
+            else:
+                request_idx, kv_end_exclusive, _ = _sfa_query_meta(
+                    query_token_idx,
+                    QUERY_LENGTHS,
+                    KV_LENGTHS,
+                    NUM_REQUESTS,
+                    QUERY_SEQ_CAPACITY,
+                    0,
+                    QUERY_IS_TND,
+                    False,
+                    HAS_QUERY_LENGTHS,
+                    True,
+                    CAUSAL,
+                )
+                selection_positions = tl.arange(0, TL_FAST_SPARSE_ENTRIES)
+                logical_indices_to_check = tl.load(
+                    selected_row_indices
+                    + query_token_idx * TL_FAST_SPARSE_ENTRIES
+                    + selection_positions
+                )
+                all_sparse_entries_valid = (
+                    (kv_end_exclusive >= TL_FAST_SPARSE_ENTRIES)
+                    & (tl.min(logical_indices_to_check, 0) >= 0)
+                    & (tl.max(logical_indices_to_check, 0) < kv_end_exclusive)
+                    & (
+                        tl.max(logical_indices_to_check, 0) // PAGE_SIZE
+                        < PAGES_PER_REQUEST
+                    )
+                )
+            if not USE_PREPARED_PHYSICAL_INDICES:
+                page_table_indices = tl.arange(
+                    0, triton.next_power_of_2(PAGES_PER_REQUEST)
+                )
+                request_page_table = tl.load(
+                    BLOCK_TABLE + request_idx * PAGES_PER_REQUEST + page_table_indices,
+                    mask=page_table_indices < PAGES_PER_REQUEST,
+                    other=0,
+                )
+        for pipeline_tick in range(total_blocks + TL_OUTPUT_STAGE_LAG):
             gather_slot = pipeline_tick % TL_NUM_PIPELINE_SLOTS
-            if pipeline_tick < NUM_SPARSE_BLOCKS // KV_BLOCK_ROWS // NUM_KV_SPLITS:
+            if pipeline_tick < total_blocks:
+                if CROSS_QUERY_PIPELINE:
+                    query_task = pipeline_tick // BLOCKS_PER_QUERY
+                    query_token_idx = (program_id + query_task * NUM_CORES).to(tl.int64)
+                    state_program_id = program_id * 2 + query_task % 2
+                    packed_query_meta = tl.load(PACKED_QUERY_META + query_token_idx).to(
+                        tl.uint32
+                    )
+                    kv_end_exclusive = (packed_query_meta >> 1).to(tl.int32)
+                    all_sparse_entries_valid = (packed_query_meta & 1) != 0
+                gather_block = (
+                    pipeline_tick % BLOCKS_PER_QUERY
+                    if CROSS_QUERY_PIPELINE
+                    else pipeline_tick
+                )
                 if all_sparse_entries_valid:
                     for gather_group_idx in range(
                         KV_BLOCK_ROWS // GATHER_BLOCK_ROWS // NUM_VECTOR_SUBCORES
                     ):
                         sparse_positions = (
                             kv_split_idx * (NUM_SPARSE_BLOCKS // NUM_KV_SPLITS)
-                            + pipeline_tick * KV_BLOCK_ROWS
+                            + gather_block * KV_BLOCK_ROWS
                             + (
                                 gather_group_idx * NUM_VECTOR_SUBCORES
                                 + vector_subcore_id
@@ -1308,7 +1724,7 @@ def _sfa_pipeline(
                         if USE_PREPARED_PHYSICAL_INDICES:
                             selection_start = (
                                 kv_split_idx * (NUM_SPARSE_BLOCKS // NUM_KV_SPLITS)
-                                + pipeline_tick * KV_BLOCK_ROWS
+                                + gather_block * KV_BLOCK_ROWS
                                 + (
                                     gather_group_idx * NUM_VECTOR_SUBCORES
                                     + vector_subcore_id
@@ -1401,7 +1817,7 @@ def _sfa_pipeline(
                     ):
                         sparse_positions = (
                             kv_split_idx * (NUM_SPARSE_BLOCKS // NUM_KV_SPLITS)
-                            + pipeline_tick * KV_BLOCK_ROWS
+                            + gather_block * KV_BLOCK_ROWS
                             + (
                                 gather_group_idx * NUM_VECTOR_SUBCORES
                                 + vector_subcore_id
@@ -1477,27 +1893,55 @@ def _sfa_pipeline(
                             + rope_feature_indices[None, :],
                             gathered_rope_tile,
                         )
-                query_tile = tl.load(
-                    tl.make_block_ptr(
-                        QUERY + query_token_idx * TL_FAST_QUERY_HEADS * TL_KV_DIM,
-                        (TL_FAST_QUERY_HEADS, TL_KV_DIM),
-                        (TL_KV_DIM, 1),
-                        (0, 0),
-                        (TL_FAST_QUERY_HEADS, TL_KV_DIM),
-                        (1, 0),
+                if ACTUAL_QUERY_HEADS == PIPELINE_HEADS:
+                    query_tile = tl.load(
+                        tl.make_block_ptr(
+                            QUERY + query_token_idx * PIPELINE_HEADS * TL_KV_DIM,
+                            (PIPELINE_HEADS, TL_KV_DIM),
+                            (TL_KV_DIM, 1),
+                            (0, 0),
+                            (PIPELINE_HEADS, TL_KV_DIM),
+                            (1, 0),
+                        )
                     )
-                )
-                query_rope_tile = tl.load(
-                    tl.make_block_ptr(
-                        QUERY_ROPE
-                        + query_token_idx * TL_FAST_QUERY_HEADS * TL_ROPE_DIM,
-                        (TL_FAST_QUERY_HEADS, TL_ROPE_DIM),
-                        (TL_ROPE_DIM, 1),
-                        (0, 0),
-                        (TL_FAST_QUERY_HEADS, TL_ROPE_DIM),
-                        (1, 0),
+                else:
+                    query_tile = tl.load(
+                        tl.make_block_ptr(
+                            QUERY + query_token_idx * ACTUAL_QUERY_HEADS * TL_KV_DIM,
+                            (ACTUAL_QUERY_HEADS, TL_KV_DIM),
+                            (TL_KV_DIM, 1),
+                            (0, 0),
+                            (PIPELINE_HEADS, TL_KV_DIM),
+                            (1, 0),
+                        ),
+                        boundary_check=(0,),
+                        padding_option="zero",
                     )
-                )
+                if ACTUAL_QUERY_HEADS == PIPELINE_HEADS:
+                    query_rope_tile = tl.load(
+                        tl.make_block_ptr(
+                            QUERY_ROPE + query_token_idx * PIPELINE_HEADS * TL_ROPE_DIM,
+                            (PIPELINE_HEADS, TL_ROPE_DIM),
+                            (TL_ROPE_DIM, 1),
+                            (0, 0),
+                            (PIPELINE_HEADS, TL_ROPE_DIM),
+                            (1, 0),
+                        )
+                    )
+                else:
+                    query_rope_tile = tl.load(
+                        tl.make_block_ptr(
+                            QUERY_ROPE
+                            + query_token_idx * ACTUAL_QUERY_HEADS * TL_ROPE_DIM,
+                            (ACTUAL_QUERY_HEADS, TL_ROPE_DIM),
+                            (TL_ROPE_DIM, 1),
+                            (0, 0),
+                            (PIPELINE_HEADS, TL_ROPE_DIM),
+                            (1, 0),
+                        ),
+                        boundary_check=(0,),
+                        padding_option="zero",
+                    )
                 if MANUAL_BLOCK_SYNC:
                     tle.dsa.ascend.sync_block_set(
                         "vector",
@@ -1549,13 +1993,13 @@ def _sfa_pipeline(
                             SCORE_WORKSPACE
                             + (program_id * TL_NUM_PIPELINE_SLOTS + gather_slot)
                             * (
-                                TL_FAST_QUERY_HEADS * KV_BLOCK_ROWS
-                                + WORKSPACE_PADDING * TL_FAST_QUERY_HEADS
+                                PIPELINE_HEADS * KV_BLOCK_ROWS
+                                + WORKSPACE_PADDING * PIPELINE_HEADS
                             ),
-                            (TL_FAST_QUERY_HEADS, KV_BLOCK_ROWS),
+                            (PIPELINE_HEADS, KV_BLOCK_ROWS),
                             (KV_BLOCK_ROWS, 1),
                             (0, qk_block_idx * QK_BLOCK_COLUMNS),
-                            (TL_FAST_QUERY_HEADS, QK_BLOCK_COLUMNS),
+                            (PIPELINE_HEADS, QK_BLOCK_COLUMNS),
                             (1, 0),
                         ),
                         attention_scores,
@@ -1568,11 +2012,23 @@ def _sfa_pipeline(
                         ASCEND_PIPE.PIPE_FIX,
                         ASCEND_PIPE.PIPE_MTE2,
                     )
-            if (
-                pipeline_tick >= 1
-                and pipeline_tick
-                < NUM_SPARSE_BLOCKS // KV_BLOCK_ROWS // NUM_KV_SPLITS + 1
-            ):
+            if pipeline_tick >= 1 and pipeline_tick < total_blocks + 1:
+                if CROSS_QUERY_PIPELINE:
+                    query_task = (pipeline_tick - 1) // BLOCKS_PER_QUERY
+                    query_token_idx = (program_id + query_task * NUM_CORES).to(tl.int64)
+                    state_program_id = program_id * 2 + query_task % 2
+                    packed_query_meta = tl.load(PACKED_QUERY_META + query_token_idx).to(
+                        tl.uint32
+                    )
+                    kv_end_exclusive = (packed_query_meta >> 1).to(tl.int32)
+                    all_sparse_entries_valid = (packed_query_meta & 1) != 0
+                else:
+                    state_program_id = program_id
+                softmax_block = (
+                    (pipeline_tick - 1) % BLOCKS_PER_QUERY
+                    if CROSS_QUERY_PIPELINE
+                    else pipeline_tick - 1
+                )
                 softmax_slot = (pipeline_tick - 1) % TL_NUM_PIPELINE_SLOTS
                 if MANUAL_BLOCK_SYNC:
                     tle.dsa.ascend.sync_block_wait(
@@ -1587,7 +2043,7 @@ def _sfa_pipeline(
                     mask_block_positions = tl.arange(0, KV_BLOCK_ROWS)
                     mask_sparse_positions = (
                         kv_split_idx * (NUM_SPARSE_BLOCKS // NUM_KV_SPLITS)
-                        + (pipeline_tick - 1) * KV_BLOCK_ROWS
+                        + softmax_block * KV_BLOCK_ROWS
                         + mask_block_positions
                     )
                     mask_selected_indices = tl.load(
@@ -1606,7 +2062,7 @@ def _sfa_pipeline(
                         valid_kv_mask, 0.0, float("-inf")
                     )
                 for head_block_idx in range(
-                    TL_FAST_QUERY_HEADS // SOFTMAX_BLOCK_HEADS // NUM_VECTOR_SUBCORES
+                    PIPELINE_HEADS // SOFTMAX_BLOCK_HEADS // NUM_VECTOR_SUBCORES
                 ):
                     head_indices = (
                         head_block_idx * NUM_VECTOR_SUBCORES + vector_subcore_id
@@ -1617,8 +2073,8 @@ def _sfa_pipeline(
                             SCORE_WORKSPACE
                             + (program_id * TL_NUM_PIPELINE_SLOTS + softmax_slot)
                             * (
-                                TL_FAST_QUERY_HEADS * KV_BLOCK_ROWS
-                                + WORKSPACE_PADDING * TL_FAST_QUERY_HEADS
+                                PIPELINE_HEADS * KV_BLOCK_ROWS
+                                + WORKSPACE_PADDING * PIPELINE_HEADS
                             )
                             + head_indices[:, None] * KV_BLOCK_ROWS
                             + sparse_positions[None, :]
@@ -1631,20 +2087,20 @@ def _sfa_pipeline(
                         tl.float32,
                     )
                     previous_softmax_sum = tl.zeros((SOFTMAX_BLOCK_HEADS,), tl.float32)
-                    if pipeline_tick > 1:
+                    if softmax_block > 0:
                         previous_softmax_max = tl.load(
                             SOFTMAX_STATE_WORKSPACE
-                            + program_id
+                            + state_program_id
                             * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                            * TL_FAST_QUERY_HEADS
+                            * PIPELINE_HEADS
                             + head_indices
                         )
                         previous_softmax_sum = tl.load(
                             SOFTMAX_STATE_WORKSPACE
-                            + program_id
+                            + state_program_id
                             * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                            * TL_FAST_QUERY_HEADS
-                            + TL_FAST_QUERY_HEADS
+                            * PIPELINE_HEADS
+                            + PIPELINE_HEADS
                             + head_indices
                         )
                     if not all_sparse_entries_valid:
@@ -1666,28 +2122,27 @@ def _sfa_pipeline(
                     )
                     tl.store(
                         SOFTMAX_STATE_WORKSPACE
-                        + program_id
+                        + state_program_id
                         * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                        * TL_FAST_QUERY_HEADS
+                        * PIPELINE_HEADS
                         + head_indices,
                         next_softmax_max,
                     )
                     tl.store(
                         SOFTMAX_STATE_WORKSPACE
-                        + program_id
+                        + state_program_id
                         * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                        * TL_FAST_QUERY_HEADS
-                        + TL_FAST_QUERY_HEADS
+                        * PIPELINE_HEADS
+                        + PIPELINE_HEADS
                         + head_indices,
                         next_softmax_sum,
                     )
                     tl.store(
                         SOFTMAX_STATE_WORKSPACE
-                        + program_id
+                        + state_program_id
                         * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                        * TL_FAST_QUERY_HEADS
-                        + (TL_SOFTMAX_ALPHA_STATE_BASE + softmax_slot)
-                        * TL_FAST_QUERY_HEADS
+                        * PIPELINE_HEADS
+                        + (TL_SOFTMAX_ALPHA_STATE_BASE + softmax_slot) * PIPELINE_HEADS
                         + head_indices,
                         previous_state_scale,
                     )
@@ -1695,8 +2150,8 @@ def _sfa_pipeline(
                         UNNORMALIZED_WEIGHTS_WORKSPACE
                         + (program_id * TL_NUM_PIPELINE_SLOTS + softmax_slot)
                         * (
-                            TL_FAST_QUERY_HEADS * KV_BLOCK_ROWS
-                            + WORKSPACE_PADDING * TL_FAST_QUERY_HEADS
+                            PIPELINE_HEADS * KV_BLOCK_ROWS
+                            + WORKSPACE_PADDING * PIPELINE_HEADS
                         )
                         + head_indices[:, None] * KV_BLOCK_ROWS
                         + sparse_positions[None, :],
@@ -1722,13 +2177,13 @@ def _sfa_pipeline(
                         UNNORMALIZED_WEIGHTS_WORKSPACE
                         + (program_id * TL_NUM_PIPELINE_SLOTS + softmax_slot)
                         * (
-                            TL_FAST_QUERY_HEADS * KV_BLOCK_ROWS
-                            + WORKSPACE_PADDING * TL_FAST_QUERY_HEADS
+                            PIPELINE_HEADS * KV_BLOCK_ROWS
+                            + WORKSPACE_PADDING * PIPELINE_HEADS
                         ),
-                        (TL_FAST_QUERY_HEADS, KV_BLOCK_ROWS),
+                        (PIPELINE_HEADS, KV_BLOCK_ROWS),
                         (KV_BLOCK_ROWS, 1),
                         (0, 0),
-                        (TL_FAST_QUERY_HEADS, KV_BLOCK_ROWS),
+                        (PIPELINE_HEADS, KV_BLOCK_ROWS),
                         (1, 0),
                     )
                 )
@@ -1752,13 +2207,13 @@ def _sfa_pipeline(
                             BLOCK_WEIGHTED_VALUE_SUM_WORKSPACE
                             + (program_id * TL_NUM_PIPELINE_SLOTS + softmax_slot)
                             * (
-                                TL_FAST_QUERY_HEADS * TL_KV_DIM
-                                + WORKSPACE_PADDING * TL_FAST_QUERY_HEADS
+                                PIPELINE_HEADS * TL_KV_DIM
+                                + WORKSPACE_PADDING * PIPELINE_HEADS
                             ),
-                            (TL_FAST_QUERY_HEADS, TL_KV_DIM),
+                            (PIPELINE_HEADS, TL_KV_DIM),
                             (TL_KV_DIM, 1),
                             (0, value_block_idx * VALUE_BLOCK_COLUMNS),
-                            (TL_FAST_QUERY_HEADS, VALUE_BLOCK_COLUMNS),
+                            (PIPELINE_HEADS, VALUE_BLOCK_COLUMNS),
                             (1, 0),
                         ),
                         block_weighted_value_sum,
@@ -1772,6 +2227,24 @@ def _sfa_pipeline(
                         ASCEND_PIPE.PIPE_MTE2,
                     )
             if pipeline_tick >= TL_OUTPUT_STAGE_LAG:
+                if CROSS_QUERY_PIPELINE:
+                    query_task = (
+                        pipeline_tick - TL_OUTPUT_STAGE_LAG
+                    ) // BLOCKS_PER_QUERY
+                    query_token_idx = (program_id + query_task * NUM_CORES).to(tl.int64)
+                    state_program_id = program_id * 2 + query_task % 2
+                    packed_query_meta = tl.load(PACKED_QUERY_META + query_token_idx).to(
+                        tl.uint32
+                    )
+                    kv_end_exclusive = (packed_query_meta >> 1).to(tl.int32)
+                    all_sparse_entries_valid = (packed_query_meta & 1) != 0
+                else:
+                    state_program_id = program_id
+                output_block = (
+                    (pipeline_tick - TL_OUTPUT_STAGE_LAG) % BLOCKS_PER_QUERY
+                    if CROSS_QUERY_PIPELINE
+                    else pipeline_tick - TL_OUTPUT_STAGE_LAG
+                )
                 output_slot = (
                     pipeline_tick - TL_OUTPUT_STAGE_LAG
                 ) % TL_NUM_PIPELINE_SLOTS
@@ -1784,26 +2257,25 @@ def _sfa_pipeline(
                         ASCEND_PIPE.PIPE_MTE2,
                     )
                 for head_block_idx in range(
-                    TL_FAST_QUERY_HEADS // OUTPUT_BLOCK_HEADS // NUM_VECTOR_SUBCORES
+                    PIPELINE_HEADS // OUTPUT_BLOCK_HEADS // NUM_VECTOR_SUBCORES
                 ):
                     head_indices = (
                         head_block_idx * NUM_VECTOR_SUBCORES + vector_subcore_id
                     ) * OUTPUT_BLOCK_HEADS + tl.arange(0, OUTPUT_BLOCK_HEADS)
                     previous_state_scale = tl.load(
                         SOFTMAX_STATE_WORKSPACE
-                        + program_id
+                        + state_program_id
                         * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                        * TL_FAST_QUERY_HEADS
-                        + (TL_SOFTMAX_ALPHA_STATE_BASE + output_slot)
-                        * TL_FAST_QUERY_HEADS
+                        * PIPELINE_HEADS
+                        + (TL_SOFTMAX_ALPHA_STATE_BASE + output_slot) * PIPELINE_HEADS
                         + head_indices
                     )
                     softmax_sum = tl.load(
                         SOFTMAX_STATE_WORKSPACE
-                        + program_id
+                        + state_program_id
                         * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                        * TL_FAST_QUERY_HEADS
-                        + TL_FAST_QUERY_HEADS
+                        * PIPELINE_HEADS
+                        + PIPELINE_HEADS
                         + head_indices
                     )
                     inverse_softmax_sum = 1.0 / tl.where(
@@ -1816,11 +2288,11 @@ def _sfa_pipeline(
                         previous_weighted_value_sum = tl.zeros(
                             (OUTPUT_BLOCK_HEADS, OUTPUT_BLOCK_COLUMNS), tl.float32
                         )
-                        if pipeline_tick > TL_OUTPUT_STAGE_LAG:
+                        if output_block > 0:
                             previous_weighted_value_sum = tl.load(
                                 OUTPUT_ACCUMULATOR_WORKSPACE
-                                + program_id
-                                * TL_FAST_QUERY_HEADS
+                                + state_program_id
+                                * PIPELINE_HEADS
                                 * (TL_KV_DIM + WORKSPACE_PADDING)
                                 + head_indices[:, None] * TL_KV_DIM
                                 + kv_columns[None, :]
@@ -1829,8 +2301,8 @@ def _sfa_pipeline(
                             BLOCK_WEIGHTED_VALUE_SUM_WORKSPACE
                             + (program_id * TL_NUM_PIPELINE_SLOTS + output_slot)
                             * (
-                                TL_FAST_QUERY_HEADS * TL_KV_DIM
-                                + WORKSPACE_PADDING * TL_FAST_QUERY_HEADS
+                                PIPELINE_HEADS * TL_KV_DIM
+                                + WORKSPACE_PADDING * PIPELINE_HEADS
                             )
                             + head_indices[:, None] * TL_KV_DIM
                             + kv_columns[None, :]
@@ -1839,29 +2311,27 @@ def _sfa_pipeline(
                             previous_weighted_value_sum * previous_state_scale[:, None]
                             + block_weighted_value_sum
                         )
-                        if (
-                            pipeline_tick
-                            == NUM_SPARSE_BLOCKS // KV_BLOCK_ROWS // NUM_KV_SPLITS + 1
-                        ):
+                        if output_block == BLOCKS_PER_QUERY - 1:
                             if NUM_KV_SPLITS == 1:
                                 tl.store(
                                     OUT
-                                    + task_idx * TL_FAST_QUERY_HEADS * TL_KV_DIM
+                                    + query_token_idx * ACTUAL_QUERY_HEADS * TL_KV_DIM
                                     + head_indices[:, None] * TL_KV_DIM
                                     + kv_columns[None, :],
                                     weighted_value_sum * inverse_softmax_sum[:, None],
+                                    head_indices[:, None] < ACTUAL_QUERY_HEADS,
                                 )
                                 if RETURN_SOFTMAX_STATS:
                                     softmax_max = tl.load(
                                         SOFTMAX_STATE_WORKSPACE
-                                        + program_id
+                                        + state_program_id
                                         * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                                        * TL_FAST_QUERY_HEADS
+                                        * PIPELINE_HEADS
                                         + head_indices
                                     )
                                     tl.store(
                                         SOFTMAX_MAX
-                                        + query_token_idx * TL_FAST_QUERY_HEADS
+                                        + query_token_idx * ACTUAL_QUERY_HEADS
                                         + head_indices,
                                         tl.where(
                                             softmax_sum > 0,
@@ -1872,10 +2342,11 @@ def _sfa_pipeline(
                                                 0.0,
                                             ),
                                         ),
+                                        head_indices < ACTUAL_QUERY_HEADS,
                                     )
                                     tl.store(
                                         SOFTMAX_SUM
-                                        + query_token_idx * TL_FAST_QUERY_HEADS
+                                        + query_token_idx * ACTUAL_QUERY_HEADS
                                         + head_indices,
                                         tl.where(
                                             softmax_sum > 0,
@@ -1884,39 +2355,40 @@ def _sfa_pipeline(
                                                 NUM_SPARSE_BLOCKS, kv_end_exclusive
                                             ).to(tl.float32),
                                         ),
+                                        head_indices < ACTUAL_QUERY_HEADS,
                                     )
                             else:
                                 tl.store(
                                     SPLIT_WEIGHTED_VALUE_SUM
-                                    + task_idx * TL_FAST_QUERY_HEADS * TL_KV_DIM
+                                    + task_idx * PIPELINE_HEADS * TL_KV_DIM
                                     + head_indices[:, None] * TL_KV_DIM
                                     + kv_columns[None, :],
                                     weighted_value_sum,
                                 )
                                 softmax_max = tl.load(
                                     SOFTMAX_STATE_WORKSPACE
-                                    + program_id
+                                    + state_program_id
                                     * (TL_SOFTMAX_STATE_ROWS + WORKSPACE_PADDING)
-                                    * TL_FAST_QUERY_HEADS
+                                    * PIPELINE_HEADS
                                     + head_indices
                                 )
                                 tl.store(
                                     SPLIT_SOFTMAX_MAX
-                                    + task_idx * TL_FAST_QUERY_HEADS
+                                    + task_idx * PIPELINE_HEADS
                                     + head_indices,
                                     softmax_max,
                                 )
                                 tl.store(
                                     SPLIT_SOFTMAX_SUM
-                                    + task_idx * TL_FAST_QUERY_HEADS
+                                    + task_idx * PIPELINE_HEADS
                                     + head_indices,
                                     softmax_sum,
                                 )
                         else:
                             tl.store(
                                 OUTPUT_ACCUMULATOR_WORKSPACE
-                                + program_id
-                                * TL_FAST_QUERY_HEADS
+                                + state_program_id
+                                * PIPELINE_HEADS
                                 * (TL_KV_DIM + WORKSPACE_PADDING)
                                 + head_indices[:, None] * TL_KV_DIM
                                 + kv_columns[None, :],
@@ -2490,9 +2962,148 @@ def sparse_flash_attention(
             else logical_sparse_indices
         )
         num_cube_cores, num_vector_cores = _get_core_num(query.device)
+        # Small head counts need padding to Cube's minimum head tile. Keeping
+        # all stages in the pipeline avoids materializing the full selection.
+        use_small_head_pipeline = (
+            paged
+            and num_query_heads == 4
+            and 2 < num_query_tokens <= SMALL_QUERY_MAX_TOKENS
+            and num_sparse_blocks == FAST_SPARSE_ENTRIES
+            and page_size == FAST_PAGE_SIZE
+            and sparse_block_size == 1
+            and kv_access_spec is None
+            and key_rope_access_spec is None
+        )
+        # Long H64 batches have enough queries to pipeline across query
+        # boundaries. Prepared physical indices and two state generations keep
+        # masking and normalization independent for every query.
+        use_cross_query_pipeline = (
+            paged
+            and num_query_heads == 64
+            and num_query_tokens > SMALL_QUERY_MAX_TOKENS
+            and num_sparse_blocks == FAST_SPARSE_ENTRIES
+            and page_size == FAST_PAGE_SIZE
+            and sparse_block_size == 1
+            and kv_access_spec is None
+            and key_rope_access_spec is None
+            and key.numel() <= MAX_CACHE_ELEMENTS_FOR_INT32_OFFSETS
+        )
+        if (
+            not use_small_head_pipeline
+            and paged
+            and num_query_tokens <= SMALL_QUERY_MAX_TOKENS
+            and num_query_heads <= 64
+            and sparse_block_size == 1
+            and num_sparse_blocks >= SMALL_QUERY_MIN_SPARSE_ENTRIES
+            and num_sparse_blocks <= SMALL_QUERY_MAX_SPARSE_ENTRIES
+            and kv_access_spec is None
+            and key_rope_access_spec is None
+        ):
+            head_block, kv_block = SMALL_QUERY_HEAD_BLOCK, SMALL_QUERY_KV_BLOCK
+            padded_sparse = triton.cdiv(num_sparse_blocks, kv_block) * kv_block
+            head_groups = triton.cdiv(num_query_heads, head_block)
+            splits = min(
+                padded_sparse // kv_block,
+                max(1, triton.cdiv(num_cube_cores, num_query_tokens * head_groups)),
+            )
+            if num_query_tokens > 2:
+                # Balance complete Cube waves against KV blocks per split;
+                # excess splits otherwise leave cores idle in the final wave.
+                kv_blocks = padded_sparse // kv_block
+                splits = min(
+                    range(1, kv_blocks + 1),
+                    key=lambda count: (
+                        triton.cdiv(
+                            num_query_tokens * head_groups * count, num_cube_cores
+                        )
+                        * triton.cdiv(kv_blocks, count),
+                        count,
+                    ),
+                )
+            programs = min(num_cube_cores, num_query_tokens * head_groups * splits)
+            gathered_kv = allocate_empty(
+                (num_query_tokens, padded_sparse, KV_DIM), query.dtype
+            )
+            gathered_rope = allocate_empty(
+                (num_query_tokens, padded_sparse, ROPE_DIM), query.dtype
+            )
+            mask = allocate_empty((num_query_tokens, padded_sparse), torch.float32)
+            kv_end = allocate_empty((num_query_tokens,), torch.int32)
+            partial_out = allocate_empty(
+                (num_query_tokens * splits, num_query_heads, KV_DIM), torch.float32
+            )
+            partial_max = allocate_empty(
+                (num_query_tokens * splits, num_query_heads), torch.float32
+            )
+            partial_sum = allocate_empty(
+                (num_query_tokens * splits, num_query_heads), torch.float32
+            )
+            _sfa_small_gather[(num_vector_cores,)](
+                key,
+                key_rope,
+                logical_sparse_indices,
+                block_table,
+                gathered_kv,
+                gathered_rope,
+                mask,
+                kv_end,
+                query_lengths,
+                kv_lengths,
+                NUM_SPARSE_BLOCKS=num_sparse_blocks,
+                PADDED_SPARSE_BLOCKS=padded_sparse,
+                PAGE_SIZE=page_size,
+                NUM_QUERY_TOKENS=num_query_tokens,
+                NUM_REQUESTS=num_requests,
+                QUERY_SEQ_CAPACITY=query_seq_capacity,
+                QUERY_IS_TND=layout_query == "TND",
+                HAS_QUERY_LENGTHS=actual_seq_lengths_query is not None,
+                CAUSAL=sparse_mode == SPARSE_MODE_CAUSAL,
+                PAGES_PER_REQUEST=pages_per_request,
+                GATHER_BLOCK_ROWS=32,
+                NUM_CORES=num_vector_cores,
+            )
+            _sfa_small_attention[(programs,)](
+                query,
+                query_rope,
+                gathered_kv,
+                gathered_rope,
+                mask,
+                partial_out,
+                partial_max,
+                partial_sum,
+                NUM_QUERY_TOKENS=num_query_tokens,
+                NUM_QUERY_HEADS=num_query_heads,
+                PADDED_SPARSE_BLOCKS=padded_sparse,
+                HEAD_BLOCK=head_block,
+                KV_BLOCK=kv_block,
+                NUM_SPLITS=splits,
+                NUM_CORES=programs,
+                SOFTMAX_SCALE=scale_value,
+                limit_auto_multi_buffer_only_for_local_buffer=False,
+                limit_auto_multi_buffer_of_local_buffer="no-limit",
+            )
+            _sfa_small_combine[(num_query_tokens * head_groups,)](
+                partial_out,
+                partial_max,
+                partial_sum,
+                attention_output,
+                softmax_max,
+                softmax_sum,
+                kv_end,
+                NUM_QUERY_HEADS=num_query_heads,
+                NUM_SPARSE_BLOCKS=num_sparse_blocks,
+                NUM_SPLITS=splits,
+                HEAD_BLOCK=head_block,
+                RETURN_STATS=return_softmax_lse,
+            )
+            return attention_output, softmax_max, softmax_sum
         if not (
             paged
-            and num_query_heads == FAST_QUERY_HEADS
+            and (
+                num_query_heads == FAST_QUERY_HEADS
+                or use_small_head_pipeline
+                or use_cross_query_pipeline
+            )
             and num_sparse_blocks == FAST_SPARSE_ENTRIES
             and page_size == FAST_PAGE_SIZE
             and sparse_block_size == 1
@@ -2688,15 +3299,23 @@ def sparse_flash_attention(
                 limit_auto_multi_buffer_of_local_buffer="no-limit",
             )
         else:
+            pipeline_heads = (
+                SMALL_QUERY_HEAD_BLOCK if use_small_head_pipeline else num_query_heads
+            )
             num_kv_splits = (
-                PIPELINE_FOUR_QUERY_SPLITS
-                if num_query_tokens == 4
-                else (PIPELINE_EIGHT_QUERY_SPLITS if num_query_tokens == 8 else 1)
+                1
+                if use_small_head_pipeline
+                else (
+                    PIPELINE_FOUR_QUERY_SPLITS
+                    if num_query_tokens == 4
+                    else (PIPELINE_EIGHT_QUERY_SPLITS if num_query_tokens == 8 else 1)
+                )
             )
             num_programs = min(num_cube_cores, num_query_tokens * num_kv_splits)
             workspace_padding = (
                 LARGE_BATCH_WORKSPACE_PADDING
-                if num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
+                if not (use_small_head_pipeline or use_cross_query_pipeline)
+                and num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
                 else 0
             )
             kv_workspace = allocate_workspace(
@@ -2723,7 +3342,7 @@ def sparse_flash_attention(
                 (
                     num_programs,
                     NUM_PIPELINE_SLOTS,
-                    FAST_QUERY_HEADS,
+                    pipeline_heads,
                     PIPELINE_KV_BLOCK_ROWS + workspace_padding,
                 ),
                 torch.float32,
@@ -2733,7 +3352,7 @@ def sparse_flash_attention(
                 (
                     num_programs,
                     NUM_PIPELINE_SLOTS,
-                    FAST_QUERY_HEADS,
+                    pipeline_heads,
                     PIPELINE_KV_BLOCK_ROWS + workspace_padding,
                 ),
                 query.dtype,
@@ -2743,7 +3362,7 @@ def sparse_flash_attention(
                 (
                     num_programs,
                     NUM_PIPELINE_SLOTS,
-                    FAST_QUERY_HEADS,
+                    pipeline_heads,
                     KV_DIM + workspace_padding,
                 ),
                 torch.float32,
@@ -2751,21 +3370,25 @@ def sparse_flash_attention(
             )
             softmax_state_workspace = allocate_workspace(
                 (
-                    num_programs,
+                    num_programs * (2 if use_cross_query_pipeline else 1),
                     SOFTMAX_STATE_ROWS + workspace_padding,
-                    FAST_QUERY_HEADS,
+                    pipeline_heads,
                 ),
                 torch.float32,
                 SOFTMAX_WORKSPACE_ADDRESS_OFFSET_BYTES,
             )
             output_accumulator_workspace = allocate_workspace(
-                (num_programs, FAST_QUERY_HEADS, KV_DIM + workspace_padding),
+                (
+                    num_programs * (2 if use_cross_query_pipeline else 1),
+                    pipeline_heads,
+                    KV_DIM + workspace_padding,
+                ),
                 torch.float32,
                 OUTPUT_WORKSPACE_ADDRESS_OFFSET_BYTES,
             )
             split_weighted_value_sum = (
                 allocate_empty(
-                    (num_query_tokens * num_kv_splits, FAST_QUERY_HEADS, KV_DIM),
+                    (num_query_tokens * num_kv_splits, pipeline_heads, KV_DIM),
                     torch.float32,
                 )
                 if num_kv_splits > 1
@@ -2773,14 +3396,14 @@ def sparse_flash_attention(
             )
             split_softmax_max = (
                 allocate_empty(
-                    (num_query_tokens * num_kv_splits, FAST_QUERY_HEADS), torch.float32
+                    (num_query_tokens * num_kv_splits, pipeline_heads), torch.float32
                 )
                 if num_kv_splits > 1
                 else softmax_max
             )
             split_softmax_sum = (
                 allocate_empty(
-                    (num_query_tokens * num_kv_splits, FAST_QUERY_HEADS), torch.float32
+                    (num_query_tokens * num_kv_splits, pipeline_heads), torch.float32
                 )
                 if num_kv_splits > 1
                 else softmax_sum
@@ -2788,7 +3411,8 @@ def sparse_flash_attention(
             packed_query_meta = None
             physical_row_indices = None
             use_prepared_physical_indices = (
-                num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
+                not use_small_head_pipeline
+                and num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
                 and key.shape[0] * FAST_PAGE_SIZE <= INT32_MAX
             )
             if use_prepared_physical_indices:
@@ -2803,7 +3427,8 @@ def sparse_flash_attention(
                 )
                 prepare_indices_kwargs = (
                     dict(
-                        ALLOW_EXACT_SORT=cache_storage_row_span <= FP32_EXACT_INT_LIMIT
+                        ALLOW_EXACT_SORT=not use_cross_query_pipeline
+                        and cache_storage_row_span <= FP32_EXACT_INT_LIMIT
                     )
                     if shared_kv_row_layout is None
                     else dict(SHARED_KV_ROW_LAYOUT=shared_kv_row_layout)
@@ -2823,6 +3448,9 @@ def sparse_flash_attention(
                 )
             _sfa_pipeline[(num_programs,)](
                 query,
+                num_query_heads,
+                pipeline_heads,
+                use_cross_query_pipeline,
                 query_rope,
                 key,
                 key_rope,
@@ -2855,7 +3483,8 @@ def sparse_flash_attention(
                 KV_BLOCK_ROWS=PIPELINE_KV_BLOCK_ROWS,
                 QK_BLOCK_COLUMNS=(
                     LARGE_BATCH_QK_COLUMNS
-                    if num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
+                    if not use_small_head_pipeline
+                    and num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
                     else SMALL_BATCH_QK_COLUMNS
                 ),
                 # Narrow offsets only when the complete cache fits in 2 GiB.
@@ -2869,7 +3498,8 @@ def sparse_flash_attention(
                         or key_rope_access_spec is not None
                         else (
                             CONTIGUOUS_GATHER_ROWS
-                            if num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
+                            if not use_small_head_pipeline
+                            and num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
                             else SMALL_BATCH_GATHER_ROWS
                         )
                     )
@@ -2879,19 +3509,29 @@ def sparse_flash_attention(
                 <= MAX_CACHE_ELEMENTS_FOR_INT32_OFFSETS
                 and kv_access_spec is None
                 and key_rope_access_spec is None,
-                SOFTMAX_BLOCK_HEADS=PIPELINE_SOFTMAX_HEADS,
+                SOFTMAX_BLOCK_HEADS=(
+                    SMALL_PIPELINE_VECTOR_HEADS
+                    if use_small_head_pipeline
+                    else PIPELINE_SOFTMAX_HEADS
+                ),
                 VALUE_BLOCK_COLUMNS=PIPELINE_VALUE_COLUMNS,
                 NUM_CORES=num_programs,
                 MANUAL_BLOCK_SYNC=True,
                 OUTPUT_BLOCK_COLUMNS=(
                     LARGE_BATCH_OUTPUT_COLUMNS
-                    if num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
+                    if not use_small_head_pipeline
+                    and num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
                     else SMALL_BATCH_OUTPUT_COLUMNS
                 ),
                 OUTPUT_BLOCK_HEADS=(
-                    LARGE_BATCH_OUTPUT_HEADS
-                    if num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
-                    else SMALL_BATCH_OUTPUT_HEADS
+                    SMALL_PIPELINE_VECTOR_HEADS
+                    if use_small_head_pipeline
+                    else (
+                        LARGE_BATCH_OUTPUT_HEADS
+                        if not use_small_head_pipeline
+                        and num_query_tokens >= LARGE_QUERY_BATCH_THRESHOLD
+                        else SMALL_BATCH_OUTPUT_HEADS
+                    )
                 ),
                 WORKSPACE_PADDING=workspace_padding,
                 NUM_KV_SPLITS=num_kv_splits,

@@ -14,6 +14,8 @@
 
 """Shared inputs and reference calls; never imported by production code."""
 
+import math
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
@@ -26,6 +28,118 @@ CASES = [
     (16, 48000, 48000),
 ]
 MODES = ("contiguous", "random", "sorted_random")
+
+
+@dataclass(frozen=True)
+class GLMSFACase:
+    name: str
+    query_lens: tuple
+    num_query_heads: int
+    num_physical_pages: int
+    page_size: int
+    pages_per_request: int
+    num_sparse_indices: int
+    kv_dim: int = 512
+    rope_dim: int = 64
+
+    @property
+    def kv_valid_lengths(self):
+        return (self.pages_per_request * self.page_size,) * len(self.query_lens)
+
+
+# PR #967 regression shapes. The head counts cover GLM attention with different
+# tensor-parallel degrees; both multi-query and one-query-per-request inputs
+# must retain the original paged/shared cache shapes.
+GLM_CASES = (
+    GLMSFACase("glm_h4_page128_topk2048", (6, 6), 4, 2242, 128, 2080, 2048),
+    GLMSFACase("glm_h32_page64_topk2051", (4,), 32, 2177, 64, 2082, 2051),
+    GLMSFACase("glm_h64_page128_topk2048", (1024,), 64, 3878, 128, 2080, 2048),
+)
+GLM_PHASES = ("prefill", "decode")
+
+
+def make_glm_inputs(case, phase, device, dtype=torch.float16):
+    """Reproduce the original GLM shapes with matched native/candidate inputs.
+
+    Decode keeps the final original Q/RoPE/index row of each request. Consume
+    the same CPU RNG sequence in both phases so KV and page-table values also
+    remain identical. Input preparation is never part of device timing.
+    """
+    if phase not in GLM_PHASES:
+        raise ValueError(f"Unknown GLM attention phase: {phase}")
+    gen = torch.Generator().manual_seed(20261030)
+    batch = len(case.query_lens)
+    original_tokens = sum(case.query_lens)
+    query = (
+        torch.randn((original_tokens, case.num_query_heads, case.kv_dim), generator=gen)
+        .to(dtype)
+        .mul_(0.5)
+    )
+    query_rope = (
+        torch.randn(
+            (original_tokens, case.num_query_heads, case.rope_dim), generator=gen
+        )
+        .to(dtype)
+        .mul_(0.5)
+    )
+    key = (
+        torch.randn(
+            (case.num_physical_pages, case.page_size, 1, case.kv_dim), generator=gen
+        )
+        .to(dtype)
+        .mul_(0.5)
+    )
+    key_rope = (
+        torch.randn(
+            (case.num_physical_pages, case.page_size, 1, case.rope_dim), generator=gen
+        )
+        .to(dtype)
+        .mul_(0.5)
+    )
+    block_table = torch.stack(
+        [
+            torch.randperm(case.num_physical_pages, generator=gen)[
+                : case.pages_per_request
+            ]
+            for _ in range(batch)
+        ]
+    ).int()
+    sparse_rows = []
+    for qlen, kv_len in zip(case.query_lens, case.kv_valid_lengths):
+        for pos in range(qlen):
+            selected = torch.randperm(kv_len, generator=gen)[: case.num_sparse_indices]
+            if phase == "prefill" or pos == qlen - 1:
+                # A view would retain a full KV-length permutation per query.
+                sparse_rows.append(selected.int())
+    sparse_indices = torch.stack(sparse_rows)[:, None, :]
+    qlens = case.query_lens
+    if phase == "decode":
+        last_rows = torch.tensor(qlens).cumsum(0) - 1
+        query = query.index_select(0, last_rows)
+        query_rope = query_rope.index_select(0, last_rows)
+        qlens = (1,) * batch
+    key_dev = key.to(device)
+    return dict(
+        query=query.to(device),
+        key=key_dev,
+        value=key_dev,
+        query_rope=query_rope.to(device),
+        key_rope=key_rope.to(device),
+        sparse_indices=sparse_indices.to(device),
+        block_table=block_table.to(device),
+        scale_value=1.0 / math.sqrt(case.kv_dim + case.rope_dim),
+        actual_seq_lengths_query=torch.tensor(qlens, dtype=torch.int32)
+        .cumsum(0)
+        .int()
+        .to(device),
+        actual_seq_lengths_kv=torch.tensor(
+            case.kv_valid_lengths, dtype=torch.int32, device=device
+        ),
+        layout_query="TND",
+        layout_kv="PA_BSND",
+        sparse_block_size=1,
+        sparse_mode=0,
+    )
 
 
 def make_inputs(case, mode, device):

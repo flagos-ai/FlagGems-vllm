@@ -625,13 +625,13 @@ def get_env(gpu_ids, op=None):
     if vendor == "ascend" and op == "sparse_flash_attention":
         # Reference vendor ops must load before pytest's initial conftests.
         # Enable the plugin only for this operator's child processes.
-        plugin = "tests.ascend_custom_ops"
+        plugin = "tools.ascend.pytest_custom_ops"
         plugins = [name for name in env.get("PYTEST_PLUGINS", "").split(",") if name]
         if plugin not in plugins:
             plugins.append(plugin)
         env["PYTEST_PLUGINS"] = ",".join(plugins)
         # Workers invoke pytest from tests/ or benchmark/, before pytest has
-        # added the repository root for importing the tests package.
+        # added the repository root for importing the tools package.
         pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(ROOT) + (os.pathsep + pythonpath if pythonpath else "")
     return env
