@@ -109,6 +109,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -161,6 +162,7 @@ __all__ = [
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "top_k_top_p",
     "topk_softplus_sqrt",
     "unpack_seq_triton",
 ]

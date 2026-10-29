@@ -1335,6 +1335,22 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: top_k_top_p
+    description: |
+      Per-row top-k / top-p filtering of [batch, vocab] sampling logits: masked
+      positions become -inf and kept positions keep their logit values.
+      Sorts the per-row top-L candidates, then applies the k/p cutoff and
+      scatters back to vocab order (Ascend port of the vLLM sampling filter,
+      replacing torch_npu.npu_top_k_top_p).
+    for:
+      - torch_npu.npu_top_k_top_p
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: topk_softmax
     description: |
       Selects the k most likely next-token candicates, sets all others to zero,
