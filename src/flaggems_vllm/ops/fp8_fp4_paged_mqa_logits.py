@@ -93,6 +93,12 @@ def _mqa_logits_kernel(
     BLOCK_D: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     IS_MXFP4: tl.constexpr,
+    PAGED_KV: tl.constexpr = False,
+    NEXT_N: tl.constexpr = 1,
+    stride_kv_page: tl.constexpr = 0,
+    stride_ctx_batch: tl.constexpr = 1,
+    stride_ctx_next: tl.constexpr = 0,
+    stride_bt_next: tl.constexpr = 0,
 ):
     """Per-tile kernel: each program processes one BLOCK_KV tile for one row."""
     kv_block = tl.program_id(0)
@@ -101,14 +107,26 @@ def _mqa_logits_kernel(
     if row_idx >= total_rows:
         return
 
-    ctx_len = tl.load(Ctx_lens_ptr + row_idx)
+    if PAGED_KV:
+        batch_idx = row_idx // NEXT_N
+        next_idx = row_idx % NEXT_N
+        ctx_len = tl.load(
+            Ctx_lens_ptr + batch_idx * stride_ctx_batch + next_idx * stride_ctx_next
+        )
+    else:
+        ctx_len = tl.load(Ctx_lens_ptr + row_idx)
     kv_start = kv_block * BLOCK_KV
     if kv_start >= ctx_len:
         return
 
     q_row_base = Q_ptr + row_idx * stride_q_row
     w_row_base = Weights_ptr + row_idx * stride_w_row
-    bt_row_base = Block_tables_ptr + row_idx * stride_bt_row
+    if PAGED_KV:
+        bt_row_base = (
+            Block_tables_ptr + batch_idx * stride_bt_row + next_idx * stride_bt_next
+        )
+    else:
+        bt_row_base = Block_tables_ptr + row_idx * stride_bt_row
     out_row_base = Output_ptr + row_idx * stride_out_row
 
     h_ids = tl.arange(0, num_heads)
@@ -158,7 +176,16 @@ def _mqa_logits_kernel(
             flat_base = phys_block * block_size
 
             # Coalesced KV load: [block_size, head_dim] as FP8
-            kv_offsets = (flat_base + p_ids[:, None]) * stride_kv_flat + d_ids[None, :]
+            if PAGED_KV:
+                kv_offsets = (
+                    phys_block * stride_kv_page
+                    + p_ids[:, None] * head_dim
+                    + d_ids[None, :]
+                )
+            else:
+                kv_offsets = (flat_base + p_ids[:, None]) * stride_kv_flat + d_ids[
+                    None, :
+                ]
             kv_u8 = tl.load(KV_data_ptr + kv_offsets)
 
             # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
@@ -170,7 +197,15 @@ def _mqa_logits_kernel(
                 dots = tl.dot(q_fp8, tl.trans(kv_fp8))
 
             # Coalesced scale load: [block_size] float32
-            scale_tile = tl.load(KV_scales_ptr + flat_base + p_ids)
+            if PAGED_KV:
+                scale_offsets = (
+                    phys_block * (stride_kv_page // 4)
+                    + block_size * head_dim // 4
+                    + p_ids
+                )
+                scale_tile = tl.load(KV_scales_ptr + scale_offsets)
+            else:
+                scale_tile = tl.load(KV_scales_ptr + flat_base + p_ids)
 
             # Fused scale, relu, weight, reduce over heads
             scores = tl.maximum(dots * scale_tile[None, :], 0.0)

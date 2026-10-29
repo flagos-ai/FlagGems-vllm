@@ -27,6 +27,8 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.tle_capabilities import supports_topk_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 _LAUNCH_GEOMETRY = None
@@ -76,13 +78,32 @@ if has_triton_tle(3, 6, 0) and _vendor_tle_enabled():
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE = True
+        HAS_TLE = supports_topk_tle(tle)
+        if not HAS_TLE:
+            # Triton's dependency walk also visits disabled TLE branches.
+            tle = None
     except ImportError:
         tle = None
         HAS_TLE = False
 else:
     tle = None
     HAS_TLE = False
+
+
+# A disabled constexpr branch still participates in Triton's dependency walk.
+# Keep the scan helper defined without referencing a missing optional symbol.
+if HAS_TLE:
+
+    @triton.jit
+    def _exclusive_cumsum(counts):
+        return tle.cumsum(counts, axis=0, reverse=False)
+
+else:
+
+    @triton.jit
+    def _exclusive_cumsum(counts):
+        total = tl.sum(counts)
+        return total - tl.cumsum(counts, axis=0, reverse=True), total
 
 
 logger = logging.getLogger(__name__)
@@ -100,7 +121,8 @@ NUM_FILNAL_ITEMS = 2048
 NUM_BINS = 2048
 RADIX_BITS_FINAL = 8
 RADIX_SIZE_FINAL = 1 << RADIX_BITS_FINAL
-RADIX_FINAL_PREFILL_VOCAB_THRESHOLD = 65536
+CANONICAL_OUTPUT_VOCAB_THRESHOLD = 65536
+RADIX_FINAL_PREFILL_VOCAB_THRESHOLD = CANONICAL_OUTPUT_VOCAB_THRESHOLD
 
 
 def _use_radix_final_for_prefill(vocab_size):
@@ -176,6 +198,14 @@ def _distribute_to_bins(
 
 
 @triton.jit
+def _stable_output_positions(base, mask):
+    # The row-owning CTA carries its counter through the scan in registers.
+    counts = tl.reshape(mask.to(tl.int32), (mask.numel,))
+    positions = base + tl.cumsum(counts, axis=0) - 1
+    return tl.reshape(positions, mask.shape), base + tl.sum(counts, axis=0)
+
+
+@triton.jit
 def _process_bins(
     logits,
     in_range,
@@ -195,8 +225,13 @@ def _process_bins(
     s_out_logits_ptr,
     STEP: tl.constexpr,
     TOPK: tl.constexpr,
+    HAS_TLE: tl.constexpr,
+    CANONICAL_OUTPUT: tl.constexpr,
     MULTIPLE_BLOCKS_PER_ROW: tl.constexpr,
     MERGE_BLOCKS: tl.constexpr,
+    found_count,
+    final_count,
+    equal_count,
 ):
     NUM_FINAL_ITEMS: tl.constexpr = 2048
 
@@ -207,13 +242,16 @@ def _process_bins(
         STEP=STEP,
     )
     take_lt = is_partial_match & (bin_idx < threshold_bin_idx) & write_directly
-    out_pos_lt = tl.atomic_add(
-        found_topk_values_ptrs,
-        ones,
-        mask=take_lt,
-        sem="relaxed",
-        scope="cta",
-    )
+    if HAS_TLE or CANONICAL_OUTPUT:
+        out_pos_lt = tl.atomic_add(
+            found_topk_values_ptrs,
+            ones,
+            mask=take_lt,
+            sem="relaxed",
+            scope="cta",
+        )
+    else:
+        out_pos_lt, found_count = _stable_output_positions(found_count, take_lt)
     if MERGE_BLOCKS:
         indices = tl.load(
             indices_ptr + offs,
@@ -245,13 +283,18 @@ def _process_bins(
     if STEP < 3:
         if use_final:
             take_eq_final = is_partial_match & (bin_idx == threshold_bin_idx)
-            final_pos = tl.atomic_add(
-                final_cnt_ptrs,
-                ones,
-                mask=take_eq_final,
-                sem="relaxed",
-                scope="cta",
-            )
+            if HAS_TLE or CANONICAL_OUTPUT:
+                final_pos = tl.atomic_add(
+                    final_cnt_ptrs,
+                    ones,
+                    mask=take_eq_final,
+                    sem="relaxed",
+                    scope="cta",
+                )
+            else:
+                final_pos, final_count = _stable_output_positions(
+                    final_count, take_eq_final
+                )
             tl.store(
                 s_final_logits_ptr + final_pos,
                 logits,
@@ -283,13 +326,16 @@ def _process_bins(
     else:
         take_eq = is_partial_match & (bin_idx == threshold_bin_idx)
         # s_histogram_ptr being used for exclude prefix sum
-        out_pos_eq = tl.atomic_add(
-            s_histogram_ptr + bin_idx,
-            ones,
-            mask=take_eq,
-            sem="relaxed",
-            scope="cta",
-        )
+        if HAS_TLE:
+            out_pos_eq = tl.atomic_add(
+                s_histogram_ptr + bin_idx,
+                ones,
+                mask=take_eq,
+                sem="relaxed",
+                scope="cta",
+            )
+        else:
+            out_pos_eq, equal_count = _stable_output_positions(equal_count, take_eq)
         if MERGE_BLOCKS:
             indices = tl.load(
                 indices_ptr + offs,
@@ -317,6 +363,7 @@ def _process_bins(
                 offs.to(tl.int32),
                 mask=take_eq & (out_pos_eq < TOPK),
             )
+    return found_count, final_count, equal_count
 
 
 @triton.jit
@@ -343,6 +390,7 @@ def _process_histogram_step(
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HAS_TLE: tl.constexpr,
+    CANONICAL_OUTPUT: tl.constexpr,
     MULTIPLE_BLOCKS_PER_ROW: tl.constexpr,
     MERGE_BLOCKS: tl.constexpr,
 ):
@@ -484,7 +532,7 @@ def _process_histogram_step(
             bins = round_idx * BLOCK_SIZE + lane
             counts = tl.load(s_histogram_ptr + bins)
             if HAS_TLE:
-                prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
+                prefix_sum, counts_total = _exclusive_cumsum(counts)
             else:
                 counts_total = tl.sum(counts)
                 prefix_sum = counts_total - tl.cumsum(counts, axis=0, reverse=True)
@@ -508,11 +556,27 @@ def _process_histogram_step(
     use_final = final_bin_size <= NUM_FINAL_ITEMS
     write_directly = ((STEP == 0) & (final_bin_size <= NUM_FINAL_ITEMS)) | (STEP >= 1)
 
-    found_ptrs = s_found_topk_values_ptr + zeros
-    final_cnt_ptrs = s_final_cnt_ptr + zeros
+    found_count = tl.zeros((), tl.int32)
+    final_count = tl.zeros((), tl.int32)
+    equal_count = tl.zeros((), tl.int32)
+    if not HAS_TLE:
+        if not CANONICAL_OUTPUT:
+            found_count = tl.load(s_found_topk_values_ptr)
+            final_count = tl.load(s_final_cnt_ptr)
+        if STEP == 3:
+            equal_count = tl.load(s_histogram_ptr + threshold_bin_idx)
+
+    found_ptrs = s_found_topk_values_ptr
+    final_cnt_ptrs = s_final_cnt_ptr
+    if HAS_TLE or CANONICAL_OUTPUT:
+        found_ptrs = s_found_topk_values_ptr + zeros
+        final_cnt_ptrs = s_final_cnt_ptr + zeros
     if assume_aligned:
-        found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
-        final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
+        found_ptrs_vec_2d = s_found_topk_values_ptr
+        final_cnt_ptrs_vec_2d = s_final_cnt_ptr
+        if HAS_TLE or CANONICAL_OUTPUT:
+            found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
+            final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
         n_tiles = tl.cdiv(vocab_size, BLOCK_SIZE)
         n_vec_full = vocab_size // (BLOCK_SIZE * VEC)
         rem_tiles = (vocab_size - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
@@ -520,7 +584,7 @@ def _process_histogram_step(
             base = t * BLOCK_SIZE * VEC + lane * VEC
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(logits_ptr + offs)
-            _process_bins(
+            found_count, final_count, equal_count = _process_bins(
                 x_vec,
                 True,
                 ones_vec_2d,
@@ -539,13 +603,18 @@ def _process_histogram_step(
                 s_out_logits_ptr,
                 STEP=STEP,
                 TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
                 MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
             x = tl.load(logits_ptr + offs)
-            _process_bins(
+            found_count, final_count, equal_count = _process_bins(
                 x,
                 True,
                 ones,
@@ -564,75 +633,32 @@ def _process_histogram_step(
                 s_out_logits_ptr,
                 STEP=STEP,
                 TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
                 MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
     elif stride1 == 1:
-        found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
-        final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
+        found_ptrs_vec_2d = s_found_topk_values_ptr
+        final_cnt_ptrs_vec_2d = s_final_cnt_ptr
+        if HAS_TLE or CANONICAL_OUTPUT:
+            found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
+            final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
         aligned_row_ptr = tl.multiple_of(logits_ptr + row_start + skip_elems, VEC * 4)
         row_len = row_end - row_start - skip_elems
         n_vec_full = row_len // (BLOCK_SIZE * VEC)
         rem_tiles = (row_len - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
         rem_elems = row_len % BLOCK_SIZE
-        for t in tl.range(0, n_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            offs = base[:, None] + vec[None, :]
-            x_vec = tl.load(aligned_row_ptr + offs)
-            _process_bins(
-                x_vec,
-                True,
-                ones_vec_2d,
-                offs + skip_elems,
-                found_ptrs_vec_2d,
-                final_cnt_ptrs_vec_2d,
-                logit_pattern,
-                threshold_bin_idx,
-                write_directly,
-                use_final,
-                row_start,
-                indices_ptr,
-                s_histogram_ptr,
-                s_final_logits_ptr,
-                s_out_indices_ptr,
-                s_out_logits_ptr,
-                STEP=STEP,
-                TOPK=TOPK,
-                MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
-                MERGE_BLOCKS=MERGE_BLOCKS,
-            )
-        for t in tl.range(0, rem_tiles):
-            offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
-            x = tl.load(aligned_row_ptr + offs)
-            _process_bins(
-                x,
-                True,
-                ones,
-                offs + skip_elems,
-                found_ptrs,
-                final_cnt_ptrs,
-                logit_pattern,
-                threshold_bin_idx,
-                write_directly,
-                use_final,
-                row_start,
-                indices_ptr,
-                s_histogram_ptr,
-                s_final_logits_ptr,
-                s_out_indices_ptr,
-                s_out_logits_ptr,
-                STEP=STEP,
-                TOPK=TOPK,
-                MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
-                MERGE_BLOCKS=MERGE_BLOCKS,
-            )
-        if skip_elems > 0:
+        if not HAS_TLE and skip_elems > 0:
             offs = lane
             in_range = lane < skip_elems
             x = tl.load(
                 logits_ptr + row_start + offs, mask=in_range, other=float("-inf")
             )
-            _process_bins(
+            found_count, final_count, equal_count = _process_bins(
                 x,
                 in_range,
                 ones,
@@ -651,6 +677,105 @@ def _process_histogram_step(
                 s_out_logits_ptr,
                 STEP=STEP,
                 TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
+                MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
+                MERGE_BLOCKS=MERGE_BLOCKS,
+            )
+        for t in tl.range(0, n_vec_full):
+            base = t * BLOCK_SIZE * VEC + lane * VEC
+            offs = base[:, None] + vec[None, :]
+            x_vec = tl.load(aligned_row_ptr + offs)
+            found_count, final_count, equal_count = _process_bins(
+                x_vec,
+                True,
+                ones_vec_2d,
+                offs + skip_elems,
+                found_ptrs_vec_2d,
+                final_cnt_ptrs_vec_2d,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                use_final,
+                row_start,
+                indices_ptr,
+                s_histogram_ptr,
+                s_final_logits_ptr,
+                s_out_indices_ptr,
+                s_out_logits_ptr,
+                STEP=STEP,
+                TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
+                MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
+                MERGE_BLOCKS=MERGE_BLOCKS,
+            )
+        for t in tl.range(0, rem_tiles):
+            offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
+            x = tl.load(aligned_row_ptr + offs)
+            found_count, final_count, equal_count = _process_bins(
+                x,
+                True,
+                ones,
+                offs + skip_elems,
+                found_ptrs,
+                final_cnt_ptrs,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                use_final,
+                row_start,
+                indices_ptr,
+                s_histogram_ptr,
+                s_final_logits_ptr,
+                s_out_indices_ptr,
+                s_out_logits_ptr,
+                STEP=STEP,
+                TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
+                MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
+                MERGE_BLOCKS=MERGE_BLOCKS,
+            )
+        if HAS_TLE and skip_elems > 0:
+            offs = lane
+            in_range = lane < skip_elems
+            x = tl.load(
+                logits_ptr + row_start + offs, mask=in_range, other=float("-inf")
+            )
+            found_count, final_count, equal_count = _process_bins(
+                x,
+                in_range,
+                ones,
+                offs,
+                found_ptrs,
+                final_cnt_ptrs,
+                logit_pattern,
+                threshold_bin_idx,
+                write_directly,
+                use_final,
+                row_start,
+                indices_ptr,
+                s_histogram_ptr,
+                s_final_logits_ptr,
+                s_out_indices_ptr,
+                s_out_logits_ptr,
+                STEP=STEP,
+                TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
                 MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
@@ -658,7 +783,7 @@ def _process_histogram_step(
             offs = (n_vec_full * VEC + rem_tiles) * BLOCK_SIZE + lane
             in_range = lane < rem_elems
             x = tl.load(aligned_row_ptr + offs, mask=in_range, other=float("-inf"))
-            _process_bins(
+            found_count, final_count, equal_count = _process_bins(
                 x,
                 in_range,
                 ones,
@@ -677,6 +802,11 @@ def _process_histogram_step(
                 s_out_logits_ptr,
                 STEP=STEP,
                 TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
                 MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
@@ -691,7 +821,7 @@ def _process_histogram_step(
                 mask=in_range,
                 other=float("-inf"),
             )
-            _process_bins(
+            found_count, final_count, equal_count = _process_bins(
                 x,
                 in_range,
                 ones,
@@ -710,9 +840,20 @@ def _process_histogram_step(
                 s_out_logits_ptr,
                 STEP=STEP,
                 TOPK=TOPK,
+                HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
+                found_count=found_count,
+                final_count=final_count,
+                equal_count=equal_count,
                 MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
+    if not HAS_TLE:
+        if not CANONICAL_OUTPUT:
+            tl.store(s_found_topk_values_ptr, found_count)
+            tl.store(s_final_cnt_ptr, final_count)
+        if STEP == 3:
+            tl.store(s_histogram_ptr + threshold_bin_idx, equal_count)
     tl.debug_barrier()
     return final_bin_size > NUM_FINAL_ITEMS, logit_pattern, threshold_bin_idx
 
@@ -787,7 +928,7 @@ def _final_select_radix(
 
                 tl.debug_barrier()
                 counts = tl.load(radix_count_vec_ptr)
-                prefix_sum, _ = tle.cumsum(counts, axis=0, reverse=False)
+                prefix_sum, _ = _exclusive_cumsum(counts)
                 next_prefix_sum = prefix_sum + counts
                 threshold_mask = (prefix_sum < k_to_find) & (
                     next_prefix_sum >= k_to_find
@@ -904,6 +1045,7 @@ def _top_k_per_row_job(
     BLOCK_SIZE: tl.constexpr,
     USE_RADIX_FINAL: tl.constexpr,
     HAS_TLE: tl.constexpr,
+    CANONICAL_OUTPUT: tl.constexpr,
     MULTIPLE_BLOCKS_PER_ROW: tl.constexpr,
     MERGE_BLOCKS: tl.constexpr,
 ):
@@ -984,6 +1126,7 @@ def _top_k_per_row_job(
                 TOPK=TOPK,
                 BLOCK_SIZE=BLOCK_SIZE,
                 HAS_TLE=HAS_TLE,
+                CANONICAL_OUTPUT=CANONICAL_OUTPUT,
                 MULTIPLE_BLOCKS_PER_ROW=MULTIPLE_BLOCKS_PER_ROW,
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
@@ -1016,9 +1159,24 @@ def _top_k_per_row_job(
                     other=0,
                 )
                 out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+                if not HAS_TLE and (CANONICAL_OUTPUT or MERGE_BLOCKS):
+                    original_i = tl.load(s_histogram_ptr + pos, mask=valid, other=0)
                 for j in tl.range(0, final_cnt):
                     logit_j = tl.load(s_final_logits_ptr + j)
-                    better = (logit_i < logit_j) | ((logit_i == logit_j) & (pos < j))
+                    if HAS_TLE:
+                        better = (logit_i < logit_j) | (
+                            (logit_i == logit_j) & (pos < j)
+                        )
+                    elif CANONICAL_OUTPUT or MERGE_BLOCKS:
+                        original_j = tl.load(s_histogram_ptr + j)
+                        better = (logit_i < logit_j) | (
+                            (logit_i == logit_j) & (original_i > original_j)
+                        )
+                    else:
+                        # Stable collection visits original indices in order.
+                        better = (logit_i < logit_j) | (
+                            (logit_i == logit_j) & (pos > j)
+                        )
                     out_rank = out_rank + (valid & better).to(tl.int32)
                 dst_pos = base_idx + out_rank
                 take = valid & (dst_pos < TOPK)
@@ -1031,6 +1189,16 @@ def _top_k_per_row_job(
                 if MULTIPLE_BLOCKS_PER_ROW:
                     tl.store(s_out_logits_ptr + dst_pos, logit_i, mask=take)
             tl.debug_barrier()
+
+    if not HAS_TLE and CANONICAL_OUTPUT:
+        # Atomic collection can reorder an otherwise identical selected set.
+        SORT_SIZE: tl.constexpr = triton.next_power_of_2(TOPK)
+        positions = tl.arange(0, SORT_SIZE)
+        selected = tl.load(
+            out_indices_ptr + positions, mask=positions < TOPK, other=0x7FFFFFFF
+        )
+        ordered = tl.sort(selected, descending=False)
+        tl.store(out_indices_ptr + positions, ordered, mask=positions < TOPK)
 
     # out_indices_ptr is identical to s_out_indices_ptr for non-tle
     if HAS_TLE:
@@ -1158,11 +1326,24 @@ def tle_top_k_per_row_prefill(
         BLOCK_SIZE=BLOCK_SIZE,
         USE_RADIX_FINAL=USE_RADIX_FINAL,
         HAS_TLE=True,
+        CANONICAL_OUTPUT=False,
         MULTIPLE_BLOCKS_PER_ROW=False,
         MERGE_BLOCKS=False,
     )
 
 
+def _standard_topk_entry(kernel):
+    if runtime.device.vendor_name != "nvidia":
+        return kernel
+    return libentry()(
+        libtuner(
+            configs=runtime.get_tuned_config("top_k_per_row_standard"),
+            key=["NUM_ROWS", "vocab_size", "TOPK", "stride0", "stride1"],
+        )(kernel)
+    )
+
+
+@_standard_topk_entry
 @triton.jit
 def non_tle_top_k_per_row_prefill(
     logits_ptr,
@@ -1178,8 +1359,10 @@ def non_tle_top_k_per_row_prefill(
     s_threshold_bin_idx_ptr,
     s_final_bin_size_ptr,
     s_found_topk_values_ptr,
+    NUM_ROWS: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    CANONICAL_OUTPUT: tl.constexpr,
     ROW_OFFSET: tl.constexpr,
 ):
     VEC: tl.constexpr = 4
@@ -1224,6 +1407,7 @@ def non_tle_top_k_per_row_prefill(
         BLOCK_SIZE=BLOCK_SIZE,
         USE_RADIX_FINAL=False,
         HAS_TLE=False,
+        CANONICAL_OUTPUT=CANONICAL_OUTPUT,
         MULTIPLE_BLOCKS_PER_ROW=False,
         MERGE_BLOCKS=False,
     )
@@ -1310,6 +1494,11 @@ def top_k_per_row_prefill(
         s_found_topk_values_ptr = torch.empty(
             (num_rows,), device=device, dtype=torch.int32
         )
+        launch_options = (
+            {}
+            if runtime.device.vendor_name == "nvidia"
+            else {"num_warps": _num_warps(NUM_THREADS_PER_BLOCK)}
+        )
         non_tle_top_k_per_row_prefill[(num_rows,)](
             logits,
             indices,
@@ -1326,6 +1515,8 @@ def top_k_per_row_prefill(
             s_found_topk_values_ptr,
             TOPK=top_k,
             BLOCK_SIZE=NUM_THREADS_PER_BLOCK,
+            CANONICAL_OUTPUT=vocab_size >= CANONICAL_OUTPUT_VOCAB_THRESHOLD,
             ROW_OFFSET=0,
-            num_warps=_num_warps(NUM_THREADS_PER_BLOCK),
+            NUM_ROWS=num_rows,
+            **launch_options,
         )

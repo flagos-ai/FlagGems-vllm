@@ -62,7 +62,8 @@ ops:
     stages:
       - stable: '2.0'
   - id: beam_search_score
-    description: Computes beam search scores by adding cumulative log probabilities with new token scores.
+    description: Computes beam search scores by adding cumulative log probabilities
+      with new token scores.
     for:
       - beam_search_score
     labels:
@@ -83,6 +84,20 @@ ops:
       - Math
     stages:
       - alpha: '5.4'
+  - id: bf16_paged_mqa_logits
+    description: |
+      Compute multi-head weighted ReLU attention logits on paged BF16 KV cache.
+      Uses shape-specialized Triton kernels for H=32 and H=64 with
+      zero-constexpr dispatch for decode-phase inference.
+    for:
+      - bf16_paged_mqa_logits
+    labels:
+      - fused
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: bincount
     description: Count the frequency of each value in an array of non-negative integers.
     for:
@@ -95,6 +110,29 @@ ops:
       - Reduction
     stages:
       - stable: '5.0'
+  - id: bmm_w8a8
+    description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
+    for:
+      - bmm_w8a8_int8
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
+  - id: bucket_sort_topk
+    description: A wrapper of the TLE version and the Triton version bucket-sort topk
+      operation.
+    for:
+      - None
+    labels:
+      - fused
+      - DSA
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: causal_conv1d_fn
     description: |
       Causal depthwise conv1d over variable-length token sequences with
@@ -122,29 +160,6 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
-  - id: bucket_sort_topk
-    description: A wrapper of the TLE version and the Triton version bucket-sort topk operation.
-    for:
-      - None
-    labels:
-      - fused
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: chunk_kda
-    description: |
-      Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
-    for:
-      - chunk_kda
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
   - id: chunk_gated_delta_rule_fwd
     description: |
       The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear Attention (FLA).
@@ -158,6 +173,18 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: chunk_kda
+    description: |
+      Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
+    for:
+      - chunk_kda
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices
@@ -241,6 +268,8 @@ ops:
       - stable: '2.0'
       - removed: '3.0'
   - id: cutlass_scaled_mm
+    description: Scaled matrix multiplication with per-tensor or per-token quantization
+      scales.
     for:
       - cutlass_scaled_mm_sm_90
     labels:
@@ -323,6 +352,7 @@ ops:
       - alpha: '5.0'
       - beta: '5.3'
   - id: flash_attention_forward
+    description: Forward pass of FlashAttention computing scaled dot-product attention.
     for:
       - _flash_attention_forward
     labels:
@@ -347,36 +377,27 @@ ops:
     stages:
       - stable: '3.1'
     cpp: '4.0'
-  - id: flash_attn_varlen_func_w8a8_fp8
+  - id: flash_attn_varlen_func_w8a8
     description: |
-      Compute variable-length FlashAttention-2 on NVIDIA Hopper or newer and
-      Moore Threads MUSA with block-wise FP8 query, key, and value tensors,
-      per-block descales, and FP16/BF16 output.
+      W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
+      FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
+      and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
+      Hygon DCU, PPU, and MetaX).
     for:
-      - None
+      - flash_attn_varlen_func_w8a8_int8
     labels:
       - NoCPU
+      - fused
       - Attention
       - FlashAttention
       - Quantization
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
-  - id: flash_attn_varlen_func_w8a8_int8
-    description: Hygon DCU and PPU INT8 Q/K/V variable-length attention with per-128-token descales and FP16/BF16 output.
-    for:
-      - flash_attn_varlen_func_w8a8_int8
-    labels:
-      - fused
-      - Attention
-      - FlashAttention
-    kind:
-      - NeuralNetwork
-    stages:
       - beta: '5.3'
   - id: flash_attn_varlen_opt_func
-    description: A variant of `flash_attn_varlen_func` that has `lse` as an optional parameter.
+    description: A variant of `flash_attn_varlen_func` that has `lse` as an optional
+      parameter.
     for:
       - flash_attn_varlen_func
     labels:
@@ -412,7 +433,8 @@ ops:
     stages:
       - alpha: '5.3'
   - id: flash_mla_with_kvcache
-    description: Dense and sparse Multi-head Latent Attention decoding with a paged KV cache.
+    description: Dense and sparse Multi-head Latent Attention decoding with a paged
+      KV cache.
     for:
       - vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache
     labels:
@@ -424,7 +446,10 @@ ops:
     stages:
       - alpha: '5.4'
   - id: fp8_einsum
-    description: Block-scaled FP8 bhr,hdr->bhd contraction on NVIDIA Hopper.
+    description: |
+      Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
+      vLLM DeepGEMM fp8_einsum) and INT8 with per-token-group activation scales
+      (Hygon, MetaX, PPU).
     for:
       - vllm.utils.deep_gemm.fp8_einsum
     labels:
@@ -433,6 +458,7 @@ ops:
       - DeepSeekV4
     kind:
       - NeuralNetwork
+      - Quantization
     stages:
       - alpha: '5.4'
   - id: fp8_fp4_mqa_logits
@@ -467,6 +493,7 @@ ops:
     stages:
       - beta: '5.3'
   - id: fused_add_rms_norm
+    description: Add two inputs element-wise and apply Root Mean Square Layer Normalization.
     for:
       - add_rms_norm
     labels:
@@ -519,8 +546,25 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
-  - id: fused_marlin_moe_w4a16_int4
-    description: Fused mixture-of-experts computation with GPTQ INT4 weights and 16-bit activations.
+  - id: fused_inv_rope_fp8_quant
+    description: |
+      Apply inverse RoPE and group-wise quantization to attention output.
+      Precisions: FP8 and INT8 (Ascend NPU).
+    for:
+      - vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant
+    labels:
+      - fused
+      - Attention
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - Quantization
+    stages:
+      - beta: '5.4'
+  - id: fused_marlin_moe_w4a16
+    description: |
+      Fused mixture-of-experts computation with 4-bit weights and 16-bit
+      activations. Precisions: GPTQ INT4 (uint4b8) and MXFP4.
     for:
       - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
     labels:
@@ -531,8 +575,10 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
-  - id: fused_marlin_moe_w4a16_mxfp4
-    description: Fused mixture-of-experts computation with MXFP4 weights and 16-bit activations.
+  - id: fused_marlin_moe_w8a16
+    description: |
+      Fused mixture-of-experts computation with 8-bit weights and 16-bit
+      activations. Precisions: FP8 (E4M3) and INT8 (uint8b128).
     for:
       - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
     labels:
@@ -582,23 +628,9 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
-  - id: gemma_rms_norm
-    description: |
-      RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
-      the learnable weight is offset by one: the output is
-      `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
-    for:
-      - vllm.model_executor.layers.layernorm.GemmaRMSNorm
-    labels:
-      - fused
-      - NoCPU
-      - Normalization
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
   - id: geglu
-    description: Gaussian Error Gated Linear Unit with GELU activation instead of sigmoid function.
+    description: Gaussian Error Gated Linear Unit with GELU activation instead of
+      sigmoid function.
     for:
       - geglu
     labels:
@@ -622,6 +654,21 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: gemma_rms_norm
+    description: |
+      RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
+      the learnable weight is offset by one: the output is
+      `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
+    for:
+      - vllm.model_executor.layers.layernorm.GemmaRMSNorm
+    labels:
+      - fused
+      - NoCPU
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: group_list_cumsum
     description: |
       Computes expert token-count offsets (cumsum) for expert-parallel MoE
@@ -712,7 +759,8 @@ ops:
     stages:
       - alpha: '5.4'
   - id: indexer_k_quant_and_cache
-    description: This is a fused operator that quantizes K tensors and writes them into the FP8 KV cache.
+    description: This is a fused operator that quantizes K tensors and writes them
+      into the FP8 KV cache.
     for:
       - None
     labels:
@@ -960,7 +1008,8 @@ ops:
     stages:
       - stable: '2.2'
   - id: mv
-    description: Performs a matrix-vector product of the matrix `input` and the vector `vec`.
+    description: Performs a matrix-vector product of the matrix `input` and the vector
+      `vec`.
     for:
       - mv
     labels:
@@ -1037,6 +1086,21 @@ ops:
     stages:
       - alpha: '4.2'
       - beta: '5.3'
+  - id: persistent_topk
+    description: |
+      vLLM-compatible persistent topk decode. Triton implementation supporting
+      three dispatch tiers (decode/medium/large) based on seq_len, with
+      cooperative multi-CTA kernels for large sequences.
+    for:
+      - _C.persistent_topk
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: reglu
     description: |
       Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of the sigmoid function for gating.
@@ -1051,7 +1115,8 @@ ops:
       - alpha: '4.2'
       - beta: '5.3'
   - id: reshape_and_cache
-    description: Store the key/value token states into the pre-allcated kv_cache buffers of paged attention.
+    description: Store the key/value token states into the pre-allcated kv_cache buffers
+      of paged attention.
     for:
       - reshape_and_cache
     labels:
@@ -1062,7 +1127,8 @@ ops:
     stages:
       - stable: '3.0'
   - id: reshape_and_cache_flash
-    description: Store the key/value token states into the pre-allcated kv_cache buffers of paged attention.
+    description: Store the key/value token states into the pre-allcated kv_cache buffers
+      of paged attention.
     for:
       - reshape_and_cache_flash
     labels:
@@ -1229,7 +1295,8 @@ ops:
     stages:
       - alpha: '5.4'
   - id: swiglu
-    description: Swish-Gated Linear Unit, a variant of GLU with the Swish activation function.
+    description: Swish-Gated Linear Unit, a variant of GLU with the Swish activation
+      function.
     for:
       - swiglu
     labels:
@@ -1250,21 +1317,6 @@ ops:
       - vLLM
       - DeepSeekV4
       - KernelGen
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: persistent_topk
-    description: |
-      vLLM-compatible persistent topk decode. Triton implementation supporting
-      three dispatch tiers (decode/medium/large) based on seq_len, with
-      cooperative multi-CTA kernels for large sequences.
-    for:
-      - _C.persistent_topk
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
     kind:
       - NeuralNetwork
     stages:
@@ -1310,7 +1362,8 @@ ops:
     stages:
       - beta: '5.3'
   - id: triton_lighting_indexer_k_tiled_interface
-    description: Part of FP8 MQA framework. It is currently not exposed as an operator for use.
+    description: Part of FP8 MQA framework. It is currently not exposed as an operator
+      for use.
     for:
       - None
     labels:
@@ -1321,7 +1374,8 @@ ops:
     stages:
       - alpha: '5.3'
   - id: unpack_seq_triton
-    description: Unpack a packed sequence tensor back to its original variable-length form.
+    description: Unpack a packed sequence tensor back to its original variable-length
+      form.
     for:
       - unpack_seq_triton
     labels:

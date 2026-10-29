@@ -34,6 +34,8 @@ from .consts import (
     BenchmarkResult,
     OperationAttribute,
     check_metric_dependencies,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
     model_shapes,
 )
 
@@ -106,6 +108,8 @@ class Benchmark:
         self.is_backward = is_backward
         self.is_inplace = is_inplace
         self._input_iter = None
+        # Baseline sub-entry for kanban operators that merge several precisions.
+        self.base_variant = None
 
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
@@ -461,6 +465,42 @@ class Benchmark:
                                     )
                     if "speedup" in self.to_bench_metrics:
                         metric.speedup = metric.latency_base / metric.latency
+                    if Config.base_data is not None and metric.latency:
+                        base_rec, miss_reason = lookup_base_record_ex(
+                            Config.base_data,
+                            self.op_name,
+                            dtype,
+                            metric.shape_detail,
+                            self.base_variant,
+                        )
+                        base_ms = base_rec.get("latency_ms") if base_rec else None
+                        if base_ms is not None:
+                            # Both baseline (latency_ms) and metric.latency are in
+                            # ms, so the raw ratio is dimensionless. Divide by this
+                            # chip's scaling factor for the baseline's bottleneck
+                            # resource to normalize away the hardware peak gap;
+                            # missing factor -> keep the raw ratio.
+                            speedup = base_ms / metric.latency
+                            factor = lookup_scaling_factor(
+                                Config.base_data,
+                                vendor_name,
+                                base_rec.get("bottle_neck_unit"),
+                                dtype,
+                            )
+                            if factor:
+                                speedup /= factor
+                            metric.compared_speedup = speedup
+                            print(
+                                f"[vs Base] {self.op_name} shape={metric.shape_detail} "
+                                f"base={base_ms:.6f}ms gems={metric.latency:.6f}ms "
+                                f"factor={factor} vs_base={speedup:.3f}"
+                            )
+                        else:
+                            # No baseline match: record and print the precise
+                            # reason (op / shape / dtype missing) so it can be
+                            # aggregated later.
+                            metric.base_miss_reason = miss_reason
+                            print(f"[vs Base][未匹配] {miss_reason}")
 
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(

@@ -378,13 +378,13 @@ def _check_w8a8_head_dim(
     _assert_w8a8_attention_close(actual, expected)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 def test_flash_attn_varlen_func_w8a8_fp8_signature():
     assert inspect.signature(w8a8_varlen) == inspect.signature(fa2_varlen)
     assert flaggems_vllm.flash_attn_varlen_func_w8a8_fp8 is w8a8_varlen
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -419,7 +419,7 @@ def test_flash_attn_varlen_func_w8a8_fp8(
     _assert_w8a8_attention_close(result, expected)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -432,9 +432,21 @@ def test_flash_attn_varlen_func_w8a8_fp8(
     reason="Requires NVIDIA Hopper or newer, or Moore Threads",
 )
 @pytest.mark.parametrize("head_size", W8A8_HEAD_SIZES)
-@pytest.mark.parametrize("fp8_dtype", W8A8_FP8_DTYPES)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["uniform", "ragged"])
+# Retain pairwise coverage of FP8 format, output dtype, and layout at every
+# head size without repeating their full Cartesian product.
+@pytest.mark.parametrize(
+    "fp8_dtype,dtype,layout",
+    [
+        (getattr(torch, fp8_name), dtype, layout)
+        for fp8_name, dtype, layout in [
+            ("float8_e4m3fn", torch.float16, "uniform"),
+            ("float8_e4m3fn", torch.bfloat16, "ragged"),
+            ("float8_e5m2", torch.float16, "ragged"),
+            ("float8_e5m2", torch.bfloat16, "uniform"),
+        ]
+        if getattr(torch, fp8_name, None) is not None
+    ],
+)
 def test_flash_attn_varlen_func_w8a8_fp8_all_head_dims(
     head_size, fp8_dtype, dtype, layout
 ):
@@ -453,7 +465,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_all_head_dims(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -485,7 +497,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_head_dim_strides(head_size, dtype, layo
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -511,7 +523,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_head_dim_long_sequences(head_size, caus
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -537,7 +549,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_head_dim_short_kv(head_size, kv_len):
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -592,7 +604,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_uniform_lse(
     torch.testing.assert_close(lse, expected_lse, rtol=1.0e-2, atol=5.0e-2)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -672,7 +684,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ragged(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -688,7 +700,11 @@ def test_flash_attn_varlen_func_w8a8_fp8_ragged(
     getattr(torch, "float8_e4m3fn", None) is None,
     reason="FP8 is not available",
 )
-@pytest.mark.parametrize("head_size", W8A8_HEAD_SIZES)
+# Packed tests cover all head sizes. Keep paging coverage at representative
+# sizes and around the 64-, 128-, 192-, and 256-element tile boundaries.
+@pytest.mark.parametrize(
+    "head_size", [8, 16, 24, 32, 56, 64, 72, 96, 120, 128, 136, 184, 192, 200, 248, 256]
+)
 @pytest.mark.parametrize("fp8_dtype", W8A8_FP8_DTYPES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size, fp8_dtype, dtype):
@@ -773,7 +789,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_paged_cache(head_size, fp8_dtype, dtype
     _assert_w8a8_lse_close(result, lse, expected_lse, q_lengths, kv_lengths, causal)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -853,7 +869,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_unsupported_inputs():
         )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -875,7 +891,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_invalid_head_dim(head_size):
         )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -898,7 +914,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_rejects_mismatched_head_dims():
         w8a8_varlen(q, torch.empty_like(q), k, 1, cu_seqlens, 1, cu_seqlens)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
@@ -1050,21 +1066,34 @@ def _check_ordinary_paged_shapes(
     _assert_w8a8_attention_close(result, expected)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA GQA coverage")
 @pytest.mark.skipif(
     not torch_device_fn.is_available(), reason="Accelerator is not available"
 )
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
-@pytest.mark.parametrize("num_heads", [(4, 4), (8, 2), (16, 2)])
-@pytest.mark.parametrize("head_size", [128, 192, 256])
 @pytest.mark.parametrize("block_size", [32])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# Retain every pair of head layout, head size, attention feature, and cache
+# capacity without repeating their full Cartesian product for both dtypes.
 @pytest.mark.parametrize(
-    "alibi,softcap", [(False, 0.0), (False, 10.0), (False, 50.0), (True, 0.0)]
+    "num_heads,head_size,alibi,softcap,num_blocks",
+    [
+        ((4, 4), 128, False, 0.0, 2048),
+        ((4, 4), 192, False, 10.0, 32768),
+        ((4, 4), 256, False, 50.0, 2048),
+        ((4, 4), 128, True, 0.0, 32768),
+        ((8, 2), 192, False, 0.0, 32768),
+        ((8, 2), 256, False, 10.0, 2048),
+        ((8, 2), 128, False, 50.0, 32768),
+        ((8, 2), 192, True, 0.0, 2048),
+        ((16, 2), 256, False, 0.0, 2048),
+        ((16, 2), 128, False, 10.0, 32768),
+        ((16, 2), 192, False, 50.0, 2048),
+        ((16, 2), 256, True, 0.0, 32768),
+    ],
 )
-@pytest.mark.parametrize("num_blocks", [32768, 2048])
 def test_flash_attn_varlen_func_w8a8_fp8_ordinary_paged_shapes(
     seq_lens, num_heads, head_size, block_size, dtype, alibi, softcap, num_blocks
 ):
@@ -1075,7 +1104,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ordinary_paged_shapes(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA GQA coverage")
 @pytest.mark.skipif(
@@ -1096,7 +1125,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_ordinary_single_query_shapes(
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA window coverage")
 @pytest.mark.skipif(
@@ -1147,7 +1176,7 @@ def test_flash_attn_varlen_func_w8a8_fp8_one_sided_windows(window_size, long_que
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.skipif(vendor_name != "mthreads", reason="MUSA GQA scale coverage")
 @pytest.mark.skipif(

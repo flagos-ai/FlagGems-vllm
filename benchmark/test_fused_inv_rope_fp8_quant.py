@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+import inspect
+from types import FunctionType
+
 import pytest
 import torch
+import triton
 import yaml
 
 import flaggems_vllm
@@ -136,6 +141,48 @@ def _vllm_fused_inv_rope_fp8_quant(
     )
 
 
+def _prepare_musa_vllm_baseline(monkeypatch):
+    if flaggems_vllm.vendor_name != "mthreads":
+        return
+    module = importlib.import_module(vllm_fused_inv_rope_fp8_quant.__module__)
+    kernel_name = "_fused_inv_rope_fp8_quant_per_head"
+    kernel = getattr(module, kernel_name, None)
+    if kernel is None:
+        return
+    params = inspect.signature(kernel.fn).parameters
+    pdl = params.get("launch_pdl")
+    if pdl is None or pdl.default is not inspect.Parameter.empty:
+        return
+    if (
+        next(reversed(params)) != "launch_pdl"
+        or pdl.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ):
+        raise RuntimeError("Unsupported vLLM launch_pdl signature for MUSA")
+
+    # vLLM omits launch_pdl when PDL is disabled, but MUSA's Triton binder
+    # requires this constexpr argument. Give it a default without changing
+    # the kernel code, globals, or launch configuration. pytest restores the
+    # original kernel after the benchmark, including on failure.
+    fn = kernel.fn
+    adapted_fn = FunctionType(
+        fn.__code__, fn.__globals__, fn.__name__, (False,), fn.__closure__
+    )
+    adapted_fn.__annotations__ = fn.__annotations__.copy()
+    adapted_fn.__module__ = fn.__module__
+    adapted_fn.__qualname__ = fn.__qualname__
+    adapted_kernel = triton.jit(
+        adapted_fn,
+        do_not_specialize=kernel.do_not_specialize,
+        do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
+        version=kernel.version,
+        debug=kernel.debug,
+        noinline=kernel.noinline,
+        launch_metadata=kernel.launch_metadata,
+    )
+    monkeypatch.setattr(module, kernel_name, adapted_kernel)
+    print("vLLM MUSA baseline: default launch_pdl=False (kernel code unchanged)")
+
+
 def _validate_baseline(device):
     """Verify the selected baseline's output contract before measuring it."""
     source = vllm_fused_inv_rope_fp8_quant.__module__
@@ -215,7 +262,8 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
     vllm_fused_inv_rope_fp8_quant is None,
     reason="vLLM fused_inv_rope_fp8_quant not installed",
 )
-def test_fused_inv_rope_fp8_quant():
+def test_fused_inv_rope_fp8_quant(monkeypatch):
+    _prepare_musa_vllm_baseline(monkeypatch)
     bench = FusedInvRopeFP8QuantBenchmark(
         op_name="fused_inv_rope_fp8_quant",
         input_fn=_input_fn,

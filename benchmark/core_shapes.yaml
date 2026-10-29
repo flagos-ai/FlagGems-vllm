@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+concat_mla_q:
+  shapes:
+    - [1, 64, 512, 64]
+    - [7, 64, 512, 64]
+    - [128, 64, 512, 64]
+    - [8192, 64, 512, 64]
+  shape_desc: "tokens, heads, nope_width, rope_width"
+
 fp8_einsum:
   shapes:
     - [1, 8, 4096, 1024]
@@ -515,3 +523,10 @@ swiglu:
     - [2560, 2048]
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
+
+bmm_w8a8:
+  shapes:
+    - [1, 33, 65, 129]
+    - [2, 64, 128, 256]
+    - [4, 129, 17, 257]
+  shape_desc: "B, M, N, K"

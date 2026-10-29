@@ -28,20 +28,21 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import CLAMP_MAX, CLAMP_MIN
 
 try:
     import torch_npu
 
-    HAS_TORCH_NPU = True
+    from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import CLAMP_MAX, CLAMP_MIN
+
+    HAS_NPU = True
 except ImportError:  # pragma: no cover - non-NPU environment
     torch_npu = None  # noqa: F841
-    HAS_TORCH_NPU = False
+    HAS_NPU = False
 
 from .test_mhc_ops import MHC_PRE_CONFIGS, generate_mhc_pre_data, mhc_pre_ref
 
 requires_ascend = pytest.mark.skipif(
-    not HAS_TORCH_NPU or flaggems_vllm.vendor_name != "ascend",
+    not HAS_NPU or flaggems_vllm.vendor_name != "ascend",
     reason="npu_mhc_pre requires torch_npu on an Ascend platform",
 )
 

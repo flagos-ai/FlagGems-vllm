@@ -119,13 +119,13 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
             )
 
 
-@pytest.mark.fused_inv_rope_int8_quant
+@pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(
     flaggems_vllm.device != "npu", reason="ascend int8 inverse-RoPE quant"
 )
 def test_fused_inv_rope_int8_quant():
     bench = FusedInvRopeInt8QuantBenchmark(
-        op_name="fused_inv_rope_int8_quant",
+        op_name="fused_inv_rope_fp8_quant",
         input_fn=make_inputs,
         torch_op=unfused_inv_rope_int8_quant,
         dtypes=[torch.bfloat16],

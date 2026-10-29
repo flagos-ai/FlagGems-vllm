@@ -2835,13 +2835,14 @@ def mha_varlan_fwd(
             num_heads,
             max_seqlen_q,
         )
+        args = cfg_params.pop("args", args)
         num_d_splits = triton.cdiv(head_size, cfg_params["BLOCK_D"])
         grid = (
             triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"]),
             batch_size,
             num_heads * num_d_splits,
         )
-        kernel = flash_varlen_fwd_kernel[grid]
+        kernel = cfg_params.pop("kernel", flash_varlen_fwd_kernel)[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
         if max_seqlen_k <= 128:

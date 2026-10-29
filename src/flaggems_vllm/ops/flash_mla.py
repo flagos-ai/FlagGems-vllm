@@ -1858,6 +1858,88 @@ def _try_flash_mla_tle(
 #     ],
 #     key=["head_num"]
 # )
+
+# Platform-specialized KV-tile load sub-kernels:
+# the vendor picks the sub-kernel with a module-level assignment, so the main
+# kernel has no in-kernel load branch and no load-config parameter.
+
+
+@triton.jit
+def _load_kv_tile_contig(
+    Kv_cache,
+    Req_to_tokens,
+    offs_n,
+    win_idx,
+    offs_d_ckv,
+    offs_d_kpe,
+    stride_kv_bs,
+    BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Ascend: per-row unit-stride vector loads replace the per-element 2-D
+    gathered addresses (which BiShengHIR lowers to scalar 1-elem loads).
+    Each row resolves its own page id with scalar arithmetic, so a window may
+    cross page boundaries: no constraint between PAGE_SIZE and BLOCK_N.
+    Accumulation stays fixed-shape because scf.for loop-carried tensors must
+    not change shape between iterations. Returns (v_c, k_pe)."""
+    kv_dtype = Kv_cache.dtype.element_ty
+    v_c = tl.zeros([BLOCK_N, HEAD_DIM_V], dtype=kv_dtype)
+    k_pe_t = tl.zeros([BLOCK_N, HEAD_DIM - HEAD_DIM_V], dtype=kv_dtype)
+    row_id = tl.arange(0, BLOCK_N)
+    win_off = win_idx * BLOCK_N
+    for r in range(BLOCK_N):
+        tok = win_off + r
+        page = tl.load(Req_to_tokens + tok // PAGE_SIZE)
+        rb = (page.to(tl.int64) * PAGE_SIZE + tok % PAGE_SIZE) * stride_kv_bs
+        sel = tl.broadcast_to((row_id == r)[:, None], [BLOCK_N, HEAD_DIM_V])
+        sel_pe = tl.broadcast_to(
+            (row_id == r)[:, None], [BLOCK_N, HEAD_DIM - HEAD_DIM_V]
+        )
+        v_row = tl.broadcast_to(
+            tl.load(Kv_cache + rb + offs_d_ckv)[None, :],
+            [BLOCK_N, HEAD_DIM_V],
+        )
+        pe_row = tl.broadcast_to(
+            tl.load(Kv_cache + rb + offs_d_kpe)[None, :],
+            [BLOCK_N, HEAD_DIM - HEAD_DIM_V],
+        )
+        v_c = tl.where(sel, v_row, v_c)
+        k_pe_t = tl.where(sel_pe, pe_row, k_pe_t)
+    return v_c, tl.trans(k_pe_t)
+
+
+@triton.jit
+def _load_kv_tile_gathered(
+    Kv_cache,
+    Req_to_tokens,
+    offs_n,
+    win_idx,
+    offs_d_ckv,
+    offs_d_kpe,
+    stride_kv_bs,
+    BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Generic: per-element 2-D gathered addresses from the block_table
+    page ids. Returns (v_c, k_pe)."""
+    kv_page_number = tl.load(Req_to_tokens + offs_n // PAGE_SIZE)
+    kv_loc = kv_page_number.to(tl.int64) * PAGE_SIZE + (offs_n % PAGE_SIZE).to(tl.int64)
+    offs_v_c = kv_loc[:, None] * stride_kv_bs + offs_d_ckv[None, :]
+    v_c = tl.load(Kv_cache + offs_v_c)
+    offs_k_pe = kv_loc[None, :] * stride_kv_bs + offs_d_kpe[:, None]
+    k_pe = tl.load(Kv_cache + offs_k_pe)
+    return v_c, k_pe
+
+
+_load_kv_tile = (
+    _load_kv_tile_contig if vendor_name == "ascend" else _load_kv_tile_gathered
+)
+
+
 @triton.heuristics(
     values={
         "EVEN_H": lambda META: META["head_num"] % META["BLOCK_H"] == 0,
@@ -1923,18 +2005,22 @@ def flash_mla_attn_kernel(
     remainder = cur_batch_seq_len % BLOCK_N
     offs_n = tl.arange(0, BLOCK_N)
     for i in range(0, loop_time):
-        kv_page_number = tl.load(Req_to_tokens + offs_n // PAGE_SIZE)
-        kv_loc = kv_page_number.to(tl.int64) * PAGE_SIZE + (offs_n % PAGE_SIZE).to(
-            tl.int64
+        v_c, k_pe = _load_kv_tile(
+            Kv_cache,
+            Req_to_tokens,
+            offs_n,
+            i,
+            offs_d_ckv,
+            offs_d_kpe,
+            stride_kv_bs,
+            BLOCK_N,
+            PAGE_SIZE,
+            HEAD_DIM_V,
+            HEAD_DIM,
         )
-        offs_v_c = kv_loc[:, None] * stride_kv_bs + offs_d_ckv[None, :]
-        v_c = tl.load(Kv_cache + offs_v_c)
         k_c = tl.trans(v_c)
 
         qk = tl.dot(q_nope, k_c)  # qk_nope
-
-        offs_k_pe = kv_loc[None, :] * stride_kv_bs + offs_d_kpe[:, None]
-        k_pe = tl.load(Kv_cache + offs_k_pe)
 
         qk = tl.dot(q_pe, k_pe, acc=qk)  # qk_rope
         qk *= sm_scale
@@ -2039,6 +2125,8 @@ def flash_mla(
 
     o = torch.empty([b * s_q, h_q, dv], dtype=q.dtype, device=device)
 
+    BLOCK_N = 64
+    num_warps = 8
     major, _ = get_device_capability()
     if major == 9 and vendor_name == "hygon":
         BLOCK_H = 64
@@ -2055,9 +2143,13 @@ def flash_mla(
     elif major == 3 and vendor_name == "mthreads":
         BLOCK_H = 32
         num_stages = 1
+    elif vendor_name == "ascend":
+        BLOCK_N = 32
+        num_warps = 4
+        BLOCK_H = 16
+        num_stages = 1
     else:
         error.backend_not_support(device)
-    BLOCK_N = 64
     grid = (
         triton.cdiv(head_num, BLOCK_H),
         batch_size,
@@ -2084,7 +2176,7 @@ def flash_mla(
             PAGE_SIZE=block_size,
             HEAD_DIM_V=dv,
             HEAD_DIM=d,
-            num_warps=8,
+            num_warps=num_warps,
             num_stages=num_stages,
         )
 

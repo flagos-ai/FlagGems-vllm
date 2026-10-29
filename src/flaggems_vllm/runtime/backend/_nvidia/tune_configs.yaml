@@ -85,6 +85,135 @@ w8a8_block_fp8_bmm_splitk:
       - 4
     stages:
       - 3
+attn_res_post:
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 1
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 1
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 8
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: true
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 16
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 16
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 8
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: true
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: true
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: true
+    num_warps: 8
+    num_stages: 2
 
 attention:
   - gen: true
@@ -930,5 +1059,76 @@ silu_and_mul_with_clamp_linear:
   - META:
       BLOCK_SIZE: 4096
       UNMASKED: false
+    num_warps: 8
+    num_stages: 1
+
+# Pure output kernels; mutation/state kernels keep a single original launch.
+glm_data_copy:
+  - META: {BLOCK: 256}
+    num_warps: 4
+  - META: {BLOCK: 512}
+    num_warps: 4
+kpool_fwht:
+  - META: {BLOCK_R: 16}
+    num_warps: 2
+  - META: {BLOCK_R: 32}
+    num_warps: 2
+  - META: {BLOCK_R: 64}
+    num_warps: 4
+kpool_hadamard:
+  - META: {}
+    num_warps: 1
+  - META: {}
+    num_warps: 2
+  - META: {}
+    num_warps: 4
+kda_safe_gate:
+  - META: {BLOCK: 256}
+    num_warps: 4
+  - META: {BLOCK: 512}
+    num_warps: 4
+mhc_rms_norm:
+  - META: {}
+    num_warps: 4
+  - META: {}
+    num_warps: 8
+
+kda_safe_gate_cumsum:
+  - META: {BD: 32}
+    num_warps: 2
+  - META: {BD: 32}
+    num_warps: 4
+  - META: {BD: 32}
+    num_warps: 8
+  - META: {BD: 64}
+    num_warps: 2
+  - META: {BD: 64}
+    num_warps: 4
+  - META: {BD: 64}
+    num_warps: 8
+
+# Sparse top-k overwrites only its output and private scratch on each launch.
+top_k_per_row_standard:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 8
+    num_stages: 3
+  - META: {}
+    num_warps: 16
+    num_stages: 3
+
+concat_mla_q:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
