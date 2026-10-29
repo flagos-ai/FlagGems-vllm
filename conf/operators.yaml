@@ -918,6 +918,21 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: megamoe_int8
+    description: |
+      Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
+      combining routing, two expert GEMMs, DUSHMEM communication, and Top-K
+      reduction in one persistent Triton/FlagTree kernel.
+    for:
+      - megamoe_int8
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - MoE
+    stages:
+      - alpha: '5.5'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).

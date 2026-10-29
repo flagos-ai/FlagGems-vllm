@@ -83,6 +83,23 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "benchmark/megamoe_hygon_vllm_baseline.py": ["tests/test_megamoe.py"],
+    "benchmark/megamoe_hygon_host.hip": ["tests/test_megamoe.py"],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "tests/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
@@ -212,6 +229,25 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "benchmark/megamoe_hygon_vllm_baseline.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "benchmark/megamoe_hygon_host.hip": ["benchmark/test_megamoe.py"],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "benchmark/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
