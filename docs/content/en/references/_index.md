@@ -11,15 +11,13 @@ Technical reference documentation for FlagGems-vllm.
 ## Topics
 
 - [Operator List](operators.md) - Complete catalog of operators with metadata
-- [MiniMax M3 Support](m3-support.md) - MiniMax M3 inference operator contracts and quantization fusion
-- [Project Structure](project-structure.md) - Repository organization
+- [MiniMax M3 Support](minimax-m3-support.md) - MiniMax M3 inference operator specifications and quantization fusion
 - [Changelog](changelog.md) - Version history and releases
 
 ## Quick Links
 
 - [Operator metadata](operators.md) - Browse operators by category, stage, and labels
-- [MiniMax M3 contracts](m3-support.md) - Verification, speedups, and quantization fusion
-- [Repository layout](project-structure.md) - Understanding the codebase
+- [MiniMax M3 specifications](minimax-m3-support.md) - Specifications, verification, and speedups
 - [Release history](changelog.md) - What's new in each version
 
 ## Operator Categories

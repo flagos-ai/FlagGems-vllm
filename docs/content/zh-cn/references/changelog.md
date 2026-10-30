@@ -26,7 +26,7 @@ FlagGems-vllm 作为独立 vLLM 算子库的首发版本。
 - 基于 Triton 实现，支持 FlagTree 多芯片统一编译器
 - 针对 NVIDIA Ampere/Hopper 架构预设调优配置
 - 支持基于 pybind11 的 C++ 扩展（可选）
-- 通过 `enable()` / `use_gems()` API 无缝对齐 PyTorch 动态调度机制
+- 提供直接导入调用接口，与 vLLM 插件层深度集成
 
 ### 测试与持续集成 (CI)
 
@@ -39,7 +39,7 @@ FlagGems-vllm 作为独立 vLLM 算子库的首发版本。
 
 - 基于 Hugo 的中英双语文档站点
 - 严格的算子开发规范协议 (`workflow.md`)
-- M3 算子支持契约与性能评测
+- MiniMax M3 算子支持规范与性能评测
 
 ### 已知问题
 

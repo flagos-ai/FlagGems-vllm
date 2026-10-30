@@ -5,11 +5,11 @@ weight: 15
 
 # MiniMax M3 Support and Quantization Fusion
 
-This document details operator support contracts, quantization fusion, validation, and performance benchmarks for MiniMax M3 model inference workloads.
+This document details operator support specifications, quantization fusion, validation, and performance benchmarks for MiniMax M3 model inference workloads.
 
-## Contracts
+## Operator Specifications
 
-| Operator | Supported Contract |
+| Operator | Supported Specification |
 |---|---|
 | `fp32_router_gemm` | BF16/FP32 `[M,6144]`, FP32 `[128,6144]`, M<=32; fresh FP32 logits, fixed FMA/reduction, no TF32/atomics, 2D strides, empty batches. Unsupported dimensions are rejected. |
 | `topk_sigmoid` | FP16/BF16/FP32 contiguous `[M,E]`, E<=256, K<=min(32,E); optional FP32 correction bias affects selection, not output probability; stable expert tie convention, exact source-row IDs, optional renormalization, NaN padding, mutable caller outputs. |
@@ -83,5 +83,5 @@ References are explicit in JSON:
 ## Related Links
 
 - [Operator List](operators.md)
-- [Project Structure](project-structure.md)
+- [Project Structure](../contribution/project-structure.md)
 - [Benchmark Results](../performance/results.md)

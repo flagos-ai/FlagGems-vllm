@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
+    fused_recurrent_gated_delta_rule_fwd,
+)
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -21,7 +24,6 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     outplace_fused_experts,
 )
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (

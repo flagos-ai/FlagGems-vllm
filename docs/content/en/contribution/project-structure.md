@@ -1,6 +1,6 @@
 ---
 title: Project Structure
-weight: 20
+weight: 40
 ---
 
 # Project Structure
@@ -12,7 +12,7 @@ FlagGems-vllm repository organization.
 ```
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python package
-│   ├── __init__.py         # Top-level exports, enable()/use_gems()
+│   ├── __init__.py         # Top-level exports and public operator APIs
 │   ├── config.py           # Configuration, C extension detection
 │   ├── ops/                # Operator implementations
 │   ├── runtime/            # Backend, device, autotune config
@@ -129,7 +129,6 @@ tools/
 ## Development Protocol (`workflow.md`)
 
 Mandatory operator development protocol with hard gates (G0–G7):
-- Pre-coding design tables (engineering baseline, torch alignment specification, implementation path design)
 - NO_TORCH_COMPUTE_FALLBACK rule
 - Autotune requirements
 - Testing and performance acceptance criteria
@@ -145,7 +144,8 @@ Mandatory operator development protocol with hard gates (G0–G7):
 
 ## Next Steps
 
-- [Operator development protocol](../contribution/workflow.md)
-- [Contributing guide](../contribution/overview.md)
-- [MiniMax M3 Support](m3-support.md)
-- [Testing guide](../testing/unittest.md)
+- [Contributing Guide](overview.md)
+- [Operator Development Protocol](workflow.md)
+- [Backend Development Guide](backend.md)
+- [MiniMax M3 Support](../references/minimax-m3-support.md)
+- [Testing Guide](../testing/unittest.md)

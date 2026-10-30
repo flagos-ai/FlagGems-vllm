@@ -35,12 +35,14 @@ logger = logging.getLogger(__name__)
 
 try:
     import triton.experimental.tle as tle
+    import triton.experimental.tle.language.raw as tle_raw
     from triton.experimental.tle.language.dsa.ascend.custom_ops import (
         SORT_IMPL_BASE,
         SORT_IMPL_S4096_K129_512,
     )
 except (AttributeError, ImportError) as exc:
     tle = None
+    tle_raw = None
     SORT_IMPL_BASE = tl.constexpr(0)
     SORT_IMPL_S4096_K129_512 = tl.constexpr(1)
     _PR1065_IMPORT_ERROR = exc
@@ -366,8 +368,8 @@ def lightning_indexer_tnd_pa_stage1_kernel(
                         tmp_reduce_res_block,
                     )
                 else:
-                    sorted_pairs_buf = tle.dsa.ascend.raw(
-                        "sort_1d_pack",
+                    sorted_pairs_buf = tle_raw.call(
+                        "ascend_sort_1d_pack",
                         tl.reshape(tmp_reduce_res_block, (wsp_nstride,)),
                         tmp_buf,
                         True,
@@ -460,8 +462,8 @@ def lightning_indexer_tnd_pa_prefill_sort_4096_top512_kernel(
             mask=segment_offsets < act_len_k,
             other=float("-inf"),
         )
-        sorted_pairs = tle.dsa.ascend.raw(
-            "sort_1d_pack",
+        sorted_pairs = tle_raw.call(
+            "ascend_sort_1d_pack",
             segment_scores,
             sort_tmp,
             True,
@@ -471,8 +473,8 @@ def lightning_indexer_tnd_pa_prefill_sort_4096_top512_kernel(
             out=sorted_pairs,
         )
         if OUTPUT_INDICES:
-            final_values, final_indices = tle.dsa.ascend.raw(
-                "unpack_sort",
+            final_values, final_indices = tle_raw.call(
+                "ascend_unpack_sort",
                 sorted_pairs,
                 TOPK,
                 out=[final_values, final_indices],
@@ -539,8 +541,8 @@ def lightning_indexer_tnd_pa_prefill_sort_merge_8192_top512_kernel(
             other=float("-inf"),
         )
         top_pairs = tl.zeros([PAIR_WORDS], dtype=tl.float32)
-        top_pairs = tle.dsa.ascend.raw(
-            "sort_1d_pack",
+        top_pairs = tle_raw.call(
+            "ascend_sort_1d_pack",
             scores,
             sort_tmp,
             True,
@@ -551,8 +553,8 @@ def lightning_indexer_tnd_pa_prefill_sort_merge_8192_top512_kernel(
         )  # one global sort avoids two proposals plus an extra two-way merge
         final_values = tl.zeros([TOPK], dtype=tl.float32)
         final_indices = tl.zeros([TOPK], dtype=tl.int32)
-        final_values, final_indices = tle.dsa.ascend.raw(
-            "unpack_sort",
+        final_values, final_indices = tle_raw.call(
+            "ascend_unpack_sort",
             top_pairs,
             TOPK,
             out=[final_values, final_indices],
@@ -720,8 +722,8 @@ def lightning_indexer_tnd_pa_decode_stage1_kernel(
                 scores,
                 float("-inf"),
             )  # invalid tail lanes must leave TopK contention with -inf in decode
-        sorted_pairs_buf = tle.dsa.ascend.raw(
-            "sort_1d_pack",
+        sorted_pairs_buf = tle_raw.call(
+            "ascend_sort_1d_pack",
             tl.reshape(scores, (wsp_nstride,)),
             tmp_buf,
             True,
@@ -913,8 +915,8 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
         )
         merged_pairs = tl.zeros([MERGE_WORDS], dtype=tl.float32)
         consumed = tl.zeros([MERGE_WAYS], dtype=tl.int32)
-        merged_pairs, consumed = tle.dsa.ascend.raw(
-            "merge_exhaust_sort4",
+        merged_pairs, consumed = tle_raw.call(
+            "ascend_merge_exhaust_sort4",
             merge_input,
             group_input_lists,
             0,
@@ -947,8 +949,8 @@ def lightning_indexer_tnd_pa_stage2_top512_merge_pairs_kernel(
         if OUTPUT_INDICES:
             final_values = tl.zeros([TOP_K], dtype=tl.float32)
             final_indices = tl.zeros([TOP_K], dtype=tl.int32)
-            final_values, final_indices = tle.dsa.ascend.raw(
-                "unpack_sort",
+            final_values, final_indices = tle_raw.call(
+                "ascend_unpack_sort",
                 top_pairs,
                 TOP_K,
                 out=[final_values, final_indices],

@@ -17,13 +17,10 @@ pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 
 ### FlagGems 依赖
 
-**FlagGems-vllm 依赖 FlagGems**。当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的通用算子。在安装 FlagGems-vllm 之前，请先安装 FlagGems：
+**FlagGems-vllm 依赖 FlagGems**。当前部分 FlagGems-vllm 算子在底层执行时会直接调用 FlagGems 中的通用算子。在安装 FlagGems-vllm 之前，请通过 pip 安装 `flag-gems==5.4.0`（源为 [FlagOS PyPI 镜像源](https://resource.flagos.net/#browse/browse:flagos-pypi-hosted:flag-gems%2F5.4.0)）：
 
 ```bash
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 ```
 
 ### PyTorch
@@ -101,11 +98,8 @@ DNN_VENDOR=amd source tools/setup.sh
 完整的 FlagOS vLLM 插件栈需按以下顺序安装:
 
 ```bash
-# 1. 安装 FlagGems (通用算子后端)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+# 1. 安装 FlagGems (通用算子后端，5.4.0 版本)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. 安装 FlagGems-vllm (vLLM 专用算子)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -143,53 +137,14 @@ print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
 "
 ```
 
-### 运行快速测试
+### 运行冒烟测试
+
+建议运行 pytest 收集检查以确认测试套件与模块导入正常：
 
 ```bash
 cd FlagGems-vllm
 PYTHONPATH=src pytest -q tests --collect-only
 PYTHONPATH=src pytest -q tests --quick
-```
-
-### 运行基准测试冒烟
-
-```bash
-PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
-```
-
-### 注意事项
-
-- 建议首先运行 `--collect-only`，快速确认模块导入与测试发现是否正常。
-- 算子支持时优先使用 `--quick` 进行快速功能验证。
-- 基准评测冒烟可使用 `--level core --iter 1 --warmup 1`。
-- 全量基准测试耗时较长，建议仅在正式性能验证时执行。
-
-## 后端选择
-
-FlagGems-vllm 自动检测硬件后端。要覆盖:
-
-```bash
-export DNN_VENDOR=nvidia  # 或 amd、ascend、hygon 等
-```
-
-可用后端: `nvidia`、`amd`、`ascend`、`cambricon`、`enflame`、`hygon`、`iluvatar`、`kunlunxin`、`metax`、`mthreads` 等(共 18 个)。
-
-## C++ 扩展
-
-FlagGems-vllm 包含通过 pybind11 编译的可选 C++ 算子。如果所需依赖存在,会自动构建。
-
-运行时启用 C++ 算子:
-
-```bash
-export USE_C_EXTENSION=1
-```
-
-检查 C++ 扩展是否可用:
-
-```python
-import flaggems_vllm
-print(flaggems_vllm.config.has_c_extension)
-print(flaggems_vllm.config.use_c_extension)
 ```
 
 ## 故障排除
