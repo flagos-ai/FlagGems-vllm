@@ -86,6 +86,32 @@ pip install flagtree
 export USE_FLAGTREE=1
 ```
 
+#### Tests using vLLM-Ascend custom ops
+
+Sparse flash attention tests and benchmarks use vLLM-Ascend as their reference.
+Enable its pytest plugin explicitly when running these files from the repository
+root:
+
+```bash
+python -m pytest -p tools.ascend.pytest_custom_ops -q tests/test_sparse_flash_attention.py
+python -m pytest -p tools.ascend.pytest_custom_ops -q benchmark/test_sparse_flash_attention.py
+```
+
+The plugin calls vLLM-Ascend's `enable_custom_op()` before pytest loads the common
+`conftest.py` files. CANN must discover the vendor implementations before device
+initialization; loading them later in a test or fixture can select the built-in
+implementation instead. The installed vLLM-Ascend package configures its own
+custom-op paths; no installation path needs to be set manually.
+
+The plugin lives under `tools/ascend/` so vendor initialization stays outside the
+shared tests directory. Importing its package does not import FlagGems or
+initialize the device runtime.
+
+`tools/run_tests.py` enables this plugin automatically for Ascend
+`sparse_flash_attention` workers. Other operator tests do not load it implicitly.
+If running a larger Ascend test selection that includes sparse flash attention,
+pass the same `-p tools.ascend.pytest_custom_ops` option for that session.
+
 ### Other Vendors
 
 Each vendor typically requires:
