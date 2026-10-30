@@ -94,6 +94,34 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
         self.assertEqual(tests, ["tests/test_mul.py"])
         self.assertEqual(benchmarks, [])
 
+    def test_backend_fla_change_selects_nested_test_and_benchmark(self):
+        test = "tests/test_FLA/test_chunk_kda_with_fused_gate.py"
+        benchmark = "benchmark/test_FLA/test_chunk_kda_with_fused_gate.py"
+        self.make_file(test)
+        self.make_file(benchmark)
+        self.make_file("tests/test_unrelated.py")
+        for vendor in ("ascend", "metax"):
+            with self.subTest(vendor=vendor):
+                source = (
+                    f"src/flaggems_vllm/runtime/backend/_{vendor}/FLA/"
+                    "chunk_kda_with_fused_gate.py"
+                )
+                self.assertEqual(
+                    select_tests.select_targets(self.repo_root, [source]),
+                    ("smoke", [test], [benchmark]),
+                )
+
+    def test_unknown_backend_fla_operator_selects_all_tests(self):
+        self.make_file("tests/test_first.py")
+        self.make_file("tests/test_FLA/test_second.py")
+        source = "src/flaggems_vllm/runtime/backend/_ascend/FLA/unknown.py"
+        mode, tests, benchmarks = select_tests.select_targets(self.repo_root, [source])
+        self.assertEqual(mode, "smoke")
+        self.assertEqual(
+            tests, ["tests/test_FLA/test_second.py", "tests/test_first.py"]
+        )
+        self.assertEqual(benchmarks, [])
+
     def test_documentation_change_is_skipped(self):
         self.assertEqual(
             select_tests.select_targets(self.repo_root, ["docs/guide.md"]),

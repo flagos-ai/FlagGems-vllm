@@ -100,3 +100,25 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+# MACA 3.8.1: multi-stage BV=32/4-warps corrupts state; wide tiles exceed LDS.
+# One-stage, two-warp tiles were checked against the independent recurrence.
+ckfg_state:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BV: 32
+    num_warps: 2
+    num_stages: 1
+
+ckfg_recurrent_metax:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BV: 32
+    num_warps: 2
+    num_stages: 1
