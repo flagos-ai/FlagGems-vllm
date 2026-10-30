@@ -26,10 +26,6 @@ try:
         from vllm_musa import _custom_ops as vendor_ops
 
         reference_fused_q_kv_rmsnorm = vendor_ops.deepseek_v4_fused_q_kv_rmsnorm
-    elif vendor == "nvidia" or vendor == "hygon":
-        from vllm.v1.attention.ops.deepseek_v4_ops import (
-            fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
-        )
 
     elif vendor == "ascend":
         import torch_npu
@@ -43,7 +39,12 @@ try:
 
         reference_fused_q_kv_rmsnorm = _npu_fused_q_kv_rmsnorm
 
-    elif vendor == "iluvatar" or vendor == "thead":
+    elif (
+        vendor == "iluvatar"
+        or vendor == "thead"
+        or vendor == "nvidia"
+        or vendor == "hygon"
+    ):
         from vllm.models.deepseek_v4.common.ops import (
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
