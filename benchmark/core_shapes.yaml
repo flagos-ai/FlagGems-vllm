@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fused_recurrent_gated_delta_rule_packed_decode:
+  shapes:
+    - [1, 8, 16, 128, 128]
+    - [4, 8, 16, 128, 128]
+    - [16, 8, 16, 128, 128]
+    - [64, 8, 16, 128, 128]
+    - [256, 8, 16, 128, 128]
+    - [9, 4, 12, 64, 32]
+    - [3, 2, 4, 17, 23]
+    - [1, 16, 64, 128, 128]
+  shape_desc: "B, H, HV, K, V"
 gdn_w8a16:
   shapes:
     - [1, 1, 2, 4, 128, 128]

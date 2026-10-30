@@ -64,7 +64,7 @@ FlagGems-vllm 支持 **17 个硬件后端**:
 - [安装指南](getting-started/_index.md)
 - [基础用法](usage/basic.md)
 - [算子列表](references/operators.md)
-- [M3 算子支持](references/m3-support.md)
+- [MiniMax M3 算子支持](references/minimax-m3-support.md)
 - [性能基准](performance/_index.md)
 - [贡献指南](contribution/_index.md)
 

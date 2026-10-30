@@ -13,17 +13,15 @@ bookCollapseSection: true
 
 ## 使用方式
 
-FlagGems-vllm 算子主要有以下使用方式:
+FlagGems-vllm **只支持直接调用方式，不支持向 PyTorch 注册分发，亦不支持 `use_gems` 上下文管理器**：
 
-1. **直接调用（配合 FlagGems）**: 导入 `flag_gems` 并调用 `flag_gems.enable()`，随后直接从 `flaggems_vllm` 调用特化算子；
-2. **全局调度注册**: 通过 `flaggems_vllm.enable()` 或 `use_gems()` 上下文管理器将算子注册进 PyTorch 调度机制；
-3. **通过 vllm-plugin-fl 自动集成**: 在 vLLM 推理服务中通过插件层全自动加载。
+1. **直接导入调用（推荐配合 FlagGems）**: 导入 `flag_gems` 并调用 `flag_gems.enable()` 激活通用算子底座，随后直接通过 `flaggems_vllm.<op>()` 调用特化/融合算子；
+2. **通过 vllm-plugin-fl 自动集成**: 在 vLLM 推理服务中通过插件层自动挂接并调用 `flaggems_vllm.<op>()`。
 
 ## 主题
 
 - [基础用法](basic.md) - 直接算子调用与 FlagGems 协同模式
 - [vLLM 插件集成](vllm-plugin.md) - 与 vllm-plugin-fl 一起使用
-- [选择性启用](selective.md) - 细粒度算子控制
 - [非 NVIDIA 后端](non-nvidia.md) - 在 AMD、昇腾等硬件上运行
 - [调试](debugging.md) - 日志和故障排除
 
