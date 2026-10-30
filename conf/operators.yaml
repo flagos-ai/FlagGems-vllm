@@ -1119,6 +1119,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: qsa_select_paged_prefill
+    description: |
+      Select compressed QSA key groups for packed prefill queries from a paged cache.
+      Supports BF16 and FP8 E4M3FN on NVIDIA SM90 with caller-provided visibility,
+      FP32 scoring, block Top-K 512/1024/2048, and -1 padding for short rows.
+      Direct-call Python API; does not expand group indices to original tokens.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: reglu
     description: |
       Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of the sigmoid function for gating.

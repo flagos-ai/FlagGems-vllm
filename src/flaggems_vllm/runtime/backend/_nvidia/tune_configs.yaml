@@ -1132,3 +1132,195 @@ concat_mla_q:
   - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
+
+qsa_select_paged_prefill_score:
+  - META: {TILE_R: 4, BLOCK_N: 64, K_TILES: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 8, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 16, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16}
+    num_warps: 4
+    num_stages: 2
+
+
+qsa_select_paged_prefill_reuse_score:
+  - META: {TILE_R: 4, BLOCK_N: 64, K_TILES: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 8, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 16, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 4}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16}
+    num_warps: 8
+    num_stages: 2
+
+
+qsa_select_paged_prefill_head_group_score:
+  - META: {TILE_R: 4, BLOCK_N: 64, K_TILES: 1, HEAD_GROUP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 8, BLOCK_N: 64, K_TILES: 4, HEAD_GROUP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 16, BLOCK_N: 64, K_TILES: 4, HEAD_GROUP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, HEAD_GROUP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4, HEAD_GROUP: false}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, HEAD_GROUP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 4, HEAD_GROUP: false}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, HEAD_GROUP: false}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 16, HEAD_GROUP: false}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, HEAD_GROUP: false}
+    num_warps: 8
+    num_stages: 2
+
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, HEAD_GROUP: true}
+    num_warps: 4
+    num_stages: 2
+
+
+qsa_select_paged_prefill_fp8_store_score:
+  - META: {TILE_R: 4, BLOCK_N: 64, K_TILES: 1, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 8, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 16, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 4
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 2
+  - META: {TILE_R: 4, BLOCK_N: 64, K_TILES: 1, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 8, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 16, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 128, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 64, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 4, QUERY_PARTS: 2}
+    num_warps: 8
+    num_stages: 1
+  - META: {TILE_R: 32, BLOCK_N: 64, K_TILES: 16, QUERY_PARTS: 2}
+    num_warps: 4
+    num_stages: 2
