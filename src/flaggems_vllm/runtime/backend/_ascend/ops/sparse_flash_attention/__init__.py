@@ -73,8 +73,10 @@ from typing import NamedTuple
 import torch
 import triton
 
-from . import common as cfg
-from .attention import (
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention import (
+    common as cfg,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention.attention import (
     _sfa_combine,
     _sfa_combine_two,
     _sfa_gathered_attention,
@@ -82,13 +84,15 @@ from .attention import (
     _sfa_split_combine,
     _sfa_tiled_attention,
 )
-from .common import (
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention.common import (
     _get_core_num,
     _sfa_gather_sparse_kv,
     _sfa_make_contiguous,
     _sfa_prepare_indices,
 )
-from .pipeline import _sfa_pipeline
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention.pipeline import (
+    _sfa_pipeline,
+)
 
 
 @dataclass(frozen=True)
