@@ -1132,3 +1132,20 @@ concat_mla_q:
   - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+    warps:
+      - 4
+      - 8
+    stages:
+      - 1
