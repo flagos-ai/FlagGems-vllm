@@ -257,25 +257,3 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
-
-# K=256 exceeds the 64-KiB LDS limit with the generic two-stage state tile.
-ckfg_state:
-  - META:
-      BV: 16
-    num_warps: 2
-    num_stages: 1
-  - META:
-      BV: 32
-    num_warps: 2
-    num_stages: 1
-
-ckfg_intra:
-  - META: {}
-    num_warps: 4
-    num_stages: 3
-  - META: {}
-    num_warps: 4
-    num_stages: 2
-  - META: {}
-    num_warps: 8
-    num_stages: 2

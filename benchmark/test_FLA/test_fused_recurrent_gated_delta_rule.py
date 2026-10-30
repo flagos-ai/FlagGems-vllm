@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 """No-Graph, reset-outside-event recurrent GDN benchmark with independent oracle."""
+
 import importlib
 import importlib.util
 import inspect
@@ -13,23 +14,12 @@ import pytest
 import torch
 
 import flaggems_vllm as gems
+from baseline.fused_recurrent_gated_delta_rule_fwd import PERF_CASES, build
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_FLA.test_fused_recurrent_gated_delta_rule import (
     assert_result,
-    build,
     reference,
 )
-
-PERF_CASES = [
-    ("decode1", [1], 4, 8, 128, 128, "index", True, False),
-    ("decode16", [1] * 16, 4, 8, 128, 128, "index", True, False),
-    ("decode64", [1] * 64, 4, 8, 128, 128, "index", True, False),
-    ("decode256", [1] * 256, 4, 8, 128, 128, "index", True, False),
-    ("strided", [1] * 16, 4, 8, 128, 128, "index", True, True),
-    ("mtp", [4] * 8, 4, 8, 128, 128, "spec", True, False),
-    ("ragged", [1, 3, 2, 4], 2, 4, 64, 32, "table", True, True),
-    ("tail", [1] * 3, 2, 4, 17, 23, "index", True, True),
-]
 
 
 def _measure(fn, data, state0):

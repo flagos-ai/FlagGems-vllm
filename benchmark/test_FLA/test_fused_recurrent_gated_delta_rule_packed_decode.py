@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 """Framework benchmark with no-Graph, reset-outside-event stateful timing."""
+
 import json
 import os
 import statistics
@@ -10,6 +11,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from baseline import fused_recurrent_gated_delta_rule_packed_decode as workload
 from benchmark import base, consts
 from benchmark.conftest import Config
 from flaggems_vllm.runtime import torch_device_fn
@@ -161,37 +163,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         with Path(destination).open("a") as f:
             f.write(json.dumps(row) + "\n")
 
-    @staticmethod
-    def make_inputs(shape, dtype, state_dtype, device, strided=False, invalid=True):
-        B, H, HV, K, V = shape
-        gen = torch.Generator().manual_seed(20261026)
-
-        def rand(size, dt=dtype):
-            return (torch.randn(size, generator=gen) * 0.2).to(dtype=dt, device=device)
-
-        width = 2 * H * K + HV * V
-        pad = 7 if strided else 0
-        mixed = rand((B, width + pad))[:, :width]
-        a = rand((B, HV + pad))[:, :HV]
-        b = rand((B, HV + pad))[:, :HV]
-        state = rand((B + 3, HV * V * K + pad), state_dtype)
-        state = state[:, : HV * V * K].view(B + 3, HV, V, K)
-        indices = torch.arange(1, B + 1, dtype=torch.int64).flip(0)
-        if invalid and B >= 3:
-            indices[-2:] = torch.tensor([0, -1])
-        storage = torch.zeros((B * 2,), dtype=torch.int64)
-        storage[::2] = indices
-        return dict(
-            mixed_qkv=mixed,
-            a=a,
-            b=b,
-            A_log=rand((HV,)),
-            dt_bias=rand((HV,)),
-            scale=K**-0.5,
-            initial_state=state,
-            out=torch.empty((B, 1, HV, V), dtype=dtype, device=device),
-            ssm_state_indices=storage.to(device)[::2],
-        )
+    make_inputs = staticmethod(workload.make_inputs)
 
     @staticmethod
     def reference(inputs, normalize=False):

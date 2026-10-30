@@ -185,18 +185,6 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
-  - id: chunk_kda_with_fused_gate
-    description: |
-      KDA prefill with fused softplus gate and 64-token chunks; V-first final state and aliased value output.
-    for:
-      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_with_fused_gate
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices

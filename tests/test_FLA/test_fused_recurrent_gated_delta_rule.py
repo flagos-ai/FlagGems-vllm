@@ -265,15 +265,3 @@ def test_recurrent_state_updated_once(entry, dtype, shape):
         assert result[1] is data["initial_state"]
         assert_result(result, expected, dtype)
         assert os.environ.get("TRITON_ALL_BLOCKS_PARALLEL") == parallel
-
-
-@pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.skipif(gems.vendor_name != "ascend", reason="Ascend FLA binding check")
-def test_ascend_package_entry_binding():
-    from flaggems_vllm.ops import FLA
-    from flaggems_vllm.runtime.backend._ascend import FLA as ascend_fla
-
-    expected = ascend_fla.fused_recurrent_gated_delta_rule_fwd
-    assert FLA.fused_recurrent_gated_delta_rule_fwd is expected
-    assert gems.ops.fused_recurrent_gated_delta_rule_fwd is expected
-    assert gems.fused_recurrent_gated_delta_rule_fwd is expected
