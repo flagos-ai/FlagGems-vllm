@@ -187,3 +187,149 @@ def test_quant_full_and_mixed_dispatch():
     with flag_gems.use_gems(include=["abs"]):
         assert moe._int8_quant_dispatch_policy() is None
     assert moe._int8_quant_dispatch_policy() is False
+
+
+@pytest.fixture
+def thead_moe_original_layout(monkeypatch):
+    from flaggems_vllm.runtime import device
+
+    if device.vendor_name != "thead":
+        pytest.skip("T-Head weight-layout regression")
+    thead_moe = importlib.import_module(
+        "flaggems_vllm.runtime.backend._thead.ops.fused_moe"
+    )
+    permute = importlib.import_module("flaggems_vllm.ops.permute_copy")
+
+    def unexpected_conversion(*args, **kwargs):
+        pytest.fail("MoE must not copy weights or query free memory")
+
+    monkeypatch.setattr(permute, "permute_copy", unexpected_conversion)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", unexpected_conversion)
+    return thead_moe
+
+
+def _thead_moe_inputs(m, dtype, padded=False, hidden=128):
+    # E/topk keeps M<=12 on the naive path and M>=13 on the aligned path.
+    # I=80 exercises partial K/N tiles. hidden=1024 also covers GEMV at M=8.
+    e, intermediate, topk = 512, 80, 10
+    x = torch.randn((m, hidden), device="cuda", dtype=dtype)
+
+    def weight(n, k):
+        shape = (e, n + 1, k + 16) if padded else (e, n, k)
+        storage = torch.randn(shape, device="cuda", dtype=dtype) * (k**-0.5)
+        return storage[:, :n, :k]
+
+    w1 = weight(2 * intermediate, hidden)
+    w2 = weight(hidden, intermediate)
+    ids = (torch.arange(m * topk, device="cuda").view(m, topk) % e).int()
+    weights = torch.full((m, topk), 1.0 / topk, device="cuda", dtype=torch.float32)
+    return x, w1, w2, weights, ids
+
+
+def _thead_moe_reference(x, w1, w2, weights, ids):
+    # Independent CPU reference; production code never calls this helper.
+    x, w1, w2, weights, ids = [t.cpu() for t in (x, w1, w2, weights, ids)]
+    result = torch.zeros(x.shape, dtype=torch.float32)
+    for rank in range(ids.shape[1]):
+        up = torch.einsum("mh,mnh->mn", x.float(), w1[ids[:, rank]].float())
+        gate, value = up.chunk(2, dim=-1)
+        activated = (torch.nn.functional.silu(gate) * value).to(x.dtype)
+        down = torch.einsum("mi,mhi->mh", activated.float(), w2[ids[:, rank]].float())
+        result += (down * weights[:, rank, None]).to(x.dtype).float()
+    return result.to(x.dtype)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [0, 1, 8, 12, 13, 64, 128, 256])
+@pytest.mark.parametrize("padded", [False, True])
+def test_thead_fused_moe_original_weight_layout(
+    thead_moe_original_layout, dtype, m, padded, monkeypatch
+):
+    torch.manual_seed(67)
+    inputs = _thead_moe_inputs(m, dtype, padded)
+    x, w1, w2, weights, ids = inputs
+    original_strides = (w1.stride(), w2.stride())
+    seen = []
+    dispatch = thead_moe_original_layout.dispatch_fused_moe_kernel
+
+    def check_weight(a, b, *args, **kwargs):
+        expected = (w1, w2)[len(seen) % 2]
+        assert b is expected
+        seen.append(b.stride())
+        return dispatch(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(
+        thead_moe_original_layout, "dispatch_fused_moe_kernel", check_weight
+    )
+    expected = _thead_moe_reference(*inputs)
+    actual = thead_moe_original_layout.fused_experts_impl(*inputs)
+    assert actual.shape == x.shape and actual.dtype == dtype
+    assert (w1.stride(), w2.stride()) == original_strides
+    assert seen == list(original_strides) * bool(m)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_thead_fused_moe_weight_reuse_and_update(thead_moe_original_layout, dtype):
+    torch.manual_seed(68)
+    # Three live pairs exceed the former four-tensor module cache capacity.
+    layers = [_thead_moe_inputs(1, dtype) for _ in range(3)]
+    for _ in range(2):
+        for inputs in layers:
+            actual = thead_moe_original_layout.fused_experts_impl(*inputs)
+            torch.testing.assert_close(
+                actual.cpu(), _thead_moe_reference(*inputs), rtol=0.05, atol=0.01
+            )
+    x, w1, w2, weights, ids = layers[0]
+    w2.neg_()
+    expected = _thead_moe_reference(x, w1, w2, weights, ids)
+    actual = thead_moe_original_layout.fused_experts_impl(
+        x, w1, w2, weights, ids, inplace=True
+    )
+    assert actual is x
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m,hidden", [(1, 128), (8, 1024), (13, 128), (64, 128)])
+@pytest.mark.parametrize("padded", [False, True])
+def test_thead_fused_moe_graph_reads_current_weights(
+    thead_moe_original_layout, dtype, m, hidden, padded
+):
+    torch.manual_seed(69)
+    inputs = _thead_moe_inputs(m, dtype, padded, hidden)
+    x, w1, w2, weights, ids = inputs
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            thead_moe_original_layout.fused_experts_impl(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = thead_moe_original_layout.fused_experts_impl(*inputs)
+
+    # Update inputs and both original weights at their captured addresses.
+    # Graphs must observe each change, not a stale cached transpose.
+    original_w1, original_w2 = w1.clone(), w2.clone()
+    previous = _thead_moe_reference(*inputs)
+    for change in ("input", "weights", "restore", "input"):
+        if change == "input":
+            x.copy_(torch.randn_like(x))
+        elif change == "weights":
+            w1.copy_(original_w1 * 0.5)
+            w2.copy_(-original_w2)
+        else:
+            w1.copy_(original_w1)
+            w2.copy_(original_w2)
+        expected = _thead_moe_reference(*inputs)
+        assert not torch.allclose(previous, expected, rtol=0.05, atol=0.01)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+        previous = expected

@@ -14,7 +14,6 @@
 
 import functools
 import logging
-import weakref
 from enum import Enum
 from typing import Any, Optional
 
@@ -1664,47 +1663,7 @@ def dispatch_fused_moe_kernel(
         )
 
 
-_TRANSPOSE_CACHE: dict = {}
 _GEMV_CFG = None  # optional gemv tuning override: {"BLOCK_N":..,"BLOCK_K":..}
-_TRANSPOSE_CACHE_MAX = 4
-# Memory-pressure adaptive degradation: below LOW the transpose cache is
-# dropped and the path degrades to the untransposed layout; only above HIGH
-# is transposing re-enabled (hysteresis prevents flapping). Re-transposing on
-# every call under sustained pressure would cost ~21ms per call, far worse
-# than the ~1.8ms kernel win the transpose provides.
-_TRANSPOSE_MEM_LOW_BYTES = 10 * 1024**3
-_TRANSPOSE_MEM_HIGH_BYTES = 16 * 1024**3
-_TRANSPOSE_DISABLED = False
-_ENABLE_TRANSPOSE = True  # debug: set False to disable weight transposition
-
-
-def _transposed_view(w: torch.Tensor) -> torch.Tensor:
-
-    from flaggems_vllm.ops.permute_copy import permute_copy  # FlagGems kernel
-
-    key = (w.data_ptr(), w.shape, w.dtype)
-    entry = _TRANSPOSE_CACHE.get(key)
-    if entry is not None and entry[0]() is w:
-        return entry[1]
-    if len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
-        dead = [k for k, (r, _) in _TRANSPOSE_CACHE.items() if r() is None]
-        for k in dead:
-            del _TRANSPOSE_CACHE[k]
-        while len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
-            _TRANSPOSE_CACHE.pop(next(iter(_TRANSPOSE_CACHE)))
-    t = permute_copy(w, (0, 2, 1))  # (E, K, N) contiguous, FlagGems kernel
-    E, N, K = w.shape
-    view = t.as_strided((E, N, K), (K * N, 1, N))
-
-    # Transpose-copy lifetime is tied to the original weight: when the weight
-    # is garbage-collected the weakref callback drops the cache entry, so the
-    # (possibly huge) transposed copy is released immediately instead of
-    # lingering until the next LRU-triggered sweep.
-    def _cleanup(ref, _cache=_TRANSPOSE_CACHE, _key=key):
-        _cache.pop(_key, None)
-
-    _TRANSPOSE_CACHE[key] = (weakref.ref(w, _cleanup), view)
-    return view
 
 
 def fused_experts_impl(
@@ -1764,30 +1723,10 @@ def fused_experts_impl(
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
 
-    # PPU: transposed weight view -> b-tile BN-contiguous reads (nopad layout
-    # win). Same shape, so N/K semantics are untouched. Quantized paths keep
-    # their original layout. Under memory pressure (free < LOW) the transpose
-    # cache is dropped and this path degrades to the untransposed layout;
-    # recovery (> HIGH) re-enables transposing. Hysteresis avoids flapping.
-    global _TRANSPOSE_DISABLED
-    try:
-        _free, _ = torch.cuda.mem_get_info()
-        if _free < _TRANSPOSE_MEM_LOW_BYTES:
-            if not _TRANSPOSE_DISABLED:
-                _TRANSPOSE_CACHE.clear()
-            _TRANSPOSE_DISABLED = True
-        elif _TRANSPOSE_DISABLED and _free > _TRANSPOSE_MEM_HIGH_BYTES:
-            _TRANSPOSE_DISABLED = False
-    except (AttributeError, RuntimeError):
-        _TRANSPOSE_DISABLED = False  # no CUDA-semantic mem query -> keep cache
-
-    if (
-        _ENABLE_TRANSPOSE
-        and not (use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-        and not (_TRANSPOSE_DISABLED)
-    ):
-        w1 = _transposed_view(w1)
-        w2 = _transposed_view(w2)
+    # GEMM and GEMV consume the caller's weight strides directly. An implicit
+    # transpose backed by a bounded cache thrashes across MoE layers and can
+    # record full-weight copies into every graph replay. Keep the original
+    # weights instead, without persistent copies or memory-pressure queries.
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
