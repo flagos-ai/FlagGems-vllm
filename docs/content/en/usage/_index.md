@@ -13,17 +13,15 @@ Learn how to use FlagGems-vllm operators in your applications.
 
 ## Usage Patterns
 
-FlagGems-vllm operators can be used in three ways:
+FlagGems-vllm **only supports direct invocation; it does not support PyTorch dispatch registration, nor does it support the `use_gems` context manager**:
 
-1. **Direct invocation (with FlagGems enabled)**: Import `flag_gems`, call `flag_gems.enable()`, and call operators directly from `flaggems_vllm`;
-2. **Global dispatch registration**: Register operators into PyTorch dispatch via `flaggems_vllm.enable()` or `use_gems()` context manager;
-3. **Through vllm-plugin-fl**: Automatic end-to-end integration within vLLM inference.
+1. **Direct invocation (recommended with FlagGems enabled)**: Import `flag_gems`, call `flag_gems.enable()` to initialize the general operator foundation, and call fused operators directly via `flaggems_vllm.<op>()`;
+2. **Through vllm-plugin-fl**: Automatic end-to-end integration within vLLM inference by invoking `flaggems_vllm.<op>()`.
 
 ## Topics
 
 - [Basic Usage](basic.md) - Direct operator calls and FlagGems cooperation patterns
 - [vLLM Plugin Integration](vllm-plugin.md) - Using with vllm-plugin-fl
-- [Selective Enablement](selective.md) - Fine-grained operator control
 - [Non-NVIDIA Backends](non-nvidia.md) - Running on AMD, Ascend, and other hardware
 - [Debugging](debugging.md) - Logging and troubleshooting
 

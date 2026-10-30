@@ -2858,7 +2858,9 @@ def mha_varlan_fwd(
         kernel = cfg_params.pop("kernel", flash_varlen_fwd_kernel)[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        if max_seqlen_k <= 128:
+        if not cfg_params.pop("split_short_k", True):
+            short_k_modes = (False,)
+        elif max_seqlen_k <= 128:
             short_k_modes = (True,)
         elif (
             not is_paged

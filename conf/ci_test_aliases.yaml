@@ -12,6 +12,7 @@
 # --- Subpackage operators (FLA/) ---
 chunk_gated_delta_rule_fwd: test_FLA/test_chunk_gated_delta_rule_fwd
 chunk_kda: test_FLA/test_chunk_kda
+fused_recurrent_gated_delta_rule_fwd: test_FLA/test_fused_recurrent_gated_delta_rule
 
 # --- MHC operators (tested in test_mhc_ops.py) ---
 hc_head_fused_kernel: test_mhc_ops

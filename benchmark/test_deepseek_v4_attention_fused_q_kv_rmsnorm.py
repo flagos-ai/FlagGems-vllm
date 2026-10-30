@@ -26,28 +26,24 @@ try:
         from vllm_musa import _custom_ops as vendor_ops
 
         reference_fused_q_kv_rmsnorm = vendor_ops.deepseek_v4_fused_q_kv_rmsnorm
-    elif vendor == "nvidia":
+    elif vendor == "nvidia" or vendor == "hygon":
         from vllm.v1.attention.ops.deepseek_v4_ops import (
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
+
     elif vendor == "ascend":
-        import torchair
-        from torchair.configs.compiler_config import CompilerConfig
+        import torch_npu
 
-        config = CompilerConfig()
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        # same as https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/patch/worker/patch_triton.py#L112
+        def _npu_fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps):
+            # Same math as the CUDA kernel: RMS in fp32, one cast at store.
+            q_out, _ = torch_npu.npu_rms_norm(qr, q_weight, eps)
+            kv_out, _ = torch_npu.npu_rms_norm(kv, kv_weight, eps)
+            return q_out, kv_out
 
-        @torch.compile(backend=npu_backend, dynamic=False)
-        def reference_fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps=1e-6):
-            q_var = qr.pow(2).mean(-1, keepdim=True)
-            q_normed = qr * torch.rsqrt(q_var + eps) * q_weight
+        reference_fused_q_kv_rmsnorm = _npu_fused_q_kv_rmsnorm
 
-            kv_var = kv.pow(2).mean(-1, keepdim=True)
-            kv_normed = kv * torch.rsqrt(kv_var + eps) * kv_weight
-
-            return q_normed, kv_normed
-
-    elif vendor == "iluvatar":
+    elif vendor == "iluvatar" or vendor == "thead":
         from vllm.models.deepseek_v4.common.ops import (
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
@@ -78,7 +74,9 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
             (128, 1536, 512),
             (512, 1536, 512),
             (2048, 1536, 512),
-        ] + ([(32, 64 * 576, 576), (128, 64 * 576, 576)] if vendor != "ascend" else [])
+            (32, 64 * 576, 576),
+            (128, 64 * 576, 576),
+        ]
 
     def get_input_iter(self, dtype):
         device = flaggems_vllm.runtime.device.name
