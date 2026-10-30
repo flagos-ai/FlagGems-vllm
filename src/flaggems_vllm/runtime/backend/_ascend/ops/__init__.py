@@ -46,8 +46,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import 
     fused_inv_rope_int8_quant,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
+    dispatch_fused_moe_kernel,
     fused_experts_impl,
     inplace_fused_experts,
+    invoke_fused_moe_triton_kernel,
     outplace_fused_experts,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
@@ -128,6 +130,7 @@ __all__ = [
     "compressor_prepared",
     "compute_slot_mapping_parallel",
     "dequantize_and_gather_k_cache",
+    "dispatch_fused_moe_kernel",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_inv_rope_int8_quant",
@@ -141,6 +144,7 @@ __all__ = [
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
+    "invoke_fused_moe_triton_kernel",
     "kda_gate_cumsum_triton",
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
