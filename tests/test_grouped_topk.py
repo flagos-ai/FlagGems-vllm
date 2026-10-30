@@ -32,6 +32,7 @@ vendor_name = flaggems_vllm.vendor_name
 if cfg.QUICK_MODE:
     N_TOKEN_LIST = [8]
     N_TOKEN_LIST_DEEPSEEK_V3_2 = [16384]
+    N_TOKEN_LIST_GLM_5_2 = [64]
     N_EXPERT_LIST = [16]
     N_GROUP_LIST = [4]
     TOPK_LIST = [2]
@@ -41,6 +42,7 @@ if cfg.QUICK_MODE:
 else:
     N_TOKEN_LIST = [1, 3, 8]
     N_TOKEN_LIST_DEEPSEEK_V3_2 = [1, 8, 32, 64, 128, 256, 496, 512, 16384]
+    N_TOKEN_LIST_GLM_5_2 = [1, 8, 64, 193, 449, 16384]
     N_EXPERT_LIST = [16]
     N_EXPERT_LIST = [8, 16]
     N_GROUP_LIST = [2, 4]
@@ -355,6 +357,64 @@ def test_grouped_topk_deepseek_v3_2(
     n_group = 8
     topk = 8
     topk_group = 4
+    routed_scaling_factor = 1.0
+    scores_dtype = torch.bfloat16
+    bias_dtype = torch.float32
+
+    scores = torch.randn(
+        (n_token, n_expert), dtype=scores_dtype, device=flaggems_vllm.device
+    )
+    bias = torch.randn((n_expert,), dtype=bias_dtype, device=flaggems_vllm.device)
+
+    ref_topk_weights, ref_topk_ids = ref_grouped_topk(
+        scores.clone(),
+        n_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func,
+    )
+    ref_topk_weights = utils.to_reference(ref_topk_weights)
+    ref_topk_ids = utils.to_reference(ref_topk_ids)
+
+    with flaggems_vllm.use_gems():
+        res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
+            scores.clone(),
+            n_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            bias,
+            scoring_func,
+        )
+
+    utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
+
+    atol, rtol = get_tolerance(ref_topk_weights.dtype, scoring_func, renormalize)
+    res_topk_weights = utils.to_reference(res_topk_weights)
+    torch.testing.assert_close(res_topk_weights, ref_topk_weights, atol=atol, rtol=rtol)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.parametrize("n_token", N_TOKEN_LIST_GLM_5_2)
+@pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
+@pytest.mark.parametrize("scoring_func", SCORING_FUNC_LIST)
+def test_grouped_topk_glm_5_2(
+    n_token,
+    renormalize,
+    scoring_func,
+):
+    """Test grouped_topk accuracy with configs from GLM-5.2"""
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    n_expert = 256
+    n_group = 1
+    topk = 8
+    topk_group = 1
     routed_scaling_factor = 1.0
     scores_dtype = torch.bfloat16
     bias_dtype = torch.float32

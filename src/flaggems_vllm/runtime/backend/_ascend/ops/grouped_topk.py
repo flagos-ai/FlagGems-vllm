@@ -641,6 +641,159 @@ def triton_moe_gating_topk_e_k_fullload_kernel(
         )
 
 
+# Adapted from vllm-ascend:
+#   ./csrc/moe_gating_top_k/op_kernel/moe_gating_top_k_without_group.h
+@triton.jit
+def triton_moe_gating_topk_without_group_kernel(
+    scores_ptr,
+    topk_values_ptr,
+    topk_indices_ptr,
+    routing_bias_ptr,
+    topk: tl.constexpr,
+    renormalize,
+    routed_scaling_factor,
+    SCORE_DTYPE: tl.constexpr,
+    BIAS_DTYPE: tl.constexpr,
+    SCORING_FUNC: tl.constexpr,
+    TOPK_PAD: tl.constexpr,
+    PER_CORE_ROWS: tl.constexpr,
+    LAST_CORE_ROWS: tl.constexpr,
+):
+    ONE_REPEAT_SORT_NUM: tl.constexpr = 32
+    NUM_EXPERTS: tl.constexpr = 256
+    REPEAT_TIME: tl.constexpr = NUM_EXPERTS // ONE_REPEAT_SORT_NUM
+
+    # init buffer
+    score_ub = tle.dsa.alloc(
+        [NUM_EXPERTS], dtype=SCORE_DTYPE, mem_addr_space=tle.dsa.ascend.UB
+    )
+    bias_ub = tle.dsa.alloc(
+        [NUM_EXPERTS], dtype=BIAS_DTYPE, mem_addr_space=tle.dsa.ascend.UB
+    )
+    # scores sorted, {val, idx} format, (NUM_EXPERTS * 2) float
+    sorted_ub = tle.dsa.alloc(
+        [NUM_EXPERTS * 2], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    sorted_ts = tle.dsa.to_tensor(sorted_ub, writable=True)
+    # merge sorted result, {val, idx} format, (ONE_REPEAT_SORT_NUM * 2 * 8) float
+    merge_sorted_ub = tle.dsa.alloc(
+        [ONE_REPEAT_SORT_NUM * 2 * 8],
+        dtype=tl.float32,
+        mem_addr_space=tle.dsa.ascend.UB,
+    )
+    # 0~3 ONE_REPEAT_SORT_NUM pairs for first merge,
+    merge_sorted_ub_part0 = tle.dsa.subview(
+        merge_sorted_ub, offsets=[0], sizes=[ONE_REPEAT_SORT_NUM * 2 * 4], strides=[1]
+    )
+    merge_sorted_ts_part0 = tle.dsa.to_tensor(merge_sorted_ub_part0, writable=True)
+    # 4~7 ONE_REPEAT_SORT_NUM pairs for second merge
+    merge_sorted_ub_part1 = tle.dsa.subview(
+        merge_sorted_ub,
+        offsets=[ONE_REPEAT_SORT_NUM * 2 * 4],
+        sizes=[ONE_REPEAT_SORT_NUM * 2 * 4],
+        strides=[1],
+    )
+    merge_sorted_ts_part1 = tle.dsa.to_tensor(merge_sorted_ub_part1, writable=True)
+
+    offs = tl.arange(0, NUM_EXPERTS)
+    topk_offs = tl.arange(0, TOPK_PAD)
+
+    # CopyInBias
+    tle.dsa.copy(routing_bias_ptr + offs, bias_ub, [NUM_EXPERTS])
+    bias = tle.dsa.to_tensor(bias_ub).to(tl.float32)
+
+    pid = tl.program_id(0)
+    row_len = LAST_CORE_ROWS if pid == tl.num_programs(0) - 1 else PER_CORE_ROWS
+    for row_idx in tl.range(row_len):
+        token_id = pid * PER_CORE_ROWS + row_idx
+        cur_scores_ptr = scores_ptr + token_id * NUM_EXPERTS
+        cur_topk_values_ptr = topk_values_ptr + token_id * topk
+        cur_topk_indices_ptr = topk_indices_ptr + token_id * topk
+        # CopyInX
+        tle.dsa.copy(cur_scores_ptr + offs, score_ub, [NUM_EXPERTS])
+        score = tle.dsa.to_tensor(score_ub).to(tl.float32)
+        # ComputeX
+        if SCORING_FUNC == 1:
+            score_sigmoid = _sigmoid(score)
+        else:
+            score_sigmoid = score
+        score_bias = score_sigmoid + bias
+        # SelectTopKExpertIdx
+        sorted_ts = tle.dsa.ascend.raw(
+            "sort32", score_bias, offs.to(tl.uint32), REPEAT_TIME, out=sorted_ts
+        )
+        merge_sorted_ts_part0 = tle.dsa.ascend.raw(
+            "mrgsort",
+            sorted_ts,
+            ONE_REPEAT_SORT_NUM * 0,
+            ONE_REPEAT_SORT_NUM * 1,
+            ONE_REPEAT_SORT_NUM * 2,
+            ONE_REPEAT_SORT_NUM * 3,
+            topk,
+            topk,
+            topk,
+            topk,
+            True,
+            15,
+            1,
+            out=merge_sorted_ts_part0,
+        )
+        merge_sorted_ts_part1 = tle.dsa.ascend.raw(
+            "mrgsort",
+            sorted_ts,
+            ONE_REPEAT_SORT_NUM * 4,
+            ONE_REPEAT_SORT_NUM * 5,
+            ONE_REPEAT_SORT_NUM * 6,
+            ONE_REPEAT_SORT_NUM * 7,
+            topk,
+            topk,
+            topk,
+            topk,
+            True,
+            15,
+            1,
+            out=merge_sorted_ts_part1,
+        )
+        sorted_ts = tle.dsa.ascend.raw(
+            "mrgsort",
+            merge_sorted_ts_part0,
+            ONE_REPEAT_SORT_NUM * 0,
+            ONE_REPEAT_SORT_NUM * 4,
+            0,
+            0,
+            topk,
+            topk,
+            0,
+            0,
+            True,
+            3,
+            1,
+            out=sorted_ts,
+        )
+        # tle.dsa.extract_slice / tle.dsa.subview with non-unit strides may yield incorrect results
+        topk_expert_idx = tl.gather(sorted_ts, topk_offs * 2 + 1, axis=0).to(
+            tl.int32, bitcast=True
+        )
+        # SelectTopKExpertScore
+        topk_unbiased = tl.gather(score_sigmoid, topk_expert_idx, axis=0)
+        topk_unbiased = tl.where(topk_offs < topk, topk_unbiased, 0.0)
+        topk_sum = 1e-20
+
+        if renormalize:
+            topk_sum += tl.sum(topk_unbiased)
+        scale = routed_scaling_factor.to(tl.float32)
+        if renormalize:
+            scale /= topk_sum
+        tl.store(
+            cur_topk_values_ptr + topk_offs,
+            topk_unbiased * scale,
+            mask=topk_offs < topk,
+        )
+        tl.store(
+            cur_topk_indices_ptr + topk_offs, topk_expert_idx, mask=topk_offs < topk
+        )
+
+
 def _has_required_raw_ops():
     try:
         if (
@@ -719,16 +872,7 @@ def grouped_topk(
         dtype=torch.int32,
     )
 
-    if (
-        _has_required_raw_ops()
-        & (num_experts == 256)
-        & (n_group == 8)
-        & (topk_group == 4)
-        & (topk <= 32)
-        & scores.is_contiguous()
-        & bias.is_contiguous()
-    ):
-        n_group_pad = triton.next_power_of_2(n_group)
+    if _has_required_raw_ops() & scores.is_contiguous() & bias.is_contiguous():
         topk_pad = triton.next_power_of_2(topk)
         vector_core_num = torch_npu.npu.get_device_properties(
             scores.device.index
@@ -740,24 +884,44 @@ def grouped_topk(
             if num_tokens % per_core_rows == 0
             else num_tokens % per_core_rows
         )
+        if (num_experts == 256) & (n_group == 8) & (topk_group == 4) & (topk <= 32):
+            # DeepSeek-v3.2
+            triton_moe_gating_topk_e_k_fullload_kernel[(need_core_num,)](
+                scores,
+                topk_values,
+                topk_indices,
+                bias,
+                topk,
+                renormalize,
+                routed_scaling_factor,
+                SCORE_DTYPE=INPUT_DTYPE,
+                BIAS_DTYPE=BIAS_DTYPE,
+                SCORING_FUNC=scoring_func,
+                TOPK_PAD=topk_pad,
+                PER_CORE_ROWS=per_core_rows,
+                LAST_CORE_ROWS=last_core_rows,
+            )
+            return topk_values, topk_indices
+        elif (num_experts == 256) & (n_group == 1):
+            # GLM 5.2
+            triton_moe_gating_topk_without_group_kernel[(need_core_num,)](
+                scores,
+                topk_values,
+                topk_indices,
+                bias,
+                topk,
+                renormalize,
+                routed_scaling_factor,
+                SCORE_DTYPE=INPUT_DTYPE,
+                BIAS_DTYPE=BIAS_DTYPE,
+                SCORING_FUNC=scoring_func,
+                TOPK_PAD=topk_pad,
+                PER_CORE_ROWS=per_core_rows,
+                LAST_CORE_ROWS=last_core_rows,
+            )
+            return topk_values, topk_indices
 
-        triton_moe_gating_topk_e_k_fullload_kernel[(need_core_num,)](
-            scores,
-            topk_values,
-            topk_indices,
-            bias,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            SCORE_DTYPE=INPUT_DTYPE,
-            BIAS_DTYPE=BIAS_DTYPE,
-            SCORING_FUNC=scoring_func,
-            TOPK_PAD=topk_pad,
-            PER_CORE_ROWS=per_core_rows,
-            LAST_CORE_ROWS=last_core_rows,
-        )
-        return topk_values, topk_indices
-    elif (
+    if (
         (n_group > 1)
         & (n_group <= 32)
         & (num_experts <= 256)
