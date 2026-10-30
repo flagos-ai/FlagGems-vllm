@@ -6,6 +6,7 @@ from flaggems_vllm.ops.FLA.bwd_preprocess import parallel_attn_bwd_preprocess
 from flaggems_vllm.ops.FLA.chunk import chunk_gated_delta_rule_fwd
 from flaggems_vllm.ops.FLA.chunk_gdn2 import chunk_gdn2
 from flaggems_vllm.ops.FLA.chunk_kda import chunk_kda
+from flaggems_vllm.ops.FLA.chunk_kda_with_fused_gate import chunk_kda_with_fused_gate
 from flaggems_vllm.ops.FLA.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
 from flaggems_vllm.ops.FLA.index import (
     prepare_chunk_indices,
@@ -22,6 +23,7 @@ __all__ = [
     "exp",
     "chunk_gdn2",
     "chunk_kda",
+    "chunk_kda_with_fused_gate",
     "fused_recurrent_gated_delta_rule_fwd",
     "log",
     "parallel_attn_bwd_preprocess",
@@ -31,3 +33,15 @@ __all__ = [
     "prepare_chunk_offsets",
     "prepare_token_indices",
 ]
+
+# Select the FLA binding before outer ops/top-level imports consume it.
+from flaggems_vllm import runtime as _runtime
+
+if _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend.FLA import (  # noqa: F811
+        chunk_kda_with_fused_gate,
+    )
+elif _runtime.device.vendor_name == "metax":
+    from flaggems_vllm.runtime.backend._metax.FLA import (  # noqa: F811
+        chunk_kda_with_fused_gate,
+    )

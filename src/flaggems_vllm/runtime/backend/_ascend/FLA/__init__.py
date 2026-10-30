@@ -13,7 +13,11 @@
 # limitations under the License.
 
 from flaggems_vllm.runtime.backend._ascend.FLA.chunk_kda import chunk_kda
+from flaggems_vllm.runtime.backend._ascend.FLA.chunk_kda_with_fused_gate import (
+    chunk_kda_with_fused_gate,
+)
 
 __all__ = [
     "chunk_kda",
+    "chunk_kda_with_fused_gate",
 ]

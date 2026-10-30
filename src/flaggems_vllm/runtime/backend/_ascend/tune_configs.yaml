@@ -258,3 +258,9 @@ compute_global_topk_indices_and_lens:
       TPP: 2
     num_warps: 1
     num_stages: 2
+
+ckfg_state_ascend:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1

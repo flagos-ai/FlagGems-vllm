@@ -569,3 +569,37 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+ckfg_gate:
+  - META:
+      BD: 32
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BD: 32
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BD: 32
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BD: 64
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BD: 64
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BD: 64
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BD: 32
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BD: 64
+    num_warps: 4
+    num_stages: 2
