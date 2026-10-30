@@ -1003,6 +1003,19 @@ ops:
       - MoE
     stages:
       - stable: '4.2'
+  - id: mrope
+    description: |
+      Applies multi-modal rotary positional embeddings to query and key tensors,
+      using temporal, height, and width sections.
+    for:
+      - mrope
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: mul
     description: Multiplies `input` by `other`.
     for:
