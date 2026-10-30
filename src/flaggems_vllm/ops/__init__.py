@@ -42,6 +42,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 )
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
+    chunk_kda_scaled_dot_kkt_fwd,
     chunk_gated_delta_rule_fwd,
     chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
@@ -245,6 +246,7 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "chunk_kda",
+    "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
