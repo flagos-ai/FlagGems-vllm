@@ -43,6 +43,14 @@ concat_mla_q:
     - [8192, 64, 512, 64]
   shape_desc: "tokens, heads, nope_width, rope_width"
 
+megapreattention:
+  shape_desc: "global tokens, TP, hidden, Q heads, KV heads, head_dim, rotary_dim"
+  shapes:
+    - [32768, 2, 2048, 16, 2, 256, 64]
+    - [32768, 4, 2048, 16, 2, 256, 64]
+    - [32768, 2, 5120, 24, 4, 256, 64]
+    - [32768, 4, 5120, 24, 4, 256, 64]
+
 fp8_einsum:
   shapes:
     - [1, 8, 4096, 1024]
