@@ -1,7 +1,9 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 """Native FLA suboperator and model-derived workload definitions."""
+
 import importlib
+import math
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +11,8 @@ import torch.nn.functional as F
 OP_NAME = "chunk_kda_fwd_intra_token_parallel"
 DTYPES = [torch.bfloat16, torch.float16]
 IS_INPLACE = True
+MUTATED_INPUTS = (4, 5)
+NATIVE_UNAVAILABLE_REASON = None
 
 _INPUT_SEED = 20261027
 
@@ -35,11 +39,16 @@ _WORKLOADS = (
 
 def native():
     """Return the exact upstream FLA suboperator, or None if unavailable."""
+    global NATIVE_UNAVAILABLE_REASON
     try:
         module = importlib.import_module("fla.ops.kda.chunk_intra_token_parallel")
-    except ImportError:
+    except ImportError as exc:
+        NATIVE_UNAVAILABLE_REASON = repr(exc)
         return None
     op = getattr(module, OP_NAME, None)
+    NATIVE_UNAVAILABLE_REASON = (
+        None if callable(op) else f"{module.__name__}.{OP_NAME} absent"
+    )
     return op if callable(op) else None
 
 
@@ -134,7 +143,7 @@ def config(binding, dtype):
         "dtype": str(torch.float32),
         "note": "preallocated, written in place",
     }
-    return {
+    result = {
         "inputs": {
             "q": {"shape": qk_shape, "dtype": str(dtype)},
             "k": {"shape": qk_shape, "dtype": str(dtype)},
@@ -173,3 +182,15 @@ def config(binding, dtype):
         "tp": 1,
         "input_seed": _INPUT_SEED,
     }
+    for section in ("inputs", "outputs"):
+        for tensor in result[section].values():
+            if isinstance(tensor, dict) and "shape" in tensor:
+                shape = tensor["shape"]
+                tensor["stride"] = [
+                    math.prod(shape[i + 1 :]) for i in range(len(shape))
+                ]
+    result["graph"] = False
+    result["outputs"]["Aqk"]["aliases"] = "Aqk"
+    result["outputs"]["Akk"]["aliases"] = "Akk"
+    result["accumulate_dtype"] = "torch.float32"
+    return result

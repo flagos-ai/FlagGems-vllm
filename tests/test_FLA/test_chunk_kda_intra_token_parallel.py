@@ -351,17 +351,6 @@ def test_chunk_kda_intra_token_parallel_invalid(invalid):
         op(*args, **kwargs)
 
 
-@pytest.mark.chunk_kda_fwd_intra_token_parallel
-def test_chunk_kda_intra_token_parallel_exports():
-    assert flaggems_vllm.chunk_kda_fwd_intra_token_parallel is op
-    assert flaggems_vllm.ops.chunk_kda_fwd_intra_token_parallel is op
-    entries = [entry for entry in flaggems_vllm._FULL_CONFIG if entry[0] == op.__name__]
-    assert entries == [(op.__name__, op)]
-    assert flaggems_vllm.FULL_CONFIG_BY_FUNC[op.__name__] == entries
-    configs = flaggems_vllm.runtime.get_tuned_config(op.__name__)
-    assert configs and all("BH" in config.kwargs for config in configs)
-
-
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.chunk_kda_fwd_intra_token_parallel

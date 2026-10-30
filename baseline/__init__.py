@@ -24,9 +24,9 @@ Each operator module must export:
     DTYPES : list[torch.dtype]
         Data types to iterate over.
     IS_INPLACE : bool
-        Whether native writes back into its inputs in place (in-place operators
-        must rebuild their arguments before NCU sampling, to avoid warmup's
-        in-place accumulation polluting the values).
+        Whether native writes back into its inputs. The collector restores
+        mutated tensors outside every warmup/timed call and rebuilds arguments
+        before NCU sampling.
     native() -> callable | None
         Resolve and return the NV native callable; return None if it cannot be
         resolved (the operator has no baseline and is skipped).
@@ -46,6 +46,14 @@ Each operator module must export:
 
 Optional exports:
 
+    MUTATED_INPUTS : tuple[int | str, ...]
+        Positional indices or keyword names of mutated tensors. Required for
+        precise reset scope; omitted means snapshot all tensor arguments.
+    NATIVE_UNAVAILABLE_REASON : str | None
+        The resolution error retained by native(), reported when it returns None.
+    unsupported_reason(binding, dtype) -> str | None
+        A known unsafe native input contract. The collector retains an explicit
+        unsupported row instead of launching it or dropping the workload.
     config(binding, dtype) -> dict
         Used by complex operators to describe the real input/output shapes at
         this collection point, written to the JSON "config" field. Suggested
