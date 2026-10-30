@@ -629,6 +629,21 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: gdn_w8a16_int8
+    description: Gated delta recurrence with per-value-channel INT8 state and BF16/FP16 activations, including packed decode and chunked prefill.
+    for:
+      - gdn_w8a16_int8
+      - chunk_gated_delta_rule_w8a16_int8
+      - quantize_gdn_state_int8
+    labels:
+      - fused
+      - FLA
+      - NoCPU
+      - Quantization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: geglu
     description: Gaussian Error Gated Linear Unit with GELU activation instead of
       sigmoid function.
