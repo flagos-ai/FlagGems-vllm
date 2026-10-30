@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import warnings
 
 import pytest
 import torch
@@ -45,7 +46,7 @@ VENDOR = flaggems_vllm.vendor_name
 # the benchmark reports the FlagGems latency only.
 _NATIVE_MHC_POST = {
     "nvidia": ("vllm.model_executor.kernels.mhc", "mhc_post_tilelang"),
-    "hygon": ("vllm.model_executor.kernels.mhc", "mhc_post_tilelang"),
+    "hygon": ("aiter", "mhc_post"),
     "thead": ("vllm.model_executor.layers.mhc", "mhc_post"),
     "mthreads": ("vllm_musa.deepseek_v4_mhc", "mhc_post_musa"),
     "iluvatar": ("ixformer.inference.functions.deepseek.mhc", "ds4_mhc_post"),
@@ -61,7 +62,14 @@ def _get_baseline_mhc_post_op():
     module_name, attr = entry
     try:
         native = getattr(importlib.import_module(module_name), attr)
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as exc:
+        warnings.warn(
+            f"mhc_post benchmark: {VENDOR} declares a native baseline at "
+            f"{module_name}.{attr} but it could not be loaded ({exc!r}); the "
+            "case runs without a baseline, so latency_base/speedup stay empty.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
     if VENDOR == "ascend":
         # npu_mhc_post(residual, h_res, h_out, h_post): mix first, (N, 4) post.
@@ -86,7 +94,14 @@ def _get_baseline_mhc_pre_op():
     module_name, attr = entry
     try:
         native = getattr(importlib.import_module(module_name), attr)
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as exc:
+        warnings.warn(
+            f"mhc_pre benchmark: {VENDOR} declares a native baseline at "
+            f"{module_name}.{attr} but it could not be loaded ({exc!r}); the "
+            "case runs without a baseline, so latency_base/speedup stay empty.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
     if module_name == "mate":
         # mate's trailing parameters are keyword-only and named differently.
