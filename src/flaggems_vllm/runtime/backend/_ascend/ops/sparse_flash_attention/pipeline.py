@@ -19,7 +19,7 @@ import triton
 import triton.experimental.tle as tle
 import triton.language as tl
 
-from .common import (
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention.common import (
     ASCEND_PIPE,
     TL_FAST_PAGE_OFFSET_MASK,
     TL_FAST_PAGE_SIZE_LOG2,
