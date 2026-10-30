@@ -18,7 +18,7 @@
 import triton
 import triton.language as tl
 
-from .common import (
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention.common import (
     TL_COMBINE_HEADS_PER_PROGRAM,
     TL_COMBINE_PROGRAMS_PER_QUERY,
     TL_COMBINE_TWO_HEADS_PER_PROGRAM,
