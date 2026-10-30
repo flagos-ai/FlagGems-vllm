@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native-only workload definition; never imported by production kernels."""
+
 import importlib
+import math
 
 import torch
 
 OP_NAME = "chunk_kda_scaled_dot_kkt_fwd"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
+NATIVE_UNAVAILABLE_REASON = None
 
 
 _SHAPES = [
@@ -21,11 +24,16 @@ _SHAPES = [
 
 def native():
     """Resolve the native vLLM KDA stage; return None when unavailable."""
+    global NATIVE_UNAVAILABLE_REASON
     try:
         mod = importlib.import_module("vllm.model_executor.layers.fla.ops.kda")
-    except ImportError:
+    except ImportError as exc:
+        NATIVE_UNAVAILABLE_REASON = repr(exc)
         return None
     op = getattr(mod, OP_NAME, None)
+    NATIVE_UNAVAILABLE_REASON = (
+        None if callable(op) else f"{mod.__name__}.{OP_NAME} absent"
+    )
     return op if callable(op) else None
 
 
@@ -103,7 +111,7 @@ def config(binding, dtype):
             "shape": [num_chunks, 2],
             "dtype": str(torch.int64),
         }
-    return {
+    result = {
         "inputs": inputs,
         "outputs": {
             "A": {"shape": [b, t, h, bt], "dtype": str(torch.float32)},
@@ -119,3 +127,14 @@ def config(binding, dtype):
             "layout": "contiguous seq-first",
         },
     }
+    for section in ("inputs", "outputs"):
+        for tensor in result[section].values():
+            if isinstance(tensor, dict) and "shape" in tensor:
+                shape = tensor["shape"]
+                tensor["stride"] = [
+                    math.prod(shape[i + 1 :]) for i in range(len(shape))
+                ]
+    result["graph"] = False
+    result["accumulate_dtype"] = "torch.float32"
+    result["input_seed"] = 2702
+    return result

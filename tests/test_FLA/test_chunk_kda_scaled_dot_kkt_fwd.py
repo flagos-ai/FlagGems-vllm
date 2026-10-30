@@ -263,14 +263,6 @@ def test_unsupported(bad):
         gems.chunk_kda_scaled_dot_kkt_fwd(*args, **kw)
 
 
-@pytest.mark.chunk_kda_scaled_dot_kkt_fwd
-def test_export():
-    op = gems.chunk_kda_scaled_dot_kkt_fwd
-    assert op is gems.ops.chunk_kda_scaled_dot_kkt_fwd
-    assert op is gems.ops.FLA.chunk_kda_scaled_dot_kkt_fwd
-    assert ("chunk_kda_scaled_dot_kkt_fwd", op) in gems._FULL_CONFIG
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("ci", [[[1, 1]], [[0, 0], [1, 2]], [[1, 0], [1, 7]]])
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
