@@ -44,12 +44,9 @@ except ImportError:
     # module cannot be imported (and so cannot be collected) elsewhere.
     _LIGHTNING_INDEXER_MODULE = None
 
-pytestmark = [
-    pytest.mark.lightning_indexer,
-    pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU"),
-]
 
-
+@pytest.mark.lightning_indexer
+@pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU")
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.case_id)
 @torch.inference_mode()
 def test_lightning_indexer_matches_reference(case):
@@ -67,6 +64,8 @@ def test_lightning_indexer_matches_reference(case):
     assert_index_multisets_equal(actual, expected)
 
 
+@pytest.mark.lightning_indexer
+@pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU")
 @torch.inference_mode()
 def test_lightning_indexer_rejects_unsupported_layout():
     assert callable(_LIGHTNING_INDEXER)
@@ -76,6 +75,8 @@ def test_lightning_indexer_rejects_unsupported_layout():
         _LIGHTNING_INDEXER(**inputs)
 
 
+@pytest.mark.lightning_indexer
+@pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU")
 def test_lightning_indexer_requires_pr1065_custom_ops(monkeypatch):
     monkeypatch.setattr(_LIGHTNING_INDEXER_MODULE, "tle", None)
     monkeypatch.setattr(

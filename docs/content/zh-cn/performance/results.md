@@ -52,7 +52,7 @@ FlagGems-vllm 算子在不同硬件后端与微架构上的实测性能与加速
 | `per_token_group_quant_fp8` | 1.3–1.6× | 支持分组的 FP8 高效量化 |
 | `scaled_int8_quant` | 1.2–1.4× | INT8 对称动态缩放量化 |
 
-更多关于 MiniMax M3 推理量化融合（`fp32_router_gemm`, `fused_minimax_m3_qknorm_rope_kv_insert` 等）的详细评测，请查阅 [M3 算子支持与评测](../references/m3-support.md)。
+更多关于 MiniMax M3 推理量化融合（`fp32_router_gemm`, `fused_minimax_m3_qknorm_rope_kv_insert` 等）的详细评测，请查阅 [MiniMax M3 算子支持与评测](../references/minimax-m3-support.md)。
 
 ## 复现测试命令
 
@@ -66,5 +66,5 @@ PYTHONPATH=src pytest -q benchmark \
 ## 下一步
 
 - [运行自己的基准测试](benchmark.md)
-- [M3 算子支持与评测](../references/m3-support.md)
+- [MiniMax M3 算子支持与评测](../references/minimax-m3-support.md)
 - [贡献性能优化代码](../contribution/overview.md)
