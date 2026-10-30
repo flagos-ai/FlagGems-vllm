@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native-only workload definition; never imported by production kernels."""
-from importlib import import_module
+import importlib
 
 import torch
 
@@ -9,18 +9,30 @@ DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
 
 
+_SHAPES = [
+    (1, 1, 1, 64, 64),
+    (1, 65, 4, 128, 64),
+    (1, 512, 8, 128, 64),
+    (1, 2048, 16, 128, 64),
+    (1, 513, 4, 128, 64, 17, 0, 64, 432),
+    (1, 1024, 8, 128, 64, 128, 128, 128, 128, 128, 128, 128, 128),
+]
+
+
 def native():
-    return getattr(import_module("vllm.model_executor.layers.fla.ops.kda"), OP_NAME)
+    """Resolve the native vLLM KDA stage; return None when unavailable."""
+    try:
+        mod = importlib.import_module("vllm.model_executor.layers.fla.ops.kda")
+    except ImportError:
+        return None
+    op = getattr(mod, OP_NAME, None)
+    return op if callable(op) else None
 
 
 def grid():
     return [
-        dict(B=1, T=1, H=1, K=64, BT=64, lengths=None),
-        dict(B=1, T=65, H=4, K=128, BT=64, lengths=None),
-        dict(B=1, T=512, H=8, K=128, BT=64, lengths=None),
-        dict(B=1, T=2048, H=16, K=128, BT=64, lengths=None),
-        dict(B=1, T=513, H=4, K=128, BT=64, lengths=[17, 0, 64, 432]),
-        dict(B=1, T=1024, H=8, K=128, BT=64, lengths=[128] * 8),
+        dict(B=b, T=t, H=h, K=k, BT=bt, lengths=lengths or None)
+        for b, t, h, k, bt, *lengths in _SHAPES
     ]
 
 
@@ -59,26 +71,51 @@ def build_inputs(binding, dtype, device):
 
 
 def key_shape(binding):
-    return repr(tuple(binding[n] for n in ("B", "T", "H", "K", "BT", "lengths")))
+    return [binding[n] for n in ("B", "T", "H", "K", "BT")] + (binding["lengths"] or [])
 
 
 def config(binding, dtype):
+    """Describe the actual inputs and the two newly allocated output matrices."""
     b, t, h, k, bt = [binding[n] for n in ("B", "T", "H", "K", "BT")]
-    return dict(
-        binding=binding,
-        qk_dtype=str(dtype),
-        gate_dtype="torch.float32",
-        beta_dtype="torch.float32",
-        output_dtype="torch.float32",
-        qk_shape=[b, t, h, k],
-        beta_shape=[b, t, h],
-        output_shape=[b, t, h, bt],
-        layout="contiguous seq-first",
-        gate_domain="chunk cumulative log2",
-        scale=k**-0.5,
-        indices="explicit" if binding["lengths"] else None,
-        compute_precision=(
-            "FP32 accumulation; operand precision varies by implementation; "
-            "see run manifest"
-        ),
-    )
+    lengths = binding["lengths"]
+    inputs = {
+        "q": {"shape": [b, t, h, k], "dtype": str(dtype)},
+        "k": {"shape": [b, t, h, k], "dtype": str(dtype)},
+        "gk": {
+            "shape": [b, t, h, k],
+            "dtype": str(torch.float32),
+            "note": "chunk-local cumulative log2 gates",
+        },
+        "beta": {"shape": [b, t, h], "dtype": str(torch.float32)},
+        "scale": {"scalar": k**-0.5},
+        "chunk_size": {"scalar": bt},
+        "output_dtype": {"scalar": str(torch.float32)},
+        "cu_seqlens": {"scalar": None},
+        "chunk_indices": {"scalar": None},
+    }
+    if lengths is not None:
+        num_chunks = sum((n + bt - 1) // bt for n in lengths)
+        inputs["cu_seqlens"] = {
+            "shape": [len(lengths) + 1],
+            "dtype": str(torch.int64),
+        }
+        inputs["chunk_indices"] = {
+            "shape": [num_chunks, 2],
+            "dtype": str(torch.int64),
+        }
+    return {
+        "inputs": inputs,
+        "outputs": {
+            "A": {"shape": [b, t, h, bt], "dtype": str(torch.float32)},
+            "Aqk": {"shape": [b, t, h, bt], "dtype": str(torch.float32)},
+        },
+        "dims": {
+            "B": b,
+            "T": t,
+            "H": h,
+            "K": k,
+            "BT": bt,
+            "lengths": lengths,
+            "layout": "contiguous seq-first",
+        },
+    }

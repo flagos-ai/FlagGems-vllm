@@ -1,17 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
-import json
-import os
-import statistics
-import time
 from pathlib import Path
 
 import pytest
-import torch
 
 import flaggems_vllm as gems
-from benchmark.conftest import update_result
-from flaggems_vllm.runtime import torch_device_fn
+from benchmark.base import Benchmark
 
 spec = importlib.util.spec_from_file_location(
     "kda_kkt_workload",
@@ -21,47 +15,40 @@ workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
 
 
-def event_samples(fn):
-    for _ in range(5):
-        fn()
-    torch_device_fn.synchronize()
-    samples = []
-    for _ in range(15):
-        start = torch_device_fn.Event(enable_timing=True)
-        end = torch_device_fn.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end))
-    return samples
+class ChunkKDAScaledDotKKTFwdBenchmark(Benchmark):
+    DEFAULT_DTYPES = workload.DTYPES
+    DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    DEFAULT_SHAPES = [
+        (
+            binding["B"],
+            binding["T"],
+            binding["H"],
+            binding["K"],
+            binding["BT"],
+            *(binding["lengths"] or []),
+        )
+        for binding in workload.grid()
+    ]
+    DEFAULT_SHAPE_DESC = "B, T, H, K, BT, seq_lens... (omitted for fixed length)"
+
+    def set_shapes(self, shape_file_path=None):
+        super().set_shapes(shape_file_path)
+        if any(len(shape) < 5 for shape in self.shapes):
+            self.shapes = self.DEFAULT_SHAPES
+            self.shape_desc = self.DEFAULT_SHAPE_DESC
+
+    def get_input_iter(self, cur_dtype):
+        for b, t, h, k, bt, *lengths in self.shapes:
+            binding = dict(B=b, T=t, H=h, K=k, BT=bt, lengths=lengths or None)
+            args, kwargs = workload.build_inputs(binding, cur_dtype, gems.device)
+            yield (*args, kwargs)
 
 
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
-@pytest.mark.parametrize("dtype", workload.DTYPES)
-@pytest.mark.parametrize("binding", workload.grid())
-def test_chunk_kda_scaled_dot_kkt_fwd_perf(binding, dtype):
-    args, kw = workload.build_inputs(binding, dtype, gems.device)
-    candidate = gems.chunk_kda_scaled_dot_kkt_fwd
-    started = time.monotonic()
-    actual = candidate(*args, **kw)
-    torch_device_fn.synchronize()
-    cold = time.monotonic() - started
-    row = dict(
-        config=workload.config(binding, dtype),
-        backend=gems.vendor_name,
-        graph=False,
-        protocol="device-event/5warmup/15samples/median-ms",
-        cold_seconds=cold,
-        gems_samples_ms=event_samples(lambda: candidate(*args, **kw)),
+def test_chunk_kda_scaled_dot_kkt_fwd_perf():
+    bench = ChunkKDAScaledDotKKTFwdBenchmark(
+        op_name=workload.OP_NAME,
+        torch_op=workload.native(),
     )
-    row["gems_ms"] = statistics.median(row["gems_samples_ms"])
-    update_result(workload.OP_NAME, row)
-    # Native is measured only after independent numerical checks by the task harness.
-    row["native_status"] = "NOT_RUN"
-    output = os.environ.get("KDA_KKT_RESULTS")
-    if output:
-        with open(output, "a") as f:
-            f.write(json.dumps(row) + "\n")
-    assert all(torch.isfinite(x).all().item() for x in actual)
-    assert row["gems_ms"] > 0
+    bench.set_gems(gems.chunk_kda_scaled_dot_kkt_fwd)
+    bench.run()
