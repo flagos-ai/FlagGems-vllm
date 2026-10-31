@@ -38,15 +38,27 @@ chunk_output = chunk_fwd_kernel_o.jit_function
 
 
 @triton.jit
-def store_int8_state(values, state, scales, offsets, scale_offsets, mask, mask_v):
+def store_int8_state(
+    values,
+    state,
+    scales,
+    offsets,
+    scale_offsets,
+    mask,
+    mask_v,
+    USE_FMA: tl.constexpr = False,
+):
     magnitude = tl.max(tl.abs(values), axis=1)
     safe_magnitude = tl.where(magnitude > 0, magnitude, 127.0)
     scale = safe_magnitude * (1.0 / 127.0)
     reciprocal_scale = 127.0 / safe_magnitude
     # Share one division across the channel instead of dividing every element.
-    quantized = tl.minimum(
-        tl.maximum(tl.floor(values * reciprocal_scale[:, None] + 0.5), -127), 127
+    rounded = (
+        tl.fma(values, reciprocal_scale[:, None], 0.5)
+        if USE_FMA
+        else values * reciprocal_scale[:, None] + 0.5
     )
+    quantized = tl.minimum(tl.maximum(tl.floor(rounded), -127), 127)
     tl.store(state + offsets, quantized.to(tl.int8), mask)
     tl.store(scales + scale_offsets, scale, mask_v)
 
@@ -140,6 +152,7 @@ def gdn_decode_int8_kernel(
     NORMALIZE: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FACTORED: tl.constexpr = False,
 ):
     sequence_head = tl.program_id(1).to(tl.int64)
     sequence, head = sequence_head // HV, sequence_head % HV
@@ -157,7 +170,9 @@ def gdn_decode_int8_kernel(
     mask = (column[:, None] < V) & (reduction[None, :] < K)
     scale_offsets = group * V + column
     state_values = tl.load(state + offsets, mask, 0).to(tl.float32)
-    state_values *= tl.load(scales + scale_offsets, column < V, 0)[:, None]
+    state_scale = tl.load(scales + scale_offsets, column < V, 0)
+    if not FACTORED:
+        state_values *= state_scale[:, None]
     query = tl.load(
         query_ptr + sequence * STRIDE_Q + query_head * K + reduction,
         reduction < K,
@@ -182,13 +197,33 @@ def gdn_decode_int8_kernel(
     softplus = tl.where(gate <= 20.0, tl.log(1.0 + tl.exp(gate)), gate)
     decay = exp(-tl.exp(tl.load(A_log + head).to(tl.float32)) * softplus)
     beta = tl.sigmoid(tl.load(b + sequence * STRIDE_B + head).to(tl.float32))
-    state_values *= decay
-    residual = (value - tl.sum(state_values * key[None, :], 1)) * beta
-    state_values += residual[:, None] * key[None, :]
-    result = tl.sum(state_values * query[None, :], 1)
+    if FACTORED:
+        # Scale and decay are constant along K. Apply their product after the
+        # dot reduction. Normalize Q/K before either dot to retain the original
+        # finite-range behavior for zero keys and overflowing squared norms.
+        state_factor = state_scale * decay
+        residual = (
+            value - tl.sum(state_values * key[None, :], 1) * state_factor
+        ) * beta
+        state_values = tl.fma(
+            residual[:, None], key[None, :], state_values * state_factor[:, None]
+        )
+        result = tl.sum(state_values * query[None, :], 1)
+    else:
+        state_values *= decay
+        residual = (value - tl.sum(state_values * key[None, :], 1)) * beta
+        state_values += residual[:, None] * key[None, :]
+        result = tl.sum(state_values * query[None, :], 1)
     tl.store(output_ptr, result, column < V)
     store_int8_state(
-        state_values, state, scales, offsets, scale_offsets, mask, column < V
+        state_values,
+        state,
+        scales,
+        offsets,
+        scale_offsets,
+        mask,
+        column < V,
+        USE_FMA=FACTORED,
     )
 
 
@@ -295,7 +330,12 @@ def gdn_w8a16(
     if not tokens:
         return out, state_int8
     # Autotuning must not replay in-place recurrence on a live state cache.
-    block_v, warps = (8 if tokens in (1, 3) else 16), 1
+    factored = reduction == columns == 128 and use_qk_l2norm_in_kernel
+    if factored:
+        block_v = 16 if query.dtype == torch.bfloat16 else (8 if tokens <= 3 else 32)
+    else:
+        block_v = 8 if tokens in (1, 3) else 16
+    warps = 1
     launch_args = (
         query,
         key,
@@ -323,6 +363,7 @@ def gdn_w8a16(
         use_qk_l2norm_in_kernel,
         triton.next_power_of_2(reduction),
         block_v,
+        factored,
     )
     # HCU specializes pointers on alignment and backing-storage range. Cache
     # those facts and compiled metadata only; never retain tensors or streams.
@@ -341,6 +382,11 @@ def gdn_w8a16(
         if compiled is not None:
             decode_launch_cache.move_to_end(cache_key)
     grid = (triton.cdiv(columns, block_v), tokens * heads, 1)
+    # A cached kernel already owns its device and resolves the current stream
+    # on every launch. Avoid exchanging an already-current device twice.
+    if compiled is not None and torch_device_fn.current_device() == query.device.index:
+        compiled[grid](*launch_args)
+        return out, state_int8
     with torch_device_fn.device(query.device):
         if compiled is None:
             compiled = gdn_decode_int8_kernel.jit_function[grid](
