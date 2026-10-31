@@ -57,6 +57,16 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+    flash_mla_with_kvcache_sparse_w8a8_int8,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+)
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    FlashMLAFp8SplitKSchedMeta,
+    flash_mla_with_kvcache_w8a8,
+    get_mla_fp8_metadata,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.expand_pools_and_append_tail import expand_pools_and_append_tail
@@ -230,6 +240,8 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -269,6 +281,8 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "flash_mla_with_kvcache_w8a8",
+    "FlashMLAFp8SplitKSchedMeta",
     "fp32_router_gemm",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
@@ -293,6 +307,7 @@ __all__ = [
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "get_mla_fp8_metadata",
     "grouped_topk",
     "hadamard128",
     "hc_head_fused_kernel",
@@ -340,6 +355,7 @@ __all__ = [
     "ple_short_conv_",
     "ple_state_gather",
     "ple_state_scatter_",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_fp8",
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_mqa_paged",

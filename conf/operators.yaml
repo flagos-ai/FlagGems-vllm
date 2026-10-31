@@ -446,6 +446,30 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: flash_mla_with_kvcache_sparse_w8a8_int8
+    description: Sparse MLA decode with per-token INT8 query and KV content on MetaX C550.
+    for:
+      - flash_mla_with_kvcache_sparse_w8a8_int8
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: flash_mla_with_kvcache_w8a8
+    description: |
+      Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific implementations.
+    for:
+      - flash_mla_with_kvcache_w8a8
+    labels:
+      - fused
+      - Attention
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fp8_einsum
     description: |
       Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
