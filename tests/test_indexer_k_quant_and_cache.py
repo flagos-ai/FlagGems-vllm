@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.ops import indexer_k_quant_and_cache
 
 from . import accuracy_utils as utils
 
@@ -121,12 +124,14 @@ def torch_npu_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
             ] = scale
 
 
-def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
+def torch_indexer(
+    k, kv_cache, slot_mapping, quant_block_size, scale_fmt, fp8_dtype=None
+):
     num_blocks = kv_cache.shape[0]
     block_size = kv_cache.shape[1]
     head_dim = k.shape[-1]
     num_quant_blocks = head_dim // quant_block_size
-    fp8_dtype = _default_fp8_dtype()
+    fp8_dtype = _default_fp8_dtype() if fp8_dtype is None else fp8_dtype
     scale_divisor = 224.0 if _is_fp8_fnuz(fp8_dtype) else 448.0
 
     flat_cache = kv_cache.view(num_blocks, -1)
@@ -167,14 +172,31 @@ def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
             ] = scale
 
 
-def _make_cache(num_blocks, block_size, head_dim, quant_block_size, device):
+def _make_cache(
+    num_blocks, block_size, head_dim, quant_block_size, device, fp8_dtype=None
+):
     cache_stride = head_dim + head_dim * 4 // quant_block_size
+    fp8_dtype = _default_fp8_dtype() if fp8_dtype is None else fp8_dtype
     k_cache = torch.empty(
         (num_blocks, block_size, cache_stride),
         dtype=torch.uint8,
-        device=device,
+        device="cpu",
     )
-    return k_cache
+    num_quant_blocks = head_dim // quant_block_size
+    flat_cache = k_cache.view(num_blocks, -1)
+    values = flat_cache[:, : block_size * head_dim].view(fp8_dtype)
+    values.copy_(torch.randn(values.shape).to(fp8_dtype))
+    scales = flat_cache[:, block_size * head_dim :].view(torch.float32)
+    scales.copy_(
+        torch.rand(
+            num_blocks,
+            block_size * num_quant_blocks,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        + 0.01
+    )
+    return k_cache.to(device)
 
 
 def _make_slot_mapping(num_tokens, num_blocks, block_size, device):
@@ -224,7 +246,10 @@ def test_indexer_k_quant_and_cache_matches_reference(
     # MetaX: the vLLM op is broken on this backend (stock mcoplib ships it as
     # a silent no-op), so use the torch composition as the reference.
     use_vllm_ref = (
-        has_vllm and dtype != torch.float16 and flaggems_vllm.vendor_name != "metax"
+        has_vllm
+        and dtype != torch.float16
+        and flaggems_vllm.vendor_name == "nvidia"
+        and torch.cuda.get_device_capability() >= (8, 9)
     )
 
     if use_vllm_ref:
@@ -232,7 +257,11 @@ def test_indexer_k_quant_and_cache_matches_reference(
     elif flaggems_vllm.vendor_name == "ascend":
         torch_npu_indexer(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
     else:
-        torch_indexer(k, reference_cache, slot_mapping, quant_block_size, scale_fmt)
+        cpu_cache = reference_cache.cpu()
+        torch_indexer(
+            k.cpu(), cpu_cache, slot_mapping.cpu(), quant_block_size, scale_fmt
+        )
+        reference_cache.copy_(cpu_cache)
     flaggems_vllm.indexer_k_quant_and_cache(
         k,
         gems_cache,
@@ -246,3 +275,42 @@ def test_indexer_k_quant_and_cache_matches_reference(
         torch.cuda.synchronize()
 
     utils.gems_assert_equal(gems_cache, utils.to_reference(reference_cache))
+
+
+@pytest.mark.indexer_k_quant_and_cache
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA-compatible graph API required"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale_fmt", ["ue8m0", "float32"])
+@pytest.mark.parametrize("head_dim", [128, 512])
+def test_software_fp8_cache_graph_matches_cpu(monkeypatch, dtype, scale_fmt, head_dim):
+    module = importlib.import_module("flaggems_vllm.ops.indexer_k_quant_and_cache")
+    monkeypatch.setattr(module, "kernel_supports_fp8_e4m3", lambda: False)
+    # Exercise this wire format even on backends whose default is FNUZ.
+    monkeypatch.setattr(module, "_get_fp8_dtype", lambda: torch.float8_e4m3fn)
+    # Exact cache-byte comparison includes untouched storage and negative slots.
+    torch.manual_seed(29)
+    k = torch.randn(19, head_dim, device="cuda", dtype=dtype)
+    k[0].zero_()
+    k[1].fill_(-0.0)
+    slots = _make_slot_mapping(19, 4, 16, "cuda")
+    cache = _make_cache(4, 16, head_dim, 128, "cuda", torch.float8_e4m3fn)
+
+    def run():
+        indexer_k_quant_and_cache(k, cache, slots, 128, scale_fmt)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for factor in (0.5, -1.25):
+        k.mul_(factor)
+        slots.copy_(slots.roll(3))
+        cache.fill_(0xA5)
+        expected = cache.cpu()
+        torch_indexer(
+            k.cpu(), expected, slots.cpu(), 128, scale_fmt, torch.float8_e4m3fn
+        )
+        graph.replay()
+        torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)

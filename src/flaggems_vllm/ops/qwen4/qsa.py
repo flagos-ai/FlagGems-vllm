@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+
 QWEN4_VENDOR_QSA_SOURCE = {
     "repository": "https://github.com/flagos-ai/vllm-plugin-FL",
     "base_commit": "fadbba0ea59bbaa46c77b06d465321ab88b44643",
@@ -252,11 +254,32 @@ def _store_qsa_rows_kernel(
     PAGE_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SCALAR_VALID_ROWS: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
     slot = tl.load(slots_ptr + row)
     valid = (row < num_rows) & (slot >= 0) & (slot < num_blocks * PAGE_SIZE)
+    if SCALAR_VALID_ROWS:
+        # Kunlun's DMA lowering needs scalar control flow to skip an invalid
+        # row; an all-false vector mask alone can still write physical slot 0.
+        if valid:
+            block = slot // PAGE_SIZE
+            token = slot % PAGE_SIZE
+            values = tl.load(
+                rows_ptr + row * stride_rows_row + dims * stride_rows_dim,
+                mask=dims < WIDTH,
+                other=0,
+            )
+            tl.store(
+                cache_ptr
+                + block * stride_cache_block
+                + token * stride_cache_token
+                + dims * stride_cache_dim,
+                values,
+                mask=dims < WIDTH,
+            )
+        return
     block = tl.maximum(slot, 0) // PAGE_SIZE
     token = tl.maximum(slot, 0) % PAGE_SIZE
     values = tl.load(
@@ -914,6 +937,7 @@ def qwen4_vendor_store_qsa_rows(
         PAGE_SIZE=cache.shape[1],
         WIDTH=cache.shape[3],
         BLOCK_D=triton.next_power_of_2(cache.shape[3]),
+        SCALAR_VALID_ROWS=runtime.device.vendor_name == "kunlunxin",
         num_warps=4,
     )
 
@@ -1389,6 +1413,7 @@ def qsa_store_cache_rows(
         PAGE_SIZE=cache.shape[1],
         WIDTH=cache.shape[3],
         BLOCK_D=triton.next_power_of_2(cache.shape[3]),
+        SCALAR_VALID_ROWS=runtime.device.vendor_name == "kunlunxin",
         num_warps=4,
     )
 

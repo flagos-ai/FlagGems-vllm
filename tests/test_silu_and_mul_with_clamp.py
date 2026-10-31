@@ -80,3 +80,40 @@ def test_silu_and_mul_with_clamp_out(shape, dtype, limit):
 
     assert ret is out
     utils.gems_assert_close(out, ref_out, dtype)
+
+
+@pytest.mark.silu_and_mul_with_clamp
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "layout", ["transpose", "broadcast2d", "broadcast_nd", "empty"]
+)
+def test_clamp_layout_autograd(dtype, layout):
+    device = flaggems_vllm.device
+    if layout == "transpose":
+        x = torch.randn(7, 5, device=device, dtype=dtype).t()
+        y = torch.randn_like(x)
+    elif layout == "broadcast2d":
+        x = torch.randn(7, 5, device=device, dtype=dtype).t()
+        y = torch.randn(1, 7, device=device, dtype=dtype)
+    elif layout == "broadcast_nd":
+        x = torch.randn(2, 3, 5, device=device, dtype=dtype).transpose(1, 2)
+        y = torch.randn(1, 5, 1, device=device, dtype=dtype)
+    else:
+        x = torch.empty(0, 3, device=device, dtype=dtype)
+        y = torch.randn(1, 3, device=device, dtype=dtype)
+    x.requires_grad_()
+    y.requires_grad_()
+    reference_x = x.detach().clone().requires_grad_()
+    reference_y = y.detach().clone().requires_grad_()
+    actual = flaggems_vllm.silu_and_mul_with_clamp(x, y, 2.0)
+    expected = torch.nn.functional.silu(reference_x.float().clamp(max=2.0))
+    expected = expected * reference_y.float().clamp(-2.0, 2.0)
+    tolerance = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
+    torch.testing.assert_close(actual.float(), expected, rtol=tolerance, atol=tolerance)
+    # Noncontiguous incoming gradients exercise the backward stride metadata.
+    grad = torch.randn(tuple(reversed(actual.shape)), device=device, dtype=dtype)
+    grad = grad.permute(tuple(reversed(range(actual.ndim))))
+    actual.backward(grad)
+    expected.backward(grad.float())
+    torch.testing.assert_close(x.grad, reference_x.grad, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(y.grad, reference_y.grad, rtol=tolerance, atol=tolerance)

@@ -19,7 +19,6 @@ import triton.language as tl
 
 from flaggems_vllm.utils import pointwise_dynamic, tl_extra_shim
 
-pow = tl_extra_shim.pow
 _tanh = tl_extra_shim.tanh
 logger = logging.getLogger(__name__)
 

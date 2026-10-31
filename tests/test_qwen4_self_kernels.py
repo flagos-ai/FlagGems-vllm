@@ -24,6 +24,7 @@ from flaggems_vllm.ops.qwen4.ple_state import (  # noqa: E402
 )
 from flaggems_vllm.ops.qwen4.qsa import (  # noqa: E402
     QWEN4_VENDOR_QSA_SOURCE,
+    qsa_store_cache_rows,
     qwen4_compress_norm_mrope_store_groups,
     qwen4_qsa_mqa_paged_dot,
     qwen4_store_qsa_kv_rows,
@@ -261,6 +262,50 @@ def test_qwen4_vendor_qsa_store_matches_torch_and_skips_invalid_slots():
     actual = initial.clone()
     qwen4_vendor_store_qsa_rows(actual, slots, values)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.qwen4_qsa
+@pytest.mark.parametrize(
+    "store",
+    [qsa_store_cache_rows, qwen4_vendor_store_qsa_rows],
+    ids=["public", "vendor"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dim", [17, 128])
+def test_qsa_cache_store_preserves_invalid_rows_strides_and_padding(
+    store, dtype, slot_dtype, dim
+):
+    _require_cuda()
+    blocks, page_size = 3, 4
+    # Keep a guard page behind the cache as well as padding behind every row.
+    storage = torch.full(
+        (blocks + 1, page_size, 1, dim + 9), -13, dtype=dtype, device=DEVICE
+    )
+    cache = storage[:blocks, :, :, :dim]
+    slot_values = (3, 4, 11, -1, -7, 12, 15)
+    slots = torch.tensor(slot_values, dtype=slot_dtype, device=DEVICE)
+    rows_storage = (
+        torch.arange(
+            len(slot_values) * (dim * 2 + 6), dtype=torch.float32, device=DEVICE
+        )
+        .reshape(len(slot_values), dim * 2 + 6)
+        .to(dtype)
+    )
+    rows = rows_storage[:, 2 : 2 + dim * 2 : 2]
+    assert rows.stride(1) == 2 and cache.stride(1) == dim + 9
+
+    expected = storage.clone()
+    for row, slot in enumerate(slot_values):
+        if 0 <= slot < blocks * page_size:
+            block, token = divmod(slot, page_size)
+            expected[block, token, 0, :dim] = rows[row]
+
+    store(cache, slots, rows)
+    # Slot zero is deliberately untouched: a negative sentinel must not alias
+    # it. The full storage comparison also checks positive invalid slots,
+    # cache-row padding, the trailing guard page and every unwritten row.
+    torch.testing.assert_close(storage, expected, atol=0, rtol=0)
 
 
 def _compress_reference(

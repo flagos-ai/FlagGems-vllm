@@ -92,3 +92,31 @@ def use_backend(module):
 def use_tl_extra(func):
     """backend function shim"""
     return use_backend(tl_extra_shim)(func)
+
+
+@triton.jit
+def _assume_unavailable(condition):
+    # Optimizer hints are optional and do not define numerical semantics.
+    return
+
+
+assume = getattr(tl, "assume", _assume_unavailable)
+
+
+_TRITON_TUPLE = tl.constexpr(hasattr(tl, "tuple"))
+
+
+@triton.jit
+def constexpr_tuple_getitem(values: tl.constexpr, index: tl.constexpr):
+    """Read static metadata on compilers with either tuple representation."""
+    if _TRITON_TUPLE:
+        return values[index]
+    else:
+        return values.value[index.value]
+
+
+@triton.jit
+def pow_square(value, exponent: tl.constexpr):
+    """Square fallback for math shims without pow; no general power emulation."""
+    tl.static_assert(exponent == 2)
+    return value * value

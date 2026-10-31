@@ -31,7 +31,10 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.data_movement import contiguous_copy
+from flaggems_vllm.ops.router_gemm import _general_router_gemm
+from flaggems_vllm.utils.libentry import _do_bench_with_timer_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +81,8 @@ def _mhc_pre_fused_kernel_hc_mult_4_impl(
     res_stride_h,
     li_stride_n,
     li_stride_h,
-    hidden_size,
-    hc_hidden_size,
+    hidden_size: tl.constexpr,
+    hc_hidden_size: tl.constexpr,
     rms_eps: tl.constexpr,
     hc_pre_eps: tl.constexpr,
     hc_sinkhorn_eps: tl.constexpr,
@@ -407,8 +410,39 @@ def _mhc_pre_fused_kernel_hc_mult_4_impl(
         )
 
 
+def _mhc_pre_do_bench(kernel_call, quantiles):
+    return _do_bench_with_timer_fallback(
+        kernel_call, warmup=25, rep=100, quantiles=quantiles
+    )
+
+
+def _mhc_pre_hc4_config_prune(configs, named_args, **kwargs):
+    """Keep Kunlun tiles within the hidden-size reduction extent."""
+    hidden_size = named_args["hidden_size"]
+    cap = triton.next_power_of_2(hidden_size)
+    if cap < 128:
+        return [
+            triton.Config({"BLOCK_H": cap}, num_warps=warps, num_stages=1)
+            for warps in (4, 8)
+        ]
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_H"] <= cap
+        and (hidden_size < 256 or config.kwargs["BLOCK_H"] >= 256)
+    ]
+
+
 @triton.autotune(
-    configs=[
+    configs=(
+        [
+            triton.Config({"BLOCK_H": 128}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 128}, num_warps=8, num_stages=1),
+        ]
+        if runtime.device.vendor_name == "kunlunxin"
+        else []
+    )
+    + [
         triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 256}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=1),
@@ -421,6 +455,14 @@ def _mhc_pre_fused_kernel_hc_mult_4_impl(
         triton.Config({"BLOCK_H": 512}, num_warps=8, num_stages=2),
     ],
     key=["hidden_size", "num_tokens_bucket"],
+    **(
+        {
+            "do_bench": _mhc_pre_do_bench,
+            "prune_configs_by": {"early_config_prune": _mhc_pre_hc4_config_prune},
+        }
+        if runtime.device.vendor_name == "kunlunxin"
+        else {}
+    ),
 )
 @triton.jit
 def mhc_pre_fused_kernel_hc_mult_4(
@@ -438,8 +480,8 @@ def mhc_pre_fused_kernel_hc_mult_4(
     res_stride_h,
     li_stride_n,
     li_stride_h,
-    hidden_size,
-    hc_hidden_size,
+    hidden_size: tl.constexpr,
+    hc_hidden_size: tl.constexpr,
     rms_eps: tl.constexpr,
     hc_pre_eps: tl.constexpr,
     hc_sinkhorn_eps: tl.constexpr,
@@ -485,6 +527,11 @@ def mhc_pre_fused_kernel_hc_mult_4(
         triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=1),
     ],
     key=["hidden_size", "num_tokens_bucket", "HC"],
+    **(
+        {"do_bench": _mhc_pre_do_bench}
+        if runtime.device.vendor_name == "kunlunxin"
+        else {}
+    ),
 )
 @triton.jit
 def mhc_pre_generic_kernel(
@@ -695,7 +742,15 @@ def mhc_pre(
     projection = torch.empty((num_tokens, hc_mult3), dtype=torch.float32, device=device)
     # BF16 split-K output atomics round every partial sum. Accumulate once in
     # FP32 through the public BMM API, then retain the original BF16 boundary.
-    bmm_out(x_flat.unsqueeze(0), fn_bf16.t().unsqueeze(0), projection.unsqueeze(0))
+    if runtime.device.vendor_name == "kunlunxin":
+        # The base FlagGems BMM tuner uses zero-resolution XPU event timing.
+        # Reuse the library's existing FP32-accumulating GEMM schedule before
+        # execution; do not retry a failed launch or round split-K partials.
+        _general_router_gemm(
+            x_flat, fn_bf16.t(), projection, num_tokens, hc_mult3, hc_hidden_size
+        )
+    else:
+        bmm_out(x_flat.unsqueeze(0), fn_bf16.t().unsqueeze(0), projection.unsqueeze(0))
     gemm_out = contiguous_copy(
         contiguous_copy(projection, torch.bfloat16), torch.float32
     )

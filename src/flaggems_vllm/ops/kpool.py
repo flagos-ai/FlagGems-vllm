@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import flag_gems
 import torch
 import triton
 import triton.language as tl
@@ -734,6 +735,16 @@ def _hadamard_kernel(X, Y, ROWS: tl.constexpr):
 def hadamard128(x):
     if x.shape[-1] != 128:
         raise ValueError("Hadamard transform requires last dimension 128")
+    if runtime.device.vendor_name == "kunlunxin" and x.numel():
+        # Public FlagGems dispatch selects Kunlun's existing global-memory
+        # butterflies: FP32 stages 1..64, then normalization and output cast.
+        # Its empty-grid case is handled by the allocation-only path below.
+        transform = getattr(flag_gems, "hadamard_transform", None)
+        if not callable(transform):
+            raise NotImplementedError(
+                "Kunlun Hadamard requires public FlagGems hadamard_transform"
+            )
+        return transform(contiguous_copy(x), scale=0.08838834764831845)
     x = contiguous_copy(x)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     rows = x.numel() // 128
