@@ -646,6 +646,8 @@ ops:
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
       Supports decode, prefill and speculative state-slot updates.
+      Hygon uses INT8 state with packed decode and chunked prefill entrypoints;
+      state and scales update in place in vLLM's [slots, HV, V, K] layout.
     for:
       - None
     labels:

@@ -26,6 +26,10 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    chunk_gated_delta_rule_w8a16,
+    gdn_w8a16,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
     gemma_rms_norm,
 )
@@ -53,9 +57,11 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
 )
 
 __all__ = [
+    "chunk_gated_delta_rule_w8a16",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
+    "gdn_w8a16",
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",
