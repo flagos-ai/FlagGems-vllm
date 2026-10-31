@@ -680,7 +680,7 @@ ops:
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
       FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU.
+      INT8 supports packed decode and chunked prefill on PPU and Hygon.
     for:
       - gdn_w8a16
       - gdn_w8a16_int8

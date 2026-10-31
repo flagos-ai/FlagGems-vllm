@@ -131,12 +131,31 @@ class GdnW8A16Benchmark(Benchmark):
 
 @pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia"
-    or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] < 9,
-    reason="FP8 GDN requires NVIDIA SM90 or newer",
+    not torch.cuda.is_available()
+    or not (
+        flaggems_vllm.gdn_w8a16.__module__
+        == "flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16"
+        or (
+            flaggems_vllm.vendor_name == "nvidia"
+            and torch.cuda.get_device_capability()[0] >= 9
+        )
+    ),
+    reason="backend does not export a supported GDN state implementation",
 )
 def test_gdn_w8a16():
-    bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
-    bench.set_gems(_fp8)
+    if (
+        flaggems_vllm.gdn_w8a16.__module__
+        == "flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16"
+    ):
+        from benchmark.gdn_w8a16_hygon import (
+            HygonGdnW8A16Benchmark,
+            int8_gdn,
+            native_gdn,
+        )
+
+        bench = HygonGdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=native_gdn)
+        bench.set_gems(int8_gdn)
+    else:
+        bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
+        bench.set_gems(_fp8)
     bench.run()
