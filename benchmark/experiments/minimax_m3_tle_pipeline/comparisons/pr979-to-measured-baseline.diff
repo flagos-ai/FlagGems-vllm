@@ -1,0 +1,2187 @@
+--- a/src/flaggems_vllm/ops/minimax_m3_sparse_attn.py
++++ b/measured/reference/baseline.py
+@@ -3,6 +3,74 @@
+-# Copyright 2026 FlagOS Contributors
+-"""MiniMax M3 selected-block attention on native vLLM 0.28 packed KV pages.
+-
+-The mathematical kernels are extracted from the measured MiniMax integration;
+-server hooks, environment overrides and native compute fallbacks are omitted.
+-Precision is an explicit request independent of the shape-dependent schedule.
++"""Research candidate: exact sparse-wide refill fallback plus frozen production kernels.
++
++Adds a third GPU-predicated sparse-wide step to attn_auto for q>=6144, H100,
++FP8 KV, D128, GQA8, one KV head. Compact union remains the frozen production
++kernel. Sparse-wide visits set bitmap bits in ascending order, retains BF16
++QK/AV, and routes duplicate-bearing or >128-span tiles to selected fallback.
++All flags are recomputed on every graph replay. No production file was edited.
++
++Original module documentation follows.
++
++Env-gated mount of the tuned MiniMax-M3 block-sparse attention kernels.
++
++What this is
++------------
++The 0.24 service ran a *tuned* kernel set for MiniMax-M3 block-sparse attention
++(``tle-m3-20261019/sparse_pkg`` + the ``attn-shapes-20261019`` grid).  vLLM 0.28
++ships its own sparse-attend kernels, and it also made the packed main-KV cache
++native, so the 0.24 *packing overlay* is obsolete -- but the *tuned kernels* are
++not.  This patch mounts them onto 0.28's native layout.  Nothing is repacked and
++there is no extra copy:
++
++    kv_cache : [num_blocks, num_kv_heads, block_size, 2*head_dim]   (fp8/bf16)
++    K = kv_cache[..., :head_dim]        V = kv_cache[..., head_dim:]
++
++Kernel families (unchanged from the tuned set; only the 0.28 addressing is new):
++
++  ``attn_union_span``  one CTA per BLOCK_Q query tokens, walks the *union span*
++                       of their selected blocks with an int32 bitmap.  Best when
++                       the index is compact (deployed recent-16 / local-window
++                       index): 1.6-6.6x over the native 0.28 kernel at
++                       q >= 384, both eager and replayed.
++  ``attn_span_split``  same walk, span cut CHUNKS ways (+ weighted merge).
++  ``attn_split``       per-token walk over the *selected* blocks only, split
++                       CHUNKS ways -- exact-per-token work, so a scattered index
++                       costs nothing.  Also the decode kernel (q == 1).
++
++What is adapted to 0.28
++-----------------------
++* KV address arithmetic takes all four strides of the native 4-D packed page
++  (``stride_kv_pos = 2*head_dim``, V at ``+head_dim``) instead of the deleted
++  5-D ``_packed_view``.
++* ``topk_idx`` is the 0.28 token-major buffer ``[:num_tokens].transpose(0, 1)``;
++  every kernel takes its three strides explicitly, so the non-contiguous view is
++  read in place (no transpose copy).
++* scales come from ``layer._k_scale`` / ``layer._v_scale`` (unit by default),
++  matching the native impl; ``fp8`` QK is the tuned decode default.
++* CUDA-graph safety: no ``.item()`` or host sync. Split partials and auto flags
++  come from cached workspaces after warmup. The native ``_run_attention``
++  groups indexer + attend into one eager break in breakable modes; FULL mode
++  can capture it. Auto recomputes its device predicates in either mode.
++
++Environment gate (default OFF -- byte-identical to stock 0.28)
++-------------------------------------------------------------
++  ``M31_ATTN_TUNED``
++      unset / ``0`` / ``off``    -> not installed at all (no kernel import)
++      ``1`` / ``decode``         -> tuned decode only
++      ``2`` / ``all``            -> tuned decode + tuned prefill
++      ``prefill``                -> tuned prefill only
++  ``M31_ATTN_TUNED_PREFILL_ARM``   ``auto`` (default) | ``union`` | ``split`` |
++      ``tok`` | ``native``. ``auto`` checks each tile's selected span on the
++      GPU, runs union only for dense spans (<=32 small-q / <=64 large-q),
++      and otherwise visits only
++      selected blocks. The predicate is recomputed on every graph replay.
++      Explicit union/split arms require a compact index; they do not adapt.
++      Auto is limited to verified NVIDIA H100/SM90 devices; other devices and
++      unsupported tensor/scale configurations keep the native prefill path.
++  ``M31_ATTN_TUNED_DECODE_MIN_B``  force the tuned decode from this batch up
++      (measurement aid; default: the measured crossover at 17).
++  ``M31_ATTN_TUNED_DECODE_CHUNKS`` force the split factor (measurement aid).
++  ``M31_ATTN_TUNED_SPEC_BF16_QK`` exactly ``1`` opts multi-token decode
++      (decode_query_len > 1) into BF16 QK. The FP8 cache and split count stay
++      unchanged; q_len=1 and the default policy keep their existing math.
++
++Evidence: ``m31-028/attn-port/REPORT.md`` (parity + per-bucket tables).
+@@ -11,2 +79,5 @@
+-import math
+-from functools import lru_cache
++from __future__ import annotations
++
++import logging
++import os
++from typing import NamedTuple
+@@ -15,2 +86,113 @@
+-import triton
+-import triton.language as tl
++
++from vllm.triton_utils import tl, triton
++
++logger = logging.getLogger(__name__)
++
++
++class AttentionPrecisionPolicy(NamedTuple):
++    """Hardware facts, independent of cache dtype and allocation policy."""
++
++    device_id: int
++    vendor: str
++    capability: int | None
++    supports_fp8: bool
++    supports_int8: bool
++    evidence: str
++
++
++_PRECISION_POLICIES: dict = {}
++_INT8_FALLBACK = False
++_PRECISION_LOCKED = False
++
++
++def attention_precision_policy(device_id=0, *, platform=None):
++    """Probe the target platform lazily and cache hardware facts per device.
++
++    No device is probed at import. NVIDIA uses the actual target SM rather
++    than assuming that a CUDA tensor or an FP8 dtype implies FP8 hardware.
++    ``platform`` is an uncached injection point for CPU capability tests.
++    """
++    if platform is None:
++        platform = _current_platform
++        if platform is None:
++            from vllm.platforms import current_platform
++            platform = current_platform
++        key = (id(platform), int(device_id))
++        found = _PRECISION_POLICIES.get(key)
++        if found is not None:
++            return found
++    else:
++        key = None
++    raw_vendor = vars(platform).get("vendor_name")
++    if raw_vendor is None:
++        for cls in type(platform).__mro__:
++            if "vendor_name" in vars(cls):
++                raw_vendor = getattr(platform, "vendor_name", None)
++                break
++    vendor = str(raw_vendor or "").lower()
++    # In vLLM, is_cuda identifies PlatformEnum.CUDA (NVIDIA), not merely
++    # the existence of a CUDA-like runtime. The SM check remains mandatory.
++    is_nvidia = vendor == "nvidia" or (
++        not vendor and platform.is_cuda() and not platform.is_rocm())
++    capability = None
++    if is_nvidia:
++        cap = platform.get_device_capability(device_id)
++        if cap is None:
++            raise RuntimeError("Cannot determine NVIDIA attention device capability")
++        if hasattr(cap, "major"):
++            capability = int(cap.major) * 10 + int(cap.minor)
++        else:
++            capability = int(cap[0]) * 10 + int(cap[1])
++        vendor = "nvidia"
++        fp8 = capability >= 89
++        int8 = capability >= 80
++        evidence = "NVIDIA target get_device_capability"
++    else:
++        fp8 = bool(platform.supports_fp8())
++        int8 = False  # No other vendor's INT8 attend kernel is validated here.
++        evidence = "current_platform.supports_fp8"
++    policy = AttentionPrecisionPolicy(int(device_id), vendor, capability,
++                                      fp8, int8, evidence)
++    if key is not None:
++        _PRECISION_POLICIES[key] = policy
++    return policy
++
++
++def _require_fp8(device_id=0):
++    policy = attention_precision_policy(device_id)
++    if not policy.supports_fp8:
++        raise RuntimeError(
++            "FP8 attention requested on a device without FP8 support "
++            f"({policy.vendor}, SM{policy.capability}); select BF16 KV before "
++            "allocation and install_attn_tuned(int8_fallback=True)")
++
++
++def _qk_int8_mode(q, kv_cache, output, k_scale=None, v_scale=None,
++                  *, fp8_requested=False):
++    """Validate storage before dispatch; never reinterpret FP8 as INT8."""
++    global _PRECISION_LOCKED
++    if _INT8_FALLBACK:
++        if (q.device.type != "cuda" or q.dtype != torch.bfloat16
++                or output.dtype != torch.bfloat16 or output.shape != q.shape
++                or kv_cache.dtype != torch.bfloat16):
++            raise ValueError("INT8 QK attention requires BF16 Q/output and BF16 KV storage; "
++                             "FP8/uint8 caches must be rejected before reinterpretation")
++        if (q.ndim != 3 or kv_cache.ndim != 4 or q.shape[-1] not in (96, 128)
++                or kv_cache.shape[2:] != (128, 2*q.shape[-1])
++                or q.shape[1] != 8*kv_cache.shape[1]):
++            raise ValueError("INT8 QK attention supports D96/128, GQA8 and page128 packed KV")
++        if not ((k_scale is None and v_scale is None) or (
++                k_scale is not None and v_scale is not None
++                and k_scale.numel() == 1 and v_scale.numel() == 1)):
++            raise ValueError("INT8 QK attention supports no scales or paired scalar scales")
++        policy = attention_precision_policy(q.device.index or 0)
++        if not policy.supports_int8:
++            raise RuntimeError("INT8 QK attention requires verified NVIDIA SM80+ kernels")
++        _PRECISION_LOCKED = True
++        return True
++    if fp8_requested or str(kv_cache.dtype).startswith("torch.float8"):
++        _require_fp8(q.device.index or 0)
++    if kv_cache.dtype == torch.uint8:
++        raise ValueError("Direct attention kernels require typed BF16/FP8 KV, not raw uint8")
++    _PRECISION_LOCKED = True
++    return False
+@@ -30 +212,2 @@
+-    normalized = tl.where(finite[:, None], tl.div_rn(xf, safe_scale[:, None]), 0.0)
++    normalized = tl.where(finite[:, None],
++                          tl.div_rn(xf, safe_scale[:, None]), 0.0)
+@@ -52 +235,2 @@
+-        exceptional = tl.dot(q_rows.to(tl.bfloat16), tl.trans(k_rows.to(tl.bfloat16)))
++        exceptional = tl.dot(q_rows.to(tl.bfloat16),
++                             tl.trans(k_rows.to(tl.bfloat16)))
+@@ -56 +240,16 @@
+-
++# ---------------------------------------------------------------------------
++# launch configuration (measured, see attn-port/REPORT.md)
++# ---------------------------------------------------------------------------
++UNION_SPAN = 32  # must fit the int32 selection bitmap
++UNION_NUM_WARPS = 8
++UNION_NUM_STAGES = 3
++SPLIT_NUM_WARPS = 4
++SPLIT_NUM_STAGES = 1
++
++#: GEMM tile height of the span-split kernel below 2048 query tokens
++PREFILL_SPLIT_BLOCK_Q = 8
++
++
++# ---------------------------------------------------------------------------
++# 1. union-span prefill kernel (compact / recent index)
++# ---------------------------------------------------------------------------
+@@ -59,14 +258,2 @@
+-    q_ptr,
+-    kv_ptr,
+-    t_ptr,
+-    o_ptr,
+-    bt_ptr,
+-    cu_ptr,
+-    seq_ptr,
+-    pre_ptr,
+-    k_scale_ptr,
+-    v_scale_ptr,
+-    gqa_group_size,
+-    head_dim,
+-    max_topk,
+-    sm_scale,
++    q_ptr, kv_ptr, t_ptr, o_ptr, bt_ptr, cu_ptr, seq_ptr, pre_ptr,
++    k_scale_ptr, v_scale_ptr, gqa_group_size, head_dim, max_topk, sm_scale,
+@@ -74,21 +261,6 @@
+-    stride_qn,
+-    stride_kv_blk,
+-    stride_kv_h,
+-    stride_kv_pos,
+-    stride_kv_d,
+-    stride_th,
+-    stride_tn,
+-    stride_tk,
+-    stride_bt_b,
+-    BLOCK_Q: tl.constexpr,
+-    BLOCK_K: tl.constexpr,
+-    BLOCK_D: tl.constexpr,
+-    TOPK: tl.constexpr,
+-    QH: tl.constexpr,
+-    SPAN: tl.constexpr,
+-    HAS_SCALE: tl.constexpr,
+-    D_POW2: tl.constexpr,
+-    INT8_QK: tl.constexpr,
+-    auto_flags_ptr=None,
+-    AUTO_SPAN: tl.constexpr = 0,
+-    stride_bt_k=1,
++    stride_qn, stride_kv_blk, stride_kv_h, stride_kv_pos, stride_kv_d,
++    stride_th, stride_tn, stride_tk, stride_bt_b,
++    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
++    TOPK: tl.constexpr, QH: tl.constexpr, SPAN: tl.constexpr,
++    HAS_SCALE: tl.constexpr, D_POW2: tl.constexpr, INT8_QK: tl.constexpr,
++    auto_flags_ptr=None, AUTO_SPAN: tl.constexpr = 0, stride_bt_k=1,
+@@ -131,5 +303,2 @@
+-        q = tl.load(
+-            qbase + row_off[:, None] * stride_qn + off_d[None, :],
+-            mask=row_ok[:, None],
+-            other=0.0,
+-        )
++        q = tl.load(qbase + row_off[:, None] * stride_qn + off_d[None, :],
++                    mask=row_ok[:, None], other=0.0)
+@@ -137,5 +306,2 @@
+-        q = tl.load(
+-            qbase + row_off[:, None] * stride_qn + off_d[None, :],
+-            mask=row_ok[:, None] & d_ok[None, :],
+-            other=0.0,
+-        )
++        q = tl.load(qbase + row_off[:, None] * stride_qn + off_d[None, :],
++                    mask=row_ok[:, None] & d_ok[None, :], other=0.0)
+@@ -167,4 +333,4 @@
+-        compact = (selected == 0) | (
+-            (span <= AUTO_SPAN) & (span * n_tok * QH <= density * selected)
+-        )
+-        flag_off = (pid_b * tl.num_programs(1) + pid_h) * tl.num_programs(0) + pid_q
++        compact = ((selected == 0) | ((span <= AUTO_SPAN)
++                   & (span * n_tok * QH <= density * selected)))
++        flag_off = ((pid_b * tl.num_programs(1) + pid_h)
++                    * tl.num_programs(0) + pid_q)
+@@ -196,10 +362,4 @@
+-    kv_k = (
+-        off_n[:, None] * stride_kv_pos
+-        + off_d[None, :] * stride_kv_d
+-        + pid_h * stride_kv_h
+-    )
+-    kv_v = (
+-        off_n[:, None] * stride_kv_pos
+-        + (head_dim + off_d[None, :]) * stride_kv_d
+-        + pid_h * stride_kv_h
+-    )
++    kv_k = (off_n[:, None] * stride_kv_pos + off_d[None, :] * stride_kv_d
++            + pid_h * stride_kv_h)
++    kv_v = (off_n[:, None] * stride_kv_pos
++            + (head_dim + off_d[None, :]) * stride_kv_d + pid_h * stride_kv_h)
+@@ -237,3 +397,2 @@
+-                k = tl.load(
+-                    kbase + kv_k, mask=pos_ok[:, None] & d_ok[None, :], other=0.0
+-                )
++                k = tl.load(kbase + kv_k, mask=pos_ok[:, None] & d_ok[None, :],
++                            other=0.0)
+@@ -244 +403,2 @@
+-            keep = sel[:, None] & (q_abs[:, None] >= pos[None, :]) & pos_ok[None, :]
++            keep = (sel[:, None] & (q_abs[:, None] >= pos[None, :])
++                    & pos_ok[None, :])
+@@ -254,3 +414,2 @@
+-                v = tl.load(
+-                    kbase + kv_v, mask=pos_ok[:, None] & d_ok[None, :], other=0.0
+-                )
++                v = tl.load(kbase + kv_v, mask=pos_ok[:, None] & d_ok[None, :],
++                            other=0.0)
+@@ -267,5 +426,2 @@
+-        tl.store(
+-            obase + row_off[:, None] * stride_qn + off_d[None, :],
+-            acc.to(o_ptr.dtype.element_ty),
+-            mask=row_ok[:, None],
+-        )
++        tl.store(obase + row_off[:, None] * stride_qn + off_d[None, :],
++                 acc.to(o_ptr.dtype.element_ty), mask=row_ok[:, None])
+@@ -273,7 +429,373 @@
+-        tl.store(
+-            obase + row_off[:, None] * stride_qn + off_d[None, :],
+-            acc.to(o_ptr.dtype.element_ty),
+-            mask=row_ok[:, None] & d_ok[None, :],
+-        )
+-
+-
++        tl.store(obase + row_off[:, None] * stride_qn + off_d[None, :],
++                 acc.to(o_ptr.dtype.element_ty),
++                 mask=row_ok[:, None] & d_ok[None, :])
++
++
++# ---------------------------------------------------------------------------
++# Independent research fallback: selected bitmap bits only, single-KV guarded.
++# ---------------------------------------------------------------------------
++@triton.jit
++def _bitmap_or(a, b):
++    return a | b
++
++
++@triton.jit(do_not_specialize_on_alignment=["t_ptr", "cu_ptr", "seq_ptr", "pre_ptr"])
++def _wide_union_sparse_kernel(
++    q_ptr, kv_ptr, t_ptr, o_ptr, bt_ptr, cu_ptr, seq_ptr, pre_ptr,
++    k_scale_ptr, v_scale_ptr, gqa_group_size, head_dim, max_topk, sm_scale,
++    heads_total,
++    stride_qn, stride_kv_blk, stride_kv_h, stride_kv_pos, stride_kv_d,
++    stride_th, stride_tn, stride_tk, stride_bt_b,
++    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
++    TOPK: tl.constexpr, QH: tl.constexpr, SPAN: tl.constexpr,
++    HAS_SCALE: tl.constexpr, D_POW2: tl.constexpr, INT8_QK: tl.constexpr,
++    auto_flags_ptr=None, AUTO_SPAN: tl.constexpr = 0, stride_bt_k=1,
++    SPARSE_WALK: tl.constexpr = False, parent_flags_ptr=None,
++    PARENT_BLOCK_Q: tl.constexpr = 0, PARENT_TILES: tl.constexpr = 0,
++):
++    pid_q = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    pid_b = tl.program_id(2)
++    q_start = tl.load(cu_ptr + pid_b)
++    q_len = tl.load(cu_ptr + pid_b + 1) - q_start
++    q0 = pid_q * BLOCK_Q
++    if q0 >= q_len:
++        return
++    # Parent compact output already owns these rows; still overwrite every active wide flag.
++    if PARENT_BLOCK_Q:
++        parent_off = ((pid_b * tl.num_programs(1) + pid_h) * PARENT_TILES
++                      + q0 // PARENT_BLOCK_Q)
++        if tl.load(parent_flags_ptr + parent_off) != 0:
++            wide_off = ((pid_b * tl.num_programs(1) + pid_h) * tl.num_programs(0) + pid_q)
++            tl.store(auto_flags_ptr + wide_off, 1)
++            return
++    seq_len = tl.load(seq_ptr + pid_b)
++    prefix_len = tl.load(pre_ptr + pid_b)
++
++    M: tl.constexpr = BLOCK_Q * QH
++    off_m = tl.arange(0, M)
++    off_d = tl.arange(0, BLOCK_D)
++    tok = off_m // QH
++    n_tok = tl.minimum(BLOCK_Q, q_len - q0)
++    row_ok = tok < n_tok
++    d_ok = off_d < head_dim
++    q_abs = prefix_len + q0 + tok
++
++    qk_scale = sm_scale * 1.4426950409
++    if HAS_SCALE:
++        qk_scale = qk_scale * tl.load(k_scale_ptr)
++
++    # `q` arrives as a flat [total_q * heads_total, head_dim] view, so one
++    # token spans heads_total heads, of which this program owns the QH heads of
++    # KV head ``pid_h``. Both the tile base and the in-tile row offset must
++    # account for that: a row is (token, head-within-KV-head), so
++    #   row_offset = tok * heads_total + off_m % QH
++    # Using ``off_m * stride_qn`` (the old code) is only right while
++    # heads_total == QH, i.e. num_kv_heads == 1; with more KV heads it walked
++    # into the neighbouring KV heads and left ~47% of the output unwritten.
++    row_off = tok * heads_total + (off_m % QH)
++    qbase = q_ptr + ((q_start + q0) * heads_total + pid_h * QH) * stride_qn
++    if D_POW2:
++        q = tl.load(qbase + row_off[:, None] * stride_qn + off_d[None, :],
++                    mask=row_ok[:, None], other=0.0)
++    else:
++        q = tl.load(qbase + row_off[:, None] * stride_qn + off_d[None, :],
++                    mask=row_ok[:, None] & d_ok[None, :], other=0.0)
++
++    if INT8_QK:
++        qi, qs = _quantize_int8_rows(q)
++    # Selection metadata has one row per query token, shared by the eight GQA heads.
++    # Keep it at BLOCK_Q, then expand the chosen bitmap for the QK tile.
++    topk_tok = tl.arange(0, BLOCK_Q)
++    topk_row_ok = topk_tok < n_tok
++    tbase = t_ptr + pid_h * stride_th + (q_start + q0 + topk_tok) * stride_tn
++    big = 2147483647
++    lo = tl.full((BLOCK_Q,), big, tl.int32)
++    hi = tl.full((BLOCK_Q,), -1, tl.int32)
++    if AUTO_SPAN:
++        n_selected = tl.zeros((BLOCK_Q,), tl.int32)
++    for j in tl.static_range(TOPK):
++        t = tl.load(tbase + j * stride_tk, mask=topk_row_ok, other=-1)
++        lo = tl.minimum(lo, tl.where(t >= 0, t, big))
++        hi = tl.maximum(hi, t)
++        if AUTO_SPAN:
++            n_selected += ((t >= 0) & topk_row_ok).to(tl.int32)
++    lo_s = tl.min(lo, axis=0)
++    hi_s = tl.max(hi, axis=0)
++    span = hi_s - lo_s + 1
++    if AUTO_SPAN:
++        # Recomputed from device indices on every invocation / graph replay.
++        # No host readback and no assumption that indexer outputs stay local.
++        # Sparse lists with few valid entries need a proportionally tighter
++        # span cap. A full TOPK=16 list permits 32 / 64 blocks respectively.
++        density = max(1, AUTO_SPAN // TOPK)
++        selected = tl.sum(n_selected, 0)
++        compact = ((selected == 0) | ((span <= AUTO_SPAN)
++                   & (span * n_tok <= density * selected)))
++        flag_off = ((pid_b * tl.num_programs(1) + pid_h)
++                    * tl.num_programs(0) + pid_q)
++        tl.store(auto_flags_ptr + flag_off, compact.to(tl.int32))
++        if not compact:
++            return
++        auto_bm = tl.zeros((BLOCK_Q,), tl.int32)
++        if AUTO_SPAN > 32:
++            auto_bm_hi = tl.zeros((BLOCK_Q,), tl.int32)
++        if AUTO_SPAN > 64:
++            auto_bm_hi2 = tl.zeros((BLOCK_Q,), tl.int32)
++            auto_bm_hi3 = tl.zeros((BLOCK_Q,), tl.int32)
++        for j in tl.static_range(TOPK):
++            t = tl.load(tbase + j * stride_tk, mask=topk_row_ok, other=-1)
++            sh = (t - lo_s) & 31
++            valid = topk_row_ok & (t >= 0)
++            auto_bm |= tl.where(valid & (t < lo_s + 32), 1 << sh, 0)
++            if AUTO_SPAN > 32:
++                auto_bm_hi |= tl.where(valid & (t >= lo_s + 32) & (t < lo_s + 64), 1 << sh, 0)
++            if AUTO_SPAN > 64:
++                auto_bm_hi2 |= tl.where(valid & (t >= lo_s + 64) & (t < lo_s + 96), 1 << sh, 0)
++                auto_bm_hi3 |= tl.where(valid & (t >= lo_s + 96), 1 << sh, 0)
++        # Bitmap membership collapses repeated ids; preserve selected-list
++        # semantics by sending duplicate-bearing tiles to fallback.
++        pop = tl.extra.cuda.libdevice.popc(auto_bm)
++        if AUTO_SPAN > 32:
++            pop += tl.extra.cuda.libdevice.popc(auto_bm_hi)
++        if AUTO_SPAN > 64:
++            pop += tl.extra.cuda.libdevice.popc(auto_bm_hi2)
++            pop += tl.extra.cuda.libdevice.popc(auto_bm_hi3)
++        duplicates = pop != n_selected
++        if tl.sum(duplicates.to(tl.int32), axis=0) != 0:
++            tl.store(auto_flags_ptr + flag_off, 0)
++            return
++
++    bt_row = bt_ptr + pid_b * stride_bt_b
++    off_n = tl.arange(0, BLOCK_K)
++    kv_k = (off_n[:, None] * stride_kv_pos + off_d[None, :] * stride_kv_d
++            + pid_h * stride_kv_h)
++    kv_v = (off_n[:, None] * stride_kv_pos
++            + (head_dim + off_d[None, :]) * stride_kv_d + pid_h * stride_kv_h)
++
++    m_i = tl.full((M,), float("-inf"), tl.float32)
++    l_i = tl.zeros((M,), tl.float32)
++    acc = tl.zeros((M, BLOCK_D), tl.float32)
++
++    g = 0
++    while g < span:
++        lo_g = lo_s + g
++        if AUTO_SPAN:
++            bm = auto_bm
++            if AUTO_SPAN > 32:
++                bm = tl.where(g == 0, auto_bm, auto_bm_hi)
++            if AUTO_SPAN > 64:
++                bm = tl.where(g == 64, auto_bm_hi2, bm)
++                bm = tl.where(g == 96, auto_bm_hi3, bm)
++        else:
++            bm = tl.zeros((BLOCK_Q,), tl.int32)
++            for j in tl.static_range(TOPK):
++                t = tl.load(tbase + j * stride_tk, mask=topk_row_ok, other=-1)
++                sh = (t - lo_g) & 31
++                ok = topk_row_ok & (t >= lo_g) & (t < lo_g + SPAN)
++                bm = bm | tl.where(ok, 1 << sh, 0)
++        if SPARSE_WALK:
++            active_bits = tl.reduce(bm, 0, _bitmap_or)
++            n_visit = tl.extra.cuda.libdevice.popc(active_bits)
++        else:
++            n_visit = tl.minimum(SPAN, span - g)
++        bm = tl.reshape(tl.broadcast_to(bm[:, None], (BLOCK_Q, QH)), (M,))
++        for visit in range(n_visit):
++            if SPARSE_WALK:
++                i = tl.extra.cuda.libdevice.ffs(active_bits) - 1
++                active_bits = active_bits & (active_bits - 1)
++            else:
++                i = visit
++            blk = lo_g + i
++            page = tl.load(bt_row + blk * stride_bt_k).to(tl.int64)
++            c = blk * BLOCK_K
++            pos = c + off_n
++            pos_ok = pos < seq_len
++            sel = ((bm >> i) & 1) != 0
++            kbase = kv_ptr + page * stride_kv_blk
++            if D_POW2:
++                k = tl.load(kbase + kv_k, mask=pos_ok[:, None], other=0.0)
++            else:
++                k = tl.load(kbase + kv_k, mask=pos_ok[:, None] & d_ok[None, :],
++                            other=0.0)
++            if INT8_QK:
++                qk = _int8_qk_dot(qi, qs, k, q) * qk_scale
++            else:
++                qk = tl.dot(q, tl.trans(k.to(q.dtype))) * qk_scale
++            keep = (sel[:, None] & (q_abs[:, None] >= pos[None, :])
++                    & pos_ok[None, :])
++            qk = tl.where(keep, qk, float("-inf"))
++            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
++            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++            p = tl.exp2(qk - m_safe[:, None])
++            alpha = tl.exp2(m_i - m_safe)
++            l_i = l_i * alpha + tl.sum(p, axis=1)
++            if D_POW2:
++                v = tl.load(kbase + kv_v, mask=pos_ok[:, None], other=0.0)
++            else:
++                v = tl.load(kbase + kv_v, mask=pos_ok[:, None] & d_ok[None, :],
++                            other=0.0)
++            acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
++            m_i = m_new
++        g += SPAN
++
++    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
++    if HAS_SCALE:
++        inv_l = inv_l * tl.load(v_scale_ptr)
++    acc = acc * inv_l[:, None]
++    obase = o_ptr + ((q_start + q0) * heads_total + pid_h * QH) * stride_qn
++    if D_POW2:
++        tl.store(obase + row_off[:, None] * stride_qn + off_d[None, :],
++                 acc.to(o_ptr.dtype.element_ty), mask=row_ok[:, None])
++    else:
++        tl.store(obase + row_off[:, None] * stride_qn + off_d[None, :],
++                 acc.to(o_ptr.dtype.element_ty),
++                 mask=row_ok[:, None] & d_ok[None, :])
++
++
++# ---------------------------------------------------------------------------
++# 1b. same walk, span split across CTAs (small-q / low-occupancy regime)
++# ---------------------------------------------------------------------------
++@triton.jit(do_not_specialize_on_alignment=["t_ptr", "cu_ptr", "seq_ptr", "pre_ptr"])
++def _span_split_kernel(
++    q_ptr, kv_ptr, t_ptr, o_ptr, l_ptr, bt_ptr, cu_ptr, seq_ptr, pre_ptr,
++    k_scale_ptr, v_scale_ptr, gqa_group_size, head_dim, max_topk, sm_scale,
++    heads_total,
++    stride_qn, stride_kv_blk, stride_kv_h, stride_kv_pos, stride_kv_d,
++    stride_th, stride_tn, stride_tk, stride_bt_b,
++    stride_o_c, stride_o_b, stride_o_h, stride_o_d,
++    stride_l_c, stride_l_b, stride_l_h,
++    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
++    TOPK: tl.constexpr, QH: tl.constexpr, SPAN: tl.constexpr,
++    CHUNKS: tl.constexpr, HAS_SCALE: tl.constexpr, D_POW2: tl.constexpr,
++    stride_bt_k=1,
++):
++    pid = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    pid_b = tl.program_id(2)
++    pid_q = pid // CHUNKS
++    pid_c = pid % CHUNKS
++    q_start = tl.load(cu_ptr + pid_b)
++    q_len = tl.load(cu_ptr + pid_b + 1) - q_start
++    q0 = pid_q * BLOCK_Q
++    if q0 >= q_len:
++        return
++    seq_len = tl.load(seq_ptr + pid_b)
++    prefix_len = tl.load(pre_ptr + pid_b)
++
++    M: tl.constexpr = BLOCK_Q * QH
++    off_m = tl.arange(0, M)
++    off_d = tl.arange(0, BLOCK_D)
++    tok = off_m // QH
++    n_tok = tl.minimum(BLOCK_Q, q_len - q0)
++    row_ok = tok < n_tok
++    d_ok = off_d < head_dim
++    q_abs = prefix_len + q0 + tok
++
++    qk_scale = sm_scale * 1.4426950409
++    if HAS_SCALE:
++        qk_scale = qk_scale * tl.load(k_scale_ptr)
++
++    row_off = tok * heads_total + (off_m % QH)
++    qbase = q_ptr + ((q_start + q0) * heads_total + pid_h * QH) * stride_qn
++    if D_POW2:
++        q = tl.load(qbase + row_off[:, None] * stride_qn + off_d[None, :],
++                    mask=row_ok[:, None], other=0.0)
++    else:
++        q = tl.load(qbase + row_off[:, None] * stride_qn + off_d[None, :],
++                    mask=row_ok[:, None] & d_ok[None, :], other=0.0)
++
++    tbase = t_ptr + pid_h * stride_th + (q_start + q0 + tok) * stride_tn
++    big = 2147483647
++    lo = tl.full((M,), big, tl.int32)
++    hi = tl.full((M,), -1, tl.int32)
++    for j in tl.static_range(TOPK):
++        t = tl.load(tbase + j * stride_tk, mask=row_ok, other=-1)
++        lo = tl.minimum(lo, tl.where(t >= 0, t, big))
++        hi = tl.maximum(hi, t)
++    lo_s = tl.min(lo, axis=0)
++    hi_s = tl.max(hi, axis=0)
++    span = hi_s - lo_s + 1
++
++    per = (span + CHUNKS - 1) // CHUNKS
++    g0 = pid_c * per
++    g1 = tl.minimum(span, g0 + per)
++
++    bt_row = bt_ptr + pid_b * stride_bt_b
++    off_n = tl.arange(0, BLOCK_K)
++    kv_k = (off_n[:, None] * stride_kv_pos + off_d[None, :] * stride_kv_d
++            + pid_h * stride_kv_h)
++    kv_v = (off_n[:, None] * stride_kv_pos
++            + (head_dim + off_d[None, :]) * stride_kv_d + pid_h * stride_kv_h)
++
++    m_i = tl.full((M,), float("-inf"), tl.float32)
++    l_i = tl.zeros((M,), tl.float32)
++    acc = tl.zeros((M, BLOCK_D), tl.float32)
++
++    g = g0
++    while g < g1:
++        lo_g = lo_s + g
++        bm = tl.zeros((M,), tl.int32)
++        for j in tl.static_range(TOPK):
++            t = tl.load(tbase + j * stride_tk, mask=row_ok, other=-1)
++            sh = (t - lo_g) & 31
++            ok = row_ok & (t >= lo_g) & (t < lo_g + SPAN)
++            bm = bm | tl.where(ok, 1 << sh, 0)
++        inner = tl.minimum(SPAN, g1 - g)
++        for i in range(inner):
++            blk = lo_g + i
++            page = tl.load(bt_row + blk * stride_bt_k).to(tl.int64)
++            c = blk * BLOCK_K
++            pos = c + off_n
++            pos_ok = pos < seq_len
++            sel = ((bm >> i) & 1) != 0
++            kbase = kv_ptr + page * stride_kv_blk
++            if D_POW2:
++                k = tl.load(kbase + kv_k, mask=pos_ok[:, None], other=0.0)
++            else:
++                k = tl.load(kbase + kv_k, mask=pos_ok[:, None] & d_ok[None, :],
++                            other=0.0)
++            qk = tl.dot(q, tl.trans(k.to(q.dtype))) * qk_scale
++            keep = (sel[:, None] & (q_abs[:, None] >= pos[None, :])
++                    & pos_ok[None, :])
++            qk = tl.where(keep, qk, float("-inf"))
++            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
++            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++            p = tl.exp2(qk - m_safe[:, None])
++            alpha = tl.exp2(m_i - m_safe)
++            l_i = l_i * alpha + tl.sum(p, axis=1)
++            if D_POW2:
++                v = tl.load(kbase + kv_v, mask=pos_ok[:, None], other=0.0)
++            else:
++                v = tl.load(kbase + kv_v, mask=pos_ok[:, None] & d_ok[None, :],
++                            other=0.0)
++            acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
++            m_i = m_new
++        g += SPAN
++
++    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
++    if HAS_SCALE:
++        inv_l = inv_l * tl.load(v_scale_ptr)
++    acc = acc * inv_l[:, None]
++    obase = (o_ptr + pid_c * stride_o_c + (q_start + q0) * stride_o_b
++             + pid_h * QH * stride_o_h)
++    if D_POW2:
++        tl.store(obase + row_off[:, None] * stride_o_h + off_d[None, :] * stride_o_d,
++                 acc.to(o_ptr.dtype.element_ty), mask=row_ok[:, None])
++    else:
++        tl.store(obase + row_off[:, None] * stride_o_h + off_d[None, :] * stride_o_d,
++                 acc.to(o_ptr.dtype.element_ty),
++                 mask=row_ok[:, None] & d_ok[None, :])
++    lse = tl.where(l_i > 0, m_i + tl.log2(tl.maximum(l_i, 1e-30)),
++                   float("-inf"))
++    # ``pid_h`` is the raw KV-head id (it also indexes the K/V cache and the
++    # top-k table), so the query-head base is ``pid_h * QH``. Using ``pid_h``
++    # alone put KV head 1 on heads 1..8 instead of 8..15 and let it overwrite
++    # KV head 0's log-sum-exp (only multi-KV-head runs showed it).
++    tl.store(l_ptr + pid_c * stride_l_c + (q_start + q0 + tok) * stride_l_b
++             + (pid_h * QH + off_m % QH) * stride_l_h, lse, mask=row_ok)
++
++
++# ---------------------------------------------------------------------------
++# 2. per-token split-K kernel (decode + scattered/small-q prefill)
++# ---------------------------------------------------------------------------
+@@ -282,31 +804,8 @@
+-    q_ptr,
+-    kv_ptr,
+-    t_ptr,
+-    o_ptr,
+-    l_ptr,
+-    bt_ptr,
+-    cu_ptr,
+-    seq_ptr,
+-    k_scale_ptr,
+-    v_scale_ptr,
+-    gqa_group_size,
+-    head_dim,
+-    max_topk,
+-    sm_scale,
+-    stride_qn,
+-    stride_qh,
+-    stride_qd,
+-    stride_kv_blk,
+-    stride_kv_h,
+-    stride_kv_pos,
+-    stride_kv_d,
+-    stride_th,
+-    stride_tn,
+-    stride_tk,
+-    stride_o_c,
+-    stride_o_b,
+-    stride_o_h,
+-    stride_o_d,
+-    stride_l_c,
+-    stride_l_b,
+-    stride_l_h,
++    q_ptr, kv_ptr, t_ptr, o_ptr, l_ptr, bt_ptr, cu_ptr, seq_ptr,
++    k_scale_ptr, v_scale_ptr,
++    gqa_group_size, head_dim, max_topk, sm_scale,
++    stride_qn, stride_qh, stride_qd,
++    stride_kv_blk, stride_kv_h, stride_kv_pos, stride_kv_d,
++    stride_th, stride_tn, stride_tk,
++    stride_o_c, stride_o_b, stride_o_h, stride_o_d,
++    stride_l_c, stride_l_b, stride_l_h,
+@@ -314,15 +813,6 @@
+-    NUM_CHUNKS: tl.constexpr,
+-    BLOCK_K: tl.constexpr,
+-    BLOCK_H: tl.constexpr,
+-    BLOCK_D: tl.constexpr,
+-    BLOCK_T: tl.constexpr,
+-    SINGLE: tl.constexpr,
+-    FP8_QK: tl.constexpr,
+-    HAS_SCALE: tl.constexpr,
+-    D_POW2: tl.constexpr,
+-    INT8_QK: tl.constexpr,
+-    USE_PREFIX: tl.constexpr,
+-    auto_flags_ptr=None,
+-    auto_prefix_ptr=None,
+-    AUTO_BLOCK_Q: tl.constexpr = 0,
+-    AUTO_TILES: tl.constexpr = 0,
++    NUM_CHUNKS: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr, BLOCK_T: tl.constexpr, SINGLE: tl.constexpr,
++    FP8_QK: tl.constexpr, HAS_SCALE: tl.constexpr, D_POW2: tl.constexpr,
++    INT8_QK: tl.constexpr, USE_PREFIX: tl.constexpr,
++    auto_flags_ptr=None, auto_prefix_ptr=None,
++    AUTO_BLOCK_Q: tl.constexpr = 0, AUTO_TILES: tl.constexpr = 0,
+@@ -349,3 +839,2 @@
+-        flag_off = (
+-            pid_b * tl.num_programs(1) + pid_kh
+-        ) * AUTO_TILES + pid_q // AUTO_BLOCK_Q
++        flag_off = ((pid_b * tl.num_programs(1) + pid_kh) * AUTO_TILES
++                    + pid_q // AUTO_BLOCK_Q)
+@@ -366 +855 @@
+-    off_t = tl.arange(0, BLOCK_T)  # noqa: F841 - preserve the measured kernel AST
++    off_t = tl.arange(0, BLOCK_T)
+@@ -379,6 +868,3 @@
+-    qptr = (
+-        q_ptr
+-        + (q_start + pid_q) * stride_qn
+-        + (pid_h + off_h)[:, None] * stride_qh
+-        + off_d[None, :] * stride_qd
+-    )
++    qptr = (q_ptr + (q_start + pid_q) * stride_qn
++            + (pid_h + off_h)[:, None] * stride_qh
++            + off_d[None, :] * stride_qd)
+@@ -421,5 +907,3 @@
+-            k = tl.load(
+-                kv_base + off_n[None, :] * stride_kv_pos + off_d[:, None] * stride_kv_d,
+-                mask=pos_ok[None, :],
+-                other=0.0,
+-            )
++            k = tl.load(kv_base + off_n[None, :] * stride_kv_pos
++                        + off_d[:, None] * stride_kv_d,
++                        mask=pos_ok[None, :], other=0.0)
+@@ -427,5 +911,3 @@
+-            k = tl.load(
+-                kv_base + off_n[None, :] * stride_kv_pos + off_d[:, None] * stride_kv_d,
+-                mask=pos_ok[None, :] & d_ok[:, None],
+-                other=0.0,
+-            )
++            k = tl.load(kv_base + off_n[None, :] * stride_kv_pos
++                        + off_d[:, None] * stride_kv_d,
++                        mask=pos_ok[None, :] & d_ok[:, None], other=0.0)
+@@ -447,7 +929,3 @@
+-            v = tl.load(
+-                kv_base
+-                + off_n[:, None] * stride_kv_pos
+-                + (head_dim + off_d[None, :]) * stride_kv_d,
+-                mask=pos_ok[:, None],
+-                other=0.0,
+-            )
++            v = tl.load(kv_base + off_n[:, None] * stride_kv_pos
++                        + (head_dim + off_d[None, :]) * stride_kv_d,
++                        mask=pos_ok[:, None], other=0.0)
+@@ -455,7 +933,3 @@
+-            v = tl.load(
+-                kv_base
+-                + off_n[:, None] * stride_kv_pos
+-                + (head_dim + off_d[None, :]) * stride_kv_d,
+-                mask=pos_ok[:, None] & d_ok[None, :],
+-                other=0.0,
+-            )
++            v = tl.load(kv_base + off_n[:, None] * stride_kv_pos
++                        + (head_dim + off_d[None, :]) * stride_kv_d,
++                        mask=pos_ok[:, None] & d_ok[None, :], other=0.0)
+@@ -476,5 +950,2 @@
+-    store_mask = (
+-        (hh < gqa_group_size)[:, None] & d_ok[None, :]
+-        if not D_POW2
+-        else (hh < gqa_group_size)[:, None]
+-    )
++    store_mask = ((hh < gqa_group_size)[:, None] & d_ok[None, :]
++                  if not D_POW2 else (hh < gqa_group_size)[:, None])
+@@ -482,8 +953,5 @@
+-        tl.store(
+-            o_ptr
+-            + (q_start + pid_q) * stride_o_b
+-            + (pid_h + hh)[:, None] * stride_o_h
+-            + off_d[None, :] * stride_o_d,
+-            acc.to(o_ptr.dtype.element_ty),
+-            mask=store_mask,
+-        )
++        tl.store(o_ptr + (q_start + pid_q) * stride_o_b
++                 + (pid_h + hh)[:, None] * stride_o_h
++                 + off_d[None, :] * stride_o_d,
++                 acc.to(o_ptr.dtype.element_ty),
++                 mask=store_mask)
+@@ -491,20 +959,9 @@
+-        tl.store(
+-            o_ptr
+-            + pid_c * stride_o_c
+-            + (q_start + pid_q) * stride_o_b
+-            + (pid_h + hh)[:, None] * stride_o_h
+-            + off_d[None, :] * stride_o_d,
+-            acc.to(o_ptr.dtype.element_ty),
+-            mask=store_mask,
+-        )
+-        lse = tl.where(
+-            l_i > 0, safe_cur + tl.log2(tl.maximum(l_i, 1e-30)), float("-inf")
+-        )
+-        tl.store(
+-            l_ptr
+-            + pid_c * stride_l_c
+-            + (q_start + pid_q) * stride_l_b
+-            + (pid_h + hh) * stride_l_h,
+-            lse,
+-            mask=hmask,
+-        )
++        tl.store(o_ptr + pid_c * stride_o_c + (q_start + pid_q) * stride_o_b
++                 + (pid_h + hh)[:, None] * stride_o_h
++                 + off_d[None, :] * stride_o_d,
++                 acc.to(o_ptr.dtype.element_ty),
++                 mask=store_mask)
++        lse = tl.where(l_i > 0, safe_cur + tl.log2(tl.maximum(l_i, 1e-30)),
++                       float("-inf"))
++        tl.store(l_ptr + pid_c * stride_l_c + (q_start + pid_q) * stride_l_b
++                 + (pid_h + hh) * stride_l_h, lse, mask=hmask)
+@@ -515,19 +972,6 @@
+-    o_ptr,
+-    l_ptr,
+-    out_ptr,
+-    cu_ptr,
+-    gqa_group_size,
+-    head_dim,
+-    stride_o_c,
+-    stride_o_b,
+-    stride_o_h,
+-    stride_o_d,
+-    stride_l_c,
+-    stride_l_b,
+-    stride_l_h,
+-    stride_out_n,
+-    stride_out_h,
+-    stride_out_d,
+-    NUM_CHUNKS: tl.constexpr,
+-    BLOCK_H: tl.constexpr,
+-    BLOCK_D: tl.constexpr,
++    o_ptr, l_ptr, out_ptr, cu_ptr,
++    gqa_group_size, head_dim,
++    stride_o_c, stride_o_b, stride_o_h, stride_o_d,
++    stride_l_c, stride_l_b, stride_l_h,
++    stride_out_n, stride_out_h, stride_out_d,
++    NUM_CHUNKS: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr,
+@@ -536,2 +980 @@
+-    AUTO_BLOCK_Q: tl.constexpr = 0,
+-    AUTO_TILES: tl.constexpr = 0,
++    AUTO_BLOCK_Q: tl.constexpr = 0, AUTO_TILES: tl.constexpr = 0,
+@@ -547,3 +990,2 @@
+-        flag_off = (
+-            pid_b * tl.num_programs(1) + pid_kh
+-        ) * AUTO_TILES + pid_q // AUTO_BLOCK_Q
++        flag_off = ((pid_b * tl.num_programs(1) + pid_kh) * AUTO_TILES
++                    + pid_q // AUTO_BLOCK_Q)
+@@ -561 +1003,2 @@
+-        m = tl.maximum(m, tl.load(lb + c * stride_l_c, mask=hmask, other=float("-inf")))
++        m = tl.maximum(m, tl.load(lb + c * stride_l_c, mask=hmask,
++                                 other=float("-inf")))
+@@ -566,3 +1009,2 @@
+-        w = tl.exp2(
+-            tl.load(lb + c * stride_l_c, mask=hmask, other=float("-inf")) - m_safe
+-        )
++        w = tl.exp2(tl.load(lb + c * stride_l_c, mask=hmask,
++                            other=float("-inf")) - m_safe)
+@@ -571,9 +1013,4 @@
+-            o = tl.load(
+-                o_ptr
+-                + c * stride_o_c
+-                + tok * stride_o_b
+-                + (pid_h + off_h)[:, None] * stride_o_h
+-                + off_d[None, :] * stride_o_d,
+-                mask=hmask[:, None],
+-                other=0.0,
+-            )
++            o = tl.load(o_ptr + c * stride_o_c + tok * stride_o_b
++                        + (pid_h + off_h)[:, None] * stride_o_h
++                        + off_d[None, :] * stride_o_d,
++                        mask=hmask[:, None], other=0.0)
+@@ -581,9 +1018,5 @@
+-            o = tl.load(
+-                o_ptr
+-                + c * stride_o_c
+-                + tok * stride_o_b
+-                + (pid_h + off_h)[:, None] * stride_o_h
+-                + off_d[None, :] * stride_o_d,
+-                mask=hmask[:, None] & (off_d < head_dim)[None, :],
+-                other=0.0,
+-            )
++            o = tl.load(o_ptr + c * stride_o_c + tok * stride_o_b
++                        + (pid_h + off_h)[:, None] * stride_o_h
++                        + off_d[None, :] * stride_o_d,
++                        mask=hmask[:, None] & (off_d < head_dim)[None, :],
++                        other=0.0)
+@@ -593,7 +1026,156 @@
+-        tl.store(
+-            out_ptr
+-            + tok * stride_out_n
+-            + (pid_h + off_h)[:, None] * stride_out_h
+-            + off_d[None, :] * stride_out_d,
+-            acc.to(out_ptr.dtype.element_ty),
+-            mask=hmask[:, None],
++        tl.store(out_ptr + tok * stride_out_n
++                 + (pid_h + off_h)[:, None] * stride_out_h
++                 + off_d[None, :] * stride_out_d,
++                 acc.to(out_ptr.dtype.element_ty), mask=hmask[:, None])
++    else:
++        tl.store(out_ptr + tok * stride_out_n
++                 + (pid_h + off_h)[:, None] * stride_out_h
++                 + off_d[None, :] * stride_out_d,
++                 acc.to(out_ptr.dtype.element_ty),
++                 mask=hmask[:, None] & (off_d < head_dim)[None, :])
++
++
++# ---------------------------------------------------------------------------
++# 3. workspace (no allocation on the launch path)
++# ---------------------------------------------------------------------------
++_WS: dict = {}
++_WS_KEEP: list = []
++
++
++def workspace(chunks: int, capacity: int, num_heads: int, head_dim: int,
++              dtype: torch.dtype, device: torch.device, stream_safe=False):
++    """Cached (partial_output, partial_lse) slices for a split launch.
++
++    ``capacity`` is the total query-token count the buffer must hold.  A larger
++    request gets a new buffer; the old one is kept alive so a captured graph
++    never points at freed memory.
++    """
++    stream = torch.cuda.current_stream(device).cuda_stream if stream_safe else None
++    key = (chunks, capacity, num_heads, head_dim, dtype, str(device), stream)
++    ws = _WS.get(key)
++    if ws is None:
++        o = torch.empty((chunks, capacity, num_heads, head_dim),
++                        dtype=dtype, device=device)
++        ls = torch.empty((chunks, capacity, num_heads),
++                         dtype=torch.float32, device=device)
++        _WS[key] = ws = (o, ls)
++        _WS_KEEP.append(ws)
++    return ws
++
++
++def clear_workspace() -> None:
++    _WS.clear()
++    _WS_KEEP.clear()
++    _AUTO_FLAGS.clear()
++    _AUTO_WIDE_FLAGS.clear()
++
++
++# ---------------------------------------------------------------------------
++# 4. wrappers
++# ---------------------------------------------------------------------------
++def _kv_strides(kv_cache: torch.Tensor):
++    """(page, head, pos, dim) element strides of the 0.28 4-D packed cache."""
++    s0, s1, s2, s3 = kv_cache.stride()
++    return s0, s1, s2, s3
++
++
++def _scale_arg(k_scale, v_scale, output):
++    has = k_scale is not None
++    return (k_scale if has else output), (v_scale if has else output), has
++
++
++@torch.no_grad()
++def attn_union_span(
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens,
++    max_query_len, num_kv_heads, sm_scale, output,
++    k_scale=None, v_scale=None, block_q=16,
++    num_warps=UNION_NUM_WARPS, num_stages=UNION_NUM_STAGES, span=UNION_SPAN,
++    auto_flags=None, auto_span=0,
++):
++    """One CTA per ``block_q`` query tokens; walks the union span of their
++    selected blocks.  Compact-index fast path (q >= 2048)."""
++    int8_qk = _qk_int8_mode(q, kv_cache, output, k_scale, v_scale)
++    if int8_qk and attention_precision_policy(q.device.index or 0).capability < 90:
++        # Ampere/Ada have smaller per-block shared memory. In particular the
++        # large-Q union tile exceeds SM86 capacity. Explicit union/env arms
++        # share the validated INT8 selected schedule on these devices.
++        return attn_split(q, kv_cache, topk_idx, block_table, cu_seqlens_q,
++                          seq_lens, prefix_lens, max_query_len, num_kv_heads,
++                          sm_scale, output, k_scale=k_scale, v_scale=v_scale,
++                          chunks=1, use_prefix=True)
++    total_q, num_heads, head_dim = q.shape
++    batch = cu_seqlens_q.shape[0] - 1
++    topk = topk_idx.shape[-1]
++    gqa = num_heads // num_kv_heads
++    if int8_qk and block_q * gqa < 16:
++        raise ValueError("INT8 union QK needs block_q * GQA >= 16")
++    assert 1 <= span <= 32, "span must fit the int32 block bitmap"
++    assert not auto_span or span == 32, "auto uses 32-bit bitmap groups"
++    k_arg, v_arg, has_scale = _scale_arg(k_scale, v_scale, output)
++    q2 = q.view(-1, head_dim)
++    o2 = output.view(-1, head_dim)
++    s0, s1, s2, s3 = _kv_strides(kv_cache)
++    _union_span_kernel[(triton.cdiv(max_query_len, block_q), num_kv_heads, batch)](
++        q2, kv_cache, topk_idx, o2, block_table, cu_seqlens_q, seq_lens,
++        prefix_lens, k_arg, v_arg, gqa, head_dim, topk, sm_scale, num_heads,
++        q2.stride(0), s0, s1, s2, s3,
++        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
++        block_table.stride(0),
++        BLOCK_Q=block_q, BLOCK_K=128,
++        BLOCK_D=triton.next_power_of_2(head_dim), TOPK=topk, QH=gqa,
++        SPAN=span, HAS_SCALE=has_scale, INT8_QK=int8_qk,
++        D_POW2=triton.next_power_of_2(head_dim) == head_dim,
++        num_warps=num_warps, num_stages=num_stages,
++        auto_flags_ptr=auto_flags, AUTO_SPAN=auto_span,
++        stride_bt_k=block_table.stride(1),
++    )
++
++
++@torch.no_grad()
++def attn_span_split(
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens,
++    max_query_len, num_kv_heads, sm_scale, output,
++    k_scale=None, v_scale=None, block_q=PREFILL_SPLIT_BLOCK_Q, chunks=2,
++    num_warps=SPLIT_NUM_WARPS, num_stages=SPLIT_NUM_STAGES, span=UNION_SPAN,
++):
++    """Union-span walk with the span cut ``chunks`` ways (+ weighted merge).
++
++    Multi-KV-head safe: the q read and the ``[chunks, q, head, d]`` workspace
++    both address rows as ``tok * heads_total + (pid_h * QH + h)``, and the
++    merge recombines with the same head stride, so any GQA ratio works.
++    """
++    int8_qk = _qk_int8_mode(q, kv_cache, output, k_scale, v_scale)
++    if int8_qk:
++        # The portable plan shares selected-block scheduling, including prefix
++        # semantics, masks and the nonfinite device branch. No INT8 variant of
++        # _span_split_kernel is installed or reachable.
++        return attn_split(q, kv_cache, topk_idx, block_table, cu_seqlens_q,
++                          seq_lens, prefix_lens, max_query_len, num_kv_heads,
++                          sm_scale, output, k_scale=k_scale, v_scale=v_scale,
++                          chunks=chunks, num_warps=num_warps,
++                          num_stages=num_stages, use_prefix=True)
++    total_q, num_heads, head_dim = q.shape
++    batch = cu_seqlens_q.shape[0] - 1
++    topk = topk_idx.shape[-1]
++    gqa = num_heads // num_kv_heads
++    k_arg, v_arg, has_scale = _scale_arg(k_scale, v_scale, output)
++    o_p, l_p = workspace(chunks, total_q, num_heads, head_dim, q.dtype,
++                         q.device, stream_safe=int8_qk)
++    s0, s1, s2, s3 = _kv_strides(kv_cache)
++    bh = triton.next_power_of_2(gqa)
++    dpow2 = triton.next_power_of_2(head_dim) == head_dim
++    q2 = q.view(-1, head_dim)
++    o2 = output.view(-1, head_dim)
++    if chunks == 1:
++        _union_span_kernel[
++            (triton.cdiv(max_query_len, block_q), num_kv_heads, batch)](
++            q2, kv_cache, topk_idx, o2, block_table, cu_seqlens_q, seq_lens,
++            prefix_lens, k_arg, v_arg, gqa, head_dim, topk, sm_scale, num_heads,
++            q2.stride(0), s0, s1, s2, s3,
++            topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
++            block_table.stride(0),
++            BLOCK_Q=block_q, BLOCK_K=128, BLOCK_D=triton.next_power_of_2(head_dim),
++            TOPK=topk, QH=gqa, SPAN=span, HAS_SCALE=has_scale, D_POW2=dpow2,
++            INT8_QK=int8_qk,
++            num_warps=UNION_NUM_WARPS, num_stages=UNION_NUM_STAGES,
++            stride_bt_k=block_table.stride(1),
+@@ -600,0 +1183,61 @@
++        return
++    _span_split_kernel[
++        (triton.cdiv(max_query_len, block_q) * chunks, num_kv_heads, batch)](
++        q2, kv_cache, topk_idx, o_p, l_p, block_table, cu_seqlens_q, seq_lens,
++        prefix_lens, k_arg, v_arg, gqa, head_dim, topk, sm_scale, num_heads,
++        q2.stride(0), s0, s1, s2, s3,
++        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
++        block_table.stride(0),
++        o_p.stride(0), o_p.stride(1), o_p.stride(2), o_p.stride(3),
++        l_p.stride(0), l_p.stride(1), l_p.stride(2),
++        BLOCK_Q=block_q, BLOCK_K=128, BLOCK_D=triton.next_power_of_2(head_dim),
++        TOPK=topk, QH=gqa, SPAN=span, CHUNKS=chunks, HAS_SCALE=has_scale,
++        D_POW2=dpow2, num_warps=num_warps, num_stages=num_stages,
++        stride_bt_k=block_table.stride(1),
++    )
++    _merge_split_kernel[(max_query_len, num_kv_heads, batch)](
++        o_p, l_p, output, cu_seqlens_q, gqa, head_dim,
++        o_p.stride(0), o_p.stride(1), o_p.stride(2), o_p.stride(3),
++        l_p.stride(0), l_p.stride(1), l_p.stride(2),
++        output.stride(0), output.stride(1), output.stride(2),
++        NUM_CHUNKS=chunks, BLOCK_H=bh,
++        BLOCK_D=triton.next_power_of_2(head_dim), D_POW2=dpow2,
++        num_warps=4, num_stages=1,
++    )
++
++
++@torch.no_grad()
++def attn_split(
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens,
++    max_query_len, num_kv_heads, sm_scale, output,
++    k_scale=None, v_scale=None, chunks=4, num_warps=SPLIT_NUM_WARPS,
++    num_stages=SPLIT_NUM_STAGES, fp8_qk=False,
++    auto_flags=None, auto_block_q=0, use_prefix=None,
++):
++    """Per-token walk over the selected blocks, split ``chunks`` ways.
++
++    Exact per-token work (topk page reads per token, independent of how far the
++    selected ids are spread), so this is the pad-safe path for a scattered
++    index at any q.  ``chunks == 1`` writes the output directly.
++    """
++    int8_qk = _qk_int8_mode(q, kv_cache, output, k_scale, v_scale,
++                              fp8_requested=bool(fp8_qk))
++    if int8_qk:
++        fp8_qk = False
++    prefix_mode = int8_qk if use_prefix is None else bool(use_prefix)
++    total_q, num_heads, head_dim = q.shape
++    batch = cu_seqlens_q.shape[0] - 1
++    topk = topk_idx.shape[-1]
++    gqa = num_heads // num_kv_heads
++    bh = triton.next_power_of_2(gqa)
++    assert bh == gqa, "BLOCK_H padding not implemented for non-pow2 gqa"
++    if int8_qk:
++        bh = max(16, bh)  # SM80 INT8 MMA requires at least 16 rows; mask keeps GQA8.
++    dpow2 = triton.next_power_of_2(head_dim) == head_dim
++    k_arg, v_arg, has_scale = _scale_arg(k_scale, v_scale, output)
++    single = chunks == 1
++    s0, s1, s2, s3 = _kv_strides(kv_cache)
++    if single:
++        o_p, l_p = output, output
++        so_c = sl_c = sl_b = sl_h = 0
++        so_b, so_h, so_d = output.stride(0), output.stride(1), output.stride(2)
+@@ -602,7 +1245,34 @@
+-        tl.store(
+-            out_ptr
+-            + tok * stride_out_n
+-            + (pid_h + off_h)[:, None] * stride_out_h
+-            + off_d[None, :] * stride_out_d,
+-            acc.to(out_ptr.dtype.element_ty),
+-            mask=hmask[:, None] & (off_d < head_dim)[None, :],
++        o_p, l_p = workspace(chunks, total_q, num_heads, head_dim, q.dtype,
++                             q.device, stream_safe=bool(auto_block_q) or int8_qk)
++        so_c, so_b, so_h, so_d = (o_p.stride(0), o_p.stride(1), o_p.stride(2),
++                                  o_p.stride(3))
++        sl_c, sl_b, sl_h = l_p.stride(0), l_p.stride(1), l_p.stride(2)
++    _split_kernel[(max_query_len * chunks, num_kv_heads, batch)](
++        q.view(-1, head_dim), kv_cache, topk_idx, o_p, l_p, block_table,
++        cu_seqlens_q, seq_lens, k_arg, v_arg,
++        gqa, head_dim, topk, sm_scale,
++        q.stride(0), q.stride(1), q.stride(2),
++        s0, s1, s2, s3,
++        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
++        so_c, so_b, so_h, so_d, sl_c, sl_b, sl_h,
++        block_table.stride(0),
++        NUM_CHUNKS=chunks, BLOCK_K=128, BLOCK_H=bh,
++        BLOCK_D=triton.next_power_of_2(head_dim), BLOCK_T=16,
++        SINGLE=single, FP8_QK=fp8_qk, HAS_SCALE=has_scale,
++        INT8_QK=int8_qk, USE_PREFIX=prefix_mode,
++        D_POW2=dpow2, num_warps=num_warps, num_stages=num_stages,
++        auto_flags_ptr=auto_flags, auto_prefix_ptr=prefix_lens,
++        stride_bt_k=block_table.stride(1),
++        AUTO_BLOCK_Q=auto_block_q,
++        AUTO_TILES=triton.cdiv(max_query_len, auto_block_q) if auto_block_q else 0,
++    )
++    if not single:
++        _merge_split_kernel[(max_query_len, num_kv_heads, batch)](
++            o_p, l_p, output, cu_seqlens_q, gqa, head_dim,
++            so_c, so_b, so_h, so_d, sl_c, sl_b, sl_h,
++            output.stride(0), output.stride(1), output.stride(2),
++            NUM_CHUNKS=chunks, BLOCK_H=bh,
++            BLOCK_D=triton.next_power_of_2(head_dim), D_POW2=dpow2,
++            num_warps=4, num_stages=1,
++            auto_flags_ptr=auto_flags, AUTO_BLOCK_Q=auto_block_q,
++            AUTO_TILES=triton.cdiv(max_query_len, auto_block_q) if auto_block_q else 0,
+@@ -612,18 +1282,79 @@
+-# Fixed launch schedules preserve the measured source. See the explicit
+-# no-autotune exemption and pending package-integration gates in the PR docs.
+-_WORKSPACE = {}
+-
+-
+-@lru_cache(maxsize=None)
+-def _device_capability(device_index):
+-    # Probe only after supported CUDA inputs exist; never at module import.
+-    if torch.version.hip is not None:
+-        raise NotImplementedError("MiniMax M3 attention currently supports NVIDIA only")
+-    return torch.cuda.get_device_capability(device_index)
+-
+-
+-@lru_cache(maxsize=None)
+-def _is_h100(device_index):
+-    props = torch.cuda.get_device_properties(device_index)
+-    return (props.major, props.minor) == (9, 0) and props.name.upper().startswith(
+-        "NVIDIA H100"
++_AUTO_FLAGS: dict = {}
++_AUTO_WIDE_FLAGS: dict = {}
++_AUTO_DEVICE_SUPPORT: dict = {}
++
++
++def _auto_device_supported(device):
++    """Check the measured H100/SM90 domain lazily, after tensors exist.
++
++    Import and install never query CUDA. CPU/HIP calls also avoid CUDA APIs;
++    a real CUDA tensor already initialized its device before this first probe.
++    """
++    if (device.type != "cuda" or device.index is None
++            or torch.version.hip is not None):
++        return False
++    supported = _AUTO_DEVICE_SUPPORT.get(device.index)
++    if supported is None:
++        props = torch.cuda.get_device_properties(device)
++        supported = ((props.major, props.minor) == (9, 0)
++                     and props.name.upper().startswith("NVIDIA H100"))
++        _AUTO_DEVICE_SUPPORT[device.index] = supported
++    return supported
++
++
++def _auto_supported(q, kv_cache, topk_idx, num_kv_heads, output,
++                    k_scale, v_scale):
++    """Measured shape/layout domain; unsupported configs keep native semantics.
++
++    This guard reads tensor metadata only. In particular, per-token KV scales
++    must go to native, since the tuned kernels implement scalar scales only.
++    KV and top-k tensor strides remain arbitrary (no transpose/copy).
++    """
++    return (q.dtype == torch.bfloat16 and output.dtype == q.dtype
++            and q.is_contiguous() and output.is_contiguous()
++            and output.shape == q.shape and q.shape[-1] in (96, 128)
++            and num_kv_heads > 0 and q.shape[1] == 8 * num_kv_heads
++            and topk_idx.shape[-1] == 16
++            and kv_cache.shape[2:] == (128, 2 * q.shape[-1])
++            and kv_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
++            and (kv_cache.dtype == torch.float8_e4m3fn
++                 or (k_scale is None and v_scale is None))
++            and ((k_scale is None and v_scale is None)
++                 or (k_scale is not None and v_scale is not None
++                     and k_scale.numel() == 1 and v_scale.numel() == 1))
++            and _auto_device_supported(q.device))
++
++
++@torch.no_grad()
++def attn_union_sparse_wide(
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens,
++    max_query_len, num_kv_heads, sm_scale, output, *, parent_flags, wide_flags,
++    parent_block_q=16, k_scale=None, v_scale=None,
++):
++    """Exact sparse-wide fallback; parent compact rows are skipped on the GPU.
++
++    Eligibility is intentionally limited to H100 FP8 KV, D128, GQA8, one KV
++    head. No FP8 QK is introduced: both dot products retain BF16 operands.
++    Duplicate-bearing eight-query tiles publish zero and use selected fallback.
++    """
++    int8_qk = _qk_int8_mode(q, kv_cache, output, k_scale, v_scale)
++    if (int8_qk or num_kv_heads != 1 or q.shape[1:] != (8, 128)
++            or kv_cache.dtype != torch.float8_e4m3fn or parent_block_q != 16
++            or not _auto_supported(q, kv_cache, topk_idx, num_kv_heads, output,
++                                   k_scale, v_scale)):
++        raise ValueError("sparse-wide requires verified H100, one KV head, GQA8, D128, FP8 KV and parent tile16")
++    batch = cu_seqlens_q.shape[0] - 1
++    k_arg, v_arg, has_scale = _scale_arg(k_scale, v_scale, output)
++    q2, o2 = q.view(-1, 128), output.view(-1, 128)
++    s0, s1, s2, s3 = _kv_strides(kv_cache)
++    _wide_union_sparse_kernel[(triton.cdiv(max_query_len, 8), 1, batch)](
++        q2, kv_cache, topk_idx, o2, block_table, cu_seqlens_q, seq_lens,
++        prefix_lens, k_arg, v_arg, 8, 128, 16, sm_scale, 8,
++        q2.stride(0), s0, s1, s2, s3,
++        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2), block_table.stride(0),
++        BLOCK_Q=8, BLOCK_K=128, BLOCK_D=128, TOPK=16, QH=8, SPAN=32,
++        HAS_SCALE=has_scale, D_POW2=True, INT8_QK=False,
++        auto_flags_ptr=wide_flags, AUTO_SPAN=128, stride_bt_k=block_table.stride(1),
++        SPARSE_WALK=True, parent_flags_ptr=parent_flags,
++        PARENT_BLOCK_Q=16, PARENT_TILES=triton.cdiv(max_query_len, 16),
++        num_warps=4, num_stages=3,
+@@ -633,6 +1364,14 @@
+-def _resolve_qk_dtype(requested, kv_dtype, capability):
+-    """Never change a BF16 request merely because hardware lacks FP8.
+-
+-    An explicit FP8 request can use INT8 on SM80/86 only with BF16 storage
+-    already selected by the caller before allocation. FP8 bytes are never
+-    reinterpreted as INT8 or BF16.
++@torch.no_grad()
++def attn_auto(
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens,
++    max_query_len, num_kv_heads, sm_scale, output,
++    k_scale=None, v_scale=None, block_q=None, max_union_span=None,
++    fallback_chunks=None, enable_wide=True,
++):
++    """GPU-selected compact union with a selected-block fallback.
++
++    The union CTA computes its selected span before reading KV and publishes
++    one int32 flag. Scattered / duplicate-bearing tiles stop there. The
++    selected-block kernel and optional merge write only fallback tiles.
++    Buffers are cached by shape and CUDA stream, remain alive for captured
++    graphs, and are overwritten on every invocation / graph replay.
+@@ -640,6 +1379,118 @@
+-    if requested not in ("bf16", "fp8", "int8"):
+-        raise ValueError("qk_dtype must be 'bf16', 'fp8', or 'int8'")
+-    sm = capability[0] * 10 + capability[1]
+-    if sm < 80:
+-        raise NotImplementedError("MiniMax M3 attention requires NVIDIA SM80+")
+-    if kv_dtype == torch.float8_e4m3fn and sm < 89:
++    int8_qk = _qk_int8_mode(q, kv_cache, output, k_scale, v_scale)
++    if not _auto_supported(q, kv_cache, topk_idx, num_kv_heads, output,
++                           k_scale, v_scale):
++        if int8_qk:
++            return attn_split(q, kv_cache, topk_idx, block_table, cu_seqlens_q,
++                              seq_lens, prefix_lens, max_query_len, num_kv_heads,
++                              sm_scale, output, k_scale=k_scale, v_scale=v_scale,
++                              chunks=fallback_chunks or 2, use_prefix=True)
++        global _native_prefill
++        if _native_prefill is None:
++            from vllm.models.minimax_m3.common.ops.sparse_attn import (
++                minimax_m3_sparse_attn)
++            _native_prefill = minimax_m3_sparse_attn
++        return _native_prefill(q, kv_cache, topk_idx, block_table, cu_seqlens_q,
++                               seq_lens, prefix_lens, max_query_len,
++                               num_kv_heads, sm_scale, output,
++                               k_scale=k_scale, v_scale=v_scale)
++    if max_union_span is None:
++        max_union_span = 32 if max_query_len < PREFILL_BIG_Q else 64
++    if not 1 <= max_union_span <= 64:
++        raise ValueError("max_union_span must be in [1, 64]")
++    if block_q is None:
++        block_q = (PREFILL_BLOCK_Q_BIG if max_query_len >= PREFILL_BIG_Q
++                   else PREFILL_BLOCK_Q_SMALL)
++    if fallback_chunks is None:
++        fallback_chunks = 2 if max_query_len < PREFILL_BIG_Q else 1
++    batch = cu_seqlens_q.shape[0] - 1
++    tiles = triton.cdiv(max_query_len, block_q)
++    stream = torch.cuda.current_stream(q.device).cuda_stream
++    key = (batch, num_kv_heads, tiles, str(q.device), stream)
++    flags = _AUTO_FLAGS.get(key)
++    if flags is None:
++        flags = torch.zeros((batch, num_kv_heads, tiles),
++                            dtype=torch.int32, device=q.device)
++        _AUTO_FLAGS[key] = flags
++    common = dict(block_table=block_table, cu_seqlens_q=cu_seqlens_q,
++                  seq_lens=seq_lens, prefix_lens=prefix_lens,
++                  max_query_len=max_query_len, num_kv_heads=num_kv_heads,
++                  sm_scale=sm_scale, output=output,
++                  k_scale=k_scale, v_scale=v_scale)
++    attn_union_span(q, kv_cache, topk_idx, block_q=block_q,
++                    auto_flags=flags, auto_span=max_union_span, **common)
++    # Metadata-only host guard; every data-dependent decision remains on the GPU.
++    # Old 1K/2K/4K schedules and non-production precision/head domains stay exact.
++    wide = (enable_wide and not int8_qk and max_query_len >= 6144
++            and num_kv_heads == 1 and q.shape[-1] == 128 and block_q == 16
++            and max_union_span == 64 and kv_cache.dtype == torch.float8_e4m3fn)
++    fallback_flags, fallback_block_q = flags, block_q
++    if wide:
++        wide_tiles = triton.cdiv(max_query_len, 8)
++        wide_key = (batch, num_kv_heads, wide_tiles, str(q.device), stream)
++        wide_flags = _AUTO_WIDE_FLAGS.get(wide_key)
++        if wide_flags is None:
++            wide_flags = torch.zeros((batch, num_kv_heads, wide_tiles), dtype=torch.int32, device=q.device)
++            _AUTO_WIDE_FLAGS[wide_key] = wide_flags
++        attn_union_sparse_wide(q, kv_cache, topk_idx, parent_flags=flags,
++                               wide_flags=wide_flags, parent_block_q=block_q, **common)
++        fallback_flags, fallback_block_q = wide_flags, 8
++    attn_split(q, kv_cache, topk_idx, chunks=fallback_chunks, fp8_qk=False,
++               auto_flags=fallback_flags, auto_block_q=fallback_block_q, **common)
++
++
++_CU_CACHE: dict = {}
++
++#: Per-batch decode plan measured on the 0.28 bucket grid (H100 132 SM, 32k
++#: context, FP8-E4M3 main KV, 16 selected blocks).  ``native`` means vLLM's own
++#: split-K decode kernel wins at that batch, so the tuned split is not mounted
++#: there: native is 8.3-10.2 us for b <= 16 while the tuned split is
++#: 9.3-11.5 us.  For b >= 24 the tuned split wins 1.11-1.47x (REPORT.md).
++DECODE_POLICY = (
++    (16, "native", 16),
++    (31, "tuned", 16),
++    (48, "tuned", 8),
++    (10**9, "tuned", 4),
++)
++
++
++def decode_plan(batch: int) -> tuple[bool, int, bool]:
++    """(use_tuned, chunks, fp8_qk) for ``batch`` decode requests."""
++    b = max(1, batch)
++    for lim, arm, chunks in DECODE_POLICY:
++        if b <= lim:
++            return arm == "tuned", chunks, True
++    return True, 4, True
++
++
++def decode_chunks(batch: int) -> tuple[int, bool]:
++    """Back-compat helper: (chunks, fp8_qk) for the tuned split."""
++    _, chunks, fp8 = decode_plan(batch)
++    return chunks, fp8
++
++
++@torch.no_grad()
++def attn_decode(
++    q, kv_cache, topk_idx, block_table, seq_lens, num_kv_heads, sm_scale,
++    output, decode_query_len=1, k_scale=None, v_scale=None,
++    chunks=None, fp8_qk=None, num_warps=SPLIT_NUM_WARPS,
++    num_stages=SPLIT_NUM_STAGES,
++):
++    """Split-K decode over the selected blocks, on the packed 0.28 cache."""
++    int8_qk = _qk_int8_mode(q, kv_cache, output, k_scale, v_scale,
++                              fp8_requested=bool(fp8_qk))
++    if int8_qk:
++        fp8_qk = False
++    total_q, num_heads, head_dim = q.shape
++    batch = seq_lens.shape[0]
++    assert total_q == batch * decode_query_len
++    auto_chunks, auto_f8 = decode_chunks(batch)
++    if chunks is None:
++        chunks = auto_chunks
++    k_is_fp8 = kv_cache.dtype == torch.float8_e4m3fn
++    if fp8_qk is None:
++        # Default follows the CACHE dtype, not just the tuned plan: the fp8 QK
++        # dot keeps K in e4m3, so a BF16 cache cannot run it at all.
++        fp8_qk = auto_f8 and k_is_fp8
++    elif fp8_qk and not k_is_fp8:
++        # Explicit request on the wrong cache: fail loudly instead of letting
++        # Triton die with "Unsupported lhs dtype fp8e4nv".
+@@ -647,2 +1498,2 @@
+-            "FP8 KV storage requires FP8 hardware; the upstream precision planner "
+-            "must allocate BF16 KV before requesting the INT8 compute fallback"
++            "fp8_qk requires an fp8_e4m3 KV cache, got "
++            f"{kv_cache.dtype}; pass fp8_qk=False"
+@@ -650,156 +1501,137 @@
+-    if requested == "fp8":
+-        if sm < 89:
+-            return "int8"
+-        if kv_dtype != torch.float8_e4m3fn:
+-            raise ValueError("FP8 QK requires typed float8_e4m3fn KV storage")
+-    if requested == "int8" and kv_dtype != torch.bfloat16:
+-        raise ValueError("INT8 QK requires BF16 KV storage, not reinterpreted FP8")
+-    return requested
+-
+-
+-def _validate_inputs(
+-    q,
+-    kv_cache,
+-    topk_idx,
+-    block_table,
+-    cu_seqlens_q,
+-    seq_lens,
+-    prefix_lens,
+-    max_query_len,
+-    num_kv_heads,
+-    sm_scale,
+-    output,
+-    k_scale,
+-    v_scale,
+-):
+-    if q.ndim != 3 or output.shape != q.shape:
+-        raise ValueError("Q/output must have matching [tokens, heads, D] shapes")
+-    if q.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+-        raise NotImplementedError("Q/output must be BF16")
+-    if q.device.type != "cuda" or torch.version.hip is not None:
+-        raise NotImplementedError("MiniMax M3 attention currently supports NVIDIA CUDA")
+-    if not q.is_contiguous() or not output.is_contiguous():
+-        raise NotImplementedError("Q/output must be contiguous")
+-    if q.requires_grad or kv_cache.requires_grad or output.requires_grad:
+-        raise NotImplementedError("MiniMax M3 sparse attention is inference only")
+-    if (
+-        isinstance(num_kv_heads, bool)
+-        or not isinstance(num_kv_heads, int)
+-        or num_kv_heads < 1
+-        or q.shape[1] != 8 * num_kv_heads
+-    ):
+-        raise NotImplementedError("Only GQA8 is validated")
+-    if q.shape[-1] not in (96, 128):
+-        raise NotImplementedError("Only head dimensions 96 and 128 are validated")
+-    if kv_cache.ndim != 4 or kv_cache.shape[1:] != (num_kv_heads, 128, 2 * q.shape[-1]):
+-        raise ValueError("KV must use packed [pages, KV_heads, 128, 2*D] storage")
+-    if kv_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+-        raise NotImplementedError("KV must be BF16 or typed float8_e4m3fn")
+-    if topk_idx.ndim != 3 or topk_idx.shape[:2] != (num_kv_heads, q.shape[0]):
+-        raise ValueError("topk_idx must be [KV_heads, tokens, TOPK]")
+-    if not 1 <= topk_idx.shape[-1] <= 32:
+-        raise NotImplementedError("Only 1 <= TOPK <= 32 is validated")
+-    if cu_seqlens_q.ndim != 1 or cu_seqlens_q.numel() < 2:
+-        raise ValueError("cu_seqlens_q must have shape [batch+1]")
+-    batch = cu_seqlens_q.numel() - 1
+-    if seq_lens.shape != (batch,) or prefix_lens.shape != (batch,):
+-        raise ValueError("seq_lens/prefix_lens must have shape [batch]")
+-    if (
+-        block_table.ndim != 2
+-        or block_table.shape[0] != batch
+-        or block_table.shape[1] < 1
+-    ):
+-        raise ValueError("block_table must be [batch, positive capacity]")
+-    metadata = (topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens)
+-    if any(t.dtype != torch.int32 for t in metadata):
+-        raise ValueError("Attention index metadata must use int32")
+-    if any(t.stride(0) != 1 for t in (cu_seqlens_q, seq_lens, prefix_lens)):
+-        raise NotImplementedError("Length metadata must be contiguous")
+-    if any(t.device != q.device for t in (kv_cache, output) + metadata):
+-        raise ValueError("All attention tensors must be on the same device")
+-    if any(
+-        any(stride <= 0 for stride in t.stride())
+-        for t in (q, kv_cache, output) + metadata
+-    ):
+-        raise NotImplementedError("Only positive strides are supported")
+-    if (
+-        isinstance(max_query_len, bool)
+-        or not isinstance(max_query_len, int)
+-        or max_query_len < 0
+-    ):
+-        raise ValueError("max_query_len must be a nonnegative host integer")
+-    if q.shape[0] and max_query_len == 0:
+-        raise ValueError("Nonempty Q requires positive max_query_len")
+-    # The retained kernels use int32 logical index expressions before page
+-    # pointers are promoted to int64. Reject larger logical views explicitly.
+-    if any(
+-        sum((n - 1) * st for n, st in zip(t.shape, t.stride())) >= 2**31
+-        for t in (q, output) + metadata
+-    ):
+-        raise NotImplementedError("Logical attention offsets must fit int32")
+-    if (
+-        isinstance(sm_scale, bool)
+-        or not isinstance(sm_scale, (float, int))
+-        or abs(sm_scale) > 3.4028234663852886e38
+-        or not math.isfinite(sm_scale)
+-    ):
+-        raise ValueError("sm_scale must be finite in FP32")
+-    if (k_scale is None) != (v_scale is None):
+-        raise ValueError("K/V scales must be provided together")
+-    if k_scale is not None:
+-        if any(
+-            t.numel() != 1 or t.dtype != torch.float32 or t.device != q.device
+-            for t in (k_scale, v_scale)
+-        ):
+-            raise ValueError("K/V scales must be scalar FP32 tensors on the Q device")
+-
+-
+-def _workspace(chunks, q, num_kv_heads, max_query_len, block_q):
+-    # Stream isolation prevents concurrent calls from overwriting partials.
+-    # Strong references preserve captured pointers. Warm every shape/stream
+-    # before capture; replay performs no allocation and no host tensor reads.
+-    stream = torch.cuda.current_stream(q.device).cuda_stream
+-    key = (
+-        q.device.index,
+-        stream,
+-        q.shape,
+-        chunks,
+-        num_kv_heads,
+-        max_query_len,
+-        block_q,
+-    )
+-    found = _WORKSPACE.get(key)
+-    if found is None:
+-        partial = torch.empty((chunks,) + q.shape, dtype=q.dtype, device=q.device)
+-        lse = torch.empty((chunks,) + q.shape[:2], dtype=torch.float32, device=q.device)
+-        found = (partial, lse)
+-        _WORKSPACE[key] = found
+-    return found
+-
+-
+-def _launch_selected(
+-    q,
+-    kv,
+-    topk,
+-    bt,
+-    cu,
+-    seq,
+-    prefix,
+-    max_q,
+-    num_kv_heads,
+-    sm_scale,
+-    output,
+-    k_scale,
+-    v_scale,
+-    chunks,
+-    qk_dtype,
+-    flags=None,
+-    block_q=0,
+-):
+-    total_q, heads, d = q.shape
+-    gqa = heads // num_kv_heads
+-    bh = max(16, gqa) if qk_dtype == "int8" else gqa
+-    if chunks == 1:
+-        partial, lse = output, output
+-        so_c = sl_c = sl_b = sl_h = 0
+-        so_b, so_h, so_d = output.stride()
++    cu_key = (batch, decode_query_len, q.device.index)
++    if int8_qk:
++        cu_key += (torch.cuda.current_stream(q.device).cuda_stream,)
++    cu = _CU_CACHE.get(cu_key)
++    if cu is None:
++        cu = torch.arange(0, (batch + 1) * decode_query_len, decode_query_len,
++                          dtype=torch.int32, device=q.device)
++        _CU_CACHE[cu_key] = cu
++    attn_split(q, kv_cache, topk_idx, block_table, cu, seq_lens, seq_lens,
++               decode_query_len, num_kv_heads, sm_scale, output,
++               k_scale=k_scale, v_scale=v_scale, chunks=chunks,
++               num_warps=num_warps, num_stages=num_stages, fp8_qk=fp8_qk,
++               use_prefix=False)
++
++
++# ---------------------------------------------------------------------------
++# 5. dispatch policy (host-side only: integers from metadata / graph-constant
++#    batch sizes, never a device value)
++# ---------------------------------------------------------------------------
++#: below this query length prefill is launch-bound and native is not slower
++PREFILL_MIN_Q = 384
++#: BLOCK_Q for the union-span walk
++PREFILL_BLOCK_Q_SMALL = 8
++PREFILL_BLOCK_Q_BIG = 16
++PREFILL_BIG_Q = 2048
++#: reference query length the span-split chunk count is derived from
++PREFILL_SPLIT_REF_Q = 2048
++
++
++def prefill_plan(max_query_len: int, arm: str = "auto") -> tuple[str, int, int]:
++    """(arm, block_q, chunks) for a prefill of ``max_query_len`` queries."""
++    if max_query_len < PREFILL_MIN_Q or arm == "native":
++        return "native", 0, 0
++    if arm == "tok":
++        return "tok", 0, 4
++    if arm == "split":
++        chunks = 2 if max_query_len >= PREFILL_SPLIT_REF_Q else max(
++            2, min(8, PREFILL_SPLIT_REF_Q // max(1, max_query_len)))
++        return "split", PREFILL_SPLIT_BLOCK_Q, chunks
++    block_q = (PREFILL_BLOCK_Q_BIG if max_query_len >= PREFILL_BIG_Q
++               else PREFILL_BLOCK_Q_SMALL)
++    if arm == "auto":
++        return "auto", block_q, 2 if max_query_len < PREFILL_BIG_Q else 1
++    return "union", block_q, 1
++
++
++# ---------------------------------------------------------------------------
++# 6. the patched impl forward
++# ---------------------------------------------------------------------------
++# bound by install(): keeps every import out of the per-layer hot path
++_get_forward_context = None
++_M3SparseMetadata = None
++_native_decode = None
++_native_prefill = None
++_current_platform = None
++
++_DECODE_ON = False
++_PREFILL_ON = False
++_PREFILL_ARM = "auto"
++_DECODE_MIN_B: int | None = None
++_DECODE_CHUNKS: int | None = None
++_DECODE_FP8: bool | None = None
++_SPEC_BF16_QK = False
++
++_ENV = "M31_ATTN_TUNED"
++_ENV_PREFILL_ARM = "M31_ATTN_TUNED_PREFILL_ARM"
++_ENV_DECODE_MIN_B = "M31_ATTN_TUNED_DECODE_MIN_B"
++_ENV_DECODE_CHUNKS = "M31_ATTN_TUNED_DECODE_CHUNKS"
++_ENV_DECODE_FP8 = "M31_ATTN_TUNED_DECODE_FP8"
++_ENV_SPEC_BF16_QK = "M31_ATTN_TUNED_SPEC_BF16_QK"
++
++_OFF = frozenset({"", "0", "off", "false", "no", "disable", "disabled"})
++_DECODE_ONLY = frozenset({"1", "on", "true", "yes", "decode", "decode-only",
++                          "decode_only"})
++_BOTH = frozenset({"2", "all", "both", "full", "decode+prefill",
++                   "decode_prefill"})
++_PREFILL_ONLY = frozenset({"prefill", "prefill-only", "prefill_only"})
++
++
++def env_modes() -> tuple[bool, bool] | None:
++    """(decode, prefill) from ``M31_ATTN_TUNED``; ``None`` = disabled."""
++    raw = os.environ.get(_ENV, "").strip().lower()
++    if raw in _OFF:
++        return None
++    if raw in _DECODE_ONLY:
++        return True, False
++    if raw in _BOTH:
++        return True, True
++    if raw in _PREFILL_ONLY:
++        return False, True
++    logger.error("[vllm_fl] %s=%r is not a known mode; leaving stock 0.28 "
++                 "attention in place (use 0/1/2/prefill)", _ENV, raw)
++    return None
++
++
++def _decode_plan_for(batch: int) -> tuple[bool, int, bool]:
++    use_tuned, chunks, fp8 = decode_plan(batch)
++    if _DECODE_CHUNKS is not None:
++        chunks = _DECODE_CHUNKS
++    if _DECODE_MIN_B is not None and batch >= _DECODE_MIN_B:
++        use_tuned = True
++    if _DECODE_FP8 is not None:
++        fp8 = _DECODE_FP8
++    return use_tuned, chunks, fp8
++
++
++def _forward_attn_tuned(self, layer, query, kv_cache, output, *,
++                        query_fp8=None):
++    """Stock 0.28 ``MiniMaxM3SparseTritonImpl.forward`` with tuned dispatch.
++
++    Kept structurally identical to the native impl: same metadata reads, same
++    token-major top-k transpose, same fp8 view and scales, same native fallback.
++    The only additions are the two integer dispatch decisions.
++    """
++    attn_metadata = _get_forward_context().attn_metadata
++    if not isinstance(attn_metadata, dict):
++        return output  # profiling run; caches unbound
++    main_md = attn_metadata[layer.layer_name]
++    assert isinstance(main_md, _M3SparseMetadata)
++
++    nd = main_md.num_decode_tokens
++    num_tokens = main_md.num_actual_tokens
++    topk_buffer = layer.topk_indices_buffer
++    assert topk_buffer is not None
++    topk = (topk_buffer if _current_platform.is_rocm()
++            else topk_buffer[:num_tokens].transpose(0, 1))
++
++    hd = self.head_size
++    q = query[:num_tokens].view(-1, self.num_heads, hd)
++    out = output[:num_tokens].view(-1, self.num_heads, hd)
++    if self.use_fp8_kv:
++        if _INT8_FALLBACK:
++            raise ValueError("INT8 fallback requires BF16 KV allocated before forward; FP8/uint8-FP8 cache is invalid")
++        _require_fp8(q.device.index or 0)
++        kv_cache = kv_cache.view(self.kv_cache_fp8_dtype)
++        k_scale = getattr(layer, "_k_scale", None)
++        v_scale = getattr(layer, "_v_scale", None)
+@@ -807,76 +1639,90 @@
+-        partial, lse = _workspace(chunks, q, num_kv_heads, max_q, block_q)
+-        so_c, so_b, so_h, so_d = partial.stride()
+-        sl_c, sl_b, sl_h = lse.stride()
+-    batch = cu.numel() - 1
+-    has_scale = k_scale is not None
+-    k_arg, v_arg = (k_scale, v_scale) if has_scale else (output, output)
+-    _split_kernel[(max_q * chunks, num_kv_heads, batch)](
+-        q.view(-1, d),
+-        kv,
+-        topk,
+-        partial,
+-        lse,
+-        bt,
+-        cu,
+-        seq,
+-        k_arg,
+-        v_arg,
+-        gqa,
+-        d,
+-        topk.shape[-1],
+-        sm_scale,
+-        *q.stride(),
+-        *kv.stride(),
+-        *topk.stride(),
+-        so_c,
+-        so_b,
+-        so_h,
+-        so_d,
+-        sl_c,
+-        sl_b,
+-        sl_h,
+-        bt.stride(0),
+-        NUM_CHUNKS=chunks,
+-        BLOCK_K=128,
+-        BLOCK_H=bh,
+-        BLOCK_D=triton.next_power_of_2(d),
+-        BLOCK_T=16,
+-        SINGLE=chunks == 1,
+-        FP8_QK=qk_dtype == "fp8",
+-        HAS_SCALE=has_scale,
+-        D_POW2=d == triton.next_power_of_2(d),
+-        INT8_QK=qk_dtype == "int8",
+-        USE_PREFIX=True,
+-        auto_flags_ptr=flags,
+-        auto_prefix_ptr=prefix,
+-        AUTO_BLOCK_Q=block_q,
+-        AUTO_TILES=triton.cdiv(max_q, block_q) if block_q else 0,
+-        stride_bt_k=bt.stride(1),
+-        num_warps=4,
+-        num_stages=1,
+-    )
+-    if chunks > 1:
+-        _merge_split_kernel[(max_q, num_kv_heads, batch)](
+-            partial,
+-            lse,
+-            output,
+-            cu,
+-            gqa,
+-            d,
+-            so_c,
+-            so_b,
+-            so_h,
+-            so_d,
+-            sl_c,
+-            sl_b,
+-            sl_h,
+-            *output.stride(),
+-            NUM_CHUNKS=chunks,
+-            BLOCK_H=bh,
+-            BLOCK_D=triton.next_power_of_2(d),
+-            D_POW2=d == triton.next_power_of_2(d),
+-            auto_flags_ptr=flags,
+-            AUTO_BLOCK_Q=block_q,
+-            AUTO_TILES=triton.cdiv(max_q, block_q) if block_q else 0,
+-            num_warps=4,
+-            num_stages=1,
++        k_scale = v_scale = None
++
++    int8_qk = _qk_int8_mode(q, kv_cache, out, k_scale, v_scale)
++
++    if main_md.num_decodes > 0:
++        d = main_md.decode
++        assert d is not None
++        use_tuned, chunks, fp8_qk = _decode_plan_for(d.seq_lens.shape[0])
++        # The tuned QK dot keeps K in fp8 and quantizes q to e4m3; with a BF16
++        # KV cache that is an illegal lhs dtype ("Unsupported lhs dtype
++        # fp8e4nv") at compile time, so fp8 QK follows the *cache* dtype, not
++        # just the tuned plan.
++        fp8_qk = bool(fp8_qk) and bool(self.use_fp8_kv)
++        # Opt-in spec verification precision: q_len1 keeps its deployed math.
++        if _SPEC_BF16_QK and d.decode_query_len > 1:
++            fp8_qk = False
++        if _DECODE_ON and (use_tuned or int8_qk):
++            attn_decode(q[:nd], kv_cache, topk[:, :nd, :], d.block_table,
++                        d.seq_lens, self.num_kv_heads, self.scale, out[:nd],
++                        decode_query_len=d.decode_query_len, k_scale=k_scale,
++                        v_scale=v_scale, chunks=chunks, fp8_qk=fp8_qk)
++        else:
++            _native_decode(q[:nd], kv_cache, topk[:, :nd, :], d.block_table,
++                           d.seq_lens, self.num_kv_heads, self.scale, out[:nd],
++                           d.decode_query_len, k_scale=k_scale,
++                           v_scale=v_scale)
++
++    if main_md.num_prefills > 0:
++        p = main_md.prefill
++        assert p is not None
++        arm, block_q, chunks = (
++            prefill_plan(p.max_query_len, _PREFILL_ARM)
++            if _PREFILL_ON else ("native", 0, 0))
++        if arm == "native" and int8_qk:
++            attn_split(q[nd:], kv_cache, topk[:, nd:num_tokens, :],
++                       p.block_table, p.cu_seqlens_q, p.seq_lens, p.context_lens,
++                       p.max_query_len, self.num_kv_heads, self.scale, out[nd:],
++                       k_scale=k_scale, v_scale=v_scale,
++                       chunks=2 if p.max_query_len < PREFILL_BIG_Q else 1,
++                       use_prefix=True)
++        elif arm == "native":
++            _native_prefill(q[nd:], kv_cache, topk[:, nd:num_tokens, :],
++                            p.block_table, p.cu_seqlens_q, p.seq_lens,
++                            p.context_lens, p.max_query_len,
++                            self.num_kv_heads, self.scale, out[nd:],
++                            k_scale=k_scale, v_scale=v_scale)
++        else:
++            common = dict(block_table=p.block_table, cu_seqlens_q=p.cu_seqlens_q,
++                          seq_lens=p.seq_lens, prefix_lens=p.context_lens,
++                          max_query_len=p.max_query_len,
++                          num_kv_heads=self.num_kv_heads, sm_scale=self.scale,
++                          k_scale=k_scale, v_scale=v_scale)
++            qs = q[nd:]
++            ts = topk[:, nd:num_tokens, :]
++            os_ = out[nd:]
++            if arm == "auto":
++                attn_auto(qs, kv_cache, ts, output=os_, block_q=block_q,
++                          fallback_chunks=chunks, **common)
++            elif arm == "union":
++                attn_union_span(qs, kv_cache, ts, output=os_, block_q=block_q,
++                                **common)
++            elif arm == "split":
++                attn_span_split(qs, kv_cache, ts, output=os_, block_q=block_q,
++                                chunks=chunks, **common)
++            else:  # "tok"
++                attn_split(qs, kv_cache, ts, output=os_, chunks=chunks,
++                           **common)
++    return output
++
++
++# ---------------------------------------------------------------------------
++# 7. installer
++# ---------------------------------------------------------------------------
++def install_attn_tuned(*, int8_fallback: bool = False) -> bool:
++    """Mount the tuned kernels when ``M31_ATTN_TUNED`` asks for them."""
++    global _get_forward_context, _M3SparseMetadata, _native_decode
++    global _native_prefill, _current_platform
++    global _DECODE_ON, _PREFILL_ON, _PREFILL_ARM, _DECODE_MIN_B, _DECODE_CHUNKS
++    global _DECODE_FP8, _SPEC_BF16_QK, _INT8_FALLBACK
++
++    modes = (True, True) if int8_fallback else env_modes()
++    if modes is None:
++        return False
++    decode_on, prefill_on = modes
++
++    try:
++        from vllm.forward_context import get_forward_context
++        from vllm.models.minimax_m3.common.sparse_attention import (
++            MiniMaxM3SparseMetadata,
++            MiniMaxM3SparseTritonImpl,
+@@ -884,141 +1730,3 @@
+-
+-
+-def minimax_m3_sparse_attn(
+-    q,
+-    kv_cache,
+-    topk_idx,
+-    block_table,
+-    cu_seqlens_q,
+-    seq_lens,
+-    prefix_lens,
+-    max_query_len,
+-    num_kv_heads,
+-    sm_scale,
+-    output,
+-    k_scale=None,
+-    v_scale=None,
+-    *,
+-    qk_dtype="bf16",
+-    schedule="auto",
+-    chunks=None,
+-):
+-    """Write causal sparse attention into ``output`` and return it.
+-
+-    ``qk_dtype`` is the requested computation, not the KV storage dtype.
+-    BF16 is preserved on all supported platforms. Explicit FP8 computation
+-    requires typed FP8 KV on SM89+; on SM80/86 that request uses INT8 only if
+-    the caller has already allocated BF16 KV. INT8 can also be requested
+-    explicitly. PV remains BF16. No FP8 capability is inferred from dtype.
+-
+-    ``schedule='auto'`` uses a GPU union predicate on the measured H100 domain
+-    (q>=384, TOPK16, GQA8) and selected-block work elsewhere. The predicate is
+-    recomputed on every graph replay and preserves duplicates through selected
+-    fallback. ``schedule='selected'`` forces exact selected-block traversal.
+-    FP8 QK always uses selected traversal, so a call never mixes QK precision.
+-
+-    Caller contracts: CU starts at zero and ends at Q token count; per-request
+-    Q length <= max_query_len; nonnegative sequence/prefix lengths fit the block
+-    table; every nonnegative selected ID fits that table and physical pages.
+-    Metadata contents stay on device and are not read/synchronized here.
+-    Output must not overlap inputs. Inference only; no autograd registration.
+-    """
+-    _validate_inputs(
+-        q,
+-        kv_cache,
+-        topk_idx,
+-        block_table,
+-        cu_seqlens_q,
+-        seq_lens,
+-        prefix_lens,
+-        max_query_len,
+-        num_kv_heads,
+-        sm_scale,
+-        output,
+-        k_scale,
+-        v_scale,
+-    )
+-    if schedule not in ("auto", "selected"):
+-        raise ValueError("schedule must be 'auto' or 'selected'")
+-    if chunks is not None and (
+-        isinstance(chunks, bool)
+-        or not isinstance(chunks, int)
+-        or chunks not in (1, 2, 3, 4, 8, 16)
+-    ):
+-        raise ValueError("chunks must be one of 1, 2, 3, 4, 8, 16")
+-    if qk_dtype not in ("bf16", "fp8", "int8"):
+-        raise ValueError("qk_dtype must be 'bf16', 'fp8', or 'int8'")
+-    if not q.shape[0]:
+-        return output
+-    precision = _resolve_qk_dtype(
+-        qk_dtype, kv_cache.dtype, _device_capability(q.device.index)
+-    )
+-    batch = cu_seqlens_q.numel() - 1
+-    use_union = (
+-        schedule == "auto"
+-        and max_query_len >= 384
+-        and topk_idx.shape[-1] == 16
+-        and precision != "fp8"
+-        and _is_h100(q.device.index)
+-    )
+-    block_q = (16 if max_query_len >= 2048 else 8) if use_union else 0
+-    if chunks is None:
+-        if use_union:
+-            chunks = 1 if max_query_len >= 2048 else 2
+-        elif max_query_len <= 4:
+-            chunks = 16 if batch < 32 else (8 if batch <= 48 else 4)
+-        else:
+-            chunks = 4
+-    if chunks * q.numel() >= 2**31:
+-        raise NotImplementedError("Split workspace offsets must fit int32")
+-    flags = None
+-    if use_union:
+-        # The union kernel writes every flag that the selected/merge kernels
+-        # can read. Invalid tail tiles return in all three before flag reads.
+-        # Allocation is uninitialized by design: no torch.zeros compute path.
+-        stream = torch.cuda.current_stream(q.device).cuda_stream
+-        tiles = triton.cdiv(max_query_len, block_q)
+-        flag_key = ("flags", q.device.index, stream, batch, num_kv_heads, tiles)
+-        flags = _WORKSPACE.get(flag_key)
+-        if flags is None:
+-            flags = torch.empty(
+-                (batch, num_kv_heads, tiles), dtype=torch.int32, device=q.device
+-            )
+-            _WORKSPACE[flag_key] = flags
+-        has_scale = k_scale is not None
+-        k_arg, v_arg = (k_scale, v_scale) if has_scale else (output, output)
+-        d = q.shape[-1]
+-        flat_q = q.view(-1, d)
+-        _union_span_kernel[(tiles, num_kv_heads, batch)](
+-            flat_q,
+-            kv_cache,
+-            topk_idx,
+-            output.view(-1, d),
+-            block_table,
+-            cu_seqlens_q,
+-            seq_lens,
+-            prefix_lens,
+-            k_arg,
+-            v_arg,
+-            8,
+-            d,
+-            topk_idx.shape[-1],
+-            sm_scale,
+-            q.shape[1],
+-            flat_q.stride(0),
+-            *kv_cache.stride(),
+-            *topk_idx.stride(),
+-            block_table.stride(0),
+-            BLOCK_Q=block_q,
+-            BLOCK_K=128,
+-            BLOCK_D=triton.next_power_of_2(d),
+-            TOPK=topk_idx.shape[-1],
+-            QH=8,
+-            SPAN=32,
+-            HAS_SCALE=has_scale,
+-            D_POW2=d == triton.next_power_of_2(d),
+-            INT8_QK=precision == "int8",
+-            auto_flags_ptr=flags,
+-            AUTO_SPAN=64 if max_query_len >= 2048 else 32,
+-            stride_bt_k=block_table.stride(1),
+-            num_warps=8,
+-            num_stages=3,
++        from vllm.models.minimax_m3.common.ops.sparse_attn import (
++            minimax_m3_sparse_attn as _npre,
++            minimax_m3_sparse_attn_decode as _ndec,
+@@ -1026,20 +1734,72 @@
+-    _launch_selected(
+-        q,
+-        kv_cache,
+-        topk_idx,
+-        block_table,
+-        cu_seqlens_q,
+-        seq_lens,
+-        prefix_lens,
+-        max_query_len,
+-        num_kv_heads,
+-        sm_scale,
+-        output,
+-        k_scale,
+-        v_scale,
+-        chunks,
+-        precision,
+-        flags,
+-        block_q,
+-    )
+-    return output
++        from vllm.platforms import current_platform
++    except Exception:  # no 0.28 M3 stack in this build
++        logger.exception("[vllm_fl] m31.attn_tuned: vLLM 0.28 M3 modules "
++                         "unavailable")
++        return False
++
++    if current_platform.is_rocm() or current_platform.device_type != "cuda":
++        if int8_fallback:
++            raise RuntimeError("INT8 attention fallback is supported only on NVIDIA SM80+")
++        logger.info("[vllm_fl] m31.attn_tuned: skipped on device_type=%s",
++                    getattr(current_platform, "device_type", "?"))
++        return False
++
++    arm = os.environ.get(_ENV_PREFILL_ARM, "auto").strip().lower() or "auto"
++    if arm not in ("auto", "union", "split", "tok", "native"):
++        logger.error("[vllm_fl] %s=%r unknown; using 'auto'",
++                     _ENV_PREFILL_ARM, arm)
++        arm = "auto"
++
++    def _int_env(name: str) -> int | None:
++        raw = os.environ.get(name, "").strip()
++        if not raw:
++            return None
++        try:
++            return int(raw)
++        except ValueError:
++            logger.error("[vllm_fl] %s=%r is not an integer; ignored", name, raw)
++            return None
++
++    _current_platform = current_platform
++    if int8_fallback:
++        if not attention_precision_policy().supports_int8:
++            raise RuntimeError("INT8 attention fallback requires NVIDIA SM80+ before allocation")
++    elif _int_env(_ENV_DECODE_FP8):
++        _require_fp8()
++
++    if getattr(MiniMaxM3SparseTritonImpl, "_m31_attn_tuned", False):
++        if MiniMaxM3SparseTritonImpl.forward is not _forward_attn_tuned:
++            raise RuntimeError("Attention is already patched by a different module; restart the worker")
++        if int8_fallback and not _INT8_FALLBACK:
++            if _PRECISION_LOCKED:
++                raise RuntimeError("INT8 fallback must be selected before the first attention/graph; restart the worker")
++            _INT8_FALLBACK = True
++            _DECODE_ON = _PREFILL_ON = True
++            return True
++        return False
++
++    _get_forward_context = get_forward_context
++    _M3SparseMetadata = MiniMaxM3SparseMetadata
++    _native_decode = _ndec
++    _native_prefill = _npre
++    _current_platform = current_platform
++    _INT8_FALLBACK = bool(int8_fallback)
++    _DECODE_ON = decode_on
++    _PREFILL_ON = prefill_on
++    _PREFILL_ARM = arm
++    _DECODE_MIN_B = _int_env(_ENV_DECODE_MIN_B)
++    _DECODE_CHUNKS = _int_env(_ENV_DECODE_CHUNKS)
++    _fp8 = _int_env(_ENV_DECODE_FP8)
++    _DECODE_FP8 = None if _fp8 is None else bool(_fp8)
++    _SPEC_BF16_QK = os.environ.get(_ENV_SPEC_BF16_QK, "0").strip() == "1"
++
++    MiniMaxM3SparseTritonImpl._m31_attn_tuned_orig_forward = (
++        MiniMaxM3SparseTritonImpl.forward)
++    MiniMaxM3SparseTritonImpl.forward = _forward_attn_tuned
++    MiniMaxM3SparseTritonImpl._m31_attn_tuned = True
++
++    logger.info(
++        "[vllm_fl] m31.attn_tuned: decode=%s prefill=%s arm=%s "
++        "decode_policy=%s prefill_min_q=%d spec_bf16_qk=%s int8_fallback=%s", decode_on, prefill_on, arm,
++        [(lim, a, c) for lim, a, c in DECODE_POLICY], PREFILL_MIN_Q, _SPEC_BF16_QK, _INT8_FALLBACK)
++    return True

@@ -1,0 +1,78 @@
+{
+  "identity": {
+    "torch": "2.13.0+cu129",
+    "cuda": "12.9",
+    "triton": "3.6.0",
+    "triton_file": "/opt/flagtree/triton/__init__.py",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "capability": [
+      9,
+      0
+    ],
+    "sources": {
+      "src/tle_pipeline.py": "838fef707fe1eaded8829451603f03ce561c2f9a644df2c58d3f945b6cfb405c",
+      "src/attention_candidate.py": "aeeca371ebecd70a9af4ebceff5c8e8ccde8e0a93125dac46b51a74dc3989868",
+      "reference/native_sparse_attn.py": "5db5d5e692044e54bb57418cbb7dcf5c9cc94f789eaccf128eec6fa8df86d967",
+      "reference/baseline.py": "1ab42fc298abf8a950d02ac5204869ed0f2eeade5185b17b58416e1be845a789",
+      "scripts/offline_compile.py": "3d61f25021c88dcda493ea820148772e1aad700470fa1497daa5278ab2985069",
+      "scripts/harness.py": "83df93b98fd342f913cabc3a9ff5f7e6884b6234fa4c6c7dd7586d20a0ac5447",
+      "scripts/gate.py": "406a626ef178bb3560f07b81ac26cb59a2155dca7b686a690aafb18c3885cec6",
+      "scripts/bench.py": "d508223547e2d8beaa6b49795de644910ed69aaf0b6d5208102ed33f58f48ae3"
+    }
+  },
+  "stages": 2,
+  "cases": [
+    {
+      "q": 512,
+      "seq": 16384,
+      "mode": "contig",
+      "d": 128,
+      "hkv": 1,
+      "batch": 1,
+      "dtype": "fp8",
+      "check": {
+        "bitwise": false,
+        "max_abs": 0.00048828125,
+        "rms": 6.848052294117224e-07,
+        "different_elements": 3,
+        "finite": true,
+        "redzone": true,
+        "deterministic_10": true,
+        "literal_candidate": {
+          "pass_": true,
+          "max_abs": 0.0006042718887329102,
+          "rms": 8.364729001186788e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "literal_baseline": {
+          "pass_": true,
+          "max_abs": 0.0006042718887329102,
+          "rms": 8.364800305571407e-05,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "native": {
+          "pass_": true,
+          "max_abs": 0.00048828125,
+          "rms": 4.79466734759626e-06,
+          "failures": 0,
+          "atol": 0.004,
+          "rtol": 0.04
+        },
+        "pass_": false
+      }
+    }
+  ],
+  "graph": {},
+  "status": "FAIL",
+  "error": "Strict eager correctness gate failed",
+  "traceback": "Traceback (most recent call last):\n  File \"/work/scripts/gate.py\", line 114, in main\n    if not row['check']['pass_']:raise RuntimeError('Strict eager correctness gate failed')\n                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Strict eager correctness gate failed\n",
+  "dispatch": {
+    "compact": 11,
+    "wide": 0,
+    "fallback": 0
+  }
+}

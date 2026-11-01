@@ -1,0 +1,13 @@
+{
+  "device": "NVIDIA H100 80GB HBM3",
+  "capability": [9, 0],
+  "torch": "2.13.0+cu129",
+  "flagtree": "0.7.0",
+  "triton": "3.6.0",
+  "compiler_backport": "Frozen minimal load-mask dependency fix from FlagTree #1415",
+  "sha256": {
+    "triton/_C/libtriton.so": "fd75320edd31ad2fa38b76f7e16d6512990f3447d28b11981ea546668dce1e83",
+    "triton/experimental/tle/language/gpu/core.py": "6e0df1f282c45b8d850aa89fa357c9103add94f0d1f4fb52a7ee989f47110256",
+    "triton/backends/nvidia/compiler.py": "ea126e98f314b76f2bf1edac780b9a4c1b13933dec06d63f99dbdbdbe6c05992"
+  }
+}

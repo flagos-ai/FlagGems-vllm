@@ -1,0 +1,20 @@
+{
+  "parent_pr": "https://github.com/flagos-ai/FlagGems-vllm/pull/979",
+  "parent_head": "fead47fdc6d4b81cc73b0d6488834dce75d95bf1",
+  "parent_operator_sha256": "f78a29abf89d18a33fc94d6402b00872182086e96757f3e985f0e9b1616babfd",
+  "measured_baseline_sha256": "1ab42fc298abf8a950d02ac5204869ed0f2eeade5185b17b58416e1be845a789",
+  "common_identical_jit_functions": [
+    "_int8_qk_dot",
+    "_merge_split_kernel",
+    "_quantize_int8_rows",
+    "_split_kernel",
+    "_union_span_kernel"
+  ],
+  "common_changed_jit_functions": [],
+  "jit_functions_only_in_measured_baseline": [
+    "_bitmap_or",
+    "_span_split_kernel",
+    "_wide_union_sparse_kernel"
+  ],
+  "scope": "Serving precursor with later sparse-wide support, not a GPU execution of the #979 package API."
+}
