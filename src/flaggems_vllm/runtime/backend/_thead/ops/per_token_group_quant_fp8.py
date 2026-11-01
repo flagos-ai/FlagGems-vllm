@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
@@ -111,36 +112,39 @@ def _per_token_group_quant_fp8_vec(
 
     start_gid = row * GROUPS_PER_ROW + pg * NGROUPS
 
-    gids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row.to(tl.int64) * y_row_stride
-        + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
-        + cols[None, :]
-    )
-    if BLOCK == GROUP_SIZE:
-        y = tl.load(y_ptr + offsets).to(tl.float32)
-    else:
-        y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
-            tl.float32
+    for gid in tle.range(0, NGROUPS, loop_vectorize_factor=NGROUPS):
+        gids = gid + tl.arange(0, 1)
+        cols = tl.arange(0, BLOCK)
+        offsets = (
+            row.to(tl.int64) * y_row_stride
+            + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
+            + cols[None, :]
         )
+        if BLOCK == GROUP_SIZE:
+            y = tl.load(y_ptr + offsets).to(tl.float32)
+        else:
+            y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
+                tl.float32
+            )
 
-    y_q, y_s = _quant_groups(
-        y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
-    )
-    if fast_cvt:
-        y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
-    else:
-        y_q = y_q.to(y_q_ptr.dtype.element_ty)
+        y_q, y_s = _quant_groups(
+            y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
+        )
+        if fast_cvt:
+            y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
+        else:
+            y_q = y_q.to(y_q_ptr.dtype.element_ty)
 
-    out_offsets = (
-        start_gid.to(tl.int64) * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
-    )
-    if BLOCK == GROUP_SIZE:
-        tl.store(y_q_ptr + out_offsets, y_q)
-    else:
-        tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
-    tl.store(y_s_ptr + start_gid + gids, y_s)
+        out_offsets = (
+            start_gid.to(tl.int64) * GROUP_SIZE
+            + gids[:, None] * GROUP_SIZE
+            + cols[None, :]
+        )
+        if BLOCK == GROUP_SIZE:
+            tl.store(y_q_ptr + out_offsets, y_q)
+        else:
+            tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
+        tl.store(y_s_ptr + start_gid + gids, y_s)
 
 
 @triton.jit
@@ -169,37 +173,40 @@ def _per_token_group_quant_fp8_colmajor_vec(
 
     start_gid = row * GROUPS_PER_ROW + pg * NGROUPS
 
-    gids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row.to(tl.int64) * y_row_stride
-        + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
-        + cols[None, :]
-    )
-    if BLOCK == GROUP_SIZE:
-        y = tl.load(y_ptr + offsets).to(tl.float32)
-    else:
-        y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
-            tl.float32
+    for gid in tle.range(0, NGROUPS, loop_vectorize_factor=NGROUPS):
+        gids = gid + tl.arange(0, 1)
+        cols = tl.arange(0, BLOCK)
+        offsets = (
+            row.to(tl.int64) * y_row_stride
+            + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
+            + cols[None, :]
         )
+        if BLOCK == GROUP_SIZE:
+            y = tl.load(y_ptr + offsets).to(tl.float32)
+        else:
+            y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
+                tl.float32
+            )
 
-    y_q, y_s = _quant_groups(
-        y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
-    )
-    if fast_cvt:
-        y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
-    else:
-        y_q = y_q.to(y_q_ptr.dtype.element_ty)
+        y_q, y_s = _quant_groups(
+            y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
+        )
+        if fast_cvt:
+            y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
+        else:
+            y_q = y_q.to(y_q_ptr.dtype.element_ty)
 
-    out_offsets = (
-        start_gid.to(tl.int64) * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
-    )
-    scale_offsets = (pg * NGROUPS + gids) * y_s_col_stride + row
-    if BLOCK == GROUP_SIZE:
-        tl.store(y_q_ptr + out_offsets, y_q)
-    else:
-        tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
-    tl.store(y_s_ptr + scale_offsets, y_s)
+        out_offsets = (
+            start_gid.to(tl.int64) * GROUP_SIZE
+            + gids[:, None] * GROUP_SIZE
+            + cols[None, :]
+        )
+        scale_offsets = (pg * NGROUPS + gids) * y_s_col_stride + row
+        if BLOCK == GROUP_SIZE:
+            tl.store(y_q_ptr + out_offsets, y_q)
+        else:
+            tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
+        tl.store(y_s_ptr + scale_offsets, y_s)
 
 
 def _ngroups_per_program(

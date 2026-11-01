@@ -16,6 +16,7 @@ import logging
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
@@ -188,7 +189,7 @@ def _hygon_moe_sum_general_kernel(
         + hidden_offsets * input_stride_hidden
     )
 
-    for k in range(topk):
+    for k in tle.range(topk, loop_vectorize_factor=4):
         x = tl.load(
             input_base + k * input_stride_topk,
             mask=hidden_mask,
