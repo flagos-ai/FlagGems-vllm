@@ -29,9 +29,8 @@ vllm-plugin-fl (插件层)
 请按以下顺序安装全部三个组件：
 
 ```bash
-# 1. 安装 FlagGems (通用基础算子)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems && pip install --no-build-isolation -e . && cd ..
+# 1. 安装 FlagGems (通用基础算子，5.4.0 版本)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. 安装 FlagGems-vllm (vLLM 专用算子)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -127,6 +126,6 @@ pip show vllm-plugin-fl
 
 ## 下一步
 
-- [选择性启用算子](selective.md)
+- [基础用法](basic.md)
 - [非 NVIDIA 后端配置](non-nvidia.md)
 - [运行性能基准评测](../performance/benchmark.md)

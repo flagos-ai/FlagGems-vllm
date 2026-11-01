@@ -26,7 +26,7 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 - Triton-based operator implementations with FlagTree compiler support
 - Pre-tuned autotune configs for NVIDIA Ampere/Hopper architectures
 - C++ extension support via pybind11 (optional)
-- PyTorch dispatch integration via `enable()` / `use_gems()` API
+- Direct invocation interface designed for seamless vLLM plugin integration
 
 ### Testing & CI
 
