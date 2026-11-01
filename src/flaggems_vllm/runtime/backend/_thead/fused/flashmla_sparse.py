@@ -19,10 +19,10 @@ An eight-warp QK group gathers KV blocks two positions ahead, computes scores,
 and hands each block to an eight-warp PV group for online softmax and P @ V.
 A combine kernel merges TOPK splits when query parallelism is low.
 
-The default KV ring uses cp.async inline assembly. The opt-in tle.pipe variant
-uses compiler-managed stage ownership for the ring. Each ready/free barrier
-generation is consumed exactly once. Without PPU TLE warp specialization, dispatch
-uses the original PPU Triton implementation.
+The KV ring uses cp.async inline assembly or compiler-managed tle.pipe stages,
+selected by _USE_TLE_PIPE below. Each ready/free barrier generation is consumed
+exactly once. Without PPU TLE warp specialization, dispatch uses the original
+PPU Triton implementation.
 """
 
 import functools
@@ -92,6 +92,8 @@ _MAX_SPLIT = 16
 _COMBINE_HEADS = 8
 # Warps of each of the two warp groups.
 _GROUP_WARPS = 8
+# The inline-assembly ring is faster on the measured PPU workloads.
+_USE_TLE_PIPE = False
 
 _TRITON_BLOCK_K = 128
 _TRITON_ITEM_US = {64: 10.6, 32: 8.0, 16: 6.5}
@@ -1067,7 +1069,7 @@ if tle is not None:
                 _store_o(o_ptr, BD, acc2, factor, BD, NS == 1)
                 _store_o(o_ptr, BD + HB, acc3, factor, BD, NS == 1)
 
-    # tle.pipe variant (FLAGGEMS_FLASHMLA_SPARSE_RING=pipe). The KV ring is one pipe: the QK
+    # tle.pipe variant. The KV ring is one pipe: the QK
     # group writes a position with tle.gpu.copy and is its own reader ("qk"), the PV group
     # is the second reader ("pv"). The index ring is replaced by register-held indices.
     @triton.jit
@@ -1822,35 +1824,8 @@ if tle is not None:
 
 @functools.lru_cache(maxsize=None)
 def _has_tle() -> bool:
-    return _tle_api is not None and _tle_api.is_tle_supported(_TLE_PRIMITIVES)
-
-
-@functools.lru_cache(maxsize=None)
-def _has_tle_pipe() -> bool:
-    return _tle_api is not None and _tle_api.is_tle_supported(_TLE_PIPE_PRIMITIVES)
-
-
-def _use_pipe() -> bool:
-    """Select the KV-ring implementation independently of TLE dispatch."""
-    value = os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_RING", "auto").strip().lower()
-    if value not in {"auto", "inline_asm", "pipe"}:
-        raise ValueError(
-            f"invalid FLAGGEMS_FLASHMLA_SPARSE_RING={value!r}; "
-            "expected auto, inline_asm or pipe"
-        )
-    if value == "pipe":
-        if not _has_tle_pipe():
-            raise NotImplementedError(
-                "FLAGGEMS_FLASHMLA_SPARSE_RING=pipe requires PPU TLE pipe support"
-            )
-        return True
-    if value == "inline_asm" or "FLAGGEMS_FLASHMLA_SPARSE_RING" in os.environ:
-        return False
-    return (
-        os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "0").lower()
-        in {"1", "true", "on", "yes"}
-        and _has_tle_pipe()
-    )
+    primitives = _TLE_PIPE_PRIMITIVES if _USE_TLE_PIPE else _TLE_PRIMITIVES
+    return _tle_api is not None and _tle_api.is_tle_supported(primitives)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1984,7 +1959,7 @@ def flash_mla_sparse_fwd(
         if use_tle:
             # warp_specialize cannot capture None: unused pointers get a placeholder
             kernel = (
-                _ppu_sparse_mla_kernel_pipe if _use_pipe() else _ppu_sparse_mla_kernel
+                _ppu_sparse_mla_kernel_pipe if _USE_TLE_PIPE else _ppu_sparse_mla_kernel
             )
             kernel[(min(n_items, n_sm),)](
                 q,
