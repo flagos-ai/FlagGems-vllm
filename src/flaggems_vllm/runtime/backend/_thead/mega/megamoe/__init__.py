@@ -12,8 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PPU INT8 MegaMoE with internal temporary storage and dynamic routing."""
+"""PPU INT8 MegaMoE with caller-owned workspace and dynamic routing."""
 
-from .api import megamoe, pack_gate_up_rows, peer_buffer_sizes
+from .api import (
+    MegaMoEConfig,
+    MegaMoEContext,
+    megamoe,
+    pack_gate_up_rows,
+    peer_buffer_sizes,
+)
 
-__all__ = ["megamoe", "pack_gate_up_rows", "peer_buffer_sizes"]
+__all__ = [
+    "MegaMoEConfig",
+    "MegaMoEContext",
+    "megamoe",
+    "pack_gate_up_rows",
+    "peer_buffer_sizes",
+]

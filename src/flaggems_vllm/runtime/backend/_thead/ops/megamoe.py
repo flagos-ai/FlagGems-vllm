@@ -15,9 +15,17 @@
 """Public PPU exports for the INT8 expert-parallel MegaMoE kernel."""
 
 from flaggems_vllm.runtime.backend._thead.mega.megamoe.api import (
+    MegaMoEConfig,
+    MegaMoEContext,
     megamoe,
     pack_gate_up_rows,
     peer_buffer_sizes,
 )
 
-__all__ = ["megamoe", "pack_gate_up_rows", "peer_buffer_sizes"]
+__all__ = [
+    "MegaMoEConfig",
+    "MegaMoEContext",
+    "megamoe",
+    "pack_gate_up_rows",
+    "peer_buffer_sizes",
+]

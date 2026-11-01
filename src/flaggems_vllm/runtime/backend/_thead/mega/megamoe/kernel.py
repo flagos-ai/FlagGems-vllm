@@ -43,18 +43,6 @@ def peer_bf16(tab, pe):
 
 
 @triton.jit
-def fence_sys():
-    _ = tl.inline_asm_elementwise(
-        "fence.acq_rel.sys; mov.u32 $0, 0;",
-        "=r,~{memory}",
-        [],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def load_acquire(ptr):
     sentinel = tl.full((), -1, ptr.dtype.element_ty)
     return tl.atomic_cas(ptr, sentinel, sentinel, sem="acquire", scope="gpu")
@@ -63,7 +51,6 @@ def load_acquire(ptr):
 @triton.jit
 def peer_barrier(sig_tab, slot, MY_PE: tl.constexpr, NPES: tl.constexpr):
     """One combine CTA per rank participates after all L2 peer stores finish."""
-    fence_sys()
     tl.debug_barrier()
     for pe in tl.static_range(0, NPES):
         tl.atomic_add(peer_i32(sig_tab, pe) + slot, 1, sem="release", scope="sys")
@@ -72,7 +59,6 @@ def peer_barrier(sig_tab, slot, MY_PE: tl.constexpr, NPES: tl.constexpr):
     while v < NPES:
         v = tl.atomic_cas(sl + slot, -1, -1, sem="acquire", scope="sys")
     tl.debug_barrier()
-    fence_sys()
 
 
 @triton.jit
@@ -280,7 +266,6 @@ def cta_l2_batch_finish(
         if NPES > 1:
             peer_barrier(sig_tab, 1, MY_PE, NPES)
         tl.debug_barrier()
-        fence_sys()
         tl.atomic_xchg(combine_ready, 1, sem="release")
 
 
@@ -545,12 +530,10 @@ def dispatch_payload(buffers, config: tl.constexpr):
                 sem="release",
                 mask=empty,
             )
-        fence_sys()
         meta_id = tl.atomic_add(dispatch_cursor + 2, 128, sem="relaxed")
     tl.debug_barrier()
     tl.atomic_add(dispatch_phase + 3, 1, sem="release")
     wait_count(dispatch_phase + 3, ROLE_BUDGET)
-    fence_sys()
     tl.debug_barrier()
     wait_count(dispatch_phase + 1, 1)
     source_ids = tl.arange(0, triton.next_power_of_2(NPES))
@@ -657,7 +640,6 @@ def dispatch_payload(buffers, config: tl.constexpr):
         tl.store(meta_l + pool_row * 3 + 1, src_tok, mask=take)
         tl.store(meta_l + pool_row * 3 + 2, src_topk, mask=take)
         tl.debug_barrier()
-        fence_sys()
         block_id = pool_row // BLOCK_M
         valid_block_m = tl.load(
             block_rows + block_id, mask=take, other=0, cache_modifier=".cg"
@@ -813,7 +795,6 @@ def cta_role_megakernel(
         dispatch_payload_noinline(dispatch_buffers, dispatch_config)
     else:
         dispatch_payload(dispatch_buffers, dispatch_config)
-    fence_sys()
     tl.debug_barrier()
     # Schedule only the tiles produced by this invocation's routing.
     active_blocks = tl.load(dispatch_phase + 2)
@@ -860,7 +841,6 @@ def cta_role_megakernel(
         if l1_count > 0:
             tl.atomic_add(l1_done, l1_count, sem="acq_rel")
     wait_count(l1_done, active_l1_tasks)
-    fence_sys()
     tl.debug_barrier()
     count = tl.full((), 0, tl.int32)
     batch_size: tl.constexpr = 4 if AGGREGATE_COMPLETION else 1
@@ -898,7 +878,6 @@ def cta_role_megakernel(
                 )
                 count += 1
         batch = tl.atomic_add(task_cursor + 1, batch_size, sem="relaxed")
-    fence_sys()
     tl.debug_barrier()
     if count > 0:
         cta_l2_batch_finish(
@@ -911,7 +890,6 @@ def cta_role_megakernel(
             count=count,
         )
     wait_count(combine_ready, 1)
-    fence_sys()
     tl.debug_barrier()
     if AGGREGATE_COMPLETION:
         task = worker_id

@@ -64,6 +64,8 @@ from flaggems_vllm.utils.triton_version_utils import has_triton_tle  # noqa: E40
 
 # isort: on
 
+from benchmark.test_megamoe import _make_ppu_context, _reference_int8_moe  # noqa: E402
+
 pytestmark = pytest.mark.megamoe
 HYGON_CANONICAL_DATA = Path(
     os.environ.get(
@@ -756,29 +758,7 @@ def _require_ppu_device():
     return api
 
 
-def _reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids):
-    """Independent CPU reference, including the two BF16 rounding boundaries."""
-    t, h = x.shape
-    partial = torch.zeros((ids.shape[1], t, h), dtype=torch.bfloat16)
-    for expert in range(w1.shape[0]):
-        tokens, slots = torch.where(ids == expert)
-        if not len(tokens):
-            continue
-        first = x[tokens].float() @ w1[expert].float().T
-        first = (first * scales[tokens] * s1[expert].T).bfloat16().float()
-        gate, up = first.chunk(2, dim=-1)
-        silu = (gate / (1 + torch.exp(-gate))).bfloat16().float()
-        activated = (silu * up).bfloat16().float()
-        amax = activated.abs().amax(-1, keepdim=True).clamp_min(1e-10)
-        scale = amax / 127
-        scaled = activated * (127 / amax)
-        quantized = (scaled.sign() * (scaled.abs() + 0.5).floor()).to(torch.int8)
-        second = quantized.float() @ w2[expert].float().T
-        values = second * scale * s2[expert].T * router[tokens, slots, None]
-        partial[slots, tokens] = values.bfloat16()
-    return partial.float().sum(0).bfloat16()
-
-
+@pytest.mark.megamoe
 def test_megamoe_is_exported_on_ppu():
     api = _ppu_api()
     assert callable(api.megamoe)
@@ -789,6 +769,8 @@ def test_megamoe_is_exported_on_ppu():
     assert package.megamoe is api.megamoe
     assert package.pack_gate_up_rows is api.pack_gate_up_rows
     assert package.peer_buffer_sizes is api.peer_buffer_sizes
+    assert package.MegaMoEContext is api.MegaMoEContext
+    assert package.MegaMoEConfig is api.MegaMoEConfig
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float32])
@@ -879,6 +861,10 @@ def test_megamoe_int8_correctness(shape, ids_dtype, routing):
     elif routing == "dropped":
         ids.fill_(-1)
     expected = _reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids)
+    context = _make_ppu_context(
+        api.MegaMoEConfig(t, h, i, e, k),
+        torch.device("cuda", torch.cuda.current_device()),
+    )
     actual = api.megamoe(
         x.cuda(),
         scales.cuda(),
@@ -888,7 +874,9 @@ def test_megamoe_int8_correctness(shape, ids_dtype, routing):
         s2.cuda(),
         router.cuda(),
         ids.cuda(),
+        context=context,
     )
+    assert actual is context.output
     assert actual.dtype == torch.bfloat16 and actual.shape == (t, h)
     actual = actual.cpu()
     if routing == "dropped":
@@ -897,6 +885,79 @@ def test_megamoe_int8_correctness(shape, ids_dtype, routing):
         from benchmark.test_megamoe import _assert_relative_l2
 
         _assert_relative_l2(actual, expected)
+
+
+def test_megamoe_context_reuse_with_changing_routes():
+    api = _require_ppu_device()
+    t, h, i, e, k = 17, 256, 384, 5, 3
+    device = torch.device("cuda", torch.cuda.current_device())
+    context = _make_ppu_context(api.MegaMoEConfig(t, h, i, e, k), device)
+    rng = torch.Generator().manual_seed(123)
+    x = torch.randint(-8, 9, (t, h), dtype=torch.int8, generator=rng)
+    scales = torch.rand(t, 1, generator=rng) * 0.02 + 0.01
+    w1 = torch.randint(-8, 9, (e, 2 * i, h), dtype=torch.int8, generator=rng)
+    s1 = torch.rand(e, 2 * i, 1, generator=rng) * 0.02 + 0.01
+    w2 = torch.randint(-8, 9, (e, h, i), dtype=torch.int8, generator=rng)
+    s2 = torch.rand(e, h, 1, generator=rng) * 0.02 + 0.01
+    inputs = (
+        x.to(device),
+        scales.to(device),
+        api.pack_gate_up_rows(w1.to(device)),
+        api.pack_gate_up_rows(s1.to(device)),
+        w2.to(device),
+        s2.to(device),
+    )
+    pointers = {name: tensor.data_ptr() for name, tensor in context.buffers.items()}
+    for routing in ("normal", "skew", "dropped", "normal"):
+        ids = torch.randint(e, (t, k), generator=rng, dtype=torch.int32)
+        if routing == "skew":
+            ids.fill_(e - 1)
+        elif routing == "dropped":
+            ids.fill_(-1)
+        router = torch.rand(t, k, generator=rng)
+        expected = _reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids)
+        # Poison both state and payload to expose missing reset/overwrite paths.
+        for tensor in context.buffers.values():
+            tensor.fill_(7)
+        actual = api.megamoe(
+            *inputs, router.to(device), ids.to(device), context=context
+        )
+        assert actual is context.output
+        if routing == "dropped":
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        else:
+            from benchmark.test_megamoe import _assert_relative_l2
+
+            _assert_relative_l2(actual.cpu(), expected)
+        assert pointers == {
+            name: tensor.data_ptr() for name, tensor in context.buffers.items()
+        }
+
+
+def test_megamoe_rejects_mismatched_context():
+    from dataclasses import replace
+
+    api = _require_ppu_device()
+    device = torch.device("cuda", torch.cuda.current_device())
+    context = _make_ppu_context(api.MegaMoEConfig(1, 128, 128, 4, 1), device)
+    inputs = (
+        torch.empty((1, 128), device=device, dtype=torch.int8),
+        torch.empty((1, 1), device=device, dtype=torch.float32),
+        torch.empty((4, 256, 128), device=device, dtype=torch.int8),
+        torch.empty((4, 256, 1), device=device, dtype=torch.float32),
+        torch.empty((4, 128, 128), device=device, dtype=torch.int8),
+        torch.empty((4, 128, 1), device=device, dtype=torch.float32),
+        torch.empty((1, 1), device=device, dtype=torch.float32),
+        torch.empty((1, 1), device=device, dtype=torch.int32),
+    )
+    with pytest.raises(TypeError, match="MegaMoEContext"):
+        api.megamoe(*inputs, context=None)
+    with pytest.raises(ValueError, match="context dimensions and device"):
+        api.megamoe(
+            *inputs, context=replace(context, config=replace(context.config, tokens=2))
+        )
+    with pytest.raises(ValueError, match="context dimensions and device"):
+        api.megamoe(*inputs, context=replace(context, device=torch.device("cpu")))
 
 
 @pytest.mark.parametrize("num_ranks", [2, 4, 8])
@@ -917,6 +978,30 @@ def test_megamoe_expert_parallel(num_ranks, model_shape):
         stages=4,
         warmup=0,
         iterations=1,
+        timeout=120,
+        ppu=True,
+        validate=True,
+    )
+    assert _launch_ppu_megamoe(config) > 0
+
+
+@pytest.mark.parametrize("tokens", [216, 448])
+def test_megamoe_ep4_repeated_combine(tokens):
+    _require_ppu_device()
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four visible PPU devices")
+    from benchmark.test_megamoe import _PPUBenchmarkConfig, _launch_ppu_megamoe
+
+    config = _PPUBenchmarkConfig(
+        num_ranks=4,
+        tokens=tokens,
+        hidden=2048,
+        intermediate=512,
+        num_experts=256,
+        topk=8,
+        stages=4,
+        warmup=10,
+        iterations=500,
         timeout=120,
         ppu=True,
         validate=True,

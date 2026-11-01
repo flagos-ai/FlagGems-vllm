@@ -1850,6 +1850,29 @@ class _StandaloneSailshmem:
             self.close()
 
 
+def _reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids):
+    """Independent CPU reference, including the two BF16 rounding boundaries."""
+    t, h = x.shape
+    partial = torch.zeros((ids.shape[1], t, h), dtype=torch.bfloat16)
+    for expert in range(w1.shape[0]):
+        tokens, slots = torch.where(ids == expert)
+        if not len(tokens):
+            continue
+        first = x[tokens].float() @ w1[expert].float().T
+        first = (first * scales[tokens] * s1[expert].T).bfloat16().float()
+        gate, up = first.chunk(2, dim=-1)
+        silu = (gate / (1 + torch.exp(-gate))).bfloat16().float()
+        activated = (silu * up).bfloat16().float()
+        amax = activated.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+        scale = amax / 127
+        scaled = activated * (127 / amax)
+        quantized = (scaled.sign() * (scaled.abs() + 0.5).floor()).to(torch.int8)
+        second = quantized.float() @ w2[expert].float().T
+        values = second * scale * s2[expert].T * router[tokens, slots, None]
+        partial[slots, tokens] = values.bfloat16()
+    return partial.float().sum(0).bfloat16()
+
+
 def _make_ppu_cpu_inputs(config):
     """Use the same seeded global inputs on every rank, without external datasets."""
     generator = torch.Generator().manual_seed(1234)
@@ -1875,8 +1898,219 @@ def _make_ppu_cpu_inputs(config):
     )
 
 
+@triton.jit
+def _write_tables(
+    table,
+    buffers,
+    sizes: tl.constexpr,
+    peer_tables=(),
+    peer_sizes: tl.constexpr = (),
+    RANK: tl.constexpr = 0,
+):
+    for index in tl.static_range(len(buffers)):
+        tl.store(table + index * 2, buffers[index].to(tl.int64))
+        tl.store(table + index * 2 + 1, sizes[index])
+    for index in tl.static_range(len(peer_sizes)):
+        row = len(sizes) + index
+        tl.store(table + row * 2, tl.load(peer_tables[index] + RANK))
+        tl.store(table + row * 2 + 1, peer_sizes[index])
+
+
+def _make_ppu_context(
+    config,
+    device,
+    peer_tables=None,
+    barrier=None,
+):
+    """Allocate the PPU context in the caller, outside timed invocations."""
+    from flaggems_vllm.runtime.backend._thead.mega.megamoe.api import (
+        MegaMoEContext,
+        _buffer_sizes,
+        _is_tuned_shape,
+        _tiles,
+    )
+
+    sizes = _buffer_sizes(config)
+    if barrier is not None and not callable(barrier):
+        raise TypeError("barrier must be a stream barrier callable")
+    if config.num_ranks > 1 and (peer_tables is None or barrier is None):
+        raise ValueError(
+            "multiple ranks require explicit peer tables and a stream barrier"
+        )
+    with torch.cuda.device(device):
+        references = []
+        tables = dict(peer_tables or {})
+        if config.num_ranks == 1 and not tables:
+            for name, size in sizes.items():
+                memory = torch.empty(size, device=device, dtype=torch.int8)
+                table = torch.empty(2, device=device, dtype=torch.int64)
+                _write_tables[(1,)](table, (memory,), (size,))
+                tables[name] = table[:1]
+                references.extend((memory, table))
+        for name in sizes:
+            if name not in tables:
+                raise ValueError(f"missing peer pointer table: {name}")
+            table = tables[name]
+            if (
+                table.dtype != torch.int64
+                or table.device != device
+                or table.shape != (config.num_ranks,)
+                or not table.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous INT64 pointer table of shape (num_ranks,) on {device}"
+                )
+
+        block_m, block_n, l2_block_n, l2_group_m = _tiles(config)
+        epr = config.num_experts // config.num_ranks
+        max_blocks = sizes["meta_tab"] // (block_m * 12)
+        pool_tokens = sizes["meta_tab"] // 12
+        route_chunks = triton.cdiv(config.tokens * config.topk, 32)
+        nl1n = config.intermediate_size // (block_n // 2)
+        nl2n = config.hidden_size // l2_block_n
+        l1_tasks = max_blocks * nl1n
+        l2_tasks = max_blocks * nl2n
+        buffers = {}
+
+        def allocate(name, shape, dtype=torch.int32):
+            result = torch.empty(shape, device=device, dtype=dtype)
+            buffers[name] = result
+            return result
+
+        allocate("block_base_tab", epr)
+        allocate("active_routes", config.num_ranks * config.tokens * config.topk)
+        allocate("active_count", config.num_ranks)
+        allocate("block_rows", max_blocks)
+        allocate("dispatch_counts", epr * config.num_ranks)
+        allocate("dispatch_chunk_counts", config.num_ranks * route_chunks * epr)
+        allocate("dispatch_chunk_offsets", config.num_ranks * route_chunks * epr)
+        allocate("dispatch_block_arrived", max_blocks)
+        allocate("dispatch_phase", 4)
+        allocate("dispatch_cursor", 3)
+        allocate("l1_tok", (pool_tokens, config.hidden_size), torch.int8)
+        allocate("l1_sf", pool_tokens, torch.float32)
+        allocate("l1_w", pool_tokens, torch.float32)
+        allocate("l2_acts", (pool_tokens, config.intermediate_size), torch.int8)
+        allocate("l2_bf16", (pool_tokens, config.intermediate_size), torch.bfloat16)
+        allocate("l2_sf", pool_tokens, torch.float32)
+        allocate("l2_mask", max_blocks, torch.int64)
+        allocate("l1_meta", (l1_tasks, 4))
+        allocate("l2_meta", (l2_tasks, 4))
+        for name, size in (
+            ("l2_done", 1),
+            ("l1_done", 1),
+            ("l1_ready", l1_tasks),
+            ("task_cursor", 3),
+            ("combine_ready", 1),
+        ):
+            allocate(name, size)
+        output = allocate(
+            "final_y", (config.tokens, config.hidden_size), torch.bfloat16
+        )
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        canonical = _is_tuned_shape(config)
+        large_np2 = canonical and config.num_ranks == 2 and config.tokens >= 2048
+        packed_routes = (
+            large_np2 and epr <= 128 and config.tokens * config.topk <= 1 << 19
+        )
+        options = dict(
+            MY_PE=config.rank,
+            NPES=config.num_ranks,
+            NTOK=config.tokens,
+            TOPK=config.topk,
+            K=config.hidden_size,
+            INTER=config.intermediate_size,
+            L1_N=2 * config.intermediate_size,
+            L2_N=config.hidden_size,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=128,
+            L1_OUT_N=block_n // 2,
+            NPAIR=block_n // 16,
+            NK1=config.hidden_size // 128,
+            NK2=config.intermediate_size // 128,
+            POOL_TOKENS=pool_tokens,
+            K_POW2=config.hidden_size,
+            NL1N=nl1n,
+            NL2N=nl2n,
+            L2_GROUP_M=32 if packed_routes else l2_group_m,
+            LARGE_NP2_TUNE=large_np2,
+            PACK_ROUTE_META=packed_routes,
+            AGGREGATE_COMPLETION=canonical
+            and config.tokens > 512
+            and config.num_ranks in (2, 4, 8),
+            NSF=1,
+            EPR=epr,
+            EPR_POW2=triton.next_power_of_2(epr),
+            ROLE_BUDGET=sms,
+            ROUTE_CHUNK=32,
+            ROUTE_CHUNKS=route_chunks,
+            num_warps=4,
+            launch_cooperative_grid=True,
+        )
+        reset_names = (
+            "l2_mask",
+            "dispatch_counts",
+            "dispatch_chunk_counts",
+            "dispatch_chunk_offsets",
+            "active_count",
+            "dispatch_block_arrived",
+            "block_rows",
+            "dispatch_phase",
+            "dispatch_cursor",
+            "l2_done",
+            "l1_done",
+            "l1_ready",
+            "task_cursor",
+            "combine_ready",
+        )
+        reset_items = [
+            (
+                buffers[name],
+                buffers[name].numel() * buffers[name].element_size(),
+            )
+            for name in reset_names
+        ]
+        # Peer-buffer reset pointers are resolved on-device; no raw pointer table is
+        # copied to the CPU by this module.
+        peer_reset_names = ("meta_tab", "sig_tab", "cb_tab")
+        reset_table = torch.empty(
+            (len(reset_items) + len(peer_reset_names), 2),
+            device=device,
+            dtype=torch.int64,
+        )
+        _write_tables[(1,)](
+            reset_table,
+            tuple(x[0] for x in reset_items),
+            tuple(x[1] for x in reset_items),
+            tuple(tables[name] for name in peer_reset_names),
+            tuple(sizes[name] for name in peer_reset_names),
+            config.rank,
+        )
+        return MegaMoEContext(
+            config,
+            device,
+            buffers,
+            tables,
+            options,
+            reset_table,
+            min(
+                sms * 4,
+                sum(
+                    triton.cdiv(size, 4096)
+                    for size in [x[1] for x in reset_items]
+                    + [sizes[name] for name in peer_reset_names]
+                ),
+            ),
+            barrier,
+            tuple(references),
+            output,
+        )
+
+
 def _run_ppu_worker(config):
     from flaggems_vllm.runtime.backend._thead.ops.megamoe import (
+        MegaMoEConfig,
         megamoe,
         pack_gate_up_rows,
         peer_buffer_sizes,
@@ -1906,6 +2140,21 @@ def _run_ppu_worker(config):
             )
         )
 
+        context = _make_ppu_context(
+            MegaMoEConfig(
+                config.tokens,
+                config.hidden,
+                config.intermediate,
+                config.num_experts,
+                config.topk,
+                config.num_ranks,
+                rank,
+            ),
+            device,
+            tables,
+            runtime.barrier,
+        )
+
         def invoke():
             return megamoe(
                 x,
@@ -1916,15 +2165,10 @@ def _run_ppu_worker(config):
                 s2,
                 router,
                 ids,
-                rank=rank,
-                num_ranks=config.num_ranks,
-                peer_tables=tables,
-                barrier=runtime.barrier,
+                context=context,
             )
 
         if config.validate:
-            from tests.test_megamoe import _reference_int8_moe
-
             actual = invoke()
             runtime.synchronize()
             reference = _reference_int8_moe(
@@ -1959,6 +2203,9 @@ def _run_ppu_worker(config):
             runtime.start_event = None
             samples.append(start.elapsed_time(end) * 1000)
         assert output.shape == (config.tokens, config.hidden)
+        if config.validate:
+            runtime.synchronize()
+            _assert_relative_l2(output.cpu(), reference)
         print(
             f"MEGAMOE_RESULT scope=kernel rank={rank} world={runtime.world_size} "
             f"latency_us={sum(samples) / len(samples):.3f}",
