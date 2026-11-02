@@ -55,7 +55,10 @@ def native_weight_scale():
             raise RuntimeError(
                 "The native indexer baseline requires the indexer-test dependency "
                 "group (vLLM 0.33.0+empty); vLLM 0.24+empty has no such entry. "
-                "See docs/content/en/getting-started/install.md."
+                "In this repository's test venv, run "
+                "'uv pip install --group indexer-build', then "
+                "'uv pip install --group indexer-test "
+                "--excludes tools/accelerator-test-excludes.txt'."
             ) from exc
 
         yield _fused_indexer_weight_scale
