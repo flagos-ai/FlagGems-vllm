@@ -42,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache imp
 from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
@@ -118,6 +121,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
+    "fused_indexer_weight_scale",
     "add_rms_norm",
     "build_compressor_metadata",
     "causal_conv1d_fn",

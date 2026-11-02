@@ -53,7 +53,7 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 
 _FULL_CONFIG = tuple(
     (op_name, globals()[op_name])
-    for op_name in getattr(_ops_module, "__all__", [])
+    for op_name in _ops_module.__all__ + ["fused_indexer_weight_scale"]
     if op_name in globals() and callable(globals()[op_name])
 )
 
