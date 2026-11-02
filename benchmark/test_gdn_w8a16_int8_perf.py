@@ -18,7 +18,6 @@ from pathlib import Path
 import flag_gems
 import pytest
 import torch
-import yaml
 
 import flaggems_vllm
 from benchmark.base import Benchmark
@@ -45,13 +44,6 @@ class Int8StateGdnBenchmark(Benchmark):
 
     def set_shapes(self, shape_file_path: str):
         super().set_shapes(shape_file_path)
-        # FP8 and INT8 share an operator ID but use different shape contracts.
-        with open(shape_file_path) as shape_file:
-            shape_config = yaml.safe_load(shape_file)
-        variant = shape_config.get(self.op_name, {}).get("variants", {}).get("int8")
-        if variant is not None:
-            self.shapes = [tuple(shape) for shape in variant["shapes"]]
-            self.shape_desc = variant.get("shape_desc", self.DEFAULT_SHAPE_DESC)
         if (
             Config.bench_level == BenchLevel.CORE
             and Path(shape_file_path).resolve()

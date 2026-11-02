@@ -42,9 +42,6 @@ TESTS_DIR = "tests"
 INIT_FILE = "src/flaggems_vllm/__init__.py"
 OPS_INIT_FILE = "src/flaggems_vllm/ops/__init__.py"
 
-# Precision-specific files share the acceptance operator ID.
-OPERATOR_ID_ALIASES = {"gdn_w8a16_int8": "gdn_w8a16"}
-
 # Generic ops file: src/flaggems_vllm/ops/<name>.py
 OPS_FILE_RE = re.compile(r"^src/flaggems_vllm/ops/([^/]+)\.py$")
 
@@ -186,7 +183,7 @@ def derive_operators(changed_files: list[str], all_operators: dict) -> list[str]
             # Strip _perf suffix if present
             if stem.endswith("_perf"):
                 stem = stem[:-5]
-            if stem in all_operators or stem in OPERATOR_ID_ALIASES:
+            if stem in all_operators:
                 changed_ops.add(stem)
             continue
 
@@ -197,9 +194,7 @@ def derive_operators(changed_files: list[str], all_operators: dict) -> list[str]
 
     # Remove sentinel markers from operator list for downstream
     sentinel_markers = {"__operators_yaml_changed__", "__init_changed__"}
-    real_ops = sorted(
-        {OPERATOR_ID_ALIASES.get(op, op) for op in changed_ops - sentinel_markers}
-    )
+    real_ops = sorted(changed_ops - sentinel_markers)
 
     return real_ops
 
