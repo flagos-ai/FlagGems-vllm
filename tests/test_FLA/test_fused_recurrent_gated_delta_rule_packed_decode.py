@@ -218,7 +218,7 @@ def test_parallel_multistep_state_updated_once(entry, dtype, shape):
     ref_data["initial_state"] = data["initial_state"].cpu().clone()
     fn = getattr(flaggems_vllm.ops if entry == "generic" else flaggems_vllm, OP)
     if flaggems_vllm.vendor_name == "ascend":
-        from flaggems_vllm.runtime.backend._ascend.ops.fused_recurrent_gated_delta_rule_packed_decode import (
+        from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_gated_delta_rule_packed_decode import (
             fused_recurrent_gated_delta_rule_packed_decode as specialized,
         )
 
