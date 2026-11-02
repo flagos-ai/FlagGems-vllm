@@ -6,7 +6,6 @@ import logging
 from collections import OrderedDict
 from threading import Lock
 
-import flag_gems
 import torch
 import triton
 import triton.language as tl
@@ -19,6 +18,7 @@ from flaggems_vllm.ops.FLA.chunk_o import chunk_fwd_kernel_o
 from flaggems_vllm.ops.FLA.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel,
 )
+from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import _recurrent_gdn_kernel
 from flaggems_vllm.ops.FLA.triton_ops_helper import exp
 from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd_kernel
 from flaggems_vllm.runtime import torch_device_fn
@@ -450,6 +450,7 @@ def dequantize_prefill_state(
         group = tl.program_id(1).to(tl.int64)
     if value_block is None:
         value_block = tl.program_id(0)
+    group = group.to(tl.int64)
     columns = value_block * BV + tl.arange(0, BV)
     reduction = tl.arange(0, K)
     source = (group * V + columns[:, None]) * K + reduction[None, :]
@@ -461,6 +462,151 @@ def dequantize_prefill_state(
     values = tl.load(state + source, columns[:, None] < V, 0).to(tl.float32)
     scale = tl.load(scales + group * V + columns, columns < V, 0)
     tl.store(output + target, values * scale[:, None], columns[:, None] < V)
+
+
+normalize_prefill_qk_core = normalize_prefill_qk.jit_function
+dequantize_prefill_state_core = dequantize_prefill_state.jit_function
+
+
+@triton.jit
+def initialize_prefill(
+    q,
+    k,
+    q_out,
+    k_out,
+    state,
+    scales,
+    initial,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    STATE_V_MAJOR: tl.constexpr = False,
+):
+    block = tl.program_id(0)
+    norm_blocks: tl.constexpr = tl.cdiv(ROWS, 16) if NORMALIZE else 0
+    if block < norm_blocks:
+        normalize_prefill_qk_core(q, k, q_out, k_out, ROWS, K, K, 16, block)
+    else:
+        state_block = block - norm_blocks
+        value_blocks: tl.constexpr = tl.cdiv(V, 32)
+        dequantize_prefill_state_core(
+            state,
+            scales,
+            initial,
+            K,
+            V,
+            32,
+            STATE_V_MAJOR,
+            state_block % value_blocks,
+            state_block // value_blocks,
+        )
+
+
+@triton.jit
+def prepare_prefill(
+    g_in,
+    g_out,
+    k,
+    beta,
+    matrix,
+    inverse,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+    TILED_ZERO: tl.constexpr = False,
+):
+    chunk_prepare(
+        g_in,
+        g_out,
+        k,
+        beta,
+        matrix,
+        inverse,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        H,
+        Hg,
+        K,
+        BT,
+        BK,
+        IS_VARLEN,
+        USE_G,
+        USE_TMA,
+        DOT_PRECISION,
+    )
+    chunk, head = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN:
+        sequence = tl.load(chunk_indices + chunk * 2)
+        chunk = tl.load(chunk_indices + chunk * 2 + 1)
+        begin = tl.load(cu_seqlens + sequence)
+        length = tl.load(cu_seqlens + sequence + 1) - begin
+    else:
+        begin, length = 0, T
+    if TILED_ZERO:
+        rows, columns = tl.arange(0, 16), tl.arange(0, 16)
+        for row_tile in tl.static_range(BT // 16):
+            for col_tile in tl.static_range(BT // 16):
+                if row_tile < col_tile:
+                    tokens = chunk * BT + row_tile * 16 + rows
+                    offsets = (
+                        ((begin + tokens[:, None]) * H + head) * BT
+                        + col_tile * 16
+                        + columns[None, :]
+                    )
+                    tl.store(inverse + offsets, 0, tokens[:, None] < length)
+    else:
+        rows, columns = tl.arange(0, BT), tl.arange(0, BT)
+        tokens = chunk * BT + rows
+        offsets = ((begin + tokens[:, None]) * H + head) * BT + columns[None, :]
+        # The shared solve writes diagonal and lower 16x16 tiles only.
+        # Initialize its untouched tiles here to avoid a separate zeros launch.
+        mask = (tokens[:, None] < length) & (
+            rows[:, None] // 16 < columns[None, :] // 16
+        )
+        tl.store(inverse + offsets, 0, mask)
+
+
+PREFILL_CACHE_SIZE = 32
+prefill_launch_cache = OrderedDict()
+prefill_launch_lock = Lock()
+
+
+class PrefillLaunch:
+    """Bounded launch plans retain compiled metadata, never call buffers."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.compiled = None
+        self.tail_names = ()
+        self.tail_defaults = ()
+
+    def __getitem__(self, grid):
+        def launch(*args, **options):
+            if self.compiled is None:
+                compiled = self.kernel[grid](*args, **options)
+                params = self.kernel.params[len(args) :]
+                self.tail_names = tuple(p.name for p in params)
+                self.tail_defaults = tuple(p.default for p in params)
+                self.compiled = compiled
+            else:
+                tail = tuple(
+                    options.get(name, default)
+                    for name, default in zip(self.tail_names, self.tail_defaults)
+                )
+                self.compiled[(grid + (1, 1))[:3]](*args, *tail)
+
+        return launch
 
 
 def chunk_gated_delta_rule_w8a16(
@@ -538,6 +684,144 @@ def chunk_gated_delta_rule_w8a16(
     if tokens == 0:
         return output, state_int8
     launch_scale = reduction**-0.5 if scale is None else float(scale)
+    # HCU also specializes backing-storage range. Fresh workspaces below 2 GiB
+    # share that specialization; larger workspaces use ordinary JIT dispatch.
+    cacheable = (
+        max(
+            tokens * heads * max(reduction, columns, CHUNK_SIZE) * 4,
+            chunks * heads * reduction * columns * 2,
+            sequences * heads * reduction * columns * 4,
+        )
+        < 2**31
+    )
+    cache_key = (
+        q.device.index,
+        tokens,
+        query_heads,
+        heads,
+        sequences,
+        chunks,
+        use_qk_l2norm_in_kernel,
+        launch_scale,
+        tuple(
+            (t.dtype, t.data_ptr() % 16 == 0, t.untyped_storage().size() < 2**31)
+            for t in tensors
+        ),
+    )
+    with prefill_launch_lock:
+        launchers = prefill_launch_cache.get(cache_key) if cacheable else None
+        if launchers is not None:
+            prefill_launch_cache.move_to_end(cache_key)
+    cache_miss = launchers is None
+    short = tokens <= 64
+    if cache_miss:
+        kernels = (
+            (
+                initialize_prefill,
+                _recurrent_gdn_kernel,
+                quantize_prefill_state.jit_function,
+            )
+            if short
+            else (
+                initialize_prefill,
+                prepare_prefill,
+                chunk_wy,
+                chunk_state,
+                chunk_output,
+                quantize_prefill_state.jit_function,
+            )
+        )
+        launchers = tuple(PrefillLaunch(kernel) for kernel in kernels)
+    if short:
+        initialize, recurrent, quantize = launchers
+        initial = torch.empty(
+            (sequences, heads, columns, reduction), device=q.device, dtype=torch.float32
+        )
+        q_norm, k_norm = q, k
+        if use_qk_l2norm_in_kernel:
+            q_norm, k_norm = torch.empty_like(q), torch.empty_like(k)
+        with torch_device_fn.device(q.device):
+            norm_blocks = (
+                triton.cdiv(tokens * query_heads, 16) if use_qk_l2norm_in_kernel else 0
+            )
+            initialize[(norm_blocks + triton.cdiv(columns, 32) * sequences * heads,)](
+                q,
+                k,
+                q_norm,
+                k_norm,
+                state_int8,
+                state_scale,
+                initial,
+                tokens * query_heads,
+                reduction,
+                columns,
+                use_qk_l2norm_in_kernel,
+                STATE_V_MAJOR=True,
+                num_warps=4,
+                num_stages=1,
+            )
+            recurrent[(triton.cdiv(columns, 8) * sequences * heads,)](
+                Q=q_norm,
+                Kp=k_norm,
+                Vp=v,
+                G=g,
+                Beta=beta,
+                State=initial,
+                Out=output,
+                Final=initial,
+                Cu=cu_seqlens,
+                Indices=None,
+                Accepted=None,
+                scale=launch_scale,
+                T=tokens,
+                H=query_heads,
+                HV=heads,
+                K=reduction,
+                V=columns,
+                POOL=sequences,
+                QS=q_norm.stride(),
+                KS=k_norm.stride(),
+                VS=v.stride(),
+                GS=g.stride(),
+                BS=beta.stride(),
+                SS=initial.stride(),
+                IX=(0, 0),
+                WIDTH=1,
+                VARLEN=cu_seqlens is not None,
+                INDEXED=False,
+                TABLE=False,
+                SPEC=False,
+                INITIAL=True,
+                INPLACE=True,
+                VECTOR_BETA=False,
+                NORMALIZE=False,
+                HAS_G=True,
+                HAS_BETA=True,
+                BK=128,
+                BV=8,
+                num_warps=1,
+                num_stages=1,
+            )
+            quantize[(triton.cdiv(columns, 16), sequences * heads)](
+                initial,
+                state_int8,
+                state_scale,
+                reduction,
+                columns,
+                reduction,
+                16,
+                STATE_V_MAJOR=True,
+                num_warps=4,
+                num_stages=1,
+            )
+        if cache_miss and cacheable:
+            with prefill_launch_lock:
+                prefill_launch_cache.setdefault(cache_key, launchers)
+                prefill_launch_cache.move_to_end(cache_key)
+                if len(prefill_launch_cache) > PREFILL_CACHE_SIZE:
+                    prefill_launch_cache.popitem(last=False)
+        return output, state_int8
+    initialize, prepare, wy, update, compute_output, quantize = launchers
     initial = torch.empty(
         (sequences, heads, reduction, columns), device=q.device, dtype=torch.float32
     )
@@ -546,7 +830,7 @@ def chunk_gated_delta_rule_w8a16(
     matrix = torch.empty(
         (batch, tokens, heads, CHUNK_SIZE), device=q.device, dtype=torch.float32
     )
-    inverse = flag_gems.zeros(matrix.shape, device=q.device, dtype=q.dtype)
+    inverse = torch.empty(matrix.shape, device=q.device, dtype=q.dtype)
     # WY has one row per value head, including grouped-query attention.
     w = torch.empty((batch, tokens, heads, reduction), device=q.device, dtype=q.dtype)
     u, v_new = torch.empty_like(v), torch.empty_like(v)
@@ -558,33 +842,31 @@ def chunk_gated_delta_rule_w8a16(
     with torch_device_fn.device(q.device):
         if use_qk_l2norm_in_kernel:
             q_norm, k_norm = torch.empty_like(q), torch.empty_like(k)
-            normalize_prefill_qk[(triton.cdiv(tokens * query_heads, 16),)](
-                q,
-                k,
-                q_norm,
-                k_norm,
-                tokens * query_heads,
-                reduction,
-                reduction,
-                16,
-                num_warps=4,
-            )
-        dequantize_prefill_state[(triton.cdiv(columns, 32), sequences * heads)](
+        norm_blocks = (
+            triton.cdiv(tokens * query_heads, 16) if use_qk_l2norm_in_kernel else 0
+        )
+        initialize[(norm_blocks + triton.cdiv(columns, 32) * sequences * heads,)](
+            q,
+            k,
+            q_norm,
+            k_norm,
             state_int8,
             state_scale,
             initial,
+            tokens * query_heads,
             reduction,
             columns,
-            32,
+            use_qk_l2norm_in_kernel,
             num_warps=4,
+            num_stages=1,
         )
-        chunk_prepare[(chunks, heads)](
+        prepare[(chunks, heads)](
             g_in=g,
             g_out=gate_sum,
             k=k_norm,
             beta=beta,
-            A=matrix,
-            A_inv=inverse,
+            matrix=matrix,
+            inverse=inverse,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             T=tokens,
@@ -597,10 +879,11 @@ def chunk_gated_delta_rule_w8a16(
             USE_G=True,
             USE_TMA=False,
             DOT_PRECISION="ieee",
-            num_warps=4,
+            TILED_ZERO=tokens > 128,
+            num_warps=1 if tokens > 128 else 4,
             num_stages=1,
         )
-        chunk_wy[(chunks, heads)](
+        wy[(chunks, heads)](
             k=k_norm,
             v=v,
             beta=beta,
@@ -617,12 +900,12 @@ def chunk_gated_delta_rule_w8a16(
             V=columns,
             BT=CHUNK_SIZE,
             BK=128,
-            BV=64,
+            BV=128 if tokens > 128 else 64,
             IS_VARLEN=variable,
             num_warps=4,
             num_stages=1,
         )
-        chunk_state[(triton.cdiv(columns, 32), sequences * heads)](
+        update[(triton.cdiv(columns, 32), sequences * heads)](
             k=k_norm,
             v=u,
             w=w,
@@ -647,10 +930,10 @@ def chunk_gated_delta_rule_w8a16(
             STORE_FINAL_STATE=True,
             SAVE_NEW_VALUE=True,
             IS_VARLEN=variable,
-            num_warps=4,
-            num_stages=1,
+            num_warps=8 if tokens > 128 else 4,
+            num_stages=2 if tokens > 128 else 1,
         )
-        chunk_output[(1, chunks, heads)](
+        compute_output[(1, chunks, heads)](
             q=q_norm,
             k=k_norm,
             v=v_new,
@@ -670,10 +953,10 @@ def chunk_gated_delta_rule_w8a16(
             BV=128,
             USE_G=True,
             IS_VARLEN=variable,
-            num_warps=4,
+            num_warps=8 if tokens > 128 else 4,
             num_stages=1,
         )
-        quantize_prefill_state[(triton.cdiv(columns, 16), sequences * heads)](
+        quantize[(triton.cdiv(columns, 16), sequences * heads)](
             final,
             state_int8,
             state_scale,
@@ -683,4 +966,10 @@ def chunk_gated_delta_rule_w8a16(
             16,
             num_warps=4,
         )
+    if cache_miss and cacheable:
+        with prefill_launch_lock:
+            prefill_launch_cache.setdefault(cache_key, launchers)
+            prefill_launch_cache.move_to_end(cache_key)
+            if len(prefill_launch_cache) > PREFILL_CACHE_SIZE:
+                prefill_launch_cache.popitem(last=False)
     return output, state_int8
