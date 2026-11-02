@@ -87,25 +87,50 @@ def native_per_token_group_quant_fp8(
 
 
 @pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize(
+    "output_dtype",
+    [None, torch.float8_e4m3fn] if flaggems_vllm.vendor_name == "thead" else [None],
+)
+@pytest.mark.parametrize(
+    "column_major_scales",
+    [False, True] if flaggems_vllm.vendor_name == "thead" else [False],
+)
 @pytest.mark.parametrize("seed", utils.FP8_QUANT_SHAPES["SEEDS"])
 @pytest.mark.parametrize("group_size", utils.FP8_QUANT_SHAPES["GROUP_SIZE"])
 @pytest.mark.parametrize("dtype", utils.FP8_QUANT_SHAPES["DTYPES"])
 @pytest.mark.parametrize("d", utils.FP8_QUANT_SHAPES["D"])
 @pytest.mark.parametrize("num_tokens", utils.FP8_QUANT_SHAPES["NUM_TOKENS"])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
-def test_per_token_group_quant_fp8(num_tokens, d, dtype, group_size, seed, scale_ue8m0):
+def test_per_token_group_quant_fp8(
+    num_tokens,
+    d,
+    dtype,
+    group_size,
+    seed,
+    scale_ue8m0,
+    output_dtype,
+    column_major_scales,
+):
     torch.manual_seed(seed)
 
     x = torch.rand(num_tokens, d, dtype=dtype, device=flaggems_vllm.device)
     ref_x = utils.to_reference(x)
 
     ref_out, ref_scale = native_per_token_group_quant_fp8(
-        ref_x, group_size, scale_ue8m0=scale_ue8m0
+        ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
     )
     with flaggems_vllm.use_gems():
         out, scale = flaggems_vllm.per_token_group_quant_fp8(
-            x, group_size, scale_ue8m0=scale_ue8m0
+            x,
+            group_size,
+            dtype=output_dtype,
+            column_major_scales=column_major_scales,
+            scale_ue8m0=scale_ue8m0,
         )
+
+    assert out.dtype == ref_out.dtype
+    if column_major_scales:
+        assert scale.stride(0) == 1
 
     utils.gems_assert_close(scale, ref_scale, dtype=torch.float32)
 
