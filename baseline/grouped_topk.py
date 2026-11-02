@@ -98,8 +98,8 @@ def config(binding, dtype):
             "scoring_func": {"scalar": scoring_func},
         },
         "outputs": {
-            "topk_weights": {"shape": [num_experts, topk], "dtype": "torch.float32"},
-            "topk_ids": {"shape": [num_experts, topk], "dtype": "torch.int32"},
+            "topk_weights": {"shape": [num_tokens, topk], "dtype": "torch.float32"},
+            "topk_ids": {"shape": [num_tokens, topk], "dtype": "torch.int32"},
         },
         "dims": {
             "T": num_tokens,

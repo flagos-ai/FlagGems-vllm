@@ -373,7 +373,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
             scores_ptr + offs,
             mask=(rows[:, None, None] < row_len)
             & (groups[None, :, None] < num_groups)
-            & (group_experts[None, :, None] < num_experts_per_group),
+            & (group_experts[None, None, :] < num_experts_per_group),
             other=neg_inf,
         ).to(tl.float32)
     if SCORING_FUNC == 1:
