@@ -55,6 +55,7 @@ class PackedDecodeBenchmark(base.Benchmark):
             self.torch_op = native
             self.native_reason = None
             self.metrics = self.DEFAULT_METRICS
+        self._native_import_reason = self.native_reason
         super().init_user_config()
 
     def get_input_iter(self, dtype):
@@ -62,6 +63,10 @@ class PackedDecodeBenchmark(base.Benchmark):
             self._shape = shape
             self._dtype = dtype
             self._latencies = None
+            self.native_reason = self._native_import_reason
+            self._native_result = dict(
+                accuracy="NOT_RUN", performance="N/A", reason=self.native_reason
+            )
             yield (
                 self.make_inputs(
                     shape,
@@ -77,6 +82,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         return {
             "entry": self.entry,
             "normalize": True,
+            "native": self._native_result,
             "inputs": super().record_shapes(*args, **kwargs),
         }
 
@@ -87,7 +93,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         # the generic --warmup/--iter duration budgets do not apply here.
         if self._latencies is None:
             self._latencies = self._measure_pair(kwargs)
-        return self._latencies["native" if op is self.torch_op else "gems"]
+        return self._latencies.get("native" if op is self.torch_op else "gems")
 
     def _measure_pair(self, data):
         state0 = data["initial_state"].clone()
@@ -95,32 +101,74 @@ class PackedDecodeBenchmark(base.Benchmark):
         functions = {"gems": self.gems_op}
         if self.torch_op is not None:
             functions["native"] = self.torch_op
-        for fn in functions.values():
+        for name, fn in list(functions.items()):
             data["initial_state"].copy_(state0)
-            fn(**data, use_qk_l2norm_in_kernel=True)
-            self.assert_result(data, expected, self._dtype)
-        for fn in functions.values():
-            for _ in range(self.warmup):
-                data["initial_state"].copy_(state0)
+            try:
                 fn(**data, use_qk_l2norm_in_kernel=True)
-        torch_device_fn.synchronize()
+                self.assert_result(data, expected, self._dtype)
+            except Exception as exc:
+                if name == "gems":
+                    raise
+                self._native_result.update(accuracy="FAIL")
+                self._exclude_native(exc)
+                del functions[name]
+            else:
+                if name == "native":
+                    self._native_result.update(accuracy="PASS")
         samples = {name: [] for name in functions}
+        for name, fn in list(functions.items()):
+            try:
+                for _ in range(self.warmup):
+                    data["initial_state"].copy_(state0)
+                    fn(**data, use_qk_l2norm_in_kernel=True)
+            except Exception as exc:
+                if name == "gems":
+                    raise
+                self._exclude_native(exc)
+                del functions[name]
+                del samples[name]
+        torch_device_fn.synchronize()
         for i in range(self.repetitions):
             names = list(functions) if i % 2 == 0 else list(reversed(functions))
             for name in names:
                 data["initial_state"].copy_(state0)
                 torch_device_fn.synchronize()
-                start = torch_device_fn.Event(enable_timing=True)
-                end = torch_device_fn.Event(enable_timing=True)
-                start.record()
-                functions[name](**data, use_qk_l2norm_in_kernel=True)
-                end.record()
-                torch_device_fn.synchronize()
-                samples[name].append(start.elapsed_time(end))
-        self.assert_result(data, expected, self._dtype)
+                try:
+                    start = torch_device_fn.Event(enable_timing=True)
+                    end = torch_device_fn.Event(enable_timing=True)
+                    start.record()
+                    functions[name](**data, use_qk_l2norm_in_kernel=True)
+                    end.record()
+                    torch_device_fn.synchronize()
+                    samples[name].append(start.elapsed_time(end))
+                except Exception as exc:
+                    if name == "gems":
+                        raise
+                    self._exclude_native(exc)
+                    del functions[name]
+                    del samples[name]
+        # Recheck each implementation separately; native must not invalidate a
+        # correct Gems row if its state update becomes unstable after warmup.
+        for name, fn in functions.items():
+            data["initial_state"].copy_(state0)
+            try:
+                fn(**data, use_qk_l2norm_in_kernel=True)
+                self.assert_result(data, expected, self._dtype)
+            except Exception as exc:
+                if name == "gems":
+                    raise
+                self._native_result.update(accuracy="FAIL")
+                self._exclude_native(exc)
+                del samples[name]
+        if "native" in samples:
+            self._native_result.update(performance="PASS", reason=None)
         medians = {name: statistics.median(values) for name, values in samples.items()}
         self._record_samples(data, samples, medians)
         return medians
+
+    def _exclude_native(self, exc):
+        self.native_reason = f"{type(exc).__name__}: {exc}"
+        self._native_result.update(performance="N/A", reason=self.native_reason)
 
     def _record_samples(self, data, samples, medians):
         # Optional raw samples supplement the framework's --record/--output.
@@ -158,6 +206,10 @@ class PackedDecodeBenchmark(base.Benchmark):
             samples=samples,
             median_ms=medians,
             native_reason=self.native_reason,
+            native=dict(self._native_result),
+            native_speedup=(
+                medians["native"] / medians["gems"] if "native" in medians else None
+            ),
             candidate_module=self.gems_op.__module__,
         )
         with Path(destination).open("a") as f:
