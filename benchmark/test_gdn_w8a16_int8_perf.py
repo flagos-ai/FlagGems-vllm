@@ -18,6 +18,7 @@ from pathlib import Path
 import flag_gems
 import pytest
 import torch
+import yaml
 
 import flaggems_vllm
 from benchmark.base import Benchmark
@@ -44,6 +45,13 @@ class Int8StateGdnBenchmark(Benchmark):
 
     def set_shapes(self, shape_file_path: str):
         super().set_shapes(shape_file_path)
+        # FP8 and INT8 share an operator ID but use different shape contracts.
+        with open(shape_file_path) as shape_file:
+            shape_config = yaml.safe_load(shape_file)
+        variant = shape_config.get(self.op_name, {}).get("variants", {}).get("int8")
+        if variant is not None:
+            self.shapes = [tuple(shape) for shape in variant["shapes"]]
+            self.shape_desc = variant.get("shape_desc", self.DEFAULT_SHAPE_DESC)
         if (
             Config.bench_level == BenchLevel.CORE
             and Path(shape_file_path).resolve()
@@ -192,14 +200,15 @@ def run_int8_state_gdn(reference, args):
         return flaggems_vllm.gdn_w8a16_int8(*args)
 
 
-@pytest.mark.gdn_w8a16_int8
+@pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
     "gdn_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state GDN",
 )
 def test_perf_gdn_w8a16_int8():
     bench = Int8StateGdnBenchmark(
-        op_name="gdn_w8a16_int8", torch_op=native_int8_state_gdn_baseline
+        op_name="gdn_w8a16", torch_op=native_int8_state_gdn_baseline
     )
+    bench.base_variant = "int8"
     bench.set_gems(run_int8_state_gdn)
     bench.run()

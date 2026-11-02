@@ -629,7 +629,7 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
-  - id: gdn_w8a16_int8
+  - id: gdn_w8a16
     description: Gated delta recurrence with per-value-channel INT8 state and BF16/FP16 activations, including packed decode and chunked prefill.
     for:
       - gdn_w8a16_int8

@@ -241,7 +241,7 @@ def recurrent_gdn_reference(q, k, v, g, beta, initial, boundaries, normalize, sc
     return output, torch.stack(final)
 
 
-@pytest.mark.gdn_w8a16_int8
+@pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
     "chunk_gated_delta_rule_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state prefill",
@@ -281,7 +281,7 @@ def test_int8_state_gdn_prefill(dtype, shape, caplog):
     )
 
 
-@pytest.mark.gdn_w8a16_int8
+@pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
     "chunk_gated_delta_rule_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state prefill",
@@ -364,7 +364,7 @@ def test_int8_state_gdn_prefill_independent_calls(
         assert calls[0][2].data_ptr() != calls[1][2].data_ptr()
 
 
-@pytest.mark.gdn_w8a16_int8
+@pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
     "gdn_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state GDN",
@@ -401,7 +401,7 @@ def test_int8_state_gdn_decode(dtype, tokens, steps, dimensions, caplog):
         )
 
 
-@pytest.mark.gdn_w8a16_int8
+@pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
     "gdn_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state GDN",
