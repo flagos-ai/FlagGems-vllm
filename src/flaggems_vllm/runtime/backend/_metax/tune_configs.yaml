@@ -100,3 +100,10 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 8
+    num_warps: 1
+    num_stages: 1

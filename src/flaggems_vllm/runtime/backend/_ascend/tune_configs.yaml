@@ -258,3 +258,10 @@ compute_global_topk_indices_and_lens:
       TPP: 2
     num_warps: 1
     num_stages: 2
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 32
+    num_warps: 1
+    num_stages: 1
