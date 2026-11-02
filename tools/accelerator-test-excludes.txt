@@ -1,0 +1,5 @@
+# Supplied by the vendor test environment. Use only with the indexer install command.
+torch
+torch-npu
+triton
+flagtree

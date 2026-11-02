@@ -64,6 +64,63 @@ pip install --no-build-isolation -e '.[test]'
 
 This installs pytest, numpy, scipy, cupy-cuda12x, and other test utilities.
 
+### Native indexer baseline dependencies
+
+The `fused_indexer_weight_scale` tests and benchmark directly import the native
+GLM-5.3 function from vLLM 0.33.0. The QA image's vLLM 0.24+empty does not contain
+this entry. The operator implementation itself does not import vLLM.
+
+`pyproject.toml` records two opt-in dependency groups: `indexer-build` contains
+source-build tools and `indexer-test` pins the official vLLM v0.33.0 release
+commit and the matching torchvision 0.25.0 / torchaudio 2.10.0 imports.
+The uv build configuration selects `VLLM_TARGET_DEVICE=empty` and reuses
+the existing accelerator torch for the build. The install command excludes
+vendor-provided torch, torch_npu, Triton, and FlagTree
+from dependency resolution. This exclusion applies only to that command;
+normal repository setup is unchanged. No CUDA vLLM wheel is used.
+
+Use Python 3.11+ and uv (validated with 0.11.22). Activate this repository's
+vendor test virtual environment (validated with torch 2.10.0+cpu and
+torch_npu 2.10.0.post2), with FlagTree,
+FlagGems, and test tools already installed, then run from the repository root:
+
+```bash
+source .venv/bin/activate
+uv pip install --python "$VIRTUAL_ENV/bin/python" --group indexer-build
+uv pip install --python "$VIRTUAL_ENV/bin/python" --group indexer-test \
+  --excludes tools/accelerator-test-excludes.txt
+
+PYTHONPATH=src python -m pytest -q tests/test_fused_indexer_weight_scale.py --quick
+PYTHONPATH=src python -m pytest -q \
+  benchmark/test_fused_indexer_weight_scale.py --level core --warmup 1 --iter 1
+```
+
+These commands install the newer empty baseline and its Python dependencies in
+this repository's test environment. They do not add this dependency to the
+normal package installation or change the shared image. QA/CI must run the
+group installation explicitly before these tests; `pip install -e . --no-deps`
+does not install the groups. vLLM 0.24 itself remains unsupported as this
+operator's native reference. The source download requires access to GitHub's
+official source archive endpoint.
+
+If the archive URL is blocked, download the same pinned source through GitHub's
+codeload endpoint and pass a local source override. The checksum below was
+verified against the official release archive:
+
+```bash
+curl --fail --location \
+  https://codeload.github.com/vllm-project/vllm/tar.gz/4ba787ec9959e566d3b587a796dff07673324da5 \
+  --output /tmp/indexer-vllm-0.33.0.tar.gz
+printf '%s  %s\n' \
+  0293dfa0ffa7e1b657b60a3e383d2eaa1f14813ba55d3119faa542441a897670 \
+  /tmp/indexer-vllm-0.33.0.tar.gz | sha256sum --check
+printf '%s\n' 'vllm @ file:///tmp/indexer-vllm-0.33.0.tar.gz' \
+  > /tmp/indexer-source-override.txt
+uv pip install --python "$VIRTUAL_ENV/bin/python" --group indexer-test \
+  --excludes tools/accelerator-test-excludes.txt \
+  --overrides /tmp/indexer-source-override.txt
+```
+
 ## Full GPU Environment Setup
 
 Use the provided `tools/setup.sh` script for a complete environment bootstrap:

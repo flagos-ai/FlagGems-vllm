@@ -47,7 +47,16 @@ SHAPES = (
 def native_weight_scale():
     # Match the native Ascend simple_compile_backend policy outside timing.
     with torch.compiler.set_stance("force_eager"):
-        from vllm.models.glm5next.common.attention import _fused_indexer_weight_scale
+        try:
+            from vllm.models.glm5next.common.attention import (
+                _fused_indexer_weight_scale,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "The native indexer baseline requires the indexer-test dependency "
+                "group (vLLM 0.33.0+empty); vLLM 0.24+empty has no such entry. "
+                "See docs/content/en/getting-started/install.md."
+            ) from exc
 
         yield _fused_indexer_weight_scale
 
