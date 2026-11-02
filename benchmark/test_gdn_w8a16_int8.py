@@ -51,7 +51,8 @@ class Int8StateGdnBenchmark(Benchmark):
             super().set_shapes(shape_file_path)
         else:
             self.shapes = [
-                tuple(shape) for shape in shape_config.get("shapes", self.DEFAULT_SHAPES)
+                tuple(shape)
+                for shape in shape_config.get("shapes", self.DEFAULT_SHAPES)
             ]
             self.shape_desc = shape_config.get("shape_desc", self.DEFAULT_SHAPE_DESC)
         if (
