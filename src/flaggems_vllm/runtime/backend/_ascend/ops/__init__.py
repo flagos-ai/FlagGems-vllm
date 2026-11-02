@@ -121,7 +121,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
-    "fused_indexer_weight_scale",
     "add_rms_norm",
     "build_compressor_metadata",
     "causal_conv1d_fn",
@@ -134,6 +133,7 @@ __all__ = [
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
