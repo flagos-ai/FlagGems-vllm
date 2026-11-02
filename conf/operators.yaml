@@ -422,7 +422,12 @@ ops:
     stages:
       - stable: '3.0'
   - id: flash_mla_sparse_fwd
-    description: Part of the FlashMLA.
+    description: |
+      BF16 sparse MLA forward with 4, 64 or 128 query heads and 512/576-wide
+      QK vectors. Four-head inputs use masked register tiles and compact
+      output storage. Providers expose supported_query_heads and an optional
+      supports_single_token_decode_graph capability; callers must also enforce
+      their single-token decode layout and stable-buffer requirements.
     for:
       - vllm.v1.attention.backends.mla.flashmla_sparse
     labels:
