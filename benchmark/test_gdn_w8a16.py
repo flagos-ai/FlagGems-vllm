@@ -1,260 +1,142 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark with external real-shape data (not bundled in this repository).
 
-Default source: /data/fzy/real_shapes_20261012/gdn_w8a16_fp8__int8/shapes.json
-Override with GDN_SHAPE_FILE=/path/to/shapes.json. The JSON is a list of
-records with op, labels, shape, and count fields; additional fields are allowed.
-Run: GDN_SHAPE_FILE=/path/to/shapes.json python benchmark/test_gdn_w8a16.py
-"""
+import math
 
-import gc
-import json
-import os
-import statistics
-import time
-from functools import partial
-from pathlib import Path
-
+import pytest
 import torch
 
-from flaggems_vllm import gdn_w8a16
+import flaggems_vllm
+from benchmark.base import Benchmark
+from flaggems_vllm.ops.gdn_w8a16 import quantize_gdn_state_fp8
 
-ROOT = Path(os.environ.get("GDN_RESULT_DIR", "gdn_w8a16_results"))
-SHAPES = Path(
-    os.environ.get(
-        "GDN_SHAPE_FILE",
-        "/data/fzy/real_shapes_20261012/gdn_w8a16_fp8__int8/shapes.json",
+
+def _vllm_bf16(q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t):
+    from vllm.model_executor.layers.fla.ops import fused_recurrent_gated_delta_rule
+
+    return fused_recurrent_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=128**-0.5,
+        initial_state=state_bf16,
+        inplace_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        num_accepted_tokens=None,
+        use_qk_l2norm_in_kernel=True,
     )
+
+
+def _fp8(q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t):
+    return flaggems_vllm.gdn_w8a16(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        128**-0.5,
+        state_fp8,
+        state_scale,
+        cu_seqlens=cu,
+        ssm_state_indices=indices[:, 0],
+        use_qk_l2norm_in_kernel=True,
+        max_sequence_length=t,
+    )
+
+
+class GdnW8A16Benchmark(Benchmark):
+    DEFAULT_DTYPES = [torch.bfloat16]
+    DEFAULT_SHAPE_DESC = "N, T, H, HV, K, V"
+    DEFAULT_SHAPES = [
+        (n, t, 2, hv, 128, 128)
+        for hv in (4, 6)
+        for n, t in (
+            [
+                (n, 1)
+                for n in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+            ]
+            + [
+                (1, 2),
+                (1, 8),
+                (1, 32),
+                (4, 4),
+                (4, 16),
+                (16, 4),
+                (1, 256),
+                (1, 512),
+                (2, 192),
+                (4, 256),
+                (8, 128),
+                (16, 128),
+                (32, 64),
+                (64, 32),
+                (128, 24),
+            ]
+        )
+    ]
+
+    def set_more_shapes(self):
+        return self.DEFAULT_SHAPES
+
+    def get_input_iter(self, cur_dtype):
+        for n, t, h, hv, key_dim, value_dim in self.shapes:
+            if key_dim != 128 or value_dim != 128:
+                raise ValueError("This benchmark covers K=V=128")
+            torch.manual_seed(42)
+            device = flaggems_vllm.device
+            q = torch.randn(1, n * t, h, key_dim, device=device, dtype=cur_dtype)
+            k = torch.randn_like(q)
+            v = 0.125 * torch.randn(
+                1, n * t, hv, value_dim, device=device, dtype=cur_dtype
+            )
+            g = torch.empty(1, n * t, hv, device=device, dtype=cur_dtype).uniform_(
+                math.log(0.98), math.log(0.995)
+            )
+            beta = torch.rand(1, n * t, hv, device=device, dtype=cur_dtype)
+            state = torch.zeros(
+                n + 1, hv, key_dim, value_dim, device=device, dtype=cur_dtype
+            )
+            state_fp8, state_scale = quantize_gdn_state_fp8(state)
+            cu = torch.arange(0, n * t + 1, t, device=device, dtype=torch.int32)
+            indices = (
+                torch.arange(1, n + 1, device=device, dtype=torch.int64)[:, None]
+                .expand(n, t)
+                .contiguous()
+            )
+            inputs = q, k, v, g, beta, state, state_fp8, state_scale, cu, indices, t
+            baseline, _ = _vllm_bf16(*inputs)
+            torch.cuda.synchronize()
+            # A zero initial state gives a closed-form first-token output.
+            query = q.reshape(n, t, h, key_dim)[:, 0].float()
+            key = k.reshape(n, t, h, key_dim)[:, 0].float()
+            query *= torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+            key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+            correlation = (query * key).sum(-1).repeat_interleave(hv // h, -1)
+            expected = (
+                correlation[..., None]
+                * key_dim**-0.5
+                * v.reshape(n, t, hv, value_dim)[:, 0].float()
+                * beta.reshape(n, t, hv)[:, 0].float()[..., None]
+            )
+            first_output = baseline.reshape(n, t, hv, value_dim)[:, 0]
+            torch.testing.assert_close(
+                first_output.float(), expected, atol=2e-3, rtol=5e-2
+            )
+            state.zero_()
+            yield inputs
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "nvidia"
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 9,
+    reason="FP8 GDN requires NVIDIA SM90 or newer",
 )
-
-
-def make_inputs(row):
-    shape = row["shape"]
-    if len(shape) == 4:
-        tokens, _, hv, dv = shape
-        heads, dk, n = 16, 128, tokens
-        packed = torch.randn(
-            tokens, 2 * heads * dk + hv * dv, device="cuda", dtype=torch.bfloat16
-        )
-        q = packed[:, : heads * dk].view(1, tokens, heads, dk)
-        k = packed[:, heads * dk : 2 * heads * dk].view(1, tokens, heads, dk)
-        v = packed[:, 2 * heads * dk :].view(1, tokens, hv, dv)
-    else:
-        _, tokens, heads, dk, hv, dv, n = shape
-        q = torch.randn(1, tokens, heads, dk, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn_like(q)
-        v = torch.randn(1, tokens, hv, dv, device="cuda", dtype=torch.bfloat16)
-    # Raw normal draws; no per-vector normalization. Small beta keeps the
-    # recurrence stable with unit-variance keys (expected squared norm = K).
-    g = -torch.rand(1, tokens, hv, device="cuda") * 0.1
-    beta = torch.rand(1, tokens, hv, device="cuda") / dk
-    state = torch.randn(n, hv, dv, dk, device="cuda") * 0.1
-    bounds = [i * tokens // n for i in range(n + 1)]
-    cu = torch.tensor(bounds, dtype=torch.int32, device="cuda")
-    return (q, k, v, g, beta, state, cu), bounds
-
-
-def torch_baseline(args, bounds):
-    q, k, v, g, beta, state, _ = args
-    if len(bounds) - 1 == q.shape[1]:
-        group = v.shape[2] // q.shape[2]
-        qq = q[0].float().repeat_interleave(group, 1)
-        kk = k[0].float().repeat_interleave(group, 1)
-        vv = v[0].float()
-        s = state * g[0].exp()[..., None, None]
-        delta = (vv - torch.matmul(s, kk.unsqueeze(-1)).squeeze(-1)) * beta[
-            0, :, :, None
-        ]
-        s = s + delta.unsqueeze(-1) * kk.unsqueeze(-2)
-        o = torch.matmul(s, qq.unsqueeze(-1)).squeeze(-1) * (q.shape[-1] ** -0.5)
-        return o.unsqueeze(0).to(q.dtype), s
-    return torch_prefill(args, bounds)
-
-
-def torch_prefill(args, bounds):
-    q, k, v, g, beta, state, _ = args
-    group = v.shape[2] // q.shape[2]
-    q = q[0].float().repeat_interleave(group, 1).transpose(0, 1)
-    k = k[0].float().repeat_interleave(group, 1).transpose(0, 1)
-    v = v[0].float().transpose(0, 1)
-    g = g[0].transpose(0, 1)
-    beta = beta[0].transpose(0, 1)
-    outputs, states = [], []
-    for seq, (start, stop) in enumerate(zip(bounds, bounds[1:])):
-        length = stop - start
-        chunks = (length + 63) // 64
-        padding = chunks * 64 - length
-        qq = torch.nn.functional.pad(q[:, start:stop], (0, 0, 0, padding)).reshape(
-            q.shape[0], chunks, 64, q.shape[-1]
-        )
-        kk = torch.nn.functional.pad(k[:, start:stop], (0, 0, 0, padding)).reshape(
-            k.shape[0], chunks, 64, k.shape[-1]
-        )
-        vv = torch.nn.functional.pad(v[:, start:stop], (0, 0, 0, padding)).reshape(
-            v.shape[0], chunks, 64, v.shape[-1]
-        )
-        gg = (
-            torch.nn.functional.pad(g[:, start:stop], (0, padding))
-            .reshape(g.shape[0], chunks, 64)
-            .cumsum(-1)
-        )
-        bb = torch.nn.functional.pad(beta[:, start:stop], (0, padding)).reshape(
-            beta.shape[0], chunks, 64
-        )
-        decay = (gg[..., :, None] - gg[..., None, :]).exp().tril()
-        lhs = (kk @ kk.transpose(-1, -2) * decay * bb[..., None]).tril(-1)
-        # Strictly lower 64x64 L is nilpotent: the finite geometric series
-        # gives (I+L)^-1 exactly, using only PyTorch batched matmuls.
-        power = -lhs
-        inverse = torch.eye(64, device=q.device) + power
-        for _ in range(5):
-            power = power @ power
-            inverse = inverse + inverse @ power
-        rhs = bb[..., None] * torch.cat((vv, gg.exp()[..., None] * kk), dim=-1)
-        solved = inverse @ rhs
-        u, w = solved.split((vv.shape[-1], kk.shape[-1]), dim=-1)
-        q_exp = qq * gg.exp()[..., None]
-        qk = (qq @ kk.transpose(-1, -2)) * decay
-        weighted_k = kk * (gg[..., -1:] - gg).exp()[..., None]
-        last_decay = gg[..., -1].exp()
-        s = state[seq].transpose(-1, -2)
-        chunk_outputs = []
-        for i in range(chunks):
-            update = u[:, i] - w[:, i] @ s
-            chunk_outputs.append(q_exp[:, i] @ s + qk[:, i] @ update)
-            s = (
-                last_decay[:, i, None, None] * s
-                + weighted_k[:, i].transpose(-1, -2) @ update
-            )
-        outputs.append(
-            torch.stack(chunk_outputs, dim=1).reshape(
-                q.shape[0], chunks * 64, v.shape[-1]
-            )[:, :length]
-        )
-        states.append(s.transpose(-1, -2))
-    output = torch.cat(outputs, dim=1).transpose(0, 1).unsqueeze(0) * (
-        q.shape[-1] ** -0.5
-    )
-    return output.to(args[0].dtype), torch.stack(states).contiguous()
-
-
-def capture(fn):
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            fn()
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        result = fn()
-    for _ in range(5):
-        graph.replay()
-    torch.cuda.synchronize()
-    return graph, result
-
-
-def measure_pair(first, second, samples=31):
-    values = [[], []]
-    for i in range(samples):
-        for which in (0, 1) if i % 2 == 0 else (1, 0):
-            graph = (first, second)[which]
-            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                enable_timing=True
-            )
-            begin.record()
-            for _ in range(3):
-                graph.replay()
-            end.record()
-            end.synchronize()
-            values[which].append(begin.elapsed_time(end) * 1000 / 3)
-    return values
-
-
-def main():
-    ROOT.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(20261019)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    rows = json.loads(SHAPES.read_text())
-    limit = int(os.environ.get("GDN_LIMIT", "0"))
-    if limit:
-        rows = rows[:limit]
-    results = []
-    metadata = dict(
-        operator="gdn_w8a16",
-        implementation="basic Triton recurrence",
-        baseline=(
-            "PyTorch batched recurrence for single-token sequences; "
-            "FP32 batched chunk, finite-series triangular inverse via matmul, "
-            "plus state scan for prefill"
-        ),
-        timing="CUDA Graph, 31 alternating-order samples, each 3 replays, median us per replay",
-        dtype="BF16 q/k/v, FP32 g/beta/state and accumulation; BF16 output",
-        input_distribution="raw q/k/v N(0,1), g=-U(0,0.1), beta=U(0,1)/K, state=N(0,0.1); no q/k normalization",
-        scope="GDN recurrence core, precomputed g/beta; no projection or sigmoid/softplus",
-        sequence_boundaries="floor(i*T/N), exact original per-request lengths unavailable",
-        torch=torch.__version__,
-        seed=20261019,
-        gpu=torch.cuda.get_device_name(0),
-    )
-    for i, row in enumerate(rows):
-        start = time.monotonic()
-        args, bounds = make_inputs(row)
-        fn = partial(gdn_w8a16, *args)
-        baseline = partial(torch_baseline, args, bounds)
-        print("START", i + 1, row["shape"], flush=True)
-        actual = fn()
-        expected = baseline()
-        for a, e in zip(actual, expected):
-            if not torch.isfinite(a).all() or not torch.isfinite(e).all():
-                raise RuntimeError("Non-finite output/state")
-            torch.testing.assert_close(a.float(), e.float(), atol=0.002, rtol=0.02)
-        print("CAPTURE", i + 1, flush=True)
-        graph, out = capture(fn)
-        base_graph, base_out = capture(baseline)
-        for a, e in zip(out, base_out):
-            torch.testing.assert_close(a.float(), e.float(), atol=0.002, rtol=0.02)
-        candidate, base = measure_pair(graph, base_graph)
-        us, base_us = statistics.median(candidate), statistics.median(base)
-        results.append(
-            dict(
-                row,
-                core_us=us,
-                baseline_us=base_us,
-                speedup=base_us / us,
-                status="pass",
-                output_max_abs=float(
-                    (actual[0].float() - expected[0].float()).abs().max()
-                ),
-                state_max_abs=float((actual[1] - expected[1]).abs().max()),
-                samples_us=candidate,
-                baseline_samples_us=base,
-            )
-        )
-        (ROOT / "results.json").write_text(
-            json.dumps(dict(metadata=metadata, results=results), indent=2)
-        )
-        print(
-            i + 1,
-            row["op"],
-            row["shape"],
-            "candidate_us",
-            round(us, 3),
-            "torch_us",
-            round(base_us, 3),
-            "speedup",
-            round(base_us / us, 4),
-            "sec",
-            round(time.monotonic() - start, 2),
-            flush=True,
-        )
-        del graph, base_graph, out, base_out, actual, expected, args, fn, baseline
-        gc.collect()
-        torch.cuda.empty_cache()
-    print("ALL PASSED", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+def test_gdn_w8a16():
+    bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
+    bench.set_gems(_fp8)
+    bench.run()

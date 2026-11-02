@@ -26,10 +26,10 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
+from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 from flaggems_vllm.utils.device_info import get_device_capability, get_sm_count
 
-if has_triton_tle(3, 6, 0):
+if has_triton_tle_attrs(("load",), 3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 

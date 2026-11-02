@@ -162,7 +162,7 @@ def main():
         raise ValueError("Set GDN_CURRENT_IMPL to the frozen original implementation")
     current = load_module("gdn_current_reference", Path(path))
     bench = load_module(
-        "gdn_benchmark_inputs", Path(__file__).with_name("test_gdn_w8a16.py")
+        "gdn_benchmark_inputs", Path(__file__).with_name("test_gdn_w8a16_metax.py")
     )
     rows = json.loads(bench.SHAPES.read_text())
     group = os.environ.get("GDN_COMPARE_GROUP", "all")

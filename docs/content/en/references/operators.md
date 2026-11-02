@@ -34,20 +34,24 @@ Complete list of FlagGems-vllm operators with metadata from `conf/operators.yaml
 
 ## Usage
 
-All operators are exported from `flaggems_vllm`:
+FlagGems-vllm depends on FlagGems, and some operators call FlagGems operators internally. Operators can be called directly, and it is recommended to enable FlagGems for underlying operator support:
 
 ```python
+import flag_gems
 import flaggems_vllm
 
-# Direct call
+# 1. Enable FlagGems general operators
+flag_gems.enable()
+
+# 2. Direct call to FlagGems-vllm operator
 result = flaggems_vllm.moe_align_block_size(topk_ids, block_size, num_experts)
 
-# Check availability
-ops = flaggems_vllm.all_registered_ops()
+# 3. Inspect all exported operators
+ops = flaggems_vllm.ops.__all__
 print(f"Available: {len(ops)} operators")
 ```
 
 ## Next Steps
 
-- [Basic usage patterns](/FlagGems-vllm/usage/basic/)
+- [Basic usage patterns](../usage/basic.md)
 - [Operator source code](https://github.com/flagos-ai/FlagGems-vllm/tree/main/src/flaggems_vllm/ops)

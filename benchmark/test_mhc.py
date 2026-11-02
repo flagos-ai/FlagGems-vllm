@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm.ops.mhc.hc_head_fused_kernel import hc_head_fused_kernel
 
 try:
@@ -30,14 +33,51 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     mhc_split_sinkhorn_torch_ref,
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
+from flaggems_vllm.ops.mhc.mhc_post import mhc_post
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
 
 from . import base
 
+VENDOR = flaggems_vllm.vendor_name
+
+# Vendor-native mhc_post, one entry per vendor (nvidia mirrors
+# baseline/mhc_post.py::native()). A vendor missing here has no native kernel and
+# the benchmark reports the FlagGems latency only.
+_NATIVE_MHC_POST = {
+    "nvidia": ("vllm.model_executor.kernels.mhc", "mhc_post_tilelang"),
+    "hygon": ("vllm.model_executor.kernels.mhc", "mhc_post_tilelang"),
+    "thead": ("vllm.model_executor.layers.mhc", "mhc_post"),
+    "mthreads": ("vllm_musa.deepseek_v4_mhc", "mhc_post_musa"),
+    "iluvatar": ("ixformer.inference.functions.deepseek.mhc", "ds4_mhc_post"),
+    "ascend": ("torch_npu", "npu_mhc_post"),
+}
+
+
+def _get_baseline_op():
+    """Vendor-native mhc_post, or None when this vendor ships none."""
+    entry = _NATIVE_MHC_POST.get(VENDOR)
+    if entry is None:
+        return None
+    module_name, attr = entry
+    try:
+        native = getattr(importlib.import_module(module_name), attr)
+    except (ImportError, AttributeError):
+        return None
+    if VENDOR == "ascend":
+        # npu_mhc_post(residual, h_res, h_out, h_post): mix first, (N, 4) post.
+        return lambda x, r, p, m: native(r, m, x, p.squeeze(-1))
+    return native
+
 
 class MHCPostBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "N, H"
+
+    def init_user_config(self):
+        """Apply restrictions imposed by the selected baseline."""
+        super().init_user_config()
+
+        if self.torch_op is None:
+            pytest.skip(f"No vendor-native mhc_post kernel is available for {VENDOR}.")
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
@@ -66,7 +106,7 @@ class MHCPostBenchmark(base.Benchmark):
 def test_mhc_post():
     bench = MHCPostBenchmark(
         op_name="mhc_post",
-        torch_op=mhc_post_ref,
+        torch_op=_get_baseline_op(),
         gems_op=mhc_post,
         dtypes=[torch.bfloat16],
     )

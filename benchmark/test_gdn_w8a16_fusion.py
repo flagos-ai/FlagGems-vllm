@@ -35,7 +35,7 @@ def main():
         raise ValueError("Set GDN_CURRENT_IMPL to the frozen current implementation")
     baseline = load_module("gdn_current_fusion_reference", Path(path))
     bench = load_module(
-        "gdn_fusion_inputs", Path(__file__).with_name("test_gdn_w8a16.py")
+        "gdn_fusion_inputs", Path(__file__).with_name("test_gdn_w8a16_metax.py")
     )
     torch.manual_seed(20261019)
     torch.backends.cuda.matmul.allow_tf32 = False
