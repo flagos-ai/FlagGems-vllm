@@ -148,28 +148,16 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        if NUM_SPLITS == 1:
-            keys = tl.load(
-                k_cache_ptr
-                + safe_page[:, None] * stride_k_block
-                + page_offset[:, None] * stride_k_token
-                + kv_head * stride_k_head
-                + dim_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-            keys = tl.permute(keys, (1, 0))
-        else:
-            keys = tl.load(
-                k_cache_ptr
-                + safe_page[:, None] * stride_k_block
-                + page_offset[:, None] * stride_k_token
-                + kv_head * stride_k_head
-                + dim_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-            keys = tl.permute(keys, (1, 0))
+        keys = tl.load(
+            k_cache_ptr
+            + safe_page[:, None] * stride_k_block
+            + page_offset[:, None] * stride_k_token
+            + kv_head * stride_k_head
+            + dim_offsets[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        keys = tl.permute(keys, (1, 0))
         if not DEFER_V_LOAD:
             values = tl.load(
                 v_cache_ptr
