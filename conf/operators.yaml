@@ -643,34 +643,23 @@ ops:
       - alpha: '5.4'
   - id: gdn_w8a16
     description: |
-      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 state,
+      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
-      Supports decode, prefill and speculative state-slot updates.
+      FP8 supports decode, prefill and speculative state-slot updates.
+      INT8 supports packed decode and chunked prefill on PPU.
     for:
-      - None
-    labels:
-      - fused
-      - FLA
-      - Attention
-      - Quantization
-      - NoCPU
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: gdn_w8a16_int8
-    description: Gated delta recurrence with per-value-channel INT8 state and BF16/FP16 activations, including packed decode and chunked prefill.
-    for:
+      - gdn_w8a16
       - gdn_w8a16_int8
       - chunk_gated_delta_rule_w8a16_int8
       - quantize_gdn_state_int8
     labels:
       - fused
       - FLA
-      - NoCPU
+      - Attention
       - Quantization
+      - NoCPU
     kind:
-      - NeuralNetwork
+      - Attention
     stages:
       - alpha: '5.4'
   - id: geglu
