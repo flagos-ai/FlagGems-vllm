@@ -17,7 +17,7 @@ import torch
 
 import flaggems_vllm
 
-from .accuracy_utils import gems_assert_close
+from .accuracy_utils import gems_assert_close, gems_assert_equal
 from .conftest import QUICK_MODE
 
 API_NAME = "fused_indexer_weight_scale"
@@ -111,13 +111,32 @@ def test_fused_indexer_weight_scale_independent_strides(
 
 
 @pytest.mark.fused_indexer_weight_scale
-def test_fused_indexer_weight_scale_nonfinite(native_weight_scale):
+@pytest.mark.parametrize("scale", [0.0, 0.125, float("inf"), float("nan")])
+def test_fused_indexer_weight_scale_nonfinite(native_weight_scale, scale):
     torch.manual_seed(0)
     weights, q_scale = make_inputs(2, 32, flaggems_vllm.device)
     weights[0, :3] = torch.tensor([1.0, 0.0, -1.0], device=weights.device)
     q_scale[0, :3, 0] = torch.tensor(
         [float("nan"), float("inf"), -float("inf")], device=weights.device
     )
-    expected = native_weight_scale(weights, q_scale, 0.125)
-    output = flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, 0.125)
+    expected = native_weight_scale(weights, q_scale, scale)
+    output = flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, scale)
     gems_assert_close(output, expected, torch.float32, atol=1e-6, equal_nan=True)
+
+
+@pytest.mark.fused_indexer_weight_scale
+@pytest.mark.parametrize("offset", [1, 8])
+def test_fused_indexer_weight_scale_storage_offset(native_weight_scale, offset):
+    torch.manual_seed(0)
+    total = 35 * 32
+    weights_base = torch.randn(total + offset, device=flaggems_vllm.device)
+    query_base = torch.randn(total + offset, device=flaggems_vllm.device)
+    weights_saved = weights_base.clone()
+    query_saved = query_base.clone()
+    weights = weights_base[offset:].view(35, 32)
+    query = query_base[offset:].view(35, 32, 1)
+    expected = native_weight_scale(weights, query, 0.015625)
+    output = flaggems_vllm.fused_indexer_weight_scale(weights, query, 0.015625)
+    gems_assert_close(output, expected, torch.float32, atol=1e-6)
+    gems_assert_equal(weights_base, weights_saved)
+    gems_assert_equal(query_base, query_saved)
