@@ -1,0 +1,56 @@
+{
+  "status": "PARTIAL",
+  "scope": "MoE stays on; current attention family includes existingFP8-QK path. BF16-QK alignment pending.",
+  "records": [
+    {
+      "input": 4096,
+      "complete": true,
+      "on": 2112.5498255103557,
+      "off": 1945.312365341078,
+      "gain_percent": 8.596946338741617,
+      "rounds": [
+        {
+          "round": 2,
+          "on": 2108.721765305952,
+          "off": 1934.5183494181642,
+          "preemptions": 0.0,
+          "prefixhits": 0.0,
+          "source": "e2e-028-20261021/next-e2e/tp8-benefit-attn-off/c64/cold-prefix/flagos/input-4096/round-2/summary.json"
+        },
+        {
+          "round": 3,
+          "on": 2116.37788571476,
+          "off": 1956.106381263992,
+          "preemptions": 0.0,
+          "prefixhits": 0.0,
+          "source": "e2e-028-20261021/next-e2e/tp8-benefit-attn-off/c64/cold-prefix/flagos/input-4096/round-3/summary.json"
+        }
+      ]
+    },
+    {
+      "input": 16384,
+      "complete": true,
+      "on": 788.6247006357867,
+      "off": 748.6739107854564,
+      "gain_percent": 5.3362070288273555,
+      "rounds": [
+        {
+          "round": 2,
+          "on": 786.220232931064,
+          "off": 747.1117427303548,
+          "preemptions": 4.0,
+          "prefixhits": 0.0,
+          "source": "e2e-028-20261021/next-e2e/tp8-benefit-attn-off/c64/cold-prefix/flagos/input-16384/round-2/summary.json"
+        },
+        {
+          "round": 3,
+          "on": 791.0291683405093,
+          "off": 750.236078840558,
+          "preemptions": 4.0,
+          "prefixhits": 0.0,
+          "source": "e2e-028-20261021/next-e2e/tp8-benefit-attn-off/c64/cold-prefix/flagos/input-16384/round-3/summary.json"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "status": "PASS",
+  "source_sha256": "c44d602c25417a9e5281d55a8cdccb0f917e03d7760c9f638d05da79c458a314",
+  "package_op_sha256": "f78a29abf89d18a33fc94d6402b00872182086e96757f3e985f0e9b1616babfd",
+  "kernels": {
+    "_quantize_int8_rows": {
+      "ast_equal": true,
+      "ast_sha256": "00a3abf788a8f506aa76b2070219321e213aa435576977fc97f7344db35f49e9"
+    },
+    "_int8_qk_dot": {
+      "ast_equal": true,
+      "ast_sha256": "9fe955e3b6e6f8bb291587ea3f893bee050b12007a53cf2fa832227898d45fdf"
+    },
+    "_union_span_kernel": {
+      "ast_equal": true,
+      "ast_sha256": "c470eeee52c157f92e61c1e5819dc475cc9ae5f20afdcd4999c26b4840bbf398"
+    },
+    "_split_kernel": {
+      "ast_equal": true,
+      "ast_sha256": "f9250bceb5ec6fc74f2c5d9405e049be9fe12d820b4998f4fd6802dc3837d5f0"
+    },
+    "_merge_split_kernel": {
+      "ast_equal": true,
+      "ast_sha256": "b757aa31500595a9c45343dd5b815687d620206f40b09c66c03e67a32f195195"
+    }
+  }
+}
