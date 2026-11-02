@@ -17,6 +17,10 @@ from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_model1 impo
     can_use_model1_thead,
     sparse_decode_model1_thead,
 )
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_v32 import (
+    can_use_v32_thead,
+    sparse_decode_v32_thead,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -35,6 +39,7 @@ from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "can_use_model1_thead",
+    "can_use_v32_thead",
     "fused_experts_impl",
     "gemma_rms_norm",
     "inplace_fused_experts",
@@ -43,5 +48,6 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "sparse_decode_model1_thead",
+    "sparse_decode_v32_thead",
     "topk_softplus_sqrt",
 ]

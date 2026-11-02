@@ -59,9 +59,19 @@ if HAS_TLE:
         HAS_TLE_MODEL1_THEAD = True
     except ImportError:
         HAS_TLE_MODEL1_THEAD = False
+    try:
+        from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_v32 import (
+            can_use_v32_thead,
+            sparse_decode_v32_thead,
+        )
+
+        HAS_TLE_V32_THEAD = True
+    except ImportError:
+        HAS_TLE_V32_THEAD = False
 else:
     HAS_TLE_MODEL1 = False
     HAS_TLE_MODEL1_THEAD = False
+    HAS_TLE_V32_THEAD = False
 
 
 # TLE constants for decode
@@ -1256,6 +1266,25 @@ def _sparse_decode_dispatch(
             topk_length is not None,
             extra_kv is not None,
             extra_topk_length is not None,
+        )
+        return
+
+    # V32 fast path for T-Head PPU (FlagTree TLE). It keeps its tile schedule
+    # in sched_meta and reuses it on later calls.
+    if (
+        is_fp8_kvcache
+        and HAS_TLE_V32_THEAD
+        and can_use_v32_thead(q, kv, indices, out, lse, topk_length)
+    ):
+        sparse_decode_v32_thead(
+            q,
+            kv,
+            indices,
+            attn_sink=attn_sink,
+            out=out,
+            lse=lse,
+            sm_scale=softmax_scale,
+            sched_meta=sched_meta,
         )
         return
 
