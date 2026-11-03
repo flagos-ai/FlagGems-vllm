@@ -37,6 +37,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+from flaggems_vllm.utils.libentry import _do_bench_with_timer_fallback
+
 logger = logging.getLogger(__name__)
 
 _HC_MULT4_AUTOTUNE_CONFIG = [
@@ -134,10 +137,21 @@ def _npu_grid_prune(configs, nargs, **kwargs):
     return [min(scored, key=_programs)]
 
 
+def _mhc_post_do_bench(kernel_call, quantiles):
+    return _do_bench_with_timer_fallback(
+        kernel_call, warmup=25, rep=100, quantiles=quantiles
+    )
+
+
 @triton.autotune(
     configs=_HC_MULT4_AUTOTUNE_CONFIG,
     key=["H"],
     prune_configs_by={"early_config_prune": _npu_grid_prune},
+    **(
+        {"do_bench": _mhc_post_do_bench}
+        if runtime.device.vendor_name == "kunlunxin"
+        else {}
+    ),
 )
 @triton.jit
 def mhc_post_kernel_hc_mult_4(
@@ -224,6 +238,11 @@ def mhc_post_kernel_hc_mult_4(
     configs=_GENERIC_AUTOTUNE_CONFIG,
     key=["H", "HC"],
     prune_configs_by={"early_config_prune": _npu_grid_prune},
+    **(
+        {"do_bench": _mhc_post_do_bench}
+        if runtime.device.vendor_name == "kunlunxin"
+        else {}
+    ),
 )
 @triton.jit
 def mhc_post_kernel_generic(
@@ -382,12 +401,15 @@ def mhc_post(
         # configs the sustained sweep showed to be fastest. Our configs are
         # validated through the raw JIT path (no aabs), so disable the
         # rewrite for this launch only and restore it afterwards.
-        _aabs = triton.knobs.autotuning.adjust_block_size
-        triton.knobs.autotuning.adjust_block_size = False
+        # Stock Triton has no FlagTree AABS knob. Keep the actual owner and
+        # value so a failed launch cannot leak this optional setting.
+        _autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
+        _missing = object()
+        _aabs = getattr(_autotuning, "adjust_block_size", _missing)
+        if _aabs is not _missing:
+            _autotuning.adjust_block_size = False
         try:
-            from triton._flagtree_backend import FLAGTREE_BACKEND
-
-            if FLAGTREE_BACKEND == "ppu":
+            if runtime.device.vendor_name == "thead":
                 # PPU: same ABI, vendor-shaped launch (one CTA per token).
                 from flaggems_vllm.runtime.backend._thead.ops.mhc_post import (
                     mhc_post_hc4_tokloop,
@@ -399,7 +421,8 @@ def mhc_post(
                     a, b, c, d, out, a_sn, a_sj, a_si, H=H
                 )
         finally:
-            triton.knobs.autotuning.adjust_block_size = _aabs
+            if _aabs is not _missing:
+                _autotuning.adjust_block_size = _aabs
     else:
 
         def grid_generic(META):

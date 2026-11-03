@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+
 QWEN4_VENDOR_QSA_SOURCE = {
     "repository": "https://github.com/flagos-ai/vllm-plugin-FL",
     "base_commit": "fadbba0ea59bbaa46c77b06d465321ab88b44643",
@@ -252,11 +254,30 @@ def _store_qsa_rows_kernel(
     PAGE_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SCALAR_VALID_ROWS: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
-    dims = tl.arange(0, BLOCK_D)
     slot = tl.load(slots_ptr + row)
     valid = (row < num_rows) & (slot >= 0) & (slot < num_blocks * PAGE_SIZE)
+    if SCALAR_VALID_ROWS:
+        # Scalar accesses preserve row padding as well as invalid slots on
+        # Kunlun, where vector tail stores can write past WIDTH.
+        if valid:
+            block = slot // PAGE_SIZE
+            token = slot % PAGE_SIZE
+            for dim in range(WIDTH):
+                value = tl.load(
+                    rows_ptr + row * stride_rows_row + dim * stride_rows_dim
+                )
+                tl.store(
+                    cache_ptr
+                    + block * stride_cache_block
+                    + token * stride_cache_token
+                    + dim * stride_cache_dim,
+                    value,
+                )
+        return
+    dims = tl.arange(0, BLOCK_D)
     block = tl.maximum(slot, 0) // PAGE_SIZE
     token = tl.maximum(slot, 0) % PAGE_SIZE
     values = tl.load(
@@ -301,14 +322,50 @@ def _store_qsa_kv_rows_kernel(
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SCALAR_VALID_ROWS: tl.constexpr = False,
 ) -> None:
     """Store K and V together while preserving arbitrary cache strides."""
 
     row = tl.program_id(0)
     head = tl.program_id(1)
-    dims = tl.arange(0, BLOCK_D)
     slot = tl.load(slots_ptr + row)
     valid = (row < num_rows) & (slot >= 0) & (slot < num_blocks * PAGE_SIZE)
+    if SCALAR_VALID_ROWS:
+        # Avoid vector tail writes into either cache's padding on Kunlun.
+        if valid & (head < NUM_HEADS):
+            block = slot // PAGE_SIZE
+            token = slot % PAGE_SIZE
+            for dim in range(HEAD_DIM):
+                k_value = tl.load(
+                    k_rows_ptr
+                    + row * stride_k_rows_row
+                    + head * stride_k_rows_head
+                    + dim * stride_k_rows_dim
+                )
+                v_value = tl.load(
+                    v_rows_ptr
+                    + row * stride_v_rows_row
+                    + head * stride_v_rows_head
+                    + dim * stride_v_rows_dim
+                )
+                tl.store(
+                    k_cache_ptr
+                    + block * stride_k_cache_block
+                    + token * stride_k_cache_token
+                    + head * stride_k_cache_head
+                    + dim * stride_k_cache_dim,
+                    k_value,
+                )
+                tl.store(
+                    v_cache_ptr
+                    + block * stride_v_cache_block
+                    + token * stride_v_cache_token
+                    + head * stride_v_cache_head
+                    + dim * stride_v_cache_dim,
+                    v_value,
+                )
+        return
+    dims = tl.arange(0, BLOCK_D)
     block = tl.maximum(slot, 0) // PAGE_SIZE
     token = tl.maximum(slot, 0) % PAGE_SIZE
     k_values = tl.load(
@@ -914,6 +971,7 @@ def qwen4_vendor_store_qsa_rows(
         PAGE_SIZE=cache.shape[1],
         WIDTH=cache.shape[3],
         BLOCK_D=triton.next_power_of_2(cache.shape[3]),
+        SCALAR_VALID_ROWS=runtime.device.vendor_name == "kunlunxin",
         num_warps=4,
     )
 
@@ -974,6 +1032,7 @@ def qwen4_store_qsa_kv_rows(
         NUM_HEADS=key.shape[1],
         HEAD_DIM=key.shape[2],
         BLOCK_D=triton.next_power_of_2(key.shape[2]),
+        SCALAR_VALID_ROWS=runtime.device.vendor_name == "kunlunxin",
         num_warps=4,
     )
 
@@ -1389,6 +1448,7 @@ def qsa_store_cache_rows(
         PAGE_SIZE=cache.shape[1],
         WIDTH=cache.shape[3],
         BLOCK_D=triton.next_power_of_2(cache.shape[3]),
+        SCALAR_VALID_ROWS=runtime.device.vendor_name == "kunlunxin",
         num_warps=4,
     )
 
@@ -1447,6 +1507,7 @@ def qsa_store_kv_cache_rows(
         NUM_HEADS=key.shape[1],
         HEAD_DIM=key.shape[2],
         BLOCK_D=triton.next_power_of_2(key.shape[2]),
+        SCALAR_VALID_ROWS=runtime.device.vendor_name == "kunlunxin",
         num_warps=4,
     )
 

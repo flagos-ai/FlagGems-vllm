@@ -23,7 +23,6 @@ from flaggems_vllm.utils import tl_extra_shim
 
 sigmoid = tl.sigmoid
 exp = tl_extra_shim.exp
-pow = tl_extra_shim.pow
 
 logger = logging.getLogger(__name__)
 

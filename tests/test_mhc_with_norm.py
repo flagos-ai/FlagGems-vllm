@@ -141,6 +141,7 @@ def test_mhc_hot_projection_materialization_and_mix_norm_stages(monkeypatch):
     after_post = gems.mhc_post(x, residual, post, comb)
     projections, mix_inputs = [], []
     original_bmm = module.flag_gems.bmm_out
+    original_router = module._general_router_gemm
     original_kernel = module.mhc_pre_fused_kernel_hc_mult_4
 
     def observe_bmm(a, b, out):
@@ -150,6 +151,15 @@ def test_mhc_hot_projection_materialization_and_mix_norm_stages(monkeypatch):
         torch.testing.assert_close(b[0], fn.bfloat16().t(), rtol=0, atol=0)
         result = original_bmm(a, b, out)
         projections.append(out[0].clone())
+        return result
+
+    def observe_router(a, b, out, *shape):
+        assert a.dtype == b.dtype == torch.bfloat16
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(a, after_post.flatten(-2), rtol=0, atol=0)
+        torch.testing.assert_close(b, fn.bfloat16().t(), rtol=0, atol=0)
+        result = original_router(a, b, out, *shape)
+        projections.append(out.clone())
         return result
 
     class ObserveMix:
@@ -163,6 +173,7 @@ def test_mhc_hot_projection_materialization_and_mix_norm_stages(monkeypatch):
             return observe
 
     monkeypatch.setattr(module.flag_gems, "bmm_out", observe_bmm)
+    monkeypatch.setattr(module, "_general_router_gemm", observe_router)
     monkeypatch.setattr(module, "mhc_pre_fused_kernel_hc_mult_4", ObserveMix())
     actual = gems.mhc_fused_post_pre_with_norm(
         x,

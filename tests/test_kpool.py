@@ -795,3 +795,170 @@ def test_seed_all_negative_slots_preserve_padded_tail(pool_size, dtype):
     )
     kpool_seed_tail_cache(tail, key, score, slots, pool_size, HEAD_DIM)
     _assert_storage_exact(backing, expected)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 7, 96])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_hadamard_stage_order_dtype_strides(rows, dtype):
+    torch.manual_seed(73)
+    backing = torch.randn(rows, 256, dtype=dtype, device=device)
+    value = backing[:, ::2]
+    before = backing.clone()
+    matrix = torch.ones(1, 1, dtype=torch.float64, device="cpu")
+    for _ in range(7):
+        matrix = torch.cat(
+            (torch.cat((matrix, matrix), 1), torch.cat((matrix, -matrix), 1)), 0
+        )
+    expected = (value.cpu().double() @ matrix / 128**0.5).to(dtype)
+    actual = kpool_ops.hadamard128(value)
+    assert actual.shape == value.shape and actual.dtype == dtype
+    assert actual.is_contiguous()
+    torch.testing.assert_close(
+        actual.cpu(),
+        expected,
+        rtol=0 if dtype == torch.bfloat16 else 2e-5,
+        atol=0 if dtype == torch.bfloat16 else 2e-5,
+    )
+    torch.testing.assert_close(backing, before, rtol=0, atol=0)
+
+
+def _hadamard128_fp32_stages_cpu(x):
+    """CPU oracle for ascending FP32 butterflies and the final dtype cast."""
+    dtype = x.dtype
+    value = x.to(dtype=torch.float32, device="cpu")
+    for stride in (1, 2, 4, 8, 16, 32, 64):
+        blocks = value.reshape(*value.shape[:-1], -1, 2, stride)
+        left, right = blocks[..., 0, :], blocks[..., 1, :]
+        value = torch.stack((left + right, left - right), dim=-2).reshape(x.shape)
+    return (value * (1 / math.sqrt(128))).to(dtype)
+
+
+@pytest.mark.skipif(
+    kpool_ops.runtime.device.vendor_name != "kunlunxin",
+    reason="requires the real Kunlun FlagGems public dispatch",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("entry", ["public", "wrapper"])
+def test_kunlun_hadamard_real_fp32_contract(dtype, entry):
+    # Check the real provider selection; do not replace flag_gems with a stub.
+    transform = kpool_ops.flag_gems.hadamard_transform
+    assert kpool_ops.flag_gems.vendor_name == "kunlunxin"
+    assert "_kunlunxin" in transform.__module__.split(".")
+
+    generator = torch.Generator(device="cpu").manual_seed(7821)
+    host = torch.randint(-7, 8, (2, 3, 128), generator=generator).to(dtype)
+    host[0, 0].zero_()
+    host[0, 1].zero_()
+    # Reversing FP32 stage order produces a nonzero first output on row 0.
+    host[0, 0, :4] = torch.tensor([32768, 2**-11, -32768, 2**-11], dtype=dtype)
+    # Rounding intermediate stages to FP16/BF16 changes row 1's first output.
+    host[0, 1, :4] = torch.tensor([2048, 1, -2048, 1], dtype=dtype)
+    expected = _hadamard128_fp32_stages_cpu(host)
+    assert expected[0, 0, 0] == 0
+    assert expected[0, 1, 0] == torch.tensor(2 / math.sqrt(128), dtype=dtype)
+
+    backing = torch.zeros((2, 3, 256), dtype=dtype, device=device)
+    value = backing[..., ::2]
+    value.copy_(host.to(device))
+    before = backing.clone()
+    if entry == "public":
+        # The public function accepts a contiguous input. The wrapper is tested
+        # separately with a strided input and must make its own contiguous copy.
+        value = value.contiguous()
+        before_value = value.clone()
+        actual = transform(value, scale=1 / math.sqrt(128))
+        torch.testing.assert_close(value, before_value, rtol=0, atol=0)
+    else:
+        actual = kpool_ops.hadamard128(value)
+
+    assert actual.shape == host.shape and actual.dtype == dtype
+    assert actual.device == value.device and actual.is_contiguous()
+    assert actual.data_ptr() != value.data_ptr()
+    torch.testing.assert_close(backing, before, rtol=0, atol=0)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-6, atol=0)
+
+    # The non-adversarial rows also use an independent FP64 Hadamard matrix,
+    # so a shared error in both butterfly implementations cannot pass alone.
+    matrix = torch.ones(1, 1, dtype=torch.float64)
+    for _ in range(7):
+        matrix = torch.cat(
+            (torch.cat((matrix, matrix), 1), torch.cat((matrix, -matrix), 1)), 0
+        )
+    matrix_ref = (host.reshape(-1, 128)[2:].double() @ matrix / 128**0.5).to(dtype)
+    torch.testing.assert_close(
+        actual.cpu().reshape(-1, 128)[2:],
+        matrix_ref,
+        rtol=2e-6 if dtype == torch.float32 else 0,
+        atol=1e-6 if dtype == torch.float32 else 0,
+    )
+
+
+@pytest.mark.parametrize("rows", [0, 3])
+def test_kunlun_hadamard_public_host_empty_and_strides(monkeypatch, rows):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        kpool_ops.runtime, "device", SimpleNamespace(vendor_name="kunlunxin")
+    )
+    value = torch.randn(rows, 256, dtype=torch.bfloat16, device=device)[:, ::2]
+    before = value.clone()
+    result = torch.empty(rows, 128, dtype=value.dtype, device=device)
+    calls = []
+
+    def public(x, scale):
+        assert x.is_contiguous()
+        torch.testing.assert_close(x, value, rtol=0, atol=0)
+        calls.append(scale)
+        return result
+
+    monkeypatch.setattr(
+        kpool_ops.flag_gems, "hadamard_transform", public, raising=False
+    )
+    actual = kpool_ops.hadamard128(value)
+    assert actual.shape == value.shape and actual.dtype == value.dtype
+    if rows:
+        assert actual is result
+        assert calls == [0.08838834764831845]
+    else:
+        assert not calls
+    torch.testing.assert_close(value, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("launch failure"), ZeroDivisionError("host failure")]
+)
+def test_kunlun_hadamard_execution_error_propagates_once(monkeypatch, error):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        kpool_ops.runtime, "device", SimpleNamespace(vendor_name="kunlunxin")
+    )
+    calls = []
+
+    def public(*args, **kwargs):
+        calls.append(True)
+        raise error
+
+    monkeypatch.setattr(
+        kpool_ops.flag_gems, "hadamard_transform", public, raising=False
+    )
+    with pytest.raises(type(error)) as caught:
+        kpool_ops.hadamard128(torch.empty(1, 128, device=device))
+    assert caught.value is error
+    assert calls == [True]
+
+
+def test_kunlun_hadamard_missing_public_capability_precedes_copy(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        kpool_ops.runtime, "device", SimpleNamespace(vendor_name="kunlunxin")
+    )
+    monkeypatch.setattr(kpool_ops.flag_gems, "hadamard_transform", None, raising=False)
+    monkeypatch.setattr(
+        kpool_ops,
+        "contiguous_copy",
+        lambda *args: pytest.fail("copied before capability check"),
+    )
+    with pytest.raises(NotImplementedError, match="public FlagGems hadamard_transform"):
+        kpool_ops.hadamard128(torch.empty(1, 128, device=device))

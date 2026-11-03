@@ -29,6 +29,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.tle_capabilities import supports_topk_tle
+from flaggems_vllm.utils.triton_lang_helper import assume
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 _LAUNCH_GEOMETRY = None
@@ -1051,12 +1052,12 @@ def _top_k_per_row_job(
         & ((vocab_size % BLOCK_SIZE) == 0)
     )
     if assume_aligned:
-        tl.assume(row_start == 0)
-        tl.assume(row_end == vocab_size)
-        tl.assume(stride1 == 1)
+        assume(row_start == 0)
+        assume(row_end == vocab_size)
+        assume(stride1 == 1)
         vocab_size = tl.multiple_of(vocab_size, BLOCK_SIZE)
     elif stride1 == 1:
-        tl.assume(stride1 == 1)
+        assume(stride1 == 1)
 
     lane = tl.arange(0, BLOCK_SIZE)
     row_len = row_end - row_start

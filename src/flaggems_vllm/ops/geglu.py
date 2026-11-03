@@ -21,9 +21,9 @@ import triton.language as tl
 
 from flaggems_vllm.utils import tl_extra_shim
 
+pow = tl_extra_shim.pow
 erf = tl_extra_shim.erf
 exp = tl_extra_shim.exp
-pow = tl_extra_shim.pow
 tanh = tl_extra_shim.tanh
 
 logger = logging.getLogger(__name__)

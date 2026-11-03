@@ -476,6 +476,39 @@ class CiPinsTest(unittest.TestCase):
         self.assertEqual(len(pins), 3)
         self.assertEqual(len(set(pins)), 1)
 
+    def _run_pin_check(self, *, drift=False):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            checkout = Path(temp)
+            pin = check_ci_pins.extract_pins(source)[0]
+            for relative in (
+                ".github/workflows/basic-ci.yml",
+                ".github/actions/setup-flaggems/action.yml",
+            ):
+                path = checkout / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = (source / relative).read_text(encoding="utf-8")
+                if drift and relative.endswith("action.yml"):
+                    content = content.replace(pin, "0" * 40, 1)
+                path.write_text(content, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(source / "tools/check_ci_pins.py")],
+                cwd=checkout,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_pin_check_only_needs_ci_inputs(self):
+        result = self._run_pin_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FlagGems CI pin:", result.stdout)
+
+    def test_ci_pin_mismatch_fails_pin_check(self):
+        result = self._run_pin_check(drift=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FlagGems CI pins are inconsistent", result.stderr)
+
 
 class BackendTuneConfigTest(unittest.TestCase):
     @classmethod

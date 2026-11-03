@@ -9,6 +9,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.triton_lang_helper import constexpr_tuple_getitem
 
 
 @libentry()
@@ -26,8 +27,10 @@ def _copy_kernel(
     offset = tl.full((BLOCK,), 0, tl.int64)
     remaining = i
     for d in tl.static_range(len(SHAPE) - 1, -1, -1):
-        offset += (remaining % SHAPE[d]) * STRIDES[d]
-        remaining //= SHAPE[d]
+        offset += (
+            remaining % constexpr_tuple_getitem(SHAPE, d)
+        ) * constexpr_tuple_getitem(STRIDES, d)
+        remaining //= constexpr_tuple_getitem(SHAPE, d)
     value = tl.load(X + offset, i < N, other=0)
     tl.store(Y + i, value, i < N)
 

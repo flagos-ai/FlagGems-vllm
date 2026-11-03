@@ -82,6 +82,151 @@ if major_version == 2:
 FLAGGEMS_DB_URL = os.getenv("FLAGGEMS_DB_URL", None)
 
 
+def _summarize_benchmark(samples, quantiles):
+    samples.sort()
+    if quantiles is None:
+        return sum(samples) / len(samples)
+
+    def percentile(q):
+        if not 0 <= q <= 1:
+            raise ValueError("Quantiles must be in the range [0, 1]")
+        position = q * (len(samples) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(samples) - 1)
+        return samples[lower] + (samples[upper] - samples[lower]) * (position - lower)
+
+    result = [percentile(q) for q in quantiles]
+    return result[0] if len(result) == 1 else result
+
+
+def _wall_clock_bench(kernel_call, *, warmup, rep, quantiles):
+    # Synchronize each sample so it measures completed work. This includes
+    # launch/synchronization overhead and does not flush L2 between samples.
+    torch_device_fn.synchronize()
+    deadline = time.perf_counter() + warmup / 1000
+    while time.perf_counter() < deadline:
+        kernel_call()
+        torch_device_fn.synchronize()
+    samples = []
+    deadline = time.perf_counter() + rep / 1000
+    while not samples or time.perf_counter() < deadline:
+        start = time.perf_counter()
+        kernel_call()
+        torch_device_fn.synchronize()
+        elapsed = (time.perf_counter() - start) * 1000
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise RuntimeError(
+                "XPU wall-clock timer returned an unusable sample; " "benchmark failed"
+            )
+        samples.append(elapsed)
+    return _summarize_benchmark(samples, quantiles)
+
+
+def _clear_benchmark_cache(driver, cache):
+    # Triton 3.2 exposes the cache tensor; newer releases expose clear_cache.
+    clear_cache = getattr(driver, "clear_cache", None)
+    if clear_cache is None:
+        cache.zero_()
+    else:
+        clear_cache(cache)
+
+
+def _event_timer_estimate(kernel_call):
+    # Mirror do_bench's initial call and five-call estimate using the actual
+    # callback, including its existing pre/post hooks and cache flushes. The
+    # measured estimate is also used below; do_bench is not called again.
+    driver = triton.runtime.driver.active
+    device_interface = driver.get_device_interface()
+    kernel_call()
+    device_interface.synchronize()
+    cache = driver.get_empty_cache_for_benchmark()
+    start = device_interface.Event(enable_timing=True)
+    end = device_interface.Event(enable_timing=True)
+    calls = [
+        (
+            device_interface.Event(enable_timing=True),
+            device_interface.Event(enable_timing=True),
+        )
+        for _ in range(5)
+    ]
+    start.record()
+    for call_start, call_end in calls:
+        _clear_benchmark_cache(driver, cache)
+        call_start.record()
+        kernel_call()
+        call_end.record()
+    end.record()
+    device_interface.synchronize()
+    elapsed = start.elapsed_time(end)
+    call_times = [call_start.elapsed_time(call_end) for call_start, call_end in calls]
+    return driver, device_interface, cache, elapsed / 5, call_times
+
+
+def _event_bench(
+    kernel_call, *, driver, device_interface, cache, estimate, warmup, rep, quantiles
+):
+    # Match Triton's event benchmark after the estimate: warm up, flush cache
+    # before each timed call, then synchronize and summarize individual events.
+    n_warmup = max(1, int(warmup / estimate))
+    n_repeat = max(1, int(rep / estimate))
+    for _ in range(n_warmup):
+        kernel_call()
+    events = [
+        (
+            device_interface.Event(enable_timing=True),
+            device_interface.Event(enable_timing=True),
+        )
+        for _ in range(n_repeat)
+    ]
+    for start, end in events:
+        _clear_benchmark_cache(driver, cache)
+        start.record()
+        kernel_call()
+        end.record()
+    device_interface.synchronize()
+    samples = [start.elapsed_time(end) for start, end in events]
+    if any(not math.isfinite(sample) or sample <= 0 for sample in samples):
+        raise RuntimeError(
+            "XPU event timer returned an unusable sample; " "benchmark failed"
+        )
+    return _summarize_benchmark(samples, quantiles)
+
+
+def _do_bench_with_timer_fallback(kernel_call, *, warmup, rep, quantiles):
+    if runtime.device.vendor_name != "kunlunxin":
+        return triton.testing.do_bench(
+            kernel_call, warmup=warmup, rep=rep, quantiles=quantiles
+        )
+    # Probe this callback's actual work. Reuse the estimate instead of asking
+    # Triton's benchmark to estimate it again from a potentially zero event.
+    driver, device_interface, cache, estimate, call_times = _event_timer_estimate(
+        kernel_call
+    )
+    usable = (
+        math.isfinite(estimate)
+        and estimate > 0
+        and all(math.isfinite(value) and value > 0 for value in call_times)
+    )
+    if not usable:
+        logger.warning(
+            "XPU event timer cannot resolve the workload; "
+            "using synchronized wall-clock tuning"
+        )
+        return _wall_clock_bench(
+            kernel_call, warmup=warmup, rep=rep, quantiles=quantiles
+        )
+    return _event_bench(
+        kernel_call,
+        driver=driver,
+        device_interface=device_interface,
+        cache=cache,
+        estimate=estimate,
+        warmup=warmup,
+        rep=rep,
+        quantiles=quantiles,
+    )
+
+
 class Cache(object):
     def __init__(
         self, table_name: str, model: PersistantModel, *args, **kwargs
@@ -308,7 +453,7 @@ class LibTuner(triton.runtime.Autotuner):
                 elif warmup is not None or rep is not None:
 
                     def do_bench(kernel_call, quantiles):
-                        return triton.testing.do_bench(
+                        return _do_bench_with_timer_fallback(
                             kernel_call,
                             warmup=warmup if warmup is not None else 25,
                             rep=rep if rep is not None else 100,

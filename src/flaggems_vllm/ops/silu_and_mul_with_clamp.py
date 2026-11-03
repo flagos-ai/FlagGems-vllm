@@ -25,6 +25,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.triton_lang_helper import constexpr_tuple_getitem
 from flaggems_vllm.utils.type_utils import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
     type_promotion,
@@ -78,11 +79,11 @@ def silu_clamp_full_early_prune(configs, named_args, **kwargs):
 def _strided_offset(linear, SHAPE: tl.constexpr, STRIDES: tl.constexpr):
     offset = tl.full(linear.shape, 0, tl.int64)
     for dim in tl.static_range(len(SHAPE) - 1, 0, -1):
-        index = linear % SHAPE[dim]
-        linear = linear // SHAPE[dim]
-        offset += index.to(tl.int64) * STRIDES[dim]
+        index = linear % constexpr_tuple_getitem(SHAPE, dim)
+        linear = linear // constexpr_tuple_getitem(SHAPE, dim)
+        offset += index.to(tl.int64) * constexpr_tuple_getitem(STRIDES, dim)
     if len(SHAPE) > 0:
-        offset += linear.to(tl.int64) * STRIDES[0]
+        offset += linear.to(tl.int64) * constexpr_tuple_getitem(STRIDES, 0)
     return offset
 
 
@@ -227,9 +228,15 @@ def silu_and_mul_with_clamp_2d_kernel(
     mask = offsets < n_elements
     row = (offsets // n_cols).to(tl.int64)
     col = offsets % n_cols
-    xo = row * X_STRIDES[0] + col * X_STRIDES[1]
-    yo = row * Y_STRIDES[0] + col * Y_STRIDES[1]
-    oo = row * OUT_STRIDES[0] + col * OUT_STRIDES[1]
+    xo = row * constexpr_tuple_getitem(X_STRIDES, 0) + col * constexpr_tuple_getitem(
+        X_STRIDES, 1
+    )
+    yo = row * constexpr_tuple_getitem(Y_STRIDES, 0) + col * constexpr_tuple_getitem(
+        Y_STRIDES, 1
+    )
+    oo = row * constexpr_tuple_getitem(OUT_STRIDES, 0) + col * constexpr_tuple_getitem(
+        OUT_STRIDES, 1
+    )
     x = tl.load(x_ptr + xo, mask=mask, other=0).to(tl.float32)
     y = tl.load(y_ptr + yo, mask=mask, other=0).to(tl.float32)
     result = _silu_clamp_value(x, y, limit)
@@ -355,9 +362,15 @@ def silu_and_mul_with_clamp_backward_2d_kernel(
     mask = offsets < n_elements
     row = (offsets // n_cols).to(tl.int64)
     col = offsets % n_cols
-    xo = row * X_STRIDES[0] + col * X_STRIDES[1]
-    yo = row * Y_STRIDES[0] + col * Y_STRIDES[1]
-    go = row * G_STRIDES[0] + col * G_STRIDES[1]
+    xo = row * constexpr_tuple_getitem(X_STRIDES, 0) + col * constexpr_tuple_getitem(
+        X_STRIDES, 1
+    )
+    yo = row * constexpr_tuple_getitem(Y_STRIDES, 0) + col * constexpr_tuple_getitem(
+        Y_STRIDES, 1
+    )
+    go = row * constexpr_tuple_getitem(G_STRIDES, 0) + col * constexpr_tuple_getitem(
+        G_STRIDES, 1
+    )
     x = tl.load(x_ptr + xo, mask=mask, other=0).to(tl.float32)
     y = tl.load(y_ptr + yo, mask=mask, other=0).to(tl.float32)
     grad = tl.load(grad_ptr + go, mask=mask, other=0).to(tl.float32)

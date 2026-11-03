@@ -249,6 +249,9 @@ MHC_PRE_CONFIGS = list(
     )
 )
 
+# Keep the shared model-size matrix unchanged for the standalone NPU tests.
+_MHC_PRE_SMALL_CONFIGS = [(1, 128, 4), (3, 127, 4), (3, 128, 4), (3, 129, 4)]
+
 
 def generate_mhc_pre_data(
     n: int,
@@ -293,8 +296,11 @@ def generate_mhc_pre_data(
 @pytest.mark.mhc_pre
 @pytest.mark.parametrize(
     "n, hidden_size, hc_mult",
-    MHC_PRE_CONFIGS,
-    ids=[f"n{n}_h{h}_hc_mult{hc_mult}" for n, h, hc_mult in MHC_PRE_CONFIGS],
+    MHC_PRE_CONFIGS + _MHC_PRE_SMALL_CONFIGS,
+    ids=[
+        f"n{n}_h{h}_hc_mult{hc_mult}"
+        for n, h, hc_mult in MHC_PRE_CONFIGS + _MHC_PRE_SMALL_CONFIGS
+    ],
 )
 def test_mhc_pre_vs_ref(n, hidden_size, hc_mult):
     """Test Triton mhc_pre against PyTorch CPU reference."""

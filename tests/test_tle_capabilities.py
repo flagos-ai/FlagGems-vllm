@@ -3,7 +3,7 @@
 
 import sys
 from importlib import import_module, util
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
@@ -18,13 +18,16 @@ def _language():
     def api(*args, **kwargs):
         raise AssertionError("capability check executed an optional API")
 
-    return SimpleNamespace(
-        cumsum=api,
-        pipe=api,
-        gpu=SimpleNamespace(
-            alloc=api, local_ptr=api, copy=api, warp_specialize=api, smem=object()
-        ),
-    )
+    # libtuner now hashes dependencies during import. Model the same marker as
+    # the real TLE builtins without executing or compiling the fake API.
+    api.__triton_builtin__ = True
+    language = ModuleType("triton.experimental.tle.language")
+    language.cumsum = language.pipe = api
+    language.gpu = ModuleType("triton.experimental.tle.language.gpu")
+    for attr in ("alloc", "local_ptr", "copy", "warp_specialize"):
+        setattr(language.gpu, attr, api)
+    language.gpu.smem = object()
+    return language
 
 
 @pytest.mark.parametrize(
@@ -58,6 +61,28 @@ def test_missing_used_api_rejects_tle_without_mutation(predicate, missing):
 @pytest.mark.parametrize("predicate", [supports_topk_tle, supports_sparse_mla_tle])
 def test_optional_language_absence(predicate):
     assert not predicate(None)
+
+
+def test_attn_res_import_with_tle_without_load(monkeypatch):
+    original = import_module("flaggems_vllm.ops.attn_res")
+    experimental = import_module("triton.experimental")
+    version_utils = import_module("flaggems_vllm.utils.triton_version_utils")
+    monkeypatch.setattr(version_utils, "_triton_version_at_least", lambda *a: True)
+    package = ModuleType("triton.experimental.tle")
+    language = ModuleType("triton.experimental.tle.language")
+    package.language = language
+    monkeypatch.setattr(experimental, "tle", package, raising=False)
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setitem(sys.modules, language.__name__, language)
+    spec = util.spec_from_file_location(f"{original.__name__}_test", original.__file__)
+    module = util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    # Import includes libtuner's real dependency hashing, which previously
+    # dereferenced the missing tle.load before any operator was called.
+    spec.loader.exec_module(module)
+    assert not module._HAS_TLE_LOAD
+    assert module._load_source_vectors.cache_key
+    assert not hasattr(language, "load")
 
 
 @pytest.mark.parametrize("attr", ["cumsum", "pipe"])
@@ -120,7 +145,10 @@ def test_incomplete_tle_does_not_break_non_tle_cache_key(
     module = load(language)
     assert module.HAS_TLE is False
     # Exercise Triton's real dependency walk, including disabled constexpr branches.
-    assert getattr(module, f"non_tle_top_k_per_row_{phase}").cache_key
+    kernel = getattr(module, f"non_tle_top_k_per_row_{phase}")
+    while not hasattr(kernel, "cache_key"):
+        kernel = kernel.fn
+    assert kernel.cache_key
     assert module.tle is None
     assert vars(target) == before
 
