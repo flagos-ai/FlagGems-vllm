@@ -446,6 +446,19 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: flash_mla_with_kvcache_fwd
+    description: |
+      Dense W8A8 INT8 MLA decode with per-token-scaled KVCache on Hygon.
+    for:
+      - flash_mla_with_kvcache_fwd_w8a8_int8
+    labels:
+      - fused
+      - Attention
+      - Hygon
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fp8_einsum
     description: |
       Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
