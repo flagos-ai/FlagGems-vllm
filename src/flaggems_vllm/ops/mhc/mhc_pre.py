@@ -309,7 +309,7 @@ def _mhc_pre_fused_kernel_hc_mult_4_impl(
     cm_23 *= inv_cs3
     cm_33 *= inv_cs3
 
-    for _ in tl.static_range(sinkhorn_repeat - 1):
+    for _ in range(sinkhorn_repeat - 1):
         rs0 = cm_00 + cm_01 + cm_02 + cm_03
         rs1 = cm_10 + cm_11 + cm_12 + cm_13
         rs2 = cm_20 + cm_21 + cm_22 + cm_23

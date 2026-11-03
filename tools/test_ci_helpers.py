@@ -476,6 +476,32 @@ class CiPinsTest(unittest.TestCase):
         self.assertEqual(len(pins), 3)
         self.assertEqual(len(set(pins)), 1)
 
+    def test_kunlun_requirement_drift_fails_pin_check(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            checkout = Path(temp)
+            for relative in (
+                ".github/workflows/basic-ci.yml",
+                ".github/actions/setup-flaggems/action.yml",
+            ):
+                path = checkout / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text((source / relative).read_text(encoding="utf-8"))
+            (checkout / "requirements-kunlunxin.txt").write_text(
+                "flag-gems @ git+https://github.com/flagos-ai/FlagGems.git@"
+                + "0" * 40
+                + "\n"
+            )
+            result = subprocess.run(
+                [sys.executable, str(source / "tools/check_ci_pins.py")],
+                cwd=checkout,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Kunlun FlagGems pin differs from CI", result.stderr)
+
 
 class BackendTuneConfigTest(unittest.TestCase):
     @classmethod

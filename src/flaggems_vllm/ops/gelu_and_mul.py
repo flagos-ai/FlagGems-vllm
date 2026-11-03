@@ -19,9 +19,8 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils import pointwise_dynamic, tl_extra_shim
-from flaggems_vllm.utils.triton_lang_helper import pow_square
 
-pow = getattr(tl_extra_shim, "pow", pow_square)
+pow = tl_extra_shim.pow
 erf = tl_extra_shim.erf
 tanh = tl_extra_shim.tanh
 logger = logging.getLogger(__name__)

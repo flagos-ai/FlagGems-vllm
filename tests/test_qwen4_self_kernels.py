@@ -7,6 +7,7 @@ required to fail closed instead of dispatching a Torch compute fallback.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,7 @@ from flaggems_vllm.ops.qwen4.ple_state import (  # noqa: E402
 from flaggems_vllm.ops.qwen4.qsa import (  # noqa: E402
     QWEN4_VENDOR_QSA_SOURCE,
     qsa_store_cache_rows,
+    qsa_store_kv_cache_rows,
     qwen4_compress_norm_mrope_store_groups,
     qwen4_qsa_mqa_paged_dot,
     qwen4_store_qsa_kv_rows,
@@ -306,6 +308,82 @@ def test_qsa_cache_store_preserves_invalid_rows_strides_and_padding(
     # it. The full storage comparison also checks positive invalid slots,
     # cache-row padding, the trailing guard page and every unwritten row.
     torch.testing.assert_close(storage, expected, atol=0, rtol=0)
+
+
+@pytest.mark.qwen4_qsa
+@pytest.mark.parametrize(
+    "store",
+    [qsa_store_kv_cache_rows, qwen4_store_qsa_kv_rows],
+    ids=["public", "qwen4"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dim", [17, 128])
+def test_qsa_kv_store_preserves_invalid_rows_strides_and_padding(
+    store, dtype, slot_dtype, dim
+):
+    _require_cuda()
+    blocks, page_size, heads = 3, 4, 2
+    k_storage = torch.full(
+        (blocks + 1, page_size, heads, dim + 9), -13, dtype=dtype, device=DEVICE
+    )
+    v_storage = torch.full(
+        (blocks + 1, page_size, heads, dim + 5), -17, dtype=dtype, device=DEVICE
+    )
+    k_cache = k_storage[:blocks, :, :, :dim]
+    v_cache = v_storage[:blocks, :, :, :dim]
+    slot_values = (3, 4, 11, -1, -7, 12, 15)
+    slots = torch.tensor(slot_values, dtype=slot_dtype, device=DEVICE)
+    rows = len(slot_values)
+    key = (
+        torch.arange(rows * heads * (dim * 2), dtype=torch.float32, device=DEVICE)
+        .reshape(rows, heads, dim * 2)
+        .to(dtype)[:, :, ::2]
+    )
+    value = (key * -2).contiguous()
+    assert key.stride(-1) == 2
+
+    expected_k, expected_v = k_storage.clone(), v_storage.clone()
+    for row, slot in enumerate(slot_values):
+        if 0 <= slot < blocks * page_size:
+            block, token = divmod(slot, page_size)
+            expected_k[block, token, :, :dim] = key[row]
+            expected_v[block, token, :, :dim] = value[row]
+
+    store(k_cache, v_cache, slots, key, value)
+    # Compare both complete storages, including slot zero, row padding and
+    # the extra guard page behind the logical cache.
+    torch.testing.assert_close(k_storage, expected_k, atol=0, rtol=0)
+    torch.testing.assert_close(v_storage, expected_v, atol=0, rtol=0)
+
+
+@pytest.mark.qwen4_qsa
+@pytest.mark.parametrize(
+    "store_name", ["qsa_store_kv_cache_rows", "qwen4_store_qsa_kv_rows"]
+)
+@pytest.mark.parametrize("vendor", ["kunlunxin", "nvidia", "metax"])
+def test_qsa_kv_store_selects_scalar_guard_only_on_kunlun(
+    monkeypatch, store_name, vendor
+):
+    from flaggems_vllm.ops.qwen4 import qsa as module
+
+    monkeypatch.setattr(module.runtime, "device", SimpleNamespace(vendor_name=vendor))
+    monkeypatch.setattr(module, "_is_triton_device", lambda *tensors: True)
+    calls = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((grid, kwargs["SCALAR_VALID_ROWS"]))
+
+            return launch
+
+    monkeypatch.setattr(module, "_store_qsa_kv_rows_kernel", CaptureLaunch())
+    cache = torch.empty((3, 4, 2, 17))
+    slots = torch.tensor([0, -1])
+    rows = torch.empty((2, 2, 17))
+    getattr(module, store_name)(cache, cache.clone(), slots, rows, rows.clone())
+    assert calls == [((2, 2), vendor == "kunlunxin")]
 
 
 def _compress_reference(

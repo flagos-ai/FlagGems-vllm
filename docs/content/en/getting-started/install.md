@@ -23,6 +23,22 @@ pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 ```
 
+For Kunlunxin, after cloning this repository, install the pinned FlagGems
+revision in your isolated vendor environment instead of the release package:
+
+```bash
+pip install --no-deps --force-reinstall -r requirements-kunlunxin.txt
+```
+
+This pin matches the FlagGems CI checkout and supplies the Hadamard transform
+used by the Kunlunxin `hadamard128` path. FlagGems-vllm does not install
+FlagGems automatically. An existing `PYTHONPATH` pointing to another checkout
+can override the installation; verify that
+`python -c "import importlib.util; print(importlib.util.find_spec('flag_gems').origin)"`
+resolves inside your intended environment. Run
+`pytest -q tests/test_kpool.py::test_kunlun_hadamard_real_fp32_contract` on the
+target device to verify the public provider and its numeric contract.
+
 ### PyTorch
 
 Install a PyTorch build compatible with your target accelerator **before** installing FlagGems-vllm. FlagGems-vllm does not reinstall PyTorch automatically.
@@ -96,6 +112,8 @@ DNN_VENDOR=amd source tools/setup.sh
 ## Install with FlagGems and vllm-plugin-fl
 
 For the full FlagOS vLLM plugin stack, install in this order:
+On Kunlunxin, replace the FlagGems release installation in step 1 with the
+pinned installation described above after cloning FlagGems-vllm.
 
 ```bash
 # 1. Install FlagGems (general operator backend, version 5.4.0)

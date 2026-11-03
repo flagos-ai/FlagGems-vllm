@@ -12,15 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+from types import ModuleType
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
 import flaggems_vllm
-from flaggems_vllm.utils.triton_lang_helper import _fallback_pow, _fallback_tanh
+from flaggems_vllm.utils.triton_lang_helper import (
+    _complete_math_shim,
+    _fallback_pow,
+    _fallback_tanh,
+    tl_extra_shim,
+)
 
 from . import accuracy_utils as utils
+
+
+@pytest.mark.parametrize("has_native_pow", [True, False])
+def test_pow_shim_completes_missing_function_without_mutating_vendor(has_native_pow):
+    vendor = ModuleType("vendor_math")
+    native_pow = object()
+    vendor.tanh = object()
+    if has_native_pow:
+        vendor.pow = native_pow
+
+    shim = _complete_math_shim(vendor)
+    assert shim.pow is (native_pow if has_native_pow else _fallback_pow)
+    assert shim.tanh is vendor.tanh
+    assert hasattr(vendor, "pow") is has_native_pow
+    assert (shim is vendor) is has_native_pow
+
+
+@pytest.mark.parametrize("name", ["geglu", "gelu_and_mul"])
+def test_activation_pow_uses_completed_shim(name):
+    module = importlib.import_module(f"flaggems_vllm.ops.{name}")
+    assert module.pow is tl_extra_shim.pow
 
 
 @triton.jit

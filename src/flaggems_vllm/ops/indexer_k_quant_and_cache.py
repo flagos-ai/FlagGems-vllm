@@ -19,8 +19,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.fp8_storage import encode_e4m3fn
-from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
+from flaggems_vllm.runtime import torch_device_fn
 
 
 def _get_fp8_dtype() -> torch.dtype:
@@ -136,7 +137,9 @@ def indexer_k_quant_and_cache(
     kv_cache_flat = kv_cache.view(num_blocks, -1)
     fp8_dtype = _get_fp8_dtype()
     software_e4m3fn = (
-        fp8_dtype == torch.float8_e4m3fn and not kernel_supports_fp8_e4m3()
+        fp8_dtype == torch.float8_e4m3fn
+        and runtime.device.vendor_name == "nvidia"
+        and torch_device_fn.get_device_capability(k.device) == (8, 0)
     )
     # An untyped byte view keeps unsupported FP8 types out of the SM80 IR.
     storage_dtype = torch.uint8 if software_e4m3fn else fp8_dtype

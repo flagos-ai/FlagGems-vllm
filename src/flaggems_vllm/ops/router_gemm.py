@@ -142,9 +142,9 @@ def _general_router_gemm(x, weight_t, out, M, N, K):
         N,
         K,
     )
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-    )
+    # The launch tiles below are fixed. A concrete grid also keeps XPU JIT
+    # compilation options stable across repeated host calls.
+    grid = (triton.cdiv(M, 64) * triton.cdiv(N, 64),)
     with torch_device_fn.device(x.device):
         _router_gemm_kernel[grid](
             x,

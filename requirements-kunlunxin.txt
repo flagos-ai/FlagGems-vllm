@@ -1,0 +1,2 @@
+# Keep this source revision aligned with the FlagGems CI setup.
+flag-gems @ git+https://github.com/flagos-ai/FlagGems.git@42d396ff8270f7b051f478217929f75484e53ef4

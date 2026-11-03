@@ -113,10 +113,3 @@ def constexpr_tuple_getitem(values: tl.constexpr, index: tl.constexpr):
         return values[index]
     else:
         return values.value[index.value]
-
-
-@triton.jit
-def pow_square(value, exponent: tl.constexpr):
-    """Square fallback for math shims without pow; no general power emulation."""
-    tl.static_assert(exponent == 2)
-    return value * value

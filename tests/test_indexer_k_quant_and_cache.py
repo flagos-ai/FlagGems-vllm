@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -278,16 +279,78 @@ def test_indexer_k_quant_and_cache_matches_reference(
 
 
 @pytest.mark.indexer_k_quant_and_cache
+@pytest.mark.parametrize(
+    "vendor,capability,fp8_dtype,expected_software",
+    [
+        ("nvidia", (8, 0), torch.float8_e4m3fn, True),
+        ("nvidia", (8, 6), torch.float8_e4m3fn, False),
+        ("nvidia", (9, 0), torch.float8_e4m3fn, False),
+        ("metax", (8, 0), torch.float8_e4m3fn, False),
+        ("kunlunxin", (8, 0), torch.float8_e4m3fn, False),
+    ]
+    + (
+        [
+            ("nvidia", (8, 0), torch.float8_e4m3fnuz, False),
+            ("amd", (8, 0), torch.float8_e4m3fnuz, False),
+        ]
+        if hasattr(torch, "float8_e4m3fnuz")
+        else []
+    ),
+)
+def test_software_fp8_dispatch_is_limited_to_sm80(
+    monkeypatch, vendor, capability, fp8_dtype, expected_software
+):
+    module = importlib.import_module("flaggems_vllm.ops.indexer_k_quant_and_cache")
+    monkeypatch.setattr(module.runtime, "device", SimpleNamespace(vendor_name=vendor))
+    capability_devices = []
+
+    def get_capability(device):
+        capability_devices.append(device)
+        return capability
+
+    monkeypatch.setattr(
+        module, "torch_device_fn", SimpleNamespace(get_device_capability=get_capability)
+    )
+    monkeypatch.setattr(module, "_get_fp8_dtype", lambda: fp8_dtype)
+    calls = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((grid, args[1].dtype, kwargs["SOFTWARE_E4M3FN"]))
+
+            return launch
+
+    monkeypatch.setattr(module, "_indexer_k_quant_and_cache_kernel", CaptureLaunch())
+    keys = torch.empty((2, 128), dtype=torch.bfloat16)
+    cache = torch.empty((2, 4, 132), dtype=torch.uint8)
+    slots = torch.tensor([0, 1])
+    module.indexer_k_quant_and_cache(keys, cache, slots, 128, "float32")
+
+    expected_dtype = torch.uint8 if expected_software else fp8_dtype
+    assert calls == [((2, 1), expected_dtype, expected_software)]
+    if vendor == "nvidia" and fp8_dtype == torch.float8_e4m3fn:
+        assert capability_devices == [keys.device]
+    else:
+        assert not capability_devices
+
+
+@pytest.mark.indexer_k_quant_and_cache
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA-compatible graph API required"
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA graph API required",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale_fmt", ["ue8m0", "float32"])
 @pytest.mark.parametrize("head_dim", [128, 512])
 def test_software_fp8_cache_graph_matches_cpu(monkeypatch, dtype, scale_fmt, head_dim):
     module = importlib.import_module("flaggems_vllm.ops.indexer_k_quant_and_cache")
-    monkeypatch.setattr(module, "kernel_supports_fp8_e4m3", lambda: False)
-    # Exercise this wire format even on backends whose default is FNUZ.
+    # Exercise the SM80 dispatch on a newer NVIDIA device as well.
+    monkeypatch.setattr(
+        module,
+        "torch_device_fn",
+        SimpleNamespace(get_device_capability=lambda device: (8, 0)),
+    )
     monkeypatch.setattr(module, "_get_fp8_dtype", lambda: torch.float8_e4m3fn)
     # Exact cache-byte comparison includes untouched storage and negative slots.
     torch.manual_seed(29)
