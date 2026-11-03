@@ -55,7 +55,7 @@ vendor/Iluvatar
 vendor/Kunlunxin
 vendor/MetaX
 vendor/MooreThreads
-vendor/SpaceMit
+vendor/SpacemiT
 vendor/Sunrise
 vendor/THead
 vendor/TsingMicro
@@ -89,8 +89,8 @@ first hardware validation; a failure must be fixed or the candidate removed,
 not hidden by widening or bypassing the policy.
 
 The generic preflight is not a substitute for a vendor health query. In
-particular, the current SpaceMit descriptor exposes a CPU-compatible device
-name. Enflame, SpaceMit, and Sunrise should gain dedicated `gpu_check` scripts
+particular, the current SpacemiT descriptor exposes a CPU-compatible device
+name. Enflame, SpacemiT, and Sunrise should gain dedicated `gpu_check` scripts
 in FlagGems before their hardware availability is considered fully verified.
 
 ## Reuse contract
@@ -266,7 +266,7 @@ FlagGems-vllm checkout
   -> allowlisted FlagGems-vllm operator tests
 ```
 
-Enflame, SpaceMit, and Sunrise currently have no dedicated `gpu_check` entry.
+Enflame, SpacemiT, and Sunrise currently have no dedicated `gpu_check` entry.
 Add those checks in FlagGems before treating their generic tensor preflight as
 a complete hardware health check.
 

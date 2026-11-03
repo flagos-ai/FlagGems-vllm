@@ -45,7 +45,9 @@ from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
     chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
+    fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -135,6 +137,10 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
+)
+from flaggems_vllm.ops.minimax_m3_sparse_attn import (
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
@@ -290,10 +296,12 @@ __all__ = [
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gather_rows",
     "gather_state_rows",
+    "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
@@ -320,6 +328,8 @@ __all__ = [
     "mhc_pre",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
     "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",
