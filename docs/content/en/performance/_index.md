@@ -17,8 +17,8 @@ FlagGems-vllm operators are optimized for vLLM inference scenarios with:
 
 ## Topics
 
-- [Running Benchmarks](benchmark/) - How to run performance benchmarks
-- [Benchmark Results](results/) - Performance data and speedup metrics
+- [Running Benchmarks](benchmark.md) - How to run performance benchmarks
+- [Benchmark Results](results.md) - Performance data and speedup metrics
 
 ## Quick Benchmark
 
@@ -48,5 +48,5 @@ Acceptance target: **SpeedUp ≥ 0.9** for core shapes.
 
 ## Next Steps
 
-- [Benchmark guide](benchmark/)
-- [View results](results/)
+- [Benchmark guide](benchmark.md)
+- [View results](results.md)
