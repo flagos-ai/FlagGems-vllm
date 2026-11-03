@@ -19,6 +19,9 @@ import torch
 import triton
 import triton.language as tl
 
+# Retain the software FP8 encoder used for gfx936, where generic conversion
+# expands to a longer emulated sequence. Sharing it preserves that optimization;
+# its benefit is separate from the load-reorder window below.
 from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     _HAS_LOAD_REORDER,
     _f32_to_fp8_e4m3fn,

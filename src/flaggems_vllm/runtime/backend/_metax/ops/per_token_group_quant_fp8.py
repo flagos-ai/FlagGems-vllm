@@ -19,6 +19,9 @@ import torch
 import triton
 import triton.language as tl
 
+# Retain the C550 software FP8 encoder: the validated MACA compiler's generic
+# conversion used a longer compare/select sequence. Instruction counts depend
+# on compiler versions; this existing optimization is independent of reorder.
 from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     _HAS_LOAD_REORDER,
     _f32_to_fp8_e4m3fn,

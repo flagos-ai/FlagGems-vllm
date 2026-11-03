@@ -185,8 +185,6 @@ CORE_SHAPES = [
     (83, 512, 64),
     (2048, 4096, 256),
     (2048, 13824, 512),
-    (4096, 13824, 512),
-    (8192, 13824, 512),
 ]
 
 
@@ -204,7 +202,8 @@ class PerTokenGroupQuantFp8Benchmark(base.GenericBenchmark):
         super().set_shapes(shape_file_path)
 
     def set_more_shapes(self):
-        return []
+        # Exercise larger workloads without expanding the default core matrix.
+        return [(4096, 13824, 512), (8192, 13824, 512)]
 
 
 def _input_fn(shape, dtype, device, scale_ue8m0):

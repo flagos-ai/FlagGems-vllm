@@ -109,10 +109,17 @@ def _contiguous_group_config(num_groups, group_size, scale_ue8m0, warp_size=32):
 # Shared vendor arithmetic. The generic kernels retain their existing divide path.
 @triton.jit
 def _f32_to_fp8_e4m3fn(y):
-    """Software e4m3fn conversion with round-to-nearest-even.
+    """Encode finite FP32 values in [-448, 448] as E4M3FN uint8 bits.
 
-    Used by vendor paths without native FP8 conversion. Inputs must be finite
-    and clamped to [-448, 448]; keep the integer rounding sequence unchanged.
+    Uses round-to-nearest-even. Normal values (abs(y) >= 2**-6) are encoded
+    by rebiasing the exponent and rounding the mantissa from 23 to 3 bits.
+    Subnormals use abs(y) * 512 + 2**23 to round to the 2**-9 FP8 step.
+    The caller bitcasts the returned bytes to the FP8 output type.
+
+    Shared by vendor paths where generic FP8 conversion lowers to a more
+    expensive software sequence. Preserve the rounding constants and arithmetic
+    order. Clamping limits the range but does not establish the finite-input
+    precondition for NaNs.
     """
     b = y.to(tl.uint32, bitcast=True)
     a = b & 0x7FFFFFFF
