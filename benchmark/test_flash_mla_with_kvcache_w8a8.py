@@ -29,8 +29,6 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
 from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED, quantize_dense_fp8
 
 from . import base
-from .consts import BenchmarkMetrics
-from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 try:
     from flash_mla_fp8 import flash_mla_ckv_fp8_per_token as cuda_flash_mla
@@ -60,10 +58,8 @@ def run_prepared(
     return handle(out=output, lse=lse)
 
 
-class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
+class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
     """Measure steady-state decode after both implementations are prepared."""
-
-    RECORD_PARALLEL_RESULTS = True
 
     def __init__(self):
         if not HAS_CUDA_FP8_FLASHMLA:
@@ -90,29 +86,23 @@ class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
                 )
                 self.torch_op(*args, metadata, splits, **kwargs)
                 self.gems_op(handle, output, lse)
-                yield cuda_input, (handle, output, lse)
+                self.gems_input = (handle, output, lse)
+                yield cuda_input
 
-    def _build_metric_from_input(self, input_item):
-        cuda_input, gems_input = input_item
-        cuda_args, cuda_kwargs = self.unpack_to_args_kwargs(cuda_input)
-        metric = BenchmarkMetrics()
-        metric.shape_detail = self.record_shapes(*cuda_args[:9], **cuda_kwargs)
-        if "latency_base" in self.to_bench_metrics:
-            metric.latency_base = self.get_latency(
-                self.torch_op, *cuda_args, **cuda_kwargs
-            )
-        if "latency" in self.to_bench_metrics:
-            metric.latency = self.get_latency(self.gems_op, *gems_input)
-        if "speedup" in self.to_bench_metrics:
-            metric.speedup = metric.latency_base / metric.latency
-        return metric
+    def get_latency(self, op, *args, **kwargs):
+        if op is self.gems_op:
+            return super().get_latency(op, *self.gems_input)
+        return super().get_latency(op, *args, **kwargs)
+
+    def record_shapes(self, *args, **kwargs):
+        return super().record_shapes(*args[:9], **kwargs)
 
     @staticmethod
     def make_input(param: TestParam, dtype):
         torch.manual_seed(0)
         lengths = [param.seqlen] * param.batch
         if param.varlen:
-            # Preserve the native reference's seeded length stream when selecting a shard.
+            # Match the native reference's seeded length stream for each shape.
             generator = random.Random(0)
             for mean, heads, queries in product(
                 (4096, 8192, 16384), (16, 32, 64, 128), (1, 2)
