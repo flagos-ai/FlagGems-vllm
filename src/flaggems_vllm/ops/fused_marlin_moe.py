@@ -3367,26 +3367,21 @@ def fused_moe_kernel_w8a16_unified_moe(
         tl.atomic_add(out_ptrs, partial.to(compute_type), mask=out_mask)
 
 
-def _prune_w8a16_fp8_gateup_configs(configs, named_args, **kwargs):
-    named_args = {**named_args, **kwargs}
-    if named_args["T"] < 16 or named_args["H"] < 1024 or named_args["Nw1"] < 2048:
-        return [config for config in configs if config.num_stages == 1]
-    return configs
-
-
 def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
     if not {**named_args, **kwargs}.get("USE_PACKED_INT8", False):
         return [config for config in configs if config.kwargs["BLOCK_SIZE_K"] <= 64]
     return configs
 
 
-# Share kernel bodies while tuning INT8 and FP8 independently. Only the split
-# gateup enables deeper pipelines; multi-stage down fails on Triton 3.6/Hopper.
+# Share kernel bodies while tuning INT8 and FP8 independently. The tuning
+# library picks the stage count per shape; on FP8 decode shapes the deeper
+# pipelines pay off (down 1.12x, unified 1.18x, gateup_silu 1.67x over
+# num_stages=1). INT8 down keeps num_stages=1 only: deeper stages measured
+# 0.69-0.72x at T <= 64.
 _fused_moe_kernel_w8a16_gateup_fp8 = _w8a16_tuned_kernel(
     fused_moe_kernel_w8a16_gateup,
     "fused_marlin_moe_w8a16_fp8_gateup",
     key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
-    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_gateup_configs},
 )
 
 _fused_moe_kernel_w8a16_gateup_silu_fp8 = _w8a16_tuned_kernel(

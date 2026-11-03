@@ -23,6 +23,15 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
     --level core --iter 1 --warmup 1
 ```
 
+Run focused benchmarks for specific vLLM operators:
+
+```bash
+PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py::test_moe_align_block_size_triton \
+    --level core --iter 1 --warmup 1
+PYTHONPATH=src pytest -q benchmark/test_fused_inv_rope_fp8_quant.py \
+    --level core --iter 1 --warmup 1
+```
+
 ## Benchmark Options
 
 Benchmarks are controlled via pytest options (defined in `benchmark/conftest.py`):
@@ -170,5 +179,5 @@ Benchmarks run in CI for changed operators:
 
 ## Next Steps
 
-- [View benchmark results](results/)
-- [Contribute benchmarks](/FlagGems-vllm/contribution/overview/)
+- [View benchmark results](results.md)
+- [Contribute benchmarks](../contribution/overview.md)
