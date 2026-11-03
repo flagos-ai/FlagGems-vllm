@@ -154,6 +154,163 @@ def _fused_inv_rope_fp8_quant_per_head(
         tl.store(scale_addrs, scales)
 
 
+try:
+    import inspect
+
+    import triton.experimental.tle.language as tle
+
+    _HAS_LOAD_REORDER = "reorder" in inspect.signature(tle.range.__init__).parameters
+except (ImportError, AttributeError, TypeError, ValueError):
+    tle = tl
+    _HAS_LOAD_REORDER = False
+
+
+@triton.jit
+def _fused_inv_rope_fp8_quant_window(
+    O,
+    P,
+    C,
+    Q,
+    S,
+    T: tl.constexpr,
+    HEAD_TILE: tl.constexpr,
+    PACKED: tl.constexpr,
+    REORDER: tl.constexpr,
+    OS0: tl.constexpr,
+    OS1: tl.constexpr,
+    CS0: tl.constexpr,
+    QS0: tl.constexpr,
+    QS1: tl.constexpr,
+    SS0: tl.constexpr,
+    SS2: tl.constexpr,
+    HPG: tl.constexpr,
+    NO_CLAMP: tl.constexpr = False,
+):
+    token = tl.program_id(0)
+    head_base = tl.program_id(1) * (HEAD_TILE * 2)
+    heads = tl.arange(0, HEAD_TILE)
+    a = tl.arange(0, 256)
+    b = tl.arange(0, 128)
+    scale_idx = tl.arange(0, 2)
+    local = b - 64
+    mask = b >= 64
+    pos = tl.load(P + token)
+    idx = tl.maximum(local >> 1, 0)
+    cos = tl.load(C + pos * CS0 + idx, mask=mask, other=1.0)
+    sin = tl.load(C + pos * CS0 + 32 + idx, mask=mask, other=0.0)
+    a0 = tl.full((HEAD_TILE, 256), 0, tl.uint8)
+    b0 = tl.full((HEAD_TILE, 128), 0, tl.uint8)
+    c0 = tl.full((HEAD_TILE, 128), 0, tl.uint8)
+    sa0 = tl.full((HEAD_TILE, 2), 0, tl.float32)
+    sb0 = tl.full((HEAD_TILE,), 0, tl.float32)
+    sc0 = tl.full((HEAD_TILE,), 0, tl.float32)
+    a1 = tl.full((HEAD_TILE, 256), 0, tl.uint8)
+    b1 = tl.full((HEAD_TILE, 128), 0, tl.uint8)
+    c1 = tl.full((HEAD_TILE, 128), 0, tl.uint8)
+    sa1 = tl.full((HEAD_TILE, 2), 0, tl.float32)
+    sb1 = tl.full((HEAD_TILE,), 0, tl.float32)
+    sc1 = tl.full((HEAD_TILE,), 0, tl.float32)
+    for i in tle.range(0, 2, loop_unroll_factor=2, reorder=REORDER):
+        h = head_base + i * HEAD_TILE + heads
+        base = O + token * OS0 + h[:, None] * OS1
+        xa = tl.load(base + a[None, :]).to(tl.float32)
+        xb = tl.load(base + 256 + b[None, :]).to(tl.float32)
+        xc = tl.load(base + 384 + b[None, :]).to(tl.float32)
+        xe, xo = tl.split(tl.reshape(xc, (HEAD_TILE, 64, 2)))
+        partner = tl.reshape(tl.join(xo, xe), (HEAD_TILE, 128))
+        rotated = tl.where(
+            (local[None, :] & 1) == 0,
+            xc * cos[None, :] + partner * sin[None, :],
+            xc * cos[None, :] - partner * sin[None, :],
+        )
+        xc = tl.where(mask[None, :], rotated, xc)
+        sa = tl.maximum(
+            tl.max(tl.reshape(tl.abs(xa), (HEAD_TILE, 2, 128)), axis=2), 1e-10
+        ) * (1.0 / 448.0)
+        sb = tl.maximum(tl.max(tl.abs(xb), axis=1), 1e-10) * (1.0 / 448.0)
+        sc = tl.maximum(tl.max(tl.abs(xc), axis=1), 1e-10) * (1.0 / 448.0)
+        if PACKED:
+            v = tl.maximum(tl.abs(sa), 1e-10)
+            bits = v.to(tl.uint32, bitcast=True)
+            sa = tl.where(
+                bits >= 0x7F800000,
+                v,
+                ((bits + 0x007FFFFF) & 0xFF800000).to(tl.float32, bitcast=True),
+            )
+            v = tl.maximum(tl.abs(sb), 1e-10)
+            bits = v.to(tl.uint32, bitcast=True)
+            sb = tl.where(
+                bits >= 0x7F800000,
+                v,
+                ((bits + 0x007FFFFF) & 0xFF800000).to(tl.float32, bitcast=True),
+            )
+            v = tl.maximum(tl.abs(sc), 1e-10)
+            bits = v.to(tl.uint32, bitcast=True)
+            sc = tl.where(
+                bits >= 0x7F800000,
+                v,
+                ((bits + 0x007FFFFF) & 0xFF800000).to(tl.float32, bitcast=True),
+            )
+        va = xa / tl.reshape(
+            tl.broadcast_to(sa[:, :, None], (HEAD_TILE, 2, 128)), (HEAD_TILE, 256)
+        )
+        vb = xb / sb[:, None]
+        vc = xc / sc[:, None]
+        if not NO_CLAMP:
+            va = tl.clamp(va, -448.0, 448.0)
+            vb = tl.clamp(vb, -448.0, 448.0)
+            vc = tl.clamp(vc, -448.0, 448.0)
+        qa = va.to(Q.dtype.element_ty).to(tl.uint8, bitcast=True)
+        qb = vb.to(Q.dtype.element_ty).to(tl.uint8, bitcast=True)
+        qc = vc.to(Q.dtype.element_ty).to(tl.uint8, bitcast=True)
+        a0, a1 = a1, qa
+        b0, b1 = b1, qb
+        c0, c1 = c1, qc
+        sa0, sa1 = sa1, sa
+        sb0, sb1 = sb1, sb
+        sc0, sc1 = sc1, sc
+    h0 = head_base + 0 * HEAD_TILE + heads
+    group0 = h0 // HPG
+    within0 = h0 % HPG
+    out0 = Q + group0[:, None] * QS0 + token * QS1 + within0[:, None] * 512
+    tl.store(out0 + a[None, :], a0.to(Q.dtype.element_ty, bitcast=True))
+    tl.store(out0 + 256 + b[None, :], b0.to(Q.dtype.element_ty, bitcast=True))
+    tl.store(out0 + 384 + b[None, :], c0.to(Q.dtype.element_ty, bitcast=True))
+    if PACKED:
+        aa0 = (sa0.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        bb0 = (sb0.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        cc0 = (sc0.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        packed0 = (
+            tl.sum(aa0 << (scale_idx[None, :] * 8), axis=1) | (bb0 << 16) | (cc0 << 24)
+        )
+        tl.store(S + group0 * SS0 + token + within0 * SS2, packed0.to(tl.int32))
+    else:
+        base_s0 = S + group0 * SS0 + token + within0 * 4 * SS2
+        tl.store(base_s0[:, None] + scale_idx[None, :] * SS2, sa0)
+        tl.store(base_s0 + 2 * SS2, sb0)
+        tl.store(base_s0 + 3 * SS2, sc0)
+    h1 = head_base + 1 * HEAD_TILE + heads
+    group1 = h1 // HPG
+    within1 = h1 % HPG
+    out1 = Q + group1[:, None] * QS0 + token * QS1 + within1[:, None] * 512
+    tl.store(out1 + a[None, :], a1.to(Q.dtype.element_ty, bitcast=True))
+    tl.store(out1 + 256 + b[None, :], b1.to(Q.dtype.element_ty, bitcast=True))
+    tl.store(out1 + 384 + b[None, :], c1.to(Q.dtype.element_ty, bitcast=True))
+    if PACKED:
+        aa1 = (sa1.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        bb1 = (sb1.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        cc1 = (sc1.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        packed1 = (
+            tl.sum(aa1 << (scale_idx[None, :] * 8), axis=1) | (bb1 << 16) | (cc1 << 24)
+        )
+        tl.store(S + group1 * SS0 + token + within1 * SS2, packed1.to(tl.int32))
+    else:
+        base_s1 = S + group1 * SS0 + token + within1 * 4 * SS2
+        tl.store(base_s1[:, None] + scale_idx[None, :] * SS2, sa1)
+        tl.store(base_s1 + 2 * SS2, sb1)
+        tl.store(base_s1 + 3 * SS2, sc1)
+
+
 def fused_inv_rope_fp8_quant(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -225,6 +382,44 @@ def fused_inv_rope_fp8_quant(
         (n_groups, num_tokens, scale_inner),
         (scale_inner * tma_aligned_t, 1, tma_aligned_t),
     )
+
+    # Two independent head tiles expose a load window to the optional pass.
+    # Keep the incumbent kernel for other geometries and unsupported compilers.
+    if (
+        _HAS_LOAD_REORDER
+        and o.dtype == torch.bfloat16
+        and o.is_contiguous()
+        and positions.is_contiguous()
+        and cos_sin_cache.is_contiguous()
+        and (nope_dim, rope_dim, quant_group_size) == (448, 64, 128)
+        and eps == 1e-10
+        and num_heads % 8 == 0
+        and num_tokens >= 256
+        and num_tokens % 4 == 0
+    ):
+        head_tile = 4
+        _fused_inv_rope_fp8_quant_window[(num_tokens, num_heads // (2 * head_tile))](
+            o,
+            positions,
+            cos_sin_cache,
+            fp8_q,
+            scale,
+            num_tokens,
+            head_tile,
+            tma_aligned_scales,
+            True,
+            o.stride(0),
+            o.stride(1),
+            cos_sin_cache.stride(0),
+            fp8_q.stride(0),
+            fp8_q.stride(1),
+            scale.stride(0),
+            scale.stride(2),
+            heads_per_group,
+            num_warps=2,
+            num_stages=1,
+        )
+        return fp8_q.transpose(0, 1), scale.transpose(0, 1)
 
     grid = (tma_aligned_t, n_groups * heads_per_group)
     _fused_inv_rope_fp8_quant_per_head[grid](
