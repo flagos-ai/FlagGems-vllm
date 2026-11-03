@@ -50,12 +50,6 @@ class QSASparsePagedAttentionBenchmark(base.Benchmark):
             gems_op=flaggems_vllm.qsa_sparse_paged_attention,
         )
 
-    def init_user_config(self):
-        super().init_user_config()
-        if base.Config.mode == consts.BenchMode.CUDAGRAPH:
-            raise ValueError(
-                "QSA baseline comparison uses non-graph timing; use --mode kernel"
-            )
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
