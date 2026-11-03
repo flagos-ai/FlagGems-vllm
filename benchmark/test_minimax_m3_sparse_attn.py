@@ -90,6 +90,7 @@ def _kv_dtype():
 
 @pytest.mark.parametrize("distribution", ["scattered", "compact"])
 @pytest.mark.parametrize("qlen", [512, 2048, 4096, 8192])
+@pytest.mark.minimax_m3_sparse_attn
 def test_perf_minimax_m3_sparse_attn(qlen, distribution):
     """Prefill latency across query lengths and index distributions."""
     if bench_cfg.Config.bench_level.value == "core" and (
@@ -143,6 +144,7 @@ def test_perf_minimax_m3_sparse_attn(qlen, distribution):
 
 
 @pytest.mark.parametrize("num_reqs", [1, 16, 64, 128])
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_perf_minimax_m3_sparse_attn_decode(num_reqs):
     """Decode latency across the batch sizes that move the split-K count."""
     if bench_cfg.Config.bench_level.value == "core" and num_reqs not in (16, 64):

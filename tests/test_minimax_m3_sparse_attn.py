@@ -163,6 +163,7 @@ def assert_matches_native(actual, expected):
 @pytest.mark.parametrize("d", [96, 128])
 @pytest.mark.parametrize("kv_heads", [1, 2])
 @pytest.mark.parametrize("mode", ["scattered", "compact"])
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_matches_native(d, kv_heads, mode):
     if cfg.QUICK_MODE and (kv_heads == 2 and mode == "compact"):
         pytest.skip("non-quick case")
@@ -176,6 +177,7 @@ def test_prefill_matches_native(d, kv_heads, mode):
 
 
 @pytest.mark.parametrize("n_valid", [1, 4, 12])
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_trailing_padding(n_valid):
     """Short contexts make the indexer emit a -1 suffix; honor the count."""
     args = make_inputs(qlens=(17, 13), topk=16, n_valid=n_valid)
@@ -187,6 +189,7 @@ def test_prefill_trailing_padding(n_valid):
 
 
 @pytest.mark.parametrize("qlens", [(1,), (384, 256), (2048,)])
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_query_lengths(qlens):
     """Query lengths that select different internal prefill schedules."""
     if cfg.QUICK_MODE and qlens == (2048,):
@@ -200,6 +203,7 @@ def test_prefill_query_lengths(qlens):
 
 
 @pytest.mark.parametrize("d", [96, 128])
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_does_not_write_out_of_bounds(d):
     """A guard band catches a store tail that is not masked.
 
@@ -219,6 +223,7 @@ def test_prefill_does_not_write_out_of_bounds(d):
     assert_matches_native(out, reference)
 
 
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_fp8_kv_matches_native():
     if torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("typed FP8 KV requires SM89+")
@@ -230,6 +235,7 @@ def test_prefill_fp8_kv_matches_native():
     assert_matches_native(out, reference)
 
 
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_fully_masked_rows_agree_with_native():
     """Rows whose selected blocks are all in the future are a boundary case.
 
@@ -255,6 +261,7 @@ def test_prefill_fully_masked_rows_agree_with_native():
         )
 
 
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_cuda_graph_replay():
     """Replay must recompute from device metadata, not captured values."""
     args = make_inputs(qlens=(384, 256), kv_heads=2)
@@ -276,6 +283,7 @@ def test_prefill_cuda_graph_replay():
         assert_matches_native(out, reference)
 
 
+@pytest.mark.minimax_m3_sparse_attn
 def test_prefill_empty_query_is_a_noop():
     args = list(make_inputs())
     args[0] = args[0][:0]
@@ -287,6 +295,7 @@ def test_prefill_empty_query_is_a_noop():
 
 @pytest.mark.parametrize("d", [96, 128])
 @pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_decode_matches_native(d, kv_heads):
     args = make_decode_inputs(num_reqs=5, d=d, kv_heads=kv_heads, topk=17)
     out = torch.empty_like(args[0])
@@ -302,6 +311,7 @@ def test_decode_matches_native(d, kv_heads):
 
 
 @pytest.mark.parametrize("num_reqs", [1, 16, 48, 128])
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_decode_split_k_chunk_counts(num_reqs):
     """Batch sizes that move the internal split-K chunk count."""
     if cfg.QUICK_MODE and num_reqs not in (1, 48):
@@ -319,6 +329,7 @@ def test_decode_split_k_chunk_counts(num_reqs):
 
 
 @pytest.mark.parametrize("decode_query_len", [1, 2, 4])
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_decode_multi_token(decode_query_len):
     args = make_decode_inputs(num_reqs=4, decode_query_len=decode_query_len)
     out = torch.empty_like(args[0])
@@ -333,6 +344,7 @@ def test_decode_multi_token(decode_query_len):
 
 
 @pytest.mark.parametrize("n_valid", [1, 8])
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_decode_trailing_padding(n_valid):
     args = make_decode_inputs(num_reqs=5, topk=16, n_valid=n_valid)
     out = torch.empty_like(args[0])
@@ -356,6 +368,8 @@ def test_decode_trailing_padding(n_valid):
         (lambda a: a.__setitem__(7, -1), ValueError),
     ],
 )
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_rejects_unsupported_contract(mutate, error):
     """Unsupported input must raise, never silently fall back to torch."""
     args = list(make_inputs())
@@ -365,6 +379,8 @@ def test_rejects_unsupported_contract(mutate, error):
         flaggems_vllm.minimax_m3_sparse_attn(*args, output=out)
 
 
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_scales_must_be_paired():
     args = make_inputs()
     out = torch.empty_like(args[0])
@@ -373,6 +389,8 @@ def test_scales_must_be_paired():
         flaggems_vllm.minimax_m3_sparse_attn(*args, output=out, k_scale=scale)
 
 
+@pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.minimax_m3_sparse_attn_decode
 def test_exports_are_not_registered_as_aten_overrides():
     """Library-only APIs must stay out of the ATen registration config."""
     registered = {name for name, _ in flaggems_vllm._FULL_CONFIG}
