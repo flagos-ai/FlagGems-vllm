@@ -58,70 +58,33 @@ output = flaggems_vllm.fused_add_rms_norm(hidden, residual, weight, eps=1e-6)
 
 ## 查询可用算子
 
-列出所有已注册的算子（注意：需要在调用 `enable()` 后，注册器才能列出注册项）：
+直接从 `flaggems_vllm.ops.__all__` 获取已导出的全部可用特化算子列表：
 
 ```python
 import flaggems_vllm
 
-# 启用注册
-flaggems_vllm.enable()
-
-# 获取所有注册算子名称
-ops = flaggems_vllm.all_registered_ops()
+ops = flaggems_vllm.ops.__all__
 print(f"可用算子总数: {len(ops)}")
 print(ops[:10])  # 前 10 个算子
-
-# 获取所有注册键值
-keys = flaggems_vllm.all_registered_keys()
-print(f"注册键数: {len(keys)}")
 ```
 
-## 全局启用 API
+## 仅支持直接调用机制
 
-FlagGems-vllm 提供了与 FlagGems 一致的启用接口：
-
-### `enable()` 与 `flag_gems.enable()`
-
-在大多数场景下，FlagGems-vllm 的算子是显式直接调用的。但由于部分算子底层依赖 FlagGems，且模型中通常包含大量通用的基础算子，标准用法是：
-
-1. **调用 `flag_gems.enable()`**：为环境注册通用的 PyTorch/Triton 算子，并激活 FlagGems-vllm 内部调用所需的基础算子能力；
-2. **直接调用 `flaggems_vllm.<op>()`**：执行针对 vLLM 推理特化的融合内核；
-3. **调用 `flaggems_vllm.enable()`（可选）**：将 FlagGems-vllm 的算子进一步注册到 PyTorch dispatch 调度表中。
-
-```python
-import flag_gems
-import flaggems_vllm
-
-# 1. 启用 FlagGems 算子（必需/推荐）
-flag_gems.enable()
-
-# 2. 全局启用 FlagGems-vllm 调度（可选）
-flaggems_vllm.enable()
-```
-
-### `only_enable()`
-
-仅启用指定算子：
-
-```python
-import flaggems_vllm
-
-flaggems_vllm.only_enable(include=['grouped_topk', 'moe_align_block_size'])
-```
-
-### `use_gems()` (上下文管理器)
-
-在指定代码块中临时启用：
-
-```python
-import torch
-import flaggems_vllm
-
-with flaggems_vllm.use_gems():
-    # 作用域内算子生效
-    result = some_computation()
-# 退出作用域后自动还原
-```
+> [!IMPORTANT]
+> **设计说明**：FlagGems-vllm 专为 vLLM 专用特化与融合算子设立，**只支持直接调用方式（`flaggems_vllm.<op>()`），不支持向 PyTorch 注册分发**，亦不支持 `flaggems_vllm.use_gems`。
+>
+> 通用基础算子的 PyTorch 动态分发由底层依赖的 FlagGems 负责。在调用 FlagGems-vllm 算子前，只需调用 `flag_gems.enable()` 激活通用算子底座即可：
+>
+> ```python
+> import flag_gems
+> import flaggems_vllm
+>
+> # 激活 FlagGems 通用算子支持
+> flag_gems.enable()
+>
+> # 直接调用 FlagGems-vllm 特化融合算子
+> output = flaggems_vllm.grouped_topk(...)
+> ```
 
 ## 检查设备与后端
 
@@ -132,6 +95,27 @@ from flaggems_vllm import runtime
 print(f"厂商名称: {flaggems_vllm.vendor_name}")  # 例如 'nvidia'
 print(f"设备名称: {flaggems_vllm.device}")        # 例如 'cuda'
 print(f"设备数量: {runtime.device.device_count}")
+```
+
+多后端详细配置与环境变量选择请参阅[非 NVIDIA 硬件平台](non-nvidia.md)。
+
+## C++ 原生扩展配置
+
+FlagGems-vllm 包含通过 pybind11 编译的可选 C++ 扩展算子。如果构建时所需依赖就绪，会自动编译生成。
+
+运行时可通过环境变量控制是否启用 C++ 算子：
+
+```bash
+export USE_C_EXTENSION=1
+```
+
+检查 C++ 扩展状态：
+
+```python
+import flaggems_vllm
+
+print("C++ 扩展可用:", flaggems_vllm.config.has_c_extension)
+print("当前启用 C++ 扩展:", flaggems_vllm.config.use_c_extension)
 ```
 
 ## 算子分类概览
@@ -191,6 +175,6 @@ except NotImplementedError as e:
 ## 下一步
 
 - [vLLM 插件集成](vllm-plugin.md)
-- [选择性启用](selective.md)
+- [非 NVIDIA 硬件平台](non-nvidia.md)
 - [调试与日志](debugging.md)
 - [运行基准测试](../performance/benchmark.md)

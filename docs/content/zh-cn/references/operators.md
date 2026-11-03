@@ -46,14 +46,13 @@ flag_gems.enable()
 # 2. 直接调用 FlagGems-vllm 特化算子
 result = flaggems_vllm.moe_align_block_size(topk_ids, block_size, num_experts)
 
-# 3. 启用 FlagGems-vllm 调度并查看已注册的算子列表
-flaggems_vllm.enable()
-ops = flaggems_vllm.all_registered_ops()
-print(f"当前已注册: {len(ops)} 个算子")
+# 3. 查看已导出的全部可用算子
+ops = flaggems_vllm.ops.__all__
+print(f"当前已导出: {len(ops)} 个算子")
 ```
 
 ## 下一步
 
 - [基础用法](../usage/basic.md)
-- [M3 算子支持](m3-support.md)
+- [MiniMax M3 算子支持](minimax-m3-support.md)
 - [算子源码仓库](https://github.com/flagos-ai/FlagGems-vllm/tree/main/src/flaggems_vllm/ops)

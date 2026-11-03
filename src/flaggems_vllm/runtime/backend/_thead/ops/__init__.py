@@ -15,10 +15,18 @@
 
 import flag_gems
 
+from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
+    chunk_gated_delta_rule_w8a16_int8,
+    gdn_w8a16_int8,
+    quantize_gdn_state_int8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
@@ -41,7 +49,10 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_matmul import (
 )
 
 __all__ = [
+    "chunk_gated_delta_rule_w8a16_int8",
     "fused_experts_impl",
+    "fused_q_kv_rmsnorm",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
@@ -49,6 +60,7 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "quantize_gdn_state_int8",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",

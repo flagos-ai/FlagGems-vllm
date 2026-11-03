@@ -5,11 +5,11 @@ weight: 15
 
 # MiniMax M3 算子支持与量化融合
 
-本文档详细说明了针对 MiniMax M3 模型推理场景的算子支持契约、量化融合、功能验证与基准测试性能表现。
+本文档详细说明了针对 MiniMax M3 模型推理场景的算子支持规范、量化融合、功能验证与基准测试性能表现。
 
-## 算子契约 (Contracts)
+## 算子接口规范 (Operator Specifications)
 
-| 算子 | 支持契约 |
+| 算子 | 支持规范与约束 |
 |---|---|
 | `fp32_router_gemm` | BF16/FP32 `[M,6144]`, FP32 `[128,6144]`, M<=32；原生 FP32 logits，固定 FMA/约简逻辑，禁用 TF32/原子操作，2D strides，支持空批次。拒绝不支持的维度。 |
 | `topk_sigmoid` | FP16/BF16/FP32 连续 `[M,E]`, E<=256, K<=min(32,E)；可选 FP32 修正偏置仅影响选择不影响输出概率；稳定的 tie 打平规则，精确源行 ID，可选重归一化与 NaN 填充，支持就地修改调用方缓冲区。 |
@@ -71,5 +71,5 @@ export FLAG_GEMS_W8A8_QUANT_FUSION=quant
 ## 相关链接
 
 - [算子列表](operators.md)
-- [项目结构](project-structure.md)
+- [项目结构](../contribution/project-structure.md)
 - [基准测试结果](../performance/results.md)

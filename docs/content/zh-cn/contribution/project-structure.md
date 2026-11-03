@@ -1,6 +1,6 @@
 ---
 title: 项目结构
-weight: 20
+weight: 40
 ---
 
 # 项目结构
@@ -12,7 +12,7 @@ FlagGems-vllm 仓库组织与模块架构。
 ```
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python 核心包
-│   ├── __init__.py         # 顶层导出、enable()/use_gems()
+│   ├── __init__.py         # 顶层导出与公开算子暴露
 │   ├── config.py           # 配置与 C 扩展检测
 │   ├── ops/                # 算子实现
 │   ├── runtime/            # 后端管理、设备检测、自动调优配置
@@ -129,7 +129,6 @@ tools/
 ## 开发协议规范 (`workflow.md`)
 
 强制性算子开发协议规范，设有严格的门禁（G0–G7）：
-- 编码前三张设计表（工程基线、Torch 对齐规范、实现路径设计）
 - NO_TORCH_COMPUTE_FALLBACK 无 PyTorch 计算回退规则
 - 自动调优要求
 - 测试与性能验收标准
@@ -145,7 +144,8 @@ tools/
 
 ## 下一步
 
-- [算子开发协议](../contribution/workflow.md)
-- [贡献指南概述](../contribution/overview.md)
-- [M3 算子支持](m3-support.md)
+- [贡献指南概述](overview.md)
+- [算子开发协议](workflow.md)
+- [硬件后端开发指南](backend.md)
+- [MiniMax M3 算子支持](../references/minimax-m3-support.md)
 - [单元测试指南](../testing/unittest.md)
