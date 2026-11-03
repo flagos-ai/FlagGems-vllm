@@ -70,6 +70,9 @@ def test_perf_fused_recurrent_gated_delta_rule(case, dtype, entry):
         },
         candidate_accuracy="NOT_RUN",
         native_accuracy="NOT_RUN",
+        native_performance="N/A",
+        native_ms=None,
+        native_speedup=None,
         before_accuracy="NOT_RUN",
     )
     functions = {"gems": candidate}
@@ -120,23 +123,35 @@ def test_perf_fused_recurrent_gated_delta_rule(case, dtype, entry):
             row[name + "_error"] = repr(exc)
             if name == "gems":
                 candidate_error = exc
+            # Retain the failed accuracy result, but never time an invalid baseline.
+            continue
         try:
-            # Invalid numerical results remain diagnostic, never valid scores.
+            # Only implementations passing the oracle are eligible for timing.
             values = _measure(fn, data, state0)
+            data["initial_state"].copy_(state0)
+            assert_result(fn(**data), expected, dtype)
             row[name + "_samples_ms"] = values
             row[name + "_ms"] = statistics.median(values)
+            if name == "native":
+                row["native_performance"] = "PASS"
         except Exception as exc:
             row[name + "_timing_error"] = repr(exc)
+            if isinstance(exc, AssertionError):
+                row[key] = "FAIL"
+                row[name + "_error"] = repr(exc)
+            if name == "gems":
+                candidate_error = exc
     if (
         row["candidate_accuracy"] == "PASS"
         and row["native_accuracy"] == "PASS"
-        and row.get("native_ms", 0) > 0
-        and row.get("gems_ms", 0) > 0
+        and (row.get("native_ms") or 0) > 0
+        and (row.get("gems_ms") or 0) > 0
     ):
         row["native_speedup"] = row["native_ms"] / row["gems_ms"]
         row["selected_source"] = "native"
     else:
         row["selected_source"] = None
+    print(json.dumps(row))
     target = os.environ.get("GDN_RESULTS")
     if target:
         with Path(target).open("a") as f:
