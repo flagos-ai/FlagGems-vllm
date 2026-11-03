@@ -647,7 +647,10 @@ ops:
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
       Supports decode, prefill and speculative state-slot updates.
       MetaX uses a backend-specific core interface with precomputed FP32 gates
-      and immutable FP32 state, returning output and final state.
+      and immutable FP32 state, returning output and final state. Its opt-in mixed_precision=True chunk path
+      uses BF16/FP16 intermediates with FP32 accumulation and bounded workspace.
+      MetaX decode=True accepts raw gates and packed/separate QKV and updates
+      indexed FP32 state slots in place with fused normalization and gating.
     for:
       - None
     labels:

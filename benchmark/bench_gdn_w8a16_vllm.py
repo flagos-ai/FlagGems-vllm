@@ -1,23 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Compare the installed vLLM-MetaX default GDN path against this PR.
+"""MetaX gdn_w8a16 versus installed vLLM default and PyTorch reference.
 
-Run in an existing vLLM-MetaX environment, without replacing its compiler:
-    GDN_SHAPE_FILE=/external/shapes.json python benchmark/bench_gdn_w8a16_vllm.py
-Optional: GDN_REPO selects a frozen source checkout; GDN_CASES selects comma-
-separated 1-based case indices; GDN_RESULT_DIR selects the output directory.
-
-Prefill measures the default selected Triton/FLA core with precomputed gates,
-matching the layer's prefill call (normalization already handled upstream).
-Decode includes gate generation, QK normalization and state cache writeback;
-state reset is outside timing. The migration adapter uses PyTorch preprocessing
-and cache copy, so decode results describe this adapter, not a fused GDN kernel.
-The primitive named by each external shape record is used for decode.
-
-Only the candidate's two package imports are isolated to allow execution in
-vendor containers without FlagGems dependencies. Kernel source and launch
-configuration are unchanged; source hashes and installed versions are recorded.
-This is an operator-level comparison, not full-model inference throughput.
+GDN_SHAPE_FILE selects an external captured-shape manifest. GDN_REPO may
+select a checkout; GDN_RESULT_DIR selects output. CUDA Graph median timing.
+Only package imports are isolated for vendor-container compatibility.
 """
 
 
@@ -97,6 +84,12 @@ def main():
     )
     (tmp / "isolated_chunk.py").write_bytes(chunk_path.read_bytes())
     (tmp / "isolated_entry.py").write_text(entry)
+    backend_dir = chunk_path.parent
+    for module in ("gdn_w8a16_short", "gdn_w8a16_decode", "gdn_w8a16_fp32"):
+        load(
+            "flaggems_vllm.runtime.backend._metax." + module,
+            backend_dir / (module + ".py"),
+        )
     candidate = load("isolated_entry", tmp / "isolated_entry.py").gdn_w8a16
     bench_path = REPO / "benchmark/test_gdn_w8a16_metax.py"
     (tmp / "isolated_bench.py").write_text(
@@ -116,6 +109,10 @@ def main():
     assert prefill.gdn_prefill_backend == "triton"
     assert os.getenv("MACA_VLLM_USE_EXTERNAL_FLA", "0") == "0"
     paths = [
+        backend_dir / "gdn_w8a16_fp32.py",
+        backend_dir / "gdn_w8a16_short.py",
+        backend_dir / "gdn_w8a16_decode.py",
+        Path(__file__),
         entry_path,
         chunk_path,
         bench_path,
@@ -141,6 +138,9 @@ def main():
             "replays/sample; state reset outside events"
         ),
         seed=20261019,
+        experimental_config={
+            k: v for k, v in os.environ.items() if k.startswith(("GDN_", "DECODE_"))
+        },
         raw_shape_file_sha256=hashlib.sha256(bench.SHAPES.read_bytes()).hexdigest(),
         candidate_import_adaptation="runtime vendor constant + local chunk import only; no kernel edits",
         prefill_scope="precomputed gates, no QK normalization, immutable FP32 state, metadata prebuilt",
@@ -169,7 +169,7 @@ def main():
             )
             return (
                 {
-                    "migrated": lambda: candidate(*args),
+                    "optimized": lambda: candidate(*args, mixed_precision=True),
                     "vllm_metax_default": native,
                     "pytorch": lambda: bench.torch_baseline(args, bounds),
                 },
@@ -196,7 +196,7 @@ def main():
         original = torch.cat((torch.zeros_like(state[:1]), state), dim=0)
         caches = {
             name: original.clone()
-            for name in ["migrated", "vllm_metax_default", "pytorch"]
+            for name in ["optimized", "vllm_metax_default", "pytorch"]
         }
 
         def core_args(cache):
@@ -210,11 +210,25 @@ def main():
             bb = b.float().sigmoid().to(b.dtype).float().unsqueeze(0)
             return qq, kk, v, gg, bb, cache[1:], cu
 
-        def migrated():
-            cache = caches["migrated"]
-            o, f = candidate(*core_args(cache))
-            cache[1:].copy_(f)
-            return o, cache[1:]
+        optimized_out = torch.empty((1, n, hv, dv), device=q.device, dtype=q.dtype)
+
+        def optimized():
+            cache = caches["optimized"]
+            packed = row["op"] == "fused_recurrent_gated_delta_rule_packed_decode"
+            candidate(
+                mixed if packed else q,
+                None if packed else k,
+                None if packed else v,
+                initial_state=cache,
+                decode=True,
+                a=a,
+                b=b,
+                A_log=alog,
+                dt_bias=bias,
+                state_indices=ids,
+                out=optimized_out,
+            )
+            return optimized_out, cache[1:]
 
         def pytorch():
             cache = caches["pytorch"]
@@ -274,17 +288,22 @@ def main():
             for name, cache in caches.items()
         }
         return (
-            {"migrated": migrated, "vllm_metax_default": native, "pytorch": pytorch},
+            {"optimized": optimized, "vllm_metax_default": native, "pytorch": pytorch},
             resets,
             expected,
         )
 
     def run_case(row):
         fns, resets, expected = build_case(row)
+        if os.getenv("GDN_NO_TORCH") == "1":
+            fns.pop("pytorch")
         graphs = {}
         outputs = {}
         valid = {}
         errors = {}
+        memory = {}
+        strict = {}
+        relative_rms = {}
         noop = lambda: None
         for name, fn in fns.items():
             reset = resets.get(name, noop)
@@ -292,8 +311,19 @@ def main():
                 reset()
                 fn()
             reset()
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
             actual = fn()
             torch.cuda.synchronize()
+            memory[name] = (torch.cuda.max_memory_allocated() - before) / 1024**2
+            strict[name] = torch.allclose(
+                actual[1].float(), expected[1].float(), atol=1e-4, rtol=0.002
+            )
+            relative_rms[name] = float(
+                (actual[1].float() - expected[1].float()).square().mean().sqrt()
+                / expected[1].float().square().mean().sqrt().clamp_min(1e-20)
+            )
             valid[name] = all(
                 torch.allclose(a.float(), b.float(), atol=0.002, rtol=0.02)
                 for a, b in zip(actual, expected)
@@ -316,11 +346,19 @@ def main():
             graphs[name] = graph
             outputs[name] = out
         if not all(valid.values()):
-            return dict(valid=valid, errors=errors, us={}, samples_us={})
+            return dict(
+                valid=valid,
+                errors=errors,
+                strict=strict,
+                relative_rms=relative_rms,
+                peak_mib=memory,
+                us={},
+                samples_us={},
+            )
         samples = {name: [] for name in fns}
         names = list(fns)
-        for i in range(31):
-            order = names[i % 3 :] + names[: i % 3]
+        for i in range(int(os.getenv("GDN_SAMPLES", "31"))):
+            order = names[i % len(names) :] + names[: i % len(names)]
             if i % 2:
                 order = order[::-1]
             for name in order:
@@ -341,6 +379,9 @@ def main():
         return dict(
             valid=valid,
             errors=errors,
+            strict=strict,
+            relative_rms=relative_rms,
+            peak_mib=memory,
             us={k: statistics.median(v) for k, v in samples.items()},
             samples_us=samples,
         )

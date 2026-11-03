@@ -85,13 +85,23 @@ def gdn_w8a16_kernel(
 
 def gdn_w8a16(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
+    *,
+    decode: bool = False,
+    mixed_precision: bool = False,
+    a: torch.Tensor | None = None,
+    b: torch.Tensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    normalize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GDN core forward with precomputed log-decay and sigmoid beta.
 
@@ -100,8 +110,42 @@ def gdn_w8a16(
     W8 refers to the surrounding model weights; no projection is performed here.
     This forward-only implementation leaves input state unchanged. MetaX uses
     a 64-token chunk path for long sequences with 128-dimensional heads;
-    other shapes retain the recurrence. Chunk workspace is capped at 2 GiB.
+    other shapes retain the recurrence. Temporary workspace is capped at 256 MiB.
+    Default core mode preserves FP32 intermediates. mixed_precision=True opts
+    into activation-dtype chunk intermediates/dot operands with FP32 state and
+    accumulation. Its error is input-distribution dependent; validate model
+    quality before enabling it. Decode always uses FP32 recurrent state.
+
+    With decode=True, q is packed [T,2*H*K+HV*V], or q/k/v are separate.
+    a/b are raw BF16/FP16 gates, A_log/dt_bias are FP32 [HV], state_indices
+    is an integer [T] vector. Positive indices must be distinct valid slots;
+    nonpositive indices are padding. This mode updates initial_state in place
+    and returns (out, initial_state), optionally using a preallocated out.
+    QK normalization and gate generation are fused into the Triton kernel.
     """
+    if decode:
+        from flaggems_vllm.runtime.backend._metax.gdn_w8a16_decode import (
+            decode as fused_decode,
+        )
+
+        if any(x is None for x in (a, b, A_log, dt_bias, initial_state, state_indices)):
+            raise ValueError("decode requires raw gates, FP32 state and state_indices")
+        if (k is None) != (v is None):
+            raise ValueError("provide both k/v or packed q")
+        return fused_decode(
+            q if k is None else (q, k, v),
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            state_indices,
+            out,
+            scale=scale,
+            normalize=normalize,
+        )
+    if any(x is None for x in (k, v, g, beta, initial_state, cu_seqlens)):
+        raise ValueError("core mode requires q/k/v, g/beta, state and cu_seqlens")
     if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
         raise ValueError("Expected rank-four q/k/v and matching q/k shapes")
     batch, tokens, heads, key_dim = q.shape
@@ -158,13 +202,19 @@ def gdn_w8a16(
     if (
         runtime.device.vendor_name == "metax"
         and key_dim == value_dim == 128
-        and tokens >= 128 * sequences
+        and tokens >= (32 if mixed_precision else 128) * sequences
         and sequences <= 64
     ):
-        from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import (
-            _workspace_plan,
-            gdn_w8a16_chunk,
-        )
+        if mixed_precision:
+            from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import (
+                _workspace_plan,
+                gdn_w8a16_chunk,
+            )
+        else:
+            from flaggems_vllm.runtime.backend._metax.gdn_w8a16_fp32 import (
+                _workspace_plan,
+                gdn_w8a16_chunk,
+            )
 
         if _workspace_plan(tokens, sequences, value_heads)[1]:
             return gdn_w8a16_chunk(

@@ -1,13 +1,15 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""64-token GDN chunks with FP32 workspace and accumulation.
+"""Bounded FLA-style chunks with low-precision workspace.
 
 The 16x16 blocked triangular inverse and V-major state layout follow the
 MetaX GDN design in FlagGems-vllm PR #771. Unlike that path, this variant
-keeps intermediate states/W/U in FP32 and constructs chunk mappings on GPU.
+keeps recurrence state in FP32 and stores W/U/history in activation dtype.
+The scan uses K-major register tiles while external state remains V-major.
+Chunk mappings are constructed on GPU.
 A bounded streaming window reuses temporary storage. Requests are interleaved
 when they fit in one window, preserving state-update parallelism.
-FP32 dot operands use three-term TF32 decomposition (tf32x3), not TF32.
+FP32 inverse retains its original precision; state/WY/output dots use activation dtype.
 """
 
 import torch
@@ -207,19 +209,6 @@ def _gdn_chunk_prep(
     _gdn_chunk_store16(A, c, h, 1, 2, z, HV)
     _gdn_chunk_store16(A, c, h, 1, 3, z, HV)
     _gdn_chunk_store16(A, c, h, 2, 3, z, HV)
-    k = tl.load(
-        K + token[:, None] * KS + kh * DK + d[None, :],
-        (token[:, None] < end) & (d[None, :] < DK),
-        0,
-    )
-    q = tl.load(
-        Q + token[:, None] * QS + kh * DK + d[None, :],
-        (token[:, None] < end) & (d[None, :] < DK),
-        0,
-    )
-    qk = tl.dot(q, tl.trans(k)) * tl.exp(gc[:, None] - gc[None, :])
-    qk = tl.where(t[:, None] >= t[None, :], qk, 0.0)
-    tl.store(QK + ((c * HV + h) * 64 + t[:, None]) * 64 + t[None, :], qk)
     tl.store(GC + (c * HV + h) * 64 + t, gc)
 
 
@@ -245,6 +234,7 @@ def _gdn_chunk_wy(
     VS: tl.constexpr,
     PREC: tl.constexpr,
     WIDE: tl.constexpr,
+    BW: tl.constexpr,
 ):
     c = tl.program_id(0)
     h = tl.program_id(1)
@@ -253,7 +243,7 @@ def _gdn_chunk_wy(
     if seq >= N:
         return
     t = tl.arange(0, 64)
-    d = tile * 32 + tl.arange(0, 32)
+    d = tile * BW + tl.arange(0, BW)
     token = start + t
     inv = tl.load(A + ((c * HV + h) * 64 + t[:, None]) * 64 + t[None, :])
     beta = tl.load(B + token * HV + h, token < end, 0)
@@ -269,8 +259,11 @@ def _gdn_chunk_wy(
         (token[:, None] < end) & (d[None, :] < DV),
         0,
     ).to(tl.float32)
-    w = _gdn_chunk_dotfp(inv, k * (beta * tl.exp(g))[:, None], PREC=PREC)
-    u = _gdn_chunk_dotfp(inv, v * beta[:, None], PREC=PREC)
+    w = tl.dot(
+        inv.to(K.dtype.element_ty),
+        (k * (beta * tl.exp(g))[:, None]).to(K.dtype.element_ty),
+    )
+    u = tl.dot(inv.to(V.dtype.element_ty), (v * beta[:, None]).to(V.dtype.element_ty))
     tl.store(W + ((c * HV + h) * 64 + t[:, None]) * DK + d[None, :], w, d[None, :] < DK)
     tl.store(U + ((c * HV + h) * 64 + t[:, None]) * DV + d[None, :], u, d[None, :] < DV)
 
@@ -328,8 +321,8 @@ def _gdn_chunk_scan(
     kdim = tl.arange(0, BK)
     vdim = tile * BV + tl.arange(0, BV)
     t = tl.arange(0, 64)
-    stateoff = ((seq * HV + h) * DV + vdim[:, None]) * DK + kdim[None, :]
-    state = tl.load(S + stateoff, (vdim[:, None] < DV) & (kdim[None, :] < DK), 0)
+    stateoff = ((seq * HV + h) * DV + vdim[None, :]) * DK + kdim[:, None]
+    state = tl.load(S + stateoff, (vdim[None, :] < DV) & (kdim[:, None] < DK), 0)
     for ch in range(first, stop):
         if N == 1 or N > CAP:
             c = offset + ch - BASE
@@ -352,12 +345,12 @@ def _gdn_chunk_scan(
             vdim[None, :] < DV,
             0,
         )
-        update = u - _gdn_chunk_dotfp(w, tl.trans(state), PREC=PREC)
+        update = u.to(tl.float32) - tl.dot(w, state.to(w.dtype))
         kh = h // (HV // H)
         tl.store(
-            HS + ((c * HV + h) * DV + vdim[:, None]) * DK + kdim[None, :],
+            HS + ((c * HV + h) * DV + vdim[None, :]) * DK + kdim[:, None],
             state,
-            (vdim[:, None] < DV) & (kdim[None, :] < DK),
+            (vdim[None, :] < DV) & (kdim[:, None] < DK),
         )
         tl.store(
             UP + ((c * HV + h) * 64 + t[:, None]) * DV + vdim[None, :],
@@ -369,10 +362,11 @@ def _gdn_chunk_scan(
             (token[:, None] < end) & (kdim[None, :] < DK),
             0,
         ).to(tl.float32)
-        state = tl.exp(last) * state + _gdn_chunk_dotfp(
-            tl.trans(update), k * tl.exp(last - gc)[:, None], PREC=PREC
+        state = tl.exp(last) * state + tl.dot(
+            tl.trans((k * tl.exp(last - gc)[:, None]).to(K.dtype.element_ty)),
+            update.to(K.dtype.element_ty),
         )
-    tl.store(F + stateoff, state, (vdim[:, None] < DV) & (kdim[None, :] < DK))
+    tl.store(F + stateoff, state, (vdim[None, :] < DV) & (kdim[:, None] < DK))
 
 
 @tr.jit
@@ -382,7 +376,7 @@ def _gdn_chunk_output(
     Q,
     Cu,
     GC,
-    QK,
+    K,
     HS,
     UP,
     O,
@@ -393,6 +387,7 @@ def _gdn_chunk_output(
     N: tl.constexpr,
     NN: tl.constexpr,
     QS: tl.constexpr,
+    KS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     SCALE: tl.constexpr,
@@ -420,13 +415,19 @@ def _gdn_chunk_output(
         (vd[:, None] < DV) & (kd[None, :] < DK),
         0,
     )
-    qk = tl.load(QK + ((c * HV + h) * 64 + t[:, None]) * 64 + t[None, :])
+    keys = tl.load(
+        K + token[:, None] * KS + (h // (HV // H)) * DK + kd[None, :],
+        (token[:, None] < end) & (kd[None, :] < DK),
+        0,
+    )
+    qk = tl.dot(q.to(keys.dtype), tl.trans(keys)) * tl.exp(gc[:, None] - gc[None, :])
+    qk = tl.where(t[:, None] >= t[None, :], qk, 0).to(UP.dtype.element_ty)
     update = tl.load(
         UP + ((c * HV + h) * 64 + t[:, None]) * DV + vd[None, :], vd[None, :] < DV, 0
     )
     o = (
-        _gdn_chunk_dotfp(q * tl.exp(gc)[:, None], tl.trans(state), PREC)
-        + _gdn_chunk_dotfp(qk, update, PREC)
+        tl.dot((q * tl.exp(gc)[:, None]).to(state.dtype), tl.trans(state))
+        + tl.dot(qk, update)
     ) * SCALE
     tl.store(
         O + (token[:, None] * HV + h) * DV + vd[None, :],
@@ -435,30 +436,40 @@ def _gdn_chunk_output(
     )
 
 
-# Temporary FP32 tensors only; output/final state are separate API results.
+# Temporary mixed-precision tensors only; output/final state are separate API results.
 _WORKSPACE_LIMIT_BYTES = 256 * 1024**2
-_MAX_CHUNKS_PER_WINDOW = 32
+_MAX_CHUNKS_PER_WINDOW = 64
 
 
 def _workspace_plan(tokens, sequences, value_heads):
     # Sum ceil(length / 64) <= floor((T + 63*N) / 64), including empty requests.
     total = (tokens + 63 * sequences) // 64
-    # A + QK + GC + W + U + HS; UP aliases U after its last read.
-    bytes_per_chunk = value_heads * (2 * 64**2 + 64 + 2 * 64 * 128 + 128**2) * 4
+    # A + GC + W + U + HS; QK is fused into output; UP aliases U after its last read.
+    bytes_per_chunk = value_heads * ((64**2 + 2 * 64 * 128 + 128**2) * 2 + 64 * 4)
     max_slots = _WORKSPACE_LIMIT_BYTES // bytes_per_chunk
     if not max_slots:
         return total, 0, 0
-    capacity = min(total, _MAX_CHUNKS_PER_WINDOW, 1 << (max_slots.bit_length() - 1))
+    target = 64
+    if sequences > 1:
+        target = ((target + sequences - 1) // sequences) * sequences
+    capacity = min(total, target, max_slots)
     return total, capacity, capacity * bytes_per_chunk
 
 
 def gdn_w8a16_chunk(args, scale):
     # Fixed MetaX configuration selected outside graph capture.
-    bv, warps, prec = 64, 4, "tf32x3"
+    bv, warps, prec = 32, 4, "tf32x3"
     q, k, v, g, b, s, cu = args
     t, h, dk = q.shape[1:]
+    if t < 128:
+        from flaggems_vllm.runtime.backend._metax.gdn_w8a16_short import (
+            gdn_w8a16_chunk as short_chunk,
+        )
+
+        return short_chunk(args, scale)
     hv, dv = v.shape[2:]
     n = cu.numel() - 1
+    bv = 32 if n <= 2 else 64
     total, c, _ = _workspace_plan(t, n, hv)
     if not c:
         raise NotImplementedError("GDN chunk workspace cannot fit one chunk")
@@ -467,10 +478,13 @@ def gdn_w8a16_chunk(args, scale):
         >= 2**31
     )
     nn = tr.next_power_of_2(n)
-    alloc = lambda shape: torch.empty(shape, device=q.device, dtype=torch.float32)
+    bw = 64
+    obv = 128
+    owarps = 4
+    alloc = lambda shape: torch.empty(shape, device=q.device, dtype=q.dtype)
     a = alloc((c, hv, 64, 64))
-    qk = torch.empty_like(a)
-    gc = alloc((c, hv, 64))
+    qk = a  # QK is computed in output; no separate buffer
+    gc = torch.empty((c, hv, 64), device=q.device, dtype=torch.float32)
     w = alloc((c, hv, 64, dk))
     u = alloc((c, hv, 64, dv))
     hs = alloc((c, hv, dv, dk))
@@ -507,7 +521,7 @@ def gdn_w8a16_chunk(args, scale):
             wide,
             num_warps=4,
         )
-        _gdn_chunk_wy[(c, hv, tr.cdiv(max(dk, dv), 32))](
+        _gdn_chunk_wy[(c, hv, tr.cdiv(max(dk, dv), bw))](
             base,
             c,
             k,
@@ -528,6 +542,7 @@ def gdn_w8a16_chunk(args, scale):
             v.stride(1),
             prec,
             wide,
+            bw,
             num_warps=4,
         )
         _gdn_chunk_scan[(n, hv, tr.cdiv(dv, bv))](
@@ -562,13 +577,13 @@ def gdn_w8a16_chunk(args, scale):
             num_stages=1,
             pipeline="cpasync-mixed",
         )
-        _gdn_chunk_output[(c, hv, tr.cdiv(dv, bv))](
+        _gdn_chunk_output[(c, hv, tr.cdiv(dv, obv))](
             base,
             c,
             q,
             cu,
             gc,
-            qk,
+            k,
             hs,
             up,
             o,
@@ -579,11 +594,12 @@ def gdn_w8a16_chunk(args, scale):
             n,
             nn,
             q.stride(1),
+            k.stride(1),
             tr.next_power_of_2(dk),
-            bv,
+            obv,
             scale,
             prec,
             wide,
-            num_warps=4,
+            num_warps=owarps,
         )
     return o, f

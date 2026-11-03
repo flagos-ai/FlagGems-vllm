@@ -193,7 +193,7 @@ def test_gdn_w8a16_bounded_workspace_replay(monkeypatch, dtype, sequences):
 
     if runtime.device.vendor_name != "metax":
         pytest.skip("MetaX windowed chunk implementation")
-    import flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk as chunk
+    import flaggems_vllm.runtime.backend._metax.gdn_w8a16_fp32 as chunk
 
     # A small budget forces several windows without a large CI allocation.
     budget = 4 * 1024**2
@@ -239,3 +239,60 @@ def test_gdn_w8a16_backend_registration():
     assert flaggems_vllm.gdn_w8a16 is metax_gdn
     entries = [e for e in flaggems_vllm._FULL_CONFIG if e[0] == "gdn_w8a16"]
     assert entries == [("gdn_w8a16", metax_gdn)]
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_gdn_w8a16_fused_decode(dtype, packed, normalize):
+    torch.manual_seed(537)
+    n, h, hv, dk, dv = 3, 2, 4, 33, 17
+    q = torch.randn((1, n, h, dk), device="cuda", dtype=dtype) * 0.2
+    k = torch.randn_like(q) * 0.2
+    v = torch.randn((1, n, hv, dv), device="cuda", dtype=dtype) * 0.2
+    a = torch.randn((n, hv), device="cuda", dtype=dtype)
+    b = torch.randn_like(a)
+    al = torch.randn(hv, device="cuda") * 0.1
+    bias = torch.randn_like(al) * 0.1
+    ids = torch.tensor([3, 1, 0], device="cuda", dtype=torch.int64)
+    state = torch.randn((n + 2, hv, dv, dk), device="cuda") * 0.1
+    expected = state.clone()
+    qq, kk = q[0].float(), k[0].float()
+    if normalize:
+        qq *= torch.rsqrt(qq.square().sum(-1, keepdim=True) + 1e-6)
+        kk *= torch.rsqrt(kk.square().sum(-1, keepdim=True) + 1e-6)
+    qq = qq.repeat_interleave(hv // h, 1)
+    kk = kk.repeat_interleave(hv // h, 1)
+    s = (
+        state[ids]
+        * torch.exp(-al.exp() * torch.nn.functional.softplus(a.float() + bias))[
+            ..., None, None
+        ]
+    )
+    delta = (v[0].float() - (s * kk[..., None, :]).sum(-1)) * b.float().sigmoid().to(
+        dtype
+    ).float()[..., None]
+    s += delta[..., None] * kk[..., None, :]
+    ref = (s * qq[..., None, :]).sum(-1) * dk**-0.5
+    ref[-1] = 0
+    expected[ids[:2]] = s[:2]
+    out = torch.empty_like(v)
+    mixed = torch.cat((q[0].flatten(1), k[0].flatten(1), v[0].flatten(1)), dim=-1)
+    actual, cache = gdn_w8a16(
+        mixed if packed else q,
+        None if packed else k,
+        None if packed else v,
+        initial_state=state,
+        decode=True,
+        a=a,
+        b=b,
+        A_log=al,
+        dt_bias=bias,
+        state_indices=ids,
+        out=out,
+        normalize=normalize,
+    )
+    assert actual is out and cache is state
+    torch.testing.assert_close(out[0], ref.to(dtype), atol=0.002, rtol=0.02)
+    torch.testing.assert_close(state, expected, atol=1e-5, rtol=0.002)
