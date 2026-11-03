@@ -26,6 +26,7 @@ def literal_quant(x):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 384), (1, 127), (7, 384), (32, 768), (64, 6144)])
+@pytest.mark.fused_moe
 def test_quant_and_oai_quant(dtype, shape):
     torch.manual_seed(43)
     x = torch.randn(shape, device="cuda", dtype=dtype) * 8
