@@ -1738,20 +1738,30 @@ class FlashMLAInt8PreparedHandle:
         scale: float,
         causal: bool,
         automatic_splits: bool = False,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
     ):
         self.tensors = tensors
         query, rope = tensors[:2]
         self.batch, self.queries, self.heads, _ = query.shape
         self.scale, self.causal = scale, causal
-        self.output = torch.empty(
-            (self.batch, self.queries, self.heads, 512),
-            dtype=rope.dtype,
-            device=query.device,
+        self.output = (
+            torch.empty(
+                (self.batch, self.queries, self.heads, 512),
+                dtype=rope.dtype,
+                device=query.device,
+            )
+            if out is None
+            else out
         )
-        self.lse = torch.empty(
-            (self.batch, self.heads, self.queries),
-            dtype=torch.float32,
-            device=query.device,
+        self.lse = (
+            torch.empty(
+                (self.batch, self.heads, self.queries),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            if lse is None
+            else lse
         )
         self.capacity = tensors[6].shape[1]
         merged_heads = self.queries * self.heads
@@ -1824,6 +1834,7 @@ class FlashMLAInt8PreparedHandle:
             self.staged
             and (merged_heads == 32 or merged_heads >= 64)
             and rope.dtype == torch.bfloat16
+            and self.output.data_ptr() % 16 == 0
             and self.batch * triton.cdiv(merged_heads, 64) * 2
             >= _get_num_sms(query.device)
             and 63 * kv.stride(1) + 512 < 2**31
@@ -2237,7 +2248,7 @@ class FlashMLAInt8PreparedHandle:
         return self.output, self.lse
 
 
-def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+def prepare_flash_mla_with_kvcache_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_lora: torch.Tensor,
@@ -2251,6 +2262,8 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     num_splits: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> tuple[FlashMLAInt8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
     """Decode 64-token pages; RoPE is divided by the content scale as in PR851.
 
@@ -2359,6 +2372,16 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         or splits not in (1, 2, 4, 8, 16)
     ):
         raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
+    for tensor, shape, dtype, label in (
+        (out, (batch, queries, heads, head_dim_v), q_rope.dtype, "out"),
+        (lse, (batch, heads, queries), torch.float32, "lse"),
+    ):
+        if tensor is None:
+            continue
+        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
+        if tensor.device != q_nope.device or not tensor.is_contiguous():
+            raise ValueError(f"{label} must be contiguous on the query device")
     output_bytes = batch * queries * heads * 512 * q_rope.element_size()
     partial_bytes = (splits if splits > 1 else 0) * batch * queries * heads * 512 * 4
     if max(output_bytes, partial_bytes) > 2**31 - 1:
@@ -2366,31 +2389,41 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
             "output and partial workspaces must fit signed INT32 indexing"
         )
     handle = FlashMLAInt8PreparedHandle(
-        tensors, splits, scale, causal, automatic_splits=num_splits is None
+        tensors,
+        splits,
+        scale,
+        causal,
+        automatic_splits=num_splits is None,
+        out=out,
+        lse=lse,
     )
     return handle, handle()
 
 
-def flash_mla_with_kvcache_fwd_w8a8_int8(
+def flash_mla_with_kvcache_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
-    k_lora: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    head_dim_v: int = 512,
-    *,
+    head_dim_v: int,
+    tile_scheduler_metadata: object | None = None,
+    num_splits: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    num_splits: Optional[int] = None,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, outputs = prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+    if tile_scheduler_metadata is not None:
+        raise NotImplementedError("HCU does not accept external scheduler metadata")
+    _, outputs = prepare_flash_mla_with_kvcache_w8a8(
         q_nope,
         q_rope,
-        k_lora,
-        k_rope,
+        k_cache_lora,
+        k_cache_rope,
         q_scale,
         k_scale,
         block_table,
@@ -2399,5 +2432,7 @@ def flash_mla_with_kvcache_fwd_w8a8_int8(
         softmax_scale=softmax_scale,
         causal=causal,
         num_splits=num_splits,
+        out=out,
+        lse=lse,
     )
     return outputs

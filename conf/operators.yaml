@@ -446,15 +446,14 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
-  - id: flash_mla_with_kvcache_fwd
+  - id: flash_mla_with_kvcache_w8a8
     description: |
-      Dense W8A8 INT8 MLA decode with per-token-scaled KVCache on Hygon.
+      Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific implementations.
     for:
-      - flash_mla_with_kvcache_fwd_w8a8_int8
+      - flash_mla_with_kvcache_w8a8
     labels:
       - fused
       - Attention
-      - Hygon
     kind:
       - NeuralNetwork
     stages:
