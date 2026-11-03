@@ -1,0 +1,141 @@
+{
+  "status": "MEASURED_PRODUCTION_FAMILY_ABLATION_NOT_TARGET_PORT",
+  "source_partial_sha256": "b1118ea4302d57cd2cc66f1036ee6f5e104c9669d5a1542b6b3ea2076e01ee33",
+  "records": [
+    {
+      "input": 4096,
+      "output": 1024,
+      "C": 64,
+      "current_tok_s": 2112.5498255103557,
+      "moe_off_tok_s": 1857.5706612850129,
+      "current_vs_off_pct": 13.726485325137272,
+      "off_rounds": [
+        {
+          "round": 2,
+          "tok_s": 1855.730535559857,
+          "successful": true,
+          "preemptions": 0.0,
+          "prefix_hits": 0.0,
+          "summary_sha256": "1200952c08a741e597571278d5a15707e906a8bb04dcc3128620e6dbe3ddfd2e"
+        },
+        {
+          "round": 3,
+          "tok_s": 1859.4107870101689,
+          "successful": true,
+          "preemptions": 0.0,
+          "prefix_hits": 0.0,
+          "summary_sha256": "1c07821cc09606cfa82eff74de34188fc48bf16988dba452a44b1e71eb86e263"
+        }
+      ],
+      "current_rounds": [
+        {
+          "round": 2,
+          "summary_sha256": "8c46990e8a7fd88d98dc29d311df86caf2d213f2033338289f367fd568235e0d"
+        },
+        {
+          "round": 3,
+          "summary_sha256": "744355515e23d3fa803049a8dd229207d832009cf0096b03340c7ac1206899d0"
+        }
+      ]
+    },
+    {
+      "input": 16384,
+      "output": 1024,
+      "C": 64,
+      "current_tok_s": 788.6247006357867,
+      "moe_off_tok_s": 674.1118498646181,
+      "current_vs_off_pct": 16.987218188519627,
+      "off_rounds": [
+        {
+          "round": 2,
+          "tok_s": 672.2977519438413,
+          "successful": true,
+          "preemptions": 4.0,
+          "prefix_hits": 0.0,
+          "summary_sha256": "5ea5db236916d699cb81fe5d1e802cf9fbd17fa8b7e398de4027c335ff0a4fe4"
+        },
+        {
+          "round": 3,
+          "tok_s": 675.9259477853948,
+          "successful": true,
+          "preemptions": 4.0,
+          "prefix_hits": 0.0,
+          "summary_sha256": "e5e72f74e8810acb71825b9dc79cbe2d29ba45f9a1ee8b8a3e37f7350148cc51"
+        }
+      ],
+      "current_rounds": [
+        {
+          "round": 2,
+          "summary_sha256": "767152e632a56e2c9f19854455dd1c4a34211e789117ffce962e6a9b43dd8fa1"
+        },
+        {
+          "round": 3,
+          "summary_sha256": "9793e9920c2088350ae2ef2e41573647adfc07030b78d701614211fa26ca0c11"
+        }
+      ]
+    },
+    {
+      "input": 32768,
+      "output": 1024,
+      "C": 64,
+      "current_tok_s": 423.0680426051979,
+      "moe_off_tok_s": 361.1464708305298,
+      "current_vs_off_pct": 17.14583327708197,
+      "off_rounds": [
+        {
+          "round": 2,
+          "tok_s": 360.80144967826357,
+          "successful": true,
+          "preemptions": 0.0,
+          "prefix_hits": 0.0,
+          "summary_sha256": "4d4a356a21f5e071568b13996c526faa02205ba690a3f4ebbe09c74fd95c655a"
+        },
+        {
+          "round": 3,
+          "tok_s": 361.491491982796,
+          "successful": true,
+          "preemptions": 0.0,
+          "prefix_hits": 0.0,
+          "summary_sha256": "64946658e098da0ad1d8e7503fd370dbb7ee552e217ce6965e656301cc723d73"
+        }
+      ],
+      "current_rounds": [
+        {
+          "round": 2,
+          "summary_sha256": "2a1d9f71dbce8c86ab8becaa9adda0b0161df4fa0e37dc6f336e2e68d90a8660"
+        },
+        {
+          "round": 3,
+          "summary_sha256": "9ed65c3f2a79ba10019efbd88adaf29f0b78483e2477763fef2ad76d0534e95c"
+        }
+      ]
+    }
+  ],
+  "scope": "Conditional on attention enabled; tp8_h100 plus quant/OAI family, not original PR957 alone",
+  "protocol": {
+    "gpus": "8 x H100 80GB HBM3 NVLink",
+    "TP": 8,
+    "DP": 1,
+    "EP": false,
+    "speculation": false,
+    "concurrency": 64,
+    "requests": 128,
+    "output_tokens": 1024,
+    "seeds": "independent seed per request",
+    "main_kv": "fp8_e4m3",
+    "index_kv": "bf16",
+    "kv_bytes_per_rank": 15032385536,
+    "kv_slots": 489088,
+    "rounds": "R1 warmup excluded; mean of R2 and R3",
+    "temperature": 1,
+    "top_p": 0.95,
+    "ignore_eos": true
+  },
+  "limitations": [
+    "16K and 32K capacity constrained; C64 client does not mean 64 full-length resident decode requests",
+    "16K has 4 preemptions per round on both sides; 4K and 32K have 0",
+    "All completed requests and output lengths validated; prefix cache hits are zero; server ITL count is 130944",
+    "4K current reused same frozen code/config result, not a concurrent paired run",
+    "Do not add conditional family gains or attribute this total to original PR957 alone"
+  ]
+}
