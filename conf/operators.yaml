@@ -1545,3 +1545,15 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+
+  - id: layernorm
+    description: MetaX C550 inference LayerNorm for vLLM vision hidden states, with FP32 centered variance.
+    for:
+      - torch.nn.functional.layer_norm
+    labels:
+      - vLLM
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'

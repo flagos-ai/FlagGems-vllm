@@ -221,6 +221,7 @@ from flaggems_vllm.ops.kpool import (
     kpool_decode_update_and_maybe_write_cache_batched,
     kpool_seed_tail_cache,
 )
+from flaggems_vllm.ops.layernorm import layernorm
 from flaggems_vllm.ops.mhc_with_norm import (
     mhc_fused_post_pre_with_norm,
     mhc_pre_with_norm,
@@ -234,6 +235,7 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "layernorm",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
