@@ -1003,6 +1003,36 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: minimax_m3_sparse_attn
+    description: |
+      MiniMax M3 block-sparse GQA prefill attention over packed paged KV
+      (one 128-token page per sparse block). Dispatches to FlagAttention's
+      flag_attn.minimax_sparse_attention kernels.
+    for:
+      - vllm.models.minimax_m3.common.ops.sparse_attn
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: minimax_m3_sparse_attn_decode
+    description: |
+      MiniMax M3 block-sparse GQA decode attention; split-K over the selected
+      blocks with an LSE merge. Dispatches to FlagAttention's
+      flag_attn.minimax_sparse_attention kernels.
+    for:
+      - vllm.models.minimax_m3.common.ops.sparse_attn
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: moe_align_block_size_triton
     description: |
       Aligns the token distribution across experts to be compatible with block size
