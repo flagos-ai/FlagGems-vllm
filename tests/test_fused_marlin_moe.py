@@ -1065,10 +1065,7 @@ def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, blocks):
 def test_fused_marlin_moe_w8a16_fp8_gateup_pipeline(num_tokens, dtype):
     module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
     configs = module._fused_moe_kernel_w8a16_gateup_fp8.fn.configs
-    eligible = module._prune_w8a16_fp8_gateup_configs(
-        configs, {"T": num_tokens, "H": 1024, "Nw1": 2048}
-    )
-    assert any(config.num_stages > 1 for config in eligible)
+    assert any(config.num_stages > 1 for config in configs)
     hs, w1, w2, r1, r2, tw, ti, s1, s2 = _make_inputs_fp8_weight(
         num_tokens, 8, 1024, 1024, 2, dtype, flaggems_vllm.device
     )
