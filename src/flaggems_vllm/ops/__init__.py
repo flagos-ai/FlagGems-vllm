@@ -235,7 +235,6 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
-    "layernorm",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -314,6 +313,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "layernorm",
     "mhc_bwd",
     "mhc_bwd_ref",
     "mhc_fused_post_pre_with_norm",

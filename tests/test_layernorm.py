@@ -85,6 +85,7 @@ def test_layernorm_special_values(value):
     )
 
 
+@pytest.mark.layernorm
 def test_layernorm_real_shape():
     torch.manual_seed(77)
     tensor = torch.randn(65536, 1, 1152, device="cuda", dtype=torch.bfloat16)
