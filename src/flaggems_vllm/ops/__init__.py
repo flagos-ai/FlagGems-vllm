@@ -132,6 +132,10 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
 )
+from flaggems_vllm.ops.minimax_m3_sparse_attn import (
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
     moe_align_block_size_no_tle,
@@ -315,6 +319,8 @@ __all__ = [
     "mhc_pre",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
     "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",
