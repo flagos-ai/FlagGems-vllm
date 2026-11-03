@@ -20,7 +20,7 @@ import torch
 import flaggems_vllm
 from baseline import qsa_sparse_paged_attention as qsa_baseline
 
-from . import base, consts
+from . import base
 
 VENDOR = flaggems_vllm.vendor_name
 
@@ -49,7 +49,6 @@ class QSASparsePagedAttentionBenchmark(base.Benchmark):
             qsa_baseline.DTYPES,
             gems_op=flaggems_vllm.qsa_sparse_paged_attention,
         )
-
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
