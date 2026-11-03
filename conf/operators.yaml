@@ -547,6 +547,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_indexer_weight_scale
+    description: |
+      Fuse indexer weights with per-head query scales and a scalar factor,
+      producing FP32 weights for GLM5-next attention on MetaX.
+    for:
+      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_inv_rope_fp8_quant
     description: |
       Apply inverse RoPE and group-wise quantization to attention output.

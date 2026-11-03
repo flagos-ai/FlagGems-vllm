@@ -573,3 +573,17 @@ gdn_w8a16_int8:
     - [35, 8192, 32, 128]
     - [51, 8192, 32, 128]
   shape_desc: "decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N"
+
+fused_indexer_weight_scale:
+  shapes:
+    - [4, 32]
+    - [8, 32]
+    - [35, 32]
+    - [65, 32]
+    - [18, 32]
+    - [46, 32]
+    - [13, 32]
+    - [51, 32]
+    - [24, 32]
+    - [76, 32]
+  shape_desc: tokens, heads
