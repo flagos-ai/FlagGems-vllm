@@ -8,13 +8,11 @@ imported lazily because it only exists in vLLM builds that ship the packed
 4D KV layout ``[num_blocks, num_kv_heads, 128, 2 * head_dim]``; older builds
 use a 5D layout and are skipped rather than silently compared.
 
-Each record carries the selected-index span statistics. Sparse-attention
-latency depends heavily on how clustered the top-k ids are, so a speedup is
-only interpretable next to the distribution that produced it.
+Sparse-attention latency depends heavily on how clustered the selected block
+ids are, so each shape is run under both a compact and a scattered top-k
+distribution and the span statistics are reported as an extra metric: a
+speedup is not interpretable without the distribution that produced it.
 """
-
-import json
-import statistics
 
 import pytest
 import torch
@@ -27,7 +25,7 @@ from tests.test_minimax_m3_sparse_attn import (
     topk_span_stats,
 )
 
-from . import conftest as bench_cfg
+from . import base
 
 native = pytest.importorskip(
     "vllm.models.minimax_m3.common.ops.sparse_attn",
@@ -35,7 +33,6 @@ native = pytest.importorskip(
 )
 
 pytestmark = [
-    pytest.mark.minimax_m3_sparse_attn,
     pytest.mark.skipif(
         flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available(),
         reason="requires an NVIDIA GPU",
@@ -48,158 +45,77 @@ pytestmark = [
     ),
 ]
 
-WARMUP = 20
-SAMPLES = 50
+_QLENS = [512, 2048, 4096, 8192]
+_DECODE_REQS = [1, 16, 64, 128]
+_DISTRIBUTIONS = ["compact", "scattered"]
 
 
-def _median_us(fn):
-    """Interleaved CUDA-event timing; returns the median microseconds."""
-    for _ in range(WARMUP):
-        fn()
-    torch.cuda.synchronize()
-    pairs = [
-        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-        for _ in range(SAMPLES)
-    ]
-    for start, end in pairs:
-        start.record()
-        fn()
-        end.record()
-    torch.cuda.synchronize()
-    values = sorted(start.elapsed_time(end) * 1000 for start, end in pairs)
-    return statistics.median(values), values[SAMPLES // 10], values[-SAMPLES // 10]
+class _MSABenchmark(base.Benchmark):
+    """Shared plumbing for the two MSA phases.
+
+    ``BenchmarkMetrics`` has a fixed field set and the run loop only computes
+    ``gbps``/``tflops`` by name, so the selected-index span cannot be added as
+    a custom metric. It rides along in ``shape_detail`` instead, which takes
+    arbitrary values -- the span is the most predictive input property for this
+    operator (the same shape and top-k count can differ severalfold between a
+    clustered and a dispersed selection), so a latency row without it is not
+    interpretable.
+    """
+
+    DEFAULT_DTYPES = [torch.bfloat16]
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(n, dist) for n in self._sizes for dist in _DISTRIBUTIONS]
+
+    def record_shapes(self, *args, **kwargs):
+        stats = topk_span_stats(args[2])
+        return (
+            super().record_shapes(*args, **kwargs),
+            f"span_median={stats.get('span_median')}",
+            f"redundancy_median={stats.get('redundancy_median')}",
+        )
 
 
-def _emit(op_name, record, native_us, gems_us):
-    """SpeedUp = latency_vllm_baseline / latency_flaggems (repo convention)."""
-    record["flaggems_us"] = round(gems_us, 2)
-    record["vllm_us"] = round(native_us, 2)
-    record["speedup"] = round(native_us / gems_us, 3)
-    print(json.dumps(record), flush=True)
-    if bench_cfg.Config.record_json:
-        bench_cfg.update_result(op_name, record)
+class MinimaxM3SparseAttnBenchmark(_MSABenchmark):
+    DEFAULT_SHAPE_DESC = "query_len, topk_distribution"
+    _sizes = _QLENS
+
+    def get_input_iter(self, dtype):
+        for qlen, mode in self.shapes:
+            args = make_inputs(qlens=(qlen,), dtype=dtype, mode=mode, context=16384)
+            yield (*args, {"output": torch.empty_like(args[0])})
 
 
-def _kv_dtype():
-    return (
-        torch.float8_e4m3fn
-        if torch.cuda.get_device_capability() >= (8, 9)
-        else torch.bfloat16
-    )
+class MinimaxM3SparseAttnDecodeBenchmark(_MSABenchmark):
+    DEFAULT_SHAPE_DESC = "num_reqs, topk_distribution"
+    _sizes = _DECODE_REQS
+
+    def get_input_iter(self, dtype):
+        for num_reqs, mode in self.shapes:
+            args = make_decode_inputs(
+                num_reqs=num_reqs, dtype=dtype, mode=mode, context=16384
+            )
+            yield (
+                *args[:7],
+                {"output": torch.empty_like(args[0]), "decode_query_len": args[7]},
+            )
 
 
-@pytest.mark.parametrize("distribution", ["scattered", "compact"])
-@pytest.mark.parametrize("qlen", [512, 2048, 4096, 8192])
 @pytest.mark.minimax_m3_sparse_attn
-def test_perf_minimax_m3_sparse_attn(qlen, distribution):
-    """Prefill latency across query lengths and index distributions."""
-    if bench_cfg.Config.bench_level.value == "core" and (
-        qlen not in (512, 2048) or distribution != "scattered"
-    ):
-        pytest.skip("non-core shape")
-    dtype = _kv_dtype()
-    args = make_inputs(
-        qlens=(qlen,), d=128, kv_heads=1, dtype=dtype, mode=distribution, context=32768
+def test_perf_minimax_m3_sparse_attn():
+    bench = MinimaxM3SparseAttnBenchmark(
+        op_name="minimax_m3_sparse_attn",
+        torch_op=native.minimax_m3_sparse_attn,
+        gems_op=flaggems_vllm.minimax_m3_sparse_attn,
     )
-    out = torch.empty_like(args[0])
-    out_native = torch.empty_like(args[0])
-
-    def candidate():
-        flaggems_vllm.minimax_m3_sparse_attn(*args, output=out)
-
-    def baseline():
-        native.minimax_m3_sparse_attn(*args, output=out_native)
-
-    # Timing a wrong kernel is meaningless; agree with the baseline first.
-    baseline()
-    candidate()
-    torch.cuda.synchronize()
-    finite = torch.isfinite(out) & torch.isfinite(out_native)
-    if bool(finite.any()):
-        torch.testing.assert_close(
-            out.float()[finite], out_native.float()[finite], atol=0.02, rtol=0
-        )
-
-    native_us = _median_us(baseline)[0]
-    gems_us, p10, p90 = _median_us(candidate)
-    record = {
-        "stage": "prefill",
-        "q": qlen,
-        "heads": 8,
-        "D": 128,
-        "kv_heads": 1,
-        "context": 32768,
-        "TOPK": 16,
-        "page": 128,
-        "distribution": distribution,
-        "kv_dtype": str(dtype),
-        "warmup": WARMUP,
-        "samples": SAMPLES,
-        "p10_us": round(p10, 2),
-        "p90_us": round(p90, 2),
-        "index_span": topk_span_stats(args[2]),
-        "device": torch.cuda.get_device_name(),
-    }
-    _emit("minimax_m3_sparse_attn", record, native_us, gems_us)
+    bench.run()
 
 
-@pytest.mark.parametrize("num_reqs", [1, 16, 64, 128])
 @pytest.mark.minimax_m3_sparse_attn_decode
-def test_perf_minimax_m3_sparse_attn_decode(num_reqs):
-    """Decode latency across the batch sizes that move the split-K count."""
-    if bench_cfg.Config.bench_level.value == "core" and num_reqs not in (16, 64):
-        pytest.skip("non-core shape")
-    dtype = _kv_dtype()
-    args = make_decode_inputs(
-        num_reqs=num_reqs,
-        d=128,
-        kv_heads=1,
-        dtype=dtype,
-        mode="scattered",
-        context=32768,
+def test_perf_minimax_m3_sparse_attn_decode():
+    bench = MinimaxM3SparseAttnDecodeBenchmark(
+        op_name="minimax_m3_sparse_attn_decode",
+        torch_op=native.minimax_m3_sparse_attn_decode,
+        gems_op=flaggems_vllm.minimax_m3_sparse_attn_decode,
     )
-    out = torch.empty_like(args[0])
-
-    out_native = torch.empty_like(args[0])
-
-    def candidate():
-        flaggems_vllm.minimax_m3_sparse_attn_decode(
-            *args[:7], output=out, decode_query_len=args[7]
-        )
-
-    def baseline():
-        native.minimax_m3_sparse_attn_decode(
-            *args[:7], output=out_native, decode_query_len=args[7]
-        )
-
-    baseline()
-    candidate()
-    torch.cuda.synchronize()
-    finite = torch.isfinite(out) & torch.isfinite(out_native)
-    if bool(finite.any()):
-        torch.testing.assert_close(
-            out.float()[finite], out_native.float()[finite], atol=0.02, rtol=0
-        )
-
-    native_us = _median_us(baseline)[0]
-    gems_us, p10, p90 = _median_us(candidate)
-    record = {
-        "stage": "decode",
-        "num_reqs": num_reqs,
-        "decode_query_len": 1,
-        "heads": 8,
-        "D": 128,
-        "kv_heads": 1,
-        "context": 32768,
-        "TOPK": 16,
-        "page": 128,
-        "distribution": "scattered",
-        "kv_dtype": str(dtype),
-        "warmup": WARMUP,
-        "samples": SAMPLES,
-        "p10_us": round(p10, 2),
-        "p90_us": round(p90, 2),
-        "index_span": topk_span_stats(args[2]),
-        "device": torch.cuda.get_device_name(),
-    }
-    _emit("minimax_m3_sparse_attn_decode", record, native_us, gems_us)
+    bench.run()
