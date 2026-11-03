@@ -23,21 +23,6 @@ pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 ```
 
-昆仑芯用户克隆本仓库后，请在独立的厂商环境中安装固定的 FlagGems 源码版本，
-替代上述发布包：
-
-```bash
-pip install --no-deps --force-reinstall -r requirements-kunlunxin.txt
-```
-
-该版本与 FlagGems CI 检出版本一致，提供昆仑芯 `hadamard128` 路径使用的
-Hadamard 算子。FlagGems-vllm 不会自动安装 FlagGems。如果已有 `PYTHONPATH` 指向
-其他源码目录，它可能覆盖此安装；请运行
-`python -c "import importlib.util; print(importlib.util.find_spec('flag_gems').origin)"`
-确认导入路径属于目标环境。可在目标设备上运行
-`pytest -q tests/test_kpool.py::test_kunlun_hadamard_real_fp32_contract`，验证公开
-接口及其数值契约。
-
 ### PyTorch
 
 在安装 FlagGems-vllm **之前**,先安装与目标加速器兼容的 PyTorch。FlagGems-vllm 不会自动重新安装 PyTorch。
@@ -111,8 +96,6 @@ DNN_VENDOR=amd source tools/setup.sh
 ## 与 FlagGems 和 vllm-plugin-fl 一起安装
 
 完整的 FlagOS vLLM 插件栈需按以下顺序安装:
-昆仑芯用户请在克隆 FlagGems-vllm 后，使用上文固定版本的安装命令替代步骤 1
-中的 FlagGems 发布包安装。
 
 ```bash
 # 1. 安装 FlagGems (通用算子后端，5.4.0 版本)

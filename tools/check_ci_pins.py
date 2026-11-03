@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Keep the FlagGems CI and Kunlun installation pins aligned."""
+"""Ensure every FlagGems CI integration point uses the same full commit SHA."""
 
 from __future__ import annotations
 
@@ -27,10 +27,6 @@ REUSABLE_PATTERN = re.compile(
 )
 CHECKOUT_PATTERN = re.compile(
     rf"repository:\s*flagos-ai/FlagGems\s+ref:\s*({SHA})", re.MULTILINE
-)
-KUNLUN_REQUIREMENT_PATTERN = re.compile(
-    rf"^flag-gems @ git\+https://github\.com/flagos-ai/FlagGems\.git@({SHA})$",
-    re.MULTILINE,
 )
 
 
@@ -48,18 +44,11 @@ def extract_pins(repo_root: Path) -> list[str]:
 
 
 def main() -> int:
-    repo_root = Path.cwd()
-    pins = extract_pins(repo_root)
+    pins = extract_pins(Path.cwd())
     if len(pins) != 3:
         raise RuntimeError(f"expected 3 FlagGems CI pins, found {len(pins)}: {pins}")
     if len(set(pins)) != 1:
         raise RuntimeError(f"FlagGems CI pins are inconsistent: {pins}")
-    kunlun_requirements = (repo_root / "requirements-kunlunxin.txt").read_text(
-        encoding="utf-8"
-    )
-    kunlun_pins = KUNLUN_REQUIREMENT_PATTERN.findall(kunlun_requirements)
-    if kunlun_pins != [pins[0]]:
-        raise RuntimeError(f"Kunlun FlagGems pin differs from CI: {kunlun_pins}")
     print(f"FlagGems CI pin: {pins[0]}")
     return 0
 
