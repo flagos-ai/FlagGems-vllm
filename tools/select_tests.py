@@ -86,9 +86,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py": [
         "tests/test_gdn_w8a16_metax.py"
     ],
-    "src/flaggems_vllm/runtime/backend/_metax/gdn_w8a16_chunk.py": [
-        "tests/test_gdn_w8a16_metax.py"
-    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
@@ -219,9 +216,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py": [
-        "benchmark/test_gdn_w8a16_metax.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_metax/gdn_w8a16_chunk.py": [
         "benchmark/test_gdn_w8a16_metax.py"
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [

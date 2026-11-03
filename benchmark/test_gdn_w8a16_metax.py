@@ -192,35 +192,18 @@ def main():
         return inspect.getsourcefile(fn)
 
     # Load exactly the PR kernels without importing unrelated operators/dependencies.
-    # Only two import statements are adapted; computation and launch configs unchanged.
+    # Only the runtime-vendor import is adapted; computation and launch configs unchanged.
     scratch = tempfile.TemporaryDirectory(prefix="gdn-isolated-")
     tmp = Path(scratch.name)
     sys.path.insert(0, str(tmp))
     entry_path = REPO / "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py"
-    chunk_path = REPO / "src/flaggems_vllm/runtime/backend/_metax/gdn_w8a16_chunk.py"
-    entry = entry_path.read_text()
-    assert entry.count("from flaggems_vllm import runtime") == 1
-    assert (
-        entry.count("from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import")
-        == 1
-    )
-    entry = entry.replace(
+    entry = entry_path.read_text().replace(
         "from flaggems_vllm import runtime",
         'from types import SimpleNamespace\nruntime = SimpleNamespace(device=SimpleNamespace(vendor_name="metax"))',
     )
-    entry = entry.replace(
-        "from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import",
-        "from isolated_chunk import",
-    )
-    (tmp / "isolated_chunk.py").write_bytes(chunk_path.read_bytes())
     (tmp / "isolated_entry.py").write_text(entry)
-    backend_dir = chunk_path.parent
-    for module in ("gdn_w8a16_short", "gdn_w8a16_decode", "gdn_w8a16_fp32"):
-        load(
-            "flaggems_vllm.runtime.backend._metax." + module,
-            backend_dir / (module + ".py"),
-        )
     candidate = load("isolated_entry", tmp / "isolated_entry.py").gdn_w8a16
+
     cfg = VllmConfig()
     cfg.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(linear_key_head_dim=128)
@@ -230,12 +213,8 @@ def main():
     assert prefill.gdn_prefill_backend == "triton"
     assert os.getenv("MACA_VLLM_USE_EXTERNAL_FLA", "0") == "0"
     paths = [
-        backend_dir / "gdn_w8a16_fp32.py",
-        backend_dir / "gdn_w8a16_short.py",
-        backend_dir / "gdn_w8a16_decode.py",
         Path(__file__),
         entry_path,
-        chunk_path,
         Path(source_path(prefill._forward_method)),
         Path(source_path(chunk_delta_h.chunk_gated_delta_rule_fwd_kernel_h_blockdim64)),
         Path(source_path(fused_recurrent_gated_delta_rule_packed_decode)),
@@ -262,7 +241,7 @@ def main():
             k: v for k, v in os.environ.items() if k.startswith(("GDN_", "DECODE_"))
         },
         raw_shape_file_sha256=hashlib.sha256(SHAPES.read_bytes()).hexdigest(),
-        candidate_import_adaptation="runtime vendor constant + local chunk import only; no kernel edits",
+        candidate_import_adaptation="runtime vendor constant only; no kernel edits",
         prefill_scope="precomputed gates, no QK normalization, immutable FP32 state, metadata prebuilt",
         decode_scope=(
             "gate generation + QK L2 normalization + recurrence + "

@@ -193,7 +193,11 @@ def test_gdn_w8a16_bounded_workspace_replay(monkeypatch, dtype, sequences):
 
     if runtime.device.vendor_name != "metax":
         pytest.skip("MetaX windowed chunk implementation")
-    import flaggems_vllm.runtime.backend._metax.gdn_w8a16_fp32 as chunk
+    import importlib
+
+    chunk = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16"
+    )
 
     # A small budget forces several windows without a large CI allocation.
     budget = 4 * 1024**2
