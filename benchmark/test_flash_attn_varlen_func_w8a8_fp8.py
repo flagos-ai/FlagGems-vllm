@@ -556,13 +556,14 @@ def _paged_w8a8_input_fn(config, dtype, device):
     getattr(torch, "float8_e4m3fn", None) is None,
     reason="FP8 is not available",
 )
-@pytest.mark.flash_attn_varlen_func_w8a8_fp8
+@pytest.mark.flash_attn_varlen_func_w8a8
 def test_flash_attn_varlen_func_w8a8_fp8():
     bench = FlashAttnVarlenFuncW8A8FP8Benchmark(
-        op_name="flash_attn_varlen_func_w8a8_fp8",
+        op_name="flash_attn_varlen_func_w8a8",
         input_fn=flash_attn_varlen_func_w8a8_fp8_input_fn,
         torch_op=baseline_flash_attn_varlen_func_w8a8_fp8,
         dtypes=[torch.float16, torch.bfloat16],
     )
+    bench.base_variant = "fp8"
     bench.set_gems(gems_flash_attn_varlen_func_w8a8_fp8)
     bench.run()

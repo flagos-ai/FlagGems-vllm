@@ -18,14 +18,21 @@ from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.dequantize_and_gather_k_cache import (
+    dequantize_and_gather_k_cache,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -44,22 +51,29 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
+    w8a8_block_fp8_matmul,
+)
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
+    "dequantize_and_gather_k_cache",
     "flash_attn_varlen_func_w8a8_fp8",
-    "grouped_topk",
-    "per_token_group_quant_fp8",
-    "qwen4_store_qsa_kv_rows",
-    "qwen4_hc_inject_combine",
-    "ple_state_scatter_",
-    "qwen4_qsa_mqa_paged_dot",
-    "qwen4_compress_norm_mrope_store_groups",
-    "scaled_int8_quant",
     "fused_experts_impl",
+    "fused_inv_rope_fp8_quant",
+    "fused_q_kv_rmsnorm",
+    "gemma_rms_norm",
+    "grouped_topk",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "per_token_group_quant_fp8",
     "persistent_topk",
-    "fused_q_kv_rmsnorm",
+    "ple_state_scatter_",
+    "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
+    "scaled_int8_quant",
+    "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
+    "w8a8_block_fp8_matmul",
 ]

@@ -14,6 +14,7 @@
 
 import itertools
 import math
+from importlib import import_module
 
 import pytest
 import torch
@@ -21,7 +22,13 @@ import torch.nn.functional as F
 
 import flaggems_vllm
 from benchmark.base import Benchmark
-from flaggems_vllm.ops.FLA import chunk_kda
+
+try:
+    chunk_kda = import_module(
+        f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}.FLA"
+    ).chunk_kda
+except ModuleNotFoundError:
+    from flaggems_vllm.ops.FLA import chunk_kda
 
 LOWER_BOUND = -5.0
 DEFAULT_H = 96
@@ -257,14 +264,11 @@ class ChunkKDABenchmark(Benchmark):
                 "dt_bias": dt_bias,
                 "state_v_first": True,
                 "cu_seqlens": cu_seqlens,
-                "chunk_size": 16,
+                "chunk_size": 32 if flaggems_vllm.vendor_name == "mthreads" else 16,
             },
         )
 
 
-@pytest.mark.skipif(
-    flaggems_vllm.device != "cuda", reason="chunk_kda benchmark requires CUDA"
-)
 @pytest.mark.chunk_kda
 def test_chunk_kda():
     bench = ChunkKDABenchmark(

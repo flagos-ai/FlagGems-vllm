@@ -16,6 +16,9 @@
 flaggems_vllm - DNN operations implemented with Triton
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
+
 import torch
 
 import flaggems_vllm.ops as _ops_module
@@ -32,7 +35,10 @@ registrar = Register
 current_work_registrar = None
 runtime.replace_customized_ops(globals())
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata_version("flaggems_vllm")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 _COMPAT_OP_ALIASES = {
     "ops_add_rms_norm": "fused_add_rms_norm",
@@ -45,10 +51,22 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
     if _target in globals():
         globals()[_alias] = globals()[_target]
 
+# Callable library APIs that deliberately have no ATen schema to override.
+# They stay importable as `flaggems_vllm.<op>` but are never registered into
+# PyTorch dispatch by enable()/only_enable().
+_LIBRARY_ONLY_OPS = frozenset(
+    {
+        "minimax_m3_sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+    }
+)
+
 _FULL_CONFIG = tuple(
     (op_name, globals()[op_name])
     for op_name in getattr(_ops_module, "__all__", [])
-    if op_name in globals() and callable(globals()[op_name])
+    if op_name in globals()
+    and callable(globals()[op_name])
+    and op_name not in _LIBRARY_ONLY_OPS
 )
 
 if "weight_norm_interface" in globals():

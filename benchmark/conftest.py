@@ -90,6 +90,34 @@ class BenchConfig:
         self.shape_file = os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
         self.query = False
         self.parallel = 0
+        # NVIDIA baseline data loaded from --base-data; None means "not enabled",
+        # in which case behavior is identical to before this option existed.
+        self.base_data = None
+
+
+def _load_base_data(path):
+    """Load the NVIDIA baseline JSON for the optional 'vs Base' column.
+
+    Returns the parsed dict, or None when no path is given or the file cannot
+    be read/parsed. Never raises: a missing or malformed baseline must not
+    break the benchmark run (silent degradation to N/A).
+    """
+    if not path:
+        print("[base-data] 未指定 --base-data，'vs Base' 列关闭。")
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        n_ops = sum(1 for k in data if not k.startswith("_"))
+        has_sf = "_scaling_factors" in data
+        print(
+            f"[base-data] 已加载基线 {path}："
+            f"{n_ops} 个算子，_scaling_factors={'有' if has_sf else '无'}。"
+        )
+        return data
+    except (OSError, ValueError) as e:
+        print(f"[base-data] 加载失败 {path}: {e}；'vs Base' 列关闭。")
+        return None
 
 
 def pytest_addoption(parser):
@@ -171,6 +199,19 @@ def pytest_addoption(parser):
         help="Specify the shape file name for benchmarks. If not specified, a default shape list will be used.",
     )
 
+    parser.addoption(
+        "--base-data",
+        action="store",
+        default=None,
+        required=False,
+        help=(
+            "Path to an NVIDIA baseline JSON (e.g. op_perf_baseline.json). "
+            "When provided, an extra 'vs Base' column comparing each result "
+            "against the baseline latency is shown. If omitted or unreadable, "
+            "the column is silently N/A and behavior is unchanged."
+        ),
+    )
+
     try:
         parser.addoption(
             "--record",
@@ -248,6 +289,8 @@ def pytest_configure(config):
 
     shape_file_str = config.getoption("--shape_file")
     Config.shape_file = shape_file_str
+
+    Config.base_data = _load_base_data(config.getoption("--base-data"))
 
     Config.record_log = config.getoption("--record") == "log"
     Config.record_json = config.getoption("--record") == "json"
@@ -331,6 +374,21 @@ def extract_and_log_op_attributes(request):
         emit_record_logger(json.dumps(op_attributes, indent=2))
 
 
+# When several tests share one operator mark, a failure stays visible and a
+# skipped test never hides a passed one.
+_RESULT_PRIORITY = {"skipped": 0, "passed": 1, "failed": 2}
+
+
+def _record_outcome(op, outcome, test_case, reason):
+    entry = TEST_RESULTS[op]
+    previous = entry.get("result")
+    if _RESULT_PRIORITY.get(previous, -1) > _RESULT_PRIORITY.get(outcome, -1):
+        return
+    entry["result"] = outcome
+    entry["test_case"] = test_case
+    entry["reason"] = reason
+
+
 def get_reason(report):
     """Get reason for skipped or failed test."""
 
@@ -366,20 +424,13 @@ def pytest_runtest_logreport(report):
 
     if report.when == "setup":
         if report.outcome == "skipped":
-            reason = get_reason(report)
-            TEST_RESULTS[op]["result"] = "skipped"
-            TEST_RESULTS[op]["reason"] = reason
-            TEST_RESULTS[op]["test_case"] = report.nodeid
+            _record_outcome(op, "skipped", report.nodeid, get_reason(report))
 
     elif report.when == "call":
-        TEST_RESULTS[op]["result"] = report.outcome
-        TEST_RESULTS[op]["test_case"] = report.nodeid
-
+        reason = None
         if report.outcome in ["skipped", "failed"]:
             reason = get_reason(report)
-            TEST_RESULTS[op]["reason"] = reason
-        else:
-            TEST_RESULTS[op]["reason"] = None
+        _record_outcome(op, report.outcome, report.nodeid, reason)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

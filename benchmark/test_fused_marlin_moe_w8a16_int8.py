@@ -543,7 +543,7 @@ def _gems_call_int8(
     )
 
 
-@pytest.mark.fused_marlin_moe
+@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
@@ -558,9 +558,10 @@ def test_fused_marlin_moe_w8a16_int8():
     per-group-128 scales, in native and Marlin-repacked layouts respectively.
     """
     bench = FusedMarlinMoEW8A16INT8Benchmark(
-        op_name="fused_marlin_moe_w8a16_int8",
+        op_name="fused_marlin_moe_w8a16",
         torch_op=_vllm_baseline_int8,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "int8"
     bench.set_gems(_gems_call_int8)
     bench.run()

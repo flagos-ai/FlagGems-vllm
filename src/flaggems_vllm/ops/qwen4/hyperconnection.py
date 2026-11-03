@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Graph-safe Triton kernels for Qwen4 gated HyperConnection.
 
-This module contains only the three self-developed Qwen4 HC device kernels.
+This module contains the Qwen4 HC kernels, including delayed combine + norm.
 The model wiring and vLLM custom-op registration stay in the model/plugin
 repository.  The wrappers below are standalone FlagGems-vllm entry points and
 fail closed when their accelerator/layout contract is not met.
@@ -325,10 +325,166 @@ def qwen4_hc_inject_combine_fake(
     return torch.empty_like(residual)
 
 
+def can_use_hc_combine_norm_triton(
+    injection_logits: torch.Tensor,
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> bool:
+    """Return whether delayed combine+grouped-RMSNorm can use Triton.
+
+    The injection view may retain the wider row stride of the packed
+    down+inject projection.  The residual and block output are required to
+    remain contiguous because the fused kernel writes a fresh contiguous
+    multi-stream state and normalizes each branch in place conceptually.
+    """
+
+    return bool(
+        can_use_hc_inject_triton(injection_logits, block_output, residual)
+        and norm_weight.device == residual.device
+        and norm_weight.dtype in (torch.bfloat16, torch.float16)
+        and norm_weight.is_contiguous()
+    )
+
+
+@triton.jit
+def _hc_combine_norm_kernel(
+    block_ptr,
+    residual_ptr,
+    injection_ptr,
+    weight_ptr,
+    output_ptr,
+    normed_ptr,
+    stride_block_row,
+    stride_residual_row,
+    stride_injection_row,
+    stride_output_row,
+    stride_normed_row,
+    hidden_size: tl.constexpr,
+    hc_count: tl.constexpr,
+    weight_shared: tl.constexpr,
+    eps: tl.constexpr,
+    block_h: tl.constexpr,
+) -> None:
+    """Fuse pending HC injection, materialization, and grouped RMSNorm.
+
+    One program owns one token/branch pair.  All hidden-size tiles are kept
+    in the program so the RMS reduction sees the same rounded-to-residual-dtype
+    values that the unfused combine -> norm sequence would consume.
+    """
+
+    num_tiles: tl.constexpr = triton.cdiv(hidden_size, block_h)
+    num_tiles_padded: tl.constexpr = triton.next_power_of_2(num_tiles)
+
+    row = tl.program_id(0)
+    branch = tl.program_id(1)
+    tile_ids = tl.arange(0, num_tiles_padded)
+    offsets = tile_ids[:, None] * block_h + tl.arange(0, block_h)[None, :]
+    mask = offsets < hidden_size
+    branch_offsets = branch * hidden_size + offsets
+    weight_offsets = offsets if weight_shared else branch_offsets
+
+    residual = tl.load(
+        residual_ptr + row * stride_residual_row + branch_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    block = tl.load(
+        block_ptr + row * stride_block_row + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    injection = tl.load(
+        injection_ptr + row * stride_injection_row + branch,
+    ).to(tl.float32)
+    injection = 2.0 * tl.sigmoid(injection / hc_count)
+
+    # Match the official fused kernel's explicit residual-dtype boundary.
+    combined = (residual + block * injection).to(output_ptr.dtype.element_ty)
+    tl.store(
+        output_ptr + row * stride_output_row + branch_offsets,
+        combined,
+        mask=mask,
+    )
+
+    combined_f32 = combined.to(tl.float32)
+    sum_sq = tl.sum(tl.sum(combined_f32 * combined_f32, axis=1), axis=0)
+    inv_rms = tl.rsqrt(sum_sq / hidden_size + eps)
+    weight = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0)
+    normalized = combined_f32 * inv_rms
+    normalized += normalized * weight.to(tl.float32)
+    tl.store(
+        normed_ptr + row * stride_normed_row + branch_offsets,
+        normalized,
+        mask=mask,
+    )
+
+
+def qwen4_hc_combine_norm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused delayed HC combine + grouped Gemma RMSNorm."""
+
+    if residual.ndim != 2 or block_output.ndim != 2 or injection_logits.ndim != 2:
+        raise ValueError("Qwen4 HC combine_norm currently requires 2-D tensors")
+    if hc_count <= 0 or residual.shape[-1] % hc_count:
+        raise ValueError("Qwen4 HC combine_norm requires a valid HC count")
+    hidden_size = residual.shape[-1] // hc_count
+    if block_output.shape != (residual.shape[0], hidden_size):
+        raise ValueError("Qwen4 HC combine_norm block output shape is invalid")
+    if injection_logits.shape != (residual.shape[0], hc_count):
+        raise ValueError("Qwen4 HC combine_norm injection shape is invalid")
+    if norm_weight.numel() not in (hidden_size, residual.shape[-1]):
+        raise ValueError("Qwen4 HC combine_norm weight shape is invalid")
+    if not can_use_hc_combine_norm_triton(
+        injection_logits, block_output, residual, norm_weight
+    ):
+        raise NotImplementedError(
+            "Qwen4 HC combine_norm requires contiguous accelerator tensors"
+        )
+
+    if eps <= 0:
+        raise ValueError("HC normalization epsilon must be positive")
+    output = torch.empty_like(residual)
+    normalized = torch.empty_like(residual)
+    if not residual.numel():
+        return output, normalized
+
+    block_h = 512
+    rows = residual.shape[0]
+    _hc_combine_norm_kernel[(rows, hc_count)](
+        block_output,
+        residual,
+        injection_logits,
+        norm_weight,
+        output,
+        normalized,
+        block_output.stride(0),
+        residual.stride(0),
+        injection_logits.stride(0),
+        output.stride(0),
+        normalized.stride(0),
+        hidden_size=hidden_size,
+        hc_count=hc_count,
+        weight_shared=norm_weight.numel() == hidden_size,
+        eps=eps,
+        block_h=block_h,
+        num_warps=8 if hidden_size > 2048 else 4,
+    )
+    return output, normalized
+
+
 __all__ = [
-    "can_use_hc_inject_triton",
     "can_use_hc_triton",
+    "can_use_hc_inject_triton",
+    "can_use_hc_combine_norm_triton",
     "qwen4_grouped_gemma_rmsnorm",
     "qwen4_hc_gate_reduce",
     "qwen4_hc_inject_combine",
+    "qwen4_hc_combine_norm",
 ]

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Benchmark FlagGems-vllm persistent_topk against the vendor-native kernel."""
+
 import pytest
 import torch
 
@@ -19,199 +21,117 @@ import flaggems_vllm
 
 from . import base
 
-# Bind the top-level entry: on vendor backends with a specialized
-# implementation (e.g. _hygon/fused), flaggems_vllm.persistent_topk is the
-# vendor version (replaced at import time); on NVIDIA it is the generic one.
-persistent_topk = flaggems_vllm.persistent_topk
+VENDOR = flaggems_vllm.vendor_name
 
-device = flaggems_vllm.device
+VLLM_NATIVE_VENDORS = {
+    "nvidia",
+    "metax",
+}
 
-# The vLLM native op is used as the baseline where available (NVIDIA); on
-# platforms without torch.ops._C.persistent_topk (e.g. Hygon vllm-hcu) the
-# benchmark falls back to a torch.topk reference below.
-HAS_VLLM = False
-try:
+
+if VENDOR in VLLM_NATIVE_VENDORS:
     import vllm._custom_ops  # noqa: F401
 
-    # `vllm._custom_ops` may import cleanly even when the compiled C++ extension
-    # is missing, in which case the native op raises NotImplementedError at
-    # dispatch time. Probe one tiny call so the benchmark falls back (rather
-    # than errors) when the kernel is not actually available.
-    _probe_logits = torch.zeros(1, 4102, dtype=torch.float32, device="cuda")
-    _probe_lengths = torch.tensor([4102], dtype=torch.int32, device="cuda")
-    torch.ops._C.persistent_topk(
-        _probe_logits,
-        _probe_lengths,
-        torch.empty((1, 512), dtype=torch.int32, device="cuda"),
-        torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
-        512,
-        4102,
-    )
-    HAS_VLLM = True
-except (ImportError, AttributeError, NotImplementedError, RuntimeError):
-    pass
+if VENDOR == "metax":
+    try:
+        import mcoplib._C  # noqa: F401
+    except ImportError:
+        pass
 
-STRIDE = 262144
+
 K = 512
+WORKSPACE_BYTES = 1 << 20
 
-# CUDA-Graph-safe lengths (torch.topk fallback only): the reference needs
-# host-side seq_lens to decide batched-vs-padded and to slice logits. Reading
-# the device tensor back (seq_lens.tolist()) inside CUDA Graph capture is
-# illegal on HIP, and even a warmed cache does not help: torch.topk's own
-# graph capture (small slices first, then large) leaves its private memory
-# pool reused by a later shape's seq_lens tensor, whose content is then
-# observed as 0/garbage on the first D2H read -> baseline collapses to
-# ~0.0018ms. Fix: precompute the host list once per shape in get_input_iter,
-# keyed by tensor id; _host_lengths only looks up the dict and never reads
-# the device tensor in the measured path.
-_HLEN_CACHE: dict = {}
+_HOMO_SHAPES = [
+    # DeepSeek-V4.1-Flash, 1k context, ratio 1
+    (67, 1044, 65536, 65536),
+    (128, 1044, 65536, 65536),
+    (256, 1044, 65536, 65536),
+    (508, 1044, 65536, 65536),
+    # DeepSeek-V4.1-Flash, 1k context, ratio 2
+    (67, 522, 32768, 32768),
+    (128, 522, 32768, 32768),
+    (256, 522, 32768, 32768),
+    (508, 522, 32768, 32768),
+    # DeepSeek-V4.1-Flash, 4k context (ratio 1 / ratio 2)
+    (16, 4096, 65536, 65536),
+    (125, 4096, 65536, 65536),
+    (48, 2048, 32768, 32768),
+    (120, 2048, 32768, 32768),
+    # DeepSeek-V4.1-Flash, 32k context (ratio 1 / ratio 2)
+    (3, 32769, 65536, 65536),
+    (5, 16384, 32768, 32768),
+    # DeepSeek-V4-Flash
+    (12, 4105, 4105, 262144),
+    (24, 4108, 4108, 262144),
+    (10, 1055, 1055, 262144),
+    (1, 32773, 32773, 262144),
+]
 
 
-def _host_lengths(seq_lens):
-    return _HLEN_CACHE[id(seq_lens)]
+def _get_supported_dtypes():
+    return [torch.float32]
 
 
-def _baseline_persistent_topk(
-    logits, lengths, indices, workspace, max_seq_len, seq_lens
-):
-    """torch.topk baseline: vLLM native op where available, else a torch.topk
-    reference.
+def _input_fn(shape, dtype, device):
 
-    Matches persistent_topk semantics: top-k column indices in arbitrary
-    order (sorted=False), -1 padding when seq_len < k.
+    num_rows, seq_len, max_seq_len, stride = shape
 
-    The torch.topk fallback is batched when all seq_lens are equal, else a
-    single batched topk over the -inf-padded rows (the heterogeneous rows are
-    -inf-padded to the full stride by get_input_iter, so one batched call
-    returns the per-row top-min(K, seq_len) real entries, and pad slots are
-    masked back to -1 via the returned values). A per-row baseline loop is
-    avoided: its sequential launches inflated the measured latency and made
-    the SpeedUp comparison unreliable.
-    """
-    if HAS_VLLM:
-        torch.ops._C.persistent_topk(
-            logits, lengths, indices, workspace, K, max_seq_len
-        )
-        return indices
-    lens = _host_lengths(seq_lens)
-    first = lens[0]
-    if all(x == first for x in lens):
-        k = min(K, first)
-        if k > 0:
-            _, idx = logits[:, :first].topk(k, dim=-1, sorted=False)
-            indices[:, :k] = idx
-        indices[:, k:] = -1
-        return indices
-    vals, idx = logits.topk(K, dim=-1, sorted=False)
-    real = vals > -1e30
-    indices[:, :] = torch.where(real, idx, -1)
+    logits = torch.full((num_rows, stride), float("-inf"), dtype=dtype, device=device)
+    logits[:, :seq_len] = torch.randn(num_rows, seq_len, dtype=dtype, device=device)
+    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device=device)
+
+    indices = torch.empty((num_rows, K), dtype=torch.int32, device=device)
+    workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+
+    yield logits, lengths, indices, workspace, K, max_seq_len
+
+
+def _vllm_native_op(logits, lengths, indices, workspace, k, max_seq_len):
+
+    torch.ops._C.persistent_topk(logits, lengths, indices, workspace, k, max_seq_len)
+
     return indices
 
 
-def _gems_decode(logits, lengths, indices, workspace, max_seq_len, seq_lens):
-    persistent_topk(logits, lengths, indices, workspace, K, max_seq_len=max_seq_len)
-    return indices
+def _get_baseline_op():
+
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        return _vllm_native_op
+
+    return None
 
 
-class PersistentTopKBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_DESC = "num_rows, seq_len, max_seq_len"
+class PersistentTopKBenchmark(base.GenericBenchmarkExcluse1D):
+
+    DEFAULT_SHAPE_DESC = "num_rows, seq_len, max_seq_len, stride"
+
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in ("latency_base", "speedup")
+            ]
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            # Medium path shapes (commented out: not real-world scenarios)
-            # (1, 10000, 10000),
-            # (1, 15000, 15000),
-            # (1, 20000, 20000),
-            # (1, 32768, 32768),
-            # (4, 10000, 10000),
-            # (8, 10000, 10000),
-            # (12, 20000, 20000),
-            # (20, 32768, 32768),
-            # Decode path shapes
-            (1, 4102, 4102),
-            (4, 4102, 4102),
-            (10, 1055, 1055),
-            (12, 4105, 4105),
-            (20, 4105, 4105),
-            (28, 4109, 4109),
-            (1, 8192, 8192),
-            # Large path lower bound
-            (1, 32773, 32773),
-            # Large path: num_rows=1..32, seq_len=262144
-            *[(nr, 262144, 1048576) for nr in range(1, 33)],
-            (496, 262144, 1048576),
-            (512, 262144, 1048576),
-        ]
-        self.hetero_shapes = [
-            (496, 1048576),
-            (496, 1),
-        ]
+        _ = shape_file_path
 
-    def get_input_iter(self, dtype):
-        for num_rows, seq_len, max_seq_len in self.shapes:
-            torch.manual_seed(torch.randint(0, 2**31, (1,)).item())
-            logits = torch.full(
-                (num_rows, STRIDE),
-                float("-inf"),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            logits[:, :seq_len] = torch.randn(num_rows, seq_len, device=self.device)
-
-            lengths = torch.full(
-                (num_rows,), seq_len, dtype=torch.int32, device=self.device
-            )
-            indices = torch.empty((num_rows, K), dtype=torch.int32, device=self.device)
-            # vLLM native op uses its own layout (1MB suffices); the torch.topk
-            # fallback runs the vendor kernels, which need 2MB headroom.
-            workspace = torch.empty(
-                (1 if HAS_VLLM else 2) * 1024 * 1024,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            seq_lens = torch.full(
-                (num_rows,), seq_len, dtype=torch.int32, device=self.device
-            )
-            # precompute host lengths once per shape; _host_lengths only looks
-            # this up (never reads the device tensor in the measured path)
-            _HLEN_CACHE[id(seq_lens)] = [seq_len] * num_rows
-
-            yield logits, lengths, indices, workspace, max_seq_len, seq_lens
-
-        # Heterogeneous batches (FlagOSTune production shapes)
-        for num_rows, max_len in self.hetero_shapes:
-            torch.manual_seed(torch.randint(0, 2**31, (1,)).item())
-            lengths_values = torch.linspace(
-                1, min(max_len, STRIDE), num_rows, dtype=torch.int32, device=self.device
-            )
-            logits = torch.full(
-                (num_rows, STRIDE),
-                float("-inf"),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            for i, sl in enumerate(lengths_values):
-                logits[i, :sl] = torch.randn(sl, device=self.device)
-
-            lengths = lengths_values
-            indices = torch.empty((num_rows, K), dtype=torch.int32, device=self.device)
-            workspace = torch.empty(
-                (1 if HAS_VLLM else 2) * 1024 * 1024,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            seq_lens = lengths_values
-            _HLEN_CACHE[id(seq_lens)] = lengths_values.tolist()
-
-            yield logits, lengths, indices, workspace, max_len, seq_lens
+        self.shapes = list(_HOMO_SHAPES)
 
 
 @pytest.mark.persistent_topk
 def test_persistent_topk():
+    baseline_op = _get_baseline_op()
+
     bench = PersistentTopKBenchmark(
+        input_fn=_input_fn,
         op_name="persistent_topk",
-        torch_op=_baseline_persistent_topk,
-        gems_op=_gems_decode,
-        dtypes=[torch.float32],
+        torch_op=baseline_op,
+        gems_op=flaggems_vllm.persistent_topk,
+        dtypes=_get_supported_dtypes(),
     )
+
     bench.run()

@@ -109,6 +109,7 @@ import json
 import os
 import platform
 import queue as queue_module
+import re
 import shlex
 import shutil
 import signal
@@ -169,6 +170,23 @@ def perror(msg, **kwargs):
 
 def pwarn(msg, **kwargs):
     print(f"{YELLOW}[WARN]{NC} {msg}", flush=True, **kwargs)
+
+
+def resolve_base_data_path(path):
+    """Resolve a baseline path passed by CI to a file pytest can open later."""
+    if not path:
+        return None
+
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    for root in (ROOT, ROOT / "tools"):
+        resolved = root / candidate
+        if resolved.is_file():
+            return str(resolved)
+
+    return path
 
 
 def ensure_dir(p):
@@ -437,6 +455,129 @@ def _probe_vllm():
         pwarn(f"vllm detection failed: {e}")
 
 
+def _read_cann_version():
+    """Read CANN version from $ASCEND_HOME_PATH/opp/version.info (best-effort).
+
+    The file holds a ``Version=8.5.0`` line; return the value after ``Version=``.
+    """
+    roots = [
+        os.environ.get(v)
+        for v in (
+            "ASCEND_HOME_PATH",
+            "ASCEND_TOOLKIT_HOME",
+            "ASCEND_TOOLKIT_LATEST_HOME",
+        )
+    ]
+    roots.append("/usr/local/Ascend/ascend-toolkit/latest")
+    for root in filter(None, roots):
+        info = Path(root) / "opp" / "version.info"
+        if info.is_file():
+            try:
+                m = re.search(r"^Version=([\w.]+)", info.read_text(), re.MULTILINE)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+    return None
+
+
+def _read_xpu_version():
+    """Read Kunlunxin XRE version from /usr/local/xpu/version.txt (first line)."""
+    txt = Path("/usr/local/xpu/version.txt")
+    if txt.is_file():
+        try:
+            first = txt.read_text().strip().splitlines()[0].strip()
+            if first:
+                return first
+        except Exception:
+            pass
+    return None
+
+
+def _read_tops_version():
+    """Read Enflame TOPS version from the ``EFSMI:`` field of ``efsmi`` output."""
+    try:
+        out = subprocess.run(
+            ["efsmi"], capture_output=True, text=True, timeout=30
+        ).stdout
+        m = re.search(r"EFSMI:\s*([\d.]+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _read_ppu_version():
+    """Read T-Head PPU version from /usr/local/PPU_SDK/release.yaml.
+
+    The file has a ``version: 2.1.0-a5f865`` line; keep the numeric part.
+    """
+    yml = Path("/usr/local/PPU_SDK/release.yaml")
+    if yml.is_file():
+        try:
+            m = re.search(r"^version:\s*(\d+\.\d+\.\d+)", yml.read_text(), re.MULTILINE)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return None
+
+
+def _probe_sdk():
+    """Probe the accelerator SDK version.
+
+    Most domestic torch builds encode their SDK version in the PyPI local
+    version suffix (``torch==<ver>+<vendor><sdk>``); scan those first. Then a
+    vendor fallback for stacks that expose the SDK elsewhere (Ascend/CANN,
+    Kunlunxin/XRE) -- these come before generic CUDA because such boxes also
+    report a CUDA-compatible version we do not want to pick. Finally plain CUDA
+    via ``torch.version.cuda`` for NVIDIA and pure CUDA-compatible stacks.
+    """
+    import torch
+
+    full = metadata.version("torch")
+    name, version = None, None
+
+    # (display name, regex capturing the SDK version from the torch suffix)
+    SDK_SUFFIX = (
+        ("COREX", r"corex\.?(\d+\.\d+\.\d+)"),  # iluvatar: 4.5.0.20260804 -> 4.5.0
+        ("METAX", r"metax(\d+\.\d+\.\d+)"),  # metax:    3.8.1.0       -> 3.8.1
+        ("MUSA", r"musa(\d+\.\d+\.\d+)"),  # mthreads: 5.2.0
+        ("DTK", r"dtk(\d+)"),  # hygon:    2604
+    )
+    for sdk_name, pat in SDK_SUFFIX:
+        m = re.search(pat, full)
+        if m:
+            name, version = sdk_name, m.group(1)
+            if sdk_name == "DTK":  # 2604 -> 26.04 (year.month)
+                version = f"{version[:2]}.{version[2:]}"
+            break
+
+    if version is None:
+        vendor = ENV_INFO.get("flaggems_vllm", {}).get("vendor", "")
+        if vendor == "ascend":
+            name = "CANN"
+            version = os.environ.get("ASCEND_TOOLKIT_VERSION") or _read_cann_version()
+        elif vendor == "kunlunxin":
+            name = "XRE"
+            version = _read_xpu_version()
+        elif vendor == "enflame":
+            name = "TOPS"
+            version = _read_tops_version()
+        elif vendor == "thead":
+            name = "PPU"
+            version = _read_ppu_version()
+
+    if version is None:
+        v = getattr(torch.version, "cuda", None)
+        if v:
+            name, version = "CUDA", v
+
+    ENV_INFO["sdk"] = {"name": name, "version": version}
+    pinfo(f"SDK detection ... {name} {version}")
+
+
 def probe_env():
     ENV_INFO["architecture"] = platform.machine()
     if distro is not None:
@@ -451,6 +592,7 @@ def probe_env():
     _probe_triton()
     _probe_flaggems_vllm()
     _probe_vllm()
+    _probe_sdk()
 
 
 def get_env(gpu_ids):
@@ -646,6 +788,12 @@ def parse_perf_data(op, result_file):
     bench_res = {}
     records = data.get("details", [])
 
+    # Collect, deduplicated, every "no baseline match" reason reported by the
+    # benchmark layer (op / shape / dtype missing). Only populated when
+    # --base-data was passed and some shape failed to match.
+    base_miss_reasons = []
+    seen_reasons = set()
+
     for item in records:
         dtype = consts.DTYPE_MAP.get(item["dtype"], item["dtype"])
         details = {}
@@ -656,16 +804,65 @@ def parse_perf_data(op, result_file):
             details.setdefault(shape, {})
             details[shape]["base"] = res.get("latency_base", 0.0)
             details[shape]["gems"] = res.get("latency", 0.0)
-            speedup = res.get("speedup", 0.0)
+            # Two ratios may be present: "speedup" is the on-machine
+            # gems-vs-torch ratio (always computed), "compared_speedup" is the
+            # vs-baseline ratio (only when --base-data matched this
+            # op/shape/dtype). summary.json reports a single value per shape; how
+            # we pick between the two is controlled by CFG.speedup_source:
+            #   - "speedup" (default): prefer the on-machine ratio, fall back to
+            #     compared_speedup only when speedup is missing.
+            #   - "compared_speedup": prefer the vs-baseline ratio, fall back to
+            #     the on-machine ratio when compared_speedup is missing.
+            # Without --base-data, compared_speedup is always None, so only the
+            # on-machine speedup is available regardless of the option.
+            # "origin" names the on-machine gems-vs-torch ratio (res["speedup"]);
+            # "nv_baseline" names the vs-baseline ratio (res["compared_speedup"],
+            # only present when --base-data matched). CFG.speedup_source picks
+            # which one to prefer; the other is a fallback. speedup_source below
+            # records the source actually used after fallback, so each shape says
+            # where its number came from.
+            measured = res.get("speedup", 0.0)
+            compared = res.get("compared_speedup", None)
+            if getattr(CFG, "speedup_source", "origin") == "nv_baseline":
+                if compared is not None:
+                    speedup, used = compared, "nv_baseline"
+                else:
+                    speedup, used = measured, "origin"
+            else:
+                if measured is not None:
+                    speedup, used = measured, "origin"
+                else:
+                    speedup, used = compared, "nv_baseline"
+            # Latency-only records (no reference implementation on this
+            # machine) carry speedup=None. Keep the None per shape and leave it
+            # out of the mean instead of counting it as 0; its source is unknown.
+            if speedup is None:
+                used = None
             details[shape]["speedup"] = speedup
-            count += 1
-            total += speedup
+            details[shape]["speedup_source"] = used
+            miss = res.get("base_miss_reason", None)
+            if miss:
+                details[shape]["base_miss_reason"] = miss
+                if miss not in seen_reasons:
+                    seen_reasons.add(miss)
+                    base_miss_reasons.append(miss)
+            if isinstance(speedup, (int, float)):
+                count += 1
+                total += speedup
 
-        if details:
+        if count:
             bench_res[dtype] = {
                 "result": "OK",
                 "details": details,
                 "speedup": total / count,
+            }
+        elif details:
+            # Only latency was measured (no valid speedup for any shape):
+            # report Unknown with the latency details and no speedup.
+            bench_res[dtype] = {
+                "result": "Unknown",
+                "details": details,
+                "speedup": None,
             }
         else:
             bench_res[dtype] = {
@@ -674,11 +871,14 @@ def parse_perf_data(op, result_file):
                 "speedup": 0,
             }
 
-    return {
+    record = {
         "status": result.title(),
         "data": bench_res,
         "test_case": data.get("test_case", "Unknown"),
     }
+    if base_miss_reasons:
+        record["base_miss_reasons"] = base_miss_reasons
+    return record
 
 
 def run_accuracy_q(gpu_id, op):
@@ -752,6 +952,16 @@ def run_benchmark_q(gpu_id, op):
 
     dur = time.time()
     cmd = f'pytest -m "{op}" --level core --record json --output benchmark_{op}.json --continue-on-collection-errors'
+    if getattr(CFG, "base_data", None):
+        # Use "--base-data=<path>" (with '=') rather than a space-separated
+        # value. pytest resolves rootdir BEFORE conftest registers this option,
+        # so a space-separated absolute path (e.g. one living outside the repo)
+        # is mistaken for a positional test path, dragging rootdir to that
+        # path's directory. Then pytest.ini is not found and every custom option
+        # (--level/--record/--base-data) becomes "unrecognized". Gluing the
+        # value with '=' keeps it a single '--'-prefixed token that early
+        # parsing ignores, so rootdir stays inside the repo.
+        cmd += f" --base-data={shlex.quote(CFG.base_data)}"
     code = run_cmd(op, cmd, cwd=benchmark_dir, env=env, flavor="performance")
     dur = time.time() - dur
 
@@ -1295,6 +1505,31 @@ def main():
         help="Save each test's stdout/stderr to log files (default: discard)",
     )
     parser.add_argument(
+        "--base-data",
+        required=False,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to an NVIDIA baseline JSON (e.g. op_perf_baseline.json). "
+            "When provided, benchmarks show an extra 'vs Base' column. "
+            "If omitted, behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--speedup-source",
+        choices=["origin", "nv_baseline"],
+        default="nv_baseline",
+        help=(
+            "Which ratio summary.json reports per shape when --base-data is set. "
+            "'origin' (default): prefer the on-machine gems-vs-torch speedup and "
+            "fall back to the vs-baseline ratio only when the on-machine one is "
+            "absent. 'nv_baseline': prefer the vs-baseline ratio and fall back to "
+            "the on-machine speedup. Without --base-data only the on-machine ratio "
+            "exists, so this option has no effect. Each shape's "
+            "'speedup_source' field records the source actually used."
+        ),
+    )
+    parser.add_argument(
         "--color",
         choices=["auto", "always", "never"],
         default="auto",
@@ -1303,6 +1538,8 @@ def main():
     OPTS = parser.parse_args()
     CFG.dump_output = OPTS.dump_output
     CFG.start = OPTS.start
+    CFG.base_data = resolve_base_data_path(OPTS.base_data)
+    CFG.speedup_source = OPTS.speedup_source
 
     # Apply color mode (IS_TTY controls cursor-based footer, USE_COLORS controls ANSI colors)
     global USE_COLORS, RED, GREEN, YELLOW, CYAN, DIM, NC

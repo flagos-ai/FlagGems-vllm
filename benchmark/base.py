@@ -34,6 +34,8 @@ from .consts import (
     BenchmarkResult,
     OperationAttribute,
     check_metric_dependencies,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
     model_shapes,
 )
 
@@ -78,6 +80,68 @@ def get_iter_count(fn):
     )
 
 
+def do_bench_cudagraph(
+    fn,
+    *,
+    rep=20,
+    return_mode="median",
+    grad_to_none=None,
+    replay_count=None,
+    warmup_replay_count=0,
+    rank_barrier=None,
+):
+    """Run the repository's common CUDA Graph benchmark path.
+
+    ``replay_count`` gives distributed collectives an identical replay count
+    on every rank. The default keeps Triton's duration-based behavior.
+    """
+    if replay_count is None:
+        return triton.testing.do_bench_cudagraph(
+            fn,
+            rep=rep,
+            return_mode=return_mode,
+            grad_to_none=grad_to_none,
+        )
+    if replay_count < 1 or warmup_replay_count < 0:
+        raise ValueError(
+            "replay_count must be positive and warmup_replay_count nonnegative"
+        )
+    if grad_to_none is not None:
+        raise ValueError("fixed CUDA Graph replay does not support gradients")
+    if return_mode != "mean":
+        raise ValueError("fixed CUDA Graph replay reports mean latency")
+
+    fn()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+
+    for _ in range(warmup_replay_count):
+        graph.replay()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(replay_count):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    latency = start.elapsed_time(end) / replay_count
+    if rank_barrier is not None:
+        rank_barrier()
+    graph.reset()
+    return latency
+
+
 class Benchmark:
     device: str = device
     DEFAULT_METRICS = consts.DEFAULT_METRICS
@@ -106,6 +170,8 @@ class Benchmark:
         self.is_backward = is_backward
         self.is_inplace = is_inplace
         self._input_iter = None
+        # Baseline sub-entry for kanban operators that merge several precisions.
+        self.base_variant = None
 
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
@@ -334,7 +400,6 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / n_rep * 1000
         elif Config.mode == consts.BenchMode.CUDAGRAPH:
-            do_bench_cudagraph = triton.testing.do_bench_cudagraph
             latency = do_bench_cudagraph(
                 fn,
                 rep=Config.repetition,
@@ -437,7 +502,10 @@ class Benchmark:
                 try:
                     args, kwargs = self.unpack_to_args_kwargs(input)
                     metric.shape_detail = self.record_shapes(*args, **kwargs)
-                    if "latency_base" in self.to_bench_metrics:
+                    if (
+                        "latency_base" in self.to_bench_metrics
+                        and self.torch_op is not None
+                    ):
                         metric.latency_base = self.get_latency(
                             self.torch_op, *args, **kwargs
                         )
@@ -459,8 +527,60 @@ class Benchmark:
                                     metric.latency = self.get_latency(
                                         self.torch_op, *args, **kwargs
                                     )
-                    if "speedup" in self.to_bench_metrics:
+                    if (
+                        "speedup" in self.to_bench_metrics
+                        and metric.latency_base is not None
+                        and metric.latency
+                    ):
                         metric.speedup = metric.latency_base / metric.latency
+                    if Config.base_data is not None and metric.latency:
+                        base_rec, miss_reason = lookup_base_record_ex(
+                            Config.base_data,
+                            self.op_name,
+                            dtype,
+                            metric.shape_detail,
+                            self.base_variant,
+                        )
+                        base_ms = base_rec.get("latency_ms") if base_rec else None
+                        if base_ms is not None:
+                            # Both baseline (latency_ms) and metric.latency are in
+                            # ms, so the raw ratio is dimensionless. Divide by this
+                            # chip's scaling factor for the baseline's bottleneck
+                            # resource to normalize away the hardware peak gap;
+                            # missing factor -> keep the raw ratio.
+                            speedup = base_ms / metric.latency
+                            factor = lookup_scaling_factor(
+                                Config.base_data,
+                                vendor_name,
+                                base_rec.get("bottle_neck_unit"),
+                                dtype,
+                            )
+                            if factor:
+                                speedup /= factor
+                            metric.compared_speedup = speedup
+                            print(
+                                f"[vs Base] {self.op_name} shape={metric.shape_detail} "
+                                f"base={base_ms:.6f}ms gems={metric.latency:.6f}ms "
+                                f"factor={factor} vs_base={speedup:.3f}"
+                            )
+                        else:
+                            # No baseline match: record and print the precise
+                            # reason (op / shape / dtype missing) so it can be
+                            # aggregated later.
+                            metric.base_miss_reason = miss_reason
+                            print(f"[vs Base][未匹配] {miss_reason}")
+                            # Method A hard error: when there is no on-machine
+                            # reference (torch_op is None, i.e. the vendor has no
+                            # native implementation) AND the NV baseline has no
+                            # matching record, there is no usable baseline at all
+                            # -> fail this case instead of silently yielding a
+                            # speedup/compared_speedup that are both None.
+                            if self.torch_op is None:
+                                raise RuntimeError(
+                                    f"no baseline available for '{self.op_name}'"
+                                    f" (dtype={dtype}): vendor-native missing and"
+                                    f" NV baseline unmatched ({miss_reason})"
+                                )
 
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(
@@ -468,7 +588,7 @@ class Benchmark:
                         )
                         metric.gbps = self.get_gbps(args, latency=metric.latency)
 
-                    if "tflops" in self.to_bench_metrics:
+                    if "tflops" in self.to_bench_metrics and self.torch_op is not None:
                         metric.tflops = (
                             self.get_tflops(self.torch_op, *args, **kwargs)
                             / metric.latency

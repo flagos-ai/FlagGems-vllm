@@ -16,37 +16,49 @@
 Triton implementation of mHC Pre operator (optimized v2).
 
 Key optimizations:
-- GEMM: torch.mm in bf16 (cuBLAS tensor cores)
+- GEMM: public FlagGems BMM with FP32 accumulation and a BF16 output boundary
 - sqrsum + norm + mix + sinkhorn + weighted sum: single fused Triton kernel
   Two passes over residual: pass 1 computes sqrsum, pass 2 does weighted sum
 """
 
+from __future__ import annotations
+
 import logging
 import weakref
 
+import flag_gems
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.data_movement import contiguous_copy
+
 logger = logging.getLogger(__name__)
 
 
-_FN_BF16_CACHE: weakref.WeakKeyDictionary[torch.Tensor, tuple[int, torch.Tensor]] = (
-    weakref.WeakKeyDictionary()
-)
+_FN_BF16_CACHE: dict[int, tuple[weakref.ReferenceType, int, torch.Tensor]] = {}
 
 
 def _get_fn_bf16_cached(fn: torch.Tensor) -> torch.Tensor:
-    if fn.requires_grad or torch.is_grad_enabled():
-        return fn.to(dtype=torch.bfloat16)
+    if fn.requires_grad or torch.is_grad_enabled() or fn.is_inference():
+        return contiguous_copy(fn, torch.bfloat16)
     version = fn._version
-    cached = _FN_BF16_CACHE.get(fn)
+    key = id(fn)
+    cached = _FN_BF16_CACHE.get(key)
     if cached is not None:
-        cached_version, cached_bf16 = cached
-        if cached_version == version:
+        ref, cached_version, cached_bf16 = cached
+        if ref() is fn and cached_version == version:
             return cached_bf16
-    fn_bf16 = fn.to(dtype=torch.bfloat16)
-    _FN_BF16_CACHE[fn] = (version, fn_bf16)
+    fn_bf16 = contiguous_copy(fn, torch.bfloat16)
+
+    def expire(ref, key=key):
+        cached = _FN_BF16_CACHE.get(key)
+        if cached is not None and cached[0] is ref:
+            _FN_BF16_CACHE.pop(key)
+
+    # WeakKeyDictionary compares tensors when looking up a repeated key.
+    # An identity key and checked weakref avoid Tensor.__eq__ and id reuse.
+    _FN_BF16_CACHE[key] = (weakref.ref(fn, expire), version, fn_bf16)
     return fn_bf16
 
 
@@ -649,10 +661,23 @@ def mhc_pre(
 
     assert fn.shape == (hc_mult3, hc_hidden_size)
 
+    bmm_out = getattr(flag_gems, "bmm_out", None)
+    if not callable(bmm_out):
+        raise NotImplementedError("MHC projection requires public FlagGems bmm_out")
     outer_shape = residual.shape[:-2]
-    residual_flat = residual.reshape(-1, hc_mult, hidden_size).contiguous()
+    residual_flat = contiguous_copy(residual).view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
     device = residual.device
+    if num_tokens == 0:
+        return (
+            torch.empty((*outer_shape, hc_mult, 1), dtype=torch.float32, device=device),
+            torch.empty(
+                (*outer_shape, hc_mult, hc_mult), dtype=torch.float32, device=device
+            ),
+            torch.empty(
+                (*outer_shape, hidden_size), dtype=torch.bfloat16, device=device
+            ),
+        )
     if num_tokens <= 512:
         num_tokens_bucket = 1
     elif num_tokens <= 1024:
@@ -664,10 +689,16 @@ def mhc_pre(
     else:
         num_tokens_bucket = 5
 
-    # ── Step 1: GEMM via cuBLAS (bf16 tensor cores) ──
+    # Preserve BF16 GEMM materialization before converting the projection to FP32.
     x_flat = residual_flat.reshape(num_tokens, hc_hidden_size)
     fn_bf16 = _get_fn_bf16_cached(fn)
-    gemm_out = torch.mm(x_flat, fn_bf16.t()).float()
+    projection = torch.empty((num_tokens, hc_mult3), dtype=torch.float32, device=device)
+    # BF16 split-K output atomics round every partial sum. Accumulate once in
+    # FP32 through the public BMM API, then retain the original BF16 boundary.
+    bmm_out(x_flat.unsqueeze(0), fn_bf16.t().unsqueeze(0), projection.unsqueeze(0))
+    gemm_out = contiguous_copy(
+        contiguous_copy(projection, torch.bfloat16), torch.float32
+    )
 
     # ── Step 2: Fused sqrsum + norm + mix + sinkhorn + weighted sum ──
     post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)

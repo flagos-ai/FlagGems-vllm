@@ -530,7 +530,7 @@ def _gems_call_mxfp4(
     )
 
 
-@pytest.mark.fused_marlin_moe_w4a16_mxfp4
+@pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
@@ -544,9 +544,10 @@ def test_fused_marlin_moe_w4a16_mxfp4():
     fused_experts on Hygon. Both run FP4 E2M1 + per-32 E8M0 W4A16 GEMM.
     """
     bench = FusedMarlinMoEW4A16MXFP4Benchmark(
-        op_name="fused_marlin_moe_w4a16_mxfp4",
+        op_name="fused_marlin_moe_w4a16",
         torch_op=_vllm_baseline_mxfp4,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "mxfp4"
     bench.set_gems(_gems_call_mxfp4)
     bench.run()

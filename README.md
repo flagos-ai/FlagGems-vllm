@@ -2,25 +2,22 @@
 
 ## Introduction
 
-FlagGems-vllm is part of [FlagOS](https://flagos.io/).
-FlagGems-vllm is a high-performance operator library designed for multiple hardware backends. It provides optimized implementations of common vLLM operators and supports high-performance inference and deployment for a variety of widely used models.
-
-FlagGems-vllm is a high-performance deep learning operator library implemented using the [Triton programming language](https://github.com/openai/triton) launched by OpenAI.
+FlagGems-vllm is part of [FlagOS](https://flagos.io/). It is a high-performance operator library implemented using the [Triton programming language](https://github.com/openai/triton) launched by OpenAI, designed for multiple hardware backends. It provides optimized implementations of common vLLM operators and supports high-performance inference and deployment for a variety of widely used models.
 
 ## Features
 
 - Operators have undergone deep performance tuning
 - Triton kernel call optimization
 - Flexible multi-backend support mechanism
-- Support for common vllm operators (moe_align_block_size, etc.)
+- Support for common vLLM operators (`moe_align_block_size`, `grouped_topk`, etc.)
 
 ## Relationship with FlagGems and vllm-plugin-fl
 
-The three repositories are used together but have different responsibilities:
+The three repositories work together in the FlagOS ecosystem but have different responsibilities:
 
-- **FlagGems**: the general-purpose FlagGems operator library. It provides common PyTorch/Triton operator replacements and exposes `flag_gems.enable()` / `flag_gems.use_gems()` to register operators into PyTorch dispatch.
-- **FlagGems-vllm**: this repository. It contains vLLM-scenario operator implementations and tests/benchmarks that are aligned with the corresponding FlagGems implementations where the same operator exists. It exposes operators through the `flaggems_vllm` Python package, for example `flaggems_vllm.grouped_topk`, `flaggems_vllm.fused_experts_impl`, and `flaggems_vllm.moe_align_block_size`.
-- **vllm-plugin-fl**: the vLLM plugin layer. It uses FlagGems as the global operator backend by importing FlagGems and calling `flag_gems.enable()`. For vLLM-specific fused kernels that are not enabled through PyTorch dispatch, it explicitly imports and calls operators from FlagGems-vllm.
+- **FlagGems**: The general-purpose FlagGems operator library. It provides common PyTorch/Triton operator replacements and exposes `flag_gems.enable()` / `flag_gems.use_gems()` to register operators into PyTorch dispatch. **FlagGems-vllm depends on FlagGems**, and currently some FlagGems-vllm operators invoke operators from FlagGems internally.
+- **FlagGems-vllm**: This repository. It contains vLLM-scenario operator implementations and tests/benchmarks that are aligned with the corresponding FlagGems implementations where the same operator exists. It exposes operators through the `flaggems_vllm` Python package, for example `flaggems_vllm.grouped_topk`, `flaggems_vllm.fused_experts_impl`, and `flaggems_vllm.moe_align_block_size`.
+- **vllm-plugin-fl**: The vLLM plugin layer. It uses FlagGems as the global operator backend by importing FlagGems and calling `flag_gems.enable()`. For vLLM-specific fused kernels that are not enabled through PyTorch dispatch, it explicitly imports and calls operators from FlagGems-vllm.
 
 In a typical vLLM plugin environment, the call flow is:
 
@@ -28,108 +25,35 @@ In a typical vLLM plugin environment, the call flow is:
 vLLM
 	-> vllm-plugin-fl
 			-> flag_gems.enable() for general FlagGems operator registration
-			-> flaggems_vllm.<operator>() for vLLM-specific fused operators
+			-> flaggems_vllm.<operator>() for vLLM-specific fused operators (some calling flag_gems operators internally)
 ```
 
-This means `FlagGems` and `FlagGems-vllm` are complementary: `FlagGems` provides the common operator backend, while `FlagGems-vllm` provides vLLM-oriented kernels and compatibility tests/benchmarks used by `vllm-plugin-fl`.
+This means `FlagGems-vllm` builds on top of `FlagGems`: `FlagGems` provides the common operator foundation and internal utility operators, while `FlagGems-vllm` provides vLLM-oriented kernels and compatibility tests/benchmarks used by `vllm-plugin-fl`.
 
-## Quick Installation
-### Install Dependencies
+## Quick Start
+
+### Quick Installation
+
 ```shell
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
-```
-
-Install a PyTorch build compatible with the target accelerator before installing
-FlagGems-vllm. As in FlagGems, PyTorch is managed by the backend environment and
-is not reinstalled by the FlagGems-vllm package.
-
-### Install FlagGems-vllm
-```shell
-git clone https://github.com/flagos-ai/FlagGems-vllm.git
-cd FlagGems-vllm
-pip install  .
-```
-
-For development, use editable installation:
-
-```shell
 pip install --no-build-isolation -e .
 ```
 
-If you want to run tests, install the test dependencies as well:
+For complete installation steps (including test dependencies, full environment bootstrapping via `tools/setup.sh`, and multi-repository setup with FlagGems and vllm-plugin-fl), please refer to the [Installation Guide](docs/content/en/getting-started/install.md).
 
-```shell
-pip install -e '.[test]'
-```
+### Quick Usage
 
-### Install with FlagGems and vllm-plugin-fl
-
-When validating the full plugin stack, install the repositories in this order:
-
-```shell
-# 1. Install FlagGems
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-
-# 2. Install FlagGems-vllm
-git clone https://github.com/flagos-ai/FlagGems-vllm.git
-cd FlagGems-vllm
-pip install --no-build-isolation -e .
-
-# 3. Install vllm-plugin-fl
-git clone https://github.com/flagos-ai/vllm-plugin-fl.git
-cd vllm-plugin-fl
-pip install --no-build-isolation -e .
-```
-
-If multiple vLLM plugins are installed, select the FlagOS plugin explicitly:
-
-```shell
-export VLLM_PLUGINS=fl
-```
-
-## Usage Example
-
-```python
-import torch
-import flaggems_vllm
-
-# Prepare a simple topk_ids tensor for MoE routing
-num_tokens = 128
-topk = 2
-num_experts = 16
-block_size = 32
-
-topk_ids = torch.randint(
-	low=0,
-	high=num_experts,
-	size=(num_tokens, topk),
-	device='cuda',
-	dtype=torch.int32,
-)
-
-# Align tokens by expert and block size
-sorted_ids, expert_ids, num_tokens_post_pad = flaggems_vllm.ops.moe_align_block_size(
-	topk_ids=topk_ids,
-	block_size=block_size,
-	num_experts=num_experts,
-)
-
-print(sorted_ids.shape, expert_ids.shape, num_tokens_post_pad)
-```
-
-### Usage with FlagGems enabled
-
-`vllm-plugin-fl` enables the general FlagGems backend and can also call FlagGems-vllm operators directly. A minimal smoke test looks like this:
+Since FlagGems-vllm depends on FlagGems, remember to enable FlagGems before using FlagGems-vllm operators:
 
 ```python
 import torch
 import flag_gems
 import flaggems_vllm
 
+# Enable FlagGems general operators
 flag_gems.enable()
 
+# Call FlagGems-vllm fused operators
 scores = torch.randn((8, 16), device="cuda", dtype=torch.float32)
 bias = torch.randn((16,), device="cuda", dtype=torch.float32)
 
@@ -143,89 +67,23 @@ topk_weights, topk_ids = flaggems_vllm.grouped_topk(
 	bias=bias,
 	scoring_func=0,
 )
-
 print(topk_weights.shape, topk_ids.shape)
 ```
 
-## Tests and Benchmark Quick Start
+For more examples (such as `moe_align_block_size`, `flash_attention_forward`, and `fused_add_rms_norm`), see the [Basic Usage Guide](docs/content/en/usage/basic.md).
 
-The following commands can be used for quick validation after installation.
+## Documentation
 
-Most tests and benchmarks require a supported accelerator runtime, its vendor
-PyTorch build, a compatible Triton implementation, and vLLM dependencies.
+Comprehensive documentation is available in the [docs](docs/) directory:
 
-### Import smoke tests
+- 📖 **Getting Started**: [Installation Guide](docs/content/en/getting-started/install.md)
+- 🚀 **Usage**: [Basic Usage](docs/content/en/usage/basic.md) | [vLLM Plugin Integration](docs/content/en/usage/vllm-plugin.md)
+- 🔧 **Hardware Backends**: [Non-NVIDIA Hardware Support](docs/content/en/usage/non-nvidia.md)
+- 🧪 **Testing**: [Unit Testing Guide](docs/content/en/testing/unittest.md) | [Coverage](docs/content/en/testing/coverage.md)
+- ⚡ **Benchmarking**: [Running Benchmarks](docs/content/en/performance/benchmark.md) | [Performance Results](docs/content/en/performance/results.md)
+- 📋 **References**: [Supported Operators](docs/content/en/references/operators.md) | [MiniMax M3 Support](docs/content/en/references/minimax-m3-support.md)
+- 🤝 **Contributing**: [Contribution Overview](docs/content/en/contribution/overview.md) | [Development Workflow](docs/content/en/contribution/workflow.md) | [Project Structure](docs/content/en/contribution/project-structure.md)
 
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src python - <<'PY'
-import torch
-import flaggems_vllm
-from flaggems_vllm import runtime
-
-print('torch:', torch.__version__)
-print('vendor:', flaggems_vllm.vendor_name)
-print('flaggems_vllm device:', flaggems_vllm.device)
-print('device count:', runtime.device.device_count)
-print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
-PY
-```
-
-### Run tests
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests --collect-only
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests --quick
-```
-
-Run a focused operator test:
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests/test_grouped_topk.py
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q tests/test_fused_inv_rope_fp8_quant.py --quick
-```
-
-### Run benchmark
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark --collect-only
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark/test_moe_align_block_size_triton.py::test_moe_align_block_size_triton --level core --iter 1 --warmup 1
-```
-
-Run focused benchmarks for vLLM-specific operators:
-
-```shell
-cd /workspace/FlagGems-vllm
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark/test_grouped_topk.py --level core --iter 1 --warmup 1
-PYTHONPATH=/workspace/FlagGems-vllm/src pytest -q benchmark/test_fused_inv_rope_fp8_quant.py --level core --iter 1 --warmup 1
-```
-
-### Validate with vllm-plugin-fl
-
-After installing `FlagGems`, `FlagGems-vllm`, and `vllm-plugin-fl`, validate that the plugin imports and that FlagGems-vllm operators are available:
-
-```shell
-export VLLM_PLUGINS=fl
-python - <<'PY'
-import flag_gems
-import flaggems_vllm
-
-flag_gems.enable()
-print('FlagGems enabled')
-print('FlagGems-vllm grouped_topk available:', callable(flaggems_vllm.grouped_topk))
-PY
-```
-
-If a model and vLLM runtime are available, run a small vLLM offline inference from the `vllm-plugin-fl` repository examples, for example `examples/offline_inference.py`.
-
-### Notes
-
-- `--collect-only` is recommended first to quickly check import and test discovery.
-- Use `--quick` for fast functional validation when supported by the test.
-- Use `--level core --iter 1 --warmup 1` for fast benchmark smoke tests.
-- Full benchmark runs can take a long time and should be reserved for performance validation.
+## License
 
 This project is licensed under the [Apache (version 2.0) License](./LICENSE).
