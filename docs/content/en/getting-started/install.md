@@ -17,13 +17,10 @@ pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 
 ### FlagGems Dependency
 
-**FlagGems-vllm depends on FlagGems**. Several FlagGems-vllm operators invoke general FlagGems operators internally. Install FlagGems before installing FlagGems-vllm:
+**FlagGems-vllm depends on FlagGems**. Several FlagGems-vllm operators invoke general FlagGems operators internally. Before installing FlagGems-vllm, install `flag-gems==5.4.0` via pip (hosted at [FlagOS PyPI repository](https://resource.flagos.net/#browse/browse:flagos-pypi-hosted:flag-gems%2F5.4.0)):
 
 ```bash
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 ```
 
 ### PyTorch
@@ -101,11 +98,8 @@ DNN_VENDOR=amd source tools/setup.sh
 For the full FlagOS vLLM plugin stack, install in this order:
 
 ```bash
-# 1. Install FlagGems (general operator backend)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+# 1. Install FlagGems (general operator backend, version 5.4.0)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. Install FlagGems-vllm (vLLM-specific operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -143,53 +137,14 @@ print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
 "
 ```
 
-### Run Quick Tests
+### Run Smoke Tests
+
+Verify test discovery and basic module import:
 
 ```bash
 cd FlagGems-vllm
 PYTHONPATH=src pytest -q tests --collect-only
 PYTHONPATH=src pytest -q tests --quick
-```
-
-### Run a Benchmark Smoke Test
-
-```bash
-PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
-```
-
-### Notes
-
-- `--collect-only` is recommended first to quickly check import and test discovery.
-- Use `--quick` for fast functional validation when supported by the test.
-- Use `--level core --iter 1 --warmup 1` for fast benchmark smoke tests.
-- Full benchmark runs can take a long time and should be reserved for performance validation.
-
-## Backend Selection
-
-FlagGems-vllm auto-detects the hardware backend. To override:
-
-```bash
-export DNN_VENDOR=nvidia  # or amd, ascend, hygon, etc.
-```
-
-Available backends: `nvidia`, `amd`, `ascend`, `cambricon`, `enflame`, `hygon`, `iluvatar`, `kunlunxin`, `metax`, `mthreads`, and more (18 total).
-
-## C++ Extension
-
-FlagGems-vllm includes optional C++ operators compiled via pybind11. These are built automatically if the required dependencies are present.
-
-To enable C++ operators at runtime:
-
-```bash
-export USE_C_EXTENSION=1
-```
-
-Check if C++ extension is available:
-
-```python
-import flaggems_vllm
-print(flaggems_vllm.config.has_c_extension)
-print(flaggems_vllm.config.use_c_extension)
 ```
 
 ## Troubleshooting

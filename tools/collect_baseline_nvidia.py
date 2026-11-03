@@ -6,6 +6,7 @@ import importlib
 import io
 import json
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -122,6 +123,7 @@ def _make_args():
 args, kwargs = _make_args()
 for _ in range({warmup}):
     op(*args, **kwargs)
+    args, kwargs = _make_args()
 torch.cuda.synchronize()
 args, kwargs = _make_args()
 torch.cuda.synchronize()
@@ -506,6 +508,55 @@ def _select_ops(discovered, only=None):
     return [(name, mod) for name, mod in discovered if only is None or name in only]
 
 
+def _measure_latency(
+    op_module, op, args, kwargs, warmup=5, repetitions=25, raw_samples=None
+):
+    """No-Graph latency; state restoration is outside each CUDA event pair."""
+    if not op_module.IS_INPLACE:
+        return triton.testing.do_bench(
+            lambda: op(*args, **kwargs), warmup=25, rep=100, return_mode="median"
+        )
+    locations = getattr(op_module, "MUTATED_INPUTS", None)
+    if locations is None:
+        tensors = [
+            value
+            for value in (*args, *kwargs.values())
+            if isinstance(value, torch.Tensor)
+        ]
+    else:
+        tensors = [
+            args[key] if isinstance(key, int) else kwargs[key] for key in locations
+        ]
+    saved = [(tensor, tensor.clone()) for tensor in tensors]
+
+    def restore():
+        for tensor, initial in saved:
+            tensor.copy_(initial)
+
+    try:
+        for _ in range(warmup):
+            restore()
+            op(*args, **kwargs)
+        torch.cuda.synchronize()
+        samples = []
+        for _ in range(repetitions):
+            restore()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            op(*args, **kwargs)
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end))
+        if raw_samples is not None:
+            raw_samples.extend(samples)
+        return statistics.median(samples)
+    finally:
+        restore()
+        torch.cuda.synchronize()
+
+
 def _collect_one_op_ops(
     op_module, report_dir, results=None, output_path=None, ops_dir=None
 ):
@@ -515,7 +566,8 @@ def _collect_one_op_ops(
     mod_name = op_module.__name__
     op = op_module.native()
     if op is None:
-        print(f"\nskipping {op_name}: native() resolved no callable")
+        reason = getattr(op_module, "NATIVE_UNAVAILABLE_REASON", None)
+        print(f"\nskipping {op_name}: native() resolved no callable ({reason})")
         return None
 
     dtypes = op_module.DTYPES
@@ -546,9 +598,25 @@ def _collect_one_op_ops(
         per_dtype = shapes.setdefault(str(shape), {})
         for dtype in dtypes:
             dtype_str = str(dtype)
+            cfg = (
+                op_module.config(binding, dtype)
+                if hasattr(op_module, "config")
+                else None
+            )
+            reason_fn = getattr(op_module, "unsupported_reason", None)
+            reason = reason_fn(binding, dtype) if reason_fn else None
+            if reason:
+                per_dtype[dtype_str] = {
+                    "status": "unsupported",
+                    "reason": reason,
+                    "config": cfg,
+                }
+                _flush_results(results, output_path)
+                continue
             args, kwargs = op_module.build_inputs(binding, dtype, "cuda")
-            latency_ms = triton.testing.do_bench(
-                lambda a=args, k=kwargs: op(*a, **k), warmup=25, rep=100
+            samples = []
+            latency_ms = _measure_latency(
+                op_module, op, args, kwargs, raw_samples=samples
             )
             # The NCU subprocess allocates its own inputs; free ours first so a
             # large-E MoE does not OOM from holding two copies at once.
@@ -561,10 +629,14 @@ def _collect_one_op_ops(
                 op_name, script, shape, dtype_str, report_dir=report_dir
             )
             # Optional config(binding, dtype) describing real input/output shapes.
-            cfg = None
-            if hasattr(op_module, "config"):
-                cfg = op_module.config(binding, dtype)
             per_dtype[dtype_str] = _finalize_record(latency_ms, ncu, config=cfg)
+            per_dtype[dtype_str]["timing_protocol"] = (
+                "no-graph-device-event-reset-outside-5warmup-25sample-median"
+                if op_module.IS_INPLACE
+                else "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+            )
+            if samples:
+                per_dtype[dtype_str]["samples_ms"] = samples
 
             bn = ncu["bottle_neck_unit"]
             suffix = f"  bottleneck={bn} ({ncu['U_bottle_neck']:.1f}%)" if bn else ""
@@ -650,8 +722,8 @@ def _check_one_op(op_module, device=None):
         result["detail"] = f"native() raised: {type(e).__name__}: {e}"
         return result
     if op is None:
-        result["detail"] = (
-            "native() returned None (intentionally skipped or unresolved)"
+        result["detail"] = "native() returned None: " + str(
+            getattr(op_module, "NATIVE_UNAVAILABLE_REASON", "unresolved")
         )
         return result
 
