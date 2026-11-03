@@ -20,7 +20,6 @@ import flaggems_vllm
 from .conftest import QUICK_MODE
 
 pytestmark = [
-    pytest.mark.fused_indexer_weight_scale,
     pytest.mark.skipif(
         flaggems_vllm.vendor_name != "metax", reason="MetaX backend implementation"
     ),
@@ -74,6 +73,7 @@ SHAPES = (
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["dense", "strided", "offset", "broadcast"])
 @pytest.mark.parametrize("scale", [0.0, 128**-0.5 * 32**-0.5, -0.037])
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale(shape, dtype, layout, scale):
     torch.manual_seed(0)
     weights, query = make_inputs(*shape, dtype, layout)
@@ -88,6 +88,7 @@ def test_fused_indexer_weight_scale(shape, dtype, layout, scale):
 
 
 @pytest.mark.parametrize("scale", [0.0, -0.125, float("inf"), float("nan")])
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_nonfinite(scale):
     weights = torch.tensor(
         [[0.0, -0.0, 1.0, -1.0, float("inf"), float("nan")]], device="cuda"
@@ -104,6 +105,7 @@ def test_fused_indexer_weight_scale_nonfinite(scale):
     )
 
 
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_independent_strides():
     weights, query = make_inputs(35, 32, torch.float32, "strided")
     for dense_weights in (False, True):
@@ -118,6 +120,7 @@ def test_fused_indexer_weight_scale_independent_strides():
         )
 
 
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_invalid_inputs():
     weights = torch.empty(4, 32, device="cuda")
     query = torch.empty(4, 32, 1, device="cuda")
@@ -133,12 +136,14 @@ def test_fused_indexer_weight_scale_invalid_inputs():
         flaggems_vllm.fused_indexer_weight_scale(weights.cpu(), query.cpu(), 1.0)
 
 
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_library_export():
     assert callable(flaggems_vllm.fused_indexer_weight_scale)
     assert "fused_indexer_weight_scale" not in flaggems_vllm.FULL_CONFIG_BY_FUNC
 
 
 @pytest.mark.parametrize("offset", [1, 4])
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_vector_offset(offset):
     torch.manual_seed(0)
     total = 1036 * 32
@@ -151,6 +156,7 @@ def test_fused_indexer_weight_scale_vector_offset(offset):
 
 
 @pytest.mark.parametrize("scale", [0.0, 0.125, -0.125, float("inf"), float("nan")])
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_vector_nonfinite(scale):
     weights = torch.tensor(
         [[0.0, -0.0, 1.0, -1.0, float("inf"), float("nan")]], device="cuda"
@@ -175,6 +181,7 @@ def test_fused_indexer_weight_scale_vector_nonfinite(scale):
     )
 
 
+@pytest.mark.fused_indexer_weight_scale
 def test_fused_indexer_weight_scale_without_gluon(monkeypatch):
     import importlib
 
