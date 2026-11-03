@@ -64,6 +64,7 @@ def _reference(a, b, a_scale, b_scale, block_n, block_k):
     return result
 
 
+@pytest.mark.w8a8_block_int8_matmul
 @pytest.mark.parametrize("M,N,K", INT8_MNK_SHAPES)
 @pytest.mark.parametrize("output_dtype", OUTPUT_DTYPES)
 def test_w8a8_block_int8_matmul(M, N, K, output_dtype):
