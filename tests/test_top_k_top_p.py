@@ -26,11 +26,14 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 
 from .conftest import QUICK_MODE
 
 torch_npu = pytest.importorskip("torch_npu")
+
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import (  # noqa: E402
+    top_k_top_p,
+)
 
 device = flaggems_vllm.device
 
