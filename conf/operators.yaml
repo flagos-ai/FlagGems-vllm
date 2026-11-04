@@ -1425,8 +1425,9 @@ ops:
       positions become -inf and kept positions keep their logit values.
       Returns a new tensor and preserves the input. The shared argument order
       is (logits, p=None, k=None). Ascend uses sorted top-L candidates; MetaX
-      uses values-only counting/radix sorting for contiguous FP32 inputs
-      with batch <= 64 and vocab <= 262144. Ascend launch overrides remain
+      uses single-row integer-key tile/merge sorting and batched counting/radix
+      sorting for contiguous FP32 with batch <= 64 and vocab <= 262144.
+      Ascend launch overrides remain
       backend-specific.
     for:
       - torch_npu.npu_top_k_top_p

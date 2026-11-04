@@ -428,9 +428,10 @@ def top_k_top_p(
     compared with another reduction implementation.
     Filter values are not read back to the host for range validation.
 
-    Counting sort is selected by a device-side exact BF16 check. All other
-    FP32 values use a values-only radix sort. Neither path synchronizes the
-    device with the host, and both can be captured and replayed in a graph.
+    Single rows use integer-key tile sorting and stable merges. Larger
+    batches select counting sort with a device-side exact BF16 check, or
+    values-only radix sorting otherwise. All paths support graph capture
+    and replay without synchronizing filter values with the host.
     """
     logger.debug("GEMS_METAX TOP_K_TOP_P")
     if k is None and p is None:
