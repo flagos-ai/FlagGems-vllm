@@ -107,9 +107,10 @@ def _cpu_reference(sampled, mapping, traces, lengths, total, prompt):
     return result
 
 
-def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected):
+def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=None):
     cpu_expected = _cpu_reference(sampled, mapping, traces, lengths, total, prompt)
-    assert cpu_expected == expected
+    if expected is not None:
+        assert cpu_expected == expected
     reference_sampled = (
         sampled.clone() if flaggems_vllm.vendor_name == "nvidia" else None
     )
@@ -174,4 +175,33 @@ def test_idx_mapping_indirection_and_negative_skip():
         _i32([10, 7]),
         _i32([10, 6]),
         [501, 2, 3],
+    )
+
+
+@pytest.mark.parametrize("num_reqs", [5, 33, 127, 128, 129, 256, 257])
+def test_mixed_requests_with_padded_trace_rows(num_reqs):
+    row_width = MAX_MODEL_LEN + 3
+    traces = torch.arange(
+        (num_reqs + 1) * row_width, dtype=torch.int32, device=DEVICE
+    ).reshape(num_reqs + 1, row_width)[:, 1:-2]
+    mapping = _i32(list(reversed(range(num_reqs))))
+    mapping[::11] = -1
+    lengths = _i32([idx % 4 for idx in range(num_reqs)])
+    prompt = _i32([5] * num_reqs)
+    total = _i32([4 + idx % 6 for idx in range(num_reqs)])
+    _assert_replay(_i64([-7] * num_reqs), mapping, traces, lengths, total, prompt)
+
+
+def test_repeated_request_mapping_and_negative_token():
+    traces = torch.zeros(2, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
+    traces[0, 0] = -1
+    traces[1, 1] = -123456789
+    _assert_replay(
+        _i64([11, 12, 13, 14, 15]),
+        _i32([1, 1, -1, 0, 1]),
+        traces,
+        _i32([1, 2]),
+        _i32([5, 6]),
+        _i32([5, 5]),
+        [-123456789, -123456789, 13, -1, -123456789],
     )

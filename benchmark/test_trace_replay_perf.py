@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
 """Benchmark trace replay against the vLLM implementation."""
 
 import contextlib
@@ -16,8 +17,8 @@ try:
 except (ImportError, OSError):
     vllm_reference = None
 
-from . import base
-from .conftest import Config
+from benchmark import base
+from benchmark.conftest import Config
 
 
 _kernel_mark = pytest.MarkDecorator(
@@ -28,12 +29,13 @@ pytestmark = [
     pytest.mark.apply_trace_tokens,
     _kernel_mark,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-    pytest.mark.skipif(vllm_reference is None, reason="vLLM trace replay unavailable"),
 ]
 
 
 class TraceReplayBenchmark(base.Benchmark):
-    DEFAULT_SHAPES = [(1, 2048), (2, 2048), (3, 2048), (32, 2048), (128, 2048)]
+    DEFAULT_SHAPES = [
+        (n, 2048) for n in (1, 2, 3, 5, 32, 33, 127, 128, 129, 256, 257, 4096)
+    ]
     DEFAULT_SHAPE_DESC = "num_reqs, max_model_len"
 
     def __init__(self, *args, **kwargs):
@@ -53,6 +55,14 @@ class TraceReplayBenchmark(base.Benchmark):
     def run(self):
         if Config.query:
             return super().run()
+        if vllm_reference is None:
+            self.init_user_config()
+            for dtype in self.to_bench_dtypes:
+                for inputs in self.get_input_iter(dtype):
+                    args, kwargs = self.unpack_to_args_kwargs(inputs)
+                    self.get_latency(self.gems_op, *args, **kwargs)
+            self.print_summary()
+            return
         output = io.StringIO()
         try:
             with contextlib.redirect_stdout(output):
@@ -65,15 +75,28 @@ class TraceReplayBenchmark(base.Benchmark):
     def print_summary(self):
         if not self._latency_ms:
             return
-        print("\nTrace replay latency (CUDA event, microseconds)")
-        print("Requests  Trace slots  vLLM ref  FlagGems  Speedup")
-        print("-" * 52)
+        mode_label = {
+            "kernel": "CUDA event",
+            "cudagraph": "CUDA Graph",
+        }.get(Config.mode.value, Config.mode.value)
+        print(f"\nTrace replay latency ({mode_label}, microseconds)")
+        if vllm_reference is None:
+            print("Requests  Trace slots  FlagGems")
+            print("-" * 34)
+        else:
+            print("Requests  Trace slots  vLLM ref  FlagGems  Speedup")
+            print("-" * 52)
         for num_reqs, max_model_len in self.shapes:
             measured = self._latency_ms.get((num_reqs, max_model_len), {})
-            if "vllm" not in measured or "flaggems" not in measured:
+            if "flaggems" not in measured:
+                continue
+            candidate_us = measured["flaggems"] * 1000
+            if vllm_reference is None:
+                print(f"{num_reqs:>8}  {max_model_len:>11}  {candidate_us:>8.3f}")
+                continue
+            if "vllm" not in measured:
                 continue
             baseline_us = measured["vllm"] * 1000
-            candidate_us = measured["flaggems"] * 1000
             print(
                 f"{num_reqs:>8}  {max_model_len:>11}  "
                 f"{baseline_us:>8.3f}  {candidate_us:>8.3f}  "
@@ -101,15 +124,16 @@ class TraceReplayBenchmark(base.Benchmark):
                 lengths[0] = 0
 
             arguments = (mapping, traces, lengths, total, prompt)
-            reference_sampled = sampled.clone()
             candidate_sampled = sampled.clone()
-            assert vllm_reference(reference_sampled, *arguments) is None
             assert (
                 flaggems_apply_trace_tokens(candidate_sampled, *arguments) is None
             )
-            torch.testing.assert_close(
-                candidate_sampled, reference_sampled, rtol=0, atol=0
-            )
+            if vllm_reference is not None:
+                reference_sampled = sampled.clone()
+                assert vllm_reference(reference_sampled, *arguments) is None
+                torch.testing.assert_close(
+                    candidate_sampled, reference_sampled, rtol=0, atol=0
+                )
             yield (sampled, *arguments)
 
 
