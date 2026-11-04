@@ -24,15 +24,18 @@ from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
 
 if has_triton_tle(3, 6, 0):
     try:
+        import triton.experimental.tle as tle_api
         import triton.experimental.tle.language as tle
         import triton.experimental.tle.language.gpu as tleg
 
         HAS_TLE = True
     except ImportError:
+        tle_api = None
         tle = None
         tleg = None
         HAS_TLE = False
 else:
+    tle_api = None
     tle = None
     tleg = None
     HAS_TLE = False
@@ -42,6 +45,13 @@ logger = logging.getLogger(__name__)
 
 TLE_CLUSTER_SIZE = 8
 TLE_BIG_TOKEN_THRESHOLD_TOKENS = 4096
+TLE_COMMON_FEATURES = (
+    "device_mesh",
+    "distributed_barrier",
+    "gpu.alloc",
+    "gpu.local_ptr",
+)
+TLE_CLUSTER_FEATURES = (*TLE_COMMON_FEATURES, "remote", "shard_id")
 _TRITON_ALLOCATOR_INSTALLED = False
 TLE_ATOMIC_WARPS_CONFIGS = [
     triton.Config(kwargs={}, num_warps=4),
@@ -609,21 +619,13 @@ def moe_align_block_size_triton(
     block_expert_tle = triton.next_power_of_2(num_experts)
 
     # Query the current compiler target at dispatch; older TLE versions fall back.
-    is_tle_supported = getattr(tle, "is_tle_supported", None)
+    is_tle_supported = getattr(tle_api, "is_tle_supported", None)
     if (
         HAS_TLE
         and topk_ids.is_cuda
         and block_expert_tle <= 1024
         and callable(is_tle_supported)
-        and all(
-            is_tle_supported(api)
-            for api in (
-                "device_mesh",
-                "distributed_barrier",
-                "gpu.alloc",
-                "gpu.local_ptr",
-            )
-        )
+        and is_tle_supported(TLE_COMMON_FEATURES)
     ):
         block_tokens_taf, _ = _pick_tle_atomic_fused_launch_params(numel, num_experts)
         experts_per_shard = ceil_div(num_experts, TLE_CLUSTER_SIZE)
@@ -678,7 +680,7 @@ def moe_align_block_size_triton(
         if (
             num_tokens < TLE_BIG_TOKEN_THRESHOLD_TOKENS
             and _supports_tle_cluster_remote()
-            and all(is_tle_supported(api) for api in ("remote", "shard_id"))
+            and is_tle_supported(TLE_CLUSTER_FEATURES)
         ):
             try:
                 moe_align_block_size_tle_cluster_fused[(1,)](

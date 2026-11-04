@@ -82,14 +82,21 @@ def test_moe_align_tle_backend_dispatch(
     expert_ids = SimpleNamespace(numel=lambda: (1280 + num_experts * 15) // 16)
     queries = []
 
-    def is_tle_supported(api):
-        queries.append(api)
-        return api != unsupported
+    def is_tle_supported(features):
+        queries.append(features)
+        return unsupported not in features
 
-    language = SimpleNamespace()
+    api = SimpleNamespace()
     if has_query:
-        language.is_tle_supported = is_tle_supported
-    monkeypatch.setattr(module, "tle", language if has_tle else None)
+        api.is_tle_supported = is_tle_supported
+    monkeypatch.setattr(module, "tle_api", api if has_tle else None)
+    monkeypatch.setattr(
+        module,
+        "tle",
+        SimpleNamespace(
+            is_tle_supported=lambda _: pytest.fail("query must use the root TLE API")
+        ),
+    )
     monkeypatch.setattr(module, "HAS_TLE", has_tle)
     monkeypatch.setattr(module, "_supports_tle_cluster_remote", lambda: False)
     monkeypatch.setattr(module, "_block_mesh", lambda _: None)
@@ -108,9 +115,13 @@ def test_moe_align_tle_backend_dispatch(
         )
     assert calls.count("tle") == expected_tle_calls
     if has_tle and is_cuda and num_experts <= 1024 and has_query:
-        assert queries.count("device_mesh") == 2
-        if unsupported:
-            assert queries.count(unsupported) == 2
+        common_features = (
+            "device_mesh",
+            "distributed_barrier",
+            "gpu.alloc",
+            "gpu.local_ptr",
+        )
+        assert queries == [common_features] * 2
     else:
         assert queries == []
     if expected_tle_calls and not tle_failure:
@@ -126,6 +137,8 @@ def test_moe_align_tle_backend_dispatch(
 
 
 @pytest.mark.moe_align_block_size_triton
+@pytest.mark.parametrize("num_tokens", [128, 4096])
+@pytest.mark.parametrize("supports_cluster", [False, True])
 @pytest.mark.parametrize(
     "unsupported,error,cluster_calls",
     [
@@ -136,7 +149,7 @@ def test_moe_align_tle_backend_dispatch(
     ],
 )
 def test_moe_align_cluster_capability_is_independent(
-    monkeypatch, unsupported, error, cluster_calls
+    monkeypatch, num_tokens, supports_cluster, unsupported, error, cluster_calls
 ):
     module = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
     calls = []
@@ -153,11 +166,19 @@ def test_moe_align_cluster_capability_is_independent(
 
             return launch
 
+    queries = []
+
+    def is_tle_supported(features):
+        queries.append(features)
+        return unsupported not in features
+
     monkeypatch.setattr(module, "HAS_TLE", True)
     monkeypatch.setattr(
-        module, "tle", SimpleNamespace(is_tle_supported=lambda api: api != unsupported)
+        module, "tle_api", SimpleNamespace(is_tle_supported=is_tle_supported)
     )
-    monkeypatch.setattr(module, "_supports_tle_cluster_remote", lambda: True)
+    monkeypatch.setattr(
+        module, "_supports_tle_cluster_remote", lambda: supports_cluster
+    )
     monkeypatch.setattr(module, "_block_mesh", lambda _: None)
     monkeypatch.setattr(module, "_block_cluster_mesh_8", lambda: None)
     monkeypatch.setattr(module, "_pick_tle_atomic_fused_num_blocks", lambda *args: 1)
@@ -169,14 +190,30 @@ def test_moe_align_cluster_capability_is_independent(
         module, "moe_align_block_size_tle_atomic_fused_coop", Kernel("atomic")
     )
     topk = SimpleNamespace(
-        numel=lambda: 1280, shape=(128, 10), ndim=2, is_cuda=True, device="cuda:0"
+        numel=lambda: num_tokens * 10,
+        shape=(num_tokens, 10),
+        ndim=2,
+        is_cuda=True,
+        device="cuda:0",
     )
-    sorted_ids = SimpleNamespace(numel=lambda: 8960)
-    expert_ids = SimpleNamespace(numel=lambda: 560)
+    sorted_ids = SimpleNamespace(numel=lambda: num_tokens * 10 + 512 * 15)
+    expert_ids = SimpleNamespace(numel=lambda: (num_tokens * 10 + 512 * 15) // 16)
     for _ in range(2):
         module.moe_align_block_size_triton(topk, 512, 16, sorted_ids, expert_ids, None)
-    assert calls.count("cluster") == cluster_calls
-    assert calls.count("atomic") == (0 if unsupported is None and error is None else 2)
+    cluster_eligible = supports_cluster and num_tokens < 4096
+    assert calls.count("cluster") == (cluster_calls if cluster_eligible else 0)
+    cluster_succeeded = cluster_eligible and unsupported is None and error is None
+    assert calls.count("atomic") == (0 if cluster_succeeded else 2)
+    common_features = (
+        "device_mesh",
+        "distributed_barrier",
+        "gpu.alloc",
+        "gpu.local_ptr",
+    )
+    expected_queries = [common_features]
+    if cluster_eligible:
+        expected_queries.append((*common_features, "remote", "shard_id"))
+    assert queries == expected_queries * 2
 
 
 @pytest.mark.moe_align_block_size_triton
