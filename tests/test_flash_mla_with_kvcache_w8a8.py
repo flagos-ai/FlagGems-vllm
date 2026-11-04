@@ -35,20 +35,14 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 OUTPUT_ATOL = 2e-3
-IS_HCU = flaggems_vllm.vendor_name == "hygon"
-SUPPORTED = torch.cuda.is_available() and (
-    IS_HCU or (HAS_TLE and torch.cuda.get_device_capability()[0] == 9)
+SUPPORTED = (
+    HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
 )
 
 
-def quantize_dense_w8a8(x, *, dequantize=True):
-    bound = 127.0 if IS_HCU else 448.0
-    scale = x[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / bound
-    if IS_HCU:
-        scale = torch.exp2(torch.ceil(torch.log2(scale)))
-        nope = (x[..., :512].float() / scale).round().to(torch.int8)
-    else:
-        nope = (x[..., :512].float() / scale).to(torch.float8_e4m3fn)
+def quantize_dense_fp8(x, *, dequantize=True):
+    scale = x[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.0
+    nope = (x[..., :512].float() / scale).to(torch.float8_e4m3fn)
     rope = (x[..., 512:].float() / scale).to(torch.bfloat16)
     if dequantize:
         native = (torch.cat((nope.float(), rope.float()), -1) * scale).to(
@@ -101,7 +95,7 @@ def vllm_reference(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs)
     )
 
 
-def assert_dense_w8a8_close(actual, reference):
+def assert_dense_fp8_close(actual, reference):
     reference = tuple(to_reference(tensor) for tensor in reference)
     if reference[0].device.type == "cpu":
         actual = tuple(tensor.cpu() for tensor in actual)
@@ -111,15 +105,11 @@ def assert_dense_w8a8_close(actual, reference):
     gems_assert_close(actual[1], reference[1], torch.float32, atol=2e-4)
 
 
-REFERENCES = (
-    (torch_reference, vllm_reference)
-    if VLLM_AVAILABLE and not IS_HCU
-    else (torch_reference,)
-)
+REFERENCES = (torch_reference, vllm_reference) if VLLM_AVAILABLE else (torch_reference,)
 
 
 @pytest.mark.flash_mla_with_kvcache_w8a8
-@pytest.mark.skipif(not SUPPORTED, reason="Requires a supported W8A8 MLA backend")
+@pytest.mark.skipif(not SUPPORTED, reason="FP8 MLA requires NVIDIA Hopper and TLE")
 @pytest.mark.parametrize("reference", REFERENCES)
 @pytest.mark.parametrize(
     "batch,seqlen,varlen",
@@ -162,8 +152,8 @@ def test_dense_decode(reference, seq_q, h_q, batch, seqlen, varlen):
     else:
         pass
     lengths = torch.tensor(host_lengths, dtype=torch.int32, device=flaggems_vllm.device)
-    q_nope, q_rope, q_scale, native_q = quantize_dense_w8a8(q)
-    k_nope, k_rope, k_scale, native_cache = quantize_dense_w8a8(cache)
+    q_nope, q_rope, q_scale, native_q = quantize_dense_fp8(q)
+    k_nope, k_rope, k_scale, native_cache = quantize_dense_fp8(cache)
     actual = flaggems_vllm.flash_mla_with_kvcache_w8a8(
         q_nope,
         q_rope,
@@ -179,4 +169,4 @@ def test_dense_decode(reference, seq_q, h_q, batch, seqlen, varlen):
     expected = reference(
         native_q, native_cache, table, lengths, head_dim_v, causal=True
     )
-    assert_dense_w8a8_close(actual, expected)
+    assert_dense_fp8_close(actual, expected)
