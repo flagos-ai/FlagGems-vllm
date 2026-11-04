@@ -12,13 +12,29 @@ import torch
 import flaggems_vllm
 from flaggems_vllm import expand_pools_and_append_tail
 
-from .expand_pool_oracle import expand_pool_oracle
-
 pytestmark = [pytest.mark.gpu, pytest.mark.expand_pools_and_append_tail]
 
 DEVICE = flaggems_vllm.device
 INT32_MAX = 2**31 - 1
 GUARD_SIZE = 11
+
+
+def expand_pool_oracle(pool_ids, seq_lens, pool_size):
+    """Construct every output element using Python integers and CPU int64 inputs."""
+    pools = pool_ids.detach().to(device="cpu", dtype=torch.int64)
+    lengths = seq_lens.detach().to(device="cpu", dtype=torch.int64)
+    rows, groups = pools.shape
+    out_cols = groups * pool_size + pool_size - 1
+    result = []
+    for row_pools, length in zip(pools.tolist(), lengths.tolist()):
+        for pool in row_pools:
+            for offset in range(pool_size):
+                result.append(pool * pool_size + offset if pool >= 0 else -1)
+        tail_start = (length // pool_size) * pool_size
+        tail_count = length % pool_size
+        for offset in range(pool_size - 1):
+            result.append(tail_start + offset if offset < tail_count else -1)
+    return torch.tensor(result, dtype=torch.int32, device="cpu").reshape(rows, out_cols)
 
 
 def _storage_bytes(tensor):
