@@ -72,7 +72,14 @@ def fused_indexer_weight_scale(
     total = tokens * heads
     if total == 0:
         return output
-    block = 256
+    is_dense = weights.is_contiguous() and q_scale.is_contiguous()
+    should_use_small_block = (
+        is_dense
+        and weights.dtype == torch.float32
+        and (total <= 2048 or 4096 < total <= 8192)
+    )
+    # Measured small-grid regressions retain the larger tile in the middle bucket.
+    block = 128 if should_use_small_block else 256
     with torch_device_fn.device(weights.device):
         indexer_weight_scale_kernel[(triton.cdiv(total, block),)](
             weights,
@@ -85,7 +92,7 @@ def fused_indexer_weight_scale(
             weights.stride(1),
             q_scale.stride(0),
             q_scale.stride(1),
-            weights.is_contiguous() and q_scale.is_contiguous(),
+            is_dense,
             block,
             num_warps=4,
             enable_fp_fusion=False,

@@ -167,3 +167,12 @@ def test_fused_indexer_weight_scale_broadcast_strides(native_weight_scale):
     expected = native_weight_scale(weights, q_scale, 0.015625)
     output = flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, 0.015625)
     gems_assert_close(output, expected, torch.float32, atol=1e-6)
+
+
+@pytest.mark.fused_indexer_weight_scale
+def test_fused_indexer_weight_scale_multiplication_order(native_weight_scale):
+    weights = torch.tensor([[1e20, -1e20]], device=flaggems_vllm.device)
+    q_scale = torch.full((1, 2, 1), 1e20, device=weights.device)
+    expected = native_weight_scale(weights, q_scale, 1e-30)
+    output = flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, 1e-30)
+    gems_assert_equal(output, expected)
