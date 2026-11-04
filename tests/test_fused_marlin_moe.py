@@ -26,8 +26,8 @@ shared by both sides.
 """
 
 import importlib
-import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -47,6 +47,76 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
+from .accuracy_utils import gems_assert_close, gems_assert_equal
+
+
+def _vllm_bf16_moe(hidden_states, w1, w2, topk_weights, topk_ids):
+    """vLLM BF16 GEMMs with FL auxiliary ops for the empty PPU wheel.
+
+    Only routing, activation and output reduction use the platform provider.
+    Both GEMMs and their dispatch remain vLLM's native Triton implementation.
+    Restore bindings after each call so other benchmarks are unaffected.
+    """
+    from vllm.model_executor.layers.fused_moe import fused_moe as native
+    from vllm_fl.dispatch.backends.flaggems.impl.fused_moe import (
+        moe_align_block_size_flaggems,
+        moe_sum_flaggems,
+    )
+    from vllm_fl.ops.fused_moe.activation import apply_moe_activation
+
+    with patch.multiple(
+        native,
+        moe_align_block_size=moe_align_block_size_flaggems,
+        apply_moe_activation=apply_moe_activation,
+    ), patch.object(native.ops, "moe_sum", moe_sum_flaggems):
+        return native.fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
+
+
+def _reference_moe_rounded(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids):
+    """PyTorch SwiGLU MoE ground truth, rounding each GEMM stage into the
+    activation dtype like the Hygon kernel."""
+    dtype = hidden_states.dtype
+    accumulation_dtype = torch.float64 if dtype == torch.float16 else torch.float32
+    m, k = hidden_states.shape
+    topk = topk_ids.shape[1]
+    flat_ids = topk_ids.flatten()
+    flat_weights = topk_weights.flatten()
+    result = torch.zeros((m * topk, k), dtype=dtype, device=hidden_states.device)
+    for expert in range(w1_ref.shape[0]):
+        routes = torch.where(flat_ids == expert)[0]
+        if routes.numel() == 0:
+            continue
+        x = hidden_states[routes // topk].to(accumulation_dtype)
+        gate_up = x @ w1_ref[expert].to(accumulation_dtype).T
+        gate, up = gate_up.to(dtype).float().chunk(2, -1)
+        act = (torch.nn.functional.silu(gate) * up).to(dtype)
+        out = (
+            act.to(accumulation_dtype) @ w2_ref[expert].to(accumulation_dtype).T
+        ).float()
+        result[routes] = (out * flat_weights[routes, None].float()).to(dtype)
+    return result.view(m, topk, k).float().sum(1).to(dtype)
+
+
+def _moe_relative_errors(actual, expected):
+    delta = actual.float() - expected.float()
+    rms = (
+        delta.square().mean().sqrt()
+        / expected.float().square().mean().sqrt().clamp_min(1e-12)
+    )
+    peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
+    return rms.item(), peak.item()
+
+
+def _assert_moe_bf16_close(actual, expected):
+    """Reuse the MoE benchmark's 1% RMS and 2% global peak tolerances.
+
+    Decoding weights and storing each GEMM result in BF16 introduces rounding
+    relative to fused dequantization. A global scale avoids unstable relative
+    errors near individual zero outputs.
+    """
+    rms, peak = _moe_relative_errors(actual, expected)
+    errors = torch.tensor([rms, peak / 2], device=actual.device, dtype=torch.float32)
+    gems_assert_close(errors, torch.zeros_like(errors), dtype=torch.float32, atol=0.01)
 
 
 def _is_hopper():
@@ -77,6 +147,11 @@ def _runs_quantized_moe():
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
 
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
+
+_MTHREADS_NO_INT8 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="MThreads backend does not implement INT8 W8A16",
+)
 
 
 def _runs_generic_impl():
@@ -186,7 +261,7 @@ QUICK_CONFIGS = [
 ]
 
 W8A16_CONFIGS = (
-    QUICK_CONFIGS[:2]
+    QUICK_CONFIGS[:2] + [(4, 16, 128, 1024, 2)]
     if cfg.QUICK_MODE
     else QUICK_CONFIGS
     + [
@@ -519,6 +594,7 @@ def _make_inputs_w4a16_mxfp4(
 def _quantize_moe_weight_fp8(w_fp, group_size):
     """Quantize each expert's weights to FP8 E4M3 with per-group scales."""
     num_experts, out_dim, in_dim = w_fp.shape
+    group_size = in_dim if group_size == -1 else group_size
     assert in_dim % group_size == 0
 
     fp8_dtype = torch.float8_e4m3fn
@@ -550,7 +626,14 @@ def _quantize_moe_weight_fp8(w_fp, group_size):
 
 
 def _make_inputs_fp8_weight(
-    num_tokens, num_experts, hidden_size, intermediate_size, topk, dtype, device
+    num_tokens,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    topk,
+    dtype,
+    device,
+    group_size=GROUP_SIZE,
 ):
     """Build a W(FP8)A16 case with FP16/BF16 activations."""
     torch.manual_seed(0)
@@ -571,8 +654,8 @@ def _make_inputs_fp8_weight(
         )
         / 10.0
     )
-    w1_q, w1_ref, w1_scale = _quantize_moe_weight_fp8(w1_fp, GROUP_SIZE)
-    w2_q, w2_ref, w2_scale = _quantize_moe_weight_fp8(w2_fp, GROUP_SIZE)
+    w1_q, w1_ref, w1_scale = _quantize_moe_weight_fp8(w1_fp, group_size)
+    w2_q, w2_ref, w2_scale = _quantize_moe_weight_fp8(w2_fp, group_size)
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
@@ -629,7 +712,9 @@ def _reference_swiglu_moe(
     return out
 
 
-def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
+def _reference_w8a16_grouped(
+    hs, w1_ref, w2_ref, tw, ti, apply_router_weight_on_input=False
+):
     """FP32 MoE reference with one weight conversion per active expert."""
     ref = torch.zeros_like(hs, dtype=torch.float32)
     for expert in range(w1_ref.shape[0]):
@@ -638,9 +723,17 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
             tokens = tokens.contiguous()
         if tokens.numel() == 0:
             continue
-        gate, up = (hs[tokens].float() @ w1_ref[expert].float().T).chunk(2, dim=-1)
+        route_input = hs[tokens].float()
+        route_weight = tw[tokens, slots, None].float()
+        route_input = (
+            route_input * route_weight if apply_router_weight_on_input else route_input
+        )
+        gate, up = (route_input @ w1_ref[expert].float().T).chunk(2, dim=-1)
         values = (torch.nn.functional.silu(gate) * up) @ w2_ref[expert].float().T
-        ref.index_add_(0, tokens, values * tw[tokens, slots, None].float())
+        if apply_router_weight_on_input:
+            ref.index_add_(0, tokens, values)
+        else:
+            ref.index_add_(0, tokens, values * route_weight)
     return ref
 
 
@@ -1066,10 +1159,7 @@ def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, blocks):
 def test_fused_marlin_moe_w8a16_fp8_gateup_pipeline(num_tokens, dtype):
     module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
     configs = module._fused_moe_kernel_w8a16_gateup_fp8.fn.configs
-    eligible = module._prune_w8a16_fp8_gateup_configs(
-        configs, {"T": num_tokens, "H": 1024, "Nw1": 2048}
-    )
-    assert any(config.num_stages > 1 for config in eligible)
+    assert any(config.num_stages > 1 for config in configs)
     hs, w1, w2, r1, r2, tw, ti, s1, s2 = _make_inputs_fp8_weight(
         num_tokens, 8, 1024, 1024, 2, dtype, flaggems_vllm.device
     )
@@ -1439,7 +1529,9 @@ def test_rejects_fp8_input_dtype():
         )
 
 
-def _check_w8a16_fp8(config, dtype):
+def _check_w8a16_fp8(
+    config, dtype, group_size=GROUP_SIZE, apply_router_weight_on_input=False
+):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -1451,6 +1543,7 @@ def _check_w8a16_fp8(config, dtype):
         topk,
         dtype,
         device,
+        group_size,
     )
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
@@ -1463,8 +1556,12 @@ def _check_w8a16_fp8(config, dtype):
         w2_scale=w2s,
         topk_weights=tw,
         topk_ids=ti,
+        group_size=group_size,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
-    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    ref = _reference_w8a16_grouped(
+        hs, w1_ref, w2_ref, tw, ti, apply_router_weight_on_input
+    )
     torch_device_fn.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
@@ -1480,158 +1577,6 @@ def test_fused_marlin_moe_uses_thead_specialization():
     )
 
 
-def _e4m3_lut(device):
-    values = []
-    for q in range(256):
-        exponent = (q >> 3) & 15
-        mantissa = q & 7
-        value = (
-            math.ldexp(mantissa, -9)
-            if exponent == 0
-            else math.ldexp(1 + mantissa / 8, exponent - 7)
-        )
-        if exponent == 15 and mantissa == 7:
-            value = float("nan")
-        values.append(-value if q & 128 else value)
-    return torch.tensor(values, dtype=torch.float32, device=device)
-
-
-def _make_inputs_w8a16_fp8(
-    num_tokens,
-    num_experts,
-    hidden_size,
-    intermediate_size,
-    topk,
-    dtype,
-    device,
-    group_size,
-):
-    torch.manual_seed(37)
-    hidden_states = (
-        torch.randn((num_tokens, hidden_size), dtype=dtype, device=device) * 0.1
-    )
-    weights = []
-    refs = []
-    scales = []
-    lut = _e4m3_lut(device)
-    for output_size, input_size in (
-        (2 * intermediate_size, hidden_size),
-        (hidden_size, intermediate_size),
-    ):
-        raw = torch.randint(
-            0,
-            256,
-            (num_experts, output_size, input_size),
-            dtype=torch.uint8,
-            device=device,
-        )
-        raw = torch.where((raw & 127) == 127, raw - 1, raw)
-        groups = 1 if group_size == -1 else input_size // group_size
-        scale = (
-            torch.rand(
-                (num_experts, output_size, groups),
-                dtype=torch.float32,
-                device=device,
-            )
-            * 0.001
-            + 0.0005
-        ).to(dtype)
-        expanded_scale = (
-            scale.float().expand(num_experts, output_size, input_size)
-            if group_size == -1
-            else scale.float().repeat_interleave(group_size, dim=-1)
-        )
-        weights.append(raw.view(torch.float8_e4m3fn))
-        refs.append((lut[raw.long()] * expanded_scale).to(dtype))
-        scales.append(scale)
-    topk_ids = (
-        torch.rand((num_tokens, num_experts), device=device).topk(topk, dim=-1).indices
-    )
-    topk_weights = torch.softmax(
-        torch.randn((num_tokens, topk), device=device), dim=-1
-    ).to(dtype)
-    return (
-        hidden_states,
-        weights[0],
-        weights[1],
-        refs[0],
-        refs[1],
-        topk_weights,
-        topk_ids,
-        scales[0],
-        scales[1],
-    )
-
-
-@pytest.mark.fused_marlin_moe_w4a16
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead",
-    reason="This test forces the T-Head expert-grouped AIU path",
-)
-def test_fused_marlin_moe_w4a16_int4_ppu_grouped():
-    # 32 * top_k=2 exceeds the direct-route limit and naturally selects the
-    # expert-grouped path.
-    config = (32, 8, 128, 256, 2)
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
-        *config, torch.bfloat16, flaggems_vllm.device
-    )
-    result = flaggems_vllm.fused_marlin_moe(
-        hidden_states=hs,
-        w1=w1_q,
-        w2=w2_q,
-        bias1=None,
-        bias2=None,
-        w1_scale=w1s,
-        w2_scale=w2s,
-        topk_weights=tw,
-        topk_ids=ti,
-        quant_type_id=QUANT_TYPE_UINT4B8,
-    )
-    ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
-    torch_device_fn.synchronize()
-    max_diff = compute_max_diff(result.float(), ref)
-    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
-
-
-@pytest.mark.fused_marlin_moe_w4a16
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead",
-    reason="This test covers the T-Head fused GEMM2/top-k reduction path",
-)
-@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
-def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
-    apply_router_weight_on_input,
-):
-    config = (2, 8, 128, 256, 2)
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
-        *config, torch.bfloat16, flaggems_vllm.device
-    )
-    result = flaggems_vllm.fused_marlin_moe(
-        hidden_states=hs,
-        w1=w1_q,
-        w2=w2_q,
-        bias1=None,
-        bias2=None,
-        w1_scale=w1s,
-        w2_scale=w2s,
-        topk_weights=tw,
-        topk_ids=ti,
-        quant_type_id=QUANT_TYPE_UINT4B8,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-    )
-    ref = _reference_swiglu_moe(
-        hs,
-        w1_ref,
-        w2_ref,
-        tw,
-        ti,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-    )
-    torch_device_fn.synchronize()
-    max_diff = compute_max_diff(result.float(), ref)
-    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
-
-
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead",
@@ -1639,47 +1584,146 @@ def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
 )
 @pytest.mark.parametrize("num_tokens", [1, 33])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("group_size", [-1, 32, 128])
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size, group_size",
+    [(128, 256, group) for group in (-1, 32, 64, 128)]
+    + [(96, 160, group) for group in (-1, 32)],
+)
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w8a16_fp8_ppu(
-    num_tokens, dtype, group_size, apply_router_weight_on_input
+    num_tokens,
+    dtype,
+    hidden_size,
+    intermediate_size,
+    group_size,
+    apply_router_weight_on_input,
 ):
-    args = _make_inputs_w8a16_fp8(
-        num_tokens,
-        4,
-        128,
-        256,
-        2,
+    _check_w8a16_fp8(
+        (num_tokens, 4, hidden_size, intermediate_size, 2),
         dtype,
-        flaggems_vllm.device,
         group_size,
+        apply_router_weight_on_input,
     )
-    hs, w1, w2, w1_ref, w2_ref, tw, ti, w1s, w2s = args
-    result = flaggems_vllm.fused_marlin_moe(
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
+@pytest.mark.parametrize(
+    "precision", [pytest.param("int8", marks=_MTHREADS_NO_INT8), "fp8"]
+)
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
+def test_fused_marlin_moe_w8a16_inference_updates(
+    precision, num_tokens, updated_tensor
+):
+    with torch.inference_mode():
+        if precision == "int8":
+            args = _make_inputs_w8a16_int8(
+                num_tokens, 4, 128, 1024, 2, torch.bfloat16, flaggems_vllm.device
+            )
+        else:
+            args = _make_inputs_fp8_weight(
+                num_tokens, 4, 128, 1024, 2, torch.bfloat16, flaggems_vllm.device
+            )
+        hs, w1, w2, _, _, tw, ti, s1, s2 = args
+        kwargs = dict(
+            hidden_states=hs,
+            w1=w1,
+            w2=w2,
+            w1_scale=s1,
+            w2_scale=s2,
+            bias1=None,
+            bias2=None,
+            topk_weights=tw,
+            topk_ids=ti,
+            quant_type_id=(
+                QUANT_TYPE_UINT8B128 if precision == "int8" else QUANT_TYPE_FP8_E4M3
+            ),
+        )
+        flaggems_vllm.fused_marlin_moe(**kwargs)
+        if updated_tensor in ("w1", "w2"):
+            kwargs[updated_tensor].view(torch.uint8).fill_(
+                128 if precision == "int8" else 0
+            )
+        else:
+            kwargs[updated_tensor].zero_()
+        actual = flaggems_vllm.fused_marlin_moe(**kwargs)
+        gems_assert_equal(actual, torch.zeros_like(hs))
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 33])
+def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens):
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        num_tokens, 1, 128, 128, 1, dtype, flaggems_vllm.device
+    )
+    codes = torch.arange(256, device=hs.device, dtype=torch.int32).to(torch.uint8)
+    codes = torch.where((codes & 127) == 127, codes - 1, codes)
+    w1.view(torch.uint8).copy_(codes.view(1, 256, 1).expand_as(w1))
+    # Identity down weights keep each finite code's result separate.
+    w2.view(torch.uint8).copy_(
+        (torch.eye(128, device=hs.device, dtype=torch.uint8) * 0x38).unsqueeze(0)
+    )
+    hs.fill_(0.1)
+    s1.fill_(0.01)
+    s2.fill_(1.0)
+    w1_ref = (w1.float() * s1.expand_as(w1)).to(dtype)
+    w2_ref = (w2.float() * s2.expand_as(w2)).to(dtype)
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3
+    )
+    reference = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    gems_assert_close(actual, reference.to(dtype), dtype, reduce_dim=128)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+)
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize(
+    "special", ["weight_nan", "scale_inf", "scale_nan", "scale_large"]
+)
+def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(num_tokens, special):
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        num_tokens, 2, 96, 160, 2, torch.bfloat16, flaggems_vllm.device, -1
+    )
+    # Positive subnormal codes isolate scale overflow from cancellation error.
+    w1.view(torch.uint8).fill_(1)
+    w2.view(torch.uint8).fill_(1)
+    hs.fill_(1e-15)
+    s1 = s1.float()
+    if special == "weight_nan":
+        w1.view(torch.uint8)[0, 0, 0] = 127
+    else:
+        s1.fill_(
+            {"scale_inf": float("inf"), "scale_nan": float("nan"), "scale_large": 1e20}[
+                special
+            ]
+        )
+    w1_ref = (w1.float() * s1.expand(w1.shape)).to(hs.dtype)
+    w2_ref = (w2.float() * s2.expand(w2.shape)).to(hs.dtype)
+    actual = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1,
         w2=w2,
+        w1_scale=s1,
+        w2_scale=s2,
         bias1=None,
         bias2=None,
-        w1_scale=w1s,
-        w2_scale=w2s,
         topk_weights=tw,
         topk_ids=ti,
         quant_type_id=QUANT_TYPE_FP8_E4M3,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        group_size=group_size,
+        group_size=-1,
     )
-    ref = _reference_swiglu_moe(
-        hs,
-        w1_ref,
-        w2_ref,
-        tw,
-        ti,
-        apply_router_weight_on_input=apply_router_weight_on_input,
+    reference = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    gems_assert_close(
+        actual, reference.to(hs.dtype), hs.dtype, equal_nan=True, reduce_dim=128
     )
-    torch_device_fn.synchronize()
-    max_diff = compute_max_diff(result.float(), ref)
-    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
 # -----------------------------------------------------------------------------
@@ -1693,13 +1737,11 @@ _MTHREADS_NO_MXFP4 = pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
     reason="MThreads backend does not implement MXFP4 W4A16",
 )
-_MTHREADS_NO_INT8 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement INT8 W8A16",
-)
 
 
-def _cases(precision, configs, with_router_weight_on_input=False, marks=()):
+def _cases(
+    precision, configs, with_router_weight_on_input=False, marks=(), id_prefix=""
+):
     cases = []
     flags = [False, True] if with_router_weight_on_input else [None]
     for flag in flags:
@@ -1716,7 +1758,7 @@ def _cases(precision, configs, with_router_weight_on_input=False, marks=()):
                         dtype,
                         flag,
                         marks=marks,
-                        id="-".join(parts),
+                        id=id_prefix + "-".join(parts),
                     )
                 )
     return cases
@@ -1724,6 +1766,16 @@ def _cases(precision, configs, with_router_weight_on_input=False, marks=()):
 
 _W4A16_CASES = _cases("int4", FULL_CONFIGS, with_router_weight_on_input=True) + _cases(
     "mxfp4", FULL_CONFIGS, marks=_MTHREADS_NO_MXFP4
+)
+_W4A16_CASES += _cases(
+    "int4",
+    [(32, 8, 128, 256, 2), (2, 8, 128, 256, 2)],
+    with_router_weight_on_input=True,
+    marks=pytest.mark.skipif(
+        flaggems_vllm.vendor_name != "thead",
+        reason="T-Head grouped/reduce-direct coverage",
+    ),
+    id_prefix="ppu-",
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
@@ -1753,3 +1805,43 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU BF16 baseline")
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize(
+    "precision",
+    [
+        pytest.param(p, marks=getattr(pytest.mark, "fused_marlin_moe_" + width))
+        for p, width in [
+            ("int8", "w8a16"),
+            ("fp8", "w8a16"),
+            ("int4", "w4a16"),
+            ("mxfp4", "w4a16"),
+        ]
+    ],
+)
+def test_fused_marlin_moe_ppu_bf16_baseline(precision, num_tokens, monkeypatch):
+    generators = {
+        "int8": _make_inputs_w8a16_int8,
+        "fp8": _make_inputs_fp8_weight,
+        "int4": _make_inputs_w4a16_int4,
+        "mxfp4": _make_inputs_w4a16_mxfp4,
+    }
+    hs, _, _, w1_ref, w2_ref, tw, ti, _, _ = generators[precision](
+        num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    native = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
+    gemm = native.invoke_fused_moe_triton_kernel
+    alignment = native.moe_align_block_size
+
+    def reject_quantized_call(*args, **kwargs):
+        raise AssertionError("BF16 baseline called the quantized implementation")
+
+    monkeypatch.setattr(flaggems_vllm, "fused_marlin_moe", reject_quantized_call)
+    actual = _vllm_bf16_moe(hs, w1_ref, w2_ref, tw, ti)
+    expected = _reference_moe_rounded(hs, w1_ref, w2_ref, tw, ti)
+    gems_assert_close(actual, expected, dtype=hs.dtype)
+    assert native.invoke_fused_moe_triton_kernel is gemm
+    assert native.moe_align_block_size is alignment
+    assert gemm.__module__ == "vllm.model_executor.layers.fused_moe.fused_moe"

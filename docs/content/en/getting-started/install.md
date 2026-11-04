@@ -15,9 +15,18 @@ Install build tools before installing FlagGems-vllm:
 pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
 ```
 
+### FlagGems Dependency
+
+**FlagGems-vllm depends on FlagGems**. Several FlagGems-vllm operators invoke general FlagGems operators internally. Before installing FlagGems-vllm, install `flag-gems==5.4.0` via pip (hosted at [FlagOS PyPI repository](https://resource.flagos.net/#browse/browse:flagos-pypi-hosted:flag-gems%2F5.4.0)):
+
+```bash
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+```
+
 ### PyTorch
 
-Install a PyTorch build compatible with your target accelerator **before** installing FlagGems-vllm. FlagGems-vllm does not reinstall PyTorch automatically.
+Install a PyTorch build compatible with your target accelerator **before** installing FlagGems-vllm. The basic FlagGems-vllm installation does not reinstall PyTorch. The NVIDIA
+framework extra resolves the matching PyTorch dependencies declared by vLLM.
 
 For NVIDIA GPUs with CUDA 12.1+:
 ```bash
@@ -90,11 +99,8 @@ DNN_VENDOR=amd source tools/setup.sh
 For the full FlagOS vLLM plugin stack, install in this order:
 
 ```bash
-# 1. Install FlagGems (general operator backend)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems
-pip install --no-build-isolation -e .
-cd ..
+# 1. Install FlagGems (general operator backend, version 5.4.0)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. Install FlagGems-vllm (vLLM-specific operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -132,46 +138,14 @@ print('grouped_topk:', callable(flaggems_vllm.grouped_topk))
 "
 ```
 
-### Run Quick Tests
+### Run Smoke Tests
+
+Verify test discovery and basic module import:
 
 ```bash
 cd FlagGems-vllm
 PYTHONPATH=src pytest -q tests --collect-only
 PYTHONPATH=src pytest -q tests --quick
-```
-
-### Run a Benchmark Smoke Test
-
-```bash
-PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py --level core --iter 1 --warmup 1
-```
-
-## Backend Selection
-
-FlagGems-vllm auto-detects the hardware backend. To override:
-
-```bash
-export DNN_VENDOR=nvidia  # or amd, ascend, hygon, etc.
-```
-
-Available backends: `nvidia`, `amd`, `ascend`, `cambricon`, `enflame`, `hygon`, `iluvatar`, `kunlunxin`, `metax`, `mthreads`, and more (18 total).
-
-## C++ Extension
-
-FlagGems-vllm includes optional C++ operators compiled via pybind11. These are built automatically if the required dependencies are present.
-
-To enable C++ operators at runtime:
-
-```bash
-export USE_C_EXTENSION=1
-```
-
-Check if C++ extension is available:
-
-```python
-import flaggems_vllm
-print(flaggems_vllm.config.has_c_extension)
-print(flaggems_vllm.config.use_c_extension)
 ```
 
 ## Troubleshooting
@@ -210,7 +184,58 @@ pip install -e '.[test]'
 
 ## Next Steps
 
-- [Basic usage patterns](/FlagGems-vllm/usage/basic/)
-- [Integration with vllm-plugin-fl](/FlagGems-vllm/usage/vllm-plugin/)
-- [Running tests](/FlagGems-vllm/testing/unittest/)
-- [Running benchmarks](/FlagGems-vllm/performance/benchmark/)
+- [Basic usage patterns](../usage/basic.md)
+- [Integration with vllm-plugin-fl](../usage/vllm-plugin.md)
+- [Running tests](../testing/unittest.md)
+- [Running benchmarks](../performance/benchmark.md)
+# Repository dependencies for operator baselines
+
+After preparing the matching FlagGems accelerator environment, install this
+repository's framework dependencies in that virtual environment:
+
+```bash
+# Python 3.11+: reuse FlagGems vendor detection, then select the declared extra.
+python tools/install_vendor_deps.py --dry-run
+python tools/install_vendor_deps.py
+
+# Explicit selection is also supported.
+pip install -e '.[nvidia]'
+python tools/install_vendor_deps.py --vendor metax --extra-index-url \
+  https://resource.flagos.net/repository/flagos-pypi-hosted/simple
+python tools/install_vendor_deps.py --vendor thead --extra-index-url \
+  https://resource.flagos.net/repository/flagos-pypi-hosted/simple
+```
+
+The NVIDIA extra selects the official vLLM 0.24 wheel. The MetaX and T-Head
+extras build the pinned upstream vLLM 0.24 source in empty mode and install the
+FL platform provider. The installer first installs the declared `vllm-build`
+tools; it uses the existing torch and keeps Rust artifacts optional for
+operator benchmarks. The profiles retain the accelerator torch and FlagTree installation prepared by FlagGems. Project
+dependencies are installed from the checkout; they need not be baked into the
+runtime image. Other vendors require a declared dependency group before using
+this installer.
+
+On PPU, fused Marlin MoE benchmarks compare the quantized implementation with
+vLLM's BF16 Triton `fused_experts`, using the same decoded weights. The empty
+wheel's missing routing, activation and output-reduction kernels are supplied
+by the FL platform provider; both BF16 GEMMs and their dispatch are vLLM's.
+This baseline does not use the quantized implementation under test. Weight
+decoding occurs before timing; routing, activation and reduction are timed.
+
+For PPU benchmark commands, enable the installed platform provider:
+
+```bash
+export VLLM_PLUGINS=fl
+export VLLM_FL_USE_FLAGGEMS_VLLM=1
+pytest -q benchmark/test_fused_marlin_moe_w8a16_int8.py \
+  -m fused_marlin_moe_w8a16 --level core --record json
+```
+
+The extras are standard pip extras. For MetaX and PPU, use the installer so
+empty-mode build settings and restoration of the selected FlagTree compiler
+are applied in the correct order. Transitive framework dependencies may install
+Triton; the installer removes it and reinstalls the original FlagTree version,
+using its recorded local wheel when available, as in `tools/setup.sh`.
+
+The runtime image still needs the vendor SDK and a matching FlagGems backend
+environment. Building empty vLLM does not compile NVIDIA GPU extensions.

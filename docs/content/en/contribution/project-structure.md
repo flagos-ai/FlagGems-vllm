@@ -1,6 +1,6 @@
 ---
 title: Project Structure
-weight: 20
+weight: 40
 ---
 
 # Project Structure
@@ -12,7 +12,7 @@ FlagGems-vllm repository organization.
 ```
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python package
-│   ├── __init__.py         # Top-level exports, enable()/use_gems()
+│   ├── __init__.py         # Top-level exports and public operator APIs
 │   ├── config.py           # Configuration, C extension detection
 │   ├── ops/                # Operator implementations
 │   ├── runtime/            # Backend, device, autotune config
@@ -33,10 +33,10 @@ FlagGems-vllm/
 
 ```
 ops/
-├── __init__.py             # Re-exports all operators + __all__
-├── <op>.py                 # Single-file operator (e.g., grouped_topk.py)
+├── __init__.py             # Re-exports all operators + __all__ (157 exported ops)
+├── <op>.py                 # 80+ root operator implementations (e.g., grouped_topk.py)
 ├── DSA/                    # Domain-specific architectures
-├── FLA/                    # Flash Linear Attention
+├── FLA/                    # Flash Linear Attention (includes gdn2_native)
 ├── mhc/                    # Multi-head computation
 └── qwen4/                  # Qwen4 model-specific ops
 ```
@@ -50,29 +50,36 @@ Each operator file typically contains:
 
 ```
 runtime/
-├── __init__.py             # Device detection, get_tuned_config()
+├── __init__.py             # Device detection, get_tuned_config(), replace_customized_ops()
+├── common.py               # Vendor registry, VendorInfo, feature capabilities
 ├── register.py             # Register class (PyTorch dispatch)
 ├── configloader.py         # Load tune_configs.yaml
-├── backend/
-│   ├── _nvidia/            # NVIDIA backend
-│   │   ├── tune_configs.yaml    # Pre-tuned autotune configs
-│   │   ├── ampere/              # Ampere-specific configs
-│   │   └── hopper/              # Hopper-specific configs
-│   ├── _amd/               # AMD backend
-│   ├── _ascend/            # Huawei Ascend
-│   └── ...                 # 15+ more backends
-└── device.py               # Device abstraction (device_count, etc.)
+├── flagtune.py             # FlagTune integration
+└── backend/
+    ├── device_finder.py    # DeviceDetector singleton
+    ├── device.py           # Device abstraction helpers
+    ├── backend_utils.py    # Backend helper utilities
+    ├── _nvidia/            # NVIDIA backend
+    │   ├── tune_configs.yaml    # Pre-tuned autotune configs
+    │   ├── ampere/              # Ampere-specific configs
+    │   └── hopper/              # Hopper-specific configs
+    ├── _amd/               # AMD backend
+    ├── _ascend/            # Huawei Ascend backend
+    └── ...                 # 17 hardware backends total
 ```
 
 ### `utils/` - Utilities
 
 ```
 utils/
-├── libentry.py             # @libentry() decorator (operator entry point)
-├── libtuner.py             # @libtuner() decorator (autotune integration)
-├── triton_helpers.py       # Triton kernel utilities
+├── libentry.py             # @libentry() and @libtuner() decorators
 ├── pointwise_dynamic.py    # Dynamic pointwise codegen
-└── dtype_utils.py          # Data type helpers
+├── shape_utils.py          # Tensor shape, broadcast, and offset helpers
+├── type_utils.py           # Data type utilities
+├── triton_lang_helper.py   # Triton language shims and helpers
+├── triton_driver_helper.py # Triton device driver properties
+├── triton_version_utils.py # Triton and TLE version feature checks
+└── models/                 # Model-specific helper modules
 ```
 
 ## Tests (`tests/`)
@@ -95,6 +102,7 @@ benchmark/
 ├── conftest.py             # Pytest hooks, --level/--iter/--warmup
 ├── core_shapes.yaml        # Core shapes per operator
 ├── test_<op>.py            # Per-operator performance benchmarks
+├── test_FLA/               # FLA benchmarks
 └── base.py                 # Benchmark utilities
 ```
 
@@ -102,14 +110,16 @@ benchmark/
 
 ```
 conf/
-└── operators.yaml          # Operator metadata (102 ops)
-                            # - id, name, description, kind, labels, stage
+└── operators.yaml          # Operator metadata (105 ops)
+                            # - id, description, for, labels, kind, stages
 ```
 
 ## Tools (`tools/`)
 
 ```
 tools/
+├── ci_checks/              # CI verification scripts (YAML, exports, markers)
+├── gpu_check_<vendor>.sh   # Hardware check scripts for 13 vendor chips
 ├── setup.sh                # Full GPU environment bootstrap
 ├── select_tests.py         # CI: map changed files → test targets
 ├── select_backends.py      # CI: multi-backend test selection
@@ -119,7 +129,6 @@ tools/
 ## Development Protocol (`workflow.md`)
 
 Mandatory operator development protocol with hard gates (G0–G7):
-- Pre-coding tables (project truth, torch contract, implementation paths)
 - NO_TORCH_COMPUTE_FALLBACK rule
 - Autotune requirements
 - Testing and performance acceptance criteria
@@ -135,6 +144,8 @@ Mandatory operator development protocol with hard gates (G0–G7):
 
 ## Next Steps
 
-- [Operator development protocol](/FlagGems-vllm/contribution/workflow/)
-- [Contributing guide](/FlagGems-vllm/contribution/overview/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Contributing Guide](overview.md)
+- [Operator Development Protocol](workflow.md)
+- [Backend Development Guide](backend.md)
+- [MiniMax M3 Support](../references/minimax-m3-support.md)
+- [Testing Guide](../testing/unittest.md)

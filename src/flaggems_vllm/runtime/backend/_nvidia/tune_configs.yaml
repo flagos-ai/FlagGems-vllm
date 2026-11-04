@@ -85,6 +85,135 @@ w8a8_block_fp8_bmm_splitk:
       - 4
     stages:
       - 3
+attn_res_post:
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 1
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 1
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 8
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: true
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 16
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 16
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 8
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: true
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: true
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: true
+    num_warps: 8
+    num_stages: 2
 
 attention:
   - gen: true
@@ -627,6 +756,21 @@ fused_marlin_moe_w8a16_fp8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 2
 
 fused_marlin_moe_w8a16_int8_gateup_silu_large:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
@@ -661,6 +805,18 @@ fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
@@ -681,6 +837,24 @@ fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
@@ -692,6 +866,15 @@ fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
     num_warps: 4
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_gateup:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
@@ -751,6 +934,39 @@ fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}

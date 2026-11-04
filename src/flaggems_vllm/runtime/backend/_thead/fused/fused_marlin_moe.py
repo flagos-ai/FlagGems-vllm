@@ -19,8 +19,9 @@ All four formats share the same routing, staging and GEMM kernels; weight
 decoding is selected at compile time from ``quant_type_id``.
 
 The grouped path consumes the same sorted routing layout as ``fused_moe``.
-Its GEMM stays separate because Marlin weights are output-major INT32 tiles
-that must be asynchronously loaded and decoded before each dot product.
+Four-bit formats retain the shared INT32 packing. INT8/FP8 weights and scales
+use no-copy views of the public output-major storage. FP8 scale-safety flags
+are recomputed each call; no 8-bit weights, scales or flags are cached.
 """
 
 from typing import Any, Callable, NamedTuple, Optional
@@ -28,6 +29,7 @@ from typing import Any, Callable, NamedTuple, Optional
 import torch
 import triton
 import triton.language as tl
+from flag_gems import zeros
 from torch.utils.weak import WeakTensorKeyDictionary
 
 try:
@@ -46,15 +48,13 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
 )
 from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
+from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
-_PACK_CACHE = WeakTensorKeyDictionary()
 _SCALE_CACHE = WeakTensorKeyDictionary()
-_FP8_SCALE_CACHE = WeakTensorKeyDictionary()
-_INT8_SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_FAST_VARIANTS = {
     QUANT_TYPE_UINT4B8: (False,),
     QUANT_TYPE_UINT8B128: (False,),
@@ -69,11 +69,10 @@ _TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
 _VLLM_QUANT_TYPE_FP8_E4M3 = 2814749767172868
 
 
-class _PackedStage(NamedTuple):
+class _QuantizedStage(NamedTuple):
     weight: torch.Tensor
     scale: torch.Tensor
-    weight_safe: torch.Tensor
-    scale_safe: torch.Tensor
+    scale_safe: Optional[torch.Tensor]
 
 
 @triton.jit
@@ -89,17 +88,19 @@ def _decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = Fals
         # Preserve E4M3 subnormals by embedding the bits in BF16. Its exponent
         # bias is corrected by an exact power-of-two factor in the scale.
         bits = ((q & 128) << 8) | ((q & 127) << 4)
+        # Set the BF16 NaN exponent without a floating-point select per weight.
+        bits = bits | (-(((q & 127) + 1) >> 7) & 0x7F80)
         tiny = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
         exponent_bias = 2.0**120
     else:
         # E4M3 bits embedded in FP16 have exponent bias 15 rather than 7.
         bits = ((q & 128) << 8) | ((q & 127) << 7)
+        bits = bits | (-(((q & 127) + 1) >> 7) & 0x7C00)
         tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
         exponent_bias = 256.0
     value = tiny
     if not FAST:
         value = value * exponent_bias
-        value = tl.where((q & 127) == 127, float("nan"), value)
     return (value * scale).to(compute_type)
 
 
@@ -151,10 +152,8 @@ def _dequant_int8(
     compute_type: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
-    tl.static_assert(b.shape[0] == 32, "INT8 packing uses 128-K tiles")
-    parts = tl.arange(0, 4)
-    quant = (b[None, :, :] >> (parts[:, None, None] * 8)) & 255
-    quant = tl.reshape(quant, (128, ns.shape[0])).to(tl.int32) - 128
+    tl.static_assert(b.shape[0] == 128)
+    quant = b.to(tl.int32) - 128
     group = k_base // GROUP_SIZE
     scale = tl.load(
         s_ptr + expert * se + group * sg + ns * sn,
@@ -210,10 +209,8 @@ def _dequant_fp8(
     GROUP_SIZE: tl.constexpr,
     FAST: tl.constexpr = False,
 ):
-    tl.static_assert(b.shape[0] == 32, "FP8 packing uses 128-K tiles")
-    parts = tl.arange(0, 4)
-    quant = (b[None, :, :] >> (parts[:, None, None] * 8)) & 255
-    quant = tl.reshape(quant, (128, ns.shape[0]))
+    tl.static_assert(b.shape[0] == 128)
+    quant = b.to(tl.uint32)
     if GROUP_SIZE == -1 or GROUP_SIZE >= 128:
         group = 0 if GROUP_SIZE == -1 else k_base // GROUP_SIZE
         scale_ptrs = s_ptr + expert * se + group * sg + ns * sn
@@ -353,99 +350,8 @@ def _reduce_safety_kernel(
 
 
 @triton.jit
-def _pack_w8_kernel(
-    W,
-    P,
-    Flags,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SK: tl.constexpr,
-    KP: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    BLOCK: tl.constexpr,
-    CHECK_E4M3: tl.constexpr,
-):
-    # Large MoE weights can exceed 2 GiB (for example E=256, N=7168,
-    # K=2048). Keep expert-stride address arithmetic in 64 bits.
-    e = tl.program_id(1).to(tl.int64)
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n, pk = idx % N, idx // N
-    base = (pk // 32) * 128 + pk % 32
-    packed = tl.full((BLOCK,), 0, tl.uint32)
-    bad = tl.full((BLOCK,), 0, tl.int32)
-    for i in tl.static_range(4):
-        k = base + i * 32
-        valid = (pk < KP) & (k < K)
-        byte = tl.load(W + e * SE + n * SN + k * SK, mask=valid, other=0).to(tl.uint32)
-        packed |= byte << (i * 8)
-        if CHECK_E4M3:
-            bad |= ((byte & 127) == 127) & valid
-    tl.store(P + e * KP * N + idx, packed, mask=pk < KP)
-    if CHECK_E4M3:
-        tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad, 0) != 0)
-
-
-def _pack_w8_cache(w, check_e4m3):
-    try:
-        version = w._version
-    except RuntimeError:
-        version = None
-    cache_key = (version, check_e4m3)
-    cached = _PACK_CACHE.get(w)
-    if cached is not None and cached[0] == cache_key:
-        return cached[1]
-    e, n, k = w.shape
-    kp = triton.cdiv(k, 128) * 32
-    count = triton.cdiv(kp * n, 256)
-    packed = torch.empty((e, kp, n), device=w.device, dtype=torch.int32)
-    chunks = (
-        torch.empty((e, count), device=w.device, dtype=torch.int32)
-        if check_e4m3
-        else packed
-    )
-    _pack_w8_kernel[(count, e)](
-        w.view(torch.uint8),
-        packed,
-        chunks,
-        n,
-        k,
-        *w.stride(),
-        kp,
-        count,
-        256,
-        CHECK_E4M3=check_e4m3,
-    )
-    if check_e4m3:
-        safe = torch.empty((e + 1,), device=w.device, dtype=torch.int32)
-        _reduce_safety_kernel[(e + 1,)](chunks, safe, e, count, 512)
-    else:
-        safe = packed
-    result = (packed, safe)
-    if not torch.cuda.is_current_stream_capturing():
-        _PACK_CACHE[w] = (cache_key, result)
-    return result
-
-
-def _pack_int8_scale_cache(s):
-    try:
-        version = s._version
-    except RuntimeError:
-        version = None
-    cached = _INT8_SCALE_CACHE.get(s)
-    if cached is not None and cached[0] == version:
-        return cached[1]
-    packed = s.transpose(1, 2).contiguous()
-    if not torch.cuda.is_current_stream_capturing():
-        _INT8_SCALE_CACHE[s] = (version, packed)
-    return packed
-
-
-@triton.jit
-def _pack_fp8_scale_kernel(
+def _check_fp8_scale_kernel(
     S,
-    Out,
     Flags,
     N: tl.constexpr,
     G: tl.constexpr,
@@ -457,38 +363,22 @@ def _pack_fp8_scale_kernel(
 ):
     e = tl.program_id(1)
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n, g = i % N, i // N
-    valid = i < G * N
+    n, g = i // G, i % G
+    valid = i < N * G
     scale = tl.load(S + e * SE + n * SN + g * SG, mask=valid, other=1.0).to(tl.float32)
     folded = scale * (2.0**120)
-    # NaN/Inf scales remain semantically valid on the fast path. Use the
-    # stronger BF16 exponent correction when deciding whether folding is safe.
     bad = (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf")) & valid
-    tl.store(Out + e * G * N + i, scale, mask=valid)
     tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad.to(tl.int32), 0) != 0)
 
 
-def _pack_fp8_scale_cache(s, input_size=None):
-    try:
-        version = s._version
-    except RuntimeError:
-        version = None
-    cache_key = (version, input_size)
-    cached = _FP8_SCALE_CACHE.get(s)
-    if cached is not None and cached[0] == cache_key:
-        return cached[1]
+def _fp8_scale_safety(s):
     e, n, g = s.shape
     count = triton.cdiv(n * g, 256)
-    out_dtype = s.dtype if input_size is not None and input_size > n else torch.float32
-    out = torch.empty((e, g, n), device=s.device, dtype=out_dtype)
     chunks = torch.empty((e, count), device=s.device, dtype=torch.int32)
     safe = torch.empty((e + 1,), device=s.device, dtype=torch.int32)
-    _pack_fp8_scale_kernel[(count, e)](s, out, chunks, n, g, *s.stride(), count, 256)
+    _check_fp8_scale_kernel[(count, e)](s, chunks, n, g, *s.stride(), count, 256)
     _reduce_safety_kernel[(e + 1,)](chunks, safe, e, count, 512)
-    result = (out, safe)
-    if not torch.cuda.is_current_stream_capturing():
-        _FP8_SCALE_CACHE[s] = (cache_key, result)
-    return result
+    return safe
 
 
 if tle_async is not None:
@@ -515,12 +405,11 @@ if tle_async is not None:
     ):
         """Load, decode and multiply one stream of 128-K weight tiles."""
         BLOCK_SIZE_K: tl.constexpr = 128
-        BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32
-            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+        IS_8BIT: tl.constexpr = (
+            QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
-            else 16
         )
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             activation = tle_async.load(
@@ -530,16 +419,16 @@ if tle_async is not None:
                 is_async=True,
             )
             if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
-                b_packed = tle_async.load(b_block_ptr, is_async=True)
+                b_quantized = tle_async.load(b_block_ptr, is_async=True)
             else:
-                b_packed = tle_async.load(
+                b_quantized = tle_async.load(
                     b_block_ptr,
                     boundary_check=(0, 1),
                     padding_option="zero",
                     is_async=True,
                 )
             weight = _dequant_weight(
-                b_packed,
+                b_quantized,
                 b_scale_ptr,
                 expert,
                 k_tile * BLOCK_SIZE_K,
@@ -556,7 +445,7 @@ if tle_async is not None:
             )
             acc = tl.dot(tl.trans(weight), tl.trans(activation), acc=acc)
             a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
         return acc
 
     @libentry()
@@ -586,7 +475,6 @@ if tle_async is not None:
         PIPELINE_STAGES: tl.constexpr,
         compute_type: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
-        W_safe,
         S_safe,
         NUM_EXPERTS: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
@@ -597,15 +485,14 @@ if tle_async is not None:
         # 2D tile; boundary padding leaves only row zero valid.
         BLOCK_SIZE_M: tl.constexpr = 16
         BLOCK_SIZE_K: tl.constexpr = 128
-        BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32
-            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+        IS_8BIT: tl.constexpr = (
+            QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
-            else 16
         )
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
-            is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
+            is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
 
@@ -623,14 +510,16 @@ if tle_async is not None:
             block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
             order=(1, 0),
         )
-        # Packed B stores either four FP8 or eight 4-bit values per int32.
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
-            shape=(tl.cdiv(K, 128) * BLOCK_SIZE_K_PACK, N),
+            shape=(
+                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                N,
+            ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
-            order=(1, 0),
+            block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
+            order=((0, 1) if IS_8BIT else (1, 0)),
         )
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         acc = _quantized_gemm_tile(
@@ -695,22 +584,20 @@ if tle_async is not None:
         PIPELINE_STAGES: tl.constexpr,
         compute_type: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
-        W_safe,
         S_safe,
         NUM_EXPERTS: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
         FAST: tl.constexpr,
     ):
         BLOCK_SIZE_K: tl.constexpr = 128
-        BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32
-            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+        IS_8BIT: tl.constexpr = (
+            QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
-            else 16
         )
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
-            is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
+            is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
 
@@ -722,11 +609,14 @@ if tle_async is not None:
         a_row = route // A_ROUTE_DIVISOR
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
-            shape=(tl.cdiv(K, BLOCK_SIZE_K) * BLOCK_SIZE_K_PACK, N),
+            shape=(
+                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                N,
+            ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
-            order=(1, 0),
+            block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
+            order=((0, 1) if IS_8BIT else (1, 0)),
         )
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -741,16 +631,16 @@ if tle_async is not None:
                 other=0.0,
             )
             if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
-                b_packed = tle_async.load(b_block_ptr, is_async=True)
+                b_quantized = tle_async.load(b_block_ptr, is_async=True)
             else:
-                b_packed = tle_async.load(
+                b_quantized = tle_async.load(
                     b_block_ptr,
                     boundary_check=(0, 1),
                     padding_option="zero",
                     is_async=True,
                 )
             b = _dequant_weight(
-                b_packed,
+                b_quantized,
                 b_scale_ptr,
                 expert,
                 k_tile * BLOCK_SIZE_K,
@@ -766,7 +656,7 @@ if tle_async is not None:
                 FAST,
             )
             acc += tl.sum(a[:, None].to(tl.float32) * b.to(tl.float32), axis=0)
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
 
         if MUL_ROUTED_WEIGHT:
             acc *= tl.load(topk_weights_ptr + route).to(tl.float32)
@@ -803,7 +693,6 @@ if tle_async is not None:
         PIPELINE_STAGES: tl.constexpr,
         compute_type: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
-        W_safe,
         S_safe,
         NUM_EXPERTS: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
@@ -812,15 +701,14 @@ if tle_async is not None:
         """Compute GEMM2 and reduce all routed experts into one token row."""
         BLOCK_SIZE_M: tl.constexpr = 16
         BLOCK_SIZE_K: tl.constexpr = 128
-        BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32
-            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+        IS_8BIT: tl.constexpr = (
+            QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
-            else 16
         )
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
-            is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
+            is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
 
@@ -844,11 +732,14 @@ if tle_async is not None:
             )
             b_block_ptr = tl.make_block_ptr(
                 base=b_ptr + expert * stride_be,
-                shape=(tl.cdiv(K, 128) * BLOCK_SIZE_K_PACK, N),
+                shape=(
+                    (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                    N,
+                ),
                 strides=(stride_bk, stride_bn),
                 offsets=(0, pid_n * BLOCK_SIZE_N),
-                block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
-                order=(1, 0),
+                block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
+                order=((0, 1) if IS_8BIT else (1, 0)),
             )
 
             for k_tile in tl.range(
@@ -860,7 +751,7 @@ if tle_async is not None:
                     padding_option="zero",
                     is_async=True,
                 )
-                b_packed = tle_async.load(
+                b_quantized = tle_async.load(
                     b_block_ptr,
                     boundary_check=(0, 1),
                     padding_option="zero",
@@ -869,7 +760,7 @@ if tle_async is not None:
 
                 offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
                 b = _dequant_weight(
-                    b_packed,
+                    b_quantized,
                     b_scale_ptr,
                     expert,
                     k_tile * BLOCK_SIZE_K,
@@ -887,7 +778,7 @@ if tle_async is not None:
                 route_acc = tl.dot(tl.trans(b), tl.trans(a), acc=route_acc)
 
                 a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-                b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+                b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
 
             if MUL_ROUTED_WEIGHT:
                 routed_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
@@ -932,7 +823,6 @@ if tle_async is not None:
         PIPELINE_STAGES: tl.constexpr,
         compute_type: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
-        W_safe,
         S_safe,
         NUM_EXPERTS: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
@@ -940,15 +830,14 @@ if tle_async is not None:
     ):
         BLOCK_SIZE_M: tl.constexpr = 16
         BLOCK_SIZE_K: tl.constexpr = 128
-        BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32
-            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+        IS_8BIT: tl.constexpr = (
+            QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
-            else 16
         )
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
-            is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
+            is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
 
@@ -968,19 +857,25 @@ if tle_async is not None:
         )
         b_gate_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
-            shape=(tl.cdiv(K, 128) * BLOCK_SIZE_K_PACK, 2 * N),
+            shape=(
+                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                2 * N,
+            ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
-            order=(1, 0),
+            block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
+            order=((0, 1) if IS_8BIT else (1, 0)),
         )
         b_up_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
-            shape=(tl.cdiv(K, 128) * BLOCK_SIZE_K_PACK, 2 * N),
+            shape=(
+                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                2 * N,
+            ),
             strides=(stride_bk, stride_bn),
             offsets=(0, N + pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
-            order=(1, 0),
+            block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
+            order=((0, 1) if IS_8BIT else (1, 0)),
         )
         acc_gate = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
@@ -992,13 +887,13 @@ if tle_async is not None:
                 padding_option="zero",
                 is_async=True,
             )
-            b_gate_packed = tle_async.load(
+            b_gate_quantized = tle_async.load(
                 b_gate_block_ptr,
                 boundary_check=(0, 1),
                 padding_option="zero",
                 is_async=True,
             )
-            b_up_packed = tle_async.load(
+            b_up_quantized = tle_async.load(
                 b_up_block_ptr,
                 boundary_check=(0, 1),
                 padding_option="zero",
@@ -1007,7 +902,7 @@ if tle_async is not None:
 
             offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             gate_b = _dequant_weight(
-                b_gate_packed,
+                b_gate_quantized,
                 b_scale_ptr,
                 expert,
                 k_tile * BLOCK_SIZE_K,
@@ -1023,7 +918,7 @@ if tle_async is not None:
                 FAST,
             )
             up_b = _dequant_weight(
-                b_up_packed,
+                b_up_quantized,
                 b_scale_ptr + N * stride_bsn,
                 expert,
                 k_tile * BLOCK_SIZE_K,
@@ -1043,8 +938,8 @@ if tle_async is not None:
             acc_up = tl.dot(tl.trans(up_b), a_trans, acc=acc_up)
 
             a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-            b_gate_block_ptr = tl.advance(b_gate_block_ptr, (BLOCK_SIZE_K_PACK, 0))
-            b_up_block_ptr = tl.advance(b_up_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+            b_gate_block_ptr = tl.advance(b_gate_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
+            b_up_block_ptr = tl.advance(b_up_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
 
         if MUL_ROUTED_WEIGHT:
             routed_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
@@ -1182,17 +1077,17 @@ if tle_async is not None:
         MUL_ROUTED_WEIGHT: tl.constexpr,
         PIPELINE_STAGES: tl.constexpr,
         compute_type: tl.constexpr,
-        W_safe,
         S_safe,
         QUANT_TYPE: tl.constexpr,
         FAST: tl.constexpr,
     ):
         """Expert-grouped quantized GEMM using contiguous TLE AIU transfers."""
-        BLOCK_SIZE_K_PACK: tl.constexpr = (
-            BLOCK_SIZE_K // 4
-            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+        IS_8BIT: tl.constexpr = (
+            QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
-            else BLOCK_SIZE_K // 8
+        )
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 8
         )
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1214,7 +1109,7 @@ if tle_async is not None:
 
         expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
-            is_safe = tl.load(W_safe + expert) & tl.load(S_safe + expert)
+            is_safe = tl.load(S_safe + expert)
             if is_safe:
                 return
 
@@ -1237,11 +1132,14 @@ if tle_async is not None:
         )
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
-            shape=(tl.cdiv(K, 128) * BLOCK_SIZE_K_PACK, N),
+            shape=(
+                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                N,
+            ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
-            order=(1, 0),
+            block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
+            order=((0, 1) if IS_8BIT else (1, 0)),
         )
         acc = _quantized_gemm_tile(
             a_block_ptr,
@@ -1340,30 +1238,23 @@ def _use_direct_route(
     return routes <= min(_PPU_DIRECT_ROUTE_LIMIT, max_routes_by_grid)
 
 
-def _align_grouped_tokens(
-    topk_ids: torch.Tensor,
-    block_m: int,
-    num_experts: int,
-):
-    # FlagGems-vLLM is integrated into vLLM, and the T-Head CUDA extension's
-    # alignment kernel avoids the high fixed cost of the generic Triton path.
-    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-        moe_align_block_size as vllm_moe_align_block_size,
+def _align_grouped_tokens(topk_ids: torch.Tensor, block_m: int, num_experts: int):
+    # Supply Triton-zeroed workspace to keep alignment independent of Torch kernels.
+    workspace = (
+        zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device),
+        zeros(
+            (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
+        ),
     )
-
-    return vllm_moe_align_block_size(
-        topk_ids,
-        block_m,
-        num_experts,
-        expert_map=None,
-        ignore_invalid_experts=True,
+    return moe_align_block_size_no_tle(
+        topk_ids, block_m, num_experts, workspace=workspace
     )
 
 
 def _invoke_marlin_moe_gemm_direct(
     A: torch.Tensor,
     C: torch.Tensor,
-    packed: _PackedStage,
+    stage: _QuantizedStage,
     topk_weights: Optional[torch.Tensor],
     topk_ids: torch.Tensor,
     *,
@@ -1378,7 +1269,7 @@ def _invoke_marlin_moe_gemm_direct(
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
 
-    B, B_scale = packed.weight, packed.scale
+    B, B_scale = stage.weight, stage.scale
     K = A.size(1)
     N = C.size(-1) if fuse_silu else B.size(2)
     routes = topk_ids.numel()
@@ -1433,8 +1324,7 @@ def _invoke_marlin_moe_gemm_direct(
             compute_type=compute_type,
             BLOCK_SIZE_N=block_n,
             num_stages=pipeline_stages,
-            W_safe=packed.weight_safe,
-            S_safe=packed.scale_safe,
+            S_safe=stage.scale_safe,
             NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
@@ -1444,7 +1334,7 @@ def _invoke_marlin_moe_gemm_direct(
 def _invoke_marlin_moe_gemm_reduce_direct(
     A: torch.Tensor,
     C: torch.Tensor,
-    packed: _PackedStage,
+    stage: _QuantizedStage,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     *,
@@ -1456,7 +1346,7 @@ def _invoke_marlin_moe_gemm_reduce_direct(
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
 
-    B, B_scale = packed.weight, packed.scale
+    B, B_scale = stage.weight, stage.scale
     K = A.size(1)
     N = B.size(2)
     top_k = topk_ids.size(1)
@@ -1493,8 +1383,7 @@ def _invoke_marlin_moe_gemm_reduce_direct(
             compute_type=compute_type,
             BLOCK_SIZE_N=block_n,
             num_stages=pipeline_stages,
-            W_safe=packed.weight_safe,
-            S_safe=packed.scale_safe,
+            S_safe=stage.scale_safe,
             NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
@@ -1565,7 +1454,7 @@ def _silu_and_stage_grouped(
 def _invoke_marlin_moe_gemm_grouped(
     A: torch.Tensor,
     C: torch.Tensor,
-    packed: _PackedStage,
+    stage: _QuantizedStage,
     topk_weights: Optional[torch.Tensor],
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -1581,7 +1470,7 @@ def _invoke_marlin_moe_gemm_grouped(
 ):
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
-    B, B_scale = packed.weight, packed.scale
+    B, B_scale = stage.weight, stage.scale
     em = sorted_token_ids.size(0)
     num_valid_tokens = C.size(0) * C.size(1) if C.ndim == 3 else A.size(0) * top_k
     if input_is_routed:
@@ -1637,8 +1526,7 @@ def _invoke_marlin_moe_gemm_grouped(
             compute_type=compute_type,
             num_warps=num_warps,
             num_stages=pipeline_stages,
-            W_safe=packed.weight_safe,
-            S_safe=packed.scale_safe,
+            S_safe=stage.scale_safe,
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
         )
@@ -1769,42 +1657,24 @@ def _validate_inputs(
     return m, k, n, e, ids.shape[1]
 
 
-def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_size):
+def _prepare_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_size):
     if quant_type_id == QUANT_TYPE_UINT4B8:
         b1, b2, s1, s2 = w4a16_int4_pack(
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            cached=True,
-            block_size_k=group_size,
+            w1, w2, w1_scale, w2_scale, cached=True, block_size_k=group_size
         )
-        safety = (b1, s1, b2, s2)
     elif quant_type_id == QUANT_TYPE_FP4_E2M1:
-        b1, b2, _, _ = w4a16_int4_pack(
-            w1,
-            w2,
-            cached=True,
-            block_size_k=128,
-        )
+        b1, b2, _, _ = w4a16_int4_pack(w1, w2, cached=True, block_size_k=128)
         s1, s2 = _pack_e8m0(w1_scale), _pack_e8m0(w2_scale)
-        safety = (b1, s1, b2, s2)
-    elif quant_type_id == QUANT_TYPE_UINT8B128:
-        b1, _ = _pack_w8_cache(w1, check_e4m3=False)
-        b2, _ = _pack_w8_cache(w2, check_e4m3=False)
-        s1 = _pack_int8_scale_cache(w1_scale)
-        s2 = _pack_int8_scale_cache(w2_scale)
-        safety = (b1, s1, b2, s2)
     else:
-        b1, b1_safe = _pack_w8_cache(w1, check_e4m3=True)
-        b2, b2_safe = _pack_w8_cache(w2, check_e4m3=True)
-        s1, s1_safe = _pack_fp8_scale_cache(w1_scale, w1.size(2))
-        s2, s2_safe = _pack_fp8_scale_cache(w2_scale, w2.size(2))
-        safety = (b1_safe, s1_safe, b2_safe, s2_safe)
-    return (
-        _PackedStage(b1, s1, safety[0], safety[1]),
-        _PackedStage(b2, s2, safety[2], safety[3]),
-    )
+        b1 = w1.view(torch.uint8).transpose(1, 2)
+        b2 = w2.view(torch.uint8).transpose(1, 2)
+        s1 = w1_scale.transpose(1, 2)
+        s2 = w2_scale.transpose(1, 2)
+    if quant_type_id == QUANT_TYPE_FP8_E4M3:
+        safe1, safe2 = _fp8_scale_safety(w1_scale), _fp8_scale_safety(w2_scale)
+    else:
+        safe1, safe2 = None, None
+    return _QuantizedStage(b1, s1, safe1), _QuantizedStage(b2, s2, safe2)
 
 
 def _fused_marlin_moe_impl(
@@ -1824,8 +1694,8 @@ def _fused_marlin_moe_impl(
 ):
     """Forward SwiGLU MoE with output-major quantized weights.
 
-    Weight tensors created in torch.inference_mode are immutable after their
-    first invocation. Warm up outside CUDA Graph capture to cache packing.
+    INT8/FP8 weights and scales are read directly on every invocation.
+    Four-bit formats retain the existing cached packing behavior.
     Expert IDs must be in [0, E); expert parallel maps are not supported.
     """
     m, k, n, e, topk = _validate_inputs(
@@ -1852,7 +1722,7 @@ def _fused_marlin_moe_impl(
         return out
     compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
     with torch.cuda.device(hidden_states.device):
-        stage1, stage2 = _pack_quantized_weights(
+        stage1, stage2 = _prepare_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size
         )
         direct = _use_direct_route(m, e, topk, k, n)
@@ -1885,7 +1755,7 @@ def _fused_marlin_moe_impl(
                 _invoke_marlin_moe_gemm_direct(
                     A=hidden_states,
                     C=c1,
-                    packed=stage1,
+                    stage=stage1,
                     topk_weights=stage1_topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=apply_router_weight_on_input,
@@ -1900,7 +1770,7 @@ def _fused_marlin_moe_impl(
                 _invoke_marlin_moe_gemm_direct(
                     A=hidden_states,
                     C=c2,
-                    packed=stage1,
+                    stage=stage1,
                     topk_weights=stage1_topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=apply_router_weight_on_input,
@@ -1914,7 +1784,7 @@ def _fused_marlin_moe_impl(
                 _invoke_marlin_moe_gemm_reduce_direct(
                     A=c2,
                     C=out,
-                    packed=stage2,
+                    stage=stage2,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=not apply_router_weight_on_input,
@@ -1926,7 +1796,7 @@ def _fused_marlin_moe_impl(
                 _invoke_marlin_moe_gemm_direct(
                     A=c2,
                     C=c3,
-                    packed=stage2,
+                    stage=stage2,
                     topk_weights=stage2_topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=not apply_router_weight_on_input,
@@ -1943,7 +1813,7 @@ def _fused_marlin_moe_impl(
             _invoke_marlin_moe_gemm_grouped(
                 A=hidden_states,
                 C=c1,
-                packed=stage1,
+                stage=stage1,
                 topk_weights=stage1_topk_weights,
                 sorted_token_ids=sorted_ids,
                 expert_ids=experts,
@@ -1966,7 +1836,7 @@ def _fused_marlin_moe_impl(
             _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
                 C=c3,
-                packed=stage2,
+                stage=stage2,
                 topk_weights=stage2_topk_weights,
                 sorted_token_ids=sorted_ids,
                 expert_ids=experts,

@@ -33,6 +33,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
@@ -58,6 +61,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
     indexer_gemm_score,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import (
+    indexer_k_quant_and_cache,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
@@ -106,6 +112,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
     top_k_per_row_prefill,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -125,6 +132,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_inv_rope_int8_quant",
+    "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
     "gemma_rms_norm",
@@ -132,6 +140,7 @@ __all__ = [
     "grouped_topk",
     "indexer_epilogue",
     "indexer_gemm_score",
+    "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "kda_gate_cumsum_triton",
     "kpool_state_compress",
@@ -157,6 +166,7 @@ __all__ = [
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "top_k_top_p",
     "topk_softplus_sqrt",
     "unpack_seq_triton",
 ]

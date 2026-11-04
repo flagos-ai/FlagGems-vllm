@@ -30,6 +30,72 @@ import select_backends
 import select_tests
 
 
+class InstallVendorDependenciesTest(unittest.TestCase):
+    def test_detected_vendor_selects_repository_extra(self):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import install_vendor_deps
+
+        with patch.dict(
+            sys.modules, {"flag_gems": SimpleNamespace(vendor_name="thead")}
+        ), patch.object(
+            sys, "argv", ["install_vendor_deps.py", "--dry-run"]
+        ), patch.object(
+            install_vendor_deps.subprocess, "run"
+        ) as run, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as output:
+            install_vendor_deps.main()
+        self.assertIn("[thead]", output.getvalue())
+        run.assert_not_called()
+
+    def test_installer_rejects_base_environment(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        import install_vendor_deps
+
+        with patch.object(
+            sys, "argv", ["install_vendor_deps.py", "--vendor", "thead"]
+        ), patch.object(sys, "prefix", sys.base_prefix), patch.object(
+            install_vendor_deps.subprocess, "run"
+        ) as run, contextlib.redirect_stderr(
+            io.StringIO()
+        ), self.assertRaises(
+            SystemExit
+        ):
+            install_vendor_deps.main()
+        run.assert_not_called()
+
+    def test_framework_install_restores_selected_flagtree(self):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import install_vendor_deps
+
+        distribution = SimpleNamespace(version="0.7.0+ppu3.6", read_text=lambda _: None)
+        with patch.object(
+            sys, "argv", ["install_vendor_deps.py", "--vendor", "thead"]
+        ), patch.object(sys, "prefix", "/tmp/test-vendor-venv"), patch.object(
+            install_vendor_deps.metadata, "distribution", return_value=distribution
+        ), patch.object(
+            install_vendor_deps.subprocess, "run"
+        ) as run, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            install_vendor_deps.main()
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[-2][-3:], ["uninstall", "-y", "triton"])
+        self.assertIn("flagtree==0.7.0+ppu3.6", commands[-1])
+        self.assertIn("--no-deps", commands[-1])
+
+
 class TemporaryRepositoryTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()

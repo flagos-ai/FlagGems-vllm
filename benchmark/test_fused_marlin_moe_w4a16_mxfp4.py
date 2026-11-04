@@ -23,7 +23,6 @@ try:
         fused_marlin_moe as vllm_fused_marlin_moe,
     )
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        marlin_moe_permute_scales,
         marlin_permute_scales,
     )
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -52,6 +51,10 @@ import flaggems_vllm
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP4_E2M1
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
+from tests.test_fused_marlin_moe import _assert_moe_bf16_close
+from tests.test_fused_marlin_moe import _moe_relative_errors as _hygon_relative_errors
+from tests.test_fused_marlin_moe import _reference_moe_rounded as _hygon_reference
+from tests.test_fused_marlin_moe import _vllm_bf16_moe
 
 from . import base
 
@@ -69,7 +72,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
+    if flaggems_vllm.vendor_name in ("hygon", "thead")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
@@ -88,41 +91,6 @@ _E2M1_MAX = 6.0
 # fused_experts running the same decoded weights. Both implementations are
 # checked against a PyTorch fp32 reference on every benchmarked shape.
 # -----------------------------------------------------------------------------
-
-
-def _hygon_reference(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids):
-    """PyTorch SwiGLU MoE ground truth, rounding each GEMM stage into the
-    activation dtype like the Hygon kernel."""
-    dtype = hidden_states.dtype
-    accumulation_dtype = torch.float64 if dtype == torch.float16 else torch.float32
-    m, k = hidden_states.shape
-    topk = topk_ids.shape[1]
-    flat_ids = topk_ids.flatten()
-    flat_weights = topk_weights.flatten()
-    result = torch.zeros((m * topk, k), dtype=dtype, device=hidden_states.device)
-    for expert in range(w1_ref.shape[0]):
-        routes = torch.where(flat_ids == expert)[0]
-        if routes.numel() == 0:
-            continue
-        x = hidden_states[routes // topk].to(accumulation_dtype)
-        gate_up = x @ w1_ref[expert].to(accumulation_dtype).T
-        gate, up = gate_up.to(dtype).float().chunk(2, -1)
-        act = (torch.nn.functional.silu(gate) * up).to(dtype)
-        out = (
-            act.to(accumulation_dtype) @ w2_ref[expert].to(accumulation_dtype).T
-        ).float()
-        result[routes] = (out * flat_weights[routes, None].float()).to(dtype)
-    return result.view(m, topk, k).float().sum(1).to(dtype)
-
-
-def _hygon_relative_errors(actual, expected):
-    delta = actual.float() - expected.float()
-    rms = (
-        delta.square().mean().sqrt()
-        / expected.float().square().mean().sqrt().clamp_min(1e-12)
-    )
-    peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
-    return rms.item(), peak.item()
 
 
 def _hygon_decode_mxfp4(w_q, scales, dtype):
@@ -317,53 +285,6 @@ def _marlin_mxfp4_quantize_per_expert(w_fp, dtype):
     return torch.stack(qweight_l, 0).contiguous(), torch.stack(scales_l, 0).contiguous()
 
 
-def _pack_gptq_int32(weight):
-    """Convert output-major packed MXFP4 bytes to GPTQ INT32 packing."""
-    experts, output_size, packed_k = weight.shape
-    packed = torch.empty(
-        (experts, packed_k // 4, output_size),
-        device=weight.device,
-        dtype=torch.int32,
-    )
-    for expert in range(experts):
-        bytes4 = weight[expert].to(torch.int32).reshape(output_size, packed_k // 4, 4)
-        words = (
-            bytes4[..., 0]
-            | (bytes4[..., 1] << 8)
-            | (bytes4[..., 2] << 16)
-            | (bytes4[..., 3] << 24)
-        )
-        packed[expert].copy_(words.transpose(0, 1))
-    return packed
-
-
-def _to_vllm_trace_layout(weight, scales, size_k, size_n):
-    qweight = _pack_gptq_int32(weight)
-    empty_perm = torch.empty(
-        (weight.size(0), 0), device=weight.device, dtype=torch.int32
-    )
-    qweight = vllm_ops.gptq_marlin_moe_repack(
-        qweight,
-        empty_perm,
-        size_k=size_k,
-        size_n=size_n,
-        num_bits=4,
-    )
-    scales = marlin_moe_permute_scales(
-        scales.transpose(1, 2).contiguous(),
-        size_k=size_k,
-        size_n=size_n,
-        group_size=MXFP4_GROUP_SIZE,
-    )
-    scales = (
-        scales.reshape(-1, 4)[:, [0, 2, 1, 3]]
-        .reshape(weight.size(0), size_k // MXFP4_GROUP_SIZE, size_n)
-        .contiguous()
-        .view(torch.float8_e8m0fnu)
-    )
-    return qweight, scales
-
-
 def _make_ppu_trace_weights(num_experts, hidden_size, intermediate_size):
     torch.manual_seed(7)
     device = flaggems_vllm.device
@@ -395,16 +316,11 @@ def _make_ppu_trace_weights(num_experts, hidden_size, intermediate_size):
         device=device,
         dtype=torch.uint8,
     )
-    if HAS_REQUIRED_VLLM:
-        vllm_w1, vllm_w1_scale = _to_vllm_trace_layout(
-            w1, w1_scale, hidden_size, 2 * intermediate_size
-        )
-        vllm_w2, vllm_w2_scale = _to_vllm_trace_layout(
-            w2, w2_scale, intermediate_size, hidden_size
-        )
-    else:
-        # Latency-only run: the vLLM Marlin layout is not needed.
-        vllm_w1 = vllm_w1_scale = vllm_w2 = vllm_w2_scale = None
+    if not HAS_REQUIRED_VLLM:
+        raise RuntimeError("Install PPU baseline dependencies with .[thead]")
+    vllm_w1 = _hygon_decode_mxfp4(w1, w1_scale, torch.bfloat16)
+    vllm_w2 = _hygon_decode_mxfp4(w2, w2_scale, torch.bfloat16)
+    vllm_w1_scale = vllm_w2_scale = None
     return (
         w1,
         w2,
@@ -467,6 +383,8 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
             num_tokens, num_experts, hidden_size, intermediate_size, top_k = config
             next_geometry = (num_experts, hidden_size, intermediate_size)
             if geometry != next_geometry:
+                weights = inputs = None
+                torch.cuda.empty_cache()
                 weights = _make_ppu_trace_weights(
                     num_experts, hidden_size, intermediate_size
                 )
@@ -489,7 +407,9 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
                 torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
                 dim=-1,
             ).to(torch.float32)
-            yield (hidden_states, *weights, topk_weights, topk_ids)
+            inputs = (hidden_states, *weights, topk_weights, topk_ids)
+            _assert_moe_bf16_close(self.gems_op(*inputs), self.torch_op(*inputs))
+            yield inputs
 
     def _get_hygon_input_iter(self, dtype):
         geometry = None
@@ -612,6 +532,10 @@ def _vllm_baseline_mxfp4(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "thead":
+        return _vllm_bf16_moe(
+            hidden_states, w1_q_marlin, w2_q_marlin, topk_weights, topk_ids
+        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,

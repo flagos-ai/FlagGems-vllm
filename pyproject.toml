@@ -41,6 +41,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Framework and baseline dependencies belong to this repository. Accelerator
+# torch/FlagTree packages are supplied by FlagGems' matching backend setup.
+nvidia = ["vllm==0.24.0,!=0.24.0+empty,!=0.24.0+flagos"]
+metax = [
+    "vllm @ https://github.com/vllm-project/vllm/archive/ee0da84ab9e04ac7610e28580af62c365e898389.tar.gz",
+    "vllm-plugin-fl==0.3.0",
+]
+thead = [
+    "vllm @ https://github.com/vllm-project/vllm/archive/ee0da84ab9e04ac7610e28580af62c365e898389.tar.gz",
+    "vllm-plugin-fl==0.3.0",
+]
+vllm-build = ["setuptools>=77.0.3,<81", "setuptools-scm>=8", "setuptools-rust>=1.9", "wheel", "jinja2"]
 test = [
     "pytest>=7.1.0",
     "scipy>=1.14,<1.18.0",  # Keep the existing NumPy version
@@ -60,6 +72,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.utils" = ["configs/*.yaml"]
 
 [tool.black]
 line-length = 88

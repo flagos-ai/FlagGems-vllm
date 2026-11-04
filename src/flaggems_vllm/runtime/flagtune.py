@@ -214,6 +214,11 @@ register_flagtune_op(
     default=False,
     description="W8A8 block FP8 batched matrix multiplication",
 )
+register_flagtune_op(
+    "w8a8_block_int8_matmul",
+    default=False,
+    description="W8A8 block INT8 matrix multiplication",
+)
 
 # DEFAULT_FLAGTUNE_INCLUDE and SUPPORTED_FLAGTUNE_OPS are provided by __getattr__.
 __all__ = [  # noqa: F822

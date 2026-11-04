@@ -10,8 +10,8 @@ FlagGems-vllm 包含全面的功能测试来验证算子正确性。
 
 ## 主题
 
-- [单元测试](unittest/) - 运行功能测试
-- [测试覆盖率](coverage/) - 覆盖率报告
+- [单元测试](unittest.md) - 运行功能测试
+- [测试覆盖率](coverage.md) - 覆盖率报告
 
 ## 快速开始
 
@@ -47,5 +47,5 @@ PYTHONPATH=src pytest -v tests/test_grouped_topk.py
 
 ## 下一步
 
-- [单元测试指南](unittest/)
-- [覆盖率报告](coverage/)
+- [单元测试指南](unittest.md)
+- [覆盖率报告](coverage.md)

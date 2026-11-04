@@ -48,6 +48,8 @@ except ImportError:
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
 from flaggems_vllm.runtime import torch_device_fn
+from tests.test_fused_marlin_moe import _moe_relative_errors as _hygon_relative_errors
+from tests.test_fused_marlin_moe import _reference_moe_rounded as _hygon_reference
 
 from . import base
 
@@ -76,41 +78,6 @@ GROUP_SIZE = 128
 # same decoded weights. Both implementations are checked against a PyTorch
 # fp32 reference on every benchmarked shape before timing them.
 # -----------------------------------------------------------------------------
-
-
-def _hygon_reference(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids):
-    """PyTorch SwiGLU MoE ground truth, rounding each GEMM stage into the
-    activation dtype like the Hygon kernel."""
-    dtype = hidden_states.dtype
-    accumulation_dtype = torch.float64 if dtype == torch.float16 else torch.float32
-    m, k = hidden_states.shape
-    topk = topk_ids.shape[1]
-    flat_ids = topk_ids.flatten()
-    flat_weights = topk_weights.flatten()
-    result = torch.zeros((m * topk, k), dtype=dtype, device=hidden_states.device)
-    for expert in range(w1_ref.shape[0]):
-        routes = torch.where(flat_ids == expert)[0]
-        if routes.numel() == 0:
-            continue
-        x = hidden_states[routes // topk].to(accumulation_dtype)
-        gate_up = x @ w1_ref[expert].to(accumulation_dtype).T
-        gate, up = gate_up.to(dtype).float().chunk(2, -1)
-        act = (torch.nn.functional.silu(gate) * up).to(dtype)
-        out = (
-            act.to(accumulation_dtype) @ w2_ref[expert].to(accumulation_dtype).T
-        ).float()
-        result[routes] = (out * flat_weights[routes, None].float()).to(dtype)
-    return result.view(m, topk, k).float().sum(1).to(dtype)
-
-
-def _hygon_relative_errors(actual, expected):
-    delta = actual.float() - expected.float()
-    rms = (
-        delta.square().mean().sqrt()
-        / expected.float().square().mean().sqrt().clamp_min(1e-12)
-    )
-    peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
-    return rms.item(), peak.item()
 
 
 _HYGON_ADDRESS_PATCH = None
