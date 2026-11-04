@@ -113,8 +113,8 @@ def test_public_dispatch(monkeypatch):
             return invoke
 
     monkeypatch.setattr(backend, "_count_bf16", CountLaunch())
-    logits = make_logits((1, 257))
-    k, p = filters(1, 257, "both")
+    logits = make_logits((3, 257))
+    k, p = filters(3, 257, "both")
     flaggems_vllm.top_k_top_p(logits, p, k)
     torch.cuda.synchronize()
     assert called == [True]
@@ -240,8 +240,8 @@ def test_unsupported_metadata(case):
 
 
 @pytest.mark.parametrize("bf16_grid", [True, False])
-def test_graph_changed_inputs(bf16_grid):
-    shape = (3, 8193)
+@pytest.mark.parametrize("shape", [(1, 4096), (1, 151936), (3, 8193)])
+def test_graph_changed_inputs(bf16_grid, shape):
     logits = make_logits(shape, bf16_grid)
     original = logits.clone()
     k, p = filters(*shape, "both")
@@ -278,3 +278,59 @@ def test_shared_signature_input_preserved_and_hints():
         with pytest.raises(NotImplementedError, match="only supported by Ascend"):
             flaggems_vllm.top_k_top_p(before, p=p, k=k, **hints)
         assert_exact(before, make_logits((2, 257)))
+
+
+@pytest.mark.parametrize("n", [1, 17, 4095, 4096, 4097, 8193, 65537, 151936, 262144])
+@pytest.mark.parametrize("bf16_grid", [True, False])
+def test_single_row_sort_bits(n, bf16_grid):
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.top_k_top_p"
+    )
+    logits = make_logits((1, n), bf16_grid)
+    # Signed zeros and different NaN payloads must preserve the radix key order.
+    special_bits = torch.tensor(
+        [
+            -8388608,
+            -1082130432,
+            -2147483648,
+            0,
+            1065353216,
+            2139095040,
+            2143289345,
+            2143289346,
+            -4194303,
+        ],
+        dtype=torch.int32,
+    )
+    if n >= special_bits.numel():
+        logits[0, : special_bits.numel()].copy_(special_bits.view(torch.float32))
+    before = logits.view(torch.int32).clone()
+    bits = before.cpu().long() & 0xFFFFFFFF
+    keys = torch.where(
+        (bits & 0x80000000) != 0, (~bits) & 0xFFFFFFFF, bits ^ 0x80000000
+    )
+    order = keys.argsort(dim=-1, stable=True)
+    expected_bits = before.cpu().gather(1, order)
+    result = backend._sorted_values(logits)
+    assert torch.equal(result.view(torch.int32).cpu(), expected_bits)
+    assert torch.equal(logits.view(torch.int32), before)
+
+
+def test_single_row_dispatch(monkeypatch):
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.top_k_top_p"
+    )
+    original = backend._sorted_values_single_row
+    calls = []
+
+    def observed(logits):
+        calls.append(logits.shape)
+        return original(logits)
+
+    monkeypatch.setattr(backend, "_sorted_values_single_row", observed)
+    logits = make_logits((1, 4097))
+    k, p = filters(1, 4097, "both")
+    assert_exact(
+        flaggems_vllm.top_k_top_p(logits, p, k), reference(logits.clone(), k, p)
+    )
+    assert calls == [logits.shape]

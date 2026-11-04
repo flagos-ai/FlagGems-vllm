@@ -14,8 +14,9 @@
 
 """MetaX values-only top-k/top-p filtering.
 
-Semantics follow vLLM apply_top_k_top_p_pytorch at ee0da84ab. The counting
-algorithm uses counting sort for exactly BF16-representable values; other
+Semantics follow vLLM apply_top_k_top_p_pytorch at ee0da84ab. Single rows use
+integer-key tile sorting and stable parallel merges. The batched algorithm uses
+counting sort for exactly BF16-representable values; other
 FP32 inputs use the existing FlagGems radix kernels without token indices.
 """
 
@@ -27,6 +28,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.utils import libentry
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +150,72 @@ def _guarded_sweep(
         )
 
 
+@libentry()
+@triton.jit
+def _sort_value_tiles(logits, out, N: tl.constexpr, BLOCK: tl.constexpr):
+    col = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(logits + col, mask=col < N, other=0.0)
+    key = tl.where(col < N, _order_key(value), 0xFFFFFFFF).to(tl.uint32)
+    key = tl.sort(key, descending=False)
+    raw = tl.where((key & 0x80000000) != 0, key ^ 0x80000000, ~key)
+    tl.store(out + col, raw.to(tl.float32, bitcast=True), mask=col < N)
+
+
+@libentry()
+@triton.jit
+def _merge_value_runs(
+    source,
+    out,
+    N: tl.constexpr,
+    RUN: tl.constexpr,
+    STEPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    col = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = col < N
+    value = tl.load(source + col, mask=valid, other=0.0)
+    key = _order_key(value)
+    base = (col // (2 * RUN)) * (2 * RUN)
+    left = col - base < RUN
+    other = base + tl.where(left, RUN, 0)
+    length = tl.minimum(tl.maximum(N - other, 0), RUN)
+    lo = tl.zeros((BLOCK,), tl.int32)
+    hi = length
+    for _ in range(STEPS):
+        mid = (lo + hi) // 2
+        other_value = tl.load(
+            source + other + mid, mask=valid & (mid < length), other=0.0
+        )
+        other_key = _order_key(other_value)
+        # Left run wins ties: lower_bound for left, upper_bound for right.
+        advance = tl.where(left, other_key < key, other_key <= key) & (mid < length)
+        lo = tl.where(advance, mid + 1, lo)
+        hi = tl.where(advance, hi, mid)
+    dest = base + col % RUN + lo
+    tl.store(out + dest, value, mask=valid)
+
+
+def _sorted_values_single_row(logits):
+    n = logits.shape[1]
+    block = min(4096, triton.next_power_of_2(n))
+    result = torch.empty_like(logits)
+    _sort_value_tiles[(triton.cdiv(n, block),)](logits, result, n, block)
+    if n <= block:
+        return result
+    scratch = torch.empty_like(logits)
+    run = block
+    while run < n:
+        _merge_value_runs[(triton.cdiv(n, 256),)](
+            result, scratch, n, run, run.bit_length(), 256
+        )
+        result, scratch = scratch, result
+        run *= 2
+    return result
+
+
 def _sorted_values(logits):
+    if logits.shape[0] == 1:
+        return _sorted_values_single_row(logits)
     global _sort_ops
     import flag_gems
 
