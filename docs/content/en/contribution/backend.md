@@ -9,7 +9,7 @@ Add support for new hardware backends in FlagGems-vllm.
 
 ## Overview
 
-FlagGems-vllm supports 18+ hardware backends. Each backend has:
+FlagGems-vllm supports 17 hardware backends. Each backend has:
 - Device detection logic
 - Optional autotune configuration
 - Architecture-specific tuning (e.g., NVIDIA Ampere vs Hopper)
