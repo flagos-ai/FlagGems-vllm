@@ -425,7 +425,26 @@ def get_default_config(
         return _qwenvl_tp2_config(M, gemm_stage)
 
     if _is_qwen_tp2_moe_shape(E, N, K, topk, dtype, gemm_stage):
-        return _qwen_tp2_config(M, gemm_stage, enable_gemm_fast_path)
+        config = _qwen_tp2_config(M, gemm_stage, enable_gemm_fast_path)
+        # Retain the measured plain-BF16 C550 configurations at these two M's.
+        # Embedded configs take precedence in try_get_optimal_moe_config.
+        if (
+            dtype == "bf16"
+            and M in (64, 8192)
+            and block_shape is None
+            and not use_int8_w8a8
+            and _get_device_name() == "MetaX_C550"
+            and not bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0")))
+        ):
+            if M == 64:
+                config["num_stages"] = 2
+            elif not enable_gemm_fast_path:
+                # Keep the newer unfused-SiLU/BK128 fast path unchanged.
+                config.update(GROUP_SIZE_M=1, SPLIT_K=1, PAIR_GATE_UP_DOT=False)
+                config["num_stages"] = 2 if gemm_stage == "gemm1" else 1
+                if gemm_stage == "gemm2":
+                    config.update(pipeline="basic", pipeline_load_num=-1)
+        return config
 
     if not _is_qwen_moe_shape(E, N, K, topk, dtype, gemm_stage):
         return _generic_get_default_config(
