@@ -65,7 +65,7 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
-    "top_k_top_p",
     "SUPPORTED_FP8_DTYPE",
+    "top_k_top_p",
     "w8a8_block_int8_bmm",
 ]
