@@ -98,7 +98,7 @@ Consult your hardware vendor's documentation for PyTorch installation.
 ## Compiler: Triton vs FlagTree
 
 - **OpenAI Triton**: Works on NVIDIA, AMD (ROCm)
-- **FlagTree**: Supports all 18+ backends via vendor-specific codegen
+- **FlagTree**: Supports all 17 backends via vendor-specific codegen
 
 To use FlagTree:
 
