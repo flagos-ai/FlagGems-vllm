@@ -106,7 +106,7 @@ grouped_topk:
 加速比计算公式：
 
 ```text
-SpeedUp = 基线耗时 (latency_torch_baseline) / FlagGems-vllm 算子耗时 (latency_flaggems_vllm)
+SpeedUp = 基线耗时 (latency_vllm_baseline) / FlagGems-vllm 算子耗时 (latency_flaggems_vllm)
 ```
 
 - **SpeedUp > 1.0**: FlagGems-vllm 性能优于基线
