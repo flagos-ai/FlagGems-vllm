@@ -78,8 +78,12 @@ def fused_indexer_weight_scale(
         and weights.dtype == torch.float32
         and (total <= 2048 or 4096 < total <= 8192)
     )
-    # Measured small-grid regressions retain the larger tile in the middle bucket.
-    block = 128 if should_use_small_block else 256
+    # Keep measured small-grid buckets separate to avoid neighboring regressions.
+    if should_use_small_block:
+        block = 64 if 512 < total <= 768 else 128
+    else:
+        block = 256
+    num_warps = 2 if block == 64 else 4
     with torch_device_fn.device(weights.device):
         indexer_weight_scale_kernel[(triton.cdiv(total, block),)](
             weights,
@@ -94,7 +98,7 @@ def fused_indexer_weight_scale(
             q_scale.stride(1),
             is_dense,
             block,
-            num_warps=4,
+            num_warps=num_warps,
             enable_fp_fusion=False,
         )
     return output
