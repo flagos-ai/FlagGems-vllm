@@ -185,6 +185,14 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_scaled_dot_kkt_fwd
+    description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_scaled_dot_kkt_fwd
+    labels: [fused, FLA]
+    kind: [Attention]
+    stages:
+      - alpha: '5.4'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices
