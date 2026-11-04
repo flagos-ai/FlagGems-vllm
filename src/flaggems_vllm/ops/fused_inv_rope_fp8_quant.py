@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
 from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
+
+try:
+    import triton.experimental.tle.language as tle
+
+    _HAS_LOAD_REORDER = "reorder" in inspect.signature(tle.range.__init__).parameters
+except (ImportError, AttributeError, TypeError, ValueError):
+    tle = tl
+    _HAS_LOAD_REORDER = False
 
 if kernel_supports_fp8_e4m3():
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
@@ -31,17 +41,6 @@ logger = logging.getLogger(__name__)
 
 def _get_tma_aligned_size(size: int, align: int) -> int:
     return ((size + align - 1) // align) * align
-
-
-try:
-    import inspect
-
-    import triton.experimental.tle.language as tle
-
-    _HAS_LOAD_REORDER = "reorder" in inspect.signature(tle.range.__init__).parameters
-except (ImportError, AttributeError, TypeError, ValueError):
-    tle = tl
-    _HAS_LOAD_REORDER = False
 
 
 @triton.jit
