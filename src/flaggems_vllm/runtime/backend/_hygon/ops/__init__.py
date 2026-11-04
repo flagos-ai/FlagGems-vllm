@@ -26,6 +26,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
     gemma_rms_norm,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
+    "gate_sigmoid_mul",
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",

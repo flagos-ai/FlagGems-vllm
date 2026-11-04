@@ -280,3 +280,17 @@ fused_recurrent_kda:
       BV: 32
     num_warps: 1
     num_stages: 1
+
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1

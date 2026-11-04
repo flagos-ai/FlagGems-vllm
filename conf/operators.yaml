@@ -689,6 +689,18 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: gate_sigmoid_mul
+    description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
+    for:
+      - vllm.models.kimi_k3.nvidia.mla._gate_sigmoid_mul
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
