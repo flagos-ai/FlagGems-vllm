@@ -18,7 +18,6 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops import per_token_group_quant_fp8
 from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import accuracy_utils as utils
@@ -29,8 +28,9 @@ ROPE_DIM = 64
 QUANT_GROUP_SIZE = 128
 EPS = 1e-10
 
-HAS_NATIVE_FP8 = hasattr(torch, "float8_e4m3fn") and (
+HAS_FP8_QUANT = hasattr(torch, "float8_e4m3fn") and (
     flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
+    or flaggems_vllm.vendor_name == "thead"
     or (flaggems_vllm.vendor_name == "mthreads" and get_device_capability() >= (3, 1))
 )
 
@@ -230,7 +230,7 @@ def _unfused_inv_rope_fp8_quant(
     d = heads_per_group * o.shape[-1]
     o_grouped = o_rot.view(num_tokens, n_groups, d)
     o_flat = o_grouped.permute(1, 0, 2).contiguous().reshape(-1, d)
-    o_fp8, o_scale = per_token_group_quant_fp8(
+    o_fp8, o_scale = flaggems_vllm.per_token_group_quant_fp8(
         o_flat,
         group_size=quant_group_size,
         dtype=torch.float8_e4m3fn,
@@ -326,7 +326,9 @@ def _run_case(
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize("seed", utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["SEEDS"])
 @pytest.mark.parametrize(
     "num_heads,n_groups",
@@ -357,7 +359,9 @@ def test_fused_inv_rope_fp8_quant(num_tokens, num_heads, n_groups, seed):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize(
     "num_tokens",
     utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["OUTPUT_LAYOUT_NUM_TOKENS"],
@@ -382,7 +386,9 @@ def test_output_layout(num_tokens, num_heads, n_groups):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize(
     "num_tokens",
     utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["PER_GROUP_CONTIGUITY_NUM_TOKENS"],
@@ -399,7 +405,9 @@ def test_per_group_contiguity(num_tokens):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_scales_are_power_of_two():
     result = _run_case(32, 64, 8, True, seed=0)
     scales = result["scale"]
@@ -413,7 +421,9 @@ def test_scales_are_power_of_two():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_large_values():
     result = _run_case(8, 64, 8, True, seed=0, scale=1000.0)
     _assert_dequant_close(
@@ -427,7 +437,9 @@ def test_large_values():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_nope_dims_unchanged():
     num_tokens, num_heads, n_groups = 16, 64, 8
     heads_per_group = num_heads // n_groups
@@ -470,7 +482,9 @@ def test_nope_dims_unchanged():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_zero_positions():
     positions = torch.zeros(16, device=flaggems_vllm.device, dtype=torch.long)
     result = _run_case(16, 64, 8, True, seed=0, positions=positions)
@@ -485,7 +499,9 @@ def test_zero_positions():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_dequant_numerical_accuracy():
     result = _run_case(32, 64, 8, True, seed=0)
     o = result["o"]
@@ -511,7 +527,9 @@ def test_dequant_numerical_accuracy():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize("seed", utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["SEEDS"])
 @pytest.mark.parametrize(
     "num_heads,n_groups",
@@ -543,7 +561,9 @@ def test_unfused_path(num_tokens, num_heads, n_groups, seed):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize(
     "num_tokens",
     utils.FUSED_INV_ROPE_FP8_QUANT_SHAPES["REAL_ROPE_NUM_TOKENS"],
@@ -599,7 +619,9 @@ def _call_edge(o, positions, cache, tma_aligned_scales, **kwargs):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize(
     "num_tokens", [512] if utils.QUICK_MODE else [512, 1024, 2048, 4096]
 )
@@ -628,7 +650,9 @@ def test_prefill_shapes(num_tokens):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize("value", [0.0, 2.0**-40])
 def test_zero_and_tiny_values(value):
     o, positions, cache = _edge_inputs()
@@ -644,11 +668,13 @@ def test_zero_and_tiny_values(value):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
-def test_custom_epsilon():
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
+@pytest.mark.parametrize("eps", [1e-12, 1e-10, 1e-6])
+def test_custom_epsilon(eps):
     o, positions, cache = _edge_inputs()
     o.zero_()
-    eps = 1e-6
     out, scale = _call_edge(o, positions, cache, True, eps=eps)
     scale = _unpack_ue8m0_scales(scale, HEAD_DIM // QUANT_GROUP_SIZE)
     expected_scale = eps / torch.finfo(torch.float8_e4m3fn).max
@@ -660,7 +686,9 @@ def test_custom_epsilon():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_empty_tokens():
     o, positions, cache = _edge_inputs(num_tokens=0)
     out, scale = _call_edge(o, positions, cache, True)
@@ -673,7 +701,9 @@ def test_empty_tokens():
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize("num_tokens", [1, 7])
 def test_scale_padding_is_zero(num_tokens):
     result = _run_case(num_tokens, 32, 4, True)
@@ -687,7 +717,9 @@ def test_scale_padding_is_zero(num_tokens):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.parametrize("layout", ["token", "head", "cache"])
 def test_strided_outer_dimensions(layout):
     o, positions, cache = _edge_inputs()
@@ -717,7 +749,9 @@ def test_strided_outer_dimensions(layout):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_repeated_calls_observe_mutation():
     o, positions, cache = _edge_inputs()
     addresses = [x.data_ptr() for x in (o, positions, cache)]
@@ -813,7 +847,9 @@ def test_musa_rejects_unsupported_inputs(invalid):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 def test_prefill_head_tail_and_strides():
     torch.manual_seed(42)
     device = flaggems_vllm.device

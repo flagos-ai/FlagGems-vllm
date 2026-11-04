@@ -245,4 +245,4 @@ Add performance benchmarks in `benchmark/test_<op>.py`:
 
 ## 10. Operator Development Protocol {#development-protocol}
 
-Operator implementation and modifications must adhere to the mandatory protocol defined in `workflow.md` (quality gates G0–G6). See [Operator Development Protocol](workflow.md).
+Operator implementation and modifications must adhere to the mandatory protocol defined in `workflow.md` (quality gates G0–G7). See [Operator Development Protocol](workflow.md).
