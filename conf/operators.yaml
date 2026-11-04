@@ -657,11 +657,15 @@ ops:
       - alpha: '5.4'
   - id: gdn_w8a16
     description: |
-      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 state,
+      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
-      Supports decode, prefill and speculative state-slot updates.
+      FP8 supports decode, prefill and speculative state-slot updates.
+      INT8 supports packed decode and chunked prefill on PPU.
     for:
-      - None
+      - gdn_w8a16
+      - gdn_w8a16_int8
+      - chunk_gated_delta_rule_w8a16_int8
+      - quantize_gdn_state_int8
     labels:
       - fused
       - FLA
@@ -1000,6 +1004,36 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: minimax_m3_sparse_attn
+    description: |
+      MiniMax M3 block-sparse GQA prefill attention over packed paged KV
+      (one 128-token page per sparse block). Dispatches to FlagAttention's
+      flag_attn.minimax_sparse_attention kernels.
+    for:
+      - vllm.models.minimax_m3.common.ops.sparse_attn
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: minimax_m3_sparse_attn_decode
+    description: |
+      MiniMax M3 block-sparse GQA decode attention; split-K over the selected
+      blocks with an LSE merge. Dispatches to FlagAttention's
+      flag_attn.minimax_sparse_attention kernels.
+    for:
+      - vllm.models.minimax_m3.common.ops.sparse_attn
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: moe_align_block_size_triton
     description: |
       Aligns the token distribution across experts to be compatible with block size
@@ -1029,6 +1063,19 @@ ops:
       - MoE
     stages:
       - stable: '4.2'
+  - id: mrope
+    description: |
+      Applies multi-modal rotary positional embeddings to query and key tensors,
+      using temporal, height, and width sections.
+    for:
+      - mrope
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: mul
     description: Multiplies `input` by `other`.
     for:
@@ -1378,6 +1425,22 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: top_k_top_p
+    description: |
+      Per-row top-k / top-p filtering of [batch, vocab] sampling logits: masked
+      positions become -inf and kept positions keep their logit values.
+      Sorts the per-row top-L candidates, then applies the k/p cutoff and
+      scatters back to vocab order (Ascend port of the vLLM sampling filter,
+      replacing torch_npu.npu_top_k_top_p).
+    for:
+      - torch_npu.npu_top_k_top_p
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: topk_softmax
     description: |
       Selects the k most likely next-token candicates, sets all others to zero,
@@ -1430,6 +1493,30 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: w8a8_block_fp8_matmul
+    description: Matrix multiplication with block-wise scaled FP8 activations and weights.
+    for:
+      - w8a8_block_fp8_matmul
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
+    cpp: '5.5'
+  - id: w8a8_block_int8_matmul
+    description: Matrix multiplication with block-wise scaled INT8 activations and weights.
+    for:
+      - w8a8_block_int8_matmul
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
+    cpp: '5.5'
   - id: weight_norm
     description: |
       Reparameterizes a module's weight tensor by decoupling its magnitude (g)
