@@ -1163,6 +1163,19 @@ ops:
     stages:
       - alpha: '4.2'
       - beta: '5.3'
+  - id: per_token_quant_int8
+    description: |
+      Quantize each input token to signed INT8 with a per-token FP32 scale,
+      matching vLLM's symmetric quantization and halfway-away-from-zero rounding.
+    for:
+      - per_token_quant_int8
+    labels:
+      - NoCPU
+      - vLLM
+    kind:
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: persistent_topk
     description: |
       vLLM-compatible persistent topk decode. Triton implementation supporting
