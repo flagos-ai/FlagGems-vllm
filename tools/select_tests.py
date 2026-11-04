@@ -103,6 +103,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_attn_varlen_func.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "tests/test_grouped_gemma_rmsnorm.py",
+        "tests/test_qwen4_self_kernels.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "tests/test_hyperconnection.py",
         "tests/test_qwen4_self_kernels.py",
@@ -235,6 +239,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_flash_attn_varlen_func.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["benchmark/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "benchmark/test_grouped_gemma_rmsnorm.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "benchmark/test_hyperconnection.py",
         "benchmark/test_qwen4_self_kernels.py",
