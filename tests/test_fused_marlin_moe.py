@@ -27,7 +27,6 @@ shared by both sides.
 
 import importlib
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -48,75 +47,6 @@ from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
 from .accuracy_utils import gems_assert_close, gems_assert_equal
-
-
-def _vllm_bf16_moe(hidden_states, w1, w2, topk_weights, topk_ids):
-    """vLLM BF16 GEMMs with FL auxiliary ops for the empty PPU wheel.
-
-    Only routing, activation and output reduction use the platform provider.
-    Both GEMMs and their dispatch remain vLLM's native Triton implementation.
-    Restore bindings after each call so other benchmarks are unaffected.
-    """
-    from vllm.model_executor.layers.fused_moe import fused_moe as native
-    from vllm_fl.dispatch.backends.flaggems.impl.fused_moe import (
-        moe_align_block_size_flaggems,
-        moe_sum_flaggems,
-    )
-    from vllm_fl.ops.fused_moe.activation import apply_moe_activation
-
-    with patch.multiple(
-        native,
-        moe_align_block_size=moe_align_block_size_flaggems,
-        apply_moe_activation=apply_moe_activation,
-    ), patch.object(native.ops, "moe_sum", moe_sum_flaggems):
-        return native.fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
-
-
-def _reference_moe_rounded(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids):
-    """PyTorch SwiGLU MoE ground truth, rounding each GEMM stage into the
-    activation dtype like the Hygon kernel."""
-    dtype = hidden_states.dtype
-    accumulation_dtype = torch.float64 if dtype == torch.float16 else torch.float32
-    m, k = hidden_states.shape
-    topk = topk_ids.shape[1]
-    flat_ids = topk_ids.flatten()
-    flat_weights = topk_weights.flatten()
-    result = torch.zeros((m * topk, k), dtype=dtype, device=hidden_states.device)
-    for expert in range(w1_ref.shape[0]):
-        routes = torch.where(flat_ids == expert)[0]
-        if routes.numel() == 0:
-            continue
-        x = hidden_states[routes // topk].to(accumulation_dtype)
-        gate_up = x @ w1_ref[expert].to(accumulation_dtype).T
-        gate, up = gate_up.to(dtype).float().chunk(2, -1)
-        act = (torch.nn.functional.silu(gate) * up).to(dtype)
-        out = (
-            act.to(accumulation_dtype) @ w2_ref[expert].to(accumulation_dtype).T
-        ).float()
-        result[routes] = (out * flat_weights[routes, None].float()).to(dtype)
-    return result.view(m, topk, k).float().sum(1).to(dtype)
-
-
-def _moe_relative_errors(actual, expected):
-    delta = actual.float() - expected.float()
-    rms = (
-        delta.square().mean().sqrt()
-        / expected.float().square().mean().sqrt().clamp_min(1e-12)
-    )
-    peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
-    return rms.item(), peak.item()
-
-
-def _assert_moe_bf16_close(actual, expected):
-    """Reuse the MoE benchmark's 1% RMS and 2% global peak tolerances.
-
-    Decoding weights and storing each GEMM result in BF16 introduces rounding
-    relative to fused dequantization. A global scale avoids unstable relative
-    errors near individual zero outputs.
-    """
-    rms, peak = _moe_relative_errors(actual, expected)
-    errors = torch.tensor([rms, peak / 2], device=actual.device, dtype=torch.float32)
-    gems_assert_close(errors, torch.zeros_like(errors), dtype=torch.float32, atol=0.01)
 
 
 def _is_hopper():
@@ -1805,43 +1735,3 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
-
-
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU BF16 baseline")
-@pytest.mark.parametrize("num_tokens", [1, 33])
-@pytest.mark.parametrize(
-    "precision",
-    [
-        pytest.param(p, marks=getattr(pytest.mark, "fused_marlin_moe_" + width))
-        for p, width in [
-            ("int8", "w8a16"),
-            ("fp8", "w8a16"),
-            ("int4", "w4a16"),
-            ("mxfp4", "w4a16"),
-        ]
-    ],
-)
-def test_fused_marlin_moe_ppu_bf16_baseline(precision, num_tokens, monkeypatch):
-    generators = {
-        "int8": _make_inputs_w8a16_int8,
-        "fp8": _make_inputs_fp8_weight,
-        "int4": _make_inputs_w4a16_int4,
-        "mxfp4": _make_inputs_w4a16_mxfp4,
-    }
-    hs, _, _, w1_ref, w2_ref, tw, ti, _, _ = generators[precision](
-        num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
-    )
-    native = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
-    gemm = native.invoke_fused_moe_triton_kernel
-    alignment = native.moe_align_block_size
-
-    def reject_quantized_call(*args, **kwargs):
-        raise AssertionError("BF16 baseline called the quantized implementation")
-
-    monkeypatch.setattr(flaggems_vllm, "fused_marlin_moe", reject_quantized_call)
-    actual = _vllm_bf16_moe(hs, w1_ref, w2_ref, tw, ti)
-    expected = _reference_moe_rounded(hs, w1_ref, w2_ref, tw, ti)
-    gems_assert_close(actual, expected, dtype=hs.dtype)
-    assert native.invoke_fused_moe_triton_kernel is gemm
-    assert native.moe_align_block_size is alignment
-    assert gemm.__module__ == "vllm.model_executor.layers.fused_moe.fused_moe"

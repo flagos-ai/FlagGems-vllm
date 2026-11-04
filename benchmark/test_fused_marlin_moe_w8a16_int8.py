@@ -46,25 +46,16 @@ try:
 except ImportError:
     HAS_VLLM_FUSED_EXPERTS = False
 
-
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import (
-    QUANT_TYPE_FP8_E4M3,
-    QUANT_TYPE_UINT8B128,
-    fused_marlin_moe,
-)
-from tests.test_fused_marlin_moe import _assert_moe_bf16_close
-from tests.test_fused_marlin_moe import _moe_relative_errors as _hygon_relative_errors
-from tests.test_fused_marlin_moe import _reference_moe_rounded as _hygon_reference
-from tests.test_fused_marlin_moe import _vllm_bf16_moe
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
 
 from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "thead"):
+    if flaggems_vllm.vendor_name == "hygon":
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -76,7 +67,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "thead")
+    if flaggems_vllm.vendor_name == "hygon"
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
@@ -89,6 +80,41 @@ GROUP_SIZE = 128
 # its quantization groups). Both implementations are checked against a
 # PyTorch fp32 reference on every benchmarked shape before timing them.
 # -----------------------------------------------------------------------------
+
+
+def _hygon_reference(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids):
+    """PyTorch SwiGLU MoE ground truth, rounding each GEMM stage into the
+    activation dtype like the Hygon kernel."""
+    dtype = hidden_states.dtype
+    accumulation_dtype = torch.float64 if dtype == torch.float16 else torch.float32
+    m, k = hidden_states.shape
+    topk = topk_ids.shape[1]
+    flat_ids = topk_ids.flatten()
+    flat_weights = topk_weights.flatten()
+    result = torch.zeros((m * topk, k), dtype=dtype, device=hidden_states.device)
+    for expert in range(w1_ref.shape[0]):
+        routes = torch.where(flat_ids == expert)[0]
+        if routes.numel() == 0:
+            continue
+        x = hidden_states[routes // topk].to(accumulation_dtype)
+        gate_up = x @ w1_ref[expert].to(accumulation_dtype).T
+        gate, up = gate_up.to(dtype).float().chunk(2, -1)
+        act = (torch.nn.functional.silu(gate) * up).to(dtype)
+        out = (
+            act.to(accumulation_dtype) @ w2_ref[expert].to(accumulation_dtype).T
+        ).float()
+        result[routes] = (out * flat_weights[routes, None].float()).to(dtype)
+    return result.view(m, topk, k).float().sum(1).to(dtype)
+
+
+def _hygon_relative_errors(actual, expected):
+    delta = actual.float() - expected.float()
+    rms = (
+        delta.square().mean().sqrt()
+        / expected.float().square().mean().sqrt().clamp_min(1e-12)
+    )
+    peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
+    return rms.item(), peak.item()
 
 
 _HYGON_ADDRESS_PATCH = None
@@ -275,67 +301,14 @@ def _marlin_repack_per_expert_int8(w_q, scales):
     return qweight, scales
 
 
-def _make_ppu_w8_weights(num_experts, hidden_size, intermediate_size, dtype, fp8):
-    has_baseline = HAS_VLLM_FUSED_EXPERTS
-    torch.manual_seed(7)
-    weights = []
-    scales = []
-    native_weights = []
-    native_scales = []
-    for output_size, input_size in (
-        (2 * intermediate_size, hidden_size),
-        (hidden_size, intermediate_size),
-    ):
-        raw = torch.randint(
-            0,
-            256,
-            (num_experts, output_size, input_size),
-            device=flaggems_vllm.device,
-            dtype=torch.uint8,
-        )
-        weight = raw
-        if fp8:
-            raw = torch.where((raw & 127) == 127, raw - 1, raw)
-            weight = raw.view(torch.float8_e4m3fn)
-        scale = (
-            torch.rand(
-                (num_experts, output_size, input_size // GROUP_SIZE),
-                device=flaggems_vllm.device,
-            )
-            * 0.001
-            + 0.0005
-        ).to(dtype)
-        if not has_baseline:
-            raise RuntimeError("Install PPU baseline dependencies with .[thead]")
-        native_weight = torch.empty_like(weight, dtype=dtype)
-        for expert in range(num_experts):
-            values = weight[expert].float()
-            if not fp8:
-                values = values - 128
-            native_weight[expert] = (
-                values * scale[expert].float().repeat_interleave(GROUP_SIZE, dim=-1)
-            ).to(dtype)
-        native_scale = None
-        weights.append(weight)
-        scales.append(scale)
-        native_weights.append(native_weight)
-        native_scales.append(native_scale)
-    return (*weights, *scales, *native_weights, *native_scales)
-
-
 class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W8A16 INT8 (fused-dequant MoE GEMM).
     Sister of FusedMarlinMoEW4A16INT4Benchmark (W4A16 INT4).
     """
 
-    HAS_BASELINE = HAS_REQUIRED_VLLM
-
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
-        if not self.HAS_BASELINE:
-            # T-Head PPU without the vLLM baseline: time FlagGems only.
-            self.metrics = ["latency"]
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
@@ -353,46 +326,8 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
-        if flaggems_vllm.vendor_name == "thead":
-            yield from self._get_ppu_input_iter(cur_dtype, fp8=False)
-            return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
-
-    def _get_ppu_input_iter(self, dtype, fp8):
-        geometry = None
-        weights = None
-        for config in self.shapes:
-            num_tokens, num_experts, hidden_size, intermediate_size, top_k = config
-            next_geometry = (num_experts, hidden_size, intermediate_size)
-            if geometry != next_geometry:
-                weights = inputs = None
-                torch.cuda.empty_cache()
-                weights = _make_ppu_w8_weights(
-                    num_experts, hidden_size, intermediate_size, dtype, fp8
-                )
-                geometry = next_geometry
-            torch.manual_seed(7 + num_tokens)
-            hidden_states = (
-                torch.randn(
-                    (num_tokens, hidden_size),
-                    device=flaggems_vllm.device,
-                    dtype=dtype,
-                )
-                * 0.1
-            )
-            topk_ids = (
-                torch.rand((num_tokens, num_experts), device=flaggems_vllm.device)
-                .topk(top_k, dim=-1)
-                .indices
-            )
-            topk_weights = torch.softmax(
-                torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
-                dim=-1,
-            ).to(torch.float32)
-            inputs = (hidden_states, *weights, topk_weights, topk_ids)
-            _assert_moe_bf16_close(self.gems_op(*inputs), self.torch_op(*inputs))
-            yield inputs
 
     def _get_hygon_input_iter(self, dtype):
         geometry = None
@@ -550,10 +485,6 @@ def _vllm_baseline_int8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native INT8
     W8A16 fused_experts (Hygon)."""
-    if flaggems_vllm.vendor_name == "thead":
-        return _vllm_bf16_moe(
-            hidden_states, w1_q_marlin, w2_q_marlin, topk_weights, topk_ids
-        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -595,7 +526,7 @@ def _gems_call_int8(
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "thead")
+        if flaggems_vllm.vendor_name == "hygon"
         else fused_marlin_moe
     )
     return gems_op(
@@ -609,17 +540,15 @@ def _gems_call_int8(
         w2_scale=w2_scale_wna16,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        group_size=GROUP_SIZE,
     )
 
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM and flaggems_vllm.vendor_name != "thead",
-    reason="required vLLM baseline is unavailable",
+    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or T-Head PPU"
+    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
 )
 def test_fused_marlin_moe_w8a16_int8():
     """
@@ -635,74 +564,4 @@ def test_fused_marlin_moe_w8a16_int8():
     )
     bench.base_variant = "int8"
     bench.set_gems(_gems_call_int8)
-    bench.run()
-
-
-class FusedMarlinMoEW8A16FP8Benchmark(FusedMarlinMoEW8A16INT8Benchmark):
-    """Run W8A16 FP8 with the same upstream benchmark shapes on T-Head PPU."""
-
-    HAS_BASELINE = HAS_VLLM_FUSED_EXPERTS
-
-    def get_input_iter(self, cur_dtype):
-        yield from self._get_ppu_input_iter(cur_dtype, fp8=True)
-
-
-def _vllm_baseline_fp8(
-    hidden_states,
-    w1,
-    w2,
-    w1_scale,
-    w2_scale,
-    vllm_w1,
-    vllm_w2,
-    vllm_w1_scale,
-    vllm_w2_scale,
-    topk_weights,
-    topk_ids,
-):
-    del w1, w2, w1_scale, w2_scale
-    return _vllm_bf16_moe(hidden_states, vllm_w1, vllm_w2, topk_weights, topk_ids)
-
-
-def _gems_call_fp8(
-    hidden_states,
-    w1,
-    w2,
-    w1_scale,
-    w2_scale,
-    vllm_w1,
-    vllm_w2,
-    vllm_w1_scale,
-    vllm_w2_scale,
-    topk_weights,
-    topk_ids,
-):
-    del vllm_w1, vllm_w2, vllm_w1_scale, vllm_w2_scale
-    return flaggems_vllm.fused_marlin_moe(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        bias1=None,
-        bias2=None,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        quant_type_id=QUANT_TYPE_FP8_E4M3,
-        group_size=GROUP_SIZE,
-    )
-
-
-@pytest.mark.fused_marlin_moe_w8a16
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head PPU FP8 benchmark"
-)
-def test_fused_marlin_moe_w8a16_fp8():
-    bench = FusedMarlinMoEW8A16FP8Benchmark(
-        op_name="fused_marlin_moe_w8a16",
-        torch_op=_vllm_baseline_fp8,
-        dtypes=[torch.bfloat16],
-    )
-    bench.base_variant = "fp8"
-    bench.set_gems(_gems_call_fp8)
     bench.run()

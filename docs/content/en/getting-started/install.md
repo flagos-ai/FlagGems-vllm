@@ -25,8 +25,7 @@ pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repos
 
 ### PyTorch
 
-Install a PyTorch build compatible with your target accelerator **before** installing FlagGems-vllm. The basic FlagGems-vllm installation does not reinstall PyTorch. The NVIDIA
-framework extra resolves the matching PyTorch dependencies declared by vLLM.
+Install a PyTorch build compatible with your target accelerator **before** installing FlagGems-vllm. FlagGems-vllm does not reinstall PyTorch automatically.
 
 For NVIDIA GPUs with CUDA 12.1+:
 ```bash
@@ -188,54 +187,3 @@ pip install -e '.[test]'
 - [Integration with vllm-plugin-fl](../usage/vllm-plugin.md)
 - [Running tests](../testing/unittest.md)
 - [Running benchmarks](../performance/benchmark.md)
-# Repository dependencies for operator baselines
-
-After preparing the matching FlagGems accelerator environment, install this
-repository's framework dependencies in that virtual environment:
-
-```bash
-# Python 3.11+: reuse FlagGems vendor detection, then select the declared extra.
-python tools/install_vendor_deps.py --dry-run
-python tools/install_vendor_deps.py
-
-# Explicit selection is also supported.
-pip install -e '.[nvidia]'
-python tools/install_vendor_deps.py --vendor metax --extra-index-url \
-  https://resource.flagos.net/repository/flagos-pypi-hosted/simple
-python tools/install_vendor_deps.py --vendor thead --extra-index-url \
-  https://resource.flagos.net/repository/flagos-pypi-hosted/simple
-```
-
-The NVIDIA extra selects the official vLLM 0.24 wheel. The MetaX and T-Head
-extras build the pinned upstream vLLM 0.24 source in empty mode and install the
-FL platform provider. The installer first installs the declared `vllm-build`
-tools; it uses the existing torch and keeps Rust artifacts optional for
-operator benchmarks. The profiles retain the accelerator torch and FlagTree installation prepared by FlagGems. Project
-dependencies are installed from the checkout; they need not be baked into the
-runtime image. Other vendors require a declared dependency group before using
-this installer.
-
-On PPU, fused Marlin MoE benchmarks compare the quantized implementation with
-vLLM's BF16 Triton `fused_experts`, using the same decoded weights. The empty
-wheel's missing routing, activation and output-reduction kernels are supplied
-by the FL platform provider; both BF16 GEMMs and their dispatch are vLLM's.
-This baseline does not use the quantized implementation under test. Weight
-decoding occurs before timing; routing, activation and reduction are timed.
-
-For PPU benchmark commands, enable the installed platform provider:
-
-```bash
-export VLLM_PLUGINS=fl
-export VLLM_FL_USE_FLAGGEMS_VLLM=1
-pytest -q benchmark/test_fused_marlin_moe_w8a16_int8.py \
-  -m fused_marlin_moe_w8a16 --level core --record json
-```
-
-The extras are standard pip extras. For MetaX and PPU, use the installer so
-empty-mode build settings and restoration of the selected FlagTree compiler
-are applied in the correct order. Transitive framework dependencies may install
-Triton; the installer removes it and reinstalls the original FlagTree version,
-using its recorded local wheel when available, as in `tools/setup.sh`.
-
-The runtime image still needs the vendor SDK and a matching FlagGems backend
-environment. Building empty vLLM does not compile NVIDIA GPU extensions.

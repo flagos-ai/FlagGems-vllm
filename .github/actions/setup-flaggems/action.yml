@@ -151,17 +151,6 @@ runs:
         export FLAGGEMS_VENDOR="${vendor}"
         export PYTHONPATH="${GITHUB_WORKSPACE}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
-        # Empty vLLM and its platform provider are repository dependencies.
-        # These packages do not depend on NVIDIA torch or Triton wheels.
-        if [[ "${vendor}" == "thead" || "${vendor}" == "metax" ]]; then
-          python tools/install_vendor_deps.py \
-            --vendor "${vendor}" \
-            --index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple \
-            --extra-index-url https://mirrors.aliyun.com/pypi/simple
-          echo "VLLM_PLUGINS=fl" >> "${GITHUB_ENV}"
-          echo "VLLM_FL_USE_FLAGGEMS_VLLM=1" >> "${GITHUB_ENV}"
-        fi
-
         echo "FLAGGEMS_VENDOR=${FLAGGEMS_VENDOR}" >> "${GITHUB_ENV}"
         echo "PYTHONPATH=${PYTHONPATH}" >> "${GITHUB_ENV}"
         echo "VIRTUAL_ENV=${FLAGGEMS_VENV}" >> "${GITHUB_ENV}"
