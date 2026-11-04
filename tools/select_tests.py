@@ -83,6 +83,7 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/testing/layernorm_shapes.py": ["tests/test_layernorm.py"],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],

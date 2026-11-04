@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import math
 import statistics
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import triton
 
 import flaggems_vllm
 from benchmark.base import Benchmark
+from flaggems_vllm.testing.layernorm_shapes import LEGACY_LAYERNORM_CASES
 
 
 class LayernormBenchmark(Benchmark):
@@ -36,6 +38,31 @@ def test_layernorm():
     # vLLM Qwen3_VisionTransformer uses nn.LayerNorm -> F.layer_norm.
     bench = LayernormBenchmark(
         op_name="layernorm", torch_op=F.layer_norm, dtypes=[torch.bfloat16]
+    )
+    bench.set_gems(flaggems_vllm.layernorm)
+    bench.run()
+
+
+class LegacyLayernormBenchmark(Benchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [shape for shape, _ in LEGACY_LAYERNORM_CASES]
+
+    def get_input_iter(self, dtype):
+        torch.manual_seed(20261104)
+        for shape, normalized_shape in LEGACY_LAYERNORM_CASES:
+            tensor = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
+            weight = torch.randn(normalized_shape, dtype=dtype, device=tensor.device)
+            bias = torch.randn_like(weight)
+            yield tensor, normalized_shape, weight, bias, 1e-5
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX only")
+@pytest.mark.layernorm
+def test_layernorm_legacy():
+    bench = LegacyLayernormBenchmark(
+        op_name="layernorm",
+        torch_op=F.layer_norm,
+        dtypes=[torch.float16, torch.bfloat16, torch.float32],
     )
     bench.set_gems(flaggems_vllm.layernorm)
     bench.run()
@@ -145,9 +172,51 @@ def benchmark_manifest_case(record, nodes, replays, samples):
     }
 
 
+def legacy_layernorm_records(dtypes):
+    records = []
+    for shape, normalized_shape in LEGACY_LAYERNORM_CASES:
+        for dtype in dtypes:
+            affine = {
+                "shape": normalized_shape,
+                "stride": [
+                    math.prod(normalized_shape[index + 1 :])
+                    for index in range(len(normalized_shape))
+                ],
+                "dtype": f"torch.{dtype}",
+            }
+            extra = {
+                "normalized_shape": normalized_shape,
+                "input_dtype": f"torch.{dtype}",
+                "input_stride": [
+                    math.prod(shape[index + 1 :]) for index in range(len(shape))
+                ],
+                "weight": affine,
+                "bias": affine,
+                "eps": 1e-5,
+            }
+            records.append(
+                {
+                    "shape": shape,
+                    "extra": json.dumps(extra),
+                    "count": 0,
+                    "sources": {"repository_legacy": 0},
+                }
+            )
+    return records
+
+
 def run_manifest_benchmark():
     parser = argparse.ArgumentParser(description="Benchmark captured LayerNorm shapes")
-    parser.add_argument("--shape-file", type=Path, required=True)
+    suite = parser.add_mutually_exclusive_group(required=True)
+    suite.add_argument("--shape-file", type=Path)
+    suite.add_argument("--legacy-shapes", action="store_true")
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=["float16", "bfloat16", "float32"],
+        default=["float16", "bfloat16", "float32"],
+        help="Dtypes for --legacy-shapes; external manifest dtypes are preserved",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--nodes", type=int, default=16)
     parser.add_argument("--replays", type=int, default=20)
@@ -155,7 +224,11 @@ def run_manifest_benchmark():
     args = parser.parse_args()
     if min(args.nodes, args.replays, args.samples) < 1:
         parser.error("nodes, replays and samples must be positive")
-    records = json.loads(args.shape_file.read_text())
+    records = (
+        legacy_layernorm_records(args.dtypes)
+        if args.legacy_shapes
+        else json.loads(args.shape_file.read_text())
+    )
     if not records:
         parser.error("shape manifest must not be empty")
     if flaggems_vllm.vendor_name != "metax":
@@ -175,7 +248,12 @@ def run_manifest_benchmark():
         "torch": torch.__version__,
         "triton": triton.__version__,
         "device": str(torch.cuda.get_device_properties(0)),
-        "shape_file_sha256": hashlib.sha256(args.shape_file.read_bytes()).hexdigest(),
+        "shape_file_sha256": (
+            hashlib.sha256(args.shape_file.read_bytes()).hexdigest()
+            if args.shape_file
+            else None
+        ),
+        "suite": "repository_legacy" if args.legacy_shapes else "external_manifest",
         "implementation_sha256": hashlib.sha256(
             implementation.read_bytes()
         ).hexdigest(),
@@ -183,7 +261,10 @@ def run_manifest_benchmark():
         "graph_nodes": args.nodes,
         "replays_per_sample": args.replays,
         "samples": args.samples,
-        "unique_shapes": len(results),
+        "unique_shapes": len(
+            {(tuple(row["shape"]), tuple(row["normalized_shape"])) for row in results}
+        ),
+        "case_count": len(results),
         "captured_calls": sum(record["count"] for record in records),
         "arithmetic_mean_speedup": statistics.mean(row["speedup"] for row in results),
         "results": results,

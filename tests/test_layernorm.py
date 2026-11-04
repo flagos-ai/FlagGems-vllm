@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
+from flaggems_vllm.testing.layernorm_shapes import (
+    LEGACY_LAYERNORM_CASES,
+    UNSUPPORTED_LEGACY_LAYERNORM_CASES,
+)
 
 pytestmark = [
     pytest.mark.layernorm,
@@ -137,3 +141,31 @@ def test_layernorm_exact_segments(dtype, width, affine):
         1e-6 if dtype == torch.float32 else (1e-2 if dtype == torch.bfloat16 else 1e-3)
     )
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.layernorm
+@pytest.mark.parametrize("shape,normalized_shape", LEGACY_LAYERNORM_CASES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("affine", [False, True])
+def test_layernorm_legacy_shapes(shape, normalized_shape, dtype, affine):
+    torch.manual_seed(20261104)
+    tensor = torch.randn(shape, dtype=dtype, device="cuda")
+    weight = (
+        torch.randn(normalized_shape, dtype=dtype, device="cuda") if affine else None
+    )
+    bias = torch.randn_like(weight) if affine else None
+    actual = flaggems_vllm.layernorm(tensor, normalized_shape, weight, bias, 1e-5)
+    expected = F.layer_norm(tensor, normalized_shape, weight, bias, 1e-5)
+    tolerance = (
+        1e-6 if dtype == torch.float32 else (1e-2 if dtype == torch.bfloat16 else 1e-3)
+    )
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.layernorm
+@pytest.mark.parametrize("shape,normalized_shape", UNSUPPORTED_LEGACY_LAYERNORM_CASES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_layernorm_legacy_unsupported_extents(shape, normalized_shape, dtype):
+    tensor = torch.empty(shape, dtype=dtype, device="cuda")
+    with pytest.raises(NotImplementedError, match="above 65536"):
+        flaggems_vllm.layernorm(tensor, normalized_shape)
