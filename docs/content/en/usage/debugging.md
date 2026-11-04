@@ -89,7 +89,7 @@ except NotImplementedError as e:
 
 ### 3. Performance Slower Than Expected
 
-**Symptom**: FlagGems-vllm slower than torch baseline.
+**Symptom**: FlagGems-vllm slower than the vLLM baseline.
 
 **Cause**: Missing autotune, poor shape, or cold start.
 
