@@ -569,3 +569,18 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 8
+    num_stages: 1
