@@ -46,7 +46,7 @@ New production paths use Triton and metadata/empty allocations, without Torch co
 
 CUDA Graph timing setup: 25 warmup calls, 100 captured calls, 5 event samples, 2 reversed-order rounds. Values below are mean round medians.
 
-References are explicit in JSON:
+References are explicit in the [raw benchmark JSON](/data/m3-operator-benchmark.json):
 - Router baseline uses literal FP32 `F.linear` with TF32 disabled.
 - Quantization baseline uses the full Torch chain.
 - ViT uses optimized Torch SDPA.
