@@ -359,6 +359,17 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: expand_pools_and_append_tail
+    description: Expand identity-mapped history pools and append an incomplete token tail.
+    for:
+      - vllm.models.glm5next.nvidia.ops.kpool_compress.expand_pools_and_append_tail
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Indexing
+    stages:
+      - alpha: '0.3'
   - id: flash_attention_forward
     description: Forward pass of FlashAttention computing scaled dot-product attention.
     for:
