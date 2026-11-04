@@ -51,6 +51,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_n
 from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.grouped_matmul import grouped_matmul
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
