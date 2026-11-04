@@ -192,14 +192,6 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
             return self.input_shape
         return super().record_shapes(*args[:9], **kwargs)
 
-    def set_more_shapes(self):
-        return [
-            (128, queries, length, heads, varlen)
-            for length, heads, queries, varlen in product(
-                (4096, 8192, 16384), (16, 32, 64, 128), (1, 2), (False, True)
-            )
-        ]
-
     @staticmethod
     def make_input(param: TestParam, dtype):
         torch.manual_seed(0)
