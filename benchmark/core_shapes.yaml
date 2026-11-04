@@ -192,6 +192,23 @@ BlasBenchmark:
     - [16, 4096, 4096, 4096]
   shape_desc: "B, M, N, K"   # shapes are defined as (B, M, N, K)
 
+# Complete dtype/weight/layout bindings live in baseline/grouped_gemma_rmsnorm.py.
+grouped_gemma_rmsnorm:
+  shapes:
+    - [1, 1, 1]
+    - [1, 3, 1]
+    - [1, 4, 4]
+    - [3, 12, 4]
+    - [17, 508, 4]
+    - [3, 762, 2]
+    - [128, 5120, 2]
+    - [1, 8192, 1]
+    - [128, 10240, 4]
+    - [512, 10240, 4]
+    - [17, 32768, 4]
+    - [128, 32768, 4]
+    - [3, 16386, 2]
+  shape_desc: "N, DIM, num_groups"
 groupmm:
   shapes:
     - [16, 512, 2048]

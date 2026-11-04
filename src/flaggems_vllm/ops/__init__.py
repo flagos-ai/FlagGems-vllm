@@ -112,6 +112,7 @@ from flaggems_vllm.ops.mhc import (
     sinkhorn_forward,
 )
 from flaggems_vllm.ops.qwen4 import (
+    grouped_gemma_rmsnorm,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -303,6 +304,7 @@ __all__ = [
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
     "hc_head_fused_kernel",

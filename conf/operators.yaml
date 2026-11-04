@@ -766,6 +766,18 @@ ops:
       - Reduction
     stages:
       - alpha: '5.4'
+  - id: grouped_gemma_rmsnorm
+    description: Grouped Gemma RMS normalization with shared or per-group affine weights.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.hc.grouped_gemma_rmsnorm
+    labels:
+      - fused
+      - vLLM
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
