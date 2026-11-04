@@ -17,10 +17,8 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry
 
 
-@libentry()
 @triton.jit(do_not_specialize=["scale"])
 def indexer_weight_scale_kernel(
     weights_ptr,
