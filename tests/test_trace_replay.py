@@ -123,9 +123,12 @@ def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=No
     assert sampled.cpu().tolist() == cpu_expected
 
     if reference_sampled is not None:
-        assert apply_trace_tokens(
-            reference_sampled, mapping, traces, lengths, total, prompt
-        ) is None
+        assert (
+            apply_trace_tokens(
+                reference_sampled, mapping, traces, lengths, total, prompt
+            )
+            is None
+        )
         assert reference_sampled.cpu().tolist() == cpu_expected
 
 
@@ -159,9 +162,7 @@ def test_past_end_of_trace_leaves_sampled_untouched():
 
 def test_non_trace_request_untouched():
     traces = torch.zeros(1, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
-    _assert_replay(
-        _i64([42]), _i32([0]), traces, _i32([0]), _i32([3]), _i32([3]), [42]
-    )
+    _assert_replay(_i64([42]), _i32([0]), traces, _i32([0]), _i32([3]), _i32([3]), [42])
 
 
 def test_idx_mapping_indirection_and_negative_skip():

@@ -20,7 +20,6 @@ except (ImportError, OSError):
 from benchmark import base
 from benchmark.conftest import Config
 
-
 _kernel_mark = pytest.MarkDecorator(
     pytest.Mark("_trace_replay_kernel", (), {}, _ispytest=True),
     _ispytest=True,
@@ -125,9 +124,7 @@ class TraceReplayBenchmark(base.Benchmark):
 
             arguments = (mapping, traces, lengths, total, prompt)
             candidate_sampled = sampled.clone()
-            assert (
-                flaggems_apply_trace_tokens(candidate_sampled, *arguments) is None
-            )
+            assert flaggems_apply_trace_tokens(candidate_sampled, *arguments) is None
             if vllm_reference is not None:
                 reference_sampled = sampled.clone()
                 assert vllm_reference(reference_sampled, *arguments) is None
