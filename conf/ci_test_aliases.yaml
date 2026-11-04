@@ -23,6 +23,7 @@ mhc_pre: test_mhc_ops
 
 # --- Inplace / _out variants sharing test with base ---
 beam_search_score_: test_beam_search_score
+minimax_m3_sparse_attn_decode: test_minimax_m3_sparse_attn
 mul_: test_mul
 silu_and_mul_out: test_silu_and_mul
 silu_and_mul_with_clamp_out: test_silu_and_mul_with_clamp
@@ -37,3 +38,4 @@ moe_align_block_size_triton: test_moe_align_block_size
 flash_attn_varlen_func_w8a8: test_flash_attn_varlen_func_w8a8_fp8
 fused_marlin_moe_w4a16: test_fused_marlin_moe
 fused_marlin_moe_w8a16: test_fused_marlin_moe
+gdn_w8a16: test_gdn_w8a16_int8
