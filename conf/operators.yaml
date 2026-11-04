@@ -185,6 +185,14 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_scaled_dot_kkt_fwd
+    description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_scaled_dot_kkt_fwd
+    labels: [fused, FLA]
+    kind: [Attention]
+    stages:
+      - alpha: '5.4'
   - id: chunk_kda_with_fused_gate
     description: |
       KDA prefill with fused softplus gate and 64-token chunks; V-first final state and aliased value output.
