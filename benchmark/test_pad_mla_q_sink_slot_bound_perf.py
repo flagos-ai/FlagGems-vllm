@@ -41,7 +41,10 @@ class PadEndpointBenchmark(base.Benchmark):
 
 
 @pytest.mark.pad_mla_q_sink_slot_bound
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="CUDA required",
+)
 @torch.inference_mode()
 def test_pad_mla_q_sink_slot_bound_perf():
     bench = PadEndpointBenchmark(

@@ -21,7 +21,10 @@ def reference(packed, limit):
 
 
 @pytest.mark.silu_clamp_int8_quant
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @pytest.mark.parametrize("rows", [1, 208, 256])
 @torch.inference_mode()
 def test_clamp_quant_reference_and_graph(rows):

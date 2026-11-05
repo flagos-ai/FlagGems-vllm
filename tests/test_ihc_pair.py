@@ -22,7 +22,10 @@ def reference(x, residual, post, weight, scale, base):
 
 
 @pytest.mark.ihc_post_pre_pair
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="SM90 CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="SM90 CUDA required",
+)
 @pytest.mark.parametrize("rows", [208, 256, 1024])
 @torch.inference_mode()
 def test_pair_math_and_mutable_graph(rows):

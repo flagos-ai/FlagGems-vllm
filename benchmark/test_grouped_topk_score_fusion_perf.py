@@ -24,7 +24,10 @@ class ScoreFusionBenchmark(base.Benchmark):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @torch.inference_mode()
 def test_grouped_topk_score_fusion_perf(monkeypatch):
     module = importlib.import_module(

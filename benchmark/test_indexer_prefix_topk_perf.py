@@ -33,7 +33,10 @@ class PrefixTopKBenchmark(base.Benchmark):
 
 
 @pytest.mark.indexer_prefix_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="CUDA required",
+)
 @torch.inference_mode()
 def test_indexer_prefix_topk_perf():
     from flag_gems.utils.triton_version_utils import HAS_TLE

@@ -31,7 +31,10 @@ class SiluQuantBenchmark(base.Benchmark):
 
 
 @pytest.mark.silu_clamp_int8_quant
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="CUDA required",
+)
 @torch.inference_mode()
 def test_silu_clamp_int8_quant_perf():
     bench = SiluQuantBenchmark(

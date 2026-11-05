@@ -29,7 +29,10 @@ class IHCPairBenchmark(base.Benchmark):
 
 
 @pytest.mark.ihc_post_pre_pair
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="SM90 CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="SM90 CUDA required",
+)
 @torch.inference_mode()
 def test_ihc_pair_perf():
     if torch.cuda.get_device_capability() != (9, 0):

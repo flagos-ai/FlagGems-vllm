@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent affine reference and refreshed-input graph replay."""
 
+import flaggems_vllm
 import pytest
 import torch
 from flaggems_vllm import fused_mm_input_norm
@@ -15,7 +16,9 @@ def reference(inputs, outputs, weight, bias):
 
 @pytest.mark.fused_mm_input_norm
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or flaggems_vllm.vendor_name != "nvidia",
     reason="NVIDIA CUDA required",
 )
 @pytest.mark.parametrize("rows", [0, 1, 17])

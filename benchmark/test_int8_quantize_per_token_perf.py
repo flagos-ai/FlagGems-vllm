@@ -27,7 +27,10 @@ class PerTokenQuantBenchmark(base.Benchmark):
 
 
 @pytest.mark.int8_quantize_per_token
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @torch.inference_mode()
 def test_int8_quantize_per_token_perf():
     bench = PerTokenQuantBenchmark(

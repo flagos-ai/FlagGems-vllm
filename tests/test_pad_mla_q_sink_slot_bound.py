@@ -8,7 +8,10 @@ import torch
 
 
 @pytest.mark.pad_mla_q_sink_slot_bound
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @pytest.mark.parametrize("tokens", [1, 3, 17])
 @torch.inference_mode()
 def test_padding_endpoint_and_fresh_input_graph(tokens):

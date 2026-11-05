@@ -69,7 +69,10 @@ def reference(args):
 
 
 @pytest.mark.int8_indexer_paged_logits_empty_tile
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @pytest.mark.parametrize(
     "rows,width,pure_prefill",
     [(0, 16384, False), (4, 32768, False), (4, 204800, False), (256, 16384, True)],

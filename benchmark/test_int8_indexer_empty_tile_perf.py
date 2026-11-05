@@ -50,7 +50,10 @@ class EmptyTileBenchmark(base.Benchmark):
 
 
 @pytest.mark.int8_indexer_paged_logits_empty_tile
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="CUDA required",
+)
 @torch.inference_mode()
 def test_int8_indexer_empty_tile_perf():
     bench = EmptyTileBenchmark(

@@ -16,7 +16,10 @@ def reference(x):
 
 
 @pytest.mark.int8_quantize_per_token
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @pytest.mark.parametrize("width", [2048, 6144])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()

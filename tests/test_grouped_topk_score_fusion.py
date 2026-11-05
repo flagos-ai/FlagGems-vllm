@@ -30,7 +30,10 @@ def reference(scores, bias, count, scale, groups, keep_groups):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @pytest.mark.parametrize("rows", [1, 64, 256])
 @pytest.mark.parametrize("groups", [1, 4])
 @torch.inference_mode()

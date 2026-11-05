@@ -25,7 +25,10 @@ def reference(values, lengths, count):
 pytestmark = pytest.mark.indexer_prefix_topk
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="NVIDIA CUDA required",
+)
 @pytest.mark.parametrize("width", [16384, 32768, 65536, 204800])
 @pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
 @torch.inference_mode()
@@ -74,7 +77,10 @@ def test_prefix_topk_reference_and_changed_input_graph(width, length_dtype):
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA descriptors required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
+    reason="CUDA descriptors required",
+)
 @torch.inference_mode()
 def test_prefix_topk_rejects_one_changed_descriptor_before_launch():
     scores = torch.zeros((1, 4096), device="cuda")
