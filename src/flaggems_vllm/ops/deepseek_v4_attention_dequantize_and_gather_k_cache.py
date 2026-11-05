@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from typing import Optional
 
 import torch
@@ -22,7 +21,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_tle_range_reorder
 
 # FlagTree reorder-loop-loads: `tle.range(..., loop_unroll_factor=2, reorder=True)`
 # issues the block-table and cache loads of the next gathered token before the
@@ -30,14 +29,15 @@ from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 # indirect load, then eight dependent loads per token); measured on H20 the op
 # is 4-12% faster across the benchmark shapes, bit-exact. Upstream Triton keeps
 # the plain loop.
-try:
-    import triton.experimental.tle.language as tle
+if has_tle_range_reorder(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
 
-    _HAS_REORDER_LOOP_LOADS = (
-        has_triton_tle(3, 6, 0)
-        and "reorder" in inspect.signature(getattr(tle, "range").__init__).parameters
-    )
-except (ImportError, AttributeError, ValueError):
+        _HAS_REORDER_LOOP_LOADS = True
+    except ImportError:
+        tle = None
+        _HAS_REORDER_LOOP_LOADS = False
+else:
     tle = None
     _HAS_REORDER_LOOP_LOADS = False
 

@@ -6,29 +6,28 @@ to FP32 on load; router weights and returned logits stay FP32. No bias is
 applied here. Unsupported dimensions or larger batches are explicitly rejected.
 """
 
-import inspect
-
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_tle_range_reorder
 
 # FlagTree reorder-loop-loads: with few rows the grid is 128 experts x 1..2
 # programs and the K loop is latency bound. `tle.range(..., reorder=True)`
 # issues the next block's loads before the current fma; the (unroll, reorder)
 # pair per (M, dtype) bucket below is the one measured on H20 (see
 # _loop_schedule). Upstream Triton compiles the plain loop as before.
-try:
-    import triton.experimental.tle.language as tle
+if has_tle_range_reorder(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
 
-    _HAS_REORDER_LOOP_LOADS = (
-        has_triton_tle(3, 6, 0)
-        and "reorder" in inspect.signature(getattr(tle, "range").__init__).parameters
-    )
-except (ImportError, AttributeError, ValueError):
+        _HAS_REORDER_LOOP_LOADS = True
+    except ImportError:
+        tle = None
+        _HAS_REORDER_LOOP_LOADS = False
+else:
     tle = None
     _HAS_REORDER_LOOP_LOADS = False
 

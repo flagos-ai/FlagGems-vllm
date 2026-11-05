@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import inspect
 import re
 
 import triton
@@ -67,6 +69,29 @@ def has_triton_tle_attrs(
                 return False
             obj = getattr(obj, part)
     return True
+
+
+@functools.lru_cache(maxsize=None)
+def has_tle_range_reorder(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
+    """Whether ``tle.range`` takes the FlagTree ``reorder`` hint.
+
+    FlagTree 3.6 adds ``tle.range(..., reorder=...)``, a prefetch hint for the
+    reorder-loop-loads step of LoopUnroll (flagos-ai/FlagTree#775). Plain
+    Triton 3.6 ships ``tle.range`` without it, so existence of the function is
+    not enough; the keyword is looked up in its signature.
+    """
+    if not _triton_version_at_least(major, minor, patch):
+        return False
+    try:
+        import triton.experimental.tle.language as tle
+    except ImportError:
+        return False
+
+    try:
+        params = inspect.signature(tle.range.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "reorder" in params
 
 
 HAS_TLE = has_triton_tle()

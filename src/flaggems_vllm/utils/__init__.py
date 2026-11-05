@@ -25,6 +25,7 @@ from flaggems_vllm.utils.triton_driver_helper import get_device_properties
 from flaggems_vllm.utils.triton_lang_helper import tl_extra_shim
 from flaggems_vllm.utils.triton_version_utils import (
     HAS_TLE,
+    has_tle_range_reorder,
     has_triton_tle,
     has_triton_tle_attrs,
 )
@@ -42,5 +43,6 @@ __all__ = [
     "tl_extra_shim",
     "has_triton_tle",
     "has_triton_tle_attrs",
+    "has_tle_range_reorder",
     "HAS_TLE",
 ]

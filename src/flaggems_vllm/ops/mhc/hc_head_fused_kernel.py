@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
 
 import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_tle_range_reorder
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +29,15 @@ logger = logging.getLogger(__name__)
 # issues the next block's loads before the current block's FMAs. Autotune
 # picks per (H, HC), so a shape that gains nothing keeps its original config.
 # Upstream Triton sees only the original configs.
-try:
-    import triton.experimental.tle.language as tle
+if has_tle_range_reorder(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
 
-    _HAS_REORDER_LOOP_LOADS = (
-        has_triton_tle(3, 6, 0)
-        and "reorder" in inspect.signature(getattr(tle, "range").__init__).parameters
-    )
-except (ImportError, AttributeError, ValueError):
+        _HAS_REORDER_LOOP_LOADS = True
+    except ImportError:
+        tle = None
+        _HAS_REORDER_LOOP_LOADS = False
+else:
     tle = None
     _HAS_REORDER_LOOP_LOADS = False
 
