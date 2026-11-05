@@ -1912,16 +1912,18 @@ if tle is not None:
         )
 
 
-def _env_flag(name: str, default: str) -> bool:
-    """An environment switch: off for 0 / false / off / no (any case), on otherwise."""
-    return os.environ.get(name, default).lower() not in {"0", "false", "off", "no"}
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _flash_mla_sparse_ring() -> str:
     """The KV ring of the TLE kernel, read at every call: "asm" (cp.async inline
     assembly, the faster one on the measured PPU workloads) or "pipe" (tle.pipe
     stages, FLAGGEMS_FLASHMLA_SPARSE_PIPE=1)."""
-    return "pipe" if _env_flag("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "0") else "asm"
+    return "pipe" if _env_flag("FLAGGEMS_FLASHMLA_SPARSE_PIPE", False) else "asm"
 
 
 @functools.lru_cache(maxsize=None)
@@ -1935,7 +1937,7 @@ def _tle_ring_supported(ring: str) -> bool:
 def _flash_mla_sparse_tle_enabled(ring: str) -> bool:
     """The environment switch, read at every call like the generic operator's, and
     the compiler's support of the ring."""
-    return _env_flag("FLAGGEMS_FLASHMLA_SPARSE_TLE", "1") and _tle_ring_supported(ring)
+    return _env_flag("FLAGGEMS_FLASHMLA_SPARSE_TLE", True) and _tle_ring_supported(ring)
 
 
 @functools.lru_cache(maxsize=None)
