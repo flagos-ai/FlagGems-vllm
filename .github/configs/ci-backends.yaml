@@ -95,21 +95,40 @@ platforms:
     gpu_check_script: tools/gpu_check_iluvatar.sh
 
   metax:
-    description: "MetaX (Muxi) on the official vllm-metax image"
-    # TODO: `runner_labels` is a guess that follows the naming pattern of the
-    # other three runners; the actual MetaX runner label was not supplied.
-    # Until it is confirmed, this job queues forever instead of failing (no
-    # runner matches), which is why `enabled: false` keeps it out of the
-    # matrix. Set the real label, then flip `enabled` to true.
-    enabled: false
+    description: "MetaX (Muxi) MXC550 on the official vllm-metax image"
     backend: metax-maca3810
-    runner_labels: metax-c550-1
+    runner_labels: metax-mxc550-1
     container_image: >-
       cr.metax-tech.com/public-ai-release/maca/vllm-metax:0.28.0-maca.ai3.8.2.401-torch2.10-py312-ubuntu22.04-amd64
+    # Mirrors the device flags C550.yaml uses for the periodic lane.
     container_options: >-
+      --uts=host
       --ipc=host
       --privileged
       --device=/dev/mxcd
       --device=/dev/dri
     container_volumes: []
+    test_env:
+      FLAGTREE_BACKEND: metax
     gpu_check_script: tools/gpu_check_metax.sh
+
+  mthreads:
+    description: "Moore Threads S5000 on the official vllm-openai image"
+    backend: mthreads-musa520
+    runner_labels: mthreads-s5000-1
+    container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+    # MTHREADS_VISIBLE_DEVICES / MTHREADS_DRIVER_CAPABILITIES are how the
+    # vendor runtime exposes cards to the container; without them the image
+    # sees no GPU. Mirrors MTT-S5000.yaml in the periodic lane.
+    container_options: >-
+      --pid=host
+      --privileged
+      --cap-add=SYS_PTRACE
+      --shm-size=16g
+      --security-opt seccomp=unconfined
+      --env MTHREADS_VISIBLE_DEVICES=all
+      --env MTHREADS_DRIVER_CAPABILITIES=all
+    container_volumes: []
+    test_env:
+      FLAGTREE_BACKEND: mthreads
+    gpu_check_script: tools/gpu_check_mthreads.sh

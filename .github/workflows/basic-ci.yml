@@ -365,6 +365,8 @@ jobs:
     env:
       FLAGGEMS_VENDOR: ${{ matrix.platform }}
       PYTHONPATH: ${{ github.workspace }}/src
+      BACKEND: ${{ matrix.backend }}
+      CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
     steps:
       - name: check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -394,9 +396,7 @@ jobs:
       - name: run selected tests
         shell: bash
         continue-on-error: true
-        env:
-          CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
-          BACKEND: ${{ matrix.backend }}
+        env: ${{ fromJSON(matrix.test_env) }}
         run: |
           python3 tools/run_ci_targets.py \
             --backend "${BACKEND}" \

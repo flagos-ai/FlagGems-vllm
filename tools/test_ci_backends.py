@@ -95,6 +95,23 @@ class SelectCiBackendsTest(unittest.TestCase):
                 select_ci_backends.load_platforms(path), {"typo"}
             )
 
+    def test_non_string_test_env_is_rejected(self):
+        path = self.write_config(
+            """
+            platforms:
+              broken:
+                backend: broken-backend
+                runner_labels: broken-1
+                container_image: example.invalid/broken:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+                test_env:
+                  SOME_FLAG: 1
+            """
+        )
+
+        with self.assertRaises(ValueError):
+            select_ci_backends.load_platforms(path)
+
     def test_missing_required_field_is_rejected(self):
         path = self.write_config(
             """
@@ -147,8 +164,21 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
     def test_config_loads_and_selects_the_enabled_platforms(self):
         self.assertEqual(
             [entry["platform"] for entry in self.selected],
-            ["hygon", "ascend", "iluvatar"],
+            ["hygon", "ascend", "iluvatar", "metax", "mthreads"],
         )
+
+    def test_test_env_round_trips_as_json(self):
+        # The workflow consumes this with fromJSON(matrix.test_env), which
+        # fails the whole job if the value is not valid JSON.
+        by_platform = {entry["platform"]: entry for entry in self.selected}
+        for entry in self.selected:
+            with self.subTest(platform=entry["platform"]):
+                self.assertIsInstance(json.loads(entry["test_env"]), dict)
+        self.assertEqual(
+            json.loads(by_platform["mthreads"]["test_env"]),
+            {"FLAGTREE_BACKEND": "mthreads"},
+        )
+        self.assertEqual(json.loads(by_platform["hygon"]["test_env"]), {})
 
     def test_container_images_have_no_embedded_whitespace(self):
         for entry in self.selected:

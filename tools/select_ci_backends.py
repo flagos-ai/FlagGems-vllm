@@ -68,6 +68,12 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"platform {name!r}.container_volumes must be a list of strings"
             )
+        test_env = entry.get("test_env") or {}
+        if not isinstance(test_env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in test_env.items()
+        ):
+            raise ValueError(f"platform {name!r}.test_env must be a mapping of strings")
     return platforms
 
 
@@ -101,6 +107,11 @@ def select_platforms(
                 # Kept as a real list so `container.volumes` can consume it
                 # directly, matching how ops-test.yaml passes volumes.
                 "container_volumes": entry.get("container_volumes") or [],
+                # JSON-encoded so the workflow can fromJSON it into `env:`,
+                # matching how ops-test.yaml passes test_env.
+                "test_env": json.dumps(
+                    entry.get("test_env") or {}, separators=(",", ":")
+                ),
                 "gpu_check_script": entry["gpu_check_script"],
             }
         )
