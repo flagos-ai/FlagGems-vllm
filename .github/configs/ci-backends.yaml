@@ -47,17 +47,18 @@ platforms:
     runner_labels: hygon-bw1000-1
     container_image: >-
       harbor.sourcefind.cn:5443/hcu/admin/base/vllm:0.21.0-ubuntu22.04-dtk2604-py3.10
+    # Device flags follow FlagGems' backends.json `hygon-dtk2604.container`,
+    # whose `runs_on_vllm` is this runner.
     container_options: >-
-      --ipc=host
-      --privileged
+      --device /dev/kfd
+      --device /dev/mkfd
+      --device /dev/dri
       --group-add video
-      --cap-add=SYS_PTRACE
       --security-opt seccomp=unconfined
-      --device=/dev/kfd
-      --device=/dev/mkfd
-      --device=/dev/dri
-    container_volumes:
-      - /opt/hyhal:/opt/hyhal
+      --shm-size=256g
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    container_volumes: []
     gpu_check_script: tools/gpu_check_hygon.sh
 
   ascend:
@@ -79,19 +80,20 @@ platforms:
     gpu_check_script: tools/gpu_check_ascend.sh
 
   iluvatar:
-    description: "Iluvatar BI-V150 on the official CoreX vLLM image"
+    description: "Iluvatar BI-V150 on the FlagOS CoreX 4.5.0 vLLM image"
     backend: iluvatar
     runner_labels: iluvatar-bi-v150-1
     container_image: >-
-      registry.iluvatar.com.cn:10443/release/vllm:0.27.1_py3.12-corex.5.0.0-ubuntu24.04
+      harbor.baai.ac.cn/flagos-app/vllm0.20.2-iluvatar-corex4.5.0:2.2.0-0.2.2
+    # Device flags follow FlagGems' backends.json
+    # `iluvatar-corex450.container`, whose `runs_on_vllm` is this runner.
     container_options: >-
-      --ipc=host
-      --privileged
+      --device /dev/iluvatar0
+      --device /dev/itrctl
       --shm-size=256g
-      --security-opt seccomp=unconfined
-      --device=/dev/itrctl
-    container_volumes:
-      - /lib/modules:/lib/modules
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    container_volumes: []
     gpu_check_script: tools/gpu_check_iluvatar.sh
 
   metax:
@@ -100,13 +102,12 @@ platforms:
     runner_labels: metax-mxc550-1
     container_image: >-
       cr.metax-tech.com/public-ai-release/maca/vllm-metax:0.28.0-maca.ai3.8.2.401-torch2.10-py312-ubuntu22.04-amd64
-    # Mirrors the device flags C550.yaml uses for the periodic lane.
+    # Device flags follow FlagGems' backends.json `metax-maca3810.container`,
+    # whose `runs_on_vllm` is this runner.
     container_options: >-
-      --uts=host
-      --ipc=host
-      --privileged
-      --device=/dev/mxcd
-      --device=/dev/dri
+      --device /dev/mxcd
+      --device /dev/dri
+      --group-add video
     container_volumes: []
     test_env:
       FLAGTREE_BACKEND: metax
@@ -116,19 +117,26 @@ platforms:
     description: "Moore Threads S5000 on the official vllm-openai image"
     backend: mthreads-musa520
     runner_labels: mthreads-s5000-1
-    container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
-    # MTHREADS_VISIBLE_DEVICES / MTHREADS_DRIVER_CAPABILITIES are how the
-    # vendor runtime exposes cards to the container; without them the image
-    # sees no GPU. Mirrors MTT-S5000.yaml in the periodic lane.
+    container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
+    # Device flags follow FlagGems' backends.json
+    # `mthreads-musa520.container`, whose `runs_on_vllm` is this runner.
     container_options: >-
-      --pid=host
-      --privileged
-      --cap-add=SYS_PTRACE
-      --shm-size=16g
-      --security-opt seccomp=unconfined
-      --env MTHREADS_VISIBLE_DEVICES=all
-      --env MTHREADS_DRIVER_CAPABILITIES=all
-    container_volumes: []
+      --device /dev/mtgpu.0
+      --device /dev/mtgpu.1
+      --device /dev/mtgpu.2
+      --device /dev/mtgpu.3
+      --device /dev/mtgpu.4
+      --device /dev/mtgpu.5
+      --device /dev/mtgpu.6
+      --device /dev/mtgpu.7
+      --device /dev/dri
+      --shm-size=256g
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    # gpu_check_mthreads.sh shells out to `mthreads-gmi`, which lives on the
+    # host rather than in the image.
+    container_volumes:
+      - /usr/bin/mthreads-gmi:/usr/bin/mthreads-gmi:ro
     test_env:
       FLAGTREE_BACKEND: mthreads
     gpu_check_script: tools/gpu_check_mthreads.sh
