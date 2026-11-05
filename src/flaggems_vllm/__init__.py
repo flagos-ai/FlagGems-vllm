@@ -19,8 +19,9 @@ flaggems_vllm - DNN operations implemented with Triton
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _metadata_version
 
-import flaggems_vllm.ops as _ops_module
 import torch
+
+import flaggems_vllm.ops as _ops_module
 from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.config import aten_patch_list, resolve_user_setting
