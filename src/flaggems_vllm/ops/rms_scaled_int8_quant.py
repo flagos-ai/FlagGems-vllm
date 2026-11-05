@@ -5,6 +5,7 @@
 Returns the original BF16 normalized value as well as its INT8 representation.
 No registration, serving policy, training, or GEMM is part of this operator.
 """
+
 import torch
 import triton
 import triton.language as tl

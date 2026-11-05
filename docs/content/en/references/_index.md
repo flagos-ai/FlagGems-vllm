@@ -10,15 +10,15 @@ Technical reference documentation for FlagGems-vllm.
 
 ## Topics
 
-- [Operator List](operators/) - Complete list of all 102 operators
-- [Project Structure](project-structure/) - Repository organization
-- [Changelog](changelog/) - Version history and releases
+- [Operator List](operators.md) - Complete catalog of operators with metadata
+- [MiniMax M3 Support](minimax-m3-support.md) - MiniMax M3 inference operator specifications and quantization fusion
+- [Changelog](changelog.md) - Version history and releases
 
 ## Quick Links
 
-- [Operator metadata](operators/) - Browse operators by category, stage, and labels
-- [Repository layout](project-structure/) - Understanding the codebase
-- [Release history](changelog/) - What's new in each version
+- [Operator metadata](operators.md) - Browse operators by category, stage, and labels
+- [MiniMax M3 specifications](minimax-m3-support.md) - Specifications, verification, and speedups
+- [Release history](changelog.md) - What's new in each version
 
 ## Operator Categories
 
@@ -28,4 +28,4 @@ FlagGems-vllm operators are organized by:
 - **Labels**: aten, fused, vLLM, MoE, Attention, Quantization, RoPE, KernelGen
 - **Stage**: alpha, beta, stable
 
-See the [operator list](operators/) for the complete catalog.
+See the [operator list](operators.md) for the complete catalog.

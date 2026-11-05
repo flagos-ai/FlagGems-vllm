@@ -34,7 +34,8 @@ Two-stage design:
   stage1: per-token fp32 reduction over hc*d producing mix[N, 2*hc] (w-projection)
           and sqrsum[N]. M-blocked (one program owns BLOCK_M tokens, x read once
           per K-chunk and reused for sqrsum + all 2*hc FMAs) with a TLE-pipelined
-          K loop; a K-split grid (fp32 atomic combine) kicks in for small N.
+          K loop; a K-split grid (per-split slots, reduced in stage2) kicks in
+          for small N.
   stage2: mix + sqrsum -> rms, pre/post sigmoid gates, post store, and the
           pre-gated channel sum y[n, :] = sum_i pre[n, i] * x[n, i, :].
 """
@@ -80,18 +81,33 @@ def _decode_block_k(num_tokens: int) -> int:
 # fp32 accumulation keeps the post gate bit-accurate (no tensor cores); tl.dot in
 # bf16/tf32 would blow the 2e-5 gate tolerance at K = hc*hidden.
 #
-# One grid axis for the token blocks, one (NSPLIT-wide) for an optional K-split:
-# with NSPLIT == 1 each program owns a whole row and plain-stores the result;
-# with NSPLIT > 1 (small N, too few token-blocks to fill the GPU) each program
-# covers a K-chunk and fp32-atomic-adds its partial into mix / sqrsum.
+# One grid axis for the token blocks, one (NSPLIT-wide) for a K-split that kicks
+# in when the token-blocks alone cannot fill the GPU. Every program writes its
+# own (split, token) slot and stage2 sums the slots in index order, so the
+# reduction order is fixed no matter how the blocks interleave.
+#
+# The slots replace an earlier fp32 tl.atomic_add into mix / sqrsum. The atomic
+# was not an accuracy problem (the post gates stayed ~2e-7 against fp64, well
+# inside their 2e-5 tolerance) but it made the result depend on which block
+# arrived first, so repeated launches were not bitwise identical -- measured
+# spread ~6e-7 on the post gates at 256..2048 tokens, which is what disqualifies
+# an op from a batch-invariant path. Private slots are also faster here, since
+# they drop both the atomic contention and the pre-zeroing the accumulate
+# required: 1.26x at 256 tokens / NSPLIT=16, tapering to 1.03x at NSPLIT=2.
+#
+# X_STRIDE is the full row length and K_CHUNK is this program's share of it.
+# They have to be separate: deriving the row stride from the reduction length
+# (as a single K_TOTAL did) is what forced the atomic, because then a program
+# could not cover part of K while still addressing whole rows.
 @triton.jit
 def _ihc_pre_stage1(
     x_ptr,
     weight_ptr,
-    sumsq_ptr,
-    mix_ptr,
+    sumsq_slot_ptr,
+    mix_slot_ptr,
     N,
-    K_TOTAL: tl.constexpr,
+    X_STRIDE: tl.constexpr,
+    K_CHUNK: tl.constexpr,
     TWO_HC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -104,8 +120,7 @@ def _ihc_pre_stage1(
     m_off = token_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = m_off < N
 
-    CHUNK: tl.constexpr = K_TOTAL // NSPLIT
-    k_start = split_idx * CHUNK
+    k_start = split_idx * K_CHUNK
 
     # One accumulator per projection row, plus one for the row sqrsum. Triton
     # has no mutable list, so the running values are carried in a tuple that is
@@ -115,10 +130,10 @@ def _ihc_pre_stage1(
     for _ in tl.static_range(TWO_HC):
         mixes = mixes + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
 
-    x_base = x_ptr + m_off[:, None] * K_TOTAL
-    for k_offset in tl.range(0, CHUNK, BLOCK_K, num_stages=NUM_STAGES):
+    x_base = x_ptr + m_off[:, None] * X_STRIDE
+    for k_offset in tl.range(0, K_CHUNK, BLOCK_K, num_stages=NUM_STAGES):
         k_off = k_start + k_offset + tl.arange(0, BLOCK_K)
-        k_mask = k_off < K_TOTAL
+        k_mask = k_off < X_STRIDE
 
         x = tl.load(
             x_base + k_off[None, :],
@@ -132,23 +147,18 @@ def _ihc_pre_stage1(
         next_mixes = ()
         for j in tl.static_range(TWO_HC):
             weight_row = tl.load(
-                weight_ptr + j * K_TOTAL + k_off, mask=k_mask, other=0.0
+                weight_ptr + j * X_STRIDE + k_off, mask=k_mask, other=0.0
             )
             contribution = tl.sum(x * weight_row[None, :], axis=1)
             next_mixes = next_mixes + (mixes[j] + contribution,)
         mixes = next_mixes
 
-    mix_ptrs = mix_ptr + m_off * TWO_HC
-    if NSPLIT == 1:
-        # This program owns the whole row, so a plain store is enough.
-        tl.store(sumsq_ptr + m_off, sum_squares, mask=m_mask)
-        for j in tl.static_range(TWO_HC):
-            tl.store(mix_ptrs + j, mixes[j], mask=m_mask)
-    else:
-        # The row is split across programs; combine with fp32 atomics.
-        tl.atomic_add(sumsq_ptr + m_off, sum_squares, mask=m_mask)
-        for j in tl.static_range(TWO_HC):
-            tl.atomic_add(mix_ptrs + j, mixes[j], mask=m_mask)
+    # Private slot per (split, token): a plain store either way, so NSPLIT == 1
+    # needs no special case.
+    tl.store(sumsq_slot_ptr + split_idx * N + m_off, sum_squares, mask=m_mask)
+    mix_slot = mix_slot_ptr + split_idx * N * TWO_HC + m_off * TWO_HC
+    for j in tl.static_range(TWO_HC):
+        tl.store(mix_slot + j, mixes[j], mask=m_mask)
 
 
 # Decode-shaped stage1: one program per (token, K-chunk). With few tokens there
@@ -196,23 +206,31 @@ def _ihc_pre_stage1_decode(
     tl.store(partial + 1 + mix_idx, mixes)
 
 
-# stage2 reads the fp32 mix[N, 2*hc] and sqrsum[N] from stage1, forms the pre /
-# post sigmoid gates, stores the post gate, and emits the pre-gated channel sum
+# stage2 reduces the per-split slots stage1 wrote, forms the pre / post sigmoid
+# gates, stores the post gate, and emits the pre-gated channel sum
 # y[n, :] = sum_i pre[n, i] * x[n, i, :].
+#
+# Folding the slot reduction in here keeps the op at two launches, the same
+# trick _ihc_pre_stage2_decode uses; a separate reduction kernel would add a
+# third. The sum runs over the split axis in index order, which is what makes
+# the result independent of block completion order.
 @triton.jit
 def _ihc_pre_stage2(
     x_ptr,
-    mix_ptr,
-    sumsq_ptr,
+    mix_slot_ptr,
+    sumsq_slot_ptr,
     scale_ptr,
     base_ptr,
     output_ptr,
     post_ptr,
+    N,
     HIDDEN_SIZE: tl.constexpr,
     K_TOTAL: tl.constexpr,
     HC_MULT: tl.constexpr,
     HC_POW2: tl.constexpr,
     TWO_HC: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
     MAGNITUDE: tl.constexpr,
     NORM_EPS: tl.constexpr,
@@ -223,10 +241,30 @@ def _ihc_pre_stage2(
     hc_idx = tl.arange(0, HC_POW2)
     hc_mask = hc_idx < HC_MULT
 
-    sum_squares = tl.load(sumsq_ptr + token_idx)
-    mix_row = mix_ptr + token_idx * TWO_HC
-    pre_mix = tl.load(mix_row + hc_idx, mask=hc_mask, other=0.0)
-    post_mix = tl.load(mix_row + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
+    split_idx = tl.arange(0, BLOCK_S)
+    split_mask = split_idx < NSPLIT
+
+    sum_squares = tl.sum(
+        tl.load(sumsq_slot_ptr + split_idx * N + token_idx, mask=split_mask, other=0.0),
+        axis=0,
+    )
+
+    mix_idx = tl.arange(0, TWO_HC)
+    mix_parts = tl.load(
+        mix_slot_ptr
+        + split_idx[:, None] * N * TWO_HC
+        + token_idx * TWO_HC
+        + mix_idx[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    mixes = tl.sum(mix_parts, axis=0)
+
+    # Split the reduced row into the pre gates' logits and the post gates'.
+    is_pre = mix_idx[None, :] == hc_idx[:, None]
+    is_post = mix_idx[None, :] == (hc_idx[:, None] + HC_MULT)
+    pre_mix = tl.sum(tl.where(is_pre, mixes[None, :], 0.0), axis=1)
+    post_mix = tl.sum(tl.where(is_post, mixes[None, :], 0.0), axis=1)
 
     reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
     pre_scale = tl.load(scale_ptr)
@@ -449,9 +487,14 @@ def ihc_pre(
         )
         return output, post
 
-    # stage1: fp32 mix[N, 2*hc] + sqrsum[N]. K-split only when token-blocks alone
-    # cannot fill the GPU; otherwise the single-pass M-block grid already has
-    # enough programs and splitting just adds the atomic-combine tax.
+    # stage1: fp32 mix / sqrsum slots, one per (split, token). K-split only when
+    # token-blocks alone cannot fill the GPU; otherwise the single-pass M-block
+    # grid already has enough programs and splitting just adds slots to reduce.
+    #
+    # The split is not merely about program count: it also shortens each
+    # program's serial K chain (24576 -> 1536 at NSPLIT=16). Lowering BLOCK_M
+    # raises the program count too but leaves that chain intact, and measures
+    # 2.3x slower at 256 tokens even with 256 programs on 78 SMs.
     grid_m = triton.cdiv(num_tokens, _BLOCK_M)
     nsplit = 1
     while (
@@ -459,17 +502,21 @@ def ihc_pre(
     ):
         nsplit *= 2
 
-    # NSPLIT > 1 accumulates with atomic_add, so the outputs must start zeroed.
-    alloc = torch.empty if nsplit == 1 else torch.zeros
-    sumsq = alloc(num_tokens, dtype=torch.float32, device=x.device)
-    mix = alloc(num_tokens, two_hc, dtype=torch.float32, device=x.device)
+    # One slot per (split, token); stage2 reduces them. torch.empty is enough
+    # because nothing accumulates into these -- the atomic variant this replaces
+    # needed torch.zeros.
+    sumsq = torch.empty(nsplit * num_tokens, dtype=torch.float32, device=x.device)
+    mix = torch.empty(
+        nsplit * num_tokens * two_hc, dtype=torch.float32, device=x.device
+    )
     _ihc_pre_stage1[(grid_m, nsplit)](
         x_flat,
         weight,
         sumsq,
         mix,
         num_tokens,
-        K_TOTAL=k_total,
+        X_STRIDE=k_total,
+        K_CHUNK=k_total // nsplit,
         TWO_HC=two_hc,
         BLOCK_M=_BLOCK_M,
         BLOCK_K=_BLOCK_K,
@@ -487,11 +534,14 @@ def ihc_pre(
         base,
         output,
         post,
+        num_tokens,
         HIDDEN_SIZE=hidden_size,
         K_TOTAL=k_total,
         HC_MULT=hc_mult,
         HC_POW2=hc_pow2,
         TWO_HC=two_hc,
+        NSPLIT=nsplit,
+        BLOCK_S=triton.next_power_of_2(nsplit),
         BLOCK_D=_BLOCK_D,
         MAGNITUDE=magnitude,
         NORM_EPS=norm_eps,
