@@ -579,6 +579,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_indexer_weight_scale
+    description: |
+      Scale floating-point indexer weights by FP32 query scales and a scalar.
+      Returns FP32 per-token, per-head weights on Ascend.
+    for:
+      - fused_indexer_weight_scale
+      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: fused_inv_rope_fp8_quant
     description: |
       Apply inverse RoPE and group-wise quantization to attention output.
