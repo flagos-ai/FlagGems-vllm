@@ -33,10 +33,13 @@ except (ImportError, AttributeError):
 
 import flaggems_vllm
 
-pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend" or not _NPU_AVAILABLE,
-    reason="kv_rmsnorm_rope_cache is only implemented for available Ascend NPUs",
-)
+pytestmark = [
+    pytest.mark.kv_rmsnorm_rope_cache,
+    pytest.mark.skipif(
+        flaggems_vllm.vendor_name != "ascend" or not _NPU_AVAILABLE,
+        reason="kv_rmsnorm_rope_cache is only implemented for available Ascend NPUs",
+    ),
+]
 
 RMS_SIZE = 512
 ROPE_SIZE = 64
