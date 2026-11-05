@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent affine reference and refreshed-input graph replay."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 from flaggems_vllm import fused_mm_input_norm
 
 

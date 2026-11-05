@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Padding and endpoint transport; both arms overwrite all output buffers."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 from . import base
 

@@ -10,6 +10,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+
 from flaggems_vllm.ops.ihc_post_pre import _ihc_pre_stage2
 from flaggems_vllm.utils import libentry
 

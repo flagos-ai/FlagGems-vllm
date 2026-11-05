@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent bit-key reference and mutable-input graph contracts."""
 
-import flaggems_vllm
 import numpy as np
 import pytest
 import torch
+
+import flaggems_vllm
 
 
 def reference(values, lengths, count):
@@ -22,9 +23,7 @@ def reference(values, lengths, count):
     return result
 
 
-pytestmark = pytest.mark.indexer_prefix_topk
-
-
+@pytest.mark.indexer_prefix_topk
 @pytest.mark.skipif(
     not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
     reason="NVIDIA CUDA required",
@@ -77,6 +76,7 @@ def test_prefix_topk_reference_and_changed_input_graph(width, length_dtype):
         )
 
 
+@pytest.mark.indexer_prefix_topk
 @pytest.mark.skipif(
     not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
     reason="CUDA descriptors required",

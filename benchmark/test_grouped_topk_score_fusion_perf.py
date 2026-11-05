@@ -4,9 +4,10 @@
 
 import importlib
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 from flaggems_vllm.ops.grouped_topk import grouped_topk as generic_grouped_topk
 
 from . import base

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Raw-bit transport and last-slot endpoint, including internal holes."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 
 @pytest.mark.pad_mla_q_sink_slot_bound

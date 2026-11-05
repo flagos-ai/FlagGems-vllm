@@ -10,7 +10,8 @@ import pytest
     ["int8_indexer_quantize", "int8_indexer_cache_store", "int8_indexer_paged_logits"],
 )
 def test_public_int8_apis_are_the_shared_implementation(name):
-    import flaggems_vllm
     from flag_gems.fused import int8_sparse_indexer
+
+    import flaggems_vllm
 
     assert getattr(flaggems_vllm, name) is getattr(int8_sparse_indexer, name)

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paged scores, including complete output writes and caller-owned cache."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 from . import base
 

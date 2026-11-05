@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paired post-to-pre iHC compared with the existing unpaired direct API."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 from . import base
 

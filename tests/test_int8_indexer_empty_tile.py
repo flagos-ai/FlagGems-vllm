@@ -4,9 +4,10 @@
 
 import importlib
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 
 def fixture(rows, width):

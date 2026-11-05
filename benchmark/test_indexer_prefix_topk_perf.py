@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Complete prefix TopK and serving epilogue with the same stable-key baseline."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 from . import base
 

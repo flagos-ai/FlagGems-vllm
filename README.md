@@ -93,7 +93,7 @@ This project is licensed under the [Apache (version 2.0) License](./LICENSE).
 Use one combined `flaggems_vllm` revision for the Hy4 numerical API set. It
 includes the RMSNorm/INT8 foundation; install the matching fixed FlagGems Core
 dependency before using these APIs. This revision declares the public fixed
-Core commit `18ba1ff2d49fb9e1aed8ebb471ac7eb65559fe91` in its package metadata;
+Core commit `36d8e98ba627d52963f1fd0d56567eabd3b79c53` in its package metadata;
 ordinary installation resolves it automatically. If installing with `--no-deps`,
 install the same Core revision explicitly first.
 

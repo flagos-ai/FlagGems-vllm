@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-token quantization at the two selected MoE widths."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 
 def reference(x):

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Complete dynamic quantization with identical row-scale semantics."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 from . import base
 

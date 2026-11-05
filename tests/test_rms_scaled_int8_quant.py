@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct Hy4-preview fused RMS API; GPU cases are explicit and bounded."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 from flaggems_vllm.ops.rms_scaled_int8_quant import (
     rms_scaled_int8_quant,
     supports_rms_scaled_int8_quant,

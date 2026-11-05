@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Clamped activation and FP32 reciprocal-multiply quantization reference."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 
 def reference(packed, limit):

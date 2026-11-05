@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent paired-iHC math with the existing post/pre tolerances."""
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 
 def reference(x, residual, post, weight, scale, base):
