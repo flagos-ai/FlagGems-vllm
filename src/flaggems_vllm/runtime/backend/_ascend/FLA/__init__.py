@@ -19,9 +19,13 @@ from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_gated_delta_rule 
 from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_gated_delta_rule_packed_decode import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_kda import (
+    fused_recurrent_kda,
+)
 
 __all__ = [
     "chunk_kda",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "fused_recurrent_kda",
 ]

@@ -13,7 +13,11 @@
 # limitations under the License.
 
 from flaggems_vllm.runtime.backend._hygon.FLA.chunk_kda import chunk_kda
+from flaggems_vllm.runtime.backend._hygon.FLA.fused_recurrent_kda import (
+    fused_recurrent_kda,
+)
 
 __all__ = [
     "chunk_kda",
+    "fused_recurrent_kda",
 ]
