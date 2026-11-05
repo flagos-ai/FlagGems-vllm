@@ -19,9 +19,8 @@ flaggems_vllm - DNN operations implemented with Triton
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _metadata_version
 
-import torch
-
 import flaggems_vllm.ops as _ops_module
+import torch
 from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.config import aten_patch_list, resolve_user_setting
@@ -61,12 +60,55 @@ _DIRECT_ONLY_OPS = frozenset(
     }
 )
 
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | frozenset(
+    [
+        "int8_indexer_paged_logits_empty_tile",
+        "indexer_prefix_topk",
+        "supports_indexer_prefix_topk",
+        "can_ihc_pair",
+        "ihc_pre_pair",
+        "ihc_post_pre_pair",
+        "pad_mla_q_sink_slot_bound",
+        "rms_scaled_int8_quant",
+        "supports_rms_scaled_int8_quant",
+    ]
+)
+
+# Callable library APIs that deliberately have no ATen schema to override.
+# They stay importable as `flaggems_vllm.<op>` but are never registered into
+# PyTorch dispatch by enable()/only_enable().
+_LIBRARY_ONLY_OPS = frozenset(
+    {
+        "minimax_m3_sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+    }
+)
+
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | frozenset(
+    [
+        "int8_indexer_cache_store",
+        "int8_indexer_paged_logits",
+        "int8_indexer_quantize",
+        "silu_clamp",
+        "silu_clamp_int8_quant",
+        "supports_silu_clamp_int8_quant",
+        "can_ihc_post_pre",
+    ]
+)
+
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | {"fused_mm_input_norm"}
+
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | {
+    "int8_quantize_per_token",
+    "supports_int8_quantize_per_token",
+}
+
 _FULL_CONFIG = tuple(
     (op_name, globals()[op_name])
     for op_name in getattr(_ops_module, "__all__", [])
     if op_name in globals()
     and callable(globals()[op_name])
-    and op_name not in _DIRECT_ONLY_OPS
+    and op_name not in (_DIRECT_ONLY_OPS | _LIBRARY_ONLY_OPS)
 )
 
 if "weight_norm_interface" in globals():
@@ -258,3 +300,29 @@ __all__ = [
     "use_dnn",
     "use_gems",
 ]
+
+__all__ += [
+    "int8_indexer_paged_logits_empty_tile",
+    "indexer_prefix_topk",
+    "supports_indexer_prefix_topk",
+    "can_ihc_pair",
+    "ihc_pre_pair",
+    "ihc_post_pre_pair",
+    "pad_mla_q_sink_slot_bound",
+    "rms_scaled_int8_quant",
+    "supports_rms_scaled_int8_quant",
+]
+
+__all__ += [
+    "int8_indexer_cache_store",
+    "int8_indexer_paged_logits",
+    "int8_indexer_quantize",
+    "silu_clamp",
+    "silu_clamp_int8_quant",
+    "supports_silu_clamp_int8_quant",
+    "can_ihc_post_pre",
+]
+
+__all__.append("fused_mm_input_norm")
+
+__all__ += ["int8_quantize_per_token", "supports_int8_quantize_per_token"]

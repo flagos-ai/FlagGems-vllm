@@ -34,6 +34,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
+    "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@18ba1ff2d49fb9e1aed8ebb471ac7eb65559fe91",
     "packaging",
     "pybind11",
     "PyYAML",
@@ -60,6 +61,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.utils" = ["configs/*.yaml"]
 
 [tool.black]
 line-length = 88

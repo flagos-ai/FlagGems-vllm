@@ -42,10 +42,14 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 )
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
+    chunk_kda_scaled_dot_kkt_fwd,
     chunk_gated_delta_rule_fwd,
     chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
+    fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_kda,
 )
+from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -55,17 +59,22 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_w8a8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.expand_pools_and_append_tail import expand_pools_and_append_tail
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
-
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_allreduce_rms_norm import (
+    fused_allreduce_rms_norm,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -127,6 +136,10 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
 )
+from flaggems_vllm.ops.minimax_m3_sparse_attn import (
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
     moe_align_block_size_no_tle,
@@ -179,9 +192,6 @@ from flaggems_vllm.ops.weightnorm import (
     weight_norm_interface_backward,
 )
 from flaggems_vllm.ops.weight_norm import weight_norm
-
-# isort: on
-
 from flaggems_vllm.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from flaggems_vllm.ops.data_movement import (
     concat_query,
@@ -200,7 +210,6 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
-    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -223,6 +232,39 @@ from flaggems_vllm.ops.vit_attention import (
     vision_flash_attn_varlen,
     vit_flash_attn_wrapper,
 )
+from flaggems_vllm import runtime as _runtime
+from flaggems_vllm.ops.ihc_pair import can_ihc_pair, ihc_post_pre_pair, ihc_pre_pair
+from flaggems_vllm.ops.indexer_prefix_topk import (
+    indexer_prefix_topk,
+    supports_indexer_prefix_topk,
+)
+from flaggems_vllm.ops.int8_indexer_empty_tile import (
+    int8_indexer_paged_logits_empty_tile,
+)
+from flaggems_vllm.ops.pad_mla_q_sink_slot_bound import pad_mla_q_sink_slot_bound
+from flaggems_vllm.ops.rms_scaled_int8_quant import (
+    rms_scaled_int8_quant,
+    supports_rms_scaled_int8_quant,
+)
+from flaggems_vllm.ops.ihc_post_pre import can_ihc_post_pre
+from flaggems_vllm.ops.int8_sparse_indexer import (
+    int8_indexer_cache_store,
+    int8_indexer_paged_logits,
+    int8_indexer_quantize,
+)
+from flaggems_vllm.ops.silu_clamp_int8_quant import (
+    silu_clamp,
+    silu_clamp_int8_quant,
+    supports_silu_clamp_int8_quant,
+)
+from flaggems_vllm.ops.fused_mm_input_norm import fused_mm_input_norm
+from flaggems_vllm.ops.silu_clamp_int8_quant import (
+    int8_quantize_per_token,
+    supports_int8_quantize_per_token,
+)
+
+# isort: on
+
 
 __all__ = [
     "act_quant_triton",
@@ -240,6 +282,7 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "chunk_kda",
+    "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
@@ -265,12 +308,14 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "flash_mla_with_kvcache_w8a8",
     "fp32_router_gemm",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
     "fp8_fp4_paged_mqa_logits",
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
+    "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
@@ -279,10 +324,12 @@ __all__ = [
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gather_rows",
     "gather_state_rows",
+    "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
@@ -310,6 +357,8 @@ __all__ = [
     "mhc_pre",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
     "MixLayout",
     "moe_align_block_size",
     "moe_align_block_size_no_tle",
@@ -394,7 +443,6 @@ __all__ = [
 ]
 
 # Backend-only APIs have no implementation on other vendors.
-from flaggems_vllm import runtime as _runtime
 
 # These archived numerical contracts are qualified on NVIDIA CUDA only.
 if _runtime.device.vendor_name == "nvidia":
@@ -476,3 +524,33 @@ if _runtime.device.vendor_name == "ascend":
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
     __all__.append("flash_attn_varlen_func_w8a8")
+
+
+__all__ += [
+    "int8_indexer_paged_logits_empty_tile",
+    "indexer_prefix_topk",
+    "supports_indexer_prefix_topk",
+    "can_ihc_pair",
+    "ihc_pre_pair",
+    "ihc_post_pre_pair",
+    "pad_mla_q_sink_slot_bound",
+    "rms_scaled_int8_quant",
+    "supports_rms_scaled_int8_quant",
+]
+
+
+__all__ += [
+    "int8_indexer_cache_store",
+    "int8_indexer_paged_logits",
+    "int8_indexer_quantize",
+    "silu_clamp",
+    "silu_clamp_int8_quant",
+    "supports_silu_clamp_int8_quant",
+    "can_ihc_post_pre",
+]
+
+
+__all__ += ["fused_mm_input_norm"]
+
+
+__all__ += ["int8_quantize_per_token", "supports_int8_quantize_per_token"]

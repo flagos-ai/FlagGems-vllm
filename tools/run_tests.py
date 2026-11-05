@@ -1518,7 +1518,7 @@ def main():
     parser.add_argument(
         "--speedup-source",
         choices=["origin", "nv_baseline"],
-        default="origin",
+        default="nv_baseline",
         help=(
             "Which ratio summary.json reports per shape when --base-data is set. "
             "'origin' (default): prefer the on-machine gems-vs-torch speedup and "

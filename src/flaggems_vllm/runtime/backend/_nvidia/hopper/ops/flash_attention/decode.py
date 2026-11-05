@@ -54,6 +54,7 @@ def _decode_step(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASK_K: tl.constexpr,
+    INDEX_INT64: tl.constexpr,
 ):
     cols = tl.arange(0, BLOCK_N)
     dims = tl.arange(0, BLOCK_K)
@@ -71,7 +72,7 @@ def _decode_step(
             BOUNDARY_CHECK=MASK_K,
         )
     else:
-        physical = indices
+        physical = indices.to(tl.int64) if INDEX_INT64 else indices
     k = tl.load(
         k_base + physical[None, :] * k_row_stride + dims[:, None],
         mask=(dims[:, None] < d) & ((indices[None, :] < k_len) | (not MASK_K)),
@@ -124,6 +125,7 @@ def _decode_attention(
     BLOCK_N: tl.constexpr,
     COMPUTE_LSE: tl.constexpr = True,
     SINGLE_TILE: tl.constexpr = False,
+    INDEX_INT64: tl.constexpr = False,
 ):
     rows = tl.arange(0, 16)
     dims = tl.arange(0, BLOCK_K)
@@ -137,8 +139,10 @@ def _decode_attention(
         k_base = k_ptr + head_pid * k_head_stride
         v_base = v_ptr + head_pid * v_head_stride
     else:
-        k_base = k_ptr + k_bos * k_row_stride + head_pid * k_head_stride
-        v_base = v_ptr + k_bos * v_row_stride + head_pid * v_head_stride
+        # Dense K/V larger than 2**31 elements overflow int32 row offsets.
+        k_row = tl.cast(k_bos, tl.int64) if INDEX_INT64 else k_bos
+        k_base = k_ptr + k_row * k_row_stride + head_pid * k_head_stride
+        v_base = v_ptr + k_row * v_row_stride + head_pid * v_head_stride
     rowmax = tl.full([16], float("-inf"), tl.float32)
     rowsum = tl.zeros([16], tl.float32)
     acc = tl.zeros([16, BLOCK_K], tl.float32)
@@ -165,6 +169,7 @@ def _decode_attention(
             BLOCK_K,
             BLOCK_N,
             True,
+            INDEX_INT64,
         )
     else:
         # Process the possible boundary once; full blocks need no KV/page mask.
@@ -192,6 +197,7 @@ def _decode_attention(
                 BLOCK_K,
                 BLOCK_N,
                 True,
+                INDEX_INT64,
             )
         # Dense D256 loads need one stage to stay within shared-memory capacity.
         for block in tl.range(
@@ -219,6 +225,7 @@ def _decode_attention(
                 BLOCK_K,
                 BLOCK_N,
                 False,
+                INDEX_INT64,
             )
     invalid = (rowsum == 0.0) | (rowsum != rowsum)
     acc *= tl.where(invalid, 1.0, 1.0 / rowsum)[:, None]
@@ -420,6 +427,7 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
     TUNING_Q=0,
     DECODE_SHAPE_BUCKET=(),
     DECODE_POLICY_VERSION: tl.constexpr = 0,
+    INDEX_INT64: tl.constexpr = False,
 ):
     tl.static_assert(PACK_GQA and BLOCK_M == 16 and h_hk_ratio <= 16 and MAX_SPLITS > 1)
     bid = tl.program_id(1)
@@ -458,8 +466,9 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
                 k_base = k_ptr + page * k_batch_stride + head_pid * k_head_stride
                 v_base = v_ptr + page * k_batch_stride + head_pid * v_head_stride
             else:
-                k_base = k_ptr + k_bos * k_row_stride + head_pid * k_head_stride
-                v_base = v_ptr + k_bos * v_row_stride + head_pid * v_head_stride
+                k_row = tl.cast(k_bos, tl.int64) if INDEX_INT64 else k_bos
+                k_base = k_ptr + k_row * k_row_stride + head_pid * k_head_stride
+                v_base = v_ptr + k_row * v_row_stride + head_pid * v_head_stride
             kval = tl.load(k_base + dims, mask=(dims < d) & (k_len > 0), other=0.0)
             vval = tl.load(v_base + dims, mask=(dims < d) & (k_len > 0), other=0.0)
             score = tl.sum(q.to(tl.float32) * kval[None, :].to(tl.float32), 1)
@@ -506,6 +515,7 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
                 64,
                 STORE_LSE,
                 True,
+                INDEX_INT64=INDEX_INT64,
             )
         elif k_len <= 128:
             acc, lse = _decode_attention(
@@ -538,6 +548,7 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
                 128,
                 STORE_LSE,
                 True,
+                INDEX_INT64=INDEX_INT64,
             )
         elif k_len < 1024:
             acc, lse = _decode_attention(
@@ -569,6 +580,7 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
                 BLOCK_K,
                 128,
                 STORE_LSE,
+                INDEX_INT64=INDEX_INT64,
             )
         else:
             n_min, n_max = _split_n_block_range(
@@ -602,6 +614,7 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
                 is_paged,
                 BLOCK_K,
                 BLOCK_N,
+                INDEX_INT64=INDEX_INT64,
             )
         if split_count == 1:
             output = (

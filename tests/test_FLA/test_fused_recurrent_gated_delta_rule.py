@@ -1,374 +1,267 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-import random
-from typing import Dict, List
+import os
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-import flaggems_vllm
+import flaggems_vllm as gems
 
-try:
-    from vllm.model_executor.layers.fla.ops import (
-        fused_recurrent_gated_delta_rule as base_fused_recurrent_gated_delta_rule,
-    )
-
-    VLLM_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency guard
-    base_fused_recurrent_gated_delta_rule = None
-    VLLM_AVAILABLE = False
-
-random.seed(42)
-torch.manual_seed(42)
-
-
-def is_cuda_available() -> bool:
-    return torch.cuda.is_available() and flaggems_vllm.device == "cuda"
+CASES = [
+    ("decode", [1] * 4, 4, 8, 128, 128, "index", True, False),
+    ("rectangular", [1] * 3, 2, 4, 17, 23, "index", True, True),
+    ("uniform", [4, 4], 2, 4, 32, 16, "plain", True, True),
+    ("ragged", [0, 2, 1, 5], 2, 6, 32, 19, "table", True, True),
+    ("spec", [1, 3, 2], 2, 4, 64, 32, "spec", True, True),
+    ("outofplace", [2, 0, 5], 2, 4, 17, 23, "table", False, True),
+    ("zero_initial", [3, 3], 1, 2, 32, 16, "none", False, False),
+    ("vector_beta", [4, 2], 2, 4, 32, 23, "table", True, True),
+    ("padding", [1, 1, 1, 1], 2, 4, 17, 23, "index", True, True),
+    ("low_state", [6, 3], 2, 4, 32, 16, "table", True, True),
+    ("long", [65], 1, 2, 32, 16, "table", False, True),
+    ("empty", [0], 1, 2, 17, 23, "index", True, False),
+]
 
 
-CUDA_AVAILABLE = is_cuda_available()
+def build(case, dtype, device, normalize=True):
+    name, lengths, H, HV, K, V, mode, inplace, strided = case
+    torch.manual_seed(2701)
+    N = len(lengths)
+    plain = mode in ("plain", "none")
+    B, T = (N, lengths[0]) if plain else (1, sum(lengths))
 
-
-def rearrange_mixed_qkv(
-    mixed_qkv,
-    key_dim,
-    value_dim,
-    head_k_dim,
-    head_v_dim,
-    tp_size=1,
-    contiguous=True,
-):
-    query, key, value = torch.split(
-        mixed_qkv,
-        [
-            key_dim // tp_size,
-            key_dim // tp_size,
-            value_dim // tp_size,
-        ],
-        dim=-1,
-    )
-    query = query.view(1, query.shape[0], -1, head_k_dim)
-    key = key.view(1, key.shape[0], -1, head_k_dim)
-    value = value.view(1, value.shape[0], -1, head_v_dim)
-    if contiguous:
-        return query.contiguous(), key.contiguous(), value.contiguous()
-    else:
-        return query, key, value
-
-
-class FusedRecurrentGatedDeltaRuleTestKit:
-    base_dtype = torch.bfloat16
-
-    @staticmethod
-    def _cases() -> List[Dict]:
-        cases = [
-            {  # cu_seqlens situation
-                "H": 16,  # global heads(aka key_dim); local = H / tp_size = 4
-                "HV": 32,  # global value heads(aka value_dim); local = HV / tp_size = 8
-                "K": 128,
-                "V": 128,
-                "tp_size": 4,
-                "beta_has_dim_v": False,
-                "inplace_final_state": True,
-                "use_qk_l2norm": True,
-                "scale": 0.08838834764831845,
-                "ssm_state_len": 4589,
-                "ssm_state_indices_all_zero": True,
-                "cu_seqlens_explicit": True,
-            },
-        ]
-        return cases
-
-    @classmethod
-    def get_test_params(cls) -> List[Dict]:
-        return cls._cases()
-
-    @classmethod
-    def build_inputs(cls, cfg: Dict, T, qkv_contiguous: bool) -> Dict:
-        device = flaggems_vllm.device
-        dtype = cls.base_dtype
-        tp_size = cfg.get("tp_size", 1)
-
-        B = 1  # for cu_seqlens inputs, batch size is 1 and cu_seqlens is required
-        cu_seqlens_len = T + 1
-        key_dim = cfg["H"] * cfg["K"]  # 16 * 128 = 2048
-        value_dim = cfg["HV"] * cfg["V"]  # 32 * 128 = 4096
-
-        assert key_dim % tp_size == 0, "key_dim must be divisible by tp_size"
-        assert value_dim % tp_size == 0, "value_dim must be divisible by tp_size"
-        assert (key_dim // tp_size) % cfg[
-            "K"
-        ] == 0, "(key_dim/tp_size) must be multiple of head_k_dim"
-        assert (value_dim // tp_size) % cfg[
-            "V"
-        ] == 0, "(value_dim/tp_size) must be multiple of head_v_dim"
-
-        # Build mixed_qkv with explicit (T, mixed_qkv_dim) shape. For the non-contiguous
-        # branch we slice a strided view from a 3D buffer to simulate a real packing.
-        mixed_qkv_dim = (2 * key_dim + value_dim) // tp_size
-        total_tokens = B * T  # currently B=1, so this equals T
-        mixed_qkv = torch.randn(
-            (total_tokens, mixed_qkv_dim), device=device, dtype=dtype
-        )
-
-        query, key, value = rearrange_mixed_qkv(
-            mixed_qkv,
-            key_dim=key_dim,
-            value_dim=value_dim,
-            head_k_dim=cfg["K"],
-            head_v_dim=cfg["V"],
-            tp_size=tp_size,
-            contiguous=qkv_contiguous,
-        )
-
-        HV_local = value.shape[2]
-
-        g = F.logsigmoid(torch.randn((B, T, HV_local), device=device, dtype=dtype))
-        if cfg["beta_has_dim_v"]:
-            beta = torch.rand(
-                B, T, HV_local, cfg["V"], device=device, dtype=dtype
-            ).sigmoid()
+    def rand(shape, dt=dtype):
+        if strided:
+            x = torch.randn((*shape[:-1], shape[-1] * 2), dtype=dt)[..., ::2]
         else:
-            beta = torch.rand(B, T, HV_local, device=device, dtype=dtype).sigmoid()
+            x = torch.randn(shape, dtype=dt)
+        # Preserve the tested strides after device transfer.
+        out = torch.empty_strided(x.shape, x.stride(), dtype=dt, device=device)
+        out.copy_(x)
+        return out
 
-        cu_seqlens = torch.arange(cu_seqlens_len, device=device, dtype=torch.long)
-        initial_state = torch.zeros(
-            (cfg["ssm_state_len"], HV_local, cfg["K"], cfg["V"]),
+    q, k, v = rand((B, T, H, K)), rand((B, T, H, K)), rand((B, T, HV, V))
+    k.mul_(0.05)
+    g = rand((B, T, HV), torch.float32)
+    g.copy_(-g.abs() * 0.1)
+    beta = rand((B, T, HV, V) if name == "vector_beta" else (B, T, HV))
+    beta.copy_(beta.sigmoid())
+    width = max(max(lengths), 4)
+    pool = N * width + 3
+    state_dtype = dtype if name == "low_state" else torch.float32
+    state = rand((pool, HV, V, K), state_dtype)
+    state.mul_(0.05)
+    indices = None
+    if mode in ("index", "table", "spec"):
+        if mode == "index":
+            indices = torch.arange(1, N + 1, dtype=torch.int32)
+            if name == "padding":
+                indices[:2] = torch.tensor([0, -1], dtype=torch.int32)
+        else:
+            indices = torch.arange(1, N * width + 1, dtype=torch.int64).view(N, width)
+        if strided:
+            buf = torch.empty(
+                (*indices.shape[:-1], indices.shape[-1] * 2), dtype=indices.dtype
+            )
+            buf[..., ::2] = indices
+            indices = buf[..., ::2]
+        d = torch.empty_strided(
+            indices.shape, indices.stride(), dtype=indices.dtype, device=device
+        )
+        d.copy_(indices)
+        indices = d
+    cu = (
+        None
+        if plain
+        else torch.tensor(
+            [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
+            dtype=torch.int32,
             device=device,
-            dtype=dtype,
         )
-        if cfg.get("ssm_state_indices_all_zero", False):
-            ssm_state_indices = torch.zeros(T, device=device, dtype=torch.long)
-        else:
-            ssm_state_indices = torch.arange(T, device=device, dtype=torch.long)
-
-        scale = cfg["scale"] if cfg["scale"] is not None else cfg["K"] ** -0.5
-
-        return {
-            "q": query,
-            "k": key,
-            "v": value,
-            "g": g,
-            "beta": beta,
-            "scale": float(scale),
-            "initial_state": initial_state,
-            "cu_seqlens": cu_seqlens,
-            "inplace_final_state": cfg["inplace_final_state"],
-            "use_qk_l2norm_in_kernel": cfg["use_qk_l2norm"],
-            "ssm_state_indices": ssm_state_indices,
-        }
-
-
-@pytest.mark.skipif(
-    not (VLLM_AVAILABLE and CUDA_AVAILABLE),
-    reason="requires vLLM installed and CUDA device",
-)
-@pytest.mark.skip(
-    reason="vLLM fused recurrent reference is numerically unstable on current stack"
-)
-@pytest.mark.fused_recurrent_gated_delta_rule
-@pytest.mark.parametrize("cfg", FusedRecurrentGatedDeltaRuleTestKit.get_test_params())
-@pytest.mark.parametrize("T", [1, 2, 4, 128, 512])
-@pytest.mark.parametrize("qkv_contiguous", [True, False])
-def test_fused_recurrent_gated_delta_rule_matches_vllm(cfg, T, qkv_contiguous):
-    kit = FusedRecurrentGatedDeltaRuleTestKit
-    inputs = kit.build_inputs(cfg, T, qkv_contiguous)
-
-    flag_initial = inputs["initial_state"].clone()
-    base_initial = inputs["initial_state"].clone()
-
-    flag_out, flag_final = flaggems_vllm.fused_recurrent_gated_delta_rule_fwd(
-        q=inputs["q"],
-        k=inputs["k"],
-        v=inputs["v"],
-        g=inputs["g"],
-        beta=inputs["beta"],
-        scale=inputs["scale"],
-        initial_state=flag_initial,
-        inplace_final_state=inputs["inplace_final_state"],
-        cu_seqlens=inputs["cu_seqlens"],
-        ssm_state_indices=inputs["ssm_state_indices"],
-        num_accepted_tokens=None,
-        use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+    )
+    accepted = (
+        torch.tensor([3] * N, dtype=torch.int32, device=device)
+        if mode == "spec"
+        else None
+    )
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=K**-0.5,
+        initial_state=None if mode == "none" else state,
+        inplace_final_state=inplace,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        num_accepted_tokens=accepted,
+        use_qk_l2norm_in_kernel=normalize,
     )
 
-    base_out, base_final = base_fused_recurrent_gated_delta_rule(
-        q=inputs["q"],
-        k=inputs["k"],
-        v=inputs["v"],
-        g=inputs["g"],
-        beta=inputs["beta"],
-        scale=inputs["scale"],
-        initial_state=base_initial,
-        inplace_final_state=inputs["inplace_final_state"],
-        cu_seqlens=inputs["cu_seqlens"],
-        ssm_state_indices=inputs["ssm_state_indices"],
-        num_accepted_tokens=None,
-        use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
-    )
 
-    torch.testing.assert_close(flag_out, base_out, rtol=1e-1, atol=2e-1)
-    torch.testing.assert_close(flag_final, base_final, rtol=1.5, atol=1.0)
-
-
-def _reference_fused_recurrent_gated_delta_rule_fwd(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    initial_state,
-    cu_seqlens,
-    ssm_state_indices,
-    use_qk_l2norm_in_kernel=False,
-    inplace_final_state=True,
-):
-    """Pure PyTorch reference implementation for accuracy testing."""
+def reference(data):
+    q, k, v = (data[x].detach().cpu().double() for x in ("q", "k", "v"))
+    g = data["g"].cpu().double() if data["g"] is not None else None
+    beta = data["beta"].cpu().double() if data["beta"] is not None else None
+    state = data["initial_state"]
+    state = state.cpu().clone() if state is not None else None
     B, T, H, K = q.shape
-    HV = v.shape[2]
-    V = v.shape[3]
-    N = len(cu_seqlens) - 1
+    HV, V = v.shape[-2:]
+    indices = data["ssm_state_indices"]
+    indices = indices.cpu() if indices is not None else None
+    cu = data["cu_seqlens"]
+    bounds = (
+        list(zip(cu.cpu().tolist()[:-1], cu.cpu().tolist()[1:]))
+        if cu is not None
+        else [(0, T)] * B
+    )
+    accepted = data["num_accepted_tokens"]
+    output = torch.zeros(v.shape, dtype=torch.float64)
+    final = (
+        state.clone()
+        if data["inplace_final_state"]
+        else torch.zeros(
+            (B * T, HV, V, K), dtype=state.dtype if state is not None else torch.float32
+        )
+    )
+    for n, (start, end) in enumerate(bounds):
+        batch = 0 if cu is not None else n
+        slot = n
+        if indices is not None:
+            col = int(accepted[n].item()) - 1 if accepted is not None else 0
+            slot = int(indices[n, col] if indices.ndim == 2 else indices[n])
+            if slot <= 0 or slot >= len(state):
+                continue
+        acc = (
+            state[slot].double().clone()
+            if state is not None
+            else torch.zeros((HV, V, K), dtype=torch.float64)
+        )
+        for t in range(start, end):
+            qv, kv = q[batch, t], k[batch, t]
+            if data["use_qk_l2norm_in_kernel"]:
+                qv = qv / (qv.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+                kv = kv / (kv.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+            qv = qv.repeat_interleave(HV // H, 0) * data["scale"]
+            kv = kv.repeat_interleave(HV // H, 0)
+            if g is not None:
+                acc = acc * g[batch, t].exp()[:, None, None]
+            residual = v[batch, t] - (acc * kv[:, None, :]).sum(-1)
+            if beta is not None:
+                bv = beta[batch, t]
+                residual = residual * (bv[:, None] if bv.ndim == 1 else bv)
+            acc = acc + residual[:, :, None] * kv[:, None, :]
+            output[batch, t] = (acc * qv[:, None, :]).sum(-1)
+            if data["inplace_final_state"]:
+                if indices is not None and indices.ndim == 2:
+                    dest = int(indices[n, t - start])
+                    if 0 < dest < len(final):
+                        final[dest] = acc
+                elif t == end - 1:
+                    final[slot] = acc
+            else:
+                final[batch * T + t] = acc
+    return output.to(data["v"].dtype), final
 
-    o = torch.zeros_like(v)
-    if inplace_final_state:
-        final_state = initial_state.clone()
-    else:
-        final_state = torch.zeros(T, HV, K, V, dtype=q.dtype, device=q.device)
 
-    for n in range(N):
-        bos = cu_seqlens[n].item()
-        eos = cu_seqlens[n + 1].item()
-        seq_len = eos - bos
-
-        for i_hv in range(HV):
-            i_h = i_hv // (HV // H)
-            h = initial_state[ssm_state_indices[bos].item(), i_hv].float().clone()
-
-            for t in range(seq_len):
-                pos = bos + t
-                bq = q[0, pos, i_h].float()
-                bk = k[0, pos, i_h].float()
-                bv = v[0, pos, i_hv].float()
-
-                if use_qk_l2norm_in_kernel:
-                    bq = bq / (bq.norm() + 1e-6)
-                    bk = bk / (bk.norm() + 1e-6)
-                bq = bq * scale
-
-                bg = g[0, pos, i_hv].float()
-                h = h * torch.exp(bg)
-
-                bv = bv - (h * bk[:, None]).sum(0)
-                bb = beta[0, pos, i_hv].float()
-                bv = bv * bb
-
-                h = h + bk[:, None] * bv[None, :]
-                bo = (h * bq[:, None]).sum(0)
-                o[0, pos, i_hv] = bo.to(o.dtype)
-
-                state_idx = ssm_state_indices[pos].item()
-                if inplace_final_state:
-                    final_state[state_idx, i_hv] = h.to(final_state.dtype)
-                else:
-                    final_state[pos, i_hv] = h.to(final_state.dtype)
-
-    return o, final_state
+def assert_result(result, expected, dtype):
+    tol = {
+        torch.float16: (3e-3, 3e-3),
+        torch.bfloat16: (2e-2, 2e-2),
+        torch.float32: (3e-5, 3e-5),
+    }
+    for got, ref in zip(result, expected):
+        rtol, atol = tol[got.dtype]
+        torch.testing.assert_close(got.detach().cpu(), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
-@pytest.mark.parametrize("T", [1, 2, 4, 8])
-@pytest.mark.parametrize("qkv_contiguous", [True, False])
-@pytest.mark.parametrize("use_qk_l2norm", [True, False])
-def test_fused_recurrent_gated_delta_rule_fwd_accuracy(
-    T, qkv_contiguous, use_qk_l2norm
-):
-    """Self-contained accuracy test using a pure PyTorch reference."""
-    device = flaggems_vllm.device
-    dtype = torch.bfloat16
-
-    B = 1
-    H, HV, K, V = 4, 8, 64, 64
-    tp_size = 1
-    key_dim = H * K
-    value_dim = HV * V
-
-    mixed_qkv_dim = (2 * key_dim + value_dim) // tp_size
-    total_tokens = B * T
-    mixed_qkv = torch.randn((total_tokens, mixed_qkv_dim), device=device, dtype=dtype)
-
-    query, key, value = rearrange_mixed_qkv(
-        mixed_qkv,
-        key_dim=key_dim,
-        value_dim=value_dim,
-        head_k_dim=K,
-        head_v_dim=V,
-        tp_size=tp_size,
-        contiguous=qkv_contiguous,
+@pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("normalize", [True, False])
+@pytest.mark.parametrize("entry", ["generic", "top"])
+def test_recurrent_contract(case, dtype, normalize, entry):
+    data = build(case, dtype, gems.device, normalize)
+    expected = reference(data)
+    original = (
+        data["initial_state"].clone() if data["initial_state"] is not None else None
     )
-
-    HV_local = value.shape[2]
-    g = F.logsigmoid(torch.randn((B, T, HV_local), device=device, dtype=dtype))
-    beta = torch.rand(B, T, HV_local, device=device, dtype=dtype).sigmoid()
-    cu_seqlens = torch.arange(T + 1, device=device, dtype=torch.long)
-    ssm_state_len = 128
-    initial_state = (
-        torch.randn((ssm_state_len, HV_local, K, V), device=device, dtype=dtype) * 0.01
+    fn = getattr(
+        gems.ops if entry == "generic" else gems, "fused_recurrent_gated_delta_rule_fwd"
     )
-    ssm_state_indices = torch.zeros(T, device=device, dtype=torch.long)
-    scale = K**-0.5
+    result = fn(**data)
+    assert_result(result, expected, dtype)
+    if data["inplace_final_state"]:
+        assert result[1] is data["initial_state"]
+        # Unwritten slots are part of the alias contract, not a tolerance check.
+        original_cpu = original.cpu()
+        untouched = (expected[1] == original_cpu).flatten(1).all(1)
+        torch.testing.assert_close(
+            result[1].cpu()[untouched], original_cpu[untouched], rtol=0, atol=0
+        )
+    elif original is not None:
+        torch.testing.assert_close(data["initial_state"], original, rtol=0, atol=0)
 
-    ref_out, ref_final = _reference_fused_recurrent_gated_delta_rule_fwd(
-        q=query.clone(),
-        k=key.clone(),
-        v=value.clone(),
-        g=g.clone(),
-        beta=beta.clone(),
-        scale=scale,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        use_qk_l2norm_in_kernel=use_qk_l2norm,
-        inplace_final_state=True,
+
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("tiny", [False, True])
+def test_recurrent_optional_gate_and_beta(dtype, tiny):
+    data = build(CASES[1], dtype, gems.device)
+    data.update(g=None, beta=None)
+    if tiny:
+        data["q"].mul_(1e-5)
+        data["k"].mul_(1e-5)
+    expected = reference(data)
+    assert_result(gems.fused_recurrent_gated_delta_rule_fwd(**data), expected, dtype)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize(
+    "kind", ["layout", "scale", "indices", "accepted", "state", "dtype"]
+)
+def test_recurrent_invalid_metadata(kind):
+    data = build(CASES[1], torch.float32, gems.device)
+    if kind == "layout":
+        data["initial_state"] = data["initial_state"].transpose(-1, -2)
+    if kind == "scale":
+        data["scale"] = 0
+    if kind == "indices":
+        data["ssm_state_indices"] = data["ssm_state_indices"][:1]
+    if kind == "accepted":
+        data["num_accepted_tokens"] = torch.ones(
+            3, dtype=torch.int32, device=gems.device
+        )
+    if kind == "state":
+        data["initial_state"] = None
+    if kind == "dtype":
+        data["q"] = data["q"].to(torch.int32)
+    with pytest.raises((ValueError, NotImplementedError)):
+        gems.fused_recurrent_gated_delta_rule_fwd(**data)
+
+
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.parametrize("entry", ["generic", "top"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", [(9, 4, 12, 64, 32), (1, 16, 64, 128, 128)])
+def test_recurrent_state_updated_once(entry, dtype, shape):
+    # More logical tiles than AIV cores; task zero must be valid to expose replay.
+    n, h, hv, k, v = shape
+    case = ("multistep", [1] * n, h, hv, k, v, "index", True, True)
+    data = build(case, dtype, gems.device)
+    ref_data = {
+        key: value.cpu().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in data.items()
+    }
+    parallel = os.environ.get("TRITON_ALL_BLOCKS_PARALLEL")
+    fn = getattr(
+        gems.ops if entry == "generic" else gems, "fused_recurrent_gated_delta_rule_fwd"
     )
-
-    flag_out, flag_final = flaggems_vllm.fused_recurrent_gated_delta_rule_fwd(
-        q=query,
-        k=key,
-        v=value,
-        g=g,
-        beta=beta,
-        scale=scale,
-        initial_state=initial_state.clone(),
-        inplace_final_state=True,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
-        use_qk_l2norm_in_kernel=use_qk_l2norm,
-    )
-
-    torch.testing.assert_close(flag_out, ref_out, rtol=1e-1, atol=2e-1)
-    # Final state accumulates over T timesteps; use per-element relative check
-    # with generous tolerance since bfloat16 errors compound across recurrence.
-    mask = ref_final.abs() > 1e-3
-    if mask.any():
-        rel_err = (
-            flag_final[mask].float() - ref_final[mask].float()
-        ).abs() / ref_final[mask].float().abs()
-        assert (
-            rel_err.median() < 0.1
-        ), f"Median relative error on final_state too large: {rel_err.median():.4f}"
+    for _ in range(4):
+        expected = reference(ref_data)
+        ref_data["initial_state"] = expected[1]
+        result = fn(**data)
+        assert result[1] is data["initial_state"]
+        assert_result(result, expected, dtype)
+        assert os.environ.get("TRITON_ALL_BLOCKS_PARALLEL") == parallel
