@@ -596,3 +596,17 @@ gdn_w8a16_int8:
     - [35, 8192, 32, 128]
     - [51, 8192, 32, 128]
   shape_desc: "decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N"
+
+fused_deepseek_v4_kv_rope_insert:
+  shapes:
+    - [1, 1, 32]
+    - [2, 2, 32]
+    - [4, 4, 32]
+    - [8, 8, 32]
+    - [64, 64, 32]
+    - [100, 100, 32]
+    - [1027, 1024, 32]
+    - [2048, 2048, 32]
+    - [8192, 8192, 32]
+    - [16384, 16384, 32]
+  shape_desc: "num_tokens, num_tokens_insert, cache_block_size"
