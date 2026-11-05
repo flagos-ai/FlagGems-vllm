@@ -87,3 +87,46 @@ Comprehensive documentation is available in the [docs](docs/) directory:
 ## License
 
 This project is licensed under the [Apache (version 2.0) License](./LICENSE).
+
+### Explicit Hy4 inference APIs
+
+Use one combined `flaggems_vllm` revision for the Hy4 numerical API set. It
+includes the RMSNorm/INT8 foundation; install the matching fixed FlagGems Core
+dependency before using these APIs. This revision declares the public fixed
+Core commit `36d8e98ba627d52963f1fd0d56567eabd3b79c53` in its package metadata;
+ordinary installation resolves it automatically. If installing with `--no-deps`,
+install the same Core revision explicitly first.
+
+| API | Contract |
+|---|---|
+| `rms_scaled_int8_quant` | BF16 RMSNorm, INT8 data and FP32 row scales; retain both BF16 boundaries. |
+| `int8_indexer_quantize`, `int8_indexer_cache_store`, `int8_indexer_paged_logits` | Identity exports of Core APIs; callers own mapping and cache lifetime. |
+| `int8_indexer_paged_logits_empty_tile` | Packed D128 paged INT8 scores; invalid tiles become negative infinity and all output lanes are written. Width is caller-proven capacity. |
+| `indexer_prefix_topk` | Stable descending FP32 TopK with GPU prefix lengths, int32 indices and -1 for nonfinite selections. Width up to 204800 uses 32-bit packing above 65535. |
+| `can_ihc_pair`, `ihc_pre_pair`, `ihc_post_pre_pair` | SM90 paired-token weight reuse at rows 208/256/1024, hidden 6144 and HC4; preserve the BF16 residual boundary. |
+| `can_ihc_post_pre`, `ihc_post_pre` | Metadata predicate and existing post-to-pre iHC contract. |
+| `pad_mla_q_sink_slot_bound` | Raw-bit query/sink padding and final nonnegative TopK slot plus one; interior holes retain their positions. |
+| `int8_quantize_per_token` | The selected per-token INT8 scale/division contract for MoE input and output quantization, isolated from other modes. |
+| `silu_clamp`, `silu_clamp_int8_quant` | Clamped SiLU, optionally with INT8 data/scales, preserving the BF16/FP16 activation workspace. |
+| `fused_mm_input_norm` | FP32 per-channel affine normalization of contiguous image patches into a caller-owned output. |
+| `mul_scaled_int8_quant`, `int8_scaled_mm_decode`, `concat_pad_mla_q_and_sink`, `mrope_strided_cache` | Existing gate quantization, projection, query transport and rotary contracts. |
+
+The standard backend registry selects NVIDIA implementations. Explicit fused
+APIs stay outside ATen registration; unsupported metadata rejects before launch,
+and execution failures propagate without retries. `fused_moe` retains the
+existing `FLAG_GEMS_W8A8_QUANT_FUSION` setting: `quant_silu` selects the clamped
+SiLU path and its two per-token quantizers; other modes preserve current-main quantization and its wide-row/NaN
+handling. Request/token/slot mapping and staging remain framework responsibilities.
+
+The existing `FLAG_GEMS_GROUPED_TOPK_SCORE_FUSION=1` setting fuses score
+processing into group selection. Setting
+`FLAG_GEMS_GROUPED_TOPK_SINGLE_GROUP_FUSION=1` as well enables the selected
+single-group route. Both default off and are resolved before graph warmup;
+current-main small-expert paths keep their precedence.
+
+Fixed radix, paired-iHC, paged-dot and transport launch schedules preserve the
+selected numerical order and are exempt from autotuning during this migration.
+Retuning requires separate correctness and performance qualification. Callers
+own persistent buffers, graph lifetimes, independent outputs and stream ordering.
+Matching functional and `benchmark/test_<api>_perf.py` tests require the supported
+CUDA runtime. CPU checks do not qualify integrated model quality or throughput.

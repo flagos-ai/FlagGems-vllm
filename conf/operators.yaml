@@ -252,6 +252,17 @@ ops:
       - Attention
     stages:
       - beta: '3.0'
+  - id: concat_pad_mla_q_and_sink
+    description: Concatenate BF16 MLA query components and pad heads and FP32 sinks.
+    for:
+      - concat_pad_mla_q_and_sink
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: cp_gather_indexer_k_quant_cache
     description: This is a fused operator that gathers FP8 K cache values and scales.
     for:
@@ -610,6 +621,17 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: fused_mm_input_norm
+    description: FP32 channel affine on contiguous patches with caller-owned output.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: fused_moe
     description: The generic interface for fused MoE.
     for:
@@ -794,6 +816,39 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: ihc_post_pre
+    description: Fuse BF16 iHC residual scatter with the following pre reduction.
+    for:
+      - ihc_post_pre
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
+  - id: ihc_post_pre_pair
+    description: Paired-token BF16 residual scatter and iHC pre reduction.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: ihc_pre_pair
+    description: Paired-token iHC pre reduction with the selected FP32 tree.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: indexer_epilogue
     description: |
       Fused post-topk epilogue for the GLM lightning indexer: expands the
@@ -838,6 +893,17 @@ ops:
       - Quantization
     stages:
       - beta: '5.3'
+  - id: indexer_prefix_topk
+    description: Stable length-aware TopK with nonfinite filtering and 32-bit long indices.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: inplace_fused_experts
     description: This operator writes output directly to `hidden_states`.
     for:
@@ -864,6 +930,72 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
+  - id: int8_indexer_cache_store
+    description: Identity export of the shared Core packed-key cache writer.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: int8_indexer_paged_logits
+    description: Identity export of the shared Core paged INT8 score API.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: int8_indexer_paged_logits_empty_tile
+    description: Paged INT8 scores with complete writes for invalid tiles.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: int8_indexer_quantize
+    description: Identity export of the shared Core INT8 query quantizer.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: int8_quantize_per_token
+    description: Per-token INT8 preserving the selected live quantization division contract.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: int8_scaled_mm_decode
+    description: SM90 INT8 output projection with exact per-token/channel scaling.
+    for:
+      - int8_scaled_mm_decode
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
   - id: kda_conv_gather
     description: |
       Stages the rows used by a batch out of the block-strided Kimi Delta
@@ -1096,6 +1228,17 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: mrope_strided_cache
+    description: Apply adjacent-pair M-RoPE directly to gapped BF16 rotary views.
+    for:
+      - mrope_strided_cache
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: mul
     description: Multiplies `input` by `other`.
     for:
@@ -1118,6 +1261,17 @@ ops:
       - Math
     stages:
       - stable: '2.2'
+  - id: mul_scaled_int8_quant
+    description: Fuse BF16 product rounding with symmetric per-token INT8 quantization.
+    for:
+      - mul_scaled_int8_quant
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: mv
     description: Performs a matrix-vector product of the matrix `input` and the vector
       `vec`.
@@ -1167,6 +1321,17 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: pad_mla_q_sink_slot_bound
+    description: Bit-preserving MLA padding and final valid slot endpoint.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,
@@ -1249,6 +1414,17 @@ ops:
     stages:
       - stable: '3.0'
     cpp: '4.0'
+  - id: rms_scaled_int8_quant
+    description: BF16 RMSNorm and dynamic INT8 dual output.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: rwkv_ka_fusion
     description: |
       Merges, aligns, and enhances features from different data sources or spatial directions
@@ -1321,6 +1497,28 @@ ops:
       - Activation
     stages:
       - stable: '5.3'
+  - id: silu_clamp
+    description: Clamped SiLU preserving the BF16/FP16 materialization boundary.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
+  - id: silu_clamp_int8_quant
+    description: Clamped SiLU preserving the BF16/FP16 materialization boundary.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: skip_layer_norm
     description: |
       An optimized operation used in Transformer models to improve performance

@@ -66,7 +66,6 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.expand_pools_and_append_tail import expand_pools_and_append_tail
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
-
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
@@ -193,9 +192,6 @@ from flaggems_vllm.ops.weightnorm import (
     weight_norm_interface_backward,
 )
 from flaggems_vllm.ops.weight_norm import weight_norm
-
-# isort: on
-
 from flaggems_vllm.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from flaggems_vllm.ops.data_movement import (
     concat_query,
@@ -236,6 +232,39 @@ from flaggems_vllm.ops.vit_attention import (
     vision_flash_attn_varlen,
     vit_flash_attn_wrapper,
 )
+from flaggems_vllm import runtime as _runtime
+from flaggems_vllm.ops.ihc_pair import can_ihc_pair, ihc_post_pre_pair, ihc_pre_pair
+from flaggems_vllm.ops.indexer_prefix_topk import (
+    indexer_prefix_topk,
+    supports_indexer_prefix_topk,
+)
+from flaggems_vllm.ops.int8_indexer_empty_tile import (
+    int8_indexer_paged_logits_empty_tile,
+)
+from flaggems_vllm.ops.pad_mla_q_sink_slot_bound import pad_mla_q_sink_slot_bound
+from flaggems_vllm.ops.rms_scaled_int8_quant import (
+    rms_scaled_int8_quant,
+    supports_rms_scaled_int8_quant,
+)
+from flaggems_vllm.ops.ihc_post_pre import can_ihc_post_pre
+from flaggems_vllm.ops.int8_sparse_indexer import (
+    int8_indexer_cache_store,
+    int8_indexer_paged_logits,
+    int8_indexer_quantize,
+)
+from flaggems_vllm.ops.silu_clamp_int8_quant import (
+    silu_clamp,
+    silu_clamp_int8_quant,
+    supports_silu_clamp_int8_quant,
+)
+from flaggems_vllm.ops.fused_mm_input_norm import fused_mm_input_norm
+from flaggems_vllm.ops.silu_clamp_int8_quant import (
+    int8_quantize_per_token,
+    supports_int8_quantize_per_token,
+)
+
+# isort: on
+
 
 __all__ = [
     "act_quant_triton",
@@ -259,6 +288,7 @@ __all__ = [
     "compute_global_topk_indices_and_lens",
     "concat_and_cache_mla",
     "concat_mla_q",
+    "concat_pad_mla_q_and_sink",
     "concat_query",
     "contiguous_copy",
     "copy_to",
@@ -308,12 +338,14 @@ __all__ = [
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "ihc_post",
+    "ihc_post_pre",
     "ihc_post_ref",
     "ihc_pre",
     "ihc_pre_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
+    "int8_scaled_mm_decode",
     "invoke_fused_moe_triton_kernel",
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
@@ -333,8 +365,10 @@ __all__ = [
     "moe_align_block_size_triton",
     "moe_sum",
     "mrope",
+    "mrope_strided_cache",
     "mul",
     "mul_",
+    "mul_scaled_int8_quant",
     "mv",
     "outer",
     "outplace_fused_experts",
@@ -409,7 +443,33 @@ __all__ = [
 ]
 
 # Backend-only APIs have no implementation on other vendors.
-from flaggems_vllm import runtime as _runtime
+
+# These archived numerical contracts are qualified on NVIDIA CUDA only.
+if _runtime.device.vendor_name == "nvidia":
+    from flaggems_vllm.ops.concat_pad_mla_q_and_sink import concat_pad_mla_q_and_sink
+    from flaggems_vllm.ops.ihc_post_pre import ihc_post_pre
+    from flaggems_vllm.ops.int8_scaled_mm_decode import int8_scaled_mm_decode
+    from flaggems_vllm.ops.mrope_strided_cache import mrope_strided_cache
+    from flaggems_vllm.ops.mul_scaled_int8_quant import mul_scaled_int8_quant
+else:
+
+    def mrope_strided_cache(*args, **kwargs):
+        raise NotImplementedError(
+            "Hy4-preview mrope_strided_cache requires NVIDIA CUDA"
+        )
+
+    def concat_pad_mla_q_and_sink(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview concat/pad requires NVIDIA CUDA")
+
+    def int8_scaled_mm_decode(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview INT8 decode requires NVIDIA SM90 CUDA")
+
+    def ihc_post_pre(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview IHC post/pre requires NVIDIA CUDA")
+
+    def mul_scaled_int8_quant(*args, **kwargs):
+        raise NotImplementedError("Hy4-preview mul/INT8 requires NVIDIA CUDA")
+
 
 if _runtime.device.vendor_name == "hygon":
     from flaggems_vllm.runtime.backend._hygon.fused import attention as hygon_attention
@@ -464,3 +524,33 @@ if _runtime.device.vendor_name == "ascend":
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
     __all__.append("flash_attn_varlen_func_w8a8")
+
+
+__all__ += [
+    "int8_indexer_paged_logits_empty_tile",
+    "indexer_prefix_topk",
+    "supports_indexer_prefix_topk",
+    "can_ihc_pair",
+    "ihc_pre_pair",
+    "ihc_post_pre_pair",
+    "pad_mla_q_sink_slot_bound",
+    "rms_scaled_int8_quant",
+    "supports_rms_scaled_int8_quant",
+]
+
+
+__all__ += [
+    "int8_indexer_cache_store",
+    "int8_indexer_paged_logits",
+    "int8_indexer_quantize",
+    "silu_clamp",
+    "silu_clamp_int8_quant",
+    "supports_silu_clamp_int8_quant",
+    "can_ihc_post_pre",
+]
+
+
+__all__ += ["fused_mm_input_norm"]
+
+
+__all__ += ["int8_quantize_per_token", "supports_int8_quantize_per_token"]

@@ -51,6 +51,30 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
     if _target in globals():
         globals()[_alias] = globals()[_target]
 
+_DIRECT_ONLY_OPS = frozenset(
+    {
+        "mrope_strided_cache",
+        "concat_pad_mla_q_and_sink",
+        "ihc_post_pre",
+        "int8_scaled_mm_decode",
+        "mul_scaled_int8_quant",
+    }
+)
+
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | frozenset(
+    [
+        "int8_indexer_paged_logits_empty_tile",
+        "indexer_prefix_topk",
+        "supports_indexer_prefix_topk",
+        "can_ihc_pair",
+        "ihc_pre_pair",
+        "ihc_post_pre_pair",
+        "pad_mla_q_sink_slot_bound",
+        "rms_scaled_int8_quant",
+        "supports_rms_scaled_int8_quant",
+    ]
+)
+
 # Callable library APIs that deliberately have no ATen schema to override.
 # They stay importable as `flaggems_vllm.<op>` but are never registered into
 # PyTorch dispatch by enable()/only_enable().
@@ -61,12 +85,31 @@ _LIBRARY_ONLY_OPS = frozenset(
     }
 )
 
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | frozenset(
+    [
+        "int8_indexer_cache_store",
+        "int8_indexer_paged_logits",
+        "int8_indexer_quantize",
+        "silu_clamp",
+        "silu_clamp_int8_quant",
+        "supports_silu_clamp_int8_quant",
+        "can_ihc_post_pre",
+    ]
+)
+
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | {"fused_mm_input_norm"}
+
+_DIRECT_ONLY_OPS = _DIRECT_ONLY_OPS | {
+    "int8_quantize_per_token",
+    "supports_int8_quantize_per_token",
+}
+
 _FULL_CONFIG = tuple(
     (op_name, globals()[op_name])
     for op_name in getattr(_ops_module, "__all__", [])
     if op_name in globals()
     and callable(globals()[op_name])
-    and op_name not in _LIBRARY_ONLY_OPS
+    and op_name not in (_DIRECT_ONLY_OPS | _LIBRARY_ONLY_OPS)
 )
 
 if "weight_norm_interface" in globals():
@@ -245,11 +288,42 @@ def all_registered_keys():
 
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
+    "all_registered_keys",
+    "all_registered_ops",
+    "concat_pad_mla_q_and_sink",
     "enable",
+    "ihc_post_pre",
+    "int8_scaled_mm_decode",
+    "mrope_strided_cache",
+    "mul_scaled_int8_quant",
     "only_enable",
+    "SUPPORTED_FP8_DTYPE",
     "use_dnn",
     "use_gems",
-    "all_registered_ops",
-    "all_registered_keys",
 ]
+
+__all__ += [
+    "int8_indexer_paged_logits_empty_tile",
+    "indexer_prefix_topk",
+    "supports_indexer_prefix_topk",
+    "can_ihc_pair",
+    "ihc_pre_pair",
+    "ihc_post_pre_pair",
+    "pad_mla_q_sink_slot_bound",
+    "rms_scaled_int8_quant",
+    "supports_rms_scaled_int8_quant",
+]
+
+__all__ += [
+    "int8_indexer_cache_store",
+    "int8_indexer_paged_logits",
+    "int8_indexer_quantize",
+    "silu_clamp",
+    "silu_clamp_int8_quant",
+    "supports_silu_clamp_int8_quant",
+    "can_ihc_post_pre",
+]
+
+__all__.append("fused_mm_input_norm")
+
+__all__ += ["int8_quantize_per_token", "supports_int8_quantize_per_token"]
