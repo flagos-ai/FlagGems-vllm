@@ -629,6 +629,7 @@ def chunk_gated_delta_rule_w8a16(
     State is dequantized once, accumulated across all chunks, and requantized
     once at the end. This entry is forward-only and mutates state and scales.
     """
+    logger.debug("GEMS_HYGON CHUNK_GATED_DELTA_RULE_W8A16_INT8")
     if q.ndim != 4 or q.shape != k.shape or v.ndim != 4:
         raise ValueError("expected Q/K[B,T,H,K] and V[B,T,HV,V]")
     batch, tokens, query_heads, reduction = q.shape
