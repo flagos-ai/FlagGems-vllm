@@ -6,12 +6,31 @@ to FP32 on load; router weights and returned logits stay FP32. No bias is
 applied here. Unsupported dimensions or larger batches are explicitly rejected.
 """
 
+import inspect
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+# FlagTree reorder-loop-loads: with few rows the grid is 128 experts x 1..2
+# programs and the K loop is latency bound. `tle.range(..., reorder=True)`
+# issues the next block's loads before the current fma; the (unroll, reorder)
+# pair per (M, dtype) bucket below is the one measured on H20 (see
+# _loop_schedule). Upstream Triton compiles the plain loop as before.
+try:
+    import triton.experimental.tle.language as tle
+
+    _HAS_REORDER_LOOP_LOADS = (
+        has_triton_tle(3, 6, 0)
+        and "reorder" in inspect.signature(getattr(tle, "range").__init__).parameters
+    )
+except (ImportError, AttributeError, ValueError):
+    tle = None
+    _HAS_REORDER_LOOP_LOADS = False
 
 
 def supports_fp32_router_gemm(hidden_size, num_experts, input_dtype, weight_dtype):
@@ -41,6 +60,36 @@ def _check(input, router_weight):
         raise NotImplementedError("FP32 router specialization supports M<=32")
 
 
+@triton.jit
+def _router_step(
+    input_ptr,
+    weight_ptr,
+    rows,
+    offsets_k,
+    start,
+    M,
+    H,
+    expert,
+    input_stride_m,
+    input_stride_k,
+    weight_stride_e,
+    weight_stride_k,
+    accumulator,
+):
+    cols = start + offsets_k
+    x = tl.load(
+        input_ptr + rows[:, None] * input_stride_m + cols[None, :] * input_stride_k,
+        mask=(rows[:, None] < M) & (cols[None, :] < H),
+        other=0.0,
+    ).to(tl.float32)
+    weight = tl.load(
+        weight_ptr + expert * weight_stride_e + cols * weight_stride_k,
+        mask=cols < H,
+        other=0.0,
+    )
+    return tl.fma(x, weight[None, :], accumulator)
+
+
 @libentry()
 @triton.jit
 def _router_kernel(
@@ -56,29 +105,73 @@ def _router_kernel(
     weight_stride_k: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LOOP_UNROLL: tl.constexpr,
+    REORDER: tl.constexpr,
 ):
     expert = tl.program_id(0)
     rows = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
     offsets_k = tl.arange(0, BLOCK_K)
     accumulator = tl.full((BLOCK_M, BLOCK_K), 0.0, tl.float32)
-    for start in range(0, H, BLOCK_K):
-        cols = start + offsets_k
-        x = tl.load(
-            input_ptr + rows[:, None] * input_stride_m + cols[None, :] * input_stride_k,
-            mask=(rows[:, None] < M) & (cols[None, :] < H),
-            other=0.0,
-        ).to(tl.float32)
-        weight = tl.load(
-            weight_ptr + expert * weight_stride_e + cols * weight_stride_k,
-            mask=cols < H,
-            other=0.0,
-        )
-        accumulator = tl.fma(x, weight[None, :], accumulator)
+    if REORDER:
+        for start in tle.range(
+            0, H, BLOCK_K, loop_unroll_factor=LOOP_UNROLL, reorder=True
+        ):
+            accumulator = _router_step(
+                input_ptr,
+                weight_ptr,
+                rows,
+                offsets_k,
+                start,
+                M,
+                H,
+                expert,
+                input_stride_m,
+                input_stride_k,
+                weight_stride_e,
+                weight_stride_k,
+                accumulator,
+            )
+    elif LOOP_UNROLL > 1:
+        for start in tl.range(0, H, BLOCK_K, loop_unroll_factor=LOOP_UNROLL):
+            accumulator = _router_step(
+                input_ptr,
+                weight_ptr,
+                rows,
+                offsets_k,
+                start,
+                M,
+                H,
+                expert,
+                input_stride_m,
+                input_stride_k,
+                weight_stride_e,
+                weight_stride_k,
+                accumulator,
+            )
+    else:
+        for start in range(0, H, BLOCK_K):
+            accumulator = _router_step(
+                input_ptr,
+                weight_ptr,
+                rows,
+                offsets_k,
+                start,
+                M,
+                H,
+                expert,
+                input_stride_m,
+                input_stride_k,
+                weight_stride_e,
+                weight_stride_k,
+                accumulator,
+            )
     logits = tl.sum(accumulator, axis=1)
     tl.store(output_ptr + rows * E + expert, logits, mask=rows < M)
 
 
-def _launch(input, router_weight, *, block_m, block_k, num_warps):
+def _launch(
+    input, router_weight, *, block_m, block_k, num_warps, loop_unroll=1, reorder=False
+):
     output = torch.empty(
         (input.shape[0], router_weight.shape[0]),
         dtype=torch.float32,
@@ -98,10 +191,33 @@ def _launch(input, router_weight, *, block_m, block_k, num_warps):
             router_weight.stride(1),
             BLOCK_M=block_m,
             BLOCK_K=block_k,
+            LOOP_UNROLL=loop_unroll,
+            REORDER=reorder,
             num_warps=num_warps,
             num_stages=1,
         )
     return output
+
+
+def _loop_schedule(m, dtype):
+    """(loop_unroll, reorder) for the K loop of the (m, dtype) launch bucket.
+
+    Only buckets where the FlagTree reorder hint measured faster than the plain
+    loop on H20 get one (bf16 M=2..4: +30%, M=5..8: +15..18%, fp32 M=1: +8%);
+    every other bucket measured slower with any unroll and keeps the plain
+    loop. Without the hint the plain loop is used everywhere.
+    """
+    if not _HAS_REORDER_LOOP_LOADS:
+        return 1, False
+    if dtype == torch.bfloat16:
+        if 2 <= m <= 4:
+            return 4, True
+        if 5 <= m <= 8:
+            return 2, True
+        return 1, False
+    if m == 1:
+        return 4, True
+    return 1, False
 
 
 @torch.library.custom_op("flaggems_vllm::fp32_router_gemm", mutates_args=())
@@ -127,7 +243,16 @@ def _fp32_router_gemm_op(
         block_m, block_k = 8, 1024
     else:
         block_m, block_k = 16, 512
-    return _launch(input, router_weight, block_m=block_m, block_k=block_k, num_warps=4)
+    loop_unroll, reorder = _loop_schedule(m, input.dtype)
+    return _launch(
+        input,
+        router_weight,
+        block_m=block_m,
+        block_k=block_k,
+        num_warps=4,
+        loop_unroll=loop_unroll,
+        reorder=reorder,
+    )
 
 
 @_fp32_router_gemm_op.register_fake
