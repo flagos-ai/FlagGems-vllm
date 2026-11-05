@@ -168,29 +168,35 @@ def dispatch_nvlink_barrier(
 
 
 @triton.jit
-def nvlink_barrier(
+def dual_math_nvlink_barrier(
     sig_tab,
     slot,
     ctr,
     sm_idx,
+    WG: tl.constexpr,
     MY_PE: tl.constexpr,
     NPES: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """comm::nvlink_barrier, barrier.cuh:38-80."""
+    """Join both math WGs around the cross-rank L2-scatter rendezvous."""
     fence_sys()
-    rank_barrier(ctr, NUM_SMS)
-    if sm_idx == 0:
-        # Assign one signaling thread to each peer.
-        pe = tl.arange(0, 8)
-        tl.atomic_add(
-            peer_i32(sig_tab, pe) + slot, 1, mask=pe < NPES, sem="release", scope="sys"
-        )
-        sl = peer_i32(sig_tab, MY_PE)
-        v = tl.atomic_add(sl + slot, 0, sem="acquire", scope="sys")
-        while v < NPES:
+    rank_barrier(ctr, 2 * NUM_SMS)
+    if WG == 0:
+        if sm_idx == 0:
+            # Assign one signaling thread to each peer.
+            pe = tl.arange(0, 8)
+            tl.atomic_add(
+                peer_i32(sig_tab, pe) + slot,
+                1,
+                mask=pe < NPES,
+                sem="release",
+                scope="sys",
+            )
+            sl = peer_i32(sig_tab, MY_PE)
             v = tl.atomic_add(sl + slot, 0, sem="acquire", scope="sys")
-    rank_barrier(ctr + 1, NUM_SMS)
+            while v < NPES:
+                v = tl.atomic_add(sl + slot, 0, sem="acquire", scope="sys")
+    rank_barrier(ctr + 1, 2 * NUM_SMS)
 
 
 @triton.jit
@@ -706,9 +712,11 @@ def math_role(
                         [cd_addr, dst_addr, valid_m_wg, scatter_cols, bar_wg],
                     )
 
-    # Only WG0 runs the cross-rank barrier and the per-token combine step.
+    # Both math WGs publish their final remote scatter before WG0 signals peers.
+    dual_math_nvlink_barrier(sig_tab, 1, gctr + 3, sm_idx, WG, MY_PE, NPES, NUM_SMS)
+
+    # Only WG0 runs the per-token combine step.
     if WG == 0:
-        nvlink_barrier(sig_tab, 1, gctr + 3, sm_idx, MY_PE, NPES, NUM_SMS)
         cb_l = tl.multiple_of(cb_local.to(tl.pointer_type(tl.bfloat16)), 16)
         offs_hid = tl.arange(0, K_POW2)
         hid_ok = offs_hid < K
