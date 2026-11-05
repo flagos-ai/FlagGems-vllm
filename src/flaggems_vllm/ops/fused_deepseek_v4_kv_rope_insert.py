@@ -69,9 +69,7 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
             kv + token_idx * 512 + dims, mask=dims < 448, other=0.0
         ).to(tl.float32)
         rope_dims = tl.arange(0, 64)
-        rope_values = tl.load(kv + token_idx * 512 + 448 + rope_dims).to(
-            tl.float32
-        )
+        rope_values = tl.load(kv + token_idx * 512 + 448 + rope_dims).to(tl.float32)
 
         quantized, exponent = _quantize_ue8m0(nope_values, 8, 64)
         quantized = tl.reshape(quantized, (512,)).to(tl.uint8, bitcast=True)
@@ -100,9 +98,7 @@ def _fused_deepseek_v4_kv_rope_insert_kernel(
     rope_dims = tl.arange(0, 64)
     rope_values = tl.load(kv + token_idx * 512 + 448 + rope_dims).to(tl.float32)
     even, odd = tl.split(tl.reshape(rope_values, (32, 2)))
-    rotated_rope = tl.interleave(
-        even * cos - odd * sin, tl.fma(even, sin, odd * cos)
-    )
+    rotated_rope = tl.interleave(even * cos - odd * sin, tl.fma(even, sin, odd * cos))
     tiles = tl.reshape(values, (8, 64))
     rotated = tl.reshape(
         tl.where(tl.arange(0, 8)[:, None] == 7, rotated_rope[None, :], tiles),

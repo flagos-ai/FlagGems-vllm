@@ -99,9 +99,7 @@ def _assert_bytes_equal(actual, expected):
 def test_matches_vllm_reference(
     num_tokens, num_tokens_insert, cache_block_size, cache_format
 ):
-    inputs = _make_inputs(
-        num_tokens, num_tokens_insert, cache_block_size, cache_format
-    )
+    inputs = _make_inputs(num_tokens, num_tokens_insert, cache_block_size, cache_format)
     reference_cache = inputs["k_cache"].clone()
     kv_before = inputs["kv"].clone()
 
@@ -178,9 +176,9 @@ def test_matches_vllm_with_padded_pages(cache_format):
     cache_block_size = 256
     num_insert = 17
     num_blocks = (num_insert + cache_block_size - 1) // cache_block_size + 1
-    slots = torch.randperm(
-        num_blocks * cache_block_size, device=flaggems_vllm.device
-    )[:num_insert]
+    slots = torch.randperm(num_blocks * cache_block_size, device=flaggems_vllm.device)[
+        :num_insert
+    ]
     slots[::5] = -1
     inputs = _make_inputs(
         20,
@@ -191,9 +189,7 @@ def test_matches_vllm_with_padded_pages(cache_format):
         slot_mapping=slots,
     )
     page_stride = inputs["k_cache"].stride(0)
-    backing = inputs["k_cache"].as_strided(
-        (num_blocks, page_stride), (page_stride, 1)
-    )
+    backing = inputs["k_cache"].as_strided((num_blocks, page_stride), (page_stride, 1))
     reference_backing = backing.clone()
     reference_cache = reference_backing.as_strided(
         inputs["k_cache"].shape, inputs["k_cache"].stride()
