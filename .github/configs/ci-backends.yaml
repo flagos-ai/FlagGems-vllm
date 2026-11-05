@@ -117,7 +117,8 @@ platforms:
     description: "Moore Threads S5000 on the official vllm-openai image"
     backend: mthreads-musa520
     runner_labels: mthreads-s5000-1
-    container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.32.0
+    # v0.32.0 is not pullable from this registry; stay on v0.28.0.
+    container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
     # Device flags follow FlagGems' backends.json
     # `mthreads-musa520.container`, whose `runs_on_vllm` is this runner.
     container_options: >-
