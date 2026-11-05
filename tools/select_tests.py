@@ -85,6 +85,9 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py": [
         "tests/test_gdn_w8a16_metax.py"
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "tests/test_flash_mla.py",
+        "tests/test_flash_mla_with_kvcache_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -217,6 +220,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py": [
         "benchmark/test_gdn_w8a16_metax.py"
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "benchmark/test_flash_mla.py",
+        "benchmark/test_flash_mla_with_kvcache_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
