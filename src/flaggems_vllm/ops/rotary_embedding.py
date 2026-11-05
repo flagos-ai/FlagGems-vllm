@@ -61,11 +61,17 @@ def _rope_head(
     mask,
     cos,
     sin,
+    sync: tl.constexpr = False,
 ):
     ordered_cols = off_h * src_stride_h + (ordered_block * src_stride_d)
     rotated_cols = off_h * src_stride_h + (rotated_block * src_stride_d)
     x = tl.load(src_ptr + ordered_cols, mask=mask, other=0.0)
     rotated_x = tl.load(src_ptr + rotated_cols, mask=mask, other=0.0)
+    if sync:
+        # In place (dst == src), rotated_x is loaded by other threads than the
+        # ones that store its element: every load of this head must be done
+        # before any thread stores.
+        tl.debug_barrier()
     y = x * cos + rotated_x * sin
     tl.store(
         dst_ptr + off_h * dst_stride_h + (ordered_block * dst_stride_d), y, mask=mask
@@ -208,11 +214,12 @@ def apply_rotary_pos_emb_kernel(
             )
 
 
-# NOTE (pre-existing, not covered by tests/test_apply_rotary_pos_emb.py): with
-# rotary_interleaved=False the in-place update races. The two halves of a head
-# live in different threads; a thread may store its half before the thread that
-# needs it as `rotated_x` has loaded it. Results differ from run to run. The
-# interleaved layout keeps both partners in one thread and is not affected.
+# In place, the two halves of a head are loaded by different threads than the
+# ones that store them (rotary_interleaved=False pairs element i with i+D/2),
+# so _rope_head(sync=True) puts a barrier between the loads and the store of
+# every head. With the reorder hint the loads of eight heads are issued before
+# the first barrier (a barrier orders its own iteration only), so the in-place
+# path keeps the prefetch.
 @libentry()
 @triton.jit
 def apply_rotary_pos_emb_inplace_kernel(
@@ -285,6 +292,7 @@ def apply_rotary_pos_emb_inplace_kernel(
                 mask,
                 cos,
                 sin,
+                sync=True,
             )  # In-place update
     else:
         for off_h in range(0, NUM_Q_HEADS):
@@ -301,6 +309,7 @@ def apply_rotary_pos_emb_inplace_kernel(
                 mask,
                 cos,
                 sin,
+                sync=True,
             )  # In-place update
 
     k_ptr += s_id * k_stride_s
@@ -320,6 +329,7 @@ def apply_rotary_pos_emb_inplace_kernel(
                 mask,
                 cos,
                 sin,
+                sync=True,
             )  # In-place update
     else:
         for off_h in range(0, NUM_K_HEADS):
@@ -336,6 +346,7 @@ def apply_rotary_pos_emb_inplace_kernel(
                 mask,
                 cos,
                 sin,
+                sync=True,
             )  # In-place update
 
 
