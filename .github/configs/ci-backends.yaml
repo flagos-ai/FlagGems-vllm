@@ -1,0 +1,115 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# PR-level container CI backends for FlagGems-vllm.
+#
+# Scope: this file drives ONLY the `vendor-container-tests` job in
+# `.github/workflows/basic-ci.yml` (per-PR smoke tests on vendor-provided
+# vLLM base images). It is deliberately separate from:
+#
+#   - `.github/configs/backends/*.yaml` — inputs to `ops-test.yaml`, the
+#     periodic full-suite run. Those use internal harbor images and
+#     `*-flaggems-weekly` runners. Do not merge the two: a PR-level smoke
+#     test and a 4h weekly sweep have different runners, images and blast
+#     radius, and sharing one file would couple both lanes.
+#   - FlagGems' `.github/backends.json` — the registry behind the
+#     `non-nvidia-tests` job, whose contract is "run FlagGems setup.sh on a
+#     bare runner". The vendor images below ship their own torch/vLLM, so
+#     they do not fit that contract.
+#
+# Schema: intentionally mirrors FlagOps' `flagos-user-tests/resource_map.yaml`
+# (`platforms.<name>` -> runner labels + container image + container options)
+# so this data can move to FlagOps for org-wide reuse by changing only the
+# read path, not the workflow. See `.github/MULTI_BACKEND_CI.md` for the
+# reuse plan.
+#
+# NVIDIA is intentionally absent: the `nvidia-tests` job runs directly on the
+# H20 host via `tools/setup.sh` and must not be forced into a container.
+
+platforms:
+
+  hygon:
+    description: "Hygon DCU (BW1000) on a vendor vLLM image"
+    # `backend` is the key looked up in `.github/backend-capabilities.json`
+    # to decide which tests/benchmarks are approved for this hardware.
+    backend: hygon
+    runner_labels: hygon-bw1000-1
+    container_image: >-
+      harbor.sourcefind.cn:5443/hcu/admin/base/vllm:0.21.0-ubuntu22.04-dtk2604-py3.10
+    container_options: >-
+      --ipc=host
+      --privileged
+      --group-add video
+      --cap-add=SYS_PTRACE
+      --security-opt seccomp=unconfined
+      --device=/dev/kfd
+      --device=/dev/mkfd
+      --device=/dev/dri
+    container_volumes:
+      - /opt/hyhal:/opt/hyhal
+    gpu_check_script: tools/gpu_check_hygon.sh
+
+  ascend:
+    description: "Huawei Ascend 910B on the official vllm-ascend image"
+    backend: ascend-cann900
+    runner_labels: ascend-910b-1
+    container_image: m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0.post1
+    container_options: >-
+      --ipc=host
+      --privileged
+      --device=/dev/davinci_manager
+      --device=/dev/devmm_svm
+      --device=/dev/hisi_hdc
+    container_volumes:
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+      - /usr/local/Ascend/add-ons/:/usr/local/Ascend/add-ons/
+      - /usr/local/sbin/:/usr/local/sbin/
+      - /etc/ascend_install.info:/etc/ascend_install.info
+    gpu_check_script: tools/gpu_check_ascend.sh
+
+  iluvatar:
+    description: "Iluvatar BI-V150 on the official CoreX vLLM image"
+    backend: iluvatar
+    runner_labels: iluvatar-bi-v150-1
+    container_image: >-
+      registry.iluvatar.com.cn:10443/release/vllm:0.27.1_py3.12-corex.5.0.0-ubuntu24.04
+    container_options: >-
+      --ipc=host
+      --privileged
+      --shm-size=256g
+      --security-opt seccomp=unconfined
+      --device=/dev/itrctl
+    container_volumes:
+      - /lib/modules:/lib/modules
+    gpu_check_script: tools/gpu_check_iluvatar.sh
+
+  metax:
+    description: "MetaX (Muxi) on the official vllm-metax image"
+    # TODO: `runner_labels` is a guess that follows the naming pattern of the
+    # other three runners; the actual MetaX runner label was not supplied.
+    # Until it is confirmed, this job queues forever instead of failing (no
+    # runner matches), which is why `enabled: false` keeps it out of the
+    # matrix. Set the real label, then flip `enabled` to true.
+    enabled: false
+    backend: metax-maca3810
+    runner_labels: metax-c550-1
+    container_image: >-
+      cr.metax-tech.com/public-ai-release/maca/vllm-metax:0.28.0-maca.ai3.8.2.401-torch2.10-py312-ubuntu22.04-amd64
+    container_options: >-
+      --ipc=host
+      --privileged
+      --device=/dev/mxcd
+      --device=/dev/dri
+    container_volumes: []
+    gpu_check_script: tools/gpu_check_metax.sh

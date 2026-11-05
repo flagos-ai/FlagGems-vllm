@@ -37,6 +37,7 @@ NON_TEST_FILES = {
 
 ENV_SMOKE_TRIGGER_FILES = {
     ".github/backend-capabilities.json",
+    ".github/configs/ci-backends.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
     "pyproject.toml",
@@ -48,6 +49,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",
     "tools/select_backends.py",
+    "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
 }
