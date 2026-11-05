@@ -1220,6 +1220,14 @@ concat_mla_q:
     num_warps: 8
     num_stages: 1
 
+flash_mla_fp8_copy_table:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+
 kda_kkt_pairs:
   - META: {PAIRS: 16}
     num_warps: 4
@@ -1233,6 +1241,13 @@ kda_kkt_inter:
 kda_kkt_diag:
   - META: {}
     num_warps: 4
+    num_stages: 1
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 8
+    num_warps: 1
     num_stages: 1
 
 chunk_kda_fwd_intra_token_parallel:
