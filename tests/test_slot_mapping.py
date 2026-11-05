@@ -81,7 +81,7 @@ def _load_upstream_kernel() -> bool:
 HAS_UPSTREAM = _load_upstream_kernel()
 
 
-@pytest.mark.slot_mapping_triton
+@pytest.mark.compute_slot_mapping
 @pytest.mark.parametrize("nreq,tlen,maxtok,bs", CASES)
 def test_slot_mapping_accuracy(nreq, tlen, maxtok, bs):
     torch.manual_seed(0)
@@ -105,14 +105,14 @@ def test_slot_mapping_accuracy(nreq, tlen, maxtok, bs):
     )
 
     out = torch.full((maxtok,), -1, dtype=torch.int64, device="npu")
-    flaggems_vllm.compute_slot_mapping_parallel(
-        sum(lens), maxtok, qsl, nreq, pos, btab, out, block_size=bs
+    flaggems_vllm.compute_slot_mapping(
+        nreq, sum(lens), maxtok, qsl, pos, btab, btab.stride(0), bs, out
     )
     torch.npu.synchronize()
     assert torch.equal(out[: sum(lens)], expected)
 
 
-@pytest.mark.slot_mapping_triton
+@pytest.mark.compute_slot_mapping
 @pytest.mark.skipif(not HAS_UPSTREAM, reason="vllm package not available")
 @pytest.mark.parametrize("nreq,tlen,maxtok,bs", CASES)
 def test_slot_mapping_matches_upstream_kernel(nreq, tlen, maxtok, bs):
@@ -151,8 +151,8 @@ def test_slot_mapping_matches_upstream_kernel(nreq, tlen, maxtok, bs):
         PAD_ID=-1,
     )
     new = torch.full((maxtok,), -1, dtype=torch.int64, device="npu")
-    flaggems_vllm.compute_slot_mapping_parallel(
-        sum(lens), maxtok, qsl, nreq, pos, btab, new, block_size=bs
+    flaggems_vllm.compute_slot_mapping(
+        nreq, sum(lens), maxtok, qsl, pos, btab, btab.stride(0), bs, new
     )
     torch.npu.synchronize()
     assert torch.equal(old[: sum(lens)], new[: sum(lens)])
