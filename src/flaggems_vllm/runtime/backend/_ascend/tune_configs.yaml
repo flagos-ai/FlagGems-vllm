@@ -273,3 +273,10 @@ kda_kkt_diag:
   - META: {}
     num_warps: 4
     num_stages: 1
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 32
+    num_warps: 1
+    num_stages: 1

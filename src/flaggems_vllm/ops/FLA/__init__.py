@@ -15,6 +15,7 @@ from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
 from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule_packed_decode import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.ops.FLA.fused_recurrent_kda import fused_recurrent_kda
 from flaggems_vllm.ops.FLA.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -33,6 +34,7 @@ __all__ = [
     "chunk_kda_scaled_dot_kkt_fwd",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "fused_recurrent_kda",
     "log",
     "parallel_attn_bwd_preprocess",
     "parallel_nsa",
@@ -50,4 +52,9 @@ if _runtime.device.vendor_name == "ascend":
     from flaggems_vllm.runtime.backend._ascend.FLA import (  # noqa: F811
         fused_recurrent_gated_delta_rule_fwd,
         fused_recurrent_gated_delta_rule_packed_decode,
+        fused_recurrent_kda,
+    )
+elif _runtime.device.vendor_name == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.FLA import (  # noqa: F811
+        fused_recurrent_kda,
     )

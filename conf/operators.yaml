@@ -675,6 +675,20 @@ ops:
       - FLA
     stages:
       - alpha: '5.4'
+  - id: fused_recurrent_kda
+    description: |
+      Independent Triton KDA decode with key-wise gate decay, optional QK L2
+      normalization, scalar/vector beta and FP32 value-major recurrent state.
+      Supports varlen, per-token state tables and strided inputs.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
