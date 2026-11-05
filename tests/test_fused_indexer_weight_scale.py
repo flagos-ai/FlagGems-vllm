@@ -25,15 +25,18 @@ pytestmark = pytest.mark.skipif(
     API_NAME not in vars(flaggems_vllm), reason="backend has no indexer weight scaling"
 )
 SHAPES = (
-    [(0, 32), (1, 32), (7, 13), (20, 32), (1036, 32)]
+    [(0, 32), (1, 32), (3, 17), (7, 13), (8, 32), (20, 32), (28, 32), (1036, 32)]
     if QUICK_MODE
     else [
         (0, 32),
         (7, 0),
         (1, 1),
         (1, 32),
+        (3, 17),
         (7, 13),
+        (8, 32),
         (20, 32),
+        (28, 32),
         (33, 64),
         (1003, 16),
         (64, 129),
