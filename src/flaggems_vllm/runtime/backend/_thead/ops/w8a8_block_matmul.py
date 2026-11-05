@@ -559,7 +559,7 @@ _last_validated_signature = None
 _last_validation_key = None
 
 
-def w8a8_block_int8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
