@@ -103,6 +103,9 @@ def _w8a8_block_int8_small_m_core(
         accs = updated
     for row in tl.static_range(BM):
         rm = (tl.program_id(0) // tl.cdiv(N, BN)) * BM + row
+        if M * N >= 2**31:
+            rm = rm.to(tl.int64)
+            rn = rn.to(tl.int64)
         tl.store(C + rm * N + rn, tl.sum(accs[row], 1), (rm < M) & (rn < N))
 
 
@@ -135,6 +138,9 @@ def _w8a8_block_int8_address_core(
     pn = pid % (GM * npn) // size
     rm = pm * BM + tl.arange(0, BM)
     rn = pn * BN + tl.arange(0, BN)
+    if M * N >= 2**31:
+        rm = rm.to(tl.int64)
+        rn = rn.to(tl.int64)
     rk = tl.arange(0, 128)
     ml = (rm % M).to(tl.int64)
     nl = (rn % N).to(tl.int64)
@@ -391,6 +397,9 @@ def _w8a8_block_int8_matmul_kernel(
     # Compile-time shapes simplify tile/tail addressing and short K loops.
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if M * N >= 2**31:
+        rm = rm.to(tl.int64)
+        rn = rn.to(tl.int64)
     rk = tl.arange(0, BLOCK_K)
     mask_m = rm < M
     mask_n = rn < N
@@ -399,6 +408,10 @@ def _w8a8_block_int8_matmul_kernel(
     # M/N predicates from the A/B and scale loads while preserving C exactly.
     rm_load = rm % M
     rn_load = rn % N
+    if M * K >= 2**31:
+        rm_load = rm_load.to(tl.int64)
+    if N * K >= 2**31:
+        rn_load = rn_load.to(tl.int64)
     acc_dtype: tl.constexpr = tl.float32 if ACC_FP32 else tl.bfloat16
     if SWAP_AB:
         acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=acc_dtype)
@@ -647,6 +660,9 @@ def _w8a8_block_int8_splitk_core(
     # Compile-time shapes simplify tile/tail addressing and short K loops.
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if M * N >= 2**31:
+        rm = rm.to(tl.int64)
+        rn = rn.to(tl.int64)
     rk = tl.arange(0, BLOCK_K)
     mask_m = rm < M
     mask_n = rn < N
@@ -750,7 +766,10 @@ def _w8a8_block_int8_reduce_splitk(
     SPLITS: tl.constexpr = 0,
     CAPACITY: tl.constexpr = 64,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    pid = tl.program_id(0)
+    if M * N >= 2**31:
+        pid = pid.to(tl.int64)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
     if SPLITS:
         split = tl.arange(0, triton.next_power_of_2(SPLITS))
         active_splits = SPLITS

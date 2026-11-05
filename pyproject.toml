@@ -34,6 +34,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
+    "flag-gems",
     "packaging",
     "pybind11",
     "PyYAML",
@@ -60,6 +61,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.utils" = ["configs/*.yaml"]
 
 [tool.black]
 line-length = 88

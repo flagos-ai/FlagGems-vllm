@@ -249,6 +249,17 @@ def _prune_matmul_configs(configs, named_args, **kwargs):
     return result
 
 
+def _prune_gemv_configs(configs, named_args, **kwargs):
+    if named_args["K"] % 16 == 0:
+        return configs
+    # Unaligned INT8 rows need compact per-warp tiles to avoid private-memory spills.
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_N"] <= 32 * config.num_warps
+    ]
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("w8a8_block_int8_matmul_metax"),
@@ -396,6 +407,7 @@ def _w8a8_block_int8_kernel_swap(
     rep=20,
     flagtune_op_name="w8a8_block_int8_matmul",
     flagtune_expand_op_name="w8a8_block_int8_gemv",
+    prune_configs_by={"early_config_prune": _prune_gemv_configs},
 )
 @triton.jit
 def _w8a8_block_int8_gemv_kernel_tuned(
@@ -623,94 +635,99 @@ def w8a8_block_int8_matmul(
         # handles (and can exceed the 64 KiB shared-memory limit at lower
         # warp counts).
         block_n = 64 if N <= 128 else 128
-        _w8a8_block_int8_gemv_kernel[(triton.cdiv(N, block_n),)](
-            A,
-            B,
-            C,
-            As,
-            Bs,
-            N,
-            K,
-            A.stride(-1),
-            B.stride(1),
-            B.stride(0),
-            As.stride(-1),
-            Bs.stride(0),
-            Bs.stride(1),
-            GROUP_N=group_n,
-            GROUP_K=group_k,
-            BLOCK_N=block_n,
-            BLOCK_K=128,
-            num_warps=4,
-            num_stages=2,
-        )
+        with torch_device_fn.device(A.device):
+            _w8a8_block_int8_gemv_kernel[(triton.cdiv(N, block_n),)](
+                A,
+                B,
+                C,
+                As,
+                Bs,
+                N,
+                K,
+                A.stride(-1),
+                B.stride(1),
+                B.stride(0),
+                As.stride(-1),
+                Bs.stride(0),
+                Bs.stride(1),
+                GROUP_N=group_n,
+                GROUP_K=group_k,
+                BLOCK_N=block_n,
+                BLOCK_K=128,
+                num_warps=4,
+                num_stages=2,
+            )
         return C
     if not expand and group_k == 128 and ((M <= 16 and K <= 2304) or skinny_swap):
         C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
         block_n = 16 if N <= 16 else 32
-        _w8a8_block_int8_kernel_core[(triton.cdiv(M, 16) * triton.cdiv(N, block_n), 1)](
-            A,
-            B,
-            C,
-            As,
-            Bs,
-            M,
-            N,
-            K,
-            K,
-            1,
-            1,
-            K,
-            N,
-            1,
-            groups,
-            1,
-            groups,
-            1,
-            GROUP_N=group_n,
-            GROUP_K=group_k,
-            BLOCK_M=16,
-            BLOCK_N=block_n,
-            BLOCK_K=group_k,
-            GROUP_M=8,
-            SWAP=True,
-            SPLITS=1,
-            num_warps=4,
-            num_stages=2,
-        )
+        with torch_device_fn.device(A.device):
+            _w8a8_block_int8_kernel_core[
+                (triton.cdiv(M, 16) * triton.cdiv(N, block_n), 1)
+            ](
+                A,
+                B,
+                C,
+                As,
+                Bs,
+                M,
+                N,
+                K,
+                K,
+                1,
+                1,
+                K,
+                N,
+                1,
+                groups,
+                1,
+                groups,
+                1,
+                GROUP_N=group_n,
+                GROUP_K=group_k,
+                BLOCK_M=16,
+                BLOCK_N=block_n,
+                BLOCK_K=group_k,
+                GROUP_M=8,
+                SWAP=True,
+                SPLITS=1,
+                num_warps=4,
+                num_stages=2,
+            )
         return C
     if not expand and M >= 17 and K <= 2304 and group_k == 128:
         C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
-        _w8a8_block_int8_kernel_core[(triton.cdiv(M, 64) * triton.cdiv(N, 128), 1)](
-            A,
-            B,
-            C,
-            As,
-            Bs,
-            M,
-            N,
-            K,
-            K,
-            1,
-            1,
-            K,
-            N,
-            1,
-            groups,
-            1,
-            groups,
-            1,
-            GROUP_N=group_n,
-            GROUP_K=group_k,
-            BLOCK_M=64,
-            BLOCK_N=128,
-            BLOCK_K=128,
-            GROUP_M=8,
-            SWAP=False,
-            SPLITS=1,
-            num_warps=4,
-            num_stages=2,
-        )
+        with torch_device_fn.device(A.device):
+            _w8a8_block_int8_kernel_core[(triton.cdiv(M, 64) * triton.cdiv(N, 128), 1)](
+                A,
+                B,
+                C,
+                As,
+                Bs,
+                M,
+                N,
+                K,
+                K,
+                1,
+                1,
+                K,
+                N,
+                1,
+                groups,
+                1,
+                groups,
+                1,
+                GROUP_N=group_n,
+                GROUP_K=group_k,
+                BLOCK_M=64,
+                BLOCK_N=128,
+                BLOCK_K=128,
+                GROUP_M=8,
+                SWAP=False,
+                SPLITS=1,
+                num_warps=4,
+                num_stages=2,
+            )
         return C
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     splits = 1
