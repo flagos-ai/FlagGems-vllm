@@ -34,6 +34,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
+    "flag-gems",
     "packaging",
     "pybind11",
     "PyYAML",
