@@ -23,6 +23,21 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+fused_indexer_weight_scale:
+  # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
+  shapes:
+    - [4, 32]  # count=1079584
+    - [8, 32]  # count=177584
+    - [35, 32]  # count=158752
+    - [65, 32]  # count=158576
+    - [18, 32]  # count=90288
+    - [46, 32]  # count=90112
+    - [13, 32]  # count=86064
+    - [51, 32]  # count=85888
+    - [24, 32]  # count=20064
+    - [76, 32]  # count=19712
+  shape_desc: "tokens, heads"
+
 gdn_w8a16:
   shapes:
     - [1, 1, 2, 4, 128, 128]
