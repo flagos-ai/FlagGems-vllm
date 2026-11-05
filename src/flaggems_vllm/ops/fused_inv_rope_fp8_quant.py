@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
 from typing import Optional, Tuple
 
@@ -23,10 +22,14 @@ import triton.language as tl
 from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
 
 try:
+    import triton.experimental.tle as tle_api
     import triton.experimental.tle.language as tle
 
-    _HAS_LOAD_REORDER = "reorder" in inspect.signature(tle.range.__init__).parameters
-except (ImportError, AttributeError, TypeError, ValueError):
+    # Older FlagTree releases expose reorder without the capability API.
+    tle.range(0, 2, loop_unroll_factor=2, reorder=True)
+    supports_tle = getattr(tle_api, "is_tle_supported", None)
+    _HAS_LOAD_REORDER = supports_tle("range") if supports_tle is not None else True
+except (ImportError, AttributeError, TypeError, ValueError, RuntimeError):
     tle = tl
     _HAS_LOAD_REORDER = False
 
