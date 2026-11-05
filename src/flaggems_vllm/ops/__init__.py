@@ -49,6 +49,7 @@ from flaggems_vllm.ops.FLA import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_kda,
 )
+from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
@@ -269,6 +270,7 @@ __all__ = [
     "dgeglu",
     "dispatch_fused_moe_kernel",
     "dreglu",
+    "dsv41_o_proj",
     "dswiglu",
     "expand_pools_and_append_tail",
     "flash_attention_forward",
