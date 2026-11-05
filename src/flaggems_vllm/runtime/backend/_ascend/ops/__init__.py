@@ -42,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache imp
 from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
@@ -131,6 +134,7 @@ __all__ = [
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
