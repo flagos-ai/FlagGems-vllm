@@ -185,6 +185,19 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_fwd_intra_token_parallel
+    description: |
+      Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
+      Writes Aqk/Akk in place and preserves their unwritten regions.
+    for:
+      - chunk_kda_fwd_intra_token_parallel
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: chunk_kda_scaled_dot_kkt_fwd
     description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
     for:
@@ -570,7 +583,7 @@ ops:
   - id: fused_indexer_weight_scale
     description: |
       Scale floating-point indexer weights by FP32 query scales and a scalar.
-      Returns FP32 per-token, per-head weights on Ascend.
+      Returns FP32 per-token, per-head weights on Ascend and MThreads.
     for:
       - fused_indexer_weight_scale
       - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
@@ -650,7 +663,7 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule_fwd
+  - id: fused_recurrent_gated_delta_rule
     description: |
       Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
       variable-length sequences and speculative-decoding state tables.
@@ -706,7 +719,7 @@ ops:
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
       FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU.
+      INT8 supports packed decode and chunked prefill on PPU and Hygon.
     for:
       - gdn_w8a16
       - gdn_w8a16_int8

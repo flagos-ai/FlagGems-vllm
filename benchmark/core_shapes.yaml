@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fused_recurrent_gated_delta_rule:
+  # Resolve names through baseline.PERF_CASES to preserve the full workloads.
+  shapes:
+    - [decode1]
+    - [decode16]
+    - [decode64]
+    - [decode256]
+    - [strided]
+    - [mtp]
+    - [ragged]
+    - [tail]
+  shape_desc: "case (baseline.PERF_CASES)"
 fused_recurrent_gated_delta_rule_packed_decode:
   shapes:
     - [1, 8, 16, 128, 128]
