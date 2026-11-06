@@ -28,7 +28,6 @@ from . import conftest as cfg
 VLLM_REF = native()
 
 pytestmark = [
-    pytest.mark.fused_deepseek_v4_kv_rope_insert,
     pytest.mark.skipif(VLLM_REF is None, reason="vLLM native op unavailable"),
 ]
 
@@ -93,6 +92,7 @@ def _assert_bytes_equal(actual, expected):
     )
 
 
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @pytest.mark.parametrize("num_tokens,num_tokens_insert,cache_block_size", SHAPES)
 @torch.inference_mode()
@@ -129,6 +129,7 @@ def test_matches_vllm_reference(
     _assert_bytes_equal(inputs["k_cache"], reference_cache)
 
 
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @torch.inference_mode()
 def test_nontrivial_positions_slots_and_scale(cache_format):
@@ -170,6 +171,7 @@ def test_nontrivial_positions_slots_and_scale(cache_format):
     _assert_bytes_equal(inputs["k_cache"], reference_cache)
 
 
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @torch.inference_mode()
 def test_matches_vllm_with_padded_pages(cache_format):
@@ -221,6 +223,7 @@ def test_matches_vllm_with_padded_pages(cache_format):
     _assert_bytes_equal(inputs["kv"], kv_before)
 
 
+@pytest.mark.fused_deepseek_v4_kv_rope_insert
 @pytest.mark.parametrize("cache_format", CACHE_FORMATS)
 @torch.inference_mode()
 def test_empty_insert_is_noop(cache_format):
