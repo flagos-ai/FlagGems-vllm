@@ -87,3 +87,23 @@ Comprehensive documentation is available in the [docs](docs/) directory:
 ## License
 
 This project is licensed under the [Apache (version 2.0) License](./LICENSE).
+
+### RMSNorm with dynamic INT8 output
+
+`flaggems_vllm.rms_scaled_int8_quant(x, weight, eps=1e-5)` is an explicit
+inference API returning BF16 normalized values, signed INT8 values and FP32
+per-row scales. Inputs are CUDA BF16 `[M,N]` with unit inner stride,
+nonoverlapping rows and `1 <= N <= 4096`; weights are contiguous BF16 `[N]`
+on the same device. Run with gradients disabled. Optional `norm_out`, `out`
+and `scale_out` buffers must have disjoint storage and matching dtype/shape.
+Unsupported metadata raises `NotImplementedError` before launch.
+
+The operator preserves BF16 rounding before the weight multiplication and
+again before quantization. Zero rows produce zero INT8 values and scales.
+It does not register an ATen operation or choose projection providers. Its
+fixed reduction schedule uses `next_power_of_2(N)`, four warps and one stage;
+changing that schedule requires independent numerical qualification.
+
+Run `pytest -q tests/test_rms_scaled_int8_quant.py` for finite math and ordinary
+graph tests, and `pytest -q benchmark/test_rms_scaled_int8_quant_perf.py --level core`
+for the standalone semantic baseline.

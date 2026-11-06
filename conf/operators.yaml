@@ -1333,6 +1333,17 @@ ops:
     stages:
       - stable: '3.0'
     cpp: '4.0'
+  - id: rms_scaled_int8_quant
+    description: BF16 RMSNorm and signed INT8 data with FP32 row scales.
+    for:
+    - null
+    labels:
+    - fused
+    - vLLM
+    kind:
+    - NeuralNetwork
+    stages:
+    - alpha: '5.5'
   - id: rwkv_ka_fusion
     description: |
       Merges, aligns, and enhances features from different data sources or spatial directions
