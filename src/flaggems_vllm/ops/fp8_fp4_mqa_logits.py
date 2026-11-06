@@ -107,6 +107,7 @@ def _fp8_fp4_mqa_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
+    BF16_DOT: tl.constexpr = False,
 ):
     """Fused FP8 MQA logits with head-batched tiled dot products.
 
@@ -157,7 +158,12 @@ def _fp8_fp4_mqa_logits_kernel(
         q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
 
         # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
-        dot = tl.dot(q_2d, tl.trans(k))
+        if BF16_DOT:
+            # Every finite E4M3FN value is exact in BF16. MetaX C550 FMA
+            # lowering rejects FP8 operands; the accumulator remains FP32.
+            dot = tl.dot(q_2d.to(tl.bfloat16), tl.trans(k).to(tl.bfloat16))
+        else:
+            dot = tl.dot(q_2d, tl.trans(k))
 
         # Fused k_scale + ReLU activation
         dot = tl.maximum(dot * k_scale[None, :], 0.0)
@@ -667,6 +673,7 @@ def fp8_fp4_mqa_logits(
                 logits.stride(1),
                 weights.stride(0),
                 weights.stride(1),
+                BF16_DOT=runtime.device.vendor_name == "metax",
             )
 
     if clean_logits:
