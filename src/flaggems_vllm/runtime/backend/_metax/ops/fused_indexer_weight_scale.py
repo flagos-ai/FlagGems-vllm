@@ -18,138 +18,68 @@ import triton.language as tl
 
 from flaggems_vllm.utils import libentry
 
-try:
-    import triton.experimental.gluon as gluon
-    import triton.experimental.gluon.language as gl
-except ImportError:
-    HAS_GLUON = False
-else:
-    HAS_GLUON = True
+
+@triton.jit
+def _indexer_weight_scale_vector_tile(
+    weights_ptr,
+    query_ptr,
+    output_ptr,
+    offsets,
+    TOTAL: tl.constexpr,
+    SCALE: tl.constexpr,
+    MASKED: tl.constexpr,
+):
+    mask = offsets < TOTAL if MASKED else True
+    weights = tl.load(weights_ptr + offsets, mask, other=0)
+    query = tl.load(query_ptr + offsets, mask, other=0)
+    output = (weights * query) * SCALE
+    scale_value = tl.full((), SCALE, tl.float32)
+    zero_sign = (
+        weights.to(tl.uint32, bitcast=True)
+        ^ query.to(tl.uint32, bitcast=True)
+        ^ scale_value.to(tl.uint32, bitcast=True)
+    ) & 0x80000000
+    # Preserve IEEE zero signs when MACA folds multiplication by a power of two.
+    output_bits = (output.to(tl.uint32, bitcast=True) & 0x7FFFFFFF) | zero_sign
+    tl.store(output_ptr + offsets, output_bits.to(tl.float32, bitcast=True), mask)
 
 
-if HAS_GLUON:
+@libentry()
+@triton.jit
+def indexer_weight_scale_vector_kernel(
+    weights_ptr,
+    query_ptr,
+    output_ptr,
+    TOTAL: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    _indexer_weight_scale_vector_tile(
+        weights_ptr, query_ptr, output_ptr, offsets, TOTAL, SCALE, TOTAL % BLOCK != 0
+    )
 
-    @gluon.jit
-    def _indexer_weight_scale_vector_tile(
-        weights_ptr,
-        query_ptr,
-        output_ptr,
-        offsets,
-        TOTAL: gl.constexpr,
-        SCALE: gl.constexpr,
-        BLOCK: gl.constexpr,
-        WARPS: gl.constexpr,
-        MASKED: gl.constexpr,
-    ):
-        if MASKED:
-            mask = offsets < TOTAL
-        else:
-            mask = gl.full(
-                (BLOCK,),
-                True,
-                gl.int1,
-                layout=gl.constexpr(gl.BlockedLayout([4], [64], [WARPS], [0])),
-            )
-        weights = gl.load(weights_ptr + offsets, mask, other=0)
-        query = gl.load(query_ptr + offsets, mask, other=0)
-        output = (weights * query) * SCALE
-        scale_value = gl.full(
-            (BLOCK,),
-            SCALE,
-            gl.float32,
-            layout=gl.constexpr(gl.BlockedLayout([4], [64], [WARPS], [0])),
+
+@libentry()
+@triton.jit
+def indexer_weight_scale_short_tail_kernel(
+    weights_ptr,
+    query_ptr,
+    output_ptr,
+    TOTAL: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # The branch is uniform within a CTA; only the last CTA needs a mask.
+    if tl.program_id(0) < TOTAL // BLOCK:
+        _indexer_weight_scale_vector_tile(
+            weights_ptr, query_ptr, output_ptr, offsets, TOTAL, SCALE, False
         )
-        zero_sign = (
-            weights.to(gl.uint32, bitcast=True)
-            ^ query.to(gl.uint32, bitcast=True)
-            ^ scale_value.to(gl.uint32, bitcast=True)
-        ) & 0x80000000
-        # Multiplication signs are the XOR of operand signs, including signed zero.
-        output_bits = (output.to(gl.uint32, bitcast=True) & 0x7FFFFFFF) | zero_sign
-        gl.store(output_ptr + offsets, output_bits.to(gl.float32, bitcast=True), mask)
-
-    @libentry()
-    @gluon.jit
-    def indexer_weight_scale_vector_kernel(
-        weights_ptr,
-        query_ptr,
-        output_ptr,
-        TOTAL: gl.constexpr,
-        SCALE: gl.constexpr,
-        BLOCK: gl.constexpr,
-        WARPS: gl.constexpr,
-    ):
-        # Four consecutive FP32 elements per lane enable vector memory accesses.
-        offsets = gl.program_id(0) * BLOCK + gl.arange(
-            0, BLOCK, layout=gl.constexpr(gl.BlockedLayout([4], [64], [WARPS], [0]))
+    else:
+        _indexer_weight_scale_vector_tile(
+            weights_ptr, query_ptr, output_ptr, offsets, TOTAL, SCALE, True
         )
-        if TOTAL % BLOCK == 0:
-            mask = gl.full(
-                (BLOCK,),
-                True,
-                gl.int1,
-                layout=gl.constexpr(gl.BlockedLayout([4], [64], [WARPS], [0])),
-            )
-        else:
-            mask = offsets < TOTAL
-        weights = gl.load(weights_ptr + offsets, mask, other=0)
-        query = gl.load(query_ptr + offsets, mask, other=0)
-        output = (weights * query) * SCALE
-        scale_value = gl.full(
-            (BLOCK,),
-            SCALE,
-            gl.float32,
-            layout=gl.constexpr(gl.BlockedLayout([4], [64], [WARPS], [0])),
-        )
-        zero_sign = (
-            weights.to(gl.uint32, bitcast=True)
-            ^ query.to(gl.uint32, bitcast=True)
-            ^ scale_value.to(gl.uint32, bitcast=True)
-        ) & 0x80000000
-        # Multiplication signs are the XOR of operand signs, including signed zero.
-        output_bits = (output.to(gl.uint32, bitcast=True) & 0x7FFFFFFF) | zero_sign
-        gl.store(output_ptr + offsets, output_bits.to(gl.float32, bitcast=True), mask)
-
-    @libentry()
-    @gluon.jit
-    def indexer_weight_scale_short_tail_kernel(
-        weights_ptr,
-        query_ptr,
-        output_ptr,
-        TOTAL: gl.constexpr,
-        SCALE: gl.constexpr,
-        BLOCK: gl.constexpr,
-        WARPS: gl.constexpr,
-    ):
-        # Four consecutive FP32 elements per lane enable 128-bit memory accesses.
-        offsets = gl.program_id(0) * BLOCK + gl.arange(
-            0, BLOCK, layout=gl.constexpr(gl.BlockedLayout([4], [64], [WARPS], [0]))
-        )
-        # The branch is uniform within a CTA; only the last CTA needs a mask.
-        if gl.program_id(0) < TOTAL // BLOCK:
-            _indexer_weight_scale_vector_tile(
-                weights_ptr,
-                query_ptr,
-                output_ptr,
-                offsets,
-                TOTAL,
-                SCALE,
-                BLOCK,
-                WARPS,
-                False,
-            )
-        else:
-            _indexer_weight_scale_vector_tile(
-                weights_ptr,
-                query_ptr,
-                output_ptr,
-                offsets,
-                TOTAL,
-                SCALE,
-                BLOCK,
-                WARPS,
-                True,
-            )
 
 
 @libentry()
@@ -216,8 +146,7 @@ def fused_indexer_weight_scale(
         return output
     is_dense = weights.is_contiguous() and q_scale.is_contiguous()
     if (
-        HAS_GLUON
-        and is_dense
+        is_dense
         and weights.dtype == torch.float32
         and scale > 0.0
         and total > 8192
@@ -241,7 +170,6 @@ def fused_indexer_weight_scale(
             total,
             scale,
             block,
-            warps,
             num_warps=warps,
             enable_fp_fusion=False,
             pipeline=pipeline,

@@ -317,19 +317,23 @@ class TestMetaXIndexerWeightScale:
             torch.signbit(output[finite]), torch.signbit(expected[finite])
         )
 
+    @pytest.mark.parametrize("tokens", [8998, 9105])
+    @pytest.mark.parametrize("offset", [0, 4])
+    @pytest.mark.parametrize("scale", [0.015625, 0.037, float("inf")])
     @pytest.mark.fused_indexer_weight_scale
-    def test_fused_indexer_weight_scale_without_gluon(self, monkeypatch):
-        import importlib
-
-        module = importlib.import_module(
-            "flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale"
-        )
-        monkeypatch.setattr(module, "HAS_GLUON", False)
-        weights, query = make_metax_inputs(1036, 32, torch.float32, "dense")
-        output = flaggems_vllm.fused_indexer_weight_scale(weights, query, 0.037)
-        torch.testing.assert_close(
-            output,
-            metax_reference_weight_scale(weights, query, 0.037),
-            rtol=1e-6,
-            atol=1e-7,
+    def test_fused_indexer_weight_scale_short_tail(self, tokens, offset, scale):
+        values = torch.tensor([0.0, -0.0, 1.0, -1.0, float("inf"), float("nan")])
+        total = tokens * 32
+        weights_base = values.repeat((total + offset + 5) // 6).to("cuda")
+        query_values = torch.tensor([1.0, 1.0, -1.0, -1.0, 0.0, 1.0])
+        query_base = query_values.repeat((total + offset + 5) // 6).to("cuda")
+        weights = weights_base[offset : offset + total].view(tokens, 32)
+        query = query_base[offset : offset + total].view(tokens, 32, 1)
+        output = flaggems_vllm.fused_indexer_weight_scale(weights, query, scale)
+        expected = metax_reference_weight_scale(weights.cpu(), query.cpu(), scale)
+        actual = output.cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        finite = torch.isfinite(expected)
+        assert torch.equal(
+            torch.signbit(actual[finite]), torch.signbit(expected[finite])
         )
