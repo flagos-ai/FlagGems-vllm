@@ -339,6 +339,14 @@ kda_kkt_inter:
     num_warps: 4
     num_stages: 1
 
+pad_indexer_heads:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
 kda_kkt_diag:
   - META: {}
     num_warps: 2
@@ -363,11 +371,3 @@ chunk_kda_fwd_intra_token_parallel:
       - 8
     stages:
       - 1
-
-pad_indexer_heads:
-  - META: {BLOCK: 256}
-    num_warps: 4
-    num_stages: 1
-  - META: {BLOCK: 1024}
-    num_warps: 4
-    num_stages: 1
