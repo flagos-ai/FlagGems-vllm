@@ -912,16 +912,7 @@ class ValuesKernel:
 
 
 class NativeSmallHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, causal):
-        capacity = tensors[6].shape[1] * 64
-        splits = min(
-            (
-                4
-                if tensors[0].shape[1] * tensors[0].shape[2] == 32 and capacity <= 8192
-                else 8
-            ),
-            triton.next_power_of_2(tensors[6].shape[1]),
-        )
+    def __init__(self, tensors, scale, causal, splits):
         super().__init__(tensors, splits, scale, causal)
         self.head_tile = self.queries * self.heads
         self.normalized_partials = True
@@ -936,20 +927,13 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
 
 
 class NativeCachedHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, causal):
+    def __init__(self, tensors, scale, causal, score_splits):
         super().__init__(tensors, 1, scale, causal)
         merged = self.queries * self.heads
         rows = self.batch * merged
         device = tensors[0].device
         self.capacity = tensors[6].shape[1] * 64
         self.head_tile = 64
-        self.pv_head_tile = 64
-        self.prequantized = False
-        self.grouped = False
-        self.quantized_cache = True
-        self.qk_native_statistics = True
-        self.native_barriers = True
-        self.value_staging = True
         self.adaptive = merged <= 64
         self.sort_batches = self.batch <= 256
         self.value_splits = (
@@ -962,9 +946,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             else 1
         )
         self.value_merge_heads = 4 if self.adaptive else 0
-        self.score_splits = (
-            8 if merged == 64 or (merged <= 128 and self.capacity >= 16384) else 4
-        )
+        self.score_splits = score_splits
         if 1 < self.batch <= 256:
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=device
@@ -1279,8 +1261,10 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         ) - torch.cuda.memory_allocated(q_nope.device)
         fast_path = workspace_bytes <= min(8 * 1024**3, free_bytes // 2)
     if fast_path:
-        handle_class = NativeSmallHandle if merged_heads <= 32 else NativeCachedHandle
-        handle = handle_class(tensors, scale, causal)
+        if merged_heads <= 32:
+            handle = NativeSmallHandle(tensors, scale, causal, native_splits)
+        else:
+            handle = NativeCachedHandle(tensors, scale, causal, score_splits)
     else:
         handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)
     return handle, handle()

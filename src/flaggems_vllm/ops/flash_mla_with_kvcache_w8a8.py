@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+from itertools import accumulate
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -41,25 +42,14 @@ class FlashMLAFp8SplitKSchedMeta:
 
     def __init__(self) -> None:
         self.have_initialized = False
-        self.config = None
-        self.tile_scheduler_metadata = None
         self.num_splits = None
         self.split_batch = None
         self.split_page_begin = None
-        self.split_page_end = None
         self.split_num_pages = None
         self.split_order = None
-        self.max_splits = 1
         self.total_split_capacity = 0
-        self.max_pages_per_split = 0
-        self.lifetime_safe_one_pair = True
-        self.cache_seqlens_data_ptr = 0
-        self.cache_seqlens_version = -1
-        self.num_splits_data_ptr = 0
-        self.num_splits_version = -1
         self.adaptive_fixed_pages = None
         self.adaptive_fixed_pairs = None
-        self.adaptive_selection = ()
         self.capacity_splits = ()
         self.padded_pages = 0
         # Shape a GPU length plan was built for (get_mla_fp8_metadata).
@@ -131,9 +121,6 @@ ADAPTIVE_MAX_FIXED_PAGES = 32
 
 
 ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES = 34
-
-
-ADAPTIVE_CTA_PENALTY = 0.5
 
 
 CUDA_REF_FIXED_OVERHEAD_PAGES = 5
@@ -2883,14 +2870,7 @@ def wave_grain_selection(
     )
     max_pages = max(capacity_pages, default=0)
     if max_pages < ADAPTIVE_MODEL_MIN_PAGES:
-        selected = adaptive_fixed_pages(max_pages)
-        return selected, (
-            {
-                "pages": selected,
-                "policy": "adaptive_short_sequence",
-                "max_pages": max_pages,
-            },
-        )
+        return adaptive_fixed_pages(max_pages)
 
     if h_q <= 0 or (h_q not in (16, 32) and h_q % TLE_FP8_BH):
         raise ValueError("HQ must be 16, 32 or a positive multiple of 64")
@@ -2937,12 +2917,10 @@ def wave_grain_selection(
     # This is deliberately capped at 34 pages: it changes B8/L33280 from
     # 8 * ceil(520 / 32) = 136 CTAs to 8 * ceil(520 / 34) = 128 CTAs while
     # leaving the other formal routing points unchanged.
-    initial_selected_pages = selected_pages
     initial_counts = tuple(
         max(1, math.ceil(pages / selected_pages)) for pages in capacity_pages
     )
     initial_total_ctas = sum(initial_counts) * rh
-    tail_wave_eliminated = False
     if sm_count < initial_total_ctas <= 2 * sm_count:
         for candidate_pages in range(
             selected_pages + 2,
@@ -2954,109 +2932,9 @@ def wave_grain_selection(
             )
             if sum(candidate_counts) * rh <= sm_count:
                 selected_pages = candidate_pages
-                tail_wave_eliminated = True
                 break
 
-    records = []
-    for fixed_pages in range(
-        ADAPTIVE_MIN_FIXED_PAGES,
-        ADAPTIVE_MAX_FIXED_PAGES + 1,
-        2,
-    ):
-        counts = tuple(
-            max(1, math.ceil(pages / fixed_pages)) for pages in capacity_pages
-        )
-        total_splits = sum(counts)
-        total_ctas = total_splits * rh
-        waves = math.ceil(total_ctas / sm_count)
-        fixed_pairs = fixed_pages // 2
-        score = waves * (fixed_pairs + 1) + ADAPTIVE_CTA_PENALTY * total_ctas / sm_count
-        records.append(
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pairs,
-                "total_splits": total_splits,
-                "total_ctas": total_ctas,
-                "waves": waves,
-                "score": score,
-                "policy": "h800_wave_cost",
-            }
-        )
-    selected_counts = tuple(
-        max(1, math.ceil(pages / selected_pages)) for pages in capacity_pages
-    )
-    selection = {
-        "pages": selected_pages,
-        "pairs": selected_pages // 2,
-        "total_splits": sum(selected_counts),
-        "total_ctas": sum(selected_counts) * rh,
-        "num_sm_parts": num_sm_parts,
-        "fixed_overhead_pages": CUDA_REF_FIXED_OVERHEAD_PAGES,
-        "payload_blocks": payload_blocks,
-        "usable_pages_before_pair_rounding": usable_pages,
-        "policy": (
-            "cuda_tail_wave_elimination_even_pair"
-            if tail_wave_eliminated
-            else "cuda_fixed_overhead_even_pair_payload"
-        ),
-        "tail_wave_eliminated": tail_wave_eliminated,
-        "initial_selected_pages": initial_selected_pages,
-        "initial_total_ctas": initial_total_ctas,
-    }
-    return int(selected_pages), (selection, *records)
-
-
-def adaptive_schedule(max_cache_seqlens, pages_per_split: int):
-    capacity_pages = tuple(
-        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
-    )
-    counts = tuple(
-        max(1, math.ceil(pages / pages_per_split)) for pages in capacity_pages
-    )
-    prefix = [0]
-    split_batch = []
-    split_page_begin = []
-    split_page_end = []
-    split_num_pages = []
-    for batch_index, (pages, count) in enumerate(zip(capacity_pages, counts)):
-        prefix.append(prefix[-1] + count)
-        for split_index in range(count):
-            if pages_per_split == 16 and pages == 520 and count == 33:
-                # Pair-aligned balancing: 29x16 + 4x14 = 520 pages.  Spread
-                # the four 14-page splits through the row so no 8-page tail
-                # remains, while every split retains an even page count.
-                short_before = (split_index * 4) // count
-                short_through = ((split_index + 1) * 4) // count
-                page_begin = split_index * 16 - 2 * short_before
-                num_pages = 14 if short_through != short_before else 16
-                page_end = page_begin + num_pages
-            elif pages_per_split == 34 and pages == 520 and count == 16:
-                page_begin = (pages * split_index) // count
-                page_end = (pages * (split_index + 1)) // count
-                num_pages = page_end - page_begin
-            else:
-                page_begin = split_index * pages_per_split
-                num_pages = max(0, min(pages_per_split, pages - page_begin))
-            split_batch.append(batch_index)
-            split_page_begin.append(page_begin)
-            split_page_end.append(page_begin + num_pages)
-            split_num_pages.append(num_pages)
-    padded_pages = max(
-        1,
-        max(
-            (count * pages_per_split for count in counts),
-            default=1,
-        ),
-    )
-    return (
-        tuple(prefix),
-        tuple(split_batch),
-        tuple(split_page_begin),
-        tuple(split_page_end),
-        tuple(split_num_pages),
-        counts,
-        padded_pages,
-    )
+    return int(selected_pages)
 
 
 def build_adaptive_execution_meta(
@@ -3071,13 +2949,6 @@ def build_adaptive_execution_meta(
     max_pages = max(capacity_pages, default=0)
     if max_pages <= 2:
         fixed_pages = int(short_pages_per_split)
-        selection = (
-            {
-                "pages": fixed_pages,
-                "policy": "direct_two_page",
-                "max_pages": max_pages,
-            },
-        )
     elif (
         max_pages >= 64
         and len(capacity_pages) >= 128
@@ -3085,7 +2956,6 @@ def build_adaptive_execution_meta(
     ):
         # The query-row grid fills the device; avoid redundant split CTAs and Q loads.
         fixed_pages = max_pages
-        selection = ({"pages": fixed_pages, "policy": "high_batch_row_capacity"},)
     elif (
         max_pages in (4, 8, 16, 32, 64)
         and h_q == 128
@@ -3095,27 +2965,12 @@ def build_adaptive_execution_meta(
         # The measured high-batch workload already fills two CTA waves without
         # splitting; finer grains add redundant query loads and merge traffic.
         fixed_pages = max_pages
-        selection = (
-            {
-                "pages": fixed_pages,
-                "policy": "high_batch_uniform_row_direct",
-                "max_pages": max_pages,
-            },
-        )
     elif 3 <= max_pages <= 8:
         # Short-K route: expose one physical-page CTA at a time instead of
         # serializing the complete 3-8 page row in a single CTA.  This is
         # host scheduling only; the strict-2WG kernel and pair pipeline are
         # unchanged.
         fixed_pages = 1
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": 1,
-                "policy": "shortk_pagegrain_3_to_8_pages_v1",
-                "max_pages": max_pages,
-            },
-        )
     elif (
         max_pages == 10
         and len(capacity_pages) >= 32
@@ -3126,14 +2981,6 @@ def build_adaptive_execution_meta(
         # direct-output CTA per (batch, 64-head group) and only finalize LSE.
         # Keep this eligibility exact for heterogeneous rows and adjacent lengths.
         fixed_pages = max_pages
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": math.ceil(fixed_pages / 2),
-                "policy": "b32plus_l640_direct_single",
-                "max_pages": max_pages,
-            },
-        )
     elif (
         max_pages == 10
         and h_q == 128
@@ -3144,28 +2991,12 @@ def build_adaptive_execution_meta(
         # two-page splits per row) to 96 CTAs (three four-page-capacity
         # splits per row and two head groups).
         fixed_pages = 4
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pages // 2,
-                "policy": "b16_l640_four_page_grain",
-                "max_pages": max_pages,
-            },
-        )
     elif 9 <= max_pages <= 10:
         # A ten-page direct-single CTA is not the best short-sequence route.  Use the finest
         # legal two-page pair grain to expose five split CTAs, mirroring the
         # CUDA reference's short-workload parallel split behavior.  Keep the
         # policy deliberately narrow until adjacent page ranges are measured.
         fixed_pages = 2
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": 1,
-                "policy": "cuda_short_parallel_pair_9_to_10_pages",
-                "max_pages": max_pages,
-            },
-        )
     elif (
         max_pages == 128
         and h_q == 64
@@ -3182,14 +3013,6 @@ def build_adaptive_execution_meta(
             max_pages,
             2 * math.ceil(math.ceil(max_pages / target_splits_per_row) / 2),
         )
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pages // 2,
-                "policy": "b64plus_l8192_onewave_even_grain",
-                "max_pages": max_pages,
-            },
-        )
     elif (
         max_pages == 520
         and h_q == 64
@@ -3197,9 +3020,6 @@ def build_adaptive_execution_meta(
         and all(pages == 520 for pages in capacity_pages)
     ):
         fixed_pages = 65
-        selection = (
-            {"pages": 65, "pairs": 33, "policy": "b16_l33280_uniform_grain65"},
-        )
     elif (
         max_pages == 520
         and h_q == 64
@@ -3214,50 +3034,31 @@ def build_adaptive_execution_meta(
             max_pages,
             2 * math.ceil(math.ceil(max_pages / target_splits_per_row) / 2),
         )
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pages // 2,
-                "policy": "b16plus_l33280_onewave_even_grain",
-                "max_pages": max_pages,
-            },
-        )
     elif (
         h_q == 64
         and len(capacity_pages) == 16
         and all(pages == 128 for pages in capacity_pages)
     ):
         fixed_pages = 16
-        selection = ({"pages": 16, "pairs": 8, "policy": "b16_l8192_balanced_grain16"},)
     else:
         sm_count = int(_get_num_sms(device))
-        fixed_pages, selection = wave_grain_selection(
-            tuple(max_cache_seqlens), h_q, sm_count
-        )
-    (
-        prefix,
-        split_batch,
-        split_page_begin,
-        split_page_end,
-        split_num_pages,
-        counts,
-        padded_pages,
-    ) = adaptive_schedule(max_cache_seqlens, fixed_pages)
+        fixed_pages = wave_grain_selection(tuple(max_cache_seqlens), h_q, sm_count)
+    # Host counts size the workspace; split ranges are generated only on the GPU.
+    counts = tuple(max(1, math.ceil(pages / fixed_pages)) for pages in capacity_pages)
+    prefix = (0, *accumulate(counts))
+    total_splits = prefix[-1]
+    padded_pages = max(1, max(counts, default=1) * fixed_pages)
 
     meta = FlashMLAFp8SplitKSchedMeta()
     meta.have_initialized = True
     meta.num_splits = torch.empty((len(prefix),), dtype=torch.int32, device=device)
-    meta.split_batch = torch.empty(
-        (len(split_batch),), dtype=torch.int32, device=device
-    )
+    meta.split_batch = torch.empty((total_splits,), dtype=torch.int32, device=device)
     meta.split_page_begin = torch.empty_like(meta.split_batch)
-    meta.split_page_end = torch.empty_like(meta.split_batch)
     meta.split_num_pages = torch.empty_like(meta.split_batch)
     initialize_capacity_plan[(len(capacity_pages),)](
         meta.num_splits,
         meta.split_batch,
         meta.split_page_begin,
-        meta.split_page_end,
         meta.split_num_pages,
         capacity_pages,
         prefix,
@@ -3270,18 +3071,12 @@ def build_adaptive_execution_meta(
     order_dense_splits[(1,)](
         meta.split_num_pages,
         meta.split_order,
-        len(split_batch),
-        triton.next_power_of_2(len(split_batch)),
+        total_splits,
+        triton.next_power_of_2(total_splits),
     )
-    meta.max_splits = max(counts, default=1)
-    meta.total_split_capacity = len(split_batch)
-    meta.max_pages_per_split = max(split_num_pages, default=0)
-    meta.lifetime_safe_one_pair = meta.max_pages_per_split <= 2
-    meta.num_splits_data_ptr = int(meta.num_splits.data_ptr())
-    meta.num_splits_version = tensor_version(meta.num_splits)
+    meta.total_split_capacity = total_splits
     meta.adaptive_fixed_pages = fixed_pages
     meta.adaptive_fixed_pairs = math.ceil(fixed_pages / 2)
-    meta.adaptive_selection = selection
     meta.capacity_splits = counts
     meta.padded_pages = padded_pages
     return meta
@@ -3304,7 +3099,6 @@ if HAS_TLE:
         Prefix,
         Batch,
         Begin,
-        End,
         Pages,
         CapacityPages,
         PrefixValues,
@@ -3346,7 +3140,6 @@ if HAS_TLE:
             tl.store(Prefix + BATCH, stop)
         tl.store(Batch + start + local, batch, mask)
         tl.store(Begin + start + local, page_begin, mask)
-        tl.store(End + start + local, page_begin + num_pages, mask)
         tl.store(Pages + start + local, num_pages, mask)
 
 
@@ -3856,10 +3649,7 @@ def prepare_dense_decode_core(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int,
-    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
-    num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
-    causal: bool = False,
     pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
     max_splits: Optional[int] = None,
     *,
@@ -4191,7 +3981,6 @@ class FlashMLAFp8PreparedHandle:
         return (
             self.has_length_certificate
             and self.direct_single_output
-            and int(self.meta.max_pages_per_split) == 2
             and self.cache_seqlens_host == self.max_cache_seqlens
             and all(
                 PAGE_SIZE < length <= 2 * PAGE_SIZE
@@ -4755,8 +4544,6 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int,
-    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
-    num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
@@ -4795,12 +4582,9 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
             block_table,
             cache_seqlens,
             head_dim_v,
-            tile_scheduler_metadata,
-            num_splits,
-            softmax_scale,
-            causal,
-            pages_per_split,
-            max_splits,
+            softmax_scale=softmax_scale,
+            pages_per_split=pages_per_split,
+            max_splits=max_splits,
             initial_cache_seqlens=initial_cache_seqlens,
             max_cache_seqlens=max_cache_seqlens,
             has_length_certificate=has_length_certificate,
@@ -4836,7 +4620,6 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         packed_lengths,
         head_dim_v,
         softmax_scale=softmax_scale,
-        causal=False,
         pages_per_split=pages_per_split,
         max_splits=max_splits,
         initial_cache_seqlens=initial,
