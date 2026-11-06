@@ -81,8 +81,18 @@ def _conv_kernel(
             tl.where(valid, result, 0),
             channel < D,
         )
-        nxt = tl.broadcast_to(((j + 1) % BW)[None, :], (BLOCK_D, BW))
-        history = tl.gather(window, nxt, 1)
+        # GLM53_NO_TL_GATHER: 用 where+sum 替换 tl.gather(axis=1)。
+        # tl.gather 沿 axis=1 的寄存器置换会被 lowering 成 warp shuffle
+        # (maca.shfl.sync)，而 MACA 后端缺该 op 的 lowering，编译直接失败。
+        # 这里 BW = next_power_of_2(width) = 4，4x4 的 where+sum 代价可忽略，
+        # 语义与 gather 完全等价：history[d, i] = window[d, (i + 1) % BW]
+        _src = (j + 1) % BW
+        # history[i] = window[(i + 1) % BW] —— 索引必须落在 **输出槽位** 轴上。
+        # 写成 _src[None, :] == j[:, None] 会得到 (k + 1) % BW == i，
+        # 即 history[i] = window[(i - 1) % BW]，移位方向反了
+        # （元素级相等是对称的，对调两个操作数并不能纠正）。
+        _match = _src[:, None] == j[None, :]
+        history = tl.sum(tl.where(_match[None, :, :], window[:, None, :], 0.0), axis=2)
     tl.store(
         st_base + j[None, :] * SS_T,
         history,
