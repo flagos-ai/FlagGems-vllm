@@ -314,3 +314,8 @@ chunk_kda_fwd_intra_token_parallel:
       BH: 8
     num_warps: 4
     num_stages: 1
+
+hc_combine:
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
