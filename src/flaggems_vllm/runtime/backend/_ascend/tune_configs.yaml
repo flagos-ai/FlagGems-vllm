@@ -259,6 +259,11 @@ compute_global_topk_indices_and_lens:
     num_warps: 1
     num_stages: 2
 
+ckfg_state_ascend:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
 kda_kkt_pairs:
   - META: {PAIRS: 16}
     num_warps: 4
@@ -281,8 +286,23 @@ fused_recurrent_kda:
     num_warps: 1
     num_stages: 1
 
-ckfg_state_ascend:
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+    warps:
+      - 4
+      - 8
+    stages:
+      - 1
   - META:
-      BV: 16
-    num_warps: 2
+      BH: 8
+    num_warps: 4
     num_stages: 1

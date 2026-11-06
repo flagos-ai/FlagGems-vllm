@@ -258,6 +258,26 @@ dequantize_and_gather_k_cache:
       num_workers: 4096
     num_warps: 2
 
+ckfg_state:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BV: 32
+    num_warps: 2
+    num_stages: 1
+
+ckfg_intra:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2
 kda_kkt_pairs:
   - META: {PAIRS: 16}
     num_warps: 4
@@ -286,23 +306,22 @@ fused_recurrent_kda:
     num_warps: 1
     num_stages: 1
 
-ckfg_state:
-  - META:
-      BV: 16
-    num_warps: 2
-    num_stages: 1
-  - META:
-      BV: 32
-    num_warps: 2
-    num_stages: 1
-
-ckfg_intra:
-  - META: {}
-    num_warps: 4
-    num_stages: 3
-  - META: {}
-    num_warps: 4
-    num_stages: 2
-  - META: {}
-    num_warps: 8
-    num_stages: 2
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+      - 8
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+    stages:
+      - 1

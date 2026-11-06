@@ -177,6 +177,7 @@ def assert_result(result, expected, dtype):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("normalize", [True, False])
@@ -205,6 +206,7 @@ def test_recurrent_contract(case, dtype, normalize, entry):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("tiny", [False, True])
 def test_recurrent_optional_gate_and_beta(dtype, tiny):
@@ -218,6 +220,7 @@ def test_recurrent_optional_gate_and_beta(dtype, tiny):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize(
     "kind", ["layout", "scale", "indices", "accepted", "state", "dtype"]
 )
@@ -242,6 +245,7 @@ def test_recurrent_invalid_metadata(kind):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("entry", ["generic", "top"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(9, 4, 12, 64, 32), (1, 16, 64, 128, 128)])
