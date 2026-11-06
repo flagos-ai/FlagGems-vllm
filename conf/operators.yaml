@@ -1251,6 +1251,16 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: pad_indexer_heads
+    description: Append zero heads to GLM5Next FP8 queries and per-head weights with bit-preserving copies.
+    for:
+      - None
+    labels:
+      - vLLM
+    kind:
+      - DataMovement
+    stages:
+      - beta: '0.3'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,
