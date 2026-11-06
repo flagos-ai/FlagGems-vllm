@@ -19,5 +19,5 @@ def hc_combine(
     injection_logits: torch.Tensor | None,
     hc_count: int,
 ) -> torch.Tensor:
-    logger.debug("GEMS HC_COMBINE")
+    logger.debug("GEMS_METAX HC_COMBINE")
     return _combine(residual, block_output, injection_logits, hc_count)

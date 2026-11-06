@@ -27,7 +27,7 @@ def hc_combine(
     hc_count: int,
 ) -> torch.Tensor:
     # Keep metadata validation in this public entry to avoid a second host call.
-    logger.debug("GEMS HC_COMBINE")
+    logger.debug("GEMS_THEAD HC_COMBINE")
     if isinstance(hc_count, bool) or not isinstance(hc_count, int) or hc_count <= 0:
         raise ValueError("hc_combine requires a positive integer hc_count")
     shape = residual.shape
