@@ -185,6 +185,15 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
             with self.subTest(platform=entry["platform"]):
                 self.assertNotIn(" ", entry["container_image"])
 
+    def test_no_platform_declares_container_volumes(self):
+        # The ARC `k8s-novolume` hook backing these runners cannot bind-mount
+        # host paths; it mkdirs each mount point and fails when the target
+        # exists as a file. Run 42145278734 failed on exactly the platforms
+        # that declared a volume.
+        for name, entry in self.platforms.items():
+            with self.subTest(platform=name):
+                self.assertEqual(entry.get("container_volumes") or [], [])
+
     def test_gpu_check_scripts_exist(self):
         for name, entry in self.platforms.items():
             with self.subTest(platform=name):

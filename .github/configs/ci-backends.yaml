@@ -36,6 +36,13 @@
 #
 # NVIDIA is intentionally absent: the `nvidia-tests` job runs directly on the
 # H20 host via `tools/setup.sh` and must not be forced into a container.
+#
+# Keep `container_volumes` empty. These runners are ephemeral ARC pods driven
+# by the `k8s-novolume` container hook, which cannot bind-mount host paths: it
+# creates each mount point with mkdir, so a mount fails outright when the
+# target already exists as a file. Run 42145278734 showed every platform with
+# a volume failing and every platform without one passing. Anything a test
+# needs must be baked into the image.
 
 platforms:
 
@@ -72,11 +79,10 @@ platforms:
       --device=/dev/davinci_manager
       --device=/dev/devmm_svm
       --device=/dev/hisi_hdc
-    container_volumes:
-      - /usr/local/Ascend/driver:/usr/local/Ascend/driver
-      - /usr/local/Ascend/add-ons/:/usr/local/Ascend/add-ons/
-      - /usr/local/sbin/:/usr/local/sbin/
-      - /etc/ascend_install.info:/etc/ascend_install.info
+    # No volumes: see the mthreads note below. The ARC `k8s-novolume` hook
+    # cannot bind-mount host paths, so the CANN driver and add-ons have to
+    # come from the image.
+    container_volumes: []
     gpu_check_script: tools/gpu_check_ascend.sh
 
   iluvatar:
@@ -137,10 +143,12 @@ platforms:
       --shm-size=256g
       --ulimit memlock=-1
       --ulimit stack=67108864
-    # gpu_check_mthreads.sh shells out to `mthreads-gmi`, which lives on the
-    # host rather than in the image.
-    container_volumes:
-      - /usr/bin/mthreads-gmi:/usr/bin/mthreads-gmi:ro
+    # No volumes: these runners are ARC pods using the `k8s-novolume` hook,
+    # where a host-path mount is created with mkdir and fails against an
+    # existing file ("cannot create directory '/usr/bin/mthreads-gmi': File
+    # exists"). gpu_check_mthreads.sh therefore needs `mthreads-gmi` to be
+    # present in the image itself.
+    container_volumes: []
     test_env:
       FLAGTREE_BACKEND: mthreads
     gpu_check_script: tools/gpu_check_mthreads.sh
