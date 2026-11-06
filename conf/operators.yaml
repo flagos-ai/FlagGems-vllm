@@ -712,7 +712,7 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
 
   - id: gdn_w8a16
     description: |
