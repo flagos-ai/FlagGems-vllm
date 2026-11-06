@@ -1394,6 +1394,23 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: sparse_attn_sharedkv_fp8
+    description: |
+      The decode step of sparse_attn_sharedkv over the packed FP8 KV cache
+      (584 bytes per token against 1024 for BF16), dequantised in software on
+      910B4, which has no hardware FP8.
+    for:
+      - None
+    labels:
+      - fused
+      - TLE
+      - vLLM
+      - DeepSeekV4
+      - Attention
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: sparse_attn_triton
     description: Sparse attention with attention-sink.
     for:

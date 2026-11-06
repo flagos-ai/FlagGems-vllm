@@ -51,6 +51,11 @@ import triton.language.extra.cann.extension as cann_ext
 from triton.language.extra.cann import libdevice as cann_libdevice
 from triton.runtime.libentry import libentry
 
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv_fp8 import (
+    is_packed_fp8_cache,
+    sparse_attn_sharedkv_fp8,
+)
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 
@@ -9168,6 +9173,17 @@ def sparse_attn_sharedkv(
     if q.device.type != "npu":
         raise NotImplementedError(
             "SparseAttnSharedKV is implemented only for Ascend NPU."
+        )
+    if is_packed_fp8_cache(kwargs.get("ori_kv")):
+        # The decode step over the packed FP8 cache, which carries its own
+        # scales and so cannot be described by a dtype. Everything else keeps
+        # the paths below.
+        return sparse_attn_sharedkv_fp8(
+            q,
+            host_q_lens=host_q_lens,
+            host_kv_lens=host_kv_lens,
+            max_model_len=max_model_len,
+            **kwargs,
         )
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("Q must be FP16 or BF16.")
