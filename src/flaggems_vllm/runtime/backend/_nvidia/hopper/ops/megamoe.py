@@ -12,17 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cd /share/project/tle/pr/flash-linear-attention
+"""Public Hopper exports for the FP8 expert-parallel MegaMoE kernel."""
 
-SRC=perf/gdn2-fused-infer
-BASE=$(git merge-base origin/main "$SRC")
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.api import (
+    MegaMoEContext,
+    megamoe_fp8,
+)
 
-GEMS=/share/project/tle/pr/FlagGems-vllm
-DST=$GEMS/src/flaggems_vllm/ops/FLA/gdn2_native
-
-mkdir -p "$DST"
-touch "$DST/__init__.py"
-
-for f in chunk_fwd.py chunk_intra.py chunk_intra_token_parallel.py wy_fast.py; do
-    git show "$BASE:fla/ops/gdn2/$f" > "$DST/$f"
-done
+__all__ = ["MegaMoEContext", "megamoe_fp8"]
