@@ -49,7 +49,6 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_recurrent_kda,
 )
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
@@ -62,8 +61,15 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+    flash_mla_with_kvcache_sparse_w8a8_int8,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    FlashMLAFp8SplitKSchedMeta,
     flash_mla_with_kvcache_w8a8,
+    get_mla_fp8_metadata,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
@@ -219,6 +225,7 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -243,6 +250,8 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -286,6 +295,7 @@ __all__ = [
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
     "flash_mla_with_kvcache_w8a8",
+    "FlashMLAFp8SplitKSchedMeta",
     "fp32_router_gemm",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
@@ -311,6 +321,7 @@ __all__ = [
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "get_mla_fp8_metadata",
     "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
@@ -362,6 +373,7 @@ __all__ = [
     "ple_short_conv_",
     "ple_state_gather",
     "ple_state_scatter_",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_fp8",
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_mqa_paged",
