@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import (
     _mqa_logits_kernel,
     _select_block_kv,
@@ -137,6 +138,7 @@ def fp8_fp4_paged_mqa_logits_graph(
         BLOCK_D=128,
         NUM_BLOCKS=num_blocks,
         IS_MXFP4=is_fp4,
+        BF16_DOT=runtime.device.vendor_name == "metax",
         PAGED_KV=True,
         NEXT_N=next_n,
         stride_kv_page=kv_cache.stride(0),
