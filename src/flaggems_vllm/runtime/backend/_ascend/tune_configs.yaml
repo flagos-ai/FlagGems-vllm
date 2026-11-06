@@ -280,3 +280,8 @@ fused_recurrent_kda:
       BV: 32
     num_warps: 1
     num_stages: 1
+
+hc_combine:
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1

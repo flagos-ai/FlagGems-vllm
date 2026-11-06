@@ -1249,3 +1249,23 @@ fused_recurrent_kda:
       BV: 8
     num_warps: 1
     num_stages: 1
+
+hc_combine:
+  - META: {BLOCK_D: 128, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 128, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: true}
+    num_warps: 4
+    num_stages: 1

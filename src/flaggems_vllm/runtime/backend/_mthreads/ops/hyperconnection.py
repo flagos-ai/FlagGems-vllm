@@ -23,6 +23,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.qwen4.hc_combine import _combine
+
 
 @triton.jit
 def _hc_inject_combine_kernel(
@@ -79,58 +81,19 @@ def _hc_inject_combine_kernel(
         )
 
 
+def hc_combine(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor | None,
+    hc_count: int,
+) -> torch.Tensor:
+    return _combine(residual, block_output, injection_logits, hc_count)
+
+
 def qwen4_hc_inject_combine(
     injection_logits: torch.Tensor,
     block_output: torch.Tensor,
     residual: torch.Tensor,
     hc_count: int,
 ) -> torch.Tensor:
-    if injection_logits.shape != (*block_output.shape[:-1], hc_count):
-        raise ValueError("Qwen4 HC injection logits have an invalid shape")
-    if hc_count <= 0:
-        raise ValueError("Qwen4 HC injection requires a positive HC count")
-    if residual.shape != (
-        *block_output.shape[:-1],
-        hc_count * block_output.shape[-1],
-    ):
-        raise ValueError("Qwen4 HC residual and block output shapes are incompatible")
-    if any(
-        t.device.type in ("cpu", "meta")
-        or t.dtype not in (torch.bfloat16, torch.float16)
-        for t in (injection_logits, block_output, residual)
-    ):
-        raise RuntimeError(
-            "Qwen4 HC injection received an unsupported accelerator layout"
-        )
-    if len({t.device for t in (injection_logits, block_output, residual)}) != 1:
-        raise RuntimeError("Qwen4 HC injection requires same-device tensors")
-
-    output = torch.empty_like(residual)
-    if not residual.numel():
-        return output
-
-    hidden_size = block_output.shape[-1]
-    rows = block_output.numel() // hidden_size
-
-    if rows * ((hidden_size + 255) // 256) >= 256:
-        block_h = 512
-    else:
-        block_h = 256
-
-    grid = (hc_count, rows, (hidden_size + block_h - 1) // block_h)
-    _hc_inject_combine_kernel[grid](
-        injection_logits,
-        block_output,
-        residual,
-        output,
-        injection_logits.stride(-2),
-        block_output.stride(-2),
-        residual.stride(-2),
-        output.stride(-2),
-        hidden_size=hidden_size,
-        hc_count=hc_count,
-        block_h=block_h,
-        need_mask=(hidden_size % block_h) != 0,
-        num_warps=2,
-    )
-    return output
+    return _combine(residual, block_output, injection_logits, hc_count, legacy=True)

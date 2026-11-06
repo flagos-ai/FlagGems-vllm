@@ -343,3 +343,11 @@ kda_kkt_diag:
   - META: {}
     num_warps: 2
     num_stages: 1
+
+hc_combine:
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1

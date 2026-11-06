@@ -59,6 +59,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
+    hc_combine,
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
@@ -142,6 +143,7 @@ __all__ = [
     "gemma_rms_norm",
     "group_list_cumsum",
     "grouped_topk",
+    "hc_combine",
     "indexer_epilogue",
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
