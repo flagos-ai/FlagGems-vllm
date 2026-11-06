@@ -75,7 +75,7 @@ if "mm_w8a8_int8" in vars(flag_gems):
 
     __all__ += ["bmm_w8a8_int8"]
 
+from flaggems_vllm.runtime.backend._thead.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._thead.ops.hyperconnection import (
-    hc_combine,
     qwen4_hc_inject_combine,
 )

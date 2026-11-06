@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Pinned Qwen4 hc_combine native and shared, immutable workload matrix."""
-
-import hashlib
-import importlib.util
-import os
-import sys
-from pathlib import Path
+"""Installed vLLM hc_combine baseline and shared, immutable workload matrix."""
 
 import torch
 
@@ -15,41 +9,25 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 IS_INPLACE = False
 MUTATED_INPUTS = ()
 NATIVE_API = "vllm.models.qwen4_exp.nvidia.ops.hc.hc_combine"
-NATIVE_REF = "a17e79abde45715e79a00deb99ad34be49162231"
-NATIVE_URL = f"https://github.com/vllm-project/vllm/blob/{NATIVE_REF}/vllm/models/qwen4_exp/nvidia/ops/hc.py"
-NATIVE_SHA256 = "8f9b47aa1620d2809f1887a2ce333f5c3bb40f2b05abdaa42d072c19b7176f5a"
 NATIVE_UNAVAILABLE_REASON = None
+NATIVE_VERSION = None
 
 
 def native():
-    global NATIVE_UNAVAILABLE_REASON
-    path = os.environ.get("HC_COMBINE_NATIVE_SOURCE")
-    if not path:
-        NATIVE_UNAVAILABLE_REASON = (
-            "HC_COMBINE_NATIVE_SOURCE must point to the pinned native hc.py"
-        )
-        return None
-    source = Path(path)
-    if not source.is_file():
-        NATIVE_UNAVAILABLE_REASON = f"Pinned source missing: {source}"
-        return None
-    if hashlib.sha256(source.read_bytes()).hexdigest() != NATIVE_SHA256:
-        raise ValueError("hc_combine native source does not match the frozen revision")
-    spec = importlib.util.spec_from_file_location("hc_combine_native_pinned", source)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
+    global NATIVE_UNAVAILABLE_REASON, NATIVE_VERSION
+    NATIVE_VERSION = None
     try:
-        spec.loader.exec_module(module)
+        import vllm
+        from vllm.models.qwen4_exp.nvidia.ops.hc import hc_combine
     except (ImportError, AttributeError) as exc:
-        sys.modules.pop(spec.name, None)
         NATIVE_UNAVAILABLE_REASON = repr(exc)
         return None
-    op = getattr(module, "hc_combine", None)
-    if not callable(op):
-        NATIVE_UNAVAILABLE_REASON = "Pinned native hc_combine is not callable"
+    if not callable(hc_combine):
+        NATIVE_UNAVAILABLE_REASON = "Installed vLLM hc_combine is not callable"
         return None
+    NATIVE_VERSION = getattr(vllm, "__version__", None)
     NATIVE_UNAVAILABLE_REASON = None
-    return op
+    return hc_combine
 
 
 def grid():
@@ -126,9 +104,9 @@ def config(binding, dtype):
         ),
         outputs=dict(output=tensor(hc * d, dtype)),
         dims=dict(binding),
-        native_ref=NATIVE_REF,
+        native_version=NATIVE_VERSION,
         native_api=NATIVE_API,
-        baseline_kind="explicit-pinned-vllm-source; not a vendor-C baseline",
+        baseline_kind="installed-vllm",
         mutation="none",
         alias="fresh output, no input alias",
         graph=False,

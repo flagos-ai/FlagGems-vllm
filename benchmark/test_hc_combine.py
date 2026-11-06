@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Public canonical entry; pinned native; standard reports with per-case N/A.
+"""Public canonical entry; installed vLLM; standard reports with per-case N/A.
 
 The local timer supplies non-Graph device events on every vendor, rather than
 assuming that vendor do_bench implementations use the same timing mechanism.

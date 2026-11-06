@@ -37,8 +37,8 @@ from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
-    hc_combine,
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (

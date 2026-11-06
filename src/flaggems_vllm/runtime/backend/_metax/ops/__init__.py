@@ -26,8 +26,8 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._metax.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
-    hc_combine,
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._metax.ops.int8_einsum import int8_einsum

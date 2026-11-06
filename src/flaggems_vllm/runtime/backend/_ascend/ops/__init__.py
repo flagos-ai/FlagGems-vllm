@@ -58,8 +58,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
-    hc_combine,
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue

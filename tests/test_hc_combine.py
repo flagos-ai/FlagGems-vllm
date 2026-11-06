@@ -2,7 +2,9 @@
 # Copyright 2026 FlagOS Contributors
 """Independent CPU oracle, public dispatch, boundaries, and legacy regression."""
 
+import builtins
 import itertools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -225,3 +227,55 @@ def test_hc_combine_native(dtype, injection):
         dict(n=7, hc=3, d=513, layout="packed", injection=injection), dtype, gems.device
     )
     check(data, native)
+
+
+@pytest.mark.hc_combine
+@pytest.mark.parametrize(
+    "mode",
+    ["ready", "versionless", "missing_module", "missing_attribute", "not_callable"],
+)
+def test_hc_combine_native_resolution(monkeypatch, mode):
+    # Resolver fault injection is separate from the numerical native tests above.
+    # Successful resolution must return and call the original imported function.
+    calls = []
+    output = object()
+
+    def imported_native(*args):
+        calls.append(args)
+        return output
+
+    original_import = builtins.__import__
+
+    def import_vllm(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "vllm":
+            return (
+                SimpleNamespace()
+                if mode == "versionless"
+                else SimpleNamespace(__version__="test-version")
+            )
+        if name == "vllm.models.qwen4_exp.nvidia.ops.hc":
+            if mode == "missing_module":
+                raise ImportError("vLLM hc module unavailable")
+            if mode == "missing_attribute":
+                raise AttributeError("vLLM hc_combine unavailable")
+            return SimpleNamespace(
+                hc_combine=None if mode == "not_callable" else imported_native
+            )
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_vllm)
+    monkeypatch.setattr(baseline, "NATIVE_UNAVAILABLE_REASON", "previous failure")
+    monkeypatch.setattr(baseline, "NATIVE_VERSION", None)
+    monkeypatch.setenv("HC_COMBINE_NATIVE_SOURCE", "/unused/pinned/source.py")
+    native = baseline.native()
+    if mode in ("ready", "versionless"):
+        assert native is imported_native
+        args = (object(), object(), None, 3)
+        assert native(*args) is output and calls == [args]
+        assert baseline.NATIVE_UNAVAILABLE_REASON is None
+        assert baseline.NATIVE_VERSION == (
+            None if mode == "versionless" else "test-version"
+        )
+    else:
+        assert native is None and not calls
+        assert baseline.NATIVE_UNAVAILABLE_REASON
