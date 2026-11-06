@@ -631,3 +631,14 @@ gdn_w8a16_int8:
     - [35, 8192, 32, 128]
     - [51, 8192, 32, 128]
   shape_desc: "decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N"
+
+gate_sigmoid_mul:
+  # Full dtype/layout sweep is defined in baseline/gate_sigmoid_mul.py.
+  shapes:
+    - [1, 1536, contiguous]
+    - [16, 3072, split_gate]
+    - [256, 6144, contiguous]
+    - [511, 12288, split_gate]
+    - [512, 12288, contiguous]
+    - [4096, 12288, split_gate]
+  shape_desc: "tokens, width, gate_layout"
