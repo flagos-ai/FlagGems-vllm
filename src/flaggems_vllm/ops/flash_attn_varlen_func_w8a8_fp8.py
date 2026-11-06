@@ -23,97 +23,21 @@ from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, tl_extra_shim
 from flaggems_vllm.utils.device_info import get_device_capability
-from flaggems_vllm.utils.random_utils import philox_backend_seed_offset
 
 logger = logging.getLogger(__name__)
-_debug = False
 
 
-@triton.jit
-def u64_to_lohi(x):
-    return (x >> 32).to(tl.uint32), (x & 0xFFFFFFFF).to(tl.uint32)
-
-
-@triton.jit
-def philox_(seed, subsequence, offset):
-    kPhilox10A: tl.constexpr = 0x9E3779B9
-    kPhilox10B: tl.constexpr = 0xBB67AE85
-    k0, k1 = u64_to_lohi(seed.to(tl.uint64))
-    c0, c1 = u64_to_lohi(offset.to(tl.uint64))
-    c2, c3 = u64_to_lohi(subsequence.to(tl.uint64))
-
-    # pragma unroll
-    kPhiloxSA: tl.constexpr = 0xD2511F53
-    kPhiloxSB: tl.constexpr = 0xCD9E8D57
-    for _ in tl.static_range(6):
-        res0 = kPhiloxSA * c0.to(tl.uint64)
-        res1 = kPhiloxSB * c2.to(tl.uint64)
-        res0_x, res0_y = u64_to_lohi(res0)
-        res1_x, res1_y = u64_to_lohi(res1)
-        c0, c1, c2, c3 = res1_y ^ c1 ^ k0, res1_x, res0_y ^ c3 ^ k1, res0_x
-        k0 += kPhilox10A
-        k1 += kPhilox10B
-
-    res0 = kPhiloxSA * c0.to(tl.uint64)
-    res1 = kPhiloxSB * c2.to(tl.uint64)
-    res0_x, res0_y = u64_to_lohi(res0)
-    res1_x, res1_y = u64_to_lohi(res1)
-    c0, c1, c2, c3 = res1_y ^ c1 ^ k0, res1_x, res0_y ^ c3 ^ k1, res0_x
-
-    return c0, c1, c2, c3
-
-
-@triton.jit
-def apply_dropout_mask(
-    P,
-    mask,
-    encode_dropout_in_sign_bit: tl.constexpr,
-):
-    if encode_dropout_in_sign_bit:
-        P = tl.where(mask, -P, P)
-    else:
-        P = tl.where(mask, (P * 0).to(P.dtype), P)
-    return P
-
-
-@triton.jit
-def apply_dropout(
-    P,
-    row_start,
-    col_start,
-    n_cols,
-    bid,
-    hid,
-    philox_seed,
-    philox_offset,
-    p_dropout_uint8: tl.constexpr,
-    is_dropout: tl.constexpr,
-    encode_dropout_in_sign_bit: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    if is_dropout:
-        row_start = tl.multiple_of(row_start, BLOCK_M)
-        col_start = tl.multiple_of(col_start, BLOCK_N)
-        row = row_start + tl.arange(0, BLOCK_M)[:, None]
-        # Down scale col_idx by 4
-        col = col_start // 4 + tl.arange(0, BLOCK_N // 4)[None, :]
-
-        subsequence = row.to(tl.uint64) * n_cols + col.to(tl.uint64)
-
-        offset = philox_offset + bid * NUM_HEADS + hid
-        offset += subsequence * 0
-        r0, r1, r2, r3 = philox_(philox_seed, subsequence, offset)
-
-        r = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(BLOCK_M, BLOCK_N)
-
-        mask = (r & 0xFF) >= p_dropout_uint8
-
-        P = apply_dropout_mask(
-            P, mask, encode_dropout_in_sign_bit=encode_dropout_in_sign_bit
-        )
-    return P
+def _select_decode_splits(batch, kv_heads, chunks, max_k, block_n, num_sms):
+    # Target one wave of grouped CTAs, with at least four KV tiles per split.
+    tasks = max(1, batch * kv_heads * chunks)
+    desired = max(1, (num_sms + tasks - 1) // tasks)
+    kv_tiles = max(1, (max_k + block_n - 1) // block_n)
+    limit = min(8, desired, max(1, kv_tiles // 4))
+    splits = 1
+    for candidate in (2, 4, 8):
+        if candidate <= limit:
+            splits = candidate
+    return splits
 
 
 @triton.jit
@@ -168,7 +92,6 @@ def apply_mask(
     is_local: tl.constexpr,
 ):
     need_mask = is_causal | is_local | (not is_even_mn)
-    # need_mask: tl.constexpr = is_causal | is_local
     if need_mask:
         # Extra care should be taken to void one-off errors: both col_lb and col_rb are inclusive!
         col_lb = max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left)
@@ -202,7 +125,7 @@ def softmax_rescale(
     softmax_scale_log2e: tl.constexpr,
     is_border: tl.constexpr,
     fp8_p_max: tl.constexpr,
-    # is_init: tl.constexpr
+    acc_rescale=1.0,
 ):
     prev_max = row_max
     row_max = tl.maximum(row_max, tl.max(S, 1))
@@ -214,10 +137,10 @@ def softmax_rescale(
 
     p_scale = tl.math.exp2((prev_max - cur_max) * softmax_scale_log2e)
     row_sum *= p_scale
-    O_acc *= p_scale[:, None]
+    O_acc *= (p_scale * acc_rescale)[:, None]
 
     # Scale E4M3 probabilities by 256 in the exponent domain.
-    p_log2_scale: tl.constexpr = 8.0 if fp8_p_max == 448.0 else 0.0
+    p_log2_scale: tl.constexpr = 8.0
     max_scaled = tl.where(
         row_max == float("-inf"),
         0,
@@ -283,26 +206,588 @@ def _fp8_pv_dot(
     fp8_dtype: tl.constexpr,
     precise_p: tl.constexpr = False,
 ):
-    if fp8_p_max == 448.0:
-        # The scaled row sum cancels the factor of 256 during normalization.
-        P_scaled = P
-        p_descale = 1.0
-        p_dtype: tl.constexpr = fp8_dtype
-    else:
-        # Probabilities do not need E5M2's wider exponent range. Keep the
-        # extra E4M3 mantissa bit even when V uses E5M2; Hopper supports
-        # mixed FP8 formats in the PV dot product.
-        P_scaled = P * 256.0
-        p_descale = 1.0 / 256.0
-        p_dtype: tl.constexpr = tl.float8e4nv
-    P_fp8 = P_scaled.to(p_dtype)
+    # The scaled row sum cancels the factor of 256 during normalization.
+    P_fp8 = P.to(fp8_dtype)
     pv = tl.dot(P_fp8, V, out_dtype=tl.float32)
     if precise_p:
         # Short KV sequences and sparse boundary rows amplify P rounding.
         # Correct its residual with another FP8 dot, not a BF16 fallback.
-        P_residual = ((P_scaled - P_fp8.to(tl.float32)) * 32.0).to(p_dtype)
+        P_residual = ((P - P_fp8.to(tl.float32)) * 32.0).to(fp8_dtype)
         pv += tl.dot(P_residual, V, out_dtype=tl.float32) * (1.0 / 32.0)
-    return acc + pv * (p_descale * v_descale)
+    return acc + pv * v_descale
+
+
+@triton.jit
+def _fp16_pv_dot(
+    P,
+    V,
+    acc,
+    v_descale,
+    fp8_p_max: tl.constexpr,
+    fp8_dtype: tl.constexpr,
+    precise_p: tl.constexpr = False,
+):
+    # Keep FP8 storage, but avoid probability quantization and its second
+    # residual dot in the accuracy-sensitive wide-head prefill path.
+    pv = tl.dot(P.to(tl.float16), V.to(tl.float16), out_dtype=tl.float32)
+    return acc + pv * v_descale
+
+
+@triton.jit
+def _fp16_pv_dot_residual(
+    P,
+    V,
+    acc,
+    v_descale,
+    fp8_p_max: tl.constexpr,
+    fp8_dtype: tl.constexpr,
+    precise_p: tl.constexpr = False,
+):
+    # Large V scales can amplify FP16 probability rounding near cancellation.
+    # Preserve the FP32 probability residual with a second FP16 dot. Scaling
+    # E4M3 V by 1/32 is exact in FP16, including its smallest nonzero value.
+    P_hi = P.to(tl.float16)
+    P_lo = ((P - P_hi.to(tl.float32)) * 32.0).to(tl.float16)
+    V_hi = V.to(tl.float16)
+    pv = tl.dot(P_hi, V_hi, out_dtype=tl.float32)
+    pv = tl.dot(
+        P_lo,
+        (V_hi * (1.0 / 32.0)).to(tl.float16),
+        acc=pv,
+        out_dtype=tl.float32,
+    )
+    return acc + pv * v_descale
+
+
+@triton.jit
+def _fusion_load_kv(
+    K,
+    V,
+    TABLE,
+    bid,
+    kv_head,
+    col,
+    length,
+    table_row,
+    k_page,
+    k_row,
+    k_head,
+    v_page,
+    v_row,
+    v_head,
+    PAGE: tl.constexpr,
+    D: tl.constexpr,
+):
+    physical = tl.load(
+        TABLE + bid * table_row + col // PAGE,
+        mask=col < length,
+        other=0,
+    ).to(tl.int64)
+    dims = tl.arange(0, D)
+    key_offset = physical * k_page + (col % PAGE) * k_row + kv_head * k_head
+    value_offset = physical * v_page + (col % PAGE) * v_row + kv_head * v_head
+    key = tl.load(
+        K + key_offset[None, :] + dims[:, None],
+        mask=col[None, :] < length,
+        other=0.0,
+    )
+    value = tl.load(
+        V + value_offset[:, None] + dims[None, :],
+        mask=col[:, None] < length,
+        other=0.0,
+    )
+    return key, value
+
+
+@triton.jit
+def _fusion_softmax_pv(
+    acc,
+    row_max,
+    row_sum,
+    scores,
+    value,
+    v_scale,
+    SCALE: tl.constexpr,
+    BORDER: tl.constexpr,
+):
+    previous = row_max
+    row_max = tl.maximum(row_max, tl.max(scores, 1))
+    current = tl.where(row_max == -float("inf"), 0.0, row_max) if BORDER else row_max
+    alpha = tl.exp2((previous - current) * (SCALE * 1.4426950408889634))
+    row_sum *= alpha
+    acc *= alpha[:, None]
+    maximum_scaled = tl.where(
+        row_max == -float("inf"),
+        0.0,
+        row_max * (SCALE * 1.4426950408889634) - 8.0,
+    )
+    probability = tl.exp2(
+        scores * (SCALE * 1.4426950408889634) - maximum_scaled[:, None]
+    )
+    row_sum += tl.sum(probability, 1)
+    acc += (
+        tl.dot(probability.to(tl.float16), value.to(tl.float16), out_dtype=tl.float32)
+        * v_scale
+    )
+    return acc, row_max, row_sum
+
+
+@triton.jit
+def _short_fused_fwd(
+    Q,
+    K,
+    V,
+    CU,
+    USED,
+    TABLE,
+    QS,
+    KS,
+    VS,
+    OUT,
+    LSE,
+    q_row,
+    q_head,
+    k_page,
+    k_row,
+    k_head,
+    v_page,
+    v_row,
+    v_head,
+    table_row,
+    qs_b,
+    qs_h,
+    qs_n,
+    ks_b,
+    ks_h,
+    ks_n,
+    vs_b,
+    vs_h,
+    vs_n,
+    B: tl.constexpr,
+    SPLITS: tl.constexpr,
+    MAX_Q: tl.constexpr,
+    H: tl.constexpr,
+    G: tl.constexpr,
+    PAGE: tl.constexpr,
+    SCALE: tl.constexpr,
+    FUSED_HEADS: tl.constexpr,
+    ROWS: tl.constexpr,
+    BN: tl.constexpr,
+    STAGES: tl.constexpr,
+    CAUSAL: tl.constexpr = True,
+    D: tl.constexpr = 256,
+):
+    token_tile = tl.program_id(0)
+    bid = tl.program_id(1)
+    head_group = tl.program_id(2) // SPLITS
+    split = tl.program_id(2) % SPLITS
+    chunks: tl.constexpr = G // FUSED_HEADS
+    token_rows: tl.constexpr = ROWS // FUSED_HEADS
+    kv_head = head_group // chunks
+    head_chunk = head_group % chunks
+    first = tl.load(CU + bid)
+    q_len = tl.load(CU + bid + 1) - first
+    if q_len <= 1 or q_len > MAX_Q or token_tile * token_rows >= q_len:
+        return
+    k_len = tl.load(USED + bid)
+
+    # Token-major rows keep the fused Q heads adjacent in packed Q storage.
+    matrix_rows = tl.arange(0, ROWS)
+    query_row = token_tile * token_rows + matrix_rows // FUSED_HEADS
+    head = kv_head * G + head_chunk * FUSED_HEADS + matrix_rows % FUSED_HEADS
+    dims = tl.arange(0, D)
+    query = tl.load(
+        Q
+        + (first + query_row[:, None]) * q_row
+        + head[:, None] * q_head
+        + dims[None, :],
+        mask=query_row[:, None] < q_len,
+        other=0.0,
+    ).to(tl.float16)
+    q_scale = tl.load(
+        QS + bid * qs_b + head * qs_h + (query_row // 128) * qs_n,
+        mask=query_row < q_len,
+        other=1.0,
+    ).to(tl.float32)
+    acc = tl.zeros((ROWS, D), tl.float32)
+    row_max = tl.full((ROWS,), -float("inf"), tl.float32)
+    row_sum = tl.zeros((ROWS,), tl.float32)
+    split_blocks = tl.cdiv(tl.cdiv(k_len, BN), SPLITS)
+    first_block = split * split_blocks
+    end_block = tl.minimum(tl.cdiv(k_len, BN), (split + 1) * split_blocks)
+    if CAUSAL:
+        end_block = tl.minimum(
+            end_block,
+            tl.cdiv((token_tile + 1) * token_rows + k_len - q_len, BN),
+        )
+    end_block = tl.maximum(end_block, first_block)
+    boundary_blocks = tl.minimum(
+        end_block - first_block, tl.cdiv(token_rows, BN) + 1 if CAUSAL else 1
+    )
+    for step in tl.range(0, boundary_blocks):
+        block = end_block - 1 - step
+        col = block * BN + tl.arange(0, BN)
+        key, value = _fusion_load_kv(
+            K,
+            V,
+            TABLE,
+            bid,
+            kv_head,
+            col,
+            k_len,
+            table_row,
+            k_page,
+            k_row,
+            k_head,
+            v_page,
+            v_row,
+            v_head,
+            PAGE,
+            D,
+        )
+        k_scale = tl.load(KS + bid * ks_b + kv_head * ks_h + (block * BN // 128) * ks_n)
+        v_scale = tl.load(VS + bid * vs_b + kv_head * vs_h + (block * BN // 128) * vs_n)
+        scores = tl.dot(query, key.to(tl.float16), out_dtype=tl.float32)
+        scores *= q_scale[:, None] * k_scale
+        visible = col[None, :] < k_len
+        if CAUSAL:
+            visible = visible & (col[None, :] <= query_row[:, None] + k_len - q_len)
+        scores = tl.where(visible, scores, -float("inf"))
+        acc, row_max, row_sum = _fusion_softmax_pv(
+            acc, row_max, row_sum, scores, value, v_scale, SCALE, True
+        )
+
+    for block in tl.range(
+        end_block - boundary_blocks - 1, first_block - 1, -1, num_stages=STAGES
+    ):
+        col = block * BN + tl.arange(0, BN)
+        key, value = _fusion_load_kv(
+            K,
+            V,
+            TABLE,
+            bid,
+            kv_head,
+            col,
+            k_len,
+            table_row,
+            k_page,
+            k_row,
+            k_head,
+            v_page,
+            v_row,
+            v_head,
+            PAGE,
+            D,
+        )
+        k_scale = tl.load(KS + bid * ks_b + kv_head * ks_h + (block * BN // 128) * ks_n)
+        v_scale = tl.load(VS + bid * vs_b + kv_head * vs_h + (block * BN // 128) * vs_n)
+        scores = tl.dot(query, key.to(tl.float16), out_dtype=tl.float32)
+        scores *= q_scale[:, None] * k_scale
+        acc, row_max, row_sum = _fusion_softmax_pv(
+            acc, row_max, row_sum, scores, value, v_scale, SCALE, False
+        )
+
+    empty = (row_sum == 0) | (row_sum != row_sum)
+    acc /= tl.where(empty, 1.0, row_sum)[:, None]
+    lse = tl.where(
+        empty,
+        -float("inf"),
+        row_max * SCALE + tl.log(row_sum * (1.0 / 256.0)),
+    )
+    partial_token = (split * B + bid) * MAX_Q + query_row
+    tl.store(
+        OUT + (partial_token[:, None] * H + head[:, None]) * D + dims[None, :],
+        acc,
+        mask=query_row[:, None] < q_len,
+    )
+    tl.store(
+        LSE + ((split * B + bid) * H + head) * MAX_Q + query_row,
+        lse,
+        mask=query_row < q_len,
+    )
+
+
+@triton.jit
+def _short_fused_combine(
+    PARTIAL,
+    PARTIAL_LSE,
+    CU,
+    OUT,
+    LSE,
+    out_row,
+    out_head,
+    total_q,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    SPLITS: tl.constexpr,
+    MAX_Q: tl.constexpr,
+):
+    row = tl.program_id(0)
+    bid = tl.program_id(1)
+    head = tl.program_id(2)
+    first = tl.load(CU + bid)
+    q_len = tl.load(CU + bid + 1) - first
+    if q_len <= 1 or q_len > MAX_Q or row >= q_len:
+        return
+    split = tl.arange(0, SPLITS)
+    partial_lse = tl.load(PARTIAL_LSE + ((split * B + bid) * H + head) * MAX_Q + row)
+    maximum = tl.max(partial_lse, 0)
+    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp(partial_lse - safe_maximum)
+    denominator = tl.sum(weights, 0)
+    dims = tl.arange(0, D)
+    partial = tl.load(
+        PARTIAL
+        + (((split[:, None] * B + bid) * MAX_Q + row) * H + head) * D
+        + dims[None, :]
+    )
+    value = tl.sum(partial * weights[:, None], 0) / tl.where(
+        denominator > 0.0, denominator, 1.0
+    )
+    lse = tl.where(denominator > 0.0, maximum + tl.log(denominator), float("inf"))
+    tl.store(OUT + (first + row) * out_row + head * out_head + dims, value)
+    tl.store(LSE + head * total_q + first + row, lse)
+
+
+@triton.jit
+def _flash_varlen_grouped_decode_fwd(
+    Q,
+    K,
+    V,
+    CU,
+    USED,
+    TABLE,
+    QS,
+    KS,
+    VS,
+    OUT,
+    LSE,
+    PART,
+    PLSE,
+    q_row,
+    q_head,
+    k_page,
+    k_row,
+    k_head,
+    v_page,
+    v_row,
+    v_head,
+    table_row,
+    qs_b,
+    qs_h,
+    ks_b,
+    ks_h,
+    ks_n,
+    vs_b,
+    vs_h,
+    vs_n,
+    out_row,
+    out_head,
+    total_q,
+    H: tl.constexpr,
+    HK: tl.constexpr,
+    G: tl.constexpr,
+    PAGE: tl.constexpr,
+    SPLITS: tl.constexpr,
+    SCALE: tl.constexpr,
+    BN: tl.constexpr,
+    WORKERS: tl.constexpr,
+    BM: tl.constexpr = 16,
+    D: tl.constexpr = 256,
+    PART_BY_BATCH: tl.constexpr = False,
+    PART_ROWS: tl.constexpr = 0,
+):
+    bid = tl.program_id(0)
+    GROUP_TILE: tl.constexpr = 8
+    chunks: tl.constexpr = tl.cdiv(G, GROUP_TILE)
+    kh = tl.program_id(1) // chunks
+    chunk = tl.program_id(1) % chunks
+    worker = tl.program_id(2)
+    token = tl.load(CU + bid)
+    q_end = tl.load(CU + bid + 1)
+    if q_end - token != 1:
+        return
+    partial_token = bid if PART_BY_BATCH else token
+    partial_rows = PART_ROWS if PART_BY_BATCH else total_q
+    length = tl.load(USED + bid)
+    tiles = tl.cdiv(length, BN)
+    tiles_per_split = tl.maximum(tl.cdiv(tiles, SPLITS), 1)
+    active_splits = tl.cdiv(tiles, tiles_per_split)
+    if worker >= tl.maximum(active_splits, 1):
+        return
+    local_group = tl.arange(0, BM)
+    group = chunk * GROUP_TILE + local_group
+    valid_heads = (local_group < GROUP_TILE) & (group < G)
+    heads = kh * G + group
+    dims = tl.arange(0, D)
+    q = tl.load(
+        Q + token * q_row + heads[:, None] * q_head + dims[None, :],
+        mask=valid_heads[:, None],
+        other=0.0,
+    )
+    q_scale = tl.load(QS + bid * qs_b + heads * qs_h, mask=valid_heads, other=1).to(
+        tl.float32
+    )
+    if WORKERS == 1:
+        merged_maximum = tl.full((BM,), -float("inf"), tl.float32)
+        merged_denominator = tl.zeros((BM,), tl.float32)
+        merged_acc = tl.zeros((BM, D), tl.float32)
+    for split in range(worker, tl.maximum(active_splits, 1), WORKERS):
+        first = split * tiles_per_split
+        last = tl.minimum(first + tiles_per_split, tiles)
+        maximum = tl.full((BM,), -float("inf"), tl.float32)
+        denominator = tl.zeros((BM,), tl.float32)
+        acc = tl.zeros((BM, D), tl.float32)
+        for tile in range(first, last):
+            positions = tile * BN + tl.arange(0, BN)
+            tl.static_assert(BN % PAGE == 0)
+            # A KV tile starts on a page boundary. Load each page ID once
+            # and share it across that page's token offsets.
+            logical_pages = tile * (BN // PAGE) + tl.arange(0, BN // PAGE)
+            page_ids = tl.load(
+                TABLE + bid * table_row + logical_pages,
+                mask=logical_pages * PAGE < length,
+                other=0,
+            )
+            page = tl.broadcast_to(page_ids[:, None], (BN // PAGE, PAGE))
+            page = page.reshape(BN).to(tl.int64)
+            k_offsets = page * k_page + (positions % PAGE) * k_row + kh * k_head
+            v_offsets = page * v_page + (positions % PAGE) * v_row + kh * v_head
+            key = tl.load(
+                K + k_offsets[None, :] + dims[:, None],
+                mask=positions[None, :] < length,
+                other=0.0,
+            )
+            value = tl.load(
+                V + v_offsets[:, None] + dims[None, :],
+                mask=positions[:, None] < length,
+                other=0.0,
+            )
+            k_scale = tl.load(KS + bid * ks_b + kh * ks_h + (tile * BN // 128) * ks_n)
+            v_scale = tl.load(VS + bid * vs_b + kh * vs_h + (tile * BN // 128) * vs_n)
+            scores = tl.dot(q, key).to(tl.float32)
+            scores *= q_scale[:, None] * k_scale * (SCALE * 1.4426950408889634)
+            scores = tl.where(positions[None, :] < length, scores, -float("inf"))
+            new_maximum = tl.maximum(maximum, tl.max(scores, 1))
+            alpha = tl.exp2(maximum - new_maximum)
+            probabilities = tl.exp2(scores - new_maximum[:, None]) * 256.0
+            denominator = denominator * alpha + tl.sum(probabilities, 1)
+            acc *= alpha[:, None]
+            # Correct FP8 probability rounding for short sequences as in the general path.
+            acc = _fp8_pv_dot(
+                probabilities, value, acc, v_scale, 448.0, tl.float8e4nv, precise_p=True
+            )
+            maximum = new_maximum
+        empty = denominator == 0
+        result = acc / tl.where(empty, 1.0, denominator)[:, None]
+        lse = tl.where(
+            empty,
+            float("inf"),
+            maximum * 0.6931471805599453 + tl.log(denominator / 256.0),
+        )
+        # Empty partitions are never materialized. A sole nonempty partition is final.
+        if WORKERS == 1:
+            new_maximum = tl.maximum(merged_maximum, maximum)
+            safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
+            old_weight = tl.exp2(merged_maximum - safe_maximum)
+            new_weight = tl.exp2(maximum - safe_maximum)
+            merged_acc = merged_acc * old_weight[:, None] + acc * new_weight[:, None]
+            merged_denominator = (
+                merged_denominator * old_weight + denominator * new_weight
+            )
+            merged_maximum = new_maximum
+        elif active_splits <= 1:
+            tl.store(
+                OUT + token * out_row + heads[:, None] * out_head + dims[None, :],
+                result,
+                mask=valid_heads[:, None],
+            )
+            tl.store(LSE + heads * total_q + token, lse, mask=valid_heads)
+        else:
+            tl.store(
+                PART
+                + ((split * partial_rows + partial_token) * H + heads[:, None]) * D
+                + dims[None, :],
+                result,
+                mask=valid_heads[:, None],
+            )
+            tl.store(
+                PLSE + (split * H + heads) * partial_rows + partial_token,
+                lse,
+                mask=valid_heads,
+            )
+    if WORKERS == 1:
+        empty = merged_denominator == 0
+        result = merged_acc / tl.where(empty, 1.0, merged_denominator)[:, None]
+        lse = tl.where(
+            empty,
+            float("inf"),
+            merged_maximum * 0.6931471805599453 + tl.log(merged_denominator / 256.0),
+        )
+        tl.store(
+            OUT + token * out_row + heads[:, None] * out_head + dims[None, :],
+            result,
+            mask=valid_heads[:, None],
+        )
+        tl.store(LSE + heads * total_q + token, lse, mask=valid_heads)
+
+
+@triton.jit
+def _flash_varlen_grouped_decode_combine(
+    OUT,
+    LSE,
+    PART,
+    PLSE,
+    CU,
+    USED,
+    total_q,
+    out_row,
+    out_head,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BS: tl.constexpr,
+    BN: tl.constexpr,
+    BD: tl.constexpr = 64,
+    PART_BY_BATCH: tl.constexpr = False,
+    PART_ROWS: tl.constexpr = 0,
+):
+    bid = tl.program_id(0)
+    head = tl.program_id(1)
+    d_start = tl.program_id(2) * BD
+    token = tl.load(CU + bid)
+    if tl.load(CU + bid + 1) - token != 1:
+        return
+    partial_token = bid if PART_BY_BATCH else token
+    partial_rows = PART_ROWS if PART_BY_BATCH else total_q
+    length = tl.load(USED + bid)
+    tiles = tl.cdiv(length, BN)
+    per_split = tl.maximum(tl.cdiv(tiles, SPLITS), 1)
+    active = tl.cdiv(tiles, per_split)
+    if active <= 1:
+        return
+    splits = tl.arange(0, BS)
+    dims = d_start + tl.arange(0, BD)
+    lse = tl.load(
+        PLSE + (splits * H + head) * partial_rows + partial_token,
+        mask=splits < active,
+        other=-float("inf"),
+    )
+    maximum = tl.max(lse, 0)
+    weights = tl.exp(lse - maximum)
+    weight_sum = tl.sum(weights, 0)
+    values = tl.load(
+        PART
+        + ((splits[:, None] * partial_rows + partial_token) * H + head) * D
+        + dims[None, :],
+        mask=splits[:, None] < active,
+        other=0,
+    )
+    result = tl.sum(values * weights[:, None], 0) / weight_sum
+    tl.store(OUT + token * out_row + head * out_head + dims, result)
+    if d_start == 0:
+        tl.store(LSE + head * total_q + token, maximum + tl.log(weight_sum))
 
 
 @triton.jit
@@ -386,16 +871,12 @@ def fwd_configs_w8a8():
 
 def prune_fwd_configs_w8a8(configs, nargs, **kwargs):
     d = nargs["d"]
-    is_dropout = nargs["is_dropout"]
     out = []
     for cfg in configs:
         BM = cfg.kwargs["BLOCK_M"]
         BN = cfg.kwargs["BLOCK_N"]
         w = cfg.num_warps
         s = cfg.num_stages
-
-        if is_dropout and (w != 4 or s > 3):
-            continue
 
         # keep D64 and D128 candidate sets separate to avoid trying
         # configs that are known to have poor register/occupancy balance.
@@ -586,10 +1067,6 @@ def flash_fwd_kernel(
         # local
         masking_cols: tl.constexpr = (tl.cdiv(BLOCK_M, BLOCK_N) + 1) * BLOCK_N
 
-    if is_dropout:
-        philox_seed = tl.load(philox_args).to(tl.uint64)
-        philox_offset = tl.load(philox_args + 1).to(tl.uint64)
-
     if is_alibi:
         alibi_offset = bid * alibi_slopes_batch_stride + hid
         alibi_slope = tl.load(alibi_slopes_ptr + alibi_offset)
@@ -608,15 +1085,6 @@ def flash_fwd_kernel(
         Q = tl.load(q_ptr + q_off, cache_modifier=".cg")
     else:
         Q = tl.load(q_ptr + q_off, mask=qmask, cache_modifier=".cg")
-
-    if return_softmax:
-        p_ptr += (
-            (bid * h + hid) * seqlen_q_rounded + m_block * BLOCK_M
-        ) * seqlen_k_rounded
-        p_offset = tl.arange(0, BLOCK_M)[:, None] * seqlen_k_rounded + tl.arange(
-            0, BLOCK_N
-        )
-        p_bp0 = p_ptr + p_offset
 
     # Use a [BLOCK_M, BLOCK_D] PV accumulator. For D128, BLOCK_D is 64,
     # so one CTA does not hold a [BM, 128] accumulator, reducing register pressure.
@@ -734,59 +1202,6 @@ def flash_fwd_kernel(
                 is_border=(is_causal or is_local),
                 fp8_p_max=fp8_p_max,
             )
-            # keep P in fp32 until after dropout/masking, then
-            # dynamically quantize it for the FP8 PV tensor-core matmul.
-
-            if is_dropout:
-                if return_softmax:
-                    P_drop = P * (1.0 / 256.0 if fp8_p_max == 448.0 else 1.0)
-
-                    P_drop = apply_dropout(
-                        P_drop,
-                        row_start,
-                        col_start,
-                        seqlen_k,
-                        bid,
-                        hid,
-                        philox_seed,
-                        philox_offset,
-                        p_dropout_in_uint8_t,
-                        is_dropout,
-                        encode_dropout_in_sign_bit=True,
-                        NUM_HEADS=h,
-                        BLOCK_M=BLOCK_M,
-                        BLOCK_N=BLOCK_N,
-                    )
-                    if IS_EVEN_MN:
-                        # Both split-D CTAs produce the same softmax tile, so only
-                        # D split 0 writes the debug P tensor.
-                        tl.store(p_bp0 + col_start, P_drop, mask=d_split == 0)
-                    else:
-                        kvmask = col_idx < seqlen_k
-                        # Both split-D CTAs produce the same softmax tile, so only
-                        # D split 0 writes the debug P tensor.
-                        tl.store(
-                            p_bp0 + col_start,
-                            P_drop,
-                            mask=qmask & kvmask[None, :] & (d_split == 0),
-                        )
-
-                P = apply_dropout(
-                    P,
-                    row_start,
-                    col_start,
-                    seqlen_k,
-                    bid,
-                    hid,
-                    philox_seed,
-                    philox_offset,
-                    p_dropout_in_uint8_t,
-                    is_dropout,
-                    encode_dropout_in_sign_bit=False,
-                    NUM_HEADS=h,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                )
 
             if not PRE_LOAD_V:
                 off = col_start * k_row_stride
@@ -876,58 +1291,6 @@ def flash_fwd_kernel(
             is_border=is_local,
             fp8_p_max=fp8_p_max,
         )
-        # P is quantized at the PV call site so dropout sees
-        # the high-precision softmax probabilities.
-
-        if is_dropout:
-            if return_softmax:
-                P_drop = P * (1.0 / 256.0 if fp8_p_max == 448.0 else 1.0)
-                P_drop = apply_dropout(
-                    P_drop,
-                    row_start,
-                    col_start,
-                    seqlen_k,
-                    bid,
-                    hid,
-                    philox_seed,
-                    philox_offset,
-                    p_dropout_in_uint8_t,
-                    is_dropout,
-                    encode_dropout_in_sign_bit=True,
-                    NUM_HEADS=h,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                )
-                if IS_EVEN_MN:
-                    # Both split-D CTAs produce the same softmax tile, so only
-                    # D split 0 writes the debug P tensor.
-                    tl.store(p_bp0 + col_start, P_drop, mask=d_split == 0)
-                else:
-                    kvmask = col_idx < seqlen_k
-                    # Both split-D CTAs produce the same softmax tile, so only
-                    # D split 0 writes the debug P tensor.
-                    tl.store(
-                        p_bp0 + col_start,
-                        P_drop,
-                        mask=qmask & kvmask[None, :] & (d_split == 0),
-                    )
-
-            P = apply_dropout(
-                P,
-                row_start,
-                col_start,
-                seqlen_k,
-                bid,
-                hid,
-                philox_seed,
-                philox_offset,
-                p_dropout_in_uint8_t,
-                is_dropout,
-                encode_dropout_in_sign_bit=False,
-                NUM_HEADS=h,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-            )
 
         if not PRE_LOAD_V:
             off = col_start * k_row_stride
@@ -943,15 +1306,10 @@ def flash_fwd_kernel(
     lse = tl.where(
         rowsum_ == 0 | (rowsum_ != rowsum_),
         float("inf"),
-        rowmax_ * scale_softmax
-        + tl.log(rowsum_ * (1.0 / 256.0 if fp8_p_max == 448.0 else 1.0)),
+        rowmax_ * scale_softmax + tl.log(rowsum_ * (1.0 / 256.0)),
     )
     inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
-
-    if is_dropout:
-        acc_ *= inv_sum[:, None] * rp_dropout
-    else:
-        acc_ *= inv_sum[:, None]
+    acc_ *= inv_sum[:, None]
 
     out = acc_.to(o_ptr.type.element_ty)  # noqa
 
@@ -1353,8 +1711,7 @@ def flash_fwd_splitkv_kernel(
     lse = tl.where(
         rowsum_ == 0 | (rowsum_ != rowsum_),
         float("-inf"),
-        rowmax_ * scale_softmax
-        + tl.log(rowsum_ * (1.0 / 256.0 if fp8_p_max == 448.0 else 1.0)),
+        rowmax_ * scale_softmax + tl.log(rowsum_ * (1.0 / 256.0)),
     )
     inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
 
@@ -1505,6 +1862,46 @@ def virtual_to_cache_offset(
 
 
 @triton.jit
+def _load_paged_k_tile_late_v(
+    k_ptr_base,
+    cache_rows,
+    virtual_index,
+    max_virtual_index,
+    d: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    dims = tl.arange(0, BLOCK_K)
+    mask = virtual_index[None, :] < max_virtual_index
+    if d != BLOCK_K:
+        mask = mask & (dims[:, None] < d)
+    return tl.load(
+        k_ptr_base + cache_rows[None, :] + dims[:, None],
+        mask=mask,
+        other=0.0,
+    )
+
+
+@triton.jit
+def _load_paged_v_tile_late_v(
+    v_ptr_base,
+    cache_rows,
+    virtual_index,
+    max_virtual_index,
+    d: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    dims = tl.arange(0, BLOCK_K)
+    mask = virtual_index[:, None] < max_virtual_index
+    if d != BLOCK_K:
+        mask = mask & (dims[None, :] < d)
+    return tl.load(
+        v_ptr_base + cache_rows[:, None] + dims[None, :],
+        mask=mask,
+        other=0.0,
+    )
+
+
+@triton.jit
 def load_from_kvcache(
     virtual_index,
     max_virtual_index,
@@ -1544,6 +1941,179 @@ def load_from_kvcache(
         bK = tl.load(k_ptr_base + k_offset, mask=bK_mask, other=0.0)
         bV = tl.load(v_ptr_base + v_offset, mask=bV_mask, other=0.0)
     return bK, bV
+
+
+@triton.jit
+def query_tile_prefix_kernel(
+    cu_q_ptr,
+    prefix_ptr,
+    batch_map_ptr,
+    tile_map_ptr,
+    B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    bids = tl.arange(0, BLOCK_B)
+    starts = tl.load(cu_q_ptr + bids, mask=bids < B, other=0)
+    ends = tl.load(cu_q_ptr + bids + 1, mask=bids < B, other=0)
+    counts = tl.cdiv(ends - starts, BLOCK_M)
+    prefix = tl.cumsum(counts)
+    tl.store(prefix_ptr + bids + 1, prefix, mask=bids < B)
+    tl.store(prefix_ptr, 0)
+    local_tiles = tl.arange(0, BLOCK_T)
+    positions = (prefix - counts)[:, None] + local_tiles[None, :]
+    mask = (bids[:, None] < B) & (local_tiles[None, :] < counts[:, None])
+    tl.store(batch_map_ptr + positions, bids[:, None], mask=mask)
+    tl.store(tile_map_ptr + positions, local_tiles[None, :], mask=mask)
+
+
+@triton.jit
+def _check_varlen_v_scales(
+    v_descale_ptr,
+    cu_seqlens_k_ptr,
+    seqused_k_ptr,
+    safe_flags_ptr,
+    v_batch_stride,
+    v_head_stride,
+    v_block_stride,
+    max_seqlen_k,
+    HK: tl.constexpr,
+    HAS_SEQUSED_K: tl.constexpr,
+    SCAN_BLOCKS: tl.constexpr,
+):
+    # One CTA checks each request/KV-head pair for this invocation. The flag
+    # is rewritten on every graph replay; no input-value cache is retained.
+    bid = tl.program_id(0)
+    kv_hid = tl.program_id(1)
+    if HAS_SEQUSED_K:
+        k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
+    else:
+        k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
+        k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
+        k_len = k_eos - k_bos
+    logical_blocks = tl.cdiv(k_len, 128)
+    declared_blocks = tl.cdiv(max_seqlen_k, 128)
+    scale_index = tl.arange(0, SCAN_BLOCKS)
+    valid = (scale_index < logical_blocks) & (scale_index < declared_blocks)
+    scale = tl.load(
+        v_descale_ptr
+        + bid * v_batch_stride
+        + kv_hid * v_head_stride
+        + scale_index * v_block_stride,
+        mask=valid,
+        other=1.0,
+    ).to(tl.float32)
+    in_range = (scale >= 0.00390625) & (scale <= 0.0625)
+    safe = tl.min(tl.where(valid, in_range, True).to(tl.int32), 0) == 1
+    safe = (
+        safe & (k_len >= 0) & (k_len <= max_seqlen_k) & (logical_blocks <= SCAN_BLOCKS)
+    )
+    tl.store(safe_flags_ptr + bid * HK + kv_hid, safe.to(tl.int32))
+
+
+@triton.jit
+def _scale_group_fwd_tile(
+    bQ,
+    acc,
+    row_max,
+    row_sum,
+    q_scale,
+    k_scale,
+    frame_ratio,
+    n_block,
+    row_idx,
+    q_len,
+    k_len,
+    page_table_ptr,
+    k_ptr_base,
+    v_ptr_base,
+    k_row_stride,
+    k_page_stride,
+    block_size: tl.constexpr,
+    d: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    scale_softmax_log2: tl.constexpr,
+    is_causal: tl.constexpr,
+    is_local: tl.constexpr,
+    window_size_left: tl.constexpr,
+    window_size_right: tl.constexpr,
+    is_softcap: tl.constexpr,
+    softcap: tl.constexpr,
+    is_alibi: tl.constexpr,
+    alibi_slope,
+    MASKED: tl.constexpr,
+):
+    # Reuse the quantization-group scales for both reverse-order BN64 tiles.
+    col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    cache_rows = virtual_to_cache_offset(
+        col_idx,
+        k_len,
+        page_table_ptr,
+        block_size,
+        k_row_stride,
+        k_page_stride,
+        boundary_check=MASKED,
+    )
+    bK = _load_paged_k_tile_late_v(
+        k_ptr_base,
+        cache_rows,
+        col_idx,
+        k_len,
+        d,
+        BLOCK_K,
+    )
+    scores = tl.dot(bQ.to(tl.float16), bK.to(tl.float16), out_dtype=tl.float32)
+    scores *= q_scale * k_scale
+    scores = apply_softcap(scores, softcap, is_softcap)
+    scores = apply_alibi(
+        scores,
+        col_idx,
+        row_idx,
+        q_len,
+        k_len,
+        is_causal=is_causal,
+        is_alibi=is_alibi,
+        alibi_slope=alibi_slope,
+    )
+    scores = apply_mask(
+        scores,
+        col_idx,
+        row_idx,
+        q_len,
+        k_len,
+        window_size_left,
+        window_size_right,
+        is_even_mn=not MASKED,
+        is_causal=is_causal and MASKED,
+        is_local=is_local,
+    )
+    acc, probabilities, row_max, row_sum = softmax_rescale(
+        acc,
+        scores,
+        row_max,
+        row_sum,
+        softmax_scale_log2e=scale_softmax_log2,
+        is_border=MASKED or is_local,
+        fp8_p_max=448.0,
+        acc_rescale=frame_ratio,
+    )
+    bV = _load_paged_v_tile_late_v(
+        v_ptr_base,
+        cache_rows,
+        col_idx,
+        k_len,
+        d,
+        BLOCK_K,
+    )
+    acc = tl.dot(
+        probabilities.to(tl.float16),
+        bV.to(tl.float16),
+        acc=acc,
+        out_dtype=tl.float32,
+    )
+    return acc, row_max, row_sum
 
 
 @libentry()
@@ -1651,10 +2221,41 @@ def flash_varlen_fwd_kernel(
     PRECISE_SHORT_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr = 1,
+    SKIP_SINGLE_Q: tl.constexpr = False,
+    SKIP_SHORT_Q: tl.constexpr = False,
+    PAGED_PIPELINE_STAGES: tl.constexpr = 1,
+    DELAY_PAGED_V: tl.constexpr = False,
+    GROUP_FP8_SCALES: tl.constexpr = False,
+    FULL_FP32_QK: tl.constexpr = False,
+    UNIFIED_K_LENGTHS: tl.constexpr = False,
     PV_DOT: tl.constexpr = _fp8_pv_dot,
+    QUERY_TILE_PREFIX=None,
+    QUERY_BATCH_MAP=None,
+    QUERY_LOCAL_TILE_MAP=None,
+    COMPACT_QUERY_SCHEDULE: tl.constexpr = False,
+    REVERSE_QUERY_TILES: tl.constexpr = False,
+    SCALE_AWARE_GUARD: tl.constexpr = False,
+    SCALE_AWARE_ACC: tl.constexpr = False,
+    SCALE_SCAN_BLOCKS: tl.constexpr = 1,
+    SCALE_SAFE_FLAGS=None,
+    PRECHECK_SCALE_GUARD: tl.constexpr = False,
 ):
-    m_block = tl.program_id(0)
-    bid = tl.program_id(1)
+    if COMPACT_QUERY_SCHEDULE:
+        query_tile = tl.program_id(0)
+        if query_tile >= tl.load(QUERY_TILE_PREFIX + b):
+            return
+        bid = tl.load(QUERY_BATCH_MAP + query_tile)
+        m_block = tl.load(QUERY_LOCAL_TILE_MAP + query_tile)
+        kv_split = tl.program_id(1)
+    else:
+        m_block = tl.program_id(0)
+        if NUM_KV_SPLITS > 1:
+            bid = tl.program_id(1) % b
+            kv_split = tl.program_id(1) // b
+        else:
+            bid = tl.program_id(1)
+            kv_split = 0
     # The varlen grid has only three dimensions, so encode both the head
     # and D split in program_id(2).
     hd = tl.program_id(2)
@@ -1677,6 +2278,20 @@ def flash_varlen_fwd_kernel(
         o_offset = bid * o_batch_stride
         lse_offset = bid * seqlen_q
 
+    if REVERSE_QUERY_TILES and is_causal and not COMPACT_QUERY_SCHEDULE:
+        if q_len > 512:
+            # Schedule the longest causal query tiles first. Compact scheduling
+            # keeps the local tile indices supplied by its existing map.
+            num_m_tiles = tl.cdiv(q_len, BLOCK_M)
+            if m_block >= num_m_tiles:
+                return
+            m_block = num_m_tiles - 1 - m_block
+
+    if SKIP_SINGLE_Q and q_len == 1:
+        return
+    if SKIP_SHORT_Q and q_len <= 32:
+        return
+
     if is_cu_seqlens_k:
         k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
         k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
@@ -1693,12 +2308,51 @@ def flash_varlen_fwd_kernel(
 
     # Specialize the full KV loop, rather than putting a runtime branch
     # around every PV dot and disabling the long-sequence pipeline.
-    if (k_len <= 128) != PRECISE_SHORT_K:
+    if not UNIFIED_K_LENGTHS and (k_len <= 128) != PRECISE_SHORT_K:
         return
 
     # Noop CTA
     if m_block * BLOCK_M >= q_len:
         return
+
+    if SCALE_AWARE_GUARD:
+        if PRECHECK_SCALE_GUARD:
+            # Reuse the per-invocation result for every query tile and GQA head.
+            all_scales_safe = (
+                tl.load(SCALE_SAFE_FLAGS + bid * hk + (hid // h_hk_ratio)) != 0
+            )
+        else:
+            # Select exactly one static loop variant using current device scales.
+            # Positive bounded scales avoid zero division and extreme frame ratios.
+            scale_index = tl.arange(0, SCALE_SCAN_BLOCKS)
+            logical_blocks = tl.cdiv(k_len, 128)
+            declared_blocks = tl.cdiv(seqlen_k, 128)
+            scale_mask = (scale_index < logical_blocks) & (
+                scale_index < declared_blocks
+            )
+            guard_scale = tl.load(
+                v_descale_ptr
+                + bid * v_descale_batch_stride
+                + (hid // h_hk_ratio) * v_descale_head_stride
+                + scale_index * v_descale_block_stride,
+                mask=scale_mask,
+                other=1.0,
+            ).to(tl.float32)
+            # The upper bound limits the FP16-P rounding contribution to about
+            # 2^-11 * 448 / 16 = 0.0137 in the normalized output. Other errors
+            # still require the independent reference checks.
+            scale_in_range = (guard_scale >= 0.00390625) & (guard_scale <= 0.0625)
+            all_scales_safe = (
+                tl.min(tl.where(scale_mask, scale_in_range, True).to(tl.int32), 0) == 1
+            )
+            all_scales_safe = (
+                all_scales_safe
+                & (k_len >= 0)
+                & (k_len <= seqlen_k)
+                & (logical_blocks <= SCALE_SCAN_BLOCKS)
+            )
+        if all_scales_safe != SCALE_AWARE_ACC:
+            return
 
     # is_even_mn = (q_len % BLOCK_M == 0) and (k_len % BLOCK_N == 0)
     is_even_mn: tl.constexpr = False
@@ -1719,9 +2373,14 @@ def flash_varlen_fwd_kernel(
             ),
         )
 
-    if is_dropout:
-        philox_seed = tl.load(philox_args).to(tl.uint64)
-        philox_offset = tl.load(philox_args + 1).to(tl.uint64)
+    if NUM_KV_SPLITS > 1:
+        # Partition logical KV tiles, independently of physical cache pages.
+        # Some causal/local rows have no keys in a split; they contribute zero.
+        split_blocks = tl.cdiv(tl.cdiv(k_len, BLOCK_N), NUM_KV_SPLITS)
+        n_block_min = max(n_block_min, kv_split * split_blocks)
+        n_block_max = max(n_block_min, min(n_block_max, (kv_split + 1) * split_blocks))
+        o_ptr += kv_split * total_q * h * d
+        softmax_lse_ptr += kv_split * h * total_q
 
     # Locate the page table entry for the current batch element
     if is_paged:
@@ -1749,8 +2408,11 @@ def flash_varlen_fwd_kernel(
         padding_option="zero",
     )
 
-    # Partition wide PV accumulators into D64 slices to bound register use.
+    # BLOCK_D selects a full-width or split-D PV accumulator.
     acc_ = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    if SCALE_AWARE_ACC:
+        # acc_ represents the unnormalized output divided by this scale.
+        previous_v_descale = tl.full((), 1.0, tl.float32)
     rowmax_ = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     rowsum_ = tl.zeros([BLOCK_M], dtype=tl.float32)
 
@@ -1771,271 +2433,542 @@ def flash_varlen_fwd_kernel(
     n_masking_steps = min(n_block_max - n_block_min, n_masking_steps)
 
     row_idx = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_block = n_block_max - 1
-    for step in tl.range(0, n_masking_steps):
-        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-        if is_paged:
-            bK, bV = load_from_kvcache(
-                col_idx,
-                k_len,
-                page_table_ptr,
-                k_ptr_base,
-                v_ptr_base,
-                block_size,
-                d,
-                k_row_stride,
-                k_page_stride,
-                BLOCK_K=BLOCK_K,
-                boundary_check=True,
-            )
-        else:
-            start_n = n_block * BLOCK_N
-            k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-            v_ptr_seq = v_ptr_base + k_bos * k_row_stride
-            gK = tl.make_block_ptr(
-                base=k_ptr_seq,
-                shape=(k_len, d),
-                strides=(k_row_stride, 1),
-                offsets=(start_n, 0),
-                block_shape=(BLOCK_N, BLOCK_K),
-                order=(0, 1),
-            )
-            gV = tl.make_block_ptr(
-                base=v_ptr_seq,
-                shape=(k_len, d),
-                strides=(k_row_stride, 1),
-                # For non-paged varlen attention, load only the V slice for
-                # the current D split.
-                offsets=(start_n, d_start),
-                block_shape=(BLOCK_N, BLOCK_D),
-                order=(0, 1),
-            )
-            bK = tl.load(gK, boundary_check=(0, 1), padding_option="zero")
-            bK = tl.trans(bK)
-            bV = tl.load(gV, boundary_check=(0, 1), padding_option="zero")
-        q_descale, k_descale, v_descale = _load_fp8_block_descales(
-            q_descale_ptr,
-            k_descale_ptr,
-            v_descale_ptr,
-            q_descale_batch_stride,
-            q_descale_head_stride,
-            q_descale_block_stride,
-            k_descale_batch_stride,
-            k_descale_head_stride,
-            k_descale_block_stride,
-            v_descale_batch_stride,
-            v_descale_head_stride,
-            v_descale_block_stride,
-            bid,
-            hid,
-            kv_hid,
-            m_block * BLOCK_M,
-            n_block * BLOCK_N,
-        )
-        # varlen QK uses FP8 Q/K plus per-request block descales.
-        S = tl.dot(bQ, bK, out_dtype=tl.float32)
-        S *= q_descale * k_descale
-        S = apply_softcap(S, softcap, is_softcap)
-        S = apply_alibi(
-            S,
-            col_idx,
-            row_idx,
-            q_len,
-            k_len,
-            is_causal=is_causal,
-            is_alibi=is_alibi,
-            alibi_slope=alibi_slope,
-        )
-        S = apply_mask(
-            S,
-            col_idx,
-            row_idx,
-            q_len,
-            k_len,
-            window_size_left,
-            window_size_right,
-            is_even_mn=is_even_mn,
-            is_causal=is_causal,
-            is_local=is_local,
-        )
+    if GROUP_FP8_SCALES and SCALE_AWARE_ACC:
+        tl.static_assert((is_paged and FULL_FP32_QK))
+        tl.static_assert(BLOCK_N == 64 and 128 % BLOCK_M == 0)
+        tl.static_assert((not SPLIT_D))
+        # The current Q tile never crosses a logical 128-token scale block.
+        q_descale = tl.load(
+            q_descale_ptr
+            + bid * q_descale_batch_stride
+            + hid * q_descale_head_stride
+            + (m_block * BLOCK_M // 128) * q_descale_block_stride
+        ).to(tl.float32)
+        # Empty KV splits must not access even an unused scale block.
+        if n_block_max > n_block_min:
+            # Complete the masked prefix down to a quantization-group boundary.
+            # This keeps every subsequent full group entirely in the unmasked loop.
+            masked_start = max(n_block_min, ((n_block_max - n_masking_steps) // 2) * 2)
+            for kv_group in tl.range(
+                tl.cdiv(n_block_max, 2) - 1,
+                masked_start // 2 - 1,
+                -1,
+            ):
+                k_descale = tl.load(
+                    k_descale_ptr
+                    + bid * k_descale_batch_stride
+                    + kv_hid * k_descale_head_stride
+                    + kv_group * k_descale_block_stride
+                ).to(tl.float32)
+                v_descale = tl.load(
+                    v_descale_ptr
+                    + bid * v_descale_batch_stride
+                    + kv_hid * v_descale_head_stride
+                    + kv_group * v_descale_block_stride
+                ).to(tl.float32)
+                group_ratio = tl.where(
+                    previous_v_descale == v_descale,
+                    1.0,
+                    previous_v_descale / v_descale,
+                )
+                # A partial top group can start at its even tile. Apply the
+                # frame conversion to the first valid tile, exactly once.
+                first_block = min(n_block_max - 1, kv_group * 2 + 1)
+                for sub_tile in tl.range(0, 2, loop_unroll_factor=1):
+                    n_block = kv_group * 2 + 1 - sub_tile
+                    if n_block < n_block_max and n_block >= masked_start:
+                        frame_ratio = tl.where(n_block == first_block, group_ratio, 1.0)
+                        acc_, rowmax_, rowsum_ = _scale_group_fwd_tile(
+                            bQ,
+                            acc_,
+                            rowmax_,
+                            rowsum_,
+                            q_descale,
+                            k_descale,
+                            frame_ratio,
+                            n_block,
+                            row_idx,
+                            q_len,
+                            k_len,
+                            page_table_ptr,
+                            k_ptr_base,
+                            v_ptr_base,
+                            k_row_stride,
+                            k_page_stride,
+                            block_size,
+                            d,
+                            BLOCK_K,
+                            BLOCK_N,
+                            scale_softmax_log2,
+                            is_causal,
+                            is_local,
+                            window_size_left,
+                            window_size_right,
+                            is_softcap,
+                            softcap,
+                            is_alibi,
+                            alibi_slope,
+                            MASKED=True,
+                        )
+                previous_v_descale = v_descale
 
-        acc_, P, rowmax_, rowsum_ = softmax_rescale(
-            acc_,
-            S,
-            rowmax_,
-            rowsum_,
-            softmax_scale_log2e=scale_softmax_log2,
-            is_border=True,
-            fp8_p_max=fp8_p_max,
-        )
-        if is_dropout:
-            P = apply_dropout(
-                P,
-                n_block * BLOCK_N,
-                m_block * BLOCK_M,
-                k_len,
+            # Full interior groups have two valid tiles, with no per-tile scale
+            # load, ratio division, or group-transition branch.
+            for kv_group in tl.range(
+                masked_start // 2 - 1,
+                tl.cdiv(n_block_min, 2) - 1,
+                -1,
+                num_stages=PAGED_PIPELINE_STAGES,
+            ):
+                k_descale = tl.load(
+                    k_descale_ptr
+                    + bid * k_descale_batch_stride
+                    + kv_hid * k_descale_head_stride
+                    + kv_group * k_descale_block_stride
+                ).to(tl.float32)
+                v_descale = tl.load(
+                    v_descale_ptr
+                    + bid * v_descale_batch_stride
+                    + kv_hid * v_descale_head_stride
+                    + kv_group * v_descale_block_stride
+                ).to(tl.float32)
+                group_ratio = tl.where(
+                    previous_v_descale == v_descale,
+                    1.0,
+                    previous_v_descale / v_descale,
+                )
+                for sub_tile in tl.range(0, 2, loop_unroll_factor=1):
+                    n_block = kv_group * 2 + 1 - sub_tile
+                    frame_ratio = tl.where(sub_tile == 0, group_ratio, 1.0)
+                    acc_, rowmax_, rowsum_ = _scale_group_fwd_tile(
+                        bQ,
+                        acc_,
+                        rowmax_,
+                        rowsum_,
+                        q_descale,
+                        k_descale,
+                        frame_ratio,
+                        n_block,
+                        row_idx,
+                        q_len,
+                        k_len,
+                        page_table_ptr,
+                        k_ptr_base,
+                        v_ptr_base,
+                        k_row_stride,
+                        k_page_stride,
+                        block_size,
+                        d,
+                        BLOCK_K,
+                        BLOCK_N,
+                        scale_softmax_log2,
+                        is_causal,
+                        is_local,
+                        window_size_left,
+                        window_size_right,
+                        is_softcap,
+                        softcap,
+                        is_alibi,
+                        alibi_slope,
+                        MASKED=False,
+                    )
+                previous_v_descale = v_descale
+
+            # An odd split/window lower bound leaves only the high tile of its
+            # final group. Do not read the tile owned by the preceding KV split.
+            if n_block_min % 2 != 0 and masked_start > n_block_min:
+                kv_group = n_block_min // 2
+                k_descale = tl.load(
+                    k_descale_ptr
+                    + bid * k_descale_batch_stride
+                    + kv_hid * k_descale_head_stride
+                    + kv_group * k_descale_block_stride
+                ).to(tl.float32)
+                v_descale = tl.load(
+                    v_descale_ptr
+                    + bid * v_descale_batch_stride
+                    + kv_hid * v_descale_head_stride
+                    + kv_group * v_descale_block_stride
+                ).to(tl.float32)
+                group_ratio = tl.where(
+                    previous_v_descale == v_descale,
+                    1.0,
+                    previous_v_descale / v_descale,
+                )
+                n_block = n_block_min
+                acc_, rowmax_, rowsum_ = _scale_group_fwd_tile(
+                    bQ,
+                    acc_,
+                    rowmax_,
+                    rowsum_,
+                    q_descale,
+                    k_descale,
+                    group_ratio,
+                    n_block,
+                    row_idx,
+                    q_len,
+                    k_len,
+                    page_table_ptr,
+                    k_ptr_base,
+                    v_ptr_base,
+                    k_row_stride,
+                    k_page_stride,
+                    block_size,
+                    d,
+                    BLOCK_K,
+                    BLOCK_N,
+                    scale_softmax_log2,
+                    is_causal,
+                    is_local,
+                    window_size_left,
+                    window_size_right,
+                    is_softcap,
+                    softcap,
+                    is_alibi,
+                    alibi_slope,
+                    MASKED=False,
+                )
+                previous_v_descale = v_descale
+    else:
+        n_block = n_block_max - 1
+        for step in tl.range(0, n_masking_steps):
+            col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+            if is_paged:
+                if DELAY_PAGED_V:
+                    # Carry only the token row offsets across QK and softmax.
+                    cache_rows = virtual_to_cache_offset(
+                        col_idx,
+                        k_len,
+                        page_table_ptr,
+                        block_size,
+                        k_row_stride,
+                        k_page_stride,
+                        boundary_check=True,
+                    )
+                    bK = _load_paged_k_tile_late_v(
+                        k_ptr_base,
+                        cache_rows,
+                        col_idx,
+                        k_len,
+                        d,
+                        BLOCK_K,
+                    )
+                else:
+                    bK, bV = load_from_kvcache(
+                        col_idx,
+                        k_len,
+                        page_table_ptr,
+                        k_ptr_base,
+                        v_ptr_base,
+                        block_size,
+                        d,
+                        k_row_stride,
+                        k_page_stride,
+                        BLOCK_K=BLOCK_K,
+                        boundary_check=True,
+                    )
+            else:
+                start_n = n_block * BLOCK_N
+                k_ptr_seq = k_ptr_base + k_bos * k_row_stride
+                v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+                gK = tl.make_block_ptr(
+                    base=k_ptr_seq,
+                    shape=(k_len, d),
+                    strides=(k_row_stride, 1),
+                    offsets=(start_n, 0),
+                    block_shape=(BLOCK_N, BLOCK_K),
+                    order=(0, 1),
+                )
+                gV = tl.make_block_ptr(
+                    base=v_ptr_seq,
+                    shape=(k_len, d),
+                    strides=(k_row_stride, 1),
+                    # For non-paged varlen attention, load only the V slice for
+                    # the current D split.
+                    offsets=(start_n, d_start),
+                    block_shape=(BLOCK_N, BLOCK_D),
+                    order=(0, 1),
+                )
+                bK = tl.load(gK, boundary_check=(0, 1), padding_option="zero")
+                bK = tl.trans(bK)
+                bV = tl.load(gV, boundary_check=(0, 1), padding_option="zero")
+            q_descale, k_descale, v_descale = _load_fp8_block_descales(
+                q_descale_ptr,
+                k_descale_ptr,
+                v_descale_ptr,
+                q_descale_batch_stride,
+                q_descale_head_stride,
+                q_descale_block_stride,
+                k_descale_batch_stride,
+                k_descale_head_stride,
+                k_descale_block_stride,
+                v_descale_batch_stride,
+                v_descale_head_stride,
+                v_descale_block_stride,
                 bid,
                 hid,
-                philox_seed,
-                philox_offset,
-                p_dropout_in_uint8_t,
-                is_dropout,
-                encode_dropout_in_sign_bit=False,
-                NUM_HEADS=h,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-            )
-
-        # varlen PV uses dynamically quantized FP8 P and FP8 V.
-        acc_ = PV_DOT(
-            P,
-            bV,
-            acc_,
-            v_descale,
-            fp8_p_max,
-            v_ptr.type.element_ty,
-            precise_p=is_causal or is_local or PRECISE_SHORT_K,
-        )
-        n_block -= 1
-
-    for n_block in tl.range(
-        n_block_max - n_masking_steps - 1,
-        n_block_min - 1,
-        step=-1,
-        num_stages=1 if is_paged else num_stages,
-    ):
-        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-        if is_paged:
-            bK, bV = load_from_kvcache(
-                col_idx,
-                k_len,
-                page_table_ptr,
-                k_ptr_base,
-                v_ptr_base,
-                block_size,
-                d,
-                k_row_stride,
-                k_page_stride,
-                BLOCK_K=BLOCK_K,
-            )
-        else:
-            start_n = n_block * BLOCK_N
-            k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-            v_ptr_seq = v_ptr_base + k_bos * k_row_stride
-            gK = tl.make_block_ptr(
-                base=k_ptr_seq,
-                shape=(k_len, d),
-                strides=(k_row_stride, 1),
-                offsets=(start_n, 0),
-                block_shape=(BLOCK_N, BLOCK_K),
-                order=(0, 1),
-            )
-            gV = tl.make_block_ptr(
-                base=v_ptr_seq,
-                shape=(k_len, d),
-                strides=(k_row_stride, 1),
-                # For non-paged varlen attention, load only the V slice for
-                # the current D split.
-                offsets=(start_n, d_start),
-                block_shape=(BLOCK_N, BLOCK_D),
-                order=(0, 1),
-            )
-            # Sequence tiles are complete here, but head_dim may be padded.
-            bK = tl.load(gK, boundary_check=(1,), padding_option="zero")
-            bK = tl.trans(bK)
-            bV = tl.load(gV, boundary_check=(1,), padding_option="zero")
-        q_descale, k_descale, v_descale = _load_fp8_block_descales(
-            q_descale_ptr,
-            k_descale_ptr,
-            v_descale_ptr,
-            q_descale_batch_stride,
-            q_descale_head_stride,
-            q_descale_block_stride,
-            k_descale_batch_stride,
-            k_descale_head_stride,
-            k_descale_block_stride,
-            v_descale_batch_stride,
-            v_descale_head_stride,
-            v_descale_block_stride,
-            bid,
-            hid,
-            kv_hid,
-            m_block * BLOCK_M,
-            n_block * BLOCK_N,
-        )
-        # non-masking varlen QK uses the same block descale path.
-        S = tl.dot(bQ, bK, out_dtype=tl.float32)
-        S *= q_descale * k_descale
-        S = apply_softcap(S, softcap, is_softcap)
-        S = apply_alibi(
-            S,
-            col_idx,
-            row_idx,
-            q_len,
-            k_len,
-            is_causal=is_causal,
-            is_alibi=is_alibi,
-            alibi_slope=alibi_slope,
-        )
-        S = apply_mask(
-            S,
-            col_idx,
-            row_idx,
-            q_len,
-            k_len,
-            window_size_left,
-            window_size_right,
-            is_even_mn=True,
-            is_causal=False,
-            is_local=is_local,
-        )
-
-        acc_, P, rowmax_, rowsum_ = softmax_rescale(
-            acc_,
-            S,
-            rowmax_,
-            rowsum_,
-            softmax_scale_log2e=scale_softmax_log2,
-            is_border=is_local,
-            fp8_p_max=fp8_p_max,
-        )
-        if is_dropout:
-            P = apply_dropout(
-                P,
+                kv_hid,
                 m_block * BLOCK_M,
                 n_block * BLOCK_N,
+            )
+            if FULL_FP32_QK:
+                S = tl.dot(bQ.to(tl.float16), bK.to(tl.float16), out_dtype=tl.float32)
+            else:
+                S = tl.dot(bQ, bK, out_dtype=tl.float32)
+            S *= q_descale * k_descale
+            S = apply_softcap(S, softcap, is_softcap)
+            S = apply_alibi(
+                S,
+                col_idx,
+                row_idx,
+                q_len,
                 k_len,
+                is_causal=is_causal,
+                is_alibi=is_alibi,
+                alibi_slope=alibi_slope,
+            )
+            S = apply_mask(
+                S,
+                col_idx,
+                row_idx,
+                q_len,
+                k_len,
+                window_size_left,
+                window_size_right,
+                is_even_mn=is_even_mn,
+                is_causal=is_causal,
+                is_local=is_local,
+            )
+
+            if SCALE_AWARE_ACC:
+                # Fold the frame change into online-softmax rescaling, keeping
+                # one FP32 accumulator instead of a separate FP32 PV result.
+                # Keep repeated logical-block scales exact. Other positive scale
+                # ratios are bounded by 16 by the entry guard.
+                acc_rescale = tl.where(
+                    previous_v_descale == v_descale,
+                    1.0,
+                    previous_v_descale / v_descale,
+                )
+            else:
+                acc_rescale = 1.0
+            acc_, P, rowmax_, rowsum_ = softmax_rescale(
+                acc_,
+                S,
+                rowmax_,
+                rowsum_,
+                softmax_scale_log2e=scale_softmax_log2,
+                is_border=True,
+                fp8_p_max=fp8_p_max,
+                acc_rescale=acc_rescale,
+            )
+
+            if is_paged and DELAY_PAGED_V:
+                # Convert and consume V only after probabilities are available.
+                bV = _load_paged_v_tile_late_v(
+                    v_ptr_base,
+                    cache_rows,
+                    col_idx,
+                    k_len,
+                    d,
+                    BLOCK_K,
+                )
+            if SCALE_AWARE_ACC:
+                acc_ = tl.dot(
+                    P.to(tl.float16),
+                    bV.to(tl.float16),
+                    acc=acc_,
+                    out_dtype=tl.float32,
+                )
+                previous_v_descale = v_descale
+            else:
+                acc_ = PV_DOT(
+                    P,
+                    bV,
+                    acc_,
+                    v_descale,
+                    fp8_p_max,
+                    v_ptr.type.element_ty,
+                    precise_p=is_causal or is_local or PRECISE_SHORT_K,
+                )
+            n_block -= 1
+
+        for n_block in tl.range(
+            n_block_max - n_masking_steps - 1,
+            n_block_min - 1,
+            step=-1,
+            num_stages=PAGED_PIPELINE_STAGES if is_paged else num_stages,
+        ):
+            col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+            if is_paged:
+                if DELAY_PAGED_V:
+                    # Carry only the token row offsets across QK and softmax.
+                    cache_rows = virtual_to_cache_offset(
+                        col_idx,
+                        k_len,
+                        page_table_ptr,
+                        block_size,
+                        k_row_stride,
+                        k_page_stride,
+                        boundary_check=False,
+                    )
+                    bK = _load_paged_k_tile_late_v(
+                        k_ptr_base,
+                        cache_rows,
+                        col_idx,
+                        k_len,
+                        d,
+                        BLOCK_K,
+                    )
+                else:
+                    bK, bV = load_from_kvcache(
+                        col_idx,
+                        k_len,
+                        page_table_ptr,
+                        k_ptr_base,
+                        v_ptr_base,
+                        block_size,
+                        d,
+                        k_row_stride,
+                        k_page_stride,
+                        BLOCK_K=BLOCK_K,
+                    )
+            else:
+                start_n = n_block * BLOCK_N
+                k_ptr_seq = k_ptr_base + k_bos * k_row_stride
+                v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+                gK = tl.make_block_ptr(
+                    base=k_ptr_seq,
+                    shape=(k_len, d),
+                    strides=(k_row_stride, 1),
+                    offsets=(start_n, 0),
+                    block_shape=(BLOCK_N, BLOCK_K),
+                    order=(0, 1),
+                )
+                gV = tl.make_block_ptr(
+                    base=v_ptr_seq,
+                    shape=(k_len, d),
+                    strides=(k_row_stride, 1),
+                    # For non-paged varlen attention, load only the V slice for
+                    # the current D split.
+                    offsets=(start_n, d_start),
+                    block_shape=(BLOCK_N, BLOCK_D),
+                    order=(0, 1),
+                )
+                # Sequence tiles are complete here, but head_dim may be padded.
+                bK = tl.load(gK, boundary_check=(1,), padding_option="zero")
+                bK = tl.trans(bK)
+                bV = tl.load(gV, boundary_check=(1,), padding_option="zero")
+            q_descale, k_descale, v_descale = _load_fp8_block_descales(
+                q_descale_ptr,
+                k_descale_ptr,
+                v_descale_ptr,
+                q_descale_batch_stride,
+                q_descale_head_stride,
+                q_descale_block_stride,
+                k_descale_batch_stride,
+                k_descale_head_stride,
+                k_descale_block_stride,
+                v_descale_batch_stride,
+                v_descale_head_stride,
+                v_descale_block_stride,
                 bid,
                 hid,
-                philox_seed,
-                philox_offset,
-                p_dropout_in_uint8_t,
-                is_dropout,
-                encode_dropout_in_sign_bit=False,
-                NUM_HEADS=h,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
+                kv_hid,
+                m_block * BLOCK_M,
+                n_block * BLOCK_N,
             )
-        # non-masking varlen PV runs as FP8 P * FP8 V.
-        acc_ = PV_DOT(
-            P,
-            bV,
-            acc_,
-            v_descale,
-            fp8_p_max,
-            v_ptr.type.element_ty,
-            precise_p=PRECISE_SHORT_K,
-        )
+            if FULL_FP32_QK:
+                S = tl.dot(bQ.to(tl.float16), bK.to(tl.float16), out_dtype=tl.float32)
+            else:
+                S = tl.dot(bQ, bK, out_dtype=tl.float32)
+            S *= q_descale * k_descale
+            S = apply_softcap(S, softcap, is_softcap)
+            S = apply_alibi(
+                S,
+                col_idx,
+                row_idx,
+                q_len,
+                k_len,
+                is_causal=is_causal,
+                is_alibi=is_alibi,
+                alibi_slope=alibi_slope,
+            )
+            S = apply_mask(
+                S,
+                col_idx,
+                row_idx,
+                q_len,
+                k_len,
+                window_size_left,
+                window_size_right,
+                is_even_mn=True,
+                is_causal=False,
+                is_local=is_local,
+            )
+
+            if SCALE_AWARE_ACC:
+                # Fold the frame change into online-softmax rescaling, keeping
+                # one FP32 accumulator instead of a separate FP32 PV result.
+                # Keep repeated logical-block scales exact. Other positive scale
+                # ratios are bounded by 16 by the entry guard.
+                acc_rescale = tl.where(
+                    previous_v_descale == v_descale,
+                    1.0,
+                    previous_v_descale / v_descale,
+                )
+            else:
+                acc_rescale = 1.0
+            acc_, P, rowmax_, rowsum_ = softmax_rescale(
+                acc_,
+                S,
+                rowmax_,
+                rowsum_,
+                softmax_scale_log2e=scale_softmax_log2,
+                is_border=is_local,
+                fp8_p_max=fp8_p_max,
+                acc_rescale=acc_rescale,
+            )
+            if is_paged and DELAY_PAGED_V:
+                # Convert and consume V only after probabilities are available.
+                bV = _load_paged_v_tile_late_v(
+                    v_ptr_base,
+                    cache_rows,
+                    col_idx,
+                    k_len,
+                    d,
+                    BLOCK_K,
+                )
+            if SCALE_AWARE_ACC:
+                acc_ = tl.dot(
+                    P.to(tl.float16),
+                    bV.to(tl.float16),
+                    acc=acc_,
+                    out_dtype=tl.float32,
+                )
+                previous_v_descale = v_descale
+            else:
+                acc_ = PV_DOT(
+                    P,
+                    bV,
+                    acc_,
+                    v_descale,
+                    fp8_p_max,
+                    v_ptr.type.element_ty,
+                    precise_p=PRECISE_SHORT_K,
+                )
 
     # LSE
+    empty_row = (rowsum_ == 0) | (rowsum_ != rowsum_)
     lse = tl.where(
-        rowsum_ == 0 | (rowsum_ != rowsum_),
-        float("inf"),
-        rowmax_ * scale_softmax
-        + tl.log(rowsum_ * (1.0 / 256.0 if fp8_p_max == 448.0 else 1.0)),
+        empty_row,
+        float("-inf") if NUM_KV_SPLITS > 1 else float("inf"),
+        rowmax_ * scale_softmax + tl.log(rowsum_ * (1.0 / 256.0)),
     )
-    inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
+    inv_sum = tl.where(empty_row, 1.0, 1.0 / rowsum_)
 
+    if SCALE_AWARE_ACC:
+        inv_sum *= previous_v_descale
     acc_ *= inv_sum[:, None]
 
     out = acc_.to(o_ptr.type.element_ty)  # noqa
@@ -2067,22 +3000,64 @@ def flash_varlen_fwd_kernel(
     )
 
 
+@libentry()
+@triton.jit
+def flash_varlen_splitkv_combine_kernel(
+    out_ptr,
+    lse_ptr,
+    partial_out_ptr,
+    partial_lse_ptr,
+    total_q,
+    out_row_stride,
+    out_head_stride,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hid = row % H
+    token = row // H
+    d_start = tl.program_id(1) * BLOCK_D
+    splits = tl.arange(0, BLOCK_S)
+    dims = d_start + tl.arange(0, BLOCK_D)
+    partial_lse = tl.load(
+        partial_lse_ptr + (splits * H + hid) * total_q + token,
+        mask=splits < NUM_KV_SPLITS,
+        other=float("-inf"),
+    )
+    max_lse = tl.max(partial_lse, 0)
+    # All-empty rows must avoid -inf - -inf and retain the public +inf LSE.
+    safe_max = tl.where(max_lse == float("-inf"), 0.0, max_lse)
+    weights = tl.exp(partial_lse - safe_max)
+    weight_sum = tl.sum(weights, 0)
+    weights /= tl.where(weight_sum == 0.0, 1.0, weight_sum)
+    partial_out = tl.load(
+        partial_out_ptr
+        + ((splits[:, None] * total_q + token) * H + hid) * D
+        + dims[None, :],
+        mask=(splits[:, None] < NUM_KV_SPLITS) & (dims[None, :] < D),
+        other=0.0,
+    )
+    result = tl.sum(partial_out * weights[:, None], 0)
+    tl.store(
+        out_ptr + token * out_row_stride + hid * out_head_stride + dims,
+        result,
+        mask=dims < D,
+    )
+    lse = tl.where(weight_sum == 0.0, float("inf"), safe_max + tl.log(weight_sum))
+    if d_start == 0:
+        tl.store(lse_ptr + hid * total_q + token, lse)
+
+
 def CHECK_DEVICE(x):
     assert x.device.type == runtime.device.name
 
 
 # Q/K/V are FP8 inputs while O stays FP16/BF16. The FP32 descale tensors carry
 # the per-block quantization scales used by the QK and PV tensor-core matmuls.
-_FP8_DTYPES = tuple(
-    dtype
-    for dtype in (
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e5m2", None),
-        getattr(torch, "float8_e4m3fnuz", None),
-        getattr(torch, "float8_e5m2fnuz", None),
-    )
-    if dtype is not None
-)
+_FP8_DTYPES = (torch.float8_e4m3fn,)
 _HIGH_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
 
 
@@ -2119,6 +3094,8 @@ def _normalize_dense_descale(descale, batch_size, num_heads, nblocks, device, na
 
 
 class fwd_params:
+    # This positional ABI is also consumed by backend-specific kernels.
+    # Keep the inference-only dropout and FP8 metadata slots for those callers.
     __slots__ = (
         # pointers and strides
         "q_ptr",
@@ -2431,13 +3408,32 @@ def _get_varlen_fwd_config(
     )
     if (
         is_hopper
+        and is_paged
+        and head_size == 256
+        and max_seqlen_q > 512
+        and is_standard_attention
+        and not is_alibi
+        and not is_softcap
+    ):
+        # Keep QK shared by all output channels. Explicit FP16 promotion
+        # enables Hopper WGMMA while retaining full FP32 QK accumulation.
+        # One FP16 PV dot avoids the probability rounding and residual-dot
+        # cost of the FP8 path; Q/K/V storage remains FP8.
+        cfg_params.update(
+            BLOCK_D=256,
+            SPLIT_D=False,
+            PV_DOT=_fp16_pv_dot,
+            FULL_FP32_QK=True,
+        )
+        if avg_rows_per_cta > 16:
+            cfg_params.update(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=1)
+    if (
+        is_hopper
         and not is_paged
         and is_standard_attention
         and not is_alibi
         and not is_softcap
-        and not is_dropout
-        and head_size in (64, 128)
-    ):
+    ) and head_size in (64, 128):
         cfg_params.update(
             {
                 "BLOCK_M": 128,
@@ -2531,14 +3527,25 @@ def mha_varlan_fwd(
     get_config=_get_varlen_fwd_config,
     pv_dot=_fp8_pv_dot,
     allow_group_swap=True,
+    num_splits=0,
 ):
+    if p_dropout != 0.0 or return_softmax:
+        raise NotImplementedError(
+            "dropout and attention probabilities are not supported"
+        )
+    if fp8_p_max != 448.0:
+        raise ValueError("E4M3FN attention requires fp8_p_max=448.0")
     CHECK_DEVICE(q), CHECK_DEVICE(k), CHECK_DEVICE(v)
+    if zero_tensors:
+        raise NotImplementedError("zero_tensors is not supported")
     q_device = q.device
     q_dtype = q.dtype
     v_dtype = v.dtype
     # varlen forward also consumes FP8 Q/K/V and uses explicit
     # descale tensors, matching the dense kernel contract.
-    assert q_dtype in _FP8_DTYPES, "W8A8 FP8 FlashAttention expects q to be fp8"
+    assert (
+        q_dtype in _FP8_DTYPES
+    ), "W8A8 FP8 FlashAttention requires torch.float8_e4m3fn"
     assert (
         k.dtype == q_dtype
     ), "W8A8 FP8 FlashAttention expects q and k to use the same fp8 dtype"
@@ -2568,7 +3575,6 @@ def mha_varlan_fwd(
     block_size = k.size(1) if is_paged else 1
     num_pages = k.size(0) if is_paged else 0
     k_batch_size = num_pages
-    # max_num_pages_per_seq = page_table.size(1)
     page_table_batch_stride = page_table.stride(0)
     k_batch_stride = k.stride(0)
     v_batch_stride = v.stride(0)
@@ -2605,7 +3611,6 @@ def mha_varlan_fwd(
         and num_heads > num_heads_k
         and window_size_left < 0
         and window_size_right < 0
-        and p_dropout == 0
     )
     q_groups = num_heads // num_heads_k
     if seqlenq_ngroups_swapped:
@@ -2621,7 +3626,6 @@ def mha_varlan_fwd(
         q_batch_stride = q.stride(0) * max_seqlen_q
         k_batch_stride = k.stride(0)
         v_batch_stride = v.stride(0)
-        # o_batch_stride = out.stride(0) * max_seqlen_q
     else:
         q_batch_stride = 0
         k_batch_stride = 0
@@ -2646,9 +3650,6 @@ def mha_varlan_fwd(
         assert k.shape == (num_pages, block_size, num_heads_k, head_size)
         assert v.shape == (num_pages, block_size, num_heads_k, head_size)
     assert k.stride() == v.stride()
-
-    if softcap > 0.0:
-        assert p_dropout == 0, "dropout is not supported if softcap is used."
 
     round_multiple = lambda x, m: (x + m - 1) // m * m
     head_size_rounded = round_multiple(head_size, 32) if head_size <= 192 else 256
@@ -2698,34 +3699,125 @@ def mha_varlan_fwd(
             o_batch_stride = out.stride(0) * max_seqlen_q
 
         lse = torch.empty((num_heads, total_q), dtype=torch.float, device=q_device)
-
-        if p_dropout > 0:
-            is_dropout = True
-            increment = batch_size * num_heads * 32
-            philox_seed, philox_offset = philox_backend_seed_offset(increment)
-            philox_args = torch.tensor(
-                [philox_seed, philox_offset], dtype=torch.int64, device=q_device
+        num_kv_splits = max(1, num_splits)
+        is_h20_or_h800 = runtime.device.vendor_name == "nvidia" and any(
+            name in torch_device_fn.get_device_properties(runtime.device.name).name
+            for name in ("H20", "H800")
+        )
+        use_short_prefill = (
+            (
+                (
+                    is_h20_or_h800
+                    and get_device_capability()[0] == 9
+                    and is_paged
+                    and block_size in (16, 32)
+                    and head_size == 256
+                    and q_groups in (4, 8)
+                    and batch_size > 1
+                    and max_seqlen_q > 512
+                )
+                and num_splits == 0
+                and num_kv_splits == 1
+                and seqused_k is not None
+                and not allow_group_swap
+                and not is_alibi
+                and not is_softcap
             )
-        else:
-            is_dropout = False
-            philox_args = torch.empty((2,), dtype=torch.int64, device=q_device)
-
-        p_dropout = 1 - p_dropout
-        p_dropout_in_uint8_t = math.floor(p_dropout * 255.0)
-        rp_dropout = 1.0 / p_dropout
-
-        if return_softmax:
-            assert is_dropout, "Only supported with non-zero dropout."
-            p = torch.empty(
-                (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
+            and not is_local
+            and is_causal
+            and window_size_left == -1
+            and window_size_right == 0
+        )
+        use_grouped_decode = (
+            runtime.device.vendor_name == "nvidia"
+            and get_device_capability()[0] == 9
+            and is_paged
+            and block_size in (16, 32)
+            and head_size == 256
+            and max_seqlen_q == 1
+            and q_groups in (4, 8, 16, 32)
+            and seqused_k is not None
+            and not allow_group_swap
+            and not is_alibi
+            and not is_softcap
+        ) and not is_local
+        use_hybrid_decode = (
+            (
+                runtime.device.vendor_name == "nvidia"
+                and get_device_capability()[0] == 9
+                and is_paged
+                and block_size in (16, 32)
+                and head_size == 256
+                and max_seqlen_q > 1
+                and (
+                    (batch_size >= 32 and batch_size * num_heads_k >= 48)
+                    or (
+                        batch_size >= 3 and 2 * batch_size * max_seqlen_q >= 3 * total_q
+                    )
+                )
+                and q_groups in (4, 8, 16, 32)
+                and seqused_k is not None
+                and not allow_group_swap
+                and not is_alibi
+                and not is_softcap
+            )
+            and not is_local
+            and window_size_left == -1
+            and (
+                (is_causal and window_size_right == 0)
+                or (not is_causal and window_size_right == -1)
+            )
+            and num_splits == 0
+        )
+        if use_short_prefill:
+            # Decode, short prefill, and long prefill have disjoint output rows.
+            use_hybrid_decode = True
+        decode_chunks = triton.cdiv(q_groups, 8)
+        decode_bn = 128
+        decode_splits = num_kv_splits
+        decode_workers = num_kv_splits
+        if use_grouped_decode or use_hybrid_decode:
+            num_sms = torch_device_fn.get_device_properties(
+                runtime.device.name
+            ).multi_processor_count
+            if num_splits == 0:
+                if use_hybrid_decode and q_groups in (4, 8):
+                    # Preserve the validated schedule for existing mixed requests.
+                    decode_splits = 32
+                else:
+                    decode_splits = _select_decode_splits(
+                        batch_size,
+                        num_heads_k,
+                        decode_chunks,
+                        max_seqlen_k,
+                        decode_bn,
+                        num_sms,
+                    )
+                if use_grouped_decode:
+                    num_kv_splits = decode_splits
+            decode_workers = min(
+                decode_splits,
+                triton.cdiv(2 * num_sms, batch_size * num_heads_k * decode_chunks),
+            )
+        if num_kv_splits > 1 and not (use_grouped_decode and decode_workers == 1):
+            partial_out = torch.empty(
+                (num_kv_splits, total_q, num_heads, head_size),
+                dtype=torch.float32,
                 device=q_device,
             )
-        else:
-            p = torch.empty((), device=q_device)
+            partial_lse = torch.empty(
+                (num_kv_splits, num_heads, total_q),
+                dtype=torch.float32,
+                device=q_device,
+            )
 
-        if zero_tensors:
-            out.zero_()
-            lse.fill_(float("-inf"))
+        # Keep the shared backend ABI without allocating unused inference state.
+        is_dropout = False
+        p_dropout = 1.0
+        p_dropout_in_uint8_t = 255
+        rp_dropout = 1.0
+        philox_args = None
+        p = None
 
         q_nblocks = triton.cdiv(max_seqlen_q, 128)
         k_nblocks = triton.cdiv(max_seqlen_k, 128)
@@ -2741,21 +3833,205 @@ def mha_varlan_fwd(
             v_descale, batch_size, num_heads_k, k_nblocks, q_device, "v_descale"
         )
 
+        if use_grouped_decode or use_hybrid_decode:
+            if use_hybrid_decode:
+                if decode_workers > 1:
+                    decode_partials = torch.empty(
+                        (decode_splits, batch_size, num_heads, head_size),
+                        dtype=torch.float32,
+                        device=q_device,
+                    )
+                    decode_partial_lse = torch.empty(
+                        (decode_splits, num_heads, batch_size),
+                        dtype=torch.float32,
+                        device=q_device,
+                    )
+                else:
+                    decode_partials, decode_partial_lse = out, lse
+            else:
+                decode_partials = partial_out if decode_workers > 1 else out
+                decode_partial_lse = partial_lse if decode_workers > 1 else lse
+            _flash_varlen_grouped_decode_fwd[
+                (batch_size, num_heads_k * decode_chunks, decode_workers)
+            ](
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                seqused_k,
+                page_table,
+                q_descale,
+                k_descale,
+                v_descale,
+                out,
+                lse,
+                decode_partials,
+                decode_partial_lse,
+                q.stride(0),
+                q.stride(1),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                page_table.stride(0),
+                q_descale.stride(0),
+                q_descale.stride(1),
+                k_descale.stride(0),
+                k_descale.stride(1),
+                k_descale.stride(2),
+                v_descale.stride(0),
+                v_descale.stride(1),
+                v_descale.stride(2),
+                out.stride(0),
+                out.stride(1),
+                total_q,
+                H=num_heads,
+                HK=num_heads_k,
+                G=q_groups,
+                PAGE=block_size,
+                SPLITS=decode_splits,
+                SCALE=softmax_scale,
+                BN=decode_bn,
+                WORKERS=decode_workers,
+                num_warps=4,
+                num_stages=1,
+                PART_BY_BATCH=use_hybrid_decode,
+                PART_ROWS=batch_size,
+            )
+            if decode_workers > 1:
+                _flash_varlen_grouped_decode_combine[(batch_size, num_heads, 4)](
+                    out,
+                    lse,
+                    decode_partials,
+                    decode_partial_lse,
+                    cu_seqlens_q,
+                    seqused_k,
+                    total_q,
+                    out.stride(0),
+                    out.stride(1),
+                    H=num_heads,
+                    D=head_size,
+                    SPLITS=decode_splits,
+                    BS=triton.next_power_of_2(decode_splits),
+                    BN=decode_bn,
+                    num_warps=4,
+                    PART_BY_BATCH=use_hybrid_decode,
+                    PART_ROWS=batch_size,
+                )
+            if use_grouped_decode:
+                unused = None
+                return out, q, k, v, lse, philox_args, unused, p
+
+        if use_short_prefill:
+            short_heads = q_groups
+            short_rows = 128
+            short_capacity = 32
+            short_token_rows = short_rows // short_heads
+            short_splits = _select_decode_splits(
+                batch_size,
+                num_heads_k,
+                triton.cdiv(short_capacity, short_token_rows),
+                max_seqlen_k,
+                64,
+                num_sms,
+            )
+            short_partial = torch.empty(
+                (short_splits, batch_size, short_capacity, num_heads, head_size),
+                dtype=torch.float32,
+                device=q_device,
+            )
+            short_lse = torch.empty(
+                (short_splits, batch_size, num_heads, short_capacity),
+                dtype=torch.float32,
+                device=q_device,
+            )
+            _short_fused_fwd[
+                (
+                    triton.cdiv(short_capacity, short_token_rows),
+                    batch_size,
+                    num_heads_k * short_splits,
+                )
+            ](
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                seqused_k,
+                page_table,
+                q_descale,
+                k_descale,
+                v_descale,
+                short_partial,
+                short_lse,
+                q.stride(0),
+                q.stride(1),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                page_table.stride(0),
+                q_descale.stride(0),
+                q_descale.stride(1),
+                q_descale.stride(2),
+                k_descale.stride(0),
+                k_descale.stride(1),
+                k_descale.stride(2),
+                v_descale.stride(0),
+                v_descale.stride(1),
+                v_descale.stride(2),
+                B=batch_size,
+                SPLITS=short_splits,
+                MAX_Q=short_capacity,
+                H=num_heads,
+                G=q_groups,
+                PAGE=block_size,
+                SCALE=softmax_scale,
+                FUSED_HEADS=short_heads,
+                ROWS=short_rows,
+                BN=64,
+                STAGES=1,
+                num_warps=8,
+                num_stages=1,
+            )
+            _short_fused_combine[(short_capacity, batch_size, num_heads)](
+                short_partial,
+                short_lse,
+                cu_seqlens_q,
+                out,
+                lse,
+                out.stride(0),
+                out.stride(1),
+                total_q,
+                B=batch_size,
+                H=num_heads,
+                D=head_size,
+                SPLITS=short_splits,
+                MAX_Q=short_capacity,
+                num_warps=4,
+                num_stages=1,
+            )
+
+        kernel_out = partial_out[0] if num_kv_splits > 1 else out
+        kernel_lse = partial_lse[0] if num_kv_splits > 1 else lse
         params = fwd_params(
             q,  # q_ptr,
             k,  # k_ptr,
             v,  # v_ptr,
-            out,  # o_ptr,
+            kernel_out,  # o_ptr,
             p,  # p_ptr,
-            lse,  # softmax_lse_ptr,
+            kernel_lse,  # softmax_lse_ptr,
             q.stride(-3),  # q_row_stride,
             k.stride(-3),  # k_row_stride,
             v.stride(-3),  # v_row_stride,
             q.stride(-2),  # q_head_stride,
             k.stride(-2),  # k_head_stride,
             v.stride(-2),  # v_head_stride,
-            out.stride(-3),  # o_row_stride,
-            out.stride(-2),  # o_head_stride,
+            kernel_out.stride(-3),  # o_row_stride,
+            kernel_out.stride(-2),  # o_head_stride,
             q_batch_stride,  # q_batch_stride,
             k_batch_stride,  # k_batch_stride,
             v_batch_stride,  # v_batch_stride,
@@ -2827,8 +4103,8 @@ def mha_varlan_fwd(
             params.k_ptr = k.view(k.shape[0], k.shape[1], -1)
             params.v_ptr = v.view(v.shape[0], v.shape[1], -1)
         logger.debug("kernel: flash_varlen_fwd")
-        # Use D64 output slices for non-paged dimensions above 64. The
-        # paged-cache loader continues to load the full D dimension.
+        # Packed wide heads use D64 output slices. Paged D256 instead
+        # keeps QK shared with a full-width PV accumulator.
         use_varlen_split_d = head_size > 64 and not is_paged
         args = tuple(getattr(params, k) for k in params.__slots__)
 
@@ -2848,13 +4124,98 @@ def mha_varlan_fwd(
             num_heads,
             max_seqlen_q,
         )
+        if (
+            (cfg_params.get("FULL_FP32_QK", False))
+            and batch_size == 1
+            and num_heads == 4
+            and num_heads_k == 1
+            and is_causal
+            and total_q >= 4096
+            and num_kv_splits == 1
+        ):
+            # Wider query tiles improve KV reuse for long single-request MQA.
+            cfg_params.update(BLOCK_M=128, BLOCK_N=64, num_warps=8, num_stages=1)
+        if is_h20_or_h800 and cfg_params.get("FULL_FP32_QK", False):
+            # H20 and H800 use smaller query tiles and asynchronous KV loads.
+            cfg_params.update(
+                BLOCK_M=64,
+                BLOCK_N=64,
+                num_warps=4,
+                PAGED_PIPELINE_STAGES=2,
+            )
+        if (
+            runtime.device.vendor_name == "nvidia"
+            and "H800"
+            in torch_device_fn.get_device_properties(runtime.device.name).name
+            and is_paged
+            and head_size == 256
+            and max_seqlen_q > 512
+            and cfg_params.get("FULL_FP32_QK", False)
+        ):
+            cfg_params["PAGED_PIPELINE_STAGES"] = 1
+            cfg_params["DELAY_PAGED_V"] = True
+        cfg_params["REVERSE_QUERY_TILES"] = (
+            (is_h20_or_h800 and cfg_params.get("FULL_FP32_QK", False))
+            and is_causal
+            and not is_local
+        )
+        cfg_params["SKIP_SINGLE_Q"] = use_hybrid_decode
+        cfg_params["SKIP_SHORT_Q"] = use_short_prefill
         args = cfg_params.pop("args", args)
         num_d_splits = triton.cdiv(head_size, cfg_params["BLOCK_D"])
+        if num_kv_splits > 1:
+            cfg_params["NUM_KV_SPLITS"] = num_kv_splits
         grid = (
             triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"]),
-            batch_size,
+            batch_size * num_kv_splits,
             num_heads * num_d_splits,
         )
+        max_query_tiles = triton.cdiv(total_q, cfg_params["BLOCK_M"]) + batch_size - 1
+        max_tiles_per_sequence = triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
+        use_compact_schedule = (
+            runtime.device.vendor_name == "nvidia"
+            and get_device_capability()[0] == 9
+            and is_paged
+            and head_size == 256
+            and batch_size >= 32
+            and cu_seqlens_q is not None
+            and batch_size * max_tiles_per_sequence >= 8 * max_query_tiles
+            and triton.next_power_of_2(batch_size)
+            * triton.next_power_of_2(max_tiles_per_sequence)
+            <= 16384
+        )
+        if use_compact_schedule:
+            prefix = torch.empty((batch_size + 1,), dtype=torch.int32, device=q_device)
+            batch_map = torch.empty(
+                (max_query_tiles,), dtype=torch.int32, device=q_device
+            )
+            local_tile_map = torch.empty_like(batch_map)
+            query_tile_prefix_kernel[(1,)](
+                cu_seqlens_q,
+                prefix,
+                batch_map,
+                local_tile_map,
+                B=batch_size,
+                BLOCK_M=cfg_params["BLOCK_M"],
+                BLOCK_B=triton.next_power_of_2(batch_size),
+                BLOCK_T=triton.next_power_of_2(
+                    triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
+                ),
+                num_warps=4,
+            )
+            # Sum(ceil(q_len/M)) <= ceil(total_q/M) + B - 1, without a
+            # device-to-host read or changing the recorded input dimensions.
+            grid = (
+                triton.cdiv(total_q, cfg_params["BLOCK_M"]) + batch_size - 1,
+                num_kv_splits,
+                num_heads * num_d_splits,
+            )
+            cfg_params.update(
+                QUERY_TILE_PREFIX=prefix,
+                QUERY_BATCH_MAP=batch_map,
+                QUERY_LOCAL_TILE_MAP=local_tile_map,
+                COMPACT_QUERY_SCHEDULE=True,
+            )
         kernel = cfg_params.pop("kernel", flash_varlen_fwd_kernel)[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
@@ -2872,8 +4233,99 @@ def mha_varlan_fwd(
         else:
             # Each CTA runs in exactly one variant, selected by its KV length.
             short_k_modes = (False, True)
+        selected_pv_dot = cfg_params.pop("PV_DOT", pv_dot)
+        if cfg_params.get("FULL_FP32_QK", False):
+            # This path uses the same precise PV calculation for every KV
+            # length, so a second short-sequence launch is unnecessary.
+            cfg_params["UNIFIED_K_LENGTHS"] = True
+            short_k_modes = (False,)
+        use_scale_aware_acc = (
+            runtime.device.vendor_name == "nvidia"
+            and "H800"
+            in torch_device_fn.get_device_properties(runtime.device.name).name
+            and is_paged
+            and head_size == 256
+            and max_seqlen_q > 512
+            and cfg_params.get("FULL_FP32_QK", False)
+        )
+        if use_scale_aware_acc:
+            # The device guard selects the bounded direct-accumulator path.
+            # All other scales retain their value and use residual-corrected PV.
+            selected_pv_dot = _fp16_pv_dot_residual
+            # Preserve the grouped loop with its original CTA guard for the
+            # single-request GQA/Page32 regime. Other eligible layouts share one guard check.
+            use_group_scales = (
+                batch_size == 1
+                and q_groups == 8
+                and block_size == 32
+                and cfg_params["BLOCK_N"] == 64
+            )
+            cfg_params["GROUP_FP8_SCALES"] = use_group_scales
+            precheck_scale_guard = not use_group_scales
+            scale_safe_flags = None
+            if precheck_scale_guard:
+                # Fresh stream-local workspace is captured by CUDA Graph and
+                # overwritten by the check kernel before either main kernel reads it.
+                scale_safe_flags = torch.empty(
+                    (batch_size, num_heads_k), dtype=torch.int32, device=q_device
+                )
+                _check_varlen_v_scales[(batch_size, num_heads_k)](
+                    v_descale,
+                    cu_seqlens_k,
+                    seqused_k,
+                    scale_safe_flags,
+                    v_descale.stride(0),
+                    v_descale.stride(1),
+                    v_descale.stride(2),
+                    max_seqlen_k,
+                    HK=num_heads_k,
+                    HAS_SEQUSED_K=seqused_k is not None,
+                    SCAN_BLOCKS=triton.next_power_of_2(triton.cdiv(max_seqlen_k, 128)),
+                    num_warps=4,
+                    num_stages=1,
+                )
+        scale_acc_modes = (True, False) if use_scale_aware_acc else (None,)
         for precise_short_k in short_k_modes:
-            kernel(*args, PRECISE_SHORT_K=precise_short_k, PV_DOT=pv_dot, **cfg_params)
+            for scale_acc_fast in scale_acc_modes:
+                launch_config = cfg_params
+                if scale_acc_fast is not None:
+                    launch_config = dict(
+                        cfg_params,
+                        SCALE_AWARE_GUARD=True,
+                        SCALE_AWARE_ACC=scale_acc_fast,
+                        SCALE_SAFE_FLAGS=scale_safe_flags,
+                        PRECHECK_SCALE_GUARD=precheck_scale_guard,
+                        SCALE_SCAN_BLOCKS=(
+                            triton.next_power_of_2(triton.cdiv(max_seqlen_k, 128))
+                            if use_group_scales
+                            else 1
+                        ),
+                    )
+                kernel(
+                    *args,
+                    PRECISE_SHORT_K=precise_short_k,
+                    PV_DOT=selected_pv_dot,
+                    **launch_config,
+                )
+
+        if num_kv_splits > 1:
+            flash_varlen_splitkv_combine_kernel[
+                (total_q * num_heads, triton.cdiv(head_size, 64))
+            ](
+                out,
+                lse,
+                partial_out,
+                partial_lse,
+                total_q,
+                out.stride(0),
+                out.stride(1),
+                H=num_heads,
+                D=head_size,
+                NUM_KV_SPLITS=num_kv_splits,
+                BLOCK_S=triton.next_power_of_2(num_kv_splits),
+                BLOCK_D=64,
+                num_warps=4,
+            )
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(
@@ -2887,7 +4339,7 @@ def mha_varlan_fwd(
             lse = lse.reshape(num_heads_k, batch_size, max_seqlen_q)
             lse = lse.reshape(num_heads_k * max_seqlen_q, batch_size)
 
-        unused = torch.empty((), dtype=torch.int64, device=q_device)
+        unused = None
     return out, q, k, v, lse, philox_args, unused, p
 
 
@@ -2910,13 +4362,21 @@ def mha_fwd(
     v_descale=None,
     fp8_p_max=448.0,
 ):
+    if p_dropout != 0.0 or return_softmax:
+        raise NotImplementedError(
+            "dropout and attention probabilities are not supported"
+        )
+    if fp8_p_max != 448.0:
+        raise ValueError("E4M3FN attention requires fp8_p_max=448.0")
     CHECK_DEVICE(q), CHECK_DEVICE(k), CHECK_DEVICE(v)
     q_dtype = q.dtype
     v_dtype = v.dtype
     q_device = q.device
     # The internal dense forward consumes FP8 Q/K/V
     # tensors and the output keeps the caller's high-precision output dtype.
-    assert q_dtype in _FP8_DTYPES, "W8A8 FP8 FlashAttention expects q to be fp8"
+    assert (
+        q_dtype in _FP8_DTYPES
+    ), "W8A8 FP8 FlashAttention requires torch.float8_e4m3fn"
     assert (
         k.dtype == q_dtype
     ), "W8A8 FP8 FlashAttention expects q and k to use the same fp8 dtype"
@@ -2959,7 +4419,6 @@ def mha_fwd(
         and num_heads > num_heads_k
         and window_size_left < 0
         and window_size_right < 0
-        and p_dropout == 0
     )
     q_groups = num_heads // num_heads_k
 
@@ -3011,30 +4470,13 @@ def mha_fwd(
             # three inputs are FP8.
             out = torch.empty_like(q, dtype=torch.bfloat16)
 
-        # Set dropout params
-        if p_dropout > 0:
-            is_dropout = True
-            increment = batch_size * num_heads * 32
-            philox_seed, philox_offset = philox_backend_seed_offset(increment)
-            philox_args = torch.tensor(
-                [philox_seed, philox_offset], dtype=torch.int64, device=q_device
-            )
-        else:
-            is_dropout = False
-            philox_args = torch.empty((2,), dtype=torch.int64, device=q_device)
-
-        p_dropout = 1 - p_dropout
-        p_dropout_in_uint8_t = math.floor(p_dropout * 255.0)
-        rp_dropout = 1.0 / p_dropout
-
-        if return_softmax:
-            assert is_dropout, "Only supported with non-zero dropout."
-            p = torch.empty(
-                (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
-                device=q_device,
-            )
-        else:
-            p = torch.empty((), device=q_device)
+        # Keep the shared backend ABI without allocating unused inference state.
+        is_dropout = False
+        p_dropout = 1.0
+        p_dropout_in_uint8_t = 255
+        rp_dropout = 1.0
+        philox_args = None
+        p = None
 
         q_nblocks = triton.cdiv(seqlen_q, 128)
         k_nblocks = triton.cdiv(seqlen_k, 128)
@@ -3095,12 +4537,7 @@ def mha_fwd(
             disable_splitkv1 = disable_splitkv or seqlen_q <= 512
 
             # Try splitkv
-            if (
-                (not use_split_d)
-                and not is_dropout
-                and not is_local
-                and not disable_splitkv1
-            ):
+            if ((not use_split_d)) and not is_local and not disable_splitkv1:
                 BM = block_m_splitkv_heuristic(D)
                 n_tasks = B * H * triton.cdiv(seqlen_q, BM)
                 BN = block_n_splitkv_heuristic(D)
@@ -3176,14 +4613,6 @@ def mha_fwd(
             }
             kernel = kernel(*params.args(), **extra_args)
             return kernel
-
-        if _debug:
-            p = torch.empty(
-                (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
-                dtype=torch.float32,
-                device=q_device,
-            )
-            return_softmax = True
 
         params = fwd_params(
             q,  # q_ptr,
@@ -3274,13 +4703,7 @@ def mha_fwd(
             params.q_ptr = q.transpose(1, 2)
             params.k_ptr = k.transpose(1, 2)
             params.v_ptr = v.transpose(1, 2)
-        kernel = dispatch(batch_size, num_heads, seqlen_q, seqlen_k, head_size, params)
-
-        if _debug:
-            print(f"{kernel.name} shared memory:", kernel.metadata.shared)
-            print(f"{kernel.name} num_warps:", kernel.metadata.num_warps)
-            print(f"{kernel.name} num_stages:", kernel.metadata.num_stages)
-            # print(kernel.asm['ttgir'])
+        dispatch(batch_size, num_heads, seqlen_q, seqlen_k, head_size, params)
 
         if seqlenq_ngroups_swapped:
             out = out.transpose(1, 2).reshape(
@@ -3291,7 +4714,7 @@ def mha_fwd(
             )
             lse = lse.reshape((batch_size, num_heads_k * seqlen_q, 1))
 
-        unused = torch.empty((), dtype=torch.int64, device=q_device)
+        unused = None
 
     return out, q, k, v, lse, philox_args, unused, p
 
@@ -3331,6 +4754,7 @@ def _flash_attn_varlen_func_w8a8_fp8(
     *,
     fp8_dtypes=_FP8_DTYPES,
     allow_gqa=False,
+    allow_scheduler_args=False,
     use_dense=True,
     varlen_fwd=mha_varlan_fwd,
 ):
@@ -3350,11 +4774,17 @@ def _flash_attn_varlen_func_w8a8_fp8(
         softmax_scale: Score scale. Defaults to ``1 / sqrt(head_dim)``.
         causal: Whether to apply a causal mask.
         out: Optional packed FP16/BF16 output tensor.
+        scheduler_metadata: Optional backend-specific scheduling hint. NVIDIA
+            FA2 computes its own schedule and does not read this FA3 metadata.
+        num_splits: Number of KV partitions on NVIDIA. Zero uses the default
+            schedule, which may partition single-token requests in a mixed
+            batch. Explicit positive values retain that many logical KV
+            partitions. Multiple partitions use a stable FP32 merge.
 
     The public signature matches ``flash_attn_varlen_func``. Descales are
     applied per logical 128-token block. The returned tensor uses ``out.dtype``
-    when supplied and BF16 otherwise. Backend entry points select the supported
-    FP8 formats, head grouping and launch strategy.
+    when supplied and BF16 otherwise. Q/K/V must use ``torch.float8_e4m3fn``.
+    Backend entry points select head grouping and launch strategy.
     Head dimensions must be multiples of 8 between 8 and 256, inclusive.
     """
     if dropout_p != 0.0:
@@ -3363,13 +4793,19 @@ def _flash_attn_varlen_func_w8a8_fp8(
         raise NotImplementedError("return_attn_probs is not supported")
     if q_v is not None:
         raise NotImplementedError("q_v is not supported")
-    if scheduler_metadata is not None or s_aux is not None:
+    if scheduler_metadata is not None and not allow_scheduler_args:
         raise NotImplementedError("scheduler arguments are not supported")
+    if s_aux is not None:
+        raise NotImplementedError("attention sinks are not supported")
     if cp_world_size != 1 or cp_rank != 0 or cp_tot_seqused_k is not None:
         raise NotImplementedError("context parallel attention is not supported")
     if fa_version != 2:
         raise RuntimeError("Only FA2 is implemented.")
-    if num_splits > 0:
+    if not isinstance(num_splits, int) or isinstance(num_splits, bool):
+        raise TypeError("num_splits must be a Python integer")
+    if num_splits < 0:
+        raise ValueError("num_splits must be nonnegative")
+    if num_splits > 0 and not allow_scheduler_args:
         raise RuntimeError("num_splits > 0 is not implemented.")
     assert (
         cu_seqlens_k is not None or seqused_k is not None
@@ -3392,8 +4828,13 @@ def _flash_attn_varlen_func_w8a8_fp8(
     expected_kv_ndim = 4 if block_table is not None else 3
     if k.ndim != expected_kv_ndim or v.ndim != expected_kv_ndim:
         raise ValueError("k and v rank does not match the selected cache layout")
-    if q.dtype not in fp8_dtypes or k.dtype != q.dtype or v.dtype != q.dtype:
-        raise TypeError("q, k, and v must have the same supported FP8 dtype")
+    if (
+        q.dtype != torch.float8_e4m3fn
+        or q.dtype not in fp8_dtypes
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+    ):
+        raise TypeError("q, k, and v must all have dtype torch.float8_e4m3fn")
     if q.device != k.device or q.device != v.device:
         raise ValueError("q, k, and v must be on the same device")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
@@ -3471,11 +4912,12 @@ def _flash_attn_varlen_func_w8a8_fp8(
     # restricts only the tuned dense shortcut, not public dimension support.
     uniform_nonpaged = (
         use_dense
+        and q.shape[1] == num_heads_k
+        and num_splits == 0
         and head_size in (64, 128)
         and block_table is None
         and cu_seqlens_k is not None
         and seqused_k is None
-        and dropout_p == 0.0
         and not return_softmax_lse
         and max_seqlen_q % 128 == 0
         and max_seqlen_k % 128 == 0
@@ -3513,13 +4955,18 @@ def _flash_attn_varlen_func_w8a8_fp8(
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
-            fp8_p_max=float(torch.finfo(q.dtype).max),
+            fp8_p_max=448.0,
         )
         return out if out is not None else dense_result[0].view(q.shape)
 
     cu_seqlens_k_arg = (
         torch.empty_like(cu_seqlens_q) if cu_seqlens_k is None else cu_seqlens_k
     )
+    varlen_kwargs = {}
+    if allow_scheduler_args:
+        # Keep the logical query heads intact so their individual descales
+        # stay aligned. FA3 scheduler metadata is advisory, not attention data.
+        varlen_kwargs.update(num_splits=num_splits, allow_group_swap=False)
     result = varlen_fwd(
         q,
         k,
@@ -3540,12 +4987,13 @@ def _flash_attn_varlen_func_w8a8_fp8(
         real_window_size[0],
         real_window_size[1],
         softcap,
-        return_softmax_lse and dropout_p > 0,
+        False,
         None,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
-        fp8_p_max=float(torch.finfo(q.dtype).max),
+        fp8_p_max=448.0,
+        **varlen_kwargs,
     )
     return (result[0], result[4]) if return_softmax_lse else result[0]
 
@@ -3583,7 +5031,12 @@ def flash_attn_varlen_func_w8a8_fp8(
     cp_tot_seqused_k=None,
     fa_version: int = 2,
 ):
-    """Compute block-scaled FP8 FlashAttention-2 on NVIDIA Hopper or newer."""
+    """Compute block-scaled E4M3FN MHA/GQA/MQA on NVIDIA Hopper or newer.
+
+    Q/K/V must use ``torch.float8_e4m3fn`` with FP32 block descales.
+    ``scheduler_metadata`` is an opaque FA3 scheduling hint and is not consumed
+    by this FA2 implementation. ``num_splits`` controls actual KV partitioning.
+    """
     if runtime.device.vendor_name != "nvidia" or get_device_capability()[0] < 9:
         raise NotImplementedError("W8A8 FP8 attention requires NVIDIA Hopper or newer")
     return _flash_attn_varlen_func_w8a8_fp8(
@@ -3617,4 +5070,6 @@ def flash_attn_varlen_func_w8a8_fp8(
         cp_rank=cp_rank,
         cp_tot_seqused_k=cp_tot_seqused_k,
         fa_version=fa_version,
+        allow_gqa=True,
+        allow_scheduler_args=True,
     )
