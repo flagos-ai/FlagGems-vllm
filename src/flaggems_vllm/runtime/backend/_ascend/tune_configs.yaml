@@ -247,6 +247,15 @@ moe_sum_general:
     num_warps: 8
     num_stages: 2
 
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 16

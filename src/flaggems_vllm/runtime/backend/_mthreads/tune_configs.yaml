@@ -253,6 +253,19 @@ w8a8_block_fp8_matmul_mthreads_tle:
     WS: false
   num_warps: 4
   num_stages: 1
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 512
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
 - META:
     BLOCK: 16
