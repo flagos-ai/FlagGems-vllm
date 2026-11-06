@@ -185,6 +185,27 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_fwd_intra_token_parallel
+    description: |
+      Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
+      Writes Aqk/Akk in place and preserves their unwritten regions.
+    for:
+      - chunk_kda_fwd_intra_token_parallel
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: chunk_kda_scaled_dot_kkt_fwd
+    description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_scaled_dot_kkt_fwd
+    labels: [fused, FLA]
+    kind: [Attention]
+    stages:
+      - alpha: '5.4'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices
@@ -446,6 +467,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: flash_mla_with_kvcache_w8a8
+    description: |
+      Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific implementations.
+    for:
+      - flash_mla_with_kvcache_w8a8
+    labels:
+      - fused
+      - Attention
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fp8_einsum
     description: |
       Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
@@ -547,6 +580,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_indexer_weight_scale
+    description: |
+      Scale floating-point indexer weights by FP32 query scales and a scalar.
+      Returns FP32 per-token, per-head weights on Ascend and MThreads.
+    for:
+      - fused_indexer_weight_scale
+      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: fused_inv_rope_fp8_quant
     description: |
       Apply inverse RoPE and group-wise quantization to attention output.
@@ -616,7 +663,7 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule_fwd
+  - id: fused_recurrent_gated_delta_rule
     description: |
       Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
       variable-length sequences and speculative-decoding state tables.
@@ -641,12 +688,26 @@ ops:
       - FLA
     stages:
       - alpha: '5.4'
+  - id: fused_recurrent_kda
+    description: |
+      Independent Triton KDA decode with key-wise gate decay, optional QK L2
+      normalization, scalar/vector beta and FP32 value-major recurrent state.
+      Supports varlen, per-token state tables and strided inputs.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
       FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU.
+      INT8 supports packed decode and chunked prefill on PPU and Hygon.
     for:
       - gdn_w8a16
       - gdn_w8a16_int8

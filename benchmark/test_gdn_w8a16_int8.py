@@ -29,9 +29,17 @@ from tests.test_gdn_w8a16_int8 import (
     build_int8_gdn_prefill_inputs,
 )
 
+HYGON_INT8_STATE = (
+    "gdn_w8a16_int8" in vars(flaggems_vllm)
+    and flaggems_vllm.gdn_w8a16_int8.__module__
+    == "flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16"
+)
+
 
 class Int8StateGdnBenchmark(Benchmark):
-    DEFAULT_DTYPES = [torch.bfloat16]
+    DEFAULT_DTYPES = (
+        [torch.bfloat16, torch.float16] if HYGON_INT8_STATE else [torch.bfloat16]
+    )
     DEFAULT_SHAPES = [
         (1, 8192, 32, 128),
         (3, 8192, 32, 128),
@@ -66,21 +74,32 @@ class Int8StateGdnBenchmark(Benchmark):
             ]
 
     def get_input_iter(self, dtype):
-        # Resolve the compiled backends selected by vLLM-SAIL 0.31.0. Importing
-        # upstream FLA functions alone would select its Triton implementation.
-        from vllm_sail.attention.pla_decode import (
-            get_sail_cuda_pla_k_last,
-            get_sail_cuda_pla_k_last_packed,
-        )
-        from vllm_sail.attention.pla_prefill import get_sail_cuda_pla_prefill_fwd
-
-        packed_decode = get_sail_cuda_pla_k_last_packed()
-        update = get_sail_cuda_pla_k_last()
-        prefill = get_sail_cuda_pla_prefill_fwd()
-        if packed_decode is None or update is None or prefill is None:
-            raise RuntimeError(
-                "GDN benchmarks require the vLLM-SAIL PLA native backends"
+        if HYGON_INT8_STATE:
+            from vllm.model_executor.layers.fla.ops.chunk import (
+                chunk_gated_delta_rule as prefill,
             )
+            from vllm.model_executor.layers.fla.ops.fused_recurrent import (
+                fused_recurrent_gated_delta_rule_packed_decode as packed_decode,
+            )
+            from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
+                fused_sigmoid_gating_delta_rule_update as update,
+            )
+        else:
+            # Resolve the compiled backends selected by vLLM-SAIL 0.31.0. Importing
+            # upstream FLA functions alone would select its Triton implementation.
+            from vllm_sail.attention.pla_decode import (
+                get_sail_cuda_pla_k_last,
+                get_sail_cuda_pla_k_last_packed,
+            )
+            from vllm_sail.attention.pla_prefill import get_sail_cuda_pla_prefill_fwd
+
+            packed_decode = get_sail_cuda_pla_k_last_packed()
+            update = get_sail_cuda_pla_k_last()
+            prefill = get_sail_cuda_pla_prefill_fwd()
+            if packed_decode is None or update is None or prefill is None:
+                raise RuntimeError(
+                    "GDN benchmarks require the vLLM-SAIL PLA native backends"
+                )
 
         for shape in self.shapes:
             torch.manual_seed(42)
@@ -122,55 +141,90 @@ class Int8StateGdnBenchmark(Benchmark):
                     k.reshape(1, tokens, query_heads, reduction).contiguous(),
                     v.reshape(1, tokens, heads, columns).contiguous(),
                 )
-                native_call = partial(
-                    update,
-                    a_log,
-                    a,
-                    native_bias,
-                    1.0,
-                    20.0,
-                    *qkv,
-                    b,
-                    state,
-                    native_indices,
-                    scale,
-                    normalize,
-                    cu_seqlens,
-                    False,
-                    False,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    False,
-                )
+                if HYGON_INT8_STATE:
+                    native_call = partial(
+                        update,
+                        A_log=a_log,
+                        a=a,
+                        b=b,
+                        dt_bias=bias,
+                        q=qkv[0],
+                        k=qkv[1],
+                        v=qkv[2],
+                        scale=scale,
+                        initial_state=state,
+                        inplace_final_state=True,
+                        cu_seqlens=cu_seqlens,
+                        ssm_state_indices=indices,
+                        use_qk_l2norm_in_kernel=normalize,
+                    )
+                else:
+                    native_call = partial(
+                        update,
+                        a_log,
+                        a,
+                        native_bias,
+                        1.0,
+                        20.0,
+                        *qkv,
+                        b,
+                        state,
+                        native_indices,
+                        scale,
+                        normalize,
+                        cu_seqlens,
+                        False,
+                        False,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        False,
+                    )
                 yield ("update", native_call, state), (qkv, *args[1:])
             else:
-                native_call = partial(
-                    packed_decode,
-                    mixed,
-                    a,
-                    b,
-                    a_log,
-                    native_bias,
-                    1.0,
-                    20.0,
-                    scale,
-                    state,
-                    native_indices,
-                    out,
-                    normalize,
-                    cu_seqlens,
-                    False,
-                    False,
-                )
+                if HYGON_INT8_STATE:
+                    native_call = partial(packed_decode, *reference)
+                else:
+                    native_call = partial(
+                        packed_decode,
+                        mixed,
+                        a,
+                        b,
+                        a_log,
+                        native_bias,
+                        1.0,
+                        20.0,
+                        scale,
+                        state,
+                        native_indices,
+                        out,
+                        normalize,
+                        cu_seqlens,
+                        False,
+                        False,
+                    )
                 yield ("decode", native_call, state), args
 
 
 def native_int8_state_gdn_baseline(reference, args):
     kind, native_call, data = reference
     if kind == "prefill":
+        if HYGON_INT8_STATE:
+            return native_call(
+                q=data["q"],
+                k=data["k"],
+                v=data["v"],
+                g=data["g"],
+                beta=data["beta"],
+                initial_state=data["initial_state"],
+                cu_seqlens=data["cu_seqlens"],
+                chunk_indices=args[8],
+                chunk_offsets=args[9],
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
         # Include normalization, beta conversion and the native state-layout
         # bridge in timing. Host sequence metadata is prepared for both routes.
         result = native_call(
@@ -186,6 +240,8 @@ def native_int8_state_gdn_baseline(reference, args):
             raw_cu_seqlens=data["raw_cu_seqlens"],
         )
         return result[2], result[4].transpose(-1, -2)
+    elif HYGON_INT8_STATE:
+        return native_call()
     else:
         return native_call(), data
 
@@ -193,7 +249,7 @@ def native_int8_state_gdn_baseline(reference, args):
 def run_int8_state_gdn(reference, args):
     if reference[0] == "prefill":
         return flaggems_vllm.chunk_gated_delta_rule_w8a16_int8(*args)
-    elif reference[0] == "update":
+    elif reference[0] == "update" and not HYGON_INT8_STATE:
         tokens = args[0][0].shape[1]
         mixed = flag_gems.cat(
             tuple(tensor.view(tokens, -1) for tensor in args[0]), dim=1
