@@ -81,7 +81,7 @@ def _load_upstream_kernel() -> bool:
 HAS_UPSTREAM = _load_upstream_kernel()
 
 
-@pytest.mark.slot_mapping
+@pytest.mark.slot_mapping_triton
 @pytest.mark.parametrize("nreq,tlen,maxtok,bs", CASES)
 def test_slot_mapping_accuracy(nreq, tlen, maxtok, bs):
     torch.manual_seed(0)
@@ -112,7 +112,7 @@ def test_slot_mapping_accuracy(nreq, tlen, maxtok, bs):
     assert torch.equal(out[: sum(lens)], expected)
 
 
-@pytest.mark.slot_mapping
+@pytest.mark.slot_mapping_triton
 @pytest.mark.skipif(not HAS_UPSTREAM, reason="vllm package not available")
 @pytest.mark.parametrize("nreq,tlen,maxtok,bs", CASES)
 def test_slot_mapping_matches_upstream_kernel(nreq, tlen, maxtok, bs):

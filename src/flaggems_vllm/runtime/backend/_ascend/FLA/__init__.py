@@ -13,6 +13,9 @@
 # limitations under the License.
 
 from flaggems_vllm.runtime.backend._ascend.FLA.chunk_kda import chunk_kda
+from flaggems_vllm.runtime.backend._ascend.FLA.chunk_kda_with_fused_gate import (
+    chunk_kda_with_fused_gate,
+)
 from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_gated_delta_rule import (
     fused_recurrent_gated_delta_rule_fwd,
 )
@@ -25,6 +28,7 @@ from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_kda import (
 
 __all__ = [
     "chunk_kda",
+    "chunk_kda_with_fused_gate",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",

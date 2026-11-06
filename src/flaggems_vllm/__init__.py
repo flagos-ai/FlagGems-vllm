@@ -57,6 +57,8 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 _LIBRARY_ONLY_OPS = frozenset(
     {
         "dsv41_o_proj",
+        "grouped_gemma_rmsnorm",
+        "hc_combine",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
     }

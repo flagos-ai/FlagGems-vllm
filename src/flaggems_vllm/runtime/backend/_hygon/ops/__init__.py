@@ -21,11 +21,26 @@ from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_r
 from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.gate_sigmoid_mul import gate_sigmoid_mul
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    chunk_gated_delta_rule_w8a16,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    chunk_gated_delta_rule_w8a16 as chunk_gated_delta_rule_w8a16_int8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import gdn_w8a16
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    gdn_w8a16 as gdn_w8a16_int8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import quantize_gdn_state_int8
 from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
     gemma_rms_norm,
 )
@@ -53,9 +68,15 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
 )
 
 __all__ = [
+    "chunk_gated_delta_rule_w8a16",
+    "chunk_gated_delta_rule_w8a16_int8",
     "fused_add_rms_norm",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_q_kv_rmsnorm",
+    "gate_sigmoid_mul",
+    "gdn_w8a16",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",
@@ -63,6 +84,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
+    "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
