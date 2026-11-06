@@ -605,7 +605,6 @@ flash_mla_with_kvcache_w8a8:
     - [128, 1, 16384, 128, true]
     - [128, 2, 16384, 128, false]
     - [128, 2, 16384, 128, true]
-
 fused_allreduce_rms_norm:
   shapes:
     - [6, 6144]
