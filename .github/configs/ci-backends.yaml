@@ -74,7 +74,7 @@ platforms:
     # ascend-910b-1 was unusable: all three of its ARC runners stayed offline
     # and the job never got a pod (run 42145278734).
     runner_labels: flagcicd-910c
-    container_image: m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0.post1
+    container_image: m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0.post1-a3
     container_options: >-
       --ipc=host
       --privileged
