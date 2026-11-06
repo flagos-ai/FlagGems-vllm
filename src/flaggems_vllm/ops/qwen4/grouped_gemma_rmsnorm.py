@@ -14,6 +14,7 @@
 
 """The canonical Qwen4 grouped Gemma RMSNorm forward interface."""
 
+import logging
 from numbers import Integral, Real
 
 import torch
@@ -22,6 +23,8 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE_DEVICE_TYPE = runtime.device.name
 _ACTIVE_ACCELERATOR = _ACTIVE_DEVICE_TYPE not in ("cpu", "meta")
@@ -127,6 +130,8 @@ def grouped_gemma_rmsnorm(
     The result is fresh and contiguous. This is an inference-only forward API;
     CPU/meta tensors and autograd are not supported.
     """
+    logger.debug("GEMS GROUPED_GEMMA_RMSNORM")
+
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         raise TypeError("x and weight must be tensors")
     if x.layout != torch.strided or weight.layout != torch.strided:
