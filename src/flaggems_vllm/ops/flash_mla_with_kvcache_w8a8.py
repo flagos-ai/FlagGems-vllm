@@ -4415,6 +4415,26 @@ if HAS_TLE:
         tl.store(LSE + (batch * HEADS + head) * QUERIES + query, lse, lse_mask)
 
 
+def validate_dense_outputs(
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    query: torch.Tensor,
+    output_dtype: torch.dtype,
+    head_dim_v: int,
+) -> None:
+    batch, queries, heads, _ = query.shape
+    for tensor, shape, dtype, label in (
+        (out, (batch, queries, heads, head_dim_v), output_dtype, "out"),
+        (lse, (batch, heads, queries), torch.float32, "lse"),
+    ):
+        if tensor is None:
+            continue
+        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
+        if tensor.device != query.device or not tensor.is_contiguous():
+            raise ValueError(f"{label} must be contiguous on the query device")
+
+
 def validate_dense_query_layout(query: torch.Tensor) -> None:
     if query.ndim != 4 or query.shape[1] not in (1, 2):
         raise NotImplementedError("dense MLA supports one or two query tokens")
@@ -4692,14 +4712,7 @@ def flash_mla_with_kvcache_w8a8(
         lse = torch.empty(
             (batch, heads, queries), dtype=torch.float32, device=q_nope.device
         )
-    for tensor, shape, dtype, label in (
-        (out, (batch, queries, heads, head_dim_v), q_rope.dtype, "out"),
-        (lse, (batch, heads, queries), torch.float32, "lse"),
-    ):
-        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
-            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
-        if tensor.device != q_nope.device or not tensor.is_contiguous():
-            raise ValueError(f"{label} must be contiguous on the query device")
+    validate_dense_outputs(out, lse, q_nope, q_rope.dtype, head_dim_v)
     launch_length_scheduled_decode(
         q_nope.view(batch, 1, merged_heads, D_CKV),
         q_rope.view(batch, 1, merged_heads, D_ROPE),
