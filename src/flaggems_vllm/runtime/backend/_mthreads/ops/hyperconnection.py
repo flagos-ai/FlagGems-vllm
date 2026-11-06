@@ -19,11 +19,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.qwen4.hc_combine import _combine
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -87,6 +91,7 @@ def hc_combine(
     injection_logits: torch.Tensor | None,
     hc_count: int,
 ) -> torch.Tensor:
+    logger.debug("GEMS HC_COMBINE")
     return _combine(residual, block_output, injection_logits, hc_count)
 
 

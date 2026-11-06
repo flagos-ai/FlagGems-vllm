@@ -789,7 +789,7 @@ ops:
     kind:
       - Pointwise
     stages:
-      - alpha: '0.3'
+      - beta: '0.3'
   - id: hc_head_fused_kernel
     description: |
       The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).

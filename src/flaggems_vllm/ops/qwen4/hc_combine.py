@@ -4,12 +4,16 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
+
+logger = logging.getLogger(__name__)
 
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -145,4 +149,5 @@ def hc_combine(
     nonnegative row stride (including packed, overlapping, and expanded rows).
     The fresh contiguous output has residual's shape and dtype.
     """
+    logger.debug("GEMS HC_COMBINE")
     return _combine(residual, block_output, injection_logits, hc_count)

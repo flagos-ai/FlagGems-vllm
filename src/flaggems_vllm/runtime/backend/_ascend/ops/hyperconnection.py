@@ -19,12 +19,16 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.qwen4.hc_combine import _combine, _hc_combine_kernel
+
+logger = logging.getLogger(__name__)
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # A uniform D tile permits a concrete grid, avoiding a metadata merge per call.
@@ -84,6 +88,7 @@ def hc_combine(
     hc_count: int,
 ) -> torch.Tensor:
     # Keep metadata validation in this public entry to avoid a second host call.
+    logger.debug("GEMS HC_COMBINE")
     if isinstance(hc_count, bool) or not isinstance(hc_count, int) or hc_count <= 0:
         raise ValueError("hc_combine requires a positive integer hc_count")
     shape = residual.shape
