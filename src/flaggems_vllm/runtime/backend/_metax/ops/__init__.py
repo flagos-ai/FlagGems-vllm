@@ -18,6 +18,9 @@ from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -52,6 +55,7 @@ else:
 
 __all__ = [
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "hc_combine",

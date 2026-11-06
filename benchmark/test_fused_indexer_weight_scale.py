@@ -44,7 +44,10 @@ class IndexerWeightScaleBenchmark(ParallelBenchmarkMixin, base.GenericBenchmark)
         for index, inputs in enumerate(super().get_input_iter(dtype)):
             expected = self.torch_op(*inputs)
             output = self.gems_op(*inputs)
-            gems_assert_close(output, expected, torch.float32, atol=1e-6)
+            if flaggems_vllm.vendor_name == "metax":
+                torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-7)
+            else:
+                gems_assert_close(output, expected, torch.float32, atol=1e-6)
             if index or flaggems_vllm.vendor_name != "mthreads":
                 yield inputs
                 continue
