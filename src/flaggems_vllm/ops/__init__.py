@@ -115,6 +115,7 @@ from flaggems_vllm.ops.mhc import (
 )
 from flaggems_vllm.ops.qwen4 import (
     grouped_gemma_rmsnorm,
+    hc_combine,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -311,6 +312,7 @@ __all__ = [
     "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
+    "hc_combine",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "ihc_post",
