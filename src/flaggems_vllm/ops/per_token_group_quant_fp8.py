@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 from typing import Optional, Tuple
 
@@ -28,6 +29,139 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    import triton.experimental.tle.language as tle
+except ImportError:
+    tle = tl
+
+
+def _supports_load_reorder():
+    if tle is None:
+        return False
+    try:
+        return "reorder" in inspect.signature(tle.range.__init__).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+_HAS_LOAD_REORDER = _supports_load_reorder()
+
+
+def _vendor_ngroups_per_program(total_groups, groups_per_row, group_size, cu_count):
+    """Choose a group tile while retaining enough independent programs."""
+    cap = max(1, 1024 // group_size)
+    ngroups = 1
+    while ngroups < cap and groups_per_row % (ngroups * 2) == 0:
+        ngroups *= 2
+    while ngroups > 1 and total_groups // ngroups < 4 * cu_count:
+        ngroups //= 2
+    return ngroups
+
+
+def _vendor_reorder_launch_config(
+    x, fp8_dtype, column_major_scales, supported_group, num_groups, block, has_reorder
+):
+    """Select a shared window schedule after the backend accepts the group size."""
+    loop_groups = max(1, 1024 // block)
+    if (
+        has_reorder
+        and x.dtype == torch.bfloat16
+        and fp8_dtype == torch.float8_e4m3fn
+        and x.dim() == 2
+        and x.is_contiguous()
+        and not column_major_scales
+        and supported_group
+        and num_groups >= loop_groups * 2 * 1024
+    ):
+        return loop_groups, 2, 1, (triton.cdiv(num_groups, loop_groups * 2),)
+    return None
+
+
+def _contiguous_group_config(num_groups, group_size, scale_ue8m0, warp_size=32):
+    # Bound live values using the group width and available parallel work.
+    # Fixed schedules keep same-configuration OFF/ON comparisons reproducible;
+    # this is an explicit no-autotune exemption, independent of GPU model.
+    if num_groups < 128:
+        groups, steps, warps = 1, 2, 1
+    elif group_size <= 128:
+        # Power-of-two scales need no buffered window at this group width.
+        if group_size == 128 and scale_ue8m0:
+            groups, steps, warps = 8, 1, 1
+        else:
+            vector_groups = min(32, 4 * warp_size * 16 // group_size)
+            if (
+                _HAS_LOAD_REORDER
+                and group_size == 128
+                and num_groups >= vector_groups * 2 * 1024
+            ):
+                groups, steps, warps = vector_groups, 2, 4
+            else:
+                groups, steps, warps = 1, 4, 1
+    elif group_size == 256:
+        groups, steps, warps = (16, 1, 4) if scale_ue8m0 else (8, 2, 4)
+    else:
+        groups, steps, warps = 8, 2 if scale_ue8m0 else 4, 4
+    return groups, steps if _HAS_LOAD_REORDER else 1, warps
+
+
+# Shared vendor arithmetic. The generic kernels retain their existing divide path.
+@triton.jit
+def _f32_to_fp8_e4m3fn(y):
+    """Encode finite FP32 values in [-448, 448] as E4M3FN uint8 bits.
+
+    Uses round-to-nearest-even. Normal values (abs(y) >= 2**-6) are encoded
+    by rebiasing the exponent and rounding the mantissa from 23 to 3 bits.
+    Subnormals use abs(y) * 512 + 2**23 to round to the 2**-9 FP8 step.
+    The caller bitcasts the returned bytes to the FP8 output type.
+
+    Shared by vendor paths where generic FP8 conversion lowers to a more
+    expensive software sequence. Preserve the rounding constants and arithmetic
+    order. Clamping limits the range but does not establish the finite-input
+    precondition for NaNs.
+    """
+    b = y.to(tl.uint32, bitcast=True)
+    a = b & 0x7FFFFFFF
+    t = a - 0x3C000000
+    t += 0x0007FFFF + ((t >> 20) & 1)
+    r_norm = t >> 20
+    r_sub = (a.to(tl.float32, bitcast=True) * 512.0 + 8388608.0).to(
+        tl.uint32, bitcast=True
+    ) - 0x4B000000
+    r = tl.where(a >= 0x3C800000, r_norm, r_sub)
+    return (r | ((b >> 24) & 0x80)).to(tl.uint8)
+
+
+@triton.jit
+def _quant_groups(
+    y,
+    eps,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    inv_fp8_max: tl.constexpr,
+    scale_ue8m0: tl.constexpr,
+    subnormal_scale: tl.constexpr,
+):
+    """Per-row (axis=1) abs-max scale + quantize, in f32."""
+    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+    y_s = _absmax * inv_fp8_max
+
+    if scale_ue8m0:
+        e = tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10)))
+        y_s = tl.exp2(e)
+        # y_s is a power of two, so multiplying by 2^-e is a bit-exact
+        # division and avoids one f32 divide per element.
+        y_q = tl.clamp(y * tl.exp2(-e)[:, None], fp8_min, fp8_max)
+    elif subnormal_scale:
+        # `y_s` is subnormal when `fp8_max` is huge (e.g. fp32), and some
+        # backends flush subnormal fp32 divisors to zero; divide by the always
+        # normal `_absmax` instead and scale at the end.
+        y_q = tl.clamp((y / _absmax[:, None]) * fp8_max, fp8_min, fp8_max)
+    else:
+        # one reciprocal per group instead of one divide per element
+        y_q = tl.clamp(y * (1.0 / y_s)[:, None], fp8_min, fp8_max)
+    return y_q, y_s
 
 
 @triton.jit
@@ -116,16 +250,103 @@ def _per_token_group_quant_fp8_vec(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
-    eps,
+    group_size: tl.constexpr,
+    y_num_columns: tl.constexpr,
+    y_row_stride: tl.constexpr,
+    eps: tl.constexpr,
     fp8_min,
     fp8_max,
-    scale_ue8m0,
+    scale_ue8m0: tl.constexpr,
     BLOCK: tl.constexpr,
     NGROUPS: tl.constexpr,
+    TOTAL_GROUPS: tl.constexpr = 0,
+    UNROLL: tl.constexpr = 1,
+    REORDER: tl.constexpr = False,
+    INV_FP8_MAX: tl.constexpr = 0.0,
+    SCALE_STORE_COLUMNS: tl.constexpr = 0,
 ):
+    if TOTAL_GROUPS:
+        group_ids = tl.arange(0, NGROUPS)
+        cols = tl.arange(0, BLOCK)
+        base = tl.program_id(0) * (UNROLL * NGROUPS)
+        if UNROLL == 1:
+            group = base + group_ids
+            offsets = group[:, None] * group_size + cols[None, :]
+            mask = (group[:, None] < TOTAL_GROUPS) & (cols[None, :] < group_size)
+            y = tl.load(y_ptr + offsets, mask, other=0.0).to(tl.float32)
+            maximum = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+            scale = maximum * INV_FP8_MAX
+            if scale_ue8m0:
+                scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1e-10))))
+            q = tl.clamp(y / scale[:, None], fp8_min, fp8_max).to(
+                y_q_ptr.dtype.element_ty
+            )
+            tl.store(y_q_ptr + offsets, q, mask)
+            tl.store(y_s_ptr + group, scale, group < TOTAL_GROUPS)
+        else:
+            q0 = tl.full((NGROUPS, BLOCK), 0, tl.uint8)
+            q1 = tl.full((NGROUPS, BLOCK), 1, tl.uint8)
+            q2 = tl.full((NGROUPS, BLOCK), 2, tl.uint8)
+            q3 = tl.full((NGROUPS, BLOCK), 3, tl.uint8)
+            s0 = tl.full((NGROUPS,), 0, tl.float32)
+            s1 = tl.full((NGROUPS,), 1, tl.float32)
+            s2 = tl.full((NGROUPS,), 2, tl.float32)
+            s3 = tl.full((NGROUPS,), 3, tl.float32)
+            for step in tle.range(
+                0, UNROLL, loop_unroll_factor=UNROLL, reorder=REORDER
+            ):
+                group = base + step * NGROUPS + group_ids
+                mask = (group[:, None] < TOTAL_GROUPS) & (cols[None, :] < group_size)
+                y = tl.load(
+                    y_ptr + group[:, None] * group_size + cols[None, :], mask, other=0.0
+                ).to(tl.float32)
+                maximum = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+                scale = maximum * INV_FP8_MAX
+                if scale_ue8m0:
+                    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1e-10))))
+                q = (
+                    tl.clamp(y / scale[:, None], fp8_min, fp8_max)
+                    .to(y_q_ptr.dtype.element_ty)
+                    .to(tl.uint8, bitcast=True)
+                )
+                if UNROLL == 2:
+                    q0, q1 = q1, q
+                    s0, s1 = s1, scale
+                else:
+                    q0, q1, q2, q3 = q1, q2, q3, q
+                    s0, s1, s2, s3 = s1, s2, s3, scale
+            # Keep stores after the load/reduction loop to permit load motion
+            # between independent groups without crossing visible writes.
+            for step in tl.static_range(UNROLL):
+                group = base + step * NGROUPS + group_ids
+                if step == 0:
+                    q, scale = q0, s0
+                elif step == 1:
+                    q, scale = q1, s1
+                elif step == 2:
+                    q, scale = q2, s2
+                else:
+                    q, scale = q3, s3
+                mask = (group[:, None] < TOTAL_GROUPS) & (cols[None, :] < group_size)
+                tl.store(
+                    y_q_ptr + group[:, None] * group_size + cols[None, :],
+                    q.to(y_q_ptr.dtype.element_ty, bitcast=True),
+                    mask,
+                )
+                if SCALE_STORE_COLUMNS:
+                    scale_cols = tl.arange(0, SCALE_STORE_COLUMNS)
+                    scale_group = group
+                    if NGROUPS >= SCALE_STORE_COLUMNS:
+                        scale_group = tl.max_contiguous(group, 1)
+                    tl.store(
+                        y_s_ptr + scale_group[:, None] + scale_cols[None, :],
+                        scale[:, None],
+                        (group[:, None] < TOTAL_GROUPS) & (scale_cols[None, :] == 0),
+                    )
+                else:
+                    tl.store(y_s_ptr + group, scale, group < TOTAL_GROUPS)
+        return
+
     groups_per_row = y_num_columns // group_size
     programs_per_row = groups_per_row // NGROUPS
 
@@ -252,6 +473,56 @@ def per_token_group_quant_fp8(
     else:
         shape = x.shape[:-1] + (x.shape[-1] // group_size,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
+
+    if num_groups == 0:
+        return x_q, x_s
+
+    if (
+        x.dtype == torch.bfloat16
+        and fp8_dtype == torch.float8_e4m3fn
+        and x.ndim == 2
+        and x.is_contiguous()
+        and not column_major_scales
+        and group_size in (64, 128, 256, 512)
+        and isinstance(scale_ue8m0, bool)
+    ):
+        warp_size = triton.runtime.driver.active.get_current_target().warp_size
+        groups, steps, warps = _contiguous_group_config(
+            num_groups, group_size, scale_ue8m0, warp_size
+        )
+        _per_token_group_quant_fp8_vec[(triton.cdiv(num_groups, groups * steps),)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            x.shape[1],
+            x.stride(0),
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            BLOCK=triton.next_power_of_2(group_size),
+            NGROUPS=groups,
+            TOTAL_GROUPS=num_groups,
+            UNROLL=steps,
+            # Power-of-two scale rounding increases live arithmetic; retain
+            # unrolling but avoid the measured reorder regressions in this mode.
+            REORDER=_HAS_LOAD_REORDER and not scale_ue8m0,
+            INV_FP8_MAX=1.0 / fp8_max,
+            # Match sparse scale ownership to the coalesced FP8 write layout.
+            SCALE_STORE_COLUMNS=(
+                min(
+                    warp_size,
+                    group_size
+                    // min(16, max(1, groups * group_size // (warps * warp_size))),
+                )
+                if group_size == 128 and not scale_ue8m0 and groups > 1 and steps > 1
+                else 0
+            ),
+            num_warps=warps,
+            num_stages=1,
+        )
+        return x_q, x_s
 
     block = triton.next_power_of_2(group_size)
     num_warps = min(max(block // 256, 1), 8)

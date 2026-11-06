@@ -138,3 +138,309 @@ def test_per_token_group_quant_fp8(
     ref_out_fp32 = _fp8_to_float32(ref_out)
 
     assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
+
+
+def _require_generic_group_quant_fp8(*, require_fp8=False):
+    import importlib
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    if flaggems_vllm.per_token_group_quant_fp8 is not op.per_token_group_quant_fp8:
+        pytest.skip("backend uses its own per-token group quantization implementation")
+    if require_fp8 and op.SUPPORTED_FP8_DTYPE != torch.float8_e4m3fn:
+        pytest.skip("generic FP8 e4m3fn conversion is unavailable")
+    return op
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_generic_contract_guard(monkeypatch):
+    import importlib
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    monkeypatch.setattr(
+        flaggems_vllm, "per_token_group_quant_fp8", op.per_token_group_quant_fp8
+    )
+    monkeypatch.setattr(op, "SUPPORTED_FP8_DTYPE", torch.float8_e4m3fn)
+    assert _require_generic_group_quant_fp8(require_fp8=True) is op
+
+    monkeypatch.setattr(op, "SUPPORTED_FP8_DTYPE", torch.float32)
+    assert _require_generic_group_quant_fp8() is op
+    with pytest.raises(pytest.skip.Exception, match="conversion is unavailable"):
+        _require_generic_group_quant_fp8(require_fp8=True)
+
+    monkeypatch.setattr(
+        flaggems_vllm, "per_token_group_quant_fp8", lambda *a, **k: None
+    )
+    for require_fp8 in (False, True):
+        with pytest.raises(pytest.skip.Exception, match="backend uses its own"):
+            _require_generic_group_quant_fp8(require_fp8=require_fp8)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("has_reorder", [False, True])
+def test_per_token_group_quant_fp8_reorder_schedule(monkeypatch, has_reorder):
+    import importlib
+
+    op = importlib.import_module("flaggems_vllm.ops.per_token_group_quant_fp8")
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", has_reorder)
+    for total, group, ue in [
+        (7, 512, False),
+        (112, 256, True),
+        (664, 64, False),
+        (4096, 128, True),
+        (65536, 128, False),
+        (32768, 256, True),
+        (55296, 512, False),
+        (55296, 512, True),
+    ]:
+        groups, steps, warps = op._contiguous_group_config(total, group, ue)
+        assert groups > 0 and warps in (1, 4)
+        assert steps in ((1, 2, 4) if has_reorder else (1,))
+        if has_reorder and not (group in (128, 256) and ue and total >= 128):
+            assert steps > 1
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_without_reorder(monkeypatch):
+    import triton.language as tl
+
+    op = _require_generic_group_quant_fp8(require_fp8=True)
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", False)
+    monkeypatch.setattr(op, "tle", tl)
+    torch.manual_seed(0)
+    x = torch.rand((7, 512), dtype=torch.bfloat16, device=flaggems_vllm.device)
+    expected_q, expected_s = native_per_token_group_quant_fp8(
+        utils.to_reference(x), 512
+    )
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    utils.gems_assert_close(s, expected_s, dtype=torch.float32)
+    assert torch.allclose(
+        _fp8_to_float32(utils.to_cpu(q, expected_q)),
+        _fp8_to_float32(expected_q),
+        rtol=0.15,
+    )
+
+
+def _assert_generic_group_quant_special(shape, group_size, scale_ue8m0):
+    import triton
+
+    op = _require_generic_group_quant_fp8(require_fp8=True)
+    if not op._HAS_LOAD_REORDER:
+        pytest.skip("compiler does not expose load reorder")
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    flat = x.view(-1)
+    flat[0] = float("nan")
+    flat[group_size : 2 * group_size] = float("inf")
+    flat[2 * group_size : 3 * group_size] = -float("inf")
+    flat[3 * group_size : 4 * group_size] = 0.0
+    expected_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    expected_s = torch.empty(
+        (shape[0], shape[1] // group_size), device=x.device, dtype=torch.float32
+    )
+    # This scalar kernel is unchanged from upstream, including dynamic clamp
+    # bounds. It is an independent device oracle for special values and tails.
+    op._per_token_group_quant_fp8[(x.numel() // group_size,)](
+        x,
+        expected_q,
+        expected_s,
+        group_size,
+        shape[1],
+        x.stride(0),
+        1e-10,
+        -448.0,
+        448.0,
+        scale_ue8m0,
+        BLOCK=triton.next_power_of_2(group_size),
+        num_warps=min(max(triton.next_power_of_2(group_size) // 256, 1), 8),
+        num_stages=1,
+    )
+    q, s = flaggems_vllm.per_token_group_quant_fp8(
+        x, group_size, scale_ue8m0=scale_ue8m0
+    )
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    torch.testing.assert_close(s, expected_s, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize(
+    "shape,group_size",
+    [
+        ((7, 512), 512),
+        ((83, 512), 64),
+        ((257, 512), 256),
+        ((129, 3584), 512),
+        ((43, 384), 128),
+    ],
+)
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_per_token_group_quant_fp8_reorder_special(shape, group_size, scale_ue8m0):
+    _assert_generic_group_quant_special(shape, group_size, scale_ue8m0)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("shape,group_size", [((7, 512), 64), ((17, 768), 256)])
+@pytest.mark.parametrize(
+    "row_strided,column_major", [(True, False), (False, True), (True, True)]
+)
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_per_token_group_quant_fp8_generic_fallback_layout(
+    shape, group_size, row_strided, column_major, scale_ue8m0
+):
+    _require_generic_group_quant_fp8(require_fp8=True)
+    torch.manual_seed(0)
+    rows, cols = shape
+    x = torch.rand(
+        (rows * (2 if row_strided else 1), cols),
+        dtype=torch.bfloat16,
+        device=flaggems_vllm.device,
+    )
+    if row_strided:
+        x = x[::2]
+        assert not x.is_contiguous() and x.stride(-1) == 1
+    ref_x = utils.to_reference(x.contiguous())
+    expected_q, expected_s = native_per_token_group_quant_fp8(
+        ref_x, group_size, scale_ue8m0=scale_ue8m0
+    )
+    q, s = flaggems_vllm.per_token_group_quant_fp8(
+        x,
+        group_size,
+        dtype=torch.float8_e4m3fn,
+        column_major_scales=column_major,
+        scale_ue8m0=scale_ue8m0,
+    )
+    assert q.shape == x.shape and q.dtype == torch.float8_e4m3fn
+    assert s.shape == (rows, cols // group_size) and s.dtype == torch.float32
+    if column_major:
+        assert s.stride() == (1, rows)
+    utils.gems_assert_close(s, expected_s, dtype=torch.float32)
+    assert torch.allclose(
+        _fp8_to_float32(utils.to_cpu(q, expected_q)),
+        _fp8_to_float32(expected_q),
+        rtol=0.15,
+    )
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("shape", [(0, 512), (7, 0)])
+def test_per_token_group_quant_fp8_empty(shape):
+    _require_generic_group_quant_fp8()
+    x = torch.empty(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, 512)
+    assert q.shape == x.shape and q.device == x.device and q.numel() == 0
+    assert s.shape == (shape[0], shape[1] // 512) and s.dtype == torch.float32
+    assert s.device == x.device and s.numel() == 0
+
+
+def _require_vendor_group_quant_fp8(vendors=("hygon", "metax", "thead")):
+    import importlib
+
+    if flaggems_vllm.vendor_name not in vendors:
+        pytest.skip("vendor load-window path is not active")
+    op = importlib.import_module(flaggems_vllm.per_token_group_quant_fp8.__module__)
+    if not getattr(op, "_HAS_LOAD_REORDER", False):
+        pytest.skip("compiler does not expose load reorder")
+    return op
+
+
+def _assert_vendor_group_quant_fallback(
+    monkeypatch, op, x, group_size, scale_ue8m0, *, observe_dispatch=False
+):
+    import triton
+    import triton.language as tl
+
+    kwargs = dict(dtype=torch.float8_e4m3fn, scale_ue8m0=scale_ue8m0)
+    if observe_dispatch:
+        launches = []
+        original_run = triton.runtime.jit.JITFunction.run
+
+        def observe(jit, *args, **kw):
+            if "UNROLL" in kw:
+                launches.append((kw["UNROLL"], kw.get("REORDER")))
+            return original_run(jit, *args, **kw)
+
+        with monkeypatch.context() as observe_patch:
+            observe_patch.setattr(triton.runtime.jit.JITFunction, "run", observe)
+            expected_q, expected_s = flaggems_vllm.per_token_group_quant_fp8(
+                x, group_size, **kwargs
+            )
+        if (2, True) not in launches:
+            pytest.skip("workload does not select the reorder window on this device")
+    else:
+        expected_q, expected_s = flaggems_vllm.per_token_group_quant_fp8(
+            x, group_size, **kwargs
+        )
+    expected_q = expected_q.cpu().view(torch.uint8)
+    expected_s = expected_s.cpu()
+    _assert_group_quant_graph_replay(x, group_size, kwargs, expected_q, expected_s)
+    monkeypatch.setattr(op, "_HAS_LOAD_REORDER", False)
+    monkeypatch.setattr(op, "tle", tl)
+    q, s = flaggems_vllm.per_token_group_quant_fp8(x, group_size, **kwargs)
+    assert torch.equal(q.cpu().view(torch.uint8), expected_q)
+    torch.testing.assert_close(s.cpu(), expected_s, rtol=0, atol=0, equal_nan=True)
+    _assert_group_quant_graph_replay(x, group_size, kwargs, expected_q, expected_s)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_per_token_group_quant_fp8_vendor_optional_reorder(monkeypatch, scale_ue8m0):
+    op = _require_vendor_group_quant_fp8()
+    # Three groups per row cross program boundaries and leave a partial window.
+    torch.manual_seed(0)
+    test_shape = (21846, 1536) if flaggems_vllm.vendor_name == "thead" else (2731, 1536)
+    x = torch.randn(test_shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    _assert_vendor_group_quant_fallback(monkeypatch, op, x, 512, scale_ue8m0)
+
+
+def _assert_group_quant_graph_replay(x, group_size, kwargs, expected_q, expected_s):
+    api = flaggems_vllm.runtime.torch_device_fn
+    graph, stream = api.CUDAGraph(), api.Stream()
+    with api.graph(graph, stream=stream):
+        graph_q, graph_s = flaggems_vllm.per_token_group_quant_fp8(
+            x, group_size, **kwargs
+        )
+    api.synchronize()
+    graph_q.view(torch.uint8).fill_(127)
+    graph_s.fill_(float("nan"))
+    graph.replay()
+    api.synchronize()
+    assert torch.equal(graph_q.cpu().view(torch.uint8), expected_q)
+    torch.testing.assert_close(
+        graph_s.cpu(), expected_s, rtol=0, atol=0, equal_nan=True
+    )
+
+
+@pytest.mark.per_token_group_quant_fp8
+def test_per_token_group_quant_fp8_group128_vector_tail():
+    _assert_generic_group_quant_special((21846, 384), 128, False)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("scale_ue8m0", [True])
+def test_per_token_group_quant_fp8_vendor_g128_window_tail(monkeypatch, scale_ue8m0):
+    op = _require_vendor_group_quant_fp8(vendors=("hygon",))
+    # Eight groups per row and 16,392 total groups leave an eight-group tail.
+    torch.manual_seed(0)
+    x = torch.randn((2049, 1024), dtype=torch.bfloat16, device=flaggems_vllm.device)
+    _assert_vendor_group_quant_fallback(monkeypatch, op, x, 128, scale_ue8m0)
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_per_token_group_quant_fp8_vendor_special_fallback(monkeypatch, scale_ue8m0):
+    op = _require_vendor_group_quant_fp8()
+    group = 512
+    shape = (21846, 1536) if flaggems_vllm.vendor_name == "thead" else (2731, 1536)
+    torch.manual_seed(20261022)
+    x = torch.randn(shape, dtype=torch.bfloat16, device=flaggems_vllm.device)
+    groups = x.view(-1, group)
+    groups[0, :8] = 0
+    groups[0, 1] = -0.0
+    groups[1, 0] = float("nan")
+    groups[2, 0] = float("inf")
+    groups[3, 0] = -float("inf")
+    groups[4, :] = 0
+    groups[4, 0] = 1.4960765838623047e-05
+    groups[4, 1] = 0.98046875
+    _assert_vendor_group_quant_fallback(
+        monkeypatch, op, x, group, scale_ue8m0, observe_dispatch=True
+    )
