@@ -30,6 +30,7 @@ from tests.test_flash_mla_with_kvcache_w8a8 import (
     IS_HCU,
     SUPPORTED,
     assert_dense_w8a8_close,
+    paged_torch_reference,
     quantize_dense_w8a8,
 )
 
@@ -76,35 +77,6 @@ def run_prepared(
     if IS_HCU:
         return handle()
     return handle(out=output, lse=lse)
-
-
-def hcu_reference(native, host_lengths):
-    from tests.test_flash_mla import _scaled_dot_product_attention
-
-    query, cache = native
-    batch, queries, heads, _ = query.shape
-    reference_out = torch.empty(
-        (batch, queries, heads, 512), dtype=torch.float32, device=query.device
-    )
-    reference_lse = torch.empty(
-        (batch, heads, queries), dtype=torch.float32, device=query.device
-    )
-    cache_rows = cache.view(batch, -1, 1, 576)
-    for row, length in enumerate(host_lengths):
-        for query_index in range(queries):
-            bound = length - queries + query_index + 1
-            values = cache_rows[row, :bound].transpose(0, 1)
-            output, logsum = _scaled_dot_product_attention(
-                query[row, query_index].unsqueeze(0),
-                values,
-                values[..., :512],
-                1,
-                1,
-                False,
-            )
-            reference_out[row, query_index] = output[0]
-            reference_lse[row, :, query_index] = logsum[0]
-    return reference_out, reference_lse
 
 
 def assert_hcu_replay(handle, reference):
@@ -155,7 +127,7 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
                         metadata,
                         splits,
                     )
-                    self.reference = hcu_reference(native, host_lengths)
+                    self.reference = paged_torch_reference(*native, host_lengths)
                 else:
                     handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
                         *args,

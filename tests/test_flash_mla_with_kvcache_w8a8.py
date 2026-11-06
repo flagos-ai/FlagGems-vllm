@@ -94,6 +94,30 @@ def torch_reference(
     return output, torch.logsumexp(scores, -1).transpose(1, 2)
 
 
+def paged_torch_reference(query, cache, host_lengths):
+    # Evaluate one row at a time to bound reference score memory for large benchmarks.
+    batch, queries, heads, _ = query.shape
+    output = torch.empty(
+        (batch, queries, heads, 512), dtype=query.dtype, device=query.device
+    )
+    lse = torch.empty((batch, heads, queries), dtype=torch.float32, device=query.device)
+    pages_per_row = cache.shape[0] // batch
+    for row, length in enumerate(host_lengths):
+        table = torch.arange(
+            row * pages_per_row,
+            (row + 1) * pages_per_row,
+            dtype=torch.int32,
+            device=query.device,
+        ).unsqueeze(0)
+        lengths = torch.tensor([length], dtype=torch.int32, device=query.device)
+        row_output, row_lse = torch_reference(
+            query[row : row + 1], cache, table, lengths, 512, causal=True
+        )
+        output[row] = row_output[0]
+        lse[row] = row_lse[0]
+    return output, lse
+
+
 def vllm_reference(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
     metadata, _ = cuda_get_mla_metadata()
     return cuda_flash_mla(
