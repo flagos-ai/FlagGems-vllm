@@ -382,7 +382,7 @@ ops:
     kind:
       - Indexing
     stages:
-      - alpha: '0.3'
+      - beta: '0.3'
   - id: flash_attention_forward
     description: Forward pass of FlashAttention computing scaled dot-product attention.
     for:
