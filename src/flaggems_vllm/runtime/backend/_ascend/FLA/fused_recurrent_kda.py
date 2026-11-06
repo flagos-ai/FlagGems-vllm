@@ -37,7 +37,11 @@ def _ascend_recurrent_kda_kernel(
     Final,
     Cu,
     Indices,
+    A_log,
+    Dt_bias,
+    Accepted,
     scale,
+    lower_bound,
     META: tl.constexpr,
 ):
     T: tl.constexpr = META[0]
@@ -63,6 +67,12 @@ def _ascend_recurrent_kda_kernel(
     BV: tl.constexpr = META[20]
     TOTAL: tl.constexpr = META[21]
     FAST: tl.constexpr = META[22]
+    # Kimi K3 passes the raw gate projection and expects the bounded gate plus
+    # beta's sigmoid to be fused, matching AscendC recurrent_kda's
+    # use_gate_in_kernel / use_beta_sigmoid_in_kernel / safe_gate flags.
+    SAFE_GATE: tl.constexpr = META[23]
+    BETA_SIGMOID: tl.constexpr = META[24]
+    SPEC: tl.constexpr = META[25]
     programs = tl.num_programs(0)
     core = tl.program_id(0)
     blocks = TOTAL // programs
@@ -84,8 +94,16 @@ def _ascend_recurrent_kda_kernel(
         slot = (batch * T + start).to(tl.int64)
         valid = slot < POOL
         if INDEXED:
-            slot = tl.load(Indices + n * IX[0]).to(tl.int64)
-            valid = (slot > 0) & (slot < POOL)
+            # Speculative decode seeds from the last accepted token's column
+            # rather than column zero.
+            column = 0
+            if SPEC:
+                column = tl.load(Accepted + n).to(tl.int64) - 1
+            inrange = (column >= 0) & (column < WIDTH)
+            slot = tl.load(
+                Indices + n * IX[0] + column * IX[1], inrange, 0
+            ).to(tl.int64)
+            valid = inrange & (slot > 0) & (slot < POOL)
         rk = tl.arange(0, BK)
         rv = iv * BV + tl.arange(0, BV)
         linear = tl.arange(0, BV * BK)
@@ -123,6 +141,13 @@ def _ascend_recurrent_kda_kernel(
             gate = tl.load(
                 G + batch * GS[0] + t * GS[1] + h * GS[2] + rk * GS[3], key_mask, 0
             ).to(tl.float32)
+            if SAFE_GATE:
+                # gate = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)).
+                # Hoisting A_log/dt_bias out of this loop is left to the
+                # compiler: both are loop-invariant per (head, key) lane.
+                decay = tl.load(A_log + h).to(tl.float32)
+                bias = tl.load(Dt_bias + h * K + rk, key_mask, 0.0).to(tl.float32)
+                gate = lower_bound * tl.sigmoid(tl.exp(decay) * (gate + bias))
             acc *= tl.exp(gate)[None, :]
             value = tl.load(
                 Vp + batch * VS[0] + t * VS[1] + h * VS[2] + rv * VS[3], value_mask, 0
@@ -132,6 +157,8 @@ def _ascend_recurrent_kda_kernel(
                 beta = tl.load(bp + rv * BS[3], value_mask, 0).to(tl.float32)
             else:
                 beta = tl.load(bp).to(tl.float32)
+            if BETA_SIGMOID:
+                beta = tl.sigmoid(beta)
             delta = (value - tl.sum(acc * k[None, :], 1)) * beta
             acc += delta[:, None] * k[None, :]
             output = tl.sum(acc * q[None, :], 1)
@@ -176,6 +203,12 @@ def fused_recurrent_kda(
     use_qk_l2norm_in_kernel=True,
     cu_seqlens=None,
     ssm_state_indices=None,
+    A_log=None,
+    dt_bias=None,
+    safe_gate=False,
+    lower_bound=-5.0,
+    use_beta_sigmoid_in_kernel=False,
+    num_accepted_tokens=None,
     **kwargs,
 ):
     """Return output and FP32 [pool,H,V,K] state, without calling native vLLM.
@@ -189,6 +222,17 @@ def fused_recurrent_kda(
     Invalid destination slots suppress only that write. Out-of-place mode
     returns [T,H,V,K] token states and leaves initial_state unchanged. Without
     indices its initial state is token-major, matching vLLM's KDA convention.
+
+    Kimi K3 additionally needs the activations AscendC ``recurrent_kda`` fuses,
+    so ``g``/``beta`` may be passed as raw projections:
+
+    * ``safe_gate`` with ``A_log``/``dt_bias`` applies the bounded gate
+      ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` in-kernel;
+    * ``use_beta_sigmoid_in_kernel`` folds in beta's sigmoid;
+    * ``num_accepted_tokens`` selects each sequence's seed column from a 2D
+      slot table, as speculative decode requires.
+
+    Omitting all four keeps the pre-activated-gate contract unchanged.
     """
     scale = (
         q.shape[-1] ** -0.5
@@ -237,6 +281,17 @@ def fused_recurrent_kda(
         if ssm_state_indices.ndim == 2:
             ix, width = ssm_state_indices.stride(), ssm_state_indices.shape[1]
     bs = beta.stride() if beta.ndim == 4 else (*beta.stride(), 0)
+    if safe_gate and (A_log is None or dt_bias is None):
+        raise ValueError("The in-kernel safe gate needs both A_log and dt_bias")
+    if safe_gate and (
+        A_log.numel() != h or dt_bias.numel() != h * dk
+    ):
+        raise ValueError("A_log must hold H entries and dt_bias H*K entries")
+    if num_accepted_tokens is not None:
+        if ssm_state_indices is None or ssm_state_indices.ndim != 2:
+            raise ValueError("Accepted-token counts require a 2D state table")
+        if num_accepted_tokens.shape != (n,):
+            raise ValueError("Accepted-token counts must be a [N] vector")
     with torch_device_fn.device(q.device):
         total = n * h * triton.cdiv(dv, bv)
         grid = (min(total, _vector_core_count(q.device.index)),)
@@ -251,7 +306,11 @@ def fused_recurrent_kda(
             final,
             cu_seqlens,
             ssm_state_indices,
+            A_log,
+            dt_bias,
+            num_accepted_tokens,
             scale,
+            lower_bound,
             (
                 t,
                 h,
@@ -276,6 +335,9 @@ def fused_recurrent_kda(
                 bv,
                 total,
                 fast,
+                safe_gate,
+                use_beta_sigmoid_in_kernel,
+                num_accepted_tokens is not None,
             ),
             num_warps=warps,
             num_stages=stages,

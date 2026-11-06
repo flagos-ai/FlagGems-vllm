@@ -3,28 +3,12 @@
 import numpy as np
 import torch
 import triton
-
-try:
-    import triton.experimental.tle as tle
-except ModuleNotFoundError:
-    # TLE (Triton experimental language extensions) ships with FlagTree but
-    # not with stock Triton. All `tle.*` references in this module occur
-    # inside @triton.jit-traced function bodies, so the name only needs to
-    # resolve lazily when those kernels are actually compiled/launched. This
-    # stub keeps module import working on a stock-Triton environment and
-    # raises a clear error only if a TLE-backed kernel in this module is
-    # actually invoked (the aligned-tile fast path in swiglu_kernel genuinely
-    # requires tle.dsa; the ragged-edge tl.store fallback does not).
-    class _MissingTLE:
-        def __getattr__(self, name):
-            raise ModuleNotFoundError(
-                "triton.experimental.tle is required to run this module's "
-                "kernels, but is not installed (requires FlagTree; see "
-                "tools/setup.sh)."
-            )
-
-    tle = _MissingTLE()
 import triton.language as tl
+
+# Ascend-native slice extraction. This ships with the triton-ascend backend in
+# stock Triton, unlike the equivalent `tle.dsa.extract_slice`, which requires
+# a FlagTree build.
+from triton.language.extra.cann.extension import extract_slice
 
 PAD_SLOT_ID = -1
 
@@ -419,16 +403,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     x_base_1d = x_base + token_offset * stride_x_token  # starting of chunk
 
-    # PRE-LOAD WEIGHTS in 2D
-    # column offset: [pid_c*BLOCK_N, pid_c*BLOCK_N+1, ..., pid_c*BLOCK_N+BLOCK_N-1]
-    col_offsets = idx_feats
+    # PRE-LOAD WEIGHTS in 2D, then flatten once so each tap can be taken from
+    # registers instead of re-reading memory every token.
     # row offsets: [0, dim, 2*dim, ..., (KERNEL_WIDTH-1)*dim]
     row_offsets = tl.arange(0, KERNEL_WIDTH) * stride_w_width
-    w_ptrs_2d = w_ptr + row_offsets[:, None] + col_offsets[None, :]
-
-    # Create mask for boundary conditions
+    w_ptrs_2d = w_ptr + row_offsets[:, None] + idx_feats[None, :]
     mask_w_2d = idx_feats[None, :] < dim
-
     w_tile_2d = tl.load(w_ptrs_2d, mask=mask_w_2d, other=0.0).to(tl.float32)
     w_tile = tl.reshape(w_tile_2d, (KERNEL_WIDTH * BLOCK_N,))
 
@@ -436,48 +416,24 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     for idx_token in range(segment_len):
         acc = acc_preload
 
-        # Use extract_slice to get weight columns on-demand from 1D vector
-        matrix_w = tle.dsa.extract_slice(
-            w_tile, offsets=(0 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-        )
         matrix_x = col0
         for j in tl.static_range(KERNEL_WIDTH):
-            if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(1 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(1 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(2 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(1 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(2 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(3 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+            # Tap j is row j of the staged tile. KERNEL_WIDTH is a constexpr
+            # and this is a static_range, so `j * BLOCK_N` is a compile-time
+            # offset into the flattened tile.
+            matrix_w = extract_slice(
+                w_tile, offsets=(j * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
+            )
+            # The newest column is the current token; the older ones are the
+            # sliding-window registers carried across iterations.
+            # This loop, like the col-shift below, covers KERNEL_WIDTH 2-4.
+            if j == KERNEL_WIDTH - 1:
+                x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+            elif j == 1:
+                matrix_x = col1
+            elif j == 2:
+                matrix_x = col2
 
             acc += matrix_x * matrix_w  # [BLOCK_N]
 
