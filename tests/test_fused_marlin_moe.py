@@ -1581,6 +1581,63 @@ def test_fused_marlin_moe_w8a16_inference_updates(
         gems_assert_equal(actual, torch.zeros_like(hs))
 
 
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head MXFP4")
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("updated_tensor", ["w1_scale", "w2_scale"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_marlin_moe_mxfp4_scale_updates_ppu(num_tokens, updated_tensor, dtype):
+    with torch.inference_mode():
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
+            num_tokens, 4, 128, 256, 2, dtype, flaggems_vllm.device
+        )
+        kwargs = dict(
+            hidden_states=hs,
+            w1=w1,
+            w2=w2,
+            bias1=None,
+            bias2=None,
+            w1_scale=s1,
+            w2_scale=s2,
+            topk_weights=tw,
+            topk_ids=ti,
+            quant_type_id=QUANT_TYPE_FP4_E2M1,
+            group_size=MXFP4_GROUP_SIZE,
+        )
+        flaggems_vllm.fused_marlin_moe(**kwargs)
+        kwargs[updated_tensor].view(torch.uint8).add_(1)
+        if updated_tensor == "w1_scale":
+            ref1 = ref1 * 2
+        else:
+            ref2 = ref2 * 2
+        actual = flaggems_vllm.fused_marlin_moe(**kwargs)
+        reference = _reference_swiglu_moe(hs, ref1, ref2, tw, ti)
+        gems_assert_close(actual, reference.to(dtype), dtype, reduce_dim=128)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head MXFP4")
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(96, 128), (128, 160)])
+def test_fused_marlin_moe_mxfp4_alignment_ppu(hidden_size, intermediate_size):
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
+        1, 2, hidden_size, intermediate_size, 1, torch.bfloat16, flaggems_vllm.device
+    )
+    with pytest.raises(ValueError, match="multiples of 128"):
+        flaggems_vllm.fused_marlin_moe(
+            hs,
+            w1,
+            w2,
+            None,
+            None,
+            s1,
+            s2,
+            tw,
+            ti,
+            QUANT_TYPE_FP4_E2M1,
+            group_size=MXFP4_GROUP_SIZE,
+        )
+
+
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"

@@ -20,8 +20,9 @@ decoding is selected at compile time from ``quant_type_id``.
 
 The grouped path consumes the same sorted routing layout as ``fused_moe``.
 Four-bit formats retain the shared INT32 packing. INT8/FP8 weights and scales
-use no-copy views of the public output-major storage. FP8 scale-safety flags
-are recomputed each call; no 8-bit weights, scales or flags are cached.
+use no-copy views of the public output-major storage. Unversioned MXFP4 scales
+are converted on every call. FP8 direct routes check only the scales loaded by
+the GEMM; grouped routes retain per-call safety flags to preserve throughput.
 """
 
 from typing import Any, Callable, NamedTuple, Optional
@@ -98,10 +99,18 @@ def _decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = Fals
         bits = bits | (-(((q & 127) + 1) >> 7) & 0x7C00)
         tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
         exponent_bias = 256.0
-    value = tiny
-    if not FAST:
-        value = value * exponent_bias
-    return (value * scale).to(compute_type)
+    if FAST is None:
+        # Sparse routes avoid scanning scales for experts they never read.
+        folded = scale * exponent_bias
+        overflow = (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf"))
+        folded = tl.where(overflow, scale, folded)
+        value = tl.where(overflow, tiny * exponent_bias, tiny)
+        return (value * folded).to(compute_type)
+    else:
+        value = tiny
+        if not FAST:
+            value = value * exponent_bias
+        return (value * scale).to(compute_type)
 
 
 @triton.jit
@@ -318,16 +327,17 @@ def _pack_e8m0(s):
     try:
         version = s._version
     except RuntimeError:
+        # Inference tensors can change without a version counter.
         version = None
     cached = _SCALE_CACHE.get(s)
-    if cached is not None and cached[0] == version:
+    if version is not None and cached is not None and cached[0] == version:
         return cached[1]
     e, n, g = s.shape
     out = torch.empty((e, g, n), device=s.device, dtype=torch.float32)
     _pack_e8m0_kernel[(triton.cdiv(n * g, 256), e)](
         s.view(torch.uint8), out, n, g, *s.stride(), 256
     )
-    if not torch.cuda.is_current_stream_capturing():
+    if version is not None and not torch.cuda.is_current_stream_capturing():
         _SCALE_CACHE[s] = (version, out)
     return out
 
@@ -491,7 +501,7 @@ if tle_async is not None:
         )
         BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
@@ -596,7 +606,7 @@ if tle_async is not None:
         )
         BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
@@ -707,7 +717,7 @@ if tle_async is not None:
         )
         BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
@@ -836,7 +846,7 @@ if tle_async is not None:
         )
         BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
             if is_safe:
                 return
@@ -1108,7 +1118,7 @@ if tle_async is not None:
             return
 
         expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + expert)
             if is_safe:
                 return
@@ -1287,7 +1297,11 @@ def _invoke_marlin_moe_gemm_direct(
     pipeline_stages = 3 if K > 128 else 1
     grid = (routes * triton.cdiv(N, block_n),)
 
-    fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
+    fast_variants = (
+        (None,)
+        if quant_type_id == QUANT_TYPE_FP8_E4M3
+        else _PPU_FAST_VARIANTS[quant_type_id]
+    )
     kernel = (
         _marlin_moe_gemm_silu_direct_kernel
         if fuse_silu
@@ -1355,7 +1369,11 @@ def _invoke_marlin_moe_gemm_reduce_direct(
     pipeline_stages = 3 if K > 128 else 1
     grid = (tokens * triton.cdiv(N, block_n),)
 
-    fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
+    fast_variants = (
+        (None,)
+        if quant_type_id == QUANT_TYPE_FP8_E4M3
+        else _PPU_FAST_VARIANTS[quant_type_id]
+    )
     for fast_variant in fast_variants:
         _marlin_moe_gemm_reduce_direct_kernel[grid](
             A,
@@ -1597,8 +1615,10 @@ def _validate_inputs(
                 f"quant_type_id={quant_type_id} requires group_size="
                 f"{expected_group_size}"
             )
-        if k % group_size or n % group_size:
-            raise ValueError("Input dimensions must be divisible by group_size")
+        if k % 128 or n % 128:
+            raise ValueError(
+                "4-bit hidden_size and intermediate_size must be multiples of 128"
+            )
         if s1.shape != (e, 2 * n, k // group_size) or s2.shape != (
             e,
             k,
@@ -1657,7 +1677,9 @@ def _validate_inputs(
     return m, k, n, e, ids.shape[1]
 
 
-def _prepare_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_size):
+def _prepare_quantized_weights(
+    w1, w2, w1_scale, w2_scale, quant_type_id, group_size, *, direct=False
+):
     if quant_type_id == QUANT_TYPE_UINT4B8:
         b1, b2, s1, s2 = w4a16_int4_pack(
             w1, w2, w1_scale, w2_scale, cached=True, block_size_k=group_size
@@ -1670,7 +1692,7 @@ def _prepare_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_
         b2 = w2.view(torch.uint8).transpose(1, 2)
         s1 = w1_scale.transpose(1, 2)
         s2 = w2_scale.transpose(1, 2)
-    if quant_type_id == QUANT_TYPE_FP8_E4M3:
+    if quant_type_id == QUANT_TYPE_FP8_E4M3 and not direct:
         safe1, safe2 = _fp8_scale_safety(w1_scale), _fp8_scale_safety(w2_scale)
     else:
         safe1, safe2 = None, None
@@ -1695,7 +1717,8 @@ def _fused_marlin_moe_impl(
     """Forward SwiGLU MoE with output-major quantized weights.
 
     INT8/FP8 weights and scales are read directly on every invocation.
-    Four-bit formats retain the existing cached packing behavior.
+    Four-bit weights retain the existing cached packing behavior. MXFP4 scale
+    conversions are cached only when the input has a version counter.
     Expert IDs must be in [0, E); expert parallel maps are not supported.
     """
     m, k, n, e, topk = _validate_inputs(
@@ -1722,10 +1745,10 @@ def _fused_marlin_moe_impl(
         return out
     compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
     with torch.cuda.device(hidden_states.device):
-        stage1, stage2 = _prepare_quantized_weights(
-            w1, w2, w1_scale, w2_scale, quant_type_id, group_size
-        )
         direct = _use_direct_route(m, e, topk, k, n)
+        stage1, stage2 = _prepare_quantized_weights(
+            w1, w2, w1_scale, w2_scale, quant_type_id, group_size, direct=direct
+        )
         split_silu = direct and n >= 1024
         use_matvec = (
             direct
