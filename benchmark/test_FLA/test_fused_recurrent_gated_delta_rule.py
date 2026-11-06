@@ -14,7 +14,8 @@ import pytest
 import torch
 
 import flaggems_vllm as gems
-from baseline.fused_recurrent_gated_delta_rule_fwd import PERF_CASES, build
+from baseline.fused_recurrent_gated_delta_rule import OP_NAME, PERF_CASES, build
+from benchmark.conftest import Config, update_result
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_FLA.test_fused_recurrent_gated_delta_rule import (
     assert_result,
@@ -41,11 +42,65 @@ def _measure(fn, data, state0):
     return samples
 
 
+@pytest.fixture(scope="module")
+def _performance_records():
+    return {}
+
+
+def _record_performance(row, dtype, entry, records):
+    """Expose the measured case to the standard weekly-test report parser."""
+    native_valid = (
+        row["native_accuracy"] == "PASS" and row["native_performance"] == "PASS"
+    )
+    dtype = str(dtype)
+    if dtype not in records:
+        # The weekly parser expects one record containing all cases per dtype.
+        records[dtype] = {
+            "op_name": OP_NAME,
+            "dtype": dtype,
+            "mode": "kernel",
+            "level": Config.bench_level.value,
+            "result": [],
+        }
+        update_result(OP_NAME, records[dtype])
+    record = records[dtype]
+    result = {
+        "shape_detail": {
+            "case": row["case"],
+            "entry": entry,
+            "inputs": row["config"],
+        },
+        "latency": row.get("gems_ms"),
+        "latency_base": row.get("native_ms") if native_valid else None,
+        "speedup": row.get("native_speedup") if native_valid else None,
+        "native_accuracy": row["native_accuracy"],
+        "native_performance": row["native_performance"],
+        "error_msg": row.get("gems_error") or row.get("gems_timing_error"),
+    }
+    record["result"].append(result)
+    if not native_valid:
+        reason = row.get("native_error") or row.get("native_timing_error")
+        result["native_baseline_skip_reason"] = (
+            f"Native accuracy {row['native_accuracy']}: "
+            f"{reason or 'no validated native timing'}"
+        )
+        record["native_baseline_skip_reason"] = "; ".join(
+            dict.fromkeys(
+                r["native_baseline_skip_reason"]
+                for r in record["result"]
+                if r.get("native_baseline_skip_reason")
+            )
+        )
+
+
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
+@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c[0] for c in PERF_CASES])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("entry", ["generic", "top"])
-def test_perf_fused_recurrent_gated_delta_rule(case, dtype, entry):
+def test_perf_fused_recurrent_gated_delta_rule(
+    case, dtype, entry, _performance_records
+):
     data = build(case, dtype, gems.device)
     state0 = data["initial_state"].clone()
     expected = reference(data)
@@ -151,6 +206,7 @@ def test_perf_fused_recurrent_gated_delta_rule(case, dtype, entry):
         row["selected_source"] = "native"
     else:
         row["selected_source"] = None
+    _record_performance(row, dtype, entry, _performance_records)
     print(json.dumps(row))
     target = os.environ.get("GDN_RESULTS")
     if target:
