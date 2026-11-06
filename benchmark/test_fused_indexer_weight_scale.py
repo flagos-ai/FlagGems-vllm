@@ -1,5 +1,16 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 
@@ -16,7 +27,8 @@ from .test_blas_perf_parallel import PARALLEL_WORKER_ENV, ParallelBenchmarkMixin
 native_weight_scale = indexer_tests.native_weight_scale
 
 # All unique GLM-5.3-Flash shapes captured with the native model structure and
-# dummy weights, 2026-11-02. Across four FlagOSTune scenarios, sum(count)=1990208.
+# dummy weights. Published shapes/counts: https://github.com/flagos-ai/FlagGems-vllm/pull/1048
+# Across four FlagOSTune scenarios, sum(count)=1990208.
 REAL_TOKEN_COUNTS = (
     1,
     2,
@@ -76,12 +88,12 @@ REAL_TOKEN_COUNTS = (
 def input_fn(shape, dtype, device):
     torch.manual_seed(0)
     tokens, heads = shape
-    weights, query = indexer_tests.make_inputs(tokens, heads, device, dtype)
+    weights, query = indexer_tests.make_inputs(tokens, heads, device, dtype=dtype)
     yield weights, query, 128**-0.5 * heads**-0.5
 
 
 class IndexerWeightScaleBenchmark(ParallelBenchmarkMixin, GenericBenchmark):
-    DEFAULT_SHAPES = [(4, 32), (8, 32), (35, 32), (65, 32), (16384, 32)]
+    DEFAULT_SHAPES = [(1, 32), (35, 32), (16384, 32)]
     DEFAULT_SHAPE_DESC = "tokens, heads"
     RECORD_PARALLEL_RESULTS = True
 

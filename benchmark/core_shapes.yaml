@@ -12,9 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fused_recurrent_gated_delta_rule_packed_decode:
+  shapes:
+    - [1, 8, 16, 128, 128]
+    - [4, 8, 16, 128, 128]
+    - [16, 8, 16, 128, 128]
+    - [64, 8, 16, 128, 128]
+    - [256, 8, 16, 128, 128]
+    - [9, 4, 12, 64, 32]
+    - [3, 2, 4, 17, 23]
+    - [1, 16, 64, 128, 128]
+  shape_desc: "B, H, HV, K, V"
 fused_indexer_weight_scale:
-  # GLM-5.3-Flash native model with dummy weights, 2026-11-02.
-  # Top 10 shapes by call count; comprehensive covers all 52 captured shapes.
+  # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
   shapes:
     - [4, 32]  # count=1079584
     - [8, 32]  # count=177584
@@ -28,17 +38,6 @@ fused_indexer_weight_scale:
     - [76, 32]  # count=19712
   shape_desc: "tokens, heads"
 
-fused_recurrent_gated_delta_rule_packed_decode:
-  shapes:
-    - [1, 8, 16, 128, 128]
-    - [4, 8, 16, 128, 128]
-    - [16, 8, 16, 128, 128]
-    - [64, 8, 16, 128, 128]
-    - [256, 8, 16, 128, 128]
-    - [9, 4, 12, 64, 32]
-    - [3, 2, 4, 17, 23]
-    - [1, 16, 64, 128, 128]
-  shape_desc: "B, H, HV, K, V"
 gdn_w8a16:
   shapes:
     - [1, 1, 2, 4, 128, 128]
