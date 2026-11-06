@@ -185,6 +185,19 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_fwd_intra_token_parallel
+    description: |
+      Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
+      Writes Aqk/Akk in place and preserves their unwritten regions.
+    for:
+      - chunk_kda_fwd_intra_token_parallel
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: chunk_kda_scaled_dot_kkt_fwd
     description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
     for:
