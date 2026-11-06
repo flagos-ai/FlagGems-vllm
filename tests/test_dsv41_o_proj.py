@@ -297,11 +297,54 @@ def test_dsv41_o_proj_empty():
     assert res.shape == (0, n_groups * rank)
 
 
+def _bf16_weight(w, ws, n_groups, rank):
+    """BF16 wo_a without scales, the layout vLLM keeps for an unquantized wo_a."""
+    w3 = ref_dequant_weight(
+        w.view(n_groups, rank, -1), ws.view(n_groups, rank // QUANT_BLOCK, -1)
+    )
+    return w3.to(torch.bfloat16).view(w.shape)
+
+
+def ref_dsv41_o_proj_bf16(attn_out, positions, cos_sin_cache, w16, n_groups, hpg, rank):
+    """vLLM's non-quantizing branch: rotate into BF16, then a BF16 x BF16 GEMM."""
+    T = attn_out.shape[0]
+    x = ref_inverse_rope(
+        attn_out[:, : n_groups * hpg], positions, cos_sin_cache, NOPE_DIM, ROPE_DIM
+    )
+    x = x.to(torch.bfloat16).float().reshape(T, n_groups, hpg * HEAD_DIM)
+    w = w16.float().view(n_groups, rank, -1)
+    return torch.einsum("bhr,hdr->bhd", x, w).reshape(T, n_groups * rank)
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [1, 7, 32, 96, 257] + ([] if cfg.QUICK_MODE else [2048])
+)
+@pytest.mark.parametrize("n_groups, hpg, rank", [*GROUP_CONFIGS, (1, 8, 1024)])
+def test_dsv41_o_proj_bf16_weight(num_tokens, n_groups, hpg, rank):
+    """A BF16 wo_a takes the non-quantizing path; only BF16 rounding remains."""
+    attn_out, pos, csc, w, ws = make_inputs(
+        num_tokens, n_groups, hpg, rank, pad_heads=4
+    )
+    w16 = _bf16_weight(w, ws, n_groups, rank)
+    res = call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)
+    ref = ref_dsv41_o_proj_bf16(attn_out, pos, csc, w16, n_groups, hpg, rank)
+    # FP32 accumulation of BF16 products; the BF16 output rounding dominates.
+    assert_relative_close(res, ref, n_groups, rank, max_rel=5e-3)
+    w3 = w16.view(n_groups, rank, -1)
+    res3 = call_gems(attn_out, pos, csc, w3, None, n_groups, hpg, rank)
+    assert torch.equal(res3, res)
+
+
 def test_dsv41_o_proj_unsupported():
     n_groups, hpg, rank = 2, 8, 1024
     attn_out, pos, csc, w, ws = make_inputs(4, n_groups, hpg, rank)
-    with pytest.raises(NotImplementedError):  # BF16 wo_a
-        call_gems(attn_out, pos, csc, w.to(torch.bfloat16), ws, n_groups, hpg, rank)
+    w16 = _bf16_weight(w, ws, n_groups, rank)
+    with pytest.raises(ValueError):  # a BF16 wo_a takes no scale
+        call_gems(attn_out, pos, csc, w16, ws, n_groups, hpg, rank)
+    with pytest.raises(NotImplementedError):  # FP8 wo_a needs its scale
+        call_gems(attn_out, pos, csc, w, None, n_groups, hpg, rank)
+    with pytest.raises(NotImplementedError):  # FP16 wo_a
+        call_gems(attn_out, pos, csc, w16.half(), None, n_groups, hpg, rank)
     with pytest.raises(NotImplementedError):  # packed UE8M0 scales (SM100 recipe)
         call_gems(attn_out, pos, csc, w, ws.view(torch.int32), n_groups, hpg, rank)
     with pytest.raises(NotImplementedError):  # non-bf16 activation
