@@ -21,6 +21,25 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.triton_version_utils import has_tle_range_reorder
+
+# FlagTree reorder-loop-loads: `tle.range(..., loop_unroll_factor=2, reorder=True)`
+# issues the block-table and cache loads of the next gathered token before the
+# current token's dequantize/store. The gather loop is latency bound (one
+# indirect load, then eight dependent loads per token); measured on H20 the op
+# is 4-12% faster across the benchmark shapes, bit-exact. Upstream Triton keeps
+# the plain loop.
+if has_tle_range_reorder(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+
+        _HAS_REORDER_LOOP_LOADS = True
+    except ImportError:
+        tle = None
+        _HAS_REORDER_LOOP_LOADS = False
+else:
+    tle = None
+    _HAS_REORDER_LOOP_LOADS = False
 
 
 def _default_scale_slots(nope_dim: int) -> int:
@@ -48,6 +67,77 @@ def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
             return k_cache.view(k_cache.shape[0], -1)
         return k_cache.contiguous().view(k_cache.shape[0], -1)
     raise ValueError(f"k_cache must be 2D or 3D, got shape={tuple(k_cache.shape)}")
+
+
+@triton.jit
+def _gather_token(
+    local_i,
+    req_idx,
+    start_pos,
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    k_cache_ptr,
+    block_table_ptr,
+    offset,
+    max_blocks_per_seq: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    scale_slots: tl.constexpr,
+    quant_block: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    cache_block_stride: tl.constexpr,
+    n_quant_blocks: tl.constexpr,
+):
+    pos = start_pos + local_i
+    block_in_seq = pos // cache_block_size
+    pos_in_block = pos - block_in_seq * cache_block_size
+    physical_block = tl.load(
+        block_table_ptr + req_idx * max_blocks_per_seq + block_in_seq
+    )
+    cache_block = k_cache_ptr + physical_block.to(tl.int64) * cache_block_stride
+    token_data = cache_block + pos_in_block * token_data_size
+    scale_base = (
+        cache_block + cache_block_size * token_data_size + pos_in_block * scale_slots
+    )
+    out_row = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
+
+    if nope_dim % quant_block == 0:
+        for qblock in tl.static_range(0, n_quant_blocks):
+            qoffs = qblock * quant_block + tl.arange(0, quant_block)
+            x_u8 = tl.load(token_data + qoffs)
+            x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            encoded = tl.load(scale_base + qblock)
+            scale = tl.exp2(encoded.to(tl.float32) - 127.0)
+            x = x_fp8 * scale
+            tl.store(out_row + qoffs, x.to(tl.bfloat16))
+    else:
+        for qblock in tl.static_range(0, n_quant_blocks - 1):
+            qoffs = qblock * quant_block + tl.arange(0, quant_block)
+            x_u8 = tl.load(token_data + qoffs)
+            x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            encoded = tl.load(scale_base + qblock)
+            scale = tl.exp2(encoded.to(tl.float32) - 127.0)
+            x = x_fp8 * scale
+            tl.store(out_row + qoffs, x.to(tl.bfloat16))
+
+        qblock = n_quant_blocks - 1
+        qoffs = qblock * quant_block + tl.arange(0, quant_block)
+        qmask = qoffs < nope_dim
+        x_u8 = tl.load(token_data + qoffs, mask=qmask, other=0)
+        x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        encoded = tl.load(scale_base + qblock)
+        scale = tl.exp2(encoded.to(tl.float32) - 127.0)
+        x = x_fp8 * scale
+        tl.store(out_row + qoffs, x.to(tl.bfloat16), mask=qmask)
+
+    bf16_ptr = (token_data + nope_dim).to(tl.pointer_type(tl.bfloat16))
+    for rblock in tl.static_range(0, rope_dim, 64):
+        roffs = rblock + tl.arange(0, 64)
+        rmask = roffs < rope_dim
+        vals = tl.load(bf16_ptr + roffs, mask=rmask, other=0.0)
+        tl.store(out_row + nope_dim + roffs, vals, mask=rmask)
 
 
 @libentry()
@@ -81,6 +171,7 @@ def _dequantize_and_gather_k_cache_kernel(
     HAVE_GATHER_LENS: tl.constexpr,
     num_tokens: tl.constexpr,
     max_gather_len: tl.constexpr,
+    REORDER_GATHER_LOOP: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     worker_idx = tl.program_id(1)
@@ -91,57 +182,52 @@ def _dequantize_and_gather_k_cache_kernel(
         gather_len = seq_len
     start_pos = seq_len - gather_len
 
-    for local_i in range(worker_idx, gather_len, num_workers):
-        pos = start_pos + local_i
-        block_in_seq = pos // cache_block_size
-        pos_in_block = pos - block_in_seq * cache_block_size
-        physical_block = tl.load(
-            block_table_ptr + req_idx * max_blocks_per_seq + block_in_seq
-        )
-        cache_block = k_cache_ptr + physical_block.to(tl.int64) * cache_block_stride
-        token_data = cache_block + pos_in_block * token_data_size
-        scale_base = (
-            cache_block
-            + cache_block_size * token_data_size
-            + pos_in_block * scale_slots
-        )
-        out_row = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
-
-        if nope_dim % quant_block == 0:
-            for qblock in tl.static_range(0, n_quant_blocks):
-                qoffs = qblock * quant_block + tl.arange(0, quant_block)
-                x_u8 = tl.load(token_data + qoffs)
-                x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-                encoded = tl.load(scale_base + qblock)
-                scale = tl.exp2(encoded.to(tl.float32) - 127.0)
-                x = x_fp8 * scale
-                tl.store(out_row + qoffs, x.to(tl.bfloat16))
-        else:
-            for qblock in tl.static_range(0, n_quant_blocks - 1):
-                qoffs = qblock * quant_block + tl.arange(0, quant_block)
-                x_u8 = tl.load(token_data + qoffs)
-                x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-                encoded = tl.load(scale_base + qblock)
-                scale = tl.exp2(encoded.to(tl.float32) - 127.0)
-                x = x_fp8 * scale
-                tl.store(out_row + qoffs, x.to(tl.bfloat16))
-
-            qblock = n_quant_blocks - 1
-            qoffs = qblock * quant_block + tl.arange(0, quant_block)
-            qmask = qoffs < nope_dim
-            x_u8 = tl.load(token_data + qoffs, mask=qmask, other=0)
-            x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-            encoded = tl.load(scale_base + qblock)
-            scale = tl.exp2(encoded.to(tl.float32) - 127.0)
-            x = x_fp8 * scale
-            tl.store(out_row + qoffs, x.to(tl.bfloat16), mask=qmask)
-
-        bf16_ptr = (token_data + nope_dim).to(tl.pointer_type(tl.bfloat16))
-        for rblock in tl.static_range(0, rope_dim, 64):
-            roffs = rblock + tl.arange(0, 64)
-            rmask = roffs < rope_dim
-            vals = tl.load(bf16_ptr + roffs, mask=rmask, other=0.0)
-            tl.store(out_row + nope_dim + roffs, vals, mask=rmask)
+    if REORDER_GATHER_LOOP:
+        for local_i in tle.range(
+            worker_idx, gather_len, num_workers, loop_unroll_factor=2, reorder=True
+        ):
+            _gather_token(
+                local_i,
+                req_idx,
+                start_pos,
+                out_ptr,
+                out_stride0,
+                out_stride1,
+                k_cache_ptr,
+                block_table_ptr,
+                offset,
+                max_blocks_per_seq,
+                nope_dim,
+                rope_dim,
+                scale_slots,
+                quant_block,
+                cache_block_size,
+                token_data_size,
+                cache_block_stride,
+                n_quant_blocks,
+            )
+    else:
+        for local_i in range(worker_idx, gather_len, num_workers):
+            _gather_token(
+                local_i,
+                req_idx,
+                start_pos,
+                out_ptr,
+                out_stride0,
+                out_stride1,
+                k_cache_ptr,
+                block_table_ptr,
+                offset,
+                max_blocks_per_seq,
+                nope_dim,
+                rope_dim,
+                scale_slots,
+                quant_block,
+                cache_block_size,
+                token_data_size,
+                cache_block_stride,
+                n_quant_blocks,
+            )
 
 
 def dequantize_and_gather_k_cache(
@@ -194,6 +280,7 @@ def dequantize_and_gather_k_cache(
             HAVE_GATHER_LENS=gather_lens is not None,
             num_tokens=_stat_total(gather_lens, num_reqs),
             max_gather_len=_stat_max(gather_lens),
+            REORDER_GATHER_LOOP=_HAS_REORDER_LOOP_LOADS,
         )
 
 

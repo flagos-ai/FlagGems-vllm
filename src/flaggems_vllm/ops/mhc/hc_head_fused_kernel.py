@@ -18,17 +18,161 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.triton_version_utils import has_tle_range_reorder
+
 logger = logging.getLogger(__name__)
+
+# FlagTree reorder-loop-loads: both H loops are latency bound at small token
+# counts (one program per token, 8..16 loads per block). The autotune space
+# below keeps the five original configs and adds, for each of them, the loop
+# unrolled by 2, and unrolled by 2 / 4 with `tle.range(..., reorder=1)`, which
+# issues the next block's loads before the current block's FMAs. Autotune
+# picks per (H, HC), so a shape that gains nothing keeps its original config.
+# Upstream Triton sees only the original configs.
+if has_tle_range_reorder(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+
+        _HAS_REORDER_LOOP_LOADS = True
+    except ImportError:
+        tle = None
+        _HAS_REORDER_LOOP_LOADS = False
+else:
+    tle = None
+    _HAS_REORDER_LOOP_LOADS = False
+
+
+def _hc_configs():
+    base = [
+        (512, 4, 2),
+        (1024, 4, 2),
+        (1024, 8, 2),
+        (2048, 8, 2),
+        (2048, 8, 3),
+    ]
+    schedules = [(1, False)]
+    if _HAS_REORDER_LOOP_LOADS:
+        schedules += [(2, False), (2, True), (4, True)]
+    return [
+        triton.Config(
+            {"BLOCK_H": block_h, "LOOP_UNROLL": unroll, "REORDER": reorder},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_h, num_warps, num_stages in base
+        for unroll, reorder in schedules
+    ]
+
+
+@triton.jit
+def _hc_accumulate(
+    residual_ptr,
+    fn_ptr,
+    x_base,
+    h_start,
+    H: tl.constexpr,
+    fn_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    sqr_acc,
+    mix_acc0,
+    mix_acc1,
+    mix_acc2,
+    mix_acc3,
+):
+    h_off = h_start + tl.arange(0, BLOCK_H)
+    h_mask = h_off < H
+
+    r0 = tl.load(residual_ptr + x_base + 0 * H + h_off, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
+    r1 = tl.load(residual_ptr + x_base + 1 * H + h_off, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
+    sqr_acc += r0 * r0 + r1 * r1
+
+    fn00 = tl.load(fn_ptr + 0 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0)
+    fn01 = tl.load(fn_ptr + 0 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0)
+    mix_acc0 += r0 * fn00 + r1 * fn01
+
+    fn10 = tl.load(fn_ptr + 1 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0)
+    fn11 = tl.load(fn_ptr + 1 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0)
+    mix_acc1 += r0 * fn10 + r1 * fn11
+
+    if HC > 2:
+        r2 = tl.load(residual_ptr + x_base + 2 * H + h_off, mask=h_mask, other=0.0).to(
+            tl.float32
+        )
+        r3 = tl.load(residual_ptr + x_base + 3 * H + h_off, mask=h_mask, other=0.0).to(
+            tl.float32
+        )
+        sqr_acc += r2 * r2 + r3 * r3
+
+        mix_acc0 += r2 * tl.load(
+            fn_ptr + 0 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
+        )
+        mix_acc0 += r3 * tl.load(
+            fn_ptr + 0 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
+        )
+
+        mix_acc1 += r2 * tl.load(
+            fn_ptr + 1 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
+        )
+        mix_acc1 += r3 * tl.load(
+            fn_ptr + 1 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
+        )
+
+        fn20 = tl.load(fn_ptr + 2 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0)
+        fn21 = tl.load(fn_ptr + 2 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0)
+        fn22 = tl.load(fn_ptr + 2 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0)
+        fn23 = tl.load(fn_ptr + 2 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0)
+        mix_acc2 += r0 * fn20 + r1 * fn21 + r2 * fn22 + r3 * fn23
+
+        fn30 = tl.load(fn_ptr + 3 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0)
+        fn31 = tl.load(fn_ptr + 3 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0)
+        fn32 = tl.load(fn_ptr + 3 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0)
+        fn33 = tl.load(fn_ptr + 3 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0)
+        mix_acc3 += r0 * fn30 + r1 * fn31 + r2 * fn32 + r3 * fn33
+    return sqr_acc, mix_acc0, mix_acc1, mix_acc2, mix_acc3
+
+
+@triton.jit
+def _hc_weighted_store(
+    residual_ptr,
+    out_ptr,
+    x_base,
+    out_base,
+    h_start,
+    H: tl.constexpr,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    pre_mix0,
+    pre_mix1,
+    pre_mix2,
+    pre_mix3,
+):
+    h_off = h_start + tl.arange(0, BLOCK_H)
+    h_mask = h_off < H
+    r0 = tl.load(residual_ptr + x_base + 0 * H + h_off, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
+    r1 = tl.load(residual_ptr + x_base + 1 * H + h_off, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
+    acc = pre_mix0 * r0 + pre_mix1 * r1
+    if HC > 2:
+        r2 = tl.load(residual_ptr + x_base + 2 * H + h_off, mask=h_mask, other=0.0).to(
+            tl.float32
+        )
+        r3 = tl.load(residual_ptr + x_base + 3 * H + h_off, mask=h_mask, other=0.0).to(
+            tl.float32
+        )
+        acc += pre_mix2 * r2 + pre_mix3 * r3
+    tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_H": 2048}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_H": 2048}, num_warps=8, num_stages=3),
-    ],
+    configs=_hc_configs(),
     key=["H", "HC"],
 )
 @triton.jit
@@ -47,6 +191,8 @@ def _hc_head_fused_kernel(
     out_stride_t,
     HC: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    LOOP_UNROLL: tl.constexpr,
+    REORDER: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     if pid_t >= T:
@@ -61,76 +207,59 @@ def _hc_head_fused_kernel(
     mix_acc2 = tl.zeros([BLOCK_H], dtype=tl.float32)
     mix_acc3 = tl.zeros([BLOCK_H], dtype=tl.float32)
 
-    for h_start in range(0, H, BLOCK_H):
-        h_off = h_start + tl.arange(0, BLOCK_H)
-        h_mask = h_off < H
-
-        r0 = tl.load(residual_ptr + x_base + 0 * H + h_off, mask=h_mask, other=0.0).to(
-            tl.float32
-        )
-        r1 = tl.load(residual_ptr + x_base + 1 * H + h_off, mask=h_mask, other=0.0).to(
-            tl.float32
-        )
-        sqr_acc += r0 * r0 + r1 * r1
-
-        fn00 = tl.load(fn_ptr + 0 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0)
-        fn01 = tl.load(fn_ptr + 0 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0)
-        mix_acc0 += r0 * fn00 + r1 * fn01
-
-        fn10 = tl.load(fn_ptr + 1 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0)
-        fn11 = tl.load(fn_ptr + 1 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0)
-        mix_acc1 += r0 * fn10 + r1 * fn11
-
-        if HC > 2:
-            r2 = tl.load(
-                residual_ptr + x_base + 2 * H + h_off, mask=h_mask, other=0.0
-            ).to(tl.float32)
-            r3 = tl.load(
-                residual_ptr + x_base + 3 * H + h_off, mask=h_mask, other=0.0
-            ).to(tl.float32)
-            sqr_acc += r2 * r2 + r3 * r3
-
-            mix_acc0 += r2 * tl.load(
-                fn_ptr + 0 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
+    if REORDER:
+        for h_start in tle.range(
+            0, H, BLOCK_H, loop_unroll_factor=LOOP_UNROLL, reorder=1
+        ):
+            sqr_acc, mix_acc0, mix_acc1, mix_acc2, mix_acc3 = _hc_accumulate(
+                residual_ptr,
+                fn_ptr,
+                x_base,
+                h_start,
+                H,
+                fn_stride_m,
+                HC,
+                BLOCK_H,
+                sqr_acc,
+                mix_acc0,
+                mix_acc1,
+                mix_acc2,
+                mix_acc3,
             )
-            mix_acc0 += r3 * tl.load(
-                fn_ptr + 0 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
+    elif LOOP_UNROLL > 1:
+        for h_start in tl.range(0, H, BLOCK_H, loop_unroll_factor=LOOP_UNROLL):
+            sqr_acc, mix_acc0, mix_acc1, mix_acc2, mix_acc3 = _hc_accumulate(
+                residual_ptr,
+                fn_ptr,
+                x_base,
+                h_start,
+                H,
+                fn_stride_m,
+                HC,
+                BLOCK_H,
+                sqr_acc,
+                mix_acc0,
+                mix_acc1,
+                mix_acc2,
+                mix_acc3,
             )
-
-            mix_acc1 += r2 * tl.load(
-                fn_ptr + 1 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
+    else:
+        for h_start in range(0, H, BLOCK_H):
+            sqr_acc, mix_acc0, mix_acc1, mix_acc2, mix_acc3 = _hc_accumulate(
+                residual_ptr,
+                fn_ptr,
+                x_base,
+                h_start,
+                H,
+                fn_stride_m,
+                HC,
+                BLOCK_H,
+                sqr_acc,
+                mix_acc0,
+                mix_acc1,
+                mix_acc2,
+                mix_acc3,
             )
-            mix_acc1 += r3 * tl.load(
-                fn_ptr + 1 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
-            )
-
-            fn20 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0
-            )
-            fn21 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0
-            )
-            fn22 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
-            )
-            fn23 = tl.load(
-                fn_ptr + 2 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
-            )
-            mix_acc2 += r0 * fn20 + r1 * fn21 + r2 * fn22 + r3 * fn23
-
-            fn30 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 0 * H + h_off, mask=h_mask, other=0.0
-            )
-            fn31 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 1 * H + h_off, mask=h_mask, other=0.0
-            )
-            fn32 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 2 * H + h_off, mask=h_mask, other=0.0
-            )
-            fn33 = tl.load(
-                fn_ptr + 3 * fn_stride_m + 3 * H + h_off, mask=h_mask, other=0.0
-            )
-            mix_acc3 += r0 * fn30 + r1 * fn31 + r2 * fn32 + r3 * fn33
 
     K = HC * H
     sqr_total = tl.sum(sqr_acc)
@@ -154,25 +283,62 @@ def _hc_head_fused_kernel(
 
     # Pass 2: weighted sum
     out_base = pid_t * out_stride_t
-    for h_start in range(0, H, BLOCK_H):
-        h_off = h_start + tl.arange(0, BLOCK_H)
-        h_mask = h_off < H
-        r0 = tl.load(residual_ptr + x_base + 0 * H + h_off, mask=h_mask, other=0.0).to(
-            tl.float32
-        )
-        r1 = tl.load(residual_ptr + x_base + 1 * H + h_off, mask=h_mask, other=0.0).to(
-            tl.float32
-        )
-        acc = pre_mix0 * r0 + pre_mix1 * r1
-        if HC > 2:
-            r2 = tl.load(
-                residual_ptr + x_base + 2 * H + h_off, mask=h_mask, other=0.0
-            ).to(tl.float32)
-            r3 = tl.load(
-                residual_ptr + x_base + 3 * H + h_off, mask=h_mask, other=0.0
-            ).to(tl.float32)
-            acc += pre_mix2 * r2 + pre_mix3 * r3
-        tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
+    if HC > 2:
+        pm2 = pre_mix2
+        pm3 = pre_mix3
+    else:
+        pm2 = 0.0
+        pm3 = 0.0
+    if REORDER:
+        for h_start in tle.range(
+            0, H, BLOCK_H, loop_unroll_factor=LOOP_UNROLL, reorder=1
+        ):
+            _hc_weighted_store(
+                residual_ptr,
+                out_ptr,
+                x_base,
+                out_base,
+                h_start,
+                H,
+                HC,
+                BLOCK_H,
+                pre_mix0,
+                pre_mix1,
+                pm2,
+                pm3,
+            )
+    elif LOOP_UNROLL > 1:
+        for h_start in tl.range(0, H, BLOCK_H, loop_unroll_factor=LOOP_UNROLL):
+            _hc_weighted_store(
+                residual_ptr,
+                out_ptr,
+                x_base,
+                out_base,
+                h_start,
+                H,
+                HC,
+                BLOCK_H,
+                pre_mix0,
+                pre_mix1,
+                pm2,
+                pm3,
+            )
+    else:
+        for h_start in range(0, H, BLOCK_H):
+            _hc_weighted_store(
+                residual_ptr,
+                out_ptr,
+                x_base,
+                out_base,
+                h_start,
+                H,
+                HC,
+                BLOCK_H,
+                pre_mix0,
+                pre_mix1,
+                pm2,
+                pm3,
+            )
 
 
 def hc_head_fused_kernel_ref(
