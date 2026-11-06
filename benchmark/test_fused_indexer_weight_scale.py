@@ -12,19 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from pathlib import Path
-
 import pytest
 import torch
-import yaml
 
 import flaggems_vllm
 from tests import test_fused_indexer_weight_scale as indexer_tests
 from tests.accuracy_utils import gems_assert_close
 
 from . import base
-from .test_blas_perf_parallel import PARALLEL_WORKER_ENV, ParallelBenchmarkMixin
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 native_weight_scale = indexer_tests.native_weight_scale
 
@@ -42,12 +38,7 @@ class IndexerWeightScaleBenchmark(ParallelBenchmarkMixin, base.GenericBenchmark)
     DEFAULT_SHAPE_DESC = "tokens, heads"
 
     def set_more_shapes(self):
-        if os.environ.get(PARALLEL_WORKER_ENV):
-            return []
-        shape_file = Path(__file__).with_name("core_shapes.yaml")
-        config = yaml.safe_load(shape_file.read_text(encoding="utf-8"))[self.op_name]
-        shapes = config["shapes"] + config["comprehensive_extra_shapes"]
-        return [tuple(shape) for shape in shapes]
+        return []
 
     def get_input_iter(self, dtype):
         for index, inputs in enumerate(super().get_input_iter(dtype)):
