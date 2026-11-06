@@ -39,7 +39,7 @@ export FLAG_GEMS_W8A8_QUANT_FUSION=quant
 
 ## 综合性能评测
 
-基于 CUDA Graph 测时（25 次预热，100 次捕获调用，5 次事件采样，2 轮反序测试取中位数均值）：
+基于 CUDA Graph 测时（25 次预热，100 次捕获调用，5 次事件采样，2 轮反序测试取中位数均值），完整原始数据见[基准测试 JSON](/data/m3-operator-benchmark.json)：
 
 | 算子与形状 | 基线 (μs) | 候选实现 (μs) | 加速比 |
 |---|---:|---:|---:|

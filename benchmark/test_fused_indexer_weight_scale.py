@@ -16,27 +16,24 @@ import pytest
 import torch
 
 import flaggems_vllm
+from tests import test_fused_indexer_weight_scale as indexer_tests
+from tests.accuracy_utils import gems_assert_close
 
 from . import base
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
-
-@pytest.fixture(scope="module")
-def native_weight_scale():
-    # Requires official vLLM 0.33.0+empty in an isolated vendor environment.
-    from vllm.models.glm5next.common.attention import _fused_indexer_weight_scale
-
-    return _fused_indexer_weight_scale
+native_weight_scale = indexer_tests.native_weight_scale
 
 
 def input_fn(shape, dtype, device):
     torch.manual_seed(0)
     tokens, heads = shape
-    weights = torch.randn((tokens, heads), dtype=dtype, device=device)
-    query = torch.exp2(torch.randint(-8, 1, (tokens, heads, 1), device=device).float())
-    yield weights, query, 128**-0.5 * heads**-0.5
+    weights, q_scale = indexer_tests.make_inputs(tokens, heads, device, dtype=dtype)
+    yield weights, q_scale, 128**-0.5 * heads**-0.5
 
 
-class IndexerWeightScaleBenchmark(base.GenericBenchmark):
+class IndexerWeightScaleBenchmark(ParallelBenchmarkMixin, base.GenericBenchmark):
+    RECORD_PARALLEL_RESULTS = True
     DEFAULT_SHAPES = [(1, 32), (35, 32), (16384, 32)]
     DEFAULT_SHAPE_DESC = "tokens, heads"
 
@@ -44,17 +41,26 @@ class IndexerWeightScaleBenchmark(base.GenericBenchmark):
         return []
 
     def get_input_iter(self, dtype):
-        for inputs in super().get_input_iter(dtype):
+        for index, inputs in enumerate(super().get_input_iter(dtype)):
+            expected = self.torch_op(*inputs)
             output = self.gems_op(*inputs)
-            torch.testing.assert_close(
-                output, self.torch_op(*inputs), rtol=1e-6, atol=1e-7
-            )
+            if flaggems_vllm.vendor_name == "metax":
+                torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-7)
+            else:
+                gems_assert_close(output, expected, torch.float32, atol=1e-6)
+            if index or flaggems_vllm.vendor_name != "mthreads":
+                yield inputs
+                continue
+            # Prime first-use setup equally for the compiled MThreads baseline.
+            self.get_latency(self.torch_op, *inputs)
+            self.get_latency(self.gems_op, *inputs)
             yield inputs
 
 
 @pytest.mark.fused_indexer_weight_scale
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "metax", reason="MetaX backend implementation"
+    indexer_tests.API_NAME not in vars(flaggems_vllm),
+    reason="backend has no indexer weight scaling",
 )
 def test_fused_indexer_weight_scale(native_weight_scale):
     bench = IndexerWeightScaleBenchmark(
