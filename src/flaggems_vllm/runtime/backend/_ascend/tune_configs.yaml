@@ -247,6 +247,15 @@ moe_sum_general:
     num_warps: 8
     num_stages: 2
 
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 16
@@ -258,3 +267,69 @@ compute_global_topk_indices_and_lens:
       TPP: 2
     num_warps: 1
     num_stages: 2
+
+ckfg_state_ascend:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 32
+    num_warps: 1
+    num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+    warps:
+      - 4
+      - 8
+    stages:
+      - 1
+  - META:
+      BH: 8
+    num_warps: 4
+    num_stages: 1
+
+hc_combine:
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1

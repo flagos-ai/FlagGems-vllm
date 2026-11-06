@@ -6,12 +6,20 @@ from flaggems_vllm.ops.FLA.bwd_preprocess import parallel_attn_bwd_preprocess
 from flaggems_vllm.ops.FLA.chunk import chunk_gated_delta_rule_fwd
 from flaggems_vllm.ops.FLA.chunk_gdn2 import chunk_gdn2
 from flaggems_vllm.ops.FLA.chunk_kda import chunk_kda
+from flaggems_vllm.ops.FLA.chunk_kda_intra_token_parallel import (
+    chunk_kda_fwd_intra_token_parallel,
+)
+from flaggems_vllm.ops.FLA.chunk_kda_scaled_dot_kkt_fwd import (
+    chunk_kda_scaled_dot_kkt_fwd,
+)
+from flaggems_vllm.ops.FLA.chunk_kda_with_fused_gate import chunk_kda_with_fused_gate
 from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
     fused_recurrent_gated_delta_rule_fwd,
 )
 from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule_packed_decode import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.ops.FLA.fused_recurrent_kda import fused_recurrent_kda
 from flaggems_vllm.ops.FLA.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -27,8 +35,12 @@ __all__ = [
     "exp",
     "chunk_gdn2",
     "chunk_kda",
+    "chunk_kda_scaled_dot_kkt_fwd",
+    "chunk_kda_fwd_intra_token_parallel",
+    "chunk_kda_with_fused_gate",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "fused_recurrent_kda",
     "log",
     "parallel_attn_bwd_preprocess",
     "parallel_nsa",
@@ -44,6 +56,17 @@ from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "ascend":
     from flaggems_vllm.runtime.backend._ascend.FLA import (  # noqa: F811
+        chunk_kda_with_fused_gate,
         fused_recurrent_gated_delta_rule_fwd,
         fused_recurrent_gated_delta_rule_packed_decode,
+        fused_recurrent_kda,
+    )
+elif _runtime.device.vendor_name == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.FLA import (  # noqa: F811
+        fused_recurrent_kda,
+    )
+
+elif _runtime.device.vendor_name == "metax":
+    from flaggems_vllm.runtime.backend._metax.FLA import (  # noqa: F811
+        chunk_kda_with_fused_gate,
     )

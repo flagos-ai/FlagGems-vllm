@@ -138,14 +138,14 @@ grouped_topk:
 
 ## SpeedUp Calculation
 
-Benchmarks compute speedup relative to a torch baseline:
+Benchmarks compute speedup relative to the vLLM baseline implementation:
 
 ```
-SpeedUp = latency_torch_baseline / latency_flaggems_vllm
+SpeedUp = latency_vllm_baseline / latency_flaggems_vllm
 ```
 
 - **SpeedUp > 1.0**: FlagGems-vllm is faster
-- **SpeedUp < 1.0**: Torch baseline is faster
+- **SpeedUp < 1.0**: vLLM baseline is faster
 - **Target**: SpeedUp ≥ 0.9 for core shapes
 
 ## Result Format

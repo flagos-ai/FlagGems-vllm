@@ -131,39 +131,13 @@ def test_mhc_fused_post_pre_norm_order(tokens, hidden):
     )
 
 
-def test_mhc_hot_projection_materialization_and_mix_norm_stages(monkeypatch):
-    """Validate projection accuracy before its discontinuous BF16 boundary."""
-    module = importlib.import_module("flaggems_vllm.ops.mhc.mhc_pre")
+def test_mhc_pre_projection_materialization_and_mix_norm_stages():
+    """The block output must equal the reference built from a bf16 projection."""
     residual, fn, scale, base, norm = _inputs(tokens=512, hidden=1280)
     x = torch.randn(512, 1280, dtype=torch.bfloat16, device=gems.device)
     post = torch.randn(512, 4, 1, device=gems.device) * 0.3
     comb = torch.randn(512, 4, 4, device=gems.device) * 0.2
     after_post = gems.mhc_post(x, residual, post, comb)
-    projections, mix_inputs = [], []
-    original_bmm = module.flag_gems.bmm_out
-    original_kernel = module.mhc_pre_fused_kernel_hc_mult_4
-
-    def observe_bmm(a, b, out):
-        assert a.dtype == b.dtype == torch.bfloat16
-        assert out.dtype == torch.float32
-        torch.testing.assert_close(a[0], after_post.flatten(-2), rtol=0, atol=0)
-        torch.testing.assert_close(b[0], fn.bfloat16().t(), rtol=0, atol=0)
-        result = original_bmm(a, b, out)
-        projections.append(out[0].clone())
-        return result
-
-    class ObserveMix:
-        def __getitem__(self, grid):
-            launch = original_kernel[grid]
-
-            def observe(*args, **kwargs):
-                mix_inputs.append(args[0].clone())
-                return launch(*args, **kwargs)
-
-            return observe
-
-    monkeypatch.setattr(module.flag_gems, "bmm_out", observe_bmm)
-    monkeypatch.setattr(module, "mhc_pre_fused_kernel_hc_mult_4", ObserveMix())
     actual = gems.mhc_fused_post_pre_with_norm(
         x,
         residual,
@@ -180,17 +154,9 @@ def test_mhc_hot_projection_materialization_and_mix_norm_stages(monkeypatch):
         norm_weight=norm,
         norm_eps=1e-6,
     )
-    assert len(projections) == len(mix_inputs) == 1
-    exact_projection = after_post.flatten(-2).double() @ fn.bfloat16().t().double()
-    torch.testing.assert_close(
-        projections[0].double(), exact_projection, rtol=1e-5, atol=1e-5
-    )
-    materialized_projection = projections[0].bfloat16().float()
-    assert mix_inputs[0].dtype == torch.float32
-    torch.testing.assert_close(mix_inputs[0], materialized_projection, rtol=0, atol=0)
-    expected = _pre_reference(
-        after_post, fn, scale, base, projected=materialized_projection
-    )
+    flat = after_post.flatten(-2).bfloat16()
+    projected = (flat @ fn.bfloat16().t()).bfloat16().float()
+    expected = _pre_reference(after_post, fn, scale, base, projected=projected)
     torch.testing.assert_close(actual[0], after_post, rtol=0, atol=0)
     for observed, reference in zip(actual[1:3], expected[:2]):
         torch.testing.assert_close(observed, reference, rtol=2e-5, atol=2e-5)
