@@ -502,6 +502,24 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: dsv41_o_proj
+    description: |
+      DeepSeek-V4.1 attention output projection (wo_a stage): inverse GPT-J
+      RoPE + per-128 FP8 quant + grouped block-scaled FP8 GEMM. Hopper recipe
+      (1, 128, 128); wo_b is an optional caller-supplied callback. Small batches
+      run in one kernel launch. A BF16 wo_a takes vLLM's non-quantizing path
+      (BF16 inverse RoPE + grouped BF16 GEMM, one Triton kernel).
+    for:
+      - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: fp8_einsum
     description: |
       Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
