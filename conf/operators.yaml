@@ -552,6 +552,22 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: fused_indexer_k_norm
+    description: |
+      GLM5Next indexer FP32 LayerNorm with FP32 weight and bias, followed by
+      a cast to the input dtype. Supports two-dimensional FP16/BF16/FP32
+      inputs with nonnegative strides and widths from 1 through 4096.
+      Forward inference only; returns a fresh contiguous tensor.
+    for:
+      - vllm.models.glm5next.common.attention._fused_indexer_k_norm
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_indexer_q_rope_quant
     description: |
       Applies RoPE to sparse indexer Q, quantizes it to FP8 or MXFP4, and folds
