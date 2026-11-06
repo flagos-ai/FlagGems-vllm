@@ -121,7 +121,7 @@ def expand_pools_and_append_tail(
     and all generated token indices must fit int32. Negative pool IDs denote
     missing pools. Values outside this domain are not checked on the host.
     """
-    logger.debug("GEMS EXPAND POOLS AND APPEND TAIL")
+    logger.debug("GEMS EXPAND_POOLS_AND_APPEND_TAIL")
     if not isinstance(pool_size, int) or isinstance(pool_size, bool) or pool_size < 1:
         raise ValueError("pool_size must be a positive integer")
     if pool_size > _INT32_MAX:
