@@ -25,8 +25,8 @@ from .conftest import QUICK_MODE
 pytestmark = [
     pytest.mark.w8a8_block_int8_matmul,
     pytest.mark.skipif(
-        flaggems_vllm.vendor_name != "thead",
-        reason="T-Head PPU W8A8 Block INT8 backend",
+        flaggems_vllm.vendor_name not in ("metax", "hygon", "thead"),
+        reason="W8A8 Block INT8 vendor backends",
     ),
 ]
 
@@ -64,6 +64,7 @@ def _reference(a, b, a_scale, b_scale, block_n, block_k):
     return result
 
 
+@pytest.mark.w8a8_block_int8_matmul
 @pytest.mark.parametrize("M,N,K", INT8_MNK_SHAPES)
 @pytest.mark.parametrize("output_dtype", OUTPUT_DTYPES)
 def test_w8a8_block_int8_matmul(M, N, K, output_dtype):
@@ -108,6 +109,9 @@ def test_w8a8_block_int8_empty_shapes():
         assert out.shape == (m, n)
 
 
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "hygon", reason="Hygon currently requires block_k=128"
+)
 def test_w8a8_block_int8_block_k256_scales():
     m, n, k = 7, 129, 512
     block_n, block_k = 128, 256
@@ -138,7 +142,7 @@ def test_w8a8_block_int8_rejects_invalid_inputs():
         )
     with pytest.raises(NotImplementedError, match="contiguous"):
         flaggems_vllm.w8a8_block_int8_matmul(
-            a[:, ::2], b[:, ::2], a_scale, b_scale, [128, 64], torch.float32
+            a[:, ::2], b[:, ::2], a_scale, b_scale, [128, 128], torch.float32
         )
 
 
