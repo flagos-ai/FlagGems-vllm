@@ -6,6 +6,8 @@ This path retains FP32 state and residuals; it writes an independent output
 buffer so stage tuning never consumes an overwritten value input.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -29,6 +31,8 @@ from flaggems_vllm.ops.FLA.chunk_kda_with_fused_gate import (
     _validate,
 )
 from flaggems_vllm.utils import libentry, libtuner
+
+logger = logging.getLogger(__name__)
 
 
 @libentry()
@@ -134,6 +138,7 @@ def chunk_kda_with_fused_gate(
     Beta is already activated. Packed cu_seqlens must be monotone, start at 0
     and end at T. Like vLLM 0.24.0, extra kwargs do not select a safe gate.
     """
+    logger.debug("GEMS_METAX CHUNK_KDA_WITH_FUSED_GATE")
     n = _validate(q, k, v, raw_g, beta, A_log, g_bias, initial_state, cu_seqlens, scale)
     b, t, h, dk = q.shape
     dv = v.shape[-1]
