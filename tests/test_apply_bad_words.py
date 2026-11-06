@@ -15,149 +15,95 @@
 import pytest
 import torch
 
-try:
-    from vllm.platforms import current_platform
-except (ImportError, OSError):
-    pytest.skip(
-        "vLLM is required for the bad-words reference state", allow_module_level=True
-    )
+import flaggems_vllm
 
-if not torch.cuda.is_available() or not current_platform.is_cuda():
-    pytest.skip("bad-words tests require CUDA", allow_module_level=True)
-
-from vllm.sampling_params import SamplingParams
-from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
-from vllm.v1.worker.gpu.states import RequestState
-
-from flaggems_vllm.ops.bad_words import apply_bad_words
-
-try:
-    from vllm.v1.worker.gpu.sample.logits_processor import LogitsProcRequestState
-except ModuleNotFoundError:
-    LogitsProcRequestState = None
-
-DEVICE = torch.device("cuda")
+device = torch.device(flaggems_vllm.device)
 VOCAB_SIZE = 128
-
-# Committed tokens: prompt [5], output [10, 11]. Draft tokens: [12, 13].
-# Local position 0 holds the last committed token; drafts start at position 1.
 PROMPT_LEN = 1
-COMMITTED = [5, 10, 11]
+
+# The committed history is [prompt=5, output=10]. input_ids contains the
+# current input token followed by speculative tokens: [11, 12, 13].
+# A logit at local position p sees input_ids[0:p] as prior tokens.
+ALL_TOKEN_IDS = [5, 10]
 INPUT_IDS = [11, 12, 13]
 LOCAL_POS = [0, 1, 2]
 
 
-def _make_state(bad_words_token_ids: list[list[int]]) -> tuple[BadWordsState, int]:
-    req_states = RequestState(
-        max_num_reqs=4,
-        max_model_len=64,
-        max_num_batched_tokens=16,
-        num_speculative_steps=4,
-        vocab_size=VOCAB_SIZE,
-        device=DEVICE,
-    )
-    req_states.add_request(
-        req_id="req",
-        prompt_len=PROMPT_LEN,
-        all_token_ids=COMMITTED,
-        num_computed_tokens=len(COMMITTED),
-        max_tokens=32,
-    )
-    req_states.apply_staged_writes()
+def _apply(bad_words: list[list[int]]) -> torch.Tensor:
+    """Call the public operator using low-level tensors, without vLLM state."""
+    num_bad_words = len(bad_words)
+    packed_tokens: list[int] = []
+    offsets = [0]
+    for word in bad_words:
+        packed_tokens.extend(word)
+        offsets.append(len(packed_tokens))
 
-    req_idx = req_states.req_id_to_index["req"]
-    if LogitsProcRequestState is None:
-        state = BadWordsState(req_states)
-    else:
-        state = BadWordsState(
-            None,
-            LogitsProcRequestState.from_request_state(req_states),
-        )
-    state.add_request(
-        req_idx,
-        SamplingParams(_bad_words_token_ids=bad_words_token_ids),
-    )
-    state.apply_staged_writes()
-    return state, req_idx
+    # Keep storage non-empty for zero-word cases; max_num_bad_words=0 makes
+    # the operator return without launching a kernel.
+    token_storage = packed_tokens or [0]
+    offset_storage = offsets if num_bad_words else [0]
 
-
-def _apply_state(
-    state: BadWordsState,
-    req_idx: int,
-    max_num_bad_words: int,
-) -> torch.Tensor:
-    num_logits = len(INPUT_IDS)
-    logits = torch.zeros((num_logits, VOCAB_SIZE), device=DEVICE)
-    expanded_idx_mapping = torch.tensor(
-        [req_idx] * num_logits,
-        dtype=torch.int32,
-        device=DEVICE,
-    )
-    input_ids = torch.tensor(INPUT_IDS, dtype=torch.int32, device=DEVICE)
-    expanded_local_pos = torch.tensor(
-        LOCAL_POS,
-        dtype=torch.int32,
-        device=DEVICE,
-    )
-
-    apply_bad_words(
+    logits = torch.zeros((len(INPUT_IDS), VOCAB_SIZE), device=device)
+    flaggems_vllm.apply_bad_words(
         logits,
-        expanded_idx_mapping,
-        state.bad_word_token_ids.gpu,
-        state.bad_word_offsets.gpu,
-        state.num_bad_words.gpu,
-        state.req_states.all_token_ids.gpu,
-        state.req_states.prompt_len.gpu,
-        state.req_states.total_len.gpu,
-        input_ids,
-        expanded_local_pos,
-        max_num_bad_words,
+        torch.zeros(len(INPUT_IDS), dtype=torch.int32, device=device),
+        torch.tensor([token_storage], dtype=torch.int32, device=device),
+        torch.tensor([offset_storage], dtype=torch.int32, device=device),
+        torch.tensor([num_bad_words], dtype=torch.int32, device=device),
+        torch.tensor([ALL_TOKEN_IDS], dtype=torch.int32, device=device),
+        torch.tensor([PROMPT_LEN], dtype=torch.int32, device=device),
+        torch.tensor([len(ALL_TOKEN_IDS)], dtype=torch.int32, device=device),
+        torch.tensor(INPUT_IDS, dtype=torch.int32, device=device),
+        torch.tensor(LOCAL_POS, dtype=torch.int32, device=device),
+        num_bad_words,
     )
     return logits.cpu()
 
 
-def _apply(bad_words_token_ids: list[list[int]]) -> torch.Tensor:
-    state, req_idx = _make_state(bad_words_token_ids)
-    return _apply_state(state, req_idx, len(bad_words_token_ids))
-
-
 @pytest.mark.apply_bad_words
-def test_apply_bad_words_slot_reuse_clears_state():
-    state, req_idx = _make_state([[10, 11, 60]])
-    state.add_request(req_idx, SamplingParams())
-    state.apply_staged_writes()
-
-    assert int(state.num_bad_words.np[req_idx]) == 0
-    out = _apply_state(state, req_idx, max_num_bad_words=0)
+def test_apply_bad_words_empty_list_is_noop():
+    out = _apply([])
     assert not torch.isinf(out).any()
 
 
 @pytest.mark.apply_bad_words
-def test_apply_bad_words_prefix_inside_draft_tokens():
-    out = _apply([[12, 13, 40]])
+def test_apply_bad_words_prefix_inside_speculative_history():
+    # At local position 2, the prior input tokens are [11, 12].
+    out = _apply([[11, 12, 40]])
     expected = torch.zeros_like(out)
     expected[2, 40] = -float("inf")
     torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.apply_bad_words
-def test_apply_bad_words_prefix_spanning_committed_and_draft_tokens():
-    out = _apply([[11, 12, 30]])
+def test_apply_bad_words_prefix_spanning_committed_and_speculative_history():
+    # At local position 2, the visible history ends in [10, 11, 12].
+    out = _apply([[10, 11, 12, 30]])
     expected = torch.zeros_like(out)
-    expected[1, 30] = -float("inf")
+    expected[2, 30] = -float("inf")
     torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.apply_bad_words
-def test_apply_bad_words_no_spurious_match_from_last_committed_token():
+def test_apply_bad_words_does_not_duplicate_last_committed_token():
+    # The history at local position 2 ends in [11, 12], not [11, 11].
     out = _apply([[11, 11, 50]])
     expected = torch.zeros_like(out)
     torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.apply_bad_words
-def test_apply_bad_words_committed_prefix():
+def test_apply_bad_words_committed_prefix_before_current_input():
+    # At local position 1, the visible history is [10, 11].
     out = _apply([[10, 11, 60]])
     expected = torch.zeros_like(out)
-    expected[0, 60] = -float("inf")
+    expected[1, 60] = -float("inf")
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.apply_bad_words
+def test_apply_bad_words_single_token_word_masks_every_position():
+    out = _apply([[70]])
+    expected = torch.zeros_like(out)
+    expected[:, 70] = -float("inf")
     torch.testing.assert_close(out, expected)

@@ -18,12 +18,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from flaggems_vllm.ops.bad_words import apply_bad_words as apply_bad_words_impl
-
-try:
-    from flashinfer.testing import bench_gpu_time_with_cupti
-except (ImportError, OSError):
-    bench_gpu_time_with_cupti = None
+import flaggems_vllm
+from .base import backend_do_bench
 
 try:
     from vllm.v1.worker.gpu.sample.bad_words import (
@@ -32,10 +28,7 @@ try:
 except (ImportError, OSError):
     apply_bad_words_reference = None
 
-if not torch.cuda.is_available():
-    pytest.skip("TLE bad-words benchmarks require CUDA", allow_module_level=True)
-
-DEVICE = torch.device("cuda")
+DEVICE = torch.device(flaggems_vllm.device)
 DTYPE = torch.float32
 VOCAB_SIZE = 128_000
 PROMPT_LEN = 128
@@ -43,17 +36,11 @@ DEFAULT_OUTPUT_LEN = 32
 MAX_BAD_WORDS = 128
 MAX_BAD_WORD_TOKENS = 1024
 MATCH_PATTERNS = ("miss", "hit", "mixed")
-BENCH_DRY_RUN = 50
-BENCH_ITERS = 300
-BENCH_REPEAT = 5
-BENCH_GRAPH = True
-BENCH_COLD_L2 = True
+BENCH_WARMUP_MS = 25
+BENCH_REP_MS = 100
+BENCH_REPEAT = 3
 PERF_RESULTS = []
-TIMING_BACKEND = (
-    "FlashInfer helper"
-    if bench_gpu_time_with_cupti is not None
-    else "CUDA Events fallback"
-)
+TIMING_BACKEND = "backend-aware Triton do_bench"
 
 
 @dataclass(frozen=True)
@@ -258,33 +245,18 @@ def _run_triton(*args) -> None:
     apply_bad_words_reference(*args)
 
 
-def _run_tle(*args) -> None:
-    apply_bad_words_impl(*args)
+def _run_flaggems(*args) -> None:
+    flaggems_vllm.apply_bad_words(*args)
 
 
 def _time_us(fn, input_args: tuple) -> float:
-    if bench_gpu_time_with_cupti is not None:
-        samples_ms = bench_gpu_time_with_cupti(
-            fn,
-            dry_run_iters=BENCH_DRY_RUN,
-            repeat_iters=BENCH_ITERS,
-            use_cuda_graph=BENCH_GRAPH,
-            input_args=input_args,
-            cold_l2_cache=BENCH_COLD_L2,
-        )
-        return statistics.median(samples_ms) * 1000
-
-    for _ in range(BENCH_DRY_RUN):
-        fn(*input_args)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(BENCH_ITERS):
-        fn(*input_args)
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) * 1000 / BENCH_ITERS
+    latency_ms = backend_do_bench(
+        lambda: fn(*input_args),
+        warmup=BENCH_WARMUP_MS,
+        rep=BENCH_REP_MS,
+        return_mode="median",
+    )
+    return latency_ms * 1000
 
 
 def _measure(calls: dict[str, tuple]) -> dict[str, tuple[float, float, float]]:
@@ -313,9 +285,9 @@ def _print_performance_table() -> None:
         "Draft",
         "Max Bad Words",
         "Word Len",
-        ("vLLM Triton (us)" if apply_bad_words_reference is not None else "TLE (us)"),
-        ("TLE (us)" if apply_bad_words_reference is not None else "Mode"),
-        ("Triton/TLE" if apply_bad_words_reference is not None else "Reference"),
+        ("vLLM reference (us)" if apply_bad_words_reference is not None else "vLLM (us)"),
+        ("FlagGems (us)" if apply_bad_words_reference is not None else "Mode"),
+        ("vLLM/FlagGems" if apply_bad_words_reference is not None else "Reference"),
     )
     rows = [headers]
     for result in PERF_RESULTS:
@@ -330,9 +302,9 @@ def _print_performance_table() -> None:
             (
                 f'{result["triton_us"]:.3f}'
                 if result["triton_us"] is not None
-                else f'{result["tle_us"]:.3f}'
+                else f'{result["flaggems_us"]:.3f}'
             ),
-            (f'{result["tle_us"]:.3f}' if result["triton_us"] is not None else "-"),
+            (f'{result["flaggems_us"]:.3f}' if result["triton_us"] is not None else "-"),
             (
                 f'{result["speedup"]:.3f}x'
                 if result["speedup"] is not None
@@ -351,10 +323,11 @@ def _print_performance_table() -> None:
             + " |"
         )
 
-    print(f"\n\nvLLM Bad Words performance summary ({TIMING_BACKEND}, median)")
+    print(f"\n\nBad Words performance summary ({TIMING_BACKEND}, median)")
+    print(f"Active FlagGems backend: {flaggems_vllm.vendor_name} ({flaggems_vllm.device})")
     print(
-        f"Warmup replays: {BENCH_DRY_RUN}; "
-        f"Timed samples: {BENCH_ITERS}; Repeats: {BENCH_REPEAT}"
+        f"Warmup: {BENCH_WARMUP_MS} ms; Repetition: {BENCH_REP_MS} ms; "
+        f"Outer repeats: {BENCH_REPEAT}"
     )
     print(separator)
     print(format_row(rows[0]))
@@ -363,10 +336,10 @@ def _print_performance_table() -> None:
         print(format_row(row))
     print(separator)
     if apply_bad_words_reference is None:
-        print("vLLM reference unavailable: reporting TLE latency only.")
+        print("vLLM reference unavailable: reporting FlagGems latency only.")
     else:
         print(
-            "Triton/TLE > 1: TLE is faster; " "Triton/TLE < 1: vLLM Triton is faster."
+            "vLLM/FlagGems > 1: FlagGems is faster; " "vLLM/FlagGems < 1: vLLM is faster."
         )
 
 
@@ -381,26 +354,26 @@ def report_performance_results():
 @pytest.mark.parametrize("workload", WORKLOADS, ids=lambda item: item.name)
 def test_apply_bad_words(workload: Workload, match_pattern: str):
     inputs = make_inputs(workload, match_pattern)
-    tle_logits = inputs.logits.clone()
-    tle_args = _kernel_args(tle_logits, inputs)
+    flaggems_logits = inputs.logits.clone()
+    flaggems_args = _kernel_args(flaggems_logits, inputs)
 
     if apply_bad_words_reference is not None:
         triton_logits = inputs.logits.clone()
         triton_args = _kernel_args(triton_logits, inputs)
         _run_triton(*triton_args)
-        _run_tle(*tle_args)
-        torch.testing.assert_close(tle_logits, triton_logits, rtol=0, atol=0)
+        _run_flaggems(*flaggems_args)
+        torch.testing.assert_close(flaggems_logits, triton_logits, rtol=0, atol=0)
         calls = {
             "triton": (_run_triton, triton_args),
-            "tle": (_run_tle, tle_args),
+            "flaggems": (_run_flaggems, flaggems_args),
         }
     else:
-        calls = {"tle": (_run_tle, tle_args)}
+        calls = {"flaggems": (_run_flaggems, flaggems_args)}
 
     timing = _measure(calls)
     triton_us = timing["triton"][0] if "triton" in timing else None
-    tle_us = timing["tle"][0]
-    speedup = triton_us / tle_us if triton_us is not None else None
+    flaggems_us = timing["flaggems"][0]
+    speedup = triton_us / flaggems_us if triton_us is not None else None
 
     PERF_RESULTS.append(
         {
@@ -412,7 +385,7 @@ def test_apply_bad_words(workload: Workload, match_pattern: str):
             "max_num_bad_words": inputs.max_num_bad_words,
             "bad_word_len": workload.bad_word_len,
             "triton_us": triton_us,
-            "tle_us": tle_us,
+            "flaggems_us": flaggems_us,
             "speedup": speedup,
         }
     )

@@ -67,7 +67,11 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
 
+from flaggems_vllm.runtime.backend._hygon.ops.bad_words import apply_bad_words
+
+
 __all__ = [
+    "apply_bad_words",
     "chunk_gated_delta_rule_w8a16",
     "chunk_gated_delta_rule_w8a16_int8",
     "fused_add_rms_norm",
