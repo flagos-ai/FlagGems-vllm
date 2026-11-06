@@ -27,10 +27,14 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 from tests.test_flash_mla_with_kvcache_w8a8 import (
-    ADAPTER,
+    IS_METAX,
     SUPPORTED,
     assert_dense_fp8_close,
+    metax_benchmark_reference,
+    prepare_metax_benchmark,
     quantize_dense,
+    run_metax_baseline,
+    run_metax_prepared,
 )
 
 from . import base
@@ -67,22 +71,20 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
     """Measure steady-state decode after both implementations are prepared."""
 
     def __init__(self):
-        if ADAPTER is None and not HAS_CUDA_FP8_FLASHMLA:
+        if not IS_METAX and not HAS_CUDA_FP8_FLASHMLA:
             raise RuntimeError("The native CUDA flash_mla_fp8 baseline is required")
-        baseline = ADAPTER.run_baseline if ADAPTER is not None else cuda_flash_mla
+        baseline = run_metax_baseline if IS_METAX else cuda_flash_mla
         super().__init__("flash_mla_with_kvcache_w8a8", baseline, [torch.bfloat16])
-        self.set_gems(ADAPTER.run_prepared if ADAPTER is not None else run_prepared)
+        self.set_gems(run_metax_prepared if IS_METAX else run_prepared)
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             for inputs, host_lengths in self.make_input(TestParam(*shape), dtype):
                 args, kwargs = self.unpack_to_args_kwargs(inputs)
                 self.input_shapes = super().record_shapes(*args, **kwargs)
-                if ADAPTER is not None:
-                    cuda_input, self.gems_input = ADAPTER.prepare_benchmark(
-                        args, kwargs
-                    )
-                    self.reference = ADAPTER.benchmark_reference(cuda_input)
+                if IS_METAX:
+                    cuda_input, self.gems_input = prepare_metax_benchmark(args, kwargs)
+                    self.reference = metax_benchmark_reference(cuda_input)
                     self.gems_op(*self.gems_input)
                     assert_dense_fp8_close(
                         (self.gems_input[0].output, self.gems_input[0].lse),
@@ -109,7 +111,7 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
     def get_latency(self, op, *args, **kwargs):
         if op is self.gems_op:
             latency = super().get_latency(op, *self.gems_input)
-            if ADAPTER is not None:
+            if IS_METAX:
                 handle = self.gems_input[0]
                 assert_dense_fp8_close((handle.output, handle.lse), self.reference)
             return latency

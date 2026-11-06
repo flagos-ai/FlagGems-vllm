@@ -25,8 +25,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
 from triton.language.core import extern
 from triton.runtime.cache import get_cache_manager
 
@@ -460,82 +458,38 @@ def dense_int8_probability_merge(
 
 
 @libentry()
-@gluon.jit
+@triton.jit
 def dense_int8_value_merge(
     Partial,
-    PartialD,
-    Metadata,
     Scale,
     Output,
-    LSE,
     SplitFlag,
-    B: gl.constexpr,
-    H: gl.constexpr,
-    SQ: gl.constexpr,
-    SPLITS: gl.constexpr,
-    QUANTIZED_CACHE: gl.constexpr = False,
-    MERGE_HEADS: gl.constexpr = 4,
-    UNIFORM_SPLITS: gl.constexpr = 1,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    SPLITS: tl.constexpr,
+    UNIFORM_SPLITS: tl.constexpr,
 ):
-    if UNIFORM_SPLITS > 1 or gl.load(SplitFlag) != 0:
-        parent: gl.constexpr = gl.BlockedLayout(
-            [1, 1, 4], [1, 1, 64], [1, 2, 2], [2, 1, 0]
-        )
-        meta: gl.constexpr = gl.SliceLayout(2, parent)
-        outlayout: gl.constexpr = gl.SliceLayout(0, parent)
-        batch = gl.program_id(0)
-        hs = gl.program_id(1) * MERGE_HEADS
-        splits = gl.arange(0, SPLITS, layout=gl.SliceLayout(1, meta))
-        heads = hs + gl.arange(0, MERGE_HEADS, layout=gl.SliceLayout(0, meta))
-        oh = hs + gl.arange(0, MERGE_HEADS, layout=gl.SliceLayout(1, outlayout))
-        dims = gl.arange(0, 512, layout=gl.SliceLayout(0, outlayout))
-        s2 = gl.expand_dims(splits, 1)
-        h2 = gl.expand_dims(heads, 0)
-        s3 = gl.expand_dims(s2, 2)
-        h3 = gl.expand_dims(h2, 2)
-        d3 = gl.expand_dims(gl.expand_dims(dims, 0), 0)
-        # Native PV writes only active partitions.
-        split_count = SPLITS
-        if UNIFORM_SPLITS > 1 and UNIFORM_SPLITS < SPLITS:
-            split_count = gl.where(gl.load(SplitFlag) != 0, SPLITS, UNIFORM_SPLITS)
-        values = gl.load(
-            Partial + ((s3.to(gl.int64) * B + batch) * H * SQ + h3) * 512 + d3,
-            (h3 < H * SQ) & (s3 < split_count),
-            0.0,
-        )
-        scale = gl.load(Scale + batch * H * SQ + oh, oh < H * SQ, 0.0)
-        if QUANTIZED_CACHE:
-            output = gl.sum(values, 0) * gl.expand_dims(scale, 1)
-        else:
-            denominator = gl.sum(
-                gl.load(
-                    PartialD + (s2 * B + batch) * H * SQ + h2,
-                    (h2 < H * SQ) & (s2 < split_count),
-                    0.0,
-                ),
-                0,
+    is_variable = tl.load(SplitFlag) != 0
+    if UNIFORM_SPLITS > 1 or is_variable:
+        batch = tl.program_id(0)
+        heads = tl.program_id(1) * 4 + tl.arange(0, 4)
+        dims = tl.arange(0, 512)
+        offsets = (batch.to(tl.int64) * H * SQ + heads[:, None]) * 512 + dims[None, :]
+        split_count = tl.where(is_variable, SPLITS, UNIFORM_SPLITS)
+        accumulator = tl.zeros((4, 512), tl.float32)
+        # Native PV leaves inactive partition buffers unwritten.
+        for split in tl.static_range(SPLITS):
+            values = tl.load(
+                Partial + split * B * H * SQ * 512 + offsets,
+                (heads[:, None] < H * SQ) & (split < split_count),
+                0.0,
             )
-            denom = gl.convert_layout(
-                gl.where(denominator > 0, denominator, 1.0),
-                gl.SliceLayout(1, outlayout),
-            )
-            output = gl.sum(values, 0) * gl.expand_dims(scale / denom, 1)
-        gl.store(
-            Output
-            + (batch.to(gl.int64) * H * SQ + gl.expand_dims(oh, 1)) * 512
-            + gl.expand_dims(dims, 0),
-            output,
-            gl.expand_dims(oh < H * SQ, 1),
+            accumulator += values
+        scale = tl.load(Scale + batch * H * SQ + heads, heads < H * SQ, 0.0)
+        tl.store(
+            Output + offsets, accumulator * scale[:, None], heads[:, None] < H * SQ
         )
-        if not QUANTIZED_CACHE:
-            maximum = gl.load(Metadata + (batch * H * SQ + oh) * 2, oh < H * SQ, 0.0)
-            denominator = gl.convert_layout(denominator, gl.SliceLayout(1, outlayout))
-            logsum = gl.where(
-                denominator > 0,
-                maximum * 0.6931471805599453 + gl.log(denominator),
-                float("inf"),
-            )
-            gl.store(LSE + (batch * H + oh % H) * SQ + oh // H, logsum, oh < H * SQ)
 
 
 @libentry()
@@ -945,7 +899,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             and (self.capacity == 8192 or 16384 <= self.capacity <= 32768)
             else 1
         )
-        self.value_merge_heads = 4 if self.adaptive else 0
         self.score_splits = score_splits
         if 1 < self.batch <= 256:
             self.batch_order = torch.empty(
@@ -1071,17 +1024,13 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             if self.adaptive:
                 dense_int8_value_merge[(self.batch, triton.cdiv(merged, 4))](
                     self.partial,
-                    self.partial_denominator,
-                    self.probability_metadata,
                     self.probability_scale,
                     self.output,
-                    self.lse,
                     self.split_flag,
                     self.batch,
                     self.heads,
                     self.queries,
                     self.value_splits,
-                    QUANTIZED_CACHE=True,
                     UNIFORM_SPLITS=self.uniform_value_splits,
                     num_warps=4,
                     num_stages=1,

@@ -36,17 +36,19 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 OUTPUT_ATOL = 2e-3
-IMPLEMENTATION = dict(flaggems_vllm.runtime.backend.get_customized_ops()).get(
-    "flash_mla_with_kvcache_w8a8"
-)
-if IMPLEMENTATION is not None:
-    ADAPTER = import_module(
-        IMPLEMENTATION.__module__.rsplit(".ops.", 1)[0]
-        + ".testing.flash_mla_with_kvcache_w8a8"
+IS_METAX = flaggems_vllm.vendor_name == "metax"
+if IS_METAX:
+    from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+        FlashMLAInt8PreparedHandle,
+        prepare_flash_mla_with_kvcache_fwd_w8a8_int8,
     )
-    SUPPORTED = ADAPTER.supported()
+
+    SUPPORTED = (
+        "flash_mla_with_kvcache_w8a8"
+        in dict(flaggems_vllm.runtime.backend.get_customized_ops())
+        and flaggems_vllm.runtime.torch_device_fn.is_available()
+    )
 else:
-    ADAPTER = None
     SUPPORTED = (
         flaggems_vllm.vendor_name == "nvidia"
         and HAS_TLE
@@ -116,13 +118,96 @@ def assert_dense_fp8_close(actual, reference):
         actual = tuple(tensor.cpu() for tensor in actual)
     else:
         pass
-    gems_assert_close(actual[0], reference[0], torch.bfloat16, atol=OUTPUT_ATOL)
+    gems_assert_close(actual[0], reference[0], actual[0].dtype, atol=OUTPUT_ATOL)
     gems_assert_close(actual[1], reference[1], torch.float32, atol=2e-4)
 
 
-if ADAPTER is not None:
-    quantize_dense = ADAPTER.quantize
-    REFERENCES = (torch_reference, ADAPTER.native_reference)
+def quantize_metax(x: torch.Tensor, *, dequantize: bool = True):
+    scale = x[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127.0
+    scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    nope = (x[..., :512].float() / scale).round().to(torch.int8)
+    rope = (x[..., 512:].float() / scale).to(x.dtype)
+    if dequantize:
+        native = (torch.cat((nope.float(), rope.float()), -1) * scale).to(x.dtype)
+    else:
+        native = None
+    return nope, rope, scale, native
+
+
+def metax_native_reference(
+    q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs
+):
+    native = import_module("flash_mla")
+    metadata, splits = native.get_mla_metadata(
+        cache_seqlens, q.shape[1] * q.shape[2], 1
+    )
+    return native.flash_mla_with_kvcache(
+        q, k_cache, block_table, cache_seqlens, head_dim_v, metadata, splits, **kwargs
+    )
+
+
+def run_metax_baseline(*args, **kwargs):
+    return import_module("flash_mla").flash_mla_with_kvcache(*args, **kwargs)
+
+
+def prepare_metax_benchmark(args: tuple, kwargs: dict) -> tuple[tuple, tuple]:
+    native = import_module("flash_mla")
+    q_nope, q_rope, k_nope, k_rope, q_scale, k_scale, table, lengths, value_dim = args
+    query = (torch.cat((q_nope.float(), q_rope.float()), -1) * q_scale).to(
+        torch.bfloat16
+    )
+    cache = (torch.cat((k_nope.float(), k_rope.float()), -1) * k_scale).to(
+        torch.bfloat16
+    )
+    metadata, splits = native.get_mla_metadata(
+        lengths, q_nope.shape[1] * q_nope.shape[2], 1
+    )
+    handle, _ = prepare_flash_mla_with_kvcache_fwd_w8a8_int8(*args, **kwargs)
+    baseline = query, cache, table, lengths, value_dim, metadata, splits, kwargs
+    return baseline, (handle,)
+
+
+def run_metax_prepared(
+    handle: "FlashMLAInt8PreparedHandle",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return handle()
+
+
+def metax_benchmark_reference(inputs: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+    from tests.test_flash_mla import _scaled_dot_product_attention
+
+    query, cache, table, lengths, _, _, _, _ = inputs
+    batch, queries, heads, _ = query.shape
+    output = torch.empty(
+        (batch, queries, heads, 512), dtype=query.dtype, device=query.device
+    )
+    lse = torch.empty((batch, heads, queries), dtype=torch.float32, device=query.device)
+    cache_rows = cache.view(batch, -1, 1, 576)
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for row, length in enumerate(lengths.tolist()):
+            for query_index in range(queries):
+                bound = length - queries + query_index + 1
+                keys = cache_rows[row, :bound].transpose(0, 1)
+                result, logsum = _scaled_dot_product_attention(
+                    query[row, query_index].unsqueeze(0),
+                    keys,
+                    keys[..., :512],
+                    1,
+                    1,
+                    False,
+                )
+                output[row, query_index] = result[0]
+                lse[row, :, query_index] = logsum[0]
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    return output, lse
+
+
+if IS_METAX:
+    quantize_dense = quantize_metax
+    REFERENCES = (torch_reference, metax_native_reference)
 else:
     quantize_dense = quantize_dense_fp8
     REFERENCES = (
@@ -130,11 +215,21 @@ else:
     )
 
 
+REFERENCE_CASES = [
+    pytest.param(torch.bfloat16, reference, id=reference.__name__)
+    for reference in REFERENCES
+]
+if IS_METAX:
+    REFERENCE_CASES.append(
+        pytest.param(torch.float16, torch_reference, id="fp16-torch_reference")
+    )
+
+
 @pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
     not SUPPORTED, reason="No supported quantized dense MLA implementation"
 )
-@pytest.mark.parametrize("reference", REFERENCES)
+@pytest.mark.parametrize("dtype,reference", REFERENCE_CASES)
 @pytest.mark.parametrize(
     "batch,seqlen,varlen",
     [
@@ -147,12 +242,10 @@ else:
 )
 @pytest.mark.parametrize("seq_q", (1, 2))
 @pytest.mark.parametrize("h_q", (16, 32, 64, 128))
-def test_dense_decode(reference, seq_q, h_q, batch, seqlen, varlen):
+def test_dense_decode(dtype, reference, seq_q, h_q, batch, seqlen, varlen):
     head_dim_v, page_block_size = 512, 64
     torch.manual_seed(45)
-    q = torch.randn(
-        batch, seq_q, h_q, 576, dtype=torch.bfloat16, device=flaggems_vllm.device
-    )
+    q = torch.randn(batch, seq_q, h_q, 576, dtype=dtype, device=flaggems_vllm.device)
     max_pages_per_seq = math.ceil(seqlen / page_block_size) + 4
     total_pages = batch * max_pages_per_seq
     cache = (
@@ -161,7 +254,7 @@ def test_dense_decode(reference, seq_q, h_q, batch, seqlen, varlen):
             page_block_size,
             1,
             576,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device=flaggems_vllm.device,
         )
         * 0.1
