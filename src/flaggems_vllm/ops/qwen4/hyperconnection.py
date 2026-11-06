@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.qwen4.hc_combine import _combine
+
 HAS_TRITON = True
 
 
@@ -197,9 +199,21 @@ def qwen4_grouped_gemma_rmsnorm(
         raise ValueError("Qwen4 HC RMSNorm requires a valid HC count")
     if not can_use_hc_triton(hidden_states, weight):
         raise RuntimeError("Qwen4 HC RMSNorm requires contiguous accelerator tensors")
-    output = torch.empty_like(hidden_states)
     if not hidden_states.numel():
-        return output
+        return torch.empty_like(hidden_states)
+    if hidden_states.device.type == "npu":
+        from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+
+        # Keep the legacy validation and argument order, while sharing the
+        # bounded Ascend kernel and its compiled variants with the canonical API.
+        output = grouped_gemma_rmsnorm(
+            hidden_states.view(-1, hidden_states.shape[-1]),
+            weight,
+            float(eps) if isinstance(eps, bool) else eps,
+            int(hc_count) if isinstance(hc_count, bool) else hc_count,
+        )
+        return output.view_as(hidden_states)
+    output = torch.empty_like(hidden_states)
     hidden_size = weight.numel() // hc_count
     block_h = triton.next_power_of_2(hidden_size)
     rows = hidden_states.numel() // weight.numel()
@@ -279,40 +293,7 @@ def qwen4_hc_inject_combine(
     residual: torch.Tensor,
     hc_count: int,
 ) -> torch.Tensor:
-    if injection_logits.shape != (*block_output.shape[:-1], hc_count):
-        raise ValueError("Qwen4 HC injection logits have an invalid shape")
-    if hc_count <= 0:
-        raise ValueError("Qwen4 HC injection requires a positive HC count")
-    if residual.shape != (
-        *block_output.shape[:-1],
-        hc_count * block_output.shape[-1],
-    ):
-        raise ValueError("Qwen4 HC residual and block output shapes are incompatible")
-    if not can_use_hc_inject_triton(injection_logits, block_output, residual):
-        raise RuntimeError(
-            "Qwen4 HC injection received an unsupported accelerator layout"
-        )
-    output = torch.empty_like(residual)
-    if not residual.numel():
-        return output
-    hidden_size = block_output.shape[-1]
-    rows = block_output.numel() // hidden_size
-    block_h = 256
-    _hc_inject_combine_kernel[(rows, hc_count, triton.cdiv(hidden_size, block_h))](
-        injection_logits,
-        block_output,
-        residual,
-        output,
-        injection_logits.stride(-2),
-        block_output.stride(-2),
-        residual.stride(-2),
-        output.stride(-2),
-        hidden_size=hidden_size,
-        hc_count=hc_count,
-        block_h=block_h,
-        num_warps=4,
-    )
-    return output
+    return _combine(residual, block_output, injection_logits, hc_count, legacy=True)
 
 
 def qwen4_hc_inject_combine_fake(

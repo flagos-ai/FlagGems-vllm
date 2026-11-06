@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -45,8 +47,13 @@ SHAPES = (
 
 @pytest.fixture(scope="module")
 def native_weight_scale():
-    # Match the native Ascend simple_compile_backend policy outside timing.
-    with torch.compiler.set_stance("force_eager"):
+    # Match each backend's native compile policy outside timing.
+    native_context = (
+        torch.compiler.set_stance("force_eager")
+        if flaggems_vllm.vendor_name == "ascend"
+        else nullcontext()
+    )
+    with native_context:
         try:
             from vllm.models.glm5next.common.attention import (
                 _fused_indexer_weight_scale,
