@@ -14,9 +14,18 @@
 
 import triton
 
+from flaggems_vllm.utils import triton_version_utils as _triton_version_utils
+
 if triton.__version__ >= "3.4":
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.w8a8_block_fp8_matmul import (  # noqa: F401
         w8a8_block_fp8_matmul,
     )
 
 __all__ = ["w8a8_block_fp8_matmul"]
+
+if _triton_version_utils.has_triton_tle(3, 6, 0):
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megamoe import (  # noqa: F401
+        megamoe_fp8,
+    )
+
+    __all__.append("megamoe_fp8")

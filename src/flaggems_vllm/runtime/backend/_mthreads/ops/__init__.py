@@ -27,6 +27,9 @@ from flaggems_vllm.runtime.backend._mthreads.ops.flash_attn_varlen_func_w8a8_fp8
 from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_w8a8 import (
     flash_mla_with_kvcache_w8a8,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
@@ -37,6 +40,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -63,10 +67,12 @@ __all__ = [
     "flash_attn_varlen_func_w8a8_fp8",
     "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
     "grouped_topk",
+    "hc_combine",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",

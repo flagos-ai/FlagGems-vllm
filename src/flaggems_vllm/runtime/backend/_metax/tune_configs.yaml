@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 512
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 64
@@ -101,11 +114,43 @@ dequantize_and_gather_k_cache:
       num_workers: 4096
     num_warps: 2
 
+ckfg_state:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BV: 32
+    num_warps: 2
+    num_stages: 1
+
+ckfg_recurrent_metax:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BV: 32
+    num_warps: 2
+    num_stages: 1
 kda_kkt_pairs:
   - META: {PAIRS: 16}
     num_warps: 4
     num_stages: 1
 
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 4
+    num_stages: 1
 kda_kkt_inter:
   - META: {BK: 64}
     num_warps: 4
@@ -124,4 +169,24 @@ fused_recurrent_kda:
   - META:
       BV: 8
     num_warps: 1
+    num_stages: 1
+
+hc_combine:
+  - META: {BLOCK_D: 128, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 128, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: true}
+    num_warps: 4
     num_stages: 1

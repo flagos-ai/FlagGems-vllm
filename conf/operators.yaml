@@ -185,6 +185,19 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_fwd_intra_token_parallel
+    description: |
+      Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
+      Writes Aqk/Akk in place and preserves their unwritten regions.
+    for:
+      - chunk_kda_fwd_intra_token_parallel
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: chunk_kda_scaled_dot_kkt_fwd
     description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
     for:
@@ -193,6 +206,18 @@ ops:
     kind: [Attention]
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_with_fused_gate
+    description: |
+      KDA prefill with fused softplus gate and 64-token chunks; V-first final state and aliased value output.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_with_fused_gate
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - beta: '0.3'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices
@@ -359,6 +384,17 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: expand_pools_and_append_tail
+    description: Expand identity-mapped history pools and append an incomplete token tail.
+    for:
+      - vllm.models.glm5next.nvidia.ops.kpool_compress.expand_pools_and_append_tail
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Indexing
+    stages:
+      - beta: '0.3'
   - id: flash_attention_forward
     description: Forward pass of FlashAttention computing scaled dot-product attention.
     for:
@@ -567,6 +603,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_indexer_weight_scale
+    description: |
+      Scale floating-point indexer weights by FP32 query scales and a scalar.
+      Returns FP32 per-token, per-head weights on Ascend and MThreads.
+    for:
+      - fused_indexer_weight_scale
+      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: fused_inv_rope_fp8_quant
     description: |
       Apply inverse RoPE and group-wise quantization to attention output.
@@ -636,7 +686,7 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule_fwd
+  - id: fused_recurrent_gated_delta_rule
     description: |
       Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
       variable-length sequences and speculative-decoding state tables.
@@ -675,12 +725,24 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: gate_sigmoid_mul
+    description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
+    for:
+      - vllm.models.kimi_k3.nvidia.mla._gate_sigmoid_mul
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '0.3'
+
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
       FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU.
+      INT8 supports packed decode and chunked prefill on PPU and Hygon.
     for:
       - gdn_w8a16
       - gdn_w8a16_int8
@@ -752,6 +814,18 @@ ops:
       - Reduction
     stages:
       - alpha: '5.4'
+  - id: grouped_gemma_rmsnorm
+    description: Grouped Gemma RMS normalization with shared or per-group affine weights.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.hc.grouped_gemma_rmsnorm
+    labels:
+      - fused
+      - vLLM
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '0.3'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
@@ -766,6 +840,16 @@ ops:
       - MoE
     stages:
       - stable: '5.0'
+  - id: hc_combine
+    description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
+    for:
+      - hc_combine
+    labels:
+      - fused
+    kind:
+      - Pointwise
+    stages:
+      - beta: '0.3'
   - id: hc_head_fused_kernel
     description: |
       The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
