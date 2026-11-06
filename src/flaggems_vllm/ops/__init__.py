@@ -46,10 +46,12 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda,
     chunk_kda_scaled_dot_kkt_fwd,
     chunk_kda_fwd_intra_token_parallel,
+    chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_kda,
 )
+from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
@@ -114,6 +116,7 @@ from flaggems_vllm.ops.mhc import (
 )
 from flaggems_vllm.ops.qwen4 import (
     grouped_gemma_rmsnorm,
+    hc_combine,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -257,6 +260,7 @@ __all__ = [
     "chunk_kda",
     "chunk_kda_fwd_intra_token_parallel",
     "chunk_kda_scaled_dot_kkt_fwd",
+    "chunk_kda_with_fused_gate",
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
@@ -300,6 +304,7 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
+    "gate_sigmoid_mul",
     "gather_rows",
     "gather_state_rows",
     "gdn_w8a16",
@@ -309,6 +314,7 @@ __all__ = [
     "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
+    "hc_combine",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "ihc_post",
