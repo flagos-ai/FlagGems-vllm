@@ -18,6 +18,9 @@ import flag_gems
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._thead.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -51,6 +54,7 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_matmul import (
 __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
