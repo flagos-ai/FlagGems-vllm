@@ -16,6 +16,7 @@ import logging
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,7 @@ def _moe_sum_general_kernel(
         + token_idx * input_stride_token
         + hidden_offsets * input_stride_hidden
     )
-    for expert_idx in range(topk):
+    for expert_idx in tle.range(topk, loop_vectorize_factor=4):
         expert_data = tl.load(
             input_base + expert_idx * input_stride_topk,
             mask=hidden_mask,

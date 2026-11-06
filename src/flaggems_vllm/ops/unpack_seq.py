@@ -18,6 +18,7 @@ import logging
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm.ops.data_movement import contiguous_copy
@@ -55,9 +56,9 @@ def _unpack_seq_triton_kernel(
     off_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)  # [BLOCK_D]
 
     # bounds: compute start from cumulative lengths
-    off_b = tl.arange(0, BLOCK_B)
-    prev_lengths = tl.load(lengths_ptr + off_b, mask=off_b < pid_b, other=0)
-    in_start = tl.sum(prev_lengths, axis=0)
+    in_start = 0
+    for i in tle.range(0, BLOCK_B, loop_vectorize_factor=BLOCK_B):
+        in_start += tl.load(lengths_ptr + i, mask=i < pid_b, other=0)
     seq_len = tl.load(lengths_ptr + pid_b)
 
     # valid time positions for this block

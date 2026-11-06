@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
@@ -136,30 +137,31 @@ def _per_token_group_quant_fp8_vec(
     start_group = program_id * NGROUPS
     start_gid = row * groups_per_row + start_group
 
-    group_ids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row * y_row_stride
-        + start_group * group_size
-        + group_ids[:, None] * group_size
-        + cols[None, :]
-    )
-    mask = cols[None, :] < group_size
+    for group_id in tle.range(0, NGROUPS, loop_vectorize_factor=NGROUPS):
+        group_ids = group_id + tl.arange(0, 1)
+        cols = tl.arange(0, BLOCK)
+        offsets = (
+            row * y_row_stride
+            + start_group * group_size
+            + group_ids[:, None] * group_size
+            + cols[None, :]
+        )
+        mask = cols[None, :] < group_size
 
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax * (1.0 / fp8_max)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+        y_s = _absmax * (1.0 / fp8_max)
 
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
+        if scale_ue8m0:
+            y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
-    output_offsets = (
-        start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
-    )
+        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+        output_offsets = (
+            start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
+        )
 
-    tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
-    tl.store(y_s_ptr + start_gid + group_ids, y_s)
+        tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
+        tl.store(y_s_ptr + start_gid + group_ids, y_s)
 
 
 @triton.jit
@@ -188,31 +190,32 @@ def _per_token_group_quant_fp8_colmajor_vec(
     start_group = program_id * NGROUPS
     start_gid = row * groups_per_row + start_group
 
-    group_ids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row * y_row_stride
-        + start_group * group_size
-        + group_ids[:, None] * group_size
-        + cols[None, :]
-    )
-    mask = cols[None, :] < group_size
+    for group_id in tle.range(0, NGROUPS, loop_vectorize_factor=NGROUPS):
+        group_ids = group_id + tl.arange(0, 1)
+        cols = tl.arange(0, BLOCK)
+        offsets = (
+            row * y_row_stride
+            + start_group * group_size
+            + group_ids[:, None] * group_size
+            + cols[None, :]
+        )
+        mask = cols[None, :] < group_size
 
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax * (1.0 / fp8_max)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+        y_s = _absmax * (1.0 / fp8_max)
 
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
+        if scale_ue8m0:
+            y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
-    output_offsets = (
-        start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
-    )
-    scale_offsets = (start_group + group_ids) * y_s_col_stride + row
+        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+        output_offsets = (
+            start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
+        )
+        scale_offsets = (start_group + group_ids) * y_s_col_stride + row
 
-    tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
-    tl.store(y_s_ptr + scale_offsets, y_s)
+        tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
+        tl.store(y_s_ptr + scale_offsets, y_s)
 
 
 def _groups_per_program(x: torch.Tensor, group_size: int) -> int:
