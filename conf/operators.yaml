@@ -663,7 +663,7 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule_fwd
+  - id: fused_recurrent_gated_delta_rule
     description: |
       Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
       variable-length sequences and speculative-decoding state tables.
