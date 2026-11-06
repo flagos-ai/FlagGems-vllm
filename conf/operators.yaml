@@ -779,6 +779,14 @@ ops:
       - Reduction
     stages:
       - alpha: '5.4'
+  - id: get_num_sampled_and_rejected
+    description: Update sampled and rejected token counts per request.
+    for:
+      - get_num_sampled_and_rejected
+    labels:
+      - fused
+    kind:
+      - Sampling
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
