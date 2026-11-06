@@ -22,6 +22,7 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import _get_num_sms
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import validate_dense_outputs
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.shape_utils import can_use_int32_index
@@ -2360,16 +2361,7 @@ def prepare_flash_mla_with_kvcache_w8a8(
         or splits not in (1, 2, 4, 8, 16)
     ):
         raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
-    for tensor, shape, dtype, label in (
-        (out, (batch, queries, heads, head_dim_v), q_rope.dtype, "out"),
-        (lse, (batch, heads, queries), torch.float32, "lse"),
-    ):
-        if tensor is None:
-            continue
-        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
-            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
-        if tensor.device != q_nope.device or not tensor.is_contiguous():
-            raise ValueError(f"{label} must be contiguous on the query device")
+    validate_dense_outputs(out, lse, q_nope, q_rope.dtype, head_dim_v)
     output_bytes = batch * queries * heads * 512 * q_rope.element_size()
     partial_bytes = (splits if splits > 1 else 0) * batch * queries * heads * 512 * 4
     if max(output_bytes, partial_bytes) > 2**31 - 1:

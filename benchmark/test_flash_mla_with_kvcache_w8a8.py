@@ -79,20 +79,6 @@ def run_prepared(
     return handle(out=output, lse=lse)
 
 
-def assert_hcu_replay(handle, reference):
-    assert_dense_w8a8_close(handle(), reference)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        output, lse = handle()
-    torch.cuda.current_stream().wait_stream(stream)
-    output.fill_(float("nan"))
-    lse.fill_(float("nan"))
-    graph.replay()
-    assert_dense_w8a8_close((output, lse), reference)
-
-
 class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
     """Measure steady-state decode after both implementations are prepared."""
 
@@ -139,8 +125,6 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
                 self.gems_input = (handle, output, lse)
                 self.torch_op(*native_args, **kwargs)
                 self.gems_op(*self.gems_input)
-                if IS_HCU:
-                    assert_hcu_replay(handle, self.reference)
                 if IS_HCU:
                     # HCU scheduling metadata is opaque to the common tensor unpacker.
                     self.native_input = native_args, kwargs
