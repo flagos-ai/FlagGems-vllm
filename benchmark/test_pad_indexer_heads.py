@@ -48,7 +48,6 @@ class PadIndexerHeadsBenchmark(base.Benchmark):
             self.native_status = {
                 "status": "N/A",
                 "reason": workload.NATIVE_UNAVAILABLE_REASON,
-                "source": workload.NATIVE_PROVENANCE,
                 "graph": False,
             }
             self.native_valid = False
@@ -70,7 +69,7 @@ class PadIndexerHeadsBenchmark(base.Benchmark):
         return super().get_latency(op, *args, **kwargs)
 
     def record_shapes(self, *args, **kwargs):
-        # Native validity/provenance cannot be represented by tensor shapes.
+        # Per-configuration native validity cannot be represented by tensor shapes.
         return [
             *super().record_shapes(*args, **kwargs),
             {
