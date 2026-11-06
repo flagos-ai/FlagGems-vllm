@@ -34,7 +34,9 @@ from triton.language.extra import libdevice
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 if TYPE_CHECKING:
-    from .api import MegaMoEContext
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.api import (
+        MegaMoEContext,
+    )
 
 RAW_DIR = Path(__file__).resolve().parent
 
