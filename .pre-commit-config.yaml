@@ -13,7 +13,8 @@
 # limitations under the License.
 
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
+  # https://github.com/pre-commit/pre-commit-hooks
+  - repo: https://gitcode.com/gh_mirrors/pr/pre-commit-hooks.git
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
@@ -30,20 +31,20 @@ repos:
 
       - id: check-added-large-files
         name: check for added large files
-
-  - repo: https://github.com/PyCQA/flake8
+  # https://github.com/PyCQA/flake8
+  - repo: https://gitcode.com/gh_mirrors/fl/flake8.git
     rev: 7.1.0
     hooks:
       - id: flake8
         args: ["--ignore=F405,E731,W503,E203,E704", --max-line-length=120]
-
-  - repo: https://github.com/PyCQA/isort
+  # https://github.com/PyCQA/isort
+  - repo: https://gitcode.com/gh_mirrors/is/isort.git
     rev: 5.12.0
     hooks:
       - id: isort
         args: ["--profile", "black"]
-
-  - repo: https://github.com/psf/black
+  # https://github.com/psf/black
+  - repo: https://gitcode.com/gh_mirrors/bl/black.git
     rev: 24.8.0
     hooks:
       - id: black

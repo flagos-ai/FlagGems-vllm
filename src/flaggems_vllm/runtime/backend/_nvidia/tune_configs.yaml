@@ -12,6 +12,209 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+w8a8_block_fp8_bmm:
+  - gen: true
+    param_map:
+      META:
+        TILE_ORDER: tile_order
+      num_warps: warps
+      num_stages: stages
+    tile_order:
+      - 0
+      - 1
+    warps:
+      - 4
+      - 8
+    stages:
+      - 4
+      - 6
+      - 8
+
+w8a8_block_fp8_bmm_general:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        GROUP_M: group_m
+      num_warps: warps
+      num_stages: stages
+    block_m:
+      - 16
+      - 32
+      - 64
+    block_n:
+      - 32
+      - 64
+    block_k:
+      - 128
+    group_m:
+      - 1
+      - 4
+      - 8
+    warps:
+      - 4
+    stages:
+      - 3
+
+w8a8_block_fp8_bmm_splitk:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+        SPLIT_K: split_k
+      num_warps: warps
+      num_stages: stages
+    block_m:
+      - 16
+      - 64
+    block_n:
+      - 32
+      - 64
+    block_k:
+      - 128
+    split_k:
+      - 4
+      - 8
+      - 16
+      - 32
+    warps:
+      - 4
+    stages:
+      - 3
+attn_res_post:
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 1
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 1
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 8
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: true
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 2
+      launch_pdl: false
+    num_warps: 16
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 4
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 16
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: false
+      MERGE_PREFIX_INTO_SOURCE_LOOP: true
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 8
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: true
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: false
+    num_warps: 8
+    num_stages: 2
+  - META:
+      USE_COMPACT_SOURCE_REDUCTION: true
+      MERGE_PREFIX_INTO_SOURCE_LOOP: false
+      USE_TLE_ASYNC_LOAD: false
+      SOURCE_TILE_SIZE: 4
+      launch_pdl: true
+    num_warps: 8
+    num_stages: 2
+
 attention:
   - gen: true
     param_map:
@@ -374,6 +577,32 @@ compute_global_topk_indices_and_lens:
       TPP: 1
     num_warps: 2
     num_stages: 3
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 1
+    num_stages: 2
+  - META:
+      BLOCK: 32
+      TPP: 16
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK: 64
+      TPP: 8
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK: 128
+      TPP: 4
+    num_warps: 1
+    num_stages: 2
+  - META:
+      BLOCK: 128
+      TPP: 8
+    num_warps: 8
+    num_stages: 3
+
 fused_marlin_moe_w4a16_int4:
   - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 4}
     num_warps: 4
@@ -504,3 +733,519 @@ fused_marlin_moe_w4a16_mxfp4_gemm_silu:
     num_warps: 8
     num_stages: 3
     maxnreg: 255
+
+fp8_fp4_mqa_logits:
+  - META: {BLOCK_M: 64, BLOCK_N: 64, HEAD_BLOCK: 2}
+    num_warps: 4
+    num_stages: 2
+
+# W8A16 candidates use default register limits for a uniform library SQL schema.
+fused_marlin_moe_w8a16_fp8_gateup_silu:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 2
+
+fused_marlin_moe_w8a16_int8_gateup_silu_large:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_fp8_down:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+
+fused_marlin_moe_w8a16_int8_unified:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 3
+
+fused_marlin_moe_w8a16_fp8_unified:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+
+fused_marlin_moe_w8a16_int8_gateup:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 256, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 256, BLOCK_SIZE_K: 32}
+    num_warps: 8
+    num_stages: 1
+  - gen: true
+    param_map:
+      META: {BLOCK_SIZE_N: n, BLOCK_SIZE_K: 128}
+      num_warps: warps
+      num_stages: 1
+    n: [64, 128]
+    warps: [4, 8]
+
+fused_marlin_moe_w8a16_int8_gateup_silu:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+
+fused_marlin_moe_w8a16_int8_down:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+# The split FP8 gateup applies group scales after dot for all token sizes.
+fused_marlin_moe_w8a16_fp8_gateup:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+
+fused_marlin_moe_w8a16_int8_gemv:
+  - gen: true
+    param_map:
+      META: {BLOCK_N: n, BLOCK_K: 128, UNROLL: unroll}
+      num_warps: warps
+      num_stages: 1
+    n: [16, 32]
+    warps: [4, 8]
+    unroll: [1, 2]
+  - gen: true
+    param_map:
+      META: {BLOCK_N: 64, BLOCK_K: 128, UNROLL: unroll}
+      num_warps: 8
+      num_stages: 1
+    unroll: [1, 2]
+  - gen: true
+    param_map:
+      META: {BLOCK_N: 128, BLOCK_K: 128, UNROLL: unroll}
+      num_warps: 16
+      num_stages: 1
+    unroll: [1, 2]
+
+silu_and_mul_with_clamp:
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 8
+    num_stages: 1
+
+silu_and_mul_with_clamp_linear:
+  - META:
+      BLOCK_SIZE: 128
+      UNMASKED: false
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 128
+      UNMASKED: false
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+      UNMASKED: false
+    num_warps: 1
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 256
+      UNMASKED: false
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+      UNMASKED: false
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 512
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+      UNMASKED: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+      UNMASKED: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+      UNMASKED: false
+    num_warps: 8
+    num_stages: 1
+
+# Pure output kernels; mutation/state kernels keep a single original launch.
+glm_data_copy:
+  - META: {BLOCK: 256}
+    num_warps: 4
+  - META: {BLOCK: 512}
+    num_warps: 4
+kpool_fwht:
+  - META: {BLOCK_R: 16}
+    num_warps: 2
+  - META: {BLOCK_R: 32}
+    num_warps: 2
+  - META: {BLOCK_R: 64}
+    num_warps: 4
+kpool_hadamard:
+  - META: {}
+    num_warps: 1
+  - META: {}
+    num_warps: 2
+  - META: {}
+    num_warps: 4
+kda_safe_gate:
+  - META: {BLOCK: 256}
+    num_warps: 4
+  - META: {BLOCK: 512}
+    num_warps: 4
+mhc_rms_norm:
+  - META: {}
+    num_warps: 4
+  - META: {}
+    num_warps: 8
+
+kda_safe_gate_cumsum:
+  - META: {BD: 32}
+    num_warps: 2
+  - META: {BD: 32}
+    num_warps: 4
+  - META: {BD: 32}
+    num_warps: 8
+  - META: {BD: 64}
+    num_warps: 2
+  - META: {BD: 64}
+    num_warps: 4
+  - META: {BD: 64}
+    num_warps: 8
+
+# Sparse top-k overwrites only its output and private scratch on each launch.
+top_k_per_row_standard:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 8
+    num_stages: 3
+  - META: {}
+    num_warps: 16
+    num_stages: 3
+
+concat_mla_q:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 8
+    num_stages: 1
+
+flash_mla_fp8_copy_table:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 8
+    num_warps: 1
+    num_stages: 1

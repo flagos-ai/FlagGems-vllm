@@ -12,13 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
+import flaggems_vllm
 
 from . import base
+
+vendor = flaggems_vllm.vendor_name
+
+# ---------------------------------------------------------------------------
+# Per-vendor baseline (plain Triton) entry point.
+#
+# _gems_baseline_op : callable forcing the plain Triton kernel.
+# ---------------------------------------------------------------------------
+_gems_baseline_op = flaggems_vllm.topk_softplus_sqrt
+
+if vendor == "ascend":
+    # `use_ascend_tle` is pinned via functools.partial so the callable
+    # drops into the benchmark framework's `gems_op` slot unchanged.
+    _gems_baseline_op = functools.partial(
+        flaggems_vllm.topk_softplus_sqrt, use_ascend_tle=False
+    )
+elif vendor == "mthreads":
+    from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_baseline as _gems_baseline_op,
+    )
+elif vendor == "thead":
+    from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_baseline as _gems_baseline_op,
+    )
+elif vendor == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_baseline as _gems_baseline_op,
+    )
+elif vendor == "iluvatar":
+    from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
+        topk_softplus_sqrt_baseline as _gems_baseline_op,
+    )
 
 try:
     from vllm._custom_ops import topk_hash_softplus_sqrt as _vllm_topk_softplus_sqrt
@@ -149,7 +183,7 @@ def test_topk_softplus_sqrt():
     bench = TopkSoftplusSqrtBenchmark(
         op_name="topk_softplus_sqrt",
         torch_op=_baseline_op,
-        gems_op=topk_softplus_sqrt,
+        gems_op=_gems_baseline_op,
         dtypes=[torch.bfloat16],
     )
     bench.run()

@@ -59,11 +59,7 @@ from flaggems_vllm.testing.megamoe import (  # noqa: E402
 from . import base  # noqa: E402
 from .conftest import Config  # noqa: E402
 from .consts import DEFAULT_WARMUP_TIME  # noqa: E402
-from .consts import (  # noqa: E402
-    DEFAULT_ITER_TIME,
-    BenchLevel,
-    BenchMode,
-)
+from .consts import DEFAULT_ITER_TIME, BenchLevel, BenchMode  # noqa: E402
 
 OP_NAME = "megamoe"
 NUM_RANKS = 8

@@ -58,7 +58,7 @@ def main() -> int:
 
     # On Ascend, torch_npu must be fully initialized before triton is imported
     # to prevent a circular import (triton -> torch_npu -> torch._dynamo -> triton).
-    if args.expected_vendor.lower().startswith("cann"):
+    if args.expected_vendor.lower().startswith("ascend"):
         importlib.import_module("torch_npu")
 
     for name in REQUIRED_MODULES:

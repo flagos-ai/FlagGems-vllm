@@ -21,7 +21,7 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     mhc_split_sinkhorn_torch_ref,
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post
+from flaggems_vllm.ops.mhc.mhc_post import MixLayout, mhc_post
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
 
 __all__ = [
@@ -35,5 +35,6 @@ __all__ = [
     "mhc_pre",
     "mhc_pre_ref",
     "mhc_split_sinkhorn_torch_ref",
+    "MixLayout",
     "sinkhorn_forward",
 ]

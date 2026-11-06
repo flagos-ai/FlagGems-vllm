@@ -15,15 +15,29 @@
 import pytest
 import torch
 
+import flaggems_vllm
 import flaggems_vllm.testing as fg_testing
-from flaggems_vllm.ops.deepseek_v4_attention_combine_topk_swa_indices import (
-    combine_topk_swa_indices,
-)
+
+# Bind through the top-level entry rather than the ops submodule: when a vendor
+# ships a specialized implementation, the runtime rebinds it on the package at
+# import time, so importing from flaggems_vllm.ops.<module> would bypass vendor
+# dispatch (same reasoning as persistent_topk).
+combine_topk_swa_indices = flaggems_vllm.combine_topk_swa_indices
 
 pytestmark = pytest.mark.combine_topk_swa_indices
 
+# Device-agnostic entry point: the runtime resolves the vendor device name --
+# "cuda" on NVIDIA / MetaX / Hygon / T-Head, "musa" on MThreads, "npu" on
+# Ascend. Never hard-code "cuda" here.
+device = flaggems_vllm.device
+_device_module = getattr(torch, device, None)
+_HAS_DEVICE = _device_module is not None and _device_module.is_available()
+
+# vLLM >= 0.23 relocated this op to vllm.models.deepseek_v4.common.ops (the
+# definition lives in its .cache_utils submodule); older releases exposed it as
+# vllm.v1.attention.ops.deepseek_v4_ops.
 try:
-    from vllm.v1.attention.ops.deepseek_v4_ops import (
+    from vllm.models.deepseek_v4.common.ops import (
         combine_topk_swa_indices as vllm_combine_topk_swa_indices,
     )
 
@@ -76,7 +90,7 @@ except Exception:
         ),
     ],
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires cuda")
+@pytest.mark.skipif(not _HAS_DEVICE, reason=f"requires an available {device} device")
 def test_combine_topk_swa_indices_accuracy(
     topk_values,
     query_start_values,
@@ -88,7 +102,6 @@ def test_combine_topk_swa_indices_accuracy(
     M,
     N,
 ):
-    device = "cuda"
     topk_indices = torch.tensor(topk_values, device=device, dtype=torch.int32)
     query_start_loc = torch.tensor(query_start_values, device=device, dtype=torch.int32)
     seq_lens = torch.tensor(seq_len_values, device=device, dtype=torch.int32)
@@ -136,11 +149,10 @@ def test_combine_topk_swa_indices_accuracy(
 
 
 @pytest.mark.skipif(
-    (not torch.cuda.is_available()) or (not _HAS_VLLM_COMBINE_TOPK_SWA_INDICES),
-    reason="requires cuda and vllm deepseek_v4_ops.combine_topk_swa_indices",
+    not (_HAS_DEVICE and _HAS_VLLM_COMBINE_TOPK_SWA_INDICES),
+    reason=f"requires an available {device} device and vLLM's implementation",
 )
 def test_combine_topk_swa_indices_vllm_accuracy():
-    device = "cuda"
     topk_indices = torch.tensor(
         [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],
         device=device,

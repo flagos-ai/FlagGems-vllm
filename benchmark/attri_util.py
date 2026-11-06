@@ -94,6 +94,9 @@ class BenchmarkMetrics:
     utilization: Optional[float] = None
     # Speedup compared to base data
     compared_speedup: Optional[float] = None
+    # Why the baseline comparison was skipped (op/shape/dtype missing).
+    # None means "matched" or "--base-data not enabled". Excluded from metrics.
+    base_miss_reason: Optional[str] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -101,6 +104,7 @@ class BenchmarkMetrics:
 ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
+    "base_miss_reason",
 }
 
 DEFAULT_METRICS = [
@@ -216,6 +220,11 @@ class BenchmarkResult:
             f"{'Gems Latency (ms)':>20}",
             f"{'Gems Speedup':>20}",
         ]
+        # Only surface the baseline column when baseline data was actually
+        # matched for this op; otherwise the output stays identical to before.
+        show_vs_base = any(m.compared_speedup is not None for m in self.result)
+        if show_vs_base:
+            col_names.append(f"{'vs Base':>20}")
         if self.result[0].tflops and self.result[0].tflops != 0.0:
             col_names.append(f"{'TFLOPS':>20}")
         if self.result[0].gbps is not None:
@@ -226,10 +235,14 @@ class BenchmarkResult:
         header_break = "-" * len(header_col_names) + "\n"
         header = header_title + header_col_names + header_break
 
-        metrics_lines = "".join(self._format_metrics(ele) for ele in self.result)
+        metrics_lines = "".join(
+            self._format_metrics(ele, show_vs_base) for ele in self.result
+        )
         return header + metrics_lines
 
-    def _format_metrics(self, metrics: BenchmarkMetrics) -> str:
+    def _format_metrics(
+        self, metrics: BenchmarkMetrics, show_vs_base: bool = False
+    ) -> str:
         # self.gen_legacy_shape(metrics)
         # legacy_shape_str = (
         #     metrics.legacy_shape
@@ -241,6 +254,11 @@ class BenchmarkResult:
         )
         latency_str = f"{metrics.latency:.6f}" if metrics.latency is not None else "N/A"
         speedup_str = f"{metrics.speedup:.3f}" if metrics.speedup is not None else "N/A"
+        compared_speedup_str = (
+            f"{metrics.compared_speedup:.3f}"
+            if metrics.compared_speedup is not None
+            else "N/A"
+        )
         torch_gbps_str = (
             f"{metrics.gbps_base:.3f}" if metrics.gbps_base is not None else "N/A"
         )
@@ -259,6 +277,8 @@ class BenchmarkResult:
             f"{latency_str:>20}"
             f"{speedup_str:>20}"
         )
+        if show_vs_base:
+            data_line += f"{compared_speedup_str:>20}"
         if metrics.tflops and metrics.tflops != 0.0:
             data_line += f"{tflops_str:>20}"
         if metrics.gbps is not None:

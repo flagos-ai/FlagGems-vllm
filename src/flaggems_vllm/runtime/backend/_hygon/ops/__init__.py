@@ -32,30 +32,44 @@ from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.persistent_topk import (  # noqa: F401
+    persistent_topk,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_scaled_mm
+from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
+    w8a8_block_int8_bmm,
+)
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
+    "fused_add_rms_norm",
     "fused_experts_impl",
-    "inplace_fused_experts",
+    "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
+    "inplace_fused_experts",
+    "int8_einsum",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
-    "qwen4_store_qsa_kv_rows",
-    "qwen4_hc_inject_combine",
+    "persistent_topk",
     "ple_state_scatter_",
-    "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
+    "SUPPORTED_FP8_DTYPE",
+    "topk_softplus_sqrt",
     "triton_scaled_mm",
-    "fused_q_kv_rmsnorm",
-    "fused_add_rms_norm",
+    "w8a8_block_int8_bmm",
 ]

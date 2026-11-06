@@ -26,6 +26,8 @@ except ImportError:
     VLLM_AVAILABLE = False
     SM90_AVAILABLE = False
 
+from tests.test_fp8_fp4_mqa_logits import quantize_to_mxfp4
+
 from . import base
 
 # DeepSeek V4 production config
@@ -33,22 +35,42 @@ H = 64
 D = 128
 
 
-def _build_case(M, N, dtype, device):
+def _build_case(M, N, dtype, device, use_fp4=False):
     """Build FP8 quantized inputs for benchmarking."""
     q_bf16 = torch.randn(M, H, D, device=device, dtype=dtype)
     k_bf16 = torch.randn(N, D, device=device, dtype=dtype)
     weights = torch.randn(M, H, device=device, dtype=torch.float32).abs()
 
-    q_fp8 = q_bf16.clamp(
-        min=torch.finfo(torch.float8_e4m3fn).min,
-        max=torch.finfo(torch.float8_e4m3fn).max,
-    ).to(torch.float8_e4m3fn)
-    k_fp8, k_scale = per_custom_dims_cast_to_fp8(k_bf16, (0,), False)
+    if use_fp4:
+        q_packed, q_scale = quantize_to_mxfp4(q_bf16)
+    else:
+        q_packed = q_bf16.clamp(
+            min=torch.finfo(torch.float8_e4m3fn).min,
+            max=torch.finfo(torch.float8_e4m3fn).max,
+        ).to(torch.float8_e4m3fn)
+        q_scale = None
 
+    k_fp8, k_scale = per_custom_dims_cast_to_fp8(k_bf16, (0,), False)
     ks = torch.zeros(M, dtype=torch.int32, device=device)
     ke = torch.full((M,), N, dtype=torch.int32, device=device)
 
-    return q_fp8, k_fp8, k_scale, weights, ks, ke
+    return q_packed, q_scale, k_fp8, k_scale, weights, ks, ke
+
+
+# Shapes: (M, N)
+BENCH_SHAPES = [
+    (1, 1024),
+    (1, 2048),
+    (1, 4096),
+    (4, 2048),
+    (4, 4096),
+    (64, 4096),
+    (256, 4096),
+    (1024, 4096),
+    (2048, 4096),
+    (4096, 8192),
+    (1024, 8192),
+]
 
 
 class FP8FP4MQALogitsBenchmark(base.Benchmark):
@@ -56,29 +78,23 @@ class FP8FP4MQALogitsBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            (1, 1024),
-            (1, 2048),
-            (1, 4096),
-            (4, 2048),
-            (4, 4096),
-            (64, 4096),
-            (256, 4096),
-            (1024, 4096),
-            (2048, 4096),
-            (4096, 8192),
-            (1024, 8192),
+            (M, N, use_fp4) for use_fp4 in (False, True) for (M, N) in BENCH_SHAPES
         ]
 
     def get_input_iter(self, dtype):
-        for M, N in self.shapes:
-            case = _build_case(M, N, dtype, self.device)
-            q_fp8, k_fp8, k_scale, weights, ks, ke = case
-            yield (q_fp8, k_fp8, k_scale, weights, ks, ke, dtype)
+        for M, N, use_fp4 in self.shapes:
+            q_values, q_scale, k_fp8, k_scale, weights, ks, ke = _build_case(
+                M, N, dtype, self.device, use_fp4
+            )
+            yield (q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4)
 
 
-def _vllm_wrapper(q_fp8, k_fp8, k_scale, weights, ks, ke, dtype):
+def _vllm_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
+    if use_fp4:
+        # vLLM doesn't support FP4, skip
+        return None
     return vllm_fp8_fp4_mqa_logits(
-        q=(q_fp8, None),
+        q=(q_values, None),
         kv=(k_fp8, k_scale),
         weights=weights,
         cu_seqlen_ks=ks,
@@ -87,11 +103,11 @@ def _vllm_wrapper(q_fp8, k_fp8, k_scale, weights, ks, ke, dtype):
     )
 
 
-def _gems_wrapper(q_fp8, k_fp8, k_scale, weights, ks, ke, dtype):
+def _gems_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
     from flaggems_vllm.ops import fp8_fp4_mqa_logits
 
     return fp8_fp4_mqa_logits(
-        q=(q_fp8, None),
+        q=(q_values, q_scale),
         kv=(k_fp8, k_scale),
         weights=weights,
         cu_seqlen_ks=ks,

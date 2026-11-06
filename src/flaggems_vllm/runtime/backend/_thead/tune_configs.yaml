@@ -12,4 +12,334 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{}
+moe_sum_pair:
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 8
+    num_stages: 2
+
+moe_sum_mt:
+  - META:
+      TOKENS: 8
+      BLOCK_H: 128
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TOKENS: 4
+      BLOCK_H: 256
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TOKENS: 8
+      BLOCK_H: 256
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 2
+      BLOCK_H: 256
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 2
+      BLOCK_H: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 1
+      BLOCK_H: 1024
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 1
+      BLOCK_H: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 2
+      BLOCK_H: 1024
+    num_warps: 16
+    num_stages: 3
+
+moe_sum_general:
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 3
+
+compute_global_topk_indices_and_lens:
+  - META:
+      BLOCK: 16
+      TPP: 1
+    num_warps: 1
+    num_stages: 3
+  - META:
+      BLOCK: 128
+      TPP: 2
+    num_warps: 1
+    num_stages: 3
+
+bmm:
+  - META:
+      TILE_M: 32
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 128
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 32
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 64
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+
+dequantize_and_gather_k_cache:
+  - META:
+      num_workers: 128
+    num_warps: 2
+  - META:
+      num_workers: 256
+    num_warps: 2
+  - META:
+      num_workers: 512
+    num_warps: 2
+  - META:
+      num_workers: 1024
+    num_warps: 2
+  - META:
+      num_workers: 2048
+    num_warps: 2
+  - META:
+      num_workers: 4096
+    num_warps: 2
+
+w8a8_block_int8_matmul_thead:
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      GROUP_M: 32
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 32
+      GROUP_M: 4
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 32
+      GROUP_M: 4
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 64
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      GROUP_M: 8
+    num_warps: 8
+    num_stages: 2
+
+w8a8_block_int8_swap_thead:
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 32
+      GROUP_M: 4
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 64
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 128
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+
+w8a8_block_int8_gemv_thead:
+  - META:
+      BLOCK_N: 64
+      BLOCK_K: 128
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_N: 128
+      BLOCK_K: 128
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_N: 256
+      BLOCK_K: 128
+    num_warps: 8
+    num_stages: 2
+
+# Compact split-K candidates, timed together with the FP32 reduction.
+w8a8_block_int8_splitk_thead:
+  - META: {BLOCK_M: 16, BLOCK_N: 32, GROUP_M: 4, SPLITS: 4, SWAP: true}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 64, GROUP_M: 8, SPLITS: 4, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, GROUP_M: 8, SPLITS: 4, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 32, GROUP_M: 4, SPLITS: 8, SWAP: true}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 64, GROUP_M: 8, SPLITS: 8, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, GROUP_M: 8, SPLITS: 8, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 32, GROUP_M: 4, SPLITS: 16, SWAP: true}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 64, GROUP_M: 8, SPLITS: 16, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, GROUP_M: 8, SPLITS: 16, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
