@@ -103,9 +103,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
-    compute_slot_mapping_parallel,
-)
+from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import compute_slot_mapping
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
@@ -131,7 +129,7 @@ __all__ = [
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
-    "compute_slot_mapping_parallel",
+    "compute_slot_mapping",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",

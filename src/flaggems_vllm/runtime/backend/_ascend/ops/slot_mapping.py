@@ -20,6 +20,14 @@ requests runs on a couple of programs.  This variant parallelises over
 (request, token block); measured end-to-end on GLM-5.3-Flash prefill
 traffic: 1050.9 -> 81.2 us per rank over 8232 calls (12.9x, avg 127.8 ->
 9.9 us per call).
+
+The interface is basically aligned with the vllm version, with one
+difference: one additional parameter num_reqs.  Upstream the caller (the
+block-table method) already holds num_reqs and launches the bare kernel
+with grid=(num_reqs + 1,); here the launch is wrapped into a single
+function, so num_reqs becomes an explicit argument used only to build
+the two-dimensional grid -- like upstream, the kernel itself derives the
+pad-row boundary via tl.num_programs(0) - 1.
 """
 
 import logging
@@ -31,19 +39,11 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 
-@triton.jit(
-    do_not_specialize=[
-        "num_tokens",
-        "max_num_tokens",
-        "num_reqs",
-        "block_table_stride",
-    ]
-)
-def _slot_mapping_parallel_kernel(
+@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens", "block_table_stride"])
+def _compute_slot_mapping_kernel(
     num_tokens,
     max_num_tokens,
     query_start_loc_ptr,  # [num_reqs + 1], int32
-    num_reqs,
     positions_ptr,  # [num_tokens] int64
     block_table_ptr,  # [max_num_reqs, max_blocks_per_req], int32 (flat)
     block_table_stride,
@@ -68,7 +68,7 @@ def _slot_mapping_parallel_kernel(
     lo = blk_idx * BLOCK_SIZE
     o = tl.arange(0, BLOCK_SIZE)
 
-    if req_idx == num_reqs:
+    if req_idx == tl.num_programs(0) - 1:
         # pad row: fill [num_tokens, max_num_tokens) with PAD_ID
         offs = lo + o
         m = (offs >= num_tokens) & (offs < max_num_tokens)
@@ -106,15 +106,16 @@ def _slot_mapping_parallel_kernel(
     tl.store(slot_mapping_ptr + offs, slot_ids.to(tl.int64), mask=m)
 
 
-def compute_slot_mapping_parallel(
+def compute_slot_mapping(
+    num_reqs: int,
     num_tokens: int,
     max_num_tokens: int,
     query_start_loc: torch.Tensor,
-    num_reqs: int,
     positions: torch.Tensor,
     block_table: torch.Tensor,
-    slot_mapping: torch.Tensor,
+    block_table_stride: int,
     block_size: int,
+    slot_mapping: torch.Tensor,
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_kv_cache_interleave_size: int = 1,
@@ -126,14 +127,13 @@ def compute_slot_mapping_parallel(
     arithmetic and the PAD row beyond ``num_tokens``).
     """
     logger.debug("GEMS_ASCEND SLOT_MAPPING")
-    _slot_mapping_parallel_kernel[(num_reqs + 1, triton.cdiv(max_num_tokens, 512))](
+    _compute_slot_mapping_kernel[(num_reqs + 1, triton.cdiv(max_num_tokens, 512))](
         num_tokens,
         max_num_tokens,
         query_start_loc,
-        num_reqs,
         positions,
         block_table,
-        block_table.stride(0),
+        block_table_stride,
         slot_mapping,
         BLOCK_SZ=block_size,
         TOTAL_CP_WORLD_SIZE=cp_world_size,
