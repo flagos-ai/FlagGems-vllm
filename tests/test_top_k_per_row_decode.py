@@ -19,6 +19,8 @@ Uses value-based comparison (sorted selected values must match) to handle
 non-deterministic tie-breaking between implementations.
 """
 
+from importlib import import_module
+
 import pytest
 import torch
 
@@ -385,3 +387,71 @@ def test_repeated_inputs_stable_selection(rows, vocab, k, score_kind, strided):
         else:
             torch.testing.assert_close(out, first, rtol=0, atol=0)
     torch.testing.assert_close(logits, inputs_before, rtol=0, atol=0)
+
+
+@pytest.mark.top_k_per_row_decode
+@pytest.mark.parametrize("entry", ["public", "non_tle"])
+@pytest.mark.parametrize("vocab,k", [(128, 8), (4099, 32)])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("score_kind", ["continuous", "quantized", "constant"])
+@torch.inference_mode()
+def test_decode_stable_scan_eager_and_changed_input_graph(
+    monkeypatch, entry, vocab, k, strided, score_kind
+):
+    """Exercise scalar/vector tiles, padding and replay through both entry paths."""
+    module = import_module("flaggems_vllm.ops.top_k_per_row_decode")
+    if entry == "non_tle":
+        # Exercise the baseline even when this machine has optional TLE support.
+        # The public-entry cases separately validate normal vendor dispatch.
+        monkeypatch.setattr(module, "HAS_TLE", False)
+        op = _generic_impl
+    else:
+        op = flaggems_vllm.top_k_per_row_decode
+    rows = 4
+    torch.manual_seed(2026)
+    storage = torch.randn(rows, vocab * 2, device=device, dtype=torch.float32)
+    logits = storage[:, ::2] if strided else storage[:, :vocab]
+    out = torch.full((rows, k), -99, device=device, dtype=torch.int32)
+    next_n = 2
+    lengths = torch.tensor([1, vocab], device=device, dtype=torch.int32)
+
+    def run():
+        op(logits, next_n, lengths, out, rows, logits.stride(0), logits.stride(1), k)
+
+    # Compile/autotune before capture; retain all static inputs and output buffers.
+    for _ in range(3):
+        run()
+    device_fn = flaggems_vllm.runtime.torch_device_fn
+    device_fn.synchronize()
+    graph = device_fn.CUDAGraph()
+    with device_fn.graph(graph):
+        run()
+
+    for replay in (0, 1):
+        fresh = torch.randn_like(logits)
+        if score_kind == "quantized":
+            fresh = (fresh * 4).round() / 4
+        elif score_kind == "constant":
+            fresh.fill_(float(replay))
+        logits.copy_(fresh)
+        lengths.copy_(
+            torch.tensor([1 + replay, vocab - replay], device=device, dtype=torch.int32)
+        )
+        lengths_before = lengths.clone()
+        expected = torch.full_like(out, -1)
+        for row in range(rows):
+            start = 0
+            end = int(lengths[row // next_n]) - next_n + row % next_n + 1
+            count = min(k, end - start)
+            order = torch.argsort(logits[row, start:end], descending=True, stable=True)
+            expected[row, :count] = order[:count].to(torch.int32)
+        expected_set = torch.sort(expected, dim=1).values
+        for execute in (run, graph.replay):
+            out.fill_(-99)
+            execute()
+            device_fn.synchronize()
+            torch.testing.assert_close(
+                torch.sort(out, dim=1).values, expected_set, rtol=0, atol=0
+            )
+        torch.testing.assert_close(logits, fresh, rtol=0, atol=0)
+        torch.testing.assert_close(lengths, lengths_before, rtol=0, atol=0)

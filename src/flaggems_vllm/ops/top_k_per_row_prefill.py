@@ -199,10 +199,19 @@ def _distribute_to_bins(
 
 @triton.jit
 def _stable_output_positions(base, mask):
-    # The row-owning CTA carries its counter through the scan in registers.
-    counts = tl.reshape(mask.to(tl.int32), (mask.numel,))
-    positions = base + tl.cumsum(counts, axis=0) - 1
-    return tl.reshape(positions, mask.shape), base + tl.sum(counts, axis=0)
+    # Keep the scan in the mask's rank. Flattening a vector tile can retain a
+    # rank-2 blocked encoding on a rank-1 value in non-TLE compiler backends.
+    counts = mask.to(tl.int32)
+    if len(mask.shape) == 1:
+        positions = base + tl.cumsum(counts, axis=0) - 1
+        total = tl.sum(counts, axis=0)
+    else:
+        # Preserve the same row-major order as a flattened inclusive scan.
+        row_counts = tl.sum(counts, axis=1)
+        row_offsets = tl.cumsum(row_counts, axis=0) - row_counts
+        positions = base + row_offsets[:, None] + tl.cumsum(counts, axis=1) - 1
+        total = tl.sum(row_counts, axis=0)
+    return positions, base + total
 
 
 @triton.jit
