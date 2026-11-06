@@ -569,8 +569,8 @@ ops:
       - beta: '5.4'
   - id: fused_indexer_weight_scale
     description: |
-      Scale FP16/BF16/FP32 indexer weights by FP32 query scales and a scalar.
-      Returns FP32 per-token, per-head weights for GLM sparse attention.
+      Scale floating-point indexer weights by FP32 query scales and a scalar.
+      Returns FP32 per-token, per-head weights on Ascend.
     for:
       - fused_indexer_weight_scale
       - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
