@@ -93,35 +93,56 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd)
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = []
+        self.shape_desc = "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+        # production prefill calls; SQ values within 2% merged
+        self.shapes = [
+            # DeepSeek-V4-Flash prefill
+            (4, 64, 512, 66048, 1, 128, 512),
+            (4, 64, 512, 1114624, 1, 640, 512),
+            (4, 64, 512, 98816, 1, 8320, 512),
+            (9, 64, 512, 1114624, 1, 640, 512),
+            (9, 64, 512, 98816, 1, 8320, 512),
+            (1028, 64, 512, 66048, 1, 128, 512),
+            (1028, 64, 512, 1114624, 1, 640, 512),
+            (1028, 64, 512, 98816, 1, 8320, 512),
+            (4112, 64, 512, 66048, 1, 128, 512),
+            (4112, 64, 512, 1114624, 1, 640, 512),
+            (4112, 64, 512, 98816, 1, 8320, 512),
+            (16384, 64, 512, 66048, 1, 128, 512),
+            (16384, 64, 512, 1114624, 1, 640, 512),
+            (16384, 64, 512, 98816, 1, 8320, 512),
+            # GLM-5.2 prefill
+            (64, 64, 576, 361344, 1, 2048, 512),
+            (449, 64, 576, 361344, 1, 2048, 512),
+            (512, 64, 576, 361344, 1, 2048, 512),
+            (1280, 64, 576, 361344, 1, 2048, 512),
+            (2821, 64, 576, 361344, 1, 2048, 512),
+            (3586, 64, 576, 361344, 1, 2048, 512),
+            (11264, 64, 576, 361344, 1, 2048, 512),
+            (12356, 64, 576, 361344, 1, 2048, 512),
+            (16384, 64, 576, 361344, 1, 2048, 512),
+        ]
 
     def get_input_iter(self, dtype):
         _ = dtype
-        for param in FlashmlaSparseBenchmark.get_performance_test_params_flashmla():
+        for s_q, h_q, d_qk, s_kv, h_kv, topk, d_v in self.shapes:
+            param = TestParam(
+                s_q,
+                s_kv,
+                topk,
+                h_q=h_q,
+                h_kv=h_kv,
+                d_qk=d_qk,
+                d_v=d_v,
+                # DeepSeek-V4 passes attn_sink; GLM-5 (DQK=576) does not
+                have_attn_sink=d_qk == 512,
+            )
             yield from FlashmlaSparseBenchmark.make_input_flashmla(param)
 
     @staticmethod
     def _init_seed(seed):
         random.seed(seed)
         torch.manual_seed(seed)
-
-    @staticmethod
-    def get_performance_test_params_flashmla():
-        cases = (
-            [
-                TestParam(4096, s_kv, 2048, h_q=128, d_qk=576, have_attn_sink=True)
-                for s_kv in [8192, 32768, 65536, 98304, 131072]
-            ]
-            + [
-                TestParam(4096, s_kv, 512, h_q=64, d_qk=512, have_attn_sink=True)
-                for s_kv in [8192, 32768, 49152, 65536]
-            ]
-            + [
-                TestParam(4096, s_kv, 1024, h_q=128, d_qk=512, have_attn_sink=True)
-                for s_kv in [8192, 32768, 49152, 65536]
-            ]
-        )
-        return cases
 
     @staticmethod
     def _randperm_batch(

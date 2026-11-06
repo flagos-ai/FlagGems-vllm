@@ -31,8 +31,9 @@ NOPE_DIM = 448
 ROPE_DIM = 64
 QUANT_GROUP_SIZE = 128
 
-HAS_NATIVE_FP8 = hasattr(torch, "float8_e4m3fn") and (
+HAS_FP8_QUANT = hasattr(torch, "float8_e4m3fn") and (
     flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
+    or flaggems_vllm.vendor_name == "thead"
     or (flaggems_vllm.vendor_name == "mthreads" and get_device_capability() >= (3, 1))
 )
 
@@ -257,7 +258,9 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
 
 
 @pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
+)
 @pytest.mark.skipif(
     vllm_fused_inv_rope_fp8_quant is None,
     reason="vLLM fused_inv_rope_fp8_quant not installed",
