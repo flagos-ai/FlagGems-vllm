@@ -583,7 +583,7 @@ ops:
   - id: fused_indexer_weight_scale
     description: |
       Scale floating-point indexer weights by FP32 query scales and a scalar.
-      Returns FP32 per-token, per-head weights on Ascend.
+      Returns FP32 per-token, per-head weights on Ascend and MThreads.
     for:
       - fused_indexer_weight_scale
       - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
