@@ -29,6 +29,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
     chunk_gated_delta_rule_w8a16,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_q_kv_rmsnorm",
+    "gate_sigmoid_mul",
     "gdn_w8a16",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
