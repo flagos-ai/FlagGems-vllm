@@ -14,12 +14,9 @@
 
 import logging
 import math
-import os
 import struct
-from contextlib import contextmanager
 from functools import lru_cache
 from numbers import Real
-from threading import RLock
 
 import torch
 import triton
@@ -38,26 +35,6 @@ logger = logging.getLogger(__name__)
 
 _FULL_LINEAR_MIN_ELEMENTS = 1 << 20
 _LINEAR_BLOCK_SIZES = (128, 256, 512, 1024, 2048, 4096)
-_ASCEND_LAUNCH_LOCK = RLock()
-
-
-@contextmanager
-def _silu_clamp_blockified():
-    if runtime.device.vendor_name != "ascend":
-        yield
-        return
-    # The compiler reads this process-wide flag during JIT compilation.
-    # Serialize our scopes and restore even when compilation or launch fails.
-    with _ASCEND_LAUNCH_LOCK:
-        previous = os.environ.get("TRITON_ALL_BLOCKS_PARALLEL")
-        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
-        try:
-            yield
-        finally:
-            if previous is None:
-                os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
-            else:
-                os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = previous
 
 
 def _silu_clamp_tuning_key(value):
@@ -458,7 +435,7 @@ def _launch_forward(x, y, out, limit, shape, strides, linear):
     else:
         kernel = silu_and_mul_with_clamp_nd_kernel
         args += (shape, *strides)
-    with _silu_clamp_blockified(), torch_device_fn.device(x.device):
+    with torch_device_fn.device(x.device):
         kernel[lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)](*args)
 
 
@@ -475,7 +452,7 @@ def _launch_backward(x, y, grad, dx, dy, limit, shape, strides, linear):
         kernel = silu_and_mul_with_clamp_backward_nd_kernel
         args += (shape, *strides)
     args += (dx is not None, dy is not None)
-    with _silu_clamp_blockified(), torch_device_fn.device(x.device):
+    with torch_device_fn.device(x.device):
         kernel[lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)](*args)
 
 
