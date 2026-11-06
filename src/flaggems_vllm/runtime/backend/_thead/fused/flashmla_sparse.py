@@ -23,6 +23,7 @@ Same ABI and semantics as ``flaggems_vllm.ops.flashmla_sparse``. PPU-specific:
 """
 
 import functools
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -31,6 +32,8 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 LOG2E = 1.4426950408889634
 # Initial running max (log2 units): finite, so fully masked blocks give no NaN in
@@ -287,6 +290,7 @@ def flash_mla_sparse_fwd(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sparse attention prefill kernel; see flaggems_vllm.ops.flashmla_sparse."""
+    logger.debug("GEMS_THEAD FLASH_MLA_SPARSE_FWD")
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
     assert (
         q.dtype == torch.bfloat16
@@ -313,7 +317,14 @@ def flash_mla_sparse_fwd(
 
     # check from FlashMLA
     assert HKV == 1, "h_kv is expected to be 1"
-    assert HQ == 64 or HQ == 128, "Unsupported h_q"
+    if HQ not in (4, 64, 128):
+        raise ValueError("Unsupported h_q: expected 4, 64 or 128")
+    if HQ == 4:
+        # The generic masked-head kernel stores only the four physical heads.
+        # Preserve the optimized PPU path below for its original 64/128 ABI.
+        from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd as generic
+
+        return generic(q, kv, indices, sm_scale, d_v, attn_sink, topk_length)
     assert DQK == 576 or DQK == 512, "Unsupported d_qk"
 
     output = torch.empty((SQ, HQ, DV), device=q.device, dtype=q.dtype)
@@ -393,3 +404,8 @@ def flash_mla_sparse_fwd(
                 num_stages=1,
             )
     return output, max_logits, lse
+
+
+# Uniform single-token decode only; validated with refreshed-input replay.
+flash_mla_sparse_fwd.supports_single_token_decode_graph = True
+flash_mla_sparse_fwd.supported_query_heads = (4, 64, 128)
