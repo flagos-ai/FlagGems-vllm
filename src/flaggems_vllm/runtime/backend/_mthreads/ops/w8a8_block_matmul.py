@@ -793,7 +793,7 @@ def _matrix_view(tensor, rows, cols):
         raise NotImplementedError("leading dimensions must be view-compatible") from exc
 
 
-def w8a8_block_fp8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -839,7 +839,7 @@ def w8a8_block_fp8_matmul(
         for start in range(0, n, chunk_n):
             end = min(start + chunk_n, n)
             chunks.append(
-                w8a8_block_fp8_matmul(
+                w8a8_block_matmul(
                     A,
                     B[start:end],
                     As,
