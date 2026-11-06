@@ -1483,7 +1483,7 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
         return c
 
 
-def w8a8_block_fp8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
