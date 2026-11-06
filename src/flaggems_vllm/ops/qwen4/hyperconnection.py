@@ -199,9 +199,21 @@ def qwen4_grouped_gemma_rmsnorm(
         raise ValueError("Qwen4 HC RMSNorm requires a valid HC count")
     if not can_use_hc_triton(hidden_states, weight):
         raise RuntimeError("Qwen4 HC RMSNorm requires contiguous accelerator tensors")
-    output = torch.empty_like(hidden_states)
     if not hidden_states.numel():
-        return output
+        return torch.empty_like(hidden_states)
+    if hidden_states.device.type == "npu":
+        from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+
+        # Keep the legacy validation and argument order, while sharing the
+        # bounded Ascend kernel and its compiled variants with the canonical API.
+        output = grouped_gemma_rmsnorm(
+            hidden_states.view(-1, hidden_states.shape[-1]),
+            weight,
+            float(eps) if isinstance(eps, bool) else eps,
+            int(hc_count) if isinstance(hc_count, bool) else hc_count,
+        )
+        return output.view_as(hidden_states)
+    output = torch.empty_like(hidden_states)
     hidden_size = weight.numel() // hc_count
     block_h = triton.next_power_of_2(hidden_size)
     rows = hidden_states.numel() // weight.numel()
