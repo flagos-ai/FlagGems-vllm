@@ -27,6 +27,8 @@ from flaggems_vllm.utils.triton_version_utils import (
     HAS_TLE,
     has_triton_tle,
     has_triton_tle_attrs,
+    pipeline_options,
+    pipeline_tuning_applies,
 )
 
 __all__ = [
@@ -43,4 +45,6 @@ __all__ = [
     "has_triton_tle",
     "has_triton_tle_attrs",
     "HAS_TLE",
+    "pipeline_options",
+    "pipeline_tuning_applies",
 ]
