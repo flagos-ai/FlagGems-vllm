@@ -546,3 +546,91 @@ def test_prefill_stable_scan_eager_and_changed_input_graph(
         torch.testing.assert_close(logits, fresh, rtol=0, atol=0)
         torch.testing.assert_close(starts, starts_before, rtol=0, atol=0)
         torch.testing.assert_close(ends, ends_before, rtol=0, atol=0)
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon radix routes")
+@pytest.mark.parametrize(
+    "vocab,k,route",
+    [
+        (128, 8, (4, False, False)),
+        (4099, 256, (4, False, False)),
+        (4099, 512, (2, True, False)),
+        (703, 512, (2, True, True)),
+    ],
+)
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("constant", [False, True])
+@torch.inference_mode()
+def test_hygon_prefill_radix_counters_graph(
+    monkeypatch, vocab, k, route, strided, constant
+):
+    backend = import_module(
+        "flaggems_vllm.runtime.backend._hygon.fused.top_k_per_row_prefill"
+    )
+    assert flaggems_vllm.top_k_per_row_prefill is backend.top_k_per_row_prefill
+    monkeypatch.setattr(backend._generic, "HAS_TLE", False)
+    launch = backend._launch_radix
+    routed = []
+
+    def checked_launch(*args):
+        routed.append(args[-1])
+        return launch(*args)
+
+    monkeypatch.setattr(backend, "_launch_radix", checked_launch)
+    rows = 4
+    torch.manual_seed(2027)
+    storage = torch.randn(rows, vocab * 2, device=device, dtype=torch.float32)
+    logits = storage[:, ::2] if strided else storage[:, :vocab]
+    starts = torch.tensor([0, 3, 5, 7], device=device, dtype=torch.int32)
+    ends = torch.tensor([0, 4, vocab - 1, vocab], device=device, dtype=torch.int32)
+    out = torch.full((rows, k), -99, device=device, dtype=torch.int32)
+
+    def run():
+        flaggems_vllm.top_k_per_row_prefill(
+            logits, starts, ends, out, rows, logits.stride(0), logits.stride(1), k
+        )
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    assert routed and all(actual == route for actual in routed)
+
+    for replay in (0, 1):
+        # Distinct scores test exact selection; constant rows force all radix
+        # rounds on long rows, including the final equal-bin counter.
+        fresh = torch.stack(
+            [torch.randperm(vocab, device=device).float() for _ in range(rows)]
+        )
+        if constant:
+            fresh.fill_(float(replay))
+        logits.copy_(fresh)
+        ends.copy_(
+            torch.tensor(
+                [0, 4 + replay, vocab - 1 - replay, vocab - replay],
+                device=device,
+                dtype=torch.int32,
+            )
+        )
+        starts_before, ends_before = starts.clone(), ends.clone()
+        for execute in (run, graph.replay):
+            out.fill_(-99)
+            execute()
+            torch.cuda.synchronize()
+            for row in range(rows):
+                start, end = int(starts[row]), int(ends[row])
+                count = min(k, end - start)
+                valid = out[row][out[row] >= 0].long()
+                assert valid.numel() == count
+                assert valid.unique().numel() == count
+                assert bool((valid < end - start).all())
+                assert int((out[row] == -1).sum()) == k - count
+                expected = torch.topk(fresh[row, start:end], count).values.sort().values
+                actual = fresh[row, start + valid].sort().values
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(logits, fresh, rtol=0, atol=0)
+            torch.testing.assert_close(starts, starts_before, rtol=0, atol=0)
+            torch.testing.assert_close(ends, ends_before, rtol=0, atol=0)
