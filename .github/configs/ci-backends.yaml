@@ -69,9 +69,11 @@ platforms:
     gpu_check_script: tools/gpu_check_hygon.sh
 
   ascend:
-    description: "Huawei Ascend 910B on the official vllm-ascend image"
+    description: "Huawei Ascend 910C on the official vllm-ascend image"
     backend: ascend-cann900
-    runner_labels: ascend-910b-1
+    # ascend-910b-1 was unusable: all three of its ARC runners stayed offline
+    # and the job never got a pod (run 42145278734).
+    runner_labels: flagcicd-910c
     container_image: m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0.post1
     container_options: >-
       --ipc=host
