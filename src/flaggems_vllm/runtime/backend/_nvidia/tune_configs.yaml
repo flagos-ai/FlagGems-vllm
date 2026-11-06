@@ -1241,6 +1241,23 @@ kda_kkt_pairs:
     num_warps: 4
     num_stages: 1
 
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 1
 kda_kkt_inter:
   - META: {BK: 32}
     num_warps: 1
