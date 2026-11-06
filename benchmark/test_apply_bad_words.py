@@ -17,9 +17,9 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
-from .base import backend_do_bench
 
 try:
     from vllm.v1.worker.gpu.sample.bad_words import (
@@ -249,8 +249,20 @@ def _run_flaggems(*args) -> None:
     flaggems_vllm.apply_bad_words(*args)
 
 
+def _backend_do_bench(fn, warmup: int, rep: int, return_mode="median") -> float:
+    """Use the timing API supported by the active accelerator backend."""
+    if flaggems_vllm.vendor_name == "ascend":
+        return triton.backends.ascend.testing.do_bench_npu(fn)
+    return triton.testing.do_bench(
+        fn,
+        warmup=warmup,
+        rep=rep,
+        return_mode=return_mode,
+    )
+
+
 def _time_us(fn, input_args: tuple) -> float:
-    latency_ms = backend_do_bench(
+    latency_ms = _backend_do_bench(
         lambda: fn(*input_args),
         warmup=BENCH_WARMUP_MS,
         rep=BENCH_REP_MS,

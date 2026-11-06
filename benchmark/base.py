@@ -56,21 +56,6 @@ else:
         pass
 
 
-def backend_do_bench(fn, warmup, rep, return_mode="median", grad_to_none=None):
-    """Benchmark a callable with the timer supported by the active backend."""
-    if vendor_name == "ascend":
-        do_bench = triton.backends.ascend.testing.do_bench_npu
-        return do_bench(fn)
-
-    return triton.testing.do_bench(
-        fn,
-        warmup=warmup,
-        rep=rep,
-        return_mode=return_mode,
-        grad_to_none=grad_to_none,
-    )
-
-
 def get_iter_count(fn):
     if Config.mode == consts.BenchMode.OPERATOR:
         torch_device_fn.synchronize()
@@ -387,13 +372,23 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / n_rep * 1000
         elif Config.mode == consts.BenchMode.KERNEL:
-            latency = backend_do_bench(
-                fn,
-                warmup=Config.warm_up,
-                rep=Config.repetition,
-                return_mode="median",
-                grad_to_none=xs if self.is_backward else None,
-            )
+            if vendor_name == "ascend":
+                do_bench = triton.backends.ascend.testing.do_bench_npu
+                latency = do_bench(
+                    fn,
+                    # do_bench_npu requires iterations, rather than duration
+                    # warmup=Config.warm_up,
+                    # active=Config.repetition,
+                )
+            else:
+                do_bench = triton.testing.do_bench
+                latency = do_bench(
+                    fn,
+                    warmup=Config.warm_up,
+                    rep=Config.repetition,
+                    return_mode="median",
+                    grad_to_none=xs if self.is_backward else None,
+                )
         elif Config.mode == consts.BenchMode.WRAPPER:
             n_warm, n_rep = get_iter_count(fn)
             for i in range(n_warm):
