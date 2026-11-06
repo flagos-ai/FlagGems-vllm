@@ -17,8 +17,8 @@
 Both sides run inverse RoPE + FP8 quant + grouped FP8 GEMM; wo_b is an identity
 callback on the vLLM side, so only the wo_a stage is timed.
 
-Use ``--mode cudagraph`` as well as the default mode: replay has no Python launch
-cost, which dominates small token counts in the default mode.
+Small batches take one kernel launch and large ones two; see ``dsv41_o_proj``. Also
+run ``--mode operator``: it counts the CPU launch time the default mode partly hides.
 """
 
 import math

@@ -31,6 +31,13 @@ Scope of this op (the "general path" of vLLM's ``dsv41_o_proj``):
 ``wo_b`` is a callback, as in vLLM (a regular quantized linear, optionally with
 reduce-scatter): this op has no kernel for it and only forwards ``z``.
 
+Two paths with the same results, except with n_groups=1 and fewer than 300 tokens,
+where ``fp8_einsum`` takes its split-K path and rounds slightly differently:
+  * Up to ``_SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS``: one kernel launch
+    (``dsv41_o_proj_single_launch``), so the GPU does not idle waiting for a second.
+  * Above that: ``fused_inv_rope_fp8_quant`` + ``fp8_einsum``, whose quant kernel has
+    more throughput once computation outweighs the launch time.
+
 Results are close to vLLM but not bit-identical: vLLM rounds activation scales up
 to a power of two on Hopper and ``fused_inv_rope_fp8_quant`` does not.
 
@@ -45,6 +52,7 @@ Not covered (raise NotImplementedError, no torch fallback):
 """
 
 import logging
+from functools import lru_cache
 from typing import Callable, Optional
 
 import torch
@@ -57,6 +65,28 @@ logger = logging.getLogger(__name__)
 # Hopper recipe (1, 128, 128): activation scales per 128 elements along K,
 # weight scales per 128x128 block. This is what fp8_einsum supports today.
 _QUANT_BLOCK = 128
+# Where the two paths cross on H20, in num_tokens * n_groups.
+_SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS = 2048
+
+
+# Small batches are sensitive to CPU time here, so these per-call lookups are cached.
+@lru_cache(maxsize=None)
+def _is_hopper(device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] == 9
+    )
+
+
+@lru_cache(maxsize=1)
+def _single_launch_path():
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.dsv41_o_proj_single_launch import (
+        dsv41_o_proj_single_launch,
+        single_launch_supported,
+    )
+
+    return dsv41_o_proj_single_launch, single_launch_supported
 
 
 def _as_grouped_weight(
@@ -141,11 +171,7 @@ def dsv41_o_proj(
         raise NotImplementedError("dsv41_o_proj: attn_out must be bfloat16")
     # Hopper only for now, checked first so no kernel runs on an unsupported GPU.
     device = attn_out.device
-    if (
-        device.type != "cuda"
-        or torch.version.hip is not None
-        or torch.cuda.get_device_capability(device)[0] != 9
-    ):
+    if not _is_hopper(device):
         raise NotImplementedError("dsv41_o_proj requires an NVIDIA Hopper GPU")
     if any(t.requires_grad for t in (attn_out, wo_a_weight, wo_a_weight_scale)):
         raise NotImplementedError("dsv41_o_proj does not support autograd")
@@ -195,9 +221,36 @@ def dsv41_o_proj(
     if num_tokens == 0:
         return out if wo_b_proj is None else wo_b_proj(out)
 
-    # ---- step 1: inverse RoPE + per-128 FP8 quant ------------------------
-    # Slicing off padded heads is a view; the kernel reads through strides.
+    # Slicing off padded heads is a view; the kernels read through strides.
     o = attn_out[:, :n_heads, :]
+
+    # ---- small batches: one launch ---------------------------------------
+    if num_tokens * n_groups <= _SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS:
+        dsv41_o_proj_single_launch, single_launch_supported = _single_launch_path()
+        if single_launch_supported(
+            o,
+            positions,
+            cos_sin_cache,
+            w3,
+            ws3,
+            heads_per_group,
+            rope_dim,
+            _QUANT_BLOCK,
+        ):
+            dsv41_o_proj_single_launch(
+                o,
+                positions,
+                cos_sin_cache,
+                w3,
+                ws3,
+                out.view(num_tokens, n_groups, o_lora_rank).permute(1, 0, 2),
+                heads_per_group,
+                rope_dim,
+                _QUANT_BLOCK,
+            )
+            return out if wo_b_proj is None else wo_b_proj(out)
+
+    # ---- step 1: inverse RoPE + per-128 FP8 quant ------------------------
     x_fp8, x_scale = fused_inv_rope_fp8_quant(
         o,
         positions,

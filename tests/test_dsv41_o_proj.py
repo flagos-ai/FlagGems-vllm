@@ -21,7 +21,10 @@ Two references:
     because the two sides round activation scales differently.
 """
 
+import importlib
 import math
+import random
+import time
 import types
 
 import pytest
@@ -305,12 +308,123 @@ def test_dsv41_o_proj_unsupported():
         call_gems(attn_out.half(), pos, csc, w, ws, n_groups, hpg, rank)
 
 
+def _two_kernel_result(monkeypatch, attn_out, pos, csc, w, ws, n_groups, hpg, rank):
+    op_module = importlib.import_module("flaggems_vllm.ops.dsv41_o_proj")
+    with monkeypatch.context() as context:
+        context.setattr(op_module, "_SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS", 0)
+        return call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 128, 256])
+@pytest.mark.parametrize("n_groups, hpg, rank", [*GROUP_CONFIGS, (1, 8, 1024)])
+def test_dsv41_o_proj_single_launch_matches_two_kernels(
+    num_tokens, n_groups, hpg, rank, monkeypatch
+):
+    op_module = importlib.import_module("flaggems_vllm.ops.dsv41_o_proj")
+    monkeypatch.setattr(op_module, "_SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS", 1 << 30)
+    attn_out, pos, csc, w, ws = make_inputs(
+        num_tokens, n_groups, hpg, rank, pad_heads=4
+    )
+    res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    ref = _two_kernel_result(
+        monkeypatch, attn_out, pos, csc, w, ws, n_groups, hpg, rank
+    )
+    if n_groups == 1:
+        # fp8_einsum's split-K path sums BF16 partials, which rounds a little more.
+        assert_relative_close(res, ref, n_groups, rank)
+    else:
+        assert torch.equal(res, ref)
+
+
+def test_dsv41_o_proj_single_launch_is_stable():
+    """Every CTA must wait for all of phase 1: a race would show up as a mismatch."""
+    n_groups, hpg, rank = GROUP_CONFIGS[0]
+    for num_tokens in (1, 32, 128):
+        attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+        ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+        for _ in range(100):
+            res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+            assert torch.equal(res, ref)
+
+
+def test_dsv41_o_proj_single_launch_cudagraph_replay():
+    n_groups, hpg, rank = GROUP_CONFIGS[0]
+    attn_out, pos, csc, w, ws = make_inputs(32, n_groups, hpg, rank)
+    ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    out = torch.empty_like(ref)
+    call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, out=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, out=out)
+    for _ in range(20):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
+
+
+def test_dsv41_o_proj_single_launch_repeat_launch_reuses_compiled_kernel(monkeypatch):
+    launcher = importlib.import_module(
+        "flaggems_vllm.runtime.backend._nvidia.hopper.ops.dsv41_o_proj_single_launch"
+    )
+    n_groups, hpg, rank = GROUP_CONFIGS[0]
+    attn_out, pos, csc, w, ws = make_inputs(32, n_groups, hpg, rank)
+    ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    # Going back through Triton's argument matching would now raise.
+    monkeypatch.setattr(launcher, "_dsv41_o_proj_single_launch_kernel", None)
+    assert torch.equal(call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank), ref)
+
+
+def test_dsv41_o_proj_single_launch_reused_kernel_respects_specialization():
+    """Same shapes, but an alignment or dtype that needs a different compiled kernel."""
+    n_groups, hpg, rank = GROUP_CONFIGS[0]
+    attn_out, pos, csc, w, ws = make_inputs(32, n_groups, hpg, rank)
+    ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+
+    unaligned = torch.empty(
+        attn_out.numel() + 1, dtype=attn_out.dtype, device=attn_out.device
+    )[1:].view_as(attn_out)
+    unaligned.copy_(attn_out)
+    assert unaligned.data_ptr() % 16 != 0
+    res = call_gems(unaligned, pos, csc, w, ws, n_groups, hpg, rank)
+    # Compiled separately for unaligned loads, which can round a few values differently.
+    assert_relative_close(res, ref, n_groups, rank)
+
+    res = call_gems(attn_out, pos.to(torch.int32), csc, w, ws, n_groups, hpg, rank)
+    assert torch.equal(res, ref)
+
+
+def test_dsv41_o_proj_single_launch_new_token_count_does_not_recompile():
+    n_groups, hpg, rank = GROUP_CONFIGS[0]
+
+    def first_call_ms(num_tokens):
+        attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) * 1000
+
+    first_call_ms(128)  # compile the BLOCK_M=64 kernel once
+    # min() ignores scheduling noise. A compile takes at least 250 ms on H20.
+    best = min(first_call_ms(t) for t in random.sample(range(65, 256), 3))
+    assert best < 100, f"new token count took {best:.1f} ms"
+
+
 def test_dsv41_o_proj_rejects_non_hopper(monkeypatch):
     n_groups, hpg, rank = 2, 8, 1024
     attn_out, pos, csc, w, ws = make_inputs(4, n_groups, hpg, rank)
+    is_hopper_cache = importlib.import_module(
+        "flaggems_vllm.ops.dsv41_o_proj"
+    )._is_hopper
+    is_hopper_cache.cache_clear()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 0))
-    with pytest.raises(NotImplementedError, match="Hopper"):
-        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    try:
+        with pytest.raises(NotImplementedError, match="Hopper"):
+            call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    finally:
+        is_hopper_cache.cache_clear()
 
 
 def test_dsv41_o_proj_rejects_weight_on_other_device():
