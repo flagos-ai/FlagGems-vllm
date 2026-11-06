@@ -349,4 +349,3 @@ def gems_log_logger(fn):
     name is just the resolved function's module.
     """
     return fn.__module__
-
