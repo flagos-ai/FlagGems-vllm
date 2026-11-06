@@ -34,7 +34,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "flag-gems",
+    "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@36d8e98ba627d52963f1fd0d56567eabd3b79c53",
     "packaging",
     "pybind11",
     "PyYAML",

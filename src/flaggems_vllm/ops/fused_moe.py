@@ -670,6 +670,25 @@ class MoEActivation(Enum):
         return N if not activation.is_gated else N // 2
 
 
+def _validate_silu_clamp_limit(gemm1_clamp_limit: float | None) -> float | None:
+    """Accept an optional finite, nonnegative clamp for ordinary SwiGLU."""
+    if gemm1_clamp_limit is None:
+        return None
+    if not isinstance(gemm1_clamp_limit, numbers.Real) or isinstance(
+        gemm1_clamp_limit, bool
+    ):
+        raise ValueError("silu requires a finite scalar gemm1_clamp_limit >= 0")
+    try:
+        limit = float(gemm1_clamp_limit)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "silu requires a finite scalar gemm1_clamp_limit >= 0"
+        ) from exc
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("silu requires a finite scalar gemm1_clamp_limit >= 0")
+    return limit
+
+
 def _validate_swigluoai_uninterleave_params(
     gemm1_alpha: float | None,
     gemm1_beta: float | None,
@@ -781,6 +800,10 @@ def apply_moe_activation(
             f"{output.size(-1)} vs {input.size(-1)}"
         )
 
+    if activation == MoEActivation.SILU and gemm1_clamp_limit is not None:
+        from flaggems_vllm import silu_clamp
+
+        return silu_clamp(input, output, _validate_silu_clamp_limit(gemm1_clamp_limit))
     if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
         N = output.size(-1)
         x, y = input[:, :N], input[:, N:]
@@ -940,6 +963,20 @@ def _int8_quantize(
         return A_q, scale
 
     elif per_act_token:
+        if (
+            _W8A8_QUANT_FUSION_MODE == "quant_silu"
+            and A.ndim == 2
+            and A.dtype in (torch.bfloat16, torch.float16)
+            and A.device.type == "cuda"
+            and 0 < A.size(-1) <= 8192
+        ):
+            from flaggems_vllm import (
+                int8_quantize_per_token,
+                supports_int8_quantize_per_token,
+            )
+
+            if supports_int8_quantize_per_token(A):
+                return int8_quantize_per_token(A)
         # One Triton kernel, no eager reduce/divide/round chain.  That chain
         # dispatched through abs/amax/clamp/div/round, so its arithmetic
         # depended on whether FlagGems had overridden those operators.
@@ -2335,12 +2372,9 @@ def fused_experts_impl(
             )
         )
     elif activation_enum == MoEActivation.SILU:
-        if any(
-            value is not None for value in (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
-        ):
-            raise ValueError(
-                "gemm1_alpha/beta/clamp_limit require swigluoai_uninterleave"
-            )
+        if gemm1_alpha is not None or gemm1_beta is not None:
+            raise ValueError("gemm1_alpha/beta require swigluoai_uninterleave")
+        gemm1_clamp_limit = _validate_silu_clamp_limit(gemm1_clamp_limit)
     else:
         raise ValueError(
             f"Only 'silu' and 'swigluoai_uninterleave' activations are supported, "
@@ -2488,6 +2522,7 @@ def fused_experts_impl(
     # Check if we can safely fuse the activation with the first GEMM pass
     can_use_fused_silu = (
         activation_enum == MoEActivation.SILU
+        and gemm1_clamp_limit is None
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
     )
@@ -2620,7 +2655,37 @@ def fused_experts_impl(
             and intermediate_cache2.device.type in ("cuda", "musa", "xpu")
             and 0 < activation_out_dim <= 8192
         )
-        if fused_oai_quant2:
+        fused_silu_quant2 = False
+        if (
+            _W8A8_QUANT_FUSION_MODE == "quant_silu"
+            and use_int8_w8a8
+            and per_channel_quant
+            and block_shape is None
+            and ocp_mx_scheme is None
+            and a2_scale is None
+            and activation_enum == MoEActivation.SILU
+            and gemm1_clamp_limit is not None
+        ):
+            from flaggems_vllm import (
+                silu_clamp_int8_quant,
+                supports_silu_clamp_int8_quant,
+            )
+
+            packed_silu_input = intermediate_cache1.view(-1, N)
+            if supports_silu_clamp_int8_quant(
+                packed_silu_input,
+                intermediate_cache2,
+                gemm1_clamp_limit,
+            ):
+                qintermediate_cache2, a2q_scale = silu_clamp_int8_quant(
+                    packed_silu_input,
+                    intermediate_cache2,
+                    gemm1_clamp_limit,
+                )
+                fused_silu_quant2 = True
+        if fused_silu_quant2:
+            pass
+        elif fused_oai_quant2:
             qintermediate_cache2, a2q_scale = _swigluoai_quantize_per_token_triton(
                 intermediate_cache1.view(-1, N),
                 intermediate_cache2,
@@ -2639,7 +2704,7 @@ def fused_experts_impl(
             )
 
         # 5. Quantize activated intermediate for GEMM2
-        if not fused_oai_quant2:
+        if not (fused_oai_quant2 or fused_silu_quant2):
             qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
                 A=intermediate_cache2,
                 A_scale=a2_scale,

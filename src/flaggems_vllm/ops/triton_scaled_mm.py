@@ -34,6 +34,7 @@ def scaled_mm_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_SCALE_A: tl.constexpr,
     BLOCK_SIZE_SCALE_B: tl.constexpr,
+    SCALE_B_FIRST: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
 
@@ -103,12 +104,17 @@ def scaled_mm_kernel(
     # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
     # for scale_b below.
     scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
-    accumulator = scale_a * accumulator.to(tl.float32)
 
     masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
     scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
     scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
-    accumulator = scale_b.T * accumulator.to(tl.float32)
+    if SCALE_B_FIRST:
+        # Native W8A8 decode rounds the channel product before row scaling.
+        accumulator = scale_b.T * accumulator.to(tl.float32)
+        accumulator = scale_a * accumulator
+    else:
+        accumulator = scale_a * accumulator.to(tl.float32)
+        accumulator = scale_b.T * accumulator.to(tl.float32)
 
     # Convert to output format.
     c = accumulator.to(c_ptr.type.element_ty)

@@ -138,6 +138,33 @@ runs:
           --no-build-isolation \
           --no-deps \
           -e "${GITHUB_WORKSPACE}"
+
+        # The support workflow stays pinned above. A direct numerical-library
+        # dependency must still be installed even though vendor setup uses --no-deps.
+        core_requirement="$(
+          python - <<'PYCODE'
+        from importlib.metadata import requires
+
+        from packaging.requirements import Requirement
+
+        core = [
+            Requirement(raw)
+            for raw in requires("flaggems_vllm") or ()
+            if Requirement(raw).name.replace("-", "_").lower() == "flag_gems"
+            and Requirement(raw).marker is None
+        ]
+        if len(core) != 1:
+            raise SystemExit("expected exactly one mandatory FlagGems dependency")
+        print(str(core[0]) if core[0].url else "")
+        PYCODE
+        )"
+        if [[ -n "${core_requirement}" ]]; then
+          uv pip install \
+            --python "${FLAGGEMS_VENV}/bin/python" \
+            --no-build-isolation \
+            --no-deps \
+            "${core_requirement}"
+        fi
         # This test-only pure Python dependency is not provided by FlagGems.
         # Keep dependency resolution disabled so the vendor environment's
         # pinned packages are not upgraded or replaced.
