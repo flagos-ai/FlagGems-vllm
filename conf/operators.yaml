@@ -206,6 +206,18 @@ ops:
     kind: [Attention]
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_with_fused_gate
+    description: |
+      KDA prefill with fused softplus gate and 64-token chunks; V-first final state and aliased value output.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_with_fused_gate
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - beta: '0.3'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices
@@ -372,6 +384,17 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: expand_pools_and_append_tail
+    description: Expand identity-mapped history pools and append an incomplete token tail.
+    for:
+      - vllm.models.glm5next.nvidia.ops.kpool_compress.expand_pools_and_append_tail
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Indexing
+    stages:
+      - beta: '0.3'
   - id: flash_attention_forward
     description: Forward pass of FlashAttention computing scaled dot-product attention.
     for:
@@ -817,6 +840,16 @@ ops:
       - MoE
     stages:
       - stable: '5.0'
+  - id: hc_combine
+    description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
+    for:
+      - hc_combine
+    labels:
+      - fused
+    kind:
+      - Pointwise
+    stages:
+      - beta: '0.3'
   - id: hc_head_fused_kernel
     description: |
       The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
