@@ -241,9 +241,47 @@ def test_fused_moe_vs_ref(config, dtype):
 
 
 try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts_impl as vllm_fused_experts_impl,
-    )
+    if flaggems_vllm.vendor_name == "ascend":
+        # vLLM's vanilla Triton fused_moe is CUDA-only and cannot run on
+        # Ascend (kernel fails to compile; torch.ops._moe_C is absent in
+        # VLLM_TARGET_DEVICE=empty builds). Use the vendor (vllm-ascend)
+        # implementation as the reference instead.
+        from vllm_ascend.ops.fused_moe.moe_mlp import (
+            unquant_apply_mlp as _ascend_unquant_apply_mlp,
+        )
+
+        def vllm_fused_experts_impl(
+            hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
+        ):
+            """vllm-ascend reference: npu_grouped_matmul + npu_swiglu."""
+            num_tokens, hidden_size = hidden_states.shape
+            topk = topk_ids.shape[1]
+            num_experts = w1.shape[0]
+            flat_ids = topk_ids.reshape(-1).long()
+            # argsort on int64 falls back to the (very slow / hanging) AiCpu
+            # engine on Ascend; expert ids are small so sort as float32 on AiCore.
+            order = torch.argsort(flat_ids.float())
+            expanded = hidden_states.repeat_interleave(topk, dim=0)[order]
+            group_list = torch.bincount(flat_ids, minlength=num_experts)
+            out_sorted = _ascend_unquant_apply_mlp(
+                expanded,
+                w1,
+                w2,
+                group_list,
+                activation="silu",
+                topk_scales=topk_weights.reshape(-1)[order]
+                .unsqueeze(-1)
+                .to(expanded.dtype),
+                need_trans=True,
+            )
+            out = torch.empty_like(out_sorted)
+            out[order] = out_sorted
+            return out.view(num_tokens, topk, hidden_size).sum(dim=1)
+
+    else:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl as vllm_fused_experts_impl,
+        )
 
     HAS_VLLM_FUSED_MOE = True
 except ImportError:
