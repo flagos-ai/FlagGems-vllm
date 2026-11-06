@@ -43,12 +43,16 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 )
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
-    chunk_kda_scaled_dot_kkt_fwd,
     chunk_gated_delta_rule_fwd,
     chunk_kda,
+    chunk_kda_scaled_dot_kkt_fwd,
+    chunk_kda_fwd_intra_token_parallel,
+    chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_kda,
 )
+from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
@@ -59,6 +63,9 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_w8a8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.expand_pools_and_append_tail import expand_pools_and_append_tail
@@ -109,6 +116,8 @@ from flaggems_vllm.ops.mhc import (
     sinkhorn_forward,
 )
 from flaggems_vllm.ops.qwen4 import (
+    grouped_gemma_rmsnorm,
+    hc_combine,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -211,7 +220,6 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
-    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -251,7 +259,9 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "chunk_kda",
+    "chunk_kda_fwd_intra_token_parallel",
     "chunk_kda_scaled_dot_kkt_fwd",
+    "chunk_kda_with_fused_gate",
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
@@ -276,6 +286,7 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "flash_mla_with_kvcache_w8a8",
     "fp32_router_gemm",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
@@ -294,14 +305,17 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
+    "gate_sigmoid_mul",
     "gather_rows",
     "gather_state_rows",
     "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
+    "hc_combine",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "ihc_post",

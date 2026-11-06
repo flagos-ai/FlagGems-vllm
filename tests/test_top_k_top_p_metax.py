@@ -334,3 +334,92 @@ def test_single_row_dispatch(monkeypatch):
         flaggems_vllm.top_k_top_p(logits, p, k), reference(logits.clone(), k, p)
     )
     assert calls == [logits.shape]
+
+
+@pytest.mark.parametrize(
+    "shape", [(31, 131072), (32, 131071), (32, 131072), (33, 131073), (64, 151936)]
+)
+@pytest.mark.parametrize("bf16_grid", [True, False])
+@pytest.mark.parametrize("mode", ["k", "p", "both"])
+def test_prefix_guard_filter(shape, bf16_grid, mode, monkeypatch):
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.top_k_top_p"
+    )
+    kernel = backend._threshold_prefix_stats
+    calls = []
+
+    class ObserveLaunch:
+        def __getitem__(self, grid):
+            launch = kernel[grid]
+
+            def invoke(*args, **kwargs):
+                calls.append(grid)
+                return launch(*args, **kwargs)
+
+            return invoke
+
+    monkeypatch.setattr(backend, "_threshold_prefix_stats", ObserveLaunch())
+    logits = make_logits(shape, bf16_grid)
+    before = logits.clone()
+    k, p = filters(*shape, mode)
+    actual = flaggems_vllm.top_k_top_p(logits, p, k)
+    if mode == "p":
+        assert_top_p_mask(actual, before, p)
+    else:
+        assert_exact(actual, reference(before.clone(), k, p))
+    assert_exact(logits, before)
+    assert actual.data_ptr() != logits.data_ptr()
+    uses_prefix = mode != "k" and shape[0] >= 32 and shape[1] >= 131072
+    assert len(calls) == int(uses_prefix)
+
+
+@pytest.mark.parametrize("m,g", [(1, 1), (1, 16), (3, 33), (32, 512), (64, 1024)])
+def test_prefix_stats_cpu_int64(m, g):
+    import triton
+
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.top_k_top_p"
+    )
+    generator = torch.Generator().manual_seed(1069)
+    less = torch.randint(0, 257, (m, g), generator=generator, dtype=torch.int32)
+    equal = torch.randint(0, 257, (m, g), generator=generator, dtype=torch.int32)
+    total = torch.empty((m,), dtype=torch.int32, device=flaggems_vllm.device)
+    prefix = torch.empty((m, g), dtype=torch.int32, device=flaggems_vllm.device)
+    backend._threshold_prefix_stats[(m,)](
+        less.to(total.device),
+        equal.to(total.device),
+        total,
+        prefix,
+        g,
+        triton.next_power_of_2(g),
+        num_warps=4,
+    )
+    assert torch.equal(total.cpu().long(), less.long().sum(-1))
+    assert torch.equal(prefix.cpu().long(), equal.long().cumsum(-1) - equal.long())
+
+
+@pytest.mark.parametrize(
+    "shape", [(31, 131072), (32, 131071), (32, 131072), (33, 131073)]
+)
+@pytest.mark.parametrize("bf16_grid", [True, False])
+def test_prefix_guard_graph_changed_inputs(shape, bf16_grid):
+    logits = make_logits(shape, bf16_grid)
+    original = logits.clone()
+    k, p = filters(*shape, "both")
+    before_rng = torch.cuda.get_rng_state().clone()
+    flaggems_vllm.top_k_top_p(logits, p, k)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = flaggems_vllm.top_k_top_p(logits, p, k)
+    for shift in (1, 7, 31):
+        fresh = original.roll(shift, dims=1)
+        k.fill_(min(20 + shift, shape[1]))
+        p.fill_(0.5 if shift == 7 else 0.9)
+        result.fill_(float("nan"))
+        expected = reference(fresh.clone(), k, p)
+        logits.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_exact(result, expected)
+        assert_exact(logits, fresh)
+    assert torch.equal(before_rng, torch.cuda.get_rng_state())

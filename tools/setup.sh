@@ -31,6 +31,7 @@ MIRROR="${PIP_INDEX_URL:-https://pypi.org/simple}"
 
 VLLM_VERSION="${VLLM_VERSION:-0.20.2}"
 TORCH_BACKEND="${TORCH_BACKEND:-auto}"
+FLAG_GEMS_VERSION="${FLAG_GEMS_VERSION:-}"
 
 FLAGOS_PYPI="${FLAGOS_PYPI:-https://resource.flagos.net/repository/flagos-pypi-hosted/simple}"
 FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.1}"
@@ -51,6 +52,61 @@ STRICT_TRITON_IMPORT="${STRICT_TRITON_IMPORT:-0}"
 STRICT_PIP_CHECK="${STRICT_PIP_CHECK:-0}"
 
 CUDA_HOME="${CUDA_HOME:-}"
+
+print_help() {
+  cat <<EOF
+Usage: $(basename "$0") [-h|--help]
+
+Bootstraps a GPU-ready dev environment for FlagGems-vllm: creates a uv-managed
+virtual environment, installs vLLM + a matching PyTorch build, installs
+FlagGems and FlagGems-vllm (editable), optionally swaps Triton for FlagTree,
+and runs a test-collection smoke check.
+
+This script takes no positional arguments; all configuration is done via
+environment variables (each shown below with its default):
+
+  PYTHON_VERSION=${PYTHON_VERSION}            Python version to install via uv
+  VENV_DIR=${VENV_DIR}                  Target virtual environment directory
+  PIP_INDEX_URL=${MIRROR}
+                               Default package index (used for most installs)
+
+  VLLM_VERSION=${VLLM_VERSION}             vLLM version to install
+  TORCH_BACKEND=${TORCH_BACKEND}               Torch backend passed to --torch-backend
+                               (e.g. auto, cpu, cu121, cu124, ...)
+  FLAG_GEMS_VERSION=          FlagGems version to pin; empty installs latest
+
+  FLAGOS_PYPI=${FLAGOS_PYPI}
+                               Index used for FlagTree
+  FLAGTREE_VERSION=${FLAGTREE_VERSION}            FlagTree version to install
+
+  USE_FLAGTREE=${USE_FLAGTREE}                   Replace Triton with FlagTree (1) or keep
+                               the Triton installed by vLLM/PyTorch (0)
+  STRICT_TRITON_IMPORT=${STRICT_TRITON_IMPORT}       Fail setup if \`import triton\` fails (1) or
+                               only warn (0)
+  STRICT_PIP_CHECK=${STRICT_PIP_CHECK}          Fail setup if \`uv pip check\` reports
+                               conflicts (1) or only warn (0)
+
+  CUDA_HOME=                  CUDA toolkit path; auto-detected from
+                               /usr/local/cuda* if unset
+
+Example:
+  USE_FLAGTREE=0 VLLM_VERSION=0.20.2 bash tools/setup.sh
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown argument: $arg" >&2
+      echo "Run with -h or --help for usage." >&2
+      exit 1
+      ;;
+  esac
+done
 
 setup_cuda_env() {
   local candidate
@@ -219,6 +275,29 @@ print(" vllm:", vllm.__version__)
 PY
 ok
 
+# ── Install FlagGems (required dependency) ───────────────────
+# Must run after vLLM/torch are installed: FlagGems's packaging does not
+# declare torch as a dependency even though `import flag_gems` requires it,
+# so installing it first could leave a torch-less, unimportable flag_gems.
+printf "Installing FlagGems${FLAG_GEMS_VERSION:+==${FLAG_GEMS_VERSION}} ..."
+uv pip install -q \
+  "flag-gems${FLAG_GEMS_VERSION:+==${FLAG_GEMS_VERSION}}" \
+  --constraint "${CONSTRAINTS_FILE}" \
+  --default-index "${MIRROR}" \
+  || fail
+ok
+
+printf "Verifying FlagGems import ..."
+python - <<'PY' || fail
+import flag_gems
+
+print(" flag_gems:", getattr(flag_gems, "__version__", "unknown"))
+print(" flag_gems path:", flag_gems.__file__)
+assert hasattr(flag_gems, "enable"), "flag_gems.enable is missing"
+assert hasattr(flag_gems, "use_gems"), "flag_gems.use_gems is missing"
+PY
+ok
+
 # ── Install FlagGems-vllm before Triton replacement ──────────
 printf "Installing FlagGems-vllm editable ..."
 uv pip install -q \
@@ -274,14 +353,17 @@ fi
 # ── Verify installation ──────────────────────────────────────
 printf "Verifying imports ..."
 python - <<'PY' || fail
+import flag_gems
 import torch
 import vllm
+
 import flaggems_vllm
 
 print(" torch:", torch.__version__)
 print(" torch cuda:", torch.version.cuda)
 print(" cuda available:", torch.cuda.is_available())
 print(" vllm:", vllm.__version__)
+print(" flag_gems:", getattr(flag_gems, "__version__", "unknown"))
 print(" flaggems_vllm device:", getattr(flaggems_vllm, "device", "unknown"))
 PY
 ok

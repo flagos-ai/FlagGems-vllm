@@ -43,7 +43,18 @@ class TopKTopPMetaXBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (m, n, self.bf16_grid)
-            for m, n in [(1, 4096), (1, 151936), (8, 151936), (64, 151936)]
+            for m, n in [
+                (1, 4096),
+                (1, 151936),
+                (8, 151936),
+                (31, 131072),
+                (32, 131071),
+                (32, 131072),
+                (32, 151936),
+                (64, 4096),
+                (64, 151936),
+                (64, 262144),
+            ]
         ]
 
     def record_shapes(self, *args, **kwargs):

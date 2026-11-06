@@ -348,6 +348,27 @@ def _threshold_counts(
 
 
 @triton.jit
+def _threshold_prefix_stats(
+    less_counts_ptr,
+    equal_counts_ptr,
+    total_less_ptr,
+    prefix_equal_ptr,
+    grid_n: tl.constexpr,
+    block_counts: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, block_counts)
+    valid = cols < grid_n
+    offsets = row * grid_n + cols
+    less = tl.load(less_counts_ptr + offsets, mask=valid, other=0)
+    equal = tl.load(equal_counts_ptr + offsets, mask=valid, other=0)
+    total_less = tl.sum(less, axis=0)
+    exclusive_equal = tl.cumsum(equal, axis=0) - equal
+    tl.store(total_less_ptr + row, total_less)
+    tl.store(prefix_equal_ptr + offsets, exclusive_equal, mask=valid)
+
+
+@triton.jit
 def _stable_threshold_mask(
     logits_ptr,
     sorted_logits_ptr,
@@ -359,6 +380,9 @@ def _stable_threshold_mask(
     count_block: tl.constexpr,
     top_k_threshold_ptr,
     has_k: tl.constexpr,
+    total_less_ptr,
+    prefix_equal_ptr,
+    use_prefix: tl.constexpr,
 ):
     pid = tl.program_id(0)
     grid_n: tl.constexpr = tl.cdiv(n, block_n)
@@ -369,15 +393,23 @@ def _stable_threshold_mask(
     first_keep = tl.load(first_keep_ptr + row)
     threshold = tl.load(sorted_logits_ptr + row * n + first_keep)
 
-    count_cols = tl.arange(0, count_block)
-    count_valid = count_cols < grid_n
-    count_offsets = row * grid_n + count_cols
-    less_counts = tl.load(less_counts_ptr + count_offsets, mask=count_valid, other=0)
-    equal_counts = tl.load(equal_counts_ptr + count_offsets, mask=count_valid, other=0)
-    total_less = tl.sum(less_counts, axis=0)
-    prior_equal = tl.sum(
-        tl.where(count_valid & (count_cols < chunk), equal_counts, 0), axis=0
-    )
+    if use_prefix:
+        total_less = tl.load(total_less_ptr + row)
+        prior_equal = tl.load(prefix_equal_ptr + row * grid_n + chunk)
+    else:
+        count_cols = tl.arange(0, count_block)
+        count_valid = count_cols < grid_n
+        count_offsets = row * grid_n + count_cols
+        less_counts = tl.load(
+            less_counts_ptr + count_offsets, mask=count_valid, other=0
+        )
+        equal_counts = tl.load(
+            equal_counts_ptr + count_offsets, mask=count_valid, other=0
+        )
+        total_less = tl.sum(less_counts, axis=0)
+        prior_equal = tl.sum(
+            tl.where(count_valid & (count_cols < chunk), equal_counts, 0), axis=0
+        )
     tie_remove_count = first_keep - total_less
 
     offsets = row * n + cols
@@ -486,6 +518,23 @@ def top_k_top_p(
         less = torch.empty((m, grid_n), dtype=torch.int32, device=logits.device)
         equal = torch.empty_like(less)
         _threshold_counts[grid](logits, sorted_logits, first_keep, less, equal, n, 256)
+        # Precomputing row statistics avoids repeated O(grid_n) reductions
+        # in every mask CTA. Keep small batches/vocabs on the original path:
+        # the extra launch and workspace allocations otherwise cost more.
+        use_prefix = m >= 32 and n >= 131072
+        total_less = prefix_equal = None
+        if use_prefix:
+            total_less = torch.empty((m,), dtype=torch.int32, device=logits.device)
+            prefix_equal = torch.empty_like(equal)
+            _threshold_prefix_stats[(m,)](
+                less,
+                equal,
+                total_less,
+                prefix_equal,
+                grid_n,
+                triton.next_power_of_2(grid_n),
+                num_warps=4,
+            )
         _stable_threshold_mask[grid](
             logits,
             sorted_logits,
@@ -497,5 +546,8 @@ def top_k_top_p(
             triton.next_power_of_2(grid_n),
             thresholds,
             k is not None,
+            total_less,
+            prefix_equal,
+            use_prefix,
         )
     return logits
