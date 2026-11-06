@@ -192,19 +192,12 @@ def _distribute_to_bins(
 
 @triton.jit
 def _stable_output_positions(base, mask):
-    # Keep the scan in the mask's rank. Flattening a vector tile can retain a
-    # rank-2 blocked encoding on a rank-1 value in non-TLE compiler backends.
+    # Non-TLE tiles stay one-dimensional from load through compaction. Avoid
+    # rank-changing scan encodings in compiler backends such as MetaX.
+    tl.static_assert(len(mask.shape) == 1)
     counts = mask.to(tl.int32)
-    if len(mask.shape) == 1:
-        positions = base + tl.cumsum(counts, axis=0) - 1
-        total = tl.sum(counts, axis=0)
-    else:
-        # Preserve the same row-major order as a flattened inclusive scan.
-        row_counts = tl.sum(counts, axis=1)
-        row_offsets = tl.cumsum(row_counts, axis=0) - row_counts
-        positions = base + row_offsets[:, None] + tl.cumsum(counts, axis=1) - 1
-        total = tl.sum(row_counts, axis=0)
-    return positions, base + total
+    positions = base + tl.cumsum(counts, axis=0) - 1
+    return positions, base + tl.sum(counts, axis=0)
 
 
 @triton.jit
@@ -403,11 +396,16 @@ def _process_histogram_step(
     RADIX10_SIZE: tl.constexpr = 1024
 
     lane = tl.arange(0, BLOCK_SIZE)
-    vec = tl.arange(0, VEC)
+    if HAS_TLE:
+        vector_lane = lane[:, None] * VEC + tl.arange(0, VEC)[None, :]
+    else:
+        # The same contiguous row-major tile, without a rank conversion before
+        # the stable scan. Keep the TLE layout and launch geometry unchanged.
+        vector_lane = tl.arange(0, BLOCK_SIZE * VEC)
     ones = tl.full([BLOCK_SIZE], 1, tl.int32)
-    ones_vec_2d = tl.full([BLOCK_SIZE, VEC], 1, tl.int32)
+    ones_vec = tl.full(vector_lane.shape, 1, tl.int32)
     zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    zeros_vec_2d = tl.zeros([BLOCK_SIZE, VEC], dtype=tl.int32)
+    zeros_vec = tl.full(vector_lane.shape, 0, tl.int32)
 
     threshold_rounds: tl.constexpr = (
         RADIX10_SIZE // BLOCK_SIZE if STEP == 3 else RADIX11_SIZE // BLOCK_SIZE
@@ -427,13 +425,12 @@ def _process_histogram_step(
         n_vec_full = vocab_size // (BLOCK_SIZE * VEC)
         rem_tiles = (vocab_size - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
         for t in tl.range(0, n_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            offs = base[:, None] + vec[None, :]
+            offs = t * BLOCK_SIZE * VEC + vector_lane
             x_vec = tl.load(logits_ptr + offs)
             _distribute_to_bins(
                 x_vec,
                 True,
-                ones_vec_2d,
+                ones_vec,
                 logit_pattern,
                 s_histogram_ptr,
                 STEP=STEP,
@@ -456,13 +453,12 @@ def _process_histogram_step(
         rem_tiles = (row_len - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
         rem_elems = row_len % BLOCK_SIZE
         for t in tl.range(0, n_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            offs = base[:, None] + vec[None, :]
+            offs = t * BLOCK_SIZE * VEC + vector_lane
             x_vec = tl.load(aligned_row_ptr + offs)
             _distribute_to_bins(
                 x_vec,
                 True,
-                ones_vec_2d,
+                ones_vec,
                 logit_pattern,
                 s_histogram_ptr,
                 STEP=STEP,
@@ -574,25 +570,24 @@ def _process_histogram_step(
         found_ptrs = s_found_topk_values_ptr + zeros
         final_cnt_ptrs = s_final_cnt_ptr + zeros
     if assume_aligned:
-        found_ptrs_vec_2d = s_found_topk_values_ptr
-        final_cnt_ptrs_vec_2d = s_final_cnt_ptr
+        found_ptrs_vec = s_found_topk_values_ptr
+        final_cnt_ptrs_vec = s_final_cnt_ptr
         if HAS_TLE or CANONICAL_OUTPUT:
-            found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
-            final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
+            found_ptrs_vec = s_found_topk_values_ptr + zeros_vec
+            final_cnt_ptrs_vec = s_final_cnt_ptr + zeros_vec
         n_tiles = tl.cdiv(vocab_size, BLOCK_SIZE)
         n_vec_full = vocab_size // (BLOCK_SIZE * VEC)
         rem_tiles = (vocab_size - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
         for t in tl.range(0, n_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            offs = base[:, None] + vec[None, :]
+            offs = t * BLOCK_SIZE * VEC + vector_lane
             x_vec = tl.load(logits_ptr + offs)
             found_count, final_count, equal_count = _process_bins(
                 x_vec,
                 True,
-                ones_vec_2d,
+                ones_vec,
                 offs,
-                found_ptrs_vec_2d,
-                final_cnt_ptrs_vec_2d,
+                found_ptrs_vec,
+                final_cnt_ptrs_vec,
                 logit_pattern,
                 threshold_bin_idx,
                 write_directly,
@@ -644,11 +639,11 @@ def _process_histogram_step(
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
     elif stride1 == 1:
-        found_ptrs_vec_2d = s_found_topk_values_ptr
-        final_cnt_ptrs_vec_2d = s_final_cnt_ptr
+        found_ptrs_vec = s_found_topk_values_ptr
+        final_cnt_ptrs_vec = s_final_cnt_ptr
         if HAS_TLE or CANONICAL_OUTPUT:
-            found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
-            final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
+            found_ptrs_vec = s_found_topk_values_ptr + zeros_vec
+            final_cnt_ptrs_vec = s_final_cnt_ptr + zeros_vec
         aligned_row_ptr = tl.multiple_of(logits_ptr + row_start + skip_elems, VEC * 4)
         row_len = row_end - row_start - skip_elems
         n_vec_full = row_len // (BLOCK_SIZE * VEC)
@@ -688,16 +683,15 @@ def _process_histogram_step(
                 MERGE_BLOCKS=MERGE_BLOCKS,
             )
         for t in tl.range(0, n_vec_full):
-            base = t * BLOCK_SIZE * VEC + lane * VEC
-            offs = base[:, None] + vec[None, :]
+            offs = t * BLOCK_SIZE * VEC + vector_lane
             x_vec = tl.load(aligned_row_ptr + offs)
             found_count, final_count, equal_count = _process_bins(
                 x_vec,
                 True,
-                ones_vec_2d,
+                ones_vec,
                 offs + skip_elems,
-                found_ptrs_vec_2d,
-                final_cnt_ptrs_vec_2d,
+                found_ptrs_vec,
+                final_cnt_ptrs_vec,
                 logit_pattern,
                 threshold_bin_idx,
                 write_directly,

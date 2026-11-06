@@ -391,7 +391,7 @@ def test_repeated_inputs_stable_selection(rows, vocab, k, score_kind, strided):
 
 @pytest.mark.top_k_per_row_decode
 @pytest.mark.parametrize("entry", ["public", "non_tle"])
-@pytest.mark.parametrize("vocab,k", [(128, 8), (4099, 32)])
+@pytest.mark.parametrize("vocab,k", [(128, 8), (2048, 32), (4099, 32)])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("score_kind", ["continuous", "quantized", "constant"])
 @torch.inference_mode()
