@@ -1407,3 +1407,29 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+gather_draft_sampled:
+  - META: {BLOCK_SIZE: 32, WARPS: 1, ELEMENTS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE: 64, WARPS: 1, ELEMENTS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_SIZE: 128, WARPS: 4, ELEMENTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 256, WARPS: 4, ELEMENTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 256, WARPS: 4, ELEMENTS: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 512, WARPS: 4, ELEMENTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 512, WARPS: 4, ELEMENTS: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 1024, WARPS: 4, ELEMENTS: 2}
+    num_warps: 4
+    num_stages: 1
