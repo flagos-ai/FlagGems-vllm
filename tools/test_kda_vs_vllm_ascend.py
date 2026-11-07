@@ -485,32 +485,39 @@ def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
     """Short causal conv over the packed q/k/v projection (3 * H * D channels).
 
     Decode batches are bounded by the 950DT mixed-deployment
-    --max-num-seqs=16; prefill batches are bounded by
-    --max-num-batched-tokens=24576 (see build_chunk_kda_cases).
+    --max-num-seqs=16. Prefill shapes follow the same (T, H, seq) chunk
+    prefill sweep as build_chunk_kda_cases: T in {8k,16k,24k,32k} zipped
+    with H in {24,12,6} and seq in {2,4,8} (not a cartesian product).
     """
     cases = []
-    dim = 3 * heads * HEAD_DIM
     max_seqs = K3_950DT_MAX_NUM_SEQS
-    per_seq_at_max_seqs = K3_950DT_MAX_NUM_BATCHED_TOKENS // max_seqs
-    full_batch_cu = [i * per_seq_at_max_seqs for i in range(max_seqs + 1)]
-    shapes = (
-        ((4, 0), (max_seqs // 2, 0), (max_seqs, 0))
-        if decode
-        else ([0, 31, 96], [0, 512, 1536, 4096], full_batch_cu, [0, K3_950DT_MAX_NUM_BATCHED_TOKENS])
-    )
+    decode_shapes = ((4, heads), (max_seqs // 2, heads), (max_seqs, heads))
+
+    if decode:
+        shapes = decode_shapes
+    else:
+        n_prefill = len(CHUNK_KDA_T_VALUES)
+        shapes = tuple(
+            (CHUNK_KDA_T_VALUES[i], CHUNK_KDA_H_VALUES[i % len(CHUNK_KDA_H_VALUES)],
+             CHUNK_KDA_SEQ_VALUES[i % len(CHUNK_KDA_SEQ_VALUES)])
+            for i in range(n_prefill)
+        )
 
     for spec in shapes:
         torch.manual_seed(77)
         if decode:
-            batch = spec[0]
+            batch, case_heads = spec
             tokens = batch
             qsl = torch.arange(batch + 1, dtype=torch.int32, device=device)
         else:
-            cu_list = spec
-            tokens = cu_list[-1]
-            batch = len(cu_list) - 1
+            tokens, case_heads, n = spec
+            # Chunk-align each request's length, matching build_chunk_kda_cases.
+            per_seq = (tokens // n // ASCENDC_CHUNK_SIZE) * ASCENDC_CHUNK_SIZE
+            cu_list = [j * per_seq for j in range(n)] + [tokens]
+            batch = n
             qsl = torch.tensor(cu_list, dtype=torch.int32, device=device)
 
+        dim = 3 * case_heads * HEAD_DIM
         # AscendC takes token-major x [T, dim] and a packed [W, dim] weight
         # (see kimi_kda._pack_conv_weights), with the cache as [pool, W-1, dim].
         x = torch.randn(tokens, dim, dtype=dtype, device=device)
