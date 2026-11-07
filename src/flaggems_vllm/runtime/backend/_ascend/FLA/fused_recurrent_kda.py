@@ -73,6 +73,7 @@ def _ascend_recurrent_kda_kernel(
     SAFE_GATE: tl.constexpr = META[23]
     BETA_SIGMOID: tl.constexpr = META[24]
     SPEC: tl.constexpr = META[25]
+    DENSE: tl.constexpr = META[26]
     programs = tl.num_programs(0)
     core = tl.program_id(0)
     blocks = TOTAL // programs
@@ -106,21 +107,32 @@ def _ascend_recurrent_kda_kernel(
             valid = inrange & (slot > 0) & (slot < POOL)
         rk = tl.arange(0, BK)
         rv = iv * BV + tl.arange(0, BV)
-        linear = tl.arange(0, BV * BK)
-        flat_v, flat_k = iv * BV + linear // BK, linear - (linear // BK) * BK
-        if FAST:
-            # Expose a unit-stride 1D transfer directly to the NPU compiler.
-            # The decomposed V/K quotient-remainder expression may obscure DMA.
-            state_offsets = h * SS[1] + iv * BV * K + linear
-            state_mask = linear.to(tl.float32) < (V - iv * BV) * K
+        if DENSE:
+            # A dense [V, K] page addresses as a 2D tile, so the state never
+            # needs a BV*BK index vector or a reshape. That keeps live UB low
+            # enough for one v-tile per (sequence, head); the flat forms below
+            # cap BV at 32, which splits V and multiplies per-core iterations.
+            state_offsets = h * SS[1] + rv[:, None] * SS[2] + rk[None, :]
+            state_mask = (rv[:, None] < V) & (rk[None, :] < K)
+            acc = tl.load(
+                State + slot * SS[0] + state_offsets, state_mask & valid, 0
+            ).to(tl.float32)
         else:
-            state_offsets = h * SS[1] + flat_v * SS[2] + flat_k * SS[3]
-            state_mask = (flat_v < V) & (flat_k < K)
-        acc = (
-            tl.load(State + slot * SS[0] + state_offsets, state_mask & valid, 0)
-            .to(tl.float32)
-            .reshape((BV, BK))
-        )
+            linear = tl.arange(0, BV * BK)
+            flat_v, flat_k = iv * BV + linear // BK, linear - (linear // BK) * BK
+            if FAST:
+                # Expose a unit-stride 1D transfer directly to the NPU compiler.
+                # The decomposed V/K quotient-remainder expression may obscure DMA.
+                state_offsets = h * SS[1] + iv * BV * K + linear
+                state_mask = linear.to(tl.float32) < (V - iv * BV) * K
+            else:
+                state_offsets = h * SS[1] + flat_v * SS[2] + flat_k * SS[3]
+                state_mask = (flat_v < V) & (flat_k < K)
+            acc = (
+                tl.load(State + slot * SS[0] + state_offsets, state_mask & valid, 0)
+                .to(tl.float32)
+                .reshape((BV, BK))
+            )
         if FAST:
             key_mask = rk.to(tl.float32) < K
             value_mask = rv.to(tl.float32) < V
@@ -174,21 +186,34 @@ def _ascend_recurrent_kda_kernel(
                         Indices + n * IX[0] + column * IX[1], column < WIDTH, 0
                     ).to(tl.int64)
                     store = store & (column < WIDTH) & (dest > 0) & (dest < POOL)
-                tl.store(
-                    Final + dest * SS[0] + state_offsets,
-                    acc.reshape((BV * BK,)),
-                    state_mask & store,
-                )
-            else:
-                if FAST:
-                    offsets = ((token * H + h) * V + iv * BV) * K + linear
+                if DENSE:
+                    tl.store(
+                        Final + dest * SS[0] + state_offsets,
+                        acc,
+                        state_mask & store,
+                    )
                 else:
-                    offsets = ((token * H + h) * V + flat_v) * K + flat_k
-                tl.store(
-                    Final + offsets,
-                    tl.where(valid, acc.reshape((BV * BK,)), 0),
-                    state_mask,
-                )
+                    tl.store(
+                        Final + dest * SS[0] + state_offsets,
+                        acc.reshape((BV * BK,)),
+                        state_mask & store,
+                    )
+            else:
+                if DENSE:
+                    offsets = ((token * H + h) * V + rv[:, None]) * K + rk[None, :]
+                    tl.store(
+                        Final + offsets, tl.where(valid, acc, 0), state_mask
+                    )
+                else:
+                    if FAST:
+                        offsets = ((token * H + h) * V + iv * BV) * K + linear
+                    else:
+                        offsets = ((token * H + h) * V + flat_v) * K + flat_k
+                    tl.store(
+                        Final + offsets,
+                        tl.where(valid, acc.reshape((BV * BK,)), 0),
+                        state_mask,
+                    )
 
 
 def fused_recurrent_kda(
@@ -274,7 +299,12 @@ def fused_recurrent_kda(
         and ss[1] % 16 == 0
         and dv * v.element_size() % 64 == 0
     )
-    bv = min(bv if fast else 8, triton.next_power_of_2(dv))
+    # A dense [V, K] page lets the kernel address state as a 2D tile, which
+    # holds little enough live UB to take one v-tile per (sequence, head).
+    # The recurrence is serial over tokens, so splitting V adds no parallelism
+    # and only multiplies each core's grid-stride iterations.
+    dense = ss[2:] == (dk, 1) and dv == triton.next_power_of_2(dv)
+    bv = min(dv if dense else (bv if fast else 8), triton.next_power_of_2(dv))
     ix, width = (0, 0), 1
     if ssm_state_indices is not None:
         ix = (ssm_state_indices.stride(0), 0)
@@ -338,6 +368,7 @@ def fused_recurrent_kda(
                 safe_gate,
                 use_beta_sigmoid_in_kernel,
                 num_accepted_tokens is not None,
+                dense,
             ),
             num_warps=warps,
             num_stages=stages,
