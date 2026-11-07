@@ -50,6 +50,19 @@ except (ImportError, AttributeError, RuntimeError):
     pass
 
 
+if HAS_VLLM:
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        version = getattr(vllm, "__version__", "0.0.0")
+        parsed = Version(version.split("+", 1)[0])
+        VLLM_0_22_0_AVAILABLE = parsed >= Version("0.22.0")
+    except InvalidVersion:
+        VLLM_0_22_0_AVAILABLE = False
+else:
+    VLLM_0_22_0_AVAILABLE = False
+
+
 def _skip_if_unrunnable(ref, op_name):
     """Wrap the reference so a registered-but-unlaunchable kernel skips.
 
@@ -231,6 +244,7 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
             slot_mapping,
             positions,
             cos_sin_cache,
+            num_heads,
             eps,
             block_size,
         )
@@ -244,6 +258,10 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 @pytest.mark.skipif(
     not is_support_fp8e4nv(),
     reason="Do not support fp8e4nv when capability < 89",
+)
+@pytest.mark.skipif(
+    not VLLM_0_22_0_AVAILABLE,
+    reason="Ensure vLLM version >= 0.22.0",
 )
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert():
     bench = FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark()
