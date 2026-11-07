@@ -73,5 +73,5 @@ PYTHONPATH=src pytest -q benchmark \
 
 ## Next Steps
 
-- [Run your own benchmarks](benchmark/)
-- [Contribute optimizations](/FlagGems-vllm/contribution/overview/)
+- [Run your own benchmarks](benchmark.md)
+- [Contribute optimizations](../contribution/overview.md)

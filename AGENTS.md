@@ -93,7 +93,7 @@ Call flow: `vLLM -> vllm-plugin-fl -> flag_gems.enable() + flaggems_vllm.<op>()`
 
 ```
 src/flaggems_vllm/
-  __init__.py              # top-level exports, enable()/only_enable()/use_gems()
+  __init__.py              # top-level public operator exports
   config.py                # enable/exclude config resolution, C-extension detection
   ops/                     # operator implementations (one file per op, mostly)
     __init__.py            # re-exports every public op + __all__
@@ -185,7 +185,7 @@ Benchmark options (from `benchmark/conftest.py`): `--level
 `--record`/`--output` (JSON default `benchmark_result.json`). Shapes come from
 `benchmark/core_shapes.yaml`.
 
-SpeedUp convention: `SpeedUp = latency_torch_baseline / latency_flaggems`.
+SpeedUp convention: `SpeedUp = latency_vllm_baseline / latency_flaggems`.
 Acceptance target for key shapes is `SpeedUp >= 0.9`.
 
 ## Code style & linting
@@ -210,17 +210,25 @@ Note the two line-length numbers: black formats to 88, flake8 only errors above
 ## Operator development protocol — READ `workflow.md` FIRST
 
 `workflow.md` is the **mandatory execution protocol** for adding or modifying an
-operator. It defines hard gates (G0–G7), the required pre-coding tables, and
+operator. This repository hosts specialized and fused operators for the vLLM
+repository and **does not accept general PyTorch operators**; therefore, operators
+do not need to align with PyTorch (general PyTorch ops belong in FlagGems).
+Operators align directly with vLLM operators, native CUDA/C++ kernels, or model
+reference implementations.
+
+It defines hard gates (G0–G7) and the
 acceptance/delivery format. Key rules an agent MUST honor:
 
 1. **No torch compute fallback** (`NO_TORCH_COMPUTE_FALLBACK = true`).
-   Production paths (impl, host dispatch, helpers, fallback, unsupported) must
-   **not** use `torch` compute/copy/cast ops (`torch.<op>`,
-   `torch.nn.functional.*`, `torch.ops.aten.*`, or `Tensor` methods that emit
-   kernels like `matmul`, `sum`, `contiguous`, `clone`, `copy_`, `to`).
-   Allowed: metadata reads (shape/stride/dtype/device), uninitialized allocation
-   (`torch.empty*`), and true no-copy views. Unsupported paths must raise
-   `NotImplementedError`, never silently fall back to torch.
+   Production paths (impl, host dispatch, helpers, fallback, unsupported) allow
+   calling memory operators in PyTorch (`torch.empty*`, `torch.zeros*`), creation
+   and copy operators (`contiguous`, `clone`, `copy_`), metadata reads
+   (shape/stride/dtype/device), and true no-copy views. Calling FlagGems
+   (`flag_gems`) operators is allowed. Otherwise, calling `torch` compute/cast
+   ops (`torch.<op>`, `torch.nn.functional.*`, `torch.ops.aten.*`, or `Tensor`
+   methods that emit kernels like `matmul`, `sum`, `to`) to implement computation
+   is strictly forbidden. Unsupported paths must raise `NotImplementedError`,
+   never silently fall back to torch.
    `torch` reference implementations are allowed **only** in tests/benchmarks,
    and must never be imported by production code.
 
@@ -228,14 +236,15 @@ acceptance/delivery format. Key rules an agent MUST honor:
 
    | Purpose | Path |
    | --- | --- |
+   | Operator metadata | `conf/operators.yaml` |
    | Operator implementation | `src/flaggems_vllm/ops/<op>.py` |
    | NVIDIA autotune config | `src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml` |
    | Functional test | `tests/test_<op>.py` |
    | Performance benchmark | `benchmark/test_<op>.py` |
    | Op export | `src/flaggems_vllm/ops/__init__.py` (import + `__all__`) |
-   | Top-level registration | `src/flaggems_vllm/__init__.py` |
+   | Top-level export | `src/flaggems_vllm/__init__.py` |
 
-   An op is not "done" until it is both exported and registered.
+   An op is not "done" until it is exported and documented in `conf/operators.yaml`.
 
 3. **Autotune is not optional.** Any kernel exposing perf params (`BLOCK_*`,
    `TILE_*`, `num_warps`, `num_stages`, `num_ctas`, ...) should, on the NVIDIA

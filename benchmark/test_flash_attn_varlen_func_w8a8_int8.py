@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import lru_cache
 from itertools import accumulate
 
 import pytest
 import torch
 
 import flaggems_vllm
+from tests.accuracy_utils import gems_assert_close
 
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
 
@@ -160,17 +162,85 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             # Check the same quantized values, separating kernel error from
             # input quantization error. Timing still uses the original BF16 inputs.
             reference_args = (*dequantized, *bf16_args[3:])
-            if vendor_name == "thead":
+            if vendor_name == "ascend":
+                page = k.shape[1]
+                metadata = dict(
+                    bf16_args[-1],
+                    q_cum=bf16_args[4][1:].cpu().tolist(),
+                    k_cum=bf16_args[7].cpu().tolist(),
+                    block_size=page,
+                    fia_scale=bf16_args[10],
+                )
+                baseline = _fia(
+                    dequantized[0],
+                    dequantized[1].permute(0, 2, 1, 3).contiguous(),
+                    dequantized[2].permute(0, 2, 1, 3).contiguous(),
+                    bf16_args[17],
+                    metadata["q_cum"],
+                    metadata["k_cum"],
+                    page,
+                    metadata["fia_scale"],
+                )
+                bf16_args = (
+                    q,
+                    k.permute(0, 2, 1, 3).contiguous(),
+                    v.permute(0, 2, 1, 3).contiguous(),
+                    *bf16_args[3:-1],
+                    metadata,
+                )
+            elif vendor_name == "thead":
                 baseline = _varlen_fa3_baseline(reference_args, int8_args)
             else:
                 baseline = _varlen_bf16_baseline(reference_args, int8_args)
-            torch.testing.assert_close(
-                _varlen_int8(bf16_args, int8_args),
+            actual = _varlen_int8(bf16_args, int8_args)
+            gems_assert_close(
+                actual,
                 baseline,
+                dtype=actual.dtype,
                 atol=0.03,
-                rtol=0.03,
             )
             yield bf16_args, int8_args
+
+
+@lru_cache(maxsize=1)
+def _causal_mask(device):
+    return torch.triu(torch.ones(2048, 2048, device=device), diagonal=1).to(torch.int8)
+
+
+def _fia(query, key, value, table, q_cum, k_cum, block_size, scale):
+    import torch_npu
+
+    output, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        atten_mask=_causal_mask(query.device),
+        block_table=table,
+        input_layout="TND",
+        block_size=block_size,
+        actual_seq_lengths=q_cum,
+        actual_seq_lengths_kv=k_cum,
+        num_key_value_heads=key.shape[1],
+        num_heads=query.shape[1],
+        scale=scale,
+        sparse_mode=3,
+    )
+    return output
+
+
+def _varlen_ascend_baseline(bf16_args, _int8_args):
+    query, key, value = bf16_args[:3]
+    meta = bf16_args[-1]
+    return _fia(
+        query,
+        key,
+        value,
+        bf16_args[17],
+        meta["q_cum"],
+        meta["k_cum"],
+        meta["block_size"],
+        meta["fia_scale"],
+    )
 
 
 def _varlen_bf16_baseline(bf16_args, int8_args):
@@ -209,7 +279,7 @@ def _varlen_int8(bf16_args, int8_args):
 
 
 @pytest.mark.skipif(
-    vendor_name not in ("hygon", "thead", "metax"),
+    vendor_name not in ("hygon", "thead", "metax", "ascend"),
     reason="INT8 attention backend unavailable",
 )
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -219,6 +289,9 @@ def test_flash_attn_varlen_func_w8a8_int8():
             pytest.skip("PPU vLLM FA3 is unavailable")
         print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")
         baseline = _varlen_fa3_baseline
+    elif vendor_name == "ascend":
+        print("Baseline: vLLM-Ascend BF16 FIA; input quantization excluded.")
+        baseline = _varlen_ascend_baseline
     elif vendor_name == "metax":
         print("Baseline: vLLM-MetaX BF16 FA2; metadata and quantization excluded.")
         baseline = _varlen_bf16_baseline
