@@ -50,7 +50,11 @@ FLAGOS_PYPI="${FLAGOS_PYPI:-https://resource.flagos.net/repository/flagos-pypi-h
 # Vendor-qualified wheels (the `+cu130`-suffixed torch builds below) are only
 # published under the per-vendor FlagOS index, not the shared "hosted" one.
 FLAGOS_PYPI_NVIDIA="${FLAGOS_PYPI_NVIDIA:-https://resource.flagos.net/repository/flagos-pypi-nvidia/simple}"
-FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.1}"
+# Matches FlagGems' nvidia-cuda133 backend (src/flag_gems/backends.yaml):
+# older FlagTree builds are missing/broken Hopper warp-specialize (TLE)
+# support that some ops here require (e.g. AttributeError on
+# `buffered_tensor.reshape`, WGMMA type/shape assertion failures).
+FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.7.0}"
 
 # Whether to replace Triton with FlagTree.
 # For temporary container validation, you can run:
@@ -138,6 +142,9 @@ environment variables (each shown below with its default):
 
   CUDA_HOME=                  CUDA toolkit path; auto-detected from
                                /usr/local/cuda* if unset
+  USE_FLAGCX=OFF               Disable flagcx's communication path at
+                               runtime, matching FlagGems' nvidia-cuda133
+                               backend env
 
 Example:
   USE_FLAGTREE=0 VLLM_VERSION=0.20.2 bash tools/setup.sh
@@ -181,6 +188,11 @@ setup_cuda_env() {
       fi
     fi
   fi
+
+  # Matches FlagGems' nvidia-cuda133 backend env (src/flag_gems/backends.yaml):
+  # flagcx is installed as a dependency (some packages expect it importable)
+  # but its communication path is disabled at runtime for this backend.
+  export USE_FLAGCX="${USE_FLAGCX:-OFF}"
 }
 
 # ── Check we're in the repo root ─────────────────────────────

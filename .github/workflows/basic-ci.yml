@@ -287,6 +287,9 @@ jobs:
           if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
             echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           fi
+          if [[ -n "${USE_FLAGCX:-}" ]]; then
+            echo "USE_FLAGCX=${USE_FLAGCX}" >> "$GITHUB_ENV"
+          fi
           python --version
 
       - name: run portable backend preflight
