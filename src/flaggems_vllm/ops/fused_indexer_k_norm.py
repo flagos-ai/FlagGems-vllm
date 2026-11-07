@@ -253,9 +253,19 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
             # Ascend backend lowers uint32 bitcast to an unsupported vcast;
             # switch to the interval-based subnormal classification path.
             if runtime.device.vendor_name == "ascend":
-                _norm_kernel[(rows,)](
+                # NPU launch overhead with BLOCK_M=1 causes severe latency
+                # degradation on large M. Scale up the block size per-row
+                # threshold while keeping the same algorithm.
+                block_m = 1
+                if rows > 4096:
+                    block_m = 16
+                elif rows > 1024:
+                    block_m = 8
+                elif rows > 128:
+                    block_m = 4
+                _norm_kernel[(triton.cdiv(rows, block_m),)](
                     *args,
-                    BLOCK_M=1,
+                    BLOCK_M=block_m,
                     num_warps=4,
                     num_stages=1,
                     SUBNORMAL_METHOD=0,
