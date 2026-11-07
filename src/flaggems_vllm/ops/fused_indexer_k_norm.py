@@ -263,58 +263,19 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                 )
                 _launch_ascend(x, weight, bias, out, eps)
             elif runtime.device.vendor_name == "mthreads":
-                # MUSA: thin launcher for D=128 aligned fast path to bypass
-                # libentry host overhead (~30% of latency for small/medium M).
-                if (
-                    dim == 128
-                    and stride_xd == 1
-                    and stride_w == 1
-                    and stride_b == 1
-                ):
-                    block_m = 1
-                    if rows > 1024:
-                        block_m = 4
-                    _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
-                        *args,
-                        BLOCK_M=block_m,
-                        num_warps=4,
-                        num_stages=1,
-                    )
-                else:
-                    block_m = 1
-                    if rows > 1024:
-                        block_m = 4
-                    _norm_kernel[(triton.cdiv(rows, block_m),)](
-                        *args,
-                        BLOCK_M=block_m,
-                        num_warps=4,
-                        num_stages=1,
-                    )
+                from flaggems_vllm.runtime.backend._mthreads.ops.fused_indexer_k_norm import (
+                    _launch_musa,
+                )
+                _launch_musa(x, weight, bias, out, eps)
             elif runtime.device.vendor_name == "metax":
-                # MetaX: thin launcher for D=128 aligned path to shave
-                # libentry overhead (~6% measured on medium shapes).
-                if (
-                    dim == 128
-                    and stride_xd == 1
-                    and stride_w == 1
-                    and stride_b == 1
-                ):
-                    block_m = 1
-                    if rows > 4096:
-                        block_m = 2
-                    _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
-                        *args,
-                        BLOCK_M=block_m,
-                        num_warps=4,
-                        num_stages=1,
-                    )
-                else:
-                    _norm_kernel[(rows,)](
-                        *args,
-                        BLOCK_M=1,
-                        num_warps=4,
-                        num_stages=1,
-                    )
+                # MetaX inline path is handled in fused_indexer_k_norm() to
+                # avoid _launch_fused_indexer_k_norm dispatcher overhead.
+                _norm_kernel[(rows,)](
+                    *args,
+                    BLOCK_M=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
             else:
                 # Generic thin launcher for remaining backends (PPU, etc.)
                 # on D=128 aligned fast path.
@@ -349,27 +310,12 @@ def fused_indexer_k_norm(x, weight, bias, dim, eps):
     eps = _validate_inputs(x, weight, bias, dim, eps)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if x.shape[0]:
-        # MetaX: inlined fast path to eliminate _launch_fused_indexer_k_norm
-        # Python call overhead (~0.019ms). Verified on C550: SpeedUp 1.06x.
         if runtime.device.vendor_name == "metax":
-            rows, dim_inner = x.shape
-            stride_xm, stride_xd = x.stride()
-            stride_w = weight.stride(0)
-            stride_b = bias.stride(0)
-            if dim_inner == 128 and stride_xd == 1 and stride_w == 1 and stride_b == 1:
-                _fused_indexer_k_norm_kernel[(rows,)](
-                    x, weight, bias, out,
-                    rows, dim_inner,
-                    stride_xm, stride_xd, stride_w, stride_b, eps,
-                    BLOCK_M=1, num_warps=4, num_stages=1,
-                )
-            else:
-                _norm_kernel[(rows,)](
-                    x, weight, bias, out,
-                    rows, dim_inner,
-                    stride_xm, stride_xd, stride_w, stride_b, eps,
-                    BLOCK_M=1, num_warps=4, num_stages=1,
-                )
+            # Inline fast path to avoid _launch_fused_indexer_k_norm overhead.
+            from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_k_norm import (
+                _launch_metax_fast,
+            )
+            _launch_metax_fast(x, weight, bias, out, eps)
         else:
             _launch_fused_indexer_k_norm(x, weight, bias, out, eps)
     return out
