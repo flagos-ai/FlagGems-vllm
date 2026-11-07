@@ -86,69 +86,6 @@ def _fused_indexer_k_norm_kernel(
     tl.store(Y + rows[:, None] * D + cols[None, :], result, mask=valid)
 
 
-# ------------------------------------------------------------------
-# Ascend NPU dedicated kernel
-# ------------------------------------------------------------------
-# The Ascend backend (Triton 3.5 + CANN 9.0) does not support
-# BLOCK_M > 1 as a grid parameter (raw kernel launch fails).
-# Instead, we keep BLOCK_M=1 and amortise launch overhead by
-# looping over ROWS_PER_BLOCK inside the kernel.
-# Welford single-pass formulation reduces redundant reductions.
-# NO_MASK=1 path skips tl.where for power-of-2 D, gaining ~5%.
-# ------------------------------------------------------------------
-@triton.jit(do_not_specialize=["EPS"])
-def _ascend_fused_indexer_k_norm_kernel(
-    X, W, B, Y,
-    M,
-    D: tl.constexpr,
-    STRIDE_XM,
-    STRIDE_XD,
-    STRIDE_W,
-    STRIDE_B,
-    EPS,
-    ROWS_PER_BLOCK: tl.constexpr,
-    NO_MASK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
-    BLOCK_D: tl.constexpr = triton.next_power_of_2(D)
-    row_start = tl.program_id(0).to(tl.int64) * ROWS_PER_BLOCK
-    cols = tl.arange(0, BLOCK_D).to(tl.int64)
-
-    if NO_MASK:
-        weight = tl.load(W + cols * STRIDE_W).to(tl.float32)
-        bias = tl.load(B + cols * STRIDE_B).to(tl.float32)
-    else:
-        weight = tl.load(W + cols * STRIDE_W, mask=cols < D, other=0.0)
-        bias = tl.load(B + cols * STRIDE_B, mask=cols < D, other=0.0)
-
-    for r in range(ROWS_PER_BLOCK):
-        row = row_start + r
-        if row < M:
-            if NO_MASK:
-                values = tl.load(
-                    X + row * STRIDE_XM + cols * STRIDE_XD
-                ).to(tl.float32)
-            else:
-                values = tl.load(
-                    X + row * STRIDE_XM + cols * STRIDE_XD,
-                    mask=cols < D, other=0.0,
-                ).to(tl.float32)
-
-            mean = tl.sum(values) / D
-            if NO_MASK:
-                centered = values - mean
-            else:
-                centered = tl.where(cols < D, values - mean, 0.0)
-            variance = tl.sum(centered * centered) / D
-            rstd = tl.rsqrt(variance + EPS)
-            result = centered * rstd
-            result = result * weight + bias
-            if NO_MASK:
-                tl.store(Y + row * D + cols, result)
-            else:
-                tl.store(Y + row * D + cols, result, mask=cols < D)
-
-
 def _prune_norm_configs(configs, named_args, **kwargs):
     dim = named_args["D"]
     if dim > 256:
@@ -319,20 +256,12 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
             # Ascend backend lowers uint32 bitcast to an unsupported vcast;
             # switch to the interval-based subnormal classification path.
             if runtime.device.vendor_name == "ascend":
-                # Dedicated NPU kernel: BLOCK_M=1 (backend-compatible),
-                # ROWS_PER_BLOCK loop inside kernel to amortise launch,
-                # Welford single-pass for fewer reductions.
-                # Verified on Ascend 910C: SpeedUp 0.92-1.03x (all core shapes).
-                rpb = 16 if rows > 1024 else 8
-                no_mask = 1 if dim == triton.next_power_of_2(dim) else 0
-                _ascend_fused_indexer_k_norm_kernel[(triton.cdiv(rows, rpb),)](
-                    *args,
-                    ROWS_PER_BLOCK=rpb,
-                    NO_MASK=no_mask,
-                    BLOCK_M=1,
-                    num_warps=4,
-                    num_stages=1,
+                # Dedicated NPU kernel lives in backend-specific module so
+                # the shared operator file stays vendor-agnostic.
+                from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_k_norm import (
+                    _launch_ascend,
                 )
+                _launch_ascend(x, weight, bias, out, eps)
             elif runtime.device.vendor_name == "mthreads":
                 # MUSA: thin launcher for D=128 aligned fast path to bypass
                 # libentry host overhead (~30% of latency for small/medium M).
