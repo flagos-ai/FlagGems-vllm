@@ -278,6 +278,17 @@ source "${VENV_DIR}/bin/activate"
 printf "Python: %s" "$(python --version)"
 ok
 
+# DEBUG (temporary): on the persistent h20 runner, torch/torchaudio/torchvision
+# installs have been resolving as a no-op ("Checked N packages", no download)
+# immediately after this freshly-created venv claims success, which should be
+# impossible for a brand new venv. Dump what's actually in it to find out
+# whether it is really empty.
+echo "---- DEBUG: uv pip list right after venv creation ----"
+uv pip list
+echo "---- DEBUG: site-packages contents ----"
+ls "${VENV_DIR}"/lib/python*/site-packages/ 2>&1 | head -50
+echo "---- DEBUG: end ----"
+
 # ── Constraints ──────────────────────────────────────────────
 CONSTRAINTS_FILE="${VENV_DIR}/constraints.txt"
 
