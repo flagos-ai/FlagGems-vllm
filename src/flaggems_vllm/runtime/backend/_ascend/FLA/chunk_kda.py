@@ -91,14 +91,22 @@ MAX_GRID_BLOCKS = 32768
 #
 # BT trades the serial chunk recurrence against the factored-decay range:
 # the gate span grows ~linearly in BT, and Aqk/Akk operands are cast to bf16
-# (8 mantissa bits) for tl.dot. Measured on Ascend950DT (T=8192 H=24 seq=2 /
-# T=32768 H=24 seq=2):
-#   BT=16  3741 us / 16168 us   bit-exact vs AscendC
-#   BT=32  2627 us / 10659 us   bit-exact vs AscendC (identical max_abs)
-#   BT=64  2030 us /  8091 us   NaN -- gate range overflows even with
-#                               midpoint rebasing (3.5M+ non-finite outputs)
-# So 32 is the largest width that holds precision. See tools/_kda_bt_accuracy.py.
-_ASCEND_BT = 32
+# (8 mantissa bits) for tl.dot. A single chunk-wide midpoint anchor keeps
+# that span bit-exact through BT=32 but goes non-finite at BT=64 (3.5M-17.8M
+# non-finite outputs, see tools/_kda_bt64_subblock_math_check.py for a CPU
+# repro). SUBBLOCK_REBASE in _ascend_kda_fwd_intra_kernel splits BT=64 into
+# two 32-row sub-blocks, each rebased on its own local midpoint (mirrors
+# AscendC arch35's 32-row score reference span -- see
+# flash-linear-attention-npu/.../chunk_kda_fwd_prepare.h ScoreRefToken), which
+# keeps every span within the BT=32 bit-exact envelope while still scanning
+# in 64-row steps. Verified on Ascend950DT (tools/_kda_bt_accuracy.py: 0
+# non-finite at BT=64 with the split, vs. NaN across all 4 harness shapes
+# without it) and faster throughout (tools/_kda_shape_bench.py chunk, us):
+#   T=8192  H=24 seq=2   BT=32 2632.7   BT=64 2239.2   (1.18x)
+#   T=16384 H=12 seq=4   BT=32 2655.5   BT=64 2241.1   (1.18x)
+#   T=24576 H=6  seq=8   BT=32 2010.5   BT=64 1700.7   (1.18x)
+#   T=32768 H=24 seq=2   BT=32 10667.6  BT=64 8915.1   (1.20x)
+_ASCEND_BT = 64
 _ASCEND_BT_ENV = "FLAGGEMS_ASCEND_KDA_BT"
 
 
@@ -158,6 +166,16 @@ if HAS_TLE_KDA:
     @triton.heuristics(
         {
             "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+            # The factored decay exp2(gc-ref)*exp2(ref-gc) needs its single
+            # causal span (ref to either end of the chunk) to stay inside bf16
+            # range. At BT<=32 one chunk-wide midpoint anchor already keeps
+            # that span to <=16 tokens of decay and is verified bit-exact
+            # (see tools/_kda_bt_accuracy.py). At BT=64 the same single-anchor
+            # span covers <=32 tokens of decay, which tools/_kda_bt_accuracy.py
+            # observed going non-finite: see tools/_kda_bt64_subblock_math_check.py
+            # for the CPU-only repro (152/200*4096 entries non-finite with a
+            # single BT=64 anchor vs. 0/200*4096 with the split below).
+            "SUBBLOCK_REBASE": lambda args: args["BT"] > 32,
         }
     )
     @triton.jit(do_not_specialize=["T"])
@@ -186,6 +204,7 @@ if HAS_TLE_KDA:
         BT: tl.constexpr,
         CPT: tl.constexpr,
         IS_VARLEN: tl.constexpr,
+        SUBBLOCK_REBASE: tl.constexpr,
     ):
         i_tc, i_bh = tl.program_id(0), tl.program_id(1)
         i_hv = i_bh % HV
@@ -274,21 +293,107 @@ if HAS_TLE_KDA:
                     # 8 mantissa bits, so the product loses all significance
                     # (observed |Aqk| ~ 7e14 against a true O(1)).
                     # Rebasing on the chunk midpoint splits the span across the
-                    # two factors and cancels exactly in the difference.
-                    b_gc_anchor = tl.sum(
-                        tl.where(o_i[:, None] == BT // 2, b_gc, 0.0), 0
-                    )
-                    b_gc_reb = b_gc - b_gc_anchor[None, :]
-                    b_gq = tl.where(m_c[:, None], exp2(b_gc_reb), 0.0)
-                    b_gk = tl.where(m_c[:, None], exp2(-b_gc_reb), 0.0)
+                    # two factors and cancels exactly in the difference -- but
+                    # only up to the span a *single* anchor can cover. At
+                    # BT<=32 one chunk-wide anchor keeps each side's span to
+                    # <=16 tokens of decay, verified bit-exact. At BT=64 the
+                    # same single anchor needs each side to cover <=32 tokens
+                    # of decay, which tools/_kda_bt64_subblock_math_check.py
+                    # showed going non-finite under the real safe-gate
+                    # distribution (152/819200 entries, 200-trial sweep).
+                    if SUBBLOCK_REBASE:
+                        # Split the BT=64 chunk into two BT//2 sub-blocks, each
+                        # with its own local-midpoint anchor (mirrors AscendC
+                        # arch35's 32-row score reference span --
+                        # flash-linear-attention-npu/.../chunk_kda_fwd_prepare.h
+                        # ScoreRefToken/BuildKdaGateRegbaseExp -- which rebases
+                        # per 32-row block instead of once per 64-row chunk for
+                        # exactly this reason). Three dots instead of one:
+                        #   - SB0 diagonal (rows/cols < HALF), anchor0
+                        #   - SB1 diagonal (rows/cols >= HALF), anchor1
+                        #   - cross block (rows >= HALF, cols < HALF, always
+                        #     causal since i >= HALF > HALF-1 >= j): q-side on
+                        #     anchor1, k-side on anchor0 with the scalar
+                        #     cross-anchor correction exp2(anchor1-anchor0)
+                        #     folded in *before* the bf16 cast/dot -- the
+                        #     correction varies per-K, so it must be applied
+                        #     pre-reduction; a post-hoc per-(i,j) scalar after
+                        #     the K-sum is mathematically wrong (verified in
+                        #     tools/_kda_bt64_subblock_math_check.py).
+                        # The strictly-upper cross block (rows < HALF, cols >=
+                        # HALF) is anti-causal and stays zero from the m_Aqk
+                        # mask applied below, same as the single-anchor path.
+                        HALF: tl.constexpr = BT // 2
+                        in_sb0 = o_i[:, None] < HALF
+                        in_sb1 = ~in_sb0
+                        local_mid0 = HALF // 2
+                        local_mid1 = HALF + HALF // 2
+                        b_anchor0 = tl.sum(
+                            tl.where(o_i[:, None] == local_mid0, b_gc, 0.0), 0
+                        )[None, :]
+                        b_anchor1 = tl.sum(
+                            tl.where(o_i[:, None] == local_mid1, b_gc, 0.0), 0
+                        )[None, :]
 
-                    b_kg_t = tl.trans((b_kf * b_gk).to(tl.bfloat16))
-                    b_Aqk = tl.dot(
-                        (b_qf * b_gq).to(tl.bfloat16), b_kg_t, out_dtype=tl.float32
-                    )
-                    b_Akk = tl.dot(
-                        (b_kf * b_gq).to(tl.bfloat16), b_kg_t, out_dtype=tl.float32
-                    )
+                        b_reb0 = b_gc - b_anchor0
+                        b_reb1 = b_gc - b_anchor1
+                        b_cross_corr = exp2(b_anchor1 - b_anchor0)
+
+                        b_gq0 = tl.where(m_c[:, None] & in_sb0, exp2(b_reb0), 0.0)
+                        b_gk0 = tl.where(m_c[:, None] & in_sb0, exp2(-b_reb0), 0.0)
+                        b_gq1 = tl.where(m_c[:, None] & in_sb1, exp2(b_reb1), 0.0)
+                        b_gk1 = tl.where(m_c[:, None] & in_sb1, exp2(-b_reb1), 0.0)
+                        b_gk0_corr = tl.where(
+                            m_c[:, None] & in_sb0,
+                            exp2(-b_reb0) * b_cross_corr,
+                            0.0,
+                        )
+
+                        b_qg0_t = (b_qf * b_gq0).to(tl.bfloat16)
+                        b_kg0_t = tl.trans((b_kf * b_gk0).to(tl.bfloat16))
+                        b_qg1_t = (b_qf * b_gq1).to(tl.bfloat16)
+                        b_kg1_t = tl.trans((b_kf * b_gk1).to(tl.bfloat16))
+                        b_kg0_corr_t = tl.trans((b_kf * b_gk0_corr).to(tl.bfloat16))
+
+                        b_Aqk = tl.dot(b_qg0_t, b_kg0_t, out_dtype=tl.float32)
+                        b_Aqk += tl.dot(b_qg1_t, b_kg1_t, out_dtype=tl.float32)
+                        b_Aqk += tl.dot(b_qg1_t, b_kg0_corr_t, out_dtype=tl.float32)
+
+                        b_Akk = tl.dot(
+                            (b_kf * b_gq0).to(tl.bfloat16),
+                            b_kg0_t,
+                            out_dtype=tl.float32,
+                        )
+                        b_Akk += tl.dot(
+                            (b_kf * b_gq1).to(tl.bfloat16),
+                            b_kg1_t,
+                            out_dtype=tl.float32,
+                        )
+                        b_Akk += tl.dot(
+                            (b_kf * b_gq1).to(tl.bfloat16),
+                            b_kg0_corr_t,
+                            out_dtype=tl.float32,
+                        )
+
+                        # Downstream workspace packing (b_kb/b_qg_val/b_kg_val)
+                        # uses the unrebased exp2(b_gc)/exp2(b_gn - b_gc)
+                        # directly (elementwise, no bf16 K-reduction), so it
+                        # does not need b_gc_reb/b_anchor0/b_anchor1 at all.
+                    else:
+                        b_gc_anchor = tl.sum(
+                            tl.where(o_i[:, None] == BT // 2, b_gc, 0.0), 0
+                        )
+                        b_gc_reb = b_gc - b_gc_anchor[None, :]
+                        b_gq = tl.where(m_c[:, None], exp2(b_gc_reb), 0.0)
+                        b_gk = tl.where(m_c[:, None], exp2(-b_gc_reb), 0.0)
+
+                        b_kg_t = tl.trans((b_kf * b_gk).to(tl.bfloat16))
+                        b_Aqk = tl.dot(
+                            (b_qf * b_gq).to(tl.bfloat16), b_kg_t, out_dtype=tl.float32
+                        )
+                        b_Akk = tl.dot(
+                            (b_kf * b_gq).to(tl.bfloat16), b_kg_t, out_dtype=tl.float32
+                        )
 
                     b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
                     b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
