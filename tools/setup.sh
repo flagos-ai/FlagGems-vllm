@@ -278,17 +278,6 @@ source "${VENV_DIR}/bin/activate"
 printf "Python: %s" "$(python --version)"
 ok
 
-# DEBUG (temporary): on the persistent h20 runner, torch/torchaudio/torchvision
-# installs have been resolving as a no-op ("Checked N packages", no download)
-# immediately after this freshly-created venv claims success, which should be
-# impossible for a brand new venv. Dump what's actually in it to find out
-# whether it is really empty.
-echo "---- DEBUG: uv pip list right after venv creation ----"
-uv pip list
-echo "---- DEBUG: site-packages contents ----"
-ls "${VENV_DIR}"/lib/python*/site-packages/ 2>&1 | head -50
-echo "---- DEBUG: end ----"
-
 # ── Constraints ──────────────────────────────────────────────
 CONSTRAINTS_FILE="${VENV_DIR}/constraints.txt"
 
@@ -325,14 +314,16 @@ ok
 # probing instead (e.g. on a host where the pinned +cu130 build is wrong).
 if [ -n "${TORCH_VERSION}" ]; then
   printf "Installing torch==${TORCH_VERSION} (torchaudio==${TORCHAUDIO_VERSION}, torchvision==${TORCHVISION_VERSION}) ...\n"
-  # DEBUG (temporary): this install has been resolving as a no-op
-  # ("Checked N packages", no download) on the persistent h20 runner even
-  # though the venv is freshly created and genuinely empty (confirmed by the
-  # venv-contents dump above) — and the exact same command against a real
-  # empty venv elsewhere installs normally. -v surfaces uv's actual index
-  # lookups and cache decisions so the next CI run shows what it's doing
-  # differently here.
-  uv pip install -v \
+  # Root cause (found via -v on the persistent h20 runner): `uv` detects
+  # this repo's pyproject.toml as a workspace root and resolves this install
+  # against the workspace's *declared* dependency set rather than treating
+  # it as a plain standalone `pip install`. Since this repo's pyproject.toml
+  # does not list torch, uv decides torch is "unnecessary" and the install
+  # becomes a no-op ("Checked N packages", no download) even against a
+  # brand new, empty venv — torch is simply never installed, no error.
+  # --no-sources makes uv ignore workspace/Git/URL/local-path sources and
+  # resolve this as a standalone package install instead.
+  uv pip install -v --no-sources \
     "torch==${TORCH_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" \
     "torchvision==${TORCHVISION_VERSION}" \
