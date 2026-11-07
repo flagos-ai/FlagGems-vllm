@@ -737,6 +737,17 @@ ops:
     stages:
       - beta: '0.3'
 
+  - id: gather_sampler_output
+    description: Pack and restore batch-sharded tokens, counts, and logprobs around vLLM all-gather.
+    for:
+      - gather_sampler_output
+    labels:
+      - vLLM
+      - Sampling
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
