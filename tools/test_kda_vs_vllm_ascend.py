@@ -37,19 +37,22 @@ Both KDA entry points fuse q/k L2-norm, the bounded ("safe") decay gate
 ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` and beta's sigmoid, so the
 raw projections are passed in and the comparison covers the whole fused op.
 
-Shapes default to the Kimi K3 KDA layer: ``head_dim=128``, ``num_heads=64``
-sharded over TP (``--tp`` picks the local head count), ``conv_size=4``, and
-a ``[pool, H, V, K]`` fp32 recurrent state cache.
+Shapes default to the Kimi K3 KDA layer: ``head_dim=128``, ``num_heads=96``
+sharded over TP (``--tp`` picks the local head count; 8 matches the 950DT
+mixed-deployment TP), ``conv_size=4``, and a ``[pool, H, V, K]`` fp32
+recurrent state cache. Request/token batch sizes follow the 950DT mixed
+Prefill/Decode deployment documented in vllm-ascend's
+``docs/source/tutorials/models/Kimi-K3.md`` (section 5.1, 950DT products):
+``--max-num-seqs 16``, ``--max-num-batched-tokens 24576``, and DSpark
+speculative decoding with ``num_speculative_tokens=7``.
 
 Timing uses ``torch_npu.profiler`` with ``schedule(warmup=5, active=5)``,
 summing every kernel's ``Duration(us)`` per iteration so a multi-kernel
 implementation is charged its full device cost.
 
-Caveat: numbers drift when many ops are swept in one process -- the same
-``recurrent_kda`` bs=128 case measured 97.7 us with ``--ops recurrent_kda``
-and 364 us inside a full sweep. Compare an op against its own reference
-within one run, and re-measure a single op with ``--ops`` before acting on
-its absolute latency.
+Caveat: numbers drift when many ops are swept in one process -- compare an
+op against its own reference within one run, and re-measure a single op
+with ``--ops`` before acting on its absolute latency.
 
 Usage::
 
@@ -79,15 +82,27 @@ except ImportError as exc:  # pragma: no cover - environment guard
     print(f"FATAL: torch_npu unavailable: {exc}", file=sys.stderr)
     sys.exit(2)
 
-# Kimi K3 KDA layer geometry (vllm KimiLinearConfig / Kimi K3 checkpoint).
+# Kimi K3 KDA layer geometry (vllm-ascend tests/e2e/pull_request/four_card/
+# test_kimi_k3.py's linear_attn_config, which keeps production tensor widths:
+# head_dim=128, num_heads=96, short_conv_kernel_size=4).
 HEAD_DIM = 128
-NUM_HEADS_TOTAL = 64
+NUM_HEADS_TOTAL = 96
 CONV_SIZE = 4
 GATE_LOWER_BOUND = -5.0
 ASCENDC_CHUNK_SIZE = 64   # vllm_ascend.ops.kda.KDA_CHUNK_SIZE
 FLAGGEMS_CHUNK_SIZE = 16  # FlagGems TLE prefill is specialized for BT=16
 NULL_BLOCK_ID = 0         # vllm.v1.attention.backends.utils.NULL_BLOCK_ID
 PAD_SLOT_ID = -1
+
+# Ascend 950DT mixed Prefill/Decode deployment (vllm-ascend
+# docs/source/tutorials/models/Kimi-K3.md section 5.1, 950DT products,
+# four-node, Node 0 command): TP=8, --max-num-seqs 16,
+# --max-num-batched-tokens 24576, --max-model-len 131072, DSpark speculative
+# decoding with num_speculative_tokens=7.
+K3_950DT_MAX_NUM_SEQS = 16
+K3_950DT_MAX_NUM_BATCHED_TOKENS = 24576
+K3_950DT_MAX_MODEL_LEN = 131072
+K3_950DT_NUM_SPECULATIVE_TOKENS = 7
 
 WARMUP = 5
 ACTIVE = 5
@@ -284,10 +299,21 @@ def _kda_inputs(heads, tokens, device, dtype, seed=1234):
 
 
 def build_chunk_kda_cases(ops, device, heads, dtype) -> list[Case]:
-    """Prefill KDA: FlagGems chunk_kda vs AscendC chunk_kda_fwd."""
+    """Prefill KDA: FlagGems chunk_kda vs AscendC chunk_kda_fwd.
+
+    Batches follow the 950DT mixed-deployment scheduler budgets: at most
+    K3_950DT_MAX_NUM_SEQS=16 concurrent requests, token totals up to
+    K3_950DT_MAX_NUM_BATCHED_TOKENS=24576.
+    """
+    per_seq_at_max_seqs = K3_950DT_MAX_NUM_BATCHED_TOKENS // K3_950DT_MAX_NUM_SEQS
+    full_batch_cu = [i * per_seq_at_max_seqs for i in range(K3_950DT_MAX_NUM_SEQS + 1)]
     cases = []
-    # Ragged prefill batches as the scheduler produces them.
-    for cu_list in ([0, 128, 384], [0, 1024], [0, 31, 96], [0, 512, 1536, 4096]):
+    for cu_list in (
+        [0, 31, 96],                                  # short ragged prefill, 2 reqs
+        [0, 512, 1536, 4096],                         # mixed batch, 3 reqs, chunk-unaligned starts
+        full_batch_cu,                                # max_num_seqs=16 reqs evenly filling the 24576 budget
+        [0, K3_950DT_MAX_NUM_BATCHED_TOKENS],         # single long prefill at the full token budget
+    ):
         tokens = cu_list[-1]
         n = len(cu_list) - 1
         q, k, v, raw_g, raw_beta, a_log, dt_bias = _kda_inputs(heads, tokens, device, dtype)
@@ -355,10 +381,21 @@ def build_chunk_kda_cases(ops, device, heads, dtype) -> list[Case]:
 
 
 def build_recurrent_kda_cases(ops, device, heads, dtype) -> list[Case]:
-    """Decode / speculative KDA: FlagGems fused_recurrent_kda vs AscendC recurrent_kda."""
+    """Decode / speculative KDA: FlagGems fused_recurrent_kda vs AscendC recurrent_kda.
+
+    Decode batches are bounded by the 950DT mixed-deployment
+    --max-num-seqs=16 (one DP rank serves at most 16 concurrent requests);
+    the speculative case uses the deployed DSpark num_speculative_tokens=7.
+    """
     cases = []
     # (decode batch, speculative tokens per request); num_spec=0 is plain decode.
-    for batch, num_spec in ((4, 0), (32, 0), (128, 0), (8, 3)):
+    max_seqs = K3_950DT_MAX_NUM_SEQS
+    for batch, num_spec in (
+        (4, 0),
+        (max_seqs // 2, 0),
+        (max_seqs, 0),
+        (max_seqs, K3_950DT_NUM_SPECULATIVE_TOKENS),
+    ):
         tokens = batch * (num_spec + 1)
         q, k, v, raw_g, raw_beta, a_log, dt_bias = _kda_inputs(
             heads, tokens, device, dtype, seed=11
@@ -435,10 +472,22 @@ def build_recurrent_kda_cases(ops, device, heads, dtype) -> list[Case]:
 
 
 def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
-    """Short causal conv over the packed q/k/v projection (3 * H * D channels)."""
+    """Short causal conv over the packed q/k/v projection (3 * H * D channels).
+
+    Decode batches are bounded by the 950DT mixed-deployment
+    --max-num-seqs=16; prefill batches are bounded by
+    --max-num-batched-tokens=24576 (see build_chunk_kda_cases).
+    """
     cases = []
     dim = 3 * heads * HEAD_DIM
-    shapes = ((4, 0), (32, 0), (128, 0)) if decode else ([0, 128, 384], [0, 1024], [0, 512, 1536, 4096])
+    max_seqs = K3_950DT_MAX_NUM_SEQS
+    per_seq_at_max_seqs = K3_950DT_MAX_NUM_BATCHED_TOKENS // max_seqs
+    full_batch_cu = [i * per_seq_at_max_seqs for i in range(max_seqs + 1)]
+    shapes = (
+        ((4, 0), (max_seqs // 2, 0), (max_seqs, 0))
+        if decode
+        else ([0, 31, 96], [0, 512, 1536, 4096], full_batch_cu, [0, K3_950DT_MAX_NUM_BATCHED_TOKENS])
+    )
 
     for spec in shapes:
         torch.manual_seed(77)
