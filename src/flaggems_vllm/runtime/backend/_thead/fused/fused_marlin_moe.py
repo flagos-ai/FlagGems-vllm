@@ -372,8 +372,41 @@ def _check_fp8_scale_kernel(
     tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad.to(tl.int32), 0) != 0)
 
 
-def _fp8_scale_safety(s):
+@triton.jit
+def _compact_fp8_scale_safety_kernel(
+    S,
+    Safe,
+    N: tl.constexpr,
+    G: tl.constexpr,
+    E: tl.constexpr,
+    SE: tl.constexpr,
+    SN: tl.constexpr,
+    SG: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    ex = tl.program_id(0).to(tl.int64)
+    i = tl.arange(0, BLOCK).to(tl.int64)
+    n, g = i // G, i % G
+    scale = tl.load(S + ex * SE + n * SN + g * SG, i < N * G, other=1).to(tl.float32)
+    folded = scale * (2.0**120)
+    bad = (
+        (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf")) & (i < N * G)
+    )
+    tl.store(Safe + ex, tl.sum(bad.to(tl.int32)) == 0)
+    # Grouped GEMM reads expert flags; keep the dense global gate conservative.
+    if ex == 0:
+        tl.store(Safe + E, 0)
+
+
+def _fp8_scale_safety(s, compact=False):
     e, n, g = s.shape
+    if compact and n * g <= 16384:
+        safe = torch.empty((e + 1,), device=s.device, dtype=torch.int32)
+        block = triton.next_power_of_2(n * g)
+        _compact_fp8_scale_safety_kernel[(e,)](
+            s, safe, n, g, e, *s.stride(), block, num_warps=16 if block >= 8192 else 4
+        )
+        return safe
     count = triton.cdiv(n * g, 256)
     chunks = torch.empty((e, count), device=s.device, dtype=torch.int32)
     safe = torch.empty((e + 1,), device=s.device, dtype=torch.int32)
@@ -589,6 +622,8 @@ if tle_async is not None:
         NUM_EXPERTS: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
         FAST: tl.constexpr,
+        SPLIT_K: tl.constexpr = 1,
+        SPLIT_STRIDE: tl.constexpr = 0,
     ):
         BLOCK_SIZE_K: tl.constexpr = 128
         IS_8BIT: tl.constexpr = (
@@ -615,7 +650,14 @@ if tle_async is not None:
                 N,
             ),
             strides=(stride_bk, stride_bn),
-            offsets=(0, pid_n * BLOCK_SIZE_N),
+            offsets=(
+                (
+                    (tl.program_id(1) * tl.cdiv(tl.cdiv(K, 128), SPLIT_K) * 128)
+                    if SPLIT_K > 1
+                    else 0
+                ),
+                pid_n * BLOCK_SIZE_N,
+            ),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
             order=((0, 1) if IS_8BIT else (1, 0)),
         )
@@ -623,7 +665,14 @@ if tle_async is not None:
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
 
-        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
+        if SPLIT_K > 1:
+            chunk: tl.constexpr = tl.cdiv(tl.cdiv(K, BLOCK_SIZE_K), SPLIT_K)
+            begin = tl.program_id(1) * chunk
+            end = tl.minimum(begin + chunk, tl.cdiv(K, BLOCK_SIZE_K))
+        else:
+            begin = 0
+            end = tl.cdiv(K, BLOCK_SIZE_K)
+        for k_tile in tl.range(begin, end, num_stages=PIPELINE_STAGES):
             a = tl.load(
                 a_ptr
                 + a_row * stride_am
@@ -659,11 +708,14 @@ if tle_async is not None:
             acc += tl.sum(a[:, None].to(tl.float32) * b.to(tl.float32), axis=0)
             b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
 
-        if MUL_ROUTED_WEIGHT:
+        if MUL_ROUTED_WEIGHT and SPLIT_K == 1:
             acc *= tl.load(topk_weights_ptr + route).to(tl.float32)
         tl.store(
-            c_ptr + route * stride_cm + offs_n * stride_cn,
-            acc.to(compute_type),
+            c_ptr
+            + (tl.program_id(1) * SPLIT_STRIDE if SPLIT_K > 1 else 0)
+            + route * stride_cm
+            + offs_n * stride_cn,
+            acc.to(c_ptr.dtype.element_ty),
             mask=offs_n < N,
         )
 
@@ -1253,6 +1305,35 @@ def _align_grouped_tokens(topk_ids: torch.Tensor, block_m: int, num_experts: int
     )
 
 
+@triton.jit
+def _reduce_split_silu_kernel(
+    P,
+    C,
+    W,
+    N: tl.constexpr,
+    R: tl.constexpr,
+    S: tl.constexpr,
+    MUL: tl.constexpr,
+    BN: tl.constexpr,
+):
+    r = tl.program_id(0)
+    ns = tl.program_id(1) * BN + tl.arange(0, BN)
+    gate = tl.full((BN,), 0, tl.float32)
+    up = tl.full((BN,), 0, tl.float32)
+    for part in tl.static_range(S):
+        gate += tl.load(P + part * R * 2 * N + r * 2 * N + ns, ns < N, other=0)
+        up += tl.load(P + part * R * 2 * N + r * 2 * N + N + ns, ns < N, other=0)
+    if MUL:
+        w = tl.load(W + r)
+        gate *= w
+        up *= w
+    # Match the original GEMM1 rounding before computing SiLU.
+    gate = gate.to(C.dtype.element_ty).to(tl.float32)
+    up = up.to(C.dtype.element_ty).to(tl.float32)
+    result = tl.fdiv(gate, 1.0 + tl.exp(-gate)) * up
+    tl.store(C + r * N + ns, result, ns < N)
+
+
 def _invoke_marlin_moe_gemm_direct(
     A: torch.Tensor,
     C: torch.Tensor,
@@ -1267,6 +1348,8 @@ def _invoke_marlin_moe_gemm_direct(
     quant_type_id: int,
     use_matvec: bool = False,
     fuse_silu: bool = False,
+    silu_output: Optional[torch.Tensor] = None,
+    split_k: int = 1,
 ):
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
@@ -1317,11 +1400,24 @@ def _invoke_marlin_moe_gemm_direct(
             else _marlin_moe_gemm_direct_kernel
         )
     )
+
+    target = C
+    if split_k > 1:
+        assert use_matvec and silu_output is not None
+        partials = torch.empty(
+            (split_k, routes, N), device=C.device, dtype=torch.float32
+        )
+        target = partials
+        grid = (*grid, split_k)
+        pipeline_stages = min(
+            pipeline_stages, triton.cdiv(triton.cdiv(K, 128), split_k)
+        )
+    extra = dict(SPLIT_K=split_k, SPLIT_STRIDE=routes * N) if use_matvec else {}
     for fast_variant in fast_variants:
         kernel[grid](
             A,
             B,
-            C,
+            target,
             B_scale,
             topk_weights,
             topk_ids,
@@ -1348,6 +1444,20 @@ def _invoke_marlin_moe_gemm_direct(
             NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
+            **extra,
+        )
+
+    if split_k > 1:
+        _reduce_split_silu_kernel[(routes, triton.cdiv(N // 2, 128))](
+            partials,
+            silu_output,
+            topk_weights,
+            N // 2,
+            routes,
+            split_k,
+            mul_routed_weight,
+            128,
+            num_warps=4,
         )
 
 
@@ -1692,7 +1802,15 @@ def _validate_inputs(
 
 
 def _prepare_quantized_weights(
-    w1, w2, w1_scale, w2_scale, quant_type_id, group_size, *, direct=False
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    quant_type_id,
+    group_size,
+    *,
+    direct=False,
+    compact_safety=False,
 ):
     if quant_type_id == QUANT_TYPE_UINT4B8:
         b1, b2, s1, s2 = w4a16_int4_pack(
@@ -1707,7 +1825,9 @@ def _prepare_quantized_weights(
         s1 = w1_scale.transpose(1, 2)
         s2 = w2_scale.transpose(1, 2)
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and not direct:
-        safe1, safe2 = _fp8_scale_safety(w1_scale), _fp8_scale_safety(w2_scale)
+        safe1, safe2 = _fp8_scale_safety(w1_scale, compact_safety), _fp8_scale_safety(
+            w2_scale, compact_safety
+        )
     else:
         safe1, safe2 = None, None
     return _QuantizedStage(b1, s1, safe1), _QuantizedStage(b2, s2, safe2)
@@ -1767,10 +1887,17 @@ def _fused_marlin_moe_impl(
             == torch.bfloat16
         )
         direct = _use_direct_route(m, e, topk, k, n)
-        if packed_fp8 and e > 8 and m * topk <= 96 and max(k, 2 * n) <= 4096:
+        if packed_fp8 and e > 8 and m * topk <= 160 and max(k, 2 * n) <= 4096:
             direct = True
         stage1, stage2 = _prepare_quantized_weights(
-            w1, w2, w1_scale, w2_scale, quant_type_id, group_size, direct=direct
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            quant_type_id,
+            group_size,
+            direct=direct,
+            compact_safety=packed_fp8 and m < _PPU_DENSE_MIN_TOKENS,
         )
         if (
             m >= _PPU_DENSE_MIN_TOKENS
@@ -1805,6 +1932,21 @@ def _fused_marlin_moe_impl(
             packed_fp8
             or (m == 1 and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3))
         )
+        gemv_split_k = 1
+        if (
+            packed_fp8
+            and direct
+            and group_size == 128
+            and k >= 1024
+            and k % 1024 == 0
+            and 2 * n <= 1024
+        ):
+            routes = m * topk
+            # Fill the compute units for very sparse routes; the 33--64 route
+            # band already has enough column tiles without another reduction.
+            gemv_split_k = (
+                min(8, 64 // triton.next_power_of_2(routes)) if routes <= 64 else 4
+            )
         reduced = direct and m <= 2 and not split_silu
         stage1_topk_weights = topk_weights if apply_router_weight_on_input else None
         stage2_topk_weights = None if apply_router_weight_on_input else topk_weights
@@ -1833,8 +1975,11 @@ def _fused_marlin_moe_impl(
                     compute_type=compute_type,
                     quant_type_id=quant_type_id,
                     use_matvec=use_matvec,
+                    split_k=gemv_split_k,
+                    silu_output=c2 if gemv_split_k > 1 else None,
                 )
-                silu_and_mul_out(c1[:, :n], c1[:, n:], c2)
+                if gemv_split_k == 1:
+                    silu_and_mul_out(c1[:, :n], c1[:, n:], c2)
             else:
                 _invoke_marlin_moe_gemm_direct(
                     A=hidden_states,

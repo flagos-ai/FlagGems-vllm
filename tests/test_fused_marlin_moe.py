@@ -731,6 +731,16 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         (1, 1024, 1024),
         (65, 256, 512),
         pytest.param(
+            (1, 1024, 128),
+            marks=[
+                pytest.mark.fused_marlin_moe_w8a16,
+                pytest.mark.skipif(
+                    flaggems_vllm.vendor_name != "thead", reason="T-Head split GEMV"
+                ),
+            ],
+            id="ppu-split-gemv",
+        ),
+        pytest.param(
             (4096, 128, 256),
             marks=[
                 pytest.mark.fused_marlin_moe_w8a16,
@@ -1633,6 +1643,54 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
     )
 
 
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 graph replay"
+)
+@pytest.mark.parametrize("config", [(1, 16, 1024, 128, 6), (88, 64, 1024, 128, 4)])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
+    config, apply_router_weight_on_input
+):
+    with torch.inference_mode():
+        args = _make_inputs_fp8_weight(*config, torch.bfloat16, flaggems_vllm.device)
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = args
+
+        def call():
+            return flaggems_vllm.fused_marlin_moe(
+                hs,
+                w1,
+                w2,
+                None,
+                None,
+                s1,
+                s2,
+                tw,
+                ti,
+                QUANT_TYPE_FP8_E4M3,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+
+        call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = call()
+        # Switch from safe scales to scales whose folded exponent overflows.
+        s1.mul_(2.0**20)
+        ref1.mul_(2.0**20)
+        graph.replay()
+        reference = _reference_w8a16_grouped(
+            hs, ref1, ref2, tw, ti, apply_router_weight_on_input
+        )
+        torch.cuda.synchronize()
+        assert compute_max_diff(actual.float(), reference) < 0.04
+        s1.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        gems_assert_equal(actual, torch.zeros_like(hs))
+
+
 @pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head MXFP4")
 @pytest.mark.parametrize("num_tokens", [1, 33])
@@ -1837,6 +1895,21 @@ _W8A16_CASES += [
         id="ppu-dense-" + precision,
     )
     for precision in ("int8", "fp8")
+]
+
+
+_W8A16_CASES += [
+    pytest.param(
+        "fp8",
+        (tokens, 16, 1024, 128, 6),
+        torch.bfloat16,
+        None,
+        marks=pytest.mark.skipif(
+            flaggems_vllm.vendor_name != "thead", reason="T-Head split GEMV"
+        ),
+        id=f"ppu-split-gemv-{tokens}",
+    )
+    for tokens in (1, 2, 4, 16, 24)
 ]
 
 

@@ -59,6 +59,8 @@ def decode_int8_scaled_bf16(q, scale):
 
 @triton.jit
 def decode_fp8_scaled_bf16(q, scale):
+    # Each byte produces its NaN exponent and sign before expanding into BF16.
+    # No carries or borrows cross byte boundaries because magnitudes are <=127.
     # Folding a BF16 scale by an exact power of two adds no rounding when finite.
     folded = tl.inline_asm_elementwise(
         "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\n"
@@ -70,17 +72,14 @@ def decode_fp8_scaled_bf16(q, scale):
         pack=2,
     )
     return tl.inline_asm_elementwise(
-        "{ .reg .b32 a<2>, b<2>, m<2>, v<2>;\n"
-        "ppu.prmt.b32 a0,0,$2,0x5140; ppu.prmt.b32 a1,0,$2,0x7362;\n"
-        "ppu.and.b32 b0,a0,0x7f007f00; ppu.and.b32 b1,a1,0x7f007f00;\n"
-        "ppu.shr.b32 b0,b0,4; ppu.shr.b32 b1,b1,4;\n"
-        "ppu.add.u32 m0,b0,0x00100010; ppu.add.u32 m1,b1,0x00100010;\n"
-        "ppu.and.b32 m0,m0,0x08000800; ppu.and.b32 m1,m1,0x08000800;\n"
-        "ppu.shr.b32 m0,m0,11; ppu.shr.b32 m1,m1,11;\n"
-        "ppu.mul.lo.u32 m0,m0,0x7f80; ppu.mul.lo.u32 m1,m1,0x7f80;\n"
-        "ppu.or.b32 b0,b0,m0; ppu.or.b32 b1,b1,m1;\n"
-        "ppu.lop3.b32 v0,b0,0x80008000,a0,0xf8;\n"
-        "ppu.lop3.b32 v1,b1,0x80008000,a1,0xf8;\n"
+        "{ .reg .b32 mag, flags, high, shifted, b<2>, special<2>, v<2>;\n"
+        "ppu.and.b32 mag,$2,0x7f7f7f7f; ppu.add.u32 flags,mag,0x01010101; ppu.and.b32 flags,flags,0x80808080;\n"
+        "ppu.shr.b32 shifted,flags,7; ppu.sub.u32 high,flags,shifted;\n"
+        "ppu.lop3.b32 high,high,0x80808080,$2,0xf8;\n"
+        "ppu.prmt.b32 special0,flags,high,0x5140; ppu.prmt.b32 special1,flags,high,0x7362;\n"
+        "ppu.prmt.b32 b0,mag,0,0x4140; ppu.prmt.b32 b1,mag,0,0x4342;\n"
+        "ppu.shl.b32 b0,b0,4; ppu.shl.b32 b1,b1,4;\n"
+        "ppu.or.b32 v0,b0,special0; ppu.or.b32 v1,b1,special1;\n"
         "ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\n"
         "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
         "=r,=r,r,r,r",
