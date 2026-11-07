@@ -248,6 +248,12 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}/src
       VENV_DIR: ${{ github.workspace }}/.venv
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
+      # h20 is a persistent, non-ephemeral runner: uv's global package cache
+      # survives across jobs. A stale/partially-evicted cache entry can make
+      # `uv pip install` report success without actually installing into the
+      # freshly recreated venv (see tools/setup.sh for details), so force
+      # cache revalidation here.
+      UV_REFRESH: "1"
 
     steps:
       - name: check out repository

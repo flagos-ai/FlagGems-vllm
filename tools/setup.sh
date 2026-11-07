@@ -51,6 +51,21 @@ STRICT_TRITON_IMPORT="${STRICT_TRITON_IMPORT:-0}"
 # requirements such as "vllm requires triton".
 STRICT_PIP_CHECK="${STRICT_PIP_CHECK:-0}"
 
+# Whether to pass `--refresh` to the vLLM/FlagGems/FlagGems-vllm `uv pip
+# install` calls below. On a persistent (non-ephemeral) runner, `uv`'s global
+# cache survives across jobs; if a prior job's cache entries went stale or
+# were partially evicted, `uv` can report a cached install as successful
+# without actually materializing the package files into the freshly
+# recreated venv (e.g. `import torch` failing right after a "successful"
+# vLLM install). `--refresh` forces revalidation of cache entries instead of
+# trusting their metadata. Off by default since it slows down every install;
+# CI for persistent runners should set UV_REFRESH=1.
+UV_REFRESH="${UV_REFRESH:-0}"
+UV_REFRESH_FLAG=()
+if [ "${UV_REFRESH}" = "1" ]; then
+  UV_REFRESH_FLAG=(--refresh)
+fi
+
 CUDA_HOME="${CUDA_HOME:-}"
 
 print_help() {
@@ -85,6 +100,14 @@ environment variables (each shown below with its default):
                                only warn (0)
   STRICT_PIP_CHECK=${STRICT_PIP_CHECK}          Fail setup if \`uv pip check\` reports
                                conflicts (1) or only warn (0)
+
+  UV_REFRESH=${UV_REFRESH}                     Pass --refresh to the vLLM/FlagGems/
+                               FlagGems-vllm \`uv pip install\` calls, forcing
+                               revalidation of uv's cache instead of trusting
+                               it. Recommended on persistent (non-ephemeral)
+                               runners where a stale cache can make \`uv\`
+                               report a cached install as successful without
+                               actually installing into the fresh venv.
 
   CUDA_HOME=                  CUDA toolkit path; auto-detected from
                                /usr/local/cuda* if unset
@@ -259,6 +282,7 @@ uv pip install -q \
   --torch-backend="${TORCH_BACKEND}" \
   --constraint "${CONSTRAINTS_FILE}" \
   --default-index "${MIRROR}" \
+  "${UV_REFRESH_FLAG[@]}" \
   || fail
 ok
 
@@ -284,6 +308,7 @@ uv pip install -q \
   "flag-gems${FLAG_GEMS_VERSION:+==${FLAG_GEMS_VERSION}}" \
   --constraint "${CONSTRAINTS_FILE}" \
   --default-index "${MIRROR}" \
+  "${UV_REFRESH_FLAG[@]}" \
   || fail
 ok
 
@@ -305,6 +330,7 @@ uv pip install -q \
   -e ".[test]" \
   --constraint "${CONSTRAINTS_FILE}" \
   --default-index "${MIRROR}" \
+  "${UV_REFRESH_FLAG[@]}" \
   || fail
 ok
 
