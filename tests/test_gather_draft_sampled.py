@@ -144,6 +144,9 @@ def test_individual_integer_types(index):
 
 
 @pytest.mark.gather_draft_sampled
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "nvidia", reason="NVIDIA tuning candidate guards"
+)
 @pytest.mark.parametrize(
     "config",
     [
