@@ -323,12 +323,17 @@ if [ -n "${TORCH_VERSION}" ]; then
     || fail
   ok
 
+  # No --index FLAGOS_PYPI_NVIDIA here: torch is already installed and
+  # satisfies the constraint above, so vLLM's resolver never needs to look
+  # for it in any index. Adding that index anyway pulls in unrelated
+  # packages it also hosts (e.g. a "vllm<=0.20.2+flagos" listing) that can
+  # shadow the plain PyPI vllm==0.20.2 release under uv's default
+  # first-index-wins resolution, making the install unsatisfiable.
   printf "Installing vLLM==${VLLM_VERSION} ...\n"
   uv pip install \
     "vllm==${VLLM_VERSION}" \
     --constraint "${CONSTRAINTS_FILE}" \
     --default-index "${MIRROR}" \
-    --index "${FLAGOS_PYPI_NVIDIA}" \
     "${UV_REFRESH_FLAG[@]}" \
     || fail
   ok
