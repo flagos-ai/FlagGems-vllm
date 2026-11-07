@@ -16,6 +16,8 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 
@@ -285,3 +287,113 @@ def test_triton_unified_attention(config, dtype):
 
     atol = 2e-2 if dtype == torch.bfloat16 else 1e-2
     torch.testing.assert_close(test_out, ref_out_tensor, atol=atol, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime required")
+@pytest.mark.parametrize("query_len", [1, 4], ids=["decode", "prefill"])
+@pytest.mark.parametrize(
+    "interleaved", [False, True], ids=["contiguous", "interleaved"]
+)
+def test_triton_unified_attention_large_cache_offsets(query_len, interleaved):
+    """Exercise page offsets exceeding int32 in both K and V address arithmetic."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    block_size, num_kv_heads, head_size = 544, 1, 256
+    num_query_heads, seq_len = 8, 543
+    page_stride = block_size * num_kv_heads * head_size
+    if interleaved:
+        page_stride *= 2
+    high_page = (2**31 - 1) // page_stride + 1
+    num_pages = high_page + 1
+    shape = (
+        (num_pages, 2, block_size, num_kv_heads, head_size)
+        if interleaved
+        else (2, num_pages, block_size, num_kv_heads, head_size)
+    )
+    cache_bytes = 2 * num_pages * block_size * num_kv_heads * head_size * 2
+    torch.cuda.empty_cache()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < cache_bytes + 1024**3:
+        pytest.skip("Large-offset regression requires cache memory plus 1 GiB headroom")
+
+    torch.manual_seed(17)
+    cache = torch.empty(shape, dtype=dtype, device=device)
+    k, v = (cache[:, 0], cache[:, 1]) if interleaved else (cache[0], cache[1])
+    assert k.stride(0) == v.stride(0) == page_stride
+    assert high_page * page_stride > 2**31 - 1
+    q = torch.randn((query_len, num_query_heads, head_size), dtype=dtype, device=device)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    seqused_k = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    block_table = torch.empty((1, 1), dtype=torch.int32, device=device)
+    mask = torch.arange(seq_len, device=device)[None, :] <= (
+        seq_len - query_len + torch.arange(query_len, device=device)[:, None]
+    )
+
+    # Initialize only the addressed pages. Do not materialize a dense view of
+    # the entire multi-GiB cache, especially for the interleaved layout.
+    references = {}
+    for page in (7, high_page):
+        kd = torch.randn(
+            (block_size, num_kv_heads, head_size), dtype=dtype, device=device
+        )
+        vd = torch.randn_like(kd)
+        kd[seq_len:] = float("nan")
+        vd[seq_len:] = float("nan")
+        k[page].copy_(kd)
+        v[page].copy_(vd)
+        references[page] = (kd[:seq_len], vd[:seq_len])
+
+    def reference(page):
+        kd, vd = references[page]
+        with sdpa_kernel(SDPBackend.MATH):
+            return F.scaled_dot_product_attention(
+                q.transpose(0, 1)[None].float(),
+                kd.transpose(0, 1)[None].float(),
+                vd.transpose(0, 1)[None].float(),
+                attn_mask=mask,
+                enable_gqa=True,
+            )[0].transpose(0, 1)
+
+    def run():
+        return triton_unified_attention(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            query_len,
+            seqused_k,
+            seq_len,
+            head_size**-0.5,
+            True,
+            (-1, -1),
+            block_table,
+            0.0,
+            None,
+            None,
+            None,
+        )
+
+    for page in (7, high_page):
+        block_table.fill_(page)
+        out.fill_(float("nan"))
+        result = run()
+        torch.cuda.synchronize()
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(
+            result.float(), reference(page), atol=0.005, rtol=0.03
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # Both page selection and query values change between replays, so stale
+    # graph inputs cannot accidentally agree with the reference.
+    for page, delta in ((7, 0.25), (high_page, -0.5)):
+        block_table.fill_(page)
+        q.add_(delta)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), reference(page), atol=0.005, rtol=0.03)
