@@ -120,14 +120,16 @@ class TraceReplayBenchmark(base.Benchmark):
             return
         mode_label = {
             "kernel": "GPU event",
-            "cudagraph": "GPU Graph",
+            "cudagraph": "GPU graph",
         }.get(Config.mode.value, Config.mode.value)
-        print(f"\nTrace replay latency ({mode_label}, microseconds)")
-        print(
-            f"Requests  Trace slots  {REFERENCE_NAME + ' ref':>16}  "
-            f"{'FlagGems-vllm':>14}  Speedup"
+        print(f"\nTrace replay latency ({mode_label})")
+        header = (
+            f"{'Requests':>8}  {'Trace slots':>11}  "
+            f"{REFERENCE_NAME + ' (µs)':>19}  {'FlagGems-vllm (µs)':>19}  "
+            f"{'Speedup':>8}"
         )
-        print("-" * 69)
+        print(header)
+        print("-" * len(header))
         for num_reqs, max_model_len in self.shapes:
             measured = self._latency_ms.get((num_reqs, max_model_len), {})
             if "flaggems" not in measured or "reference" not in measured:
@@ -136,7 +138,7 @@ class TraceReplayBenchmark(base.Benchmark):
             candidate_us = measured["flaggems"] * 1000
             print(
                 f"{num_reqs:>8}  {max_model_len:>11}  "
-                f"{baseline_us:>16.3f}  {candidate_us:>14.3f}  "
+                f"{baseline_us:>19.3f}  {candidate_us:>19.3f}  "
                 f"{baseline_us / candidate_us:>7.3f}x"
             )
 
