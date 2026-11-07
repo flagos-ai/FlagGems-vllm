@@ -298,28 +298,38 @@ def _kda_inputs(heads, tokens, device, dtype, seed=1234):
     return q, k, v, raw_g, raw_beta, a_log, dt_bias
 
 
+#  (T, H, seq) chunk prefill cases, zipped (not a cartesian product):
+#  common chunk-prefill token budgets paired with the TP-sharded local head
+#  counts (tp=4/8/16 of NUM_HEADS_TOTAL=96) and small request counts. The
+#  4th T re-cycles the first (H, seq) pair since the lists have different
+#  lengths.
+CHUNK_KDA_T_VALUES = (8192, 16384, 24576, 32768)
+CHUNK_KDA_H_VALUES = (24, 12, 6)
+CHUNK_KDA_SEQ_VALUES = (2, 4, 8)
+
+
 def build_chunk_kda_cases(ops, device, heads, dtype) -> list[Case]:
     """Prefill KDA: FlagGems chunk_kda vs AscendC chunk_kda_fwd.
 
-    Batches follow the 950DT mixed-deployment scheduler budgets: at most
-    K3_950DT_MAX_NUM_SEQS=16 concurrent requests, token totals up to
-    K3_950DT_MAX_NUM_BATCHED_TOKENS=24576.
+    Shapes sweep common chunk-prefill sizes rather than the heads/batch
+    implied by ``--tp``: T in {8k,16k,24k,32k}, H in {24,12,6}, seq in
+    {2,4,8}, zipped pairwise (cycling the shorter lists) rather than a full
+    cross product. Each case's T tokens are split evenly across `seq`
+    chunk-aligned requests.
     """
-    per_seq_at_max_seqs = K3_950DT_MAX_NUM_BATCHED_TOKENS // K3_950DT_MAX_NUM_SEQS
-    full_batch_cu = [i * per_seq_at_max_seqs for i in range(K3_950DT_MAX_NUM_SEQS + 1)]
     cases = []
-    for cu_list in (
-        [0, 31, 96],                                  # short ragged prefill, 2 reqs
-        [0, 512, 1536, 4096],                         # mixed batch, 3 reqs, chunk-unaligned starts
-        full_batch_cu,                                # max_num_seqs=16 reqs evenly filling the 24576 budget
-        [0, K3_950DT_MAX_NUM_BATCHED_TOKENS],         # single long prefill at the full token budget
-    ):
-        tokens = cu_list[-1]
-        n = len(cu_list) - 1
-        q, k, v, raw_g, raw_beta, a_log, dt_bias = _kda_inputs(heads, tokens, device, dtype)
+    for i, tokens in enumerate(CHUNK_KDA_T_VALUES):
+        case_heads = CHUNK_KDA_H_VALUES[i % len(CHUNK_KDA_H_VALUES)]
+        n = CHUNK_KDA_SEQ_VALUES[i % len(CHUNK_KDA_SEQ_VALUES)]
+        # Chunk-align each request's length so both FlagGems (BT=16) and
+        # AscendC (BT=64) see whole chunks per request.
+        per_seq = (tokens // n // ASCENDC_CHUNK_SIZE) * ASCENDC_CHUNK_SIZE
+        cu_list = [j * per_seq for j in range(n)] + [tokens]
+
+        q, k, v, raw_g, raw_beta, a_log, dt_bias = _kda_inputs(case_heads, tokens, device, dtype)
         cu = torch.tensor(cu_list, dtype=torch.int64, device=device)
         # state_v_first=True: the recurrent cache stores [N, H, V, K].
-        init_vk = torch.randn(n, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device)
+        init_vk = torch.randn(n, case_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device)
 
         ci_ascendc = ops["prepare_chunk_indices"](cu, ASCENDC_CHUNK_SIZE)
         ci_gems = ops["prepare_chunk_indices"](cu, FLAGGEMS_CHUNK_SIZE)
@@ -369,7 +379,7 @@ def build_chunk_kda_cases(ops, device, heads, dtype) -> list[Case]:
         cases.append(
             Case(
                 op="chunk_kda",
-                shape=f"T={tokens} H={heads} D={HEAD_DIM} seqs={n}",
+                shape=f"T={tokens} H={case_heads} D={HEAD_DIM} seqs={n}",
                 check=check,
                 gems_step=lambda f=gems_call: f(),
                 ref_step=lambda f=ref_call: f(),
