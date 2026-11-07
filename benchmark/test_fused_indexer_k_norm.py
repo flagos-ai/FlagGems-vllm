@@ -33,11 +33,22 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
     WARMUP = 5
     SAMPLES = 25
 
-    def __init__(self):
+    def __init__(self, use_out_provided=False):
+        self._use_out_provided = use_out_provided
+        self._out_buffer = None
+        _gems = flaggems_vllm.fused_indexer_k_norm
+        if use_out_provided:
+            def _op(x, weight, bias, dim, eps):
+                buf = self._out_buffer
+                if buf is None or buf.shape != x.shape or buf.dtype != x.dtype or buf.device != x.device:
+                    buf = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+                    self._out_buffer = buf
+                return flaggems_vllm.fused_indexer_k_norm(x, weight, bias, dim, eps, buf)
+            _gems = _op
         super().__init__(
             op_name="fused_indexer_k_norm",
             torch_op=self._decomposed_op,
-            gems_op=flaggems_vllm.fused_indexer_k_norm,
+            gems_op=_gems,
         )
         self._latencies = None
 
@@ -191,3 +202,8 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
 @pytest.mark.fused_indexer_k_norm
 def test_fused_indexer_k_norm_benchmark():
     FusedIndexerKNormBenchmark().run()
+
+
+@pytest.mark.fused_indexer_k_norm
+def test_fused_indexer_k_norm_benchmark_out_provided():
+    FusedIndexerKNormBenchmark(use_out_provided=True).run()

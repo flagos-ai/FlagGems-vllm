@@ -94,6 +94,8 @@ def _prune_norm_configs(configs, named_args, **kwargs):
 
 
 def _h20z_d128_config(rows):
+    # NOTE: block_m thresholds must stay in sync with
+    # test_h20z_d128_config_thresholds.
     if rows == 1:
         return 1, 4
     if rows >= 4096:
@@ -142,29 +144,43 @@ else:
     _norm_kernel = libentry()(_fused_indexer_k_norm_kernel)
 
 
-def _validate_inputs(x, weight, bias, dim, eps):
-    for name, tensor in (("x", x), ("weight", weight), ("bias", bias)):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"fused_indexer_k_norm {name} must be a Tensor")
-        if tensor.layout != torch.strided:
-            raise NotImplementedError("fused_indexer_k_norm requires strided tensors")
+def _tensor_signature(tensor):
+    return (
+        tensor.shape,
+        tensor.stride(),
+        str(tensor.dtype),
+        str(tensor.device),
+        tensor.requires_grad,
+        str(tensor.layout),
+    )
 
-    if x.ndim != 2:
+
+@lru_cache(maxsize=256)
+def _validate_inputs_cached(x_sig, w_sig, b_sig, dim, eps):
+    eps = _validate_inputs_full(x_sig, w_sig, b_sig, dim, eps)
+    return eps
+
+
+def _validate_inputs_full(x_sig, w_sig, b_sig, dim, eps):
+    if x_sig[5] != "torch.strided" or w_sig[5] != "torch.strided" or b_sig[5] != "torch.strided":
+        raise NotImplementedError("fused_indexer_k_norm requires strided tensors")
+
+    if len(x_sig[0]) != 2:
         raise NotImplementedError("fused_indexer_k_norm requires rank-2 x")
     if isinstance(dim, bool) or not isinstance(dim, numbers.Integral):
         raise TypeError("fused_indexer_k_norm dim must be an integer")
     if not 1 <= dim <= _MAX_DIM:
         raise NotImplementedError("fused_indexer_k_norm supports dimensions 1..4096")
-    if x.shape[1] != dim:
+    if x_sig[0][1] != dim:
         raise ValueError("fused_indexer_k_norm dim must match x.shape[1]")
-    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+    if x_sig[2] not in ("torch.float16", "torch.bfloat16", "torch.float32"):
         raise NotImplementedError("fused_indexer_k_norm requires FP16, BF16, or FP32 x")
-    for name, parameter in (("weight", weight), ("bias", bias)):
-        if parameter.shape != (dim,):
+    for name, sig in (("weight", w_sig), ("bias", b_sig)):
+        if sig[0] != (dim,):
             raise ValueError(f"fused_indexer_k_norm {name} must have shape (dim,)")
-        if parameter.dtype != torch.float32:
+        if sig[2] != "torch.float32":
             raise NotImplementedError(f"fused_indexer_k_norm {name} must be FP32")
-        if parameter.device != x.device:
+        if sig[3] != x_sig[3]:
             raise ValueError("fused_indexer_k_norm tensors must share a device")
 
     if isinstance(eps, bool) or not isinstance(eps, numbers.Real):
@@ -178,34 +194,44 @@ def _validate_inputs(x, weight, bias, dim, eps):
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError("fused_indexer_k_norm eps must be finite positive FP32")
 
-    for tensor in (x, weight, bias):
-        if any(stride < 0 for stride in tensor.stride()):
+    for sig in (x_sig, w_sig, b_sig):
+        if any(stride < 0 for stride in sig[1]):
             raise NotImplementedError(
                 "fused_indexer_k_norm does not support negative strides"
             )
         if (
-            tensor.numel()
-            and sum(
+            sig[0] and sum(
                 (size - 1) * stride
-                for size, stride in zip(tensor.shape, tensor.stride())
-            )
-            > _MAX_OFFSET
+                for size, stride in zip(sig[0], sig[1])
+            ) > _MAX_OFFSET
         ):
             raise NotImplementedError(
                 "fused_indexer_k_norm tensor offsets exceed int64"
             )
-    if x.numel() > _MAX_OFFSET:
+    if x_sig[0] and x_sig[0][0] * x_sig[0][1] > _MAX_OFFSET:
         raise NotImplementedError("fused_indexer_k_norm output size exceeds int64")
-    if torch.is_grad_enabled() and any(t.requires_grad for t in (x, weight, bias)):
+    if torch.is_grad_enabled() and (x_sig[4] or w_sig[4] or b_sig[4]):
         raise NotImplementedError("fused_indexer_k_norm supports inference only")
     if (
         runtime.device.vendor_name not in _SUPPORTED_VENDORS
-        or x.device.type in ("cpu", "meta")
-        or x.device.type != runtime.device.name
+        or x_sig[3].startswith("cpu") or x_sig[3].startswith("meta")
     ):
         raise NotImplementedError(
             "fused_indexer_k_norm requires a supported accelerator"
         )
+    return eps
+
+
+def _validate_inputs(x, weight, bias, dim, eps):
+    for name, tensor in (("x", x), ("weight", weight), ("bias", bias)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"fused_indexer_k_norm {name} must be a Tensor")
+    x_sig = _tensor_signature(x)
+    w_sig = _tensor_signature(weight)
+    b_sig = _tensor_signature(bias)
+    eps = _validate_inputs_cached(x_sig, w_sig, b_sig, dim, eps)
+    if torch.is_grad_enabled() and (x_sig[4] or w_sig[4] or b_sig[4]):
+        raise NotImplementedError("fused_indexer_k_norm supports inference only")
     return eps
 
 
@@ -246,11 +272,9 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     num_stages=1,
                 )
             else:
-                _fused_indexer_k_norm_kernel[(triton.cdiv(rows, 1),)](
+                _norm_kernel[(triton.cdiv(rows, 1),)](
                     *args,
                     BLOCK_M=1,
-                    num_warps=4,
-                    num_stages=1,
                 )
         else:
             # Ascend backend lowers uint32 bitcast to an unsupported vcast;
@@ -300,15 +324,23 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     )
 
 
-def fused_indexer_k_norm(x, weight, bias, dim, eps):
+def fused_indexer_k_norm(x, weight, bias, dim, eps, out=None):
     """Normalize indexer keys in FP32 and return a fresh cast-back tensor.
 
     Supports inference on rank-2 FP16/BF16/FP32 input with width 1..4096,
     FP32 weight/bias of shape ``(dim,)``, and nonnegative read strides.
     ``eps`` must remain finite and positive after conversion to FP32.
+
+    If ``out`` is provided it must be a strided tensor with the same shape,
+    dtype and device as ``x``; otherwise a fresh output is allocated.
     """
     eps = _validate_inputs(x, weight, bias, dim, eps)
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    elif out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError(
+            "fused_indexer_k_norm out must match x in shape, dtype and device"
+        )
     if x.shape[0]:
         if runtime.device.vendor_name == "metax":
             # Inline fast path to avoid _launch_fused_indexer_k_norm overhead.
@@ -316,6 +348,30 @@ def fused_indexer_k_norm(x, weight, bias, dim, eps):
                 _launch_metax_fast,
             )
             _launch_metax_fast(x, weight, bias, out, eps)
+        elif _IS_NVIDIA and _use_h20z_d128_fast_path(
+            x.shape[0], dim, x.stride(0), x.stride(1),
+            weight.stride(0), bias.stride(0), x.device.index,
+        ):
+            # Inline fast path for H20Z to avoid _launch_fused_indexer_k_norm
+            # dispatcher overhead (~0.004-0.006ms per call).
+            rows, _ = x.shape
+            stride_xm, stride_xd = x.stride()
+            stride_w = weight.stride(0)
+            stride_b = bias.stride(0)
+            args = (
+                x, weight, bias, out,
+                rows, dim,
+                stride_xm, stride_xd, stride_w, stride_b,
+                eps,
+            )
+            block_m, num_warps = _h20z_d128_config(rows)
+            with runtime.torch_device_fn.device(x.device):
+                _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
+                    *args,
+                    BLOCK_M=block_m,
+                    num_warps=num_warps,
+                    num_stages=1,
+                )
         else:
             _launch_fused_indexer_k_norm(x, weight, bias, out, eps)
     return out
