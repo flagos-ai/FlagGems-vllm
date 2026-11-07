@@ -70,6 +70,8 @@ def ref_paged_attn(
         kv_len = kv_lens[i]
         # clone to avoid clobbering the query tensor
         q = query[start_idx : start_idx + query_len].clone()
+        if vendor_name == "ascend":
+            q = utils.to_reference(q)
         q *= scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
@@ -79,6 +81,8 @@ def ref_paged_attn(
         k = k[:kv_len]
         v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
         v = v[:kv_len]
+        if vendor_name == "ascend":
+            k, v = utils.to_reference(k), utils.to_reference(v)
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
@@ -110,7 +114,8 @@ def ref_paged_attn(
         outputs.append(out)
         start_idx += query_len
 
-    return torch.cat(outputs, dim=0)
+    result = torch.cat(outputs, dim=0)
+    return result.to(query.device) if vendor_name == "ascend" else result
 
 
 def make_paged_kv_cache(
@@ -179,6 +184,10 @@ def test_flash_attn_varlen_func(
     num_blocks: int,
     optimize_init: bool,
 ) -> None:
+    if vendor_name == "ascend" and (
+        head_size != 256 or alibi or soft_cap is not None or optimize_init
+    ):
+        pytest.skip("Ascend supports D256 without ALiBi, softcap or optimize_init")
     # (Issue) numerical stability concern
     if alibi is True and soft_cap is not None:
         return
@@ -327,6 +336,8 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
     fa_version: int,
     layout: str,
 ) -> None:
+    if vendor_name == "ascend" and optimize_init:
+        pytest.skip("Ascend uses the standard varlen attention entry")
     with torch.device(flaggems_vllm.device):
         utils.init_seed(1234567890)
 
@@ -336,7 +347,7 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
         num_seqs = len(seq_lens)
         num_query_heads = 8
         num_kv_heads = 2
-        head_size = 128
+        head_size = 256 if vendor_name == "ascend" else 128
         block_size = 32
         num_blocks = 2048
         max_query_len = max(query_lens)
@@ -417,7 +428,7 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (1, 18), (1, 463)]])
 @pytest.mark.parametrize("num_heads", [(8, 2)])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("head_size", [256] if vendor_name == "ascend" else [128])
 @pytest.mark.parametrize("block_size", [32])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -435,6 +446,8 @@ def test_flash_attn_varlen_func_swap_qg(
     soft_cap: Optional[float],
     num_blocks: int,
 ) -> None:
+    if vendor_name == "ascend" and soft_cap is not None:
+        pytest.skip("Ascend does not support softcap")
     with torch.device(flaggems_vllm.device):
         utils.init_seed(1234567890)
         num_seqs = len(seq_lens)

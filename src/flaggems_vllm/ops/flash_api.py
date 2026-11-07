@@ -272,6 +272,8 @@ def mha_varlan_fwd(
     num_splits=0,
 ):
     is_metax = runtime.device.vendor_name == "metax"
+    is_ascend = runtime.device.vendor_name == "ascend"
+    has_attention_backend = is_metax or is_ascend
     if is_metax:
         if p_dropout != 0 or return_softmax:
             raise NotImplementedError(
@@ -281,6 +283,20 @@ def mha_varlan_fwd(
             launch_attention,
         )
         from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+            copy_tensor,
+            fill_tensor,
+            reshape_view_or_copy,
+            view_tensor,
+        )
+    elif is_ascend:
+        if p_dropout != 0 or return_softmax:
+            raise NotImplementedError(
+                "Ascend varlen attention supports inference without dropout"
+            )
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention import (
+            launch_attention,
+        )
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
             copy_tensor,
             fill_tensor,
             reshape_view_or_copy,
@@ -349,11 +365,11 @@ def mha_varlan_fwd(
     # check disable swa
     if window_size_left >= max_seqlen_k:
         window_size_left = -1
-    if window_size_right >= (max_seqlen_q if is_metax else max_seqlen_k):
+    if window_size_right >= (max_seqlen_q if has_attention_backend else max_seqlen_k):
         window_size_right = -1
 
     is_local = window_size_left >= 0
-    if is_metax:
+    if has_attention_backend:
         is_local = is_local or (window_size_right >= 0 and not is_causal)
         if is_local:
             if window_size_left < 0:
@@ -363,8 +379,9 @@ def mha_varlan_fwd(
 
     # Optimize all single-query sequences by swapping the query-group and sequence dimensions
     seqlenq_ngroups_swapped = (
-        max_seqlen_q == 1
-        and (not is_metax or total_q == batch_size)
+        not is_ascend
+        and max_seqlen_q == 1
+        and (not has_attention_backend or total_q == batch_size)
         and alibi_slopes is None
         and num_heads > num_heads_k
         and window_size_left < 0
@@ -374,7 +391,7 @@ def mha_varlan_fwd(
     q_groups = num_heads // num_heads_k
     if seqlenq_ngroups_swapped:
         logger.debug("Swapping query groups and sequence dimensions")
-        if is_metax:
+        if has_attention_backend:
             q = reshape_view_or_copy(
                 reshape_view_or_copy(
                     q, (batch_size, num_heads_k, q_groups, head_size)
@@ -496,7 +513,7 @@ def mha_varlan_fwd(
             p = torch.empty((), device=q_device)
 
         if zero_tensors:
-            if is_metax:
+            if has_attention_backend:
                 fill_tensor(out, 0.0)
                 fill_tensor(lse, float("-inf"))
             else:
@@ -571,7 +588,7 @@ def mha_varlan_fwd(
             k.stride(0) if is_paged else 0,  # k_page_stride,
         )
 
-        if is_metax:
+        if has_attention_backend:
             launch_attention(params, num_splits=num_splits)
         else:
             if flaggems_vllm.vendor_name == "iluvatar":
@@ -619,7 +636,7 @@ def mha_varlan_fwd(
             logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
             kernel(*args, **cfg_params)
         if seqlenq_ngroups_swapped:
-            if is_metax:
+            if has_attention_backend:
                 out = reshape_view_or_copy(
                     out, (batch_size, max_seqlen_q, num_heads_k, head_size)
                 ).transpose(1, 2)

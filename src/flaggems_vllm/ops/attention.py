@@ -1512,14 +1512,21 @@ def flash_attn_varlen_func(
         )
 
     is_metax = runtime.device.vendor_name == "metax"
-    if is_metax:
+    is_ascend = runtime.device.vendor_name == "ascend"
+    if is_metax or is_ascend:
+        backend_name = "MetaX" if is_metax else "Ascend"
+        max_splits = 32 if is_metax else 1
         if fa_version != 2:
-            raise NotImplementedError("MetaX varlen attention supports fa_version=2")
+            raise NotImplementedError(
+                f"{backend_name} varlen attention supports fa_version=2"
+            )
         if dropout_p != 0:
-            raise NotImplementedError("MetaX varlen attention supports dropout_p=0")
+            raise NotImplementedError(
+                f"{backend_name} varlen attention supports dropout_p=0"
+            )
         if return_attn_probs:
             raise NotImplementedError(
-                "MetaX varlen attention does not return attention probabilities"
+                f"{backend_name} varlen attention does not return attention probabilities"
             )
         if (
             any(
@@ -1538,14 +1545,16 @@ def flash_attn_varlen_func(
             or cp_rank != 0
         ):
             raise NotImplementedError(
-                "MetaX varlen attention does not support FA3 or context-parallel extensions"
+                f"{backend_name} varlen attention does not support FA3 or context-parallel extensions"
             )
         if isinstance(num_splits, bool) or not isinstance(num_splits, int):
             raise TypeError(
-                f"num_splits must be an integer in [0, 32], got {num_splits!r}"
+                f"num_splits must be an integer in [0, {max_splits}], got {num_splits!r}"
             )
-        if not 0 <= num_splits <= 32:
-            raise ValueError(f"num_splits must be in [0, 32], got {num_splits}")
+        if not 0 <= num_splits <= max_splits:
+            raise ValueError(
+                f"num_splits must be in [0, {max_splits}], got {num_splits}"
+            )
         if not isinstance(max_seqlen_q, Integral) or not isinstance(
             max_seqlen_k, Integral
         ):
@@ -1569,7 +1578,7 @@ def flash_attn_varlen_func(
             raise RuntimeError("Only FA2 is implemented.")
         if num_splits > 0:
             raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
-    if use_c_extension and not is_metax:
+    if use_c_extension and not (is_metax or is_ascend):
         logger.debug("GEMS FLASH_ATTN_VARLEN_FUNC(C EXTENSION)")
         with torch_device_fn.device(q.device):
             out_cpp, softmax_lse = torch.ops.flaggems_vllm.flash_attn_varlen_func(
@@ -1626,6 +1635,12 @@ def flash_attn_varlen_func(
             real_window_size = (window_size[0], window_size[1])
         if is_metax:
             from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+                ensure_last_dim_contiguous,
+            )
+
+            q, k, v = [ensure_last_dim_contiguous(x) for x in (q, k, v)]
+        elif is_ascend:
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
                 ensure_last_dim_contiguous,
             )
 
