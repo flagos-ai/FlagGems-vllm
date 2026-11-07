@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 import triton
+import triton.language as tl
 
 import flaggems_vllm
 
@@ -27,6 +28,99 @@ try:
     )
 except (ImportError, OSError):
     apply_bad_words_reference = None
+
+# vLLM.
+@triton.jit
+def _upstream_bad_words_kernel(
+    logits_ptr,
+    logits_stride,
+    expanded_idx_mapping_ptr,
+    bad_word_token_ids_ptr,
+    bad_word_token_ids_stride,
+    bad_word_offsets_ptr,
+    bad_word_offsets_stride,
+    num_bad_words_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    prompt_len_ptr,
+    total_len_ptr,
+    input_ids_ptr,
+    expanded_local_pos_ptr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    bw_idx = tl.program_id(1)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+    num_bad_words = tl.load(num_bad_words_ptr + req_state_idx)
+    if bw_idx >= num_bad_words:
+        return
+
+    pos = tl.load(expanded_local_pos_ptr + token_idx)
+    cur_req_first_pos = token_idx - pos
+    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
+    total_len = tl.load(total_len_ptr + req_state_idx)
+    output_len = total_len - prompt_len
+    effective_len = output_len + pos
+
+    offsets_base = bad_word_offsets_ptr + req_state_idx * bad_word_offsets_stride
+    tokens_base = bad_word_token_ids_ptr + req_state_idx * bad_word_token_ids_stride
+    output_base = all_token_ids_ptr + req_state_idx * all_token_ids_stride + prompt_len
+    start = tl.load(offsets_base + bw_idx)
+    end = tl.load(offsets_base + bw_idx + 1)
+    prefix_len = end - start - 1
+    if prefix_len > effective_len:
+        return
+    last_token = tl.load(tokens_base + end - 1)
+    match = 1
+    for i in range(prefix_len):
+        expected = tl.load(tokens_base + start + i)
+        actual_pos = effective_len - prefix_len + i
+        if actual_pos >= output_len:
+            spec_offset = actual_pos - output_len
+            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)
+        else:
+            actual = tl.load(output_base + actual_pos)
+        match = match & (expected == actual)
+    if match:
+        tl.store(logits_ptr + token_idx * logits_stride + last_token, -float("inf"))
+
+
+def _upstream_reference(
+    logits,
+    expanded_idx_mapping,
+    bad_word_token_ids,
+    bad_word_offsets,
+    num_bad_words,
+    all_token_ids,
+    prompt_len,
+    total_len,
+    input_ids,
+    expanded_local_pos,
+    max_num_bad_words,
+):
+    num_tokens = logits.shape[0]
+    if num_tokens == 0 or max_num_bad_words == 0:
+        return
+    _upstream_bad_words_kernel[(num_tokens, max_num_bad_words)](
+        logits,
+        logits.stride(0),
+        expanded_idx_mapping,
+        bad_word_token_ids,
+        bad_word_token_ids.stride(0),
+        bad_word_offsets,
+        bad_word_offsets.stride(0),
+        num_bad_words,
+        all_token_ids,
+        all_token_ids.stride(0),
+        prompt_len,
+        total_len,
+        input_ids,
+        expanded_local_pos,
+    )
+
+
+REFERENCE_FN = apply_bad_words_reference or _upstream_reference
+REFERENCE_NAME = "vLLM" if apply_bad_words_reference is not None else "vLLM Triton"
+
 
 DEVICE = torch.device(flaggems_vllm.device)
 DTYPE = torch.float32
@@ -239,10 +333,8 @@ def _kernel_args(logits: torch.Tensor, inputs: Inputs) -> tuple:
     )
 
 
-def _run_triton(*args) -> None:
-    if apply_bad_words_reference is None:
-        raise RuntimeError("vLLM bad-words reference is unavailable")
-    apply_bad_words_reference(*args)
+def _run_reference(*args) -> None:
+    REFERENCE_FN(*args)
 
 
 def _run_flaggems(*args) -> None:
@@ -297,33 +389,26 @@ def _print_performance_table() -> None:
         "Draft",
         "Max Bad Words",
         "Word Len",
-        ("vLLM reference (us)" if apply_bad_words_reference is not None else "vLLM (us)"),
-        ("FlagGems (us)" if apply_bad_words_reference is not None else "Mode"),
-        ("vLLM/FlagGems" if apply_bad_words_reference is not None else "Reference"),
+        f"{REFERENCE_NAME} (us)",
+        "FlagGems-vllm (us)",
+        "Ref/FlagGems",
     )
     rows = [headers]
     for result in PERF_RESULTS:
-        row = (
-            result["workload"],
-            result["match_pattern"],
-            str(result["num_reqs"]),
-            str(result["num_tokens"]),
-            str(result["num_draft_tokens"]),
-            str(result["max_num_bad_words"]),
-            str(result["bad_word_len"]),
+        rows.append(
             (
-                f'{result["triton_us"]:.3f}'
-                if result["triton_us"] is not None
-                else f'{result["flaggems_us"]:.3f}'
-            ),
-            (f'{result["flaggems_us"]:.3f}' if result["triton_us"] is not None else "-"),
-            (
-                f'{result["speedup"]:.3f}x'
-                if result["speedup"] is not None
-                else "unavailable"
-            ),
+                result["workload"],
+                result["match_pattern"],
+                str(result["num_reqs"]),
+                str(result["num_tokens"]),
+                str(result["num_draft_tokens"]),
+                str(result["max_num_bad_words"]),
+                str(result["bad_word_len"]),
+                f'{result["reference_us"]:.3f}',
+                f'{result["flaggems_us"]:.3f}',
+                f'{result["speedup"]:.3f}x',
+            )
         )
-        rows.append(row)
 
     widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
     separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
@@ -347,12 +432,7 @@ def _print_performance_table() -> None:
     for row in rows[1:]:
         print(format_row(row))
     print(separator)
-    if apply_bad_words_reference is None:
-        print("vLLM reference unavailable: reporting FlagGems latency only.")
-    else:
-        print(
-            "vLLM/FlagGems > 1: FlagGems is faster; " "vLLM/FlagGems < 1: vLLM is faster."
-        )
+    print("Ref/FlagGems > 1: FlagGems-vllm is faster.")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -369,23 +449,21 @@ def test_apply_bad_words(workload: Workload, match_pattern: str):
     flaggems_logits = inputs.logits.clone()
     flaggems_args = _kernel_args(flaggems_logits, inputs)
 
-    if apply_bad_words_reference is not None:
-        triton_logits = inputs.logits.clone()
-        triton_args = _kernel_args(triton_logits, inputs)
-        _run_triton(*triton_args)
-        _run_flaggems(*flaggems_args)
-        torch.testing.assert_close(flaggems_logits, triton_logits, rtol=0, atol=0)
-        calls = {
-            "triton": (_run_triton, triton_args),
+    reference_logits = inputs.logits.clone()
+    reference_args = _kernel_args(reference_logits, inputs)
+    _run_reference(*reference_args)
+    _run_flaggems(*flaggems_args)
+    torch.testing.assert_close(flaggems_logits, reference_logits, rtol=0, atol=0)
+
+    timing = _measure(
+        {
+            "reference": (_run_reference, reference_args),
             "flaggems": (_run_flaggems, flaggems_args),
         }
-    else:
-        calls = {"flaggems": (_run_flaggems, flaggems_args)}
-
-    timing = _measure(calls)
-    triton_us = timing["triton"][0] if "triton" in timing else None
+    )
+    reference_us = timing["reference"][0]
     flaggems_us = timing["flaggems"][0]
-    speedup = triton_us / flaggems_us if triton_us is not None else None
+    speedup = reference_us / flaggems_us
 
     PERF_RESULTS.append(
         {
@@ -396,7 +474,7 @@ def test_apply_bad_words(workload: Workload, match_pattern: str):
             "num_draft_tokens": workload.num_draft_tokens,
             "max_num_bad_words": inputs.max_num_bad_words,
             "bad_word_len": workload.bad_word_len,
-            "triton_us": triton_us,
+            "reference_us": reference_us,
             "flaggems_us": flaggems_us,
             "speedup": speedup,
         }

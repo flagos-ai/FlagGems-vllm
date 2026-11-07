@@ -22,10 +22,10 @@ VOCAB_SIZE = 128
 PROMPT_LEN = 1
 
 # The committed history is [prompt=5, output=10]. input_ids contains the
-# current input token followed by speculative tokens: [11, 12, 13].
-# A logit at local position p sees input_ids[0:p] as prior tokens.
+# last committed token followed by speculative tokens: [10, 11, 12].
+# input_ids[0] repeats the committed token; draft history starts at index 1.
 ALL_TOKEN_IDS = [5, 10]
-INPUT_IDS = [11, 12, 13]
+INPUT_IDS = [10, 11, 12]
 LOCAL_POS = [0, 1, 2]
 
 

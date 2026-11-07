@@ -55,7 +55,7 @@ def _bad_words_match_short_prefix(
     )
     spec_offset = actual_pos - output_len
     speculative = _bad_words_load(
-        input_ids_ptr + cur_req_first_pos + spec_offset,
+        input_ids_ptr + cur_req_first_pos + spec_offset + 1,
         mask=prefix_mask & from_spec,
         other=0,
     )
@@ -234,7 +234,7 @@ def _bad_words_kernel(
             )
             long_spec_offset = long_actual_pos - output_len
             long_speculative = _bad_words_load(
-                input_ids_ptr + cur_req_first_pos + long_spec_offset,
+                input_ids_ptr + cur_req_first_pos + long_spec_offset + 1,
                 mask=long_mask & long_from_spec,
                 other=0,
             )
