@@ -314,16 +314,19 @@ ok
 # probing instead (e.g. on a host where the pinned +cu130 build is wrong).
 if [ -n "${TORCH_VERSION}" ]; then
   printf "Installing torch==${TORCH_VERSION} (torchaudio==${TORCHAUDIO_VERSION}, torchvision==${TORCHVISION_VERSION}) ...\n"
-  # Root cause (found via -v on the persistent h20 runner): `uv` detects
-  # this repo's pyproject.toml as a workspace root and resolves this install
-  # against the workspace's *declared* dependency set rather than treating
-  # it as a plain standalone `pip install`. Since this repo's pyproject.toml
-  # does not list torch, uv decides torch is "unnecessary" and the install
-  # becomes a no-op ("Checked N packages", no download) even against a
-  # brand new, empty venv — torch is simply never installed, no error.
-  # --no-sources makes uv ignore workspace/Git/URL/local-path sources and
-  # resolve this as a standalone package install instead.
-  uv pip install -v --no-sources \
+  # Root cause (found via -v on the persistent h20 runner): `uv` discovers
+  # this repo's pyproject.toml and treats it as a workspace root, so this
+  # install gets resolved against the workspace's *declared* dependency set
+  # (and reconciled like a sync: it even logs the venv's existing build
+  # tools as "Unnecessary package") rather than treated as a plain,
+  # standalone `pip install`. Since this repo's pyproject.toml does not list
+  # torch, uv's resolution never actually schedules it for installation —
+  # no error, exit 0, hence the "successful" install that leaves torch
+  # missing. --no-sources (tried first) only covers the `tool.uv.sources`
+  # table and did not stop this; --no-config stops uv from discovering
+  # pyproject.toml/uv.toml at all, so there is no workspace to resolve
+  # against in the first place.
+  uv pip install -v --no-config \
     "torch==${TORCH_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" \
     "torchvision==${TORCHVISION_VERSION}" \
