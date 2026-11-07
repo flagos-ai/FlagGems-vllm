@@ -58,9 +58,13 @@ from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
     w8a8_block_fp8_matmul,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
+    draft_watermarking_mask,
+)
 
 __all__ = [
     "dequantize_and_gather_k_cache",
+    "draft_watermarking_mask",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",
     "fused_indexer_weight_scale",

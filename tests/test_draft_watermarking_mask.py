@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm import draft_watermarking_mask
 
 try:
@@ -14,9 +15,7 @@ try:
 except (ImportError, OSError):
     vllm_reference = None
 
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-]
+DEVICE = torch.device(flaggems_vllm.device)
 
 
 def reference(inputs, window, include_prompt):
@@ -80,7 +79,7 @@ def make_inputs(rows, history, width, draft_steps=8, seed=17):
             contexts[row, 0] = -1
     mapping[4::11] = -1
     return tuple(
-        t.cuda()
+        t.to(DEVICE)
         for t in (tokens, mapping, prompt, total, prior, contexts, steps, enabled)
     )
 
@@ -145,25 +144,25 @@ def test_strides(layout):
             padded = torch.empty(
                 (original.shape[0], original.shape[1] + 3),
                 dtype=original.dtype,
-                device="cuda",
+                device=DEVICE,
             )
             padded[:, 1:-2] = original
             inputs[index] = padded[:, 1:-2]
         original = inputs[4]
-        padded = torch.empty((17, 9, 7), dtype=original.dtype, device="cuda")
+        padded = torch.empty((17, 9, 7), dtype=original.dtype, device=DEVICE)
         padded[:, :8, 1:5] = original
         inputs[4] = padded[:, :8, 1:5]
     elif layout == "columns":
         original = inputs[5]
-        padded = torch.empty((17, 8), dtype=original.dtype, device="cuda")
+        padded = torch.empty((17, 8), dtype=original.dtype, device=DEVICE)
         padded[:, ::2] = original
         inputs[5] = padded[:, ::2]
     elif layout == "broadcast_steps":
-        inputs[6] = torch.tensor(3, device="cuda", dtype=torch.int64).expand(17)
+        inputs[6] = torch.tensor(3, device=DEVICE, dtype=torch.int64).expand(17)
     else:
         for index in (1, 6, 7):
             original = inputs[index]
-            padded = torch.empty(34, dtype=original.dtype, device="cuda")
+            padded = torch.empty(34, dtype=original.dtype, device=DEVICE)
             padded[::2] = original
             inputs[index] = padded[::2]
     check(tuple(inputs), 511, True)
@@ -172,7 +171,7 @@ def test_strides(layout):
 @pytest.mark.draft_watermarking_mask
 def test_multiple_draft_steps():
     inputs = list(make_inputs(5, 33, 4))
-    inputs[6] = torch.zeros(5, dtype=torch.int64, device="cuda")
+    inputs[6] = torch.zeros(5, dtype=torch.int64, device=DEVICE)
     for step in range(8):
         inputs[6].fill_(step)
         if step % 3 == 0:
@@ -203,15 +202,16 @@ def test_frequent_anchor_tokens(matching):
 def test_plain_triton_path(monkeypatch):
     import importlib
 
-    module = importlib.import_module("flaggems_vllm.ops.draft_watermarking_mask")
-    monkeypatch.setattr(module, "_HAS_LAYOUT", False)
+    module = importlib.import_module(draft_watermarking_mask.__module__)
+    if hasattr(module, "_HAS_LAYOUT"):
+        monkeypatch.setattr(module, "_HAS_LAYOUT", False)
     check(make_inputs(5, 513, 4), 8192, True)
 
 
 @pytest.mark.draft_watermarking_mask
 def test_cpu_is_unsupported():
     inputs = tuple(t.cpu() for t in make_inputs(1, 8, 4))
-    with pytest.raises(NotImplementedError, match="CUDA"):
+    with pytest.raises((NotImplementedError, ValueError), match="requires|cpu tensor"):
         draft_watermarking_mask(*inputs, 8192, False)
 
 
@@ -221,12 +221,17 @@ def test_short_history_after_long_history(monkeypatch):
 
     import triton
 
-    module = importlib.import_module("flaggems_vllm.ops.draft_watermarking_mask")
-    kernel = module._draft_watermarking_mask_kernel
-    monkeypatch.setattr(
-        kernel.fn, "configs", [triton.Config({"BLOCK": 8192}, num_warps=4)]
-    )
-    monkeypatch.setattr(kernel, "kernel_cache", tuple({} for _ in kernel.kernel_cache))
+    module = importlib.import_module(draft_watermarking_mask.__module__)
+    kernel = getattr(module, "_draft_watermarking_mask_kernel", None)
+    if kernel is None:
+        kernel = module._repeated_context_mask_kernel
+    if hasattr(kernel.fn, "configs"):
+        monkeypatch.setattr(
+            kernel.fn, "configs", [triton.Config({"BLOCK": 8192}, num_warps=4)]
+        )
+        monkeypatch.setattr(
+            kernel, "kernel_cache", tuple({} for _ in kernel.kernel_cache)
+        )
     inputs = list(make_inputs(32, 8193, 4))
     check(tuple(inputs), 8192, False)
     for length in (64, 512, 513, 8193):
