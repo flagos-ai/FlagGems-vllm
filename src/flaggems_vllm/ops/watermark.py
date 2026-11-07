@@ -10,7 +10,9 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 
-_HAS_LAYOUT = has_triton_tle_attrs(("gpu.set_layout", "gpu.BlockEncoding"))
+_HAS_LAYOUT = runtime.device.vendor_name == "nvidia" and has_triton_tle_attrs(
+    ("gpu.set_layout", "gpu.BlockEncoding")
+)
 if _HAS_LAYOUT:
     import triton.experimental.tle.language as tle
 
@@ -60,18 +62,11 @@ def _scan_context_history(
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("draft_watermarking_mask"),
-    key=[
-        "NUM_ROWS",
-        "HISTORY_CAPACITY",
-        "CONTEXT_WIDTH",
-        "DRAFT_STEPS",
-        "MAX_HISTORY",
-        "INCLUDE_PROMPT",
-    ],
-    use_cuda_graph=True,
+    key=["CONTEXT_WIDTH", "DRAFT_STEPS"],
+    use_cuda_graph=runtime.device.name == "cuda",
 )
 @triton.jit
-def _draft_watermarking_mask_kernel(
+def _repeated_context_mask_kernel(
     output_ptr,
     tokens_ptr,
     tokens_stride,
@@ -86,8 +81,6 @@ def _draft_watermarking_mask_kernel(
     steps_ptr,
     step_stride,
     enabled_ptr,
-    NUM_ROWS: tl.constexpr,
-    HISTORY_CAPACITY: tl.constexpr,
     CONTEXT_WIDTH: tl.constexpr,
     DRAFT_STEPS: tl.constexpr,
     MAX_HISTORY: tl.constexpr,
@@ -189,8 +182,8 @@ def draft_watermarking_mask(
     buffers have unit column stride. Steps may be a stride-zero broadcast.
     Each step is in ``[0, prior_contexts.shape[1])``.
     """
-    if contexts.device.type != "cuda":
-        raise NotImplementedError("draft_watermarking_mask requires CUDA")
+    if contexts.device.type == "cpu":
+        raise NotImplementedError("draft_watermarking_mask requires an accelerator")
     if max_history is not None and max_history < 1:
         raise ValueError("max_history must be positive or None")
     if prior_contexts.stride(-1) != 1:
@@ -201,7 +194,7 @@ def draft_watermarking_mask(
     output = torch.empty(contexts.shape[0], device=contexts.device, dtype=torch.bool)
     if contexts.shape[0] == 0:
         return output
-    _draft_watermarking_mask_kernel[(contexts.shape[0],)](
+    _repeated_context_mask_kernel[(contexts.shape[0],)](
         output,
         all_token_ids,
         all_token_ids.stride(0),
@@ -216,8 +209,6 @@ def draft_watermarking_mask(
         steps,
         steps.stride(0),
         enabled,
-        NUM_ROWS=contexts.shape[0],
-        HISTORY_CAPACITY=all_token_ids.shape[1],
         CONTEXT_WIDTH=contexts.shape[1],
         DRAFT_STEPS=prior_contexts.shape[1],
         MAX_HISTORY=0 if max_history is None else max_history,

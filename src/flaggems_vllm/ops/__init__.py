@@ -40,7 +40,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_dequantize_and_gather_k_cache impor
 from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
-from flaggems_vllm.ops.draft_watermarking_mask import draft_watermarking_mask
+from flaggems_vllm.ops.watermark import draft_watermarking_mask
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,

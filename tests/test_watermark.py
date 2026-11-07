@@ -222,9 +222,7 @@ def test_short_history_after_long_history(monkeypatch):
     import triton
 
     module = importlib.import_module(draft_watermarking_mask.__module__)
-    kernel = getattr(module, "_draft_watermarking_mask_kernel", None)
-    if kernel is None:
-        kernel = module._repeated_context_mask_kernel
+    kernel = module._repeated_context_mask_kernel
     if hasattr(kernel.fn, "configs"):
         monkeypatch.setattr(
             kernel.fn, "configs", [triton.Config({"BLOCK": 8192}, num_warps=4)]
