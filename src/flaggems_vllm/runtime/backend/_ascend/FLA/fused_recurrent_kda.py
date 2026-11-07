@@ -74,6 +74,7 @@ def _ascend_recurrent_kda_kernel(
     BETA_SIGMOID: tl.constexpr = META[24]
     SPEC: tl.constexpr = META[25]
     DENSE: tl.constexpr = META[26]
+    BTOK: tl.constexpr = META[27]
     programs = tl.num_programs(0)
     core = tl.program_id(0)
     blocks = TOTAL // programs
@@ -145,28 +146,88 @@ def _ascend_recurrent_kda_kernel(
             # a [BK] transfer to every iteration of a serial recurrence.
             gate_decay = tl.exp(tl.load(A_log + h).to(tl.float32))
             gate_bias = tl.load(Dt_bias + h * K + rk, key_mask, 0.0).to(tl.float32)
+        # Speculative requests walk BTOK > 1 tokens in this program, and each
+        # per-token q/k/g/v read is a [BK] or [BV] vector at a scalar token
+        # offset -- four narrow transfers per token. Stage the whole token run
+        # as 2D tiles once and select rows from them, turning 4*BTOK narrow
+        # transfers into 4 wide ones. Measured on the bs=16 k=7 speculative
+        # case: 82.0 us -> 75.6 us (q/k alone got 80.7 us; g and v carry the
+        # rest). BTOK == 1 (plain decode) keeps the direct loads -- there is
+        # nothing to amortize there, and staging measurably regressed it.
+        if BTOK > 1:
+            ot = tl.arange(0, BTOK)
+            m_t = ot < (end - start)
+            q_tile = tl.load(
+                Q
+                + batch * QS[0]
+                + (start + ot)[:, None] * QS[1]
+                + h * QS[2]
+                + rk[None, :] * QS[3],
+                m_t[:, None] & key_mask[None, :],
+                0,
+            ).to(tl.float32)
+            k_tile = tl.load(
+                Kp
+                + batch * KS[0]
+                + (start + ot)[:, None] * KS[1]
+                + h * KS[2]
+                + rk[None, :] * KS[3],
+                m_t[:, None] & key_mask[None, :],
+                0,
+            ).to(tl.float32)
+            g_tile = tl.load(
+                G
+                + batch * GS[0]
+                + (start + ot)[:, None] * GS[1]
+                + h * GS[2]
+                + rk[None, :] * GS[3],
+                m_t[:, None] & key_mask[None, :],
+                0,
+            ).to(tl.float32)
+            v_tile = tl.load(
+                Vp
+                + batch * VS[0]
+                + (start + ot)[:, None] * VS[1]
+                + h * VS[2]
+                + rv[None, :] * VS[3],
+                m_t[:, None] & value_mask[None, :],
+                0,
+            ).to(tl.float32)
         for t in range(start, end):
-            q = tl.load(
-                Q + batch * QS[0] + t * QS[1] + h * QS[2] + rk * QS[3], key_mask, 0
-            ).to(tl.float32)
-            k = tl.load(
-                Kp + batch * KS[0] + t * KS[1] + h * KS[2] + rk * KS[3], key_mask, 0
-            ).to(tl.float32)
+            if BTOK > 1:
+                sel = tl.arange(0, BTOK)[:, None] == (t - start)
+                q = tl.sum(tl.where(sel, q_tile, 0.0), 0)
+                k = tl.sum(tl.where(sel, k_tile, 0.0), 0)
+            else:
+                q = tl.load(
+                    Q + batch * QS[0] + t * QS[1] + h * QS[2] + rk * QS[3], key_mask, 0
+                ).to(tl.float32)
+                k = tl.load(
+                    Kp + batch * KS[0] + t * KS[1] + h * KS[2] + rk * KS[3], key_mask, 0
+                ).to(tl.float32)
             if NORMALIZE:
                 q /= tl.sqrt(tl.sum(q * q, 0) + 1.0e-6)
                 k /= tl.sqrt(tl.sum(k * k, 0) + 1.0e-6)
             q *= scale
-            gate = tl.load(
-                G + batch * GS[0] + t * GS[1] + h * GS[2] + rk * GS[3], key_mask, 0
-            ).to(tl.float32)
+            if BTOK > 1:
+                gate = tl.sum(tl.where(sel, g_tile, 0.0), 0)
+            else:
+                gate = tl.load(
+                    G + batch * GS[0] + t * GS[1] + h * GS[2] + rk * GS[3], key_mask, 0
+                ).to(tl.float32)
             if SAFE_GATE:
                 # gate = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)),
                 # with exp(A_log) and dt_bias hoisted above the loop.
                 gate = lower_bound * tl.sigmoid(gate_decay * (gate + gate_bias))
             decay = tl.exp(gate)
-            value = tl.load(
-                Vp + batch * VS[0] + t * VS[1] + h * VS[2] + rv * VS[3], value_mask, 0
-            ).to(tl.float32)
+            if BTOK > 1:
+                value = tl.sum(tl.where(sel, v_tile, 0.0), 0)
+            else:
+                value = tl.load(
+                    Vp + batch * VS[0] + t * VS[1] + h * VS[2] + rv * VS[3],
+                    value_mask,
+                    0,
+                ).to(tl.float32)
             bp = Beta + batch * BS[0] + t * BS[1] + h * BS[2]
             if VECTOR_BETA:
                 beta = tl.load(bp + rv * BS[3], value_mask, 0).to(tl.float32)
@@ -181,6 +242,14 @@ def _ascend_recurrent_kda_kernel(
             # [V, K] fp32 tile -- 64KB at K=V=128 -- is traversed twice per
             # token instead of three times. Measured 121.7 us -> 94.7 us on the
             # bs=16 k=7 speculative case.
+            # Keep the two reductions dependent (delta -> acc -> output) even
+            # though the output can be algebraically rebased onto the *old*
+            # acc as `sum(acc*(decay*q)) + delta*sum(k*q)`, which shortens the
+            # serial chain. That form adds a third [V, K] traversal per token
+            # and measured worse everywhere but the longest case: decode
+            # bs=4/8/16 6.4->6.8 / 10.3->10.8 / 15.2->16.4 us against spec
+            # bs=16 k=7 82.4->80.2 us. Traversals of the 64KB tile dominate
+            # the dependency stall at these token counts.
             kd = k * decay
             delta = (value - tl.sum(acc * kd[None, :], 1)) * beta
             acc = acc * decay[None, :] + delta[:, None] * k[None, :]
@@ -327,6 +396,9 @@ def fused_recurrent_kda(
         ix = (ssm_state_indices.stride(0), 0)
         if ssm_state_indices.ndim == 2:
             ix, width = ssm_state_indices.stride(), ssm_state_indices.shape[1]
+    # Tokens a single program walks: speculative requests carry `width`
+    # candidate tokens per sequence, plain decode exactly one.
+    btok = triton.next_power_of_2(max(width, 1))
     bs = beta.stride() if beta.ndim == 4 else (*beta.stride(), 0)
     if safe_gate and (A_log is None or dt_bias is None):
         raise ValueError("The in-kernel safe gate needs both A_log and dt_bias")
@@ -384,6 +456,7 @@ def fused_recurrent_kda(
                 use_beta_sigmoid_in_kernel,
                 num_accepted_tokens is not None,
                 dense,
+                btok,
             ),
             num_warps=warps,
             num_stages=stages,

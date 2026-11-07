@@ -217,13 +217,81 @@ def bench_conv(only=None):
     return rows
 
 
+RECUR_CASES = [
+    (4, 0),
+    (8, 0),
+    (16, 0),
+    (16, 7),
+]
+
+
+def bench_recur(only=None):
+    from flaggems_vllm.runtime.backend._ascend.FLA.fused_recurrent_kda import (
+        fused_recurrent_kda,
+    )
+
+    dev = torch.device("npu:0")
+    dtype = torch.bfloat16
+    heads = 12
+    rows = []
+    for idx, (batch, num_spec) in enumerate(RECUR_CASES):
+        if only is not None and idx not in only:
+            continue
+        tokens = batch * (num_spec + 1)
+        q, k, v, raw_g, raw_beta, a_log, dt_bias = kda_inputs(
+            heads, tokens, dev, dtype, seed=11
+        )
+        pool = max(2 * tokens + 2, 64)
+        base = torch.randn(
+            pool, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=dev
+        )
+        if num_spec:
+            cu = torch.arange(
+                0, tokens + 1, num_spec + 1, dtype=torch.int32, device=dev
+            )
+            sidx = torch.arange(
+                1, batch * (num_spec + 1) + 1, dtype=torch.int32, device=dev
+            ).view(batch, num_spec + 1)
+            accepted = torch.full(
+                (batch,), num_spec + 1, dtype=torch.int32, device=dev
+            )
+        else:
+            cu = torch.arange(batch + 1, dtype=torch.int32, device=dev)
+            sidx = torch.arange(1, batch + 1, dtype=torch.int32, device=dev)
+            accepted = None
+        state = base.clone()
+
+        def step():
+            return fused_recurrent_kda(
+                q, k, v, raw_g, raw_beta,
+                scale=HEAD_DIM ** -0.5,
+                initial_state=state,
+                inplace_final_state=True,
+                cu_seqlens=cu,
+                ssm_state_indices=sidx,
+                num_accepted_tokens=accepted,
+                use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                safe_gate=True,
+                lower_bound=GATE_LOWER_BOUND,
+            )
+
+        us, nk = device_us(step)
+        label = f"decode bs={batch}" if not num_spec else f"spec bs={batch} k={num_spec}"
+        rows.append((f"{label} T={tokens}", us, nk))
+    return rows
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "chunk"
     only = None
     if len(sys.argv) > 2:
         only = {int(x) for x in sys.argv[2].split(",")}
+    fns = {"chunk": bench_chunk, "conv": bench_conv, "recur": bench_recur}
     with torch.inference_mode():
-        rows = bench_chunk(only) if which == "chunk" else bench_conv(only)
+        rows = fns[which](only)
     tag = os.environ.get("BENCH_TAG", "")
     print(f"=== {which} {tag}")
     for name, us, nk in rows:

@@ -246,6 +246,15 @@ if HAS_TLE_KDA:
                     # that serialized BT read-modify-writes of the [BT, K] tile.
                     b_gc = tl.cumsum(b_g, axis=0)
 
+                    # Store the whole [BT, K] cumsum even though the state
+                    # kernel reads only each chunk's last row. Writing just
+                    # that row cuts 32x the bytes (403 MB -> 12.6 MB per call
+                    # at T=32768 H=24) and is *slower*: a [K] store at a
+                    # scalar-computed token offset costs more than the wide
+                    # contiguous 2D burst it replaces. Measured on the intra
+                    # kernel: 1395 us -> 2948 us at T=8192 H=24, 5793 us ->
+                    # 11979 us at T=32768 H=24. This op is transfer-shape
+                    # bound, not volume bound.
                     if IS_VARLEN:
                         tl.store(
                             p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
