@@ -161,7 +161,7 @@ def _dequant_int8(
     compute_type: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
-    tl.static_assert(b.shape[0] == 128)
+    tl.static_assert(b.shape[0] == 128 or b.shape[0] == 64)
     quant = b.to(tl.int32) - 128
     group = k_base // GROUP_SIZE
     scale = tl.load(
@@ -218,7 +218,7 @@ def _dequant_fp8(
     GROUP_SIZE: tl.constexpr,
     FAST: tl.constexpr = False,
 ):
-    tl.static_assert(b.shape[0] == 128)
+    tl.static_assert(b.shape[0] == 128 or b.shape[0] == 64)
     quant = b.to(tl.uint32)
     if GROUP_SIZE == -1 or GROUP_SIZE >= 128:
         group = 0 if GROUP_SIZE == -1 else k_base // GROUP_SIZE
@@ -250,7 +250,7 @@ def _dequant_fp8(
     if K % 128 == 0:
         return decoded
     # Channel scales can be nonfinite; padded bytes must never introduce NaN.
-    return tl.where((k_base + tl.arange(0, 128))[:, None] < K, decoded, 0.0).to(
+    return tl.where((k_base + tl.arange(0, b.shape[0]))[:, None] < K, decoded, 0.0).to(
         compute_type
     )
 
@@ -412,9 +412,9 @@ if tle_async is not None:
         compute_type: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
         FAST: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr = 128,
     ):
-        """Load, decode and multiply one stream of 128-K weight tiles."""
-        BLOCK_SIZE_K: tl.constexpr = 128
+        """Load, decode and multiply one stream of quantized weight tiles."""
         IS_8BIT: tl.constexpr = (
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
@@ -1169,6 +1169,7 @@ if tle_async is not None:
             compute_type,
             QUANT_TYPE,
             FAST,
+            BLOCK_SIZE_K,
         )
 
         if MUL_ROUTED_WEIGHT:
@@ -1291,6 +1292,8 @@ def _invoke_marlin_moe_gemm_direct(
             block_n = 32
     else:
         block_n = 64 if use_matvec else _select_direct_block_n(N)
+        if use_matvec and quant_type_id == QUANT_TYPE_UINT8B128 and min(K, N) <= 512:
+            block_n = 32 if K > N else 128
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
     # the next AIU copy with the current tile's unpack/dequantize/dot work.
@@ -1509,6 +1512,9 @@ def _invoke_marlin_moe_gemm_grouped(
     block_n, group_m, num_warps, pipeline_stages = _select_grouped_config(
         batch_m, A.size(1), n, block_m, quant_type_id
     )
+    # A 64-K tile bounds decoded-weight state; FP8 can then use a wider down tile.
+    if quant_type_id == QUANT_TYPE_FP8_E4M3 and group_size == 128 and block_m <= 32:
+        block_n = 128
     stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     grid = (triton.cdiv(em, block_m) * triton.cdiv(n, block_n),)
     fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
@@ -1536,7 +1542,12 @@ def _invoke_marlin_moe_gemm_grouped(
             stride_bsn=B_scale.stride(2),
             BLOCK_SIZE_M=block_m,
             BLOCK_SIZE_N=block_n,
-            BLOCK_SIZE_K=128,
+            BLOCK_SIZE_K=(
+                64
+                if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+                and group_size == 128
+                else 128
+            ),
             GROUP_SIZE_M=group_m,
             GROUP_SIZE_K=group_size,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
@@ -1749,7 +1760,9 @@ def _fused_marlin_moe_impl(
         stage1, stage2 = _prepare_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size, direct=direct
         )
-        split_silu = direct and n >= 1024
+        split_silu = direct and (
+            n >= 1024 or quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+        )
         use_matvec = (
             direct
             and m == 1
