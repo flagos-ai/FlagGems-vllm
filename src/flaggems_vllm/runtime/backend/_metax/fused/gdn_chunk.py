@@ -23,6 +23,9 @@ from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_off
 from flaggems_vllm.ops.FLA.triton_ops_helper import exp
 from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL, tensor_cache
 from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd
+from flaggems_vllm.runtime.backend._metax.fused.gdn_wy import (
+    recompute_w_u_fwd_precise_rhs,
+)
 from flaggems_vllm.utils import libentry, libtuner
 
 _original_compile = backend.metax.translate_llvmir_to_mcfatbin
@@ -50,6 +53,15 @@ def _prune_unsafe_kloop_configs(configs, named_args, *args, **kwargs):
     K = named_args.get("K", kwargs.get("K"))
     if K is None:
         return configs
+    A = named_args.get("A_inv", kwargs.get("A_inv"))
+    # Bound compilation for the FP32 accuracy path; retain low-precision tuning.
+    k = named_args.get("k", kwargs.get("k"))
+    if A is not None and A.dtype == torch.float32 and k.dtype == torch.bfloat16:
+        return [
+            c
+            for c in configs
+            if c.kwargs == {"BK": 64} and c.num_warps == 2 and c.num_stages == 1
+        ]
     pruned = [c for c in configs if not (c.num_warps > 2 and c.kwargs.get("BK", K) < K)]
     return pruned or configs[:1]
 
@@ -173,24 +185,36 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
         b_k1 = tl.load(p_k1, boundary_check=(0, 1))
         b_k2 = tl.load(p_k2, boundary_check=(0, 1))
         b_k3 = tl.load(p_k3, boundary_check=(0, 1))
-        b_kb0 = b_k0 * b_beta0[:, None].to(b_k0.dtype)
-        b_kb1 = b_k1 * b_beta1[:, None].to(b_k1.dtype)
-        b_kb2 = b_k2 * b_beta2[:, None].to(b_k2.dtype)
-        b_kb3 = b_k3 * b_beta3[:, None].to(b_k3.dtype)
         b_k0t = tl.trans(b_k0)
         b_k1t = tl.trans(b_k1)
         b_k2t = tl.trans(b_k2)
         b_k3t = tl.trans(b_k3)
-        b_A_11 += tl.dot(b_kb0, b_k0t)
-        b_A_22 += tl.dot(b_kb1, b_k1t)
-        b_A_33 += tl.dot(b_kb2, b_k2t)
-        b_A_44 += tl.dot(b_kb3, b_k3t)
-        b_A_21 += tl.dot(b_kb1, b_k0t)
-        b_A_31 += tl.dot(b_kb2, b_k0t)
-        b_A_32 += tl.dot(b_kb2, b_k1t)
-        b_A_41 += tl.dot(b_kb3, b_k0t)
-        b_A_42 += tl.dot(b_kb3, b_k1t)
-        b_A_43 += tl.dot(b_kb3, b_k2t)
+        if A_inv.dtype.element_ty == tl.float32 and k.dtype.element_ty == tl.bfloat16:
+            b_A_11 += tl.dot(b_k0, b_k0t) * b_beta0[:, None]
+            b_A_22 += tl.dot(b_k1, b_k1t) * b_beta1[:, None]
+            b_A_33 += tl.dot(b_k2, b_k2t) * b_beta2[:, None]
+            b_A_44 += tl.dot(b_k3, b_k3t) * b_beta3[:, None]
+            b_A_21 += tl.dot(b_k1, b_k0t) * b_beta1[:, None]
+            b_A_31 += tl.dot(b_k2, b_k0t) * b_beta2[:, None]
+            b_A_32 += tl.dot(b_k2, b_k1t) * b_beta2[:, None]
+            b_A_41 += tl.dot(b_k3, b_k0t) * b_beta3[:, None]
+            b_A_42 += tl.dot(b_k3, b_k1t) * b_beta3[:, None]
+            b_A_43 += tl.dot(b_k3, b_k2t) * b_beta3[:, None]
+        else:
+            b_kb0 = b_k0 * b_beta0[:, None].to(b_k0.dtype)
+            b_kb1 = b_k1 * b_beta1[:, None].to(b_k1.dtype)
+            b_kb2 = b_k2 * b_beta2[:, None].to(b_k2.dtype)
+            b_kb3 = b_k3 * b_beta3[:, None].to(b_k3.dtype)
+            b_A_11 += tl.dot(b_kb0, b_k0t)
+            b_A_22 += tl.dot(b_kb1, b_k1t)
+            b_A_33 += tl.dot(b_kb2, b_k2t)
+            b_A_44 += tl.dot(b_kb3, b_k3t)
+            b_A_21 += tl.dot(b_kb1, b_k0t)
+            b_A_31 += tl.dot(b_kb2, b_k0t)
+            b_A_32 += tl.dot(b_kb2, b_k1t)
+            b_A_41 += tl.dot(b_kb3, b_k0t)
+            b_A_42 += tl.dot(b_kb3, b_k1t)
+            b_A_43 += tl.dot(b_kb3, b_k2t)
 
     b_A_11 = b_A_11 * exp(b_g0[:, None] - b_g0[None, :])
     b_A_22 = b_A_22 * exp(b_g1[:, None] - b_g1[None, :])
@@ -377,6 +401,26 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     return g_out, A_inv
 
 
+def _prune_fp32_h_configs(configs, named_args, *args, **kwargs):
+    w = named_args.get("w", kwargs.get("w"))
+    k = named_args.get("k", kwargs.get("k"))
+    if w is not None and w.dtype == torch.float32 and k.dtype == torch.bfloat16:
+        return [
+            c for c in configs if c.kwargs == {"BK": 32, "BV": 16} and c.num_warps == 4
+        ]
+    return configs
+
+
+def _prune_fp32_o_configs(configs, named_args, *args, **kwargs):
+    h = named_args.get("h", kwargs.get("h"))
+    q = named_args.get("q", kwargs.get("q"))
+    if h is not None and h.dtype == torch.float32 and q.dtype == torch.bfloat16:
+        return [
+            c for c in configs if c.kwargs == {"BK": 32, "BV": 32} and c.num_stages == 1
+        ]
+    return configs
+
+
 def _n_bucket(N: int) -> int:
     """Map request count to autotune tiers: 1, 2-8, 9-24, and 25+."""
     if N <= 1:
@@ -452,6 +496,7 @@ def _skew_bucket(chunk_offsets: torch.Tensor | None, N: int) -> int:
         "N_BUCKET",
         "SKEW_BUCKET",
     ],
+    prune_configs_by={"early_config_prune": _prune_fp32_h_configs},
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
@@ -483,6 +528,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
     N_BUCKET: tl.constexpr,
     SKEW_BUCKET: tl.constexpr,
 ):
+    DP: tl.constexpr = (
+        "ieee"
+        if w.dtype.element_ty == tl.float32 and k.dtype.element_ty == tl.bfloat16
+        else "tf32"
+    )
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
@@ -674,7 +724,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, BK), (1, 0)
         )
         b_v += tl.dot(
-            tl.load(p_w, boundary_check=(0, 1)), tl.trans(b_h1).to(k.dtype.element_ty)
+            tl.load(p_w, boundary_check=(0, 1)),
+            tl.trans(b_h1).to(w.dtype.element_ty),
+            input_precision=DP,
         )
         if K > BK:
             p_w = tl.make_block_ptr(
@@ -682,7 +734,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h2).to(k.dtype.element_ty),
+                tl.trans(b_h2).to(w.dtype.element_ty),
+                input_precision=DP,
             )
         if K > 2 * BK:
             p_w = tl.make_block_ptr(
@@ -690,7 +743,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h3).to(k.dtype.element_ty),
+                tl.trans(b_h3).to(w.dtype.element_ty),
+                input_precision=DP,
             )
         if K > 3 * BK:
             p_w = tl.make_block_ptr(
@@ -698,7 +752,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h4).to(k.dtype.element_ty),
+                tl.trans(b_h4).to(w.dtype.element_ty),
+                input_precision=DP,
             )
         if K > 4 * BK:
             p_w = tl.make_block_ptr(
@@ -706,7 +761,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h5).to(k.dtype.element_ty),
+                tl.trans(b_h5).to(w.dtype.element_ty),
+                input_precision=DP,
             )
         if K > 5 * BK:
             p_w = tl.make_block_ptr(
@@ -714,7 +770,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h6).to(k.dtype.element_ty),
+                tl.trans(b_h6).to(w.dtype.element_ty),
+                input_precision=DP,
             )
         if K > 6 * BK:
             p_w = tl.make_block_ptr(
@@ -722,7 +779,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h7).to(k.dtype.element_ty),
+                tl.trans(b_h7).to(w.dtype.element_ty),
+                input_precision=DP,
             )
         if K > 7 * BK:
             p_w = tl.make_block_ptr(
@@ -730,7 +788,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             )
             b_v += tl.dot(
                 tl.load(p_w, boundary_check=(0, 1)),
-                tl.trans(b_h8).to(k.dtype.element_ty),
+                tl.trans(b_h8).to(w.dtype.element_ty),
+                input_precision=DP,
             )
 
         p_v = tl.make_block_ptr(
@@ -833,7 +892,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
                 )
                 b_h8 *= exp(b_gk)[None, :]
 
-        b_v = b_v.to(k.dtype.element_ty)
+        b_v = b_v.to(w.dtype.element_ty)
 
         # Update H with trans(v_new) @ K; this form avoids a MetaX map::at failure.
         b_vt = tl.trans(b_v)  # [BV, BT]
@@ -841,7 +900,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_vmajor(
             p_k = tl.make_block_ptr(
                 k, (T, K), (stride_k, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
-            b_kv = tl.dot(b_vt, tl.load(p_k, boundary_check=(0, 1)))
+            b_kv = tl.dot(
+                b_vt,
+                tl.load(p_k, boundary_check=(0, 1)).to(w.dtype.element_ty),
+                input_precision=DP,
+            )
             if i_k == 0:
                 b_h1 += b_kv
             if K > BK and i_k == 1:
@@ -928,7 +991,7 @@ def chunk_gated_delta_rule_fwd_h_vmajor(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "head dim > 256 unsupported"
 
-    h = k.new_empty(B, NT, H, V, K)  # V-major layout, matches vLLM
+    h = k.new_empty(B, NT, H, V, K, dtype=w.dtype)  # V-major layout, matches vLLM
     final_state = (
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     )
@@ -984,6 +1047,7 @@ def chunk_gated_delta_rule_fwd_h_vmajor(
         for num_stages in [1, 2, 3]
     ],
     key=["H", "K", "V", "BT", "IS_VARLEN", "N_BUCKET"],
+    prune_configs_by={"early_config_prune": _prune_fp32_o_configs},
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
@@ -1008,6 +1072,11 @@ def chunk_fwd_kernel_o(
     IS_VARLEN: tl.constexpr,
     N_BUCKET: tl.constexpr,
 ):
+    DP: tl.constexpr = (
+        "ieee"
+        if h.dtype.element_ty == tl.float32 and q.dtype.element_ty == tl.bfloat16
+        else "tf32"
+    )
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -1052,7 +1121,7 @@ def chunk_fwd_kernel_o(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.trans(tl.load(p_h, boundary_check=(0, 1)))
 
-        b_o += tl.dot(b_q, b_h)
+        b_o += tl.dot(b_q.to(b_h.dtype), b_h, input_precision=DP)
         b_A += tl.dot(b_q, b_k)
 
     if USE_G:
@@ -1076,7 +1145,7 @@ def chunk_fwd_kernel_o(
     b_v = tl.load(p_v, boundary_check=(0, 1))
 
     # Apply scale once at the end.
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
+    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v, input_precision=DP) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -1090,6 +1159,7 @@ def chunk_fwd_o(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -1103,7 +1173,7 @@ def chunk_fwd_o(
     N = (len(cu_seqlens) - 1) if cu_seqlens is not None else B
     N_BUCKET = _n_bucket(N)
 
-    o = torch.empty_like(v)
+    o = torch.empty_like(v, dtype=output_dtype or v.dtype)
 
     def grid(meta):
         return (
@@ -1168,6 +1238,8 @@ def chunk_gated_delta_rule_fwd(
     if cu_seqlens is not None and not cu_seqlens.is_contiguous():
         cu_seqlens = cu_seqlens.contiguous()
 
+    # Preserve the accuracy of FP32 final states for quantized BF16 Q/K/V.
+    preserve_state_precision = q.dtype == k.dtype == v.dtype == torch.bfloat16
     g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         g=g,
         k=k,
@@ -1175,10 +1247,13 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=FLA_CHUNK_SIZE,
-        output_dtype=k.dtype,
+        output_dtype=torch.float32 if preserve_state_precision else k.dtype,
     )
     # Obtain WY representation; u is the new value.
-    w, u = recompute_w_u_fwd(
+    recompute = (
+        recompute_w_u_fwd_precise_rhs if preserve_state_precision else recompute_w_u_fwd
+    )
+    w, u = recompute(
         k=k,
         v=v,
         beta=beta,
@@ -1207,6 +1282,7 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        output_dtype=q.dtype if preserve_state_precision else None,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
