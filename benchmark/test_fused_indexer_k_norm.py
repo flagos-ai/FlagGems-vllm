@@ -1,449 +1,193 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""No-Graph device-event benchmark with independent oracle.
 
-"""No-Graph device-event public-operator benchmark with independent oracle.
+Inherits the base.Benchmark framework for weekly-CI aggregation while keeping
+the 5-warmup/25-sample device-event protocol and per-case oracle qualification
+from the dedicated indexer script. Run with:
 
-Run with PYTHONPATH=src python benchmark/test_fused_indexer_k_norm.py, or pytest
--q -s benchmark/test_fused_indexer_k_norm.py. INDEXER_BENCH_OUTPUT selects the
-JSON destination (default: fused_indexer_k_norm_benchmark.json). The fixed
-5-warmup/25-sample protocol follows fused_recurrent_gated_delta_rule and does
-not use the generic framework timer or CUDA Graphs.
+    pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 """
 
-import ast
-import hashlib
-import importlib
-import importlib.metadata
-import inspect
-import json
-import math
-import os
-import platform
+import gc
 import statistics
-import subprocess
-import textwrap
-from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
+from benchmark import base, consts
+from benchmark.conftest import Config, emit_record_logger, update_result
+from dataclasses import asdict
 from flaggems_vllm.runtime import torch_device_fn
 
-SEED = 20261106
-EPS = 1e-6
-WARMUP = 5
-SAMPLES = 25
-SOURCE_COMMIT = "2eae5ee9be3c6d01b008eb57d421545666ff8072"
-NATIVE_MODULE = "vllm.models.glm5next.common.attention"
-TOLERANCES = {
-    torch.float32: (2e-5, 2e-5),
-    torch.float16: (2e-3, 2e-3),
-    torch.bfloat16: (1.6e-2, 1.6e-2),
-}
 
+class FusedIndexerKNormBenchmark(base.Benchmark):
+    DEFAULT_SHAPE_FILES = "core_shapes.yaml"
+    DEFAULT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+    DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    DEFAULT_SHAPE_DESC = "M, D, row_gap"
+    EPS = 1e-6
+    SEED = 20261106
+    WARMUP = 5
+    SAMPLES = 25
 
-def _sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def _version(name):
-    try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def _git(root, *args):
-    proc = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
-    )
-    return proc.stdout.strip() if proc.returncode == 0 else None
-
-
-def _identity(candidate):
-    root = Path(__file__).resolve().parents[1]
-    files = [
-        Path(__file__).resolve(),
-        Path(inspect.getfile(inspect.unwrap(candidate))).resolve(),
-        root / "src/flaggems_vllm/ops/__init__.py",
-        root / "src/flaggems_vllm/__init__.py",
-        root / "src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml",
-    ]
-    backend_config = (
-        root
-        / "src/flaggems_vllm/runtime/backend"
-        / ("_" + flaggems_vllm.vendor_name)
-        / "tune_configs.yaml"
-    )
-    files.append(backend_config)
-    info = {
-        "utc": datetime.now(timezone.utc).isoformat(),
-        "python": platform.python_version(),
-        "torch": torch.__version__,
-        "triton": _version("triton"),
-        "flagtree": _version("flagtree"),
-        "vllm": _version("vllm"),
-        "torch_npu": _version("torch-npu"),
-        "torch_cuda_build": getattr(torch.version, "cuda", None),
-        "torch_hip_build": getattr(torch.version, "hip", None),
-        "device": str(flaggems_vllm.device),
-        "vendor": flaggems_vllm.vendor_name,
-        "package_file": flaggems_vllm.__file__,
-        "candidate_module": candidate.__module__,
-        "git_head": _git(root, "rev-parse", "HEAD"),
-        "git_status": _git(root, "status", "--short"),
-        "source_sha256": {str(p): _sha(p) for p in set(files) if p.is_file()},
-        "VLLM_PLUGINS": os.environ.get("VLLM_PLUGINS"),
-        "DNN_VENDOR": os.environ.get("DNN_VENDOR"),
-        "frozen_vllm_source_commit": SOURCE_COMMIT,
-    }
-    if hasattr(torch_device_fn, "current_device"):
-        info["device_index"] = torch_device_fn.current_device()
-    if hasattr(torch_device_fn, "get_device_name"):
-        info["device_name"] = torch_device_fn.get_device_name()
-    return info
-
-
-def _disable_compiler_graphs():
-    # Disable optional Inductor graph capture as well as avoiding capture here.
-    try:
-        config = importlib.import_module("torch._inductor.config")
-        config.triton.cudagraphs = False
-        return "torch._inductor.config.triton.cudagraphs=False"
-    except (ImportError, AttributeError) as exc:
-        return f"unavailable: {type(exc).__name__}: {exc}"
-
-
-def _native_leaf(candidate):
-    """Import the installed leaf, never reconstruct a compiled stand-in."""
-    info = {"status": "N/A", "module": NATIVE_MODULE}
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-        native = getattr(module, "_fused_indexer_k_norm")
-        original = inspect.unwrap(native)
-        source = textwrap.dedent(inspect.getsource(original))
-        info.update(
-            {
-                "file": inspect.getfile(original),
-                "file_sha256": _sha(inspect.getfile(original)),
-                "callable_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-                "original_module": original.__module__,
-                "compiled_wrapper": hasattr(native, "_torchdynamo_orig_callable"),
-            }
+    def __init__(self):
+        super().__init__(
+            op_name="fused_indexer_k_norm",
+            torch_op=self._decomposed_op,
+            gems_op=flaggems_vllm.fused_indexer_k_norm,
         )
-        expected = ast.parse(
-            "F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)",
-            mode="eval",
-        ).body
-        tree = ast.parse(source)
-        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-        returns = [node for node in ast.walk(tree) if isinstance(node, ast.Return)]
-        if (
-            native is candidate
-            or original is inspect.unwrap(candidate)
-            or original.__module__ != NATIVE_MODULE
-            or not info["compiled_wrapper"]
-            or len(functions) != 1
-            or len(functions[0].body) != 1
-            or len(returns) != 1
-            or ast.dump(returns[0].value) != ast.dump(expected)
-            or original.__globals__.get("F") is not F
-            or F.layer_norm.__module__ != "torch.nn.functional"
-        ):
+        self._latencies = None
+
+    def init_user_config(self):
+        if Config.mode != consts.BenchMode.KERNEL:
             raise ValueError(
-                "native callable identity/formula/compiled-wrapper mismatch"
+                "fused_indexer_k_norm benchmark requires --mode kernel "
+                "with no-Graph device events."
             )
-        info["status"] = "imported_pending_per_case_numerical_qualification"
-        return native, info
-    except Exception as exc:
-        info["reason"] = f"{type(exc).__name__}: {exc}"
-        return None, info
+        super().init_user_config()
 
+    def _decomposed_op(self, x, weight, bias, dim, eps):
+        return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
 
-def _oracle(x_cpu, weight_cpu, bias_cpu):
-    # Start from actual stored input, explicitly honoring the source FP32 cast.
-    values = x_cpu.float().double()
-    centered = values - values.mean(dim=-1, keepdim=True)
-    variance = centered.square().mean(dim=-1, keepdim=True)
-    normalized = centered / torch.sqrt(variance + EPS)
-    return (normalized * weight_cpu.double() + bias_cpu.double()).to(x_cpu.dtype)
+    def _oracle(self, x_cpu, weight_cpu, bias_cpu, dim, eps):
+        values = x_cpu.float().double()
+        centered = values - values.mean(dim=-1, keepdim=True)
+        variance = centered.square().mean(dim=-1, keepdim=True)
+        normalized = centered / torch.sqrt(variance + eps)
+        return (normalized * weight_cpu.double() + bias_cpu.double()).to(x_cpu.dtype)
 
+    def get_input_iter(self, dtype):
+        for shape in self.shapes:
+            # Begin a fresh measurement pair for every shape.
+            self._latencies = None
+            m, d, gap = shape
+            gen = torch.Generator(device="cpu").manual_seed(self.SEED)
+            parent_cpu = (torch.rand((m, d + gap), generator=gen) * 6 - 3).to(dtype)
+            weight_cpu = torch.rand((d,), generator=gen) * 3 - 1.5
+            bias_cpu = torch.rand((d,), generator=gen) * 3 - 1.5
+            parent = parent_cpu.to(device=self.device)
+            weight = weight_cpu.to(device=self.device)
+            bias = bias_cpu.to(device=self.device)
+            # The generator and construction must not carry into timing.
+            del gen, parent_cpu, weight_cpu, bias_cpu
+            gc.collect()
+            yield parent[:, :d], weight, bias, d, self.EPS
 
-def _check(fn, args, expected):
-    actual = fn(*args)
-    x = args[0]
-    if actual.shape != x.shape or actual.dtype != x.dtype or actual.device != x.device:
-        raise AssertionError("output shape/dtype/device mismatch")
-    if not actual.is_contiguous():
-        raise AssertionError("output must be contiguous")
-    host = actual.detach().cpu()
-    rtol, atol = TOLERANCES[x.dtype]
-    torch.testing.assert_close(host, expected, rtol=rtol, atol=atol)
-    error = host.double() - expected.double()
-    return {
-        "max_abs": error.abs().max().item(),
-        "rms": error.square().mean().sqrt().item(),
-        "rtol": rtol,
-        "atol": atol,
-    }
+    def get_latency(self, op, *args, **kwargs):
+        if self._latencies is None:
+            self._latencies = self._measure_pair(args)
+        key = "torch_op" if op == self.torch_op else "gems"
+        return self._latencies[key]
 
+    def _measure_pair(self, args):
+        x, weight, bias, dim, eps = args
 
-def _decomposed(x, weight, bias, dim, eps):
-    return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
+        # Independent CPU oracle from the exact stored inputs.
+        x_cpu = x.cpu()
+        weight_cpu = weight.cpu()
+        bias_cpu = bias.cpu()
+        expected = self._oracle(x_cpu, weight_cpu, bias_cpu, dim, eps)
 
-
-def _cases():
-    for dtype in (torch.float16, torch.bfloat16, torch.float32):
-        for m in (1, 8, 128, 1024, 4096):
-            for gap in (0, 16):
-                yield m, 128, dtype, gap, "core"
-    yield 128, 127, torch.float32, 0, "tail"
-    yield 128, 129, torch.bfloat16, 16, "tail"
-
-
-def _inputs(m, d, dtype, gap, device, index):
-    gen = torch.Generator(device="cpu").manual_seed(SEED + index)
-    # Bounded reproducible values avoid FP32 overflow in this performance set.
-    parent_cpu = (torch.rand((m, d + gap), generator=gen) * 6 - 3).to(dtype)
-    weight_cpu = torch.rand((d,), generator=gen) * 3 - 1.5
-    bias_cpu = torch.rand((d,), generator=gen) * 3 - 1.5
-    expected = _oracle(parent_cpu[:, :d], weight_cpu, bias_cpu)
-    parent = parent_cpu.to(device=device)
-    weight = weight_cpu.to(device=device)
-    bias = bias_cpu.to(device=device)
-    args = (parent[:, :d], weight, bias, d, EPS)
-    return args, expected, (parent, weight, bias), (parent_cpu, weight_cpu, bias_cpu)
-
-
-def _unchanged(device_inputs, cpu_inputs):
-    for actual, expected in zip(device_inputs, cpu_inputs):
-        torch.testing.assert_close(actual.detach().cpu(), expected, rtol=0, atol=0)
-
-
-def _measure(fn, args):
-    for _ in range(WARMUP):
-        fn(*args)
-    torch_device_fn.synchronize()
-    samples = []
-    for _ in range(SAMPLES):
-        torch_device_fn.synchronize()
-        start = torch_device_fn.Event(enable_timing=True)
-        end = torch_device_fn.Event(enable_timing=True)
-        start.record()
-        output = fn(*args)
-        end.record()
-        torch_device_fn.synchronize()
-        elapsed_us = start.elapsed_time(end) * 1000.0
-        if not math.isfinite(elapsed_us) or elapsed_us <= 0:
-            raise RuntimeError(f"invalid device-event sample: {elapsed_us} us")
-        samples.append(elapsed_us)
-        del output
-    if len(samples) != SAMPLES:
-        raise AssertionError(f"expected {SAMPLES} samples, got {len(samples)}")
-    return samples
-
-
-def _recover_candidate(candidate, args, expected, device_inputs, cpu_inputs):
-    torch_device_fn.synchronize()
-    _check(candidate, args, expected)
-    _unchanged(device_inputs, cpu_inputs)
-
-
-def _summary(samples):
-    return {
-        "samples_us": samples,
-        "median_us": statistics.median(samples),
-        "min_us": min(samples),
-        "max_us": max(samples),
-    }
-
-
-def _write(report):
-    path = Path(
-        os.environ.get("INDEXER_BENCH_OUTPUT", "fused_indexer_k_norm_benchmark.json")
-    ).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
-    return path
-
-
-@torch.no_grad()
-def run_benchmark():
-    candidate = flaggems_vllm.fused_indexer_k_norm
-    if not torch_device_fn.is_available():
-        raise RuntimeError("accelerator unavailable; no benchmark rows executed")
-    compiler_graphs = _disable_compiler_graphs()
-    native, native_info = _native_leaf(candidate)
-    if native is not None and compiler_graphs.startswith("unavailable"):
-        native = None
-        native_info.update(status="N/A", reason=compiler_graphs)
-    report = {
-        "schema_version": 2,
-        "status": "RUNNING",
-        "identity": _identity(candidate),
-        "native_identity": native_info,
-        "protocol": {
-            "unit": "us",
-            "timer": "runtime.torch_device_fn.Event",
-            "event_native_unit": "ms",
-            "event_conversion": "elapsed_time_ms * 1000 -> us",
-            "scope": "one public-operator call bracketed by device events; fresh output allocation remains inside the call",
-            "graph": False,
-            "compiler_graphs": compiler_graphs,
-            "warmup_per_method": WARMUP,
-            "samples_per_method": SAMPLES,
-            "calls_per_sample": 1,
-            "aggregation": "median/min/max of 25 independent event samples",
-            "seed": SEED,
-            "eps": EPS,
-            "expected_core_rows": 30,
-            "expected_tail_rows": 2,
-            "sync": "synchronize before every start event and after every end event",
-            "output_lifetime": "retain each fresh output until the end event has completed",
-            "order": "reverse qualified method order on alternating rows",
-            "baseline_qualification": "source identity plus independent CPU FP64 oracle immediately before and after timing",
-            "historical_scope_note": "optimization-round-1 synchronized wall-clock batch means are retained separately and are not pooled with these event samples",
-            "normalization_factor": None,
-        },
-        "rows": [],
-    }
-    print(json.dumps({"identity": report["identity"], "native": native_info}))
-    try:
-        for index, (m, d, dtype, gap, group) in enumerate(_cases()):
-            args, expected, device_inputs, cpu_inputs = _inputs(
-                m, d, dtype, gap, flaggems_vllm.device, index
-            )
-            row = {
-                "M": m,
-                "D": d,
-                "dtype": str(dtype),
-                "row_gap": gap,
-                "x_stride": list(args[0].stride()),
-                "group": group,
-                "methods": {},
-            }
-            report["rows"].append(row)
-            methods = {"candidate": candidate, "decomposed": _decomposed}
-            if native is not None:
-                methods["native"] = native
-            else:
-                row["methods"]["native"] = {
-                    "status": "N/A",
-                    "reason": native_info["reason"],
-                }
-            order = list(methods)
-            if index % 2:
-                order.reverse()
-            row["measurement_order"] = order
-            for name in order:
-                fn = methods[name]
-                try:
-                    precheck = _check(fn, args, expected)
-                    _unchanged(device_inputs, cpu_inputs)
-                except Exception as exc:
-                    if name == "candidate":
-                        raise
-                    row["methods"][name] = {
-                        "status": "N/A",
-                        "accuracy": "FAIL",
-                        "performance": "N/A",
-                        "precheck_error": f"{type(exc).__name__}: {exc}",
-                    }
-                    _recover_candidate(
-                        candidate, args, expected, device_inputs, cpu_inputs
-                    )
-                    continue
-                try:
-                    samples = _measure(fn, args)
-                    postcheck = _check(fn, args, expected)
-                    _unchanged(device_inputs, cpu_inputs)
-                except Exception as exc:
-                    if name == "candidate":
-                        raise
-                    accuracy = "FAIL" if isinstance(exc, AssertionError) else "PASS"
-                    row["methods"][name] = {
-                        "status": "N/A",
-                        "accuracy": accuracy,
-                        "performance": "N/A",
-                        "precheck": precheck,
-                        "timing_or_postcheck_error": f"{type(exc).__name__}: {exc}",
-                    }
-                    _recover_candidate(
-                        candidate, args, expected, device_inputs, cpu_inputs
-                    )
-                    continue
-                row["methods"][name] = dict(
-                    status="PASS",
-                    accuracy="PASS",
-                    performance="PASS",
-                    precheck=precheck,
-                    postcheck=postcheck,
-                    **_summary(samples),
-                )
-            _unchanged(device_inputs, cpu_inputs)
-            candidate_us = row["methods"]["candidate"]["median_us"]
-            for name in ("native", "decomposed"):
-                baseline = row["methods"][name]
-                row["S_" + name] = (
-                    baseline["median_us"] / candidate_us
-                    if baseline["status"] == "PASS"
-                    else None
-                )
-            row["native_below_0_9"] = (
-                row["S_native"] < 0.9 if row["S_native"] is not None else None
-            )
-            print(
-                f"{group} M={m} D={d} {dtype} gap={gap}: "
-                f"candidate={candidate_us:.3f}us "
-                f"S_native={row['S_native']} S_decomposed={row['S_decomposed']}"
-            )
-            _write(report)
-        report["summary"] = {
-            "executed_rows": len(report["rows"]),
-            "valid_rows": {
-                name: sum(
-                    row["methods"][name]["status"] == "PASS" for row in report["rows"]
-                )
-                for name in ("candidate", "native", "decomposed")
-            },
-            "core_native_below_0_9": [
-                index
-                for index, row in enumerate(report["rows"])
-                if row["group"] == "core" and row["native_below_0_9"]
-            ],
+        _tolerances = {
+            torch.float32: (2e-5, 2e-5),
+            torch.float16: (2e-3, 2e-3),
+            torch.bfloat16: (1.6e-2, 1.6e-2),
         }
-        report["status"] = "PASS"
-    except Exception as exc:
-        report["status"] = "FAIL"
-        report["error"] = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        print(f"INDEXER_BENCH_OUTPUT={_write(report)} status={report['status']}")
-    return report
+
+        # Candidate must pass the oracle before it is timed.
+        candidate_out = self.gems_op(*args)
+        rtol, atol = _tolerances[x.dtype]
+        torch.testing.assert_close(
+            candidate_out.cpu(), expected, rtol=rtol, atol=atol
+        )
+
+        methods = {
+            "torch_op": self.torch_op,
+            "gems": self.gems_op,
+        }
+        results = {}
+        for key, fn in methods.items():
+            for _ in range(self.WARMUP):
+                fn(*args)
+            torch_device_fn.synchronize()
+            samples = []
+            for _ in range(self.SAMPLES):
+                torch_device_fn.synchronize()
+                start = torch_device_fn.Event(enable_timing=True)
+                end = torch_device_fn.Event(enable_timing=True)
+                start.record()
+                output = fn(*args)
+                end.record()
+                torch_device_fn.synchronize()
+                samples.append(start.elapsed_time(end))
+                del output
+            results[key] = statistics.median(samples)
+        return results
+
+    def record_shapes(self, *args, **kwargs):
+        x, weight, bias, dim, eps = args
+        return {
+            "M": x.shape[0],
+            "D": dim,
+            "row_gap": x.shape[1] - dim if x.shape[1] > dim else 0,
+            "dtype": str(x.dtype),
+            "x_stride": list(x.stride()),
+        }
+
+    def run(self):
+        self.init_user_config()
+        for dtype in self.to_bench_dtypes:
+            metrics = []
+            input_iter = self.get_input_iter(dtype)
+            done = False
+            while not done:
+                try:
+                    inp = next(input_iter)
+                except StopIteration:
+                    done = True
+                    continue
+                metric = consts.BenchmarkMetrics()
+                try:
+                    args, kwargs = self.unpack_to_args_kwargs(inp)
+                    metric.shape_detail = self.record_shapes(*args, **kwargs)
+                    if (
+                        "latency_base" in self.to_bench_metrics
+                        and self.torch_op is not None
+                    ):
+                        metric.latency_base = self.get_latency(
+                            self.torch_op, *args, **kwargs
+                        )
+                    if "latency" in self.to_bench_metrics:
+                        metric.latency = self.get_latency(
+                            self.gems_op, *args, **kwargs
+                        )
+                    if (
+                        "speedup" in self.to_bench_metrics
+                        and metric.latency_base is not None
+                        and metric.latency
+                    ):
+                        metric.speedup = metric.latency_base / metric.latency
+                except Exception as e:
+                    metric.error_msg = str(e)
+                    raise
+                finally:
+                    metrics.append(metric)
+                    gc.collect()
+            result = consts.BenchmarkResult(
+                level=Config.bench_level.value,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                mode=Config.mode.value,
+                result=metrics,
+            )
+            print(result)
+            update_result(self.op_name, asdict(result))
+            emit_record_logger(result.to_json())
 
 
 @pytest.mark.fused_indexer_k_norm
 def test_fused_indexer_k_norm_benchmark():
-    report = run_benchmark()
-    assert report["status"] == "PASS"
-    assert len(report["rows"]) == 32
-
-
-if __name__ == "__main__":
-    run_benchmark()
+    FusedIndexerKNormBenchmark().run()

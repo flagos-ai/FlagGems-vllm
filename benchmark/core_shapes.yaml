@@ -35,6 +35,22 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+fused_indexer_k_norm:
+  shapes:
+    - [1, 128, 0]
+    - [8, 128, 0]
+    - [128, 128, 0]
+    - [1024, 128, 0]
+    - [4096, 128, 0]
+    - [1, 128, 16]
+    - [8, 128, 16]
+    - [128, 128, 16]
+    - [1024, 128, 16]
+    - [4096, 128, 16]
+    - [128, 127, 0]
+    - [128, 129, 16]
+  shape_desc: "M, D, row_gap"
+
 fused_indexer_weight_scale:
   # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
   shapes:

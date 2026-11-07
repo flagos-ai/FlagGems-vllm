@@ -26,14 +26,19 @@ _SUPPORTED_VENDORS = frozenset(
 
 
 @triton.jit
-def _rsqrt_preserving_subnormals(value):
+def _rsqrt_preserving_subnormals(value, SUBNORMAL_METHOD: tl.constexpr = 1):
     # Some backends lower rsqrt to an instruction that flushes subnormal
     # inputs to zero. An exact power-of-two scale makes every positive FP32
     # subnormal normal before rsqrt, then restores the reciprocal-root scale.
-    # Classify by bits so vendor LLVMs need not lower the interval test to
-    # llvm.is.fpclass, which is unavailable in some accelerator toolchains.
-    bits = value.to(tl.uint32, bitcast=True)
-    is_subnormal = (bits > 0) & (bits < 0x00800000)
+    # Two lowering-safe variants are kept in the same kernel body; Triton
+    # traces only the active branch because SUBNORMAL_METHOD is constexpr.
+    if SUBNORMAL_METHOD == 1:
+        # bitcast path: safe for backends where llvm.is.fpclass is missing.
+        bits = value.to(tl.uint32, bitcast=True)
+        is_subnormal = (bits > 0) & (bits < 0x00800000)
+    else:
+        # interval path: safe for backends where uint32 bitcast lowering fails.
+        is_subnormal = (value > 0.0) & (value < 1.1754943508222875e-38)
     scaled = tl.where(is_subnormal, value * 16777216.0, value)
     result = tl.rsqrt(scaled)
     return tl.where(is_subnormal, result * 4096.0, result)
@@ -53,6 +58,7 @@ def _fused_indexer_k_norm_kernel(
     STRIDE_B,
     EPS,
     BLOCK_M: tl.constexpr,
+    SUBNORMAL_METHOD: tl.constexpr = 1,
 ):
     # This is a semantic extent, not a tuning parameter. Keeping it inside
     # the JIT also prevents FlagTree AABS from adding host metadata to configs.
@@ -71,7 +77,7 @@ def _fused_indexer_k_norm_kernel(
     # Padding must also be zero after centering, not merely before the load.
     centered = tl.where(cols[None, :] < D, values - mean[:, None], 0.0)
     variance = tl.sum(centered * centered, axis=1) / D
-    rstd = _rsqrt_preserving_subnormals(variance + EPS)
+    rstd = _rsqrt_preserving_subnormals(variance + EPS, SUBNORMAL_METHOD)
 
     weight = tl.load(W + cols * STRIDE_W, mask=cols < D, other=0.0)
     bias = tl.load(B + cols * STRIDE_B, mask=cols < D, other=0.0)
@@ -244,12 +250,23 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)
                 ](*args)
         else:
-            _norm_kernel[(rows,)](
-                *args,
-                BLOCK_M=1,
-                num_warps=4,
-                num_stages=1,
-            )
+            # Ascend backend lowers uint32 bitcast to an unsupported vcast;
+            # switch to the interval-based subnormal classification path.
+            if runtime.device.vendor_name == "ascend":
+                _norm_kernel[(rows,)](
+                    *args,
+                    BLOCK_M=1,
+                    num_warps=4,
+                    num_stages=1,
+                    SUBNORMAL_METHOD=0,
+                )
+            else:
+                _norm_kernel[(rows,)](
+                    *args,
+                    BLOCK_M=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
 
 
 def fused_indexer_k_norm(x, weight, bias, dim, eps):
