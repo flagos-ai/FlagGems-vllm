@@ -52,7 +52,6 @@ from flaggems_vllm.ops.FLA import (
     fused_recurrent_kda,
 )
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
-from flaggems_vllm.ops.gather_draft_sampled import gather_draft_sampled
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
@@ -169,6 +168,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
+from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.rotary_embedding import apply_rotary_pos_emb

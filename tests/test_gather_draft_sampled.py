@@ -155,7 +155,7 @@ def test_individual_integer_types(index):
     ],
 )
 def test_all_tiles_and_output_guards(config):
-    module = importlib.import_module("flaggems_vllm.ops.gather_draft_sampled")
+    module = importlib.import_module("flaggems_vllm.ops.rejection_sampler")
     kernel = module._gather_draft_sampled_kernel.jit_function
     meta, warps, stages = config
     block = meta["BLOCK_SIZE"]
@@ -208,7 +208,7 @@ def test_prefill_boundary_and_first_row():
 
 @pytest.mark.gather_draft_sampled
 def test_plain_triton_path(monkeypatch):
-    module = importlib.import_module("flaggems_vllm.ops.gather_draft_sampled")
+    module = importlib.import_module("flaggems_vllm.ops.rejection_sampler")
     monkeypatch.setattr(module, "_HAS_LAYOUT", False)
     check(make_inputs(1025))
 

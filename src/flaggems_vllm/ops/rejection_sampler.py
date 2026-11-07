@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Gather logits-aligned input tokens and positions for draft verification."""
+"""Draft-verification helpers aligned with vLLM's rejection_sampler module."""
 
 import torch
 import triton

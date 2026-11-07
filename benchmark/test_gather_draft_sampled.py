@@ -85,7 +85,7 @@ def case_scenario(shape):
     return "uva_decode"
 
 
-def make_inputs(shape, seed=20261107, device=None):
+def make_inputs(shape, seed=20261107, device=None, dtype=None):
     device = DEVICE if device is None else device
     n, drafts, layout, phase, storage, *state_capacity = shape
     generator = torch.Generator().manual_seed(seed)
@@ -131,13 +131,16 @@ def make_inputs(shape, seed=20261107, device=None):
         block_start = boundary + offsets[row % 3]
     positions[indices] = block_start + local
     data = [tokens, positions, indices, mapping, local.to(torch.int32), prefill]
+    if dtype is not None:
+        data = [tensor.to(dtype) for tensor in data]
+    prefill = data[-1]
     data = [tensor.to(device) for tensor in data]
     if storage == "uva":
         if runtime.device.vendor_name != "nvidia":
             pytest.skip("mapped-host UVA state is NVIDIA-specific")
         buffer_utils = pytest.importorskip("vllm.v1.worker.gpu.buffer_utils")
         UvaBufferPool = buffer_utils.UvaBufferPool
-        pool = UvaBufferPool(prefill.shape, torch.int32, max_concurrency=1)
+        pool = UvaBufferPool(prefill.shape, prefill.dtype, max_concurrency=1)
         if not isinstance(pool._uva_bufs[0], buffer_utils.UvaBuffer):
             pytest.skip("mapped-host UVA is unavailable on this platform")
         data[-1] = pool.copy_to_uva(prefill)
@@ -156,6 +159,7 @@ class GatherDraftSampledBenchmark(base.Benchmark):
         return {
             "case": self._case,
             "scenario": case_scenario(self._case),
+            "dtype_layout": self._dtype_layout,
             "inputs": super().record_shapes(*args, **kwargs),
         }
 
@@ -171,9 +175,19 @@ class GatherDraftSampledBenchmark(base.Benchmark):
     def get_input_iter(self, dtype):
         from flaggems_vllm import gather_draft_sampled
 
+        # Preserve the caller's mixed int32/int64 layout as well as uniform
+        # integer layouts. The dtype option must change the generated tensors.
+        layouts = ("caller", "uniform") if dtype == torch.int32 else ("uniform",)
+        for layout in layouts:
+            yield from self._iter_layout(dtype, layout, gather_draft_sampled)
+
+    def _iter_layout(self, dtype, layout, gather_draft_sampled):
         for shape in self.shapes:
             self._case = shape
-            data = make_inputs(shape, device=self.device)
+            self._dtype_layout = layout
+            data = make_inputs(
+                shape, device=self.device, dtype=dtype if layout == "uniform" else None
+            )
             if vllm_reference is not None:
                 expected = vllm_reference(*data)
             else:
@@ -195,7 +209,9 @@ def test_gather_draft_sampled_perf():
     from flaggems_vllm import gather_draft_sampled
 
     bench = GatherDraftSampledBenchmark(
-        op_name="gather_draft_sampled", torch_op=vllm_reference, dtypes=[torch.int32]
+        op_name="gather_draft_sampled",
+        torch_op=vllm_reference,
+        dtypes=[torch.int32, torch.int64],
     )
     bench.set_gems(gather_draft_sampled)
     bench.run()
