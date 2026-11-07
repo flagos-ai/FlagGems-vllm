@@ -19,6 +19,4 @@ if triton.__version__ >= "3.4":
         w8a8_block_matmul,
     )
 
-    w8a8_block_fp8_matmul = w8a8_block_matmul
-
-__all__ = ["w8a8_block_fp8_matmul", "w8a8_block_matmul"]
+__all__ = ["w8a8_block_matmul"]
