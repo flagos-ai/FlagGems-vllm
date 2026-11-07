@@ -246,9 +246,12 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     num_stages=1,
                 )
             else:
-                _norm_kernel[
-                    lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)
-                ](*args)
+                _fused_indexer_k_norm_kernel[(triton.cdiv(rows, 1),)](
+                    *args,
+                    BLOCK_M=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
         else:
             # Ascend backend lowers uint32 bitcast to an unsupported vcast;
             # switch to the interval-based subnormal classification path.
