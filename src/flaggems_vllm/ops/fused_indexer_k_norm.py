@@ -263,13 +263,29 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     block_m = 8
                 elif rows > 128:
                     block_m = 4
-                _norm_kernel[(triton.cdiv(rows, block_m),)](
-                    *args,
-                    BLOCK_M=block_m,
-                    num_warps=4,
-                    num_stages=1,
-                    SUBNORMAL_METHOD=0,
-                )
+                # Thin launcher for D=128 aligned fast path to bypass
+                # libentry host overhead on NPU.
+                if (
+                    dim == 128
+                    and stride_xd == 1
+                    and stride_w == 1
+                    and stride_b == 1
+                ):
+                    _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
+                        *args,
+                        BLOCK_M=block_m,
+                        num_warps=4,
+                        num_stages=1,
+                        SUBNORMAL_METHOD=0,
+                    )
+                else:
+                    _norm_kernel[(triton.cdiv(rows, block_m),)](
+                        *args,
+                        BLOCK_M=block_m,
+                        num_warps=4,
+                        num_stages=1,
+                        SUBNORMAL_METHOD=0,
+                    )
             elif runtime.device.vendor_name == "mthreads":
                 # MUSA: thin launcher for D=128 aligned fast path to bypass
                 # libentry host overhead (~30% of latency for small/medium M).
