@@ -52,6 +52,7 @@ from flaggems_vllm.ops.FLA import (
     fused_recurrent_kda,
 )
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
+from flaggems_vllm.ops.gather_draft_sampled import gather_draft_sampled
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
@@ -305,6 +306,7 @@ __all__ = [
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gate_sigmoid_mul",
+    "gather_draft_sampled",
     "gather_rows",
     "gather_state_rows",
     "gdn_w8a16",
