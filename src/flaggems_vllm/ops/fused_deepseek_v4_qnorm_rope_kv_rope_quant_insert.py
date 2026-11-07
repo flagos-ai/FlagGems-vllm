@@ -18,90 +18,78 @@ import triton.language as tl
 
 
 @triton.jit
-def fused_qnorm_rope_kv_insert_kernel(
-    q,
-    kv,
-    k_cache,
-    slot_mapping,
-    position_ids,
-    cos_sin_cache,
-    eps,
-    cache_block_size: tl.constexpr,
-    num_tokens: tl.constexpr,
-    num_heads: tl.constexpr,
-    kv_block_stride,
-    num_tokens_insert: tl.constexpr,
+def _kv_fp8_quant(
+    kv_quant_blk,  # [64], fp32
+    out_data_ptrs,  # [64]
+    out_scale_ptr,  # scalar
 ):
-    HEAD_DIM: tl.constexpr = 512
+    FP8_MAX: tl.constexpr = 448.0
+    block_max = tl.max(tl.abs(kv_quant_blk), axis=-1)
+    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
+    # scale = 2^ceil(log2(block_max / FP8_MAX))
+    raw_scale = block_max / FP8_MAX
+    log_scale = tl.log2(raw_scale)
+    exponent = tl.ceil(log_scale)
+    scale = tl.exp2(exponent)
+    # quantize to fp8: fp8_value = bf16_value / scale
+    x_scaled = kv_quant_blk / scale
+    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+    # convert to fp8, then bitcast to uint8 for storage
+    x_fp8 = x_clamped.to(tl.float8e4nv)
+    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    # store quantized data
+    tl.store(out_data_ptrs, x_uint8)
+    # store scale: stored_value = exponent + 127 (bias)
+    encoded_scale = exponent + 127.0
+    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
+    tl.store(out_scale_ptr, encoded_scale.to(tl.uint8))
+
+
+@triton.jit
+def _kv_fp8_quant_2d(
+    kv_quant_blk,  # [2, 32], fp32
+    out_data_ptrs,  # [2, 32]
+    out_scale_ptrs,  # [2, 1]
+):
+    FP8_MAX: tl.constexpr = 448.0
+    block_max = tl.max(tl.abs(kv_quant_blk), axis=-1, keep_dims=True)
+    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
+    # scale = 2^ceil(log2(block_max / FP8_MAX))
+    raw_scale = block_max / FP8_MAX
+    log_scale = tl.log2(raw_scale)
+    exponent = tl.ceil(log_scale)
+    scale = tl.exp2(exponent)
+    # quantize to fp8: fp8_value = bf16_value / scale
+    x_scaled = kv_quant_blk / scale
+    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+    # convert to fp8, then bitcast to uint8 for storage
+    x_fp8 = x_clamped.to(tl.float8e4nv)
+    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    # store quantized data
+    tl.store(out_data_ptrs, x_uint8)
+    # store scale: stored_value = exponent + 127 (bias)
+    encoded_scale = exponent + 127.0
+    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
+    tl.store(out_scale_ptrs, encoded_scale.to(tl.uint8))
+
+
+@triton.jit
+def _deepseek_v4_kv_quant(
+    qkv_blk_rope,  # [ROPE_DIM], bf16
+    kv_base,
+    block_base,
+    pos_in_block,
+    cache_block_size,
+):
     NOPE_DIM: tl.constexpr = 448
     ROPE_DIM: tl.constexpr = 64
-    HALF_ROPE_DIM: tl.constexpr = 32
     QUANT_BLOCK: tl.constexpr = 64
     NUM_QUANT_BLOCKS: tl.constexpr = NOPE_DIM // QUANT_BLOCK  # 7
     SCALE_BYTES_PER_TOKEN: tl.constexpr = NUM_QUANT_BLOCKS + 1  # 8 (7 real + 1 pad)
     TOKEN_DATA_BYTES: tl.constexpr = NOPE_DIM + 2 * ROPE_DIM  # 576
-    FP8_MAX: tl.constexpr = 448.0
 
-    pid = tl.program_id(0).to(tl.int64)  # grid = (num_tokens * (num_heads + 1),)
-    blocks_per_token = num_heads + 1
-    token_idx = pid // blocks_per_token
-    if token_idx >= num_tokens:
-        return
-    slot_idx = pid % blocks_per_token
-    is_kv = slot_idx == num_heads
-    if is_kv and token_idx >= num_tokens_insert:  # no need to insert
-        return
-    q_base = q + (token_idx * num_heads + slot_idx) * HEAD_DIM
-    kv_base = kv + token_idx * HEAD_DIM
-    offset = tl.arange(0, HEAD_DIM)
-    mask_nope = offset < NOPE_DIM
     offset_rope = tl.arange(0, ROPE_DIM)
-    offset_half_rope = tl.arange(0, HALF_ROPE_DIM)
     offset_quant = tl.arange(0, QUANT_BLOCK)
-    if not is_kv:
-        # load q
-        q_blk = tl.load(q_base + offset).to(tl.float32)  # [NOPE_DIM]
-        q_blk_rope = tl.load(q_base + NOPE_DIM + offset_rope).to(
-            tl.float32
-        )  # [ROPE_DIM]
-        # RMSNorm with no weight
-        variance = tl.sum(q_blk * q_blk) / HEAD_DIM
-        rsqrt = tl.rsqrt(variance + eps)
-        q_blk = q_blk * rsqrt
-        # store q nope
-        tl.store(q_base + offset, q_blk.to(tl.bfloat16), mask=mask_nope)  # [NOPE_DIM]
-        qkv_blk_rope = q_blk_rope * rsqrt
-    else:
-        # load kv rope
-        qkv_blk_rope = tl.load(kv_base + NOPE_DIM + offset_rope).to(
-            tl.float32
-        )  # [ROPE_DIM]
-    # load cos/sin
-    position_id = tl.load(position_ids + token_idx)  # i64
-    cs_base = cos_sin_cache + position_id * ROPE_DIM
-    cos_blk = tl.load(cs_base + offset_half_rope)  # [HALF_ROPE_DIM], f32
-    sin_blk = tl.load(
-        cs_base + offset_half_rope + HALF_ROPE_DIM
-    )  # [HALF_ROPE_DIM], f32
-    # ROPE
-    qkv_blk_rope = tl.reshape(qkv_blk_rope, HALF_ROPE_DIM, 2)
-    even_blk, odd_blk = tl.split(qkv_blk_rope)  # [HALF_ROPE_DIM], f32
-    new_even_blk = even_blk * cos_blk - odd_blk * sin_blk
-    new_odd_blk = even_blk * sin_blk + odd_blk * cos_blk
-    qkv_blk_rope = tl.reshape(tl.join(new_even_blk, new_odd_blk), ROPE_DIM).to(
-        tl.bfloat16
-    )
-    if not is_kv:
-        # store q rope
-        tl.store(q_base + NOPE_DIM + offset_rope, qkv_blk_rope)  # [ROPE_DIM]
-        return
-    # load slot
-    slot_id = tl.load(slot_mapping + token_idx)  # i64
-    if slot_id < 0:
-        return
-    block_idx = slot_id // cache_block_size
-    pos_in_block = slot_id % cache_block_size
-    block_base = k_cache + block_idx * kv_block_stride
     token_fp8_ptr = block_base + pos_in_block * TOKEN_DATA_BYTES
     token_bf16_ptr = token_fp8_ptr + NOPE_DIM
     token_bf16_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
@@ -123,167 +111,273 @@ def fused_qnorm_rope_kv_insert_kernel(
     kv_quant_blk6 = tl.load(kv_base + 6 * QUANT_BLOCK + offset_quant)
     # quant group 0
     qblock_idx = 0
-    kv_quant_blk = kv_quant_blk0.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk0.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # quant group 1
     qblock_idx = 1
-    kv_quant_blk = kv_quant_blk1.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk1.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # quant group 2
     qblock_idx = 2
-    kv_quant_blk = kv_quant_blk2.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk2.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # quant group 3
     qblock_idx = 3
-    kv_quant_blk = kv_quant_blk3.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk3.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # quant group 4
     qblock_idx = 4
-    kv_quant_blk = kv_quant_blk4.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk4.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # quant group 5
     qblock_idx = 5
-    kv_quant_blk = kv_quant_blk5.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk5.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # quant group 6
     qblock_idx = 6
-    kv_quant_blk = kv_quant_blk6.to(tl.float32)
-    block_max = tl.max(tl.abs(kv_quant_blk), axis=0)
-    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
-    # scale = 2^ceil(log2(block_max / FP8_MAX))
-    raw_scale = block_max / FP8_MAX
-    log_scale = tl.log2(raw_scale)
-    exponent = tl.ceil(log_scale)
-    scale = tl.exp2(exponent)
-    # quantize to fp8: fp8_value = bf16_value / scale
-    x_scaled = kv_quant_blk / scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    # store quantized data
-    tl.store(token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant, x_uint8)
-    # store scale: stored_value = exponent + 127 (bias)
-    encoded_scale = exponent + 127.0
-    encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-    tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
-
+    _kv_fp8_quant(
+        kv_quant_blk6.to(tl.float32),
+        token_fp8_ptr + qblock_idx * QUANT_BLOCK + offset_quant,
+        token_scale_ptr + qblock_idx,
+    )
     # padding of scale
     tl.store(token_scale_ptr + NUM_QUANT_BLOCKS, tl.zeros((), dtype=tl.uint8))
+
+
+@triton.jit
+def _deepseek_v41_kv_quant(
+    qkv_blk_rope,  # [ROPE_DIM], bf16
+    kv_base,
+    block_base,
+    pos_in_block,
+    cache_block_size,
+):
+    """
+    V4.1 (528 B/token, kv_mxfp8=true) -- RoPE is quantized as well, so the
+    whole row is MXFP8 (fp8 e4m3 with one UE8M0 scale per 32 dims)
+    [0,      bs*512):          token data, 512 fp8 each
+    [bs*512, bs*512 + bs*16):  UE8M0 scales, 16 per token
+    """
+    NOPE_DIM: tl.constexpr = 448
+    ROPE_DIM: tl.constexpr = 64
+    QUANT_BLOCK: tl.constexpr = 32
+    TOKEN_DATA_BYTES: tl.constexpr = 512
+    SCALE_BYTES_PER_TOKEN: tl.constexpr = 16
+    NOPE_QUANT_BLOCKS: tl.constexpr = NOPE_DIM // QUANT_BLOCK  # 14
+    ROPE_QUANT_BLOCKS: tl.constexpr = ROPE_DIM // QUANT_BLOCK  # 2
+
+    repeats = tl.arange(0, ROPE_QUANT_BLOCKS)
+    offset_quant = tl.arange(0, QUANT_BLOCK)
+    token_data_ptr = block_base + pos_in_block * TOKEN_DATA_BYTES
+    token_scale_ptr = (
+        block_base
+        + cache_block_size * TOKEN_DATA_BYTES
+        + pos_in_block * SCALE_BYTES_PER_TOKEN
+    )
+    # quant rope
+    _kv_fp8_quant_2d(
+        qkv_blk_rope.reshape(ROPE_QUANT_BLOCKS, QUANT_BLOCK).to(tl.float32),
+        token_data_ptr
+        + NOPE_DIM
+        + repeats[:, None] * QUANT_BLOCK
+        + offset_quant[None, :],
+        token_scale_ptr + NOPE_QUANT_BLOCKS + repeats[:, None],
+    )
+    # quant nope
+    for i in range(NOPE_QUANT_BLOCKS // ROPE_QUANT_BLOCKS):
+        chunk_offs = i * ROPE_QUANT_BLOCKS + repeats
+        kv_quant_blk = tl.load(
+            kv_base + chunk_offs[:, None] * QUANT_BLOCK + offset_quant[None, :]
+        )
+        _kv_fp8_quant_2d(
+            kv_quant_blk.to(tl.float32),
+            token_data_ptr + chunk_offs[:, None] * QUANT_BLOCK + offset_quant[None, :],
+            token_scale_ptr + chunk_offs[:, None],
+        )
+
+
+@triton.jit
+def fused_qnorm_rope_kv_insert_kernel(
+    q,
+    q_out,
+    kv,
+    k_cache,
+    slot_mapping,
+    position_ids,
+    cos_sin_cache,
+    q_head_padded: tl.constexpr,
+    eps,
+    cache_block_size: tl.constexpr,
+    apply_q_norm: tl.constexpr,
+    kv_mxfp8: tl.constexpr,
+    apply_q_rope: tl.constexpr,
+    is_q_interleaved: tl.constexpr,
+    num_tokens,
+    num_heads: tl.constexpr,
+    kv_block_stride,
+    num_tokens_insert,
+):
+    HEAD_DIM: tl.constexpr = 512
+    NOPE_DIM: tl.constexpr = 448
+    ROPE_DIM: tl.constexpr = 64
+    HALF_ROPE_DIM: tl.constexpr = 32
+    WARP_SIZE: tl.constexpr = 32
+    ELEMS_PER_LANE: tl.constexpr = 16
+    offset = tl.arange(0, HEAD_DIM)
+    lane_offs = tl.arange(0, WARP_SIZE)
+    elem_offs = tl.arange(0, ELEMS_PER_LANE)
+
+    pid = tl.program_id(0).to(tl.int64)  # grid = (num_tokens * (q_head_padded + 1),)
+    blocks_per_token = q_head_padded + 1
+    token_idx = pid // blocks_per_token
+    if token_idx >= num_tokens:
+        return
+    slot_idx = pid % blocks_per_token
+    is_kv = slot_idx == q_head_padded
+    if is_kv and token_idx >= num_tokens_insert:  # no need to insert
+        return
+    is_pad_q = (not is_kv) and (slot_idx >= num_heads)
+    if is_pad_q:
+        if not is_q_interleaved:
+            tl.store(
+                q_out + (token_idx * q_head_padded + slot_idx) * HEAD_DIM + offset, 0
+            )
+        else:
+            tl.store(
+                q_out
+                + token_idx * q_head_padded * HEAD_DIM
+                + (lane_offs[:, None] * q_head_padded + slot_idx) * ELEMS_PER_LANE
+                + elem_offs[None, :],
+                0,
+            )
+        return
+
+    q_base = q + (token_idx * num_heads + slot_idx) * HEAD_DIM
+    kv_base = kv + token_idx * HEAD_DIM
+    mask_nope = offset < NOPE_DIM
+    offset_rope = tl.arange(0, ROPE_DIM)
+    offset_half_rope = tl.arange(0, HALF_ROPE_DIM)
+    if not is_kv:
+        # load q
+        q_blk = tl.load(q_base + offset).to(tl.float32)
+        q_blk_rope = tl.load(q_base + NOPE_DIM + offset_rope).to(tl.float32)
+        # RMSNorm with no weight
+        if apply_q_norm:
+            variance = tl.sum(q_blk * q_blk) / HEAD_DIM
+            rsqrt = tl.rsqrt(variance + eps)
+            q_blk = q_blk * rsqrt
+        # store q or q nope
+        if not is_q_interleaved:
+            tl.store(
+                q_out + (token_idx * q_head_padded + slot_idx) * HEAD_DIM + offset,
+                q_blk.to(tl.bfloat16),
+                mask=True if not apply_q_rope else mask_nope,
+            )
+        else:
+            new_lane_offs = (slot_idx * WARP_SIZE + lane_offs) // num_heads
+            new_slot_offs = (slot_idx * WARP_SIZE + lane_offs) % num_heads
+            tl.store(
+                q_out
+                + token_idx * q_head_padded * HEAD_DIM
+                + (new_lane_offs * q_head_padded + new_slot_offs)[:, None]
+                * ELEMS_PER_LANE
+                + elem_offs[None, :],
+                q_blk.reshape(WARP_SIZE, ELEMS_PER_LANE).to(tl.bfloat16),
+                mask=(
+                    True
+                    if not apply_q_rope
+                    else lane_offs[:, None] < (NOPE_DIM // ELEMS_PER_LANE)
+                ),
+            )
+
+        if not apply_q_rope:
+            return
+        if apply_q_norm:
+            qkv_blk_rope = q_blk_rope * rsqrt
+        else:
+            qkv_blk_rope = q_blk_rope
+    else:
+        # load kv rope
+        qkv_blk_rope = tl.load(kv_base + NOPE_DIM + offset_rope).to(tl.float32)
+
+    if is_kv or apply_q_rope:
+        # load cos/sin
+        position_id = tl.load(position_ids + token_idx)  # i64
+        cs_base = cos_sin_cache + position_id * ROPE_DIM
+        cos_blk = tl.load(cs_base + offset_half_rope)  # [HALF_ROPE_DIM], f32
+        sin_blk = tl.load(
+            cs_base + offset_half_rope + HALF_ROPE_DIM
+        )  # [HALF_ROPE_DIM], f32
+        # ROPE
+        qkv_blk_rope_2d = tl.reshape(qkv_blk_rope, HALF_ROPE_DIM, 2)
+        even_blk, odd_blk = tl.split(qkv_blk_rope_2d)  # [HALF_ROPE_DIM], f32
+        new_even_blk = even_blk * cos_blk - odd_blk * sin_blk
+        new_odd_blk = even_blk * sin_blk + odd_blk * cos_blk
+        qkv_blk_rope = tl.reshape(tl.join(new_even_blk, new_odd_blk), ROPE_DIM)
+        if not is_kv:
+            # store q rope
+            if not is_q_interleaved:
+                tl.store(
+                    q_out
+                    + (token_idx * q_head_padded + slot_idx) * HEAD_DIM
+                    + NOPE_DIM
+                    + offset_rope,
+                    qkv_blk_rope.to(tl.bfloat16),
+                )  # [ROPE_DIM]
+            else:
+                rope_lane_offs = NOPE_DIM // ELEMS_PER_LANE + tl.arange(
+                    0, ROPE_DIM // ELEMS_PER_LANE
+                )
+                new_lane_offs = (slot_idx * WARP_SIZE + rope_lane_offs) // num_heads
+                new_slot_offs = (slot_idx * WARP_SIZE + rope_lane_offs) % num_heads
+                tl.store(
+                    q_out
+                    + token_idx * q_head_padded * HEAD_DIM
+                    + (new_lane_offs * q_head_padded + new_slot_offs)[:, None]
+                    * ELEMS_PER_LANE
+                    + elem_offs[None, :],
+                    qkv_blk_rope.reshape(ROPE_DIM // ELEMS_PER_LANE, ELEMS_PER_LANE).to(
+                        tl.bfloat16
+                    ),
+                )
+            return
+    else:
+        # unreached branch
+        return
+    # load slot
+    slot_id = tl.load(slot_mapping + token_idx)  # i64
+    if slot_id < 0:
+        return
+    qkv_blk_rope = qkv_blk_rope.to(tl.bfloat16)
+    block_idx = slot_id // cache_block_size
+    pos_in_block = slot_id % cache_block_size
+    block_base = k_cache + block_idx * kv_block_stride
+    if kv_mxfp8:
+        _deepseek_v41_kv_quant(
+            qkv_blk_rope, kv_base, block_base, pos_in_block, cache_block_size
+        )
+    else:
+        _deepseek_v4_kv_quant(
+            qkv_blk_rope, kv_base, block_base, pos_in_block, cache_block_size
+        )
 
 
 def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
@@ -293,29 +387,60 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     slot_mapping: torch.Tensor,
     position_ids: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    q_head_padded: int,
     eps: float,
     cache_block_size: int,
+    apply_q_norm: bool = True,
+    kv_mxfp8: bool = False,
+    apply_q_rope: bool = True,
+    is_q_interleaved: bool = False,
 ):
     """
-    Horizontally-fused DeepseekV4-MLA: per-head RMSNorm + GPT-J RoPE for Q, and
-    GPT-J RoPE + UE8M0 FP8 quant + paged cache insert for KV, all in one kernel
-    launch.
-    K Cache block layout (block_size=64 tokens):
-    - First 64 * 576 = 36864 bytes: Token data
-      - Each token: 448 bytes (fp8) + 128 bytes (bf16)
-    - Next 64 * 8 = 512 bytes: Scales
-      - Each token: 8 bytes (uint8 scales, 7 real + 1 padding)
-    - Padded to multiple of 576
+    Horizontally-fused DeepseekV4-MLA:
+      - Q side:  optional per-head RMSNorm (apply_q_norm) and GPT-J RoPE on the
+                 last ROPE_DIM (apply_q_rope), plus the zero-pad to
+                 q_head_padded, in the head-major layout or (is_q_interleaved)
+                 FlashMLA's mega-attention chunk-interleaved one
+      - KV side: GPT-J RoPE on last ROPE_DIM + UE8M0 FP8 quant on NoPE + paged
+                 cache insert
+
+    Assumptions (hard-coded for DeepseekV4 attention):
+      HEAD_DIM  = 512
+      ROPE_DIM  = 64   (RoPE applied to dims [NOPE_DIM, HEAD_DIM))
+      NOPE_DIM  = 448
+      QUANT_BLOCK = 64 (UE8M0 FP8 quant block)
+      FP8_MAX   = 224.0f on ROCm FNUZ / 448.0f on OCP
+      is_neox=false (GPT-J interleaved pairs)
+      cos_sin_cache layout [max_pos, rope_dim] = cos || sin (cos first, sin
+        second along last dim; each half is rope_dim/2 = 32 values)
+
+    Cache layout per paged-cache block (block_size tokens), selected by the
+    `kv_mxfp8` argument:
+      V4 (584 B/token, kv_mxfp8=false)
+        [0,      bs*576):          token data, 448 fp8 + 128 bf16 each
+        [bs*576, bs*576 + bs*8):   UE8M0 scales, 7 real + 1 pad per token
+      V4.1 (528 B/token, kv_mxfp8=true) -- RoPE is quantized as well, so the
+      whole row is MXFP8 (fp8 e4m3 with one UE8M0 scale per 32 dims)
+        [0,      bs*512):          token data, 512 fp8 each
+        [bs*512, bs*512 + bs*16):  UE8M0 scales, 16 per token
 
     Args:
-        q: [num_tokens, num_heads, 512], bfloat16, in place
-        kv: [num_tokens, 512], bfloat16, read-only
+        q: [N, num_heads_q, 512], bf16
+        kv: [N, 512], bf16, read-only
         k_cache: [num_blocks, block_bytes], uint8
         slot_mapping: [num_tokens_insert], i64
-        position_ids: [num_tokens], i64
+        position_ids: [N], i64
         cos_sin_cache: [max_pos, 64], fp32
-        eps: used in RMSNorm
-        cache_block_size: tokens per paged-cache block
+        q_head_padded: i32
+        eps: used in RMSNorm, fp32
+        cache_block_size: tokens per paged-cache block, i32
+        apply_q_norm: optional RMSNorm for q, bool, default True
+        kv_mxfp8: True for V4.1 all-dims MXFP8 record, bool, default False
+        apply_q_rope: rotate Q too, not just KV, bool, default True
+        is_q_interleaved: is FlashMLA's mega-attention layout, bool, default False
+
+    Return:
+        q_out: [N, q_head_padded, 512] or [0], bf16
     """
     assert q.is_contiguous() and kv.is_contiguous()
     num_tokens, num_heads, head_dims = q.shape
@@ -331,17 +456,29 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     assert position_ids.dtype == torch.int64
     assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64
     assert cos_sin_cache.dtype == torch.float32
+    assert q_head_padded in (0, 8, 16, 32, 64, 128)
 
-    grid = num_tokens * (num_heads + 1)
+    if q_head_padded == 0:
+        q_out = q.new_empty([0])
+    else:
+        q_out = q.new_empty([num_tokens, q_head_padded, 512])
+
+    grid = num_tokens * (q_head_padded + 1)
     fused_qnorm_rope_kv_insert_kernel[(grid,)](
         q,
+        q_out,
         kv,
         k_cache,
         slot_mapping,
         position_ids,
         cos_sin_cache,
+        q_head_padded,
         eps,
         cache_block_size,
+        apply_q_norm,
+        kv_mxfp8,
+        apply_q_rope,
+        is_q_interleaved,
         num_tokens,
         num_heads,
         k_cache.stride(0),
@@ -349,3 +486,4 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         num_warps=1,
         num_stages=2,
     )
+    return q_out

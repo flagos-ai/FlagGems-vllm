@@ -51,6 +51,21 @@ except (ImportError, AttributeError, RuntimeError):
     pass
 
 VLLM_REF_AVAILABLE = HAS_VLLM and hasattr(torch.ops._C, OP_NAME)
+
+
+if VLLM_REF_AVAILABLE:
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        version = getattr(vllm, "__version__", "0.0.0")
+        parsed = Version(version.split("+", 1)[0])
+        VLLM_0_22_0_AVAILABLE = parsed >= Version("0.22.0")
+    except InvalidVersion:
+        VLLM_0_22_0_AVAILABLE = False
+else:
+    VLLM_0_22_0_AVAILABLE = False
+
+
 HEAD_DIM = 512
 ROPE_DIM = 64
 NOPE_DIM = HEAD_DIM - ROPE_DIM  # 448
@@ -60,6 +75,10 @@ TOKEN_DATA_BYTES = NOPE_DIM + ROPE_DIM * 2  # 576
 NUM_QUANT_BLOCKS = NOPE_DIM // QUANT_BLOCK  # 7
 SCALE_BYTES_PER_TOKEN = NUM_QUANT_BLOCKS + 1  # 8
 HEAD_BYTES = TOKEN_DATA_BYTES + SCALE_BYTES_PER_TOKEN  # 584
+V41_QUANT_BLOCK = 32
+V41_NUM_QUANT_BLOCKS = HEAD_DIM // V41_QUANT_BLOCK  # 16
+V41_SCALE_BYTES_PER_TOKEN = V41_NUM_QUANT_BLOCKS  # 16
+V41_HEAD_BYTES = HEAD_DIM + HEAD_DIM // 32  # 528
 
 
 # ─── pytorch reference implementation from vllm ───
@@ -180,14 +199,22 @@ def torch_quantize_and_insert_k_cache(
     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
     slot_mapping: torch.Tensor,  # [num_tokens_insert] int64
     block_size: int = 64,
+    kv_mxfp8: bool = False,
 ):
     """
     K Cache block layout (block_size=64 tokens):
+    kv_mxfp8 = False:
     - First 64 * 576 = 36864 bytes: Token data
       - Each token: 448 bytes (fp8) + 128 bytes (bf16)
     - Next 64 * 8 = 512 bytes: Scales
       - Each token: 8 bytes (uint8 scales, 7 real + 1 padding)
     - Padded to multiple of 576
+
+    kv_mxfp8 = True:
+    - First 64 * 512 = 32768 bytes: Token data
+      - Each token: 512 bytes (fp8)
+    - Next 64 * 16 = 1024 bytes: Scales
+      - Each token: 16 bytes (16 uint8 scales)
     """
     assert k.is_contiguous() and k.dim() == 2 and k.shape[1] == HEAD_DIM
     assert k.dtype == torch.bfloat16
@@ -210,37 +237,67 @@ def torch_quantize_and_insert_k_cache(
         token_id = token_id[mask]
     block_id = slot_id // block_size
     pos_in_block = slot_id % block_size
-    fp8_off = pos_in_block * TOKEN_DATA_BYTES
-    bf16_off = fp8_off + NOPE_DIM
-    scale_off = block_size * TOKEN_DATA_BYTES + pos_in_block * SCALE_BYTES_PER_TOKEN
-    scale_pad_off = scale_off + NUM_QUANT_BLOCKS
 
-    k_direct = (
-        k[token_id, NOPE_DIM:].view(torch.uint8).view(num, ROPE_DIM * 2).to(torch.uint8)
-    )
-    bf16_range = torch.arange(ROPE_DIM * 2, dtype=torch.int64, device=k.device)
-    k_cache[block_id[:, None], bf16_off[:, None] + bf16_range[None, :]] = k_direct
+    def quant_kv(kv_quant_blk):
+        block_max = torch.max(torch.abs(kv_quant_blk), dim=-1).values
+        block_max = torch.clamp(block_max, min=1e-4)
+        raw_scale = block_max / FP8_MAX
+        log_scale = torch.log2(raw_scale)
+        exponent = torch.ceil(log_scale)
+        scale = _exact_pow2(exponent)
+        x_scaled = kv_quant_blk / scale[:, :, None]
+        x_clamped = torch.clamp(x_scaled, min=-FP8_MAX, max=FP8_MAX)
+        x_uint8 = _to_e4m3_uint8(x_clamped)
+        encoded_scale = exponent + 127.0
+        encoded_scale = torch.clamp(encoded_scale, min=0.0, max=255.0).to(torch.uint8)
+        return x_uint8, encoded_scale
 
-    k_quant = k[token_id, :NOPE_DIM]
-    kv_quant_blk = k_quant.view(num, NUM_QUANT_BLOCKS, QUANT_BLOCK).to(torch.float32)
-    block_max = torch.max(torch.abs(kv_quant_blk), dim=-1).values
-    block_max = torch.clamp(block_max, min=1e-4)
-    raw_scale = block_max / FP8_MAX
-    log_scale = torch.log2(raw_scale)
-    exponent = torch.ceil(log_scale)
-    scale = _exact_pow2(exponent)
-    x_scaled = kv_quant_blk / scale[:, :, None]
-    x_clamped = torch.clamp(x_scaled, min=-FP8_MAX, max=FP8_MAX)
-    x_uint8 = _to_e4m3_uint8(x_clamped).view(num, NOPE_DIM)
-    fp8_range = torch.arange(NOPE_DIM, dtype=torch.int64, device=k.device)
-    k_cache[block_id[:, None], fp8_off[:, None] + fp8_range[None, :]] = x_uint8
-    encoded_scale = exponent + 127.0
-    encoded_scale = torch.clamp(encoded_scale, min=0.0, max=255.0).to(torch.uint8)
-    scale_range = torch.arange(NUM_QUANT_BLOCKS, dtype=torch.int64, device=k.device)
-    k_cache[block_id[:, None], scale_off[:, None] + scale_range[None, :]] = (
-        encoded_scale
-    )
-    k_cache[block_id, scale_pad_off] = 0
+    if not kv_mxfp8:
+        fp8_off = pos_in_block * TOKEN_DATA_BYTES
+        bf16_off = fp8_off + NOPE_DIM
+        scale_off = block_size * TOKEN_DATA_BYTES + pos_in_block * SCALE_BYTES_PER_TOKEN
+        scale_pad_off = scale_off + NUM_QUANT_BLOCKS
+
+        k_direct = (
+            k[token_id, NOPE_DIM:]
+            .view(torch.uint8)
+            .view(num, ROPE_DIM * 2)
+            .to(torch.uint8)
+        )
+        bf16_range = torch.arange(ROPE_DIM * 2, dtype=torch.int64, device=k.device)
+        k_cache[block_id[:, None], bf16_off[:, None] + bf16_range[None, :]] = k_direct
+
+        k_quant = k[token_id, :NOPE_DIM]
+        kv_quant_blk = k_quant.view(num, NUM_QUANT_BLOCKS, QUANT_BLOCK).to(
+            torch.float32
+        )
+        x_uint8, encoded_scale = quant_kv(kv_quant_blk)
+        fp8_range = torch.arange(NOPE_DIM, dtype=torch.int64, device=k.device)
+        k_cache[block_id[:, None], fp8_off[:, None] + fp8_range[None, :]] = (
+            x_uint8.view(num, NOPE_DIM)
+        )
+        scale_range = torch.arange(NUM_QUANT_BLOCKS, dtype=torch.int64, device=k.device)
+        k_cache[block_id[:, None], scale_off[:, None] + scale_range[None, :]] = (
+            encoded_scale
+        )
+        k_cache[block_id, scale_pad_off] = 0
+    else:
+        fp8_off = pos_in_block * HEAD_DIM
+        scale_off = block_size * HEAD_DIM + pos_in_block * V41_SCALE_BYTES_PER_TOKEN
+        kv_quant_blk = k.view(num, V41_NUM_QUANT_BLOCKS, V41_QUANT_BLOCK).to(
+            torch.float32
+        )
+        x_uint8, encoded_scale = quant_kv(kv_quant_blk)
+        fp8_range = torch.arange(HEAD_DIM, dtype=torch.int64, device=k.device)
+        k_cache[block_id[:, None], fp8_off[:, None] + fp8_range[None, :]] = (
+            x_uint8.view(num, HEAD_DIM)
+        )
+        scale_range = torch.arange(
+            V41_NUM_QUANT_BLOCKS, dtype=torch.int64, device=k.device
+        )
+        k_cache[block_id[:, None], scale_off[:, None] + scale_range[None, :]] = (
+            encoded_scale
+        )
 
 
 def k_cache_compare(
@@ -313,29 +370,101 @@ def _assert_close_by_token(actual, expected, rtol, atol):
         )
 
 
-def ref_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
+def ref_impl(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    q_head_padded,
+    eps,
+    bs,
+    apply_q_norm: bool = True,
+    kv_mxfp8: bool = False,
+    apply_q_rope: bool = True,
+    is_q_interleaved: bool = False,
+):
     """The oracle: always this file's torch reference, never vLLM's kernel;
     `test_matches_vllm_reference` cross-checks against vLLM separately.
     """
-    step = _tokens_per_chunk(q)
-    for start in range(0, q.shape[0], step):
-        q_chunk = q[start : start + step]
-        apply_rope_gptj_last_k(
-            q_chunk,
-            rmsnorm_no_weight_f32(q_chunk, eps),
-            positions[start : start + step],
-            cos_sin_cache,
-        )
+    if q_head_padded == 0:
+        q_out = q.new_empty([0])
+    else:
+        q_out = q.new_empty([q.shape[0], q_head_padded, 512])
+        num_heads = q.shape[1]
+        step = _tokens_per_chunk(q)
+        for start in range(0, q.shape[0], step):
+            q_chunk = q[start : start + step]
+            if apply_q_norm:
+                q_next = rmsnorm_no_weight_f32(q_chunk, eps)
+                if apply_q_rope:
+                    apply_rope_gptj_last_k(
+                        q_chunk,
+                        q_next,
+                        positions[start : start + step],
+                        cos_sin_cache,
+                    )
+                else:
+                    q_chunk = q_next.to(q.dtype)
+            else:
+                if apply_q_rope:
+                    apply_rope_gptj_last_k(
+                        q_chunk,
+                        None,
+                        positions[start : start + step],
+                        cos_sin_cache,
+                    )
+            q_out_chunk = q_out[start : start + step]
+            if is_q_interleaved:
+                real_step = q_out_chunk.shape[0]
+                q_chunk = q_chunk.reshape(real_step, num_heads * 32, 16)
+                q_out_chunk = q_out_chunk.reshape(real_step, 32, q_head_padded, 16)
+                for i in range(num_heads * 32):
+                    q_out_chunk[:, i // num_heads, i % num_heads, :] = q_chunk[:, i, :]
+                q_out_chunk[:, :, num_heads:, :] = 0
+            else:
+                q_out_chunk[:, :num_heads, :] = q_chunk
+                q_out_chunk[:, num_heads:, :] = 0
     if kv.size(0) > slot_mapping.size(0):
         kv = kv[: slot_mapping.size(0), :]
         positions = positions[: slot_mapping.size(0)]
     apply_rope_gptj_last_k(kv, None, positions, cos_sin_cache)
-    torch_quantize_and_insert_k_cache(kv, k_cache, slot_mapping, block_size=bs)
+    torch_quantize_and_insert_k_cache(
+        kv, k_cache, slot_mapping, block_size=bs, kv_mxfp8=kv_mxfp8
+    )
+    return q_out
 
 
-def fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
-    flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-        q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
+def fused_impl(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    q_head_padded,
+    eps,
+    bs,
+    apply_q_norm: bool = True,
+    kv_mxfp8: bool = False,
+    apply_q_rope: bool = True,
+    is_q_interleaved: bool = False,
+):
+    return flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        bs,
+        apply_q_norm,
+        kv_mxfp8,
+        apply_q_rope,
+        is_q_interleaved,
     )
 
 
@@ -370,6 +499,7 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     max_pos = max(4096, num_tokens)
     num_blocks = 2
     bs = 16
+    q_head_padded = 64
 
     q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
     kv = torch.zeros(num_tokens, HEAD_DIM, dtype=dtype, device=device)
@@ -386,20 +516,31 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     positions_ref = positions.clone()
     cos_sin_cache_ref = cos_sin_cache.clone()
 
-    ref_impl(
+    q_out_ref = ref_impl(
         q_ref,
         kv_ref,
         k_cache_ref,
         slot_mapping_ref,
         positions_ref,
         cos_sin_cache_ref,
+        q_head_padded,
         eps,
         bs,
     )
 
-    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs)
+    q_out_res = fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        bs,
+    )
 
-    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q_out_res, q_out_ref, rtol=1e-2, atol=1e-2)
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
@@ -430,6 +571,7 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     eps = 1e-6
     max_pos = max(4096, num_tokens)
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    q_head_padded = 64
 
     q = torch.zeros(num_tokens, 1, HEAD_DIM, dtype=dtype, device=device)
     kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
@@ -453,11 +595,22 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
         slot_mapping_ref,
         positions_ref,
         cos_sin_cache_ref,
+        q_head_padded,
         eps,
         block_size,
     )
 
-    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+    fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        block_size,
+    )
 
     k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
 
@@ -483,6 +636,7 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     max_pos = max(4096, num_tokens)
     total = num_tokens + pad
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    q_head_padded = 64
 
     q = torch.zeros(total, 1, HEAD_DIM, dtype=dtype, device=device)
     kv = torch.randn(total, HEAD_DIM, dtype=dtype, device=device)
@@ -506,11 +660,22 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
         slot_mapping_ref,
         positions_ref,
         cos_sin_cache_ref,
+        q_head_padded,
         eps,
         block_size,
     )
 
-    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+    fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        block_size,
+    )
 
     torch.testing.assert_close(k_cache, k_cache_ref, rtol=0, atol=0)
 
@@ -541,6 +706,7 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     eps = 1e-6
     max_pos = max(4096, num_tokens)
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    q_head_padded = 128
 
     q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
     kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
@@ -557,19 +723,30 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     cos_sin_cache_ref = cos_sin_cache.clone()
     slot_mapping_ref = slot_mapping.clone()
 
-    ref_impl(
+    q_out_ref = ref_impl(
         q_ref,
         kv_ref,
         k_cache_ref,
         slot_mapping_ref,
         positions_ref,
         cos_sin_cache_ref,
+        q_head_padded,
         eps,
         block_size,
     )
-    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+    q_out_res = fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        block_size,
+    )
 
-    _assert_close_by_token(q, q_ref, rtol=1e-2, atol=1e-2)
+    _assert_close_by_token(q_out_res, q_out_ref, rtol=1e-2, atol=1e-2)
     k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
 
 
@@ -598,6 +775,7 @@ def test_backend_override_matches_reference(
     eps = 1e-6
     max_pos = max(4096, num_tokens)
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    q_head_padded = 128
 
     q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
     kv = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
@@ -610,20 +788,31 @@ def test_backend_override_matches_reference(
 
     q_ref, kv_ref = q.clone(), kv.clone()
     k_cache_ref = k_cache.clone()
-    ref_impl(
+    q_out_ref = ref_impl(
         q_ref,
         kv_ref,
         k_cache_ref,
         slot_mapping.clone(),
         positions.clone(),
         cos_sin_cache.clone(),
+        q_head_padded,
         eps,
         block_size,
     )
-    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+    q_out_res = fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        block_size,
+    )
 
     k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q_out_res, q_out_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
@@ -644,6 +833,7 @@ def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
     eps = 1e-6
     max_pos = max(4096, num_tokens)
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    q_head_padded = n_heads
 
     q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
     kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
@@ -659,23 +849,109 @@ def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
     k_cache_ref = k_cache.clone()
 
     try:
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q_ref,
-            kv_ref,
-            k_cache_ref,
-            slot_mapping.clone(),
-            positions.clone(),
-            cos_sin_cache.clone(),
-            eps,
-            block_size,
-        )
+        if VLLM_0_22_0_AVAILABLE:
+            q_out_ref = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q_ref,
+                kv_ref,
+                k_cache_ref,
+                slot_mapping.clone(),
+                positions.clone(),
+                cos_sin_cache.clone(),
+                q_head_padded,
+                eps,
+                block_size,
+            )
+        else:
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q_ref,
+                kv_ref,
+                k_cache_ref,
+                slot_mapping.clone(),
+                positions.clone(),
+                cos_sin_cache.clone(),
+                eps,
+                block_size,
+            )
+            q_out_ref = q_ref
+
         torch.zeros(1, device=device).sum()  # a launch is what surfaces the error
         flaggems_vllm.runtime.torch_device_fn.synchronize()
     except Exception as e:  # registered but unlaunchable -- e.g. MetaX C550
         reason = str(e).splitlines()[0] if str(e) else type(e).__name__
         pytest.skip("vLLM kernel is registered but fails to run: " + reason)
 
-    fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
+    q_out_res = fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        block_size,
+    )
 
-    _assert_close_by_token(q, q_ref, rtol=1e-2, atol=1e-2)
+    _assert_close_by_token(q_out_res, q_out_ref, rtol=1e-2, atol=1e-2)
     k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
+@pytest.mark.parametrize("n_heads", [16, 64])
+@pytest.mark.parametrize("apply_q_norm", [False, True])
+@pytest.mark.parametrize("apply_q_rope", [False, True])
+def test_kv_mxfp8_and_q_interleaved(
+    n_heads: int, apply_q_norm: bool, apply_q_rope: bool
+):
+    torch.manual_seed(5)
+    device = flaggems_vllm.device
+    dtype = torch.bfloat16
+    block_size, num_tokens, q_head_padded = 64, 5, 64
+    eps = 1e-6
+    max_pos = max(4096, num_tokens)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    k_cache = torch.zeros(
+        num_blocks, block_size * V41_HEAD_BYTES, dtype=torch.uint8, device=device
+    )
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    k_cache_ref = k_cache.clone()
+    q_out_ref = ref_impl(
+        q.clone(),
+        kv.clone(),
+        k_cache_ref,
+        slot_mapping.clone(),
+        positions.clone(),
+        cos_sin_cache.clone(),
+        q_head_padded,
+        eps,
+        block_size,
+        apply_q_norm,
+        True,  # kv_mxfp8
+        apply_q_rope,
+        True,  # is_q_interleaved
+    )
+    q_out_res = fused_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        block_size,
+        apply_q_norm,
+        True,  # kv_mxfp8
+        apply_q_rope,
+        True,  # is_q_interleaved
+    )
+
+    _assert_close_by_token(q_out_res, q_out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_cache, k_cache_ref)
