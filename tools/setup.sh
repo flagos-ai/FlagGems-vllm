@@ -276,8 +276,8 @@ uv pip install -q \
 ok
 
 # ── Install vLLM and matching PyTorch backend ────────────────
-printf "Installing vLLM==${VLLM_VERSION} with torch backend=${TORCH_BACKEND} ..."
-uv pip install -q \
+printf "Installing vLLM==${VLLM_VERSION} with torch backend=${TORCH_BACKEND} ...\n"
+uv pip install \
   "vllm==${VLLM_VERSION}" \
   --torch-backend="${TORCH_BACKEND}" \
   --constraint "${CONSTRAINTS_FILE}" \
@@ -287,8 +287,14 @@ uv pip install -q \
 ok
 
 # ── Verify torch/vLLM before Triton replacement ──────────────
+dump_installed_and_fail() {
+  echo "---- uv pip list (debug dump on failure) ----"
+  uv pip list
+  fail
+}
+
 printf "Checking torch/vLLM ..."
-python - <<'PY' || fail
+python - <<'PY' || dump_installed_and_fail
 import torch
 import vllm
 
