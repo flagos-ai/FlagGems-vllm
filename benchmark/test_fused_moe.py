@@ -84,6 +84,9 @@ class FusedMoEBenchmark(base.Benchmark):
             (64, 256, 2048, 128, 8),
             (512, 256, 2048, 128, 8),
             (1035, 256, 2048, 128, 8),
+            # Qwen3.6-35B-A3B TP=2: retained decode/prefill configuration points.
+            (64, 256, 2048, 256, 8),
+            (8192, 256, 2048, 256, 8),
         ]
 
     def get_input_iter(self, cur_dtype):
