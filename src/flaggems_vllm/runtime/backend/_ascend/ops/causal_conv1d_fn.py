@@ -651,8 +651,19 @@ def causal_conv1d_fn(
         BLOCK_N = 128
     elif dim <= 256:
         BLOCK_N = 256
-    else:
+    elif dim <= 512:
         BLOCK_N = 512
+    else:
+        # Wide channel counts (KDA packs q/k/v, so dim = 3*H*128 reaches 9216)
+        # want the widest row the UB can hold: the op is MTE2 bound and a
+        # BLOCK_N-wide row is one contiguous burst, so doubling BLOCK_N halves
+        # the number of transfers for the same bytes. Measured on Ascend950DT
+        # (T=8192 dim=9216 / T=32768 dim=9216):
+        #   BLOCK_N=256   583 us / 2236 us
+        #   BLOCK_N=512   469 us / 1794 us
+        #   BLOCK_N=1024  404 us / 1560 us
+        #   BLOCK_N=2048  ub overflow (3637760 bits vs 2031616 available)
+        BLOCK_N = 1024
     # Tokens staged per output tile. The kernel holds a [BLOCK_T+W-1, BLOCK_N]
     # input tile plus a [BLOCK_T, BLOCK_N] fp32 accumulator, so cap the tile
     # area to keep both inside UB; BLOCK_T must also divide BLOCK_M evenly.

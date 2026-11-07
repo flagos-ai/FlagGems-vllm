@@ -84,6 +84,36 @@ __all__ = ["chunk_kda"]
 RCP_LN2 = 1.4426950216
 MAX_GRID_BLOCKS = 32768
 
+# Internal chunk width for the Ascend kernels. The caller-visible chunk_size
+# stays 16 (the cross-backend contract); only the tile the Ascend kernels walk
+# is widened, which is safe because both the intra and state kernels recompute
+# everything they need per tile from q/k/g rather than from a BT=16 layout.
+#
+# BT trades the serial chunk recurrence against the factored-decay range:
+# the gate span grows ~linearly in BT, and Aqk/Akk operands are cast to bf16
+# (8 mantissa bits) for tl.dot. Measured on Ascend950DT (T=8192 H=24 seq=2 /
+# T=32768 H=24 seq=2):
+#   BT=16  3741 us / 16168 us   bit-exact vs AscendC
+#   BT=32  2627 us / 10659 us   bit-exact vs AscendC (identical max_abs)
+#   BT=64  2030 us /  8091 us   NaN -- gate range overflows even with
+#                               midpoint rebasing (3.5M+ non-finite outputs)
+# So 32 is the largest width that holds precision. See tools/_kda_bt_accuracy.py.
+_ASCEND_BT = 32
+_ASCEND_BT_ENV = "FLAGGEMS_ASCEND_KDA_BT"
+
+
+def _ascend_chunk_width() -> int:
+    """Chunk width the Ascend KDA kernels tile with (override for tuning)."""
+    raw = os.environ.get(_ASCEND_BT_ENV)
+    if not raw:
+        return _ASCEND_BT
+    try:
+        val = int(raw)
+    except ValueError:
+        return _ASCEND_BT
+    return val if val in (16, 32, 64) else _ASCEND_BT
+
+
 _BACKEND_ENV = "FLAGGEMS_CHUNK_KDA_BACKEND"
 _BACKEND_ALIASES = {
     "auto": "auto",
@@ -209,16 +239,12 @@ if HAS_TLE_KDA:
                     # FlashKDA-compatible safe gate; lower_bound is required by the verifier.
                     b_g = (lower_bound * g_scale) * tl.sigmoid(b_A * b_g)
 
-                    acc = tl.zeros((K,), dtype=tl.float32)
-                    b_gc = b_g
-                    for r in tl.static_range(BT):
-                        row = tl.reshape(
-                            extract_slice(b_gc, (r, 0), (1, K), (1, 1)), (K,)
-                        )
-                        acc += row
-                        b_gc = insert_slice(
-                            b_gc, tl.reshape(acc, (1, K)), (r, 0), (1, K), (1, 1)
-                        )
+                    # Chunk-local gate prefix sum along the token axis.
+                    # tl.cumsum lowers to a vectorized scan on triton-ascend
+                    # (verified bit-exact against torch.cumsum at BT=16/32/64),
+                    # replacing a BT-iteration extract_slice/insert_slice chain
+                    # that serialized BT read-modify-writes of the [BT, K] tile.
+                    b_gc = tl.cumsum(b_g, axis=0)
 
                     if IS_VARLEN:
                         tl.store(
@@ -419,6 +445,10 @@ if HAS_TLE_KDA:
         # (V/BV, N*HV). Taking BV = V runs that chain once per (sequence, head)
         # instead of 2x at BV=64. Measured on the T=24576 H=12 D=128 Ascend950DT
         # prefill: 5.66 ms (BV=32), 4.38 ms (BV=64), 3.90 ms (BV=128).
+        # Re-measured on the (T,H,seq) prefill sweep, where N*HV is 48 for
+        # every case: BV=128 still wins (state kernel 1794 us vs 3038 us at
+        # BV=64 and 5957 us at BV=32 for T=8192 H=24). The serial dot chain
+        # dominates, not occupancy.
         if K <= 128:
             return min(V, 128)
         return 32
@@ -672,8 +702,20 @@ if HAS_TLE_KDA:
         if scale is None:
             scale = q.shape[-1] ** -0.5
 
-        if chunk_indices is None and cu_seqlens is not None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+        # Tile at the Ascend-internal width regardless of the caller's
+        # chunk_size: the chunked recurrence is mathematically independent of
+        # BT (only fp accumulation order changes), so a wider tile shortens the
+        # serial scan without altering the contract. Any chunk_indices built
+        # for the caller's width no longer describes our tiling, so rebuild it.
+        bt = _ascend_chunk_width()
+        if bt != chunk_size:
+            chunk_indices = (
+                prepare_chunk_indices(cu_seqlens, bt)
+                if cu_seqlens is not None
+                else None
+            )
+        elif chunk_indices is None and cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, bt)
 
         ws, Aqk, Akk, g_cumsum = _ascend_kda_fwd_intra(
             q=q,
@@ -683,7 +725,7 @@ if HAS_TLE_KDA:
             scale=scale,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
-            chunk_size=chunk_size,
+            chunk_size=bt,
             lower_bound=lower_bound,
             A_log=A_log,
             dt_bias=dt_bias,
@@ -703,7 +745,7 @@ if HAS_TLE_KDA:
             output_final_state=output_final_state,
             state_v_first=state_v_first,
             cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
+            chunk_size=bt,
         )
 
 
