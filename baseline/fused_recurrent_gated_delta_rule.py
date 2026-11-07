@@ -6,7 +6,7 @@ import math
 
 import torch
 
-OP_NAME = "fused_recurrent_gated_delta_rule_fwd"
+OP_NAME = "fused_recurrent_gated_delta_rule"
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 IS_INPLACE = True
 MUTATED_INPUTS = ("initial_state",)
