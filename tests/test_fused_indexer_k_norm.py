@@ -73,6 +73,13 @@ def _eps32(eps):
     return torch.tensor(eps, dtype=torch.float32).item()
 
 
+def _h20z_d128_fast_path_runtime_available(module):
+    return (
+        module._is_h20z()
+        and module.triton.__version__ == module._H20Z_D128_TRITON_VERSION
+    )
+
+
 def cpu_fp64_oracle(x, weight, bias, eps):
     """Formula oracle; it deliberately does not call layer_norm or candidate code."""
     eps32 = _eps32(eps)
@@ -358,6 +365,104 @@ def test_nvidia_prune_norm_configs():
     assert tuple(config.kwargs["BLOCK_M"] for config in wide) == (1, 1)
 
 
+@pytest.mark.parametrize(
+    "rows,expected",
+    (
+        (1, (1, 4)),
+        (2, (4, 4)),
+        (3, (4, 4)),
+        (4, (4, 4)),
+        (7, (4, 4)),
+        (8, (4, 4)),
+        (9, (4, 4)),
+        (17, (4, 4)),
+        (4095, (4, 4)),
+        (4096, (8, 4)),
+        (4097, (8, 4)),
+        (8192, (8, 4)),
+    ),
+)
+def test_h20z_d128_config_thresholds(rows, expected):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    assert module._h20z_d128_config(rows) == expected
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    (
+        ((1, 128, 128, 1, 1, 1), True),
+        ((17, 128, 144, 1, 1, 1), True),
+        ((8192, 128, 192, 1, 1, 1), True),
+        ((0, 128, 192, 1, 1, 1), False),
+        ((8193, 128, 192, 1, 1, 1), False),
+        ((17, 129, 129, 1, 1, 1), False),
+        ((17, 128, 160, 1, 1, 1), False),
+        ((17, 128, 256, 2, 1, 1), False),
+        ((17, 128, 128, 1, 2, 1), False),
+        ((17, 128, 128, 1, 1, 2), False),
+    ),
+)
+def test_h20z_d128_fast_path_layout_gate(monkeypatch, metadata, expected):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    monkeypatch.setattr(module, "_is_h20z", lambda device_index=None: True)
+    monkeypatch.setattr(module.triton, "__version__", "3.6.0")
+    assert module._use_h20z_d128_fast_path(*metadata) is expected
+
+
+def test_h20z_d128_fast_path_device_gate(monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    monkeypatch.setattr(module, "_is_h20z", lambda device_index=None: False)
+    assert not module._use_h20z_d128_fast_path(17, 128, 192, 1, 1, 1)
+
+
+def test_h20z_d128_fast_path_compiler_gate(monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    monkeypatch.setattr(module, "_is_h20z", lambda device_index=None: True)
+    monkeypatch.setattr(module.triton, "__version__", "3.5.0")
+    assert not module._use_h20z_d128_fast_path(17, 128, 192, 1, 1, 1)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+def test_h20z_d128_launcher_dispatches_fast_path_and_fallback(monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    calls = []
+
+    class Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((self.name, grid, args, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(module, "_is_h20z", lambda device_index=None: True)
+    monkeypatch.setattr(module.triton, "__version__", "3.6.0")
+    monkeypatch.setattr(module, "_fused_indexer_k_norm_kernel", Recorder("fast"))
+    monkeypatch.setattr(module, "_norm_kernel", Recorder("fallback"))
+
+    parent = torch.empty((2, 192), dtype=torch.float32, device=DEVICE)
+    x = parent[:, :128]
+    weight = torch.empty((128,), dtype=torch.float32, device=DEVICE)
+    bias = torch.empty_like(weight)
+    out = torch.empty_like(x)
+    module._launch_fused_indexer_k_norm(x, weight, bias, out, _eps32(1e-6))
+    assert [call[0] for call in calls] == ["fast"]
+    assert calls[0][3]["BLOCK_M"] == 4
+
+    calls.clear()
+    weight_parent = torch.empty((256,), dtype=torch.float32, device=DEVICE)
+    strided_weight = weight_parent[::2]
+    module._launch_fused_indexer_k_norm(
+        x, strided_weight, bias, out, _eps32(1e-6)
+    )
+    assert [call[0] for call in calls] == ["fallback"]
+
+
 @pytest.mark.fused_indexer_k_norm
 @DEVICE_REQUIRED
 @torch.inference_mode()
@@ -478,6 +583,17 @@ def _layout_case(kind, dtype):
     return x, weight, bias, parents
 
 
+def _h20z_fast_path_offset_case(rows, dtype):
+    torch.manual_seed(rows + 2718)
+    x_parent = torch.randn((rows + 1, 192), dtype=dtype, device=DEVICE)
+    weight_parent = torch.randn((130,), dtype=torch.float32, device=DEVICE)
+    bias_parent = torch.randn((132,), dtype=torch.float32, device=DEVICE)
+    x = x_parent[1 : 1 + rows, 3:131]
+    weight = weight_parent[1:129]
+    bias = bias_parent[3:131]
+    return x, weight, bias, (x_parent, weight_parent, bias_parent)
+
+
 @pytest.mark.fused_indexer_k_norm
 @DEVICE_REQUIRED
 @torch.inference_mode()
@@ -511,6 +627,174 @@ def test_strides_offsets_and_no_alias(kind, dtype):
     out.fill_(0)
     for actual, before in zip((x, weight, bias), before_inputs):
         torch.testing.assert_close(actual, before, rtol=0, atol=0)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", (1, 17, 4096))
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_h20z_d128_real_layout_configs(rows, dtype):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    if not _h20z_d128_fast_path_runtime_available(module):
+        pytest.skip("H20Z/Triton-specific production fast path")
+    torch.manual_seed(rows + 864)
+    parent = torch.randn((rows, 192), dtype=dtype, device=DEVICE)
+    x = parent[:, :128]
+    weight = torch.randn((128,), dtype=torch.float32, device=DEVICE)
+    bias = torch.randn((128,), dtype=torch.float32, device=DEVICE)
+
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+
+    assert x.stride() == (192, 1)
+    assert module._use_h20z_d128_fast_path(
+        rows, 128, 192, 1, 1, 1, x.device.index
+    )
+    _assert_close(out, cpu_fp64_oracle(x, weight, bias, 1e-6), dtype)
+    _assert_fresh_contiguous(out, x, weight, bias)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_h20z_d128_non_aligned_offsets_use_fast_path(dtype):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    if not _h20z_d128_fast_path_runtime_available(module):
+        pytest.skip("H20Z/Triton-specific production fast path")
+    x, weight, bias, parents = _h20z_fast_path_offset_case(17, dtype)
+    before = tuple(t.clone() for t in (x, weight, bias, *parents))
+
+    assert x.stride() == (192, 1)
+    assert weight.stride() == (1,)
+    assert bias.stride() == (1,)
+    assert x.data_ptr() % 16 != 0
+    assert weight.data_ptr() % 16 != 0
+    assert bias.data_ptr() % 16 != 0
+    assert module._use_h20z_d128_fast_path(
+        17, 128, 192, 1, 1, 1, x.device.index
+    )
+
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+
+    _assert_close(out, cpu_fp64_oracle(x, weight, bias, 1e-6), dtype)
+    _assert_fresh_contiguous(out, x, weight, bias)
+    for actual, expected in zip((x, weight, bias, *parents), before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", (1, 2, 3, 4, 7, 8, 9, 17, 4095, 4096, 4097, 8192))
+def test_h20z_d128_tiny_eps_thresholds(rows):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    if not _h20z_d128_fast_path_runtime_available(module):
+        pytest.skip("H20Z/Triton-specific production fast path")
+    parent = torch.full((rows, 192), 2.0, dtype=torch.float32, device=DEVICE)
+    x = parent[:, :128]
+    weight, bias = _c1_affine(128)
+    eps = 2.0**-149
+
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, eps)
+
+    _assert_close(out, bias.expand_as(out), x.dtype)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", (1, 17, 4096))
+def test_h20z_d128_extreme_and_tiny_variance_configs(rows):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    if not _h20z_d128_fast_path_runtime_available(module):
+        pytest.skip("H20Z/Triton-specific production fast path")
+    weight, bias = _c1_affine(128)
+    parent = torch.empty((rows, 192), dtype=torch.float32, device=DEVICE)
+
+    for c1_row in _c1_original_extreme_rows():
+        parent[:, :128] = c1_row
+        extreme = parent[:, :128]
+        extreme_out = flaggems_vllm.fused_indexer_k_norm(
+            extreme, weight, bias, 128, 1e-6
+        )
+        _assert_close(extreme_out, bias.expand_as(extreme_out), extreme.dtype)
+
+    signs = torch.where(
+        torch.arange(128, device=DEVICE) % 2 == 0,
+        torch.ones(128, device=DEVICE),
+        -torch.ones(128, device=DEVICE),
+    )
+    parent[:, :128] = signs * 2.0**-70
+    tiny = parent[:, :128]
+    for eps in FP32_EDGE_EPS_VALUES + (2.0**-125,):
+        tiny_out = flaggems_vllm.fused_indexer_k_norm(tiny, weight, bias, 128, eps)
+        _assert_close(tiny_out, cpu_fp64_oracle(tiny, weight, bias, eps), tiny.dtype)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+def test_h20z_d128_non_default_stream(monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    if not _h20z_d128_fast_path_runtime_available(module):
+        pytest.skip("H20Z/Triton-specific production fast path")
+    x, weight, bias, _ = _h20z_fast_path_offset_case(17, torch.float32)
+    gate_calls = []
+    original_gate = module._use_h20z_d128_fast_path
+
+    def record_gate(*args, **kwargs):
+        result = original_gate(*args, **kwargs)
+        gate_calls.append((args, kwargs, result))
+        return result
+
+    assert original_gate(17, 128, 192, 1, 1, 1, x.device.index)
+    monkeypatch.setattr(module, "_use_h20z_d128_fast_path", record_gate)
+    stream = flaggems_vllm.runtime.torch_device_fn.Stream()
+    stream.wait_stream(flaggems_vllm.runtime.torch_device_fn.current_stream())
+    with flaggems_vllm.runtime.torch_device_fn.stream(stream):
+        out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+    stream.synchronize()
+
+    assert len(gate_calls) == 1
+    assert gate_calls[0][2] is True
+    _assert_close(out, cpu_fp64_oracle(x, weight, bias, 1e-6), x.dtype)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@NVIDIA_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", (1, 4096))
+def test_h20z_d128_nan_inf_source_parity_for_bm1_and_bm8(rows):
+    module = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    if not _h20z_d128_fast_path_runtime_available(module):
+        pytest.skip("H20Z/Triton-specific production fast path")
+    x, weight, bias, _ = _h20z_fast_path_offset_case(rows, torch.float32)
+    assert module._use_h20z_d128_fast_path(
+        rows, 128, 192, 1, 1, 1, x.device.index
+    )
+
+    x[0, 3] = float("nan")
+    x[min(rows - 1, 1), 7] = float("inf")
+    x[min(rows - 1, 2), 9] = float("-inf")
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+    _assert_source_parity(out, source_shadow_reference(x, weight, bias, 1e-6), x.dtype)
+
+    finite_x, weight, bias, _ = _h20z_fast_path_offset_case(rows, torch.float32)
+    weight[11] = float("nan")
+    bias[29] = float("inf")
+    out = flaggems_vllm.fused_indexer_k_norm(
+        finite_x, weight, bias, 128, 1e-6
+    )
+    _assert_source_parity(
+        out, source_shadow_reference(finite_x, weight, bias, 1e-6), finite_x.dtype
+    )
 
 
 @pytest.mark.fused_indexer_k_norm

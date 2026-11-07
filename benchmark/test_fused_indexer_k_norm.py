@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone, non-Graph public-operator benchmark.
+"""No-Graph device-event public-operator benchmark with independent oracle.
 
 Run with PYTHONPATH=src python benchmark/test_fused_indexer_k_norm.py, or pytest
 -q -s benchmark/test_fused_indexer_k_norm.py. INDEXER_BENCH_OUTPUT selects the
-JSON destination (default: fused_indexer_k_norm_benchmark.json). Framework timer,
---iter, --warmup and --mode options do not change this dedicated protocol.
+JSON destination (default: fused_indexer_k_norm_benchmark.json). The fixed
+5-warmup/25-sample protocol follows fused_recurrent_gated_delta_rule and does
+not use the generic framework timer or CUDA Graphs.
 """
 
 import ast
@@ -26,12 +27,12 @@ import importlib
 import importlib.metadata
 import inspect
 import json
+import math
 import os
 import platform
 import statistics
 import subprocess
 import textwrap
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,9 +45,8 @@ from flaggems_vllm.runtime import torch_device_fn
 
 SEED = 20261106
 EPS = 1e-6
-WARMUP = 10
-REPEAT = 50
-BATCHES = 3
+WARMUP = 5
+SAMPLES = 25
 SOURCE_COMMIT = "2eae5ee9be3c6d01b008eb57d421545666ff8072"
 NATIVE_MODULE = "vllm.models.glm5next.common.attention"
 TOLERANCES = {
@@ -234,20 +234,38 @@ def _unchanged(device_inputs, cpu_inputs):
         torch.testing.assert_close(actual.detach().cpu(), expected, rtol=0, atol=0)
 
 
-def _batch_us(fn, args):
+def _measure(fn, args):
     for _ in range(WARMUP):
         fn(*args)
     torch_device_fn.synchronize()
-    begin = time.perf_counter_ns()
-    for _ in range(REPEAT):
-        fn(*args)
+    samples = []
+    for _ in range(SAMPLES):
+        torch_device_fn.synchronize()
+        start = torch_device_fn.Event(enable_timing=True)
+        end = torch_device_fn.Event(enable_timing=True)
+        start.record()
+        output = fn(*args)
+        end.record()
+        torch_device_fn.synchronize()
+        elapsed_us = start.elapsed_time(end) * 1000.0
+        if not math.isfinite(elapsed_us) or elapsed_us <= 0:
+            raise RuntimeError(f"invalid device-event sample: {elapsed_us} us")
+        samples.append(elapsed_us)
+        del output
+    if len(samples) != SAMPLES:
+        raise AssertionError(f"expected {SAMPLES} samples, got {len(samples)}")
+    return samples
+
+
+def _recover_candidate(candidate, args, expected, device_inputs, cpu_inputs):
     torch_device_fn.synchronize()
-    return (time.perf_counter_ns() - begin) / (1000 * REPEAT)
+    _check(candidate, args, expected)
+    _unchanged(device_inputs, cpu_inputs)
 
 
 def _summary(samples):
     return {
-        "batch_us": samples,
+        "samples_us": samples,
         "median_us": statistics.median(samples),
         "min_us": min(samples),
         "max_us": max(samples),
@@ -276,27 +294,31 @@ def run_benchmark():
         native = None
         native_info.update(status="N/A", reason=compiler_graphs)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "RUNNING",
         "identity": _identity(candidate),
         "native_identity": native_info,
         "protocol": {
             "unit": "us",
-            "timer": "synchronized_wall_clock_batch_mean",
-            "scope": "public_operator_including_allocation_and_python_dispatch",
+            "timer": "runtime.torch_device_fn.Event",
+            "event_native_unit": "ms",
+            "event_conversion": "elapsed_time_ms * 1000 -> us",
+            "scope": "one public-operator call bracketed by device events; fresh output allocation remains inside the call",
             "graph": False,
             "compiler_graphs": compiler_graphs,
-            "warmup_per_batch": WARMUP,
-            "calls_per_batch": REPEAT,
-            "batches": BATCHES,
-            "aggregation": "median/min/max of three batch means",
+            "warmup_per_method": WARMUP,
+            "samples_per_method": SAMPLES,
+            "calls_per_sample": 1,
+            "aggregation": "median/min/max of 25 independent event samples",
             "seed": SEED,
             "eps": EPS,
             "expected_core_rows": 30,
             "expected_tail_rows": 2,
-            "sync": "runtime.torch_device_fn.synchronize before/after timed batch",
-            "order": "rotate qualified methods by batch to reduce order bias",
-            "baseline_qualification": "source identity plus CPU FP64 before/after",
+            "sync": "synchronize before every start event and after every end event",
+            "output_lifetime": "retain each fresh output until the end event has completed",
+            "order": "reverse qualified method order on alternating rows",
+            "baseline_qualification": "source identity plus independent CPU FP64 oracle immediately before and after timing",
+            "historical_scope_note": "optimization-round-1 synchronized wall-clock batch means are retained separately and are not pooled with these event samples",
             "normalization_factor": None,
         },
         "rows": [],
@@ -317,13 +339,6 @@ def run_benchmark():
                 "methods": {},
             }
             report["rows"].append(row)
-            # Candidate exceptions are fatal and are never baseline N/A.
-            row["methods"]["candidate"] = {
-                "status": "qualified",
-                "accuracy": "PASS",
-                "precheck": _check(candidate, args, expected),
-            }
-            _unchanged(device_inputs, cpu_inputs)
             methods = {"candidate": candidate, "decomposed": _decomposed}
             if native is not None:
                 methods["native"] = native
@@ -332,72 +347,54 @@ def run_benchmark():
                     "status": "N/A",
                     "reason": native_info["reason"],
                 }
-            for name in list(methods):
-                if name == "candidate":
-                    continue
+            order = list(methods)
+            if index % 2:
+                order.reverse()
+            row["measurement_order"] = order
+            for name in order:
+                fn = methods[name]
                 try:
-                    metrics = _check(methods[name], args, expected)
+                    precheck = _check(fn, args, expected)
                     _unchanged(device_inputs, cpu_inputs)
-                    row["methods"][name] = {
-                        "status": "qualified",
-                        "accuracy": "PASS",
-                        "precheck": metrics,
-                    }
                 except Exception as exc:
+                    if name == "candidate":
+                        raise
                     row["methods"][name] = {
                         "status": "N/A",
                         "accuracy": "FAIL",
                         "performance": "N/A",
-                        "reason": f"{type(exc).__name__}: {exc}",
+                        "precheck_error": f"{type(exc).__name__}: {exc}",
                     }
-                    del methods[name]
-                    torch_device_fn.synchronize()
-                    _check(candidate, args, expected)
+                    _recover_candidate(
+                        candidate, args, expected, device_inputs, cpu_inputs
+                    )
+                    continue
+                try:
+                    samples = _measure(fn, args)
+                    postcheck = _check(fn, args, expected)
                     _unchanged(device_inputs, cpu_inputs)
-            samples = {name: [] for name in methods}
-            names = list(methods)
-            for batch in range(BATCHES):
-                order = names[batch % len(names) :] + names[: batch % len(names)]
-                for name in order:
-                    if name not in methods:
-                        continue
+                except Exception as exc:
                     if name == "candidate":
-                        samples[name].append(_batch_us(methods[name], args))
-                    else:
-                        try:
-                            samples[name].append(_batch_us(methods[name], args))
-                        except Exception as exc:
-                            row["methods"][name].update(
-                                status="N/A",
-                                performance="N/A",
-                                reason=f"{type(exc).__name__}: {exc}",
-                            )
-                            del methods[name]
-                            torch_device_fn.synchronize()
-                            _check(candidate, args, expected)
-                            _unchanged(device_inputs, cpu_inputs)
-            for name, fn in methods.items():
-                if name == "candidate":
-                    metrics = _check(fn, args, expected)
-                else:
-                    try:
-                        metrics = _check(fn, args, expected)
-                    except Exception as exc:
-                        row["methods"][name].update(
-                            status="N/A",
-                            accuracy="FAIL",
-                            performance="N/A",
-                            reason=f"{type(exc).__name__}: {exc}",
-                        )
-                        torch_device_fn.synchronize()
-                        _check(candidate, args, expected)
-                        continue
-                row["methods"][name].update(
+                        raise
+                    accuracy = "FAIL" if isinstance(exc, AssertionError) else "PASS"
+                    row["methods"][name] = {
+                        "status": "N/A",
+                        "accuracy": accuracy,
+                        "performance": "N/A",
+                        "precheck": precheck,
+                        "timing_or_postcheck_error": f"{type(exc).__name__}: {exc}",
+                    }
+                    _recover_candidate(
+                        candidate, args, expected, device_inputs, cpu_inputs
+                    )
+                    continue
+                row["methods"][name] = dict(
                     status="PASS",
                     accuracy="PASS",
                     performance="PASS",
-                    postcheck=metrics,
-                    **_summary(samples[name]),
+                    precheck=precheck,
+                    postcheck=postcheck,
+                    **_summary(samples),
                 )
             _unchanged(device_inputs, cpu_inputs)
             candidate_us = row["methods"]["candidate"]["median_us"]

@@ -5,6 +5,7 @@
 import math
 import numbers
 import struct
+from functools import lru_cache
 
 import torch
 import triton
@@ -15,7 +16,13 @@ from flaggems_vllm.utils import libentry, libtuner
 
 _MAX_DIM = 4096
 _MAX_OFFSET = (1 << 63) - 1
-_SUPPORTED_VENDORS = frozenset(("nvidia", "ascend", "thead", "metax", "iluvatar"))
+_H20Z_D128_ROW_STRIDES = frozenset((128, 144, 192))
+_H20Z_D128_MAX_ROWS = 8192
+_H20Z_D128_TRITON_VERSION = "3.6.0"
+_IS_NVIDIA = runtime.device.vendor_name == "nvidia"
+_SUPPORTED_VENDORS = frozenset(
+    ("nvidia", "ascend", "thead", "metax", "iluvatar", "mthreads")
+)
 
 
 @triton.jit
@@ -23,7 +30,10 @@ def _rsqrt_preserving_subnormals(value):
     # Some backends lower rsqrt to an instruction that flushes subnormal
     # inputs to zero. An exact power-of-two scale makes every positive FP32
     # subnormal normal before rsqrt, then restores the reciprocal-root scale.
-    is_subnormal = (value > 0.0) & (value < 1.1754943508222875e-38)
+    # Classify by bits so vendor LLVMs need not lower the interval test to
+    # llvm.is.fpclass, which is unavailable in some accelerator toolchains.
+    bits = value.to(tl.uint32, bitcast=True)
+    is_subnormal = (bits > 0) & (bits < 0x00800000)
     scaled = tl.where(is_subnormal, value * 16777216.0, value)
     result = tl.rsqrt(scaled)
     return tl.where(is_subnormal, result * 4096.0, result)
@@ -77,7 +87,41 @@ def _prune_norm_configs(configs, named_args, **kwargs):
     return configs
 
 
-if runtime.device.vendor_name == "nvidia":
+def _h20z_d128_config(rows):
+    if rows == 1:
+        return 1, 4
+    if rows >= 4096:
+        return 8, 4
+    return 4, 4
+
+
+@lru_cache(maxsize=None)
+def _is_h20z(device_index=None):
+    if not _IS_NVIDIA:
+        return False
+    try:
+        name = runtime.torch_device_fn.get_device_name(device_index)
+    except (AttributeError, RuntimeError):
+        return False
+    return "H20Z" in name.replace(" ", "_").upper().split("_")
+
+
+def _use_h20z_d128_fast_path(
+    rows, dim, stride_xm, stride_xd, stride_w, stride_b, device_index=None
+):
+    return (
+        0 < rows <= _H20Z_D128_MAX_ROWS
+        and dim == 128
+        and stride_xm in _H20Z_D128_ROW_STRIDES
+        and stride_xd == 1
+        and stride_w == 1
+        and stride_b == 1
+        and triton.__version__ == _H20Z_D128_TRITON_VERSION
+        and _is_h20z(device_index)
+    )
+
+
+if _IS_NVIDIA:
     _norm_kernel = libentry()(
         libtuner(
             configs=runtime.get_tuned_config("fused_indexer_k_norm"),
@@ -161,6 +205,9 @@ def _validate_inputs(x, weight, bias, dim, eps):
 
 def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
     rows, dim = x.shape
+    stride_xm, stride_xd = x.stride()
+    stride_w = weight.stride(0)
+    stride_b = bias.stride(0)
     args = (
         x,
         weight,
@@ -168,15 +215,34 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
         out,
         rows,
         dim,
-        x.stride(0),
-        x.stride(1),
-        weight.stride(0),
-        bias.stride(0),
+        stride_xm,
+        stride_xd,
+        stride_w,
+        stride_b,
         eps,
     )
     with runtime.torch_device_fn.device(x.device):
-        if runtime.device.vendor_name == "nvidia":
-            _norm_kernel[lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)](*args)
+        if _IS_NVIDIA:
+            if _use_h20z_d128_fast_path(
+                rows,
+                dim,
+                stride_xm,
+                stride_xd,
+                stride_w,
+                stride_b,
+                x.device.index,
+            ):
+                block_m, num_warps = _h20z_d128_config(rows)
+                _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
+                    *args,
+                    BLOCK_M=block_m,
+                    num_warps=num_warps,
+                    num_stages=1,
+                )
+            else:
+                _norm_kernel[
+                    lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)
+                ](*args)
         else:
             _norm_kernel[(rows,)](
                 *args,
