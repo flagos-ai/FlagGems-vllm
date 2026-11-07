@@ -92,6 +92,42 @@ def decode_fp8_scaled_bf16(q, scale):
 
 
 @triton.jit
+def decode_fp8_scaled_bf16_normalized(q, scale):
+    # All finite E4M3FN values are exact in both FP16 and BF16. Normalize in
+    # packed FP16 before applying the original BF16 scale, so sparse routes
+    # need neither a scale scan nor an overflow guard for every weight.
+    value = tl.inline_asm_elementwise(
+        "{ .reg .b32 a<2>, b<2>, m<2>, v<2>, bias;\n"
+        "ppu.prmt.b32 a0,0,$2,0x5140; ppu.prmt.b32 a1,0,$2,0x7362;\n"
+        "ppu.and.b32 b0,a0,0x7f007f00; ppu.and.b32 b1,a1,0x7f007f00;\n"
+        "ppu.shr.b32 b0,b0,1; ppu.shr.b32 b1,b1,1;\n"
+        "ppu.add.u32 m0,b0,0x00800080; ppu.add.u32 m1,b1,0x00800080;\n"
+        "ppu.and.b32 m0,m0,0x40004000; ppu.and.b32 m1,m1,0x40004000;\n"
+        "ppu.shr.b32 m0,m0,14; ppu.shr.b32 m1,m1,14;\n"
+        "ppu.mul.lo.u32 m0,m0,0x7c00; ppu.mul.lo.u32 m1,m1,0x7c00;\n"
+        "ppu.or.b32 b0,b0,m0; ppu.or.b32 b1,b1,m1;\n"
+        "ppu.lop3.b32 v0,b0,0x80008000,a0,0xf8; ppu.lop3.b32 v1,b1,0x80008000,a1,0xf8;\n"
+        "ppu.mov.b32 bias,0x5c005c00;\n"
+        "ppu.mul.rn.f16x2 v0,v0,bias; ppu.mul.rn.f16x2 v1,v1,bias;\n"
+        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
+        "=r,=r,r",
+        [q],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=4,
+    )
+    value = value.to(tl.bfloat16)
+    return tl.inline_asm_elementwise(
+        "ppu.mul.rn.bf16x2 $0,$1,$2;",
+        "=r,r,r",
+        [value, scale],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = False):
     if compute_type == tl.bfloat16:
         # Preserve E4M3 subnormals by embedding the bits in BF16. Its exponent

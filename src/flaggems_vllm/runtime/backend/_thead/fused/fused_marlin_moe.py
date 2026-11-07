@@ -51,6 +51,7 @@ from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16 import (
 )
 from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16 import (
     decode_fp8_scaled_bf16,
+    decode_fp8_scaled_bf16_normalized,
     decode_int8_scaled_bf16,
 )
 from flaggems_vllm.utils import libentry
@@ -227,7 +228,13 @@ def _dequant_fp8(
             scale[:, None, :], (128 // GROUP_SIZE, GROUP_SIZE, ns.shape[0])
         )
         scale = tl.reshape(scale, (128, ns.shape[0]))
-    if PACKED:
+    if (
+        FAST is None
+        and compute_type == tl.bfloat16
+        and s_ptr.dtype.element_ty == tl.bfloat16
+    ):
+        decoded = decode_fp8_scaled_bf16_normalized(b.to(tl.uint8), scale)
+    elif PACKED:
         decoded = decode_fp8_scaled_bf16(b.to(tl.uint8), scale)
     else:
         decoded = _decode_e4m3(quant, scale, compute_type, FAST)
@@ -1276,8 +1283,20 @@ def _invoke_marlin_moe_gemm_direct(
             block_n = 32
     else:
         block_n = 64 if use_matvec else _select_direct_block_n(N)
-        if use_matvec and quant_type_id == QUANT_TYPE_UINT8B128 and min(K, N) <= 512:
+        if (
+            use_matvec
+            and min(K, N) <= 512
+            and (
+                quant_type_id == QUANT_TYPE_UINT8B128
+                or (
+                    quant_type_id == QUANT_TYPE_FP8_E4M3
+                    and compute_type == tl.bfloat16
+                    and B_scale.dtype == torch.bfloat16
+                )
+            )
+        ):
             block_n = 32 if K > N else 128
+    # Packed FP8 decode favors more long-K tiles and wider short-K tiles.
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
     # the next AIU copy with the current tile's unpack/dequantize/dot work.
@@ -1740,7 +1759,16 @@ def _fused_marlin_moe_impl(
         return out
     compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
     with torch.cuda.device(hidden_states.device):
+        packed_fp8 = (
+            quant_type_id == QUANT_TYPE_FP8_E4M3
+            and hidden_states.dtype
+            == w1_scale.dtype
+            == w2_scale.dtype
+            == torch.bfloat16
+        )
         direct = _use_direct_route(m, e, topk, k, n)
+        if packed_fp8 and e > 8 and m * topk <= 96 and max(k, 2 * n) <= 4096:
+            direct = True
         stage1, stage2 = _prepare_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size, direct=direct
         )
@@ -1773,14 +1801,9 @@ def _fused_marlin_moe_impl(
         split_silu = direct and (
             n >= 1024 or quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
         )
-        use_matvec = (
-            direct
-            and m == 1
-            and quant_type_id
-            in (
-                QUANT_TYPE_UINT8B128,
-                QUANT_TYPE_FP8_E4M3,
-            )
+        use_matvec = direct and (
+            packed_fp8
+            or (m == 1 and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3))
         )
         reduced = direct and m <= 2 and not split_silu
         stage1_topk_weights = topk_weights if apply_router_weight_on_input else None

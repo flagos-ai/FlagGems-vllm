@@ -1696,9 +1696,10 @@ def test_fused_marlin_moe_mxfp4_alignment_ppu(hidden_size, intermediate_size):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 33])
-def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens):
+@pytest.mark.parametrize("num_experts", [1, 16])
+def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens, num_experts):
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
-        num_tokens, 1, 128, 128, 1, dtype, flaggems_vllm.device
+        num_tokens, num_experts, 128, 128, 1, dtype, flaggems_vllm.device
     )
     codes = torch.arange(256, device=hs.device, dtype=torch.int32).to(torch.uint8)
     codes = torch.where((codes & 127) == 127, codes - 1, codes)
@@ -1723,19 +1724,22 @@ def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens):
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
 )
-@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("num_tokens,num_experts", [(1, 2), (33, 2), (1, 16), (4, 16)])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "special", ["weight_nan", "scale_inf", "scale_nan", "scale_large"]
 )
-def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(num_tokens, special):
+def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
+    num_tokens, num_experts, scale_dtype, special
+):
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
-        num_tokens, 2, 96, 160, 2, torch.bfloat16, flaggems_vllm.device, -1
+        num_tokens, num_experts, 96, 160, 2, torch.bfloat16, flaggems_vllm.device, -1
     )
     # Positive subnormal codes isolate scale overflow from cancellation error.
     w1.view(torch.uint8).fill_(1)
     w2.view(torch.uint8).fill_(1)
     hs.fill_(1e-15)
-    s1 = s1.float()
+    s1 = s1.to(scale_dtype)
     if special == "weight_nan":
         w1.view(torch.uint8)[0, 0, 0] = 127
     else:
