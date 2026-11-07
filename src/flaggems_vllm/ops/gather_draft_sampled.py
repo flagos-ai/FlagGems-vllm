@@ -20,7 +20,7 @@ if _HAS_LAYOUT:
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("gather_draft_sampled"),
-    key=["num_logits", "STATE_CAPACITY"],
+    key=["num_logits"],
     warmup=5,
     rep=30,
     use_cuda_graph=runtime.device.name == "cuda",
@@ -36,7 +36,6 @@ def _gather_draft_sampled_kernel(
     expanded_local_pos_ptr,
     prefill_len_ptr,
     num_logits,
-    STATE_CAPACITY: tl.constexpr,
     USE_LAYOUT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     WARPS: tl.constexpr,
@@ -120,7 +119,6 @@ def gather_draft_sampled(
             expanded_local_pos,
             prefill_len,
             num_logits,
-            STATE_CAPACITY=prefill_len.numel(),
             USE_LAYOUT=_HAS_LAYOUT,
         )
     return draft_sampled, pos

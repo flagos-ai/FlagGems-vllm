@@ -169,7 +169,6 @@ def test_all_tiles_and_output_guards(config):
             pos,
             *inputs,
             rows,
-            STATE_CAPACITY=inputs[-1].numel(),
             USE_LAYOUT=module._HAS_LAYOUT,
             **meta,
             num_warps=warps,
