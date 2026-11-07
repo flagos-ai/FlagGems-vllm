@@ -340,12 +340,27 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                         num_stages=1,
                     )
             else:
-                _norm_kernel[(rows,)](
-                    *args,
-                    BLOCK_M=1,
-                    num_warps=4,
-                    num_stages=1,
-                )
+                # Generic thin launcher for remaining backends (PPU, etc.)
+                # on D=128 aligned fast path.
+                if (
+                    dim == 128
+                    and stride_xd == 1
+                    and stride_w == 1
+                    and stride_b == 1
+                ):
+                    _fused_indexer_k_norm_kernel[(rows,)](
+                        *args,
+                        BLOCK_M=1,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                else:
+                    _norm_kernel[(rows,)](
+                        *args,
+                        BLOCK_M=1,
+                        num_warps=4,
+                        num_stages=1,
+                    )
 
 
 def fused_indexer_k_norm(x, weight, bias, dim, eps):
