@@ -122,6 +122,42 @@ def _ascend_chunk_width() -> int:
     return val if val in (16, 32, 64) else _ASCEND_BT
 
 
+# Neumann truncation order for (I+L)^-1 in _ascend_kda_fwd_intra_kernel.
+# L (our b_Akk) is strictly lower triangular, so L^BT == 0 and the series
+# terminates exactly; truncation error is the only error source, bounded by
+# ||L||^(stage_order+1) / (1-||L||). The doubling scheme (I-L, +Ai@L2,
+# +Ai@L4, +Ai@L8) reaches effective order 1/3/7/15 at stage 0/1/2/3.
+#
+# tools/_kda_neumann_order_check.py measured max||L||_2 under our actual
+# safe-gate distribution (q/k/v/g/beta matching tools/_kda_shape_bench.py):
+# ~0.02-0.025 across BT in {16,32,64} and a beta-stress sweep. At that norm
+# the *stage-0* remainder bound (||L||^2/(1-||L||), the r=1 case) is already
+# ~4-6e-4, an order of magnitude below bf16 eps (~3.9e-3), so stage 0 (I-L,
+# 0 extra dots) was tried against the 3-stage default on Ascend950DT:
+#   tools/_kda_bt_accuracy.py: identical max_abs/state max_abs at every BT
+#   and shape (0 non-finite either way) -- no measurable accuracy loss.
+#   tools/test_kda_vs_vllm_ascend.py: 15/15 correct; chunk_kda speedup vs
+#   AscendC improved at every shape (T=8192/16384/24576: 1.37-1.41x ->
+#   1.50-1.55x; T=32768: 0.41x -> 0.45x).
+# So 0 extra dots is the default; set >0 only if a different gate/beta/k
+# distribution needs the extra margin (re-run _kda_neumann_order_check.py
+# first to confirm ||L|| actually warrants it before paying the dot cost).
+_ASCEND_NEUMANN_STAGES = 0
+_ASCEND_NEUMANN_STAGES_ENV = "FLAGGEMS_ASCEND_KDA_NEUMANN_STAGES"
+
+
+def _ascend_neumann_stages() -> int:
+    """Doubling stages for the (I+L)^-1 Neumann series (override for tuning)."""
+    raw = os.environ.get(_ASCEND_NEUMANN_STAGES_ENV)
+    if not raw:
+        return _ASCEND_NEUMANN_STAGES
+    try:
+        val = int(raw)
+    except ValueError:
+        return _ASCEND_NEUMANN_STAGES
+    return val if val in (0, 1, 2, 3) else _ASCEND_NEUMANN_STAGES
+
+
 _BACKEND_ENV = "FLAGGEMS_CHUNK_KDA_BACKEND"
 _BACKEND_ALIASES = {
     "auto": "auto",
@@ -205,6 +241,7 @@ if HAS_TLE_KDA:
         CPT: tl.constexpr,
         IS_VARLEN: tl.constexpr,
         SUBBLOCK_REBASE: tl.constexpr,
+        NEUMANN_STAGES: tl.constexpr,
     ):
         i_tc, i_bh = tl.program_id(0), tl.program_id(1)
         i_hv = i_bh % HV
@@ -421,20 +458,43 @@ if HAS_TLE_KDA:
                             b_Aqk.to(Aqk.dtype.element_ty),
                         )
 
-                    b_L = b_Akk.to(tl.bfloat16)
+                    # (I+L)^-1 via Neumann series: L is strictly lower
+                    # triangular so L^BT == 0 and the series terminates
+                    # exactly; truncation is the only error source, bounded
+                    # by ||L||^(stage_order+1)/(1-||L||). The doubling scheme
+                    # (I-L, +Ai@L2, +Ai@L4, +Ai@L8) reaches effective order
+                    # 1/3/7/15 at stage 0/1/2/3.
+                    #
+                    # tools/_kda_neumann_order_check.py measured
+                    # max||L||_2 ~ 0.02-0.025 under our actual safe-gate
+                    # distribution across BT in {16,32,64} (q/k L2-normalized,
+                    # so (k_i.k_j) in [-1,1] bounds ||L|| independent of the
+                    # beta distribution -- also checked with beta stressed to
+                    # raw U[0,1), same order of magnitude). At that norm the
+                    # stage-0 (r=1, 0 extra dots) remainder bound is already
+                    # ~4-6e-4, below bf16 eps (~3.9e-3); NEUMANN_STAGES lets
+                    # this be tuned instead of always paying for 3 stages.
                     b_Ai = m_I.to(tl.float32) - b_Akk
-                    b_L2 = tl.dot(b_L, b_L, out_dtype=tl.float32).to(tl.bfloat16)
-                    b_Ai = b_Ai + tl.dot(
-                        b_Ai.to(tl.bfloat16), b_L2, out_dtype=tl.float32
-                    )
-                    b_L4 = tl.dot(b_L2, b_L2, out_dtype=tl.float32).to(tl.bfloat16)
-                    b_Ai = b_Ai + tl.dot(
-                        b_Ai.to(tl.bfloat16), b_L4, out_dtype=tl.float32
-                    )
-                    b_L8 = tl.dot(b_L4, b_L4, out_dtype=tl.float32).to(tl.bfloat16)
-                    b_Ai = b_Ai + tl.dot(
-                        b_Ai.to(tl.bfloat16), b_L8, out_dtype=tl.float32
-                    )
+                    if NEUMANN_STAGES >= 1:
+                        b_L = b_Akk.to(tl.bfloat16)
+                        b_L2 = tl.dot(b_L, b_L, out_dtype=tl.float32).to(tl.bfloat16)
+                        b_Ai = b_Ai + tl.dot(
+                            b_Ai.to(tl.bfloat16), b_L2, out_dtype=tl.float32
+                        )
+                        if NEUMANN_STAGES >= 2:
+                            b_L4 = tl.dot(b_L2, b_L2, out_dtype=tl.float32).to(
+                                tl.bfloat16
+                            )
+                            b_Ai = b_Ai + tl.dot(
+                                b_Ai.to(tl.bfloat16), b_L4, out_dtype=tl.float32
+                            )
+                            if NEUMANN_STAGES >= 3:
+                                b_L8 = tl.dot(b_L4, b_L4, out_dtype=tl.float32).to(
+                                    tl.bfloat16
+                                )
+                                b_Ai = b_Ai + tl.dot(
+                                    b_Ai.to(tl.bfloat16), b_L8, out_dtype=tl.float32
+                                )
 
                     if IS_VARLEN:
                         tl.store(
@@ -545,6 +605,7 @@ if HAS_TLE_KDA:
             K=K,
             BT=BT,
             CPT=CPT,
+            NEUMANN_STAGES=_ascend_neumann_stages(),
         )
 
         return ws, Aqk, Akk, g_out
