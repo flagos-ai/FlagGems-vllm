@@ -724,7 +724,25 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])
-@pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024), (65, 256, 512)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 256, 512),
+        (1, 1024, 1024),
+        (65, 256, 512),
+        pytest.param(
+            (4096, 128, 256),
+            marks=[
+                pytest.mark.fused_marlin_moe_w8a16,
+                pytest.mark.skipif(
+                    flaggems_vllm.vendor_name != "thead",
+                    reason="T-Head bounded dense path",
+                ),
+            ],
+            id="ppu-dense",
+        ),
+    ],
+)
 def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
@@ -1541,7 +1559,19 @@ def test_fused_marlin_moe_w8a16_fp8_ppu(
 @pytest.mark.parametrize(
     "precision", [pytest.param("int8", marks=_MTHREADS_NO_INT8), "fp8"]
 )
-@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize(
+    "num_tokens",
+    [
+        1,
+        33,
+        pytest.param(
+            4096,
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "thead", reason="T-Head bounded dense path"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
 def test_fused_marlin_moe_w8a16_inference_updates(
     precision, num_tokens, updated_tensor
@@ -1579,6 +1609,28 @@ def test_fused_marlin_moe_w8a16_inference_updates(
             kwargs[updated_tensor].zero_()
         actual = flaggems_vllm.fused_marlin_moe(**kwargs)
         gems_assert_equal(actual, torch.zeros_like(hs))
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
+    monkeypatch, apply_router_weight_on_input
+):
+    original = _make_inputs_fp8_weight
+
+    def scaled_inputs(*args, **kwargs):
+        values = list(original(*args, **kwargs))
+        values[3].mul_(2.0**20)
+        values[7].mul_(2.0**20)
+        return tuple(values)
+
+    monkeypatch.setattr(__name__ + "._make_inputs_fp8_weight", scaled_inputs)
+    _check_w8a16_fp8(
+        (4096, 4, 128, 256, 2),
+        torch.bfloat16,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
 
 
 @pytest.mark.fused_marlin_moe_w4a16
@@ -1768,6 +1820,20 @@ _W4A16_CASES += _cases(
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
     "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
 )
+
+_W8A16_CASES += [
+    pytest.param(
+        precision,
+        (4096, 4, 128, 256, 2),
+        torch.bfloat16,
+        None,
+        marks=pytest.mark.skipif(
+            flaggems_vllm.vendor_name != "thead", reason="T-Head bounded dense path"
+        ),
+        id="ppu-dense-" + precision,
+    )
+    for precision in ("int8", "fp8")
+]
 
 
 @pytest.mark.fused_marlin_moe_w4a16

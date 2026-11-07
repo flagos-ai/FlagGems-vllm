@@ -14,15 +14,8 @@
 
 """T-Head PPU specialization for fused Marlin MoE.
 
-The public operator covers W4A16 INT4, W4A16 MXFP4, W8A16 INT8 and W8A16 FP8.
-All four formats share the same routing, staging and GEMM kernels; weight
-decoding is selected at compile time from ``quant_type_id``.
-
-The grouped path consumes the same sorted routing layout as ``fused_moe``.
-Four-bit formats retain the shared INT32 packing. INT8/FP8 weights and scales
-use no-copy views of the public output-major storage. Unversioned MXFP4 scales
-are converted on every call. FP8 direct routes check only the scales loaded by
-the GEMM; grouped routes retain per-call safety flags to preserve throughput.
+INT4/MXFP4 retain packed weights. W8A16 reads public byte/scale storage.
+Selected BF16 paths use packed casts and bounded per-call dense decoding.
 """
 
 from typing import Any, Callable, NamedTuple, Optional
@@ -52,9 +45,19 @@ from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
+from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_dense import run_dense_w8a16
+from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16 import (
+    decode_e4m3 as _decode_e4m3,
+)
+from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16 import (
+    decode_fp8_scaled_bf16,
+    decode_int8_scaled_bf16,
+)
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
+_PPU_DENSE_MIN_TOKENS = 4096
+_PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 _SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_FAST_VARIANTS = {
     QUANT_TYPE_UINT4B8: (False,),
@@ -81,36 +84,6 @@ def _decode_e2m1(q, scale, compute_type: tl.constexpr):
     bits = ((q & 8) << 12) | ((q & 7) << 9)
     tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
     return (tiny * 16384.0 * scale).to(compute_type)
-
-
-@triton.jit
-def _decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = False):
-    if compute_type == tl.bfloat16:
-        # Preserve E4M3 subnormals by embedding the bits in BF16. Its exponent
-        # bias is corrected by an exact power-of-two factor in the scale.
-        bits = ((q & 128) << 8) | ((q & 127) << 4)
-        # Set the BF16 NaN exponent without a floating-point select per weight.
-        bits = bits | (-(((q & 127) + 1) >> 7) & 0x7F80)
-        tiny = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
-        exponent_bias = 2.0**120
-    else:
-        # E4M3 bits embedded in FP16 have exponent bias 15 rather than 7.
-        bits = ((q & 128) << 8) | ((q & 127) << 7)
-        bits = bits | (-(((q & 127) + 1) >> 7) & 0x7C00)
-        tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
-        exponent_bias = 256.0
-    if FAST is None:
-        # Sparse routes avoid scanning scales for experts they never read.
-        folded = scale * exponent_bias
-        overflow = (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf"))
-        folded = tl.where(overflow, scale, folded)
-        value = tl.where(overflow, tiny * exponent_bias, tiny)
-        return (value * folded).to(compute_type)
-    else:
-        value = tiny
-        if not FAST:
-            value = value * exponent_bias
-        return (value * scale).to(compute_type)
 
 
 @triton.jit
@@ -162,14 +135,17 @@ def _dequant_int8(
     GROUP_SIZE: tl.constexpr,
 ):
     tl.static_assert(b.shape[0] == 128 or b.shape[0] == 64)
-    quant = b.to(tl.int32) - 128
     group = k_base // GROUP_SIZE
     scale = tl.load(
         s_ptr + expert * se + group * sg + ns * sn,
         mask=ns < N,
         other=0.0,
     )[None, :]
-    return (quant.to(compute_type) * scale).to(compute_type)
+    if compute_type == tl.bfloat16 and b.shape[1] <= 128:
+        return decode_int8_scaled_bf16(b.to(tl.uint8), scale)
+    else:
+        quant = b.to(tl.int32) - 128
+        return (quant.to(compute_type) * scale).to(compute_type)
 
 
 @triton.jit
@@ -219,6 +195,11 @@ def _dequant_fp8(
     FAST: tl.constexpr = False,
 ):
     tl.static_assert(b.shape[0] == 128 or b.shape[0] == 64)
+    PACKED: tl.constexpr = (
+        FAST is True
+        and compute_type == tl.bfloat16
+        and s_ptr.dtype.element_ty == tl.bfloat16
+    )
     quant = b.to(tl.uint32)
     if GROUP_SIZE == -1 or GROUP_SIZE >= 128:
         group = 0 if GROUP_SIZE == -1 else k_base // GROUP_SIZE
@@ -227,7 +208,7 @@ def _dequant_fp8(
             scale = tl.load(scale_ptrs)[None, :]
         else:
             scale = tl.load(scale_ptrs, mask=ns < N, other=1.0)[None, :]
-        if FAST:
+        if FAST and not PACKED:
             scale = scale * (2.0**120 if compute_type == tl.bfloat16 else 256.0)
     else:
         groups = k_base // GROUP_SIZE + tl.arange(0, 128 // GROUP_SIZE)
@@ -240,13 +221,16 @@ def _dequant_fp8(
                 mask=(ns[None, :] < N) & (groups[:, None] * GROUP_SIZE < K),
                 other=1.0,
             )
-        if FAST:
+        if FAST and not PACKED:
             scale = scale * (2.0**120 if compute_type == tl.bfloat16 else 256.0)
         scale = tl.broadcast_to(
             scale[:, None, :], (128 // GROUP_SIZE, GROUP_SIZE, ns.shape[0])
         )
         scale = tl.reshape(scale, (128, ns.shape[0]))
-    decoded = _decode_e4m3(quant, scale, compute_type, FAST)
+    if PACKED:
+        decoded = decode_fp8_scaled_bf16(b.to(tl.uint8), scale)
+    else:
+        decoded = _decode_e4m3(quant, scale, compute_type, FAST)
     if K % 128 == 0:
         return decoded
     # Channel scales can be nonfinite; padded bytes must never introduce NaN.
@@ -1760,6 +1744,32 @@ def _fused_marlin_moe_impl(
         stage1, stage2 = _prepare_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size, direct=direct
         )
+        if (
+            m >= _PPU_DENSE_MIN_TOKENS
+            and m * topk > 32 * e
+            and group_size == 128
+            and hidden_states.dtype == torch.bfloat16
+            and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
+            and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+            and max(w1.numel(), w2.numel()) * 2 <= _PPU_DENSE_MAX_DECODE_BYTES
+        ):
+            sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, 64, e)
+            return run_dense_w8a16(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                out,
+                sorted_ids,
+                experts,
+                padded,
+                stage1.scale_safe,
+                stage2.scale_safe,
+                quant_type_id == QUANT_TYPE_FP8_E4M3,
+                apply_router_weight_on_input,
+            )
         split_silu = direct and (
             n >= 1024 or quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
         )
