@@ -497,7 +497,7 @@ def _make_matmul_entry(config_name, expand_name, key=_MATMUL_TUNING_KEY):
             strategy="default",
             warmup=5,
             rep=20,
-            flagtune_op_name="w8a8_block_fp8_matmul",
+            flagtune_op_name="w8a8_block_matmul",
             flagtune_expand_op_name=expand_name,
             flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
         )(_block_fp8_matmul_kernel)
