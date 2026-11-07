@@ -40,17 +40,40 @@ from flaggems_vllm.ops.FLA.chunk_kda import (
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
+# The kernels below need exactly two slice primitives. FlagTree provides them
+# as ``tle.dsa.extract_slice`` / ``insert_slice``; stock triton-ascend ships the
+# same two ops (same offsets/sizes/strides signature, verified equivalent on a
+# sequential cumsum) under ``triton.language.extra.cann.extension``. Prefer TLE
+# when present so FlagTree behaviour is unchanged, and fall back to the
+# extension API so a stock triton-ascend build runs these kernels too instead of
+# dropping to the portable Triton path.
+_extract_slice = None
+_insert_slice = None
+_SLICE_SOURCE = "none"
+
 if has_triton_tle(3, 5, 0):
     try:
         import triton.experimental.tle as tle
 
-        HAS_TLE_KDA = True
+        _extract_slice = tle.dsa.extract_slice
+        _insert_slice = tle.dsa.insert_slice
+        _SLICE_SOURCE = "tle"
     except ImportError:
         tle = None
-        HAS_TLE_KDA = False
 else:
     tle = None
-    HAS_TLE_KDA = False
+
+if _extract_slice is None:
+    try:
+        from triton.language.extra.cann.extension import extract_slice as _extract_slice
+        from triton.language.extra.cann.extension import insert_slice as _insert_slice
+
+        _SLICE_SOURCE = "cann_extension"
+    except ImportError:
+        _extract_slice = None
+        _insert_slice = None
+
+HAS_TLE_KDA = _extract_slice is not None
 
 __all__ = ["chunk_kda"]
 
@@ -92,6 +115,11 @@ def exp2(x):
 # =============================================================================
 
 if HAS_TLE_KDA:
+    # Bind the resolved primitives to module-level names so the @triton.jit
+    # kernels below capture them as globals regardless of which source
+    # (FlagTree TLE or the cann extension) provided them.
+    extract_slice = _extract_slice
+    insert_slice = _insert_slice
 
     # ------------------------------------------------------------------
     # Kernel 1: intra-chunk Aqk/Akk + triangular inverse + workspace packing
@@ -185,10 +213,10 @@ if HAS_TLE_KDA:
                     b_gc = b_g
                     for r in tl.static_range(BT):
                         row = tl.reshape(
-                            tle.dsa.extract_slice(b_gc, (r, 0), (1, K), (1, 1)), (K,)
+                            extract_slice(b_gc, (r, 0), (1, K), (1, 1)), (K,)
                         )
                         acc += row
-                        b_gc = tle.dsa.insert_slice(
+                        b_gc = insert_slice(
                             b_gc, tl.reshape(acc, (1, K)), (r, 0), (1, K), (1, 1)
                         )
 
@@ -201,8 +229,23 @@ if HAS_TLE_KDA:
                     else:
                         tl.store(p_g_out + o_c[:, None] * (HV * K) + o_k[None, :], b_gc)
 
-                    b_gq = tl.where(m_c[:, None], exp2(b_gc), 0.0)
-                    b_gk = tl.where(m_c[:, None], exp2(-b_gc), 0.0)
+                    # Aqk/Akk only need exp2(b_gc[i] - b_gc[j]) on the causal
+                    # half (i >= j), where b_gc is non-increasing, so the true
+                    # exponent is always <= 0. Splitting it into
+                    # exp2(b_gc) * exp2(-b_gc) manufactures a huge range:
+                    # b_gc reaches about -62 log2 units over BT=16, so
+                    # exp2(-b_gc) hits ~4e18. fp32 holds that, but these
+                    # operands are cast to bf16 for tl.dot and bf16 keeps only
+                    # 8 mantissa bits, so the product loses all significance
+                    # (observed |Aqk| ~ 7e14 against a true O(1)).
+                    # Rebasing on the chunk midpoint splits the span across the
+                    # two factors and cancels exactly in the difference.
+                    b_gc_anchor = tl.sum(
+                        tl.where(o_i[:, None] == BT // 2, b_gc, 0.0), 0
+                    )
+                    b_gc_reb = b_gc - b_gc_anchor[None, :]
+                    b_gq = tl.where(m_c[:, None], exp2(b_gc_reb), 0.0)
+                    b_gk = tl.where(m_c[:, None], exp2(-b_gc_reb), 0.0)
 
                     b_kg_t = tl.trans((b_kf * b_gk).to(tl.bfloat16))
                     b_Aqk = tl.dot(
@@ -370,8 +413,15 @@ if HAS_TLE_KDA:
     # Kernel 2: state propagation + output
     # ------------------------------------------------------------------
 
-    def _pick_bv(K: int) -> int:
-        return 64 if K <= 128 else 32
+    def _pick_bv(K: int, V: int) -> int:
+        # The chunk recurrence is serial, so BV decides how many waves of
+        # programs each pay the full per-chunk dot chain: the grid is
+        # (V/BV, N*HV). Taking BV = V runs that chain once per (sequence, head)
+        # instead of 2x at BV=64. Measured on the T=24576 H=12 D=128 Ascend950DT
+        # prefill: 5.66 ms (BV=32), 4.38 ms (BV=64), 3.90 ms (BV=128).
+        if K <= 128:
+            return min(V, 128)
+        return 32
 
     @triton.heuristics(
         {
@@ -575,7 +625,8 @@ if HAS_TLE_KDA:
             else v.new_empty(1, dtype=torch.float32)
         )
 
-        grid = (triton.cdiv(V, _pick_bv(K)), N * HV)
+        bv = _pick_bv(K, V)
+        grid = (triton.cdiv(V, bv), N * HV)
         _ascend_kda_fwd_state_output_kernel[grid](
             v=v,
             beta=beta,
@@ -593,7 +644,7 @@ if HAS_TLE_KDA:
             K=K,
             V=V,
             BT=BT,
-            BV=_pick_bv(K),
+            BV=bv,
             STATE_V_FIRST=state_v_first,
         )
 

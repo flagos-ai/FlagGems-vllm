@@ -101,9 +101,9 @@ def _ascend_recurrent_kda_kernel(
             if SPEC:
                 column = tl.load(Accepted + n).to(tl.int64) - 1
             inrange = (column >= 0) & (column < WIDTH)
-            slot = tl.load(
-                Indices + n * IX[0] + column * IX[1], inrange, 0
-            ).to(tl.int64)
+            slot = tl.load(Indices + n * IX[0] + column * IX[1], inrange, 0).to(
+                tl.int64
+            )
             valid = inrange & (slot > 0) & (slot < POOL)
         rk = tl.arange(0, BK)
         rv = iv * BV + tl.arange(0, BV)
@@ -139,6 +139,12 @@ def _ascend_recurrent_kda_kernel(
         else:
             key_mask = rk < K
             value_mask = rv < V
+        if SAFE_GATE:
+            # Hoisted out of the token loop: both are indexed only by
+            # (head, key), so re-loading them per token adds a scalar fetch and
+            # a [BK] transfer to every iteration of a serial recurrence.
+            gate_decay = tl.exp(tl.load(A_log + h).to(tl.float32))
+            gate_bias = tl.load(Dt_bias + h * K + rk, key_mask, 0.0).to(tl.float32)
         for t in range(start, end):
             q = tl.load(
                 Q + batch * QS[0] + t * QS[1] + h * QS[2] + rk * QS[3], key_mask, 0
@@ -154,13 +160,10 @@ def _ascend_recurrent_kda_kernel(
                 G + batch * GS[0] + t * GS[1] + h * GS[2] + rk * GS[3], key_mask, 0
             ).to(tl.float32)
             if SAFE_GATE:
-                # gate = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)).
-                # Hoisting A_log/dt_bias out of this loop is left to the
-                # compiler: both are loop-invariant per (head, key) lane.
-                decay = tl.load(A_log + h).to(tl.float32)
-                bias = tl.load(Dt_bias + h * K + rk, key_mask, 0.0).to(tl.float32)
-                gate = lower_bound * tl.sigmoid(tl.exp(decay) * (gate + bias))
-            acc *= tl.exp(gate)[None, :]
+                # gate = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)),
+                # with exp(A_log) and dt_bias hoisted above the loop.
+                gate = lower_bound * tl.sigmoid(gate_decay * (gate + gate_bias))
+            decay = tl.exp(gate)
             value = tl.load(
                 Vp + batch * VS[0] + t * VS[1] + h * VS[2] + rv * VS[3], value_mask, 0
             ).to(tl.float32)
@@ -171,8 +174,16 @@ def _ascend_recurrent_kda_kernel(
                 beta = tl.load(bp).to(tl.float32)
             if BETA_SIGMOID:
                 beta = tl.sigmoid(beta)
-            delta = (value - tl.sum(acc * k[None, :], 1)) * beta
-            acc += delta[:, None] * k[None, :]
+            # The decayed state only ever appears inside the delta reduction
+            # and the rank-1 update, so fold `decay` into both rather than
+            # applying it as its own `acc *= decay[None, :]` pass. Same
+            # arithmetic (decay is applied to K lanes either way), but the
+            # [V, K] fp32 tile -- 64KB at K=V=128 -- is traversed twice per
+            # token instead of three times. Measured 121.7 us -> 94.7 us on the
+            # bs=16 k=7 speculative case.
+            kd = k * decay
+            delta = (value - tl.sum(acc * kd[None, :], 1)) * beta
+            acc = acc * decay[None, :] + delta[:, None] * k[None, :]
             output = tl.sum(acc * q[None, :], 1)
             token = batch * T + t
             tl.store(
@@ -181,11 +192,19 @@ def _ascend_recurrent_kda_kernel(
             if INPLACE:
                 dest, store = slot, valid
                 if TABLE:
-                    column = t - start
+                    # Name this separately from the int64 `column` computed for
+                    # the seed slot above: reusing that name re-assigns an
+                    # int64 loop-carried variable from an int32 expression,
+                    # which the Ascend backend rejects outright
+                    # ("Loop-carried variable column has initial type int32 but
+                    # is re-assigned to int64 in loop").
+                    token_column = (t - start).to(tl.int64)
                     dest = tl.load(
-                        Indices + n * IX[0] + column * IX[1], column < WIDTH, 0
+                        Indices + n * IX[0] + token_column * IX[1],
+                        token_column < WIDTH,
+                        0,
                     ).to(tl.int64)
-                    store = store & (column < WIDTH) & (dest > 0) & (dest < POOL)
+                    store = store & (token_column < WIDTH) & (dest > 0) & (dest < POOL)
                 if DENSE:
                     tl.store(
                         Final + dest * SS[0] + state_offsets,
@@ -201,9 +220,7 @@ def _ascend_recurrent_kda_kernel(
             else:
                 if DENSE:
                     offsets = ((token * H + h) * V + rv[:, None]) * K + rk[None, :]
-                    tl.store(
-                        Final + offsets, tl.where(valid, acc, 0), state_mask
-                    )
+                    tl.store(Final + offsets, tl.where(valid, acc, 0), state_mask)
                 else:
                     if FAST:
                         offsets = ((token * H + h) * V + iv * BV) * K + linear
@@ -313,9 +330,7 @@ def fused_recurrent_kda(
     bs = beta.stride() if beta.ndim == 4 else (*beta.stride(), 0)
     if safe_gate and (A_log is None or dt_bias is None):
         raise ValueError("The in-kernel safe gate needs both A_log and dt_bias")
-    if safe_gate and (
-        A_log.numel() != h or dt_bias.numel() != h * dk
-    ):
+    if safe_gate and (A_log.numel() != h or dt_bias.numel() != h * dk):
         raise ValueError("A_log must hold H entries and dt_bias H*K entries")
     if num_accepted_tokens is not None:
         if ssm_state_indices is None or ssm_state_indices.ndim != 2:

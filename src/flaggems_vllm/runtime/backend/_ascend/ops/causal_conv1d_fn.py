@@ -59,6 +59,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_T: tl.constexpr,  # tokens staged per output tile; must divide BLOCK_M
+    BLOCK_X: tl.constexpr,  # staged input rows, pow2 >= BLOCK_T + KERNEL_WIDTH - 1
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -401,8 +403,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     else:
         acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    x_base_1d = x_base + token_offset * stride_x_token  # starting of chunk
-
     # PRE-LOAD WEIGHTS in 2D, then flatten once so each tap can be taken from
     # registers instead of re-reading memory every token.
     # row offsets: [0, dim, 2*dim, ..., (KERNEL_WIDTH-1)*dim]
@@ -413,52 +413,123 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     w_tile = tl.reshape(w_tile_2d, (KERNEL_WIDTH * BLOCK_N,))
 
     mask_x_1d = idx_feats < dim
-    for idx_token in range(segment_len):
-        acc = acc_preload
 
-        matrix_x = col0
+    # Tiled output: a width-W causal conv over a contiguous token run needs each
+    # input row exactly once, so stage [BLOCK_T + W - 1, BLOCK_N] of `x` per step
+    # and take tap j as the slice shifted down by j. That turns the former
+    # per-token BLOCK_N-vector loads (a 1KB MTE2 transfer each, 24576 of them for
+    # the full token budget) into one strided 2D transfer per tile, which is what
+    # the hardware wants -- the op is bandwidth bound, not compute bound.
+    # Stage BLOCK_X >= BLOCK_T + W - 1 rows, with BLOCK_X a power of two: Ascend
+    # tile shapes must be, and extract_slice needs j + BLOCK_T <= BLOCK_X for
+    # every tap j < W. Rows past the window are masked off and never read.
+    o_ext = tl.arange(0, BLOCK_X)
+    o_tok = tl.arange(0, BLOCK_T)
+    # static_range so `t0` is a compile-time constant: only the t0 == 0 tile can
+    # sit at a sequence start, so the history correction below compiles away in
+    # every other tile. As a runtime loop it cost ~1.0 ms of masked selects on
+    # tiles that never needed them.
+    for t0 in tl.static_range(0, BLOCK_M, BLOCK_T):
+        # BLOCK_M/BLOCK_T is a compile-time trip count, so a short tail chunk
+        # still enters the loop. Triton has no `continue`, and the mask below
+        # already drops out-of-range rows, so folding `t0 < segment_len` into
+        # the load/store masks keeps a spilled-over tile from touching memory.
+        in_tile = t0 < segment_len
+        # Row r of the staged tile is sequence-local token
+        # token_offset + t0 - (W - 1) + r; rows before the sequence start read as
+        # zero and are patched from the carried history below.
+        loc = token_offset + t0 - (KERNEL_WIDTH - 1) + o_ext
+        m_ext = in_tile & (loc >= 0) & (loc < seqlen)
+        # Address with a clamped row index. The sequence's first tile has
+        # loc < 0 for its leading W-1 rows, and letting those into the pointer
+        # arithmetic corrupts the *whole* transfer rather than just those rows:
+        # the backend lowers an affine pointer tile from its base offset, so a
+        # base below the allocation invalidates every row. `m_ext` still zeroes
+        # the clamped rows, and the tl.where below supplies their real values.
+        loc_safe = tl.maximum(loc, 0)
+        x_ptrs = (
+            x_ptr
+            + ((sequence_start_index + loc_safe) * stride_x_token)[:, None]
+            + (idx_feats * stride_x_dim)[None, :]
+        )
+        b_x = tl.load(x_ptrs, mask=m_ext[:, None] & mask_x_1d[None, :], other=0.0)
+
+        acc = acc_preload[None, :] + tl.zeros((BLOCK_T, BLOCK_N), dtype=tl.float32)
         for j in tl.static_range(KERNEL_WIDTH):
-            # Tap j is row j of the staged tile. KERNEL_WIDTH is a constexpr
-            # and this is a static_range, so `j * BLOCK_N` is a compile-time
-            # offset into the flattened tile.
+            # Output token t reads input row t + j, so tap j is the staged tile
+            # offset down by the compile-time constant j.
+            b_xj = extract_slice(
+                b_x, offsets=(j, 0), sizes=(BLOCK_T, BLOCK_N), strides=(1, 1)
+            )  # rows [j, j + BLOCK_T) of the staged BLOCK_X-row tile
             matrix_w = extract_slice(
                 w_tile, offsets=(j * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
             )
-            # The newest column is the current token; the older ones are the
-            # sliding-window registers carried across iterations.
-            # This loop, like the col-shift below, covers KERNEL_WIDTH 2-4.
-            if j == KERNEL_WIDTH - 1:
-                x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif j == 1:
-                matrix_x = col1
-            elif j == 2:
-                matrix_x = col2
-
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
+            acc += b_xj.to(tl.float32) * matrix_w[None, :]
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < segment_len) & (
-            idx_feats < dim
-        )  # token-index  # feature-index
+
+        o_loc = token_offset + t0 + o_tok
+        # The staged tile zeroes rows before token 0, so at a sequence start the
+        # leading W-1 outputs are missing their history taps. Drop them here and
+        # emit them after the loop with 1D ops: correcting them inside the tile
+        # costs full [BLOCK_T, BLOCK_N] masked selects on every tile (~0.24 ms
+        # measured), and patching the input tile instead does not work --
+        # extract_slice of a broadcast-built tile folds into the broadcast and
+        # returns row 0 for every row.
+        m_o = in_tile & (o_loc < segment_len + token_offset) & (o_loc < seqlen)
+        if KERNEL_WIDTH >= 2:
+            m_o = m_o & (o_loc >= KERNEL_WIDTH - 1)
         o_ptrs = (
             o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + ((sequence_start_index + o_loc) * stride_o_token)[:, None]
+            + (idx_feats * stride_o_dim)[None, :]
         )
+        tl.store(o_ptrs, acc, mask=m_o[:, None] & mask_x_1d[None, :])
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+    # Leading W-1 outputs of the sequence, whose window straddles conv_state.
+    # Only the chunk at token_offset == 0 owns them, and there are at most W-1
+    # (3 for Kimi K3), so emit them with the same register-rolled scheme the
+    # untiled kernel used: col0..col{W-2} already hold the history tokens
+    # (sequence index c-(W-1)), captured before STEP 2 overwrote the cache line.
+    if KERNEL_WIDTH >= 2:
+        if token_offset == 0:
+            for t in tl.static_range(KERNEL_WIDTH - 1):
+                if t < seqlen:
+                    acc_h = acc_preload
+                    for j in tl.static_range(KERNEL_WIDTH):
+                        # Output t reads sequence token t + j - (W - 1): < 0 means
+                        # history col{t + j}, >= 0 means x[t + j - (W - 1)].
+                        matrix_w = extract_slice(
+                            w_tile,
+                            offsets=(j * BLOCK_N,),
+                            sizes=(BLOCK_N,),
+                            strides=(1,),
+                        )
+                        src = t + j - (KERNEL_WIDTH - 1)
+                        if src < 0:
+                            if t + j == 0:
+                                b_t = col0
+                            elif t + j == 1:
+                                b_t = col1
+                            else:
+                                b_t = col2
+                        else:
+                            b_t = tl.load(
+                                x_base + src * stride_x_token,
+                                mask=mask_x_1d & (src < seqlen),
+                                other=0.0,
+                            )
+                        acc_h += b_t.to(tl.float32) * matrix_w
+                    if SILU_ACTIVATION:
+                        acc_h = acc_h / (1 + tl.exp(-acc_h))
+                    tl.store(
+                        o_ptr
+                        + (sequence_start_index + t) * stride_o_token
+                        + idx_feats * stride_o_dim,
+                        acc_h,
+                        mask=mask_x_1d,
+                    )
 
 
 def causal_conv1d_fn(
@@ -582,6 +653,12 @@ def causal_conv1d_fn(
         BLOCK_N = 256
     else:
         BLOCK_N = 512
+    # Tokens staged per output tile. The kernel holds a [BLOCK_T+W-1, BLOCK_N]
+    # input tile plus a [BLOCK_T, BLOCK_N] fp32 accumulator, so cap the tile
+    # area to keep both inside UB; BLOCK_T must also divide BLOCK_M evenly.
+    # Keep BLOCK_T a power of two so BLOCK_X stays one too and divides BLOCK_M.
+    BLOCK_T = max(1, min(BLOCK_M, triton.next_power_of_2(8192 // BLOCK_N) // 2))
+    BLOCK_X = triton.next_power_of_2(BLOCK_T + width - 1)
     if conv_states is not None:
         # extensions to support vLLM:
         # 1. conv_states is used to replaced initial_states
@@ -749,6 +826,8 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        BLOCK_T=BLOCK_T,
+        BLOCK_X=BLOCK_X,
         num_stages=2,
     )
 
