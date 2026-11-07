@@ -271,18 +271,58 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     SUBNORMAL_METHOD=0,
                 )
             elif runtime.device.vendor_name == "mthreads":
-                # MUSA also benefits from larger BLOCK_M on large M,
-                # but non-aligned D penalises BLOCK_M>1, so only scale
-                # when M is large and we stay on the aligned fast path.
-                block_m = 1
-                if rows > 1024:
-                    block_m = 4
-                _norm_kernel[(triton.cdiv(rows, block_m),)](
-                    *args,
-                    BLOCK_M=block_m,
-                    num_warps=4,
-                    num_stages=1,
-                )
+                # MUSA: thin launcher for D=128 aligned fast path to bypass
+                # libentry host overhead (~30% of latency for small/medium M).
+                if (
+                    dim == 128
+                    and stride_xd == 1
+                    and stride_w == 1
+                    and stride_b == 1
+                ):
+                    block_m = 1
+                    if rows > 1024:
+                        block_m = 4
+                    _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
+                        *args,
+                        BLOCK_M=block_m,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                else:
+                    block_m = 1
+                    if rows > 1024:
+                        block_m = 4
+                    _norm_kernel[(triton.cdiv(rows, block_m),)](
+                        *args,
+                        BLOCK_M=block_m,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+            elif runtime.device.vendor_name == "metax":
+                # MetaX: thin launcher for D=128 aligned path to shave
+                # libentry overhead (~6% measured on medium shapes).
+                if (
+                    dim == 128
+                    and stride_xd == 1
+                    and stride_w == 1
+                    and stride_b == 1
+                ):
+                    block_m = 1
+                    if rows > 4096:
+                        block_m = 2
+                    _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
+                        *args,
+                        BLOCK_M=block_m,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                else:
+                    _norm_kernel[(rows,)](
+                        *args,
+                        BLOCK_M=1,
+                        num_warps=4,
+                        num_stages=1,
+                    )
             else:
                 _norm_kernel[(rows,)](
                     *args,
