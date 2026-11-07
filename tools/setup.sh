@@ -325,7 +325,14 @@ ok
 # probing instead (e.g. on a host where the pinned +cu130 build is wrong).
 if [ -n "${TORCH_VERSION}" ]; then
   printf "Installing torch==${TORCH_VERSION} (torchaudio==${TORCHAUDIO_VERSION}, torchvision==${TORCHVISION_VERSION}) ...\n"
-  uv pip install \
+  # DEBUG (temporary): this install has been resolving as a no-op
+  # ("Checked N packages", no download) on the persistent h20 runner even
+  # though the venv is freshly created and genuinely empty (confirmed by the
+  # venv-contents dump above) — and the exact same command against a real
+  # empty venv elsewhere installs normally. -v surfaces uv's actual index
+  # lookups and cache decisions so the next CI run shows what it's doing
+  # differently here.
+  uv pip install -v \
     "torch==${TORCH_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" \
     "torchvision==${TORCHVISION_VERSION}" \
