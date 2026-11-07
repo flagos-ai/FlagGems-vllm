@@ -270,6 +270,19 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                     num_stages=1,
                     SUBNORMAL_METHOD=0,
                 )
+            elif runtime.device.vendor_name == "mthreads":
+                # MUSA also benefits from larger BLOCK_M on large M,
+                # but non-aligned D penalises BLOCK_M>1, so only scale
+                # when M is large and we stay on the aligned fast path.
+                block_m = 1
+                if rows > 1024:
+                    block_m = 4
+                _norm_kernel[(triton.cdiv(rows, block_m),)](
+                    *args,
+                    BLOCK_M=block_m,
+                    num_warps=4,
+                    num_stages=1,
+                )
             else:
                 _norm_kernel[(rows,)](
                     *args,
