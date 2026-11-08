@@ -93,7 +93,7 @@ from flaggems_vllm.ops.fused_moe import (
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
 from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
-from flaggems_vllm.ops.get_num_sampled_and_rejected import get_num_sampled_and_rejected
+from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
