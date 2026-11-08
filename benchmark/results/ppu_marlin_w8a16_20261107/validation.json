@@ -1,0 +1,4535 @@
+{
+  "tested_operator_revision": "41cd97ecdccb2dd0a5f2239621f0ab1bb3e77ddd",
+  "numerical_limits": {
+    "relative_rms": 0.01,
+    "relative_global_peak": 0.02
+  },
+  "benchmark_numerical_cases_passed": {
+    "int8": 53,
+    "fp8": 53
+  },
+  "w8": {
+    "passed": 229,
+    "records": {
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-out-dtype0-int8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "out",
+          "dtype": "torch.bfloat16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-out-dtype0-fp8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "out",
+          "dtype": "torch.bfloat16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-out-dtype1-int8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "out",
+          "dtype": "torch.float16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-out-dtype1-fp8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "out",
+          "dtype": "torch.float16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-inplace-dtype0-int8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.bfloat16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-inplace-dtype0-fp8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.bfloat16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-inplace-dtype1-int8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.float16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-inplace-dtype1-fp8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.float16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-alias-dtype0-int8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.bfloat16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-alias-dtype0-fp8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.bfloat16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-alias-dtype1-int8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.float16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-split-gemv-alias-dtype1-fp8]": {
+        "params": {
+          "shape": [
+            1,
+            1024,
+            128
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.float16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-out-dtype0-int8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "out",
+          "dtype": "torch.bfloat16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-out-dtype0-fp8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "out",
+          "dtype": "torch.bfloat16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-out-dtype1-int8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "out",
+          "dtype": "torch.float16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-out-dtype1-fp8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "out",
+          "dtype": "torch.float16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-inplace-dtype0-int8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.bfloat16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-inplace-dtype0-fp8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.bfloat16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-inplace-dtype1-int8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.float16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-inplace-dtype1-fp8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "inplace",
+          "dtype": "torch.float16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-alias-dtype0-int8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.bfloat16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-alias-dtype0-fp8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.bfloat16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-alias-dtype1-int8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.float16",
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_output[ppu-dense-alias-dtype1-fp8]": {
+        "params": {
+          "shape": [
+            4096,
+            128,
+            256
+          ],
+          "output_mode": "alias",
+          "dtype": "torch.float16",
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256--1-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256--1-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256--1-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256--1-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-32-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-32-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-32-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-32-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-64-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-64-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-64-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-64-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-128-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-128-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-128-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-128-256-128-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160--1-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160--1-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160--1-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160--1-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160-32-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160-32-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160-32-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[False-96-160-32-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256--1-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256--1-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256--1-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256--1-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-32-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-32-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-32-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-32-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-64-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-64-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-64-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-64-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 64,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-128-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-128-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-128-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-128-256-128-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 128,
+          "intermediate_size": 256,
+          "group_size": 128,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160--1-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160--1-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160--1-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160--1-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": -1,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160-32-dtype0-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160-32-dtype0-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.bfloat16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160-32-dtype1-1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_ppu[True-96-160-32-dtype1-33]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "hidden_size": 96,
+          "intermediate_size": 160,
+          "group_size": 32,
+          "dtype": "torch.float16",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1-1-int8]": {
+        "params": {
+          "updated_tensor": "w1",
+          "num_tokens": 1,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1-1-fp8]": {
+        "params": {
+          "updated_tensor": "w1",
+          "num_tokens": 1,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1-33-int8]": {
+        "params": {
+          "updated_tensor": "w1",
+          "num_tokens": 33,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1-33-fp8]": {
+        "params": {
+          "updated_tensor": "w1",
+          "num_tokens": 33,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1-4096-int8]": {
+        "params": {
+          "updated_tensor": "w1",
+          "num_tokens": 4096,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1-4096-fp8]": {
+        "params": {
+          "updated_tensor": "w1",
+          "num_tokens": 4096,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2-1-int8]": {
+        "params": {
+          "updated_tensor": "w2",
+          "num_tokens": 1,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2-1-fp8]": {
+        "params": {
+          "updated_tensor": "w2",
+          "num_tokens": 1,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2-33-int8]": {
+        "params": {
+          "updated_tensor": "w2",
+          "num_tokens": 33,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2-33-fp8]": {
+        "params": {
+          "updated_tensor": "w2",
+          "num_tokens": 33,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2-4096-int8]": {
+        "params": {
+          "updated_tensor": "w2",
+          "num_tokens": 4096,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2-4096-fp8]": {
+        "params": {
+          "updated_tensor": "w2",
+          "num_tokens": 4096,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1_scale-1-int8]": {
+        "params": {
+          "updated_tensor": "w1_scale",
+          "num_tokens": 1,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1_scale-1-fp8]": {
+        "params": {
+          "updated_tensor": "w1_scale",
+          "num_tokens": 1,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1_scale-33-int8]": {
+        "params": {
+          "updated_tensor": "w1_scale",
+          "num_tokens": 33,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1_scale-33-fp8]": {
+        "params": {
+          "updated_tensor": "w1_scale",
+          "num_tokens": 33,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1_scale-4096-int8]": {
+        "params": {
+          "updated_tensor": "w1_scale",
+          "num_tokens": 4096,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w1_scale-4096-fp8]": {
+        "params": {
+          "updated_tensor": "w1_scale",
+          "num_tokens": 4096,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2_scale-1-int8]": {
+        "params": {
+          "updated_tensor": "w2_scale",
+          "num_tokens": 1,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2_scale-1-fp8]": {
+        "params": {
+          "updated_tensor": "w2_scale",
+          "num_tokens": 1,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2_scale-33-int8]": {
+        "params": {
+          "updated_tensor": "w2_scale",
+          "num_tokens": 33,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2_scale-33-fp8]": {
+        "params": {
+          "updated_tensor": "w2_scale",
+          "num_tokens": 33,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2_scale-4096-int8]": {
+        "params": {
+          "updated_tensor": "w2_scale",
+          "num_tokens": 4096,
+          "precision": "int8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_inference_updates[w2_scale-4096-fp8]": {
+        "params": {
+          "updated_tensor": "w2_scale",
+          "num_tokens": 4096,
+          "precision": "fp8"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_dense_large_scale_ppu[False]": {
+        "params": {
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_dense_large_scale_ppu[True]": {
+        "params": {
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu[False-config0]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "config": [
+            1,
+            16,
+            1024,
+            128,
+            6
+          ]
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu[False-config1]": {
+        "params": {
+          "apply_router_weight_on_input": false,
+          "config": [
+            88,
+            64,
+            1024,
+            128,
+            4
+          ]
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu[True-config0]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "config": [
+            1,
+            16,
+            1024,
+            128,
+            6
+          ]
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu[True-config1]": {
+        "params": {
+          "apply_router_weight_on_input": true,
+          "config": [
+            88,
+            64,
+            1024,
+            128,
+            4
+          ]
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[1-1-dtype0]": {
+        "params": {
+          "num_experts": 1,
+          "num_tokens": 1,
+          "dtype": "torch.bfloat16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[1-1-dtype1]": {
+        "params": {
+          "num_experts": 1,
+          "num_tokens": 1,
+          "dtype": "torch.float16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[1-33-dtype0]": {
+        "params": {
+          "num_experts": 1,
+          "num_tokens": 33,
+          "dtype": "torch.bfloat16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[1-33-dtype1]": {
+        "params": {
+          "num_experts": 1,
+          "num_tokens": 33,
+          "dtype": "torch.float16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[16-1-dtype0]": {
+        "params": {
+          "num_experts": 16,
+          "num_tokens": 1,
+          "dtype": "torch.bfloat16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[16-1-dtype1]": {
+        "params": {
+          "num_experts": 16,
+          "num_tokens": 1,
+          "dtype": "torch.float16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[16-33-dtype0]": {
+        "params": {
+          "num_experts": 16,
+          "num_tokens": 33,
+          "dtype": "torch.bfloat16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu[16-33-dtype1]": {
+        "params": {
+          "num_experts": 16,
+          "num_tokens": 33,
+          "dtype": "torch.float16"
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype0-1-2]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype0-33-2]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype0-1-16]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype0-4-16]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype1-1-2]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype1-33-2]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype1-1-16]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[weight_nan-scale_dtype1-4-16]": {
+        "params": {
+          "special": "weight_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype0-1-2]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype0-33-2]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype0-1-16]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype0-4-16]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype1-1-2]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype1-33-2]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype1-1-16]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_inf-scale_dtype1-4-16]": {
+        "params": {
+          "special": "scale_inf",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype0-1-2]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype0-33-2]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype0-1-16]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype0-4-16]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype1-1-2]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype1-33-2]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype1-1-16]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_nan-scale_dtype1-4-16]": {
+        "params": {
+          "special": "scale_nan",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype0-1-2]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype0-33-2]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype0-1-16]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype0-4-16]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.float32",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype1-1-2]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype1-33-2]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 33,
+          "num_experts": 2
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype1-1-16]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 1,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16_fp8_special_values_ppu[scale_large-scale_dtype1-4-16]": {
+        "params": {
+          "special": "scale_large",
+          "scale_dtype": "torch.bfloat16",
+          "num_tokens": 4,
+          "num_experts": 16
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config0]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config1]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config2]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            8,
+            256,
+            512,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config3]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            4
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config4]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config5]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config6]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config7]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config8]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config9]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config10]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config11]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config12]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config13]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config14]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config15]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config16]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config17]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config18]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype0-config19]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config0]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config1]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config2]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            8,
+            256,
+            512,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config3]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            4
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config4]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config5]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config6]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config7]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config8]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config9]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config10]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config11]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config12]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config13]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config14]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config15]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config16]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config17]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config18]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            64,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[fp8-dtype1-config19]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            256,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config0]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config1]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config2]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            8,
+            256,
+            512,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config3]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            4
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config4]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config5]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config6]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config7]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config8]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config9]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config10]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config11]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config12]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config13]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config14]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config15]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config16]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config17]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config18]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype0-config19]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config0]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config1]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config2]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            8,
+            256,
+            512,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config3]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            4
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config4]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config5]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config6]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config7]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            8,
+            4096,
+            14336,
+            2
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config8]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config9]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config10]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config11]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            256,
+            7168,
+            2048,
+            8
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config12]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config13]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config14]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config15]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            512,
+            4096,
+            1024,
+            10
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config16]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            1,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config17]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            16,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config18]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            64,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[int8-dtype1-config19]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            256,
+            256,
+            4096,
+            2048,
+            6
+          ],
+          "dtype": "torch.float16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-dense-int8]": {
+        "params": {
+          "precision": "int8",
+          "config": [
+            4096,
+            4,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-dense-fp8]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            4096,
+            4,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-split-gemv-1]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            1,
+            16,
+            1024,
+            128,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-split-gemv-2]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            2,
+            16,
+            1024,
+            128,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-split-gemv-4]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            4,
+            16,
+            1024,
+            128,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-split-gemv-16]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            16,
+            16,
+            1024,
+            128,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w8a16[ppu-split-gemv-24]": {
+        "params": {
+          "precision": "fp8",
+          "config": [
+            24,
+            16,
+            1024,
+            128,
+            6
+          ],
+          "dtype": "torch.bfloat16",
+          "_unused": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w8a16"
+        ],
+        "reason": null
+      }
+    }
+  },
+  "w4_quick": {
+    "passed": 30,
+    "records": {
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype0-w1_scale-1]": {
+        "params": {
+          "dtype": "torch.bfloat16",
+          "updated_tensor": "w1_scale",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype0-w1_scale-33]": {
+        "params": {
+          "dtype": "torch.bfloat16",
+          "updated_tensor": "w1_scale",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype0-w2_scale-1]": {
+        "params": {
+          "dtype": "torch.bfloat16",
+          "updated_tensor": "w2_scale",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype0-w2_scale-33]": {
+        "params": {
+          "dtype": "torch.bfloat16",
+          "updated_tensor": "w2_scale",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype1-w1_scale-1]": {
+        "params": {
+          "dtype": "torch.float16",
+          "updated_tensor": "w1_scale",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype1-w1_scale-33]": {
+        "params": {
+          "dtype": "torch.float16",
+          "updated_tensor": "w1_scale",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype1-w2_scale-1]": {
+        "params": {
+          "dtype": "torch.float16",
+          "updated_tensor": "w2_scale",
+          "num_tokens": 1
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_scale_updates_ppu[dtype1-w2_scale-33]": {
+        "params": {
+          "dtype": "torch.float16",
+          "updated_tensor": "w2_scale",
+          "num_tokens": 33
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_alignment_ppu[96-128]": {
+        "params": {
+          "hidden_size": 96,
+          "intermediate_size": 128
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_mxfp4_alignment_ppu[128-160]": {
+        "params": {
+          "hidden_size": 128,
+          "intermediate_size": 160
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-False-dtype0-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-False-dtype0-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-False-dtype1-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-False-dtype1-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-True-dtype0-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-True-dtype0-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-True-dtype1-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[int4-True-dtype1-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[mxfp4-dtype0-config0]": {
+        "params": {
+          "precision": "mxfp4",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[mxfp4-dtype0-config1]": {
+        "params": {
+          "precision": "mxfp4",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[mxfp4-dtype1-config0]": {
+        "params": {
+          "precision": "mxfp4",
+          "config": [
+            1,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[mxfp4-dtype1-config1]": {
+        "params": {
+          "precision": "mxfp4",
+          "config": [
+            4,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": null
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-False-dtype0-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-False-dtype0-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            2,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-False-dtype1-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-False-dtype1-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            2,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": false
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-True-dtype0-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-True-dtype0-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            2,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.bfloat16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-True-dtype1-config0]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            32,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      },
+      "tests/test_fused_marlin_moe.py::test_fused_marlin_moe_w4a16[ppu-int4-True-dtype1-config1]": {
+        "params": {
+          "precision": "int4",
+          "config": [
+            2,
+            8,
+            128,
+            256,
+            2
+          ],
+          "dtype": "torch.float16",
+          "apply_router_weight_on_input": true
+        },
+        "result": "passed",
+        "opname": [
+          "fused_marlin_moe_w4a16"
+        ],
+        "reason": null
+      }
+    }
+  },
+  "entry_source": {
+    "passed": 1,
+    "public_entry": "src/flaggems_vllm/runtime/backend/_thead/fused/fused_marlin_moe.py",
+    "imported_sources": {
+      "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe": {
+        "file": "src/flaggems_vllm/runtime/backend/_thead/fused/fused_marlin_moe.py",
+        "sha256": "c7b30306ced07fa68aeb545aa9b92375cabcf9ba060f35d90d02107befa758be"
+      },
+      "flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16": {
+        "file": "src/flaggems_vllm/runtime/backend/_thead/fused/marlin_moe_w8a16.py",
+        "sha256": "3ed38893dd72b087e174c304bd983ec14d99f666464d753ba567024b3ffbb4ca"
+      },
+      "flaggems_vllm.runtime.backend._thead.fused.marlin_moe_dense": {
+        "file": "src/flaggems_vllm/runtime/backend/_thead/fused/marlin_moe_dense.py",
+        "sha256": "ccc2075c8320612c107f1f1adc4f903b78ab26b3dd10a8fc95132b6c60a94af8"
+      }
+    }
+  },
+  "decoder": {
+    "int8": {
+      "tested_revision": "f42b731",
+      "executable_definition_unchanged": true,
+      "result": {
+        "precision": "INT8",
+        "compared": 16777216,
+        "status": "passed",
+        "scope": "all byte codes x all BF16 scales (safe folded subset for FP8)"
+      }
+    },
+    "fp8_normalized": {
+      "tested_revision": "7b34405",
+      "executable_definition_unchanged": true,
+      "result": {
+        "precision": "FP8",
+        "compared": 16777216,
+        "status": "passed",
+        "scope": "all byte codes x all BF16 scales"
+      }
+    },
+    "fp8_folded": {
+      "tested_revision": "41cd97ecdccb2dd0a5f2239621f0ab1bb3e77ddd",
+      "results": [
+        {
+          "precision": "FP8",
+          "compared": 8912896,
+          "status": "passed",
+          "mixed": false,
+          "scope": "all byte codes x all BF16 scales (safe folded subset for FP8)"
+        },
+        {
+          "precision": "FP8",
+          "compared": 8912896,
+          "status": "passed",
+          "mixed": true,
+          "scope": "all byte codes x all BF16 scales (safe folded subset for FP8)"
+        }
+      ]
+    }
+  },
+  "reproduction_smoke": {
+    "baseline_source_sha256": "57a3f7efc9624f5c437908892ed5109a81ba0dbf45e1c6ac8a1438a23131f207",
+    "rep_ms": 100,
+    "rounds": 3,
+    "results": {
+      "int8": {
+        "rows": [
+          {
+            "shape": [
+              1,
+              256,
+              4096,
+              256,
+              6
+            ],
+            "count": 172,
+            "trials_ms": {
+              "bf16": [
+                0.0461775420659996,
+                0.046184799671173095,
+                0.04617215168627003
+              ],
+              "candidate": [
+                0.04739585625697892,
+                0.04740599099691812,
+                0.04739910917462043
+              ]
+            },
+            "latency_ms": {
+              "bf16": 0.0461775420659996,
+              "candidate": 0.04739910917462043
+            },
+            "relative_rms": 0.0007570344605483115,
+            "relative_peak": 0.002439024392515421,
+            "speedup": 0.9742280576598913
+          },
+          {
+            "shape": [
+              88,
+              256,
+              4096,
+              256,
+              6
+            ],
+            "count": 172,
+            "trials_ms": {
+              "bf16": [
+                1.0549920082092286,
+                1.0539460062980652,
+                1.0580640077590941
+              ],
+              "candidate": [
+                0.8173143543180872,
+                0.8171643002827962,
+                0.8173875089551582
+              ]
+            },
+            "latency_ms": {
+              "bf16": 1.0549920082092286,
+              "candidate": 0.8173143543180872
+            },
+            "relative_rms": 0.00017177857807837427,
+            "relative_peak": 0.0014044943964108825,
+            "speedup": 1.2908032296697443
+          },
+          {
+            "shape": [
+              16384,
+              256,
+              4096,
+              256,
+              6
+            ],
+            "count": 946,
+            "trials_ms": {
+              "bf16": [
+                11.022639846801757,
+                11.05226402282715,
+                11.004889965057373
+              ],
+              "candidate": [
+                8.446341774680398,
+                8.444117806174539,
+                8.444174471768466
+              ]
+            },
+            "latency_ms": {
+              "bf16": 11.022639846801757,
+              "candidate": 8.444174471768466
+            },
+            "relative_rms": 0.0,
+            "relative_peak": 0.0,
+            "speedup": 1.305354346200912
+          }
+        ],
+        "summary": {
+          "shape_count": 3,
+          "sum_count": 1290,
+          "mean_speedup": 1.1901285445101826,
+          "count_weighted_mean_speedup": 1.2592640255246204,
+          "minimum": 0.9742280576598913,
+          "maximum": 1.305354346200912,
+          "faster": 2,
+          "cumulative_ms": {
+            "bf16": 10616.818457721802,
+            "candidate": 8136.919766013715
+          },
+          "cumulative_speedup": 1.3047711865202514
+        }
+      },
+      "fp8": {
+        "rows": [
+          {
+            "shape": [
+              1,
+              256,
+              4096,
+              256,
+              6
+            ],
+            "count": 172,
+            "trials_ms": {
+              "bf16": [
+                0.045494763634421606,
+                0.045482385589415766,
+                0.04548718078791747
+              ],
+              "candidate": [
+                0.03518688538495232,
+                0.03512239061163727,
+                0.03513375338386087
+              ]
+            },
+            "latency_ms": {
+              "bf16": 0.04548718078791747,
+              "candidate": 0.03513375338386087
+            },
+            "relative_rms": 0.0005073264474049211,
+            "relative_peak": 0.0033112582750618458,
+            "speedup": 1.2946860613193858
+          },
+          {
+            "shape": [
+              88,
+              256,
+              4096,
+              256,
+              6
+            ],
+            "count": 172,
+            "trials_ms": {
+              "bf16": [
+                1.0514040112495422,
+                1.0505079865455627,
+                1.0510660052299499
+              ],
+              "candidate": [
+                1.0374717230545847,
+                1.036244281133016,
+                1.0451628287633261
+              ]
+            },
+            "latency_ms": {
+              "bf16": 1.0510660052299499,
+              "candidate": 1.0374717230545847
+            },
+            "relative_rms": 0.00024283766106236726,
+            "relative_peak": 0.003496503457427025,
+            "speedup": 1.013103279707075
+          },
+          {
+            "shape": [
+              16384,
+              256,
+              4096,
+              256,
+              6
+            ],
+            "count": 946,
+            "trials_ms": {
+              "bf16": [
+                11.0165620803833,
+                11.033067989349366,
+                11.022749996185302
+              ],
+              "candidate": [
+                8.551859560879794,
+                8.553957228227095,
+                8.552282576127485
+              ]
+            },
+            "latency_ms": {
+              "bf16": 11.022749996185302,
+              "candidate": 8.552282576127485
+            },
+            "relative_rms": 0.0,
+            "relative_peak": 0.0,
+            "speedup": 1.2888664398150016
+          }
+        ],
+        "summary": {
+          "shape_count": 3,
+          "sum_count": 1290,
+          "mean_speedup": 1.1988852602804874,
+          "count_weighted_mean_speedup": 1.252873968001196,
+          "minimum": 1.013103279707075,
+          "maximum": 1.2946860613193858,
+          "faster": 3,
+          "cumulative_ms": {
+            "bf16": 10616.12864438637,
+            "candidate": 8274.947458964014
+          },
+          "cumulative_speedup": 1.2829239940232153
+        }
+      }
+    }
+  },
+  "context_monitoring": {
+    "int8_timing": {
+      "gpu": 12,
+      "initially_idle": true,
+      "samples": 432,
+      "duration_seconds": 439.286,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "4276c92e12763abb13681491e09647982609ce5ef8f3e31ff38bb4fac0a13dae"
+    },
+    "fp8_timing": {
+      "gpu": 12,
+      "initially_idle": true,
+      "samples": 539,
+      "duration_seconds": 547.019,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "08dc9c87dc0d0515568577e3d14bd257c93f9486186e576b3081c4bc9285ba94"
+    },
+    "w8": {
+      "gpu": 13,
+      "initially_idle": true,
+      "samples": 494,
+      "duration_seconds": 501.439,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "d8dbf0c17ba7aff15a275edb66e0a5fd55f85ce16b7552a3787670c823fd123a"
+    },
+    "w4": {
+      "gpu": 13,
+      "initially_idle": true,
+      "samples": 58,
+      "duration_seconds": 59.996,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "e99cd8ef87837763ff8432bd958b073e7511f743a51626d4ccb1d9a64550fa1e"
+    },
+    "fp8_decoder": {
+      "gpu": 13,
+      "initially_idle": true,
+      "samples": 1,
+      "duration_seconds": 1.926,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "d61ad3c05d7764c54793a0ed6506930f389c20998318d4083b7d9c1c5c97276e"
+    },
+    "entry_source": {
+      "gpu": 13,
+      "initially_idle": true,
+      "samples": 7,
+      "duration_seconds": 8.102,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "094b5a8e55f288f72728fa78c73244b5a2c2638983d39cab067c89bc9d8a1cb0"
+    },
+    "reproduction": {
+      "gpu": 13,
+      "initially_idle": true,
+      "samples": 34,
+      "duration_seconds": 35.567,
+      "foreign_contexts_observed": 0,
+      "completed": true,
+      "raw_log_sha256": "a0dfbf13ec35edf1f3070bcb9502bb2cb09b0e9a41efb6f8615a06932742841f"
+    }
+  },
+  "checks": {
+    "pre_commit": "passed",
+    "ci_tool_tests_passed": 54,
+    "ci_pin": "passed",
+    "git_diff_check": "passed"
+  }
+}

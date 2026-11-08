@@ -1,0 +1,62 @@
+{
+  "tested_operator_revision": "41cd97ecdccb2dd0a5f2239621f0ab1bb3e77ddd",
+  "comparison_revision": "7b34405c3a12649a984e8962c067805f496348b8",
+  "platform": {
+    "device": "PPU-ZW810E",
+    "target": "sm80",
+    "torch": "2.10.0",
+    "triton": "3.6.0",
+    "flagtree": "0.7.0+ppu.git1a96a36a",
+    "vllm": "0.24.0+empty"
+  },
+  "workload": {
+    "trace": "DeepSeek-V4-Flash p32768d1024",
+    "shapes": 53,
+    "calls": 10105,
+    "geometry": {
+      "E": 256,
+      "K": 4096,
+      "N": 256,
+      "topk": 6
+    },
+    "group_size": 128,
+    "activation_dtype": "bfloat16",
+    "scale_dtype": "bfloat16",
+    "tensor_values": "synthetic",
+    "weight_seed": 7,
+    "per_shape_seed": "7 + M"
+  },
+  "baseline": {
+    "operator": "vLLM Triton BF16 fused_experts",
+    "source_sha256": "57a3f7efc9624f5c437908892ed5109a81ba0dbf45e1c6ac8a1438a23131f207",
+    "auxiliary_provider": "FL routing, activation and output reduction"
+  },
+  "timing": {
+    "method": "full-operator CUDA graph",
+    "rounds": 3,
+    "rep_ms": 100,
+    "order": "alternate forward and reverse",
+    "per_shape_statistic": "median",
+    "weight_preparation_and_jit_in_timing": false
+  },
+  "production_source_sha256": {
+    "src/flaggems_vllm/runtime/backend/_thead/fused/fused_marlin_moe.py": "c7b30306ced07fa68aeb545aa9b92375cabcf9ba060f35d90d02107befa758be",
+    "src/flaggems_vllm/runtime/backend/_thead/fused/marlin_moe_w8a16.py": "3ed38893dd72b087e174c304bd983ec14d99f666464d753ba567024b3ffbb4ca",
+    "src/flaggems_vllm/runtime/backend/_thead/fused/marlin_moe_dense.py": "ccc2075c8320612c107f1f1adc4f903b78ab26b3dd10a8fc95132b6c60a94af8",
+    "tests/test_fused_marlin_moe.py": "b3e2fb64413ce3a64040ceae8e8881fb7bb8a57c1e9e9d7020f35a7710446d9c"
+  },
+  "benchmark_snapshot_sha256": {
+    "before": "b43f5a9bfe75eed77dab1cf64786f0528476cd22ea8f40891a920523e390fa0b",
+    "final_impl": "2726bfcbc96a664de60d3af87c3f617bc329b148be73defcfb2a4ff8aaee40de"
+  },
+  "benchmark_snapshot_import_substitutions": {
+    "flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16": "final_w8_helpers",
+    "flaggems_vllm.runtime.backend._thead.fused.marlin_moe_dense": "final_dense"
+  },
+  "import_adaptation_ast_verified": {
+    "final_impl.py": true,
+    "final_dense.py": true
+  },
+  "reproduction_script": "benchmark/run_ppu_marlin_w8a16.py",
+  "reproduction_script_sha256": "f7c8600ad7d5ac220a86bdb53601e8754b0f2d9dc52e899ffbf97bd73827de23"
+}
