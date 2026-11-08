@@ -17,7 +17,26 @@ import logging
 import torch
 import torch_npu
 import triton
-import triton.experimental.tle.language as tle
+
+try:
+    import triton.experimental.tle.language as tle
+except ModuleNotFoundError:
+    # TLE (Triton experimental language extensions) ships with FlagTree but
+    # not with stock Triton. All `tle.*` references in this module occur
+    # inside @triton.jit-traced function bodies, so the name only needs to
+    # resolve lazily when those kernels are actually compiled/launched. This
+    # stub keeps module import working on a stock-Triton environment and
+    # raises a clear error only if a TLE-backed kernel in this module is
+    # actually invoked.
+    class _MissingTLE:
+        def __getattr__(self, name):
+            raise ModuleNotFoundError(
+                "triton.experimental.tle.language is required to run this "
+                "module's kernels, but is not installed (requires "
+                "FlagTree; see tools/setup.sh)."
+            )
+
+    tle = _MissingTLE()
 import triton.language as tl
 
 from flaggems_vllm.utils import tl_extra_shim

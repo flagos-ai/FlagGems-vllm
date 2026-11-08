@@ -12,6 +12,7 @@ from flaggems_vllm.ops.FLA.chunk_kda_intra_token_parallel import (
 from flaggems_vllm.ops.FLA.chunk_kda_scaled_dot_kkt_fwd import (
     chunk_kda_scaled_dot_kkt_fwd,
 )
+from flaggems_vllm.ops.FLA.chunk_kda_with_fused_gate import chunk_kda_with_fused_gate
 from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
     fused_recurrent_gated_delta_rule_fwd,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "chunk_kda",
     "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_fwd_intra_token_parallel",
+    "chunk_kda_with_fused_gate",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
@@ -54,6 +56,7 @@ from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "ascend":
     from flaggems_vllm.runtime.backend._ascend.FLA import (  # noqa: F811
+        chunk_kda_with_fused_gate,
         fused_recurrent_gated_delta_rule_fwd,
         fused_recurrent_gated_delta_rule_packed_decode,
         fused_recurrent_kda,
@@ -61,4 +64,9 @@ if _runtime.device.vendor_name == "ascend":
 elif _runtime.device.vendor_name == "hygon":
     from flaggems_vllm.runtime.backend._hygon.FLA import (  # noqa: F811
         fused_recurrent_kda,
+    )
+
+elif _runtime.device.vendor_name == "metax":
+    from flaggems_vllm.runtime.backend._metax.FLA import (  # noqa: F811
+        chunk_kda_with_fused_gate,
     )
