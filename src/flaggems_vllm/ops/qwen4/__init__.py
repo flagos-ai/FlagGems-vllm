@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+from flaggems_vllm.ops.qwen4.hc_combine import hc_combine
 from flaggems_vllm.ops.qwen4.hyperconnection import (
     can_use_hc_combine_norm_triton,
     can_use_hc_inject_triton,
@@ -50,6 +52,8 @@ from flaggems_vllm.ops.qwen4.qsa_attention import (
 from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
 
 __all__ = [
+    "grouped_gemma_rmsnorm",
+    "hc_combine",
     "ple_short_conv_",
     "qwen4_hc_combine_norm",
     "ple_gate_norm_",
