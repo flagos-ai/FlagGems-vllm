@@ -60,8 +60,14 @@ def build_plan(params, num_splits):
     """Select the initial unsplit paged forward path after shared preparation."""
     if type(num_splits) is not int or num_splits not in (0, 1):
         raise NotImplementedError("Ascend attention supports num_splits=0 or 1")
-    if params.d != 256 or not params.is_paged or params.block_size not in (16, 32):
-        raise NotImplementedError("Ascend attention requires D256 and page16/page32 KV")
+    if (
+        params.d not in (128, 192, 256)
+        or not params.is_paged
+        or params.block_size not in (16, 32)
+    ):
+        raise NotImplementedError(
+            "Ascend attention requires D128/D192/D256 and page16/page32 KV"
+        )
     if not params.is_seqused_k:
         raise NotImplementedError("Ascend paged attention requires seqused_k")
     if not params.is_cu_seqlens_q and not params.seqlenq_ngroups_swapped:

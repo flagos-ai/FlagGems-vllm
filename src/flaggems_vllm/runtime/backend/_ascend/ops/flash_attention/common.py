@@ -41,10 +41,12 @@ def load_paged_tile(
     TABLE_STRIDE: tl.constexpr,
     PAGE: tl.constexpr,
     BN: tl.constexpr,
+    D: tl.constexpr = 256,
+    BD: tl.constexpr = 256,
 ):
     """Gather affine page segments with 64-bit physical cache addresses."""
     SEG: tl.constexpr = BN if BN < PAGE else PAGE
-    tile = tl.zeros((BN, 256), X.dtype.element_ty)
+    tile = tl.zeros((BN, BD), X.dtype.element_ty)
     for start in tl.static_range(0, BN, SEG):
         first = begin + start
         # Clamp even masked page addresses: scalar loads can be speculated.
@@ -53,12 +55,19 @@ def load_paged_tile(
         base = X + page.to(tl.int64) * PAGE_STRIDE
         base += (first % PAGE) * ROW_STRIDE + head * HEAD_STRIDE
         rows = tl.arange(0, SEG)
-        values = tl.load(
-            base + rows[:, None] * ROW_STRIDE + tl.arange(0, 256)[None, :],
-            first + rows[:, None] < length,
-            0,
-        )
-        tile = insert_slice(tile, values, (start, 0), (SEG, 256), (1, 1))
+        if D == BD:
+            values = tl.load(
+                base + rows[:, None] * ROW_STRIDE + tl.arange(0, BD)[None, :],
+                first + rows[:, None] < length,
+                0,
+            )
+        else:
+            values = tl.load(
+                base + rows[:, None] * ROW_STRIDE + tl.arange(0, BD)[None, :],
+                (first + rows[:, None] < length) & (tl.arange(0, BD)[None, :] < D),
+                0,
+            )
+        tile = insert_slice(tile, values, (start, 0), (SEG, BD), (1, 1))
     return tile
 
 
@@ -559,14 +568,21 @@ def load_kv_tile(
     BN: tl.constexpr,
     CONTIG_K: tl.constexpr,
     HK: tl.constexpr,
+    D: tl.constexpr = 256,
+    BD: tl.constexpr = 256,
 ):
     if CONTIG_K:
         rows = begin + tl.arange(0, BN)
-        dims = tl.arange(0, 256)
+        dims = tl.arange(0, BD)
         offset = (
             (batch.to(tl.int64) * HK + head) * CONTIG_K + rows[:, None]
-        ) * 256 + dims[None, :]
-        values = tl.load(X + offset, rows[:, None] < length, 0)
+        ) * D + dims[None, :]
+        if D == BD:
+            values = tl.load(X + offset, rows[:, None] < length, 0)
+        else:
+            values = tl.load(
+                X + offset, (rows[:, None] < length) & (dims[None, :] < D), 0
+            )
     else:
         values = load_paged_tile(
             X,
@@ -581,6 +597,8 @@ def load_kv_tile(
             TABLE_STRIDE,
             PAGE,
             BN,
+            D,
+            BD,
         )
     return values
 

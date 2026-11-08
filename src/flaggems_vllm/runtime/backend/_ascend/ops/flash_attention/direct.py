@@ -805,6 +805,8 @@ def _attention_task_direct(
     SPLITS: tl.constexpr = 1,
     CONTIG_K: tl.constexpr = 0,
     SM_N: tl.constexpr = 0,
+    D: tl.constexpr = 256,
+    BD: tl.constexpr = 256,
 ):
     SM_WIDTH: tl.constexpr = SM_N if SM_N else BS
     worker = worker.to(tl.int64)
@@ -820,7 +822,7 @@ def _attention_task_direct(
         qbase = batch.to(tl.int64) * QB
         obase = batch.to(tl.int64) * OB
     if SPLITS > 1:
-        obase += split.to(tl.int64) * TOTAL_Q * H * 256
+        obase += split.to(tl.int64) * TOTAL_Q * H * D
     klen = tl.load(USED + batch)
     group: tl.constexpr = H // HK
     head_rows = tl.minimum(group, tl.maximum(1, (128 // tl.maximum(qlen, 1)) // 2 * 2))
@@ -838,20 +840,35 @@ def _attention_task_direct(
     headlocal = headstart + rr // qs
     head = kh * group + headlocal
     validq = (rr < qs * head_rows) & (headlocal < group) & (row < qlen)
-    dd = tl.arange(0, 256)
-    q = tl.load(
-        Q + qbase + row[:, None].to(tl.int64) * QR + head[:, None] * QH + dd[None, :],
-        validq[:, None],
-        0,
-    )
+    dd = tl.arange(0, BD)
+    if D == BD:
+        q = tl.load(
+            Q
+            + qbase
+            + row[:, None].to(tl.int64) * QR
+            + head[:, None] * QH
+            + dd[None, :],
+            validq[:, None],
+            0,
+        )
+    else:
+        q = tl.load(
+            Q
+            + qbase
+            + row[:, None].to(tl.int64) * QR
+            + head[:, None] * QH
+            + dd[None, :],
+            validq[:, None] & (dd[None, :] < D),
+            0,
+        )
     sm_offsets = tl.arange(0, BM)[:, None] * BS + tl.arange(0, SM_WIDTH)[None, :]
-    pv_offsets = tl.arange(0, BM)[:, None] * 256 + dd[None, :]
+    pv_offsets = tl.arange(0, BM)[:, None] * BD + dd[None, :]
     scratch = SCORES + worker * BM * BS
     prob = PROBS + worker * BM * BS
-    pvwork = PVWORK + worker * BM * 256
+    pvwork = PVWORK + worker * BM * BD
     m = tl.full((BM,), -float("inf"), tl.float32)
     normalizer = tl.zeros((BM,), tl.float32)
-    acc = tl.zeros((BM, 256), tl.float32)
+    acc = tl.zeros((BM, BD), tl.float32)
     limit = klen
     if CAUSAL:
         # Bound by this BM subtile, including a possible wrap to the next
@@ -885,6 +902,8 @@ def _attention_task_direct(
                 BN,
                 CONTIG_K,
                 HK,
+                D,
+                BD,
             )
             qk = tl.dot(q, tl.trans(key))
             part = tl.arange(0, BM)[:, None] * BS + chunk + tl.arange(0, BN)[None, :]
@@ -910,7 +929,7 @@ def _attention_task_direct(
         tl.store(prob + sm_offsets, p.to(PROBS.dtype.element_ty))
         sync_block_set("vector", "cube", 13, PIPE.PIPE_MTE3, PIPE.PIPE_S)
         sync_block_wait("vector", "cube", 13, PIPE.PIPE_MTE3, PIPE.PIPE_S)
-        contribution = tl.zeros((BM, 256), tl.float32)
+        contribution = tl.zeros((BM, BD), tl.float32)
         for chunk in range(0, stack, BN):
             value = load_kv_tile(
                 V,
@@ -927,6 +946,8 @@ def _attention_task_direct(
                 BN,
                 CONTIG_K,
                 HK,
+                D,
+                BD,
             )
             part = tl.arange(0, BM)[:, None] * BS + chunk + tl.arange(0, BN)[None, :]
             weights = tl.load(prob + part, volatile=True)
@@ -950,11 +971,18 @@ def _attention_task_direct(
         local_head = headstart + combined // qs
         if combined < qs * head_rows and local_head < group and token < qlen:
             output_head = kh * group + local_head
-            values = extract_slice(result, (r, 0), (1, 256), (1, 1))
-            tl.store(
-                O + obase + token.to(tl.int64) * OR + output_head * OH + dd,
-                tl.reshape(values, (256,)),
-            )
+            values = extract_slice(result, (r, 0), (1, BD), (1, 1))
+            if D == BD:
+                tl.store(
+                    O + obase + token.to(tl.int64) * OR + output_head * OH + dd,
+                    tl.reshape(values, (BD,)),
+                )
+            else:
+                tl.store(
+                    O + obase + token.to(tl.int64) * OR + output_head * OH + dd,
+                    tl.reshape(values, (BD,)),
+                    dd < D,
+                )
             row_lse = extract_slice(lse, (r,), (1,), (1,))
             tl.store(
                 LSE
@@ -1013,6 +1041,8 @@ def ascend_attention_persistent(
     REQUEST_IDS=None,
     REQUEST_COUNT=None,
     REQUEST_LIST: tl.constexpr = False,
+    D: tl.constexpr = 256,
+    BD: tl.constexpr = 256,
 ):
     worker = tl.program_id(0)
     workers = tl.num_programs(0)
@@ -1085,6 +1115,8 @@ def ascend_attention_persistent(
                     BS,
                     SPLITS,
                     CONTIG_K,
+                    D=D,
+                    BD=BD,
                 )
             cursor = (cursor + ntiles) % workers
 

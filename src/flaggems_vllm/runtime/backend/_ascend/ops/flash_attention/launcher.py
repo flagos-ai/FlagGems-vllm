@@ -707,6 +707,67 @@ def _launch_pipelined(
 # ---- launcher ----
 
 
+def _launch_dimension_direct(params, plan):
+    """Use dimension-masked paged tiles without D256-specific packing."""
+    workers = torch.npu.get_device_limit(params.q_ptr.device.index)["cube_core_num"]
+    block_d = triton.next_power_of_2(params.d)
+    # Leave UB space for padding/masking D192 columns in the direct path.
+    kv_stack = 128
+    scores = torch.empty(
+        (workers, plan.block_m, kv_stack),
+        dtype=torch.float32,
+        device=params.q_ptr.device,
+    )
+    probs = torch.empty_like(scores, dtype=params.q_ptr.dtype)
+    pvwork = torch.empty(
+        (workers, plan.block_m, block_d),
+        dtype=torch.float32,
+        device=params.q_ptr.device,
+    )
+    ascend_attention_persistent[(workers,)](
+        params.q_ptr,
+        params.k_ptr,
+        params.v_ptr,
+        params.o_ptr,
+        params.softmax_lse_ptr,
+        params.cu_seqlens_q_ptr,
+        params.seqused_k_ptr,
+        params.page_table_ptr,
+        scores,
+        probs,
+        pvwork,
+        params.b,
+        params.h,
+        params.hk,
+        params.total_q,
+        params.seqlen_q,
+        params.scale_softmax,
+        params.q_row_stride,
+        params.q_head_stride,
+        params.q_batch_stride,
+        params.o_row_stride,
+        params.o_head_stride,
+        params.o_batch_stride,
+        params.k_page_stride,
+        params.k_row_stride,
+        params.k_head_stride,
+        params.v_ptr.stride(0),
+        params.v_row_stride,
+        params.v_head_stride,
+        params.page_table_batch_stride,
+        params.block_size,
+        params.is_cu_seqlens_q,
+        params.is_causal,
+        plan.block_m,
+        plan.block_n,
+        kv_stack,
+        D=params.d,
+        BD=block_d,
+        enable_fp_fusion=False,
+        multibuffer=False,
+    )
+
+
 def launch_attention(params, *, num_splits=0):
     """Launch the Ascend forward path with a packed pipelined fast path."""
     plan = build_plan(params, num_splits)
@@ -728,6 +789,9 @@ def launch_attention(params, *, num_splits=0):
     ):
         raise ValueError("attention output must not alias inputs or metadata")
     with torch_device_fn.device(params.q_ptr.device):
+        if params.d in (128, 192):
+            _launch_dimension_direct(params, plan)
+            return
         # Keep dynamic actual lengths on device, including graph replay.
         if (
             params.q_ptr.dtype == torch.bfloat16
