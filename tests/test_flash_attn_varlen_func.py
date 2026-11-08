@@ -70,8 +70,6 @@ def ref_paged_attn(
         kv_len = kv_lens[i]
         # clone to avoid clobbering the query tensor
         q = query[start_idx : start_idx + query_len].clone()
-        if vendor_name == "ascend":
-            q = utils.to_reference(q)
         q *= scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
@@ -81,8 +79,6 @@ def ref_paged_attn(
         k = k[:kv_len]
         v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
         v = v[:kv_len]
-        if vendor_name == "ascend":
-            k, v = utils.to_reference(k), utils.to_reference(v)
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
@@ -114,8 +110,7 @@ def ref_paged_attn(
         outputs.append(out)
         start_idx += query_len
 
-    result = torch.cat(outputs, dim=0)
-    return result.to(query.device) if vendor_name == "ascend" else result
+    return torch.cat(outputs, dim=0)
 
 
 def make_paged_kv_cache(
@@ -155,6 +150,9 @@ def make_paged_kv_cache(
     return key_cache, value_cache
 
 
+@pytest.mark.skipif(
+    vendor_name == "ascend", reason="Ascend D256 coverage uses the dedicated test below"
+)
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
@@ -184,10 +182,6 @@ def test_flash_attn_varlen_func(
     num_blocks: int,
     optimize_init: bool,
 ) -> None:
-    if vendor_name == "ascend" and (
-        head_size != 256 or alibi or soft_cap is not None or optimize_init
-    ):
-        pytest.skip("Ascend supports D256 without ALiBi, softcap or optimize_init")
     # (Issue) numerical stability concern
     if alibi is True and soft_cap is not None:
         return
@@ -319,6 +313,9 @@ def test_flash_attn_varlen_func(
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2, msg=msg)
 
 
+@pytest.mark.skipif(
+    vendor_name == "ascend", reason="Ascend D256 coverage uses the dedicated test below"
+)
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
@@ -336,8 +333,6 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
     fa_version: int,
     layout: str,
 ) -> None:
-    if vendor_name == "ascend" and optimize_init:
-        pytest.skip("Ascend uses the standard varlen attention entry")
     with torch.device(flaggems_vllm.device):
         utils.init_seed(1234567890)
 
@@ -347,7 +342,7 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
         num_seqs = len(seq_lens)
         num_query_heads = 8
         num_kv_heads = 2
-        head_size = 256 if vendor_name == "ascend" else 128
+        head_size = 128
         block_size = 32
         num_blocks = 2048
         max_query_len = max(query_lens)
@@ -423,12 +418,15 @@ def test_flash_attn_varlen_func_noncontiguous_kv_cache(
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2, msg=msg)
 
 
+@pytest.mark.skipif(
+    vendor_name == "ascend", reason="Ascend D256 coverage uses the dedicated test below"
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not working")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (1, 18), (1, 463)]])
 @pytest.mark.parametrize("num_heads", [(8, 2)])
-@pytest.mark.parametrize("head_size", [256] if vendor_name == "ascend" else [128])
+@pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("block_size", [32])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -446,8 +444,6 @@ def test_flash_attn_varlen_func_swap_qg(
     soft_cap: Optional[float],
     num_blocks: int,
 ) -> None:
-    if vendor_name == "ascend" and soft_cap is not None:
-        pytest.skip("Ascend does not support softcap")
     with torch.device(flaggems_vllm.device):
         utils.init_seed(1234567890)
         num_seqs = len(seq_lens)
@@ -735,3 +731,98 @@ def test_flash_attn_varlen_func_fa3_matches_fa2(
         )
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
         torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "ascend", reason="Ascend-specific paged attention")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, layout, num_blocks",
+    [
+        ([(1, 1328), (5, 18), (129, 463)], heads, "contiguous", blocks)
+        for heads in [(4, 4), (8, 2), (16, 2)]
+        for blocks in [32768, 2048]
+    ]
+    + [
+        ([(1, 1328), (5, 18), (129, 463)], (8, 2), "interleaved", 2048),
+        ([(1, 1328), (5, 18), (129, 463)], (8, 2), "padded", 2048),
+        ([(1, 1328), (1, 18), (1, 463)], (8, 2), "contiguous", 2048),
+    ],
+)
+@torch.inference_mode()
+def test_flash_attn_varlen_func_ascend(
+    dtype: torch.dtype,
+    seq_lens: List[Tuple[int, int]],
+    num_heads: Tuple[int, int],
+    layout: str,
+    num_blocks: int,
+) -> None:
+    utils.init_seed(1234567890)
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [k for _, k in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    head_size, block_size = 256, 32
+    num_seqs = len(seq_lens)
+    scale = head_size**-0.5
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device=device
+    )
+    if layout == "contiguous":
+        key_cache = torch.randn(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype=dtype,
+            device=device,
+        )
+        value_cache = torch.randn_like(key_cache)
+    else:
+        key_cache, value_cache = make_paged_kv_cache(
+            num_blocks, block_size, num_kv_heads, head_size, dtype, layout, device
+        )
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device=device
+    ).cumsum(dim=0, dtype=torch.int32)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    max_num_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks), dtype=torch.int32, device=device
+    )
+    output = flaggems_vllm.flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=seqused_k,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        fa_version=2,
+    )
+
+    # Gather only referenced pages before transferring the CPU reference inputs.
+    # The shared reference and the other vendors' test parameters stay unchanged.
+    indices = block_tables.reshape(-1).long()
+    ref_query = utils.to_reference(query)
+    ref_key = utils.to_reference(key_cache[indices])
+    ref_value = utils.to_reference(value_cache[indices])
+    ref_tables = torch.arange(
+        indices.numel(), dtype=torch.int32, device=ref_query.device
+    ).view(num_seqs, max_num_blocks)
+    ref_output = ref_paged_attn(
+        query=ref_query,
+        key_cache=ref_key,
+        value_cache=ref_value,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=ref_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(
+        output, ref_output.to(output.device), atol=2e-2, rtol=1e-2
+    )
