@@ -57,7 +57,7 @@ def _ascend_fused_indexer_k_norm_kernel(
                     mask=cols < D, other=0.0,
                 ).to(tl.float32)
 
-            mean = tl.sum(values) / D
+            mean = tl.sum(values / D)
             if NO_MASK:
                 centered = values - mean
             else:
