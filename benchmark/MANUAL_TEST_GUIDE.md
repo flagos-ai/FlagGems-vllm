@@ -173,9 +173,90 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 
 **预期**：所有 shape SpeedUp **0.92–1.03x**，全部达标。
 
+> **注意**：910C 与 910B1 共享 `_ascend` 后端特化（vendor_name 均为 `ascend`），kernel 实现相同。硬件差异体现在 G6 数值上。
+
 ---
 
-## 四、PPU（T-Head M890P）
+## 四、910B1（Ascend）
+
+### Step 1: 进入环境
+
+```bash
+ssh na
+docker exec -it flaggems-910b-dev bash
+cd /workspace/source
+```
+
+容器内 CANN 环境已预置（`/usr/local/Ascend/ascend-toolkit/latest`），无需手动 source。
+
+### Step 2: 同步最新代码
+
+在 **本地** 执行：
+
+```bash
+# 核心实现
+cat /Users/xiexuan/Projects/BAAI-FlagGems/FlagGems-vllm/src/flaggems_vllm/ops/fused_indexer_k_norm.py | \
+  ssh na 'docker exec -i flaggems-910b-dev bash -c "cat > /workspace/source/src/flaggems_vllm/ops/fused_indexer_k_norm.py"'
+
+# Ascend 后端特化（共享 kernel，与 910C 同一套代码）
+cat /Users/xiexuan/Projects/BAAI-FlagGems/FlagGems-vllm/src/flaggems_vllm/runtime/backend/_ascend/ops/fused_indexer_k_norm.py | \
+  ssh na 'docker exec -i flaggems-910b-dev bash -c "cat > /workspace/source/src/flaggems_vllm/runtime/backend/_ascend/ops/fused_indexer_k_norm.py"'
+
+# 测试文件
+cat /Users/xiexuan/Projects/BAAI-FlagGems/FlagGems-vllm/tests/test_fused_indexer_k_norm.py | \
+  ssh na 'docker exec -i flaggems-910b-dev bash -c "cat > /workspace/source/tests/test_fused_indexer_k_norm.py"'
+
+# benchmark 文件
+cat /Users/xiexuan/Projects/BAAI-FlagGems/FlagGems-vllm/benchmark/test_fused_indexer_k_norm.py | \
+  ssh na 'docker exec -i flaggems-910b-dev bash -c "cat > /workspace/source/benchmark/test_fused_indexer_k_norm.py"'
+
+# core_shapes
+cat /Users/xiexuan/Projects/BAAI-FlagGems/FlagGems-vllm/benchmark/core_shapes.yaml | \
+  ssh na 'docker exec -i flaggems-910b-dev bash -c "cat > /workspace/source/benchmark/core_shapes.yaml"'
+```
+
+### Step 3: 精度测试 (G5)
+
+在 **na 容器内** 执行：
+
+```bash
+cd /workspace/source
+export PYTHONPATH=/opt/flagtree:/workspace/source
+pytest tests/test_fused_indexer_k_norm.py -m fused_indexer_k_norm -q
+```
+
+**预期**：118 passed, 37 skipped, 0 failed（与 910C 一致，共享 ascend 后端）。
+
+> **注意**：G5 冷 JIT 编译非常慢，首次运行可能耗时 **3–6 分钟**，请耐心等待。
+
+### Step 4: 性能测试 (G6)
+
+```bash
+cd /workspace/source
+export PYTHONPATH=/opt/flagtree:/workspace/source
+pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
+```
+
+**注意**：910B1 冷 JIT 编译 36 个 shape（12 core_shapes × 3 dtype）非常慢，总耗时约 **10–20 分钟**。如需要快速验证，可临时改 `benchmark/core_shapes.yaml` 只保留 3–4 个 shape。
+
+**预期**：
+
+| dtype | M=1 D=128 | M=128 D=128 | M=1024 D=128 | M=4096 D=128 | M=128 D=127 | 状态 |
+|---|---|---|---|---|---|---|
+| FP16 | 0.66–0.71 | 0.71–0.73 | 0.70–0.78 | 0.66–0.73 | 0.73 | ❌ LIMITED |
+| BF16 | 0.69–0.71 | 0.69–0.72 | 0.71–0.72 | 0.68–0.71 | 0.71–0.72 | ❌ LIMITED |
+| FP32 | 0.43–0.45 | 0.44–0.48 | 0.46–0.48 | 0.45–0.46 | 0.46 | ❌ LIMITED |
+
+> **根因分析**：910B1 baseline（torch ref）约 **0.17–0.19ms**，gems kernel 约 **0.22–0.30ms**，kernel 始终比 baseline 慢。原因可能是：
+> 1. **torch_npu 的 `F.layer_norm` 在 910B1 上已高度优化**（CANN 深度优化算子）。
+> 2. **Triton kernel 在 910B1 上效率低于 910C**：相同 ascend 后端 kernel，910C 可做到 0.92–1.03x，910B1 仅 0.66–0.78x，说明硬件代际差异显著。
+> 3. **无公共 API 开销问题**：910B1 的 torch ref 本身就比较慢（0.17ms vs H20Z 的 0.03ms），Python 层占比不大，瓶颈在于 kernel 本身不够快。
+>
+> **结论**：910B1 的 `fused_indexer_k_norm` 在标准 benchmark 下 **LIMITED**。由于与 910C 共享 ascend 后端代码，无需单独特化；差异来自硬件本身的算力/编译器优化代际。
+
+---
+
+## 五、PPU（T-Head M890P）
 
 ### Step 1: 进入环境
 
@@ -248,7 +329,7 @@ nerdctl run --rm --privileged --shm-size=4g \
 
 ---
 
-## 五、MetaX（C550）
+## 六、MetaX（C550）
 
 ### Step 1: 进入环境
 
@@ -333,7 +414,7 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py::test_fused_indexer_k_norm_b
 
 ---
 
-## 六、MUSA（S5000）
+## 七、MUSA（S5000）
 
 ### Step 1: 进入环境
 
@@ -389,7 +470,7 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 
 ---
 
-## 七、Iluvatar（BI-V150）
+## 八、Iluvatar（BI-V150）
 
 ### Step 1: 进入环境
 
@@ -446,7 +527,7 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 
 ---
 
-## 八、结果汇总表
+## 九、结果汇总表
 
 测试完成后，把各端 G6 的 SpeedUp 填入下表（从 pytest 输出中读取 `speedup` 列）：
 
@@ -456,22 +537,26 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 | H20Z (out=prov) | 0.66 | 0.78 | 0.83 | 0.78 | ❌ LIMITED |
 | 910C | 0.95 | 0.98 | 1.03 | 0.92 | ✅ PASS |
 | PPU | 0.55 | 0.97 | 1.04 | 0.97 | ⚠️ 大M达标 |
+| 910C | 0.95 | 0.98 | 1.03 | 0.92 | ✅ PASS |
+| 910B1 | 0.66–0.71 | 0.71–0.73 | 0.70–0.78 | 0.73 | ❌ LIMITED |
 | MetaX (out=None) | 0.97 | 0.99 | 1.09 | 0.98 | ✅ PASS |
 | MetaX (out=prov) | 1.01 | 1.05 | 1.19 | 1.04 | ✅ PASS |
 | MUSA | 0.97 | 0.99 | 1.07 | 0.99 | ✅ PASS |
 | Iluvatar | 2.3 | 3.5 | 4.7 | 3.5 | ✅ PASS |
 
-**参考达标线**：1.0
+**参考达标线**：1.0（benchmark 框架下）
 
 ---
 
-## 九、常见问题
+## 十、常见问题
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
 | `No module named 'triton'` | PYTHONPATH 缺 `/opt/flagtree` | H20/910C 加 `PYTHONPATH=/opt/flagtree` |
 | `No module named 'flaggems_vllm'` | 不在仓库根目录 | `cd /workspace/source` 再跑 pytest |
 | 910C G6 卡住超 5 分钟 | 冷 JIT 编译慢 | 临时改 `benchmark/core_shapes.yaml` 只保留 3-4 个 shape |
+| 910B1 G5/G6 极慢（3–20 分钟）| 910B1 冷 JIT 比 910C 更慢 | 正常现象，请耐心等待或精简 shape |
+| 910B1 与 910C 结果不同 | 共享 ascend 后端，硬件代际差异 | 910B1 性能低是正常的，非代码 bug |
 | D=127/129 FAIL | mask 路径 padding 未归零 | 检查 kernel 中 `cols < D` 的 where 条件 |
 | PPU 找不到设备 | 容器没挂载 `--device` | nerdctl run 必须加 `--privileged` 和 `--device=/dev/alixpu*` |
 | scp 失败 | jumper server 限制 | 改用 stdin 管道传文件 |
@@ -483,7 +568,7 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 
 ---
 
-## 十、代码文件映射
+## 十一、代码文件映射
 
 如果测试中发现 bug 需要改代码：
 
@@ -491,7 +576,7 @@ pytest -q -s benchmark/test_fused_indexer_k_norm.py --mode kernel
 |---|---|---|
 | 共享实现 | `src/flaggems_vllm/ops/fused_indexer_k_norm.py` | 所有后端共用：kernel 定义、validate、公共 API |
 | H20Z | `src/flaggems_vllm/ops/fused_indexer_k_norm.py`（inline fast path） | H20Z 快路径在共享文件中（gate + config + inline launch） |
-| 910C | `src/flaggems_vllm/runtime/backend/_ascend/ops/fused_indexer_k_norm.py` | 专用 Welford kernel（BLOCK_M=1 + ROWS_PER_BLOCK 循环） |
+| 910C / 910B1 | `src/flaggems_vllm/runtime/backend/_ascend/ops/fused_indexer_k_norm.py` | 专用 Welford kernel；910C 和 910B1 共享此文件 |
 | MUSA | `src/flaggems_vllm/runtime/backend/_mthreads/ops/fused_indexer_k_norm.py` | thin launcher（绕行 libentry） |
 | MetaX | `src/flaggems_vllm/runtime/backend/_metax/ops/fused_indexer_k_norm.py` | inline fast path（消除 launcher 函数调用层） |
 | PPU / Iluvatar | `src/flaggems_vllm/ops/fused_indexer_k_norm.py`（通用路径） | 共享 kernel 的 thin launcher |
