@@ -42,17 +42,28 @@ HEAD_DIM = NOPE_DIM + ROPE_DIM  # 512
 MAX_POSITION = 8192
 
 
-def is_hopper():
-    if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 9
+def nvidia_capability():
+    if (
+        flaggems_vllm.vendor_name != "nvidia"
+        or not torch.cuda.is_available()
+        or torch.version.hip is not None
+    ):
+        return None
+    return tuple(torch.cuda.get_device_capability())
 
 
-HOPPER = is_hopper()
+CAPABILITY = nvidia_capability()
+HOPPER = CAPABILITY is not None and CAPABILITY[0] == 9
+FP8_GPU = CAPABILITY is not None and CAPABILITY >= (8, 9)
+# Hopper runs the tuned kernels, any other GPU with FP8 tensor cores the portable
+# path; both are tested here. Tests of the Hopper-only kernels say so.
+requires_hopper = pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper GPU")
 pytestmark = [
     pytest.mark.dsv41_o_proj,
-    pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper GPU"),
+    pytest.mark.skipif(
+        not FP8_GPU,
+        reason="requires an NVIDIA GPU with FP8 tensor cores (compute capability 8.9+)",
+    ),
 ]
 
 try:
@@ -358,6 +369,7 @@ def _two_kernel_result(monkeypatch, attn_out, pos, csc, w, ws, n_groups, hpg, ra
         return call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
 
 
+@requires_hopper
 @pytest.mark.parametrize("num_tokens", [1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 128, 256])
 @pytest.mark.parametrize("n_groups, hpg, rank", [*GROUP_CONFIGS, (1, 8, 1024)])
 def test_dsv41_o_proj_single_launch_matches_two_kernels(
@@ -379,6 +391,7 @@ def test_dsv41_o_proj_single_launch_matches_two_kernels(
         assert torch.equal(res, ref)
 
 
+@requires_hopper
 def test_dsv41_o_proj_single_launch_is_stable():
     """Every CTA must wait for all of phase 1: a race would show up as a mismatch."""
     n_groups, hpg, rank = GROUP_CONFIGS[0]
@@ -390,6 +403,7 @@ def test_dsv41_o_proj_single_launch_is_stable():
             assert torch.equal(res, ref)
 
 
+@requires_hopper
 def test_dsv41_o_proj_single_launch_cudagraph_replay():
     n_groups, hpg, rank = GROUP_CONFIGS[0]
     attn_out, pos, csc, w, ws = make_inputs(32, n_groups, hpg, rank)
@@ -407,6 +421,7 @@ def test_dsv41_o_proj_single_launch_cudagraph_replay():
         assert torch.equal(out, ref)
 
 
+@requires_hopper
 def test_dsv41_o_proj_single_launch_repeat_launch_reuses_compiled_kernel(monkeypatch):
     launcher = importlib.import_module(
         "flaggems_vllm.runtime.backend._nvidia.hopper.ops.dsv41_o_proj_single_launch"
@@ -419,6 +434,7 @@ def test_dsv41_o_proj_single_launch_repeat_launch_reuses_compiled_kernel(monkeyp
     assert torch.equal(call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank), ref)
 
 
+@requires_hopper
 def test_dsv41_o_proj_single_launch_reused_kernel_respects_specialization():
     """Same shapes, but an alignment or dtype that needs a different compiled kernel."""
     n_groups, hpg, rank = GROUP_CONFIGS[0]
@@ -438,6 +454,7 @@ def test_dsv41_o_proj_single_launch_reused_kernel_respects_specialization():
     assert torch.equal(res, ref)
 
 
+@requires_hopper
 def test_dsv41_o_proj_single_launch_new_token_count_does_not_recompile():
     n_groups, hpg, rank = GROUP_CONFIGS[0]
 
@@ -455,19 +472,117 @@ def test_dsv41_o_proj_single_launch_new_token_count_does_not_recompile():
     assert best < 100, f"new token count took {best:.1f} ms"
 
 
-def test_dsv41_o_proj_rejects_non_hopper(monkeypatch):
+@pytest.fixture
+def fake_capability(monkeypatch):
+    """Make the op believe the GPU has another compute capability (None: not an NVIDIA
+    CUDA device). The kernels still run on the real GPU, so this tests which path the
+    op picks, not how another GPU lowers it."""
+    module = importlib.import_module("flaggems_vllm.ops.dsv41_o_proj")
+
+    def set_capability(capability):
+        monkeypatch.setattr(module, "_capability", lambda device: capability)
+        return module
+
+    return set_capability
+
+
+def test_dsv41_o_proj_rejects_unsupported_devices(fake_capability):
     n_groups, hpg, rank = 2, 8, 1024
     attn_out, pos, csc, w, ws = make_inputs(4, n_groups, hpg, rank)
-    is_hopper_cache = importlib.import_module(
-        "flaggems_vllm.ops.dsv41_o_proj"
-    )._is_hopper
-    is_hopper_cache.cache_clear()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 0))
-    try:
-        with pytest.raises(NotImplementedError, match="Hopper"):
-            call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
-    finally:
-        is_hopper_cache.cache_clear()
+    w16 = _bf16_weight(w, ws, n_groups, rank)
+    fake_capability((8, 0))  # BF16 tensor cores, but no FP8 ones
+    with pytest.raises(NotImplementedError, match="FP8 wo_a needs.*8.9"):
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)  # BF16 still runs
+    fake_capability((7, 5))
+    with pytest.raises(NotImplementedError, match="BF16 wo_a needs.*8.0"):
+        call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)
+    fake_capability(None)  # not an NVIDIA CUDA device
+    with pytest.raises(NotImplementedError, match="NVIDIA CUDA"):
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 33, 96, 257, 1024])
+@pytest.mark.parametrize("n_groups, hpg, rank", GROUP_CONFIGS)
+def test_dsv41_o_proj_portable_fp8_path(
+    num_tokens, n_groups, hpg, rank, fake_capability, monkeypatch
+):
+    """Any other FP8-capable GPU runs plain Triton: no Hopper-only kernel is touched."""
+    attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+    hopper_res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+
+    def hopper_only(*args, **kwargs):
+        raise AssertionError("a Hopper-only kernel ran on a non-Hopper GPU")
+
+    module = fake_capability((12, 0))  # consumer Blackwell
+    monkeypatch.setattr(module, "fp8_einsum", hopper_only)
+    monkeypatch.setattr(module, "_single_launch_path", hopper_only)
+    res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+
+    ref = ref_dsv41_o_proj(
+        attn_out,
+        pos,
+        csc,
+        w.view(n_groups, rank, -1),
+        ws.view(n_groups, rank // QUANT_BLOCK, -1),
+        n_groups,
+        hpg,
+        rank,
+    )
+    assert_relative_close(res, ref, n_groups, rank)
+    # Same quantization as the Hopper paths; only the accumulation order differs.
+    assert_relative_close(res, hopper_res.float(), n_groups, rank, max_rel=1e-2)
+
+
+def test_dsv41_o_proj_portable_fp8_path_padded_heads_out_and_wo_b(
+    fake_capability, monkeypatch
+):
+    n_groups, hpg, rank = 2, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(40, n_groups, hpg, rank, pad_heads=16)
+    module = fake_capability((8, 9))  # Ada
+    monkeypatch.setattr(module, "fp8_einsum", lambda *a, **k: 1 / 0)
+    res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    attn_out[:, n_groups * hpg :] = float("nan")  # garbage in padding
+    out = torch.empty_like(res)
+    res2 = call_gems(
+        attn_out,
+        pos,
+        csc,
+        w.view(n_groups, rank, -1),
+        ws.view(n_groups, rank // QUANT_BLOCK, -1),
+        n_groups,
+        hpg,
+        rank,
+        out=out,
+    )
+    assert res2.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(res, res2, atol=0, rtol=0)
+    seen = []
+    flat = call_gems(
+        attn_out,
+        pos,
+        csc,
+        w,
+        ws,
+        n_groups,
+        hpg,
+        rank,
+        wo_b_proj=lambda z: seen.append(z.shape) or z[:, :64],
+    )
+    assert seen == [(40, n_groups * rank)] and flat.shape == (40, 64)
+    with pytest.raises(ValueError, match="contiguous"):
+        call_gems(attn_out, pos, csc, w, ws.t().contiguous().t(), n_groups, hpg, rank)
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (12, 0)])
+def test_dsv41_o_proj_bf16_path_has_no_hopper_requirement(capability, fake_capability):
+    n_groups, hpg, rank = 8, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(40, n_groups, hpg, rank, pad_heads=4)
+    w16 = _bf16_weight(w, ws, n_groups, rank)
+    fake_capability(capability)
+    res = call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)
+    ref = ref_dsv41_o_proj_bf16(attn_out, pos, csc, w16, n_groups, hpg, rank)
+    assert_relative_close(res, ref, n_groups, rank, max_rel=5e-3)
 
 
 def test_dsv41_o_proj_rejects_weight_on_other_device():

@@ -459,6 +459,16 @@ def _ticket_counter(stream: torch.cuda.Stream, device: torch.device) -> torch.Te
     return torch.zeros(1, dtype=torch.int64, device=device)
 
 
+@lru_cache(maxsize=None)
+def _is_sm90(device: torch.device) -> bool:
+    # The kernel uses TMA and WGMMA, so it is Hopper-only; other GPUs take other paths.
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] == 9
+    )
+
+
 def single_launch_supported(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -474,6 +484,7 @@ def single_launch_supported(
     device = o.device
     return (
         HAS_TLE_W8A8_BLOCK_FP8_BMM
+        and _is_sm90(device)
         and y.device == device
         and ys.device == device
         and positions.device == device

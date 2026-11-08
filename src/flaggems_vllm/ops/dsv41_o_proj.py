@@ -31,22 +31,33 @@ Scope of this op (the "general path" of vLLM's ``dsv41_o_proj``):
 ``wo_b`` is a callback, as in vLLM (a regular quantized linear, optionally with
 reduce-scatter): this op has no kernel for it and only forwards ``z``.
 
-Two paths with the same results, except with n_groups=1 and fewer than 300 tokens,
-where ``fp8_einsum`` takes its split-K path and rounds slightly differently:
+FP8 wo_a on Hopper takes one of two paths with the same results, except with
+n_groups=1 and fewer than 300 tokens, where ``fp8_einsum`` takes its split-K path and
+rounds slightly differently:
   * Up to ``_SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS``: one kernel launch
     (``dsv41_o_proj_single_launch``), so the GPU does not idle waiting for a second.
   * Above that: ``fused_inv_rope_fp8_quant`` + ``fp8_einsum``, whose quant kernel has
     more throughput once computation outweighs the launch time.
+Both use Hopper-only kernels (TMA, WGMMA), tuned and measured on H20.
+
+FP8 wo_a on any other NVIDIA GPU with FP8 tensor cores (compute capability 8.9 or
+newer, such as Ada or consumer Blackwell) takes a portable path:
+``fused_inv_rope_fp8_quant`` + a block-scaled FP8 GEMM written in plain Triton
+(``_fp8_grouped_gemm_kernel``). It has no Hopper-specific code, so the compiler lowers
+``tl.dot`` to whatever the GPU has. It is correct by construction but not tuned.
 
 Results are close to vLLM but not bit-identical: vLLM rounds activation scales up
 to a power of two on Hopper and ``fused_inv_rope_fp8_quant`` does not.
 
 Like vLLM, the precision follows wo_a: with a BF16 wo_a (and no scale) nothing is
 quantized. vLLM then rotates into BF16 and calls ``torch.bmm``; here two Triton
-kernels do the same, a BF16 inverse-RoPE copy and a grouped BF16 GEMM.
+kernels do the same, a BF16 inverse-RoPE copy and a grouped BF16 GEMM. They are plain
+Triton and run on any NVIDIA GPU with BF16 tensor cores (compute capability 8.0 or
+newer).
 
 Not covered (raise NotImplementedError, no torch fallback):
-  * Backends other than NVIDIA Hopper.
+  * Devices that are not NVIDIA CUDA GPUs; other backends bring their own op.
+  * NVIDIA GPUs older than compute capability 8.0 (BF16 wo_a) or 8.9 (FP8 wo_a).
   * vLLM's small-batch SM100/SM103 fused WO-A path (CuTe DSL, MXFP8 output).
   * Blackwell einsum recipes (1, 1, 32) / (1, 1, 128) with packed UE8M0 scales.
   * A pre-quantized ``QuantizedActivation`` input (attention kernel already
@@ -75,12 +86,11 @@ _SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS = 2048
 
 # Small batches are sensitive to CPU time here, so these per-call lookups are cached.
 @lru_cache(maxsize=None)
-def _is_hopper(device: torch.device) -> bool:
-    return (
-        device.type == "cuda"
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability(device)[0] == 9
-    )
+def _capability(device: torch.device):
+    """Compute capability of an NVIDIA CUDA device; None for any other device."""
+    if device.type != "cuda" or torch.version.hip is not None:
+        return None
+    return tuple(torch.cuda.get_device_capability(device))
 
 
 @lru_cache(maxsize=1)
@@ -237,6 +247,123 @@ def _bf16_o_proj(o, positions, cos_sin_cache, w3, z, nope_dim, rope_dim):
     )
 
 
+@triton.jit(do_not_specialize=["T", "x_sT", "x_sG", "xs_sT", "xs_sG", "xs_sK"])
+def _fp8_grouped_gemm_kernel(
+    x_ptr,
+    xs_ptr,
+    w_ptr,
+    ws_ptr,
+    z_ptr,
+    T,
+    x_sT,
+    x_sG,
+    xs_sT,
+    xs_sG,
+    xs_sK,
+    z_sB,
+    z_sM,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # z[g, t, :] = sum over 128-wide K blocks of
+    #     (x_q[t, g, block] @ w_q[g, :, block]^T) * xs[t, g, block] * ws[g, n // 128, block]
+    # x_q and xs come from fused_inv_rope_fp8_quant (read through its strides), w_q is
+    # [G, N, K] FP8 and ws is [G, N // 128, K // 128] FP32. Each 128-wide output tile
+    # has one weight scale per K block, so the product of two scales rescales the
+    # whole partial result. Plain tl.dot on FP8 operands: no TMA, no WGMMA-only code.
+    BN: tl.constexpr = 128
+    pid = tl.program_id(0)
+    g = tl.program_id(1).to(tl.int64)
+    NKB: tl.constexpr = K // 128
+    num_m = tl.cdiv(T, BM)
+    num_n: tl.constexpr = N // BN
+    first_m = pid // (GROUP_M * num_n) * GROUP_M
+    size_m = tl.minimum(num_m - first_m, GROUP_M)
+    local = pid % (GROUP_M * num_n)
+    pm = first_m + local % size_m
+    pn = local // size_m
+    rm = pm * BM + tl.arange(0, BM)
+    m_mask = rm < T
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, 128)
+    a_ptrs = x_ptr + g * x_sG + rm.to(tl.int64)[:, None] * x_sT + rk[None, :]
+    b_ptrs = w_ptr + g * N * K + rn[None, :] * K + rk[:, None]
+    xs_ptrs = xs_ptr + g * xs_sG + rm.to(tl.int64) * xs_sT
+    ws_blk = ws_ptr + (g * (N // 128) + pn) * NKB
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kb in range(NKB):
+        a = tl.load(a_ptrs + kb * 128, mask=m_mask[:, None], other=0.0)
+        xs = tl.load(xs_ptrs + kb * xs_sK, mask=m_mask, other=0.0)
+        part = tl.dot(a, tl.load(b_ptrs + kb * 128))
+        acc += part * (xs * tl.load(ws_blk + kb))[:, None]
+    z_ptrs = z_ptr + g * z_sB + rm[:, None] * z_sM + rn[None, :]
+    tl.store(z_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None])
+
+
+def _fp8_gemm_config(T):
+    """(BM, num_warps, num_stages) for the portable FP8 GEMM.
+
+    Not tuned. The tiles keep shared memory under about 80 KB so that the same code
+    fits GPUs with less of it than Hopper (consumer GPUs allow about 99 KB per block).
+    """
+    if T <= 16:
+        return 16, 4, 4
+    if T <= 64:
+        return 32, 4, 4
+    if T <= 256:
+        return 64, 4, 3
+    return 128, 8, 2
+
+
+def _fp8_o_proj_portable(
+    o, positions, cos_sin_cache, w3, ws3, out, n_groups, heads_per_group, nope, rope
+):
+    """FP8 wo_a on any GPU with FP8 tensor cores: quant op + a plain-Triton GEMM."""
+    if not (w3.is_contiguous() and ws3.is_contiguous()):
+        raise ValueError(
+            "dsv41_o_proj: wo_a weight and weight_scale must be contiguous"
+        )
+    x_fp8, x_scale = fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope,
+        rope_dim=rope,
+        quant_group_size=_QUANT_BLOCK,
+        tma_aligned_scales=False,
+    )
+    # x_fp8 is [T, G, K] and x_scale [T, G, K / 128], both strided views of
+    # group-major storage; the kernel reads them through their strides.
+    T = o.shape[0]
+    N, K = w3.shape[1], w3.shape[2]
+    BM, num_warps, num_stages = _fp8_gemm_config(T)
+    _fp8_grouped_gemm_kernel[(triton.cdiv(T, BM) * (N // _QUANT_BLOCK), n_groups)](
+        x_fp8,
+        x_scale,
+        w3,
+        ws3,
+        out,
+        T,
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        x_scale.stride(2),
+        N,
+        n_groups * N,
+        N=N,
+        K=K,
+        BM=BM,
+        GROUP_M=8,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
 def _as_grouped_weight(
     weight: torch.Tensor,
     weight_scale: Optional[torch.Tensor],
@@ -321,10 +448,14 @@ def dsv41_o_proj(
         raise ValueError("attn_out must be [num_tokens, num_heads, head_dim]")
     if attn_out.dtype != torch.bfloat16:
         raise NotImplementedError("dsv41_o_proj: attn_out must be bfloat16")
-    # Hopper only for now, checked first so no kernel runs on an unsupported GPU.
+    # Checked first so no kernel runs on an unsupported device. Which paths a GPU can
+    # take is decided below: Hopper has tuned kernels, other GPUs a portable one.
     device = attn_out.device
-    if not _is_hopper(device):
-        raise NotImplementedError("dsv41_o_proj requires an NVIDIA Hopper GPU")
+    capability = _capability(device)
+    if capability is None:
+        raise NotImplementedError(
+            "dsv41_o_proj runs on NVIDIA CUDA GPUs; other backends bring their own op"
+        )
     if any(
         t is not None and t.requires_grad
         for t in (attn_out, wo_a_weight, wo_a_weight_scale)
@@ -343,6 +474,13 @@ def dsv41_o_proj(
         raise NotImplementedError("o_lora_rank must be a multiple of 128")
 
     use_fp8 = wo_a_weight.dtype == torch.float8_e4m3fn
+    # BF16 tensor cores arrive with compute capability 8.0, FP8 ones with 8.9.
+    if capability < ((8, 9) if use_fp8 else (8, 0)):
+        raise NotImplementedError(
+            f"dsv41_o_proj: a {'FP8' if use_fp8 else 'BF16'} wo_a needs an NVIDIA GPU "
+            f"of compute capability {'8.9' if use_fp8 else '8.0'} or newer, "
+            f"got {capability[0]}.{capability[1]}"
+        )
     if wo_a_weight.dtype == torch.bfloat16:
         # vLLM's non-quantizing branch: BF16 inverse RoPE, then a BF16 GEMM.
         if wo_a_weight_scale is not None:
@@ -398,7 +536,23 @@ def dsv41_o_proj(
         )
         return out if wo_b_proj is None else wo_b_proj(out)
 
-    # ---- small batches: one launch ---------------------------------------
+    # ---- not Hopper: portable path, no Hopper-only kernel -----------------
+    if capability[0] != 9:
+        _fp8_o_proj_portable(
+            o,
+            positions,
+            cos_sin_cache,
+            w3,
+            ws3,
+            out,
+            n_groups,
+            heads_per_group,
+            nope_dim,
+            rope_dim,
+        )
+        return out if wo_b_proj is None else wo_b_proj(out)
+
+    # ---- Hopper, small batches: one launch ---------------------------------
     if num_tokens * n_groups <= _SINGLE_LAUNCH_MAX_TOKENS_X_GROUPS:
         dsv41_o_proj_single_launch, single_launch_supported = _single_launch_path()
         if single_launch_supported(
