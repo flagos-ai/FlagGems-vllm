@@ -1407,3 +1407,38 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+logprob_tle_log_softmax:
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 8
+    num_stages: 3
+
+logprob_tle_logits_ranks:
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 8
+    num_stages: 3
+
+logprob_triton_scores_ranks:
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 2048}
+    num_warps: 8
+    num_stages: 3
+
+logprob_fill_ids:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 8
+    num_stages: 3

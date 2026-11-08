@@ -98,6 +98,7 @@ from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
+from flaggems_vllm.ops.logprob import LogprobTokenIdsState, compute_topk_scores
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -264,6 +265,7 @@ __all__ = [
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
+    "compute_topk_scores",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
@@ -328,6 +330,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "LogprobTokenIdsState",
     "mhc_bwd",
     "mhc_bwd_ref",
     "mhc_fused_post_pre_with_norm",
