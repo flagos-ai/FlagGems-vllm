@@ -1696,8 +1696,11 @@ def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
 @pytest.mark.parametrize("num_tokens", [1, 33])
 @pytest.mark.parametrize("updated_tensor", ["w1_scale", "w2_scale"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_mxfp4_scale_updates_ppu(num_tokens, updated_tensor, dtype):
-    with torch.inference_mode():
+@pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
+def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
+    num_tokens, updated_tensor, dtype, capture
+):
+    with torch.inference_mode(not capture):
         hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
             num_tokens, 4, 128, 256, 2, dtype, flaggems_vllm.device
         )
@@ -1714,13 +1717,29 @@ def test_fused_marlin_moe_mxfp4_scale_updates_ppu(num_tokens, updated_tensor, dt
             quant_type_id=QUANT_TYPE_FP4_E2M1,
             group_size=MXFP4_GROUP_SIZE,
         )
+        scale = kwargs[updated_tensor]
         flaggems_vllm.fused_marlin_moe(**kwargs)
-        kwargs[updated_tensor].view(torch.uint8).add_(1)
+        if capture:
+            backend = importlib.import_module(
+                "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
+            )
+            version = scale._version
+            cached = backend._SCALE_CACHE.get(scale)
+            assert cached is not None and cached[0] == version
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = flaggems_vllm.fused_marlin_moe(**kwargs)
+        scale.view(torch.uint8).add_(1)
         if updated_tensor == "w1_scale":
             ref1 = ref1 * 2
         else:
             ref2 = ref2 * 2
-        actual = flaggems_vllm.fused_marlin_moe(**kwargs)
+        if capture:
+            assert scale._version > version
+            graph.replay()
+        else:
+            actual = flaggems_vllm.fused_marlin_moe(**kwargs)
         reference = _reference_swiglu_moe(hs, ref1, ref2, tw, ti)
         gems_assert_close(actual, reference.to(dtype), dtype, reduce_dim=128)
 

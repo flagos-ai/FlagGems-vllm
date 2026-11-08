@@ -45,15 +45,6 @@ from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
-from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_dense import run_dense_w8a16
-from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16 import (
-    decode_e4m3 as _decode_e4m3,
-)
-from flaggems_vllm.runtime.backend._thead.fused.marlin_moe_w8a16 import (
-    decode_fp8_scaled_bf16,
-    decode_fp8_scaled_bf16_normalized,
-    decode_int8_scaled_bf16,
-)
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
@@ -78,6 +69,147 @@ class _QuantizedStage(NamedTuple):
     weight: torch.Tensor
     scale: torch.Tensor
     scale_safe: Optional[torch.Tensor]
+
+
+# Packed conversion instructions are adapted from FlagTree's PPU backend.
+# Copyright (c) 2026 T-Head Semiconductor Co., Ltd. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
+@triton.jit
+def decode_int8_scaled_bf16(q, scale):
+    return tl.inline_asm_elementwise(
+        "{ .reg .b32 q, l<3>, h<3>, v<2>;\n"
+        "ppu.xor.b32 q,$2,0x80808080;\n"
+        "ppu.prmt.b32 l0,q,0x43,0x4140;\n"
+        "ppu.prmt.b32 h0,q,0x43,0x4342;\n"
+        "ppu.and.b32 l1,l0,0xff7fff7f; ppu.and.b32 h1,h0,0xff7fff7f;\n"
+        "ppu.and.b32 l2,l0,0xff80ff80; ppu.and.b32 h2,h0,0xff80ff80;\n"
+        "ppu.sub.bf16x2 v0,l1,l2; ppu.sub.bf16x2 v1,h1,h2;\n"
+        "ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\n"
+        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
+        "=r,=r,r,r,r",
+        [q, scale],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
+def decode_fp8_scaled_bf16(q, scale):
+    # Each byte produces its NaN exponent and sign before expanding into BF16.
+    # No carries or borrows cross byte boundaries because magnitudes are <=127.
+    # Folding a BF16 scale by an exact power of two adds no rounding when finite.
+    folded = tl.inline_asm_elementwise(
+        "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\n"
+        "ppu.mul.rn.bf16x2 $0,$1,bias; }",
+        "=r,r",
+        [scale],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=2,
+    )
+    return tl.inline_asm_elementwise(
+        "{ .reg .b32 mag, flags, high, shifted, b<2>, special<2>, v<2>;\n"
+        "ppu.and.b32 mag,$2,0x7f7f7f7f; ppu.add.u32 flags,mag,0x01010101; ppu.and.b32 flags,flags,0x80808080;\n"
+        "ppu.shr.b32 shifted,flags,7; ppu.sub.u32 high,flags,shifted;\n"
+        "ppu.lop3.b32 high,high,0x80808080,$2,0xf8;\n"
+        "ppu.prmt.b32 special0,flags,high,0x5140; ppu.prmt.b32 special1,flags,high,0x7362;\n"
+        "ppu.prmt.b32 b0,mag,0,0x4140; ppu.prmt.b32 b1,mag,0,0x4342;\n"
+        "ppu.shl.b32 b0,b0,4; ppu.shl.b32 b1,b1,4;\n"
+        "ppu.or.b32 v0,b0,special0; ppu.or.b32 v1,b1,special1;\n"
+        "ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\n"
+        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
+        "=r,=r,r,r,r",
+        [q, folded],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
+def decode_fp8_scaled_bf16_normalized(q, scale):
+    # All finite E4M3FN values are exact in both FP16 and BF16. Normalize in
+    # packed FP16 before applying the original BF16 scale, so sparse routes
+    # need neither a scale scan nor an overflow guard for every weight.
+    value = tl.inline_asm_elementwise(
+        "{ .reg .b32 a<2>, b<2>, m<2>, v<2>, bias;\n"
+        "ppu.prmt.b32 a0,0,$2,0x5140; ppu.prmt.b32 a1,0,$2,0x7362;\n"
+        "ppu.and.b32 b0,a0,0x7f007f00; ppu.and.b32 b1,a1,0x7f007f00;\n"
+        "ppu.shr.b32 b0,b0,1; ppu.shr.b32 b1,b1,1;\n"
+        "ppu.add.u32 m0,b0,0x00800080; ppu.add.u32 m1,b1,0x00800080;\n"
+        "ppu.and.b32 m0,m0,0x40004000; ppu.and.b32 m1,m1,0x40004000;\n"
+        "ppu.shr.b32 m0,m0,14; ppu.shr.b32 m1,m1,14;\n"
+        "ppu.mul.lo.u32 m0,m0,0x7c00; ppu.mul.lo.u32 m1,m1,0x7c00;\n"
+        "ppu.or.b32 b0,b0,m0; ppu.or.b32 b1,b1,m1;\n"
+        "ppu.lop3.b32 v0,b0,0x80008000,a0,0xf8; ppu.lop3.b32 v1,b1,0x80008000,a1,0xf8;\n"
+        "ppu.mov.b32 bias,0x5c005c00;\n"
+        "ppu.mul.rn.f16x2 v0,v0,bias; ppu.mul.rn.f16x2 v1,v1,bias;\n"
+        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
+        "=r,=r,r",
+        [q],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=4,
+    )
+    value = value.to(tl.bfloat16)
+    return tl.inline_asm_elementwise(
+        "ppu.mul.rn.bf16x2 $0,$1,$2;",
+        "=r,r,r",
+        [value, scale],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = False):
+    if compute_type == tl.bfloat16:
+        # Preserve E4M3 subnormals by embedding the bits in BF16. Its exponent
+        # bias is corrected by an exact power-of-two factor in the scale.
+        bits = ((q & 128) << 8) | ((q & 127) << 4)
+        # Set the BF16 NaN exponent without a floating-point select per weight.
+        bits = bits | (-(((q & 127) + 1) >> 7) & 0x7F80)
+        tiny = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+        exponent_bias = 2.0**120
+    else:
+        # E4M3 bits embedded in FP16 have exponent bias 15 rather than 7.
+        bits = ((q & 128) << 8) | ((q & 127) << 7)
+        bits = bits | (-(((q & 127) + 1) >> 7) & 0x7C00)
+        tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+        exponent_bias = 256.0
+    if FAST is None:
+        # Sparse routes avoid scanning scales for experts they never read.
+        folded = scale * exponent_bias
+        overflow = (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf"))
+        folded = tl.where(overflow, scale, folded)
+        value = tl.where(overflow, tiny * exponent_bias, tiny)
+        return (value * folded).to(compute_type)
+    else:
+        value = tiny
+        if not FAST:
+            value = value * exponent_bias
+        return (value * scale).to(compute_type)
 
 
 @triton.jit
@@ -320,15 +452,18 @@ def _pack_e8m0(s):
     except RuntimeError:
         # Inference tensors can change without a version counter.
         version = None
-    cached = _SCALE_CACHE.get(s)
-    if version is not None and cached is not None and cached[0] == version:
-        return cached[1]
+    # Capture the conversion so replay reads the current scale storage.
+    cacheable = version is not None and not torch.cuda.is_current_stream_capturing()
+    if cacheable:
+        cached = _SCALE_CACHE.get(s)
+        if cached is not None and cached[0] == version:
+            return cached[1]
     e, n, g = s.shape
     out = torch.empty((e, g, n), device=s.device, dtype=torch.float32)
     _pack_e8m0_kernel[(triton.cdiv(n * g, 256), e)](
         s.view(torch.uint8), out, n, g, *s.stride(), 256
     )
-    if version is not None and not torch.cuda.is_current_stream_capturing():
+    if cacheable:
         _SCALE_CACHE[s] = (version, out)
     return out
 
@@ -1831,6 +1966,148 @@ def _prepare_quantized_weights(
     else:
         safe1, safe2 = None, None
     return _QuantizedStage(b1, s1, safe1), _QuantizedStage(b2, s2, safe2)
+
+
+@triton.jit
+def decode_bank(
+    Q,
+    S,
+    D,
+    Safe,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    QE: tl.constexpr,
+    QN: tl.constexpr,
+    QK: tl.constexpr,
+    SE: tl.constexpr,
+    SN: tl.constexpr,
+    SG: tl.constexpr,
+    FP8: tl.constexpr,
+    FAST: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    if FP8 and not FAST:
+        if tl.load(Safe + E):
+            return
+    expert = tl.program_id(2).to(tl.int64)
+    if FP8 and not FAST:
+        if tl.load(Safe + expert):
+            return
+    ns = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
+    k_base = (tl.program_id(1) * BK).to(tl.int64)
+    ks = (k_base + tl.arange(0, BK)).to(tl.int64)
+    mask = (ns[:, None] < N) & (ks[None, :] < K)
+    q = tl.load(
+        Q + expert * QE + ns[:, None] * QN + ks[None, :] * QK,
+        mask,
+        other=0 if FP8 else 128,
+    )
+    scale = tl.load(S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0)[
+        :, None
+    ]
+    if FP8:
+        if FAST:
+            value = decode_fp8_scaled_bf16(q, scale)
+        else:
+            value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
+    else:
+        value = decode_int8_scaled_bf16(q, scale)
+    tl.store(D + expert * N * K + ns[:, None] + ks[None, :] * N, value, mask)
+
+
+def run_dense_w8a16(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    scale_safe1: Optional[torch.Tensor],
+    scale_safe2: Optional[torch.Tensor],
+    is_fp8: bool,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
+        get_default_config,
+        invoke_fused_moe_triton_kernel,
+    )
+
+    m, k = hidden_states.shape
+    e, n2, _ = w1.shape
+    n, topk = n2 // 2, topk_weights.shape[1]
+    scratch = torch.empty(
+        (max(w1.numel(), w2.numel()),),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    cache13 = torch.empty(
+        (m * topk * max(n2, k),), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    c1 = cache13[: m * topk * n2].view(m, topk, n2)
+    c3 = cache13[: m * topk * k].view(m, topk, k)
+    c2 = torch.empty(
+        (m * topk, n), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    b1 = scratch[: w1.numel()].view(e, k, n2).transpose(1, 2)
+    b2 = scratch[: w2.numel()].view(e, n, k).transpose(1, 2)
+    for index, (quantized_weight, scales, decoded_weight, scale_safe) in enumerate(
+        ((w1, w1_scale, b1, scale_safe1), (w2, w2_scale, b2, scale_safe2))
+    ):
+        output_size, reduction = quantized_weight.shape[1:]
+        for fast in (True, False) if is_fp8 else (True,):
+            decode_bank[(triton.cdiv(output_size, 64), triton.cdiv(reduction, 128), e)](
+                quantized_weight.view(torch.uint8),
+                scales,
+                scratch,
+                scale_safe,
+                output_size,
+                reduction,
+                e,
+                *quantized_weight.stride(),
+                *scales.stride(),
+                is_fp8,
+                fast,
+                64,
+                128,
+                num_warps=4,
+                num_stages=1,
+            )
+        first = index == 0
+        config = get_default_config(
+            m,
+            e,
+            output_size,
+            reduction,
+            topk,
+            "bf16",
+            gemm_stage="gemm1" if first else "gemm2",
+        )
+        invoke_fused_moe_triton_kernel(
+            hidden_states if first else c2,
+            decoded_weight,
+            c1 if first else c3,
+            None,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input if first else not apply_router_weight_on_input,
+            topk if first else 1,
+            config,
+            tl.bfloat16,
+        )
+        if first:
+            flat = c1.view(m * topk, n2)
+            silu_and_mul_out(flat[:, :n], flat[:, n:], c2)
+    moe_sum(c3, output)
+    return output
 
 
 def _fused_marlin_moe_impl(
