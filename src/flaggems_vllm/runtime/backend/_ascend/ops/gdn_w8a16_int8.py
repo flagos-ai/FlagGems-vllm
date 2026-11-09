@@ -380,6 +380,10 @@ def chunk_gated_delta_rule_w8a16_int8(
     once at the end. This entry is forward-only and mutates state and scales.
     """
     logger.debug("GEMS_ASCEND CHUNK_GATED_DELTA_RULE_W8A16_INT8")
+    if scale is not None and not isinstance(scale, (float, int)):
+        raise TypeError("scale must be a Python numeric scalar or None")
+    if not isinstance(use_qk_l2norm_in_kernel, bool):
+        raise TypeError("normalization must be a Python bool")
     if q.ndim != 4 or q.shape != k.shape or v.ndim != 4:
         raise ValueError("expected Q/K[B,T,H,K] and V[B,T,HV,V]")
     batch, tokens, query_heads, reduction = q.shape
