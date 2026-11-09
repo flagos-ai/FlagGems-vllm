@@ -586,6 +586,22 @@ def test_int8_state_gdn_rounding(dtype):
 
 @pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
+    "quantize_gdn_state_int8" not in vars(flaggems_vllm),
+    reason="backend does not export INT8 state quantization",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_int8_state_gdn_full_int8_range(dtype):
+    values = torch.arange(-1016, 1032, device=flaggems_vllm.device).float() / 8
+    values = values.clamp(-127, 127).to(dtype).reshape(1, 1, 16, 128)
+    # Unit scales exercise all signed byte values, ties and nonintegral inputs.
+    values[..., -1] = 127
+    state, scales = flaggems_vllm.quantize_gdn_state_int8(values)
+    gems_assert_equal(scales, torch.ones_like(scales))
+    gems_assert_equal(state, values.float().round().to(torch.int8))
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.skipif(
     "gdn_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state GDN",
 )

@@ -180,6 +180,17 @@ def quantize_gdn_state_int8(state: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return output, scales
 
 
+@tl.core.builtin
+def cast_integral_half_to_int8(value, _semantic=None):
+    # Ascend's standard FP16 cast promotes to FP32 before converting to INT8.
+    # Emit the direct conversion; this helper only receives exact INT8 integers.
+    dtype = value.type.with_element_ty(tl.int8)
+    handle = _semantic.builder.create_fp_to_si(
+        value.handle, dtype.to_ir(_semantic.builder)
+    )
+    return tl.tensor(handle, dtype)
+
+
 @triton.jit
 def store_int8_state(
     values,
@@ -194,14 +205,10 @@ def store_int8_state(
     safe_magnitude = tl.where(magnitude > 0, magnitude, 127.0)
     scale = safe_magnitude * (1.0 / 127.0)
     reciprocal_scale = 127.0 / safe_magnitude
-    # Share one division across the channel instead of dividing every element.
-    # The scaled range is [-127,127]; FP32 bias encoding rounds to nearest-even.
-    encoded = (values * reciprocal_scale[:, None] + 12582912.0).to(
-        tl.int32, bitcast=True
-    )
-    # The bias bits (0x4B400000) have a zero low byte. Narrowing removes them;
-    # the rounded result is already in [-127,127], so no clamp is needed.
-    tl.store(state + offsets, encoded.to(tl.int8), mask)
+    # FP32 bias rounding produces exact integers in [-127,127]. They remain
+    # exact in FP16, which avoids the expensive overflow-preserving INT32 cast.
+    rounded = (values * reciprocal_scale[:, None] + 12582912.0) - 12582912.0
+    tl.store(state + offsets, cast_integral_half_to_int8(rounded.to(tl.float16)), mask)
     tl.store(scales + scale_offsets, scale, mask_v)
 
 
@@ -403,7 +410,7 @@ def gdn_w8a16_int8(
         raise ValueError("all buffers must be contiguous")
     if not tokens:
         return out, state_int8
-    block_v = 64 if reduction == columns == 128 else 16
+    block_v = 128 if reduction == columns == 128 else 16
     total = tokens * heads * triton.cdiv(columns, block_v)
     # Shared normalization/gating amortizes its extra launch on larger batches.
     prepared = reduction == columns == 128 and tokens >= 16
