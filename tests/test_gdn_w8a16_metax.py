@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from flaggems_vllm import gdn_w8a16, vendor_name
+from tests.gdn_reference import recurrent_gdn_reference, torch_gdn_decode
 
 pytestmark = pytest.mark.skipif(
     vendor_name != "metax", reason="MetaX FP32-state GDN contract"
@@ -246,64 +247,8 @@ def test_gdn_w8a16_backend_registration():
 
 
 @pytest.mark.gdn_w8a16
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("normalize", [False, True])
-def test_gdn_w8a16_fused_decode(dtype, packed, normalize):
-    torch.manual_seed(537)
-    n, h, hv, dk, dv = 3, 2, 4, 33, 17
-    q = torch.randn((1, n, h, dk), device="cuda", dtype=dtype) * 0.2
-    k = torch.randn_like(q) * 0.2
-    v = torch.randn((1, n, hv, dv), device="cuda", dtype=dtype) * 0.2
-    a = torch.randn((n, hv), device="cuda", dtype=dtype)
-    b = torch.randn_like(a)
-    al = torch.randn(hv, device="cuda") * 0.1
-    bias = torch.randn_like(al) * 0.1
-    ids = torch.tensor([3, 1, 0], device="cuda", dtype=torch.int64)
-    state = torch.randn((n + 2, hv, dv, dk), device="cuda") * 0.1
-    expected = state.clone()
-    qq, kk = q[0].float(), k[0].float()
-    if normalize:
-        qq *= torch.rsqrt(qq.square().sum(-1, keepdim=True) + 1e-6)
-        kk *= torch.rsqrt(kk.square().sum(-1, keepdim=True) + 1e-6)
-    qq = qq.repeat_interleave(hv // h, 1)
-    kk = kk.repeat_interleave(hv // h, 1)
-    s = (
-        state[ids]
-        * torch.exp(-al.exp() * torch.nn.functional.softplus(a.float() + bias))[
-            ..., None, None
-        ]
-    )
-    delta = (v[0].float() - (s * kk[..., None, :]).sum(-1)) * b.float().sigmoid().to(
-        dtype
-    ).float()[..., None]
-    s += delta[..., None] * kk[..., None, :]
-    ref = (s * qq[..., None, :]).sum(-1) * dk**-0.5
-    ref[-1] = 0
-    expected[ids[:2]] = s[:2]
-    out = torch.empty_like(v)
-    mixed = torch.cat((q[0].flatten(1), k[0].flatten(1), v[0].flatten(1)), dim=-1)
-    actual, cache = gdn_w8a16(
-        mixed if packed else q,
-        None if packed else k,
-        None if packed else v,
-        initial_state=state,
-        decode=True,
-        a=a,
-        b=b,
-        A_log=al,
-        dt_bias=bias,
-        state_indices=ids,
-        out=out,
-        normalize=normalize,
-    )
-    assert actual is out and cache is state
-    torch.testing.assert_close(out[0], ref.to(dtype), atol=0.002, rtol=0.02)
-    torch.testing.assert_close(state, expected, atol=1e-5, rtol=0.002)
-
-
-@pytest.mark.gdn_w8a16
-def test_gdn_w8a16_graph_contract():
+@pytest.mark.parametrize("real_packed", [False, True])
+def test_gdn_w8a16_graph_contract(real_packed):
     """Multi-step decode and mixed-precision prefill with dynamic graph metadata."""
     from types import SimpleNamespace
 
@@ -339,35 +284,32 @@ def test_gdn_w8a16_graph_contract():
         torch.testing.assert_close(a.float(), b.float(), atol=atol, rtol=rtol)
 
     def ref_decode(q, k, v, a, b, al, bias, st, ids, norm):
-        q = q[0].float()
-        k = k[0].float()
-        v = v[0].float()
-        hv = st.shape[1]
-        h = q.shape[1]
-        if norm:
-            q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
-            k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
-        q = q.repeat_interleave(hv // h, 1)
-        k = k.repeat_interleave(hv // h, 1)
-        valid = ids > 0
-        slots = ids.clamp_min(0).long()
-        s = st[slots]
-        d = torch.exp(-al.exp() * torch.nn.functional.softplus(a.float() + bias))
-        s = s * d[..., None, None]
-        delta = (v - (s * k[..., None, :]).sum(-1)) * b.float().sigmoid().to(
-            b.dtype
-        ).float()[..., None]
-        s = s + delta[..., None] * k[..., None, :]
-        out = (s * q[..., None, :]).sum(-1) * q.shape[-1] ** -0.5
-        out = torch.where(valid[:, None, None], out, 0)
-        # Null slots must remain untouched; positive slots are distinct.
-        st[ids[valid].long()] = s[valid]
-        return out.unsqueeze(0)
+        n, hv, dv = v.shape[1:]
+        out = torch.empty((n, 1, hv, dv), dtype=v.dtype, device=v.device)
+        torch_gdn_decode(
+            (q, k, v),
+            a,
+            b,
+            al,
+            bias,
+            q.shape[-1] ** -0.5,
+            st,
+            out,
+            ids,
+            norm,
+            round_beta=True,
+        )
+        return out.view_as(v)
 
+    cases = (
+        [(n, 128, 128) for n in (1, 2, 3, 7, 9, 31)]
+        if real_packed
+        else [(0, 128, 128), (1, 128, 128), (9, 128, 128), (3, 33, 17)]
+    )
     for dtype in (torch.bfloat16, torch.float16):
-        for norm in (False, True):
-            for n, dk, dv in [(0, 128, 128), (1, 128, 128), (9, 128, 128), (3, 33, 17)]:
-                h, hv = 2, 4
+        for norm in (True,) if real_packed else (False, True):
+            for n, dk, dv in cases:
+                h, hv = (16, 32) if real_packed else (2, 4)
                 q = torch.randn((1, n, h, dk), device="cuda", dtype=dtype) * 0.2
                 k = torch.randn_like(q) * 0.2
                 v = torch.randn((1, n, hv, dv), device="cuda", dtype=dtype) * 0.2
@@ -377,12 +319,12 @@ def test_gdn_w8a16_graph_contract():
                 bias = torch.randn_like(al) * 0.1
                 ids = torch.arange(n, 0, -1, device="cuda", dtype=torch.int64)
                 if n > 1:
-                    ids[-1] = 0
+                    ids[-1] = -1 if real_packed else 0
                 original = torch.randn((n + 2, hv, dv, dk), device="cuda") * 0.1
                 mixed = torch.cat(
                     (q[0].flatten(1), k[0].flatten(1), v[0].flatten(1)), dim=1
                 )
-                for packed in (False, True):
+                for packed in (True,) if real_packed else (False, True):
                     for factor, fma in [(False, False)]:
                         st = original.clone()
                         ref = original.clone()
@@ -445,6 +387,10 @@ def test_gdn_w8a16_graph_contract():
                         )
                         print("PASS", records[-1], flush=True)
 
+    if real_packed:
+        assert len(records) == 12
+        return
+
     # Validate GPU mappings, window boundaries, empty and skewed requests, both dtypes.
     for dtype in (torch.bfloat16, torch.float16):
         for lengths in (
@@ -473,21 +419,9 @@ def test_gdn_w8a16_graph_contract():
 
             # Independent per-token FP32 recurrence, including empty requests.
             def reference():
-                out = torch.empty_like(v)
-                final = []
-                for seq in range(n):
-                    state = st[seq].clone()
-                    for token in range(bounds[seq], bounds[seq + 1]):
-                        key = k[0, token].float().repeat_interleave(hv // h, 0)
-                        query = q[0, token].float().repeat_interleave(hv // h, 0)
-                        state = state * g[0, token].exp()[:, None, None]
-                        delta = (
-                            v[0, token].float() - (state * key[:, None, :]).sum(-1)
-                        ) * b[0, token, :, None]
-                        state += delta[:, :, None] * key[:, None, :]
-                        out[0, token] = (state * query[:, None, :]).sum(-1) * dk**-0.5
-                    final.append(state)
-                return out, torch.stack(final)
+                return recurrent_gdn_reference(
+                    q, k, v, g, b, st, bounds, normalize=False, scale=dk**-0.5
+                )
 
             expected = reference()
             if not t:
@@ -520,3 +454,63 @@ def test_gdn_w8a16_graph_contract():
             print("PASS", records[-1], flush=True)
 
     assert len(records) == 46
+
+
+@pytest.mark.parametrize("n", [1, 3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.gdn_w8a16
+def test_gdn_w8a16_small_packed_scale_and_dynamic_padding(n, dtype):
+    torch.manual_seed(991 + n)
+    x = torch.randn(n, 8192, device="cuda", dtype=dtype)
+    a = torch.randn(n, 32, device="cuda", dtype=dtype)
+    b = torch.randn_like(a)
+    al = torch.randn(32, device="cuda") * 0.1
+    bias = torch.randn_like(al) * 0.1
+    base = torch.randn(n + 2, 32, 128, 128, device="cuda") * 0.1
+    state = base.clone()
+    ids = torch.arange(n, 0, -1, device="cuda", dtype=torch.int64)
+    out = torch.empty(1, n, 32, 128, device="cuda", dtype=dtype)
+    for scale in (0.37, -0.21, 0.0):
+
+        def call():
+            return gdn_w8a16(
+                x,
+                initial_state=state,
+                decode=True,
+                a=a,
+                b=b,
+                A_log=al,
+                dt_bias=bias,
+                state_indices=ids,
+                out=out,
+                scale=scale,
+            )
+
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = call()
+        for padding in (False, True, False):
+            ids.copy_(torch.arange(n, 0, -1, device="cuda", dtype=torch.int64))
+            if padding:
+                ids[-1] = -(2**40)
+            state.copy_(base)
+            expected = base.clone()
+            ref = torch.empty_like(out)
+            torch_gdn_decode(
+                x,
+                a,
+                b,
+                al,
+                bias,
+                scale,
+                expected,
+                ref.view(n, 1, 32, 128),
+                ids,
+                True,
+                round_beta=True,
+            )
+            graph.replay()
+            assert actual[0] is out and actual[1] is state
+            torch.testing.assert_close(out, ref, atol=0.002, rtol=0.02)
+            torch.testing.assert_close(state, expected, atol=1e-5, rtol=0.002)

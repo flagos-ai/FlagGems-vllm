@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import subprocess
+import sys
 from functools import partial
 from pathlib import Path
 
@@ -22,7 +26,7 @@ import yaml
 
 import flaggems_vllm
 from benchmark.base import Benchmark
-from benchmark.conftest import Config
+from benchmark.conftest import Config, emit_record_logger, update_result
 from benchmark.consts import BenchLevel
 from tests.test_gdn_w8a16_int8 import (
     build_int8_gdn_decode_inputs,
@@ -36,10 +40,7 @@ HYGON_INT8_STATE = (
 )
 
 
-class Int8StateGdnBenchmark(Benchmark):
-    DEFAULT_DTYPES = (
-        [torch.bfloat16, torch.float16] if HYGON_INT8_STATE else [torch.bfloat16]
-    )
+class GdnBenchmarkShapes(Benchmark):
     DEFAULT_SHAPES = [
         (1, 8192, 32, 128),
         (3, 8192, 32, 128),
@@ -72,6 +73,12 @@ class Int8StateGdnBenchmark(Benchmark):
             self.shapes = [
                 shape for shape in self.shapes if shape in self.DEFAULT_SHAPES
             ]
+
+
+class Int8StateGdnBenchmark(GdnBenchmarkShapes):
+    DEFAULT_DTYPES = (
+        [torch.bfloat16, torch.float16] if HYGON_INT8_STATE else [torch.bfloat16]
+    )
 
     def get_input_iter(self, dtype):
         if HYGON_INT8_STATE:
@@ -271,3 +278,73 @@ def test_perf_gdn_w8a16_int8():
     bench.base_variant = "int8"
     bench.set_gems(run_int8_state_gdn)
     bench.run()
+
+
+def _metax_shape_row(shape):
+    # Shared YAML tags distinguish independent QKV updates from chunk prefill.
+    if len(shape) == 8 and shape[0] == "update":
+        op = "fused_sigmoid_gating_delta_rule_update"
+        shape = shape[1:]
+        if shape[0] != 1 or shape[1] != shape[-1]:
+            raise ValueError(f"Expected one token per update request: {shape}")
+    elif len(shape) == 4:
+        op = "fused_recurrent_gated_delta_rule_packed_decode"
+    elif len(shape) == 7:
+        op = "chunk_gated_delta_rule"
+    else:
+        raise ValueError(f"Unsupported GDN shape: {shape}")
+    return {"op": op, "shape": list(shape), "count": 1}
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX FP32 state")
+def test_perf_gdn_w8a16_metax(tmp_path):
+    """Use shared shapes with the paired CUDA Graph benchmark and FP32 state."""
+    if Config.user_desired_dtypes and torch.bfloat16 not in Config.user_desired_dtypes:
+        pytest.skip("MetaX GDN benchmarks use BF16 activations and FP32 state")
+    shape_file = Path(os.environ.get("GDN_SHAPE_FILE") or Config.shape_file)
+    result_dir = Path(os.environ.get("GDN_RESULT_DIR", tmp_path)).resolve()
+    rows = None
+    if shape_file.suffix.lower() != ".json":
+        bench = GdnBenchmarkShapes(op_name="gdn_w8a16", torch_op=None)
+        bench.set_shapes(str(shape_file))
+        rows = [_metax_shape_row(shape) for shape in bench.shapes]
+    # Load vLLM's device plugin before FlagGems/TileLang in a fresh process.
+    # In pytest the CUDA stub can already be loaded and mask the MACA runtime.
+    subprocess.run(
+        [sys.executable, "-m", "benchmark.test_gdn_w8a16_metax", "--shared-benchmark"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "GDN_SHAPE_FILE": str(shape_file.resolve()),
+            "GDN_RESULT_DIR": str(result_dir),
+        },
+        input=json.dumps(rows),
+        text=True,
+        check=True,
+    )
+    results = json.loads((result_dir / "results.json").read_text())["results"]
+    for baseline in ("vllm_metax_default", "pytorch"):
+        metrics = [
+            dict(
+                shape_detail=row["shape"],
+                path=row["op"],
+                count=row["count"],
+                latency=row["us"]["optimized"] / 1000,
+                latency_base=row["us"][baseline] / 1000,
+                speedup=row["us"][baseline] / row["us"]["optimized"],
+            )
+            for row in results
+            if baseline in row["us"]
+        ]
+        if metrics:
+            record = dict(
+                op_name="gdn_w8a16",
+                dtype=str(torch.bfloat16),
+                mode="cudagraph",
+                level=Config.bench_level.value,
+                baseline=baseline,
+                result=metrics,
+            )
+            update_result("gdn_w8a16", record)
+            emit_record_logger(json.dumps(record))

@@ -16,6 +16,7 @@ projection, convolution and model scheduling are outside the measured scope.
 
 
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -28,14 +29,49 @@ SHAPES = Path(
 )
 
 
+def summarize_results(results):
+    """Keep frequency-weighted ratios distinct from total workload time savings."""
+    groups = {"all": results}
+    for row in results:
+        groups.setdefault(row["op"], []).append(row)
+    summary = {}
+    for scope, rows in groups.items():
+        calls = sum(row["count"] for row in rows)
+        if calls <= 0 or any(row["count"] <= 0 for row in rows):
+            raise ValueError("Captured shape counts must be positive")
+        operator_time = sum(row["count"] * row["us"]["optimized"] for row in rows)
+        baselines = {}
+        for name in ("vllm_metax_default", "pytorch"):
+            if not all(name in row["us"] for row in rows):
+                continue
+            baseline_time = sum(row["count"] * row["us"][name] for row in rows)
+            baselines[name] = {
+                "call_weighted_speedup": sum(
+                    row["count"] * row["us"][name] / row["us"]["optimized"]
+                    for row in rows
+                )
+                / calls,
+                "weighted_total_time_speedup": baseline_time / operator_time,
+                "weighted_baseline_us": baseline_time / calls,
+            }
+        summary[scope] = {
+            "shapes": len(rows),
+            "calls": calls,
+            "weighted_operator_us": operator_time / calls,
+            "baselines": baselines,
+        }
+    return summary
+
+
 def make_inputs(row):
     shape = row["shape"]
     if len(shape) == 4:
-        tokens, _, hv, dv = shape
-        heads, dk, n = 16, 128, tokens
-        packed = torch.randn(
-            tokens, 2 * heads * dk + hv * dv, device="cuda", dtype=torch.bfloat16
-        )
+        tokens, width, hv, dv = shape
+        dk, n = 128, tokens
+        heads, remainder = divmod(width - hv * dv, 2 * dk)
+        if heads <= 0 or remainder or hv % heads:
+            raise ValueError(f"Invalid packed GDN dimensions: {shape}")
+        packed = torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16)
         q = packed[:, : heads * dk].view(1, tokens, heads, dk)
         k = packed[:, heads * dk : 2 * heads * dk].view(1, tokens, heads, dk)
         v = packed[:, 2 * heads * dk :].view(1, tokens, hv, dv)
@@ -68,77 +104,12 @@ def torch_baseline(args, bounds):
         s = s + delta.unsqueeze(-1) * kk.unsqueeze(-2)
         o = torch.matmul(s, qq.unsqueeze(-1)).squeeze(-1) * (q.shape[-1] ** -0.5)
         return o.unsqueeze(0).to(q.dtype), s
-    return torch_prefill(args, bounds)
+    from tests.gdn_reference import torch_gdn_prefill
+
+    return torch_gdn_prefill(*args, bounds, normalize=False)
 
 
-def torch_prefill(args, bounds):
-    q, k, v, g, beta, state, _ = args
-    group = v.shape[2] // q.shape[2]
-    q = q[0].float().repeat_interleave(group, 1).transpose(0, 1)
-    k = k[0].float().repeat_interleave(group, 1).transpose(0, 1)
-    v = v[0].float().transpose(0, 1)
-    g = g[0].transpose(0, 1)
-    beta = beta[0].transpose(0, 1)
-    outputs, states = [], []
-    for seq, (start, stop) in enumerate(zip(bounds, bounds[1:])):
-        length = stop - start
-        chunks = (length + 63) // 64
-        padding = chunks * 64 - length
-        qq = torch.nn.functional.pad(q[:, start:stop], (0, 0, 0, padding)).reshape(
-            q.shape[0], chunks, 64, q.shape[-1]
-        )
-        kk = torch.nn.functional.pad(k[:, start:stop], (0, 0, 0, padding)).reshape(
-            k.shape[0], chunks, 64, k.shape[-1]
-        )
-        vv = torch.nn.functional.pad(v[:, start:stop], (0, 0, 0, padding)).reshape(
-            v.shape[0], chunks, 64, v.shape[-1]
-        )
-        gg = (
-            torch.nn.functional.pad(g[:, start:stop], (0, padding))
-            .reshape(g.shape[0], chunks, 64)
-            .cumsum(-1)
-        )
-        bb = torch.nn.functional.pad(beta[:, start:stop], (0, padding)).reshape(
-            beta.shape[0], chunks, 64
-        )
-        decay = (gg[..., :, None] - gg[..., None, :]).exp().tril()
-        lhs = (kk @ kk.transpose(-1, -2) * decay * bb[..., None]).tril(-1)
-        # Strictly lower 64x64 L is nilpotent: the finite geometric series
-        # gives (I+L)^-1 exactly, using only PyTorch batched matmuls.
-        power = -lhs
-        inverse = torch.eye(64, device=q.device) + power
-        for _ in range(5):
-            power = power @ power
-            inverse = inverse + inverse @ power
-        rhs = bb[..., None] * torch.cat((vv, gg.exp()[..., None] * kk), dim=-1)
-        solved = inverse @ rhs
-        u, w = solved.split((vv.shape[-1], kk.shape[-1]), dim=-1)
-        q_exp = qq * gg.exp()[..., None]
-        qk = (qq @ kk.transpose(-1, -2)) * decay
-        weighted_k = kk * (gg[..., -1:] - gg).exp()[..., None]
-        last_decay = gg[..., -1].exp()
-        s = state[seq].transpose(-1, -2)
-        chunk_outputs = []
-        for i in range(chunks):
-            update = u[:, i] - w[:, i] @ s
-            chunk_outputs.append(q_exp[:, i] @ s + qk[:, i] @ update)
-            s = (
-                last_decay[:, i, None, None] * s
-                + weighted_k[:, i].transpose(-1, -2) @ update
-            )
-        outputs.append(
-            torch.stack(chunk_outputs, dim=1).reshape(
-                q.shape[0], chunks * 64, v.shape[-1]
-            )[:, :length]
-        )
-        states.append(s.transpose(-1, -2))
-    output = torch.cat(outputs, dim=1).transpose(0, 1).unsqueeze(0) * (
-        q.shape[-1] ** -0.5
-    )
-    return output.to(args[0].dtype), torch.stack(states).contiguous()
-
-
-def main():
+def main(*, rows=None, public_entry=False):
     import gc
     import hashlib
     import importlib.util
@@ -176,6 +147,8 @@ def main():
     from vllm.platforms import current_platform
 
     ROOT = Path(os.environ.get("GDN_RESULT_DIR", "gdn_w8a16_vllm_results"))
+    shape_file = SHAPES
+    captured_counts = rows is None
     ROOT.mkdir(parents=True, exist_ok=True)
     REPO = Path(os.environ.get("GDN_REPO", Path(__file__).resolve().parents[1]))
 
@@ -191,18 +164,23 @@ def main():
             fn = fn.fn
         return inspect.getsourcefile(fn)
 
-    # Load exactly the PR kernels without importing unrelated operators/dependencies.
-    # Only the runtime-vendor import is adapted; computation and launch configs unchanged.
-    scratch = tempfile.TemporaryDirectory(prefix="gdn-isolated-")
-    tmp = Path(scratch.name)
-    sys.path.insert(0, str(tmp))
-    entry_path = REPO / "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py"
-    entry = entry_path.read_text().replace(
-        "from flaggems_vllm import runtime",
-        'from types import SimpleNamespace\nruntime = SimpleNamespace(device=SimpleNamespace(vendor_name="metax"))',
-    )
-    (tmp / "isolated_entry.py").write_text(entry)
-    candidate = load("isolated_entry", tmp / "isolated_entry.py").gdn_w8a16
+    if public_entry:
+        from flaggems_vllm import gdn_w8a16 as candidate
+
+        entry_path = Path(source_path(candidate))
+        candidate_import = "flaggems_vllm.gdn_w8a16"
+    else:
+        # The standalone command can benchmark an unpacked checkout in a vendor image.
+        scratch = tempfile.TemporaryDirectory(prefix="gdn-isolated-")
+        tmp = Path(scratch.name)
+        entry_path = REPO / "src/flaggems_vllm/runtime/backend/_metax/ops/gdn_w8a16.py"
+        entry = entry_path.read_text().replace(
+            "from flaggems_vllm import runtime",
+            'from types import SimpleNamespace\nruntime = SimpleNamespace(device=SimpleNamespace(vendor_name="metax"))',
+        )
+        (tmp / "isolated_entry.py").write_text(entry)
+        candidate = load("isolated_entry", tmp / "isolated_entry.py").gdn_w8a16
+        candidate_import = "standalone source with MetaX runtime constant"
 
     cfg = VllmConfig()
     cfg.model_config = SimpleNamespace(
@@ -220,6 +198,7 @@ def main():
         Path(source_path(fused_recurrent_gated_delta_rule_packed_decode)),
         Path(source_path(fused_sigmoid_gating_delta_rule_update)),
     ]
+    samples_per_case = int(os.environ.get("GDN_SAMPLES", "31"))
     metadata = dict(
         torch=torch.__version__,
         triton=triton.__version__,
@@ -233,15 +212,16 @@ def main():
         prefill_method=prefill._forward_method.__qualname__,
         sources={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},
         timing=(
-            "CUDA Graph median of 31 samples; mean of 3 individually timed "
+            f"CUDA Graph median of {samples_per_case} samples; mean of 3 individually timed "
             "replays/sample; state reset outside events"
         ),
         seed=20261019,
         experimental_config={
             k: v for k, v in os.environ.items() if k.startswith(("GDN_", "DECODE_"))
         },
-        raw_shape_file_sha256=hashlib.sha256(SHAPES.read_bytes()).hexdigest(),
-        candidate_import_adaptation="runtime vendor constant only; no kernel edits",
+        shape_count_source="manifest" if captured_counts else "one per YAML shape",
+        raw_shape_file_sha256=hashlib.sha256(shape_file.read_bytes()).hexdigest(),
+        candidate_import_adaptation=candidate_import,
         prefill_scope="precomputed gates, no QK normalization, immutable FP32 state, metadata prebuilt",
         decode_scope=(
             "gate generation + QK L2 normalization + recurrence + "
@@ -456,7 +436,7 @@ def main():
             )
         samples = {name: [] for name in fns}
         names = list(fns)
-        for i in range(int(os.getenv("GDN_SAMPLES", "31"))):
+        for i in range(samples_per_case):
             order = names[i % len(names) :] + names[: i % len(names)]
             if i % 2:
                 order = order[::-1]
@@ -485,7 +465,8 @@ def main():
             samples_us=samples,
         )
 
-    rows = json.loads(SHAPES.read_text())
+    if captured_counts:
+        rows = json.loads(shape_file.read_text())
     results = []
     selected = os.getenv("GDN_CASES")
     selected = set(map(int, selected.split(","))) if selected else None
@@ -507,10 +488,21 @@ def main():
         print({k: v for k, v in result.items() if k != "samples_us"}, flush=True)
         gc.collect()
         torch.cuda.empty_cache()
+    if not results:
+        raise ValueError("No GDN shapes selected")
     print("DONE", flush=True)
     if any("error" in r or not all(r["valid"].values()) for r in results):
         raise SystemExit(1)
+    summary = summarize_results(results)
+    (ROOT / "summary.json").write_text(json.dumps(summary, indent=2))
+    print("WEIGHTED SUMMARY", json.dumps(summary), flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    if sys.argv[1:] == ["--shared-benchmark"]:
+        import json
+
+        main(rows=json.load(sys.stdin), public_entry=True)
+    else:
+        main()
