@@ -610,6 +610,12 @@ chunk_gdn2:
     - [8, 1024, 8, 64, 64]
     - [8, 2048, 32, 256, 256]
 
+chunk_kda_scaled_dot_kkt_fwd:
+  shapes:
+    - [1, 65, 4, 128, 64]
+    - [1, 513, 4, 128, 64, 17, 0, 64, 432]
+  shape_desc: "B, T, H, K, BT, optional packed sequence lengths"
+
 chunk_gated_delta_rule_fwd:
   shapes:
     - [2, 16384, 16, 128, 128]
