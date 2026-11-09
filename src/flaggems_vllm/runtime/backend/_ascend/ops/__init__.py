@@ -60,6 +60,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gather_conv_state import (
+    gather_conv_state,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.gather_kda_state import gather_kda_state
 from flaggems_vllm.runtime.backend._ascend.ops.gdn_w8a16_int8 import (
     chunk_gated_delta_rule_w8a16_int8,
@@ -83,7 +86,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
