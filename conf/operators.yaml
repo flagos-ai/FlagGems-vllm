@@ -277,6 +277,20 @@ ops:
       - Attention
     stages:
       - beta: '3.0'
+  - id: cooperative_topk
+    description: |
+      vLLM-compatible exact FP32 top-k selection with in-place INT32 indices,
+      variable row lengths, short-row padding, and MThreads fast paths.
+    for:
+      - _C.cooperative_topk
+    labels:
+      - fused
+      - vLLM
+      - DSA
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '0.3'
   - id: cp_gather_indexer_k_quant_cache
     description: This is a fused operator that gathers FP8 K cache values and scales.
     for:
