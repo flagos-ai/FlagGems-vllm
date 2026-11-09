@@ -173,6 +173,63 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: gdn_950dt_triton_ascend
+    description: |
+      Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
+      Two forward entries sharing the packed TND layout of the aclnn ops:
+      `chunk_gdn_950dt` (prefill, BT=64, BV-tiled to fit the 950DT UB budget)
+      and `fused_recurrent_gdn_950dt` (decode, state resident in registers,
+      in-place pool update with slot indices). Supports FP16/BF16/FP32,
+      DK/DV <= 128, varlen via cu_seqlens, optional in-kernel q/k L2 norm.
+      Forward only: Triton GDN backward is reported to NaN on Ascend950.
+      Does not use triton.experimental.tle, which triton-ascend lacks.
+    for:
+      - chunk_gdn_950dt
+      - fused_recurrent_gdn_950dt
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: chunk_gated_delta_rule_fwd_intra_npu
+    description: |
+      The intra-chunk stage of the gated delta rule for Ascend 950DT
+      (A5 / arch35), triton-ascend only. Two interchangeable
+      implementations of the same math, both matching the signature of
+      flash-linear-attention's `chunk_gated_delta_rule_fwd_intra_npu` and
+      returning the same (w, u, A) triple.
+
+      Unfused, in `chunk_gated_delta_rule_fwd_intra_npu.py`: keeps the
+      reference's three-operator structure so each can be substituted on
+      its own -- `chunk_scaled_dot_kkt_fwd_950dt`
+      (A = tril(beta * K K^T * decay)), `solve_tril_950dt` ((I + A)^-1 by
+      doubling on 16x16 diagonal blocks plus block elimination) and
+      `recompute_w_u_fwd_950dt` (w = A @ beta*exp2(g)*k, u = A @ beta*v);
+      `chunk_gated_delta_rule_fwd_intra_npu_unfused` chains them in the
+      reference's order.
+
+      Fused, in `chunk_gated_delta_rule_fwd_intra_npu_fused.py`: one kernel
+      that keeps the triangular inverse in UB, so it is faster end to end
+      but cannot be compared per operator.
+
+      Both support FP16/BF16/FP32, chunk_size 16/32/64, DK/DV <= 128, GVA
+      (HV % H == 0) and varlen via cu_seqlens. Gate convention matches the
+      reference: g is a raw per-chunk cumulative log decay consumed through
+      exp2, never pre-exponentiated. Forward only.
+    for:
+      - chunk_gated_delta_rule_fwd_intra_npu_fused
+      - chunk_gated_delta_rule_fwd_intra_npu_unfused
+      - chunk_scaled_dot_kkt_fwd_950dt
+      - solve_tril_950dt
+      - recompute_w_u_fwd_950dt
+    labels:
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: chunk_kda
     description: |
       Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
