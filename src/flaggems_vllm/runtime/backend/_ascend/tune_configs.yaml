@@ -268,6 +268,42 @@ compute_global_topk_indices_and_lens:
     num_warps: 1
     num_stages: 2
 
+ckfg_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BK: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BK: 32}
+    num_warps: 2
+    num_stages: 3
+
+ckfg_intra:
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+
+ckfg_inverse:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_recompute:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_output:
+  - META: {BK: 32, BV: 64}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_gate:
+  - META: {BD: 64}
+    num_warps: 4
+    num_stages: 2
+
 ckfg_state_ascend:
   - META:
       BV: 16

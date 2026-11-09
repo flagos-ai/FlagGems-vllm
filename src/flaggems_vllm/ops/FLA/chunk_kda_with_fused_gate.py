@@ -42,6 +42,18 @@ from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
 
+_ASCEND = runtime.device.vendor_name == "ascend"
+# Ascend reuses binaries across scalar extents while keeping tile sizes static.
+_SCALAR = None if _ASCEND else tl.constexpr
+# Keep K in LibEntry's dispatch key while sharing binaries across alignments.
+_INTER_JIT_OPTIONS = {"do_not_specialize_on_alignment": ["K"]} if _ASCEND else {}
+_VARLEN_HEURISTIC = (
+    {} if _ASCEND else {"IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
+)
+_BIAS_HEURISTIC = (
+    {} if _ASCEND else {"HAS_BIAS": lambda args: args["g_bias"] is not None}
+)
+
 
 def _stage_bench(fn, quantiles):
     """Tune with device events, without any backend Graph benchmark helper."""
@@ -64,15 +76,32 @@ def _stage_bench(fn, quantiles):
     )
 
 
+def _prune_ascend_inter(configs, named_args, **kwargs):
+    # Packed K128 prefers the wider tile on Ascend 910B1 for both dtypes.
+    if kwargs["IS_VARLEN"] and kwargs["K"] == 128:
+        return [config for config in configs if config.kwargs["BK"] == 64] or configs
+    if kwargs["K"] <= 32:
+        # One BK32 tile already covers the reduction.
+        return [
+            config
+            for config in configs
+            if config.kwargs["BK"] == 32
+            and config.num_warps == 4
+            and config.num_stages == 2
+        ] or configs
+    return configs
+
+
 @libentry()
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(_VARLEN_HEURISTIC)
 @libtuner(
     configs=runtime.get_tuned_config("ckfg_inter"),
     key=["H", "K", "BC", "IS_VARLEN"],
+    prune_configs_by=({"early_config_prune": _prune_ascend_inter} if _ASCEND else None),
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T"], **_INTER_JIT_OPTIONS)
 def _ckfg_inter(
     q,
     k,
@@ -85,12 +114,12 @@ def _ckfg_inter(
     chunk_indices,
     T,
     H: tl.constexpr,
-    K: tl.constexpr,
+    K: _SCALAR,
     BT: tl.constexpr,
     BC: tl.constexpr,
     BK: tl.constexpr,
     NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    IS_VARLEN: _SCALAR,
 ):
     i_t, i_c, i_bh = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
     i_b, i_h = (i_bh // H, i_bh % H)
@@ -164,14 +193,14 @@ def _ckfg_inter(
 
 
 @libentry()
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(_VARLEN_HEURISTIC)
 @libtuner(
     configs=runtime.get_tuned_config("ckfg_intra"),
     key=["BK", "BT"],
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "K"] if _ASCEND else ["T"])
 def _ckfg_intra(
     q,
     k,
@@ -184,11 +213,11 @@ def _ckfg_intra(
     chunk_indices,
     T,
     H: tl.constexpr,
-    K: tl.constexpr,
+    K: _SCALAR,
     BT: tl.constexpr,
     BC: tl.constexpr,
     BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    IS_VARLEN: _SCALAR,
 ):
     i_t, i_i, i_bh = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
     i_b, i_h = (i_bh // H, i_bh % H)
@@ -261,7 +290,7 @@ def _ckfg_intra(
     {
         "STORE_QG": lambda args: args["qg"] is not None,
         "STORE_KG": lambda args: args["kg"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        **_VARLEN_HEURISTIC,
     }
 )
 @libtuner(
@@ -270,7 +299,7 @@ def _ckfg_intra(
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "K", "V"] if _ASCEND else ["T"])
 def _ckfg_recompute(
     q,
     k,
@@ -286,14 +315,14 @@ def _ckfg_recompute(
     chunk_indices,
     T,
     H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
+    K: _SCALAR,
+    V: _SCALAR,
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    IS_VARLEN: _SCALAR,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = (tl.program_id(0), tl.program_id(1))
@@ -410,14 +439,14 @@ def _ckfg_recompute(
 
 
 @libentry()
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(_VARLEN_HEURISTIC)
 @libtuner(
     configs=runtime.get_tuned_config("ckfg_output"),
     key=["BT"],
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "K", "V"] if _ASCEND else ["T"])
 def _ckfg_output(
     q,
     v,
@@ -430,12 +459,12 @@ def _ckfg_output(
     scale,
     T,
     H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
+    K: _SCALAR,
+    V: _SCALAR,
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    IS_VARLEN: _SCALAR,
 ):
     i_v, i_t, i_bh = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
     i_b, i_h = (i_bh // H, i_bh % H)
@@ -520,8 +549,8 @@ def _ckfg_output(
 @libentry()
 @triton.heuristics(
     {
-        "HAS_BIAS": lambda args: args["g_bias"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        **_BIAS_HEURISTIC,
+        **_VARLEN_HEURISTIC,
     }
 )
 @libtuner(
@@ -530,7 +559,7 @@ def _ckfg_output(
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "D"] if _ASCEND else ["T"])
 def _ckfg_gate(
     g,
     A,
@@ -543,11 +572,11 @@ def _ckfg_gate(
     threshold,
     T,
     H: tl.constexpr,
-    D: tl.constexpr,
+    D: _SCALAR,
     BT: tl.constexpr,
     BD: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    HAS_BIAS: _SCALAR,
+    IS_VARLEN: _SCALAR,
 ):
     i_d, i_t, i_bh = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
     i_b, i_h = (i_bh // H, i_bh % H)
@@ -599,7 +628,7 @@ def _ckfg_gate(
 
 
 @libentry()
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(_VARLEN_HEURISTIC)
 @libtuner(
     configs=runtime.get_tuned_config("ckfg_inverse"),
     key=["H", "BT", "IS_VARLEN"],
@@ -616,7 +645,7 @@ def _ckfg_inverse(
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    IS_VARLEN: _SCALAR,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = (tl.program_id(0), tl.program_id(1))
@@ -1140,6 +1169,11 @@ _FLOATS = (torch.float16, torch.bfloat16, torch.float32)
 def _norm_kernel(
     X, Y, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr, ROWS: tl.constexpr
 ):
+    _norm_rows(X, Y, N, K, BLOCK, ROWS)
+
+
+@triton.jit
+def _norm_rows(X, Y, N, K, BLOCK: tl.constexpr, ROWS: tl.constexpr):
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     d = tl.arange(0, BLOCK)
     mask = (row[:, None] < N) & (d[None, :] < K)
@@ -1149,14 +1183,14 @@ def _norm_kernel(
 
 
 @libentry()
-@triton.jit
+@triton.jit(do_not_specialize=["N", "NT", "SENTINEL"] if _ASCEND else [])
 def _metadata_init(
     CU,
     OFF,
     IDX,
-    N: tl.constexpr,
-    NT: tl.constexpr,
-    SENTINEL: tl.constexpr,
+    N: _SCALAR,
+    NT: _SCALAR,
+    SENTINEL: _SCALAR,
     BN: tl.constexpr,
     BT: tl.constexpr,
 ):
@@ -1202,6 +1236,23 @@ def _metadata(cu, t, device):
     )
     _metadata_expand[(n,)](cu, offsets, indices, num_warps=1)
     return indices, offsets
+
+
+def _chunk_layout_args(cu, indices, device):
+    if _ASCEND:
+        varlen = cu is not None
+        if not varlen:
+            # Dense kernels branch around these arguments and use the packed ABI.
+            cu = indices = torch.empty((1,), dtype=torch.int64, device=device)
+        return dict(cu_seqlens=cu, chunk_indices=indices, IS_VARLEN=varlen)
+    return dict(cu_seqlens=cu, chunk_indices=indices)
+
+
+def _gate_bias_args(bias, a):
+    if _ASCEND:
+        # Both flag values can use the same gate binary when the dtypes match.
+        return dict(g_bias=a if bias is None else bias, HAS_BIAS=bias is not None)
+    return dict(g_bias=bias)
 
 
 def _validate(q, k, v, raw_g, beta, a, bias, state, cu, scale):
@@ -1302,14 +1353,14 @@ def chunk_kda_with_fused_gate(
     else:
         indices, offsets = _metadata(cu, t, q.device)
         nt = indices.shape[0]
+    packing = _chunk_layout_args(cu, indices, q.device)
     gate = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     _ckfg_gate[lambda meta: (triton.cdiv(dk, meta["BD"]), nt, b * h)](
         g=raw_g,
         A=a,
         y=gate,
-        g_bias=bias,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **_gate_bias_args(bias, a),
+        **packing,
         cumsum_scale=_RCP_LN2,
         beta=1.0,
         threshold=20.0,
@@ -1329,8 +1380,7 @@ def chunk_kda_with_fused_gate(
         A=akk,
         Aqk=aqk,
         scale=scale,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         T=t,
         H=h,
         K=dk,
@@ -1343,8 +1393,7 @@ def chunk_kda_with_fused_gate(
     _ckfg_inverse[nt, b * h](
         A=akk,
         Ai=inverse,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         T=t,
         H=h,
         BT=_CHUNK,
@@ -1363,8 +1412,7 @@ def chunk_kda_with_fused_gate(
         u=u,
         A=inverse,
         gk=gate,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         T=t,
         H=h,
         K=dk,
@@ -1402,8 +1450,7 @@ def chunk_kda_with_fused_gate(
         h=history,
         o=v,
         A=aqk,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         scale=scale,
         T=t,
         H=h,
