@@ -19,6 +19,74 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit(do_not_specialize=["TOTAL"])
+def prepare_decode_kernel(
+    q,
+    k,
+    a,
+    b,
+    a_log,
+    bias,
+    q_out,
+    k_out,
+    decay_out,
+    beta_out,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    STRIDE_Q: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    OFFSET_K: tl.constexpr,
+    STRIDE_A: tl.constexpr,
+    STRIDE_B: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    BK: tl.constexpr,
+    TOTAL,
+):
+    query_rows = (TOTAL // HV) * H
+    norm_blocks = tl.cdiv(query_rows, 16)
+    gate_blocks = tl.cdiv(TOTAL, 128)
+    for task in range(
+        tl.program_id(0), tl.maximum(norm_blocks, gate_blocks), tl.num_programs(0)
+    ):
+        if task < norm_blocks:
+            rows = task * 16 + tl.arange(0, 16)
+            token, head = rows // H, rows % H
+            reduction = tl.arange(0, BK)
+            mask = (rows[:, None] < query_rows) & (reduction[None, :] < K)
+            query = tl.load(
+                q + token[:, None] * STRIDE_Q + head[:, None] * K + reduction[None, :],
+                mask,
+                0,
+            ).to(tl.float32)
+            key = tl.load(
+                k
+                + token[:, None] * STRIDE_K
+                + OFFSET_K
+                + head[:, None] * K
+                + reduction[None, :],
+                mask,
+                0,
+            ).to(tl.float32)
+            if NORMALIZE:
+                query *= tl.rsqrt(tl.sum(query * query, 1) + 1e-6)[:, None]
+                key *= tl.rsqrt(tl.sum(key * key, 1) + 1e-6)[:, None]
+            tl.store(q_out + rows[:, None] * K + reduction[None, :], query, mask)
+            tl.store(k_out + rows[:, None] * K + reduction[None, :], key, mask)
+        if task < gate_blocks:
+            rows = task * 128 + tl.arange(0, 128)
+            token, head = rows // HV, rows % HV
+            gate = tl.load(a + token * STRIDE_A + head, rows < TOTAL, 0).to(tl.float32)
+            gate += tl.load(bias + head).to(tl.float32)
+            softplus = tl.where(gate <= 20.0, tl.log(1.0 + tl.exp(gate)), gate)
+            decay = tl.exp(-tl.exp(tl.load(a_log + head).to(tl.float32)) * softplus)
+            beta = tl.sigmoid(
+                tl.load(b + token * STRIDE_B + head, rows < TOTAL, 0).to(tl.float32)
+            )
+            tl.store(decay_out + rows, decay, rows < TOTAL)
+            tl.store(beta_out + rows, beta, rows < TOTAL)
+
+
+@triton.jit(do_not_specialize=["TOTAL"])
 def transform_state_kernel(
     source,
     target,
@@ -78,7 +146,7 @@ def vector_cores() -> int:
 
 
 def quantize_gdn_state_int8(state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize contiguous [slots,HV,V,K] state with one FP32 scale per V row."""
+    """Quantize [slots,HV,V,K] with nearest-even rounding and FP32 scales per V row."""
     logger.debug("GEMS_ASCEND QUANTIZE_GDN_STATE_INT8")
     if state.ndim != 4 or not state.is_contiguous():
         raise ValueError("state must be contiguous [slots,HV,V,K]")
@@ -127,9 +195,13 @@ def store_int8_state(
     scale = safe_magnitude * (1.0 / 127.0)
     reciprocal_scale = 127.0 / safe_magnitude
     # Share one division across the channel instead of dividing every element.
-    rounded = values * reciprocal_scale[:, None] + 0.5
-    quantized = tl.minimum(tl.maximum(tl.floor(rounded), -127), 127)
-    tl.store(state + offsets, quantized.to(tl.int8), mask)
+    # The scaled range is [-127,127]; FP32 bias encoding rounds to nearest-even.
+    encoded = (values * reciprocal_scale[:, None] + 12582912.0).to(
+        tl.int32, bitcast=True
+    )
+    # The bias bits (0x4B400000) have a zero low byte. Narrowing removes them;
+    # the rounded result is already in [-127,127], so no clamp is needed.
+    tl.store(state + offsets, encoded.to(tl.int8), mask)
     tl.store(scales + scale_offsets, scale, mask_v)
 
 
@@ -162,6 +234,7 @@ def gdn_decode_int8_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     TOTAL=1,
+    PREPARED: tl.constexpr = False,
 ):
     for task in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
         sequence_head = (task // tl.cdiv(V, BV)).to(tl.int64)
@@ -176,9 +249,9 @@ def gdn_decode_int8_kernel(
             tl.store(output_ptr, 0.0, column < V)
         else:
             group = slot * HV + head
+            scale_offsets = group * V + column
             offsets = (group * V + column[:, None]) * K + reduction[None, :]
             mask = (column[:, None] < V) & (reduction[None, :] < K)
-            scale_offsets = group * V + column
             state_values = tl.load(state + offsets, mask, 0).to(tl.float32)
             state_scale = tl.load(scales + scale_offsets, column < V, 0)
             state_values *= state_scale[:, None]
@@ -197,15 +270,21 @@ def gdn_decode_int8_kernel(
                 column < V,
                 0,
             ).to(tl.float32)
-            if NORMALIZE:
+            if NORMALIZE and not PREPARED:
                 query *= tl.rsqrt(tl.sum(query * query, 0) + 1e-6)
                 key *= tl.rsqrt(tl.sum(key * key, 0) + 1e-6)
             query *= SCALE
-            gate = tl.load(a + sequence * STRIDE_A + head).to(tl.float32)
-            gate += tl.load(dt_bias + head).to(tl.float32)
-            softplus = tl.where(gate <= 20.0, tl.log(1.0 + tl.exp(gate)), gate)
-            decay = tl.exp(-tl.exp(tl.load(A_log + head).to(tl.float32)) * softplus)
-            beta = tl.sigmoid(tl.load(b + sequence * STRIDE_B + head).to(tl.float32))
+            if PREPARED:
+                decay = tl.load(a + sequence * STRIDE_A + head)
+                beta = tl.load(b + sequence * STRIDE_B + head)
+            else:
+                gate = tl.load(a + sequence * STRIDE_A + head).to(tl.float32)
+                gate += tl.load(dt_bias + head).to(tl.float32)
+                softplus = tl.where(gate <= 20.0, tl.log(1.0 + tl.exp(gate)), gate)
+                decay = tl.exp(-tl.exp(tl.load(A_log + head).to(tl.float32)) * softplus)
+                beta = tl.sigmoid(
+                    tl.load(b + sequence * STRIDE_B + head).to(tl.float32)
+                )
             state_values *= decay
             residual = (value - tl.sum(state_values * key[None, :], 1)) * beta
             state_values = tl.fma(residual[:, None], key[None, :], state_values)
@@ -326,7 +405,49 @@ def gdn_w8a16_int8(
         return out, state_int8
     block_v = 64 if reduction == columns == 128 else 16
     total = tokens * heads * triton.cdiv(columns, block_v)
+    # Shared normalization/gating amortizes its extra launch on larger batches.
+    prepared = reduction == columns == 128 and tokens >= 16
     with torch_device_fn.device(query.device):
+        if prepared:
+            normalized_q = torch.empty(
+                (tokens, query_heads, reduction),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            normalized_k = torch.empty_like(normalized_q)
+            decay = torch.empty(
+                (tokens, heads), device=query.device, dtype=torch.float32
+            )
+            beta = torch.empty_like(decay)
+            prepare_blocks = max(
+                triton.cdiv(tokens * query_heads, 16), triton.cdiv(tokens * heads, 128)
+            )
+            prepare_decode_kernel[(min(vector_cores(), prepare_blocks),)](
+                query,
+                key,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                normalized_q,
+                normalized_k,
+                decay,
+                beta,
+                query_heads,
+                heads,
+                reduction,
+                stride_q,
+                stride_k,
+                offset_k,
+                a.stride(0),
+                b.stride(0),
+                use_qk_l2norm_in_kernel,
+                triton.next_power_of_2(reduction),
+                tokens * heads,
+            )
+            query, key, a, b = normalized_q, normalized_k, decay, beta
+            stride_q = stride_k = query_heads * reduction
+            offset_k = 0
         gdn_decode_int8_kernel[(min(vector_cores(), total),)](
             query,
             key,
@@ -355,6 +476,7 @@ def gdn_w8a16_int8(
             triton.next_power_of_2(reduction),
             block_v,
             TOTAL=total,
+            PREPARED=prepared,
         )
     return out, state_int8
 

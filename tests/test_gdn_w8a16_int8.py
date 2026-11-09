@@ -568,6 +568,66 @@ def test_int8_state_gdn_zero_state(dtype):
 
 @pytest.mark.gdn_w8a16
 @pytest.mark.skipif(
+    "quantize_gdn_state_int8" not in vars(flaggems_vllm),
+    reason="backend does not export INT8 state quantization",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_int8_state_gdn_rounding(dtype):
+    # Unit scale exposes positive/negative half ties and the saturation endpoints.
+    values = torch.tensor(
+        [-127, -126.5, -125.5, -2.5, -1.5, -0.5, 0, 0.5, 1.5, 2.5, 125.5, 126.5, 127],
+        device=flaggems_vllm.device,
+        dtype=dtype,
+    ).reshape(1, 1, 1, -1)
+    state, scales = flaggems_vllm.quantize_gdn_state_int8(values)
+    gems_assert_equal(scales, torch.ones_like(scales))
+    gems_assert_equal(state, values.float().round().to(torch.int8))
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.skipif(
+    "gdn_w8a16_int8" not in vars(flaggems_vllm),
+    reason="backend does not export INT8-state GDN",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("separate", [False, True])
+def test_int8_state_gdn_prepared_tail(dtype, normalize, separate):
+    torch.manual_seed(42)
+    tokens, query_heads, heads, dim = 17, 8, 32, 128
+    packed = 2 * query_heads * dim + heads * dim
+    baseline, reference, args = build_int8_gdn_decode_inputs(
+        (tokens, packed, heads, dim), dtype
+    )
+    reference, args = list(reference), list(args)
+    reference[-1] = args[-1] = normalize
+    # Include null slots while exercising both normalization and gate tail blocks.
+    args[9][0] = 0
+    if not normalize:
+        key = args[0][:, query_heads * dim : 2 * query_heads * dim]
+        key.copy_(
+            torch.nn.functional.normalize(
+                key.reshape(tokens, query_heads, dim).float(), dim=-1
+            )
+            .to(dtype)
+            .reshape(tokens, -1)
+        )
+    expected, expected_state = baseline(*reference)
+    if separate:
+        pieces = args[0].split((query_heads * dim, query_heads * dim, heads * dim), -1)
+        args[0] = tuple(
+            piece.reshape(1, tokens, count, dim).contiguous()
+            for piece, count in zip(pieces, (query_heads, query_heads, heads))
+        )
+    actual, state = flaggems_vllm.gdn_w8a16_int8(*args)
+    gems_assert_close(actual, expected, dtype, atol=1e-6)
+    gems_assert_close(
+        state.float(), expected_state / args[7][..., None], torch.float32, atol=0.501
+    )
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.skipif(
     "chunk_gated_delta_rule_w8a16_int8" not in vars(flaggems_vllm),
     reason="backend does not export INT8-state prefill",
 )
