@@ -153,8 +153,8 @@ def _vllm_fused_inv_rope_fp8_quant(
     )
 
 
-def _prepare_musa_vllm_baseline(monkeypatch):
-    if flaggems_vllm.vendor_name != "mthreads":
+def _prepare_vllm_baseline_pdl(monkeypatch):
+    if flaggems_vllm.vendor_name not in ("hygon", "mthreads"):
         return
     module = importlib.import_module(vllm_fused_inv_rope_fp8_quant.__module__)
     kernel_name = "_fused_inv_rope_fp8_quant_per_head"
@@ -169,12 +169,10 @@ def _prepare_musa_vllm_baseline(monkeypatch):
         next(reversed(params)) != "launch_pdl"
         or pdl.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
     ):
-        raise RuntimeError("Unsupported vLLM launch_pdl signature for MUSA")
+        raise RuntimeError("Unsupported vLLM launch_pdl signature")
 
-    # vLLM omits launch_pdl when PDL is disabled, but MUSA's Triton binder
-    # requires this constexpr argument. Give it a default without changing
-    # the kernel code, globals, or launch configuration. pytest restores the
-    # original kernel after the benchmark, including on failure.
+    # vLLM omits launch_pdl when PDL is disabled, but the Hygon and MUSA
+    # binders require the argument. pytest restores the kernel after the test.
     fn = kernel.fn
     adapted_fn = FunctionType(
         fn.__code__, fn.__globals__, fn.__name__, (False,), fn.__closure__
@@ -192,7 +190,7 @@ def _prepare_musa_vllm_baseline(monkeypatch):
         launch_metadata=kernel.launch_metadata,
     )
     monkeypatch.setattr(module, kernel_name, adapted_kernel)
-    print("vLLM MUSA baseline: default launch_pdl=False (kernel code unchanged)")
+    print("vLLM baseline: default launch_pdl=False")
 
 
 def _validate_baseline(device):
@@ -276,7 +274,7 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
     reason="vLLM fused_inv_rope_fp8_quant not installed",
 )
 def test_fused_inv_rope_fp8_quant(monkeypatch):
-    _prepare_musa_vllm_baseline(monkeypatch)
+    _prepare_vllm_baseline_pdl(monkeypatch)
     bench = FusedInvRopeFP8QuantBenchmark(
         op_name="fused_inv_rope_fp8_quant",
         input_fn=_input_fn,
