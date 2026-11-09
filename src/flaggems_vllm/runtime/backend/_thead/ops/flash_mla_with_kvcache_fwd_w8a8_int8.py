@@ -263,6 +263,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_h16_kr_copy"] = False
     if "ppu_mla_row_subgroups" in available:
         defaults["ppu_mla_row_subgroups"] = False
+    if "ppu_mla_full_tiles" in available:
+        defaults["ppu_mla_full_tiles"] = False
     if "ppu_mla_uniform_request_sort" in available:
         defaults["SORT_SKIP_EQUAL"] = False
         defaults["ppu_mla_uniform_request_sort"] = False
@@ -422,6 +424,16 @@ def dense_mla_configs() -> list[triton.Config]:
             if config.kwargs.get("ppu_gather_mla_row_reductions"):
                 candidate = copy.copy(config)
                 candidate.kwargs = {**config.kwargs, "ppu_mla_row_subgroups": True}
+                enabled.append(candidate)
+        normalized.extend(enabled)
+    if "ppu_mla_full_tiles" in available:
+        enabled = []
+        for config in normalized:
+            if config.kwargs.get("ppu_mla_row_subgroups") and config.kwargs.get(
+                "ppu_mla_kr_joint_copy"
+            ):
+                candidate = copy.copy(config)
+                candidate.kwargs = {**config.kwargs, "ppu_mla_full_tiles": True}
                 enabled.append(candidate)
         normalized.extend(enabled)
     return normalized
