@@ -33,6 +33,7 @@ weight_norm_interface_backward: test_weight_norm_interface
 
 # --- Alternative naming ---
 act_quant_triton: test_quant
+apply_trace_tokens: test_trace_replay
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
 moe_align_block_size_triton: test_moe_align_block_size
 
