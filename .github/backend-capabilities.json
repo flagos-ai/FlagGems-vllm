@@ -51,6 +51,12 @@
       "benchmarks_enabled": true,
       "allow_all_benchmarks": true
     },
+    "thead": {
+      "auto_select": true,
+      "tests_allow": [
+        "tests/test_fused_indexer_weight_scale.py"
+      ]
+    },
     "tsingmicro": {
       "auto_select": true
     }
