@@ -263,6 +263,9 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_h16_kr_copy"] = False
     if "ppu_mla_row_subgroups" in available:
         defaults["ppu_mla_row_subgroups"] = False
+    if "ppu_mla_score_guard" in available:
+        defaults["ppu_mla_score_guard"] = 0
+        defaults["INTERIOR_SCORE_HINT"] = False
     if "ppu_mla_q2_tail" in available:
         defaults["ppu_mla_q2_tail"] = False
     if "ppu_mla_full_tiles" in available:
@@ -442,6 +445,26 @@ def dense_mla_configs() -> list[triton.Config]:
                     tail.kwargs = {**candidate.kwargs, "ppu_mla_q2_tail": True}
                     enabled.append(tail)
         normalized.extend(enabled)
+    if "ppu_mla_score_guard" in available:
+        enabled = []
+        for config in normalized:
+            if config.kwargs.get("ppu_mla_row_subgroups") and config.kwargs.get(
+                "ppu_mla_kr_joint_copy"
+            ):
+                modes = (1, 2, 3)
+            elif config.kwargs.get("ppu_mla_h16_kr_copy"):
+                modes = (3,)
+            else:
+                continue
+            for mode in modes:
+                candidate = copy.copy(config)
+                candidate.kwargs = {
+                    **config.kwargs,
+                    "ppu_mla_score_guard": mode,
+                    "INTERIOR_SCORE_HINT": mode == 3,
+                }
+                enabled.append(candidate)
+        normalized.extend(enabled)
     return normalized
 
 
@@ -518,6 +541,7 @@ def dense_int8_mla_kernel(
     SORT_REQUESTS: tl.constexpr = False,
     PROBABILITY_RADIX: tl.constexpr = 127,
     SORT_SKIP_EQUAL: tl.constexpr = False,
+    INTERIOR_SCORE_HINT: tl.constexpr = False,
 ):
     tl.static_assert(
         PROBABILITY_RADIX == 127
@@ -675,15 +699,15 @@ def dense_int8_mla_kernel(
             * tl.expand_dims(ks, 1 - reduction_axis)
             * (SCALE * 1.4426950408889634)
         )
-        scores = tl.where(
-            (
-                page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
-                < tl.expand_dims(query_limit, reduction_axis)
-            )
-            & tl.expand_dims(page_offsets < end_page, 1 - reduction_axis),
-            scores,
-            -float("inf"),
-        )
+        visible = (
+            page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
+            < tl.expand_dims(query_limit, reduction_axis)
+        ) & tl.expand_dims(page_offsets < end_page, 1 - reduction_axis)
+        if INTERIOR_SCORE_HINT:
+            # A later page in this split contains at least one remaining token.
+            # Both draft queries can therefore see every token of the current tile.
+            visible = (page_idx + BK // 64 < end_page) | visible
+        scores = tl.where(visible, scores, -float("inf"))
         new_maximum = tl.maximum(maximum, tl.max(scores, reduction_axis))
         safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
         probabilities = tl.exp2(scores - tl.expand_dims(safe_maximum, reduction_axis))
