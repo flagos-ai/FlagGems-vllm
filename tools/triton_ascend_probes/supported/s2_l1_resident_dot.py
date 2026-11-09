@@ -26,7 +26,7 @@ convert_layout。把消费端改成 4D zN + al.dot(fractal) 之后，copy 与
 copy_from_ub_to_l1 都能正常工作（后者会打印 deprecation warning）。
 
 运行方式:
-    PYTHONPATH=src:FlagGems/src python probe_01_l1_resident_dot.py [dot|copy|old]
+    PYTHONPATH=src:FlagGems/src python s2_l1_resident_dot.py [dot|copy|old]
       dot  : 推荐写法，al.copy + bl.to_tensor + al.dot(fractal)      -> PASS
       copy : 用 deprecated 的 al.copy_from_ub_to_l1 + al.dot(fractal) -> PASS
       old  : 旧写法 bl.to_tensor(target_shape) + tl.dot              -> FAIL
@@ -60,29 +60,18 @@ def kern(x, y, R: tl.constexpr, K: tl.constexpr, MODE: tl.constexpr):
     l1a = bl.alloc(tl.bfloat16, [K // 16, R // 16, 16, 16], al.ascend_address_space.L1)
     l1b = bl.alloc(tl.bfloat16, [R // 16, K // 16, 16, 16], al.ascend_address_space.L1)
 
-    if MODE == "old":
-        # 旧写法：把 L1 buffer 转成 2D ND tensor 后交给 tl.dot。
-        # 这条路径仍会在 lowering 阶段失败（cbuf/ub 地址空间冲突）。
-        al.copy(bl.to_buffer(a_nz, al.ascend_address_space.UB), l1a)
-        at2 = bl.to_tensor(l1a, target_shape=[R, K])
-        c = tl.dot(at2, tl.trans(at2), out_dtype=tl.float32)
+    if MODE == "copy":
+        # deprecated 别名，仅用于验证 copy 入口本身不是问题。
+        al.copy_from_ub_to_l1(bl.to_buffer(a_nz, al.ascend_address_space.UB), l1a)
+        al.copy_from_ub_to_l1(bl.to_buffer(at_nz, al.ascend_address_space.UB), l1b)
     else:
-        if MODE == "copy":
-            # deprecated 别名，仅用于验证 copy 入口本身不是问题。
-            al.copy_from_ub_to_l1(
-                bl.to_buffer(a_nz, al.ascend_address_space.UB), l1a
-            )
-            al.copy_from_ub_to_l1(
-                bl.to_buffer(at_nz, al.ascend_address_space.UB), l1b
-            )
-        else:
-            al.copy(bl.to_buffer(a_nz, al.ascend_address_space.UB), l1a)
-            al.copy(bl.to_buffer(at_nz, al.ascend_address_space.UB), l1b)
+        al.copy(bl.to_buffer(a_nz, al.ascend_address_space.UB), l1a)
+        al.copy(bl.to_buffer(at_nz, al.ascend_address_space.UB), l1b)
 
-        # 保留 4D zN 布局，直接交给 al.dot。
-        ta = bl.to_tensor(l1a)
-        tb = bl.to_tensor(l1b)
-        c = al.dot(ta, tb, format_a="fractal", format_b="fractal")
+    # 保留 4D zN 布局，直接交给 al.dot。
+    ta = bl.to_tensor(l1a)
+    tb = bl.to_tensor(l1b)
+    c = al.dot(ta, tb, format_a="fractal", format_b="fractal")
 
     tl.store(y + o_r[:, None] * R + o_r[None, :], c)
 
@@ -96,7 +85,7 @@ def main():
     with torch.inference_mode():
         kern[(1,)](x, y, R, K, MODE=mode)
         torch.npu.synchronize()
-    print(f"RESULT: PASS probe_01_l1_resident_dot mode={mode}")
+    print(f"RESULT: PASS s2_l1_resident_dot mode={mode}")
     ref = x.float() @ x.float().T
     print("maxerr", (y - ref).abs().max().item())
 

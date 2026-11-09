@@ -1,7 +1,7 @@
-"""GAP F6: ND -> zN staging for an L1-resident dot operand.
+"""GAP R1: ND -> zN staging for an L1-resident dot operand.
 
 F1 is now solved at the API level: 4D zN operands in L1 are consumable via
-`al.dot(..., format_a/b="fractal")` (see probe_01).  But the only way to build
+`al.dot(..., format_a/b="fractal")` (see supported/s2_l1_resident_dot.py).  But the only way to build
 a zN tile from a 2D ND tile is a UB-side layout conversion
 
     a_tmp = tl.permute(a.reshape(R, K // 16, 16), (1, 0, 2))
@@ -18,17 +18,19 @@ the extra UB tiles push the kernel over the 2.03 Mbit budget:
     MODE=l1     (all 7 panels staged in L1)                  ub 2.37 Mbit
     MODE=l1 two chunks (14 panels in L1)                     ub 3.94 Mbit
 
-What we need instead is a fused staging copy, e.g. an `al.copy` that accepts
-a 2D ND UB tile and a 4D zN L1 destination (`ND2NZ`), or `al.dot` accepting
-2D ND operands with an internal L1 staging that reuses the compiler's
-existing (UB-cheap) ND->zN path.  Then explicit L1 residency becomes usable
+AscendC does exactly this natively: chunk_kda_fwd_prepare_cube.h:258-290
+issues `AscendC::Nd2NzParams` + `AscendC::DataCopy` for GM(ND) -> L1(NZ)
+("后面的四次 MMAD 不再读 GM"), so the requirement is confirmed achievable
+there.  Triton needs the equivalent: an `al.copy` that accepts a 2D ND UB
+tile and a 4D zN L1 destination, or `al.dot` with 2D ND operands and an
+internal L1 staging that reuses the compiler's (UB-cheap) ND->zN path.  Then explicit L1 residency becomes usable
 for multi-panel kernels, which is what the cross-chunk pipeline (F4) needs.
 
 Usage:
-    PYTHONPATH=src:FlagGems/src python probe_07_zn_staging_budget.py plain
-    PYTHONPATH=src:FlagGems/src python probe_07_zn_staging_budget.py l1a
-    PYTHONPATH=src:FlagGems/src python probe_07_zn_staging_budget.py l1b
-    PYTHONPATH=src:FlagGems/src python probe_07_zn_staging_budget.py l1
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py plain
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py l1a
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py l1b
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py l1
 """
 
 import sys
@@ -161,7 +163,7 @@ def main():
     with torch.inference_mode():
         kern[grid](x, y, R, K, DO_A=do_a, DO_B=do_b, FA=fa, FB=fb)
         torch.npu.synchronize()
-    print(f"RESULT: PASS probe_07_zn_staging_budget mode={mode}")
+    print(f"RESULT: PASS g1_nd2nz_staging mode={mode}")
 
 
 if __name__ == "__main__":

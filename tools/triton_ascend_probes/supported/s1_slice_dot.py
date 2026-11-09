@@ -27,7 +27,7 @@ zN 布局把 M/N 方向放在内层 block 维度：
 对 A 布局面板做 M 方向切片，虽然能编译运行，但结果不正确（见 README）。
 
 运行方式:
-    PYTHONPATH=src:FlagGems/src python probe_02_slice_as_dot_operand.py [col|row|l1_col|l1_row]
+    PYTHONPATH=src:FlagGems/src python s1_slice_dot.py [col|row|l1_col|l1_row]
 """
 
 import sys
@@ -104,12 +104,8 @@ def kern(x, y, R: tl.constexpr, K: tl.constexpr, MODE: tl.constexpr):
         al.copy(bl.to_buffer(at_nz, al.ascend_address_space.UB), l1b)
         tb = bl.to_tensor(l1b)
         h1: tl.constexpr = (R // 2) // 16
-        btop = al.extract_slice(
-            tb, [0, 0, 0, 0], [h1, K // 16, 16, 16], [1, 1, 1, 1]
-        )
-        bbot = al.extract_slice(
-            tb, [h1, 0, 0, 0], [h1, K // 16, 16, 16], [1, 1, 1, 1]
-        )
+        btop = al.extract_slice(tb, [0, 0, 0, 0], [h1, K // 16, 16, 16], [1, 1, 1, 1])
+        bbot = al.extract_slice(tb, [h1, 0, 0, 0], [h1, K // 16, 16, 16], [1, 1, 1, 1])
 
         # A 布局的 M 维不是最外层，按行切片不可靠；每个行块单独分配 A 面板。
         top = extract_slice(a, [0, 0], [R // 2, K], [1, 1])
@@ -127,12 +123,8 @@ def kern(x, y, R: tl.constexpr, K: tl.constexpr, MODE: tl.constexpr):
         al.copy(bl.to_buffer(top_nz, al.ascend_address_space.UB), l1top)
         al.copy(bl.to_buffer(bot_nz, al.ascend_address_space.UB), l1bot)
 
-        c0 = al.dot(
-            bl.to_tensor(l1top), btop, format_a="fractal", format_b="fractal"
-        )
-        c1 = al.dot(
-            bl.to_tensor(l1bot), bbot, format_a="fractal", format_b="fractal"
-        )
+        c0 = al.dot(bl.to_tensor(l1top), btop, format_a="fractal", format_b="fractal")
+        c1 = al.dot(bl.to_tensor(l1bot), bbot, format_a="fractal", format_b="fractal")
         o_h = tl.arange(0, R // 2)
         tl.store(y + o_h[:, None] * (R // 2) + o_h[None, :], c0)
         tl.store(y + R * R // 2 + o_h[:, None] * (R // 2) + o_h[None, :], c1)
@@ -147,7 +139,7 @@ def main():
     with torch.inference_mode():
         kern[(1,)](x, y, R, K, MODE=mode)
         torch.npu.synchronize()
-    print(f"RESULT: PASS probe_02_slice_as_dot_operand mode={mode}")
+    print(f"RESULT: PASS s1_slice_dot mode={mode}")
 
     if mode in ("col", "l1_col"):
         ref = x[:, :K].float() @ x[:, K:].float().T

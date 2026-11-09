@@ -11,17 +11,13 @@ Triton 提供的机制为 al.scope("cube"|"vector") 以及 al.sync_block_set/wai
      -> 失败: BiShengIR 段错误 SIGSEGV (11)
   2. MODE=scope_noauto(开启 enable_mixed_cv=True, disable_auto_inject_block_sync=True):
      -> 编译通过，但运算结果错误 (maxerr ≈ 1e2，读到了未完成写入的脏数据)
-  3. MODE=scope_sync  (同上编译选项 + 手工插入 sync_block_set / wait 同步标志):
-     -> 正确: PASS (maxerr ≈ 1.5e-5)
-  4. MODE=noscope_sync(默认编译选项，不使用 scope，仅手工插入 sync_block_*):
-     -> 正确: PASS (maxerr ≈ 1.5e-5，当前 GDN 算子的临时规避方案)
+【可用替代路径】不使用 scope、只用 al.sync_block_set/wait，见
+  supported/s4_manual_cross_core_sync.py（PASS，maxerr 1.5e-5）。
+  因此本文件是"崩溃/脏读"缺陷报告，不是能力需求。
 
-【结论】
-默认的 scope 自动同步机制崩溃；关闭自动同步后需用户手工管理 flag 同步。
-此外，API 注释与实际行为存在脱节（注释要求 sync_block_* 必须在匹配的 scope 内，实测不加 scope 也能工作）。
-
-运行方式:
-    PYTHONPATH=src:FlagGems/src python probe_04_scope_sync.py [scope|scope_noauto|scope_sync|noscope_sync]
+运行方式（仓库根目录）:
+    PYTHONPATH=src:FlagGems/src python \
+        tools/triton_ascend_probes/defects/d1_scope_auto_sync.py [scope|scope_noauto]
 """
 
 import sys
@@ -54,14 +50,6 @@ def kern(a, b, c, out, R: tl.constexpr, K: tl.constexpr, MODE: tl.constexpr):
             tl.store(pc, cb)
         with al.scope("vector"):
             tl.store(po, tl.load(pc) * 2.0)
-    elif MODE == "scope_sync":
-        with al.scope("cube"):
-            cb = tl.dot(tl.load(pa), tl.trans(tl.load(pb)), out_dtype=tl.float32)
-            tl.store(pc, cb)
-            al.sync_block_set("cube", "vector", 0)
-        with al.scope("vector"):
-            al.sync_block_wait("cube", "vector", 0)
-            tl.store(po, tl.load(pc) * 2.0)
     else:
         cb = tl.dot(tl.load(pa), tl.trans(tl.load(pb)), out_dtype=tl.float32)
         tl.store(pc, cb)
@@ -86,7 +74,7 @@ def main():
         torch.npu.synchronize()
     ref = (a.float() @ b.float().T) * 2.0
     err = (out - ref).abs().max().item()
-    print(f"RESULT: PASS probe_04_scope_sync mode={mode} maxerr={err:.6e}")
+    print(f"RESULT: PASS d1_scope_auto_sync mode={mode} maxerr={err:.6e}")
 
 
 if __name__ == "__main__":

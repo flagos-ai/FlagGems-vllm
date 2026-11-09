@@ -27,8 +27,8 @@ vf_fusion_mode 提供了 max-parallel / all-op / ub-aware-op 三种模式：
 每增加一个 [64, 128] op 全网格开销递增约 100 us，直接构成了 Gram kernel 2.6 ms 的主要开销来源。
 
 运行方式:
-    PYTHONPATH=src:FlagGems/src python probe_05_vec_chain_fusion.py
-    VF_MODE=all-op PYTHONPATH=src:FlagGems/src python probe_05_vec_chain_fusion.py  # 观察编译失败
+    PYTHONPATH=src:FlagGems/src python g2_vec_chain_fusion.py
+    VF_MODE=all-op PYTHONPATH=src:FlagGems/src python g2_vec_chain_fusion.py  # 观察编译失败
 """
 
 import os
@@ -84,7 +84,7 @@ def main():
             base = us
         slope = (us - base) / n if n else 0.0
         print(
-            f"RESULT: PASS probe_05_vec_chain_fusion N={n:2d} {us:8.1f} us "
+            f"RESULT: PASS g2_vec_chain_fusion N={n:2d} {us:8.1f} us "
             f"marginal={slope:6.1f} us/op" + (f" vf={vf}" if vf else "")
         )
 

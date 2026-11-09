@@ -23,7 +23,7 @@ bl.to_tensor(l1) + al.dot(..., format_a="fractal", format_b="fractal") 读取。
 这条路径不经过 insert_slice，也不产生昂贵的 layout 转换。
 
 运行方式:
-    PYTHONPATH=src:FlagGems/src python probe_03_insert_slice_dot.py [l1_copy|insert|l1_insert]
+    PYTHONPATH=src:FlagGems/src python d2_insert_slice_dot.py [l1_copy|insert|l1_insert]
 """
 
 import sys
@@ -108,51 +108,6 @@ def kern(x, y, R: tl.constexpr, K: tl.constexpr, MODE: tl.constexpr):
         c = al.dot(full_a, full_b, format_a="fractal", format_b="fractal")
         tl.store(y + o_r[:, None] * R + o_r[None, :], c)
 
-    if MODE == "l1_copy":
-        # 推荐路径：L1 面板 + subview 定位子块 + al.copy(UB -> L1)。
-        l1a = bl.alloc(
-            tl.bfloat16, [K // 16, R // 16, 16, 16], al.ascend_address_space.L1
-        )
-        l1b = bl.alloc(
-            tl.bfloat16, [R // 16, K // 16, 16, 16], al.ascend_address_space.L1
-        )
-        sub_top_a = bl.subview(
-            l1a,
-            [0, 0, 0, 0],
-            [K // 16, (R // 2) // 16, 16, 16],
-            [1, 1, 1, 1],
-        )
-        sub_bot_a = bl.subview(
-            l1a,
-            [0, (R // 2) // 16, 0, 0],
-            [K // 16, (R // 2) // 16, 16, 16],
-            [1, 1, 1, 1],
-        )
-        sub_top_b = bl.subview(
-            l1b,
-            [0, 0, 0, 0],
-            [(R // 2) // 16, K // 16, 16, 16],
-            [1, 1, 1, 1],
-        )
-        sub_bot_b = bl.subview(
-            l1b,
-            [(R // 2) // 16, 0, 0, 0],
-            [(R // 2) // 16, K // 16, 16, 16],
-            [1, 1, 1, 1],
-        )
-        al.copy(bl.to_buffer(top_nz, al.ascend_address_space.UB), sub_top_a)
-        al.copy(bl.to_buffer(bot_nz, al.ascend_address_space.UB), sub_bot_a)
-        al.copy(bl.to_buffer(top_t_nz, al.ascend_address_space.UB), sub_top_b)
-        al.copy(bl.to_buffer(bot_t_nz, al.ascend_address_space.UB), sub_bot_b)
-
-        c = al.dot(
-            bl.to_tensor(l1a),
-            bl.to_tensor(l1b),
-            format_a="fractal",
-            format_b="fractal",
-        )
-        tl.store(y + o_r[:, None] * R + o_r[None, :], c)
-
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "l1_copy"
@@ -164,7 +119,7 @@ def main():
         kern[(1,)](x, y, R, K, MODE=mode)
         torch.npu.synchronize()
     ref = x.float() @ x.float().T
-    print(f"RESULT: PASS probe_03_insert_slice_dot mode={mode}")
+    print(f"RESULT: PASS d2_insert_slice_dot mode={mode}")
     print("maxerr", (y - ref).abs().max().item())
 
 
