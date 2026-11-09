@@ -1548,23 +1548,6 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
-- id: kda_conv_scatter
-  description: 'Restores the staged rows back into the block-strided KDA
-
-    short-convolution state cache after the AscendC conv operator in one
-
-    pass, skipping PAD entries inside the kernel.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: kda_gate_cumsum
   description: 'Fused Triton replacement for the AscendC kda_gate_cumsum operator:
 
@@ -2161,6 +2144,22 @@ ops:
   stages:
   - stable: '4.1'
   cpp: '4.0'
+- id: scatter_conv_state
+  description: |
+    Restores the staged rows back into the block-strided KDA
+    short-convolution state cache after the AscendC conv operator in one
+    pass, skipping PAD entries inside the kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (arange/masked_fill -> where/zeros_like/sum -> index_copy_)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
 - id: select_candidate_blocks_cooperative
   description: |
     DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM's
