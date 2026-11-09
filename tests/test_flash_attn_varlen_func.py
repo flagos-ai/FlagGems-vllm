@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -722,3 +727,688 @@ def test_flash_attn_varlen_func_fa3_matches_fa2(
         )
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
         torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+# FP32 support reuses the MetaX direct kernel from #808. Unlike paged #759,
+# this path accepts packed encoder inputs and preserves IEEE products.
+def _metax_fp32_oracle(q, k, v, q_lens, k_lens, scale):
+    q, k, v = [x.detach().cpu().double() for x in (q, k, v)]
+    outputs, lses = [], []
+    iq = ik = 0
+    for nq, nk in zip(q_lens, k_lens):
+        qi = q[iq : iq + nq].transpose(0, 1)
+        ki, vi = [x[ik : ik + nk].transpose(0, 1) for x in (k, v)]
+        groups = qi.shape[0] // ki.shape[0]
+        ki, vi = [x.repeat_interleave(groups, dim=0) for x in (ki, vi)]
+        if nk == 0:
+            outputs.append(torch.zeros_like(qi).transpose(0, 1))
+            lses.append(torch.full(qi.shape[:2], -torch.inf, dtype=torch.float64))
+        else:
+            out_chunks, lse_chunks = [], []
+            for start in range(0, nq, 128):
+                scores = qi[:, start : start + 128] @ ki.transpose(-1, -2) * scale
+                out_chunks.append(scores.softmax(-1) @ vi)
+                lse_chunks.append(scores.logsumexp(-1))
+            outputs.append(
+                torch.cat(out_chunks, dim=1).transpose(0, 1)
+                if out_chunks
+                else torch.empty_like(q[iq : iq + nq])
+            )
+            lses.append(
+                torch.cat(lse_chunks, dim=1)
+                if lse_chunks
+                else torch.empty(q.shape[1], 0, dtype=torch.float64)
+            )
+        iq += nq
+        ik += nk
+    return torch.cat(outputs), torch.cat(lses, dim=1)
+
+
+def _metax_fp32_inputs(q_lens, k_lens, heads, dim, layout, dtype=torch.float32):
+    generator = torch.Generator(device=device).manual_seed(1234)
+    tensors = []
+    for total, num_heads in (
+        (sum(q_lens), heads[0]),
+        (sum(k_lens), heads[1]),
+        (sum(k_lens), heads[1]),
+    ):
+        if layout == "packed":
+            x = torch.randn(
+                total,
+                3,
+                num_heads,
+                dim,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )[:, 1]
+        elif layout == "last_stride":
+            x = torch.randn(
+                total,
+                num_heads,
+                dim * 2,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )[:, :, ::2]
+        else:
+            x = torch.randn(
+                total, num_heads, dim, device=device, dtype=dtype, generator=generator
+            )
+        tensors.append(x)
+    cuq = torch.tensor([0] + q_lens, dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    cuk = torch.tensor([0] + k_lens, dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    kwargs = dict(
+        q=tensors[0],
+        k=tensors[1],
+        v=tensors[2],
+        cu_seqlens_q=cuq,
+        cu_seqlens_k=cuk,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=False,
+        return_softmax_lse=True,
+        output_scale=None,
+        mask_mod=None,
+        aux_tensors=None,
+        dynamic_causal=None,
+    )
+    return kwargs
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+@pytest.mark.parametrize("dim", [16, 32, 64, 128, 256])
+@pytest.mark.parametrize("heads", [(1, 1), (4, 2), (16, 16)])
+@pytest.mark.parametrize("layout", ["dense", "packed", "last_stride"])
+def test_metax_fp32_varlen_reference(dim, heads, layout):
+    q_lens, k_lens = [1, 2, 15, 17, 53], [3, 2, 19, 13, 67]
+    args = _metax_fp32_inputs(q_lens, k_lens, heads, dim, layout)
+    out_storage = torch.full((sum(q_lens), 2, heads[0], dim), 12345.0, device=device)
+    args["out"] = out_storage[:, 0]
+    args["softmax_scale"] = 0.37
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(
+        args["q"], args["k"], args["v"], q_lens, k_lens, 0.37
+    )
+    assert out.data_ptr() == args["out"].data_ptr()
+    torch.testing.assert_close(out.cpu().double(), ref, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+    assert (out_storage[:, 1] == 12345.0).all()
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+@pytest.mark.parametrize(
+    "q_lens,k_lens", [([0, 0], [0, 3]), ([0, 2, 5], [3, 0, 7]), ([1, 1], [2, 3])]
+)
+def test_metax_fp32_empty_and_single_query(q_lens, k_lens):
+    args = _metax_fp32_inputs(q_lens, k_lens, (4, 2), 64, "dense")
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(
+        args["q"], args["k"], args["v"], q_lens, k_lens, 0.125
+    )
+    torch.testing.assert_close(out.cpu().double(), ref, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+@pytest.mark.parametrize("length", [1024, 4096, 8192])
+@pytest.mark.parametrize("layout", ["dense", "packed"])
+def test_metax_fp32_long_encoder(length, layout):
+    args = _metax_fp32_inputs([length, 2], [length, 2], (16, 16), 64, layout)
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(
+        args["q"], args["k"], args["v"], [length, 2], [length, 2], 0.125
+    )
+    torch.testing.assert_close(out.cpu().double(), ref, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension regression")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dim", [16, 32, 64, 128, 256])
+def test_metax_fp32_half_regression(dtype, dim):
+    args = _metax_fp32_inputs([1, 17, 53], [3, 19, 67], (4, 2), dim, "packed", dtype)
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(
+        args["q"], args["k"], args["v"], [1, 17, 53], [3, 19, 67], dim**-0.5
+    )
+    torch.testing.assert_close(out.cpu().double(), ref, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(causal=True),
+        dict(window_size=(4, 4)),
+        dict(softcap=1.0),
+        dict(num_splits=2),
+        dict(dropout_p=0.1),
+    ],
+)
+def test_metax_fp32_unsupported(change):
+    args = _metax_fp32_inputs([2], [2], (1, 1), 64, "dense")
+    args.update(change)
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.flash_attn_varlen_func(**args)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+def test_metax_fp32_no_alias_or_backward():
+    args = _metax_fp32_inputs([2], [2], (1, 1), 64, "dense")
+    args["out"] = args["q"]
+    with pytest.raises(ValueError, match="alias"):
+        flaggems_vllm.flash_attn_varlen_func(**args)
+    del args["out"]
+    args["q"].requires_grad_(True)
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        flaggems_vllm.flash_attn_varlen_func(**args)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 resource coverage")
+@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("heads", [(1, 1), (16, 16)])
+@pytest.mark.parametrize("length", [127, 257, 1024])
+def test_metax_fp32_wide_launches(dim, heads, length):
+    args = _metax_fp32_inputs([length], [length], heads, dim, "packed")
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(
+        args["q"], args["k"], args["v"], [length], [length], dim**-0.5
+    )
+    torch.testing.assert_close(out.cpu().double(), ref, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+@pytest.mark.parametrize(
+    "feature", ["alibi", "paged", "seqused", "out_layout", "dimension", "grad_stride"]
+)
+def test_metax_fp32_contract_rejections(feature):
+    args = _metax_fp32_inputs([2], [2], (1, 1), 64, "dense")
+    error = NotImplementedError
+    if feature == "alibi":
+        args["alibi_slopes"] = torch.ones(1, device=device)
+    elif feature in ("paged", "seqused"):
+        args["cu_seqlens_k"] = None
+        args["seqused_k"] = torch.tensor([2], device=device, dtype=torch.int32)
+        if feature == "paged":
+            args["block_table"] = torch.zeros(1, 1, device=device, dtype=torch.int32)
+            args["k"] = args["k"].unsqueeze(0)
+            args["v"] = args["v"].unsqueeze(0)
+    elif feature == "out_layout":
+        args["out"] = torch.empty(1, 1, 64, device=device).expand(2, -1, -1)
+        error = ValueError
+    elif feature == "dimension":
+        for key in ("q", "k", "v"):
+            args[key] = args[key][:, :, :24]
+    elif feature == "grad_stride":
+        args = _metax_fp32_inputs([2], [2], (1, 1), 64, "last_stride")
+        args["q"].requires_grad_(True)
+    with pytest.raises(error):
+        flaggems_vllm.flash_attn_varlen_func(**args)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+def test_metax_fp32_document_isolation():
+    args = _metax_fp32_inputs([17, 53], [17, 53], (4, 2), 64, "packed")
+    first, first_lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    args["k"][17:] += 3
+    args["v"][17:] *= -7
+    second, second_lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    torch.testing.assert_close(first[:17], second[:17], atol=0, rtol=0)
+    torch.testing.assert_close(first_lse[:, :17], second_lse[:, :17], atol=0, rtol=0)
+    assert not torch.equal(first[17:], second[17:])
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize(
+    "head_size,length,self_attention,expected",
+    [
+        (64, 127, True, "mha_block_128"),
+        (64, 128, True, "mha_block_64"),
+        (64, 129, True, "mha_block_64"),
+        (64, 1024, True, "mha_block_64"),
+        (64, 1025, True, "mha_fp32_encoder_long"),
+        (64, 8192, True, "mha_fp32_encoder_long"),
+        (64, 4096, False, "mha_block_128"),
+        (32, 4096, True, "mha_block_128"),
+        (128, 4096, True, "mha_block_128"),
+        (256, 4096, True, "mha_block_128"),
+    ],
+)
+def test_metax_fp32_context_policy(head_size, length, self_attention, expected):
+    from flaggems_vllm.runtime.backend._metax.heuristics_config_utils import (
+        select_fp32_varlen_config,
+    )
+
+    assert (
+        select_fp32_varlen_config(
+            "mha_block_128",
+            head_size=head_size,
+            max_query_len=length,
+            self_attention=self_attention,
+        )
+        == expected
+    )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 context policy")
+@pytest.mark.parametrize("lengths", [[127], [128], [129], [1024], [4096], [2, 17, 129]])
+@pytest.mark.parametrize("heads", [1, 16])
+def test_metax_fp32_selected_context_path(monkeypatch, caplog, lengths, heads):
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attention import direct
+
+    seen = []
+    original = direct.flash_varlen_fwd_kernel
+
+    class RecordLaunch:
+        def __getitem__(self, grid):
+            def call(*args, **kwargs):
+                args[3].fill_(float("nan"))
+                args[5].fill_(float("nan"))
+                result = original[grid](*args, **kwargs)
+                seen.append(kwargs)
+                return result
+
+            return call
+
+    monkeypatch.setattr(direct, "flash_varlen_fwd_kernel", RecordLaunch())
+    caplog.set_level(
+        "DEBUG",
+        logger="flaggems_vllm.runtime.backend._metax.ops.flash_attention.launcher",
+    )
+    args = _metax_fp32_inputs(lengths, lengths, (heads, heads), 64, "packed")
+    args["cu_seqlens_k"] = args["cu_seqlens_q"]
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(
+        args["q"], args["k"], args["v"], lengths, lengths, 0.125
+    )
+    torch.testing.assert_close(out.cpu().double(), ref, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+    assert len(seen) == 1
+    assert (
+        sum(
+            record.name
+            == "flaggems_vllm.runtime.backend._metax.ops.flash_attention.launcher"
+            and record.getMessage() == "GEMS_METAX FLASH_ATTN_VARLEN_FUNC"
+            for record in caplog.records
+        )
+        == 1
+    )
+    if max(lengths) >= 128:
+        assert (
+            seen[0]["BLOCK_M"],
+            seen[0]["BLOCK_N"],
+            seen[0]["num_warps"],
+            seen[0]["num_stages"],
+        ) == ((64, 16, 4, 2) if max(lengths) > 1024 and heads == 16 else (64, 32, 4, 1))
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize("default", ["mha_block_16", "mha_block_32", "mha_block_64"])
+def test_metax_fp32_long_preserves_other_native_profiles(default):
+    from flaggems_vllm.runtime.backend._metax.heuristics_config_utils import (
+        select_fp32_varlen_config,
+    )
+
+    assert (
+        select_fp32_varlen_config(
+            default, head_size=64, max_query_len=4096, self_attention=True
+        )
+        == default
+    )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 metadata contract")
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "k_dtype",
+        "v_dtype",
+        "out_dtype",
+        "q_cpu",
+        "k_cpu",
+        "v_cpu",
+        "cu_q_dtype",
+        "cu_k_dtype",
+        "cu_q_cpu",
+        "cu_k_cpu",
+        "cu_q_rank",
+        "cu_k_rank",
+        "cu_k_batch",
+        "cu_q_empty",
+        "cu_k_stride",
+    ],
+)
+def test_metax_fp32_invalid_metadata_before_launch(monkeypatch, invalid):
+    from flaggems_vllm.runtime.backend._metax.ops import flash_attention
+
+    calls = []
+
+    def forbidden_launch(*args, **kwargs):
+        calls.append(True)
+        raise RuntimeError("Invalid metadata reached attention launch")
+
+    monkeypatch.setattr(flash_attention, "launch_attention", forbidden_launch)
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        args = _metax_fp32_inputs([2], [2], (1, 1), 64, "dense")
+        args["out"] = torch.full_like(args["q"], 7)
+        if invalid in ("k_dtype", "v_dtype", "out_dtype"):
+            key = invalid.split("_")[0]
+            args[key] = args[key].half()
+        elif invalid in ("q_cpu", "k_cpu", "v_cpu"):
+            key = invalid.split("_")[0]
+            args[key] = args[key].cpu()
+        else:
+            key = "cu_seqlens_" + invalid[3]
+            if invalid.endswith("_dtype"):
+                args[key] = args[key].long()
+            elif invalid.endswith("_cpu"):
+                args[key] = args[key].cpu()
+            elif invalid.endswith("_rank"):
+                args[key] = args[key].unsqueeze(0)
+            elif invalid == "cu_k_batch":
+                args[key] = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+            elif invalid == "cu_q_empty":
+                args[key] = args[key][:0]
+            elif invalid == "cu_k_stride":
+                args[key] = torch.tensor(
+                    [0, 99, 2, 99], dtype=torch.int32, device=device
+                )[::2]
+        before = args["out"].clone()
+        with pytest.raises(ValueError):
+            flaggems_vllm.flash_attn_varlen_func(**args)
+        assert calls == []
+        assert torch.equal(args["out"], before)
+
+
+def _vllm_varlen_signature():
+    # Frozen vLLM 0.24.0 vllm_flash_attn/flash_attn_interface.py contract.
+    # Keep this independent of both the implementation and an installed vLLM.
+    required = ("q", "k", "v", "max_seqlen_q", "cu_seqlens_q", "max_seqlen_k")
+    optional = {
+        "cu_seqlens_k": None,
+        "seqused_k": None,
+        "q_v": None,
+        "dropout_p": 0.0,
+        "softmax_scale": None,
+        "causal": False,
+        "window_size": None,
+        "softcap": 0.0,
+        "alibi_slopes": None,
+        "deterministic": False,
+        "return_attn_probs": False,
+        "block_table": None,
+        "return_softmax_lse": False,
+        "out": None,
+        "scheduler_metadata": None,
+        "q_descale": None,
+        "k_descale": None,
+        "v_descale": None,
+        "num_splits": 0,
+        "output_scale": None,
+        "fa_version": 2,
+        "s_aux": None,
+        "cp_world_size": 1,
+        "cp_rank": 0,
+        "cp_tot_seqused_k": None,
+        "mask_mod": None,
+        "aux_tensors": None,
+        "dynamic_causal": None,
+    }
+    return inspect.Signature(
+        [
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for name in required
+        ]
+        + [
+            inspect.Parameter(
+                name, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=value
+            )
+            for name, value in optional.items()
+        ]
+    )
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_varlen_signature_matches_vllm():
+
+    def contract(signature):
+        return [
+            (name, parameter.kind, parameter.default)
+            for name, parameter in signature.parameters.items()
+        ]
+
+    assert contract(
+        inspect.signature(flaggems_vllm.flash_attn_varlen_func)
+    ) == contract(_vllm_varlen_signature())
+
+
+def _mock_varlen_route(monkeypatch, route, dispatch):
+    from flaggems_vllm.ops import attention
+
+    vendor = route.split("_")[0]
+    monkeypatch.setattr(
+        attention.runtime, "device", SimpleNamespace(vendor_name=vendor, name="cuda")
+    )
+    monkeypatch.setattr(attention, "use_c_extension", route == "nvidia_cext")
+    monkeypatch.setattr(attention, "maybe_contiguous", dispatch)
+    monkeypatch.setattr(attention, "mha_varlan_fwd", dispatch)
+    monkeypatch.setattr(
+        attention, "torch_device_fn", SimpleNamespace(device=lambda _: nullcontext())
+    )
+    if route == "nvidia_cext":
+        monkeypatch.setattr(
+            torch.ops,
+            "flaggems_vllm",
+            SimpleNamespace(flash_attn_varlen_func=dispatch),
+        )
+    else:
+        module = {
+            "nvidia_fa3": "_nvidia.hopper.ops.flash_attention",
+            "metax_int8": "_metax.ops.flash_attention",
+            "metax_fp32": "_metax.ops.flash_attention",
+            "hygon_int8": "_hygon.fused.attention",
+            "thead_int8": "_thead.fused.attention",
+        }[route]
+        monkeypatch.setitem(
+            sys.modules,
+            "flaggems_vllm.runtime.backend." + module,
+            SimpleNamespace(
+                launch_attention=dispatch, flash_attn_varlen_func_w8a8_int8=dispatch
+            ),
+        )
+        if vendor in ("hygon", "thead"):
+            monkeypatch.setitem(
+                sys.modules,
+                "flaggems_vllm.runtime.backend._" + vendor + ".fused",
+                SimpleNamespace(
+                    attention=sys.modules["flaggems_vllm.runtime.backend." + module]
+                ),
+            )
+    return 3 if route == "nvidia_fa3" else 2
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize(
+    "route", ["metax_fp32", "metax_int8", "nvidia_fa3", "nvidia_cext"]
+)
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("output_scale", 0.0),
+        ("mask_mod", object()),
+        ("aux_tensors", []),
+        ("dynamic_causal", False),
+    ],
+)
+def test_varlen_new_features_rejected_before_dispatch(monkeypatch, route, name, value):
+    dispatch = Mock(side_effect=AssertionError("Unsupported input reached dispatch"))
+    version = _mock_varlen_route(monkeypatch, route, dispatch)
+    q = torch.empty(
+        1, 1, 64, dtype=torch.int8 if route.endswith("int8") else torch.float32
+    )
+    out = torch.full_like(q, 7)
+    cu = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match=name):
+        flaggems_vllm.flash_attn_varlen_func(
+            q, q, q, 1, cu, 1, cu, out=out, fa_version=version, **{name: value}
+        )
+    dispatch.assert_not_called()
+    assert torch.equal(out, torch.full_like(out, 7))
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize(
+    "route", ["metax_int8", "hygon_int8", "thead_int8", "nvidia_fa3", "nvidia_cext"]
+)
+def test_varlen_vllm_positional_tail_preserves_backend_abi(monkeypatch, route):
+    q = torch.empty(
+        1, 1, 64, dtype=torch.int8 if route.endswith("int8") else torch.float16
+    )
+    cu = torch.tensor([0, 1], dtype=torch.int32)
+    out, lse, sink, lengths = (object() for _ in range(4))
+    dispatch = Mock(return_value=(out, lse))
+    version = _mock_varlen_route(monkeypatch, route, dispatch)
+    tail = dict(
+        s_aux=sink,
+        num_splits=0 if route == "nvidia_cext" else 7,
+        cp_world_size=3,
+        cp_rank=2,
+        cp_tot_seqused_k=lengths,
+        fa_version=version,
+    )
+    bound = _vllm_varlen_signature().bind(
+        q, q, q, 1, cu, 1, cu, out=out, return_softmax_lse=True, **tail
+    )
+    bound.apply_defaults()
+    actual = flaggems_vllm.flash_attn_varlen_func(*bound.args, **bound.kwargs)
+    assert actual[0] is out and actual[1] is lse
+    dispatch.assert_called_once()
+    if route == "nvidia_fa3":
+        assert {
+            key: dispatch.call_args.kwargs[key] for key in tail if key != "fa_version"
+        } == {key: value for key, value in tail.items() if key != "fa_version"}
+    else:
+        assert dispatch.call_args.args[-6:] == tuple(tail.values())
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_varlen_contract_without_vllm(monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    assert (
+        inspect.signature(flaggems_vllm.flash_attn_varlen_func).replace(
+            parameters=[
+                p.replace(annotation=inspect.Parameter.empty)
+                for p in inspect.signature(
+                    flaggems_vllm.flash_attn_varlen_func
+                ).parameters.values()
+            ]
+        )
+        == _vllm_varlen_signature()
+    )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 metadata contract")
+@pytest.mark.parametrize(
+    "invalid", ["causal", "softcap", "alibi", "k_dtype", "dimension"]
+)
+def test_metax_fp32_strided_rejection_before_copy(monkeypatch, invalid):
+    from flaggems_vllm.runtime.backend._metax.ops import flash_attention
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attention import common
+
+    args = _metax_fp32_inputs([2], [2], (1, 1), 64, "last_stride")
+    args["out"] = torch.full(args["q"].shape, 7.0, device=device)
+    before = args["out"].clone()
+    if invalid == "causal":
+        args["causal"] = True
+    elif invalid == "softcap":
+        args["softcap"] = 1.0
+    elif invalid == "alibi":
+        args["alibi_slopes"] = torch.ones(1, device=device)
+    elif invalid == "k_dtype":
+        args["k"] = args["k"].half()
+    else:
+        args.update({key: args[key][..., :24] for key in ("q", "k", "v")})
+    forbidden = Mock(
+        side_effect=AssertionError("Invalid input reached device preparation")
+    )
+    monkeypatch.setattr(common, "ensure_last_dim_contiguous", forbidden)
+    monkeypatch.setattr(common, "copy_tensor", forbidden)
+    monkeypatch.setattr(flash_attention, "launch_attention", forbidden)
+    error = ValueError if invalid == "k_dtype" else NotImplementedError
+    with pytest.raises(error):
+        flaggems_vllm.flash_attn_varlen_func(**args)
+    forbidden.assert_not_called()
+    assert torch.equal(args["out"], before)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 input generator")
+def test_metax_fp32_inputs_preserve_rng():
+    cpu_before = torch.random.get_rng_state()
+    device_before = torch.cuda.get_rng_state()
+    first = _metax_fp32_inputs([2], [2], (1, 1), 64, "packed")
+    second = _metax_fp32_inputs([2], [2], (1, 1), 64, "packed")
+    assert torch.equal(torch.random.get_rng_state(), cpu_before)
+    assert torch.equal(torch.cuda.get_rng_state(), device_before)
+    for key in ("q", "k", "v"):
+        assert torch.equal(first[key], second[key])
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 nonfinite inputs")
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_metax_fp32_nonfinite_values(value):
+    args = _metax_fp32_inputs([2], [2], (1, 1), 64, "packed")
+    args["v"][0, 0, 0] = value
+    out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    ref, ref_lse = _metax_fp32_oracle(args["q"], args["k"], args["v"], [2], [2], 0.125)
+    torch.testing.assert_close(
+        out.cpu().double(), ref, atol=2e-5, rtol=2e-5, equal_nan=True
+    )
+    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 operator graph")
+def test_metax_fp32_graph_new_inputs():
+    args = _metax_fp32_inputs([17], [17], (4, 2), 64, "packed")
+    args["out"] = torch.empty_like(args["q"])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flaggems_vllm.flash_attn_varlen_func(**args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    for factor in (0.5, -1.5):
+        args["q"].mul_(factor)
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        ref, ref_lse = _metax_fp32_oracle(
+            args["q"], args["k"], args["v"], [17], [17], 0.125
+        )
+        torch.testing.assert_close(out.cpu().double(), ref, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)

@@ -14,6 +14,7 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
@@ -28,6 +29,9 @@ from flaggems_vllm.ops.flash_kernel import (
     softmax_rescale,
 )
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._metax.heuristics_config_utils import (
+    select_fp32_varlen_config,
+)
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     compact_ragged_tile_coords,
     online_softmax_stats,
@@ -230,6 +234,10 @@ def flash_varlen_fwd_kernel(
     )
     bQ = tl.load(gQ.advance([m_block * BLOCK_M, 0]), boundary_check=(0, 1))
 
+    # Preserve IEEE products for FP32 encoder attention, including P @ V.
+    dot_precision: tl.constexpr = (
+        "ieee" if q_ptr.dtype.element_ty == tl.float32 else None
+    )
     acc_ = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     rowmax_ = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     rowsum_ = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -290,7 +298,7 @@ def flash_varlen_fwd_kernel(
             bK = tl.load(gK, boundary_check=(0, 1))
             bK = tl.trans(bK)
             bV = tl.load(gV, boundary_check=(0, 1))
-        S = tl.dot(bQ, bK, out_dtype=tl.float32)
+        S = tl.dot(bQ, bK, out_dtype=tl.float32, input_precision=dot_precision)
         S = apply_softcap(S, softcap, is_softcap)
         S = apply_alibi(
             S,
@@ -343,7 +351,7 @@ def flash_varlen_fwd_kernel(
                 BLOCK_N=BLOCK_N,
             )
 
-        acc_ = tl.dot(P, bV, acc_)
+        acc_ = tl.dot(P, bV, acc_, input_precision=dot_precision)
         n_block -= 1
 
     for n_block in tl.range(
@@ -386,7 +394,7 @@ def flash_varlen_fwd_kernel(
             bK = tl.load(gK)
             bK = tl.trans(bK)
             bV = tl.load(gV)
-        S = tl.dot(bQ, bK, out_dtype=tl.float32)
+        S = tl.dot(bQ, bK, out_dtype=tl.float32, input_precision=dot_precision)
         S = apply_softcap(S, softcap, is_softcap)
         S = apply_alibi(
             S,
@@ -438,7 +446,7 @@ def flash_varlen_fwd_kernel(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
             )
-        acc_ = tl.dot(P, bV, acc_)
+        acc_ = tl.dot(P, bV, acc_, input_precision=dot_precision)
 
     # LSE
     lse = tl.where(
@@ -539,6 +547,24 @@ def launch_direct(
     if flaggems_vllm.vendor_name == "mthreads":
         varlen_fwd_config_str = "mha_block_32"
 
+    if (
+        params.q_ptr.dtype == torch.float32
+        and not is_paged
+        and not use_compact_worklist
+    ):
+        varlen_fwd_config_str = select_fp32_varlen_config(
+            varlen_fwd_config_str,
+            head_size=head_size,
+            max_query_len=max_seqlen_q,
+            self_attention=(
+                params.is_cu_seqlens_q
+                and params.is_cu_seqlens_k
+                and params.cu_seqlens_q_ptr is params.cu_seqlens_k_ptr
+                and params.h == params.hk
+                and params.seqlen_q == params.seqlen_k
+            ),
+        )
+
     cfg = runtime.get_heuristic_config(varlen_fwd_config_str)
     use_c550_paged_d128_block128 = (
         is_paged and head_size == 128 and varlen_fwd_config_str == "mha_block_128"
@@ -567,6 +593,15 @@ def launch_direct(
             else cfg["num_stages"](args)
         ),
     }
+
+    if varlen_fwd_config_str.startswith("mha_fp32_"):
+        cfg_params["num_stages"] = cfg["num_stages"](args)
+
+    if params.q_ptr.dtype == torch.float32 and head_size >= 128:
+        # Half-precision tiles can require 80--152 KiB with FP32 D128/D256.
+        # Bound the Q tile to 32 KiB and the KV tile to fit C550's 64 KiB limit.
+        cfg_params["BLOCK_M"] = min(cfg_params["BLOCK_M"], 8192 // head_size)
+        cfg_params["BLOCK_N"] = min(cfg_params["BLOCK_N"], 16)
 
     logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
     worklist_ptr = compact_worklist if use_compact_worklist else params.page_table_ptr

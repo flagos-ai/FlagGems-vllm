@@ -476,3 +476,102 @@ def test_flash_attn_varlen_func(monkeypatch):
         dtypes=[torch.float16, torch.bfloat16],
     )
     bench.run()
+
+
+class FP32EncoderVarlenBenchmark(base.Benchmark):
+    """Basic FP32 coverage timings; no model-specific tuning."""
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(2, 17, 53), (1024,), (4096,)]
+
+    def get_input_iter(self, dtype):
+        for lengths in self.shapes:
+            raw = torch.randn(sum(lengths), 3, 16, 64, device=self.device, dtype=dtype)
+            q, k, v = raw.unbind(1)
+            offsets = [0]
+            for length in lengths:
+                offsets.append(offsets[-1] + length)
+            cu = torch.tensor(offsets, device=self.device, dtype=torch.int32)
+            yield q, k, v, lengths, cu
+
+
+def _fp32_encoder_native(q, k, v, lengths, cu):
+    # Native torch reference only; never used by the production operator.
+    outputs = []
+    offset = 0
+    for length in lengths:
+        qi, ki, vi = [x[offset : offset + length].transpose(0, 1) for x in (q, k, v)]
+        scores = qi @ ki.transpose(-1, -2) * (q.shape[-1] ** -0.5)
+        outputs.append((scores.softmax(-1) @ vi).transpose(0, 1))
+        offset += length
+    return torch.cat(outputs)
+
+
+def _fp32_encoder_gems(q, k, v, lengths, cu):
+    return flaggems_vllm.flash_attn_varlen_func(
+        q, k, v, max(lengths), cu, max(lengths), cu, causal=False
+    )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 extension")
+def test_metax_fp32_encoder_varlen():
+    bench = FP32EncoderVarlenBenchmark(
+        op_name="flash_attn_varlen_func",
+        torch_op=_fp32_encoder_native,
+        gems_op=_fp32_encoder_gems,
+        dtypes=[torch.float32],
+    )
+    bench.run()
+
+
+class FP32EncoderPolicyBenchmark(FP32EncoderVarlenBenchmark):
+    """Compare the FP32 selection policy with the default direct profile."""
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            ((length,), heads, 64)
+            for length in (127, 128, 129, 1024, 1025, 4096, 8192)
+            for heads in (1, 16)
+        ] + [((257,), 16, dim) for dim in (128, 256)]
+
+    def get_input_iter(self, dtype):
+        for lengths, heads, dim in self.shapes:
+            raw = torch.randn(
+                sum(lengths), 3, heads, dim, device=self.device, dtype=dtype
+            )
+            q, k, v = raw.unbind(1)
+            cu = torch.tensor([0, sum(lengths)], device=self.device, dtype=torch.int32)
+            yield q, k, v, lengths, cu
+
+
+def _fp32_encoder_default_profile(q, k, v, lengths, cu):
+    from unittest.mock import patch
+
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attention import direct
+
+    # Keep IEEE arithmetic and resource safety identical on both sides.
+    # Graph replay timing excludes this host-only policy override.
+    with patch.object(
+        direct, "select_fp32_varlen_config", lambda default, **_: default
+    ):
+        return _fp32_encoder_gems(q, k, v, lengths, cu)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP32 launch policy")
+def test_metax_fp32_encoder_launch_policy():
+    from .conftest import Config
+    from .consts import BenchMode
+
+    if Config.mode != BenchMode.CUDAGRAPH:
+        pytest.skip(
+            "Policy comparison uses graph replay to exclude host override overhead"
+        )
+    bench = FP32EncoderPolicyBenchmark(
+        op_name="flash_attn_varlen_func",
+        torch_op=_fp32_encoder_default_profile,
+        gems_op=_fp32_encoder_gems,
+        dtypes=[torch.float32],
+    )
+    bench.run()
