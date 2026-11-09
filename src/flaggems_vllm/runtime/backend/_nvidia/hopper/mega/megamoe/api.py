@@ -144,7 +144,7 @@ def megamoe_fp8(
     interleave expected by the kernel.
     """
 
-    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.kernel import (
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.megamoe_kernel import (
         launch_megamoe_fp8 as _launch_megamoe_fp8,
     )
 

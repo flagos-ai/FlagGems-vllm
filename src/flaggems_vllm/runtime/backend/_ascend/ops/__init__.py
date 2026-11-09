@@ -103,6 +103,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
+    silu_and_mul_with_clamp,
+    silu_and_mul_with_clamp_out,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
     compute_slot_mapping_parallel,
 )
@@ -167,6 +171,8 @@ __all__ = [
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",
+    "silu_and_mul_with_clamp",
+    "silu_and_mul_with_clamp_out",
     "sparse_attn_sharedkv",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",

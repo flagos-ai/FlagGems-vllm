@@ -497,7 +497,7 @@ def _make_matmul_entry(config_name, expand_name, key=_MATMUL_TUNING_KEY):
             strategy="default",
             warmup=5,
             rep=20,
-            flagtune_op_name="w8a8_block_fp8_matmul",
+            flagtune_op_name="w8a8_block_matmul",
             flagtune_expand_op_name=expand_name,
             flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
         )(_block_fp8_matmul_kernel)
@@ -793,7 +793,7 @@ def _matrix_view(tensor, rows, cols):
         raise NotImplementedError("leading dimensions must be view-compatible") from exc
 
 
-def w8a8_block_fp8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -839,7 +839,7 @@ def w8a8_block_fp8_matmul(
         for start in range(0, n, chunk_n):
             end = min(start + chunk_n, n)
             chunks.append(
-                w8a8_block_fp8_matmul(
+                w8a8_block_matmul(
                     A,
                     B[start:end],
                     As,
