@@ -608,7 +608,8 @@ def test_int8_state_gdn_full_int8_range(dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("separate", [False, True])
-def test_int8_state_gdn_prepared_tail(dtype, normalize, separate):
+@pytest.mark.parametrize("cache_offset", [0, 1, 4])
+def test_int8_state_gdn_prepared_tail(dtype, normalize, separate, cache_offset):
     torch.manual_seed(42)
     tokens, query_heads, heads, dim = 17, 8, 32, 128
     packed = 2 * query_heads * dim + heads * dim
@@ -617,6 +618,15 @@ def test_int8_state_gdn_prepared_tail(dtype, normalize, separate):
     )
     reference, args = list(reference), list(args)
     reference[-1] = args[-1] = normalize
+    cache_storage = None
+    if cache_offset:
+        count = args[6].numel()
+        cache_storage = torch.full(
+            (count + cache_offset + 1,), -23, device=args[6].device, dtype=torch.int8
+        )
+        shifted = cache_storage[cache_offset : count + cache_offset].view_as(args[6])
+        shifted.copy_(args[6])
+        args[6] = shifted
     # Include null slots while exercising both normalization and gate tail blocks.
     args[9][0] = 0
     if not normalize:
@@ -640,6 +650,13 @@ def test_int8_state_gdn_prepared_tail(dtype, normalize, separate):
     gems_assert_close(
         state.float(), expected_state / args[7][..., None], torch.float32, atol=0.501
     )
+
+    if cache_storage is not None:
+        gems_assert_equal(
+            cache_storage[:cache_offset],
+            torch.full_like(cache_storage[:cache_offset], -23),
+        )
+        gems_assert_equal(cache_storage[-1:], torch.full_like(cache_storage[-1:], -23))
 
 
 @pytest.mark.gdn_w8a16

@@ -2,18 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # INT8 state arithmetic follows the public contracts from PRs #1037 and #1040.
 
+import hashlib
 import logging
+import shutil
+import subprocess
+import tempfile
 from functools import lru_cache
+from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 from triton.backends.ascend.driver import NPUUtils
+from triton.runtime.cache import get_cache_manager
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import (
     chunk_gated_delta_rule_fwd,
 )
+
+try:
+    import triton.experimental.tle.language as tle
+except ImportError:
+    tle = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +204,127 @@ def cast_integral_half_to_int8(value, _semantic=None):
     return tl.tensor(handle, dtype)
 
 
+# The generic integer cast preserves overflow with several extra vector passes.
+# This private conversion only receives rounded integers in [-127,127].
+_GDN_CAST_SOURCE = r"""
+// Copyright 2026 FlagOS Contributors
+// SPDX-License-Identifier: Apache-2.0
+#include <stdint.h>
+using namespace __cce_scalar;
+
+template <typename T> struct MemRef1D {
+  T *allocated;
+  T *aligned;
+  int64_t offset;
+  int64_t sizes[1];
+  int64_t strides[1];
+};
+
+// Input values are integral FP16 values in [-127,127].
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_gdn_bounded_fp16_to_words(MemRef1D<__ubuf__ half> *src,
+                                    int32_t count,
+                                    MemRef1D<__ubuf__ uint32_t> *dst) {
+  set_mask_count();
+  set_vector_mask(0, static_cast<uint64_t>(count));
+  auto *bytes = reinterpret_cast<__ubuf__ int8_t *>(dst->aligned + dst->offset);
+  vconv_f162s8z(bytes, src->aligned + src->offset, 1, 1, 1, 4, 8);
+  set_mask_norm();
+  set_vector_mask(static_cast<uint64_t>(-1), static_cast<uint64_t>(-1));
+}
+"""
+_GDN_CAST_FLAGS = (
+    "-O2",
+    "-x",
+    "cce",
+    "--cce-auto-sync=off",
+    "--cce-aicore-only",
+    "--cce-generic-addrspace=off",
+    "-mllvm",
+    "-disable-llvm-optzns",
+    "--cce-aicore-arch=dav-c220-vec",
+    "-std=c++17",
+    "-emit-llvm",
+    "-c",
+)
+_GDN_CAST_DIGEST = tl.constexpr(
+    hashlib.sha256((_GDN_CAST_SOURCE + repr(_GDN_CAST_FLAGS)).encode()).hexdigest()
+)
+
+
+@lru_cache(maxsize=1)
+def native_word_cast_available():
+    return (
+        tle is not None
+        and NPUUtils().get_arch().startswith("Ascend910B")
+        and shutil.which("ccec") is not None
+    )
+
+
+@lru_cache(maxsize=1)
+def native_word_cast_bitcode():
+    compiler = shutil.which("ccec")
+    if compiler is None:
+        raise NotImplementedError("The native GDN cast requires the CANN ccec compiler")
+    version = subprocess.check_output([compiler, "--version"], stderr=subprocess.STDOUT)
+    key = hashlib.sha256(
+        _GDN_CAST_DIGEST.value.encode() + compiler.encode() + version
+    ).hexdigest()
+    cache = get_cache_manager(key)
+    filename = "gdn_bounded_int8_words.bc"
+    cached = cache.get_file(filename)
+    if cached:
+        return cached
+    with tempfile.TemporaryDirectory(prefix="gdn-int8-cast-") as directory:
+        source = Path(directory) / "cast.cpp"
+        output = Path(directory) / filename
+        source.write_text(_GDN_CAST_SOURCE)
+        try:
+            subprocess.run(
+                [compiler, *_GDN_CAST_FLAGS, str(source), "-o", str(output)],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(error.stderr.decode(errors="replace")) from error
+        return cache.put(output.read_bytes(), filename, binary=True)
+
+
+@al.register_custom_op
+class _GdnBoundedInt8Words:
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, source, count, out=None):
+        assert out is not None
+        self.symbol = "gdn_bounded_fp16_to_words"
+        self.bitcode = native_word_cast_bitcode()
+
+
+if tle is not None:
+
+    @triton.jit
+    def bounded_int8_words(value):
+        tl.static_assert(value.dtype == tl.float16 and value.numel % 4 == 0)
+        # Include native source changes in the enclosing Triton kernel cache key.
+        tl.static_assert(_GDN_CAST_DIGEST != "")
+        # The conversion writes every output byte, so initialization is unnecessary.
+        target = tle.dsa.alloc([value.numel // 4], tl.uint32, tle.dsa.ascend.UB)
+        return al.custom(
+            "_GdnBoundedInt8Words",
+            tl.reshape(value, (value.numel,)),
+            value.numel,
+            out=tle.dsa.to_tensor(target),
+        )
+
+else:
+
+    @triton.jit
+    def bounded_int8_words(value):
+        tl.static_assert(False, "The native GDN conversion requires FlagTree TLE")
+
+
 @triton.jit
 def store_int8_state(
     values,
@@ -200,6 +334,7 @@ def store_int8_state(
     scale_offsets,
     mask,
     mask_v,
+    WORD_CAST: tl.constexpr = False,
 ):
     magnitude = tl.max(tl.abs(values), axis=1)
     safe_magnitude = tl.where(magnitude > 0, magnitude, 127.0)
@@ -208,7 +343,18 @@ def store_int8_state(
     # FP32 bias rounding produces exact integers in [-127,127]. They remain
     # exact in FP16, which avoids the expensive overflow-preserving INT32 cast.
     rounded = (values * reciprocal_scale[:, None] + 12582912.0) - 12582912.0
-    tl.store(state + offsets, cast_integral_half_to_int8(rounded.to(tl.float16)), mask)
+    if WORD_CAST:
+        tl.static_assert(values.shape[1] == 128)
+        packed = tl.reshape(
+            bounded_int8_words(rounded.to(tl.float16)), (values.shape[0], 32)
+        )
+        words = state.to(tl.pointer_type(tl.uint32))
+        word_offsets = scale_offsets[:, None] * 32 + tl.arange(0, 32)[None, :]
+        tl.store(words + word_offsets, packed, mask_v[:, None])
+    else:
+        tl.store(
+            state + offsets, cast_integral_half_to_int8(rounded.to(tl.float16)), mask
+        )
     tl.store(scales + scale_offsets, scale, mask_v)
 
 
@@ -242,6 +388,7 @@ def gdn_decode_int8_kernel(
     BV: tl.constexpr,
     TOTAL=1,
     PREPARED: tl.constexpr = False,
+    WORD_CAST: tl.constexpr = False,
 ):
     for task in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
         sequence_head = (task // tl.cdiv(V, BV)).to(tl.int64)
@@ -305,6 +452,7 @@ def gdn_decode_int8_kernel(
                 scale_offsets,
                 mask,
                 column < V,
+                WORD_CAST,
             )
 
 
@@ -415,6 +563,13 @@ def gdn_w8a16_int8(
     # Shared normalization/gating amortizes its extra launch on larger batches.
     prepared = reduction == columns == 128 and tokens >= 16
     with torch_device_fn.device(query.device):
+        # Word stores preserve the INT8 cache layout; byte-unaligned caches use
+        # the pure Triton conversion instead of reinterpreting their pointers.
+        word_cast = (
+            reduction == columns == 128
+            and state_int8.data_ptr() % 4 == 0
+            and native_word_cast_available()
+        )
         if prepared:
             normalized_q = torch.empty(
                 (tokens, query_heads, reduction),
@@ -484,6 +639,7 @@ def gdn_w8a16_int8(
             block_v,
             TOTAL=total,
             PREPARED=prepared,
+            WORD_CAST=word_cast,
         )
     return out, state_int8
 
