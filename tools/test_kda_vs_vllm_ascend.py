@@ -89,9 +89,9 @@ HEAD_DIM = 128
 NUM_HEADS_TOTAL = 96
 CONV_SIZE = 4
 GATE_LOWER_BOUND = -5.0
-ASCENDC_CHUNK_SIZE = 64   # vllm_ascend.ops.kda.KDA_CHUNK_SIZE
+ASCENDC_CHUNK_SIZE = 64  # vllm_ascend.ops.kda.KDA_CHUNK_SIZE
 FLAGGEMS_CHUNK_SIZE = 16  # FlagGems TLE prefill is specialized for BT=16
-NULL_BLOCK_ID = 0         # vllm.v1.attention.backends.utils.NULL_BLOCK_ID
+NULL_BLOCK_ID = 0  # vllm.v1.attention.backends.utils.NULL_BLOCK_ID
 PAD_SLOT_ID = -1
 
 # Ascend 950DT mixed Prefill/Decode deployment (vllm-ascend
@@ -153,10 +153,8 @@ def _import_sides():
 
     try:
         # The AscendC path Kimi K3 actually dispatches through.
-        from fla_npu.ops.ascendc import (
-            causal_conv1d_fn as ascendc_conv_fn,
-            causal_conv1d_update as ascendc_conv_update,
-        )
+        from fla_npu.ops.ascendc import causal_conv1d_fn as ascendc_conv_fn
+        from fla_npu.ops.ascendc import causal_conv1d_update as ascendc_conv_update
         from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
     except ImportError as exc:
         print(
@@ -182,7 +180,9 @@ def _import_sides():
 # --------------------------------------------------------------------------- #
 # profiling
 # --------------------------------------------------------------------------- #
-def profile_device_us(step: Callable[[], None], trace_root: str, tag: str) -> tuple[float, int]:
+def profile_device_us(
+    step: Callable[[], None], trace_root: str, tag: str
+) -> tuple[float, int]:
     """Return (mean per-iteration device time in us, kernels per iteration)."""
     trace_dir = os.path.join(trace_root, tag)
     shutil.rmtree(trace_dir, ignore_errors=True)
@@ -196,7 +196,9 @@ def profile_device_us(step: Callable[[], None], trace_root: str, tag: str) -> tu
     try:
         with torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU],
-            schedule=torch_npu.profiler.schedule(wait=0, warmup=WARMUP, active=ACTIVE, repeat=1),
+            schedule=torch_npu.profiler.schedule(
+                wait=0, warmup=WARMUP, active=ACTIVE, repeat=1
+            ),
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(trace_dir),
         ) as prof:
             for _ in range(WARMUP + ACTIVE):
@@ -204,7 +206,9 @@ def profile_device_us(step: Callable[[], None], trace_root: str, tag: str) -> tu
                 torch.npu.synchronize()
                 prof.step()
 
-        pattern = os.path.join(trace_dir, "*_ascend_pt", "ASCEND_PROFILER_OUTPUT", "kernel_details.csv")
+        pattern = os.path.join(
+            trace_dir, "*_ascend_pt", "ASCEND_PROFILER_OUTPUT", "kernel_details.csv"
+        )
         files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
         if not files:
             return float("nan"), 0
@@ -261,12 +265,18 @@ class Result:
 
     @property
     def speedup(self) -> float:
-        if self.ref_us != self.ref_us or self.gems_us != self.gems_us or self.gems_us <= 0:
+        if (
+            self.ref_us != self.ref_us
+            or self.gems_us != self.gems_us
+            or self.gems_us <= 0
+        ):
             return float("nan")
         return self.ref_us / self.gems_us
 
 
-def compare(name: str, got: torch.Tensor, want: torch.Tensor, rtol: float, atol: float) -> tuple[bool, str]:
+def compare(
+    name: str, got: torch.Tensor, want: torch.Tensor, rtol: float, atol: float
+) -> tuple[bool, str]:
     """Compare on CPU in fp32 and report the worst deviation either way."""
     got_c, want_c = got.detach().float().cpu(), want.detach().float().cpu()
     if got_c.shape != want_c.shape:
@@ -326,10 +336,14 @@ def build_chunk_kda_cases(ops, device, heads, dtype) -> list[Case]:
         per_seq = (tokens // n // ASCENDC_CHUNK_SIZE) * ASCENDC_CHUNK_SIZE
         cu_list = [j * per_seq for j in range(n)] + [tokens]
 
-        q, k, v, raw_g, raw_beta, a_log, dt_bias = _kda_inputs(case_heads, tokens, device, dtype)
+        q, k, v, raw_g, raw_beta, a_log, dt_bias = _kda_inputs(
+            case_heads, tokens, device, dtype
+        )
         cu = torch.tensor(cu_list, dtype=torch.int64, device=device)
         # state_v_first=True: the recurrent cache stores [N, H, V, K].
-        init_vk = torch.randn(n, case_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device)
+        init_vk = torch.randn(
+            n, case_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
+        )
 
         ci_ascendc = ops["prepare_chunk_indices"](cu, ASCENDC_CHUNK_SIZE)
         ci_gems = ops["prepare_chunk_indices"](cu, FLAGGEMS_CHUNK_SIZE)
@@ -338,17 +352,50 @@ def build_chunk_kda_cases(ops, device, heads, dtype) -> list[Case]:
         cu_host = list(cu_list)
         ci_host = ci_ascendc.flatten().cpu().tolist()
 
-        def ref_call(q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta, init=init_vk,
-                     cu_host=cu_host, ci_host=ci_host, a_log=a_log, dt_bias=dt_bias):
+        def ref_call(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            init=init_vk,
+            cu_host=cu_host,
+            ci_host=ci_host,
+            a_log=a_log,
+            dt_bias=dt_bias,
+        ):
             return ops["run_chunk_kda"](
-                q, k, v, raw_g, raw_beta.sigmoid(), init.clone(),
-                cu_host, ci_host, a_log, dt_bias, lower_bound=GATE_LOWER_BOUND,
+                q,
+                k,
+                v,
+                raw_g,
+                raw_beta.sigmoid(),
+                init.clone(),
+                cu_host,
+                ci_host,
+                a_log,
+                dt_bias,
+                lower_bound=GATE_LOWER_BOUND,
             )
 
-        def gems_call(q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta, init=init_vk,
-                      cu=cu, ci=ci_gems, a_log=a_log, dt_bias=dt_bias):
+        def gems_call(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            init=init_vk,
+            cu=cu,
+            ci=ci_gems,
+            a_log=a_log,
+            dt_bias=dt_bias,
+        ):
             return ops["chunk_kda"](
-                q, k, v, raw_g, raw_beta.to(q.dtype),
+                q,
+                k,
+                v,
+                raw_g,
+                raw_beta.to(q.dtype),
                 scale=HEAD_DIM**-0.5,
                 initial_state=init.clone(),
                 output_final_state=True,
@@ -411,16 +458,22 @@ def build_recurrent_kda_cases(ops, device, heads, dtype) -> list[Case]:
             heads, tokens, device, dtype, seed=11
         )
         pool = max(2 * tokens + 2, 64)
-        base = torch.randn(pool, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device)
+        base = torch.randn(
+            pool, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
+        )
 
         if num_spec:
             # Speculative decode: one state column per candidate token, and
             # the accepted count picks which column seeds the recurrence.
-            cu = torch.arange(0, tokens + 1, num_spec + 1, dtype=torch.int32, device=device)
+            cu = torch.arange(
+                0, tokens + 1, num_spec + 1, dtype=torch.int32, device=device
+            )
             idx = torch.arange(
                 1, batch * (num_spec + 1) + 1, dtype=torch.int32, device=device
             ).view(batch, num_spec + 1)
-            accepted = torch.full((batch,), num_spec + 1, dtype=torch.int32, device=device)
+            accepted = torch.full(
+                (batch,), num_spec + 1, dtype=torch.int32, device=device
+            )
         else:
             cu = torch.arange(batch + 1, dtype=torch.int32, device=device)
             # Slot 0 is NULL_BLOCK_ID; live slots start at 1.
@@ -430,17 +483,53 @@ def build_recurrent_kda_cases(ops, device, heads, dtype) -> list[Case]:
         ref_state = base.clone()
         gems_state = base.clone()
 
-        def ref_call(q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta, state=ref_state,
-                     cu=cu, idx=idx, a_log=a_log, dt_bias=dt_bias, accepted=accepted):
+        def ref_call(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            state=ref_state,
+            cu=cu,
+            idx=idx,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            accepted=accepted,
+        ):
             return ops["run_recurrent_kda"](
-                q, k, v, raw_g, raw_beta.sigmoid(), state, cu, idx, a_log, dt_bias,
-                lower_bound=GATE_LOWER_BOUND, num_accepted_tokens=accepted,
+                q,
+                k,
+                v,
+                raw_g,
+                raw_beta.sigmoid(),
+                state,
+                cu,
+                idx,
+                a_log,
+                dt_bias,
+                lower_bound=GATE_LOWER_BOUND,
+                num_accepted_tokens=accepted,
             )
 
-        def gems_call(q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta, state=gems_state,
-                      cu=cu, idx=idx, a_log=a_log, dt_bias=dt_bias, accepted=accepted):
+        def gems_call(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            state=gems_state,
+            cu=cu,
+            idx=idx,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            accepted=accepted,
+        ):
             return ops["fused_recurrent_kda"](
-                q, k, v, raw_g, raw_beta,
+                q,
+                k,
+                v,
+                raw_g,
+                raw_beta,
                 scale=HEAD_DIM**-0.5,
                 initial_state=state,
                 inplace_final_state=True,
@@ -455,8 +544,9 @@ def build_recurrent_kda_cases(ops, device, heads, dtype) -> list[Case]:
                 lower_bound=GATE_LOWER_BOUND,
             )
 
-        def check(gems_call=gems_call, ref_call=ref_call,
-                  a=gems_state, b=ref_state, base=base):
+        def check(
+            gems_call=gems_call, ref_call=ref_call, a=gems_state, b=ref_state, base=base
+        ):
             # Both update state in place, so reset before each side runs.
             a.copy_(base)
             b.copy_(base)
@@ -467,7 +557,9 @@ def build_recurrent_kda_cases(ops, device, heads, dtype) -> list[Case]:
             ok_s, det_s = compare("state", a, b, rtol=2e-3, atol=2e-3)
             return ok_o and ok_s, f"{det_o} | {det_s}"
 
-        label = f"decode bs={batch}" if not num_spec else f"spec bs={batch} k={num_spec}"
+        label = (
+            f"decode bs={batch}" if not num_spec else f"spec bs={batch} k={num_spec}"
+        )
         cases.append(
             Case(
                 op="recurrent_kda",
@@ -498,8 +590,11 @@ def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
     else:
         n_prefill = len(CHUNK_KDA_T_VALUES)
         shapes = tuple(
-            (CHUNK_KDA_T_VALUES[i], CHUNK_KDA_H_VALUES[i % len(CHUNK_KDA_H_VALUES)],
-             CHUNK_KDA_SEQ_VALUES[i % len(CHUNK_KDA_SEQ_VALUES)])
+            (
+                CHUNK_KDA_T_VALUES[i],
+                CHUNK_KDA_H_VALUES[i % len(CHUNK_KDA_H_VALUES)],
+                CHUNK_KDA_SEQ_VALUES[i % len(CHUNK_KDA_SEQ_VALUES)],
+            )
             for i in range(n_prefill)
         )
 
@@ -520,7 +615,13 @@ def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
         dim = 3 * case_heads * HEAD_DIM
         # AscendC takes token-major x [T, dim] and a packed [W, dim] weight
         # (see kimi_kda._pack_conv_weights), with the cache as [pool, W-1, dim].
+        # FlagGems' causal_conv1d_fn follows the upstream vLLM contract, i.e.
+        # channel-first x [dim, T].  Give each side a *contiguous* tensor in its
+        # own native layout holding the same values: a transposed view (the old
+        # setup) let ``transpose(0, 1).contiguous()`` inside FlagGems collapse to
+        # a no-op, which no real channel-first caller gets.
         x = torch.randn(tokens, dim, dtype=dtype, device=device)
+        x_gems = x.transpose(0, 1).contiguous()
         weight_t = torch.randn(CONV_SIZE, dim, dtype=dtype, device=device) * 0.1
         pool = max(2 * batch + 2, 64)
         conv_base = torch.randn(pool, CONV_SIZE - 1, dim, dtype=dtype, device=device)
@@ -532,9 +633,10 @@ def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
         gems_state = conv_base.clone()
 
         # FlagGems keeps the upstream vLLM contract: weight is (dim, width) and
-        # conv_states (pool, dim, state_len) with a unit dim stride, so
-        # transposed views of the AscendC-layout tensors satisfy both without
-        # copying and both sides touch exactly the same memory.
+        # conv_states (pool, dim, state_len) with a unit dim stride.  The weight
+        # and state are still transposed views of the AscendC-layout tensors
+        # (tiny, and both sides touch the same memory); only x differs, because
+        # each operator's fast path needs *its* axis contiguous.
         #
         # x differs by entry point: causal_conv1d_fn is varlen and takes
         # (dim, total_tokens), while causal_conv1d_update is per-request and
@@ -543,8 +645,8 @@ def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
         # Bind x/weight per case: a free variable here would make every case
         # reuse the last loop iteration's tensors.
         # Returns (x, conv_state, weight) in FlagGems' expected layouts.
-        def gems_views(state, x=x, w=weight_t, decode=decode):
-            gx = x if decode else x.transpose(0, 1)
+        def gems_views(state, x=x, x_gems=x_gems, w=weight_t, decode=decode):
+            gx = x if decode else x_gems
             return gx, state.transpose(1, 2), w.transpose(0, 1)
 
         if decode:
@@ -554,40 +656,85 @@ def build_conv_cases(ops, device, heads, dtype, decode: bool) -> list[Case]:
             # feeds the other a pre-convolved `x`.
             def ref_call(x=x, state=ref_state, w=weight_t, idx=cache_idx, qsl=qsl):
                 return ops["ascendc_conv_update"](
-                    x.clone(), state, w, bias=None, activation="silu",
-                    conv_state_indices=idx, num_accepted_tokens=None,
-                    query_start_loc=qsl, max_query_len=1, null_block_id=0,
+                    x.clone(),
+                    state,
+                    w,
+                    bias=None,
+                    activation="silu",
+                    conv_state_indices=idx,
+                    num_accepted_tokens=None,
+                    query_start_loc=qsl,
+                    max_query_len=1,
+                    null_block_id=0,
                     out=torch.empty_like(x),
                 )
 
             def gems_call(state=gems_state, idx=cache_idx, qsl=qsl, views=gems_views):
                 gx, gs, gw = views(state)
                 return ops["causal_conv1d_update"](
-                    gx.clone(), gs, gw, bias=None, activation="silu",
-                    conv_state_indices=idx, query_start_loc=qsl, max_query_len=1,
+                    gx.clone(),
+                    gs,
+                    gw,
+                    bias=None,
+                    activation="silu",
+                    conv_state_indices=idx,
+                    query_start_loc=qsl,
+                    max_query_len=1,
                 )
+
             label = f"decode bs={batch}"
         else:
-            def ref_call(x=x, state=ref_state, w=weight_t, idx=cache_idx,
-                         qsl=qsl, has_init=has_initial):
+
+            def ref_call(
+                x=x,
+                state=ref_state,
+                w=weight_t,
+                idx=cache_idx,
+                qsl=qsl,
+                has_init=has_initial,
+            ):
                 return ops["ascendc_conv_fn"](
-                    x, w, None, conv_states=state, query_start_loc=qsl,
-                    cache_indices=idx, has_initial_state=has_init,
-                    activation="silu", pad_slot_id=PAD_SLOT_ID, null_block_id=0,
+                    x,
+                    w,
+                    None,
+                    conv_states=state,
+                    query_start_loc=qsl,
+                    cache_indices=idx,
+                    has_initial_state=has_init,
+                    activation="silu",
+                    pad_slot_id=PAD_SLOT_ID,
+                    null_block_id=0,
                 )
 
-            def gems_call(state=gems_state, idx=cache_idx, qsl=qsl,
-                          has_init=has_initial, views=gems_views):
+            def gems_call(
+                state=gems_state,
+                idx=cache_idx,
+                qsl=qsl,
+                has_init=has_initial,
+                views=gems_views,
+            ):
                 gx, gs, gw = views(state)
                 return ops["causal_conv1d_fn"](
-                    gx, gw, None, conv_states=gs, query_start_loc=qsl,
-                    cache_indices=idx, has_initial_state=has_init,
-                    activation="silu", pad_slot_id=PAD_SLOT_ID,
+                    gx,
+                    gw,
+                    None,
+                    conv_states=gs,
+                    query_start_loc=qsl,
+                    cache_indices=idx,
+                    has_initial_state=has_init,
+                    activation="silu",
+                    pad_slot_id=PAD_SLOT_ID,
                 )
+
             label = f"prefill T={tokens} seqs={batch}"
 
-        def check(gems_call=gems_call, ref_call=ref_call,
-                  a=gems_state, b=ref_state, base=conv_base):
+        def check(
+            gems_call=gems_call,
+            ref_call=ref_call,
+            a=gems_state,
+            b=ref_state,
+            base=conv_base,
+        ):
             a.copy_(base)
             b.copy_(base)
             got = gems_call()
@@ -648,7 +795,9 @@ def print_report(results: list[Result], skip_perf: bool) -> None:
 
     if not skip_perf:
         print("\n" + "=" * width)
-        print("PERFORMANCE  (torch_npu.profiler, device kernel time, warmup=5 active=5)")
+        print(
+            "PERFORMANCE  (torch_npu.profiler, device kernel time, warmup=5 active=5)"
+        )
         print("=" * width)
         print(
             f"{'op':<15} {'shape':<40} {'gems us':>10} {'k':>3} "
@@ -667,20 +816,26 @@ def print_report(results: list[Result], skip_perf: bool) -> None:
                 f"{(f'{sp:.2f}x' if sp == sp else 'n/a'):>8}"
             )
         print("-" * width)
-        print("'k' = kernels per iteration. speedup = AscendC device time / FlagGems device time.")
+        print(
+            "'k' = kernels per iteration. speedup = AscendC device time / FlagGems device time."
+        )
         print("Reference operators:")
-        for label in sorted({
-            f"  {r.op}: {r.ref_label}" + (f"  [{r.notes}]" if r.notes else "")
-            for r in results
-        }):
+        for label in sorted(
+            {
+                f"  {r.op}: {r.ref_label}" + (f"  [{r.notes}]" if r.notes else "")
+                for r in results
+            }
+        ):
             print(label)
 
     failed = [r for r in results if not r.passed and not r.skipped]
     skipped = [r for r in results if r.skipped]
     graded = len(results) - len(skipped)
     print("\n" + "=" * width)
-    print(f"SUMMARY: {graded - len(failed)}/{graded} comparable cases functionally correct"
-          + (f"  ({len(skipped)} unavailable in this build)" if skipped else ""))
+    print(
+        f"SUMMARY: {graded - len(failed)}/{graded} comparable cases functionally correct"
+        + (f"  ({len(skipped)} unavailable in this build)" if skipped else "")
+    )
     if skipped:
         print("unavailable (missing dependency, not a correctness result):")
         for r in skipped:
@@ -708,13 +863,20 @@ def main() -> int:
         description="Compare FlagGems Ascend KDA ops against the AscendC operators Kimi K3 calls.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--ops", default="all", help=f"comma-separated subset of: {','.join(ALL_OPS)}")
+    parser.add_argument(
+        "--ops", default="all", help=f"comma-separated subset of: {','.join(ALL_OPS)}"
+    )
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--tp", type=int, default=8,
-                        help=f"TP size; local heads = {NUM_HEADS_TOTAL}/tp")
+    parser.add_argument(
+        "--tp", type=int, default=8, help=f"TP size; local heads = {NUM_HEADS_TOTAL}/tp"
+    )
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--skip-perf", action="store_true", help="run correctness checks only")
-    parser.add_argument("--trace-root", default=None, help="profiler scratch dir (default: a temp dir)")
+    parser.add_argument(
+        "--skip-perf", action="store_true", help="run correctness checks only"
+    )
+    parser.add_argument(
+        "--trace-root", default=None, help="profiler scratch dir (default: a temp dir)"
+    )
     args = parser.parse_args()
 
     if not torch.npu.is_available():
@@ -730,7 +892,10 @@ def main() -> int:
         selected = {o.strip() for o in args.ops.split(",") if o.strip()}
         unknown = selected - set(ALL_OPS)
         if unknown:
-            print(f"FATAL: unknown ops {sorted(unknown)}; valid: {','.join(ALL_OPS)}", file=sys.stderr)
+            print(
+                f"FATAL: unknown ops {sorted(unknown)}; valid: {','.join(ALL_OPS)}",
+                file=sys.stderr,
+            )
             return 2
 
     ops = _import_sides()
@@ -739,10 +904,14 @@ def main() -> int:
     dtype = getattr(torch, args.dtype)
     heads = NUM_HEADS_TOTAL // args.tp
 
-    print(f"device    : {args.device} ({torch_npu.npu.get_device_name(device.index or 0)})")
+    print(
+        f"device    : {args.device} ({torch_npu.npu.get_device_name(device.index or 0)})"
+    )
     print(f"torch     : {torch.__version__}  torch_npu: {torch_npu.__version__}")
-    print(f"model     : Kimi K3 KDA, head_dim={HEAD_DIM}, heads={NUM_HEADS_TOTAL} "
-          f"-> local={heads} (tp={args.tp}), conv_size={CONV_SIZE}")
+    print(
+        f"model     : Kimi K3 KDA, head_dim={HEAD_DIM}, heads={NUM_HEADS_TOTAL} "
+        f"-> local={heads} (tp={args.tp}), conv_size={CONV_SIZE}"
+    )
     print(f"ops       : {','.join(sorted(selected))}   dtype: {args.dtype}")
 
     owns_trace_root = args.trace_root is None
@@ -768,20 +937,38 @@ def main() -> int:
                     missing = _missing_dependency(exc)
                     if missing is not None:
                         results.append(
-                            Result(case.op, case.shape, case.ref_label, False,
-                                   f"unavailable: {missing}",
-                                   skipped=True, notes=case.notes)
+                            Result(
+                                case.op,
+                                case.shape,
+                                case.ref_label,
+                                False,
+                                f"unavailable: {missing}",
+                                skipped=True,
+                                notes=case.notes,
+                            )
                         )
                     else:
                         traceback.print_exc()
                         results.append(
-                            Result(case.op, case.shape, case.ref_label, False,
-                                   f"exception during check: {type(exc).__name__}: {exc}",
-                                   notes=case.notes)
+                            Result(
+                                case.op,
+                                case.shape,
+                                case.ref_label,
+                                False,
+                                f"exception during check: {type(exc).__name__}: {exc}",
+                                notes=case.notes,
+                            )
                         )
                     continue
 
-                result = Result(case.op, case.shape, case.ref_label, passed, detail, notes=case.notes)
+                result = Result(
+                    case.op,
+                    case.shape,
+                    case.ref_label,
+                    passed,
+                    detail,
+                    notes=case.notes,
+                )
                 if passed and not args.skip_perf:
                     try:
                         tag = f"{case.op}_{i}"
@@ -793,7 +980,9 @@ def main() -> int:
                         )
                     except Exception as exc:  # noqa: BLE001
                         traceback.print_exc()
-                        result.detail += f" | profiling failed: {type(exc).__name__}: {exc}"
+                        result.detail += (
+                            f" | profiling failed: {type(exc).__name__}: {exc}"
+                        )
                 results.append(result)
     finally:
         if owns_trace_root:

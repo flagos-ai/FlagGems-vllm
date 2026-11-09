@@ -3,29 +3,51 @@
 
 The launch geometry and inner loop mirror ``fla_npu``'s AscendC
 ``causal_conv1d_fn`` (``causal_conv1d_tiling_planner.h`` plus
-``RunSeq``/``RunSeqFnRolling``), which is what the previous fixed
-per-128-token-chunk grid was missing:
+``RunSeq``/``RunSeqFnRolling``):
 
 * The host splits every request into contiguous token ranges so that
-  ``#ranges x #channel_tiles`` is about one wave over the AIV cores.  The old
-  grid launched one program per 128-token chunk -- 9 sequential waves on the
-  KDA shapes -- and re-paid the per-program prologue on every one of them.
-* A program streams its whole token range in ``BLOCK_T``-token tiles, reading
-  each ``x`` row once.  The ``W`` taps are the same tile re-read at row offsets
-  ``1 .. W-1``: the raw volume stays at one read per row and the overlap is
-  served from L2.  Tile size dominates here -- a per-token loop tops out near
-  0.5 TB/s on Ascend950DT, an 8-row x 1024-channel tile reaches ~2 TB/s and is
-  at the AscendC kernel's own bandwidth.
+  ``#ranges x #channel_tiles`` is about one wave over the AIV cores.  A fixed
+  per-chunk grid launched several sequential waves on the KDA shapes and
+  re-paid the per-program prologue on every one of them.
+* A program streams its whole token range in ``BLOCK_T``-token tiles.  The
+  ``W`` taps are the same tile re-read at row offsets ``0 .. W-1``: the repeats
+  of one iteration overlap almost completely and are served from L2, and the
+  tile is large enough that the MTE2 requests amortize.  Tile size dominates
+  here -- a per-token loop tops out near 0.5 TB/s on Ascend950DT, while a wide
+  tile reaches ~2 TB/s, at the AscendC kernel's own bandwidth.
 * The ``W-1`` leading tokens of a range have a window that reaches outside it
   (conv_state history or the previous range), so they use the register rolling
   recurrence of AscendC's fast path (``s_k <- s_{k+1} + w_k x_t``).  The tiled
   loop therefore needs no masked history correction at all.
+* The ragged tail is peeled out of the loop and walked in short
+  ``BLOCK_T_TAIL``-row tiles whose *start* is scalar-clamped to
+  ``tk_end - BLOCK_T_TAIL``.  A per-lane clamped row makes the address
+  non-affine and triton-ascend answers that with one DMA per element; keeping
+  the start scalar keeps the tail affine, in bounds, and mask-free (the last
+  tile re-covers a few rows, which recomputes identical values).
 
-Re-reading a tile per tap costs MTE2 traffic, but the tap tiles of one
-iteration overlap almost completely, so the repeats hit L2.  That is measured
-to beat slicing the loaded tile with ``extract_slice``, which on triton-ascend
-either serializes the loop (without multi-buffer) or silently returns stale
-rows (multi-buffer plus ``extract_slice``).
+Two input layouts are consumed without a copy, chosen by strides:
+
+* Unit channel stride (``x`` is token-major memory, what the vLLM projection
+  produces) keeps the channel axis contiguous and uses a ``[tokens, channels]``
+  tile.  This is the fastest shape: rows of ~9 KB.
+* Unit token stride (the operator's own ``[dim, tokens]`` contract) keeps the
+  token axis contiguous and uses a ``[channels, tokens]`` tile, so the tile load
+  *is* the transpose the naive wrapper did with ``transpose(0, 1).contiguous()``
+  -- a full-size device copy.  Fusing it measured 1.26-1.79x faster end to end.
+  Rows here are only ``BLOCK_T * 2`` bytes, which caps the DMA efficiency, so
+  ``_pick_tiles_channel_first`` trades channel width for row length.
+* Anything else (neither axis unit-strided) is made contiguous once.
+
+The channel tile is the dominant knob (``_pick_tiles``): it sets the bytes per
+row transfer, and it should divide ``dim`` so no program pays a masked tail.
+One read per row plus a UB row shift was also implemented and measured ~9%
+faster (``extract_slice`` of ``BLOCK_T + W - 1`` rows), but the triton-ascend
+software pipeline (``num_stages=2``) mis-versions the extracted views and
+silently returns stale rows -- with ``num_stages=1`` the same kernel is
+correct and ~35% slower, and an explicitly bound UB buffer does not fix the
+pipeliner.  Re-reading from L2 is therefore the fastest correct formulation on
+this toolchain.
 """
 
 import numpy as np
@@ -172,7 +194,9 @@ def _causal_conv1d_fwd_kernel(
     APC_BLOCK: tl.constexpr,  # prefix-caching block size in tokens
     BLOCK_N: tl.constexpr,  # channels per program
     BLOCK_T: tl.constexpr,  # tokens per staged tile
+    BLOCK_T_TAIL: tl.constexpr,  # tokens per clamped tail tile
     NCT: tl.constexpr,  # channel tiles: cdiv(dim, BLOCK_N)
+    CHANNEL_FIRST: tl.constexpr,  # tile is [channels, tokens] instead
 ):
     pid = tl.program_id(0)
     task = pid // NCT
@@ -407,64 +431,123 @@ def _causal_conv1d_fwd_kernel(
             s0, s1, s2, s3 = ns0, ns1, ns2, ns3
 
     # ------------------------------------------------------------------ #
-    # tiled main loop: one staged read per row, taps are the same tile at a
-    # row offset, so this part never touches the rolling state.
-    #
-    # The full tiles keep an affine address in the loop inducer: clamping the
-    # row (as the ragged tail needs) makes the address non-affine and costs
-    # ~45% of the kernel, so only the peeled tail tile pays it.
+    # tiled main loop: taps are the same tile at a row/token offset, so this
+    # part never touches the rolling state.  Every address here is affine in
+    # the loop inducer; a per-lane clamped row makes it non-affine, and
+    # triton-ascend answers that with one DMA per element, so only the short
+    # fallback tail pays for it.
     # ------------------------------------------------------------------ #
     rr = tl.arange(0, BLOCK_T)
     t_first = tk_start + state_len
     n_full = tl.maximum((tk_end - t_first) // BLOCK_T, 0)
 
+    if CHANNEL_FIRST:
+        m_chan = m_feat[:, None]
+    else:
+        m_chan = m_feat[None, :]
     for it in range(0, n_full):
         rows = t_first + it * BLOCK_T + rr
-        acc = bias_v[None, :] + tl.zeros((BLOCK_T, BLOCK_N), tl.float32)
+        if CHANNEL_FIRST:
+            acc = bias_v[:, None] + tl.zeros((BLOCK_N, BLOCK_T), tl.float32)
+        else:
+            acc = bias_v[None, :] + tl.zeros((BLOCK_T, BLOCK_N), tl.float32)
         for j in tl.static_range(KERNEL_WIDTH):
             # Tap j reads x[t - j]; rows - j >= tk_start - j + state_len > 0.
-            xj = tl.load(
-                x_ptr
-                + (sequence_start_index + rows - j)[:, None] * stride_x_token
-                + (idx_feats * stride_x_dim)[None, :],
-                mask=m_feat[None, :],
-                other=0.0,
-            )
-            acc += wrows[KERNEL_WIDTH - 1 - j][None, :] * xj.to(tl.float32)
+            tok_off = (sequence_start_index + rows - j) * stride_x_token
+            if CHANNEL_FIRST:
+                x_off = (idx_feats * stride_x_dim)[:, None] + tok_off[None, :]
+                wj = wrows[KERNEL_WIDTH - 1 - j][:, None]
+            else:
+                x_off = tok_off[:, None] + (idx_feats * stride_x_dim)[None, :]
+                wj = wrows[KERNEL_WIDTH - 1 - j][None, :]
+            xj = tl.load(x_ptr + x_off, mask=m_chan, other=0.0)
+            acc += wj * xj.to(tl.float32)
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
-        tl.store(
-            o_ptr
-            + (sequence_start_index + rows)[:, None] * stride_o_token
-            + (idx_feats * stride_o_dim)[None, :],
-            acc.to(o_ptr.dtype.element_ty),
-            mask=m_feat[None, :],
-        )
+        if CHANNEL_FIRST:
+            o_off = (idx_feats * stride_o_dim)[:, None] + (
+                (sequence_start_index + rows) * stride_o_token
+            )[None, :]
+        else:
+            o_off = (sequence_start_index + rows)[:, None] * stride_o_token + (
+                idx_feats * stride_o_dim
+            )[None, :]
+        tl.store(o_ptr + o_off, acc.to(o_ptr.dtype.element_ty), mask=m_chan)
 
     # Peeled tail tile; fully masked when the range is tile aligned.
-    rows = t_first + n_full * BLOCK_T + rr
-    m_ld = (rows[:, None] < tk_end) & m_feat[None, :]
-    acc = bias_v[None, :] + tl.zeros((BLOCK_T, BLOCK_N), tl.float32)
-    for j in tl.static_range(KERNEL_WIDTH):
-        r_safe = tl.minimum(tl.maximum(rows - j, 0), seq_len - 1)
-        xj = tl.load(
-            x_ptr
-            + (sequence_start_index + r_safe)[:, None] * stride_x_token
-            + (idx_feats * stride_x_dim)[None, :],
-            mask=m_ld,
-            other=0.0,
-        )
-        acc += wrows[KERNEL_WIDTH - 1 - j][None, :] * xj.to(tl.float32)
-    if SILU_ACTIVATION:
-        acc = acc / (1 + tl.exp(-acc))
-    o_rows = tl.minimum(rows, seq_len - 1)
-    tl.store(
-        o_ptr
-        + (sequence_start_index + o_rows)[:, None] * stride_o_token
-        + (idx_feats * stride_o_dim)[None, :],
-        acc.to(o_ptr.dtype.element_ty),
-        mask=m_ld,
-    )
+    # Peeled tail.  Its rows can run past the range end and even past the
+    # tensor, and triton-ascend answers a per-lane clamped (non-affine) address
+    # with one DMA per element, so the fast path keeps the tile start scalar and
+    # walks the tail in short ``BLOCK_T_TAIL``-row tiles whose start is clamped
+    # to ``tk_end - BLOCK_T_TAIL``: every row stays in bounds and affine, and
+    # the last tile simply re-covers a few rows the previous one already wrote
+    # (the convolution is a pure function of ``x``, so the values are equal).
+    rr_t = tl.arange(0, BLOCK_T_TAIL)
+    tail_first = t_first + n_full * BLOCK_T
+    n_tail = tl.maximum(tl.cdiv(tk_end - tail_first, BLOCK_T_TAIL), 0)
+    if tk_end >= BLOCK_T_TAIL + state_len:
+        for it in range(0, n_tail):
+            tail_start = tl.minimum(
+                tail_first + it * BLOCK_T_TAIL, tk_end - BLOCK_T_TAIL
+            )
+            rows = tail_start + rr_t
+            if CHANNEL_FIRST:
+                acc = bias_v[:, None] + tl.zeros((BLOCK_N, BLOCK_T_TAIL), tl.float32)
+            else:
+                acc = bias_v[None, :] + tl.zeros((BLOCK_T_TAIL, BLOCK_N), tl.float32)
+            for j in tl.static_range(KERNEL_WIDTH):
+                tok_off = (sequence_start_index + rows - j) * stride_x_token
+                if CHANNEL_FIRST:
+                    x_off = (idx_feats * stride_x_dim)[:, None] + tok_off[None, :]
+                    wj = wrows[KERNEL_WIDTH - 1 - j][:, None]
+                else:
+                    x_off = tok_off[:, None] + (idx_feats * stride_x_dim)[None, :]
+                    wj = wrows[KERNEL_WIDTH - 1 - j][None, :]
+                xj = tl.load(x_ptr + x_off, mask=m_chan, other=0.0)
+                acc += wj * xj.to(tl.float32)
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            if CHANNEL_FIRST:
+                o_off = (idx_feats * stride_o_dim)[:, None] + (
+                    (sequence_start_index + rows) * stride_o_token
+                )[None, :]
+            else:
+                o_off = (sequence_start_index + rows)[:, None] * stride_o_token + (
+                    idx_feats * stride_o_dim
+                )[None, :]
+            tl.store(o_ptr + o_off, acc.to(o_ptr.dtype.element_ty), mask=m_chan)
+    else:
+        # A range shorter than one clipped tile: clamp per lane and mask.
+        rows = tail_first + rr_t
+        if CHANNEL_FIRST:
+            m_ld = m_feat[:, None] & (rows < tk_end)[None, :]
+            acc = bias_v[:, None] + tl.zeros((BLOCK_N, BLOCK_T_TAIL), tl.float32)
+        else:
+            m_ld = (rows < tk_end)[:, None] & m_feat[None, :]
+            acc = bias_v[None, :] + tl.zeros((BLOCK_T_TAIL, BLOCK_N), tl.float32)
+        for j in tl.static_range(KERNEL_WIDTH):
+            r_safe = tl.minimum(tl.maximum(rows - j, 0), seq_len - 1)
+            tok_off = (sequence_start_index + r_safe) * stride_x_token
+            if CHANNEL_FIRST:
+                x_off = (idx_feats * stride_x_dim)[:, None] + tok_off[None, :]
+                wj = wrows[KERNEL_WIDTH - 1 - j][:, None]
+            else:
+                x_off = tok_off[:, None] + (idx_feats * stride_x_dim)[None, :]
+                wj = wrows[KERNEL_WIDTH - 1 - j][None, :]
+            xj = tl.load(x_ptr + x_off, mask=m_ld, other=0.0)
+            acc += wj * xj.to(tl.float32)
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+        o_rows = tl.minimum(rows, seq_len - 1)
+        if CHANNEL_FIRST:
+            o_off = (idx_feats * stride_o_dim)[:, None] + (
+                (sequence_start_index + o_rows) * stride_o_token
+            )[None, :]
+        else:
+            o_off = (sequence_start_index + o_rows)[:, None] * stride_o_token + (
+                idx_feats * stride_o_dim
+            )[None, :]
+        tl.store(o_ptr + o_off, acc.to(o_ptr.dtype.element_ty), mask=m_ld)
 
     # ------------------------------------------------------------------ #
     # conv_state writes
@@ -590,25 +673,84 @@ def _plan_ranges(seqlens, nct, core_num, align, uniform=None):
     )
 
 
-def _pick_tiles(dim):
+# UB budget for the staged tiles: ``W`` tap buffers (``BLOCK_T x BLOCK_N``,
+# bf16, doubled by the auto multi-buffer pass) plus the fp32 accumulator cost
+# ``4*W + 4`` bytes per element.  A 20 B/element tile of 9216 elements (~184 KB)
+# is the largest that compiles and runs on Ascend950DT; larger tiles are
+# rejected by the compiler or spill.
+_UB_BYTES = 184 * 1024
+_MAX_BLOCK_N = 4608
+_ALIGN_N = 256
+
+
+def _pick_tiles(dim, width=4):
     """Channel tile and token tile.
 
-    The channel tile is the unit of a row transfer, so it wants to be wide; the
-    token tile is bounded by UB (``W`` staged tiles x multi-buffer plus the
-    fp32 accumulator), and 8 rows x 1024 channels measured fastest on
-    Ascend950DT.
+    The channel tile is the unit of a row transfer and the main bandwidth
+    knob: one 4608-wide tile of a 9216-channel row transfers 9 KB per row, a
+    1024-wide split only 2 KB, and the narrow split measured ~2x slower.  The
+    token tile then takes whatever the UB budget leaves.
+
+    Preferring a channel tile that divides ``dim`` exactly matters as much as
+    width: a ragged last tile makes every program in that column pay mask and
+    DMA inefficiency, and dim=2304 / dim=4608 used to land on 2048 + 256 / 512
+    tails.  Widths are rounded to 256 so each row transfer stays burst
+    aligned; Ascend 950DT KDA shapes (dim = 3*H*128, e.g. 2304 / 4608 / 9216)
+    then split into 2304x4 / 4608x2 / 4608x2 with no tail at all.
     """
+    budget = _UB_BYTES // (4 * width + 4)
     if dim <= 512:
-        # Tiny channel counts: one whole-row tile, tall token tiles are free.
-        return triton.next_power_of_2(max(1, dim)), 32
-    if dim <= 2304:
-        # Narrow rows: wider channel tiles keep each row transfer close to one
-        # burst (a 1024-wide split of a 2304-channel row copies at 1.4 TB/s,
-        # 2048-wide at 2.1 TB/s), at the price of a shorter token tile because
-        # UB caps BLOCK_T * BLOCK_N.  dim=2304 lands on 2048 + a 256-channel
-        # tail tile, which still measured faster than 1024 x 8.
-        return 2048, 4
-    return 1024, 8
+        # Tiny channel counts: one whole-row tile, tall token tiles are free
+        # until the same UB budget caps them.
+        block_n = triton.next_power_of_2(max(1, dim))
+        block_t = max(2, min(32, budget // block_n))
+    else:
+        block_n = _MAX_BLOCK_N
+        for n_tiles in range(1, 65):
+            candidate = -(-dim // n_tiles)
+            candidate = -(-candidate // _ALIGN_N) * _ALIGN_N
+            # Two token rows must fit: a single-row tile is all DMA overhead.
+            if candidate <= _MAX_BLOCK_N and 2 * candidate <= budget:
+                block_n = candidate
+                break
+        block_t = max(2, budget // block_n)
+    # Power-of-two tile heights only: a non-power-of-two height (5, 6, ...)
+    # compiled but produced wrong rows on triton-ascend.
+    block_t = 1 << (block_t.bit_length() - 1)
+    return block_n, block_t
+
+
+def _pick_tiles_channel_first(dim, width, max_seqlen):
+    """Tile for a channel-first ``[dim, tokens]`` input.
+
+    The token axis is the unit-strided one, so one channel row is
+    ``BLOCK_T * 2`` bytes of contiguous memory and ``BLOCK_T`` is the bandwidth
+    knob; ``BLOCK_N`` only sets how many programs share the row.  On the KDA
+    shapes a ~32-channel x ~256-token tile measured fastest: wider channel
+    tiles shorten the rows faster than they cut the (already cheap) program
+    count, and narrower ones make every program pay its prologue/epilogue on
+    only a few channels.
+
+    Two bounds keep other batches sane:
+
+    * ``BLOCK_T`` never exceeds the request, so the pipelined full-tile loop
+      does the work instead of the clamped tail.
+    * short requests raise ``BLOCK_N`` so a program still gets ~4K elements;
+      otherwise a batch of 8-token requests would explode into tens of
+      thousands of tiny programs.
+    """
+    budget = _UB_BYTES // (4 * width + 4)
+    need = 4096 // max(1, max_seqlen)
+    block_n = max(32, triton.next_power_of_2(max(1, need)))
+    # Wide channel tiles are cheap to *load* but not to *describe*: the scalar
+    # helpers around the tile (weights, history vectors, masks) are padded to
+    # the vector fragment shape, and >=1K channels blow the UB budget on their
+    # own (2048 channels x 2 tokens needed 462 KB).  Stay moderate.
+    block_n = min(block_n, 256, triton.next_power_of_2(max(1, dim)))
+    block_t = min(budget // block_n, triton.next_power_of_2(max(1, max_seqlen)))
+    block_t = max(2, block_t)
+    block_t = 1 << (block_t.bit_length() - 1)
+    return block_n, block_t
 
 
 def causal_conv1d_fn(
@@ -693,20 +835,36 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    x = x.transpose(0, 1).contiguous()  # (dim, seqlen) -> (seqlen, dim)
+    dim, cu_seqlen = x.shape
     weight = weight.transpose(0, 1).contiguous()  # (dim, width) -> (width, dim)
-
-    out = torch.empty_like(x)
-    cu_seqlen, dim = x.shape
     width, _ = weight.shape
 
-    is_apc_enabled = block_idx_last_scheduled_token is not None
-    seqlens = query_start_loc.diff().to("cpu")
-    if seqlens.numel() == 0:
-        return out.transpose(0, 1).to(original_x_dtype)
+    # Two layouts are consumed without a copy: unit channel stride means the
+    # token rows are contiguous (the vLLM projection layout), unit token stride
+    # means the channel rows are contiguous (the operator's own [dim, tokens]
+    # contract).  Reading the latter directly fuses what used to be an up-front
+    # ``transpose(0, 1).contiguous()`` -- a full-size device copy -- into the
+    # kernel's tile loads.  Only an input with neither axis unit-strided needs
+    # the copy.
+    channel_first = x.stride(0) != 1
+    if channel_first and x.stride(1) != 1:
+        x = x.contiguous()
+    if channel_first:
+        stride_x_dim, stride_x_token = x.stride(0), x.stride(1)
+        out = torch.empty((dim, cu_seqlen), dtype=x.dtype, device=x.device)
+        stride_o_dim, stride_o_token = out.stride(0), out.stride(1)
+        result = out
+    else:
+        stride_x_dim, stride_x_token = 1, x.stride(1)
+        out = torch.empty((cu_seqlen, dim), dtype=x.dtype, device=x.device)
+        stride_o_token, stride_o_dim = out.stride(0), out.stride(1)
+        result = out.transpose(0, 1)
 
-    stride_x_dim = x.stride(1)
-    stride_x_token = x.stride(0)
+    is_apc_enabled = block_idx_last_scheduled_token is not None
+    seqlens = query_start_loc.cpu().diff()
+    if seqlens.numel() == 0:
+        return result.to(original_x_dtype)
+
     stride_w_dim = weight.stride(1)  # (width, dim): stride(1) indexes dim
     stride_w_width = weight.stride(0)  # (width, dim): stride(0) indexes width
     num_cache_lines = conv_states.size(0)
@@ -717,8 +875,6 @@ def causal_conv1d_fn(
     stride_istate_token = conv_states.stride(2)
     if stride_istate_dim != 1:
         raise AssertionError("conv_states needs a unit dim stride")
-    stride_o_token = out.stride(0)
-    stride_o_dim = out.stride(1)
     stride_cache_indices = cache_indices.stride(0) if cache_indices is not None else 0
 
     if validate_data:
@@ -735,11 +891,17 @@ def causal_conv1d_fn(
             assert conv_states is not None
         assert weight.stride(1) == 1
         assert (width, dim) == weight.shape
-        is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
-        assert is_channel_last, "Need to run in channel-last layout"
+        assert (x.stride(0) == 1) or (
+            x.stride(1) == 1
+        ), "causal_conv1d_fn needs one unit-stride axis"
 
     core_num = _aivector_core_count(x.device.index)
-    block_n, block_t = _pick_tiles(dim)
+    if channel_first:
+        block_n, block_t = _pick_tiles_channel_first(
+            dim, width, int(seqlens.max().item()) if seqlens.numel() else 0
+        )
+    else:
+        block_n, block_t = _pick_tiles(dim, width)
     nct = triton.cdiv(dim, block_n)
 
     if is_apc_enabled:
@@ -812,9 +974,11 @@ def causal_conv1d_fn(
         APC_BLOCK=max(apc_block, 1),
         BLOCK_N=block_n,
         BLOCK_T=block_t,
+        BLOCK_T_TAIL=min(block_t, 32),
         NCT=nct,
+        CHANNEL_FIRST=channel_first,
         num_stages=2,
         multibuffer=True,
     )
 
-    return out.transpose(0, 1).to(original_x_dtype)
+    return result.to(original_x_dtype)
