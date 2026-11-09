@@ -980,7 +980,7 @@ def _splitk_matmul(A, B, As, Bs, C, M, N, K, group_n, group_k):
     return C
 
 
-def w8a8_block_int8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,

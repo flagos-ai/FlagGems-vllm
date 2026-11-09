@@ -23,7 +23,7 @@ from . import accuracy_utils as utils
 from .conftest import QUICK_MODE
 
 pytestmark = [
-    pytest.mark.w8a8_block_int8_matmul,
+    pytest.mark.w8a8_block_matmul,
     pytest.mark.skipif(
         flaggems_vllm.vendor_name not in ("metax", "hygon", "thead"),
         reason="W8A8 Block INT8 vendor backends",
@@ -64,10 +64,10 @@ def _reference(a, b, a_scale, b_scale, block_n, block_k):
     return result
 
 
-@pytest.mark.w8a8_block_int8_matmul
+@pytest.mark.w8a8_block_matmul
 @pytest.mark.parametrize("M,N,K", INT8_MNK_SHAPES)
 @pytest.mark.parametrize("output_dtype", OUTPUT_DTYPES)
-def test_w8a8_block_int8_matmul(M, N, K, output_dtype):
+def test_w8a8_block_matmul(M, N, K, output_dtype):
     device = flaggems_vllm.device
     block_n, block_k = 128, 128
     block_size = [block_n, block_k]
@@ -84,7 +84,7 @@ def test_w8a8_block_int8_matmul(M, N, K, output_dtype):
     )
 
     ref_out = _reference(A, B, As, Bs, block_n, block_k).to(output_dtype)
-    res_out = flaggems_vllm.w8a8_block_int8_matmul(
+    res_out = flaggems_vllm.w8a8_block_matmul(
         A, B, As, Bs, block_size, output_dtype=output_dtype
     )
     utils.gems_assert_close(
@@ -103,7 +103,7 @@ def test_w8a8_block_int8_empty_shapes():
         b = torch.empty((n, k), device="cuda", dtype=torch.int8)
         a_scale = torch.empty((m, 2), device="cuda", dtype=torch.float32)
         b_scale = torch.empty((1 if n else 0, 2), device="cuda", dtype=torch.float32)
-        out = flaggems_vllm.w8a8_block_int8_matmul(
+        out = flaggems_vllm.w8a8_block_matmul(
             a, b, a_scale, b_scale, [128, 128], torch.float32
         )
         assert out.shape == (m, n)
@@ -119,7 +119,7 @@ def test_w8a8_block_int8_block_k256_scales():
     b = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
     a_scale = torch.rand((m, 2), device="cuda", dtype=torch.float32) * 0.01
     b_scale = torch.rand((2, 2), device="cuda", dtype=torch.float32) * 0.01
-    output = flaggems_vllm.w8a8_block_int8_matmul(
+    output = flaggems_vllm.w8a8_block_matmul(
         a, b, a_scale, b_scale, [block_n, block_k], torch.float32
     )
     utils.gems_assert_close(
@@ -137,11 +137,11 @@ def test_w8a8_block_int8_rejects_invalid_inputs():
     a_scale = torch.ones((1, 1), device="cuda", dtype=torch.float32)
     b_scale = torch.ones((1, 1), device="cuda", dtype=torch.float32)
     with pytest.raises(NotImplementedError, match="block_k"):
-        flaggems_vllm.w8a8_block_int8_matmul(
+        flaggems_vllm.w8a8_block_matmul(
             a, b, a_scale, b_scale, [128, 16], torch.float32
         )
     with pytest.raises(NotImplementedError, match="contiguous"):
-        flaggems_vllm.w8a8_block_int8_matmul(
+        flaggems_vllm.w8a8_block_matmul(
             a[:, ::2], b[:, ::2], a_scale, b_scale, [128, 128], torch.float32
         )
 
@@ -157,7 +157,7 @@ def test_w8a8_block_int8_splitk_tails(splits, output_dtype, group_n):
     # them instead of relying on zero initialization or a previous invocation.
     backend = importlib.import_module(
         f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}"
-        ".ops.w8a8_block_int8_matmul"
+        ".ops.w8a8_block_matmul"
     )
     m, n, k = 7, 129, 4225
     group_k = 128
