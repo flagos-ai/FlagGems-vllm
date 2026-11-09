@@ -84,9 +84,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_con
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
-    scatter_kda_state,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
     glm5_next_kpool_state_compress_and_write_cache_triton as kpool_state_compress,
 )
@@ -113,6 +110,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.scatter_conv_state import (
     scatter_conv_state,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.scatter_kda_state import (
+    scatter_kda_state,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
