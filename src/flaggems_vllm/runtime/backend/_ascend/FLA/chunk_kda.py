@@ -315,24 +315,125 @@ if HAS_TLE_KDA:
     # ------------------------------------------------------------------
     @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
     @triton.jit(do_not_specialize=["T"])
-    def _ascend_kda_fwd_intra_kernel(
+    def _ascend_kda_fwd_prep_kernel(
         q,
         k,
         g,
         beta,
         ws,
-        Aqk,
-        Akk,
         g_out,
         chunk_offsets,
         A_log,
         dt_bias,
         lower_bound,
-        scale,
         g_scale,
         l2norm_eps,
         cu_seqlens,
         chunk_indices,
+        T,
+        NC,
+        H: tl.constexpr,
+        HV: tl.constexpr,
+        K: tl.constexpr,
+        BT: tl.constexpr,
+        CPT: tl.constexpr,
+        IS_VARLEN: tl.constexpr,
+    ):
+        i_tc, i_bh = tl.program_id(0), tl.program_id(1)
+        i_hv = i_bh % HV
+        i_h = i_hv // (HV // H)
+
+        for c in tl.static_range(CPT):
+            i_tg = i_tc * CPT + c
+            if i_tg < NC:
+                if IS_VARLEN:
+                    i_n = tl.load(chunk_indices + i_tg * 2).to(tl.int32)
+                    i_t = tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32)
+                    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+                    T = tl.load(cu_seqlens + i_n + 1).to(tl.int32) - bos
+                    if (i_bh == 0) & (i_t == 0):
+                        tl.store(chunk_offsets + i_n, i_tg)
+                else:
+                    i_t = i_tg
+                    bos = i_bh // HV * T
+
+                if i_t * BT < T:
+                    p_q = q + (bos * H + i_h).to(tl.int64) * K
+                    p_k = k + (bos * H + i_h).to(tl.int64) * K
+                    p_g = g + (bos * HV + i_hv).to(tl.int64) * K
+                    p_g_out = g_out + (bos * HV + i_hv).to(tl.int64) * K
+                    p_beta = beta + bos * HV + i_hv
+                    p_ws = ws + (i_tg.to(tl.int64) * HV + i_hv) * BT * 3 * K
+
+                    o_i = tl.arange(0, BT)
+                    o_c = i_t * BT + o_i
+                    m_c = o_c < T
+                    o_k = tl.arange(0, K)
+
+                    ptrs_qk = o_c[:, None] * (H * K) + o_k[None, :]
+                    ptrs_g = o_c[:, None] * (HV * K) + o_k[None, :]
+                    b_q = tl.load(p_q + ptrs_qk, mask=m_c[:, None], other=0.0)
+                    b_k = tl.load(p_k + ptrs_qk, mask=m_c[:, None], other=0.0)
+                    b_g = tl.load(p_g + ptrs_g, mask=m_c[:, None], other=0.0).to(
+                        tl.float32
+                    )
+
+                    b_qf = b_q.to(tl.float32)
+                    b_kf = b_k.to(tl.float32)
+                    b_q_rstd = 1.0 / tl.sqrt(tl.sum(b_qf * b_qf, 1) + l2norm_eps)
+                    b_k_rstd = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + l2norm_eps)
+
+                    b_A = exp2(tl.load(A_log + i_hv).to(tl.float32) * g_scale)
+                    b_bias = tl.load(dt_bias + i_hv * K + o_k).to(tl.float32)
+                    b_g = b_g + b_bias[None, :]
+                    b_g = (lower_bound * g_scale) * tl.sigmoid(b_A * b_g)
+                    b_gc = tl.cumsum(b_g, axis=0)
+
+                    if IS_VARLEN:
+                        tl.store(
+                            p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
+                            b_gc,
+                            mask=m_c[:, None],
+                        )
+                    else:
+                        tl.store(
+                            p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
+                            b_gc,
+                        )
+
+                    b_beta = tl.sigmoid(
+                        tl.load(p_beta + o_c * HV, mask=m_c, other=0.0).to(tl.float32)
+                    )
+                    ptrs_ws = o_i[:, None] * (3 * K) + o_k[None, :]
+                    b_k3 = b_kf * b_k_rstd[:, None]
+                    b_q3 = b_qf * b_q_rstd[:, None]
+                    last_local = tl.minimum(BT, T - i_t * BT) - 1
+                    b_gn = tl.sum(tl.where(o_i[:, None] == last_local, b_gc, 0.0), 0)
+                    b_w_val = b_k3 * b_beta[:, None] * exp2(b_gc)
+                    b_kg_val = b_k3 * tl.where(
+                        m_c[:, None], exp2(b_gn[None, :] - b_gc), 0.0
+                    )
+                    b_qg_val = b_q3 * exp2(b_gc)
+                    tl.store(p_ws + ptrs_ws, b_w_val.to(ws.dtype.element_ty))
+                    tl.store(p_ws + ptrs_ws + K, b_kg_val.to(ws.dtype.element_ty))
+                    tl.store(
+                        p_ws + ptrs_ws + 2 * K,
+                        b_qg_val.to(ws.dtype.element_ty),
+                    )
+
+    @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+    @triton.jit(do_not_specialize=["T"])
+    def _ascend_kda_fwd_gram_kernel(
+        q,
+        k,
+        g_out,
+        beta,
+        Aqk,
+        Akk,
+        chunk_indices,
+        scale,
+        l2norm_eps,
+        cu_seqlens,
         T,
         NC,
         H: tl.constexpr,
@@ -355,9 +456,6 @@ if HAS_TLE_KDA:
                     i_t = tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32)
                     bos = tl.load(cu_seqlens + i_n).to(tl.int32)
                     T = tl.load(cu_seqlens + i_n + 1).to(tl.int32) - bos
-                    if (i_bh == 0) & (i_t == 0):
-                        # canonical chunk -> [N] launch prefix, consumed by FwdH
-                        tl.store(chunk_offsets + i_n, i_tg)
                 else:
                     i_t = i_tg
                     bos = i_bh // HV * T
@@ -365,10 +463,8 @@ if HAS_TLE_KDA:
                 if i_t * BT < T:
                     p_q = q + (bos * H + i_h).to(tl.int64) * K
                     p_k = k + (bos * H + i_h).to(tl.int64) * K
-                    p_g = g + (bos * HV + i_hv).to(tl.int64) * K
                     p_g_out = g_out + (bos * HV + i_hv).to(tl.int64) * K
                     p_beta = beta + bos * HV + i_hv
-                    p_ws = ws + (i_tg.to(tl.int64) * HV + i_hv) * BT * 3 * K
                     p_Aqk = Aqk + (i_tg.to(tl.int64) * HV + i_hv) * BT * BT
                     p_Akk = Akk + (i_tg.to(tl.int64) * HV + i_hv) * BT * BT
 
@@ -377,60 +473,21 @@ if HAS_TLE_KDA:
                     m_c = o_c < T
                     o_k = tl.arange(0, K)
 
-                    # [BT, K] tiles; q/k/g are the real (unpadded) [B, T, H/HV, K] tensors.
                     ptrs_qk = o_c[:, None] * (H * K) + o_k[None, :]
                     ptrs_g = o_c[:, None] * (HV * K) + o_k[None, :]
-                    b_q = tl.load(p_q + ptrs_qk, mask=m_c[:, None], other=0.0)
-                    b_k = tl.load(p_k + ptrs_qk, mask=m_c[:, None], other=0.0)
-                    b_g = tl.load(p_g + ptrs_g, mask=m_c[:, None], other=0.0).to(
+                    b_qf = tl.load(p_q + ptrs_qk, mask=m_c[:, None], other=0.0).to(
                         tl.float32
                     )
-
-                    b_qf = b_q.to(tl.float32)
-                    b_kf = b_k.to(tl.float32)
-
+                    b_kf = tl.load(p_k + ptrs_qk, mask=m_c[:, None], other=0.0).to(
+                        tl.float32
+                    )
+                    b_gc = tl.load(p_g_out + ptrs_g, mask=m_c[:, None], other=0.0)
                     b_q_rstd = 1.0 / tl.sqrt(tl.sum(b_qf * b_qf, 1) + l2norm_eps)
                     b_k_rstd = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + l2norm_eps)
+                    b_beta = tl.sigmoid(
+                        tl.load(p_beta + o_c * HV, mask=m_c, other=0.0).to(tl.float32)
+                    )
 
-                    b_A = exp2(tl.load(A_log + i_hv).to(tl.float32) * g_scale)
-                    b_bias = tl.load(dt_bias + i_hv * K + o_k).to(tl.float32)
-                    b_g = b_g + b_bias[None, :]
-                    # FlashKDA-compatible safe gate; lower_bound is required by the verifier.
-                    b_g = (lower_bound * g_scale) * tl.sigmoid(b_A * b_g)
-
-                    # Chunk-local gate prefix sum along the token axis.
-                    # tl.cumsum lowers to a vectorized scan on triton-ascend
-                    # (verified bit-exact against torch.cumsum at BT=16/32/64),
-                    # replacing a BT-iteration extract_slice/insert_slice chain
-                    # that serialized BT read-modify-writes of the [BT, K] tile.
-                    b_gc = tl.cumsum(b_g, axis=0)
-
-                    # The whole [BT, K] cumsum is stored even though FwdH reads
-                    # only the chunk's last row: a compact [K] store at a
-                    # scalar-computed offset was measured *2x slower* than this
-                    # wide contiguous 2D burst (see the BT sweep in the history:
-                    # 1395 -> 2948 us at T=8192 H=24), so the extra 402 MB of
-                    # writes is cheaper than the small-store latency.
-                    if IS_VARLEN:
-                        tl.store(
-                            p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
-                            b_gc,
-                            mask=m_c[:, None],
-                        )
-                    else:
-                        tl.store(
-                            p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
-                            b_gc,
-                        )
-
-                    # Key-wise gate decay cannot be pulled out of the dot: the
-                    # factor exp2(gc[i,k] - gc[j,k]) lives inside the K sum.
-                    # Fold it into the bf16 operands, anchored per 32-row
-                    # sub-block (mirrors AscendC arch35 Prepare's
-                    # ScoreRefToken / 32-row reference span): acting as a
-                    # single BT=64 anchor makes each side cover <=32 tokens of
-                    # decay, which underflows the near-diagonal terms at the
-                    # harness gate range.
                     HALF: tl.constexpr = BT // 2
                     in_sb0 = o_i[:, None] < HALF
                     in_sb1 = ~in_sb0
@@ -451,26 +508,17 @@ if HAS_TLE_KDA:
                         m_c[:, None] & in_sb0, b_gk0 * b_cross_corr, 0.0
                     )
 
-                    b_beta = tl.sigmoid(
-                        tl.load(p_beta + o_c * HV, mask=m_c, other=0.0).to(tl.float32)
-                    )
-
                     b_qg0_t = (b_qf * b_gq0).to(tl.bfloat16)
                     b_qg1_t = (b_qf * b_gq1).to(tl.bfloat16)
                     b_kg0_t = tl.trans((b_kf * b_gk0).to(tl.bfloat16))
                     b_kg1_t = tl.trans((b_kf * b_gk1).to(tl.bfloat16))
                     b_kg0_corr_t = tl.trans((b_kf * b_gk0_corr).to(tl.bfloat16))
+                    b_kq0_t = (b_kf * b_gq0).to(tl.bfloat16)
+                    b_kq1_t = (b_kf * b_gq1).to(tl.bfloat16)
 
                     m_Aqk = o_i[:, None] >= o_i[None, :]
                     m_Akk = o_i[:, None] > o_i[None, :]
                     m_I = o_i[:, None] == o_i[None, :]
-
-                    # Build every bf16 operand, then issue all six dots before
-                    # touching either result: the vector-side Aqk postprocess
-                    # (rstd/scale/mask/store) then overlaps the Akk dots
-                    # instead of serializing ahead of them.
-                    b_kq0_t = (b_kf * b_gq0).to(tl.bfloat16)
-                    b_kq1_t = (b_kf * b_gq1).to(tl.bfloat16)
                     b_Aqk = tl.dot(b_qg0_t, b_kg0_t, out_dtype=tl.float32)
                     b_Aqk += tl.dot(b_qg1_t, b_kg1_t, out_dtype=tl.float32)
                     b_Aqk += tl.dot(b_qg1_t, b_kg0_corr_t, out_dtype=tl.float32)
@@ -487,22 +535,6 @@ if HAS_TLE_KDA:
                     b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
                     b_Akk = tl.where(m_Akk, b_Akk * b_beta[:, None], 0.0)
 
-                    # (I+L)^-1 via Neumann series: L is strictly lower
-                    # triangular so L^BT == 0 and the series terminates
-                    # exactly; truncation is the only error source, bounded
-                    # by ||L||^(stage_order+1)/(1-||L||). The doubling scheme
-                    # (I-L, +Ai@L2, +Ai@L4, +Ai@L8) reaches effective order
-                    # 1/3/7/15 at stage 0/1/2/3.
-                    #
-                    # tools/_kda_neumann_order_check.py measured
-                    # max||L||_2 ~ 0.02-0.025 under our actual safe-gate
-                    # distribution across BT in {16,32,64} (q/k L2-normalized,
-                    # so (k_i.k_j) in [-1,1] bounds ||L|| independent of the
-                    # beta distribution -- also checked with beta stressed to
-                    # raw U[0,1), same order of magnitude). At that norm the
-                    # stage-0 (r=1, 0 extra dots) remainder bound is already
-                    # ~4-6e-4, below bf16 eps (~3.9e-3); NEUMANN_STAGES lets
-                    # this be tuned instead of always paying for 3 stages.
                     b_Ai = m_I.to(tl.float32) - b_Akk
                     if NEUMANN_STAGES >= 1:
                         b_L = b_Akk.to(tl.bfloat16)
@@ -522,28 +554,14 @@ if HAS_TLE_KDA:
                                     tl.bfloat16
                                 )
                                 b_Ai = b_Ai + tl.dot(
-                                    b_Ai.to(tl.bfloat16), b_L8, out_dtype=tl.float32
+                                    b_Ai.to(tl.bfloat16),
+                                    b_L8,
+                                    out_dtype=tl.float32,
                                 )
-
                     tl.store(
                         p_Akk + o_i[:, None] * BT + o_i[None, :],
                         b_Ai.to(Akk.dtype.element_ty),
                     )
-
-                    # Pack w | kg | qg into one contiguous [BT, 3K] chunk tile.
-                    ptrs_ws = o_i[:, None] * (3 * K) + o_k[None, :]
-                    b_k3 = b_kf * b_k_rstd[:, None]
-                    b_q3 = b_qf * b_q_rstd[:, None]
-                    last_local = tl.minimum(BT, T - i_t * BT) - 1
-                    b_gn = tl.sum(tl.where(o_i[:, None] == last_local, b_gc, 0.0), 0)
-                    b_w_val = b_k3 * b_beta[:, None] * exp2(b_gc)
-                    b_kg_val = b_k3 * tl.where(
-                        m_c[:, None], exp2(b_gn[None, :] - b_gc), 0.0
-                    )
-                    b_qg_val = b_q3 * exp2(b_gc)
-                    tl.store(p_ws + ptrs_ws, b_w_val.to(ws.dtype.element_ty))
-                    tl.store(p_ws + ptrs_ws + K, b_kg_val.to(ws.dtype.element_ty))
-                    tl.store(p_ws + ptrs_ws + 2 * K, b_qg_val.to(ws.dtype.element_ty))
 
     def _ascend_kda_fwd_intra(
         q,
@@ -593,24 +611,41 @@ if HAS_TLE_KDA:
         )
         chunk_offsets = torch.empty(max(N, 1), device=q.device, dtype=torch.int32)
 
-        _ascend_kda_fwd_intra_kernel[grid](
+        _ascend_kda_fwd_prep_kernel[grid](
             q=q,
             k=k,
             g=g,
             beta=beta,
             ws=ws,
-            Aqk=Aqk,
-            Akk=Akk,
             g_out=g_out,
             chunk_offsets=chunk_offsets,
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
-            scale=scale,
             g_scale=RCP_LN2,
             l2norm_eps=1e-6,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            T=T_len,
+            NC=NC,
+            H=H,
+            HV=HV,
+            K=K,
+            BT=BT,
+            CPT=CPT,
+            multibuffer=False,
+        )
+        _ascend_kda_fwd_gram_kernel[grid](
+            q=q,
+            k=k,
+            g_out=g_out,
+            beta=beta,
+            Aqk=Aqk,
+            Akk=Akk,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            l2norm_eps=1e-6,
+            cu_seqlens=cu_seqlens,
             T=T_len,
             NC=NC,
             H=H,
