@@ -12,6 +12,7 @@ import pytest
 
 import flaggems_vllm as gems
 from baseline import fused_recurrent_kda as baseline
+from benchmark.conftest import Config
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_FLA.test_fused_recurrent_kda import assert_result, reference
 
@@ -58,8 +59,12 @@ def test_fused_recurrent_kda(case, dtype):
         selected_source=None,
     )
     functions = {"gems": gems.fused_recurrent_kda}
-    original = None if gems.vendor_name == "ascend" else baseline.native()
-    if gems.vendor_name == "ascend":
+    gems_only = Config.user_desired_metrics == ["latency"]
+    original = None if gems_only or gems.vendor_name == "ascend" else baseline.native()
+    if gems_only:
+        row["native_accuracy"] = "SKIP"
+        row["native_error"] = "native timing disabled by --metrics"
+    elif gems.vendor_name == "ascend":
         row["native_accuracy"] = "SKIP"
         row["native_error"] = "Ascend native KDA disabled: native accuracy is unstable"
     elif original is None:
