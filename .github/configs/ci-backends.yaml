@@ -1,0 +1,156 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# PR-level container CI backends for FlagGems-vllm.
+#
+# Scope: this file drives ONLY the `vendor-container-tests` job in
+# `.github/workflows/basic-ci.yml` (per-PR smoke tests on vendor-provided
+# vLLM base images). It is deliberately separate from:
+#
+#   - `.github/configs/backends/*.yaml` — inputs to `ops-test.yaml`, the
+#     periodic full-suite run. Those use internal harbor images and
+#     `*-flaggems-weekly` runners. Do not merge the two: a PR-level smoke
+#     test and a 4h weekly sweep have different runners, images and blast
+#     radius, and sharing one file would couple both lanes.
+#   - FlagGems' `.github/backends.json` — the registry behind the
+#     `non-nvidia-tests` job, whose contract is "run FlagGems setup.sh on a
+#     bare runner". The vendor images below ship their own torch/vLLM, so
+#     they do not fit that contract.
+#
+# Schema: intentionally mirrors FlagOps' `flagos-user-tests/resource_map.yaml`
+# (`platforms.<name>` -> runner labels + container image + container options)
+# so this data can move to FlagOps for org-wide reuse by changing only the
+# read path, not the workflow. See `.github/MULTI_BACKEND_CI.md` for the
+# reuse plan.
+#
+# NVIDIA is intentionally absent: the `nvidia-tests` job runs directly on the
+# H20 host via `tools/setup.sh` and must not be forced into a container.
+#
+# Keep `container_volumes` empty. These runners are ephemeral ARC pods driven
+# by the `k8s-novolume` container hook, which cannot bind-mount host paths: it
+# creates each mount point with mkdir, so a mount fails outright when the
+# target already exists as a file. Run 42145278734 showed every platform with
+# a volume failing and every platform without one passing. Anything a test
+# needs must be baked into the image.
+
+platforms:
+
+  hygon:
+    description: "Hygon DCU (BW1000) on a vendor vLLM image"
+    # `backend` is the key looked up in `.github/backend-capabilities.json`
+    # to decide which tests/benchmarks are approved for this hardware.
+    backend: hygon
+    runner_labels: hygon-bw1000-1
+    container_image: >-
+      harbor.sourcefind.cn:5443/hcu/admin/base/vllm:0.21.0-ubuntu22.04-dtk2604-py3.10
+    # Device flags follow FlagGems' backends.json `hygon-dtk2604.container`,
+    # whose `runs_on_vllm` is this runner.
+    container_options: >-
+      --device /dev/kfd
+      --device /dev/mkfd
+      --device /dev/dri
+      --group-add video
+      --security-opt seccomp=unconfined
+      --shm-size=256g
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    container_volumes: []
+    gpu_check_script: tools/gpu_check_hygon.sh
+
+  ascend:
+    description: "Huawei Ascend 910C on the official vllm-ascend image"
+    backend: ascend-cann900
+    # ascend-910b-1 was unusable: all three of its ARC runners stayed offline
+    # and the job never got a pod (run 42145278734).
+    runner_labels: flagcicd-910c
+    container_image: m.daocloud.io/quay.io/ascend/vllm-ascend:v0.23.0.post1-a3
+    container_options: >-
+      --ipc=host
+      --privileged
+      --device=/dev/davinci_manager
+      --device=/dev/devmm_svm
+      --device=/dev/hisi_hdc
+    # No volumes: see the mthreads note below. The ARC `k8s-novolume` hook
+    # cannot bind-mount host paths, so the CANN driver and add-ons have to
+    # come from the image.
+    container_volumes: []
+    gpu_check_script: tools/gpu_check_ascend.sh
+
+  iluvatar:
+    description: "Iluvatar BI-V150 on the FlagOS CoreX 4.5.0 vLLM image"
+    backend: iluvatar
+    runner_labels: iluvatar-bi-v150-1
+    container_image: >-
+      harbor.baai.ac.cn/flagos-app/vllm0.20.2-iluvatar-corex4.5.0:2.2.0-0.2.2
+    # Device flags follow FlagGems' backends.json
+    # `iluvatar-corex450.container`, whose `runs_on_vllm` is this runner.
+    container_options: >-
+      --device /dev/iluvatar0
+      --device /dev/itrctl
+      --shm-size=256g
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    container_volumes: []
+    gpu_check_script: tools/gpu_check_iluvatar.sh
+
+  metax:
+    description: "MetaX (Muxi) MXC550 on the FlagOS MACA 3.8.1.3 vLLM image"
+    backend: metax-maca3810
+    runner_labels: metax-mxc550-1
+    # The vendor's own cr.metax-tech.com image needs registry credentials. Use
+    # the FlagOS app image, which ships vLLM (33 of this repository's tests
+    # import it) unlike the flagos-runtime images upstream backends.json uses.
+    container_image: >-
+      harbor.baai.ac.cn/flagos-app/vllm0.24.0-metax-maca3.8.1.3:2.2.0-0.3.0
+    # Device flags follow FlagGems' backends.json `metax-maca3810.container`,
+    # whose `runs_on_vllm` is this runner.
+    container_options: >-
+      --device /dev/mxcd
+      --device /dev/dri
+      --group-add video
+    container_volumes: []
+    test_env:
+      FLAGTREE_BACKEND: metax
+    gpu_check_script: tools/gpu_check_metax.sh
+
+  mthreads:
+    description: "Moore Threads S5000 on the official vllm-openai image"
+    backend: mthreads-musa520
+    runner_labels: mthreads-s5000-1
+    # v0.32.0 is not pullable from this registry; stay on v0.28.0.
+    container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
+    # Device flags follow FlagGems' backends.json
+    # `mthreads-musa520.container`, whose `runs_on_vllm` is this runner.
+    container_options: >-
+      --device /dev/mtgpu.0
+      --device /dev/mtgpu.1
+      --device /dev/mtgpu.2
+      --device /dev/mtgpu.3
+      --device /dev/mtgpu.4
+      --device /dev/mtgpu.5
+      --device /dev/mtgpu.6
+      --device /dev/mtgpu.7
+      --device /dev/dri
+      --shm-size=256g
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    # No volumes: these runners are ARC pods using the `k8s-novolume` hook,
+    # where a host-path mount is created with mkdir and fails against an
+    # existing file ("cannot create directory '/usr/bin/mthreads-gmi': File
+    # exists"). gpu_check_mthreads.sh therefore needs `mthreads-gmi` to be
+    # present in the image itself.
+    container_volumes: []
+    test_env:
+      FLAGTREE_BACKEND: mthreads
+    gpu_check_script: tools/gpu_check_mthreads.sh
