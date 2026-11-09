@@ -141,7 +141,6 @@ def _thead_kda_fwd_intra_kernel(
 
     # Phase 0: L2 norm on q/k (optional) + beta sigmoid (optional)
     if USE_QK_L2NORM:
-        # 归一化后置：这里只建累加器，q/k 的读取合并进 Phase 1 的同一趟
         b_q_ss = tl.zeros([BT], dtype=tl.float32)
         b_k_ss = tl.zeros([BT], dtype=tl.float32)
 
@@ -179,10 +178,14 @@ def _thead_kda_fwd_intra_kernel(
                 p_dt = tl.make_block_ptr(
                     dt_bias + i_hv * K, (K,), (1,), (i_k * BK,), (BK,), (0,)
                 )
-                b_bias = tl.load(p_dt, boundary_check=(0,) if not EVEN else ()).to(tl.float32)
+                b_bias = tl.load(p_dt, boundary_check=(0,) if not EVEN else ()).to(
+                    tl.float32
+                )
                 b_g = b_g + b_bias[None, :]
             if USE_LOWER_BOUND:
-                b_g = (lower_bound * g_scale) / (1.0 + tl.exp2(-(b_A * b_g) * 1.4426950408889634))
+                b_g = (lower_bound * g_scale) / (
+                    1.0 + tl.exp2(-(b_A * b_g) * 1.4426950408889634)
+                )
             else:
                 b_g = -b_A * _softplus(b_g) * g_scale
         else:
@@ -217,7 +220,9 @@ def _thead_kda_fwd_intra_kernel(
     p_Aqk = tl.make_block_ptr(
         Aqk, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
-    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ())
+    tl.store(
+        p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ()
+    )
 
     b_L = b_Akk.to(tl.float16)
     b_Ai = m_I.to(tl.float16) - b_L
@@ -240,7 +245,9 @@ def _thead_kda_fwd_intra_kernel(
         b_v = tl.load(p_v, boundary_check=(0, 1) if not EVEN else ())
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_Ai.to(b_vb.dtype), b_vb)
-        tl.store(p_u, b_u.to(u.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ())
+        tl.store(
+            p_u, b_u.to(u.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ()
+        )
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(
@@ -249,17 +256,24 @@ def _thead_kda_fwd_intra_kernel(
         p_g = tl.make_block_ptr(
             g, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32) * b_k_rstd[:, None]
+        b_k = (
+            tl.load(p_k, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
+            * b_k_rstd[:, None]
+        )
         b_gk = tl.load(p_g, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
         if USE_GATE_IN_KERNEL:
             if HAS_DT_BIAS:
                 p_dt = tl.make_block_ptr(
                     dt_bias + i_hv * K, (K,), (1,), (i_k * BK,), (BK,), (0,)
                 )
-                b_bias = tl.load(p_dt, boundary_check=(0,) if not EVEN else ()).to(tl.float32)
+                b_bias = tl.load(p_dt, boundary_check=(0,) if not EVEN else ()).to(
+                    tl.float32
+                )
                 b_gk = b_gk + b_bias[None, :]
             if USE_LOWER_BOUND:
-                b_gk = (lower_bound * g_scale) / (1.0 + tl.exp2(-(b_A * b_gk) * 1.4426950408889634))
+                b_gk = (lower_bound * g_scale) / (
+                    1.0 + tl.exp2(-(b_A * b_gk) * 1.4426950408889634)
+                )
             else:
                 b_gk = -b_A * _softplus(b_gk) * g_scale
         else:
@@ -274,9 +288,16 @@ def _thead_kda_fwd_intra_kernel(
             p_qg_out = tl.make_block_ptr(
                 qg, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
-            b_q = tl.load(p_q, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32) * b_q_rstd[:, None]
+            b_q = (
+                tl.load(p_q, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
+                * b_q_rstd[:, None]
+            )
             b_qg_val = b_q * exp2(b_gk)
-            tl.store(p_qg_out, b_qg_val.to(qg.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ())
+            tl.store(
+                p_qg_out,
+                b_qg_val.to(qg.dtype.element_ty),
+                boundary_check=(0, 1) if not EVEN else (),
+            )
 
         if STORE_KG:
             # last cumsum row from the recomputed tile (same value as g_last)
@@ -285,13 +306,19 @@ def _thead_kda_fwd_intra_kernel(
             p_kg_out = tl.make_block_ptr(
                 kg, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
-            tl.store(p_kg_out, b_kg_val.to(kg.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ())
+            tl.store(
+                p_kg_out,
+                b_kg_val.to(kg.dtype.element_ty),
+                boundary_check=(0, 1) if not EVEN else (),
+            )
 
         p_w = tl.make_block_ptr(
             w, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
         b_w = tl.dot(b_Ai.to(b_kb.to(b_k.dtype).dtype), b_kb.to(b_k.dtype))
-        tl.store(p_w, b_w.to(w.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ())
+        tl.store(
+            p_w, b_w.to(w.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ()
+        )
 
 
 def _thead_kda_fwd_intra(
@@ -319,8 +346,7 @@ def _thead_kda_fwd_intra(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
-    # 只在非 varlen 且 T 对齐时走无掩码路径；varlen 保持原掩码路径，
-    # 避免为判断对齐而做 GPU->CPU 同步（实测同步会拖慢每次调用）。
+
     even_t = (cu_seqlens is None) and ((T_len % BT) == 0)
     grid = (NT, B * HV)
 
