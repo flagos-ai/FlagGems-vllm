@@ -102,6 +102,7 @@ from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
+    triton_ihc_post,
     ihc_pre,
     ihc_pre_ref,
 )
@@ -409,6 +410,7 @@ __all__ = [
     "topk_sigmoid",
     "topk_softmax",
     "topk_softplus_sqrt",
+    "triton_ihc_post",
     "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",

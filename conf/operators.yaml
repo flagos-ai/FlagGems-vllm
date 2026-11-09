@@ -1575,6 +1575,17 @@ ops:
       - MoE
     stages:
       - beta: '5.3'
+  - id: triton_ihc_post
+    description: iHC gated residual scatter with unfused FP32 multiply and addition.
+    for:
+      - triton_ihc_post
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.4'
   - id: triton_lighting_indexer_k_tiled_interface
     description: Part of FP8 MQA framework. It is currently not exposed as an operator
       for use.

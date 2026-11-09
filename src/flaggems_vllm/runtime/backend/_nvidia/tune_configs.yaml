@@ -1201,6 +1201,26 @@ mhc_rms_norm:
   - META: {}
     num_warps: 8
 
+triton_ihc_post:
+  - META: {BLOCK_D: 128, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 128, TOKEN_MAJOR: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, TOKEN_MAJOR: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, TOKEN_MAJOR: true}
+    num_warps: 4
+    num_stages: 1
+
 kda_safe_gate_cumsum:
   - META: {BD: 32}
     num_warps: 2
