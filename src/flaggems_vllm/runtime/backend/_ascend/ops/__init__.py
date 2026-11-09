@@ -39,6 +39,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention_bnsd import (
+    flash_attention_fwd,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
@@ -137,6 +140,7 @@ __all__ = [
     "compressor_prepared",
     "compute_slot_mapping_parallel",
     "dequantize_and_gather_k_cache",
+    "flash_attention_fwd",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
