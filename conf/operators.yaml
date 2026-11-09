@@ -1006,20 +1006,6 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
-  - id: kda_state_scatter
-    description: |
-      Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
-      chunk operator back into the paged [H, V, K] cache layout with the
-      transpose and dtype cast folded into a single kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
   - id: kpool_state_compress
     description: |
       Fused fast path for the GLM5 Next A3 indexer pre-compress sequence:
@@ -1357,6 +1343,20 @@ ops:
     stages:
       - stable: '4.1'
     cpp: '4.0'
+  - id: scatter_kda_state
+    description: |
+      Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
+      chunk operator back into the paged [H, V, K] cache layout with the
+      transpose and dtype cast folded into a single kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: silu_and_mul
     description: A custom operator in vLLM as activation function for SwiGLU.
     for:

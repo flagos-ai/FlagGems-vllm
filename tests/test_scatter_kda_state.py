@@ -62,10 +62,10 @@ def _ref_scatter(cache, state_indices, values):
     return out
 
 
-@pytest.mark.kda_state_scatter
+@pytest.mark.scatter_kda_state
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
-def test_kda_state_scatter_accuracy(case, dtype):
+def test_scatter_kda_state_accuracy(case, dtype):
     S, N, H, V, K = case
     torch.manual_seed(1)
     cache = torch.randn(S, H, V, K, dtype=torch.float32, device="npu").to(dtype)
@@ -79,7 +79,7 @@ def test_kda_state_scatter_accuracy(case, dtype):
     assert torch.equal(new_cache, ref_cache)
 
 
-@pytest.mark.kda_state_scatter
+@pytest.mark.scatter_kda_state
 def test_kda_state_roundtrip_bitwise():
     """Gather and scatter transposes must be each other's inverse.
 
