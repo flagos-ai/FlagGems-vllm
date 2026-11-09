@@ -15,10 +15,13 @@ projection, convolution and model scheduling are outside the measured scope.
 """
 
 
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 SHAPES = Path(
@@ -106,7 +109,7 @@ def torch_baseline(args, bounds):
         return o.unsqueeze(0).to(q.dtype), s
     from tests.gdn_reference import torch_gdn_prefill
 
-    return torch_gdn_prefill(*args, bounds, normalize=False)
+    return torch_gdn_prefill(q, k, v, g, beta, state, bounds, normalize=False)
 
 
 def main(*, rows=None, public_entry=False):
@@ -498,11 +501,98 @@ def main(*, rows=None, public_entry=False):
     print("WEIGHTED SUMMARY", json.dumps(summary), flush=True)
 
 
+def _metax_shape_row(shape):
+    # Shared YAML tags distinguish independent QKV updates from chunk prefill.
+    if len(shape) == 8 and shape[0] == "update":
+        op = "fused_sigmoid_gating_delta_rule_update"
+        shape = shape[1:]
+        if shape[0] != 1 or shape[1] != shape[-1]:
+            raise ValueError(f"Expected one token per update request: {shape}")
+    elif len(shape) == 4:
+        op = "fused_recurrent_gated_delta_rule_packed_decode"
+    elif len(shape) == 7:
+        op = "chunk_gated_delta_rule"
+    else:
+        raise ValueError(f"Unsupported GDN shape: {shape}")
+    return {"op": op, "shape": list(shape), "count": 1}
+
+
+@pytest.mark.gdn_w8a16
+def test_perf_gdn_w8a16_metax(tmp_path):
+    """Use shared shapes with the paired CUDA Graph benchmark and FP32 state."""
+    from flaggems_vllm import vendor_name
+
+    if vendor_name != "metax":
+        pytest.skip("MetaX FP32 state")
+    from benchmark.base import Benchmark
+    from benchmark.conftest import Config, emit_record_logger, update_result
+    from benchmark.consts import BenchLevel
+
+    if Config.user_desired_dtypes and torch.bfloat16 not in Config.user_desired_dtypes:
+        pytest.skip("MetaX GDN benchmarks use BF16 activations and FP32 state")
+    shape_file = Path(os.environ.get("GDN_SHAPE_FILE") or Config.shape_file)
+    result_dir = Path(os.environ.get("GDN_RESULT_DIR", tmp_path)).resolve()
+    rows = None
+    if shape_file.suffix.lower() != ".json":
+        # Only reuse the compatible packed/update/prefill dimensions from YAML.
+        bench = Benchmark(op_name="gdn_w8a16_int8", torch_op=None)
+        bench.DEFAULT_SHAPES = ()
+        bench.set_shapes(str(shape_file))
+        if not bench.shapes:
+            bench.op_name = "gdn_w8a16"
+            bench.set_shapes(str(shape_file))
+        shapes = bench.shapes
+        if (
+            Config.bench_level == BenchLevel.CORE
+            and shape_file.resolve()
+            == Path(__file__).with_name("core_shapes.yaml").resolve()
+        ):
+            shapes = shapes[:2]
+        rows = [_metax_shape_row(shape) for shape in shapes]
+    # Load vLLM's device plugin before FlagGems/TileLang in a fresh process.
+    # In pytest the CUDA stub can already be loaded and mask the MACA runtime.
+    subprocess.run(
+        [sys.executable, "-m", "benchmark.test_gdn_w8a16_metax", "--shared-benchmark"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "GDN_SHAPE_FILE": str(shape_file.resolve()),
+            "GDN_RESULT_DIR": str(result_dir),
+        },
+        input=json.dumps(rows),
+        text=True,
+        check=True,
+    )
+    results = json.loads((result_dir / "results.json").read_text())["results"]
+    for baseline in ("vllm_metax_default", "pytorch"):
+        metrics = [
+            dict(
+                shape_detail=row["shape"],
+                path=row["op"],
+                count=row["count"],
+                latency=row["us"]["optimized"] / 1000,
+                latency_base=row["us"][baseline] / 1000,
+                speedup=row["us"][baseline] / row["us"]["optimized"],
+            )
+            for row in results
+            if baseline in row["us"]
+        ]
+        if metrics:
+            record = dict(
+                op_name="gdn_w8a16",
+                dtype=str(torch.bfloat16),
+                mode="cudagraph",
+                level=Config.bench_level.value,
+                baseline=baseline,
+                result=metrics,
+            )
+            update_result("gdn_w8a16", record)
+            emit_record_logger(json.dumps(record))
+
+
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     if sys.argv[1:] == ["--shared-benchmark"]:
-        import json
-
         main(rows=json.load(sys.stdin), public_entry=True)
     else:
         main()

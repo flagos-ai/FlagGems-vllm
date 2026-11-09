@@ -5,7 +5,11 @@ import pytest
 import torch
 
 from flaggems_vllm import gdn_w8a16, vendor_name
-from tests.gdn_reference import recurrent_gdn_reference, torch_gdn_decode
+from tests.gdn_reference import (
+    recurrent_gdn_reference,
+    torch_gdn_decode,
+    torch_gdn_prefill,
+)
 
 pytestmark = pytest.mark.skipif(
     vendor_name != "metax", reason="MetaX FP32-state GDN contract"
@@ -21,37 +25,9 @@ def ieee_reference():
 
 
 def reference(q, k, v, g, beta, state, bounds):
-    h = state.transpose(-1, -2).clone()
-    out = torch.empty_like(v, dtype=torch.float32)
-    group = v.shape[2] // q.shape[2]
-    q = q[0].float().repeat_interleave(group, 1).transpose(0, 1)
-    k = k[0].float().repeat_interleave(group, 1).transpose(0, 1)
-    v = v[0].float().transpose(0, 1)
-    g = g[0].transpose(0, 1)
-    beta = beta[0].transpose(0, 1)
-    scale = q.shape[-1] ** -0.5
-    for seq, (start, end) in enumerate(zip(bounds, bounds[1:])):
-        s = h[seq]
-        for pos in range(start, end, 64):
-            stop = min(pos + 64, end)
-            qq, kk, vv = q[:, pos:stop], k[:, pos:stop], v[:, pos:stop]
-            gg = g[:, pos:stop].cumsum(-1)
-            bb = beta[:, pos:stop]
-            decay = (gg[:, :, None] - gg[:, None, :]).exp().tril()
-            lhs = (kk @ kk.transpose(-1, -2) * decay * bb[:, :, None]).tril(-1)
-            lhs.diagonal(dim1=-2, dim2=-1).fill_(1)
-            rhs = bb[:, :, None] * (vv - gg.exp()[:, :, None] * (kk @ s))
-            u = torch.linalg.solve_triangular(lhs, rhs, upper=False, unitriangular=True)
-            result = (
-                gg.exp()[:, :, None] * (qq @ s)
-                + (qq @ kk.transpose(-1, -2) * decay) @ u
-            ) * scale
-            out[0, pos:stop] = result.transpose(0, 1)
-            s = gg[:, -1].exp()[:, None, None] * s + kk.transpose(-1, -2) @ (
-                (gg[:, -1:] - gg).exp()[:, :, None] * u
-            )
-        h[seq] = s
-    return out, h.transpose(-1, -2)
+    return torch_gdn_prefill(
+        q, k, v, g, beta, state, bounds, normalize=False, output_dtype=torch.float32
+    )
 
 
 def inputs(row, dtype=torch.bfloat16):
@@ -514,3 +490,55 @@ def test_gdn_w8a16_small_packed_scale_and_dynamic_padding(n, dtype):
             assert actual[0] is out and actual[1] is state
             torch.testing.assert_close(out, ref, atol=0.002, rtol=0.02)
             torch.testing.assert_close(state, expected, atol=1e-5, rtol=0.002)
+
+
+@pytest.mark.gdn_w8a16
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_metax_fp32_state_gdn_decode(dtype, packed, normalize):
+    torch.manual_seed(537)
+    n, h, hv, dk, dv = 3, 2, 4, 33, 17
+    q = torch.randn((1, n, h, dk), device="cuda", dtype=dtype) * 0.2
+    k = torch.randn_like(q) * 0.2
+    v = torch.randn((1, n, hv, dv), device="cuda", dtype=dtype) * 0.2
+    a = torch.randn((n, hv), device="cuda", dtype=dtype)
+    b = torch.randn_like(a)
+    al = torch.randn(hv, device="cuda") * 0.1
+    bias = torch.randn_like(al) * 0.1
+    ids = torch.tensor([3, 1, 0], device="cuda", dtype=torch.int64)
+    state = torch.randn((n + 2, hv, dv, dk), device="cuda") * 0.1
+    expected = state.clone()
+    mixed = torch.cat((q[0].flatten(1), k[0].flatten(1), v[0].flatten(1)), dim=-1)
+    ref_out = torch.empty((n, 1, hv, dv), device=q.device, dtype=dtype)
+    torch_gdn_decode(
+        mixed if packed else (q, k, v),
+        a,
+        b,
+        al,
+        bias,
+        dk**-0.5,
+        expected,
+        ref_out,
+        ids,
+        normalize,
+        round_beta=True,
+    )
+    out = torch.empty_like(v)
+    actual, cache = gdn_w8a16(
+        mixed if packed else q,
+        None if packed else k,
+        None if packed else v,
+        initial_state=state,
+        decode=True,
+        a=a,
+        b=b,
+        A_log=al,
+        dt_bias=bias,
+        state_indices=ids,
+        out=out,
+        normalize=normalize,
+    )
+    assert actual is out and cache is state
+    torch.testing.assert_close(out[0], ref_out[:, 0], atol=0.002, rtol=0.02)
+    torch.testing.assert_close(state, expected, atol=1e-5, rtol=0.002)

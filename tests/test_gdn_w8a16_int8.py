@@ -18,11 +18,53 @@ import triton
 
 import flaggems_vllm
 from tests.accuracy_utils import gems_assert_close, gems_assert_equal
-from tests.gdn_reference import (
-    recurrent_gdn_reference,
-    torch_gdn_decode,
-    torch_gdn_prefill,
-)
+
+
+def torch_int8_state_gdn_decode(
+    mixed, a, b, a_log, bias, scale, state, output, indices, normalize
+):
+    """Vectorized PyTorch recurrence with FP32 state and one token per slot."""
+    _, heads, columns, reduction = state.shape
+    if isinstance(mixed, tuple):
+        q, k, v = mixed
+        tokens, query_heads = q.shape[1:3]
+    else:
+        tokens, packed = mixed.shape
+        if tokens == 0:
+            return output, state
+        query_heads = (packed - heads * columns) // (2 * reduction)
+        query, key, value = mixed.split(
+            (query_heads * reduction, query_heads * reduction, heads * columns),
+            dim=-1,
+        )
+        q = query.reshape(1, tokens, query_heads, reduction)
+        k = key.reshape(1, tokens, query_heads, reduction)
+        v = value.reshape(1, tokens, heads, columns)
+    q, k = q[0].float(), k[0].float()
+    if normalize:
+        q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+    q = q.repeat_interleave(heads // query_heads, 1) * scale
+    k = k.repeat_interleave(heads // query_heads, 1)
+    slots = indices.clamp_min(0)
+    original = state[slots].float()
+    decay = torch.exp(-a_log.exp() * torch.nn.functional.softplus(a.float() + bias))
+    current = original * decay[..., None, None]
+    delta = (v[0].float() - (current * k[..., None, :]).sum(-1)) * b.float().sigmoid()[
+        ..., None
+    ]
+    current = current + delta[..., None] * k[..., None, :]
+    valid = indices > 0
+    result = (current * q[..., None, :]).sum(-1)
+    output.copy_(
+        torch.where(valid[:, None, None], result, 0).reshape(tokens, 1, heads, columns)
+    )
+    state.index_copy_(
+        0,
+        slots,
+        torch.where(valid[:, None, None, None], current, original).to(state.dtype),
+    )
+    return output, state
 
 
 def build_int8_gdn_decode_inputs(shape, dtype, reduction=128):
@@ -46,7 +88,88 @@ def build_int8_gdn_decode_inputs(shape, dtype, reduction=128):
     shared = (mixed, a, b, A_log, dt_bias, reduction**-0.5)
     reference_args = (*shared, reference_state, reference_output, indices, True)
     gems_args = (*shared, state, scales, output, indices, True)
-    return torch_gdn_decode, reference_args, gems_args
+    return torch_int8_state_gdn_decode, reference_args, gems_args
+
+
+def torch_int8_state_gdn_prefill(
+    q, k, v, g, beta, initial_state, cu_seqlens, raw_cu_seqlens
+):
+    """PyTorch BF16/FP16-activation reference with FP32 recurrent state.
+
+    The chunk algebra follows FlagGems PR 7279's PyTorch reference. Sequence
+    boundaries are supplied on the host so timing contains no device reads.
+    """
+    dtype = q.dtype
+    q = (q.float() * torch.rsqrt(q.float().square().sum(-1, keepdim=True) + 1e-6)).to(
+        dtype
+    )
+    k = (k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)).to(
+        dtype
+    )
+    state, bounds = initial_state, raw_cu_seqlens
+    group = v.shape[2] // q.shape[2]
+    q = q[0].float().repeat_interleave(group, 1).transpose(0, 1)
+    k = k[0].float().repeat_interleave(group, 1).transpose(0, 1)
+    v = v[0].float().transpose(0, 1)
+    g = g[0].transpose(0, 1)
+    beta = beta[0].float().transpose(0, 1)
+    outputs, states = [], []
+    for seq, (start, stop) in enumerate(zip(bounds, bounds[1:])):
+        length = stop - start
+        chunks = (length + 63) // 64
+        padding = chunks * 64 - length
+        qq = torch.nn.functional.pad(q[:, start:stop], (0, 0, 0, padding)).reshape(
+            q.shape[0], chunks, 64, q.shape[-1]
+        )
+        kk = torch.nn.functional.pad(k[:, start:stop], (0, 0, 0, padding)).reshape(
+            k.shape[0], chunks, 64, k.shape[-1]
+        )
+        vv = torch.nn.functional.pad(v[:, start:stop], (0, 0, 0, padding)).reshape(
+            v.shape[0], chunks, 64, v.shape[-1]
+        )
+        gg = (
+            torch.nn.functional.pad(g[:, start:stop], (0, padding))
+            .reshape(g.shape[0], chunks, 64)
+            .cumsum(-1)
+        )
+        bb = torch.nn.functional.pad(beta[:, start:stop], (0, padding)).reshape(
+            beta.shape[0], chunks, 64
+        )
+        decay = (gg[..., :, None] - gg[..., None, :]).exp().tril()
+        lhs = (kk @ kk.transpose(-1, -2) * decay * bb[..., None]).tril(-1)
+        # Strictly lower 64x64 L is nilpotent: the finite geometric series
+        # gives (I+L)^-1 exactly, using only PyTorch batched matmuls.
+        power = -lhs
+        inverse = torch.eye(64, device=q.device) + power
+        for _ in range(5):
+            power = power @ power
+            inverse = inverse + inverse @ power
+        rhs = bb[..., None] * torch.cat((vv, gg.exp()[..., None] * kk), dim=-1)
+        solved = inverse @ rhs
+        u, w = solved.split((vv.shape[-1], kk.shape[-1]), dim=-1)
+        q_exp = qq * gg.exp()[..., None]
+        qk = (qq @ kk.transpose(-1, -2)) * decay
+        weighted_k = kk * (gg[..., -1:] - gg).exp()[..., None]
+        last_decay = gg[..., -1].exp()
+        s = state[seq].transpose(-1, -2)
+        chunk_outputs = []
+        for i in range(chunks):
+            update = u[:, i] - w[:, i] @ s
+            chunk_outputs.append(q_exp[:, i] @ s + qk[:, i] @ update)
+            s = (
+                last_decay[:, i, None, None] * s
+                + weighted_k[:, i].transpose(-1, -2) @ update
+            )
+        outputs.append(
+            torch.stack(chunk_outputs, dim=1).reshape(
+                q.shape[0], chunks * 64, v.shape[-1]
+            )[:, :length]
+        )
+        states.append(s.transpose(-1, -2))
+    output = torch.cat(outputs, dim=1).transpose(0, 1).unsqueeze(0) * (
+        q.shape[-1] ** -0.5
+    )
+    return output.to(dtype), torch.stack(states).contiguous()
 
 
 def build_int8_gdn_prefill_inputs(shape, dtype, boundaries=None):
@@ -87,10 +210,35 @@ def build_int8_gdn_prefill_inputs(shape, dtype, boundaries=None):
         raw_cu_seqlens=tuple(boundaries),
     )
     return (
-        torch_gdn_prefill,
+        torch_int8_state_gdn_prefill,
         reference,
         (q, k, v, g, beta, state, scales, cu, indices, offsets),
     )
+
+
+def recurrent_gdn_reference(q, k, v, g, beta, initial, boundaries, normalize, scale):
+    """Token recurrence independent of the chunked prefill reference."""
+    group = v.shape[2] // q.shape[2]
+    q, k = q[0].float(), k[0].float()
+    if normalize:
+        q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+    q = q.repeat_interleave(group, 1) * scale
+    k = k.repeat_interleave(group, 1)
+    output = torch.empty_like(v)
+    final = []
+    for sequence, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
+        state = initial[sequence].float().clone()
+        for token in range(begin, end):
+            state = state * g[0, token].exp()[:, None, None]
+            key = k[token, :, None, :]
+            residual = v[0, token].float() - (state * key).sum(-1)
+            state = (
+                state + (residual * beta[0, token].float()[:, None])[..., None] * key
+            )
+            output[0, token] = (state * q[token, :, None, :]).sum(-1)
+        final.append(state)
+    return output, torch.stack(final)
 
 
 @pytest.mark.gdn_w8a16
@@ -272,56 +420,3 @@ def test_int8_state_gdn_null_slots(tokens):
     gems_assert_equal(actual, expected)
     gems_assert_equal(state, old_state)
     gems_assert_equal(gems_args[7], old_scales)
-
-
-@pytest.mark.gdn_w8a16
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX FP32 state")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("normalize", [False, True])
-def test_metax_fp32_state_gdn_decode(dtype, packed, normalize):
-    torch.manual_seed(537)
-    n, h, hv, dk, dv = 3, 2, 4, 33, 17
-    q = torch.randn((1, n, h, dk), device="cuda", dtype=dtype) * 0.2
-    k = torch.randn_like(q) * 0.2
-    v = torch.randn((1, n, hv, dv), device="cuda", dtype=dtype) * 0.2
-    a = torch.randn((n, hv), device="cuda", dtype=dtype)
-    b = torch.randn_like(a)
-    al = torch.randn(hv, device="cuda") * 0.1
-    bias = torch.randn_like(al) * 0.1
-    ids = torch.tensor([3, 1, 0], device="cuda", dtype=torch.int64)
-    state = torch.randn((n + 2, hv, dv, dk), device="cuda") * 0.1
-    expected = state.clone()
-    mixed = torch.cat((q[0].flatten(1), k[0].flatten(1), v[0].flatten(1)), dim=-1)
-    ref_out = torch.empty((n, 1, hv, dv), device=q.device, dtype=dtype)
-    torch_gdn_decode(
-        mixed if packed else (q, k, v),
-        a,
-        b,
-        al,
-        bias,
-        dk**-0.5,
-        expected,
-        ref_out,
-        ids,
-        normalize,
-        round_beta=True,
-    )
-    out = torch.empty_like(v)
-    actual, cache = flaggems_vllm.gdn_w8a16(
-        mixed if packed else q,
-        None if packed else k,
-        None if packed else v,
-        initial_state=state,
-        decode=True,
-        a=a,
-        b=b,
-        A_log=al,
-        dt_bias=bias,
-        state_indices=ids,
-        out=out,
-        normalize=normalize,
-    )
-    assert actual is out and cache is state
-    torch.testing.assert_close(out[0], ref_out[:, 0], atol=0.002, rtol=0.02)
-    torch.testing.assert_close(state, expected, atol=1e-5, rtol=0.002)

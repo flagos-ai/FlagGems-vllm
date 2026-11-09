@@ -77,7 +77,7 @@ def torch_gdn_decode(
 
 
 def torch_gdn_prefill(
-    q, k, v, g, beta, initial_state, cu_seqlens, raw_cu_seqlens, *, normalize=True
+    q, k, v, g, beta, initial_state, bounds, *, normalize=True, output_dtype=None
 ):
     """PyTorch BF16/FP16-activation reference with FP32 recurrent state.
 
@@ -92,7 +92,7 @@ def torch_gdn_prefill(
         k = (
             k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)
         ).to(dtype)
-    state, bounds = initial_state, raw_cu_seqlens
+    state = initial_state
     group = v.shape[2] // q.shape[2]
     q = q[0].float().repeat_interleave(group, 1).transpose(0, 1)
     k = k[0].float().repeat_interleave(group, 1).transpose(0, 1)
@@ -159,7 +159,7 @@ def torch_gdn_prefill(
     output = torch.cat(outputs, dim=1).transpose(0, 1).unsqueeze(0) * (
         q.shape[-1] ** -0.5
     )
-    return output.to(dtype), torch.stack(states).contiguous()
+    return output.to(output_dtype or dtype), torch.stack(states).contiguous()
 
 
 def recurrent_gdn_reference(q, k, v, g, beta, initial, boundaries, normalize, scale):
