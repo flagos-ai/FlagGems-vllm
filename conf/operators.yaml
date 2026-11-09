@@ -1179,6 +1179,22 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: gather_kda_state
+  description: |
+    Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
+    layout expected by the AscendC chunk operator, zeroing slots without an
+    initial state, with the transpose folded into a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (gather -> clear_ssm_states -> transpose-copy)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
 - id: gather_sampler_output
   description: Pack and restore batch-sharded tokens, counts, and logprobs around
     vLLM all-gather.
@@ -1573,24 +1589,6 @@ ops:
     in-chunk cumulative sums with one program per (chunk, head) tile
 
     instead of one serial block per sequence.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
-- id: kda_state_gather
-  description: 'Gathers KDA recurrent states from the paged cache into the [N, H,
-    K, V]
-
-    layout expected by the AscendC chunk operator, zeroing slots without an
-
-    initial state, with the transpose folded into a single kernel.
 
     '
   for:
