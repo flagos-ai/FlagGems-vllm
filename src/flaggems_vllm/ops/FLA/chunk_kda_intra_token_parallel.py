@@ -45,10 +45,32 @@ logger = logging.getLogger(__name__)
 __all__ = ["chunk_kda_fwd_intra_token_parallel"]
 
 
+def _prune_ascend_head_tiles(configs, named_args, **kwargs):
+    heads = kwargs["HV"]
+    if heads <= 2:
+        head_tiles = (1,)
+    elif heads <= 8:
+        head_tiles = (2,)
+    else:
+        # The narrow tile wins on short dense inputs. Packed and wider-head
+        # inputs also need the wider tile. Four and eight warps time similarly.
+        head_tiles = (2, 8)
+    return [
+        config
+        for config in configs
+        if config.kwargs["BH"] in head_tiles and config.num_warps == 4
+    ] or configs
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("chunk_kda_fwd_intra_token_parallel"),
     key=["H", "HV", "K", "BT", "BC", "IS_VARLEN"],
+    prune_configs_by=(
+        {"early_config_prune": _prune_ascend_head_tiles}
+        if runtime.device.vendor_name == "ascend"
+        else None
+    ),
     use_cuda_graph=False,
 )
 @triton.jit(do_not_specialize=["T", "N"])

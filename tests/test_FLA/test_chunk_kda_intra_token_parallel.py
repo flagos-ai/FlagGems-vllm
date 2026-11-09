@@ -364,7 +364,7 @@ def test_chunk_kda_intra_token_parallel_fla_reference(dtype, packed):
     args, cu, _ = _inputs(case, dtype)
     q, k, g, beta, a, b = args
     na, nb = a.clone(), b.clone()
-    native(q, k, g, beta, na, nb, 0.5, cu_seqlens=cu, use_graph=False)
+    native(q, k, g, beta, na, nb, 0.5, cu_seqlens=cu)
     op(*args, 0.5, cu_seqlens=cu)
     for actual, expected in ((a, na), (b, nb)):
         rtol, atol = TOLERANCES[actual.dtype]
