@@ -59,6 +59,7 @@ _LIBRARY_ONLY_OPS = frozenset(
         "grouped_gemma_rmsnorm",
         "hc_combine",
         "top_k_top_p",
+        "triton_reshape_and_cache_flash",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
     }

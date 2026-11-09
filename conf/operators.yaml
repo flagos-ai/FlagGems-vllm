@@ -1587,6 +1587,17 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: triton_reshape_and_cache_flash
+    description: In-place Flash 4D and head-major KV writes with ordinary or global E4M3 FP8 storage.
+    for:
+      - triton_reshape_and_cache_flash
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '0.1'
   - id: unpack_seq_triton
     description: Unpack a packed sequence tensor back to its original variable-length
       form.
