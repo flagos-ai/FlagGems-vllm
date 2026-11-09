@@ -75,11 +75,11 @@ def _torch_gather(cache, idx, has):
     )
 
 
-@pytest.mark.kda_state_gather
+@pytest.mark.gather_kda_state
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
-def test_kda_state_gather_perf():
+def test_gather_kda_state_perf():
     KdaStateGatherBenchmark(
-        op_name="kda_state_gather",
+        op_name="gather_kda_state",
         torch_op=_torch_gather,
         gems_op=flaggems_vllm.gather_kda_state,
         dtypes=[torch.bfloat16],

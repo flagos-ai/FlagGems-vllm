@@ -736,7 +736,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '0.3'
-
+  - id: gather_kda_state
+    description: |
+      Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
+      layout expected by the AscendC chunk operator, zeroing slots without an
+      initial state, with the transpose folded into a single kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: gdn_w8a16
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
@@ -983,20 +996,6 @@ ops:
       computes the safe sigmoid gates of Kimi Delta Attention and their
       in-chunk cumulative sums with one program per (chunk, head) tile
       instead of one serial block per sequence.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: kda_state_gather
-    description: |
-      Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
-      layout expected by the AscendC chunk operator, zeroing slots without an
-      initial state, with the transpose folded into a single kernel.
     for:
       - None
     labels:

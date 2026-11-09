@@ -53,6 +53,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gather_kda_state import gather_kda_state
 from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
@@ -76,7 +77,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.kda_state_gather import gather_kda_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
     scatter_kda_state,
 )
