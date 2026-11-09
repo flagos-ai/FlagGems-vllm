@@ -34,7 +34,7 @@ PAD_SLOT_ID = -1
 
 
 @triton.jit(do_not_specialize=["slot_numel", "slot_stride", "pad_slot_id"])
-def _conv_state_gather_kernel(
+def _gather_conv_state_kernel(
     cache,
     indices,
     staged,
@@ -67,7 +67,7 @@ def gather_conv_state(
     ``conv_state[cache_indices[i]]`` (row 0 for PAD entries) and
     ``local_indices[i]`` is ``i`` or ``PAD_SLOT_ID``.
     """
-    logger.debug("GEMS_ASCEND KDA_CONV_GATHER")
+    logger.debug("GEMS_ASCEND GATHER_CONV_STATE")
     flat_indices = cache_indices.reshape(-1)
     n = flat_indices.shape[0]
     slot_numel = conv_state[0].numel()
@@ -77,7 +77,7 @@ def gather_conv_state(
     local_indices = torch.empty_like(flat_indices)
 
     BLOCK = max(2048, triton.next_power_of_2(triton.cdiv(slot_numel, 4)))
-    _conv_state_gather_kernel[(n, triton.cdiv(slot_numel, BLOCK))](
+    _gather_conv_state_kernel[(n, triton.cdiv(slot_numel, BLOCK))](
         conv_state,
         flat_indices,
         staged,
