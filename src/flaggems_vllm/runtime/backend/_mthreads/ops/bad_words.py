@@ -109,12 +109,8 @@ def _bad_words_kernel(
     bad_word_idx = bad_word_tile_idx * BAD_WORDS_TILE + tl.arange(0, BAD_WORDS_TILE)
     active_word = bad_word_idx < num_bad_words
 
-    offsets_base = (
-        bad_word_offsets_ptr + req_state_idx * bad_word_offsets_stride
-    )
-    tokens_base = (
-        bad_word_token_ids_ptr + req_state_idx * bad_word_token_ids_stride
-    )
+    offsets_base = bad_word_offsets_ptr + req_state_idx * bad_word_offsets_stride
+    tokens_base = bad_word_token_ids_ptr + req_state_idx * bad_word_token_ids_stride
     start = _bad_words_load(
         offsets_base + bad_word_idx,
         mask=active_word,
@@ -153,11 +149,7 @@ def _bad_words_kernel(
     total_len = _bad_words_load(total_len_ptr + req_state_idx)
     output_len = total_len - prompt_len
     effective_len = output_len + pos
-    output_base = (
-        all_token_ids_ptr
-        + req_state_idx * all_token_ids_stride
-        + prompt_len
-    )
+    output_base = all_token_ids_ptr + req_state_idx * all_token_ids_stride + prompt_len
 
     matches &= prefix_len <= effective_len
     max_prefix_len = tl.max(tl.where(matches, prefix_len, 0), axis=0)

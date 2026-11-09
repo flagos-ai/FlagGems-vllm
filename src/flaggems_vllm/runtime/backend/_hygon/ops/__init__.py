@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._hygon.ops.bad_words import apply_bad_words
 from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -66,9 +67,6 @@ from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_sca
 from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
-
-from flaggems_vllm.runtime.backend._hygon.ops.bad_words import apply_bad_words
-
 
 __all__ = [
     "apply_bad_words",

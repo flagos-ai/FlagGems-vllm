@@ -29,6 +29,7 @@ try:
 except (ImportError, OSError):
     apply_bad_words_reference = None
 
+
 # vLLM.
 @triton.jit
 def _upstream_bad_words_kernel(
@@ -421,7 +422,9 @@ def _print_performance_table() -> None:
         )
 
     print(f"\n\nBad Words performance summary ({TIMING_BACKEND}, median)")
-    print(f"Active FlagGems backend: {flaggems_vllm.vendor_name} ({flaggems_vllm.device})")
+    print(
+        f"Active FlagGems backend: {flaggems_vllm.vendor_name} ({flaggems_vllm.device})"
+    )
     print(
         f"Warmup: {BENCH_WARMUP_MS} ms; Repetition: {BENCH_REP_MS} ms; "
         f"Outer repeats: {BENCH_REPEAT}"

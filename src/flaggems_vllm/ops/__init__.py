@@ -426,7 +426,6 @@ from flaggems_vllm import runtime as _runtime
 if _runtime.device.vendor_name == "hygon":
     from flaggems_vllm.runtime.backend._hygon.fused import attention as hygon_attention
     from flaggems_vllm.runtime.backend._hygon.ops import (
-        apply_bad_words,
         int8_einsum,
         w8a8_block_int8_bmm,
     )
