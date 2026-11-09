@@ -1623,6 +1623,52 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
+    monkeypatch, precision, apply_router_weight_on_input, inplace
+):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    make_inputs = (
+        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+        9001, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    kwargs = dict(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        w1_scale=s1,
+        w2_scale=s2,
+        bias1=None,
+        bias2=None,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=(
+            QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128
+        ),
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    reference = flaggems_vllm.fused_marlin_moe(**kwargs)
+    monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", 13 << 20)
+    # Exclude one-time kernel tuning from the steady-state workspace bound.
+    flaggems_vllm.fused_marlin_moe(**kwargs)
+    torch_device_fn.synchronize()
+    initial_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = flaggems_vllm.fused_marlin_moe(**kwargs, inplace=inplace)
+    torch_device_fn.synchronize()
+    output_bytes = 0 if inplace else hs.numel() * hs.element_size()
+    assert (
+        torch.cuda.max_memory_allocated() - initial_bytes <= (13 << 20) + output_bytes
+    )
+    gems_assert_equal(actual, reference)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
     monkeypatch, apply_router_weight_on_input

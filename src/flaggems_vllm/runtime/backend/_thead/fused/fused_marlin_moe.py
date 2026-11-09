@@ -50,6 +50,8 @@ from flaggems_vllm.utils import libentry
 _PPU_DIRECT_ROUTE_LIMIT = 32
 _PPU_DENSE_MIN_TOKENS = 4096
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
+# Inputs and the caller-visible output are outside the temporary workspace budget.
+_PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
 _SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_FAST_VARIANTS = {
     QUANT_TYPE_UINT4B8: (False,),
@@ -2025,9 +2027,8 @@ def run_dense_w8a16(
     w2_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     output: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
+    topk_ids: torch.Tensor,
+    chunk_tokens: int,
     scale_safe1: Optional[torch.Tensor],
     scale_safe2: Optional[torch.Tensor],
     is_fp8: bool,
@@ -2047,13 +2048,14 @@ def run_dense_w8a16(
         dtype=torch.bfloat16,
     )
     cache13 = torch.empty(
-        (m * topk * max(n2, k),), device=hidden_states.device, dtype=hidden_states.dtype
+        (chunk_tokens * topk * max(n2, k),),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
     )
-    c1 = cache13[: m * topk * n2].view(m, topk, n2)
-    c3 = cache13[: m * topk * k].view(m, topk, k)
     c2 = torch.empty(
         (m * topk, n), device=hidden_states.device, dtype=hidden_states.dtype
     )
+    routing = _align_grouped_tokens(topk_ids, 64, e) if chunk_tokens == m else None
     b1 = scratch[: w1.numel()].view(e, k, n2).transpose(1, 2)
     b2 = scratch[: w2.numel()].view(e, n, k).transpose(1, 2)
     for index, (quantized_weight, scales, decoded_weight, scale_safe) in enumerate(
@@ -2080,7 +2082,8 @@ def run_dense_w8a16(
             )
         first = index == 0
         config = get_default_config(
-            m,
+            # Token alignment also uses 64 rows for the final, shorter chunk.
+            max(m, _PPU_DENSE_MIN_TOKENS),
             e,
             output_size,
             reduction,
@@ -2088,25 +2091,42 @@ def run_dense_w8a16(
             "bf16",
             gemm_stage="gemm1" if first else "gemm2",
         )
-        invoke_fused_moe_triton_kernel(
-            hidden_states if first else c2,
-            decoded_weight,
-            c1 if first else c3,
-            None,
-            None,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input if first else not apply_router_weight_on_input,
-            topk if first else 1,
-            config,
-            tl.bfloat16,
-        )
-        if first:
-            flat = c1.view(m * topk, n2)
-            silu_and_mul_out(flat[:, :n], flat[:, n:], c2)
-    moe_sum(c3, output)
+        for start in range(0, m, chunk_tokens):
+            end = min(start + chunk_tokens, m)
+            rows = end - start
+            sorted_ids, experts, padded = (
+                routing
+                if routing is not None
+                else _align_grouped_tokens(topk_ids[start:end], 64, e)
+            )
+            intermediate = c2[start * topk : end * topk]
+            projected = cache13[: rows * topk * output_size].view(
+                rows, topk, output_size
+            )
+            invoke_fused_moe_triton_kernel(
+                hidden_states[start:end] if first else intermediate,
+                decoded_weight,
+                projected,
+                None,
+                None,
+                topk_weights[start:end],
+                sorted_ids,
+                experts,
+                padded,
+                (
+                    apply_router_weight_on_input
+                    if first
+                    else not apply_router_weight_on_input
+                ),
+                topk if first else 1,
+                config,
+                tl.bfloat16,
+            )
+            if first:
+                flat = projected.view(rows * topk, n2)
+                silu_and_mul_out(flat[:, :n], flat[:, n:], intermediate)
+            else:
+                moe_sum(projected, output[start:end])
     return output
 
 
@@ -2185,23 +2205,47 @@ def _fused_marlin_moe_impl(
             and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
             and max(w1.numel(), w2.numel()) * 2 <= _PPU_DENSE_MAX_DECODE_BYTES
         ):
-            sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, 64, e)
-            return run_dense_w8a16(
-                hidden_states,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                topk_weights,
-                out,
-                sorted_ids,
-                experts,
-                padded,
-                stage1.scale_safe,
-                stage2.scale_safe,
-                quant_type_id == QUANT_TYPE_FP8_E4M3,
-                apply_router_weight_on_input,
-            )
+            decode_bytes = max(w1.numel(), w2.numel()) * 2
+            # Reserve alignment workspace, padded routes and both FP8 safety scans.
+            fixed_bytes = decode_bytes + 4 * (e + 1) ** 2 + 16 * 63 * e + 8
+            if quant_type_id == QUANT_TYPE_FP8_E4M3:
+                fixed_bytes += 8 * (e + 1) + 4 * e * max(
+                    triton.cdiv(2 * n * (k // group_size), 256),
+                    triton.cdiv(k * (n // group_size), 256),
+                )
+            available_bytes = _PPU_DENSE_MAX_WORKSPACE_BYTES - fixed_bytes
+            # Keep the SiLU intermediates across projections to decode each bank once.
+            batch_tokens = min(m, available_bytes // (4 * topk * n))
+            if batch_tokens < 1:
+                raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
+            for start in range(0, m, batch_tokens):
+                end = min(start + batch_tokens, m)
+                rows = end - start
+                chunk_tokens = min(
+                    rows,
+                    (available_bytes - rows * topk * n * 2)
+                    // (topk * (2 * max(2 * n, k) + 12)),
+                )
+                if chunk_tokens < 1:
+                    raise NotImplementedError(
+                        "PPU dense MoE workspace exceeds its budget"
+                    )
+                run_dense_w8a16(
+                    hidden_states[start:end],
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    topk_weights[start:end],
+                    out[start:end],
+                    topk_ids[start:end],
+                    chunk_tokens,
+                    stage1.scale_safe,
+                    stage2.scale_safe,
+                    quant_type_id == QUANT_TYPE_FP8_E4M3,
+                    apply_router_weight_on_input,
+                )
+            return out
         split_silu = direct and (
             n >= 1024 or quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
         )
@@ -2227,7 +2271,11 @@ def _fused_marlin_moe_impl(
         reduced = direct and m <= 2 and not split_silu
         stage1_topk_weights = topk_weights if apply_router_weight_on_input else None
         stage2_topk_weights = None if apply_router_weight_on_input else topk_weights
-        c2 = torch.empty((m * topk, n), device=out.device, dtype=out.dtype)
+        c2 = (
+            torch.empty((m * topk, n), device=out.device, dtype=out.dtype)
+            if direct
+            else None
+        )
         c1 = (
             torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             if split_silu
