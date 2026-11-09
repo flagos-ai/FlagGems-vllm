@@ -152,7 +152,7 @@ def _ascendc(g, A_log, dt_bias, cu_dev, chunk_indices, lower_bound, chunk):
 # run); the ragged tuples are edge cases beyond the profiled set.
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 @pytest.mark.parametrize("lens", CASES)
 @pytest.mark.parametrize("H", HEAD_COUNTS)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
@@ -166,7 +166,7 @@ def test_kda_gate_cumsum_accuracy(lens, H, dtype):
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 def test_kda_gate_cumsum_empty_batch():
     g, A_log, dt_bias, cu_dev, chunk_indices, cu_host = _make_inputs([0])
     out = flaggems_vllm.kda_gate_cumsum_triton(
@@ -175,7 +175,7 @@ def test_kda_gate_cumsum_empty_batch():
     assert out.shape == g.shape
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 @pytest.mark.skipif(not HAS_ASCENDC, reason="vllm_ascend extension not available")
 @pytest.mark.parametrize("lens", CASES)
 @pytest.mark.parametrize("H", HEAD_COUNTS)
