@@ -40,6 +40,13 @@ def _order_key(values):
 
 
 @triton.jit
+def _filter_order_key(values):
+    # Float comparisons tie signed zeros. Keep the reversible sort key intact.
+    raw = values.to(tl.uint32, bitcast=True)
+    return tl.where(raw == 0x80000000, 0x80000000, _order_key(values))
+
+
+@triton.jit
 def _fill_zero(ptr, size: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     tl.store(ptr + i, 0, mask=i < size)
@@ -336,13 +343,19 @@ def _threshold_counts(
     tl.store(
         less_counts_ptr + count_offset,
         tl.sum(
-            ((_order_key(values) < _order_key(threshold)) & valid).to(tl.int32), axis=0
+            ((_filter_order_key(values) < _filter_order_key(threshold)) & valid).to(
+                tl.int32
+            ),
+            axis=0,
         ),
     )
     tl.store(
         equal_counts_ptr + count_offset,
         tl.sum(
-            ((_order_key(values) == _order_key(threshold)) & valid).to(tl.int32), axis=0
+            ((_filter_order_key(values) == _filter_order_key(threshold)) & valid).to(
+                tl.int32
+            ),
+            axis=0,
         ),
     )
 
@@ -414,10 +427,10 @@ def _stable_threshold_mask(
 
     offsets = row * n + cols
     values = tl.load(logits_ptr + offsets, mask=valid)
-    is_equal = (_order_key(values) == _order_key(threshold)) & valid
+    is_equal = (_filter_order_key(values) == _filter_order_key(threshold)) & valid
     local_equal_rank = tl.cumsum(is_equal.to(tl.int32), axis=0) - 1
     remove_equal = is_equal & (prior_equal + local_equal_rank < tie_remove_count)
-    remove = (_order_key(values) < _order_key(threshold)) | remove_equal
+    remove = (_filter_order_key(values) < _filter_order_key(threshold)) | remove_equal
     if has_k:
         top_k_threshold = tl.load(top_k_threshold_ptr + row)
         remove = remove | (values < top_k_threshold)
@@ -453,9 +466,10 @@ def top_k_top_p(
     Raises:
         NotImplementedError: Unsupported metadata; no torch compute fallback.
 
-    Equal bitwise values are ordered by increasing token index. At the
-    nucleus cutoff, later tokens win ties. vLLM does not specify a stable
-    token order for tied logits; this implementation makes that order explicit.
+    Numerically equal logits, including signed zeros, are filtered in
+    increasing token index. At the nucleus cutoff, later tokens win ties.
+    vLLM does not specify a stable token order for tied logits; this
+    implementation makes that order explicit.
     FP32 softmax/cumsum rounding can change the mask at a nucleus boundary
     compared with another reduction implementation.
     Filter values are not read back to the host for range validation.

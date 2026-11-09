@@ -423,3 +423,98 @@ def test_prefix_guard_graph_changed_inputs(shape, bf16_grid):
         assert_exact(result, expected)
         assert_exact(logits, fresh)
     assert torch.equal(before_rng, torch.cuda.get_rng_state())
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [-0.0, 0.0, 0.0, -0.0],
+        [0.0, -0.0, -0.0, 0.0],
+        [-0.0, 0.0, -0.0, 0.0],
+        [0.0, -0.0, 0.0, -0.0],
+    ],
+)
+@pytest.mark.parametrize("p_value", [0.0, 0.25, 0.5, 0.75, 1.0])
+@pytest.mark.parametrize("mode", ["p", "both"])
+def test_signed_zero_nucleus_boundary(values, p_value, mode):
+    logits = torch.tensor([values], device=flaggems_vllm.device)
+    before = logits.view(torch.int32).clone()
+    p = torch.tensor([p_value], device=logits.device)
+    k = None if mode == "p" else torch.tensor([2], device=logits.device)
+    expected = reference(logits.clone(), k, p)
+    actual = flaggems_vllm.top_k_top_p(logits, p=p, k=k)
+    # Quartile probabilities are exact. Keep the suffix in input-token order,
+    # even when the signed-zero sort bit patterns are interleaved.
+    removed = min(int(4 * (1 - p_value)), 3)
+    assert torch.equal(torch.isfinite(actual)[0].cpu(), torch.arange(4) >= removed)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(logits.view(torch.int32), before)
+
+
+def make_signed_zero_logits(shape, bf16_grid):
+    m, n = shape
+    logits = torch.linspace(-40.0, -30.0, n).repeat(m, 1)
+    if bf16_grid:
+        logits = logits.bfloat16().float()
+    positions = [0, (n - 1) // 3, 2 * (n - 1) // 3, n - 1]
+    patterns = [[-0.0, 0.0, 0.0, -0.0], [0.0, -0.0, -0.0, 0.0]]
+    for row in range(m):
+        logits[row, positions] = torch.tensor(patterns[row % len(patterns)])
+    return logits.to(flaggems_vllm.device)
+
+
+SIGNED_ZERO_SHAPES = [
+    (1, 4097),
+    (3, 257),
+    (31, 131072),
+    (32, 131071),
+    (32, 131072),
+    (64, 151936),
+]
+
+
+@pytest.mark.parametrize("shape", SIGNED_ZERO_SHAPES)
+@pytest.mark.parametrize("bf16_grid", [True, False])
+@pytest.mark.parametrize("mode", ["p", "both"])
+@pytest.mark.parametrize("p_value", [0.0, 0.5, 1.0])
+def test_signed_zero_paths(shape, bf16_grid, mode, p_value):
+    logits = make_signed_zero_logits(shape, bf16_grid)
+    before = logits.view(torch.int32).clone()
+    k, p = filters(*shape, mode)
+    p.fill_(p_value)
+    before_k = None if k is None else k.clone()
+    before_p = p.clone()
+    expected = reference(logits.clone(), k, p)
+    actual = flaggems_vllm.top_k_top_p(logits, p=p, k=k)
+    assert actual.data_ptr() != logits.data_ptr()
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(logits.view(torch.int32), before)
+    assert torch.equal(p, before_p)
+    assert k is None or torch.equal(k, before_k)
+
+
+@pytest.mark.parametrize("shape", [(1, 4097), (3, 257), (32, 131072)])
+@pytest.mark.parametrize("bf16_grid", [True, False])
+@pytest.mark.parametrize("mode", ["p", "both"])
+def test_signed_zero_graph_changed_inputs(shape, bf16_grid, mode):
+    logits = make_signed_zero_logits(shape, bf16_grid)
+    original = logits.clone()
+    k, p = filters(*shape, mode)
+    before_rng = torch.cuda.get_rng_state().clone()
+    flaggems_vllm.top_k_top_p(logits, p=p, k=k)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = flaggems_vllm.top_k_top_p(logits, p=p, k=k)
+    for shift, p_value in [(1, 0.25), (7, 0.5), (31, 0.75)]:
+        fresh = original.roll(shift, dims=1)
+        p.fill_(p_value)
+        if k is not None:
+            k.fill_(min(20 + shift, shape[1]))
+        expected = reference(fresh.clone(), k, p)
+        result.fill_(float("nan"))
+        logits.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(result.view(torch.int32), expected.view(torch.int32))
+        assert torch.equal(logits.view(torch.int32), fresh.view(torch.int32))
+    assert torch.equal(before_rng, torch.cuda.get_rng_state())
