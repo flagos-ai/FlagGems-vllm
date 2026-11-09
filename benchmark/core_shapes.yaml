@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fused_recurrent_gated_delta_rule:
+  # Resolve names through baseline.PERF_CASES to preserve the full workloads.
+  shapes:
+    - [decode1]
+    - [decode16]
+    - [decode64]
+    - [decode256]
+    - [strided]
+    - [mtp]
+    - [ragged]
+    - [tail]
+  shape_desc: "case (baseline.PERF_CASES)"
 fused_recurrent_gated_delta_rule_packed_decode:
   shapes:
     - [1, 8, 16, 128, 128]
@@ -23,6 +35,21 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+fused_indexer_weight_scale:
+  # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
+  shapes:
+    - [4, 32]  # count=1079584
+    - [8, 32]  # count=177584
+    - [35, 32]  # count=158752
+    - [65, 32]  # count=158576
+    - [18, 32]  # count=90288
+    - [46, 32]  # count=90112
+    - [13, 32]  # count=86064
+    - [51, 32]  # count=85888
+    - [24, 32]  # count=20064
+    - [76, 32]  # count=19712
+  shape_desc: "tokens, heads"
+
 gdn_w8a16:
   shapes:
     - [1, 1, 2, 4, 128, 128]
@@ -177,6 +204,14 @@ BlasBenchmark:
     - [16, 4096, 4096, 4096]
   shape_desc: "B, M, N, K"   # shapes are defined as (B, M, N, K)
 
+# Complete dtype/weight/layout bindings live in baseline/grouped_gemma_rmsnorm.py.
+grouped_gemma_rmsnorm:
+  # Keep one wide decode reduction and one model-sized grouped prefill in core.
+  # set_more_shapes() restores the complete baseline matrix in comprehensive.
+  shapes:
+    - [1, 8192, 1]
+    - [128, 10240, 4]
+  shape_desc: "N, DIM, num_groups"
 groupmm:
   shapes:
     - [16, 512, 2048]
@@ -596,3 +631,14 @@ gdn_w8a16_int8:
     - [35, 8192, 32, 128]
     - [51, 8192, 32, 128]
   shape_desc: "decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N"
+
+gate_sigmoid_mul:
+  # Full dtype/layout sweep is defined in baseline/gate_sigmoid_mul.py.
+  shapes:
+    - [1, 1536, contiguous]
+    - [16, 3072, split_gate]
+    - [256, 6144, contiguous]
+    - [511, 12288, split_gate]
+    - [512, 12288, contiguous]
+    - [4096, 12288, split_gate]
+  shape_desc: "tokens, width, gate_layout"

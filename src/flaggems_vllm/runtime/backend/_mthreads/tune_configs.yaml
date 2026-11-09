@@ -253,6 +253,19 @@ w8a8_block_fp8_matmul_mthreads_tle:
     WS: false
   num_warps: 4
   num_stages: 1
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 512
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
 - META:
     BLOCK: 16
@@ -570,11 +583,57 @@ dequantize_and_gather_k_cache:
       num_workers: 4096
     num_warps: 2
 
+ckfg_gate:
+  - META:
+      BD: 32
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BD: 32
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BD: 32
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BD: 64
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BD: 64
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BD: 64
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BD: 32
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BD: 64
+    num_warps: 4
+    num_stages: 2
 kda_kkt_pairs:
   - META: {PAIRS: 16}
     num_warps: 4
     num_stages: 1
 
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 1
 kda_kkt_inter:
   - META: {BK: 32}
     num_warps: 4
@@ -590,4 +649,41 @@ fused_recurrent_kda:
   - META:
       BV: 8
     num_warps: 1
+    num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+    warps:
+      - 4
+      - 8
+    stages:
+      - 1
+
+hc_combine:
+  - META: {BLOCK_D: 128, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 128, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: true}
+    num_warps: 4
     num_stages: 1

@@ -92,7 +92,7 @@ def _gems_scatter(cache, slots, values, bs):
     return out
 
 
-@pytest.mark.paged_scatter
+@pytest.mark.paged_scatter_triton
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
 def test_paged_scatter_perf():
     PagedScatterBenchmark(

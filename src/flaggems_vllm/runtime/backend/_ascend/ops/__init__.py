@@ -42,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache imp
 from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
@@ -55,6 +58,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -99,6 +103,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
+    silu_and_mul_with_clamp,
+    silu_and_mul_with_clamp_out,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
     compute_slot_mapping_parallel,
 )
@@ -131,6 +139,7 @@ __all__ = [
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
@@ -138,6 +147,7 @@ __all__ = [
     "gemma_rms_norm",
     "group_list_cumsum",
     "grouped_topk",
+    "hc_combine",
     "indexer_epilogue",
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
@@ -161,6 +171,8 @@ __all__ = [
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",
+    "silu_and_mul_with_clamp",
+    "silu_and_mul_with_clamp_out",
     "sparse_attn_sharedkv",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
