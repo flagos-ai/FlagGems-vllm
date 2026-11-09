@@ -263,6 +263,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_h16_kr_copy"] = False
     if "ppu_mla_row_subgroups" in available:
         defaults["ppu_mla_row_subgroups"] = False
+    if "ppu_mla_q2_tail" in available:
+        defaults["ppu_mla_q2_tail"] = False
     if "ppu_mla_full_tiles" in available:
         defaults["ppu_mla_full_tiles"] = False
     if "ppu_mla_uniform_request_sort" in available:
@@ -435,6 +437,10 @@ def dense_mla_configs() -> list[triton.Config]:
                 candidate = copy.copy(config)
                 candidate.kwargs = {**config.kwargs, "ppu_mla_full_tiles": True}
                 enabled.append(candidate)
+                if "ppu_mla_q2_tail" in available:
+                    tail = copy.copy(candidate)
+                    tail.kwargs = {**candidate.kwargs, "ppu_mla_q2_tail": True}
+                    enabled.append(tail)
         normalized.extend(enabled)
     return normalized
 
@@ -446,7 +452,8 @@ def _prune_mla_configs(configs, named_args, **kwargs):
     return [
         config
         for config in configs
-        if (
+        if (not config.kwargs.get("ppu_mla_q2_tail") or heads == 2 * heads_per_query)
+        and (
             not config.kwargs.get("ppu_mla_low_probability_layout")
             or (single_query and heads == 32)
         )
