@@ -18,13 +18,21 @@ import time
 
 import pytest
 import torch
-from vllm.v1.worker.gpu.input_batch import (
-    get_num_sampled_and_rejected as vllm_op,
-)
 
 import flaggems_vllm
 
 from . import base
+
+try:
+    from vllm.v1.worker.gpu.input_batch import (
+        get_num_sampled_and_rejected as vllm_op,
+    )
+except Exception as exc:
+    # A baseline is optional, including when its native extensions cannot load.
+    vllm_op = None
+    _VLLM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+else:
+    _VLLM_IMPORT_ERROR = None
 
 
 class GetNumSampledAndRejectedBenchmark(base.Benchmark):
@@ -54,7 +62,7 @@ class GetNumSampledAndRejectedBenchmark(base.Benchmark):
     def _measure_graph_pair(self, sampled, *args, **kwargs):
         # Equal graph sizes avoid provider-specific runtime estimates.
         calls_per_graph = 1024
-        providers = (self.torch_op, self.gems_op)
+        providers = tuple(op for op in (self.torch_op, self.gems_op) if op is not None)
         graphs = {}
         buffers = {}
         outputs = {}
@@ -81,12 +89,13 @@ class GetNumSampledAndRejectedBenchmark(base.Benchmark):
             for actual, expected in zip(outputs[op], references[op]):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             torch.testing.assert_close(buffers[op], sampled, rtol=0, atol=0)
-        for native, gems in zip(outputs[providers[0]], outputs[providers[1]]):
-            torch.testing.assert_close(gems, native, rtol=0, atol=0)
+        if self.torch_op is not None:
+            for native, gems in zip(outputs[self.torch_op], outputs[self.gems_op]):
+                torch.testing.assert_close(gems, native, rtol=0, atol=0)
 
         samples = {op: [] for op in providers}
         # --iter is a measurement budget in ms per provider.
-        budget_seconds = 2 * base.Config.repetition / 1000
+        budget_seconds = len(providers) * base.Config.repetition / 1000
         deadline = time.perf_counter() + budget_seconds
         round_id = 0
         start = torch.cuda.Event(enable_timing=True)
@@ -105,6 +114,11 @@ class GetNumSampledAndRejectedBenchmark(base.Benchmark):
 
 @pytest.mark.get_num_sampled_and_rejected
 def test_get_num_sampled_and_rejected_perf():
+    if vllm_op is None:
+        print(
+            "vLLM baseline unavailable; baseline latency and speedup are N/A. "
+            f"({_VLLM_IMPORT_ERROR})"
+        )
     bench = GetNumSampledAndRejectedBenchmark(
         op_name="get_num_sampled_and_rejected",
         torch_op=vllm_op,

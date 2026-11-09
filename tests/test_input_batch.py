@@ -80,3 +80,17 @@ def test_get_num_sampled_and_rejected_boundary():
 def test_get_num_sampled_and_rejected_random():
     for seed in range(100):
         check_case(SIZES[seed % len(SIZES)], seed)
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dispatch")
+def test_get_num_sampled_and_rejected_thead_dispatch(caplog):
+    from importlib import import_module
+
+    backend = import_module(
+        "flaggems_vllm.runtime.backend._thead.ops.input_batch"
+    )
+    entry = flaggems_vllm.get_num_sampled_and_rejected
+    assert entry is backend.get_num_sampled_and_rejected
+    with caplog.at_level("DEBUG", logger=entry.__module__):
+        check_case(7, seed=0, chunked_percent=50)
+    assert "GEMS_THEAD GET_NUM_SAMPLED_AND_REJECTED" in caplog.text

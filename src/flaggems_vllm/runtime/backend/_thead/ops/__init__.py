@@ -29,6 +29,9 @@ from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
     quantize_gdn_state_int8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
+from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
+    get_num_sampled_and_rejected,
+)
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
@@ -54,6 +57,7 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "get_num_sampled_and_rejected",
     "hc_combine",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
