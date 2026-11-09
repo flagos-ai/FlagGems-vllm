@@ -602,10 +602,11 @@ def _pick_tiles(dim):
         # Tiny channel counts: one whole-row tile, tall token tiles are free.
         return triton.next_power_of_2(max(1, dim)), 32
     if dim <= 2304:
-        # Narrow rows: a 2048-wide tile still covers the whole row (like the
-        # AscendC planner's token-first baseDim), which matters because a
-        # 1024-wide split of a 2304-channel row drops the copy roofline from
-        # 2.3 TB/s to 1.4 TB/s.  UB then caps the token tile at 4.
+        # Narrow rows: wider channel tiles keep each row transfer close to one
+        # burst (a 1024-wide split of a 2304-channel row copies at 1.4 TB/s,
+        # 2048-wide at 2.1 TB/s), at the price of a shorter token tile because
+        # UB caps BLOCK_T * BLOCK_N.  dim=2304 lands on 2048 + a 256-channel
+        # tail tile, which still measured faster than 1024 x 8.
         return 2048, 4
     return 1024, 8
 
