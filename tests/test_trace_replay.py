@@ -1,5 +1,18 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 FlagOS Contributors
+# Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Accuracy tests for trace replay."""
 
 import pytest
@@ -72,7 +85,6 @@ DEVICE = flaggems_vllm.device
 _device_module = getattr(torch, DEVICE, None)
 _HAS_DEVICE = _device_module is not None and _device_module.is_available()
 pytestmark = [
-    pytest.mark.apply_trace_tokens,
     _kernel_mark,
     pytest.mark.skipif(
         not _HAS_DEVICE, reason=f"requires an available {DEVICE} device"
@@ -132,6 +144,7 @@ def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=No
         assert reference_sampled.cpu().tolist() == cpu_expected
 
 
+@pytest.mark.apply_trace_tokens
 def test_replay_overwrites_sampled_at_each_step():
     traces = torch.zeros(2, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
     traces[0, :3] = _i32([100, 101, 102])
@@ -152,6 +165,7 @@ def test_replay_overwrites_sampled_at_each_step():
         )
 
 
+@pytest.mark.apply_trace_tokens
 def test_past_end_of_trace_leaves_sampled_untouched():
     traces = torch.zeros(1, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
     traces[0, :2] = _i32([100, 101])
@@ -160,11 +174,13 @@ def test_past_end_of_trace_leaves_sampled_untouched():
     )
 
 
+@pytest.mark.apply_trace_tokens
 def test_non_trace_request_untouched():
     traces = torch.zeros(1, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
     _assert_replay(_i64([42]), _i32([0]), traces, _i32([0]), _i32([3]), _i32([3]), [42])
 
 
+@pytest.mark.apply_trace_tokens
 def test_idx_mapping_indirection_and_negative_skip():
     traces = torch.zeros(2, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
     traces[1, :2] = _i32([500, 501])
@@ -179,6 +195,7 @@ def test_idx_mapping_indirection_and_negative_skip():
     )
 
 
+@pytest.mark.apply_trace_tokens
 @pytest.mark.parametrize("num_reqs", [5, 33, 127, 128, 129, 256, 257])
 def test_mixed_requests_with_padded_trace_rows(num_reqs):
     row_width = MAX_MODEL_LEN + 3
@@ -193,6 +210,7 @@ def test_mixed_requests_with_padded_trace_rows(num_reqs):
     _assert_replay(_i64([-7] * num_reqs), mapping, traces, lengths, total, prompt)
 
 
+@pytest.mark.apply_trace_tokens
 def test_repeated_request_mapping_and_negative_token():
     traces = torch.zeros(2, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
     traces[0, 0] = -1

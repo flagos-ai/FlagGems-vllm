@@ -61,6 +61,18 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: apply_trace_tokens
+    description: |
+      Overwrite sampled tokens with request-specific trace tokens at the current decode step.
+    for:
+      - apply_trace_tokens
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: beam_search_score
     description: Computes beam search scores by adding cumulative log probabilities
       with new token scores.
