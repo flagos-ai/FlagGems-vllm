@@ -1,0 +1,498 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+# INT8 state arithmetic follows the public contracts from PRs #1037 and #1040.
+
+import logging
+from functools import lru_cache
+
+import torch
+import triton
+import triton.language as tl
+from triton.backends.ascend.driver import NPUUtils
+
+from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import (
+    chunk_gated_delta_rule_fwd,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@triton.jit(do_not_specialize=["TOTAL"])
+def transform_state_kernel(
+    source,
+    target,
+    scales,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    TOTAL,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    DEQUANTIZE: tl.constexpr,
+    TRANSPOSE: tl.constexpr,
+):
+    for task in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
+        group = (task // tl.cdiv(V, BV)).to(tl.int64)
+        column = (task % tl.cdiv(V, BV)) * BV + tl.arange(0, BV)
+        reduction = tl.arange(0, BK)
+        offsets = (group * V + column[:, None]) * K + reduction[None, :]
+        transposed = (group * K + reduction[None, :]) * V + column[:, None]
+        mask = (column[:, None] < V) & (reduction[None, :] < K)
+        source_offsets = transposed if TRANSPOSE else offsets
+        values = tl.load(source + source_offsets, mask, 0).to(tl.float32)
+        if DEQUANTIZE:
+            scale = tl.load(scales + group * V + column, column < V, 0)
+            tl.store(target + transposed, values * scale[:, None], mask)
+        else:
+            store_int8_state(
+                values, target, scales, offsets, group * V + column, mask, column < V
+            )
+
+
+@triton.jit(do_not_specialize=["ROWS"])
+def normalize_qk_kernel(q, k, q_out, k_out, ROWS, K: tl.constexpr, BK: tl.constexpr):
+    for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
+        offsets = row * K + tl.arange(0, BK)
+        mask = tl.arange(0, BK) < K
+        query = tl.load(q + offsets, mask, 0).to(tl.float32)
+        key = tl.load(k + offsets, mask, 0).to(tl.float32)
+        query *= tl.rsqrt(tl.sum(query * query, 0) + 1e-6)
+        key *= tl.rsqrt(tl.sum(key * key, 0) + 1e-6)
+        tl.store(q_out + offsets, query, mask)
+        tl.store(k_out + offsets, key, mask)
+
+
+@triton.jit
+def cast_metadata_kernel(source, target, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(
+        target + offsets,
+        tl.load(source + offsets, offsets < N, 0).to(tl.int64),
+        offsets < N,
+    )
+
+
+@lru_cache(maxsize=1)
+def vector_cores() -> int:
+    return NPUUtils().get_aivector_core_num()
+
+
+def quantize_gdn_state_int8(state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize contiguous [slots,HV,V,K] state with one FP32 scale per V row."""
+    logger.debug("GEMS_ASCEND QUANTIZE_GDN_STATE_INT8")
+    if state.ndim != 4 or not state.is_contiguous():
+        raise ValueError("state must be contiguous [slots,HV,V,K]")
+    if state.device.type != "npu" or state.requires_grad:
+        raise ValueError("state must be an inference-only NPU tensor")
+    if state.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError("state must be FP32, FP16 or BF16")
+    slots, heads, columns, reduction = state.shape
+    if min(heads, columns, reduction) < 1:
+        raise ValueError("state head and feature dimensions must be positive")
+    output = torch.empty(state.shape, device=state.device, dtype=torch.int8)
+    scales = torch.empty(
+        (slots, heads, columns), device=state.device, dtype=torch.float32
+    )
+    if state.numel() == 0:
+        return output, scales
+    total = slots * heads * triton.cdiv(columns, 16)
+    with torch_device_fn.device(state.device):
+        transform_state_kernel[(min(vector_cores(), total),)](
+            state,
+            output,
+            scales,
+            reduction,
+            columns,
+            total,
+            triton.next_power_of_2(reduction),
+            16,
+            False,
+            False,
+        )
+    return output, scales
+
+
+@triton.jit
+def store_int8_state(
+    values,
+    state,
+    scales,
+    offsets,
+    scale_offsets,
+    mask,
+    mask_v,
+):
+    magnitude = tl.max(tl.abs(values), axis=1)
+    safe_magnitude = tl.where(magnitude > 0, magnitude, 127.0)
+    scale = safe_magnitude * (1.0 / 127.0)
+    reciprocal_scale = 127.0 / safe_magnitude
+    # Share one division across the channel instead of dividing every element.
+    rounded = values * reciprocal_scale[:, None] + 0.5
+    quantized = tl.minimum(tl.maximum(tl.floor(rounded), -127), 127)
+    tl.store(state + offsets, quantized.to(tl.int8), mask)
+    tl.store(scales + scale_offsets, scale, mask_v)
+
+
+@triton.jit(do_not_specialize=["TOTAL"])
+def gdn_decode_int8_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    state,
+    scales,
+    output,
+    indices,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    STRIDE_Q: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    STRIDE_V: tl.constexpr,
+    OFFSET_K: tl.constexpr,
+    OFFSET_V: tl.constexpr,
+    STRIDE_A: tl.constexpr,
+    STRIDE_B: tl.constexpr,
+    SCALE: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    TOTAL=1,
+):
+    for task in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
+        sequence_head = (task // tl.cdiv(V, BV)).to(tl.int64)
+        sequence, head = sequence_head // HV, sequence_head % HV
+        query_head = head // (HV // H)
+        column = (task % tl.cdiv(V, BV)) * BV + tl.arange(0, BV)
+        reduction = tl.arange(0, BK)
+        slot = tl.load(indices + sequence).to(tl.int64)
+        output_ptr = output + (sequence * HV + head) * V + column
+        # Slot zero is the null block in vLLM packed decode.
+        if slot <= 0:
+            tl.store(output_ptr, 0.0, column < V)
+        else:
+            group = slot * HV + head
+            offsets = (group * V + column[:, None]) * K + reduction[None, :]
+            mask = (column[:, None] < V) & (reduction[None, :] < K)
+            scale_offsets = group * V + column
+            state_values = tl.load(state + offsets, mask, 0).to(tl.float32)
+            state_scale = tl.load(scales + scale_offsets, column < V, 0)
+            state_values *= state_scale[:, None]
+            query = tl.load(
+                query_ptr + sequence * STRIDE_Q + query_head * K + reduction,
+                reduction < K,
+                0,
+            ).to(tl.float32)
+            key = tl.load(
+                key_ptr + sequence * STRIDE_K + OFFSET_K + query_head * K + reduction,
+                reduction < K,
+                0,
+            ).to(tl.float32)
+            value = tl.load(
+                value_ptr + sequence * STRIDE_V + OFFSET_V + head * V + column,
+                column < V,
+                0,
+            ).to(tl.float32)
+            if NORMALIZE:
+                query *= tl.rsqrt(tl.sum(query * query, 0) + 1e-6)
+                key *= tl.rsqrt(tl.sum(key * key, 0) + 1e-6)
+            query *= SCALE
+            gate = tl.load(a + sequence * STRIDE_A + head).to(tl.float32)
+            gate += tl.load(dt_bias + head).to(tl.float32)
+            softplus = tl.where(gate <= 20.0, tl.log(1.0 + tl.exp(gate)), gate)
+            decay = tl.exp(-tl.exp(tl.load(A_log + head).to(tl.float32)) * softplus)
+            beta = tl.sigmoid(tl.load(b + sequence * STRIDE_B + head).to(tl.float32))
+            state_values *= decay
+            residual = (value - tl.sum(state_values * key[None, :], 1)) * beta
+            state_values = tl.fma(residual[:, None], key[None, :], state_values)
+            result = tl.sum(state_values * query[None, :], 1)
+            tl.store(output_ptr, result, column < V)
+            store_int8_state(
+                state_values,
+                state,
+                scales,
+                offsets,
+                scale_offsets,
+                mask,
+                column < V,
+            )
+
+
+def gdn_w8a16_int8(
+    mixed_qkv: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    state_int8: torch.Tensor,
+    state_scale: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-token-per-sequence GDN with in-place INT8 state.
+
+    State layout follows vLLM: [slots, HV, V, K]. Scales are [slots, HV, V].
+    Positive indices must be distinct and within the state allocation; nonpositive
+    indices are null slots. Callers retain ownership of state and scale buffers.
+    Output must not overlap read-only inputs.
+    QKV can be packed [T,2*H*K+HV*V] or a tuple of contiguous Q/K[1,T,H,K]
+    and V[1,T,HV,V] tensors. The tuple route does not allocate a packed buffer.
+    """
+    logger.debug("GEMS_ASCEND GDN_W8A16_INT8")
+    if not isinstance(scale, (float, int)) or not isinstance(
+        use_qk_l2norm_in_kernel, bool
+    ):
+        raise TypeError("scale and normalization must be Python numeric/bool scalars")
+    if state_int8.ndim != 4:
+        raise ValueError("expected four-dimensional state")
+    slots, heads, columns, reduction = state_int8.shape
+    if columns < 1 or reduction < 1 or heads < 1 or slots < 1:
+        raise ValueError("state dimensions must be positive")
+    if isinstance(mixed_qkv, tuple):
+        if len(mixed_qkv) != 3:
+            raise ValueError("separate QKV must contain three tensors")
+        query, key, value = mixed_qkv
+        activation_tensors = mixed_qkv
+        if query.ndim != 4 or query.shape != key.shape or query.shape[0] != 1:
+            raise ValueError("separate Q/K must have matching [1,T,H,K] shapes")
+        tokens, query_heads = query.shape[1:3]
+        if query.shape[3] != reduction or value.shape != (1, tokens, heads, columns):
+            raise ValueError("separate QKV dimensions do not match the state")
+        stride_q, stride_k, stride_v = query.stride(1), key.stride(1), value.stride(1)
+        offset_k, offset_v = 0, 0
+    else:
+        if mixed_qkv.ndim != 2:
+            raise ValueError("packed QKV must be two-dimensional")
+        tokens, packed = mixed_qkv.shape
+        query_dim = packed - heads * columns
+        if query_dim <= 0 or query_dim % (2 * reduction):
+            raise ValueError("packed QKV dimensions do not match the state")
+        query_heads = query_dim // (2 * reduction)
+        query = key = value = mixed_qkv
+        activation_tensors = (mixed_qkv,)
+        stride_q = stride_k = stride_v = mixed_qkv.stride(0)
+        offset_k, offset_v = query_heads * reduction, 2 * query_heads * reduction
+    if query_heads < 1 or heads % query_heads:
+        raise ValueError("value heads must be divisible by query heads")
+    if query.dtype not in (torch.bfloat16, torch.float16) or any(
+        tensor.dtype != query.dtype for tensor in activation_tensors
+    ):
+        raise TypeError("QKV must share a BF16 or FP16 dtype")
+    if state_int8.dtype != torch.int8 or state_scale.dtype != torch.float32:
+        raise TypeError("state and scales must be INT8 and FP32")
+    if state_scale.shape != (slots, heads, columns):
+        raise ValueError("state scales must have shape [slots, HV, V]")
+    if a.shape != (tokens, heads) or b.shape != a.shape:
+        raise ValueError("a and b must have shape [tokens, HV]")
+    if a.dtype != query.dtype or b.dtype != query.dtype:
+        raise TypeError("gate activations must match QKV dtype")
+    if A_log.shape != (heads,) or dt_bias.shape != (heads,):
+        raise ValueError("A_log and dt_bias must have shape [HV]")
+    if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
+        raise TypeError("A_log and dt_bias must be FP32")
+    if out.shape != (tokens, 1, heads, columns) or out.dtype != query.dtype:
+        raise ValueError("out must match activation dtype and shape [tokens, 1, HV, V]")
+    if ssm_state_indices.shape != (tokens,) or ssm_state_indices.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("state indices must be an integer vector of length tokens")
+    tensors = (
+        *activation_tensors,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state_int8,
+        state_scale,
+        out,
+        ssm_state_indices,
+    )
+    if query.device.type != "npu" or any(
+        tensor.device != query.device for tensor in tensors
+    ):
+        raise ValueError("all tensors must be on the same accelerator")
+    if any(tensor.requires_grad for tensor in tensors):
+        raise NotImplementedError("GDN INT8 state is forward-only")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all buffers must be contiguous")
+    if not tokens:
+        return out, state_int8
+    block_v = 64 if reduction == columns == 128 else 16
+    total = tokens * heads * triton.cdiv(columns, block_v)
+    with torch_device_fn.device(query.device):
+        gdn_decode_int8_kernel[(min(vector_cores(), total),)](
+            query,
+            key,
+            value,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state_int8,
+            state_scale,
+            out,
+            ssm_state_indices,
+            query_heads,
+            heads,
+            reduction,
+            columns,
+            stride_q,
+            stride_k,
+            stride_v,
+            offset_k,
+            offset_v,
+            a.stride(0),
+            b.stride(0),
+            float(scale),
+            use_qk_l2norm_in_kernel,
+            triton.next_power_of_2(reduction),
+            block_v,
+            TOTAL=total,
+        )
+    return out, state_int8
+
+
+def chunk_gated_delta_rule_w8a16_int8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state_int8: torch.Tensor,
+    state_scale: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefill with INT8 [N,HV,V,K] state and FP32 per-channel scales.
+
+    Packed variable-length calls provide consistent 64-token chunk metadata.
+    State is dequantized once, accumulated across all chunks, and requantized
+    once at the end. This entry is forward-only and mutates state and scales.
+    """
+    logger.debug("GEMS_ASCEND CHUNK_GATED_DELTA_RULE_W8A16_INT8")
+    if q.ndim != 4 or q.shape != k.shape or v.ndim != 4:
+        raise ValueError("expected Q/K[B,T,H,K] and V[B,T,HV,V]")
+    batch, tokens, query_heads, reduction = q.shape
+    heads, columns = v.shape[-2:]
+    if batch != 1 or reduction != 128 or columns != 128:
+        raise NotImplementedError("prefill supports packed B=1 and K=V=128")
+    if query_heads < 1 or heads % query_heads or v.shape[:2] != q.shape[:2]:
+        raise ValueError("invalid QKV head or token dimensions")
+    if (
+        q.dtype not in (torch.bfloat16, torch.float16)
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+    ):
+        raise TypeError("QKV must share a BF16 or FP16 dtype")
+    if g.shape != (batch, tokens, heads) or beta.shape != g.shape:
+        raise ValueError("g and beta must have shape [1,T,HV]")
+    if g.dtype != torch.float32 or beta.dtype != q.dtype:
+        raise TypeError("log gates must be FP32 and beta must match QKV dtype")
+    sequences = batch if cu_seqlens is None else cu_seqlens.numel() - 1
+    if sequences < 1 or state_int8.shape != (sequences, heads, columns, reduction):
+        raise ValueError("state must have shape [N,HV,V,K]")
+    if state_int8.dtype != torch.int8 or state_scale.dtype != torch.float32:
+        raise TypeError("state and scales must be INT8 and FP32")
+    if state_scale.shape != (sequences, heads, columns):
+        raise ValueError("state scales must have shape [N,HV,V]")
+    if cu_seqlens is None:
+        if chunk_indices is not None or chunk_offsets is not None:
+            raise ValueError("chunk metadata requires cu_seqlens")
+        metadata = ()
+    else:
+        if chunk_indices is None or chunk_offsets is None:
+            raise ValueError("varlen prefill requires chunk_indices and chunk_offsets")
+        if (
+            cu_seqlens.ndim != 1
+            or chunk_indices.ndim != 2
+            or chunk_indices.shape[1] != 2
+            or chunk_offsets.shape != (sequences + 1,)
+        ):
+            raise ValueError("invalid variable-length metadata shapes")
+        metadata = (cu_seqlens, chunk_indices, chunk_offsets)
+        if any(tensor.dtype not in (torch.int32, torch.int64) for tensor in metadata):
+            raise TypeError("chunk metadata must be integer tensors")
+    tensors = (q, k, v, g, beta, state_int8, state_scale, *metadata)
+    if q.device.type != "npu" or any(
+        tensor.device != q.device or not tensor.is_contiguous() for tensor in tensors
+    ):
+        raise ValueError("all inputs must be contiguous and on one accelerator")
+    if any(tensor.requires_grad for tensor in tensors):
+        raise NotImplementedError("INT8-state GDN is forward-only")
+    if tokens == 0:
+        return torch.empty(v.shape, device=q.device, dtype=q.dtype), state_int8
+    launch_scale = reduction**-0.5 if scale is None else float(scale)
+    with torch_device_fn.device(q.device):
+        initial = torch.empty(
+            (sequences, heads, reduction, columns), device=q.device, dtype=torch.float32
+        )
+        total = sequences * heads * triton.cdiv(columns, 16)
+        transform_state_kernel[(min(vector_cores(), total),)](
+            state_int8,
+            initial,
+            state_scale,
+            reduction,
+            columns,
+            total,
+            reduction,
+            16,
+            True,
+            False,
+        )
+        if use_qk_l2norm_in_kernel:
+            q_norm, k_norm = torch.empty_like(q), torch.empty_like(k)
+            normalize_qk_kernel[(min(vector_cores(), tokens * query_heads),)](
+                q,
+                k,
+                q_norm,
+                k_norm,
+                tokens * query_heads,
+                reduction,
+                reduction,
+            )
+        else:
+            q_norm, k_norm = q, k
+        if cu_seqlens is not None and cu_seqlens.dtype != torch.int64:
+            cu_long = torch.empty(cu_seqlens.shape, device=q.device, dtype=torch.int64)
+            cast_metadata_kernel[(triton.cdiv(cu_seqlens.numel(), 256),)](
+                cu_seqlens,
+                cu_long,
+                cu_seqlens.numel(),
+                256,
+            )
+        else:
+            cu_long = cu_seqlens
+        _, output, _, final, _, _, _ = chunk_gated_delta_rule_fwd(
+            q_norm,
+            k_norm,
+            v,
+            g,
+            beta,
+            launch_scale,
+            initial,
+            True,
+            cu_long,
+        )
+        transform_state_kernel[(min(vector_cores(), total),)](
+            final,
+            state_int8,
+            state_scale,
+            reduction,
+            columns,
+            total,
+            reduction,
+            16,
+            False,
+            True,
+        )
+    return output, state_int8
