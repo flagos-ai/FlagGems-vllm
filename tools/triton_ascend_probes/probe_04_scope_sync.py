@@ -1,22 +1,27 @@
-"""GAP: express a Cube->Vector producer/consumer hand-off in one kernel.
+"""探针 04: scope 混核分工与跨核同步 (GAP F3)
 
-What we need (the shape of an AscendC mixed-core pipeline such as
-chunk_kda_fwd_prepare): the Cube scope runs `tl.dot`, hands the result to GM;
-the Vector scope consumes it; the two overlap across loop iterations.
-The Triton front door for this is `al.scope("cube"|"vector")` plus
-`al.sync_block_set/wait`.
+【背景与目标】
+在单个 kernel 内表达 Cube 与 Vector 的混核流水分工（对应 AscendC 的 AIC/AIV C2/C4/C5/C7 流水）：
+Cube scope 负责 tl.dot 计算并将结果写入 GM，Vector scope 从 GM 消费该结果进行后续运算，
+两核在循环间流水重叠。
+Triton 提供的机制为 al.scope("cube"|"vector") 以及 al.sync_block_set/wait。
 
-Current state (Ascend950DT_9582):
-  MODE=scope       default flags                      -> SIGSEGV in bishengir
-  MODE=scope_noauto enable_mixed_cv + disable_auto_    -> compiles, WRONG
-                   inject_block_sync                     (stale/zero exchange)
-  MODE=scope_sync  same flags + explicit sync_block_* -> correct (manual)
-  MODE=noscope_sync no scopes, sync_block_* + default -> correct (fallback used
-                                                        by chunk_gated_delta_rule)
+【实测现象】(Ascend950DT_9582 / triton-ascend 3.6.0.post2)
+  1. MODE=scope       (默认编译选项):
+     -> 失败: BiShengIR 段错误 SIGSEGV (11)
+  2. MODE=scope_noauto(开启 enable_mixed_cv=True, disable_auto_inject_block_sync=True):
+     -> 编译通过，但运算结果错误 (maxerr ≈ 1e2，读到了未完成写入的脏数据)
+  3. MODE=scope_sync  (同上编译选项 + 手工插入 sync_block_set / wait 同步标志):
+     -> 正确: PASS (maxerr ≈ 1.5e-5)
+  4. MODE=noscope_sync(默认编译选项，不使用 scope，仅手工插入 sync_block_*):
+     -> 正确: PASS (maxerr ≈ 1.5e-5，当前 GDN 算子的临时规避方案)
 
-Usage:
-    PYTHONPATH=src:FlagGems/src python probe_04_scope_sync.py scope
-    ... scope_noauto | scope_sync | noscope_sync
+【结论】
+默认的 scope 自动同步机制崩溃；关闭自动同步后需用户手工管理 flag 同步。
+此外，API 注释与实际行为存在脱节（注释要求 sync_block_* 必须在匹配的 scope 内，实测不加 scope 也能工作）。
+
+运行方式:
+    PYTHONPATH=src:FlagGems/src python probe_04_scope_sync.py [scope|scope_noauto|scope_sync|noscope_sync]
 """
 
 import sys

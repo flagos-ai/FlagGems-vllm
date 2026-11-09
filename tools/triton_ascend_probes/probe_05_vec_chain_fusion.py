@@ -1,28 +1,34 @@
-"""GAP: fuse a long elementwise chain instead of one UB round-trip per op.
+"""探针 05: 长 exp2/select 链的向量指令融合 (GAP F5)
 
-The KDA Prepare/Gram kernels spend most of their time on chains of [64, 128]
-elementwise ops (safe-gate sigmoid, cumsum, exp2, masks, 5-7 multiplies).  On
-AscendC these are hand-fused into a handful of vector instructions; through
-Triton each `tl` op is emitted as a separate vector op with its own UB
-read/write, which is what caps the kernels at ~10% of the vector peak.
+【背景与目标】
+KDA Prepare/Gram kernel 的耗时瓶颈在于大量的 [64, 128] 逐元素向量运算链
+（sigmoid -> cumsum -> exp2 -> masks -> 5~7 次乘法）。
+在 AscendC 中，此类计算链会被手动融合为少数几条紧凑的向量指令；
+而在 Triton 中，每个 tl op 会被拆解为独立的向量操作并伴随频繁的 UB 读写往返，
+导致向量单元利用率受限在 ~10%。
 
-This probe measures the marginal cost of one dependent `[64, 128]` fp32
-elementwise op across the whole grid (12288 programs, i.e. the KDA Prepare
-grid at T=32768/H=24), and tries the available fusion switches.
+本探针通过在全网格（12288 个 program，对应 T=32768/H=24 网格规模）上
+构造依赖链 a = exp2(a * 1e-4) + where(a > 0.5, 1, 0)，评测长链下的边际开销与融合表现。
 
-Observed on Ascend950DT_9582 (triton-ascend 3.6.0.post2):
-    N extra ops   duration      marginal per grid-wide op
-    0             ~0.1 ms       -
-    4             ~0.6 ms       ~0.13 ms
-    8             ~1.1 ms       ~0.13 ms
-    12            ~1.6 ms       ~0.13 ms
-i.e. ~0.13 ms per dependent [64,128] op for the whole grid, or ~0.67 us per op
-per AIV (192 programs/core).  `vf_fusion_mode` only accepts max-parallel /
-all-op / ub-aware-op; `all-op` does not compile and the other two are neutral.
+【实测现象】(Ascend950DT_9582 / triton-ascend 3.6.0.post2)
+    额外 op 数 (N)   全网格耗时     单 op 边际耗时
+    0               ~255 us        -
+    4               ~271 us        ~4 us/op   (短链成功融合)
+    8               ~794 us        ~67 us/op  (出现性能断崖)
+    12              ~1478 us       ~101 us/op (单 AIV 约 0.53 us/op)
 
-Usage:
+【融合编译选项测试】
+vf_fusion_mode 提供了 max-parallel / all-op / ub-aware-op 三种模式：
+- all-op: 编译失败；
+- max-parallel 与 ub-aware-op: 性能与默认表现一致，未见改善。
+
+【结论】
+≤4 的短 op 链可被良好融合；达到 8 个 op 后编译器退化为逐 op 往返 UB，
+每增加一个 [64, 128] op 全网格开销递增约 100 us，直接构成了 Gram kernel 2.6 ms 的主要开销来源。
+
+运行方式:
     PYTHONPATH=src:FlagGems/src python probe_05_vec_chain_fusion.py
-    VF_MODE=all-op ... python probe_05_vec_chain_fusion.py   # shows the failure
+    VF_MODE=all-op PYTHONPATH=src:FlagGems/src python probe_05_vec_chain_fusion.py  # 观察编译失败
 """
 
 import os

@@ -1,116 +1,91 @@
-# triton-ascend 编译器能力需求（KDA chunk 前向 / Ascend950DT arch35）
+# chunk_kda_fwd 算子在 Ascend950DT 上对编译器能力需求
 
-本文档逐个列出 FlagGems-vllm 的 KDA chunk 前向（`chunk_kda`）在 **stock
-triton-ascend 3.6.0.post2（不使用 FlagTree/TLE）** 上落地 AscendC 级优化时，
-遇到的编译器能力缺口。每个特性都附一个可直接运行的最小验证程序，报错文本
-均为本机实测（Ascend950DT_9582，CANN 8.5，`torch_npu` 2.9）。
+## 背景介绍
 
-复现环境：
+FlagGems-vllm 仓库的 [chunk_kda](https://github.com/flagos-ai/FlagGems-vllm/tree/ascend_kda) 算子在 Ascend950DT 上进行了一轮优化，部分场景下性能超过 vllm-ascend 仓库调用 [flash-linear-attention-npu](https://github.com/flashserve/flash-linear-attention-npu)，但在长序列对齐分块场景下性能不足。
 
-```shell
-cd <flag-gems-vllm>
-PYTHONPATH=src:FlagGems/src python tools/triton_ascend_probes/probe_XX_*.py ...
-```
+目前定位到是 triton-ascend 相比 Ascend C 的表达能力限制，导致无法复刻 [flash-linear-attention-npu](https://github.com/flashserve/flash-linear-attention-npu) 中的计算逻辑。因此，对 FlagTree 编译器提出特性需求。
 
-## 0. 背景：为什么需要这些能力
+## 优化目标
 
-KDA chunked prefill 在 AscendC（`aclnnChunkKdaFwdV2`）里是 `Prepare → FwdH →
-Finalize` 三段，Prepare 内部再用手写 AIC+2×AIV 流水、4 head/轮乒乓、L1 常驻
-Q+/K+/K−。我们的 Triton 版本已经对齐了三段式并做了源级 AIV/AIC 重叠，当前
-T=32768/H=24/seqs=2 的分核耗时（us）：
+KDA chunked prefill 在原生 AscendC（`aclnnChunkKdaFwdV2`）中分为 `Prepare → FwdH → Finalize` 三阶段 。其中 Prepare 阶段通过手写 AIC + 2×AIV 混核流水、4-head 乒乓调度以及 L1 驻留 Q+/K+/K- 面板实现了极 致的延迟隐藏。
 
-| kernel | FlagGems(Triton) | AscendC | 说明 |
-|---|---:|---:|---|
-| Prepare（我们拆成 prep + Gram） | 1353 + 2649 | 1654 + 413(l2norm) | 主要差距 |
-| FwdH | 1266 | 840 | AIC MTE2 占 73% |
-| Finalize | 421 | 718 | 已优于 AscendC |
+在 FlagGems Triton 版本中，我们已对齐三阶段结构并完成了源码级 AIV/AIC 重叠。在典型评测形状（$T=32768, H=24, \text{seqs}=2$）下的分阶段耗时对比如下（单位：$\mu s$）：
 
-性能剖析（Level1，拆分前的融合版 Prepare）显示 `aiv_vec_ratio=75.4%`、
-`aic_mac_ratio=6.2%`：AIV 向量链是关键路径，AIC 大部分时间在等。AscendC 靠 L1 常驻操作数 + 32 行
-子块因子 + 混核流水把 Prepare 压到我们的一半。下面 5 个特性就是这条路上
-Triton 缺的东西。
+| Kernel 阶段                           | FlagGems (Triton) | 原生 AscendC            | 差距分析与现状                |
+|:----------------------------------- |:-----------------:|:---------------------:|:---------------------- |
+| **Prepare**（Triton 拆分为 prep + Gram） | 1353 + 2649       | 1654 + 413 (含 l2norm) | **主要性能差距来源**（落后约 2 倍）  |
+| **FwdH**                            | 1266              | 840                   | AIC MTE2 访存占比 73%      |
+| **Finalize**                        | 421               | 718                   | **Triton 已优于 AscendC** |
 
-## 1. 结论速览
+性能剖析（Level 1，拆分前的融合版 Prepare）表明：`aiv_vec_ratio = 75.4%`，`aic_mac_ratio = 6.2%`。这说明 **AIV 向量指令计算链是当前的核心关键路径**，Cube 单元大部分时间处于空闲等待状态。
 
-| 编号 | 编译器特性 | 现状 | 被阻塞的优化 | 探针 |
-|---|---|---|---|---|
-| **F1** | 显式 L1 驻留的 dot 操作数 | **API 存在，链路中断（关键在 `bl.to_tensor`）** | AscendC 式 L1 常驻面板 | `probe_01_l1_resident_dot.py` |
-| **F2** | `insert_slice` 拼装 dot 操作数 | **BiShengIR SIGABRT（Unknown PIPE!）** | 32 行子块门控（向量工作量减半） | `probe_03_insert_slice_dot.py` |
-| **F3** | `scope` 混核 + 自动跨核同步 | **默认 SIGSEGV；关自动同步后结果错** | AscendC C2/C4/C5/C7 流水 | `probe_04_scope_sync.py` |
-| **F4** | 跨 chunk 软件流水的 UB/L1 预算 | **UB 5.57 Mbit / L1 6.29 Mbit 溢出** | 隐藏 cube 等待（约 0.5–1 ms） | `probe_06_cross_chunk_l1_budget.py` + 真 kernel |
-| **F5** | 长 `exp2/select` 链的向量融合 | **短链可融，N≥8 出现断崖** | gate cumsum/因子链 | `probe_05_vec_chain_fusion.py` |
+AscendC 主要依靠 **L1 常驻操作数**、**32 行子块门控** 以及 **AIC/AIV 混核跨 chunk 流水** 将 Prepare 阶段耗时压制到 Triton 的一半以内。下文详述阻碍 Triton 实现上述优化的 5 项核心编译器能力缺口。
 
-已确认**可用**、无需改动的能力（供编译器团队排除）：
+## 需求与现状速览
 
-| 能力 | 现状 | 探针 |
-|---|---|---|
-| 列偏移 `extract_slice` 作 dot 操作数 | PASS（maxerr 7.6e-6） | `probe_02` col |
-| 行偏移 `extract_slice` 作 dot 操作数 | PASS（maxerr 5.3e-5） | `probe_02` row |
-| `al.sync_block_set/wait`（不加 scope） | PASS（maxerr 1.5e-5） | `probe_04` noscope_sync |
-| `al.copy(UB buffer → L1 buffer)` 前端类型检查 | 通过（见 F1，后端仍断） | `probe_01` |
+### 待解决的编译器问题清单
 
-## 2. F1：显式 L1 驻留的 dot 操作数
+| 编号     | 核心特性                      | 现状表现                                                         | 阻塞的算子优化                                    | 验证探针脚本                                                                                                                         |
+|:------ |:------------------------- |:------------------------------------------------------------ |:------------------------------------------ |:------------------------------------------------------------------------------------------------------------------------------ |
+| **F1** | 显式 L1 驻留的 dot 操作数         | **前端 API 完备，但 lowering 阶段报错**（关键阻碍：`bl.to_tensor` 生成错误的地址空间） | 无法实现 AscendC 式 L1 常驻面板，产生大量冗余搬运            | [`probe_01_l1_resident_dot.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_01_l1_resident_dot.py)             |
+| **F2** | `insert_slice` 拼装 dot 操作数 | **BiShengIR 崩溃** (`LLVM ERROR: Unknown PIPE!` / SIGABRT)     | 无法实施 32 行子块门控计算（导致向量工作量翻倍）                 | [`probe_03_insert_slice_dot.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_03_insert_slice_dot.py)           |
+| **F3** | `scope` 混核声明与自动跨核同步       | **默认配置下 SIGSEGV**；关闭自动同步后产生脏读导致精度错误                          | 无法通过声明式 `scope` 构建 AIC/AIV 混核流水            | [`probe_04_scope_sync.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_04_scope_sync.py)                       |
+| **F4** | 跨 chunk 软件流水与容量预算         | **编译期空间溢出**（UB 溢出 5.57 Mbit，L1 溢出 6.29 Mbit）                 | 无法做跨 chunk 流水来掩盖 Cube 等待开销（影响约 0.5~1.0 ms） | [`probe_06_cross_chunk_l1_budget.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_06_cross_chunk_l1_budget.py) |
+| **F5** | 长 `exp2/select` 链的向量融合    | **短链 (N≤4) 可融合，长链 (N≥8) 出现性能断崖**                             | 无法折叠复杂的门控因子计算链，UB 往返开销严重                   | [`probe_05_vec_chain_fusion.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_05_vec_chain_fusion.py)           |
 
-### 需求
+### 已确认可用能力（供编译器团队参考排除）
 
-AscendC Prepare 把 Q+/K+/K− 放 L1，多个 dot 复用，不反复走 UB→L1 自动 staging。
-我们想写：
+| 特性能力                                       | 验证现状                                     | 对应探针                                                                                                                               |
+|:------------------------------------------ |:---------------------------------------- |:---------------------------------------------------------------------------------------------------------------------------------- |
+| 列偏移 `extract_slice` 作为 dot 操作数             | **PASS**（精度误差 $\le 7.6 \times 10^{-6}$）  | [`probe_02_slice_as_dot_operand.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_02_slice_as_dot_operand.py) `col` |
+| 行偏移 `extract_slice` 作为 dot 操作数             | **PASS**（精度误差 $\le 5.3 \times 10^{-5}$）  | [`probe_02_slice_as_dot_operand.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_02_slice_as_dot_operand.py) `row` |
+| 手工插入 `al.sync_block_set/wait`（不使用 `scope`） | **PASS**（精度误差 $\le 1.5 \times 10^{-5}$ ） | [`probe_04_scope_sync.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_04_scope_sync.py) `noscope_sync`            |
+| `al.copy(UB buffer → L1 buffer)` 前端类型检查    | **通过**（语法受支持，受阻于后端 lowering，见 F1）        | [`probe_01_l1_resident_dot.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_01_l1_resident_dot.py) `copy`          |
+
+## 详细需求与分析
+
+### F1：显式 L1 驻留的 dot 操作数
+
+#### 1. 业务场景与诉求
+
+在 AscendC Prepare 实现中，Q+/K+/K- 操作数被保存在 L1 中，供后续 6 个点积操作多次复用，无需在每次计 算时反复执行 UB $\rightarrow$ L1 staging 搬运。
+在 Triton 中的理想书写模式如下：
 
 ```python
 ub = bl.alloc(tl.bfloat16, [BT, K], al.ascend_address_space.UB)
 l1 = bl.alloc(tl.bfloat16, [BT, K], al.ascend_address_space.L1)
-al.copy(bl.to_buffer(a, bind_buffer=ub), ub)   # SSA -> UB
+al.copy(bl.to_buffer(a, bind_buffer=ub), ub)   # SSA Tensor -> UB Buffer
 al.copy(ub, l1)                                 # UB -> L1
-at = bl.to_tensor(l1)                           # L1 视图
-c = tl.dot(at, tl.trans(at))                    # cube 直接读 L1
+at = bl.to_tensor(l1)                           # 构造 L1 视图
+c = tl.dot(at, tl.trans(at))                    # Cube 单元直接读取 L1 数据
 ```
 
-### 现状：**不支持**（API 齐全，链路多处断点）
+#### 2. 现状与错误分析
 
-| 步骤 | 结果 |
-|---|---|
-| `al.copy(UB buffer → L1 buffer)` 的前端类型检查 | 通过（`semantic.copy` 要求 src=UB、dst∈{UB,L1}） |
-| 用 `bind_buffer=ub` 从 SSA tensor 填 UB，再 copy 到 L1 | `'memref.alloc' op error: read before first write` |
-| 用位置参数 `bl.to_buffer(a, space=UB)` 填 UB | `'hivm.hir.pointer_cast' op addrs of PointerCastOp should not be empty!` |
-| `tl.store` 写 `bl.to_tensor(ub, writable=True)` 的视图 | `Unsupported ptr type <['64','128'], fp32> in tl.store` |
-| **`bl.to_tensor(l1)`**（关键最后一步） | `different memory spaces specified for base memref type 'memref<64x128xbf16, #hivm.address_space<cbuf>>' and subview memref type 'memref<1x128xbf16, strided<[128, 1], offset: ?>, #hivm.address_space<ub>>'` |
+前端语法虽然完整，但 lowering 阶段存在多处阻断：
 
-最后一处说明：`bl.to_tensor` 在 lowering 时给 L1 buffer 生成了带 **UB**
-地址空间的 `memref.subview`，与基址的 `cbuf` 不一致——这是整条链路上
-**最致命**的一处（即使前面都修好，没有 L1 视图也无法把数据交给 dot）。
-另外，用 `bind_buffer` 填 UB 的写法虽然能过前端，lowering 仍会报
-read-before-write（见第一行），所以完整可用路径目前为 0。
+| 调用方式                                                    | 错误表现                                                                                                                                                                                                          |
+|:------------------------------------------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `al.copy(UB buffer → L1 buffer)`                        | 前端类型检查通过（`semantic.copy` 允许 src=UB, dst $\in$ {UB, L1}）                                                                                                                                                       |
+| 使用 `bind_buffer=ub` 将 SSA Tensor 写入 UB，再搬运至 L1          | `'memref.alloc' op error: read before first write`                                                                                                                                                            |
+| 使用位置参数 `bl.to_buffer(a, space=UB)` 填充 UB                | `'hivm.hir.pointer_cast' op addrs of PointerCastOp should not be empty!`                                                                                                                                      |
+| 尝试通过 `tl.store` 写入 `bl.to_tensor(ub, writable=True)` 视图 | `Unsupported ptr type <['64','128'], fp32> in tl.store`                                                                                                                                                       |
+| **`bl.to_tensor(l1)`（关键阻塞点）**                           | `different memory spaces specified for base memref type 'memref<64x128xbf16, #hivm.address_space<cbuf>>' and subview memref type 'memref<1x128xbf16, strided<[128, 1], offset: ?>, #hivm.address_space<ub>>'` |
 
-### 最小验证程序
+> [!IMPORTANT]
+> `bl.to_tensor` 在 lowering 阶段为 L1 buffer 错误生成了带有 **UB** 地址空间的 `memref.subview`，与 基底类型的 `cbuf` 空间冲突。这是当前最关键的阻塞点。
 
-`probe_01_l1_resident_dot.py`：
+#### 3. 期望行为
 
-```shell
-python probe_01_l1_resident_dot.py copy   # 填 UB + UB->L1：read before first write
-python probe_01_l1_resident_dot.py dot    # 加 to_tensor(L1)+dot：cbuf/ub 地址空间不一致
-```
+- `bl.to_tensor(l1_buffer)` 应正确输出带有 **cbuf 地址空间**的 Tensor，可直接作为 `tl.dot` 的输入操 作数；或提供显式接口（如 `al.dot(..., a_in_l1=...)`）。
+- `memref.alloc` 的活跃性分析能够识别 `al.copy`，避免误报 read-before-write。
 
-### 期望语义
+### F2：`insert_slice` 拼装 dot 操作数
 
-- `bl.to_tensor(l1_buffer)` 产出 **cbuf 地址空间**的 tensor，可直接作
-  `tl.dot` 的 A/B 操作数（无需 UB 中转）；
-- 或提供 `al.dot(..., a_in_l1=...)` 之类的显式接口；
-- `bl.to_tensor(ub, writable=True)` 应可作为 `tl.store`/`insert_slice` 的目标，
-  且 `memref.alloc` 的 read-before-write 分析要把 `al.copy` 写入视为写。
+#### 1. 业务场景与诉求
 
-### 影响
-
-没有它就只能依赖编译器的自动 L1 staging（每个 dot 前重新搬一次），
-这是 Gram 核 6 个 dot 每个都要一次 UB→L1 的直接原因，也是 F4 放不下的
-原因之一。
-
-## 3. F2：`insert_slice` 拼装 dot 操作数
-
-### 需求
-
-AscendC 的门控因子按 32 行子块（ScoreRefToken span）计算再拼成 `[64,K]`。
-我们想在 `[32,K]` 上算 exp2/where（向量工作量减半），再用
-`al.insert_slice` 拼成整块送进一个全宽 dot：
+在门控计算中，因子按 32 行子块（ScoreRefToken span）计算即可满足精度要求，能减少一半向量工作量。我们期望在 `[32, K]` 粒度计算向量操作，再使用 `al.insert_slice` 拼装为完整块送入 `tl.dot`：
 
 ```python
 full = al.insert_slice(tl.zeros((64, K), tl.bfloat16), top, [0, 0], [32, K], [1, 1])
@@ -118,7 +93,9 @@ full = al.insert_slice(full, bot, [32, 0], [32, K], [1, 1])
 c = tl.dot(full, tl.trans(full))
 ```
 
-### 现状：**BiShengIR 直接崩溃**
+#### 2. 现状与错误分析
+
+当 `insert_slice` 的拼接结果被用作 `tl.dot` 的输入时，BiShengIR 发生内部崩溃：
 
 ```text
 [ConvertLinalgIRToBinary] encounters error:
@@ -126,159 +103,132 @@ LLVM ERROR: Unknown PIPE!
 ... died with <Signals.SIGABRT: 6>.
 ```
 
-（`insert_slice` 只用于 store 时是正常的；只有把结果接进 dot 才崩。）
+*(注：若 `insert_slice` 的结果仅用于 `tl.store`，则可正常执行。)*
+若改用 `tl.join + tl.permute + tl.reshape` 规避，编译器会插入 layout 格式转换指令，实测耗时增加约 4 倍（Gram 核由 2649 $\mu s$ 恶化至 10000+ $\mu s$），不可接受。
 
-替代写法 `tl.join + tl.permute + tl.reshape` 能编译、数值正确，但会插入
-layout 转换，实测比整块计算**慢 4 倍**（Gram 核 2649 → 10000+ us），
-不可用。
+#### 3. 期望行为
 
-### 最小验证程序
+- 支持 `insert_slice` 的拼接结果直接作为 `tl.dot` 操作数，并在可能的情况下复用 layout。
+- 若必须执行 layout 转换且不支持时，应在编译期抛出语义清晰的诊断错误，而非底层 SIGABRT 崩溃。
 
-`probe_03_insert_slice_dot.py`（单块，直接 SIGABRT）。
+### F3：`scope` 混核声明与自动跨核同步
 
-### 期望语义
+#### 1. 业务场景与诉求
 
-`insert_slice` 结果与源 tile 共享 layout（不产生 copy），且能作为 dot 操作数；
-若必须转换，请在编译期报“unsupported layout”，而不是 abort。
-
-## 4. F3：`scope` 混核 + 自动跨核同步
-
-### 需求
-
-用 `al.scope("cube")` / `al.scope("vector")` 表达同一个 kernel 里的 cube/vector
-分工，由编译器插入跨核 flag（对应 AscendC Prepare 的 C2/C4/C5/C7）：
+通过 `al.scope("cube")` 与 `al.scope("vector")` 在单一算子内声明 Cube 与 Vector 的职责划分，由编译器自动分析依赖并插入跨核事件同步（对齐 AscendC 的 C2/C4/C5/C7 流水模式）：
 
 ```python
 with al.scope("cube"):
-    cb = tl.dot(a, tl.trans(b)); tl.store(gm, cb)
+    cb = tl.dot(a, tl.trans(b))
+    tl.store(gm, cb)
 with al.scope("vector"):
     tl.store(out, tl.load(gm) * 2.0)
 ```
 
-### 现状：**默认不可用；关自动同步后结果错**
+#### 2. 现状与实测对比
 
-| 模式 | 编译选项 | 结果 |
-|---|---|---|
-| `scope` | 默认 | **SIGSEGV (11)** in bishengir |
-| `scope_noauto` | `enable_mixed_cv=True, disable_auto_inject_block_sync=True` | 编译通过，`maxerr≈1e2`（参考值量级 ~2e1；每次运行数值不同），读到了未写入/陈旧数据 |
-| `scope_sync` | 同上 + 手工 `sync_block_set/wait` | **correct，maxerr=1.5e-5** |
-| `noscope_sync` | 默认 + 手工 `sync_block_set/wait`（无 scope） | **correct，maxerr=1.5e-5** |
+| 执行模式           | 编译配置参数                                                      | 实测结果                                    |
+|:-------------- |:----------------------------------------------------------- |:--------------------------------------- |
+| `scope`        | 默认配置                                                        | **SIGSEGV (11)**（崩溃于 bishengir）         |
+| `scope_noauto` | `enable_mixed_cv=True, disable_auto_inject_block_sync=True` | 编译通过，但**数值 错误**（`maxerr ≈ 1e2`，读入脏数据）   |
+| `scope_sync`   | 同上 + 手工插入 `al.sync_block_set/wait`                          | **PASS**（精度误差 $\le 1.5 \times 10^{-5}$） |
+| `noscope_sync` | 默认配置 + 仅手工插入 `al.sync_block_set/wait`（无 scope）              | **PASS**（精度误差 $\le 1.5 \times 10^{-5}$） |
 
-注：`sync_block_set/wait` 的 docstring 要求“必须在匹配 sender 的 scope 内”，
-但实测**不加 scope**反而是默认选项下唯一稳定正确的用法（GDN 算子
-`chunk_gated_delta_rule_fwd.py` 就是这么写的）。
+> [!NOTE]
+> 当前文档注释要求 `sync_block_*` 必须包含在对应的 `scope` 内；但实测在**完全不声明 `scope`** 的情况下直接使用手工同步标志反而能稳定运行（目前 GDN 算子即采用此临时规避方案）。
 
-### 最小验证程序
+#### 3. 期望行为
 
-`probe_04_scope_sync.py`，四种模式：
+- 修复默认配置下启用 `scope` 导致的编译器 SIGSEGV 问题。
+- 在 `disable_auto_inject_block_sync=True` 时，若存在未显式同步的跨核数据流，提供编译期诊断警告。
+- 明确并统一文档与实现中 `sync_block_*` 对 `scope` 上下文的依赖规则。
 
-```shell
-python probe_04_scope_sync.py noscope_sync   # PASS 1.5e-5
-python probe_04_scope_sync.py scope          # SIGSEGV
-python probe_04_scope_sync.py scope_noauto   # 编译过、结果错
-python probe_04_scope_sync.py scope_sync     # PASS（手工 flag）
-```
+### F4：跨 chunk 软件流水与 L1/UB 容量预算
 
-### 期望语义
+#### 1. 业务场景与诉求
 
-- `scope` 在默认选项下不应崩溃；
-- `disable_auto_inject_block_sync=True` 时，`scope` 边界的 GM 交换要么自动
-  插 flag（推荐），要么在编译期报“需要显式 sync”；
-- 明确 `sync_block_*` 是否必须配合 scope（文档与实现不一致）。
+在 chunk $c$ 的 6 个点积计算在 Cube 单元执行期间，由 Vector 单元提前生成 chunk $c+1$ 的门控因子与面 板数据，形成 AIC/AIV 间的乒乓软件流水，隐藏 Cube 的计算延迟。
 
-## 5. F4：跨 chunk 软件流水的 UB/L1 预算
+#### 2. 现状与瓶颈
 
-### 需求
+| 尝试方案                               | 实测结果与瓶颈分析                                                                       |
+|:---------------------------------- |:------------------------------------------------------------------------------- |
+| **动态 CV 流水** (`tl.range` + 动态流水属性) | 触发 UB 容量超限：`ub overflow, requires 5573120 bits while 1769472 bits available`    |
+| **源码级 2-tile 展开流水**（同时保活两块的操作数与因子） | 触发 L1 容量超限：`cbuf overflow, requires 6291456 bits while 4194304 bits available!` |
+| **顺序展开** (`CPT=2`，无并发保活)           | 编译通过但性能下降：Gram 由 2649 $\mu s$ 增加至 **3311 $\mu s$**（后处理操作仍然阻塞了后续 chunk 的计算）      |
+| **当前单块实现**（无跨块流水）                  | Gram 耗时 2649 $\mu s$；剖析显示 AIV 利用率达 75.4%，AIC 利用率仅 6.2%，Cube 等待无法掩盖              |
 
-chunk c+1 的向量工作（门控因子、面板）在 chunk c 的 6 个 dot 在飞时执行，
-即 AscendC 的 AIC/AIV ping-pong。
+#### 3. 期望行为
 
-### 现状：**两条路都被容量卡死**
+- 软件流水调度优化：当 UB 容量承载多缓冲受限时，支持将操作数平滑下溢（spill）至 L1（作为显式 staging buffer），而非直接在 UB 内多份复制导致溢出。
+- 允许精细化指定多缓冲策略（目前 `multibuffer=False` 为全局开关，粒度过粗）。
 
-| 写法 | 结果 |
-|---|---|
-| `tl.range` + `tile_mix_vector_loop/tile_mix_cube_loop`（动态 CV 流水） | 触发 `--enable-mixed-cv=True ...`，但 `ub overflow, requires 5573120 bits while 1769472 bits available` |
-| 源级 2 tile 交错（两块的 5+2 个 bf16 面板 + fp32 因子都保活） | `cbuf overflow, requires 6291456 bits while 4194304 bits available!` |
-| 源级 `CPT=2` 顺序展开（一次只一块） | 能编译，但更慢：Gram 2649 → **3311 us** |
-| 不做流水（当前提交） | Gram 2649 us；融合版 Prepare 的剖析是 `aiv_vec=75.4%`、`aic_mac=6.2%`，拆开后 AIV 仍是唯一关键路径（Gram 未单独剖析，但 6 个 dot 的 MAC 量级不变） |
+### F5：长 `exp2/select` 链的向量融合
 
-### 最小验证程序
+#### 1. 业务场景与诉求
 
-- `probe_06_cross_chunk_l1_budget.py`：两块、每块 7 个 bf16 面板 + 6 个 dot 的
-  形状（单块能过；真 kernel 的 fp32 因子与 6 个累加器保活后才溢出）；
-- 真 kernel 复现：`src/flaggems_vllm/runtime/backend/_ascend/FLA/chunk_kda.py`
-  的 Gram kernel 改为每程序 2 chunk、dot 先行后处理（`4babebc` 之后的试验），
-  即报 `cbuf overflow 6291456 / 4194304`。
+门控因子计算包含连贯的向量运算链（$\text{sigmoid} \rightarrow \text{cumsum} \rightarrow 2\times\text{exp2} \rightarrow 4\times\text{where} \rightarrow 5\times\text{mul}$）。期望编译器将其自动融合成若 干连续计算的向量指令序列，消除逐指令读写 UB 的往返开销。
 
-### 期望语义
+#### 2. 现状与性能断崖实测
 
-- 流水调度应把操作数**溢出到 L1**（显式 staging buffer）而不是在 UB 里
-  双份复制；或在 UB 不足时给出“哪个 buffer 超了”的可操作报错；
-- 多缓冲开关应按 buffer 生效（当前 `multibuffer=False` 是全局的，见 F6）。
+使用探针 [`probe_05_vec_chain_fusion.py`](file:///workspace/FlagGems/tools/triton_ascend_probes/probe_05_vec_chain_fusion.py) 在全网格（12288 个 program，对齐典型形状）上测试计算链 `a = exp2(a * 1e-4) + where(a > 0.5, 1, 0)` 的执行表现：
 
-## 6. F5：长 `exp2/select` 链的向量融合
+| 连续操作数 (N) | 全网格耗时         | 边际耗时 (每新增 1 个 op) | 融合状态分析                          |
+|:---------:|:-------------:|:-----------------:|:------------------------------- |
+| **0**     | 255 $\mu s$   | —                 | 基准耗时                            |
+| **4**     | 271 $\mu s$   | ~4 $\mu s$ / op   | **已成功融合**                       |
+| **8**     | 794 $\mu s$   | ~67 $\mu s$ / op  | **出现性能断崖**（融合放弃，退化为逐 op 往返 UB）  |
+| **12**    | ~1478 $\mu s$ | ~101 $\mu s$ / op | 稳定在每 op 每 AIV 约 0.53 $\mu s$ 开销 |
 
-### 需求
+针对 `vf_fusion_mode` 编译开关的实测反馈：
 
-gate 链（sigmoid → cumsum → 2×exp2 → 4×where → 5×mul）希望融合成少量向量
-指令，而不是每个 `tl` op 一次 UB 往返。
+- `all-op`: 直接引发编译失败；
+- `max-parallel` 与 `ub-aware-op`: 与默认配置性能一致，未产生改善效果。
 
-### 现状：短链能融，长链断崖
+#### 3. 期望行为
 
-`probe_05_vec_chain_fusion.py` 在 12288 个 program（= T=32768/H=24 的 Gram 网格）
-上测一条依赖链 `a = exp2(a*1e-4) + where(a>0.5, 1, 0)`：
+- 改进向量融合策略：对于超长计算链，支持分段自适应融合（例如每 4~8 个 op 划分为一个融合块），避免超 过阈值后整体放弃优化。
+- 修复 `vf_fusion_mode=all-op` 的编译异常。
 
-| 链长 N | 耗时 | 边际 |
-|---:|---:|---:|
-| 0 | 255 us | — |
-| 4 | 271 us | ~4 us/op（**已融合**） |
-| 8 | 794 us | ~67 us/op |
-| 12 | ~1478 us | ~101 us/op（≈0.53 us/op/AIV） |
+## 测试与验证指南
 
-即：≤4 个 op 的链能完全融合；到 8 个 op 出现断崖（UB 压力/融合放弃），
-之后每加一个 `[64,128]` op 全网格多约 100 us——这正是 Gram 核 25+ 个
-逐 op 链耗掉 2.6 ms 的量级来源。
+### 快速一键验证
 
-### 最小验证程序
-
-```shell
-python probe_05_vec_chain_fusion.py
-```
-
-### 期望语义
-
-- 长链应分块融合（例如每 8 个 op 一个 VF），或在超过融合上限时给出提示；
-- 提供 `vf_fusion_mode=all-op` 的一个可编译实现（当前 `all-op` 直接编译失败，
-  而 `max-parallel`/`ub-aware-op` 中性）。
-
-## 7. 附：探针清单与预期
-
-| 文件 | 预期（本机实测） |
-|---|---|
-| `probe_01_l1_resident_dot.py copy` | FAIL：`memref.alloc ... read before first write` |
-| `probe_01_l1_resident_dot.py dot` | FAIL：`different memory spaces ... cbuf vs ub` |
-| `probe_02_slice_as_dot_operand.py col` | PASS，maxerr 7.6e-6 |
-| `probe_02_slice_as_dot_operand.py row` | PASS，maxerr 5.3e-5 |
-| `probe_03_insert_slice_dot.py` | FAIL：`LLVM ERROR: Unknown PIPE!` + SIGABRT |
-| `probe_04_scope_sync.py noscope_sync` | PASS，maxerr 1.5e-5 |
-| `probe_04_scope_sync.py scope` | FAIL：SIGSEGV |
-| `probe_04_scope_sync.py scope_noauto` | 编译过，maxerr ≈ 1e2（错） |
-| `probe_04_scope_sync.py scope_sync` | PASS，maxerr 1.5e-5 |
-| `probe_05_vec_chain_fusion.py` | N=4 已融合，N=8/12 断崖（见上表） |
-| `probe_06_cross_chunk_l1_budget.py` | 单块形状 PASS；真 kernel 2-chunk 交错 cbuf 溢出 |
-
-一键运行：
+在仓库根目录下执行批处理脚本，可依次运行所有探针并打印关键日志：
 
 ```shell
 bash tools/triton_ascend_probes/run_all.sh
 ```
 
-## 8. 优先级建议
+### 单项探针运行与预期一览
 
-1. **F1（L1 视图）**：一个 `bl.to_tensor` 的地址空间修复，直接解锁 AscendC
-   的 L1 常驻策略，收益最大、改动面最小（只涉及 buffer→memref 的 lowering）。
-2. **F2（insert_slice 进 dot）**：把 abort 改成合法 lower 或明确报错，
-   解锁 32 行子块因子。
-3. **F3（scope 自动同步）**：默认 SIGSEGV 是硬伤；修好后手工 flag 可以退场。
-4. **F4（流水预算）**：需要流水 pass 支持 L1 溢出而不是 UB 双份，工作量最大。
-5. **F5（长链融合）**：收益面广但依赖向量化 pass 的整体改造，可最后做。
+```shell
+# 环境准备
+export PYTHONPATH="src:FlagGems/src"
+cd tools/triton_ascend_probes
+```
+
+| 探针命令                                          | 预期运行结果（本机实测）                                           |
+|:--------------------------------------------- |:------------------------------------------------------ |
+| `python probe_01_l1_resident_dot.py copy`     | **FAIL**: 报 `memref.alloc ... read before first write` |
+| `python probe_01_l1_resident_dot.py dot`      | **FAIL**: 报 `different memory spaces ... cbuf vs ub`   |
+| `python probe_02_slice_as_dot_operand.py col` | **PASS**: 精度误差 $\le 7.6 \times 10^{-6}$                |
+| `python probe_02_slice_as_dot_operand.py row` | **PASS**: 精度误差 $\le 5.3 \times 10^{-5}$                |
+| `python probe_03_insert_slice_dot.py`         | **FAIL**: 报 `LLVM ERROR: Unknown PIPE!` 并触发 SIGABRT    |
+| `python probe_04_scope_sync.py noscope_sync`  | **PASS**: 手工标志同步，精度误差 $\le 1.5 \times 10^{-5}$         |
+| `python probe_04_scope_sync.py scope`         | **FAIL**: 编译器段错误 SIGSEGV                               |
+| `python probe_04_scope_sync.py scope_noauto`  | 编译通过但结果错误（`maxerr ≈ 1e2`）                              |
+| `python probe_04_scope_sync.py scope_sync`    | **PASS**: 带 scope 并显式手工同步                              |
+| `python probe_05_vec_chain_fusion.py`         | 验证 N=4 融合与 N=8/12 的耗时突变                                |
+| `python probe_06_cross_chunk_l1_budget.py`    | 简化模型 PASS；真实 kernel 触发 `cbuf overflow`                 |
+
+## 优化优先级建议
+
+按投入产出比与实施可行性排序：
+
+1. **P0 - F1（显式 L1 操作数视图）**：仅需在 lowering 阶段修正 `bl.to_tensor` 在 L1 buffer 上的地址 空间推导逻辑。改动范围小，能直接解锁多点积共享 L1 面板的优化策略，性能收益最为显著。
+2. **P1 - F2（`insert_slice` 拼装 dot 操作数）**：修复底层 SIGABRT，支持常规 lowering 或给出友好报错，可直接减少门控计算中 50% 的向量负载。
+3. **P1 - F3（`scope` 自动同步与稳定性）**：解决默认开启 `scope` 时的编译器崩溃，消除算子代码中硬编 码手工事件同步的需求。
+4. **P2 - F4（软件流水溢出调度与预算分配）**：使能跨 chunk 软件流水以掩盖 Cube 计算等待，提升整体硬 件利用率。
+5. **P3 - F5（长向量链分段融合）**：优化通用长计算链的生成质量，进一步缩减 AIV 执行耗时。
+

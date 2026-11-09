@@ -1,34 +1,33 @@
-"""GAP F1: a bf16 dot operand that stays resident in L1.
+"""探针 01: 显式 L1 驻留的 dot 操作数 (GAP F1)
 
-AscendC chunk_kda_fwd_prepare keeps the Q+/K+/K- panels of 4 heads in L1 and
-lets every Gram dot read them there.  The Triton front door for that is
-
+【背景与目标】
+AscendC 的 chunk_kda_fwd_prepare 将 4 个 head 的 Q+/K+/K- 面板缓存在 L1 中，
+供后续多个 Gram dot 操作复用，避免重复走 UB->L1 的自动 staging。
+在 Triton 中的理想表达形式为：
     l1 = bl.alloc(bf16, [BT, K], al.ascend_address_space.L1)
-    ... fill from UB ...
+    ... 从 UB 写入 l1 ...
     a = bl.to_tensor(l1)
     c = tl.dot(a, tl.trans(a))
 
-Observed on Ascend950DT_9582 / triton-ascend 3.6.0.post2:
+【实测现象】(Ascend950DT_9582 / triton-ascend 3.6.0.post2)
+  1. MODE=copy  (通过 bind_buffer 写入 UB 并执行 al.copy(ub, l1)):
+     -> 失败: 'memref.alloc' op error: read before first write
+  2. MODE=dot   (在 copy 基础上增加 bl.to_tensor(l1) + tl.dot):
+     -> 失败: different memory spaces specified for base memref type
+        'memref<64x128xbf16, #hivm.address_space<cbuf>>' and subview memref type
+        'memref<1x128xbf16, strided<[128, 1], offset: ?>, #hivm.address_space<ub>>'
 
-  MODE=copy  fill UB with bind_buffer + al.copy(ub, l1)    -> FAIL
-      'memref.alloc' op error: read before first write
-  MODE=dot   ... + bl.to_tensor(l1) + tl.dot               -> FAIL (last mile)
-      different memory spaces specified for base memref type
-      'memref<64x128xbf16, #hivm.address_space<cbuf>>' and subview memref type
-      'memref<1x128xbf16, strided<[128, 1], offset: ?>,
-      #hivm.address_space<ub>>'
+【相关已知异常】
+- 位置参数形式 bl.to_buffer(a, al.ascend_address_space.UB) 报错:
+  'hivm.hir.pointer_cast' op addrs of PointerCastOp should not be empty!
+- 通过 tl.store 写入 bl.to_tensor(ub, writable=True) 视图报错:
+  Unsupported ptr type ... in tl.store
 
-Also observed while developing the same path (not reproduced by this reduced
-probe): `bl.to_buffer(a, al.ascend_address_space.UB)` (the positional address
-space form) reports
-`'hivm.hir.pointer_cast' op addrs of PointerCastOp should not be empty!`, and
-`tl.store` into `bl.to_tensor(ub, writable=True)` reports
-`Unsupported ptr type ... in tl.store`.
+【结论】
+虽然 UB->L1 的 copy API 在前端能通过类型检查，但由于 bl.to_tensor lowering 时
+在 L1 buffer 上错误生成了 UB 地址空间的 subview，导致当前无法在 Triton 中获得 L1 驻留的 Tensor。
 
-So the UB->L1 copy API exists and type-checks, but no Triton program can get a
-L1-resident tensor today: `bl.to_tensor` is the single blocking step.
-
-Usage:
+运行方式:
     PYTHONPATH=src:FlagGems/src python probe_01_l1_resident_dot.py [copy|dot]
 """
 

@@ -1,14 +1,24 @@
-"""GAP: assemble a bf16 dot operand from per-32-row halves with insert_slice.
+"""探针 03: insert_slice 拼装 dot 操作数 (GAP F2)
 
-Needed to compute the KDA gate factors on 32-row sub-blocks (half the vector
-work, matching AscendC's ScoreRefToken span) and then feed the assembled
-[BT, K] tile to one full-width dot.
+【背景与目标】
+AscendC 原生实现中，门控因子按 32 行子块（对齐 ScoreRefToken span）计算，
+可减半 AIV 向量计算量，再拼接为完整的 [BT, K] 参与全宽 dot 运算。
+在 Triton 中尝试使用 al.insert_slice 分别拼接上半块与下半块：
+    full = insert_slice(base, top, [0, 0], [R // 2, K], [1, 1])
+    full = insert_slice(full, bot, [R // 2, 0], [R // 2, K], [1, 1])
+    c = tl.dot(full, tl.trans(full))
 
-Current state: `al.insert_slice` into an SSA tile used as a dot operand makes
-BiShengIR abort (SIGABRT) on Ascend950DT.  The variant that inserts into a
-tile and *stores* it works.
+【实测现象】(Ascend950DT_9582 / triton-ascend 3.6.0.post2)
+  将 al.insert_slice 拼装出的 SSA tile 作为 dot 操作数时，BiShengIR 发生崩溃：
+    LLVM ERROR: Unknown PIPE!
+    ... died with <Signals.SIGABRT: 6>.
+  注：若 insert_slice 的结果仅用于 tl.store，则能正常执行；只有送入 tl.dot 时触发崩溃。
 
-Usage:
+【结论】
+insert_slice 的输出无法直接作为 Cube dot 输入。备选方案 tl.join+permute+reshape 虽然能跑通，
+但会引入昂贵的 layout 转换，实测耗时增加约 4 倍，不具备实用性。
+
+运行方式:
     PYTHONPATH=src:FlagGems/src python probe_03_insert_slice_dot.py
 """
 

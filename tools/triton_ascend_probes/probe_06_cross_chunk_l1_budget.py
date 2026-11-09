@@ -1,22 +1,22 @@
-"""GAP: overlap two chunks' dots in one program (cross-chunk pipelining).
+"""探针 06: 跨 chunk 软件流水与 L1/UB 容量预算 (GAP F4)
 
-What we need: while chunk c's six Gram dots are in flight, build chunk c+1's
-gated bf16 operands and issue its dots, then postprocess both.  This is the
-source-level equivalent of AscendC's AIC/AIV ping-pong and is what would hide
-the cube latency that currently serializes the KDA Prepare/Gram kernel.
+【背景与目标】
+在单 program 内实现跨 chunk 流水：在 chunk c 的 6 个 Gram dot 运算期间，
+提前计算 chunk c+1 的门控 bf16 操作数并下发其 dot 指令，最后统一做后处理。
+该模式等价于 AscendC 原生的 AIC/AIV ping-pong，旨在隐藏当前串行阻塞 Prepare/Gram kernel 的 Cube 延迟。
 
-Current state (Ascend950DT_9582): the two tiles' dot operands do not fit
-L1 (cbuf) even though each tile alone compiles:
+【实测现象】(Ascend950DT_9582 / triton-ascend 3.6.0.post2)
+  两个 chunk 的点积操作数无法同时容纳在 L1 (cbuf) 中，编译报错：
     cbuf overflow, requires 6291456 bits while 4194304 bits available!
-Sequential unrolling (CPT=2, one tile at a time) compiles but is slower
-(Gram 2649 -> 3311 us at T=32768) because the postprocess still sits between
-the two tiles' dots.
+  若改用顺序循环展开 (CPT=2，每次只处理一块)，虽可通过编译，但耗时反而上升
+  （Gram 从 2649 us 恶化至 3311 us @ T=32768），因为两块 dot 之间依然被后处理串行阻塞。
 
-This probe is the minimal shape of that kernel: two tiles, five bf16 dot
-operands each, six shared-operand dots per tile, results postprocessed after
-both tiles are issued.
+【探针说明】
+本探针构建了该模式的最小形态：单 program 内包含两个 chunk，每个 chunk 包含 5 个 bf16 dot 操作数
+和 6 个共享操作数的 dot，并在 12 个 dot 全部下发后进行后处理。
+（注：本简化探针可通过编译；当与真实算子中的 fp32 因子及累加器共同保活时即触发上述 cbuf 溢出）。
 
-Usage:
+运行方式:
     PYTHONPATH=src:FlagGems/src python probe_06_cross_chunk_l1_budget.py
 """
 

@@ -1,15 +1,19 @@
-"""GAP: use a strided sub-tile of a loaded tile as a tl.dot operand.
+"""探针 02: 切片作为 dot 操作数 (可用性与回归验证)
 
-Needed by the KDA Gram kernel to build the Aqk/Akk dots from one [BT, 2K]
-workspace load (w|kg are contiguous columns of the same row) and to split a
-[2BT, K] left operand back into halves.
+【背景与目标】
+KDA Gram kernel 需要在单次载入 [BT, 2K] 连续工作区后（w 和 kg 分布在同一行的前后半段），
+通过切片切分出左右操作数来执行 Aqk 和 Akk 矩阵乘法；同时也需要把 [2BT, K] 的左操作数拆分为上下两半。
 
-Current state:
-  * column-offset slice  (extract_slice(a, [0, K], [BT, K]))  -> PASS
-  * row-offset slice     (extract_slice(a, [HALF, 0], [BT, K])) -> FAIL
-    (row-offset subviews are not layout-preserving for the cube)
+【实测现象】(Ascend950DT_9582 / triton-ascend 3.6.0.post2)
+  * 列偏移切片 (col):
+    extract_slice(a, [0, K], [BT, K]) 作为 dot 操作数 -> PASS (最大误差 7.6e-6)
+  * 行偏移切片 (row):
+    extract_slice(a, [HALF, 0], [BT, K]) 作为 dot 操作数 -> PASS (最大误差 5.3e-5)
 
-Usage:
+【结论】
+两类切片作为 dot 操作数当前均可正常运行（本探针保留作为基线功能与回归验证）。
+
+运行方式:
     PYTHONPATH=src:FlagGems/src python probe_02_slice_as_dot_operand.py col
     PYTHONPATH=src:FlagGems/src python probe_02_slice_as_dot_operand.py row
 """
