@@ -462,32 +462,27 @@ if HAS_TLE_KDA:
                     b_kg0_corr_t = tl.trans((b_kf * b_gk0_corr).to(tl.bfloat16))
 
                     m_Aqk = o_i[:, None] >= o_i[None, :]
+                    m_Akk = o_i[:, None] > o_i[None, :]
+                    m_I = o_i[:, None] == o_i[None, :]
+
+                    # Build every bf16 operand, then issue all six dots before
+                    # touching either result: the vector-side Aqk postprocess
+                    # (rstd/scale/mask/store) then overlaps the Akk dots
+                    # instead of serializing ahead of them.
+                    b_kq0_t = (b_kf * b_gq0).to(tl.bfloat16)
+                    b_kq1_t = (b_kf * b_gq1).to(tl.bfloat16)
                     b_Aqk = tl.dot(b_qg0_t, b_kg0_t, out_dtype=tl.float32)
                     b_Aqk += tl.dot(b_qg1_t, b_kg1_t, out_dtype=tl.float32)
                     b_Aqk += tl.dot(b_qg1_t, b_kg0_corr_t, out_dtype=tl.float32)
+                    b_Akk = tl.dot(b_kq0_t, b_kg0_t, out_dtype=tl.float32)
+                    b_Akk += tl.dot(b_kq1_t, b_kg1_t, out_dtype=tl.float32)
+                    b_Akk += tl.dot(b_kq1_t, b_kg0_corr_t, out_dtype=tl.float32)
+
                     b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
                     b_Aqk = tl.where(m_Aqk, b_Aqk * scale, 0.0)
                     tl.store(
                         p_Aqk + o_i[:, None] * BT + o_i[None, :],
                         b_Aqk.to(Aqk.dtype.element_ty),
-                    )
-
-                    m_Akk = o_i[:, None] > o_i[None, :]
-                    m_I = o_i[:, None] == o_i[None, :]
-                    b_Akk = tl.dot(
-                        (b_kf * b_gq0).to(tl.bfloat16),
-                        b_kg0_t,
-                        out_dtype=tl.float32,
-                    )
-                    b_Akk += tl.dot(
-                        (b_kf * b_gq1).to(tl.bfloat16),
-                        b_kg1_t,
-                        out_dtype=tl.float32,
-                    )
-                    b_Akk += tl.dot(
-                        (b_kf * b_gq1).to(tl.bfloat16),
-                        b_kg0_corr_t,
-                        out_dtype=tl.float32,
                     )
                     b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
                     b_Akk = tl.where(m_Akk, b_Akk * b_beta[:, None], 0.0)
