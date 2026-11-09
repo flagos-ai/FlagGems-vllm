@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from baseline.w8a8_block_matmul import torch_w8a8_block_matmul
 
 from . import base, consts
 
@@ -126,13 +127,16 @@ class W8A8BlockMatmulBenchmark(base.Benchmark):
 
 @pytest.mark.w8a8_block_matmul
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads"),
+    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads", "ascend"),
     reason="No W8A8 block matmul backend",
 )
 def test_perf_w8a8_block_matmul():
     if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
         pytest.skip("W8A8 block matmul is unavailable on this architecture")
-    if flaggems_vllm.vendor_name == "thead":
+    if flaggems_vllm.vendor_name == "ascend":
+        torch_op = torch_w8a8_block_matmul
+        dtypes = [torch.int8]
+    elif flaggems_vllm.vendor_name == "thead":
         if not VLLM_W8A8_BLOCK_INT8_AVAILABLE:
             pytest.skip("W8A8 block matmul benchmark requires the vLLM INT8 baseline")
         torch_op = vllm_w8a8_block_int8_matmul
