@@ -621,11 +621,20 @@ def w8a8_block_matmul(
     if M == 0 or N == 0:
         return A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     # Long reductions with few output tiles benefit from additional CTAs.
-    # Bound the FP32 workspace to 4 MiB and keep well-occupied GEMMs on the
-    # original path.  Split count and tile layout are selected by LibTuner.
+    # Keep the general path's FP32 workspace small; LibTuner selects the
+    # split count and tile layout for this case.
+    if (
+        group_k == 128
+        and 64 <= M <= 128
+        and N >= 4096
+        and 3072 <= K < 4096
+        and K % 16 != 0
+        and M * N * _MAX_SPLITS.value * 4 <= 64 * 1024 * 1024
+    ):
+        return _splitk_matmul(A, B, As, Bs, M, N, K, group_n, group_k, output_dtype)
     if group_k == 128 and K >= 4096 and M <= 128 and N <= 1536 and M * N <= 65536:
         return _splitk_matmul(A, B, As, Bs, M, N, K, group_n, group_k, output_dtype)
-    expand = runtime.flagtune_enabled("w8a8_block_int8_matmul")
+    expand = runtime.flagtune_enabled("w8a8_block_matmul")
     skinny_swap = 2 <= M <= 64 and N <= 1536 and 2304 < K <= 8192
     if not expand and M == 1 and K <= 2304 and group_k == 128:
         C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
