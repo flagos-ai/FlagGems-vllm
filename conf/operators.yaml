@@ -963,20 +963,6 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
-  - id: kda_conv_scatter
-    description: |
-      Restores the staged rows back into the block-strided KDA
-      short-convolution state cache after the AscendC conv operator in one
-      pass, skipping PAD entries inside the kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
   - id: kda_gate_cumsum
     description: |
       Fused Triton replacement for the AscendC kda_gate_cumsum operator:
@@ -1357,6 +1343,20 @@ ops:
     stages:
       - stable: '4.1'
     cpp: '4.0'
+  - id: scatter_conv_state
+    description: |
+      Restores the staged rows back into the block-strided KDA
+      short-convolution state cache after the AscendC conv operator in one
+      pass, skipping PAD entries inside the kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: silu_and_mul
     description: A custom operator in vLLM as activation function for SwiGLU.
     for:

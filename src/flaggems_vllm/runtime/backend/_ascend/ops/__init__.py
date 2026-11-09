@@ -70,9 +70,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import 
     indexer_k_quant_and_cache,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
-from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_scatter import (
-    scatter_conv_state,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
@@ -102,6 +99,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_row
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.scatter_conv_state import (
+    scatter_conv_state,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,

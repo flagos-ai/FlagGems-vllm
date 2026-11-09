@@ -34,7 +34,7 @@ PAD_SLOT_ID = -1
 
 
 @triton.jit(do_not_specialize=["slot_numel", "slot_stride", "pad_slot_id"])
-def _conv_state_scatter_kernel(
+def _scatter_conv_state_kernel(
     cache,
     indices,
     staged,
@@ -60,14 +60,14 @@ def scatter_conv_state(
     staged: torch.Tensor,
 ) -> None:
     """Write staged conv rows back; PAD entries are skipped."""
-    logger.debug("GEMS_ASCEND KDA_CONV_SCATTER")
+    logger.debug("GEMS_ASCEND SCATTER_CONV_STATE")
     flat_indices = cache_indices.reshape(-1)
     n = flat_indices.shape[0]
     if n == 0:
         return
     slot_numel = conv_state[0].numel()
     BLOCK = max(2048, triton.next_power_of_2(triton.cdiv(slot_numel, 4)))
-    _conv_state_scatter_kernel[(n, triton.cdiv(slot_numel, BLOCK))](
+    _scatter_conv_state_kernel[(n, triton.cdiv(slot_numel, BLOCK))](
         conv_state,
         flat_indices,
         staged,
