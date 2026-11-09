@@ -56,8 +56,11 @@ from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.trace_replay import apply_trace_tokens
-from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
-    w8a8_block_fp8_matmul,
+from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
+    w8a8_block_matmul,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
+    w8a8_block_matmul as w8a8_block_fp8_matmul,
 )
 
 __all__ = [
@@ -84,4 +87,5 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_fp8_matmul",
+    "w8a8_block_matmul",
 ]

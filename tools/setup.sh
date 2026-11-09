@@ -30,11 +30,31 @@ VENV_DIR="${VENV_DIR:-.venv}"
 MIRROR="${PIP_INDEX_URL:-https://pypi.org/simple}"
 
 VLLM_VERSION="${VLLM_VERSION:-0.20.2}"
+
+# `uv`'s --torch-backend=auto probes the local CUDA driver version and maps
+# it to one of uv's own known backend tags (see `uv pip install --help`).
+# On H20 runners the driver reports CUDA 13.3, which is newer than any tag
+# uv 0.11.22/0.13.1 know about (highest is cu132); `auto` then silently
+# drops torch/torchvision/torchaudio from the install instead of erroring
+# or falling back, so `import torch` fails right after a "successful" vLLM
+# install. Pin the exact vendor-qualified torch build FlagGems itself uses
+# for this backend (see FlagGems' src/flag_gems/backends.yaml
+# `nvidia-cuda133` entry) instead of relying on that probe.
 TORCH_BACKEND="${TORCH_BACKEND:-auto}"
+TORCH_VERSION="${TORCH_VERSION:-2.11.0+cu130}"
+TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.11.0+cu130}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.26.0+cu130}"
 FLAG_GEMS_VERSION="${FLAG_GEMS_VERSION:-}"
 
 FLAGOS_PYPI="${FLAGOS_PYPI:-https://resource.flagos.net/repository/flagos-pypi-hosted/simple}"
-FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.1}"
+# Vendor-qualified wheels (the `+cu130`-suffixed torch builds below) are only
+# published under the per-vendor FlagOS index, not the shared "hosted" one.
+FLAGOS_PYPI_NVIDIA="${FLAGOS_PYPI_NVIDIA:-https://resource.flagos.net/repository/flagos-pypi-nvidia/simple}"
+# Matches FlagGems' nvidia-cuda133 backend (src/flag_gems/backends.yaml):
+# older FlagTree builds are missing/broken Hopper warp-specialize (TLE)
+# support that some ops here require (e.g. AttributeError on
+# `buffered_tensor.reshape`, WGMMA type/shape assertion failures).
+FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.7.0}"
 
 # Whether to replace Triton with FlagTree.
 # For temporary container validation, you can run:
@@ -50,6 +70,21 @@ STRICT_TRITON_IMPORT="${STRICT_TRITON_IMPORT:-0}"
 # FlagTree may provide the `triton` Python module but not satisfy package metadata
 # requirements such as "vllm requires triton".
 STRICT_PIP_CHECK="${STRICT_PIP_CHECK:-0}"
+
+# Whether to pass `--refresh` to the vLLM/FlagGems/FlagGems-vllm `uv pip
+# install` calls below. On a persistent (non-ephemeral) runner, `uv`'s global
+# cache survives across jobs; if a prior job's cache entries went stale or
+# were partially evicted, `uv` can report a cached install as successful
+# without actually materializing the package files into the freshly
+# recreated venv (e.g. `import torch` failing right after a "successful"
+# vLLM install). `--refresh` forces revalidation of cache entries instead of
+# trusting their metadata. Off by default since it slows down every install;
+# CI for persistent runners should set UV_REFRESH=1.
+UV_REFRESH="${UV_REFRESH:-0}"
+UV_REFRESH_FLAG=()
+if [ "${UV_REFRESH}" = "1" ]; then
+  UV_REFRESH_FLAG=(--refresh)
+fi
 
 CUDA_HOME="${CUDA_HOME:-}"
 
@@ -71,10 +106,21 @@ environment variables (each shown below with its default):
                                Default package index (used for most installs)
 
   VLLM_VERSION=${VLLM_VERSION}             vLLM version to install
+  TORCH_VERSION=${TORCH_VERSION}      Pinned vendor-qualified torch version,
+                               installed from FLAGOS_PYPI_NVIDIA before vLLM.
+                               Set to "" to fall back to --torch-backend
+                               probing instead (see TORCH_BACKEND below).
+  TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION}  Matching torchaudio version
+  TORCHVISION_VERSION=${TORCHVISION_VERSION} Matching torchvision version
   TORCH_BACKEND=${TORCH_BACKEND}               Torch backend passed to --torch-backend
-                               (e.g. auto, cpu, cu121, cu124, ...)
+                               (e.g. auto, cpu, cu121, cu124, ...); only used
+                               when TORCH_VERSION=""
   FLAG_GEMS_VERSION=          FlagGems version to pin; empty installs latest
 
+  FLAGOS_PYPI_NVIDIA=${FLAGOS_PYPI_NVIDIA}
+                               Vendor-qualified index that publishes the
+                               +cu130-suffixed torch/torchaudio/torchvision
+                               wheels pinned above
   FLAGOS_PYPI=${FLAGOS_PYPI}
                                Index used for FlagTree
   FLAGTREE_VERSION=${FLAGTREE_VERSION}            FlagTree version to install
@@ -86,8 +132,19 @@ environment variables (each shown below with its default):
   STRICT_PIP_CHECK=${STRICT_PIP_CHECK}          Fail setup if \`uv pip check\` reports
                                conflicts (1) or only warn (0)
 
+  UV_REFRESH=${UV_REFRESH}                     Pass --refresh to the vLLM/FlagGems/
+                               FlagGems-vllm \`uv pip install\` calls, forcing
+                               revalidation of uv's cache instead of trusting
+                               it. Recommended on persistent (non-ephemeral)
+                               runners where a stale cache can make \`uv\`
+                               report a cached install as successful without
+                               actually installing into the fresh venv.
+
   CUDA_HOME=                  CUDA toolkit path; auto-detected from
                                /usr/local/cuda* if unset
+  USE_FLAGCX=OFF               Disable flagcx's communication path at
+                               runtime, matching FlagGems' nvidia-cuda133
+                               backend env
 
 Example:
   USE_FLAGTREE=0 VLLM_VERSION=0.20.2 bash tools/setup.sh
@@ -131,6 +188,11 @@ setup_cuda_env() {
       fi
     fi
   fi
+
+  # Matches FlagGems' nvidia-cuda133 backend env (src/flag_gems/backends.yaml):
+  # flagcx is installed as a dependency (some packages expect it importable)
+  # but its communication path is disabled at runtime for this backend.
+  export USE_FLAGCX="${USE_FLAGCX:-OFF}"
 }
 
 # ── Check we're in the repo root ─────────────────────────────
@@ -231,9 +293,12 @@ ok
 # ── Constraints ──────────────────────────────────────────────
 CONSTRAINTS_FILE="${VENV_DIR}/constraints.txt"
 
-cat > "${CONSTRAINTS_FILE}" <<'EOF'
+cat > "${CONSTRAINTS_FILE}" <<EOF
 setuptools>=64,<82
 cmake>=3.20,<4
+torch==${TORCH_VERSION}
+torchaudio==${TORCHAUDIO_VERSION}
+torchvision==${TORCHVISION_VERSION}
 EOF
 
 # ── Install build tools ──────────────────────────────────────
@@ -253,18 +318,70 @@ uv pip install -q \
 ok
 
 # ── Install vLLM and matching PyTorch backend ────────────────
-printf "Installing vLLM==${VLLM_VERSION} with torch backend=${TORCH_BACKEND} ..."
-uv pip install -q \
-  "vllm==${VLLM_VERSION}" \
-  --torch-backend="${TORCH_BACKEND}" \
-  --constraint "${CONSTRAINTS_FILE}" \
-  --default-index "${MIRROR}" \
-  || fail
-ok
+# Install the pinned, vendor-qualified torch stack first, from the index that
+# actually publishes it, so vLLM's resolver finds it already satisfied and
+# never falls through to --torch-backend's driver-version probing (see the
+# TORCH_VERSION comment above for why that probe is unsafe on this runner).
+# Set TORCH_VERSION="" to opt back into --torch-backend="${TORCH_BACKEND}"
+# probing instead (e.g. on a host where the pinned +cu130 build is wrong).
+if [ -n "${TORCH_VERSION}" ]; then
+  printf "Installing torch==${TORCH_VERSION} (torchaudio==${TORCHAUDIO_VERSION}, torchvision==${TORCHVISION_VERSION}) ...\n"
+  # Root cause (found via -v on the persistent h20 runner): `uv` discovers
+  # this repo's pyproject.toml and treats it as a workspace root, so this
+  # install gets resolved against the workspace's *declared* dependency set
+  # (and reconciled like a sync: it even logs the venv's existing build
+  # tools as "Unnecessary package") rather than treated as a plain,
+  # standalone `pip install`. Since this repo's pyproject.toml does not list
+  # torch, uv's resolution never actually schedules it for installation —
+  # no error, exit 0, hence the "successful" install that leaves torch
+  # missing. --no-sources (tried first) only covers the `tool.uv.sources`
+  # table and did not stop this; --no-config stops uv from discovering
+  # pyproject.toml/uv.toml at all, so there is no workspace to resolve
+  # against in the first place.
+  uv pip install -v --no-config \
+    "torch==${TORCH_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}" \
+    --default-index "${FLAGOS_PYPI_NVIDIA}" \
+    "${UV_REFRESH_FLAG[@]}" \
+    || fail
+  ok
+
+  # No --index FLAGOS_PYPI_NVIDIA here: torch is already installed and
+  # satisfies the constraint above, so vLLM's resolver never needs to look
+  # for it in any index. Adding that index anyway pulls in unrelated
+  # packages it also hosts (e.g. a "vllm<=0.20.2+flagos" listing) that can
+  # shadow the plain PyPI vllm==0.20.2 release under uv's default
+  # first-index-wins resolution, making the install unsatisfiable.
+  printf "Installing vLLM==${VLLM_VERSION} ...\n"
+  uv pip install \
+    "vllm==${VLLM_VERSION}" \
+    --constraint "${CONSTRAINTS_FILE}" \
+    --default-index "${MIRROR}" \
+    "${UV_REFRESH_FLAG[@]}" \
+    || fail
+  ok
+else
+  printf "Installing vLLM==${VLLM_VERSION} with torch backend=${TORCH_BACKEND} ...\n"
+  uv pip install \
+    "vllm==${VLLM_VERSION}" \
+    --torch-backend="${TORCH_BACKEND}" \
+    --constraint "${CONSTRAINTS_FILE}" \
+    --default-index "${MIRROR}" \
+    "${UV_REFRESH_FLAG[@]}" \
+    || fail
+  ok
+fi
 
 # ── Verify torch/vLLM before Triton replacement ──────────────
+dump_installed_and_fail() {
+  echo "---- uv pip list (debug dump on failure) ----"
+  uv pip list
+  fail
+}
+
 printf "Checking torch/vLLM ..."
-python - <<'PY' || fail
+python - <<'PY' || dump_installed_and_fail
 import torch
 import vllm
 
@@ -284,6 +401,7 @@ uv pip install -q \
   "flag-gems${FLAG_GEMS_VERSION:+==${FLAG_GEMS_VERSION}}" \
   --constraint "${CONSTRAINTS_FILE}" \
   --default-index "${MIRROR}" \
+  "${UV_REFRESH_FLAG[@]}" \
   || fail
 ok
 
@@ -305,6 +423,7 @@ uv pip install -q \
   -e ".[test]" \
   --constraint "${CONSTRAINTS_FILE}" \
   --default-index "${MIRROR}" \
+  "${UV_REFRESH_FLAG[@]}" \
   || fail
 ok
 

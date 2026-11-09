@@ -597,7 +597,7 @@ def _get_fixed_matmul_meta(M: int, N: int, K: int, block_n: int, block_k: int):
     strategy=["align32", "align32", "align32", "align32", "align32"],
     warmup=5,
     rep=5,
-    flagtune_op_name="w8a8_block_fp8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_general",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     flagtune_pre_hook=None,
@@ -714,7 +714,7 @@ def w8a8_block_fp8_matmul_kernel_general(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
-    flagtune_op_name="w8a8_block_fp8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_swap_ab",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     flagtune_pre_hook=None,
@@ -866,7 +866,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
-    flagtune_op_name="w8a8_block_fp8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_swap_ab_splitk",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     flagtune_pre_hook=None,
@@ -1009,7 +1009,7 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
-    flagtune_op_name="w8a8_block_fp8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_short_k256",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     flagtune_pre_hook=None,
@@ -1128,7 +1128,7 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
         b.stride(0) == 1,
     )
 
-    use_flagtune = runtime.flagtune_enabled("w8a8_block_fp8_matmul")
+    use_flagtune = runtime.flagtune_enabled("w8a8_block_matmul")
 
     if M < 512 and N > 2112 and K == 256:
         if use_flagtune:
@@ -1483,7 +1483,7 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
         return c
 
 
-def w8a8_block_fp8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
