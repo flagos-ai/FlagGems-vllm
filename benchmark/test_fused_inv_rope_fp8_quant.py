@@ -22,9 +22,16 @@ import triton
 import yaml
 
 import flaggems_vllm
+from flaggems_vllm.ops import fused_inv_rope_fp8_quant as generic_inv_rope_fp8_quant
 from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import base
+
+pytestmark = (
+    pytest.mark.skip(reason="inverse-RoPE uses INT8 on this backend")
+    if "fused_inv_rope_int8_quant" in vars(flaggems_vllm)
+    else pytest.mark.fused_inv_rope_fp8_quant
+)
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -35,6 +42,10 @@ HAS_FP8_QUANT = hasattr(torch, "float8_e4m3fn") and (
     flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
     or flaggems_vllm.vendor_name == "thead"
     or (flaggems_vllm.vendor_name == "mthreads" and get_device_capability() >= (3, 1))
+    or (
+        flaggems_vllm.vendor_name == "hygon"
+        and flaggems_vllm.fused_inv_rope_fp8_quant is not generic_inv_rope_fp8_quant
+    )
 )
 
 try:
@@ -257,7 +268,6 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
         yield from super().get_input_iter(dtype)
 
 
-@pytest.mark.fused_inv_rope_fp8_quant
 @pytest.mark.skipif(
     not HAS_FP8_QUANT, reason="requires float8_e4m3fn quantization support"
 )
