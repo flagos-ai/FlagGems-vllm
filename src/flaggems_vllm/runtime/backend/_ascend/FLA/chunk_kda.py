@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BT=16 inference kernels for KDA prefill.
+"""Ascend KDA prefill kernels (BT=64, chunk-major workspaces).
 
 Two forward paths with identical semantics share one public entry, ``chunk_kda``:
 
-* TLE path (``ascend_chunk_kda_fwd_infer``): TLE-optimized kernels.
+* TLE path (``ascend_chunk_kda_fwd_infer``): three kernels mirroring the
+  fla-npu AscendC ``aclnnChunkKdaFwdV2`` chain -- Prepare (gate cumsum +
+  intra-chunk Gram matrices + triangular inverse + workspace pack), FwdH (the
+  serial 3-dot chunk recurrence) and Finalize (the fully chunk-parallel
+  ``o = scale*qg@h + Aqk@v_new``).  All intermediates are chunk-major, so each
+  chunk-head is one contiguous 8-48 KiB burst instead of BT strided rows.
 * Triton fallback (``chunk_kda_fwd_infer_triton``): portable plain-Triton
-  kernels shared verbatim with ``flaggems_vllm.ops.FLA.chunk_kda``.
+  kernels shared verbatim with ``flaggems_vllm.ops.FLA.chunk_kda``.  Used when
+  TLE is unavailable or the chunk-major h buffer would exceed its budget.
 
 ``chunk_kda`` validates inputs first, then dispatches: TLE when
 available, and Triton otherwise. Set ``FLAGGEMS_CHUNK_KDA_BACKEND`` to
@@ -94,8 +100,8 @@ MAX_GRID_BLOCKS = 32768
 # (8 mantissa bits) for tl.dot. A single chunk-wide midpoint anchor keeps
 # that span bit-exact through BT=32 but goes non-finite at BT=64 (3.5M-17.8M
 # non-finite outputs, see tools/_kda_bt64_subblock_math_check.py for a CPU
-# repro). SUBBLOCK_REBASE in _ascend_kda_fwd_intra_kernel splits BT=64 into
-# two 32-row sub-blocks, each rebased on its own local midpoint (mirrors
+# repro). _ascend_kda_fwd_intra_kernel splits BT=64 into two 32-row
+# sub-blocks, each rebased on its own local midpoint (mirrors
 # AscendC arch35's 32-row score reference span -- see
 # flash-linear-attention-npu/.../chunk_kda_fwd_prepare.h ScoreRefToken), which
 # keeps every span within the BT=32 bit-exact envelope while still scanning
@@ -119,7 +125,10 @@ def _ascend_chunk_width() -> int:
         val = int(raw)
     except ValueError:
         return _ASCEND_BT
-    return val if val in (16, 32, 64) else _ASCEND_BT
+    # The intra kernel evaluates the Gram matrices in two BT//2 sub-blocks;
+    # sub-blocks below 16 rows cannot feed tl.dot, so 16 is no longer a valid
+    # internal width (it maps back to the default).
+    return val if val in (32, 64) else _ASCEND_BT
 
 
 # Neumann truncation order for (I+L)^-1 in _ascend_kda_fwd_intra_kernel.
@@ -158,6 +167,54 @@ def _ascend_neumann_stages() -> int:
     return val if val in (0, 1, 2, 3) else _ASCEND_NEUMANN_STAGES
 
 
+# The state scan used to carry an experimental ``tl.range(num_stages=...)``
+# switch.  Measured on Ascend950DT with T=32768 H=24 (tools/_kda_shape_bench.py)
+# num_stages 0/1/2/3 all gave the same 3.14 ms state-kernel time, i.e. the
+# triton-ascend backend does not software-pipeline this loop (matching the
+# category note "program 间不重叠、num_stages 无效").  It was removed rather
+# than kept as a dead knob.
+#
+# The state kernel is split into two kernels, mirroring fla-npu's AscendC
+# ``aclnnChunkKdaFwdV2`` chain (Prepare -> ChunkFwdH -> ChunkKdaFwdFinalize):
+# the serial chunk scan (_ascend_kda_fwd_state_kernel) only carries the true
+# recurrence (3 dots/chunk), while the o = qg@h + Aqk@v_new half runs in a
+# fully chunk-parallel kernel (_ascend_kda_fwd_output_kernel, 2 dots/chunk).
+# FLAGGEMS_ASCEND_KDA_FUSED_STATE=1 forces the portable chunk-at-a-time Triton
+# path instead (A/B measurement; also the memory fallback below).
+_FUSED_STATE_ENV = "FLAGGEMS_ASCEND_KDA_FUSED_STATE"
+
+
+def _ascend_fused_state() -> bool:
+    """Use the fused state+output scan instead of FwdH + Finalize."""
+    return os.environ.get(_FUSED_STATE_ENV, "0").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+# Budget for the chunk-major h buffer Finalize consumes.  h is [chunks, HV, K,
+# V] bf16: 402 MiB for the T=32768 H=24 case, the same intermediate the AscendC
+# V2 chain materializes.  Above this budget the portable chunk-at-a-time Triton
+# path runs instead so an unexpectedly large (shape, head count) combination
+# cannot OOM the device.
+_H_BUDGET_ENV = "FLAGGEMS_ASCEND_KDA_H_BUDGET_MB"
+_H_BUDGET_MB = 4096
+
+
+def _ascend_h_budget_bytes() -> int:
+    raw = os.environ.get(_H_BUDGET_ENV)
+    if not raw:
+        return _H_BUDGET_MB << 20
+    try:
+        val = int(raw)
+    except ValueError:
+        return _H_BUDGET_MB << 20
+    return max(val, 0) << 20
+
+
 _BACKEND_ENV = "FLAGGEMS_CHUNK_KDA_BACKEND"
 _BACKEND_ALIASES = {
     "auto": "auto",
@@ -184,6 +241,20 @@ def exp2(x):
     return tl.math.exp2(x.to(tl.float32))
 
 
+@triton.jit
+def _block_mul_lower(a00, a10, a11, b00, b10, b11):
+    """Product of two block lower-triangular [2H, 2H] matrices.
+
+    A = [[a00, 0], [a10, a11]], B likewise; returns (c00, c10, c11) with
+    c10 = a10@b00 + a11@b10.  fp32 in/out, bf16 operands for the dots.
+    """
+    c00 = tl.dot(a00.to(tl.bfloat16), b00.to(tl.bfloat16), out_dtype=tl.float32)
+    c11 = tl.dot(a11.to(tl.bfloat16), b11.to(tl.bfloat16), out_dtype=tl.float32)
+    c10 = tl.dot(a10.to(tl.bfloat16), b00.to(tl.bfloat16), out_dtype=tl.float32)
+    c10 += tl.dot(a11.to(tl.bfloat16), b10.to(tl.bfloat16), out_dtype=tl.float32)
+    return c00, c10, c11
+
+
 # =============================================================================
 # TLE path -- default when available
 # =============================================================================
@@ -195,25 +266,54 @@ if HAS_TLE_KDA:
     extract_slice = _extract_slice
     insert_slice = _insert_slice
 
-    # ------------------------------------------------------------------
-    # Kernel 1: intra-chunk Aqk/Akk + triangular inverse + workspace packing
-    # ------------------------------------------------------------------
+    # =================================================================
+    # Workspace layouts -- all chunk-major, mirroring the AscendC V2
+    # chain's (`aclnnChunkKdaFwdV2`: Prepare -> ChunkFwdH ->
+    # ChunkKdaFwdFinalize) internal tensors.
+    #
+    # ``gid`` is the canonical chunk id: sequence-major for varlen (the row
+    # index into ``chunk_indices``), ``i_n * NT + i_t`` for dense.
+    #
+    #   ws       [NC, HV, BT, 3K]  bf16   : w | kg | qg
+    #   Aqk      [NC, HV, BT, BT]  bf16
+    #   Akk      [NC, HV, BT, BT]  bf16   : (I+L)^-1, already applied
+    #   g_out    [B, NC*BT, HV, K] fp32   : chunk-local gate cumsum (FwdH reads
+    #                                      only each chunk's last row)
+    #   v_new    [NC, HV, BT, V]   bf16
+    #   h_buf    [NC, HV, K, V]    bf16   : state at the *start* of the chunk
+    #
+    # Chunk-major matters.  The old token-major form stored one chunk-head as
+    # BT x (BT*2 B) rows strided by HV*BT (Aqk/Akk) and BT x (256 B) rows
+    # strided by HV*3K (ws); the serial scan's profiler ratios were
+    # MTE2 49% / scalar 36% and almost no MAC, i.e. it was paying for exactly
+    # those short strided bursts.  Here each chunk-head is one contiguous
+    # 8 KiB (Aqk/Akk) / 48 KiB (ws) / 16 KiB (v_new) / 32 KiB (h) object,
+    # matching AscendC's chunk-major h/w/A workspaces.
+    # =================================================================
 
-    @triton.heuristics(
-        {
-            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-            # The factored decay exp2(gc-ref)*exp2(ref-gc) needs its single
-            # causal span (ref to either end of the chunk) to stay inside bf16
-            # range. At BT<=32 one chunk-wide midpoint anchor already keeps
-            # that span to <=16 tokens of decay and is verified bit-exact
-            # (see tools/_kda_bt_accuracy.py). At BT=64 the same single-anchor
-            # span covers <=32 tokens of decay, which tools/_kda_bt_accuracy.py
-            # observed going non-finite: see tools/_kda_bt64_subblock_math_check.py
-            # for the CPU-only repro (152/200*4096 entries non-finite with a
-            # single BT=64 anchor vs. 0/200*4096 with the split below).
-            "SUBBLOCK_REBASE": lambda args: args["BT"] > 32,
-        }
-    )
+    def _pick_bv(K: int, V: int) -> int:
+        # The chunk recurrence is serial, so BV decides how many waves of
+        # programs each pay the full per-chunk dot chain: the grid is
+        # (V/BV, N*HV). Taking BV = V runs that chain once per (sequence, head)
+        # instead of 2x at BV=64. Measured on the T=24576 H=12 D=128 Ascend950DT
+        # prefill: 5.66 ms (BV=32), 4.38 ms (BV=64), 3.90 ms (BV=128).
+        if K <= 128:
+            return min(V, 128)
+        return 32
+
+    # ------------------------------------------------------------------
+    # Kernel 1: gate cumsum + intra-chunk grans + triangular inverse +
+    # workspace packing.  Parallel over (chunk, head).
+    #
+    # Mirrors AscendC arch35 Prepare: both Gram matrices share their right
+    # operand, and the gate decay is applied *after* the dot as the
+    # [BT, BT] elementwise factor exp2(gc_i - gc_j) instead of being folded
+    # into the bf16 operands.  On the causal half gc_i - gc_j <= 0, so the
+    # factor is in [0, 1]: no bf16/fp32 overflow, no per-32-row re-basing,
+    # and only two dots (q@k^T, k@k^T) per chunk instead of the six the
+    # sub-block factored form needed at BT=64.
+    # ------------------------------------------------------------------
+    @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
     @triton.jit(do_not_specialize=["T"])
     def _ascend_kda_fwd_intra_kernel(
         q,
@@ -224,6 +324,7 @@ if HAS_TLE_KDA:
         Aqk,
         Akk,
         g_out,
+        chunk_offsets,
         A_log,
         dt_bias,
         lower_bound,
@@ -240,7 +341,6 @@ if HAS_TLE_KDA:
         BT: tl.constexpr,
         CPT: tl.constexpr,
         IS_VARLEN: tl.constexpr,
-        SUBBLOCK_REBASE: tl.constexpr,
         NEUMANN_STAGES: tl.constexpr,
     ):
         i_tc, i_bh = tl.program_id(0), tl.program_id(1)
@@ -248,15 +348,18 @@ if HAS_TLE_KDA:
         i_h = i_hv // (HV // H)
 
         for c in tl.static_range(CPT):
-            i_t = i_tc * CPT + c
-            if i_t < NC:
+            i_tg = i_tc * CPT + c
+            if i_tg < NC:
                 if IS_VARLEN:
-                    i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-                        chunk_indices + i_t * 2 + 1
-                    ).to(tl.int32)
+                    i_n = tl.load(chunk_indices + i_tg * 2).to(tl.int32)
+                    i_t = tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32)
                     bos = tl.load(cu_seqlens + i_n).to(tl.int32)
                     T = tl.load(cu_seqlens + i_n + 1).to(tl.int32) - bos
+                    if (i_bh == 0) & (i_t == 0):
+                        # canonical chunk -> [N] launch prefix, consumed by FwdH
+                        tl.store(chunk_offsets + i_n, i_tg)
                 else:
+                    i_t = i_tg
                     bos = i_bh // HV * T
 
                 if i_t * BT < T:
@@ -264,10 +367,10 @@ if HAS_TLE_KDA:
                     p_k = k + (bos * H + i_h).to(tl.int64) * K
                     p_g = g + (bos * HV + i_hv).to(tl.int64) * K
                     p_g_out = g_out + (bos * HV + i_hv).to(tl.int64) * K
-                    p_Aqk = Aqk + (bos * HV + i_hv).to(tl.int64) * BT
-                    p_Akk = Akk + (bos * HV + i_hv).to(tl.int64) * BT
-                    p_ws = ws + (bos * HV + i_hv).to(tl.int64) * 3 * K
                     p_beta = beta + bos * HV + i_hv
+                    p_ws = ws + (i_tg.to(tl.int64) * HV + i_hv) * BT * 3 * K
+                    p_Aqk = Aqk + (i_tg.to(tl.int64) * HV + i_hv) * BT * BT
+                    p_Akk = Akk + (i_tg.to(tl.int64) * HV + i_hv) * BT * BT
 
                     o_i = tl.arange(0, BT)
                     o_c = i_t * BT + o_i
@@ -302,15 +405,12 @@ if HAS_TLE_KDA:
                     # that serialized BT read-modify-writes of the [BT, K] tile.
                     b_gc = tl.cumsum(b_g, axis=0)
 
-                    # Store the whole [BT, K] cumsum even though the state
-                    # kernel reads only each chunk's last row. Writing just
-                    # that row cuts 32x the bytes (403 MB -> 12.6 MB per call
-                    # at T=32768 H=24) and is *slower*: a [K] store at a
-                    # scalar-computed token offset costs more than the wide
-                    # contiguous 2D burst it replaces. Measured on the intra
-                    # kernel: 1395 us -> 2948 us at T=8192 H=24, 5793 us ->
-                    # 11979 us at T=32768 H=24. This op is transfer-shape
-                    # bound, not volume bound.
+                    # The whole [BT, K] cumsum is stored even though FwdH reads
+                    # only the chunk's last row: a compact [K] store at a
+                    # scalar-computed offset was measured *2x slower* than this
+                    # wide contiguous 2D burst (see the BT sweep in the history:
+                    # 1395 -> 2948 us at T=8192 H=24), so the extra 402 MB of
+                    # writes is cheaper than the small-store latency.
                     if IS_VARLEN:
                         tl.store(
                             p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
@@ -318,145 +418,79 @@ if HAS_TLE_KDA:
                             mask=m_c[:, None],
                         )
                     else:
-                        tl.store(p_g_out + o_c[:, None] * (HV * K) + o_k[None, :], b_gc)
-
-                    # Aqk/Akk only need exp2(b_gc[i] - b_gc[j]) on the causal
-                    # half (i >= j), where b_gc is non-increasing, so the true
-                    # exponent is always <= 0. Splitting it into
-                    # exp2(b_gc) * exp2(-b_gc) manufactures a huge range:
-                    # b_gc reaches about -62 log2 units over BT=16, so
-                    # exp2(-b_gc) hits ~4e18. fp32 holds that, but these
-                    # operands are cast to bf16 for tl.dot and bf16 keeps only
-                    # 8 mantissa bits, so the product loses all significance
-                    # (observed |Aqk| ~ 7e14 against a true O(1)).
-                    # Rebasing on the chunk midpoint splits the span across the
-                    # two factors and cancels exactly in the difference -- but
-                    # only up to the span a *single* anchor can cover. At
-                    # BT<=32 one chunk-wide anchor keeps each side's span to
-                    # <=16 tokens of decay, verified bit-exact. At BT=64 the
-                    # same single anchor needs each side to cover <=32 tokens
-                    # of decay, which tools/_kda_bt64_subblock_math_check.py
-                    # showed going non-finite under the real safe-gate
-                    # distribution (152/819200 entries, 200-trial sweep).
-                    if SUBBLOCK_REBASE:
-                        # Split the BT=64 chunk into two BT//2 sub-blocks, each
-                        # with its own local-midpoint anchor (mirrors AscendC
-                        # arch35's 32-row score reference span --
-                        # flash-linear-attention-npu/.../chunk_kda_fwd_prepare.h
-                        # ScoreRefToken/BuildKdaGateRegbaseExp -- which rebases
-                        # per 32-row block instead of once per 64-row chunk for
-                        # exactly this reason). Three dots instead of one:
-                        #   - SB0 diagonal (rows/cols < HALF), anchor0
-                        #   - SB1 diagonal (rows/cols >= HALF), anchor1
-                        #   - cross block (rows >= HALF, cols < HALF, always
-                        #     causal since i >= HALF > HALF-1 >= j): q-side on
-                        #     anchor1, k-side on anchor0 with the scalar
-                        #     cross-anchor correction exp2(anchor1-anchor0)
-                        #     folded in *before* the bf16 cast/dot -- the
-                        #     correction varies per-K, so it must be applied
-                        #     pre-reduction; a post-hoc per-(i,j) scalar after
-                        #     the K-sum is mathematically wrong (verified in
-                        #     tools/_kda_bt64_subblock_math_check.py).
-                        # The strictly-upper cross block (rows < HALF, cols >=
-                        # HALF) is anti-causal and stays zero from the m_Aqk
-                        # mask applied below, same as the single-anchor path.
-                        HALF: tl.constexpr = BT // 2
-                        in_sb0 = o_i[:, None] < HALF
-                        in_sb1 = ~in_sb0
-                        local_mid0 = HALF // 2
-                        local_mid1 = HALF + HALF // 2
-                        b_anchor0 = tl.sum(
-                            tl.where(o_i[:, None] == local_mid0, b_gc, 0.0), 0
-                        )[None, :]
-                        b_anchor1 = tl.sum(
-                            tl.where(o_i[:, None] == local_mid1, b_gc, 0.0), 0
-                        )[None, :]
-
-                        b_reb0 = b_gc - b_anchor0
-                        b_reb1 = b_gc - b_anchor1
-                        b_cross_corr = exp2(b_anchor1 - b_anchor0)
-
-                        b_gq0 = tl.where(m_c[:, None] & in_sb0, exp2(b_reb0), 0.0)
-                        b_gk0 = tl.where(m_c[:, None] & in_sb0, exp2(-b_reb0), 0.0)
-                        b_gq1 = tl.where(m_c[:, None] & in_sb1, exp2(b_reb1), 0.0)
-                        b_gk1 = tl.where(m_c[:, None] & in_sb1, exp2(-b_reb1), 0.0)
-                        b_gk0_corr = tl.where(
-                            m_c[:, None] & in_sb0,
-                            exp2(-b_reb0) * b_cross_corr,
-                            0.0,
+                        tl.store(
+                            p_g_out + o_c[:, None] * (HV * K) + o_k[None, :],
+                            b_gc,
                         )
 
-                        b_qg0_t = (b_qf * b_gq0).to(tl.bfloat16)
-                        b_kg0_t = tl.trans((b_kf * b_gk0).to(tl.bfloat16))
-                        b_qg1_t = (b_qf * b_gq1).to(tl.bfloat16)
-                        b_kg1_t = tl.trans((b_kf * b_gk1).to(tl.bfloat16))
-                        b_kg0_corr_t = tl.trans((b_kf * b_gk0_corr).to(tl.bfloat16))
-
-                        b_Aqk = tl.dot(b_qg0_t, b_kg0_t, out_dtype=tl.float32)
-                        b_Aqk += tl.dot(b_qg1_t, b_kg1_t, out_dtype=tl.float32)
-                        b_Aqk += tl.dot(b_qg1_t, b_kg0_corr_t, out_dtype=tl.float32)
-
-                        b_Akk = tl.dot(
-                            (b_kf * b_gq0).to(tl.bfloat16),
-                            b_kg0_t,
-                            out_dtype=tl.float32,
-                        )
-                        b_Akk += tl.dot(
-                            (b_kf * b_gq1).to(tl.bfloat16),
-                            b_kg1_t,
-                            out_dtype=tl.float32,
-                        )
-                        b_Akk += tl.dot(
-                            (b_kf * b_gq1).to(tl.bfloat16),
-                            b_kg0_corr_t,
-                            out_dtype=tl.float32,
-                        )
-
-                        # Downstream workspace packing (b_kb/b_qg_val/b_kg_val)
-                        # uses the unrebased exp2(b_gc)/exp2(b_gn - b_gc)
-                        # directly (elementwise, no bf16 K-reduction), so it
-                        # does not need b_gc_reb/b_anchor0/b_anchor1 at all.
-                    else:
-                        b_gc_anchor = tl.sum(
-                            tl.where(o_i[:, None] == BT // 2, b_gc, 0.0), 0
-                        )
-                        b_gc_reb = b_gc - b_gc_anchor[None, :]
-                        b_gq = tl.where(m_c[:, None], exp2(b_gc_reb), 0.0)
-                        b_gk = tl.where(m_c[:, None], exp2(-b_gc_reb), 0.0)
-
-                        b_kg_t = tl.trans((b_kf * b_gk).to(tl.bfloat16))
-                        b_Aqk = tl.dot(
-                            (b_qf * b_gq).to(tl.bfloat16), b_kg_t, out_dtype=tl.float32
-                        )
-                        b_Akk = tl.dot(
-                            (b_kf * b_gq).to(tl.bfloat16), b_kg_t, out_dtype=tl.float32
-                        )
-
-                    b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
-                    b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
+                    # Key-wise gate decay cannot be pulled out of the dot: the
+                    # factor exp2(gc[i,k] - gc[j,k]) lives inside the K sum.
+                    # Fold it into the bf16 operands, anchored per 32-row
+                    # sub-block (mirrors AscendC arch35 Prepare's
+                    # ScoreRefToken / 32-row reference span): acting as a
+                    # single BT=64 anchor makes each side cover <=32 tokens of
+                    # decay, which underflows the near-diagonal terms at the
+                    # harness gate range.
+                    HALF: tl.constexpr = BT // 2
+                    in_sb0 = o_i[:, None] < HALF
+                    in_sb1 = ~in_sb0
+                    b_anchor0 = tl.sum(
+                        tl.where(o_i[:, None] == HALF // 2, b_gc, 0.0), 0
+                    )[None, :]
+                    b_anchor1 = tl.sum(
+                        tl.where(o_i[:, None] == HALF + HALF // 2, b_gc, 0.0), 0
+                    )[None, :]
+                    b_reb0 = b_gc - b_anchor0
+                    b_reb1 = b_gc - b_anchor1
+                    b_cross_corr = exp2(b_anchor1 - b_anchor0)
+                    b_gq0 = tl.where(m_c[:, None] & in_sb0, exp2(b_reb0), 0.0)
+                    b_gk0 = tl.where(m_c[:, None] & in_sb0, exp2(-b_reb0), 0.0)
+                    b_gq1 = tl.where(m_c[:, None] & in_sb1, exp2(b_reb1), 0.0)
+                    b_gk1 = tl.where(m_c[:, None] & in_sb1, exp2(-b_reb1), 0.0)
+                    b_gk0_corr = tl.where(
+                        m_c[:, None] & in_sb0, b_gk0 * b_cross_corr, 0.0
+                    )
 
                     b_beta = tl.sigmoid(
                         tl.load(p_beta + o_c * HV, mask=m_c, other=0.0).to(tl.float32)
                     )
 
+                    b_qg0_t = (b_qf * b_gq0).to(tl.bfloat16)
+                    b_qg1_t = (b_qf * b_gq1).to(tl.bfloat16)
+                    b_kg0_t = tl.trans((b_kf * b_gk0).to(tl.bfloat16))
+                    b_kg1_t = tl.trans((b_kf * b_gk1).to(tl.bfloat16))
+                    b_kg0_corr_t = tl.trans((b_kf * b_gk0_corr).to(tl.bfloat16))
+
                     m_Aqk = o_i[:, None] >= o_i[None, :]
+                    b_Aqk = tl.dot(b_qg0_t, b_kg0_t, out_dtype=tl.float32)
+                    b_Aqk += tl.dot(b_qg1_t, b_kg1_t, out_dtype=tl.float32)
+                    b_Aqk += tl.dot(b_qg1_t, b_kg0_corr_t, out_dtype=tl.float32)
+                    b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
+                    b_Aqk = tl.where(m_Aqk, b_Aqk * scale, 0.0)
+                    tl.store(
+                        p_Aqk + o_i[:, None] * BT + o_i[None, :],
+                        b_Aqk.to(Aqk.dtype.element_ty),
+                    )
+
                     m_Akk = o_i[:, None] > o_i[None, :]
                     m_I = o_i[:, None] == o_i[None, :]
-
-                    b_Aqk = tl.where(m_Aqk, b_Aqk * scale, 0.0)
+                    b_Akk = tl.dot(
+                        (b_kf * b_gq0).to(tl.bfloat16),
+                        b_kg0_t,
+                        out_dtype=tl.float32,
+                    )
+                    b_Akk += tl.dot(
+                        (b_kf * b_gq1).to(tl.bfloat16),
+                        b_kg1_t,
+                        out_dtype=tl.float32,
+                    )
+                    b_Akk += tl.dot(
+                        (b_kf * b_gq1).to(tl.bfloat16),
+                        b_kg0_corr_t,
+                        out_dtype=tl.float32,
+                    )
+                    b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
                     b_Akk = tl.where(m_Akk, b_Akk * b_beta[:, None], 0.0)
-
-                    if IS_VARLEN:
-                        tl.store(
-                            p_Aqk + o_c[:, None] * (HV * BT) + o_i[None, :],
-                            b_Aqk.to(Aqk.dtype.element_ty),
-                            mask=m_c[:, None],
-                        )
-                    else:
-                        tl.store(
-                            p_Aqk + o_c[:, None] * (HV * BT) + o_i[None, :],
-                            b_Aqk.to(Aqk.dtype.element_ty),
-                        )
 
                     # (I+L)^-1 via Neumann series: L is strictly lower
                     # triangular so L^BT == 0 and the series terminates
@@ -496,51 +530,25 @@ if HAS_TLE_KDA:
                                     b_Ai.to(tl.bfloat16), b_L8, out_dtype=tl.float32
                                 )
 
-                    if IS_VARLEN:
-                        tl.store(
-                            p_Akk + o_c[:, None] * (HV * BT) + o_i[None, :],
-                            b_Ai.to(Akk.dtype.element_ty),
-                            mask=m_c[:, None],
-                        )
-                    else:
-                        tl.store(
-                            p_Akk + o_c[:, None] * (HV * BT) + o_i[None, :],
-                            b_Ai.to(Akk.dtype.element_ty),
-                        )
+                    tl.store(
+                        p_Akk + o_i[:, None] * BT + o_i[None, :],
+                        b_Ai.to(Akk.dtype.element_ty),
+                    )
 
-                    # Pack w, qg, kg into the workspace at column offsets 0, K and 2*K.
-                    ptrs_ws = o_c[:, None] * (HV * 3 * K) + o_k[None, :]
+                    # Pack w | kg | qg into one contiguous [BT, 3K] chunk tile.
+                    ptrs_ws = o_i[:, None] * (3 * K) + o_k[None, :]
                     b_k3 = b_kf * b_k_rstd[:, None]
-                    b_kb = b_k3 * b_beta[:, None] * exp2(b_gc)
                     b_q3 = b_qf * b_q_rstd[:, None]
-                    b_qg_val = b_q3 * exp2(b_gc)
                     last_local = tl.minimum(BT, T - i_t * BT) - 1
                     b_gn = tl.sum(tl.where(o_i[:, None] == last_local, b_gc, 0.0), 0)
+                    b_w_val = b_k3 * b_beta[:, None] * exp2(b_gc)
                     b_kg_val = b_k3 * tl.where(
                         m_c[:, None], exp2(b_gn[None, :] - b_gc), 0.0
                     )
-                    if IS_VARLEN:
-                        tl.store(
-                            p_ws + ptrs_ws,
-                            b_kb.to(ws.dtype.element_ty),
-                            mask=m_c[:, None],
-                        )
-                        tl.store(
-                            p_ws + ptrs_ws + K,
-                            b_qg_val.to(ws.dtype.element_ty),
-                            mask=m_c[:, None],
-                        )
-                        tl.store(
-                            p_ws + ptrs_ws + 2 * K,
-                            b_kg_val.to(ws.dtype.element_ty),
-                            mask=m_c[:, None],
-                        )
-                    else:
-                        tl.store(p_ws + ptrs_ws, b_kb.to(ws.dtype.element_ty))
-                        tl.store(p_ws + ptrs_ws + K, b_qg_val.to(ws.dtype.element_ty))
-                        tl.store(
-                            p_ws + ptrs_ws + 2 * K, b_kg_val.to(ws.dtype.element_ty)
-                        )
+                    b_qg_val = b_q3 * exp2(b_gc)
+                    tl.store(p_ws + ptrs_ws, b_w_val.to(ws.dtype.element_ty))
+                    tl.store(p_ws + ptrs_ws + K, b_kg_val.to(ws.dtype.element_ty))
+                    tl.store(p_ws + ptrs_ws + 2 * K, b_qg_val.to(ws.dtype.element_ty))
 
     def _ascend_kda_fwd_intra(
         q,
@@ -561,25 +569,34 @@ if HAS_TLE_KDA:
 
         if chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-        NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
+        if cu_seqlens is None:
+            N = B
+            NT = triton.cdiv(T_len, BT)
+            NC = NT
+            NC_global = B * NT
+        else:
+            N = len(cu_seqlens) - 1
+            NC = len(chunk_indices)
+            NC_global = NC
         BHV = B * HV
 
-        # Cap the linear grid at MAX_GRID_BLOCKS.
-        # Each program then handles CPT consecutive chunks; CPT == 1 reproduces
-        # the original (NT, B*HV) grid exactly.
-        CPT = triton.cdiv(NT * BHV, MAX_GRID_BLOCKS)
-        grid0 = triton.cdiv(NT, CPT)
+        # Cap the linear grid at MAX_GRID_BLOCKS. Each program then handles CPT
+        # consecutive chunks; CPT == 1 reproduces the original grid exactly.
+        CPT = triton.cdiv(NC * BHV, MAX_GRID_BLOCKS)
+        grid0 = triton.cdiv(NC, CPT)
         while grid0 * BHV > MAX_GRID_BLOCKS:
             CPT += 1
-            grid0 = triton.cdiv(NT, CPT)
+            grid0 = triton.cdiv(NC, CPT)
         grid = (grid0, BHV)
 
-        # Pad the workspace T dimension so full BT tiles can always be stored.
-        T_padded = NT * BT
-        g_out = torch.empty(B, T_padded, HV, K, device=q.device, dtype=torch.float32)
-        ws = torch.empty(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
-        Aqk = torch.empty(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
-        Akk = torch.zeros(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
+        ws = torch.empty(NC_global, HV, BT, 3 * K, device=q.device, dtype=q.dtype)
+        Aqk = torch.empty(NC_global, HV, BT, BT, device=q.device, dtype=q.dtype)
+        Akk = torch.empty(NC_global, HV, BT, BT, device=q.device, dtype=q.dtype)
+        # [token, HV, K] fp32 cumsum, shared layout with the FwdH gk read.
+        g_out = torch.empty(
+            1, NC_global * BT, HV, K, device=q.device, dtype=torch.float32
+        )
+        chunk_offsets = torch.empty(max(N, 1), device=q.device, dtype=torch.int32)
 
         _ascend_kda_fwd_intra_kernel[grid](
             q=q,
@@ -590,6 +607,7 @@ if HAS_TLE_KDA:
             Aqk=Aqk,
             Akk=Akk,
             g_out=g_out,
+            chunk_offsets=chunk_offsets,
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
@@ -599,7 +617,7 @@ if HAS_TLE_KDA:
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             T=T_len,
-            NC=NT,
+            NC=NC,
             H=H,
             HV=HV,
             K=K,
@@ -608,26 +626,13 @@ if HAS_TLE_KDA:
             NEUMANN_STAGES=_ascend_neumann_stages(),
         )
 
-        return ws, Aqk, Akk, g_out
+        return ws, Aqk, Akk, g_out, chunk_offsets, NC, NC_global, N
 
     # ------------------------------------------------------------------
-    # Kernel 2: state propagation + output
+    # Kernel 2: FwdH -- the only serial chunk scan, 3 dots per chunk
+    # (w@h, (I+L)^-1@diff, kg^T@v_new), exactly AscendC's ChunkFwdH.
+    # qg/Aqk/o are no longer touched here; they moved to Finalize.
     # ------------------------------------------------------------------
-
-    def _pick_bv(K: int, V: int) -> int:
-        # The chunk recurrence is serial, so BV decides how many waves of
-        # programs each pay the full per-chunk dot chain: the grid is
-        # (V/BV, N*HV). Taking BV = V runs that chain once per (sequence, head)
-        # instead of 2x at BV=64. Measured on the T=24576 H=12 D=128 Ascend950DT
-        # prefill: 5.66 ms (BV=32), 4.38 ms (BV=64), 3.90 ms (BV=128).
-        # Re-measured on the (T,H,seq) prefill sweep, where N*HV is 48 for
-        # every case: BV=128 still wins (state kernel 1794 us vs 3038 us at
-        # BV=64 and 5957 us at BV=32 for T=8192 H=24). The serial dot chain
-        # dominates, not occupancy.
-        if K <= 128:
-            return min(V, 128)
-        return 32
-
     @triton.heuristics(
         {
             "USE_INITIAL_STATE": lambda args: args["h0"].numel() > 1,
@@ -636,18 +641,18 @@ if HAS_TLE_KDA:
         }
     )
     @triton.jit(do_not_specialize=["T"])
-    def _ascend_kda_fwd_state_output_kernel(
+    def _ascend_kda_fwd_state_kernel(
         v,
         beta,
         gk,
-        Aqk,
         Akk,
-        o,
         ws,
+        v_new,
+        h_buf,
         h0,
         ht,
+        chunk_offsets,
         cu_seqlens,
-        scale,
         T,
         HV: tl.constexpr,
         K: tl.constexpr,
@@ -668,19 +673,13 @@ if HAS_TLE_KDA:
             eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
             T = eos - bos
             NT = tl.cdiv(T, BT)
+            hbase = tl.load(chunk_offsets + i_n).to(tl.int32)
         else:
             i_n = i_nh // HV
             i_h = i_nh % HV
             bos = i_n * T
             NT = tl.cdiv(T, BT)
-
-        v += (bos * HV + i_h).to(tl.int64) * V
-        beta += bos * HV + i_h
-        gk += (bos * HV + i_h).to(tl.int64) * K
-        Aqk += (bos * HV + i_h).to(tl.int64) * BT
-        Akk += (bos * HV + i_h).to(tl.int64) * BT
-        o += (bos * HV + i_h).to(tl.int64) * V
-        ws_base = ws + (bos * HV + i_h).to(tl.int64) * 3 * K
+            hbase = i_n * NT
 
         o_t = tl.arange(0, BT)
         o_k = tl.arange(0, K)
@@ -691,7 +690,6 @@ if HAS_TLE_KDA:
         if USE_INITIAL_STATE:
             h0 += i_nh.to(tl.int64) * K * V
             if STATE_V_FIRST:
-                # h0 is [N, HV, V, K]
                 b_h = tl.trans(
                     tl.load(
                         h0 + (i_v * BV + o_v)[:, None] * K + o_k[None, :],
@@ -700,7 +698,6 @@ if HAS_TLE_KDA:
                     )
                 ).to(tl.float32)
             else:
-                # h0 is [N, HV, K, V]
                 b_h = tl.load(
                     h0 + o_k[:, None] * V + (i_v * BV + o_v)[None, :],
                     mask=m_v[None, :],
@@ -709,60 +706,69 @@ if HAS_TLE_KDA:
         else:
             b_h = tl.zeros((K, BV), dtype=tl.float32)
 
-        # Sequential recurrence across chunks.
         for i_t in range(NT):
             o_c = i_t * BT + o_t
             m_c = o_c < T
+            gid = hbase + i_t
 
-            ptrs_ws = o_c[:, None] * (HV * 3 * K) + o_k[None, :]
-            b_w = tl.load(ws_base + ptrs_ws)
-            b_qg = tl.load(ws_base + ptrs_ws + K)
-            b_kg = tl.load(ws_base + ptrs_ws + 2 * K)
-            b_Aqk = tl.load(Aqk + o_c[:, None] * (HV * BT) + o_t[None, :])
-            b_Akk = tl.load(Akk + o_c[:, None] * (HV * BT) + o_t[None, :])
-            if IS_VARLEN:
-                z = m_c[:, None]
-                b_w = tl.where(z, b_w, 0.0)
-                b_qg = tl.where(z, b_qg, 0.0)
-                b_kg = tl.where(z, b_kg, 0.0)
-                b_Aqk = tl.where(z, b_Aqk, 0.0)
-                b_Akk = tl.where(z, b_Akk, 0.0)
+            # w | kg | qg, one contiguous chunk tile.
+            p_ws = ws + (gid.to(tl.int64) * HV + i_h) * BT * 3 * K
+            ptrs_w = o_t[:, None] * (3 * K) + o_k[None, :]
+            b_w = tl.load(p_ws + ptrs_w)
+            b_kg = tl.load(p_ws + ptrs_w + K)
+            b_Akk = tl.load(
+                Akk
+                + (gid.to(tl.int64) * HV + i_h) * BT * BT
+                + o_t[:, None] * BT
+                + o_t[None, :]
+            )
+            gk_row = tl.minimum(i_t * BT + BT, T) - 1
+            b_gk_last = tl.load(gk + ((bos + gk_row) * HV + i_h).to(tl.int64) * K + o_k)
 
-            last_idx = tl.minimum(i_t * BT + BT, T) - 1
-            b_gk_last = tl.load(gk + last_idx * (HV * K) + o_k)
-
+            p_v = v + ((bos + i_t * BT) * HV + i_h).to(tl.int64) * V
             b_v = tl.load(
-                v + o_c[:, None] * (HV * V) + (i_v * BV + o_v)[None, :],
-                mask=m_c[:, None],
+                p_v + o_t[:, None] * (HV * V) + (i_v * BV + o_v)[None, :],
+                mask=m_c[:, None] & m_v[None, :],
                 other=0.0,
             )
             b_beta = tl.sigmoid(
-                tl.load(beta + o_c * HV, mask=m_c, other=0.0).to(tl.float32)
+                tl.load(beta + (bos + o_c) * HV + i_h, mask=m_c, other=0.0).to(
+                    tl.float32
+                )
             )
             b_vb = b_v.to(tl.float32) * b_beta[:, None]
 
             b_h_cast = b_h.to(tl.bfloat16)
+            # h at the start of this chunk, consumed by Finalize.
+            tl.store(
+                h_buf
+                + ((gid.to(tl.int64) * HV + i_h) * K + o_k[:, None]) * V
+                + (i_v * BV + o_v)[None, :],
+                b_h_cast,
+                mask=m_v[None, :],
+            )
+
             b_kh = tl.dot(b_w.to(tl.bfloat16), b_h_cast, out_dtype=tl.float32)
             b_diff = b_vb - b_kh
             b_v_new = tl.dot(
-                b_Akk.to(tl.bfloat16), b_diff.to(tl.bfloat16), out_dtype=tl.float32
+                b_Akk.to(tl.bfloat16),
+                b_diff.to(tl.bfloat16),
+                out_dtype=tl.float32,
             )
-
-            # o = scale * qg @ h + Aqk @ v_new
-            b_qh = tl.dot(b_qg.to(tl.bfloat16), b_h_cast, out_dtype=tl.float32)
-            b_o = scale * b_qh + tl.dot(
-                b_Aqk.to(tl.bfloat16), b_v_new.to(tl.bfloat16), out_dtype=tl.float32
-            )
+            b_v_new_bf = b_v_new.to(tl.bfloat16)
             tl.store(
-                o + o_c[:, None] * (HV * V) + (i_v * BV + o_v)[None, :],
-                b_o.to(o.dtype.element_ty),
-                mask=m_c[:, None],
+                v_new
+                + ((gid.to(tl.int64) * HV + i_h) * BT) * V
+                + o_t[:, None] * V
+                + (i_v * BV + o_v)[None, :],
+                b_v_new_bf,
+                mask=m_c[:, None] & m_v[None, :],
             )
 
             # h = h * exp2(gk_last) + kg^T @ v_new
             b_h = b_h * exp2(b_gk_last)[:, None] + tl.dot(
                 tl.trans(b_kg).to(tl.bfloat16),
-                b_v_new.to(tl.bfloat16),
+                b_v_new_bf,
                 out_dtype=tl.float32,
             )
 
@@ -782,33 +788,30 @@ if HAS_TLE_KDA:
                     mask=m_v[None, :],
                 )
 
-    def _ascend_kda_fwd_state_output(
-        kg,
+    def _ascend_kda_fwd_state(
         v,
         beta,
-        Akk,
         gk,
-        Aqk,
-        scale,
-        ws=None,
+        Akk,
+        ws,
+        v_new,
+        h_buf,
+        chunk_offsets,
         initial_state=None,
         output_final_state=False,
         state_v_first=True,
         cu_seqlens=None,
-        chunk_size=16,
     ):
-        B, _, HV, K = kg.shape
-        T_actual = v.shape[1]
+        B = v.shape[0]
+        HV = ws.shape[1]
+        BT = ws.shape[2]
+        K = ws.shape[3] // 3
         V = v.shape[-1]
-        BT = Akk.shape[-1]
 
         if K > 256:
             raise ValueError(f"KDA K must be <= 256, got {K}")
 
-        if cu_seqlens is None:
-            N = B
-        else:
-            N = len(cu_seqlens) - 1
+        N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
         final_state = None
         if output_final_state:
@@ -816,8 +819,6 @@ if HAS_TLE_KDA:
                 final_state = v.new_zeros(N, HV, V, K, dtype=torch.float32)
             else:
                 final_state = v.new_zeros(N, HV, K, V, dtype=torch.float32)
-
-        o = torch.zeros(B, T_actual, HV, V, device=v.device, dtype=v.dtype)
 
         h0_arg = (
             initial_state
@@ -832,19 +833,19 @@ if HAS_TLE_KDA:
 
         bv = _pick_bv(K, V)
         grid = (triton.cdiv(V, bv), N * HV)
-        _ascend_kda_fwd_state_output_kernel[grid](
+        _ascend_kda_fwd_state_kernel[grid](
             v=v,
             beta=beta,
             gk=gk,
-            Aqk=Aqk,
             Akk=Akk,
-            o=o,
             ws=ws,
+            v_new=v_new,
+            h_buf=h_buf,
             h0=h0_arg,
             ht=ht_arg,
+            chunk_offsets=chunk_offsets,
             cu_seqlens=cu_seqlens,
-            scale=scale,
-            T=T_actual,
+            T=v.shape[1],
             HV=HV,
             K=K,
             V=V,
@@ -852,8 +853,134 @@ if HAS_TLE_KDA:
             BV=bv,
             STATE_V_FIRST=state_v_first,
         )
+        return final_state
 
-        return o, final_state
+    # ------------------------------------------------------------------
+    # Kernel 3: Finalize -- o = scale * qg@h + Aqk@v_new.  Fully parallel
+    # over (chunk, head), exactly AscendC's ChunkKdaFwdFinalize.
+    # ------------------------------------------------------------------
+    @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+    @triton.jit(do_not_specialize=["T"])
+    def _ascend_kda_fwd_output_kernel(
+        qg_ws,
+        v_new,
+        Aqk,
+        h_buf,
+        o,
+        chunk_indices,
+        cu_seqlens,
+        scale,
+        T,
+        NC,
+        HV: tl.constexpr,
+        K: tl.constexpr,
+        V: tl.constexpr,
+        BT: tl.constexpr,
+        BV: tl.constexpr,
+        IS_VARLEN: tl.constexpr,
+    ):
+        i_v = tl.program_id(0)
+        i_tc = tl.program_id(1)
+        i_nh = tl.program_id(2)
+
+        if IS_VARLEN:
+            i_n = tl.load(chunk_indices + i_tc * 2).to(tl.int32)
+            i_t = tl.load(chunk_indices + i_tc * 2 + 1).to(tl.int32)
+            bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            T = eos - bos
+            gid = i_tc
+        else:
+            i_n = i_nh // HV
+            bos = i_n * T
+            i_t = i_tc
+            gid = i_n * NC + i_t
+        i_h = i_nh % HV
+
+        o_t = tl.arange(0, BT)
+        o_k = tl.arange(0, K)
+        o_v = tl.arange(0, BV)
+        m_c = i_t * BT + o_t < T
+        m_v = i_v * BV + o_v < V
+
+        p_ws = qg_ws + (gid.to(tl.int64) * HV + i_h) * BT * 3 * K
+        b_qg = tl.load(p_ws + o_t[:, None] * (3 * K) + o_k[None, :] + 2 * K)
+        b_v_new = tl.load(
+            v_new
+            + ((gid.to(tl.int64) * HV + i_h) * BT) * V
+            + o_t[:, None] * V
+            + (i_v * BV + o_v)[None, :],
+            mask=m_c[:, None] & m_v[None, :],
+            other=0.0,
+        )
+        b_Aqk = tl.load(
+            Aqk
+            + ((gid.to(tl.int64) * HV + i_h) * BT * BT)
+            + o_t[:, None] * BT
+            + o_t[None, :]
+        )
+        b_h = tl.load(
+            h_buf
+            + ((gid.to(tl.int64) * HV + i_h) * K + o_k[:, None]) * V
+            + (i_v * BV + o_v)[None, :],
+            mask=m_v[None, :],
+            other=0.0,
+        )
+
+        b_qh = tl.dot(b_qg.to(tl.bfloat16), b_h.to(tl.bfloat16), out_dtype=tl.float32)
+        b_o = scale * b_qh + tl.dot(
+            b_Aqk.to(tl.bfloat16),
+            b_v_new.to(tl.bfloat16),
+            out_dtype=tl.float32,
+        )
+
+        o += ((bos + i_t * BT) * HV + i_h).to(tl.int64) * V
+        tl.store(
+            o + o_t[:, None] * (HV * V) + (i_v * BV + o_v)[None, :],
+            b_o.to(o.dtype.element_ty),
+            mask=m_c[:, None] & m_v[None, :],
+        )
+
+    def _ascend_kda_fwd_output(
+        ws,
+        Aqk,
+        v_new,
+        h_buf,
+        NC,
+        NC_global,
+        v,
+        scale,
+        cu_seqlens=None,
+        chunk_indices=None,
+    ):
+        V = v.shape[-1]
+        HV = ws.shape[1]
+        BT = ws.shape[2]
+        K = ws.shape[3] // 3
+        bv = _pick_bv(K, V)
+        o = torch.empty(v.shape[0], v.shape[1], HV, V, device=v.device, dtype=v.dtype)
+        if cu_seqlens is None:
+            grid = (triton.cdiv(V, bv), NC, v.shape[0] * HV)
+        else:
+            grid = (triton.cdiv(V, bv), NC_global, HV)
+        _ascend_kda_fwd_output_kernel[grid](
+            qg_ws=ws,
+            v_new=v_new,
+            Aqk=Aqk,
+            h_buf=h_buf,
+            o=o,
+            chunk_indices=chunk_indices,
+            cu_seqlens=cu_seqlens,
+            scale=scale,
+            T=v.shape[1],
+            NC=NC,
+            HV=HV,
+            K=K,
+            V=V,
+            BT=BT,
+            BV=bv,
+        )
+        return o
 
     def ascend_tle_chunk_kda_fwd_infer(
         q: torch.Tensor,
@@ -892,7 +1019,39 @@ if HAS_TLE_KDA:
         elif chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, bt)
 
-        ws, Aqk, Akk, g_cumsum = _ascend_kda_fwd_intra(
+        # Memory fallback: the chunk-major h buffer is [chunks, HV, K, V]
+        # bf16 (402 MiB at T=32768 H=24). Above the budget -- or when the
+        # split is disabled for A/B -- use the portable chunk-at-a-time
+        # Triton path instead of materializing h for every chunk.
+        if cu_seqlens is None:
+            nc_global = q.shape[0] * triton.cdiv(q.shape[1], bt)
+        else:
+            nc_global = len(chunk_indices)
+        h_bytes = nc_global * g.shape[2] * q.shape[-1] * v.shape[-1] * 2
+        if _ascend_fused_state() or h_bytes > _ascend_h_budget_bytes():
+            return chunk_kda_fwd_infer_triton(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                state_v_first=state_v_first,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_size=bt,
+                safe_gate=safe_gate,
+                lower_bound=lower_bound,
+                A_log=A_log,
+                dt_bias=dt_bias,
+            )
+
+        ws, Aqk, Akk, g_out, chunk_offsets, NC, NC_global, N = _ascend_kda_fwd_intra(
             q=q,
             k=k,
             g=g,
@@ -907,21 +1066,39 @@ if HAS_TLE_KDA:
         )
 
         K = q.shape[-1]
-        return _ascend_kda_fwd_state_output(
-            kg=ws[:, :, :, 2 * K :],
+        V = v.shape[-1]
+        HV = g.shape[2]
+
+        h_buf = torch.empty(NC_global, HV, K, V, device=q.device, dtype=torch.bfloat16)
+        v_new = torch.empty(NC_global, HV, bt, V, device=q.device, dtype=torch.bfloat16)
+
+        final_state = _ascend_kda_fwd_state(
             v=v,
             beta=beta,
+            gk=g_out,
             Akk=Akk,
-            gk=g_cumsum,
-            Aqk=Aqk,
             ws=ws,
-            scale=scale,
+            v_new=v_new,
+            h_buf=h_buf,
+            chunk_offsets=chunk_offsets,
             initial_state=initial_state,
             output_final_state=output_final_state,
             state_v_first=state_v_first,
             cu_seqlens=cu_seqlens,
-            chunk_size=bt,
         )
+        o = _ascend_kda_fwd_output(
+            ws=ws,
+            Aqk=Aqk,
+            v_new=v_new,
+            h_buf=h_buf,
+            NC=NC,
+            NC_global=NC_global,
+            v=v,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        return o, final_state
 
 
 # =============================================================================
