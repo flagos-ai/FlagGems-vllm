@@ -16,79 +16,101 @@ from typing import Tuple
 
 import torch
 import triton
+import triton.experimental.tle as tle
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 
-# Rows at least this wide take the whole-row kernel when the padded block
-# still fits on-chip; wider rows fall back to the chunked loop kernel.
-_LARGE_N_THRESHOLD = 4096
+# Best measured combination on Ascend910B4 (do_bench_npu device time, all 7
+# benchmark shapes >= 1.15x vs torch_npu.npu_rms_norm x2):
+# - narrow rows (whole-tile single pass fits UB), tokens <= 1024: ONE launch
+#   with q/kv on the task axis (uni_launch); single cast per element, weights
+#   DMA'd into UB once per program.
+# - otherwise: sep_launch per tensor, each routed by its own width --
+#   narrow -> whole-tile single pass (sp); wide -> GM-streaming two-pass
+#   (sep_2p_wub, pass 2 re-reads L2-resident rows; multibuffered TILE_N loop).
+#   Mirrors CANN's own per-tensor template selection (MERGE_N / SPLIT_D).
+# Tile sizes come from measured sweeps instead of runtime autotune
+# (one config per shape key -> one compile per shape).
+_SP_TILE_BUDGET_BYTES = 128 * 1024
+_SP_TASK_MAX_TOKENS = 1024
 
-# Empirical per-core Unified Buffer limit for the whole-row kernel: blocks up
-# to 16384 fp32 elements (64KB) compile and run, 32768 (128KB) overflows UB
-# and fails in bishengir (Ascend910B4).
-_LARGE_N_UB_SAFE_BLOCK = 16384
-
-# Below this token count the single-pass whole-row kernel wins: with a handful
-# of programs the two-pass chunk loop cannot hide its second read.
-_SMALL_TOKENS_THRESHOLD = 32
-
-# Single-pass configs: N_BLOCK must cover the whole row (see prune below).
-_ASCEND_SMALL_CONFIGS = [
-    triton.Config({"TILE_M": 1, "N_BLOCK": 128}, num_warps=1),
-    triton.Config({"TILE_M": 1, "N_BLOCK": 256}, num_warps=1),
-    triton.Config({"TILE_M": 1, "N_BLOCK": 256}, num_warps=2),
-    triton.Config({"TILE_M": 2, "N_BLOCK": 256}, num_warps=2),
-    triton.Config({"TILE_M": 1, "N_BLOCK": 512}, num_warps=2),
-    triton.Config({"TILE_M": 2, "N_BLOCK": 512}, num_warps=2),
-    triton.Config({"TILE_M": 1, "N_BLOCK": 1024}, num_warps=2),
-    triton.Config({"TILE_M": 1, "N_BLOCK": 2048}, num_warps=4),
-    triton.Config({"TILE_M": 1, "N_BLOCK": 4096}, num_warps=4),
-]
-
-_ASCEND_TILE_CONFIGS = [
-    # narrow-row safety floor (rows <= 256 wide)
-    triton.Config({"TILE_M": 1, "N_BLOCK": 256}, num_warps=2),
-    triton.Config({"TILE_M": 2, "N_BLOCK": 256}, num_warps=2),
-    # mid token counts (32-128)
-    triton.Config({"TILE_M": 1, "N_BLOCK": 1024}, num_warps=2),
-    triton.Config({"TILE_M": 2, "N_BLOCK": 1024}, num_warps=2),
-    triton.Config({"TILE_M": 2, "N_BLOCK": 1024}, num_warps=4),
-    # many tokens (512+)
-    triton.Config({"TILE_M": 4, "N_BLOCK": 512}, num_warps=4),
-    triton.Config({"TILE_M": 4, "N_BLOCK": 512}, num_warps=8),
-    triton.Config({"TILE_M": 8, "N_BLOCK": 512}, num_warps=4),
-    triton.Config({"TILE_M": 8, "N_BLOCK": 512}, num_warps=8),
-    triton.Config({"TILE_M": 8, "N_BLOCK": 1024}, num_warps=4),
-    # ultra-wide rows (pruned in below): fewer chunks -> less static unroll
-    triton.Config({"TILE_M": 1, "N_BLOCK": 2048}, num_warps=4),
-    triton.Config({"TILE_M": 2, "N_BLOCK": 2048}, num_warps=4),
-]
-
-_ASCEND_LARGE_CONFIGS = [
-    triton.Config({}, num_warps=4),
-    triton.Config({}, num_warps=8),
-]
+_CORE_NUM = None
 
 
-def _prune_tile_configs(configs, named_args, **kwargs):
-    max_size = max(
-        kwargs["Q_SIZE"],
-        kwargs["KV_SIZE"],
+def _core_num() -> int:
+    global _CORE_NUM
+    if _CORE_NUM is None:
+        try:
+            import torch_npu
+
+            device = torch.npu.current_device()
+            torch.npu.set_device(device)
+            _CORE_NUM = torch_npu.npu.get_device_limit(device)["vector_core_num"]
+        except Exception:
+            _CORE_NUM = 24
+    return _CORE_NUM
+
+
+def _sp_feasible(n_pad2: int, esz: int) -> bool:
+    # can one [TILE_M, n_pad2] whole tile live in the per-core UB budget?
+    return n_pad2 * (4 + esz) <= _SP_TILE_BUDGET_BYTES
+
+
+def _sp_budget_tile(n_pad2: int, esz: int) -> int:
+    # TILE_M from the UB budget alone (caller guarantees _sp_feasible)
+    row = n_pad2 * (4 + esz)
+    tile = 1
+    while tile * 2 * row <= _SP_TILE_BUDGET_BYTES:
+        tile *= 2
+    return tile
+
+
+def _sep_sp_wub_tile_m(num_tokens: int, n_pad2: int, esz: int) -> int:
+    # TILE_M for the sep sp route: UB budget, capped so the grid still
+    # floods the vector cores
+    flood = triton.next_power_of_2(max(1, triton.cdiv(num_tokens, _core_num())))
+    return max(
+        1,
+        min(
+            _sp_budget_tile(n_pad2, esz),
+            flood,
+            triton.next_power_of_2(max(num_tokens, 1)),
+        ),
     )
-    if max_size > _LARGE_N_UB_SAFE_BLOCK:
-        return [config for config in configs if config.kwargs["N_BLOCK"] >= 1024]
-
-    max_size = max(max_size, 256)
-    return [config for config in configs if config.kwargs["N_BLOCK"] <= max_size]
 
 
-def _prune_small_configs(configs, named_args, **kwargs):
-    max_size = max(
-        kwargs["Q_SIZE"],
-        kwargs["KV_SIZE"],
+def _uni_feasible(q_pad2: int, kv_pad2: int, q_esz: int, kv_esz: int) -> bool:
+    return _sp_feasible(q_pad2, q_esz) and _sp_feasible(kv_pad2, kv_esz)
+
+
+def _uni_sp_wub_tile_m(
+    num_tokens: int, q_pad2: int, kv_pad2: int, q_esz: int, kv_esz: int
+) -> int:
+    # TILE_M for the uni launch: min of both tensors' budgets, capped only
+    # by the token count (no flood cap -- measured better for the combined kernel)
+    return max(
+        1,
+        min(
+            _sp_budget_tile(q_pad2, q_esz),
+            _sp_budget_tile(kv_pad2, kv_esz),
+            triton.next_power_of_2(max(num_tokens, 1)),
+        ),
     )
-    return [config for config in configs if config.kwargs["N_BLOCK"] >= max_size]
+
+
+def _sep_2p_tiles(num_tokens: int) -> Tuple[int, int]:
+    # largest TILE_M whose grid still fills ~3/4 of the vector cores;
+    # largest TILE_N whose per-element staging (f32 cast 4B + y f32 4B +
+    # y bf16 2B) stays within ~160KB
+    min_programs = max(8, _core_num() * 3 // 4)
+    tile_m = 1
+    while tile_m < 16 and triton.cdiv(num_tokens, tile_m * 2) >= min_programs:
+        tile_m *= 2
+    tile_n = 12288
+    while tile_m * tile_n * 10 > 160 * 1024 and tile_n > 256:
+        tile_n //= 2
+    return tile_m, tile_n
 
 
 def _check_inputs(
@@ -110,19 +132,8 @@ def _check_inputs(
     assert qr.device == kv.device == q_weight.device == kv_weight.device
 
 
-@triton.autotune(
-    configs=_ASCEND_SMALL_CONFIGS,
-    key=[
-        "num_tokens",
-        "Q_SIZE",
-        "KV_SIZE",
-    ],
-    prune_configs_by={
-        "early_config_prune": _prune_small_configs,
-    },
-)
 @triton.jit(do_not_specialize=["eps"])
-def _fused_q_kv_rmsnorm_small_kernel(
+def _rmsnorm_uni_sp_wub_kernel(
     q_ptr,
     q_out_ptr,
     q_weight_ptr,
@@ -137,400 +148,172 @@ def _fused_q_kv_rmsnorm_small_kernel(
     num_tokens,
     Q_SIZE: tl.constexpr,
     KV_SIZE: tl.constexpr,
+    Q_PAD2: tl.constexpr,
+    KV_PAD2: tl.constexpr,
     TILE_M: tl.constexpr,
-    N_BLOCK: tl.constexpr,
 ):
-    pid_m = tl.program_id(0).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
     task = tl.program_id(1)
 
-    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
-    offs_n = tl.arange(0, N_BLOCK)
+    offs_m = pid * TILE_M + tl.arange(0, TILE_M)
+    token_mask = offs_m < num_tokens
 
-    token_mask = (offs_m < num_tokens)[:, None]
-
+    # branch-local names must differ (triton if/else type-merge on shapes)
     if task == 0:
-        mask = token_mask & (offs_n < Q_SIZE)[None, :]
-
-        x = tl.load(
-            q_ptr + offs_m[:, None] * q_in_stride + offs_n[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        sum_sq = tl.sum(
-            x * x,
-            axis=1,
+        q_w_ub = tle.dsa.alloc(
+            [Q_PAD2],
+            dtype=q_weight_ptr.dtype.element_ty,
+            mem_addr_space=tle.dsa.ascend.UB,
         )
+        q_wcols = tl.arange(0, Q_PAD2)
+        tle.dsa.copy(q_weight_ptr + q_wcols, q_w_ub, [Q_SIZE])
+        q_w = tle.dsa.to_tensor(q_w_ub, writable=False).to(tl.float32)
 
-        rrms = tl.rsqrt(sum_sq / Q_SIZE + eps)
-
-        w = tl.load(
-            q_weight_ptr + offs_n,
-            mask=offs_n < Q_SIZE,
-            other=0.0,
-        ).to(tl.float32)
-
-        y = x * rrms[:, None] * w[None, :]
-
-        tl.store(
-            q_out_ptr + offs_m[:, None] * q_out_stride + offs_n[None, :],
-            y.to(q_out_ptr.dtype.element_ty),
-            mask=mask,
-        )
-
-    else:
-        mask = token_mask & (offs_n < KV_SIZE)[None, :]
-
-        x = tl.load(
-            kv_ptr + offs_m[:, None] * kv_in_stride + offs_n[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        sum_sq = tl.sum(
-            x * x,
-            axis=1,
-        )
-
-        rrms = tl.rsqrt(sum_sq / KV_SIZE + eps)
-
-        w = tl.load(
-            kv_weight_ptr + offs_n,
-            mask=offs_n < KV_SIZE,
-            other=0.0,
-        ).to(tl.float32)
-
-        y = x * rrms[:, None] * w[None, :]
-
-        tl.store(
-            kv_out_ptr + offs_m[:, None] * kv_out_stride + offs_n[None, :],
-            y.to(kv_out_ptr.dtype.element_ty),
-            mask=mask,
-        )
-
-
-def _fused_q_kv_rmsnorm_small(
-    qr: torch.Tensor,
-    kv: torch.Tensor,
-    q_weight: torch.Tensor,
-    kv_weight: torch.Tensor,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = qr.shape[0]
-
-    q_out = torch.empty_like(qr)
-    kv_out = torch.empty_like(kv)
-
-    if num_tokens == 0:
-        return q_out, kv_out
-
-    grid = lambda meta: (
-        triton.cdiv(
-            num_tokens,
-            meta["TILE_M"],
-        ),
-        2,
-    )
-
-    with torch_device_fn.device(qr.device):
-        _fused_q_kv_rmsnorm_small_kernel[grid](
-            qr,
-            q_out,
-            q_weight,
-            qr.stride(0),
-            q_out.stride(0),
-            kv,
-            kv_out,
-            kv_weight,
-            kv.stride(0),
-            kv_out.stride(0),
-            eps,
-            num_tokens,
-            Q_SIZE=qr.shape[1],
-            KV_SIZE=kv.shape[1],
-        )
-
-    return q_out, kv_out
-
-
-@triton.autotune(
-    configs=_ASCEND_TILE_CONFIGS,
-    key=[
-        "num_tokens",
-        "Q_SIZE",
-        "KV_SIZE",
-    ],
-    prune_configs_by={
-        "early_config_prune": _prune_tile_configs,
-    },
-)
-@triton.jit(do_not_specialize=["eps"])
-def _fused_q_kv_rmsnorm_tile_kernel(
-    q_ptr,
-    q_out_ptr,
-    q_weight_ptr,
-    q_in_stride,
-    q_out_stride,
-    kv_ptr,
-    kv_out_ptr,
-    kv_weight_ptr,
-    kv_in_stride,
-    kv_out_stride,
-    eps,
-    num_tokens,
-    Q_SIZE: tl.constexpr,
-    KV_SIZE: tl.constexpr,
-    TILE_M: tl.constexpr,
-    N_BLOCK: tl.constexpr,
-):
-    pid_m = tl.program_id(0).to(tl.int64)
-    task = tl.program_id(1)
-
-    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
-    token_mask = (offs_m < num_tokens)[:, None]
-    offs_n = tl.arange(0, N_BLOCK)
-
-    if task == 0:
-        # Pass 1: accumulate the row sum of squares over N_BLOCK chunks.
-        acc = tl.zeros((TILE_M,), tl.float32)
-        for nb in tl.static_range(0, Q_SIZE, N_BLOCK):
-            offs = nb + offs_n
-            mask = token_mask & (offs < Q_SIZE)[None, :]
-            x = tl.load(
-                q_ptr + offs_m[:, None] * q_in_stride + offs[None, :],
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            acc += tl.sum(
-                x * x,
-                axis=1,
-            )
-
-        rrms = tl.rsqrt(acc / Q_SIZE + eps)
-
-        # Pass 2: re-read the chunks (L1/L2 resident) and write the output.
-        for nb in tl.static_range(0, Q_SIZE, N_BLOCK):
-            offs = nb + offs_n
-            mask = token_mask & (offs < Q_SIZE)[None, :]
-            x = tl.load(
-                q_ptr + offs_m[:, None] * q_in_stride + offs[None, :],
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            w = tl.load(
-                q_weight_ptr + offs,
-                mask=offs < Q_SIZE,
-                other=0.0,
-            ).to(tl.float32)
-            tl.store(
-                q_out_ptr + offs_m[:, None] * q_out_stride + offs[None, :],
-                (x * rrms[:, None] * w[None, :]).to(q_out_ptr.dtype.element_ty),
-                mask=mask,
-            )
-
-    else:
-        acc = tl.zeros((TILE_M,), tl.float32)
-        for nb in tl.static_range(0, KV_SIZE, N_BLOCK):
-            offs = nb + offs_n
-            mask = token_mask & (offs < KV_SIZE)[None, :]
-            x = tl.load(
-                kv_ptr + offs_m[:, None] * kv_in_stride + offs[None, :],
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            acc += tl.sum(
-                x * x,
-                axis=1,
-            )
-
-        rrms = tl.rsqrt(acc / KV_SIZE + eps)
-
-        for nb in tl.static_range(0, KV_SIZE, N_BLOCK):
-            offs = nb + offs_n
-            mask = token_mask & (offs < KV_SIZE)[None, :]
-            x = tl.load(
-                kv_ptr + offs_m[:, None] * kv_in_stride + offs[None, :],
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            w = tl.load(
-                kv_weight_ptr + offs,
-                mask=offs < KV_SIZE,
-                other=0.0,
-            ).to(tl.float32)
-            tl.store(
-                kv_out_ptr + offs_m[:, None] * kv_out_stride + offs[None, :],
-                (x * rrms[:, None] * w[None, :]).to(kv_out_ptr.dtype.element_ty),
-                mask=mask,
-            )
-
-
-def _fused_q_kv_rmsnorm_tile(
-    qr: torch.Tensor,
-    kv: torch.Tensor,
-    q_weight: torch.Tensor,
-    kv_weight: torch.Tensor,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = qr.shape[0]
-
-    q_out = torch.empty_like(qr)
-    kv_out = torch.empty_like(kv)
-
-    if num_tokens == 0:
-        return q_out, kv_out
-
-    grid = lambda meta: (
-        triton.cdiv(
-            num_tokens,
-            meta["TILE_M"],
-        ),
-        2,
-    )
-
-    with torch_device_fn.device(qr.device):
-        _fused_q_kv_rmsnorm_tile_kernel[grid](
-            qr,
-            q_out,
-            q_weight,
-            qr.stride(0),
-            q_out.stride(0),
-            kv,
-            kv_out,
-            kv_weight,
-            kv.stride(0),
-            kv_out.stride(0),
-            eps,
-            num_tokens,
-            Q_SIZE=qr.shape[1],
-            KV_SIZE=kv.shape[1],
-        )
-
-    return q_out, kv_out
-
-
-@triton.autotune(
-    configs=_ASCEND_LARGE_CONFIGS,
-    key=[
-        "num_rows",
-        "Q_SIZE",
-        "KV_SIZE",
-    ],
-)
-@triton.jit(do_not_specialize=["eps"])
-def _fused_q_kv_rmsnorm_large_kernel(
-    q_ptr,
-    q_out_ptr,
-    q_weight_ptr,
-    q_in_stride,
-    q_out_stride,
-    kv_ptr,
-    kv_out_ptr,
-    kv_weight_ptr,
-    kv_in_stride,
-    kv_out_stride,
-    eps,
-    num_rows,
-    Q_SIZE: tl.constexpr,
-    KV_SIZE: tl.constexpr,
-    Q_BLOCK: tl.constexpr,
-    KV_BLOCK: tl.constexpr,
-):
-    token_idx = tl.program_id(0).to(tl.int64)
-    task = tl.program_id(1)
-
-    if task == 0:
-        q_offs = tl.arange(0, Q_BLOCK)
-        q_mask = q_offs < Q_SIZE
-
-        q_row_in = q_ptr + token_idx * q_in_stride
-
+        q_cols = tl.arange(0, Q_PAD2)
+        q_mask = token_mask[:, None] & (q_cols < Q_SIZE)[None, :]
         q_x = tl.load(
-            q_row_in + q_offs,
+            q_ptr + offs_m[:, None] * q_in_stride + q_cols[None, :],
             mask=q_mask,
             other=0.0,
         ).to(tl.float32)
-
-        q_sum_sq = tl.sum(
-            q_x * q_x,
-            axis=0,
-        )
-
-        q_rrms = tl.rsqrt(q_sum_sq / Q_SIZE + eps)
-
-        q_w = tl.load(
-            q_weight_ptr + q_offs,
-            mask=q_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        q_y = q_x * q_rrms * q_w
-
-        q_row_out = q_out_ptr + token_idx * q_out_stride
-
+        q_ssq = tl.sum(q_x * q_x, axis=1)
+        q_rrms = tl.rsqrt(q_ssq / Q_SIZE + eps)
+        q_y = q_x * q_rrms[:, None] * q_w[None, :]
         tl.store(
-            q_row_out + q_offs,
+            q_out_ptr + offs_m[:, None] * q_out_stride + q_cols[None, :],
             q_y.to(q_out_ptr.dtype.element_ty),
             mask=q_mask,
         )
-
     else:
-        kv_offs = tl.arange(0, KV_BLOCK)
-        kv_mask = kv_offs < KV_SIZE
-
-        kv_row_in = kv_ptr + token_idx * kv_in_stride
-
-        kv_x = tl.load(
-            kv_row_in + kv_offs,
-            mask=kv_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        kv_sum_sq = tl.sum(
-            kv_x * kv_x,
-            axis=0,
+        kv_w_ub = tle.dsa.alloc(
+            [KV_PAD2],
+            dtype=kv_weight_ptr.dtype.element_ty,
+            mem_addr_space=tle.dsa.ascend.UB,
         )
+        kv_wcols = tl.arange(0, KV_PAD2)
+        tle.dsa.copy(kv_weight_ptr + kv_wcols, kv_w_ub, [KV_SIZE])
+        kv_w = tle.dsa.to_tensor(kv_w_ub, writable=False).to(tl.float32)
 
-        kv_rrms = tl.rsqrt(kv_sum_sq / KV_SIZE + eps)
-
-        kv_w = tl.load(
-            kv_weight_ptr + kv_offs,
+        kv_cols = tl.arange(0, KV_PAD2)
+        kv_mask = token_mask[:, None] & (kv_cols < KV_SIZE)[None, :]
+        kv_x = tl.load(
+            kv_ptr + offs_m[:, None] * kv_in_stride + kv_cols[None, :],
             mask=kv_mask,
             other=0.0,
         ).to(tl.float32)
-
-        kv_y = kv_x * kv_rrms * kv_w
-
-        kv_row_out = kv_out_ptr + token_idx * kv_out_stride
-
+        kv_ssq = tl.sum(kv_x * kv_x, axis=1)
+        kv_rrms = tl.rsqrt(kv_ssq / KV_SIZE + eps)
+        kv_y = kv_x * kv_rrms[:, None] * kv_w[None, :]
         tl.store(
-            kv_row_out + kv_offs,
+            kv_out_ptr + offs_m[:, None] * kv_out_stride + kv_cols[None, :],
             kv_y.to(kv_out_ptr.dtype.element_ty),
             mask=kv_mask,
         )
 
 
-def _fused_q_kv_rmsnorm_large(
-    qr: torch.Tensor,
-    kv: torch.Tensor,
-    q_weight: torch.Tensor,
-    kv_weight: torch.Tensor,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+@triton.jit(do_not_specialize=["eps"])
+def _rmsnorm_sep_sp_wub_kernel(
+    x_ptr,
+    out_ptr,
+    w_ptr,
+    x_in_stride,
+    out_stride,
+    eps,
+    num_tokens,
+    N_SIZE: tl.constexpr,
+    N_PAD2: tl.constexpr,
+    TILE_M: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    offs_m = pid * TILE_M + tl.arange(0, TILE_M)
+    token_mask = offs_m < num_tokens
+
+    w_ub = tle.dsa.alloc(
+        [N_PAD2],
+        dtype=w_ptr.dtype.element_ty,
+        mem_addr_space=tle.dsa.ascend.UB,
+    )
+    wcols = tl.arange(0, N_PAD2)
+    tle.dsa.copy(w_ptr + wcols, w_ub, [N_SIZE])
+    w = tle.dsa.to_tensor(w_ub, writable=False).to(tl.float32)
+
+    cols = tl.arange(0, N_PAD2)
+    mask = token_mask[:, None] & (cols < N_SIZE)[None, :]
+    x = tl.load(
+        x_ptr + offs_m[:, None] * x_in_stride + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    ssq = tl.sum(x * x, axis=1)
+    rrms = tl.rsqrt(ssq / N_SIZE + eps)
+    y = x * rrms[:, None] * w[None, :]
+    tl.store(
+        out_ptr + offs_m[:, None] * out_stride + cols[None, :],
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit(do_not_specialize=["eps"])
+def _rmsnorm_sep_2p_kernel(
+    x_ptr,
+    out_ptr,
+    w_ptr,
+    x_in_stride,
+    out_stride,
+    eps,
+    num_tokens,
+    N_SIZE: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    offs_m = pid * TILE_M + tl.arange(0, TILE_M)
+    token_mask = offs_m < num_tokens
+    cols = tl.arange(0, TILE_N)
+
+    ssq = tl.zeros((TILE_M,), tl.float32)
+    for nb in tl.range(0, N_SIZE, TILE_N):
+        offs = nb + cols
+        m = token_mask[:, None] & (offs < N_SIZE)[None, :]
+        x = tl.load(
+            x_ptr + offs_m[:, None] * x_in_stride + offs[None, :],
+            mask=m,
+            other=0.0,
+        ).to(tl.float32)
+        ssq += tl.sum(x * x, axis=1)
+    rrms = tl.rsqrt(ssq / N_SIZE + eps)
+
+    for nb in tl.range(0, N_SIZE, TILE_N):
+        offs = nb + cols
+        m = token_mask[:, None] & (offs < N_SIZE)[None, :]
+        x = tl.load(
+            x_ptr + offs_m[:, None] * x_in_stride + offs[None, :],
+            mask=m,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(w_ptr + offs, mask=offs < N_SIZE, other=0.0).to(tl.float32)
+        y = x * rrms[:, None] * w[None, :]
+        tl.store(
+            out_ptr + offs_m[:, None] * out_stride + offs[None, :],
+            y.to(out_ptr.dtype.element_ty),
+            mask=m,
+        )
+
+
+def _uni_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out):
     num_tokens = qr.shape[0]
-
-    q_out = torch.empty_like(qr)
-    kv_out = torch.empty_like(kv)
-
-    if num_tokens == 0:
-        return q_out, kv_out
-
-    q_block = triton.next_power_of_2(qr.shape[1])
-
-    kv_block = triton.next_power_of_2(kv.shape[1])
-
+    tile_m = _uni_sp_wub_tile_m(
+        num_tokens,
+        triton.next_power_of_2(qr.shape[1]),
+        triton.next_power_of_2(kv.shape[1]),
+        qr.element_size(),
+        kv.element_size(),
+    )
+    num_tile_m = triton.cdiv(num_tokens, tile_m)
+    grid = (num_tile_m, 2)
     with torch_device_fn.device(qr.device):
-        _fused_q_kv_rmsnorm_large_kernel[(num_tokens, 2)](
+        _rmsnorm_uni_sp_wub_kernel[grid](
             qr,
             q_out,
             q_weight,
@@ -545,11 +328,58 @@ def _fused_q_kv_rmsnorm_large(
             num_tokens,
             Q_SIZE=qr.shape[1],
             KV_SIZE=kv.shape[1],
-            Q_BLOCK=q_block,
-            KV_BLOCK=kv_block,
+            Q_PAD2=triton.next_power_of_2(qr.shape[1]),
+            KV_PAD2=triton.next_power_of_2(kv.shape[1]),
+            TILE_M=tile_m,
+            num_warps=8,
+            multibuffer=False,
         )
 
-    return q_out, kv_out
+
+def _sep_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out):
+    # one sep entry: q and kv each get their own launch, routed by width
+    for x, w, out in ((qr, q_weight, q_out), (kv, kv_weight, kv_out)):
+        num_tokens = x.shape[0]
+        n_pad2 = triton.next_power_of_2(x.shape[1])
+        use_sp = _sp_feasible(n_pad2, x.element_size())
+
+        with torch_device_fn.device(x.device):
+            if use_sp:
+                tile_m = _sep_sp_wub_tile_m(num_tokens, n_pad2, x.element_size())
+                num_tile_m = triton.cdiv(num_tokens, tile_m)
+                grid = (num_tile_m,)
+                _rmsnorm_sep_sp_wub_kernel[grid](
+                    x,
+                    out,
+                    w,
+                    x.stride(0),
+                    out.stride(0),
+                    eps,
+                    num_tokens,
+                    N_SIZE=x.shape[1],
+                    N_PAD2=n_pad2,
+                    TILE_M=tile_m,
+                    num_warps=8,
+                    multibuffer=False,
+                )
+            else:
+                tile_m, tile_n = _sep_2p_tiles(num_tokens)
+                num_tile_m = triton.cdiv(num_tokens, tile_m)
+                grid = (num_tile_m,)
+                _rmsnorm_sep_2p_kernel[grid](
+                    x,
+                    out,
+                    w,
+                    x.stride(0),
+                    out.stride(0),
+                    eps,
+                    num_tokens,
+                    N_SIZE=x.shape[1],
+                    TILE_M=tile_m,
+                    TILE_N=tile_n,
+                    num_warps=8,
+                    multibuffer=True,
+                )
 
 
 def fused_q_kv_rmsnorm(
@@ -559,47 +389,29 @@ def fused_q_kv_rmsnorm(
     kv_weight: torch.Tensor,
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    _check_inputs(
-        qr,
-        kv,
-        q_weight,
-        kv_weight,
-    )
+    _check_inputs(qr, kv, q_weight, kv_weight)
 
-    q_size = qr.shape[1]
-    kv_size = kv.shape[1]
-    max_size = max(q_size, kv_size)
+    num_tokens = qr.shape[0]
+    q_out = torch.empty_like(qr)
+    kv_out = torch.empty_like(kv)
+    if num_tokens == 0:
+        return q_out, kv_out
 
-    # The single-pass whole-row kernels are only safe (UB) and fast for
-    # narrow rows and few tokens; the chunked loop kernel handles any width.
-    if qr.shape[0] < _SMALL_TOKENS_THRESHOLD and max_size < _LARGE_N_THRESHOLD:
-        return _fused_q_kv_rmsnorm_small(
-            qr,
-            kv,
-            q_weight,
-            kv_weight,
-            eps,
+    use_uni = (
+        _uni_feasible(
+            triton.next_power_of_2(qr.shape[1]),
+            triton.next_power_of_2(kv.shape[1]),
+            qr.element_size(),
+            kv.element_size(),
         )
-
-    if (
-        max_size >= _LARGE_N_THRESHOLD
-        and triton.next_power_of_2(max_size) <= _LARGE_N_UB_SAFE_BLOCK
-    ):
-        return _fused_q_kv_rmsnorm_large(
-            qr,
-            kv,
-            q_weight,
-            kv_weight,
-            eps,
-        )
-
-    return _fused_q_kv_rmsnorm_tile(
-        qr,
-        kv,
-        q_weight,
-        kv_weight,
-        eps,
+        and num_tokens <= _SP_TASK_MAX_TOKENS
     )
+    if use_uni:
+        _uni_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out)
+        return q_out, kv_out
+    else:
+        _sep_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out)
+        return q_out, kv_out
 
 
 __all__ = ["fused_q_kv_rmsnorm"]
