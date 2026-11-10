@@ -86,3 +86,17 @@ def test_topk_empty_width_pitched_output_graph():
     call()
     check()
     check_replays(call, lambda _: backing.fill_(77), check, outputs=(output,))
+
+
+@pytest.mark.top_k_per_row_decode
+def test_topk_empty_width_cpu_rejected_before_output_write():
+    from flaggems_vllm.runtime.backend._metax.ops.top_k_per_row_decode import (
+        _decode_topk_tree,
+    )
+
+    logits = torch.empty((3, 0))
+    lengths = torch.zeros(3, dtype=torch.int32)
+    output = torch.full((3, 512), 77, dtype=torch.int32)
+    with pytest.raises(ValueError, match="is_cuda"):
+        _decode_topk_tree(logits, lengths, output)
+    assert bool((output == 77).all())

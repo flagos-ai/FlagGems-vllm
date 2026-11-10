@@ -161,12 +161,6 @@ def _decode_topk_tree(logits, valid_lens, out_indices, k=512, block=1024):
         raise TypeError("Invalid Top-k dtype/layout")
     if valid_lens.device != logits.device or out_indices.device != logits.device:
         raise ValueError("Top-k inputs must share a device")
-    if logits.shape[0] == 0:
-        return out_indices
-    if logits.shape[1] == 0:
-        fill_tensor(out_indices[:, :k], -1)
-        return out_indices
-
     if not (logits.is_cuda and valid_lens.is_cuda and out_indices.is_cuda):
         raise ValueError(
             "Invalid operator argument: logits.is_cuda and valid_lens.is_cuda and out_indices.is_cuda"
@@ -175,6 +169,12 @@ def _decode_topk_tree(logits, valid_lens, out_indices, k=512, block=1024):
         raise ValueError("Invalid operator argument: logits.dtype == torch.float32")
     if not (out_indices.shape[1] >= k):
         raise ValueError("Invalid operator argument: out_indices.shape[1] >= k")
+    if logits.shape[0] == 0:
+        return out_indices
+    if logits.shape[1] == 0:
+        fill_tensor(out_indices[:, :k], -1)
+        return out_indices
+
     rows = logits.shape[0]
     nb_max = triton.cdiv(logits.shape[1], block)
     levels = _levels(nb_max)
