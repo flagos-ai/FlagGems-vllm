@@ -335,6 +335,7 @@ def store_int8_state(
     mask,
     mask_v,
     WORD_CAST: tl.constexpr = False,
+    word_state=None,
 ):
     magnitude = tl.max(tl.abs(values), axis=1)
     safe_magnitude = tl.where(magnitude > 0, magnitude, 127.0)
@@ -348,9 +349,12 @@ def store_int8_state(
         packed = tl.reshape(
             bounded_int8_words(rounded.to(tl.float16)), (values.shape[0], 32)
         )
-        words = state.to(tl.pointer_type(tl.uint32))
         word_offsets = scale_offsets[:, None] * 32 + tl.arange(0, 32)[None, :]
-        tl.store(words + word_offsets, packed, mask_v[:, None])
+        tl.store(
+            word_state + word_offsets,
+            packed.to(tl.int32, bitcast=True),
+            mask_v[:, None],
+        )
     else:
         tl.store(
             state + offsets, cast_integral_half_to_int8(rounded.to(tl.float16)), mask
@@ -389,6 +393,7 @@ def gdn_decode_int8_kernel(
     TOTAL=1,
     PREPARED: tl.constexpr = False,
     WORD_CAST: tl.constexpr = False,
+    word_state=None,
 ):
     for task in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
         sequence_head = (task // tl.cdiv(V, BV)).to(tl.int64)
@@ -453,6 +458,7 @@ def gdn_decode_int8_kernel(
                 mask,
                 column < V,
                 WORD_CAST,
+                word_state,
             )
 
 
@@ -568,6 +574,7 @@ def gdn_w8a16_int8(
         word_cast = (
             reduction == columns == 128
             and state_int8.data_ptr() % 4 == 0
+            and state_int8.storage_offset() % 4 == 0
             and native_word_cast_available()
         )
         if prepared:
@@ -640,6 +647,8 @@ def gdn_w8a16_int8(
             TOTAL=total,
             PREPARED=prepared,
             WORD_CAST=word_cast,
+            # A dtype view only reinterprets storage; it launches no torch kernel.
+            word_state=state_int8.view(torch.int32) if word_cast else None,
         )
     return out, state_int8
 
