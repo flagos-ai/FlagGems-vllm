@@ -21,7 +21,7 @@ _H20Z_D128_MAX_ROWS = 8192
 _H20Z_D128_TRITON_VERSION = "3.6.0"
 _IS_NVIDIA = runtime.device.vendor_name == "nvidia"
 _SUPPORTED_VENDORS = frozenset(
-    ("nvidia", "ascend", "thead", "metax", "iluvatar", "mthreads")
+    ("nvidia", "ascend", "thead", "metax", "iluvatar", "mthreads", "hygon")
 )
 
 
@@ -342,7 +342,14 @@ def fused_indexer_k_norm(x, weight, bias, dim, eps, out=None):
             "fused_indexer_k_norm out must match x in shape, dtype and device"
         )
     if x.shape[0]:
-        if runtime.device.vendor_name == "metax":
+        if runtime.device.vendor_name == "ascend":
+            # Inline fast path: avoid _launch_fused_indexer_k_norm dispatcher
+            # overhead on NPU where host launch cost is significant.
+            from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_k_norm import (
+                _launch_ascend,
+            )
+            _launch_ascend(x, weight, bias, out, eps)
+        elif runtime.device.vendor_name == "metax":
             # Inline fast path to avoid _launch_fused_indexer_k_norm overhead.
             from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_k_norm import (
                 _launch_metax_fast,

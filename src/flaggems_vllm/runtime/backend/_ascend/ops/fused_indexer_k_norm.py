@@ -7,9 +7,9 @@ as a grid parameter; raw kernel launch fails with
   "Keyword argument BLOCK_M was passed but not declared"
 
 This module provides a dedicated kernel that keeps BLOCK_M=1 and
-amortises launch overhead via an in-kernel ROWS_PER_BLOCK loop.
-Welford single-pass formulation keeps the math identical to the
-shared kernel while reducing redundant reductions.
+uses an in-kernel ROWS_PER_BLOCK loop to amortise launch overhead.
+RPB is tuned per-shape: too large serialises work inside each block,
+too small inflates NPU launch overhead.
 """
 
 import triton
@@ -87,6 +87,9 @@ def _launch_ascend(x, weight, bias, out, eps):
         stride_xm, stride_xd, stride_w, stride_b,
         eps,
     )
+    # Old baseline heuristic (Round 2): M=128/1024 use RPB=8 (grid=16/128),
+    # M=4096 uses RPB=16 (grid=256).  Larger RPBs (32/64) under-utilise
+    # NPU cores; smaller RPBs (2/4) explode launch overhead.
     rpb = 16 if rows > 1024 else 8
     no_mask = 1 if dim == triton.next_power_of_2(dim) else 0
     _ascend_fused_indexer_k_norm_kernel[(triton.cdiv(rows, rpb),)](
@@ -94,6 +97,6 @@ def _launch_ascend(x, weight, bias, out, eps):
         ROWS_PER_BLOCK=rpb,
         NO_MASK=no_mask,
         BLOCK_M=1,
-        num_warps=4,
+        num_warps=2,
         num_stages=1,
     )
