@@ -49,7 +49,7 @@ def _e2m1_to_f32(nibble):
 
 # =============================================================================
 # TLE (WGMMA) fast path — purely additive. The tuned baseline below is left
-# byte-for-byte untouched; the TLE path only fires inside its measured win band
+# unchanged for the default FP8 specialization; TLE only fires in its win band
 # and falls back to the baseline everywhere else (no regression guarantee).
 # See TLE_OPTIMIZATION_CASE_STUDY.md for the rationale.
 # =============================================================================
@@ -81,7 +81,11 @@ _TLE_CONFIG = (64, 64, 2, 4, 2)  # (BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("fp8_fp4_mqa_logits"),
+    configs=runtime.get_tuned_config(
+        "fp8_mqa_logits"
+        if runtime.device.vendor_name == "metax"
+        else "fp8_fp4_mqa_logits"
+    ),
     key=["M", "N", "H", "D"],
 )
 @triton.jit
@@ -107,11 +111,20 @@ def _fp8_fp4_mqa_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
+    HAS_K_SCALE: tl.constexpr = True,
+    KS_ptr=None,
+    KE_ptr=None,
+    APPLY_ROW_MASK: tl.constexpr = False,
+    CAST_FP8_TO_BF16: tl.constexpr = False,
 ):
-    """Fused FP8 MQA logits with head-batched tiled dot products.
+    """Fused MQA logits with head-batched tiled dot products.
 
     Computes logits[m, n] = sum_h(ReLU(sum_d(q[m,h,d]*k[n,d]) * k_scale[n])
                                   * weights[m, h])
+
+    HAS_K_SCALE=False supports BF16 Q/K without a scale load or quantization.
+    APPLY_ROW_MASK fuses per-row [KS, KE) bounds into caller-owned output; the
+    defaults preserve the original FP8 caller ABI and instruction ordering.
 
     K is loaded once per (BLOCK_M, BLOCK_N) tile and reused across HEAD_BLOCK
     heads to minimize global memory traffic.
@@ -126,6 +139,20 @@ def _fp8_fp4_mqa_logits_kernel(
     m_mask = m_offs < M
     n_mask = n_offs < N
 
+    if APPLY_ROW_MASK:
+        starts = tl.load(KS_ptr + m_offs, m_mask, other=2147483647)
+        ends = tl.load(KE_ptr + m_offs, m_mask, other=-2147483648)
+        lo = tl.min(starts, axis=0)
+        hi = tl.max(ends, axis=0)
+        if (pid_n * BLOCK_N >= hi) | ((pid_n + 1) * BLOCK_N <= lo):
+            ptrs = O_ptr + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
+            tl.store(
+                ptrs,
+                tl.full((BLOCK_M, BLOCK_N), -float("inf"), tl.float32),
+                m_mask[:, None] & n_mask[None, :],
+            )
+            return
+
     # Load K tile once — reused across all head batches
     k = tl.load(
         K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
@@ -133,12 +160,22 @@ def _fp8_fp4_mqa_logits_kernel(
         other=0.0,
     )
 
-    k_scale = tl.load(K_scale_ptr + n_offs, mask=n_mask, other=0.0)
+    if CAST_FP8_TO_BF16:
+        # E4M3 values embed exactly in BF16. MetaX uses this fused conversion
+        # where native FP8 dot lowering is unavailable; no extra GPU pass.
+        tl.static_assert(Q_ptr.dtype.element_ty == tl.float8e4nv)
+        tl.static_assert(K_ptr.dtype.element_ty == tl.float8e4nv)
+        k = k.to(tl.float32).to(tl.bfloat16)
+
+    if HAS_K_SCALE:
+        k_scale = tl.load(K_scale_ptr + n_offs, mask=n_mask, other=0.0)
 
     # Accumulator for output: [BLOCK_M, BLOCK_N] in fp32
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    for hb in range(0, H, HEAD_BLOCK):
+    # MetaX fused FP8 conversion needs static head expansion on this SDK.
+    # The default BF16/NVIDIA branch keeps the original dynamic range.
+    for hb in (tl.static_range if CAST_FP8_TO_BF16 else range)(0, H, HEAD_BLOCK):
         hb_offs = hb + tl.arange(0, HEAD_BLOCK)
 
         # Load Q for this head batch: [BLOCK_M, HEAD_BLOCK, D]
@@ -153,6 +190,9 @@ def _fp8_fp4_mqa_logits_kernel(
             other=0.0,
         )
 
+        if CAST_FP8_TO_BF16:
+            q = q.to(tl.float32).to(tl.bfloat16)
+
         # Flatten to 2D for MMA: [BLOCK_M * HEAD_BLOCK, D]
         q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
 
@@ -160,7 +200,10 @@ def _fp8_fp4_mqa_logits_kernel(
         dot = tl.dot(q_2d, tl.trans(k))
 
         # Fused k_scale + ReLU activation
-        dot = tl.maximum(dot * k_scale[None, :], 0.0)
+        if HAS_K_SCALE:
+            dot = tl.maximum(dot * k_scale[None, :], 0.0)
+        else:
+            dot = tl.maximum(dot, 0.0)
 
         # Load weights for this head batch: [BLOCK_M, HEAD_BLOCK]
         w = tl.load(
@@ -178,6 +221,10 @@ def _fp8_fp4_mqa_logits_kernel(
         dot_reduced = tl.sum(dot_3d, axis=1)
 
         acc += dot_reduced
+
+    if APPLY_ROW_MASK:
+        valid = (n_offs[None, :] >= starts[:, None]) & (n_offs[None, :] < ends[:, None])
+        acc = tl.where(valid, acc, -float("inf"))
 
     # Store output tile
     write_mask = m_mask[:, None] & n_mask[None, :]

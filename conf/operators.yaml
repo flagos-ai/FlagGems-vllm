@@ -1654,3 +1654,27 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+  - id: mqa_logits
+    description: Weighted MQA logits with explicit shared or per-query key storage
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+      - MetaX
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
+  - id: paged_mqa_logits
+    description: Paged MQA logits with common FP8 and MetaX BF16 query contracts
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+      - MetaX
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
