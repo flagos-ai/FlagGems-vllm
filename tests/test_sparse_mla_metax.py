@@ -168,3 +168,11 @@ def test_split_decode_model1_reference_workspace_and_replay(batch):
     check_replays(
         call, lambda value: q[:, :, :8].fill_(value), check, outputs=(result,)
     )
+
+
+@pytest.fixture(autouse=True)
+def restore_sparse_rng_state():
+    cpu, gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
+    yield
+    torch.set_rng_state(cpu)
+    torch.cuda.set_rng_state(gpu)
