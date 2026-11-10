@@ -902,6 +902,11 @@ def causal_conv1d_fn(
         )
     else:
         block_n, block_t = _pick_tiles(dim, width)
+    # The clamped tail walks in short tiles.  On the channel-first 32x256 tile
+    # a 128-row tail measured ~6% faster than 32-row fragments (whose rows are
+    # only 64 B of contiguous memory); smaller configurations keep 32 rows so
+    # the extra tile buffers cannot overflow UB.
+    block_t_tail = min(block_t, 128 if (channel_first and block_t >= 256) else 32)
     nct = triton.cdiv(dim, block_n)
 
     if is_apc_enabled:
@@ -974,7 +979,7 @@ def causal_conv1d_fn(
         APC_BLOCK=max(apc_block, 1),
         BLOCK_N=block_n,
         BLOCK_T=block_t,
-        BLOCK_T_TAIL=min(block_t, 32),
+        BLOCK_T_TAIL=block_t_tail,
         NCT=nct,
         CHANNEL_FIRST=channel_first,
         num_stages=2,
