@@ -350,11 +350,7 @@ def run_int8_state_gdn(reference, args):
 def ascend_gdn_native_runtime():
     """Initialize the native worker conventions used by the Ascend baseline."""
     import torch_npu
-    import vllm_ascend.ops  # noqa: F401 - initialize ops before DeviceOperator
-    from fla_npu.ops.ascendc import (
-        chunk_gated_delta_rule_fwd,
-        recurrent_gated_delta_rule,
-    )
+    import vllm_ascend
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         destroy_distributed_environment,
@@ -362,14 +358,18 @@ def ascend_gdn_native_runtime():
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
-    from vllm_ascend.device.device_op import DeviceOperator
     from vllm_ascend.ops.gdn_attn_builder import (
         _build_non_spec_chunked_prefill_metadata,
     )
+    from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+    from vllm_ascend.ops.triton.fla.l2norm import l2norm_fwd
     from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+    from vllm_ascend.utils import bootstrap_custom_op_env
 
+    bootstrap_custom_op_env(include_vendor_lib=True)
+    package = Path(vllm_ascend.__file__).parent
+    torch.ops.load_library(str(next(package.glob("vllm_ascend_C*.so"))))
     torch_npu.npu.set_compile_mode(jit_compile=False)
     init_device_properties_triton()
     store = tempfile.TemporaryDirectory(prefix="gdn-native-benchmark-")
@@ -390,17 +390,16 @@ def ascend_gdn_native_runtime():
 
     atexit.register(_cleanup)
     return (
-        partial(DeviceOperator.fla_gdn_prefill, fused_fwd=chunk_gated_delta_rule_fwd),
+        chunk_gated_delta_rule,
         l2norm_fwd,
         fused_gdn_gating_patch,
         _build_non_spec_chunked_prefill_metadata,
-        recurrent_gated_delta_rule,
     )
 
 
 def prepare_ascend_gdn_decode_baseline(reference):
     """Native Ascend BF16 activations / FP32 state, including gating and QK norm."""
-    _, normalize_qk, gating, _, recurrent = ascend_gdn_native_runtime()
+    _, normalize_qk, gating, _ = ascend_gdn_native_runtime()
     mixed, a, b, a_log, bias, scale, state, out, indices, normalize = reference
     a, b = (tensor.to(torch.bfloat16) for tensor in (a, b))
     is_packed = not isinstance(mixed, tuple)
@@ -431,7 +430,7 @@ def prepare_ascend_gdn_decode_baseline(reference):
             )
         else:
             q_norm, k_norm = query, key
-        result = recurrent(
+        result = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
             q_norm.squeeze(0),
             k_norm.squeeze(0),
             value.contiguous(),
@@ -452,12 +451,15 @@ def prepare_ascend_gdn_decode_baseline(reference):
 
 def prepare_ascend_gdn_prefill_baseline(reference):
     """Native chunk metadata is constructed outside the timed public call."""
-    prefill, _, _, build_metadata, _ = ascend_gdn_native_runtime()
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    prefill, _, _, build_metadata = ascend_gdn_native_runtime()
     q, k, v, beta = (
         reference[name].to(torch.bfloat16) for name in ("q", "k", "v", "beta")
     )
     state = reference["initial_state"]
     boundaries = torch.tensor(reference["raw_cu_seqlens"], dtype=torch.int32)
+    cu = boundaries.to(q.device)
     builder = SimpleNamespace(
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
@@ -467,19 +469,24 @@ def prepare_ascend_gdn_prefill_baseline(reference):
         )
     )
     plan = build_metadata(builder, boundaries, q.device)
+    context = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
 
     def _run():
-        output, final = prefill(
-            q,
-            k,
-            v,
-            reference["g"],
-            beta,
-            initial_state=state,
-            scale=q.shape[-1] ** -0.5,
-            prebuilt_meta=plan,
-        )
-        state.copy_(final)
+        initial = state.transpose(-1, -2).contiguous()
+        with override_forward_context(context):
+            output, final = prefill(
+                q,
+                k,
+                v,
+                reference["g"],
+                beta,
+                initial_state=initial,
+                output_final_state=True,
+                cu_seqlens=cu,
+                prebuilt_meta=plan,
+                use_qk_l2norm_in_kernel=True,
+            )
+        state.copy_(final.transpose(-1, -2))
         return output, state
 
     return _run, (state,)
