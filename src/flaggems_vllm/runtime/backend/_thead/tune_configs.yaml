@@ -371,3 +371,59 @@ hc_combine:
   - META: {BLOCK_D: 512, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+thead_attention_tiles:
+  - META:
+      BM: 16
+      BN: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BM: 32
+      BN: 64
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BM: 64
+      BN: 64
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BM: 128
+      BN: 64
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BM: 64
+      BN: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BM: 64
+      BN: 64
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BM: 64
+      BN: 64
+    num_warps: 4
+    num_stages: 2
+
+thead_attention_compute:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+thead_attention_decode:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
