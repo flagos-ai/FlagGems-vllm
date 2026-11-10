@@ -33,7 +33,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import libentry
 
 try:
@@ -41,23 +41,32 @@ try:
 except ImportError:
     symm_mem = None
 
-try:
-    from flashinfer.comm.comm_backend import TorchDistBackend
-    from flashinfer.comm.mnnvl import (
-        McastGPUBuffer,
-        all_ranks_support_mnnvl,
-        create_tensor_from_cuda_memory,
-        is_multicast_supported,
-    )
+TorchDistBackend = None
+McastGPUBuffer = None
+all_ranks_support_mnnvl = None
+create_tensor_from_cuda_memory = None
+is_multicast_supported = None
+_HAS_MNNVL_RUNTIME = False
 
-    _HAS_MNNVL_RUNTIME = True
-except (ImportError, OSError):
-    TorchDistBackend = None
-    McastGPUBuffer = None
-    all_ranks_support_mnnvl = None
-    create_tensor_from_cuda_memory = None
-    is_multicast_supported = None
-    _HAS_MNNVL_RUNTIME = False
+# MNNVL is NVIDIA-only; importing FlashInfer comm initializes its CUDA runtime.
+if device.vendor_name == "nvidia":
+    try:
+        from flashinfer.comm.comm_backend import TorchDistBackend
+        from flashinfer.comm.mnnvl import (
+            McastGPUBuffer,
+            all_ranks_support_mnnvl,
+            create_tensor_from_cuda_memory,
+            is_multicast_supported,
+        )
+
+        _HAS_MNNVL_RUNTIME = True
+    except (ImportError, OSError):
+        TorchDistBackend = None
+        McastGPUBuffer = None
+        all_ranks_support_mnnvl = None
+        create_tensor_from_cuda_memory = None
+        is_multicast_supported = None
+        _HAS_MNNVL_RUNTIME = False
 
 try:
     from triton.language.extra.cuda.gdc import gdc_launch_dependents, gdc_wait

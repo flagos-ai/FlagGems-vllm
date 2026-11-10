@@ -37,6 +37,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+
 logger = logging.getLogger(__name__)
 
 _HC_MULT4_AUTOTUNE_CONFIG = [
@@ -382,12 +384,13 @@ def mhc_post(
         # configs the sustained sweep showed to be fastest. Our configs are
         # validated through the raw JIT path (no aabs), so disable the
         # rewrite for this launch only and restore it afterwards.
-        _aabs = triton.knobs.autotuning.adjust_block_size
-        triton.knobs.autotuning.adjust_block_size = False
+        autotuning = triton.knobs.autotuning
+        has_aabs = hasattr(autotuning, "adjust_block_size")
+        if has_aabs:
+            original_aabs = autotuning.adjust_block_size
+            autotuning.adjust_block_size = False
         try:
-            from triton._flagtree_backend import FLAGTREE_BACKEND
-
-            if FLAGTREE_BACKEND == "ppu":
+            if runtime.device.vendor_name == "thead":
                 # PPU: same ABI, vendor-shaped launch (one CTA per token).
                 from flaggems_vllm.runtime.backend._thead.ops.mhc_post import (
                     mhc_post_hc4_tokloop,
@@ -399,7 +402,8 @@ def mhc_post(
                     a, b, c, d, out, a_sn, a_sj, a_si, H=H
                 )
         finally:
-            triton.knobs.autotuning.adjust_block_size = _aabs
+            if has_aabs:
+                autotuning.adjust_block_size = original_aabs
     else:
 
         def grid_generic(META):
