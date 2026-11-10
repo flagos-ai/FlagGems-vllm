@@ -122,19 +122,20 @@ tools/triton_ascend_probes/
 └── defects/                       # 【缺陷】编译器 Bug，已有绕行方案
     ├── d1_scope_auto_sync.py      # D1：scope 崩溃与同步错误
     ├── d2_insert_slice_dot.py     # D2：insert_slice 作 dot 操作数崩溃
-    └── d3_l1_view_2d.py           # D3：2D ND 在 L1 上 view/to_tensor 失败
+    ├── d3_l1_view_2d.py           # D3：2D ND 在 L1 上 view/to_tensor 失败
+    └── d4_extract_slice_pipeline.py # D4：单读 + UB 切片移位读到旧行/竞态
 ```
 
 ### 运行方式
 
 - **一键全量测试**（在仓库根目录下执行）：
-  
+
   ```shell
   bash tools/triton_ascend_probes/run_all.sh
   ```
 
 - **单项探针测试**（示例）：
-  
+
   ```shell
   PYTHONPATH=src:FlagGems/src python tools/triton_ascend_probes/gaps/g1_nd2nz_staging.py l1a
   ```
@@ -154,4 +155,4 @@ tools/triton_ascend_probes/
 | **defects**   | `d1_scope_auto_sync.py scope_noauto`          | 编译通过，但计算数值错误（maxerr ≈ 1e2）                 |
 | **defects**   | `d2_insert_slice_dot.py insert / l1_insert`   | **FAIL**：`Unknown PIPE!` 触发 SIGABRT        |
 | **defects**   | `d3_l1_view_2d.py nd / target`                | **FAIL**：报 `cbuf vs ub` 或 `unsupported op` |
-
+| **defects**   | `d4_extract_slice_pipeline.py`                | **FAIL**：真实 tile 下移位视图全错且两次运行结果不同（竞态）；小规模结果随写法/ns 跳变 |
