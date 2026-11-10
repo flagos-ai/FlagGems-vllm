@@ -492,6 +492,11 @@ HEURISTICS_CONFIGS = {
         "BLOCK_N": lambda args: 32,
         "num_warps": lambda args: 4,
         "num_stages": lambda args: 3,
+        # FlagTree: merging the two layout copies of the page ids is neutral
+        # on the K/V loop of this tile (measured on H20; the loop is dominated
+        # by the two large matmuls), so it is switched off there. The decode
+        # and chunked-prefill tiles keep the default.
+        "pipeline_merge_loads": lambda args: "off",
     },
     "mha_block_64": {
         "BLOCK_M": lambda args: 64,
