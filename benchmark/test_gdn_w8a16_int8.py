@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
 import math
 import statistics
-from functools import partial
+import tempfile
+from functools import lru_cache, partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import flag_gems
 import torch
@@ -27,11 +30,8 @@ from benchmark.conftest import Config
 from benchmark.consts import BenchLevel, BenchMode
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_gdn_w8a16_int8 import (
-    ascend_gdn_native_runtime,
     build_int8_gdn_decode_inputs,
     build_int8_gdn_prefill_inputs,
-    prepare_ascend_gdn_decode_baseline,
-    prepare_ascend_gdn_prefill_baseline,
 )
 
 # Shared INT8 benchmark support; test_gdn_w8a16.py owns the single pytest entry.
@@ -359,3 +359,147 @@ def run_int8_state_gdn(reference, args):
         return flaggems_vllm.gdn_w8a16_int8(mixed, *args[1:])
     else:
         return flaggems_vllm.gdn_w8a16_int8(*args)
+
+
+@lru_cache(maxsize=1)
+def ascend_gdn_native_runtime():
+    """Initialize the native worker conventions used by the Ascend baseline."""
+    import torch_npu
+    import vllm_ascend
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm_ascend.ops.gdn_attn_builder import (
+        _build_non_spec_chunked_prefill_metadata,
+    )
+    from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+    from vllm_ascend.ops.triton.fla.l2norm import l2norm_fwd
+    from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+    from vllm_ascend.utils import bootstrap_custom_op_env
+
+    bootstrap_custom_op_env(include_vendor_lib=True)
+    package = Path(vllm_ascend.__file__).parent
+    torch.ops.load_library(str(next(package.glob("vllm_ascend_C*.so"))))
+    torch_npu.npu.set_compile_mode(jit_compile=False)
+    init_device_properties_triton()
+    store = tempfile.TemporaryDirectory(prefix="gdn-native-benchmark-")
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{store.name}/store",
+            backend="hccl",
+        )
+        initialize_model_parallel(backend="hccl")
+
+    def _cleanup():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        store.cleanup()
+
+    atexit.register(_cleanup)
+    return (
+        chunk_gated_delta_rule,
+        l2norm_fwd,
+        fused_gdn_gating_patch,
+        _build_non_spec_chunked_prefill_metadata,
+    )
+
+
+def prepare_ascend_gdn_decode_baseline(reference):
+    """Native Ascend BF16 activations / FP32 state, including gating and QK norm."""
+    _, normalize_qk, gating, _ = ascend_gdn_native_runtime()
+    mixed, a, b, a_log, bias, scale, state, out, indices, normalize = reference
+    a, b = (tensor.to(torch.bfloat16) for tensor in (a, b))
+    is_packed = not isinstance(mixed, tuple)
+    if is_packed:
+        mixed = mixed.to(torch.bfloat16)
+        out = torch.empty(out.shape, device=out.device, dtype=torch.bfloat16)
+        tokens, heads, columns, reduction = mixed.shape[0], *state.shape[1:]
+        query_heads = (mixed.shape[1] - heads * columns) // (2 * reduction)
+        query, key, value = mixed.split(
+            (query_heads * reduction, query_heads * reduction, heads * columns),
+            dim=-1,
+        )
+        query = query.view(1, tokens, query_heads, reduction)
+        key = key.view_as(query)
+        value = value.view(tokens, heads, columns)
+    else:
+        query, key, value = (tensor.to(torch.bfloat16) for tensor in mixed)
+        tokens = query.shape[1]
+        value = value.squeeze(0)
+    lengths = torch.tensor([0] + [1] * tokens, device=query.device, dtype=torch.int32)
+    indices = indices.to(torch.int32)
+
+    def _run():
+        gate, beta = gating(a_log, a, b, bias)
+        if normalize:
+            q_norm, k_norm = normalize_qk(query), normalize_qk(key)
+        else:
+            q_norm, k_norm = query, key
+        result = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            q_norm.squeeze(0),
+            k_norm.squeeze(0),
+            value,
+            state,
+            beta=beta.squeeze(0),
+            g=gate.squeeze(0),
+            scale=scale,
+            actual_seq_lengths=lengths,
+            ssm_state_indices=indices,
+        )
+        if is_packed:
+            out.copy_(result.view_as(out))
+            return out, state
+        return result.unsqueeze(0), state
+
+    return _run, (state, out) if is_packed else (state,)
+
+
+def prepare_ascend_gdn_prefill_baseline(reference):
+    """Native chunk metadata is constructed outside the timed public call."""
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    prefill, _, _, build_metadata = ascend_gdn_native_runtime()
+    q, k, v, beta = (
+        reference[name].to(torch.bfloat16) for name in ("q", "k", "v", "beta")
+    )
+    state = reference["initial_state"]
+    boundaries = torch.tensor(reference["raw_cu_seqlens"], dtype=torch.int32)
+    cu = boundaries.to(q.device)
+    builder = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(linear_num_value_heads=v.shape[2])
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        )
+    )
+    plan = build_metadata(builder, boundaries, q.device)
+    context = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+
+    def _run():
+        initial = state.transpose(-1, -2).contiguous()
+        with override_forward_context(context):
+            output, final = prefill(
+                q,
+                k,
+                v,
+                reference["g"],
+                beta,
+                initial_state=initial,
+                output_final_state=True,
+                cu_seqlens=cu,
+                prebuilt_meta=plan,
+                use_qk_l2norm_in_kernel=True,
+            )
+        state.copy_(final.transpose(-1, -2))
+        return output, state
+
+    return _run, (state,)
