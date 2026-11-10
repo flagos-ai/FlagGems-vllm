@@ -23,7 +23,7 @@ from flaggems_vllm.ops.qwen4.hyperconnection import (
     qwen4_hc_gate_reduce,
     qwen4_hc_inject_combine,
 )
-from flaggems_vllm.ops.qwen4.ple_conv import ple_short_conv_
+from flaggems_vllm.ops.qwen4.ple_conv import NULL_BLOCK_ID, ple_conv, ple_short_conv_
 from flaggems_vllm.ops.qwen4.ple_fusion import (
     can_use_ple_gate_norm_triton,
     can_use_ple_prefill_conv_triton,
@@ -53,6 +53,8 @@ from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (
 __all__ = [
     "grouped_gemma_rmsnorm",
     "hc_combine",
+    "NULL_BLOCK_ID",
+    "ple_conv",
     "ple_short_conv_",
     "qwen4_hc_combine_norm",
     "ple_gate_norm_",
