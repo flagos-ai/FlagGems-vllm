@@ -133,9 +133,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
-    "cp_gather_indexer_k_quant_cache",
-    "dequantize_and_gather_k_cache",
-    "SUPPORTED_FP8_DTYPE",
     "add_rms_norm",
     "build_compressor_metadata",
     "causal_conv1d_fn",
@@ -145,6 +142,7 @@ __all__ = [
     "compressor",
     "compressor_prepared",
     "compute_slot_mapping_parallel",
+    "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
