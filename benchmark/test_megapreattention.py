@@ -14,9 +14,9 @@
 
 """Paired TP benchmark using the repository shape/metric/reporting framework.
 
-Unlike the default single-device timer, this adapter takes the slowest rank's
-mean latency, then averages five independent worker rounds. --warmup/--iter
-are counts for this distributed operator, matching the MegaMoE convention.
+Each iteration uses the maximum latency across ranks. The benchmark averages
+those samples within each round and then averages five independent rounds.
+Inputs are seeded synthetic tensors. --warmup/--iter are counts.
 """
 
 import hashlib
@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm
 
-from tests.megapreattention_utils import Output, run_distributed
+from tests.test_megapreattention import Output, run_distributed
 
 from . import base
 from .conftest import Config
@@ -211,14 +211,12 @@ def summarize_rounds(reports, mode):
     summary = {}
     kind = "wall" if mode == "operator" else "device"
     for name in ("native", "megapreattention"):
-        times = [r["metrics"][name][kind]["slowest_rank_mean_ms"] for r in reports]
+        rank_max = [r["metrics"][name][kind]["rank_max_distribution"] for r in reports]
+        times = [samples["mean_ms"] for samples in rank_max]
         summary[name] = {
             "latency_ms": statistics.mean(times),
             "round_latency_ms": times,
-            "stable_all": all(
-                r["metrics"][name][kind]["rank_max_distribution"]["stable"]
-                for r in reports
-            ),
+            "stable_all": all(samples["stable"] for samples in rank_max),
         }
     candidate = summary["megapreattention"]
     candidate["speedup"] = summary["native"]["latency_ms"] / candidate["latency_ms"]

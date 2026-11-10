@@ -269,7 +269,7 @@ def _store_head(
     EPS: tl.constexpr = 1.0e-6,
 ):
     row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    token = row_start + row
+    token = (row_start + row).to(tl.int64)
     valid = row < LOCAL_T
     cols = tl.arange(0, 256)
     raw = acc.to(tl.bfloat16)
@@ -305,7 +305,8 @@ def _store_head(
         head = pid_n // 2
         weight = tl.load(tl.where(is_key, knorm, qnorm) + cols).to(tl.float32)
         x = raw.to(tl.float32)
-        scale = tl.rsqrt(tl.sum(x * x, 1) / 256.0 + EPS)
+        partial = tl.sum((x * x).reshape(BLOCK_M, 4, 64), 2)
+        scale = tl.rsqrt(tl.sum(partial, 1) / 256.0 + EPS)
         normalized = (
             (x * scale[:, None] * (weight[None, :] + 1.0))
             .to(tl.bfloat16)
@@ -633,6 +634,12 @@ def _fused_projection(
 
 
 @triton.jit
+def _packed_input_word_offset(row_tile, vector_index, TILE_WORDS: tl.constexpr):
+    # Each vector contains four uint32 words. Widen before scaling the indices.
+    return row_tile.to(tl.int64) * TILE_WORDS + vector_index.to(tl.int64) * 4
+
+
+@triton.jit
 def _persistent(
     BULK_END: tl.constexpr,
     work_queue,
@@ -706,26 +713,25 @@ def _persistent(
             ):
                 group = block * BLOCK + tl.arange(0, BLOCK)
                 valid = group < BM * GROUP * HIDDEN // 8
-                offset = group * 4
+                local_offset = _packed_input_word_offset(
+                    row_tile, group, BM * HIDDEN // 2
+                )
                 values = tl.load(
-                    src
-                    + row_tile * (BM * HIDDEN // 2)
-                    + offset[:, None]
-                    + tl.arange(0, 4)[None, :],
+                    src + local_offset[:, None] + tl.arange(0, 4)[None, :],
                     valid[:, None],
                     0,
                 )
                 even, odd = tl.split(values.reshape(BLOCK, 2, 2))
                 x0, x2 = tl.split(even)
                 x1, x3 = tl.split(odd)
+                peer_offset = _packed_input_word_offset(pm, group, BM * HIDDEN // 2).to(
+                    tl.uint64
+                )
                 for peer_step in tl.static_range(first_peer, WORLD):
                     destination = (
                         (rank + peer_step) % WORLD if PIPE_STAGES == 3 else peer_step
                     )
-                    address = (
-                        tl.load(peers + destination)
-                        + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
-                    )
+                    address = tl.load(peers + destination) + peer_offset * 4
                     tl.inline_asm_elementwise(
                         "{.reg .pred p; setp.ne.u32 p,$6,0; "
                         "@p st.relaxed.sys.global.v4.u32 [$1],{$2,$3,$4,$5}; "
@@ -865,7 +871,7 @@ def _select_device_policy(tp, tokens, sm_count, hidden_size):
 
 @triton.jit
 def _copy_tma_input(source, destination, N: tl.constexpr, BLOCK: tl.constexpr):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(source + offset, offset < N, other=0)
     tl.store(destination + offset, value, offset < N)
 
