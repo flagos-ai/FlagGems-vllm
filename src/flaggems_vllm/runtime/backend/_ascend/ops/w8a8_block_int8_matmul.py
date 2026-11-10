@@ -872,6 +872,312 @@ def _w8a8_block_int8_stream(
                     )
 
 
+def _prune_pipeline_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    group_chunk = 8 if args["K"] >= 1024 else 4
+    block_m = (
+        64
+        if args["SCALE_MAJOR"]
+        and args["MR"] < 1024
+        and (args["K"] < 4096 or args["MR"] <= 192)
+        else 128
+    )
+    return [
+        cfg
+        for cfg in configs
+        if cfg.kwargs["GG"] == group_chunk and cfg.kwargs["BM"] == block_m
+    ]
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("w8a8_block_int8_pipeline_ascend"),
+    key=["MR", "NR", "K", "SCALE_MAJOR", "DIRECT_A", "DIRECT_B"],
+    strategy="default",
+    warmup=1,
+    rep=5,
+    use_cuda_graph=False,
+    prune_configs_by={"early_config_prune": _prune_pipeline_configs},
+)
+@triton.jit
+def _w8a8_block_int8_pipeline(
+    A,
+    B,
+    As,
+    Bs,
+    P,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    MR: tl.constexpr,
+    NR: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    GG: tl.constexpr,
+    VR: tl.constexpr,
+    W: tl.constexpr,
+    SCALE_MAJOR: tl.constexpr,
+    DIRECT_A: tl.constexpr,
+    DIRECT_B: tl.constexpr,
+):
+    worker = tl.program_id(0)
+    ab = tle.dsa.alloc([BM, 128], tl.int8, tle.dsa.ascend.L1)
+    bb = tle.dsa.alloc([BN, 128], tl.int8, tle.dsa.ascend.L1)
+    accum = tle.dsa.alloc([BM // 2, BN], tl.float32, tle.dsa.ascend.UB)
+    scratch = P + worker * 2 * GG * BM * BN
+    # Slot ownership is continuous across task boundaries. This overlaps
+    # Cube production with Vector consumption even for a one-chunk task.
+    chunks: tl.constexpr = tl.cdiv(K // 128, GG)
+    # Two free slots initially; producer/consumer explicitly own every event.
+    sync_block_set("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
+    sync_block_set("vector", "cube", 3, PIPE.PIPE_V, PIPE.PIPE_FIX)
+    with tle.scope(core_mode="cube"):
+        for task in range(worker, (M // BM) * (N // BN), W):
+            pm = task // (N // BN)
+            pn = task % (N // BN)
+            for batch in range(chunks):
+                g0 = batch * GG
+                step = (task // W) * chunks + batch
+                slot = step % 2
+                sync_block_wait("vector", "cube", 2 + slot, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                for i in range(tl.minimum(GG, K // 128 - g0)):
+                    g = g0 + i
+                    if DIRECT_A:
+                        ap = tl.make_block_ptr(
+                            A + pm * BM * K + g * 128,
+                            (BM, 128),
+                            (K, 1),
+                            (0, 0),
+                            (BM, 128),
+                            (1, 0),
+                        )
+                    else:
+                        ap = tl.make_block_ptr(
+                            A + g * M * 128 + pm * BM * 128,
+                            (BM, 128),
+                            (128, 1),
+                            (0, 0),
+                            (BM, 128),
+                            (1, 0),
+                        )
+                    if DIRECT_B:
+                        bp = tl.make_block_ptr(
+                            B + pn * BN * K + g * 128,
+                            (BN, 128),
+                            (K, 1),
+                            (0, 0),
+                            (BN, 128),
+                            (1, 0),
+                        )
+                    else:
+                        bp = tl.make_block_ptr(
+                            B + g * N * 128 + pn * BN * 128,
+                            (BN, 128),
+                            (128, 1),
+                            (0, 0),
+                            (BN, 128),
+                            (1, 0),
+                        )
+                    if DIRECT_A:
+                        tle.dsa.copy(ap, ab, [tl.minimum(BM, MR - pm * BM), 128])
+                    else:
+                        tle.dsa.copy(ap, ab, [BM, 128])
+                    tle.dsa.copy(bp, bb, [BN, 128])
+                    a = tle.dsa.to_tensor(ab, writable=False)
+                    b = tle.dsa.to_tensor(bb, writable=False)
+                    dot = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
+                    tl.store(
+                        scratch
+                        + slot * GG * BM * BN
+                        + i * BM * BN
+                        + tl.arange(0, BM)[:, None] * BN
+                        + tl.arange(0, BN)[None, :],
+                        dot,
+                    )
+                sync_block_set("cube", "vector", slot, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
+    # The independently running Vector loop uses the same task/slot sequence.
+    with tle.scope(core_mode="vector"):
+        for task in range(worker, (M // BM) * (N // BN), W):
+            pm = task // (N // BN)
+            pn = task % (N // BN)
+            tle.dsa.to_buffer(tl.full((BM // 2, BN), 0, tl.float32), bind_buffer=accum)
+            for batch in range(chunks):
+                g0 = batch * GG
+                step = (task // W) * chunks + batch
+                slot = step % 2
+                sync_block_wait("cube", "vector", slot, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
+                sub = sub_vec_id().to(tl.int32)
+                gg = g0 + tl.arange(0, GG)
+                bs = tl.load(Bs + (pn * BN // 128) * (K // 128) + gg, gg < K // 128, 0)
+                for r0 in range(0, BM // 2, VR):
+                    r = sub * (BM // 2) + r0 + tl.arange(0, VR)
+                    part = tl.load(
+                        scratch
+                        + slot * GG * BM * BN
+                        + tl.arange(0, GG)[:, None, None] * BM * BN
+                        + r[None, :, None] * BN
+                        + tl.arange(0, BN)[None, None, :],
+                        gg[:, None, None] < K // 128,
+                        0,
+                        volatile=True,
+                    ).to(tl.float32)
+                    if SCALE_MAJOR:
+                        sa = tl.load(
+                            As + gg[:, None] * M + pm * BM + r[None, :],
+                            ((pm * BM + r[None, :]) < MR) & (gg[:, None] < K // 128),
+                            0,
+                        )
+                        scale = sa * bs[:, None]
+                        v = tl.sum(part * scale[:, :, None], axis=0)
+                    else:
+                        sa = tl.load(
+                            As + (pm * BM + r[:, None]) * (K // 128) + gg[None, :],
+                            ((pm * BM + r[:, None]) < MR) & (gg[None, :] < K // 128),
+                            0,
+                        )
+                        v = tl.sum(
+                            part * tl.trans(sa)[:, :, None] * bs[:, None, None], axis=0
+                        )
+                    accv = tle.dsa.subview(accum, [r0, 0], [VR, BN], [1, 1])
+                    prev = tle.dsa.to_tensor(accv, writable=False)
+                    tle.dsa.to_buffer(prev + v, bind_buffer=accv)
+                sync_block_set("vector", "cube", 2 + slot, PIPE.PIPE_V, PIPE.PIPE_FIX)
+            sub = sub_vec_id().to(tl.int32)
+            for r0 in range(0, BM // 2, VR):
+                r = sub * (BM // 2) + r0 + tl.arange(0, VR)
+                accv = tle.dsa.subview(accum, [r0, 0], [VR, BN], [1, 1])
+                v = tle.dsa.to_tensor(accv, writable=False)
+                tl.store(
+                    C
+                    + (pm * BM + r[:, None]) * NR
+                    + pn * BN
+                    + tl.arange(0, BN)[None, :],
+                    v.to(C.dtype.element_ty),
+                    ((pm * BM + r[:, None]) < MR)
+                    & ((pn * BN + tl.arange(0, BN)[None, :]) < NR),
+                )
+    # Drain final releases before a persistent worker exits.
+    sync_block_wait("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
+    sync_block_wait("vector", "cube", 3, PIPE.PIPE_V, PIPE.PIPE_FIX)
+
+
+@triton.jit
+def _pack_w8a8_group_major(
+    X, Y, R: tl.constexpr, K: tl.constexpr, RP: tl.constexpr, W: tl.constexpr
+):
+    for t in range(tl.program_id(0), tl.cdiv(RP, 16) * tl.cdiv(K // 128, 4), W):
+        r = t // tl.cdiv(K // 128, 4) * 16 + tl.arange(0, 16)
+        g = t % tl.cdiv(K // 128, 4) * 4 + tl.arange(0, 4)
+        kk = g[:, None] * 32 + tl.arange(0, 32)[None, :]
+        v = tl.load(
+            X + r[:, None, None] * (K // 4) + kk[None, :, :],
+            (r[:, None, None] < R) & (kk[None, :, :] < K // 4),
+            0,
+        )
+        tl.store(
+            Y
+            + (g[None, :, None] * RP + r[:, None, None]) * 32
+            + tl.arange(0, 32)[None, None, :],
+            v,
+            (r[:, None, None] < RP) & (g[None, :, None] < K // 128),
+        )
+
+
+@triton.jit
+def _pack_w8a8_scales(X, Y, M: tl.constexpr, MP: tl.constexpr, G: tl.constexpr):
+    group = tl.program_id(0)
+    rows = tl.program_id(1) * 256 + tl.arange(0, 256)
+    values = tl.load(X + rows * G + group, rows < M, 0)
+    tl.store(Y + group * MP + rows, values, rows < MP)
+
+
+def _pipelined_matmul(
+    A,
+    B,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    output_dtype,
+    scale_major=False,
+    direct_a=False,
+    direct_b=False,
+):
+    bm = 64 if scale_major and M < 1024 and (K < 4096 or M <= 192) else 128
+    bn = 128
+    mp = triton.cdiv(M, bm) * bm
+    groups = K // 128
+    chunk = 8 if groups >= 8 else 4
+    ap = (
+        A
+        if direct_a
+        else torch.empty((groups, mp, 128), device=A.device, dtype=torch.int8)
+    )
+    bp = (
+        B
+        if direct_b
+        else torch.empty((groups, N, 128), device=A.device, dtype=torch.int8)
+    )
+    C = torch.empty(A.shape[:-1] + (N,), device=A.device, dtype=output_dtype)
+    workers = min(20, (mp // bm) * (N // bn))
+    P = torch.empty(
+        (workers * 2 * chunk * bm * bn,), device=A.device, dtype=torch.int32
+    )
+    with torch_device_fn.device(A.device):
+        inputs = []
+        if not direct_b:
+            inputs.append((B, bp, N, N))
+        if not direct_a:
+            inputs.insert(0, (A, ap, M, mp))
+        for source, packed, rows, padded in inputs:
+            pack_workers = min(40, triton.cdiv(padded, 16) * triton.cdiv(groups, 4))
+            _pack_w8a8_group_major[(pack_workers,)](
+                source.view(torch.int32),
+                packed.view(torch.int32),
+                rows,
+                K,
+                padded,
+                pack_workers,
+                num_warps=4,
+            )
+        if scale_major:
+            packed_scales = torch.empty(
+                (groups, mp), device=A.device, dtype=torch.float32
+            )
+            _pack_w8a8_scales[(groups, triton.cdiv(mp, 256))](
+                As,
+                packed_scales,
+                M,
+                mp,
+                groups,
+                num_warps=4,
+            )
+        else:
+            packed_scales = As
+        _w8a8_block_int8_pipeline[(workers,)](
+            ap,
+            bp,
+            packed_scales,
+            Bs,
+            P,
+            C,
+            mp,
+            N,
+            K,
+            MR=M,
+            NR=N,
+            W=workers,
+            SCALE_MAJOR=scale_major,
+            DIRECT_A=direct_a,
+            DIRECT_B=direct_b,
+            disable_auto_inject_block_sync=True,
+            multibuffer=False,
+        )
+    return C
+
+
 def _group_tile(M, N, K):
     if M <= 16:
         return 16, 128
@@ -887,12 +1193,12 @@ def _pad_group_inputs(A, B, M, N, K, mp, np, kp):
         if rows == padded_rows and K == kp:
             continue
         padded = torch.empty((padded_rows, kp), device=A.device, dtype=torch.int8)
-        # Reinterpret copies four INT8 values as one word; no conversion or
+        # A dtype view copies four INT8 values as one word; no conversion or
         # dequantization. Arbitrary byte tails retain the byte-copy kernel.
         if K % 4 == 0:
             _pad_int8_rows[(triton.cdiv(padded_rows, 8), triton.cdiv(kp // 4, 1024))](
-                triton.reinterpret(source, tl.int32),
-                triton.reinterpret(padded, tl.int32),
+                source.view(torch.int32),
+                padded.view(torch.int32),
                 rows,
                 K // 4,
                 padded_rows,
@@ -1039,6 +1345,53 @@ def w8a8_block_int8_matmul(
     # An empty K runs zero iterations and writes 0.
     if M == 0 or N == 0:
         return torch.empty(A.shape[:-1] + (N,), device=A.device, dtype=output_dtype)
+    # Group-major scales avoid a gather/transpose in every Vector row tile.
+    # Narrow-N long-K has little A reuse: read A directly and pack only B.
+    narrow_direct = N == 512 and M >= 1024 and K >= 4096
+    scale_pipeline = (
+        (M >= 33 and N >= 3072 and K >= 1024)
+        or (M >= 17 and N == 4608 and K >= 6144)
+        or (M >= 129 and N >= 1024 and K >= 1024)
+        or narrow_direct
+    )
+    packed_bytes = (triton.cdiv(M, 128) * 128 + N) * K
+    if (
+        group_n == group_k == 128
+        and N % 128 == K % 128 == 0
+        and 4 <= groups <= 64
+        and packed_bytes <= 256 * 1024 * 1024
+        and scale_pipeline
+    ):
+        return _pipelined_matmul(
+            A,
+            B,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            output_dtype,
+            scale_major=True,
+            direct_a=narrow_direct,
+            direct_b=M <= 1152 and K >= 4096 and not narrow_direct,
+        )
+    # Aligned, repeatedly reused tiles amortize group-major packing. Small
+    # or short-K matrices retain their lower-launch-overhead paths below.
+    packed_bytes = (triton.cdiv(M, 128) * 128 + N) * K
+    if (
+        group_n == group_k == 128
+        and N >= 512
+        and N % 128 == K % 128 == 0
+        and 4 <= groups <= 64
+        and packed_bytes <= 256 * 1024 * 1024
+        and not (M == 64 and N <= 1536)
+        and (
+            (M >= 129 and groups >= 16)
+            or M >= 1024
+            or (M > 32 and N >= 1024 and groups >= 24)
+        )
+    ):
+        return _pipelined_matmul(A, B, As, Bs, M, N, K, output_dtype)
     # Narrow N, long K otherwise misses both TLE paths. Small M benefits
     # from group parallelism (at most 24 MiB of partials here); larger M
     # amortizes the persistent path while keeping its scratch bounded.
