@@ -219,3 +219,132 @@ def test_shared_mqa_legacy_fp8_public_api_and_replay(m, h, n, clean, d):
         graph.replay()
         torch.cuda.synchronize()
         check()
+
+
+@pytest.fixture(autouse=True)
+def restore_rng_state():
+    cpu, gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
+    yield
+    torch.set_rng_state(cpu)
+    torch.cuda.set_rng_state(gpu)
+
+
+def bf16_cache_reference(q, keys, scales, weights, lengths):
+    dequant = (keys.cpu().bfloat16() * scales.cpu().bfloat16()[..., None]).bfloat16()
+    scores = torch.einsum("bhd,bnd->bhn", q.cpu().float(), dequant.float()).relu()
+    expected = (scores * weights.cpu()[:, :, None]).sum(1)
+    columns = torch.arange(keys.shape[1])[None, :]
+    return expected.masked_fill(columns >= lengths.cpu()[:, None], -torch.inf)
+
+
+@pytest.mark.mqa_logits
+@pytest.mark.parametrize("batch,slots", [(1, 128), (3, 256)])
+def test_gathered_bf16_query_reference_graph_and_padding(batch, slots):
+    generator = torch.Generator(device="cuda").manual_seed(713)
+    q = (
+        torch.randn(batch, 64, 128, device="cuda", generator=generator) * 0.1
+    ).bfloat16()
+    keys = (
+        torch.randn(batch, slots, 128, device="cuda", generator=generator) * 0.1
+    ).to(torch.float8_e4m3fn)
+    scales = torch.linspace(0.12345, 1.12345, batch * slots, device="cuda").view(
+        batch, slots
+    )
+    weights = torch.randn(batch, 64, device="cuda", generator=generator) * 0.1
+    lengths = torch.full((batch,), slots - 7, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    backing = torch.full((batch, slots + 8), 123.0, device="cuda")
+    out = backing[:, :slots]
+
+    def call():
+        assert ops.mqa_logits(q, (keys, scales), weights, None, lengths, out=out) is out
+
+    def check():
+        expected = bf16_cache_reference(q, keys, scales, weights, lengths)
+        torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
+        assert bool((backing[:, slots:] == 123).all())
+
+    def update(value):
+        q.fill_(value)
+        scales.add_(0.0625)
+        lengths.fill_(slots - 13)
+
+    call()
+    check()
+    check_replays(call, update, check, outputs=(out,))
+
+
+@pytest.mark.paged_mqa_logits
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("rank4", [False, True])
+def test_paged_bf16_query_pitched_shared_cache_graph(batch, rank4):
+    generator = torch.Generator(device="cuda").manual_seed(714)
+    pages, block, slots = 8, 64, 256
+    pitch = block * 132 + 64
+    raw = torch.full((pages * pitch + 64,), 93, device="cuda", dtype=torch.uint8)
+    cache = raw.as_strided(
+        (pages, block, 1, 132), (pitch, 132, 132, 1), storage_offset=64
+    )
+    flat = cache.view(pages, -1)
+    keys = (
+        torch.randn(pages, block, 128, device="cuda", generator=generator) * 0.1
+    ).to(torch.float8_e4m3fn)
+    scales = torch.linspace(0.12345, 1.12345, pages * block, device="cuda").view(
+        pages, block
+    )
+    flat[:, : block * 128].copy_(keys.view(torch.uint8).reshape(pages, -1))
+    flat[:, block * 128 :].view(torch.float32).copy_(scales)
+    q = (
+        torch.randn(batch, 64, 128, device="cuda", generator=generator) * 0.1
+    ).bfloat16()
+    weights = torch.randn(batch, 64, device="cuda", generator=generator) * 0.1
+    table_storage = torch.full((batch, 6), -1, device="cuda", dtype=torch.int32)
+    tables = table_storage[:, 1:5]
+    tables.copy_(torch.arange(4, device="cuda", dtype=torch.int32).repeat(batch, 1))
+    lengths = torch.full((batch,), slots - 7, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    backing = torch.full((batch, slots + 8), 123.0, device="cuda")
+    out = backing[:, :slots]
+    original_cache = raw.clone()
+
+    def call():
+        query = q[:, None] if rank4 else q
+        returned = ops.paged_mqa_logits(
+            query,
+            cache,
+            weights,
+            lengths[:, None] if rank4 else lengths,
+            tables,
+            None,
+            slots,
+            True,
+            out=out,
+        )
+        assert returned is out
+
+    def check():
+        table = tables.cpu().long()
+        gathered_keys = keys.cpu()[table].reshape(batch, slots, 128)
+        gathered_scales = scales.cpu()[table].reshape(batch, slots)
+        expected = bf16_cache_reference(
+            q, gathered_keys, gathered_scales, weights, lengths
+        )
+        torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
+        assert bool((backing[:, slots:] == 123).all())
+        assert torch.equal(raw, original_cache)
+        assert bool((table_storage[:, [0, -1]] == -1).all())
+
+    def update(value):
+        q.fill_(value)
+        tables.copy_(
+            (
+                torch.arange(4, device="cuda", dtype=torch.int32)[None, :]
+                + (1 if value > 0 else 3)
+            ).repeat(batch, 1)
+            % pages
+        )
+        lengths.fill_(slots - 13)
+
+    call()
+    check()
+    check_replays(call, update, check, outputs=(out,))

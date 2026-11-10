@@ -86,10 +86,12 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/paged_mqa_logits.py": [
-        "tests/test_mqa_logits.py"
+        "tests/test_mqa_logits.py",
+        "benchmark/test_mqa_logits.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/mqa_logits.py": [
-        "tests/test_mqa_logits.py"
+        "tests/test_mqa_logits.py",
+        "benchmark/test_mqa_logits.py",
     ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
