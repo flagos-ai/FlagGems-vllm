@@ -147,12 +147,6 @@ class Int8StateGdnBenchmark(Benchmark):
                 (tokens, packed, heads, columns), dtype, reduction
             )
             mixed, a, b, a_log, bias, scale, state, out, indices, normalize = reference
-            if not ASCEND_INT8_STATE:
-                native_bias = bias.to(dtype)
-                native_indices = indices.to(torch.int32)
-                cu_seqlens = torch.arange(
-                    tokens + 1, device=mixed.device, dtype=torch.int32
-                )
             if separate_qkv:
                 q, k, v = torch.split(
                     mixed,
@@ -164,12 +158,19 @@ class Int8StateGdnBenchmark(Benchmark):
                     k.reshape(1, tokens, query_heads, reduction).contiguous(),
                     v.reshape(1, tokens, heads, columns).contiguous(),
                 )
-                if ASCEND_INT8_STATE:
-                    native_call, buffers = prepare_ascend_gdn_decode_baseline(
-                        (qkv, *reference[1:])
-                    )
-                    yield ("update", native_call, buffers), (qkv, *args[1:])
-                    continue
+            if ASCEND_INT8_STATE:
+                kind = "update" if separate_qkv else "decode"
+                if separate_qkv:
+                    reference, args = (qkv, *reference[1:]), (qkv, *args[1:])
+                native_call, buffers = prepare_ascend_gdn_decode_baseline(reference)
+                yield (kind, native_call, buffers), args
+                continue
+            native_bias = bias.to(dtype)
+            native_indices = indices.to(torch.int32)
+            cu_seqlens = torch.arange(
+                tokens + 1, device=mixed.device, dtype=torch.int32
+            )
+            if separate_qkv:
                 if HYGON_INT8_STATE:
                     native_call = partial(
                         update,
@@ -213,10 +214,6 @@ class Int8StateGdnBenchmark(Benchmark):
                     )
                 yield ("update", native_call, state), (qkv, *args[1:])
             else:
-                if ASCEND_INT8_STATE:
-                    native_call, buffers = prepare_ascend_gdn_decode_baseline(reference)
-                    yield ("decode", native_call, buffers), args
-                    continue
                 if HYGON_INT8_STATE:
                     native_call = partial(packed_decode, *reference)
                 else:
@@ -252,57 +249,45 @@ class Int8StateGdnBenchmark(Benchmark):
             buffers = inputs[5:7]
         else:
             buffers = inputs[6:9]
+        from triton.backends.ascend.testing import (
+            KernelMonitor,
+            do_bench_npu_mspti,
+            do_bench_npu_profiler,
+        )
+
         saved = tuple(tensor.clone() for tensor in buffers)
-        import tempfile
-
-        import torch_npu
-        from triton.backends.ascend.testing import KernelMonitor, _collect_prof_result
-
+        do_bench = (
+            do_bench_npu_mspti if KernelMonitor is not None else do_bench_npu_profiler
+        )
         samples = []
-        # Match the NPU helper's bounded 5/30 sampling defaults.
         warmup, repetitions = min(Config.warm_up, 5), min(Config.repetition, 30)
-        for index in range(warmup + repetitions):
+        try:
+            for index in range(warmup + repetitions):
+                prepare = True
+
+                def call():
+                    nonlocal prepare
+                    if prepare:
+                        # Both upstream helpers invoke once before profiling.
+                        # Use that call to restore state outside the timed region.
+                        for tensor, original in zip(buffers, saved):
+                            tensor.copy_(original)
+                        torch_device_fn.synchronize()
+                        prepare = False
+                    else:
+                        op(*args, **kwargs)
+
+                if index < warmup:
+                    call()
+                    call()
+                    torch_device_fn.synchronize()
+                else:
+                    samples.append(do_bench(call, warmup=0, active=1))
+        finally:
             for tensor, original in zip(buffers, saved):
                 tensor.copy_(original)
-            torch_device_fn.synchronize()
-            if index < warmup:
-                op(*args, **kwargs)
-                torch_device_fn.synchronize()
-                continue
-            # Match do_bench_npu's device-kernel sum, excluding state restoration.
-            if KernelMonitor is not None:
-                durations = []
-                monitor = KernelMonitor()
-                monitor.start(
-                    lambda record: durations.append(record.end - record.start)
-                )
-                try:
-                    op(*args, **kwargs)
-                    torch_device_fn.synchronize()
-                finally:
-                    monitor.stop()
-                if not durations:
-                    raise RuntimeError("No NPU kernel records were captured")
-                samples.append(sum(durations) / 1e6)
-            else:
-                with tempfile.TemporaryDirectory(prefix="gdn-native-profile-") as path:
-                    with torch_npu.profiler.profile(
-                        activities=[torch_npu.profiler.ProfilerActivity.NPU],
-                        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                            path
-                        ),
-                        experimental_config=torch_npu.profiler._ExperimentalConfig(
-                            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                            data_simplification=False,
-                        ),
-                    ):
-                        op(*args, **kwargs)
-                        torch_device_fn.synchronize()
-                    samples.append(_collect_prof_result(path, [op], 0, 1))
-        for tensor, original in zip(buffers, saved):
-            tensor.copy_(original)
         if not samples or any(
-            not math.isfinite(sample) or sample <= 0 for sample in samples
+            not math.isfinite(value) or value <= 0 for value in samples
         ):
             raise RuntimeError("NPU profiling did not return valid device latencies")
         return statistics.median(samples)
