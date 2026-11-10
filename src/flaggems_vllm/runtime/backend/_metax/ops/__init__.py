@@ -56,7 +56,6 @@ from flaggems_vllm.runtime.backend._metax.ops.top_k_per_row_decode import (
 )
 
 __all__ = [
-    "top_k_per_row_decode",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
@@ -73,6 +72,7 @@ __all__ = [
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
+    "top_k_per_row_decode",
     "top_k_top_p",
     "w8a8_block_int8_bmm",
 ]
