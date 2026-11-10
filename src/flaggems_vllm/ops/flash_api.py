@@ -703,7 +703,7 @@ def mha_varlan_fwd_opt(
 
     is_paged = page_table is not None
     if not is_paged:
-        page_table = torch.emtpty((0, 0), device=q_device, dtype=torch.int32)
+        page_table = torch.empty((0, 0), device=q_device, dtype=torch.int32)
 
     # q shape: [total_q_tokens, num_heads, head_size]
     # k shape:
