@@ -735,3 +735,21 @@ def restore_qnorm_rng_state():
     yield
     torch.set_rng_state(cpu)
     torch.cuda.set_rng_state(gpu)
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+def test_metax_qnorm_mixed_device_rejected_before_mutation():
+    if flaggems_vllm.vendor_name != "metax":
+        pytest.skip("MetaX device guard")
+    q = torch.randn(17, 16, 512, device=flaggems_vllm.device, dtype=torch.bfloat16)
+    kv = torch.randn(17, 512, device=q.device, dtype=q.dtype)
+    cache = torch.full((2, 256 * 584), 93, dtype=torch.uint8)
+    slots = torch.arange(17, device=q.device, dtype=torch.int64)
+    trig = make_cos_sin_cache(4096, 64, torch.float32, q.device)
+    before_q, before_kv = q.clone(), kv.clone()
+    with pytest.raises(ValueError, match="share an accelerator"):
+        flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q, kv, cache, slots, slots, trig, 1e-6, 256
+        )
+    assert torch.equal(q, before_q) and torch.equal(kv, before_kv)
+    assert bool((cache == 93).all())

@@ -18,12 +18,18 @@ quant blocks straggle behind Q slots and 64-thread blocks under-fill the SM. Eac
 program here takes TPP tokens of one slot, uniformly all-Q or all-KV.
 
 Below 512 tokens this dispatches to the generic kernel, which launches cheaper
-where TPP=8 would mask off most of every program. Output is bit-identical.
+where TPP=8 would mask off most of every program. The BF16/FP8 value and state contract is checked by independent tests.
 """
+
+import logging
 
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.runtime import torch_device_fn
+
+logger = logging.getLogger(__name__)
 
 # Measured on MetaX C550; see module docstring.
 _TILED_MIN_TOKENS = 512
@@ -182,17 +188,60 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     cache_block_size: int,
 ):
     """See the generic implementation for the layout contract."""
-    if not (q.is_contiguous() and kv.is_contiguous()):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    num_tokens, num_heads, head_dims = q.shape
+    logger.debug("GEMS_METAX FUSED_DEEPSEEK_V4_QNORM_ROPE_KV_ROPE_QUANT_INSERT")
+    if not q.is_cuda or any(
+        t.device != q.device
+        for t in (kv, k_cache, slot_mapping, position_ids, cos_sin_cache)
+    ):
+        raise ValueError("QNorm/RoPE tensors must share an accelerator device")
+    with torch_device_fn.device(q.device):
+        if not (q.is_contiguous() and kv.is_contiguous()):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        num_tokens, num_heads, head_dims = q.shape
 
-    if num_tokens < _TILED_MIN_TOKENS:
-        # Small shapes are launch-bound; the narrower generic kernel wins.
-        from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert as _generic,
-        )
+        if num_tokens < _TILED_MIN_TOKENS:
+            # Small shapes are launch-bound; the narrower generic kernel wins.
+            from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+                fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert as _generic,
+            )
 
-        return _generic(
+            return _generic(
+                q,
+                kv,
+                k_cache,
+                slot_mapping,
+                position_ids,
+                cos_sin_cache,
+                eps,
+                cache_block_size,
+            )
+
+        if not (head_dims == 512):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (kv.shape == (num_tokens, 512)):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (k_cache.dtype == torch.uint8):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (slot_mapping.dim() == 1):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        num_tokens_insert = slot_mapping.shape[0]
+        if not (num_tokens_insert <= num_tokens):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (slot_mapping.dtype == torch.int64):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (position_ids.shape == (num_tokens,)):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (position_ids.dtype == torch.int64):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+        if not (cos_sin_cache.dtype == torch.float32):
+            raise ValueError("Invalid QNorm/RoPE layout or parameter")
+
+        grid = triton.cdiv(num_tokens, _TPP) * (num_heads + 1)
+        _tiled_kernel[(grid,)](
             q,
             kv,
             k_cache,
@@ -201,47 +250,11 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             cos_sin_cache,
             eps,
             cache_block_size,
+            num_tokens,
+            num_heads,
+            k_cache.stride(0),
+            num_tokens_insert,
+            TPP=_TPP,
+            num_warps=_NUM_WARPS,
+            num_stages=2,
         )
-
-    if not (head_dims == 512):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (kv.shape == (num_tokens, 512)):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (k_cache.dtype == torch.uint8):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (slot_mapping.dim() == 1):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    num_tokens_insert = slot_mapping.shape[0]
-    if not (num_tokens_insert <= num_tokens):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (slot_mapping.dtype == torch.int64):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (position_ids.shape == (num_tokens,)):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (position_ids.dtype == torch.int64):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-    if not (cos_sin_cache.dtype == torch.float32):
-        raise ValueError("Invalid QNorm/RoPE layout or parameter")
-
-    grid = triton.cdiv(num_tokens, _TPP) * (num_heads + 1)
-    _tiled_kernel[(grid,)](
-        q,
-        kv,
-        k_cache,
-        slot_mapping,
-        position_ids,
-        cos_sin_cache,
-        eps,
-        cache_block_size,
-        num_tokens,
-        num_heads,
-        k_cache.stride(0),
-        num_tokens_insert,
-        TPP=_TPP,
-        num_warps=_NUM_WARPS,
-        num_stages=2,
-    )
