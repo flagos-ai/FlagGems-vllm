@@ -3,14 +3,16 @@
 """Framework benchmark using the native FLA workload definition."""
 
 import importlib.util
+import math
 from pathlib import Path
 
 import pytest
+import torch
 
 from benchmark.base import Benchmark
 from benchmark.conftest import Config, update_result
-from benchmark.consts import lookup_base_record_ex
 from flaggems_vllm.ops.FLA import chunk_kda_fwd_intra_token_parallel
+from tests.test_FLA.test_chunk_kda_intra_token_parallel import TOLERANCES
 
 spec = importlib.util.spec_from_file_location(
     "kda_intra_workload",
@@ -19,6 +21,10 @@ spec = importlib.util.spec_from_file_location(
 )
 workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
+
+
+def _native_slot(*args, **kwargs):
+    raise RuntimeError("native slot must be resolved by get_latency")
 
 
 class ChunkKDAIntraTokenBenchmark(Benchmark):
@@ -44,57 +50,81 @@ class ChunkKDAIntraTokenBenchmark(Benchmark):
         return super().record_shapes(*args, **kwargs, use_graph=False)
 
     def run(self):
-        self.offline_baseline = (
-            None if Config.user_desired_metrics == ["latency"] else Config.base_data
+        gems_only = Config.user_desired_metrics == ["latency"]
+        self.native_op = None
+        self.native_reason = (
+            "native timing disabled by --metrics" if gems_only else None
         )
-        # Scope per-row fallback to this benchmark, including failed runs.
+        if not gems_only:
+            try:
+                self.native_op = workload.native()
+                self.native_reason = workload.NATIVE_UNAVAILABLE_REASON
+                if self.native_op is self.gems_op:
+                    self.native_op = None
+                    self.native_reason = "native resolves to the Gems candidate"
+            except Exception as error:
+                self.native_reason = f"native resolution: {error!r}"
         with pytest.MonkeyPatch.context() as config:
-            config.setattr(Config, "base_data", self.offline_baseline)
+            if gems_only:
+                config.setattr(Config, "base_data", None)
             super().run()
 
     def get_input_iter(self, dtype):
-        baseline_misses = []
+        misses = []
         for batch, heads, *lengths in self.shapes:
             binding = dict(
                 B=batch, H=heads, HV=heads, K=128, BT=64, BC=16, lengths=lengths
             )
             args, kwargs = workload.build_inputs(binding, dtype, self.device)
-            if self.torch_op is None and self.offline_baseline is not None:
-                shape = self.record_shapes(*args, **kwargs)
-                record, reason = lookup_base_record_ex(
-                    self.offline_baseline, self.op_name, dtype, shape, self.base_variant
-                )
-                if record is None or record.get("latency_ms") is None:
-                    Config.base_data = None
-                    baseline_misses.append(
-                        {"shape": shape, "reason": reason or "offline latency missing"}
-                    )
-                else:
-                    Config.base_data = self.offline_baseline
+            self.row_native_reason = self.native_reason
             yield (*args, kwargs)
-        if self.torch_op is None:
-            reason = (
-                "native timing disabled by --metrics"
-                if Config.user_desired_metrics == ["latency"]
-                else workload.NATIVE_UNAVAILABLE_REASON
-            )
+            if self.row_native_reason:
+                misses.append(
+                    dict(
+                        shape=self.record_shapes(*args, **kwargs),
+                        reason=self.row_native_reason,
+                    )
+                )
+        if misses:
             update_result(
                 self.op_name,
                 dict(
                     dtype=str(dtype),
-                    native_baseline_skip_reason=reason,
-                    offline_baseline_misses=baseline_misses,
+                    native_baseline_skip_reason="; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    native_baseline_misses=misses,
                 ),
             )
+
+    def get_latency(self, op, *args, **kwargs):
+        if op is not self.torch_op:
+            return super().get_latency(op, *args, **kwargs)
+        if self.native_op is None:
+            return None
+
+        expected_args = (*args[:4], args[4].clone(), args[5].clone(), *args[6:])
+        self.gems_op(*expected_args, **kwargs)
+        try:
+            native_args = (*args[:4], args[4].clone(), args[5].clone(), *args[6:])
+            self.native_op(*native_args, **kwargs)
+            for got, want in zip(native_args[4:6], expected_args[4:6]):
+                rtol, atol = TOLERANCES[want.dtype]
+                torch.testing.assert_close(got, want, rtol=rtol, atol=atol)
+            latency = super().get_latency(self.native_op, *native_args, **kwargs)
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"invalid native latency: {latency}")
+        except Exception as error:
+            self.row_native_reason = f"native validation or timing: {error!r}"
+            return None
+        return latency
 
 
 @pytest.mark.chunk_kda_fwd_intra_token_parallel
 def test_chunk_kda_intra_token_parallel():
     bench = ChunkKDAIntraTokenBenchmark(
         op_name=workload.OP_NAME,
-        torch_op=(
-            None if Config.user_desired_metrics == ["latency"] else workload.native()
-        ),
+        torch_op=_native_slot,
         is_inplace=workload.IS_INPLACE,
     )
     bench.set_gems(chunk_kda_fwd_intra_token_parallel)
