@@ -176,3 +176,48 @@ def restore_sparse_rng_state():
     yield
     torch.set_rng_state(cpu)
     torch.cuda.set_rng_state(gpu)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_sparse_prefill_all_masked_rows_and_empty_batch_rejection():
+    q = torch.randn(2, 16, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(16, 1, 512, device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((2, 16), -1, device="cuda", dtype=torch.int32)
+    lengths = torch.zeros(2, device="cuda", dtype=torch.int32)
+    sink = torch.zeros(16, device="cuda")
+    output = torch.empty_like(q)
+    maximum = torch.empty(2, 16, device="cuda")
+    lse = torch.empty_like(maximum)
+
+    def call():
+        ops.flash_mla_sparse_fwd(
+            q,
+            kv,
+            ids,
+            512**-0.5,
+            attn_sink=sink,
+            topk_length=lengths,
+            out=output,
+            max_logits_out=maximum,
+            lse_out=lse,
+        )
+
+    def check():
+        assert bool((output == 0).all())
+        assert bool(torch.isneginf(lse).all())
+
+    check_replays(call, lambda value: q.fill_(value), check, outputs=(output, lse))
+    output.fill_(17)
+    with pytest.raises(ValueError, match="nonempty"):
+        ops.flash_mla_sparse_fwd(
+            q[:0],
+            kv,
+            ids[:0],
+            512**-0.5,
+            attn_sink=sink,
+            topk_length=lengths[:0],
+            out=output[:0],
+            max_logits_out=maximum[:0],
+            lse_out=lse[:0],
+        )
+    assert bool((output == 17).all())
