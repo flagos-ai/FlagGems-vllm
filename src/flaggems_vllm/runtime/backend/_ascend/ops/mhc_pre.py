@@ -349,7 +349,7 @@ def npu_mhc_pre(
     # projection: bf16 GEMM (ported generic path)
     x_flat = residual_flat.reshape(num_tokens, hc_hidden_size)
     fn_bf16 = _get_fn_bf16_cached(fn)
-    gemm_out = torch.mm(x_flat, fn_bf16.t()).float()
+    gemm_out = torch.mm(x_flat, fn_bf16.t()).float()  # allow-torch-compute: dispatches to CANN native GEMM on NPU tensors
 
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
