@@ -302,7 +302,9 @@ def make_case(
         else (
             max(0, c - 3)
             if scenario == "pad"
-            else c + 5 if scenario == "truncate" else c
+            else c + 5
+            if scenario == "truncate"
+            else c
         )
     )
     if name == "_pack_sampler_output_kernel":
@@ -311,7 +313,9 @@ def make_case(
             (
                 source_cols
                 if source_cols is not None
-                else max(0, k - 2) if scenario == "pad" else k
+                else max(0, k - 2)
+                if scenario == "pad"
+                else k
             ),
         )
         packed = buffer((n, k + 2 + int(with_nans)), torch.int64, strided, True)
@@ -450,35 +454,33 @@ def run_reference(case):
 
 def run_candidate(case, config=None, use_layout=None):
     kernel = getattr(impl, case.name)
-    if case.name == "_unpack_gathered_output_kernel":
-        # Kept upstream after cold-cache profiling of grouped request tiles.
-        if config is None:
-            kernel[(case.n,)](*case.args, BLOCK_SIZE=case.block)
-        else:
-            kernel.jit_function[(case.n,)](
-                *case.args,
-                BLOCK_SIZE=case.block,
-                **config.kwargs,
-                num_warps=config.num_warps,
-                num_stages=config.num_stages,
-            )
-        return
+    block = (
+        case.block
+        if "logprobs" in case.name
+        else triton.next_power_of_2(case.k + 2 + int(case.args[6] is not None))
+    )
     layout = impl._HAS_LAYOUT if use_layout is None else use_layout
 
     def grid(meta):
         dims = (triton.cdiv(case.n, meta["BLOCK_ROWS"]),)
         return dims + ((case.k,) if "logprobs" in case.name else ())
 
+    extra = (
+        {"PACK_RANK": case.c < case.block <= 32}
+        if case.name == "_pack_logprobs_kernel"
+        else {}
+    )
     if config is None:
         kernel[grid](
-            *case.args, BLOCK_SIZE=case.block, NUM_REQS=case.n, USE_LAYOUT=layout
+            *case.args, BLOCK_SIZE=block, NUM_REQS=case.n, USE_LAYOUT=layout, **extra
         )
     else:
         kernel.jit_function[grid](
             *case.args,
-            BLOCK_SIZE=case.block,
+            BLOCK_SIZE=block,
             NUM_REQS=case.n,
             USE_LAYOUT=layout,
+            **extra,
             **config.kwargs,
             num_warps=config.num_warps,
             num_stages=config.num_stages,

@@ -114,23 +114,19 @@ def _pack_sampler_output_kernel(
     req, cols = _request_tile(BLOCK_ROWS, BLOCK_SIZE, WARPS, USE_LAYOUT)
     req = tl.program_id(0) * BLOCK_ROWS + req
     valid = req < NUM_REQS
-    row_ptr = packed_ptr + req * packed_stride
-    token_ids = tl.load(
+    values = tl.load(
         sampled_token_ids_ptr + req[:, None] * sampled_token_ids_stride + cols[None, :],
         mask=valid[:, None] & (cols[None, :] < num_src_cols),
         other=0,
+    ).to(tl.int64)
+    sampled = tl.load(num_sampled_ptr + req, mask=valid, other=0).to(tl.int64)
+    rejected = tl.load(num_rejected_ptr + req, mask=valid, other=0).to(tl.int64)
+    # Write the trailing counts in the same coalesced store as the token IDs.
+    values = tl.where(cols[None, :] == max_num_logits_per_req, sampled[:, None], values)
+    values = tl.where(
+        cols[None, :] == max_num_logits_per_req + 1, rejected[:, None], values
     )
-    tl.store(
-        row_ptr[:, None] + cols[None, :],
-        token_ids,
-        mask=valid[:, None] & (cols[None, :] < max_num_logits_per_req),
-    )
-    num_sampled = tl.load(num_sampled_ptr + req, mask=valid, other=0)
-    num_rejected = tl.load(num_rejected_ptr + req, mask=valid, other=0)
-    tl.store(row_ptr + max_num_logits_per_req, num_sampled.to(tl.int64), mask=valid)
-    tl.store(
-        row_ptr + max_num_logits_per_req + 1, num_rejected.to(tl.int64), mask=valid
-    )
+    limit = max_num_logits_per_req + 2
     if num_nans_ptr is not None:
         start = tl.load(local_cu_num_logits_ptr + req, mask=valid, other=0)
         end = tl.load(local_cu_num_logits_ptr + req + 1, mask=valid, other=0)
@@ -139,17 +135,23 @@ def _pack_sampler_output_kernel(
             mask=valid[:, None] & (cols[None, :] < (end - start)[:, None]),
             other=0,
         )
-        tl.store(
-            row_ptr + max_num_logits_per_req + 2,
-            tl.sum(nans.to(tl.int64), axis=1),
-            mask=valid,
+        total = tl.sum(nans.to(tl.int64), 1)
+        values = tl.where(
+            cols[None, :] == max_num_logits_per_req + 2, total[:, None], values
         )
+        limit += 1
+    tl.store(
+        packed_ptr + req[:, None] * packed_stride + cols[None, :],
+        values,
+        mask=valid[:, None] & (cols[None, :] < limit),
+    )
 
 
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("unpack_gathered_output"),
-    key=[],
+    prune_configs_by={"early_config_prune": _prune_sampler_tiles},
+    key=["NUM_REQS", "max_num_logits_per_req"],
     use_cuda_graph=runtime.device.name == "cuda",
 )
 @triton.jit(do_not_specialize=["max_num_logits_per_req", "gathered_stride"])
@@ -163,26 +165,46 @@ def _unpack_gathered_output_kernel(
     num_nans_ptr,
     max_num_logits_per_req,
     BLOCK_SIZE: tl.constexpr,
+    NUM_REQS,
+    BLOCK_ROWS: tl.constexpr,
+    WARPS: tl.constexpr,
+    USE_LAYOUT: tl.constexpr,
 ):
-    req_idx = tl.program_id(0)
-    src = tl.load(gathered_src_indices_ptr + req_idx)
-    row_ptr = gathered_ptr + src * gathered_stride
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < max_num_logits_per_req
-
-    token_ids = tl.load(row_ptr + cols, mask=mask)
-    tl.store(
-        sampled_token_ids_ptr + req_idx * max_num_logits_per_req + cols,
-        token_ids,
-        mask=mask,
-    )
-    num_sampled = tl.load(row_ptr + max_num_logits_per_req)
-    tl.store(num_sampled_ptr + req_idx, num_sampled.to(tl.int32))
-    num_rejected = tl.load(row_ptr + max_num_logits_per_req + 1)
-    tl.store(num_rejected_ptr + req_idx, num_rejected.to(tl.int32))
+    req, cols = _request_tile(BLOCK_ROWS, BLOCK_SIZE, WARPS, USE_LAYOUT)
+    req = tl.program_id(0) * BLOCK_ROWS + req
+    valid = req < NUM_REQS
+    src = tl.load(gathered_src_indices_ptr + req, mask=valid, other=0)
+    row = gathered_ptr + src * gathered_stride
+    limit = max_num_logits_per_req + 2
     if num_nans_ptr is not None:
-        num_nans = tl.load(row_ptr + max_num_logits_per_req + 2)
-        tl.store(num_nans_ptr + req_idx, num_nans.to(tl.int32))
+        limit += 1
+    # Read tokens and counts together; each count is written by its matching lane.
+    values = tl.load(
+        row[:, None] + cols[None, :],
+        mask=valid[:, None] & (cols[None, :] < limit),
+        other=0,
+    )
+    tl.store(
+        sampled_token_ids_ptr + req[:, None] * max_num_logits_per_req + cols[None, :],
+        values,
+        mask=valid[:, None] & (cols[None, :] < max_num_logits_per_req),
+    )
+    tl.store(
+        num_sampled_ptr + req[:, None] + cols[None, :] * 0,
+        values.to(tl.int32),
+        mask=valid[:, None] & (cols[None, :] == max_num_logits_per_req),
+    )
+    tl.store(
+        num_rejected_ptr + req[:, None] + cols[None, :] * 0,
+        values.to(tl.int32),
+        mask=valid[:, None] & (cols[None, :] == max_num_logits_per_req + 1),
+    )
+    if num_nans_ptr is not None:
+        tl.store(
+            num_nans_ptr + req[:, None] + cols[None, :] * 0,
+            values.to(tl.int32),
+            mask=valid[:, None] & (cols[None, :] == max_num_logits_per_req + 2),
+        )
 
 
 @libentry()
@@ -224,6 +246,7 @@ def _pack_logprobs_kernel(
     BLOCK_ROWS: tl.constexpr,
     WARPS: tl.constexpr,
     USE_LAYOUT: tl.constexpr,
+    PACK_RANK: tl.constexpr = False,
 ):
     if BLOCK_ROWS == 1:
         req_idx = tl.program_id(0)
@@ -248,9 +271,16 @@ def _pack_logprobs_kernel(
                 other=float("-inf"),
             )
             ids_row = send_ids_ptr + dst * send_ids_stride
-            tl.store(ids_row + cols, ids.to(tl.int64), mask=dst_mask)
-            rank = tl.load(selected_token_ranks_ptr + src)
-            tl.store(ids_row + num_logprob_cols, rank.to(tl.int64))
+            if PACK_RANK:
+                rank = tl.load(selected_token_ranks_ptr + src)
+                combined = tl.where(
+                    cols == num_logprob_cols, rank.to(tl.int64), ids.to(tl.int64)
+                )
+                tl.store(ids_row + cols, combined, mask=cols <= num_logprob_cols)
+            else:
+                tl.store(ids_row + cols, ids.to(tl.int64), mask=dst_mask)
+                rank = tl.load(selected_token_ranks_ptr + src)
+                tl.store(ids_row + num_logprob_cols, rank.to(tl.int64))
             tl.store(
                 send_logprobs_ptr + dst * send_logprobs_stride + cols,
                 logprobs.to(tl.float32),
@@ -278,9 +308,22 @@ def _pack_logprobs_kernel(
             other=float("-inf"),
         )
         ids_row = send_ids_ptr + dst * send_ids_stride
-        tl.store(ids_row[:, None] + cols[None, :], ids.to(tl.int64), mask=dst_mask)
-        rank = tl.load(selected_token_ranks_ptr + src, mask=valid, other=0)
-        tl.store(ids_row + num_logprob_cols, rank.to(tl.int64), mask=valid)
+        if PACK_RANK:
+            rank = tl.load(selected_token_ranks_ptr + src, mask=valid, other=0)
+            combined = tl.where(
+                cols[None, :] == num_logprob_cols,
+                rank[:, None].to(tl.int64),
+                ids.to(tl.int64),
+            )
+            tl.store(
+                ids_row[:, None] + cols[None, :],
+                combined,
+                mask=valid[:, None] & (cols[None, :] <= num_logprob_cols),
+            )
+        else:
+            tl.store(ids_row[:, None] + cols[None, :], ids.to(tl.int64), mask=dst_mask)
+            rank = tl.load(selected_token_ranks_ptr + src, mask=valid, other=0)
+            tl.store(ids_row + num_logprob_cols, rank.to(tl.int64), mask=valid)
         tl.store(
             send_logprobs_ptr + dst[:, None] * send_logprobs_stride + cols[None, :],
             logprobs.to(tl.float32),
@@ -429,6 +472,7 @@ def _gather_logprobs_tensors(
             BLOCK_SIZE=block_size,
             NUM_REQS=metadata.num_local_reqs,
             USE_LAYOUT=_HAS_LAYOUT,
+            PACK_RANK=num_logprob_cols < block_size <= 32,
         )
 
     gathered_ids_ranks = tensor_model_parallel_all_gather(send_ids_ranks, dim=0)
@@ -491,7 +535,7 @@ def gather_sampler_output(
 
     max_num_logits_per_req = metadata.max_num_logits_per_req
     num_packed_cols = max_num_logits_per_req + 2 + (1 if gather_num_nans else 0)
-    block_size = triton.next_power_of_2(max_num_logits_per_req)
+    block_size = triton.next_power_of_2(num_packed_cols)
 
     # Pack the sampler output tensors (excluding logprobs) into a single
     # tensor for the all-gather.
@@ -545,7 +589,9 @@ def gather_sampler_output(
         if gather_num_nans
         else None
     )
-    _unpack_gathered_output_kernel[(num_reqs,)](
+    _unpack_gathered_output_kernel[
+        lambda meta: (triton.cdiv(num_reqs, meta["BLOCK_ROWS"]),)
+    ](
         gathered,
         gathered.stride(0),
         metadata.gathered_src_indices,
@@ -555,6 +601,8 @@ def gather_sampler_output(
         num_nans,
         max_num_logits_per_req,
         BLOCK_SIZE=block_size,
+        NUM_REQS=num_reqs,
+        USE_LAYOUT=_HAS_LAYOUT,
     )
     return SamplerOutput(
         sampled_token_ids=sampled_token_ids,

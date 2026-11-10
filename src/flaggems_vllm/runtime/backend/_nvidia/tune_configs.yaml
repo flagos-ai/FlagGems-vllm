@@ -1438,9 +1438,33 @@ pack_sampler_output:
     num_stages: 1
 
 unpack_gathered_output:
-  - META: {}
+  - META: {BLOCK_ROWS: 1, WARPS: 4}
     num_warps: 4
-    num_stages: 3
+    num_stages: 1
+  - META: {BLOCK_ROWS: 1, WARPS: 8}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_ROWS: 1, WARPS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_ROWS: 4, WARPS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_ROWS: 16, WARPS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_ROWS: 32, WARPS: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_ROWS: 4, WARPS: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_ROWS: 16, WARPS: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_ROWS: 32, WARPS: 4}
+    num_warps: 4
+    num_stages: 1
 
 pack_logprobs:
   - META: {BLOCK_ROWS: 1, WARPS: 4}
