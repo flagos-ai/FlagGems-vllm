@@ -33,6 +33,7 @@ from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
 )
 from flaggems_vllm.ops.cross_entropy_loss import cross_entropy_loss
 from flaggems_vllm.ops.cutlass_scaled_mm import cutlass_scaled_mm
+from flaggems_vllm.ops.deep_gemm_fp8_o_proj import deep_gemm_fp8_o_proj
 from flaggems_vllm.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -312,6 +313,7 @@ __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",
     "cutlass_scaled_mm",
+    "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
     "dgeglu",
     "dispatch_fused_moe_kernel",
