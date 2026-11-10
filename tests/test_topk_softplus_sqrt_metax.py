@@ -55,7 +55,7 @@ def test_public_sqrtsoftplus_routing_reference_and_replay(hashed, renormalize, d
             tokens if hashed else None,
             table if hashed else None,
         )
-        result[:] = (weights, indices)
+        result[:] = (weights, indices, slots)
 
     def check():
         score = torch.nn.functional.softplus(logits.cpu().float()).sqrt()
@@ -70,6 +70,9 @@ def test_public_sqrtsoftplus_routing_reference_and_replay(hashed, renormalize, d
             weights /= weights.sum(1, keepdim=True)
         weights *= 2.5
         assert torch.equal(result[1].cpu().long(), selected)
+        assert torch.equal(
+            result[2].cpu(), torch.arange(rows * k, dtype=torch.int32).view(rows, k)
+        )
         torch.testing.assert_close(result[0].cpu(), weights, rtol=1e-4, atol=1e-6)
 
     call()
@@ -84,6 +87,7 @@ def test_public_sqrtsoftplus_routing_reference_and_replay(hashed, renormalize, d
         logits.add_(value)
         result[0].fill_(float("nan"))
         result[1].fill_(-1)
+        result[2].fill_(-999)
         graph.replay()
         torch.cuda.synchronize()
         check()
