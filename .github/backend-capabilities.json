@@ -10,7 +10,7 @@
   },
   "backends": {
     "ascend-cann900": {
-      "auto_select": true
+      "auto_select": false
     },
     "hygon": {
       "auto_select": true
