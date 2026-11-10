@@ -26,7 +26,7 @@ from flaggems_vllm.utils.device_info import get_device_capability
 
 from .conftest import QUICK_MODE
 
-_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads"})
+_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads", "thead"})
 
 
 def is_support_fp8e4nv():
