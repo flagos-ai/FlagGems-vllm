@@ -491,7 +491,7 @@ def scaled_int8_quant(
                 "Asymmetric static quantization requires one device INT32 zero point"
             )
     shape = input.shape
-    matrix = input.reshape(-1, shape[-1]).contiguous()
+    matrix = input.contiguous().view(-1, shape[-1])
     with torch_device_fn.device(input.device):
         if matrix.shape[0] == 0:
             output = torch.empty_like(matrix, dtype=torch.int8)
@@ -513,7 +513,7 @@ def scaled_int8_quant(
             output, output_scale, output_azp = _scaled_int8_quant_contiguous(
                 matrix, scale, azp, symmetric
             )
-    return output.reshape(shape), output_scale, output_azp
+    return output.view(shape), output_scale, output_azp
 
 
 def _scaled_int8_quant_contiguous(
@@ -522,7 +522,7 @@ def _scaled_int8_quant_contiguous(
     azp: torch.Tensor | None = None,
     symmetric: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_2d = input.reshape(-1, input.shape[-1])
+    input_2d = input.view(-1, input.shape[-1])
     num_tokens, hidden_size = input_2d.shape
     token_bucket = _token_bucket(num_tokens)
 
