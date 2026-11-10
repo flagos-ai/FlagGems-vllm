@@ -50,7 +50,7 @@ from flaggems_vllm.utils import libentry
 _PPU_DIRECT_ROUTE_LIMIT = 32
 _PPU_DENSE_MIN_TOKENS = 4096
 _PPU_DENSE_GATE_TILE = 256
-_PPU_DENSE_DOWN_TILE = 2048
+_PPU_DENSE_DOWN_TILE = 1024
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
