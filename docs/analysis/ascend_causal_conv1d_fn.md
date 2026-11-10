@@ -686,6 +686,7 @@ PYTHONPATH=src python -m pytest benchmark/test_causal_conv1d_fn.py --level core 
 | `num_stages=3/4` | 251/250 µs | 无变化 |
 | 单读 + `extract_slice` / `al.copy` 移位 | 142–190 µs | 结果错误/竞态，不可用 |
 | prologue 用标量 `if rel >= 0` 分支掉无效的 x load | 未测完 | 单核编译时间从 ~2s 涨到 ~30s（96 例矩阵 10 分钟没编完），放弃 |
+| conv_state 回写改成 2D tile（`[W-1, BLOCK_N]` + `tl.trans`） | 263 / 263 / 230 / 837 µs | 比现状（233 / 231 / 204 / 805）**慢 13%**，回退：该 tile 的每行只有 W-1 个 token（6–8 B），DMA 形态比逐行 1D 读更差，`trans` 与双 mask 又添了向量开销 |
 
 ### 9.3 落地的优化：CF 的 tail tile 加高
 
