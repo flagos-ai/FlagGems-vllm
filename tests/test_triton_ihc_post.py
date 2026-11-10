@@ -8,7 +8,6 @@ import pytest
 import torch
 
 import flaggems_vllm
-from baseline import triton_ihc_post as workloads
 from flaggems_vllm.ops.ihc import ihc_post
 from flaggems_vllm.runtime import torch_device_fn
 
@@ -45,7 +44,7 @@ def entry(request):
 
 
 def _oracle(x, residual, post):
-    # Separate eager CPU operations force the native FP32 rounding boundary.
+    # Separate eager CPU operations force the required FP32 rounding boundary.
     x32 = x.detach().cpu().float()
     residual32 = residual.detach().cpu().float()
     post32 = post.detach().cpu().float()
@@ -236,38 +235,9 @@ def test_triton_ihc_post_input_aliases(dtype, all_shared, device, entry):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("layout", ["contiguous", "all_strided"])
-def test_triton_ihc_post_installed_native(dtype, layout, device):
-    native = workloads.native()
-    if native is None:
-        pytest.skip(
-            workloads.NATIVE_UNAVAILABLE_REASON or "native callable unavailable"
-        )
-    binding = {"tokens": 7, "channels": 4, "hidden": 6144, "layout": layout}
-    args, _ = workloads.build_inputs(binding, dtype, device)
-    if not args[0].is_cuda:
-        pytest.skip("pinned vLLM native requires CUDA tensors (x.is_cuda)")
-    _check(native, args)
-    _check(flaggems_vllm.triton_ihc_post, args)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("case", ["fma", "signed_zero"])
-def test_triton_ihc_post_native_rounding(dtype, case, device):
-    native = workloads.native()
-    if native is None:
-        pytest.skip(
-            workloads.NATIVE_UNAVAILABLE_REASON or "native callable unavailable"
-        )
-    if case == "fma":
-        args = tuple(value.to(device) for value in _fma_fixture(dtype))
-    else:
-        x = torch.tensor([[0.0, -0.0]], dtype=dtype, device=device)
-        residual = torch.full((1, 3, 2), -0.0, dtype=dtype, device=device)
-        post = torch.tensor([[1.0, -1.0, 2.0]], dtype=torch.float32, device=device)
-        args = x, residual, post
-    if not args[0].is_cuda:
-        pytest.skip("pinned vLLM native requires CUDA tensors (x.is_cuda)")
-    _check(native, args)
+def test_triton_ihc_post_model_layouts(dtype, layout, device):
+    args, owners = _inputs((7, 4, 6144), dtype, device, (layout == "all_strided",) * 3)
+    _check(flaggems_vllm.triton_ihc_post, args, owners)
 
 
 @pytest.mark.parametrize("argument", range(3))
