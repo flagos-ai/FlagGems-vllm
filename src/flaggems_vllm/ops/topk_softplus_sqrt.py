@@ -26,6 +26,7 @@ import logging
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice as _hash_libdevice
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,10 @@ def _fused_topk_kernel(
         match_priority = tl.where(is_max, BLOCK_E - expert_offsets, 0)
         best_slot = BLOCK_E - tl.max(match_priority, axis=0)
         eidx = best_slot.to(tl.int32)
+        # Nonfinite maxima have no defined routing winner. Keep indices safe,
+        # and explicitly propagate NaN weights instead of hiding invalid data.
+        finite_max = (max_score > -float("inf")) & (max_score < float("inf"))
+        eidx = tl.where(finite_max & (eidx < num_experts), eidx, k_idx).to(tl.int32)
 
         if HAS_BIAS:
             bias_at_eidx = tl.load(e_score_correction_bias_ptr + eidx)
@@ -87,6 +92,7 @@ def _fused_topk_kernel(
         else:
             w = max_score
 
+        w = tl.where(finite_max, w, float("nan"))
         weight_sum += w
         tl.store(topk_weights_ptr + out_base + k_idx, w)
         tl.store(topk_indices_ptr + out_base + k_idx, eidx)
@@ -141,7 +147,7 @@ def _hash_kernel(
     )
 
     # Fused softplus + sqrt
-    x = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
+    x = tl.where(x > 20.0, x, _hash_libdevice.log1p(tl.exp(x)))
     x = tl.sqrt(x)
 
     # Get expert indices from lookup table
