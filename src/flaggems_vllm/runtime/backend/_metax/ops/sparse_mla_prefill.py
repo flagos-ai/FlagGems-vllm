@@ -11,8 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-from . import sparse_mla_policy as _tuning
-from .sparse_mla_policy import local_launch
+from flaggems_vllm.runtime.backend._metax.ops import sparse_mla_policy as _tuning
+from flaggems_vllm.runtime.backend._metax.ops.sparse_mla_policy import local_launch
 
 logger = logging.getLogger(__name__)
 
