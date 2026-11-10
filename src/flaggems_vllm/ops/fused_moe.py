@@ -26,11 +26,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 import yaml
-from flaggems_vllm.ops._memory_overlap import tensor_ranges_overlap
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
-from flaggems_vllm.utils import libentry, pointwise_dynamic
+from flaggems_vllm.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -659,32 +658,14 @@ def _swigluoai_uninterleave_kernel(
     )
 
 
-@libentry()
-@triton.jit
-def _swigluoai_division_flat_kernel(
-    X,
-    Y,
-    N: tl.constexpr,
-    XS: tl.constexpr,
-    YS: tl.constexpr,
-    TOTAL: tl.constexpr,
-    ALPHA: tl.constexpr,
-    BETA: tl.constexpr,
-    LIMIT: tl.constexpr,
-    B: tl.constexpr,
-):
-    i = tl.program_id(0) * B + tl.arange(0, B)
-    row = i // N
-    col = i % N
-    gate = tl.minimum(tl.load(X + row * XS + col, i < TOTAL, 0).to(tl.float32), LIMIT)
-    up = tl.minimum(
-        tl.maximum(
-            tl.load(X + row * XS + N + col, i < TOTAL, 0).to(tl.float32), -LIMIT
-        ),
-        LIMIT,
+@functools.lru_cache(maxsize=1)
+def _division_swiglu_impl():
+    # Only a callable is cached; no tensor or per-request state is retained.
+    from flaggems_vllm.runtime.backend._metax.fused.numerical_modes import (
+        division_swiglu,
     )
-    value = gate / (1.0 + tl.exp(-ALPHA * gate)) * (up + BETA)
-    tl.store(Y + row * YS + col, value, i < TOTAL)
+
+    return division_swiglu
 
 
 def apply_moe_activation(
@@ -697,11 +678,13 @@ def apply_moe_activation(
     gemm1_clamp_limit: float | None = None,
     sigmoid_mode: str = "native",
 ) -> torch.Tensor:
-    """Apply MoE activation (pure PyTorch / FlagGems Triton)."""
+    """Apply MoE activation; the division numerical mode is MetaX-specific."""
     if sigmoid_mode not in ("native", "division"):
         raise ValueError("Unknown sigmoid evaluation mode")
     if sigmoid_mode != "native" and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE:
         raise NotImplementedError("Division mode is for split-layout clamped SwiGLU")
+    if sigmoid_mode == "division" and device.vendor_name != "metax":
+        raise NotImplementedError("Division numerical mode is supported on MetaX only")
     assert input.dim() == 2, "Input must be 2D"
     assert output.dim() == 2, "Output must be 2D"
     if activation.is_gated:
@@ -728,32 +711,7 @@ def apply_moe_activation(
         if output.numel() == 0:
             return output
         if sigmoid_mode == "division":
-            if input.device.type != "cuda" or input.dtype not in (
-                torch.bfloat16,
-                torch.float16,
-                torch.float32,
-            ):
-                raise NotImplementedError("Division mode requires CUDA BF16/FP16/FP32")
-            if input.stride(-1) != 1 or output.stride(-1) != 1:
-                raise NotImplementedError("Division mode requires unit column strides")
-            if tensor_ranges_overlap(input, output):
-                raise ValueError("Input and output must not alias")
-            if output.numel() >= 2**31:
-                raise NotImplementedError("Division mode index range exceeded")
-            _swigluoai_division_flat_kernel[(triton.cdiv(output.numel(), 256),)](
-                input,
-                output,
-                output.size(1),
-                input.stride(0),
-                output.stride(0),
-                output.numel(),
-                alpha,
-                beta,
-                limit,
-                256,
-                num_warps=4,
-            )
-            return output
+            return _division_swiglu_impl()(input, output, alpha, beta, limit)
         block_i = 256
         _swigluoai_uninterleave_kernel[
             (output.size(0), triton.cdiv(output.size(1), block_i))

@@ -4,14 +4,14 @@
 
 The main FP8 cache has identity scale, matching MiniMax M3 sparse attention's
 reader. Native mode keeps norm and RoPE in FP32 until the final BF16/FP8 store.
-The opt-in bf16_staged mode materializes the norm rounding before RoPE. This module
+The MetaX bf16_staged mode materializes norm rounding before RoPE. This module
 uses no vLLM compiled extension and does not quantize query tensors.
 """
 
 import torch
 import triton
 import triton.language as tl
-from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import libentry
 
 
@@ -33,9 +33,31 @@ def _native_warp_sumsq(x):
     return tl.sum(tl.where(lanes == 0, sumsq, 0.0), 0)
 
 
-@libentry()
 @triton.jit
-def _fused_minimax_m3_kernel(
+def _native_normalize(x, weights, EPS: tl.constexpr, DTYPE: tl.constexpr):
+    rms = tl.rsqrt(_native_warp_sumsq(x) / 128.0 + EPS)
+    return (x * rms) * (1.0 + weights)
+
+
+@triton.jit
+def _native_rotate(normalized, partner, c, s, d, ROT: tl.constexpr):
+    first = tl.fma(normalized, c, -partner * s)
+    second = tl.fma(normalized, c, partner * s)
+    return tl.where(d < ROT, tl.where(d < ROT // 2, first, second), normalized)
+
+
+@triton.jit
+def _contiguous_index_offset(
+    slot,
+    BLOCK_STRIDE: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    return slot * 128
+
+
+@triton.jit
+def _fused_minimax_m3_body(
     qkv,
     q_weight,
     k_weight,
@@ -64,7 +86,9 @@ def _fused_minimax_m3_kernel(
     HAS_Q_OUT: tl.constexpr,
     HAS_IQ_OUT: tl.constexpr,
     FP8_KV: tl.constexpr,
-    STAGED_BF16: tl.constexpr = False,
+    NORMALIZE: tl.constexpr = _native_normalize,
+    ROTATE: tl.constexpr = _native_rotate,
+    INDEX_OFFSET: tl.constexpr = _contiguous_index_offset,
     INDEX_BLOCK_STRIDE: tl.constexpr = 0,
     INDEX_TOKEN_STRIDE: tl.constexpr = 0,
     INDEX_BLOCK_SIZE: tl.constexpr = 1,
@@ -107,13 +131,7 @@ def _fused_minimax_m3_kernel(
         else:
             weight_ptr = ik_weight
         weights = tl.load(weight_ptr + d).to(tl.float32)
-        if STAGED_BF16:
-            rms = tl.rsqrt(tl.sum(x * x, 0) / 128 + EPS)
-        else:
-            rms = tl.rsqrt(_native_warp_sumsq(x) / 128.0 + EPS)
-        normalized = (x * rms) * (1.0 + weights)
-        if STAGED_BF16:
-            normalized = normalized.to(qkv.dtype.element_ty).to(tl.float32)
+        normalized = NORMALIZE(x, weights, EPS, qkv.dtype.element_ty)
 
         # NeoX pairs the two halves of the rotary prefix. The remaining
         # dimensions retain their RMSNorm values.
@@ -125,16 +143,7 @@ def _fused_minimax_m3_kernel(
         s = tl.load(cos_sin + pos * ROT + ROT // 2 + phase_d, mask=d < ROT, other=0).to(
             tl.float32
         )
-        # Explicit FMA preserves the native fused-RoPE rounding order.
-        if STAGED_BF16:
-            rotated = normalized * c + tl.where(d < ROT // 2, -partner, partner) * s
-            result = tl.where(d < ROT, rotated, normalized)
-        else:
-            first = tl.fma(normalized, c, -partner * s)
-            second = tl.fma(normalized, c, partner * s)
-            result = tl.where(
-                d < ROT, tl.where(d < ROT // 2, first, second), normalized
-            )
+        result = ROTATE(normalized, partner, c, s, d, ROT)
 
         if HAS_Q_OUT and head < NQ:
             tl.store(q_out + token.to(tl.int64) * NQ * 128 + head * 128 + d, result)
@@ -168,13 +177,80 @@ def _fused_minimax_m3_kernel(
         elif HAS_INDEX and head == NQ + 2 * NKV + NIQ:
             index_slot = tl.load(index_slot_mapping + token).to(tl.int64)
             if index_slot >= 0:
-                if STAGED_BF16:
-                    offset = (index_slot // INDEX_BLOCK_SIZE) * INDEX_BLOCK_STRIDE + (
-                        index_slot % INDEX_BLOCK_SIZE
-                    ) * INDEX_TOKEN_STRIDE
-                else:
-                    offset = index_slot * 128
+                offset = INDEX_OFFSET(
+                    index_slot,
+                    INDEX_BLOCK_STRIDE,
+                    INDEX_TOKEN_STRIDE,
+                    INDEX_BLOCK_SIZE,
+                )
                 tl.store(index_cache + offset + d, result)
+
+
+@libentry()
+@triton.jit
+def _fused_minimax_m3_kernel(
+    qkv,
+    q_weight,
+    k_weight,
+    iq_weight,
+    ik_weight,
+    cos_sin,
+    positions,
+    slot_mapping,
+    index_slot_mapping,
+    kv_cache,
+    index_cache,
+    q_out,
+    iq_out,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    KV_KIND_STRIDE: tl.constexpr,
+    KV_TOKEN_STRIDE: tl.constexpr,
+    KV_HEAD_STRIDE: tl.constexpr,
+    NQ: tl.constexpr,
+    NKV: tl.constexpr,
+    NIQ: tl.constexpr,
+    ROT: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_INDEX: tl.constexpr,
+    INSERT_KV: tl.constexpr,
+    HAS_Q_OUT: tl.constexpr,
+    HAS_IQ_OUT: tl.constexpr,
+    FP8_KV: tl.constexpr,
+):
+    _fused_minimax_m3_body(
+        qkv,
+        q_weight,
+        k_weight,
+        iq_weight,
+        ik_weight,
+        cos_sin,
+        positions,
+        slot_mapping,
+        index_slot_mapping,
+        kv_cache,
+        index_cache,
+        q_out,
+        iq_out,
+        KV_BLOCK_STRIDE,
+        KV_KIND_STRIDE,
+        KV_TOKEN_STRIDE,
+        KV_HEAD_STRIDE,
+        NQ,
+        NKV,
+        NIQ,
+        ROT,
+        EPS,
+        BLOCK_SIZE,
+        HAS_INDEX,
+        INSERT_KV,
+        HAS_Q_OUT,
+        HAS_IQ_OUT,
+        FP8_KV,
+        NORMALIZE=_native_normalize,
+        ROTATE=_native_rotate,
+        INDEX_OFFSET=_contiguous_index_offset,
+    )
 
 
 @torch.library.custom_op(
@@ -208,6 +284,10 @@ def _fused_minimax_m3_op(
     if numerics not in ("native", "bf16_staged"):
         raise ValueError("Unknown MiniMax numerical mode")
     staged = numerics == "bf16_staged"
+    if staged and device.vendor_name != "metax":
+        raise NotImplementedError(
+            "Staged BF16 numerical mode is supported on MetaX only"
+        )
     if staged and (rotary_dim != 64 or kv_cache_dtype not in ("auto", "bfloat16")):
         raise NotImplementedError("Staged BF16 mode requires rotary64 and BF16 cache")
     if qkv.device.type != "cuda" or qkv.dtype != torch.bfloat16:
@@ -291,17 +371,38 @@ def _fused_minimax_m3_op(
     if qkv.shape[0] == 0:
         return
     with torch_device_fn.device(qkv.device):
-        # Preserve staged norm-only launch geometry. Grouped head launches
-        # avoid a per-head branch in large dense prefill without copying the
-        # normalization/RoPE body or changing native fused execution.
-        if staged and not insert_kv:
-            launches = [(num_heads, 1), (num_kv_heads, 2)]
-            if has_index:
-                launches += [(num_index_heads, 3), (1, 4)]
+        if staged:
+            from flaggems_vllm.runtime.backend._metax.fused.numerical_modes import (
+                launch_staged_qkv,
+            )
+
+            launch_staged_qkv(
+                qkv,
+                q_norm_weight,
+                k_norm_weight,
+                index_q_norm_weight if has_index else q_norm_weight,
+                index_k_norm_weight if has_index else k_norm_weight,
+                cos_sin_cache,
+                positions,
+                slot_mapping,
+                index_slot_mapping,
+                kv_cache,
+                index_cache,
+                q_out,
+                index_q_out,
+                cache_strides,
+                num_heads,
+                num_kv_heads,
+                num_index_heads,
+                rotary_dim,
+                float(eps),
+                block_size,
+                has_index,
+                insert_kv,
+                fp8_kv,
+            )
         else:
-            launches = [(packed_heads, 0)]
-        for head_count, head_class in launches:
-            _fused_minimax_m3_kernel[(qkv.shape[0], head_count)](
+            _fused_minimax_m3_kernel[(qkv.shape[0], packed_heads)](
                 qkv,
                 q_norm_weight,
                 k_norm_weight,
@@ -327,19 +428,7 @@ def _fused_minimax_m3_op(
                 q_out is not None,
                 index_q_out is not None,
                 fp8_kv,
-                STAGED_BF16=staged,
-                HEAD_CLASS=head_class,
-                INDEX_BLOCK_STRIDE=(
-                    index_cache.stride(0) if staged and index_cache is not None else 0
-                ),
-                INDEX_TOKEN_STRIDE=(
-                    index_cache.stride(1) if staged and index_cache is not None else 0
-                ),
-                INDEX_BLOCK_SIZE=(
-                    index_cache.shape[1] if staged and index_cache is not None else 1
-                ),
-                # Keep native CUDA reduction unchanged; staged mode uses the accepted four-warp tree.
-                num_warps=4 if staged else 1,
+                num_warps=1,
                 enable_fp_fusion=False,
             )
 

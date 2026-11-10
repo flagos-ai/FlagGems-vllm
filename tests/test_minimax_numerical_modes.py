@@ -63,6 +63,7 @@ def test_gemma_empty_and_alias():
     "m,h", [(0, 192), (1, 127), (7, 192), (32, 768), (1024, 768), (8192, 192)]
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.skipif(fgv.vendor_name != "metax", reason="MetaX numerical mode")
 def test_division_swiglu(m, h, dtype):
     torch.manual_seed(560)
     base = torch.randn(m, 2 * h + 8, device="cuda", dtype=dtype)
@@ -86,6 +87,7 @@ def test_division_swiglu(m, h, dtype):
         assert_fp32(out, g / (1 + torch.exp(-1.702 * g)) * (u + 1))
 
 
+@pytest.mark.skipif(fgv.vendor_name != "metax", reason="MetaX numerical mode")
 def test_activation_alias_and_mode_checks():
     x = torch.randn(2, 384, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError):
@@ -110,6 +112,7 @@ def test_activation_alias_and_mode_checks():
         )
 
 
+@pytest.mark.skipif(fgv.vendor_name != "metax", reason="MetaX numerical mode")
 def test_initial_baseline_cases():
     from functools import partial
 
@@ -259,6 +262,7 @@ def test_initial_baseline_cases():
 
 @pytest.mark.parametrize("m,n", [(1, 128), (64, 6144), (128, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.skipif(fgv.vendor_name != "metax", reason="MetaX numerical mode")
 def test_moe_sum_order(m, n, dtype):
     inp = torch.zeros(m, 4, n, device="cuda", dtype=dtype)
     inp[:, 0] = 1e20
@@ -275,6 +279,8 @@ def test_moe_sum_order(m, n, dtype):
 
 @pytest.mark.parametrize("kind", ["gemma", "swiglu", "qkv", "moe_sum"])
 def test_numerical_mode_changed_input_graph(kind):
+    if kind != "gemma" and fgv.vendor_name != "metax":
+        pytest.skip("MetaX numerical mode")
     torch.manual_seed(561)
     x = torch.randn(7, 768, device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(x)
@@ -339,6 +345,8 @@ def test_numerical_mode_changed_input_graph(kind):
 @pytest.mark.parametrize("m", [1, 64, 8192])
 def test_disjoint_shared_workspace(kind, m):
     """vLLM workspaces can be disjoint slices of one allocator-owned storage."""
+    if kind != "gemma" and fgv.vendor_name != "metax":
+        pytest.skip("MetaX numerical mode")
     torch.manual_seed(562)
     n = 6144 if kind == "gemma" else 384
     out_n = n if kind == "gemma" else n // 2
