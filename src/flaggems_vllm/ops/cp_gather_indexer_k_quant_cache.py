@@ -86,8 +86,10 @@ def _cp_gather_indexer_quant_cache_kernel(
         block_id[:, None].to(tl.int64) * kv_cache_stride
         + block_offset[:, None].to(tl.int64) * HEAD_DIM
     )
+    # Packed KV pages may be separated by the entire cross-layer block.
+    # Widen before multiplying: the scale offset can exceed signed int32.
     src_scale_offset = (
-        block_id * kv_cache_scale_stride
+        block_id.to(tl.int64) * kv_cache_scale_stride
         + block_offset * num_quant_blocks
         + quant_block_id
     )
@@ -151,7 +153,9 @@ def cp_gather_indexer_k_quant_cache(
     else:
         # Unused by the binary-search path; kept as a valid constexpr placeholder.
         batch_scan_size = 1
-    search_steps = batch_size.bit_length()
+    # Search all batch_size + 1 cumulative boundaries, including cu_seqlen[0].
+    # For batch sizes 2**n - 1, n steps can leave the first interval unresolved.
+    search_steps = (batch_size + 1).bit_length()
 
     grid = (triton.cdiv(num_tokens, token_block), num_quant_blocks)
     _cp_gather_indexer_quant_cache_kernel[grid](
