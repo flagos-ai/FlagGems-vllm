@@ -51,7 +51,10 @@ if triton_version_utils.has_triton_tle():
 else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
+from flaggems_vllm.runtime.backend._metax.ops.mhc_pre import mhc_pre
+
 __all__ = [
+    "mhc_pre",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
