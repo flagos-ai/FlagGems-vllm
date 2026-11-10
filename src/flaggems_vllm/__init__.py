@@ -26,6 +26,7 @@ from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.config import aten_patch_list, resolve_user_setting
 from flaggems_vllm.ops import *  # noqa: F401,F403
+from flaggems_vllm.ops.flash_mla_with_kvcache import FlashMLASchedMeta
 from flaggems_vllm.runtime.register import Register
 
 device = runtime.device.name
@@ -248,6 +249,7 @@ def all_registered_keys():
 
 
 __all__ = [
+    "FlashMLASchedMeta",
     "SUPPORTED_FP8_DTYPE",
     "enable",
     "only_enable",
