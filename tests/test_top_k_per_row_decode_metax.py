@@ -64,3 +64,25 @@ def test_topk_threshold_ties_and_invalid_padding(width):
     check_replays(
         call, lambda value: logits[:, -1].fill_(value), check, outputs=(result,)
     )
+
+
+@pytest.mark.top_k_per_row_decode
+def test_topk_empty_width_pitched_output_graph():
+    logits = torch.empty((3, 0), device="cuda")
+    lengths = torch.zeros(3, device="cuda", dtype=torch.int32)
+    backing = torch.full((5, 1028), 77, device="cuda", dtype=torch.int32)
+    output = backing[1:4, 2:1026:2]
+
+    def call():
+        ops.top_k_per_row_decode(
+            logits, 1, lengths, output, 3, logits.stride(0), 1, 512
+        )
+
+    def check():
+        expected = torch.full_like(backing, 77)
+        expected[1:4, 2:1026:2] = -1
+        assert torch.equal(backing, expected)
+
+    call()
+    check()
+    check_replays(call, lambda _: backing.fill_(77), check, outputs=(output,))
