@@ -19,7 +19,7 @@ import torch
 
 import flaggems_vllm
 
-from .accuracy_utils import gems_assert_close, gems_assert_equal
+from .accuracy_utils import gems_assert_close, gems_assert_equal, to_reference
 from .conftest import QUICK_MODE
 
 API_NAME = "fused_indexer_weight_scale"
@@ -216,11 +216,10 @@ class TestMetaXIndexerWeightScale:
         saved_weights, saved_query = weights.clone(), query.clone()
         output = flaggems_vllm.fused_indexer_weight_scale(weights, query, scale)
         expected = metax_reference_weight_scale(weights, query, scale)
-        torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-7)
-        assert output.dtype == torch.float32
+        gems_assert_close(output, to_reference(expected), torch.float32, atol=1e-7)
         assert output.is_contiguous()
-        torch.testing.assert_close(weights, saved_weights, rtol=0, atol=0)
-        torch.testing.assert_close(query, saved_query, rtol=0, atol=0)
+        gems_assert_equal(weights, to_reference(saved_weights))
+        gems_assert_equal(query, to_reference(saved_query))
 
     @pytest.mark.parametrize("scale", [0.0, -0.125, float("inf"), float("nan")])
     @pytest.mark.fused_indexer_weight_scale
@@ -234,10 +233,10 @@ class TestMetaXIndexerWeightScale:
         )
         output = flaggems_vllm.fused_indexer_weight_scale(weights, query, scale)
         expected = metax_reference_weight_scale(weights, query, scale)
-        torch.testing.assert_close(output, expected, rtol=0, atol=0, equal_nan=True)
+        gems_assert_equal(output, to_reference(expected), equal_nan=True)
         finite = torch.isfinite(expected)
-        torch.testing.assert_close(
-            torch.signbit(output[finite]), torch.signbit(expected[finite])
+        gems_assert_equal(
+            torch.signbit(output[finite]), to_reference(torch.signbit(expected[finite]))
         )
 
     @pytest.mark.fused_indexer_weight_scale
@@ -250,9 +249,8 @@ class TestMetaXIndexerWeightScale:
                 else (weights, query.contiguous())
             )
             output = flaggems_vllm.fused_indexer_weight_scale(w, q, 0.037)
-            torch.testing.assert_close(
-                output, metax_reference_weight_scale(w, q, 0.037), rtol=1e-6, atol=1e-7
-            )
+            expected = metax_reference_weight_scale(w, q, 0.037)
+            gems_assert_close(output, to_reference(expected), torch.float32, atol=1e-7)
 
     @pytest.mark.fused_indexer_weight_scale
     def test_fused_indexer_weight_scale_invalid_inputs(self):
@@ -282,12 +280,8 @@ class TestMetaXIndexerWeightScale:
         weights = torch.randn(total + offset, device="cuda")[offset:].view(1036, 32)
         query = torch.randn(total + offset, device="cuda")[offset:].view(1036, 32, 1)
         output = flaggems_vllm.fused_indexer_weight_scale(weights, query, 0.037)
-        torch.testing.assert_close(
-            output,
-            metax_reference_weight_scale(weights, query, 0.037),
-            rtol=1e-6,
-            atol=1e-7,
-        )
+        expected = metax_reference_weight_scale(weights, query, 0.037)
+        gems_assert_close(output, to_reference(expected), torch.float32, atol=1e-7)
 
     @pytest.mark.parametrize("scale", [0.0, 0.125, -0.125, float("inf"), float("nan")])
     @pytest.mark.fused_indexer_weight_scale
@@ -301,20 +295,14 @@ class TestMetaXIndexerWeightScale:
         ).repeat(2048, 1, 1)
         output = flaggems_vllm.fused_indexer_weight_scale(weights, query, scale)
         # MACA eager loses zero signs for vectorized muls; use an independent CPU oracle.
-        expected = metax_reference_weight_scale(weights.cpu(), query.cpu(), scale).to(
-            weights.device
-        )
-        torch.testing.assert_close(
-            output,
-            metax_reference_weight_scale(weights, query, scale),
-            rtol=0,
-            atol=0,
-            equal_nan=True,
-        )
-        torch.testing.assert_close(output, expected, rtol=0, atol=0, equal_nan=True)
+        expected = metax_reference_weight_scale(weights.cpu(), query.cpu(), scale)
+        eager = metax_reference_weight_scale(weights, query, scale)
+        gems_assert_equal(output, to_reference(eager), equal_nan=True)
+        actual = output.cpu()
+        gems_assert_equal(actual, expected, equal_nan=True)
         finite = torch.isfinite(expected)
-        torch.testing.assert_close(
-            torch.signbit(output[finite]), torch.signbit(expected[finite])
+        gems_assert_equal(
+            torch.signbit(actual[finite]), torch.signbit(expected[finite])
         )
 
     @pytest.mark.parametrize("tokens", [8998, 9105])
@@ -332,8 +320,8 @@ class TestMetaXIndexerWeightScale:
         output = flaggems_vllm.fused_indexer_weight_scale(weights, query, scale)
         expected = metax_reference_weight_scale(weights.cpu(), query.cpu(), scale)
         actual = output.cpu()
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        gems_assert_equal(actual, expected, equal_nan=True)
         finite = torch.isfinite(expected)
-        assert torch.equal(
+        gems_assert_equal(
             torch.signbit(actual[finite]), torch.signbit(expected[finite])
         )
