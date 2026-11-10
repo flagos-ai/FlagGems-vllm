@@ -22,7 +22,9 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout, mhc_post
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre  # ref functions live in tests/test_mhc_ops.py
+
+# ref functions (mhc_pre_ref, sinkhorn_normalize_ref) live in tests/test_mhc_ops.py
+from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
 
 __all__ = [
     "hc_head_fused_kernel",
