@@ -16,7 +16,6 @@ import logging
 
 import torch
 import triton
-import triton.backends.metax.compiler as backend
 import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
@@ -24,19 +23,6 @@ from flaggems_vllm.ops.FLA.triton_ops_helper import exp
 from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL, tensor_cache
 from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd
 from flaggems_vllm.utils import libentry, libtuner
-
-_original_compile = backend.metax.translate_llvmir_to_mcfatbin
-
-
-# Disable backend LICM only for the GDN H-state kernel.
-def _compile_without_licm(src, mxcc, maca, options):
-    name = backend.maca_get_kernel_name(src)
-    if name == "chunk_gated_delta_rule_fwd_kernel_h_vmajor":
-        options += " -mllvm -metaxgpu-disable-licm=true"
-    return _original_compile(src, mxcc, maca, options)
-
-
-backend.metax.translate_llvmir_to_mcfatbin = _compile_without_licm
 
 logger = logging.getLogger(__name__)
 
