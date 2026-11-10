@@ -1312,6 +1312,24 @@ ops:
   - Pointwise
   stages:
   - beta: '0.3'
+- id: hc_expand
+  description: 'Expand each mHC input row into hc_mult identical streams while loading
+
+    the source row once. The output is contiguous [tokens, hc_mult, hidden].
+
+    '
+  for:
+  - vllm.model_executor.layers.mhc.hc_expand
+  - vllm.models.deepseek_v41.nvidia.ops.mhc.hc_expand
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: hc_head_fused_kernel
   description: 'The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
 

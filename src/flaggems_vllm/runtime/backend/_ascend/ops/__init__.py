@@ -68,6 +68,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
+from flaggems_vllm.runtime.backend._ascend.ops.hc_expand import hc_expand
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -166,6 +167,7 @@ __all__ = [
     "group_list_cumsum",
     "grouped_topk",
     "hc_combine",
+    "hc_expand",
     "ihc_pre",
     "indexer_epilogue",
     "indexer_gemm_score",
