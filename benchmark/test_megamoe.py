@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the multi-rank Hopper MegaMoE operator.
+"""Benchmark the multi-rank MegaMoE operators.
 
 This standalone harness owns distributed/NVSHMEM setup and input prepacking;
-the operator itself accepts caller-owned tensors and communication state.
+the Hopper operator itself accepts caller-owned tensors and communication state.
+Ascend measures the complete BF16 call or Graph replay with a synchronized
+host clock.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import re
-import signal
-import subprocess
+import statistics
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,12 +52,20 @@ if _IS_WORKER:
 
 import pytest  # noqa: E402
 
+from flaggems_vllm import vendor_name  # noqa: E402
+from flaggems_vllm.testing.megamoe import SHAPE_DESC  # noqa: E402
 from flaggems_vllm.testing.megamoe import StandaloneNvshmem  # noqa: E402
 from flaggems_vllm.testing.megamoe import (  # noqa: E402
     configure_descriptor_allocator,
     interleave_l1_gate_up_rows,
+    load_ascend_shapes,
+    make_ascend_inputs,
     make_context,
     pool_tokens,
+    require_ascend,
+    run_ascend_workers,
+    run_workers,
+    shmem_rendezvous,
 )
 
 from . import base  # noqa: E402
@@ -246,33 +258,13 @@ def _worker_arguments(config: _BenchmarkConfig) -> list[str]:
 
 
 def _launch_megamoe(config: _BenchmarkConfig) -> float:
-    command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc-per-node",
-        str(config.num_ranks),
+    stdout = run_workers(
+        config.num_ranks,
         "--module",
         "benchmark.test_megamoe",
         *_worker_arguments(config),
-    ]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
+        timeout=config.timeout,
     )
-    try:
-        stdout, _ = process.communicate(timeout=config.timeout)
-    except BaseException:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-        raise
-    if process.returncode:
-        raise subprocess.CalledProcessError(process.returncode, command, output=stdout)
     latencies = {
         int(rank): float(latency) / 1e3
         for rank, world, latency in _RESULT.findall(stdout)
@@ -290,10 +282,19 @@ def _iteration_count(option, configured, default, fallback):
     return configured if explicitly_set or configured != default else fallback
 
 
+def _default_shapes(ep):
+    tokens = (
+        COMPREHENSIVE_TOKENS
+        if Config.bench_level is BenchLevel.COMPREHENSIVE
+        else CORE_TOKENS
+    )
+    return [(tokens_per_rank, 2048, 512, 256, 8, ep) for tokens_per_rank in tokens]
+
+
 class MegaMoEBenchmark(base.Benchmark):
     DEFAULT_METRICS = ["latency"]
     DEFAULT_DTYPES = [torch.float8_e4m3fn]
-    DEFAULT_SHAPE_DESC = "tokens, hidden, intermediate, num_experts, topk, num_ranks"
+    DEFAULT_SHAPE_DESC = SHAPE_DESC
 
     def __init__(self):
         super().__init__(
@@ -304,12 +305,7 @@ class MegaMoEBenchmark(base.Benchmark):
         )
 
     def set_shapes(self, shape_file_path=None):
-        tokens = (
-            COMPREHENSIVE_TOKENS
-            if Config.bench_level is BenchLevel.COMPREHENSIVE
-            else CORE_TOKENS
-        )
-        self.shapes = [(value, 2048, 512, 256, 8, NUM_RANKS) for value in tokens]
+        self.shapes = _default_shapes(NUM_RANKS)
         self.shape_desc = self.DEFAULT_SHAPE_DESC
 
     def get_input_iter(self, dtype):
@@ -347,6 +343,8 @@ class MegaMoEBenchmark(base.Benchmark):
 
 @pytest.mark.megamoe
 def test_megamoe():
+    if vendor_name == "ascend":
+        pytest.skip("requires the NVIDIA Hopper backend")
     if Config.query:
         MegaMoEBenchmark().run()
         return
@@ -378,5 +376,151 @@ def _parse_worker_config() -> _BenchmarkConfig:
     return _BenchmarkConfig(**arguments)
 
 
-if __name__ == "__main__" and _IS_WORKER:
-    _run_worker(_parse_worker_config())
+_DEFAULT_SHAPE_FILE = Path(__file__).resolve().with_name("core_shapes.yaml")
+
+
+def _measure_ascend(ep, shapes, directory):
+    config = dict(
+        shapes=shapes,
+        warmup=Config.warm_up,
+        iterations=Config.repetition,
+        graph=Config.mode.value == "cudagraph",
+    )
+    (directory / "config.json").write_text(json.dumps(config))
+    run_ascend_workers(ep, __name__, directory)
+    ranks = [
+        json.loads((directory / f"rank{rank}.json").read_text()) for rank in range(ep)
+    ]
+    if any(
+        len(latencies) != len(shapes)
+        or any(not math.isfinite(value) or value <= 0 for value in latencies)
+        for latencies in ranks
+    ):
+        raise RuntimeError("missing or invalid MegaMoE timing results")
+    return dict(zip(shapes, map(max, zip(*ranks))))
+
+
+@torch.inference_mode()
+def _run_ascend_worker(directory):
+    import torch.distributed as dist
+    import torch_npu  # noqa: F401
+
+    from flaggems_vllm import megamoe, prepare_megamoe
+
+    directory = Path(directory)
+    config = json.loads((directory / "config.json").read_text())
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(rank)
+    dist.init_process_group("hccl")
+    group = dist.group.WORLD
+    latencies = []
+    try:
+        for shape in config["shapes"]:
+            tokens, _, _, _, topk, ep = shape
+            if ep != dist.get_world_size(group):
+                raise ValueError(f"shape {shape} does not match the worker group")
+            x, ids, probs, w1, w2 = make_ascend_inputs(shape, seed=0, rank=rank)
+            workspace = prepare_megamoe(
+                w1,
+                w2,
+                group=group,
+                capacity_tokens=max(1, tokens),
+                topk=topk,
+                rendezvous=shmem_rendezvous(),
+            )
+
+            def launch():
+                return megamoe(x, ids, probs, workspace)
+
+            graph = captured = None
+            try:
+                workspace.compile(x, ids, probs)
+                call = launch
+                if config["graph"]:
+                    graph = torch.npu.NPUGraph()
+                    with torch.npu.graph(graph):
+                        captured = launch()
+                    call = graph.replay
+                for _ in range(config["warmup"]):
+                    call()
+                torch.npu.synchronize()
+                samples = []
+                for _ in range(config["iterations"]):
+                    dist.barrier(group=group)
+                    torch.npu.synchronize()
+                    start = time.perf_counter_ns()
+                    result = call()
+                    torch.npu.synchronize()
+                    samples.append((time.perf_counter_ns() - start) / 1e6)
+                    del result
+                latencies.append(statistics.mean(samples))
+            finally:
+                if graph is not None:
+                    graph.reset()
+                del captured
+                workspace.close()
+    finally:
+        dist.destroy_process_group()
+    (directory / f"rank{rank}.json").write_text(json.dumps(latencies))
+
+
+class MegaMoEAscendBenchmark(base.Benchmark):
+    DEFAULT_METRICS = ["latency"]
+    DEFAULT_DTYPES = [torch.bfloat16]
+    DEFAULT_SHAPE_DESC = SHAPE_DESC
+
+    def __init__(self, ep, directory):
+        super().__init__(OP_NAME, torch_op=None, gems_op=_measure_ascend)
+        self.ep = ep
+        self.directory = directory
+        self.latencies = None
+
+    def init_default_config(self):
+        self.set_shapes(Config.shape_file)
+
+    def set_shapes(self, shape_file_path=None):
+        self.shape_desc = SHAPE_DESC
+        if (
+            shape_file_path is None
+            or Path(shape_file_path).resolve() == _DEFAULT_SHAPE_FILE
+        ):
+            self.shapes = _default_shapes(self.ep)
+        else:
+            self.shapes = [
+                shape
+                for shape in load_ascend_shapes(shape_file_path)
+                if shape[5] == self.ep
+            ]
+            if not self.shapes:
+                pytest.skip(f"no EP{self.ep} shapes in {shape_file_path}")
+
+    def get_input_iter(self, dtype):
+        if Config.mode.value not in ("operator", "cudagraph"):
+            raise ValueError("MegaMoE requires --mode operator or cudagraph")
+        if Config.parallel:
+            raise ValueError("MegaMoE runs all ranks together")
+        if Config.warm_up < 0 or Config.repetition < 1:
+            raise ValueError("MegaMoE requires --warmup >= 0 and --iter > 0")
+        yield from self.shapes
+
+    def get_latency(self, op, *shape):
+        if self.latencies is None:
+            self.latencies = op(self.ep, self.shapes, self.directory)
+        return self.latencies[shape]
+
+
+@pytest.mark.megamoe
+@pytest.mark.parametrize("ep", [2, 4, 8], ids=["ep2", "ep4", "ep8"])
+def test_megamoe_ascend(tmp_path, ep):
+    if vendor_name != "ascend":
+        pytest.skip("requires the Ascend backend")
+    if not Config.query:
+        require_ascend(ep)
+    MegaMoEAscendBenchmark(ep, tmp_path).run()
+
+
+if __name__ == "__main__":
+    if _IS_WORKER:
+        _run_worker(_parse_worker_config())
+    elif "--ascend-worker" in sys.argv:
+        _run_ascend_worker(sys.argv[-1])
