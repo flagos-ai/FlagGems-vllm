@@ -18,8 +18,10 @@ Port of the generic Triton ``mhc_pre`` variants (copied from
 ``flaggems_vllm.ops.mhc.mhc_pre`` so that the generic fallback stays
 untouched), with two deliberate deltas:
 
-* **Model contract ``clamp(-30, 30)`` before Sinkhorn** - ``clamp_logits``
-  is a compile-time flag that is always ``True`` on this path. Provenance:
+* **Model contract ``clamp(-30, 30)`` before Sinkhorn** - the kernels in this
+  module take ``clamp_logits`` as a compile-time flag and are always called
+  with ``True``. ``hc_mult == 4`` returns early to the tiled ``ASCEND_TILED``
+  path, which does not clamp. Provenance:
   XingChen4-29B-A4B checkpoint contract (formal_issues/OP-ACC-003,
   REVIEW.md: "Model contract requires clamp(-30, 30) before Sinkhorn").
 * **Dynamic Sinkhorn loop** - ``sinkhorn_repeat`` is a runtime argument
@@ -43,7 +45,12 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["npu_mhc_pre"]
+__all__ = [
+    "npu_mhc_pre",
+    "mhc_pre_ascend_proj_kernel",
+    "mhc_pre_ascend_mix_kernel",
+    "mhc_pre_ascend_reduce_kernel",
+]
 
 # XingChen4 checkpoint contract: comb logits are clamped into this range
 # before the Sinkhorn rounds (formal_issues/OP-ACC-003).
@@ -70,431 +77,6 @@ def _get_fn_bf16_cached(fn: torch.Tensor) -> torch.Tensor:
     return fn_bf16
 
 
-@triton.jit
-def _mhc_pre_fused_kernel_hc_mult_4_impl(
-    gemm_out_ptr,  # (num_tokens, hc_mult3), float32
-    hc_scale_ptr,  # (3,), float32
-    hc_base_ptr,  # (hc_mult3,), float32
-    residual_ptr,  # (num_tokens, hc_mult, hidden_size), bfloat16
-    post_mix_ptr,  # (num_tokens, hc_mult), float32
-    comb_mix_ptr,  # (num_tokens, hc_mult*hc_mult), float32
-    layer_input_ptr,  # (num_tokens, hidden_size), bfloat16
-    num_tokens,
-    num_tokens_bucket,
-    res_stride_n,
-    res_stride_i,
-    res_stride_h,
-    li_stride_n,
-    li_stride_h,
-    hidden_size,
-    hc_hidden_size,
-    rms_eps: tl.constexpr,
-    hc_pre_eps: tl.constexpr,
-    hc_sinkhorn_eps: tl.constexpr,
-    hc_post_mult_value: tl.constexpr,
-    sinkhorn_repeat,
-    clamp_logits: tl.constexpr,
-    HC_MULT3: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Fully fused: sqrsum + RMS norm + sigmoid + Sinkhorn + weighted sum. One token per program."""
-    pid_n = tl.program_id(0)
-    if pid_n >= num_tokens:
-        return
-
-    # ══ Pass 1: compute sqrsum over all 4 heads ══
-    sq = 0.0
-    res_base = pid_n * res_stride_n
-    for k in tl.static_range(4):
-        head_base = res_base + k * res_stride_i
-        for h_start in range(0, hidden_size, BLOCK_H):
-            h_offsets = h_start + tl.arange(0, BLOCK_H)
-            h_mask = h_offsets < hidden_size
-            v = tl.load(
-                residual_ptr + head_base + h_offsets * res_stride_h,
-                mask=h_mask,
-                other=0.0,
-            ).to(tl.float32)
-            sq += tl.sum(v * v)
-
-    rms_inv = tl.rsqrt(sq / hc_hidden_size + rms_eps)
-
-    # ══ Load scales ══
-    scale_0 = tl.load(hc_scale_ptr + 0)
-    scale_1 = tl.load(hc_scale_ptr + 1)
-    scale_2 = tl.load(hc_scale_ptr + 2)
-
-    go_base = pid_n * HC_MULT3
-
-    # ══ pre_mix: indices 0..3 ══
-    pre_mix_0 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 0) * rms_inv * scale_0
-            + tl.load(hc_base_ptr + 0)
-        )
-        + hc_pre_eps
-    )
-    pre_mix_1 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 1) * rms_inv * scale_0
-            + tl.load(hc_base_ptr + 1)
-        )
-        + hc_pre_eps
-    )
-    pre_mix_2 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 2) * rms_inv * scale_0
-            + tl.load(hc_base_ptr + 2)
-        )
-        + hc_pre_eps
-    )
-    pre_mix_3 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 3) * rms_inv * scale_0
-            + tl.load(hc_base_ptr + 3)
-        )
-        + hc_pre_eps
-    )
-
-    # ══ post_mix: indices 4..7 ══
-    post_0 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 4) * rms_inv * scale_1
-            + tl.load(hc_base_ptr + 4)
-        )
-        * hc_post_mult_value
-    )
-    tl.store(post_mix_ptr + pid_n * 4 + 0, post_0)
-    post_1 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 5) * rms_inv * scale_1
-            + tl.load(hc_base_ptr + 5)
-        )
-        * hc_post_mult_value
-    )
-    tl.store(post_mix_ptr + pid_n * 4 + 1, post_1)
-    post_2 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 6) * rms_inv * scale_1
-            + tl.load(hc_base_ptr + 6)
-        )
-        * hc_post_mult_value
-    )
-    tl.store(post_mix_ptr + pid_n * 4 + 2, post_2)
-    post_3 = (
-        tl.sigmoid(
-            tl.load(gemm_out_ptr + go_base + 7) * rms_inv * scale_1
-            + tl.load(hc_base_ptr + 7)
-        )
-        * hc_post_mult_value
-    )
-    tl.store(post_mix_ptr + pid_n * 4 + 3, post_3)
-
-    # ══ comb_mix: indices 8..23 → 4x4 Sinkhorn ══
-    cb = 8
-    cm_00 = tl.load(gemm_out_ptr + go_base + cb + 0) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 0
-    )
-    cm_01 = tl.load(gemm_out_ptr + go_base + cb + 1) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 1
-    )
-    cm_02 = tl.load(gemm_out_ptr + go_base + cb + 2) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 2
-    )
-    cm_03 = tl.load(gemm_out_ptr + go_base + cb + 3) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 3
-    )
-    cm_10 = tl.load(gemm_out_ptr + go_base + cb + 4) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 4
-    )
-    cm_11 = tl.load(gemm_out_ptr + go_base + cb + 5) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 5
-    )
-    cm_12 = tl.load(gemm_out_ptr + go_base + cb + 6) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 6
-    )
-    cm_13 = tl.load(gemm_out_ptr + go_base + cb + 7) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 7
-    )
-    cm_20 = tl.load(gemm_out_ptr + go_base + cb + 8) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 8
-    )
-    cm_21 = tl.load(gemm_out_ptr + go_base + cb + 9) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 9
-    )
-    cm_22 = tl.load(gemm_out_ptr + go_base + cb + 10) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 10
-    )
-    cm_23 = tl.load(gemm_out_ptr + go_base + cb + 11) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 11
-    )
-    cm_30 = tl.load(gemm_out_ptr + go_base + cb + 12) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 12
-    )
-    cm_31 = tl.load(gemm_out_ptr + go_base + cb + 13) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 13
-    )
-    cm_32 = tl.load(gemm_out_ptr + go_base + cb + 14) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 14
-    )
-    cm_33 = tl.load(gemm_out_ptr + go_base + cb + 15) * rms_inv * scale_2 + tl.load(
-        hc_base_ptr + cb + 15
-    )
-
-    if clamp_logits:
-        cm_00 = tl.clamp(cm_00, -30.0, 30.0)
-        cm_01 = tl.clamp(cm_01, -30.0, 30.0)
-        cm_02 = tl.clamp(cm_02, -30.0, 30.0)
-        cm_03 = tl.clamp(cm_03, -30.0, 30.0)
-        cm_10 = tl.clamp(cm_10, -30.0, 30.0)
-        cm_11 = tl.clamp(cm_11, -30.0, 30.0)
-        cm_12 = tl.clamp(cm_12, -30.0, 30.0)
-        cm_13 = tl.clamp(cm_13, -30.0, 30.0)
-        cm_20 = tl.clamp(cm_20, -30.0, 30.0)
-        cm_21 = tl.clamp(cm_21, -30.0, 30.0)
-        cm_22 = tl.clamp(cm_22, -30.0, 30.0)
-        cm_23 = tl.clamp(cm_23, -30.0, 30.0)
-        cm_30 = tl.clamp(cm_30, -30.0, 30.0)
-        cm_31 = tl.clamp(cm_31, -30.0, 30.0)
-        cm_32 = tl.clamp(cm_32, -30.0, 30.0)
-        cm_33 = tl.clamp(cm_33, -30.0, 30.0)
-
-    # ── Sinkhorn iteration ──
-    rm = tl.maximum(tl.maximum(cm_00, cm_01), tl.maximum(cm_02, cm_03))
-    cm_00 = tl.exp(cm_00 - rm)
-    cm_01 = tl.exp(cm_01 - rm)
-    cm_02 = tl.exp(cm_02 - rm)
-    cm_03 = tl.exp(cm_03 - rm)
-    rs = cm_00 + cm_01 + cm_02 + cm_03
-    inv_rs = 1.0 / rs
-    cm_00 = cm_00 * inv_rs + hc_sinkhorn_eps
-    cm_01 = cm_01 * inv_rs + hc_sinkhorn_eps
-    cm_02 = cm_02 * inv_rs + hc_sinkhorn_eps
-    cm_03 = cm_03 * inv_rs + hc_sinkhorn_eps
-
-    rm = tl.maximum(tl.maximum(cm_10, cm_11), tl.maximum(cm_12, cm_13))
-    cm_10 = tl.exp(cm_10 - rm)
-    cm_11 = tl.exp(cm_11 - rm)
-    cm_12 = tl.exp(cm_12 - rm)
-    cm_13 = tl.exp(cm_13 - rm)
-    rs = cm_10 + cm_11 + cm_12 + cm_13
-    inv_rs = 1.0 / rs
-    cm_10 = cm_10 * inv_rs + hc_sinkhorn_eps
-    cm_11 = cm_11 * inv_rs + hc_sinkhorn_eps
-    cm_12 = cm_12 * inv_rs + hc_sinkhorn_eps
-    cm_13 = cm_13 * inv_rs + hc_sinkhorn_eps
-
-    rm = tl.maximum(tl.maximum(cm_20, cm_21), tl.maximum(cm_22, cm_23))
-    cm_20 = tl.exp(cm_20 - rm)
-    cm_21 = tl.exp(cm_21 - rm)
-    cm_22 = tl.exp(cm_22 - rm)
-    cm_23 = tl.exp(cm_23 - rm)
-    rs = cm_20 + cm_21 + cm_22 + cm_23
-    inv_rs = 1.0 / rs
-    cm_20 = cm_20 * inv_rs + hc_sinkhorn_eps
-    cm_21 = cm_21 * inv_rs + hc_sinkhorn_eps
-    cm_22 = cm_22 * inv_rs + hc_sinkhorn_eps
-    cm_23 = cm_23 * inv_rs + hc_sinkhorn_eps
-
-    rm = tl.maximum(tl.maximum(cm_30, cm_31), tl.maximum(cm_32, cm_33))
-    cm_30 = tl.exp(cm_30 - rm)
-    cm_31 = tl.exp(cm_31 - rm)
-    cm_32 = tl.exp(cm_32 - rm)
-    cm_33 = tl.exp(cm_33 - rm)
-    rs = cm_30 + cm_31 + cm_32 + cm_33
-    inv_rs = 1.0 / rs
-    cm_30 = cm_30 * inv_rs + hc_sinkhorn_eps
-    cm_31 = cm_31 * inv_rs + hc_sinkhorn_eps
-    cm_32 = cm_32 * inv_rs + hc_sinkhorn_eps
-    cm_33 = cm_33 * inv_rs + hc_sinkhorn_eps
-
-    cs0 = cm_00 + cm_10 + cm_20 + cm_30
-    cs1 = cm_01 + cm_11 + cm_21 + cm_31
-    cs2 = cm_02 + cm_12 + cm_22 + cm_32
-    cs3 = cm_03 + cm_13 + cm_23 + cm_33
-    inv_cs0 = 1.0 / (cs0 + hc_sinkhorn_eps)
-    inv_cs1 = 1.0 / (cs1 + hc_sinkhorn_eps)
-    inv_cs2 = 1.0 / (cs2 + hc_sinkhorn_eps)
-    inv_cs3 = 1.0 / (cs3 + hc_sinkhorn_eps)
-    cm_00 *= inv_cs0
-    cm_10 *= inv_cs0
-    cm_20 *= inv_cs0
-    cm_30 *= inv_cs0
-    cm_01 *= inv_cs1
-    cm_11 *= inv_cs1
-    cm_21 *= inv_cs1
-    cm_31 *= inv_cs1
-    cm_02 *= inv_cs2
-    cm_12 *= inv_cs2
-    cm_22 *= inv_cs2
-    cm_32 *= inv_cs2
-    cm_03 *= inv_cs3
-    cm_13 *= inv_cs3
-    cm_23 *= inv_cs3
-    cm_33 *= inv_cs3
-
-    for _ in range(sinkhorn_repeat - 1):
-        rs0 = cm_00 + cm_01 + cm_02 + cm_03
-        rs1 = cm_10 + cm_11 + cm_12 + cm_13
-        rs2 = cm_20 + cm_21 + cm_22 + cm_23
-        rs3 = cm_30 + cm_31 + cm_32 + cm_33
-        inv_rs0 = 1.0 / (rs0 + hc_sinkhorn_eps)
-        inv_rs1 = 1.0 / (rs1 + hc_sinkhorn_eps)
-        inv_rs2 = 1.0 / (rs2 + hc_sinkhorn_eps)
-        inv_rs3 = 1.0 / (rs3 + hc_sinkhorn_eps)
-        cm_00 *= inv_rs0
-        cm_01 *= inv_rs0
-        cm_02 *= inv_rs0
-        cm_03 *= inv_rs0
-        cm_10 *= inv_rs1
-        cm_11 *= inv_rs1
-        cm_12 *= inv_rs1
-        cm_13 *= inv_rs1
-        cm_20 *= inv_rs2
-        cm_21 *= inv_rs2
-        cm_22 *= inv_rs2
-        cm_23 *= inv_rs2
-        cm_30 *= inv_rs3
-        cm_31 *= inv_rs3
-        cm_32 *= inv_rs3
-        cm_33 *= inv_rs3
-        cs0 = cm_00 + cm_10 + cm_20 + cm_30
-        cs1 = cm_01 + cm_11 + cm_21 + cm_31
-        cs2 = cm_02 + cm_12 + cm_22 + cm_32
-        cs3 = cm_03 + cm_13 + cm_23 + cm_33
-        inv_cs0 = 1.0 / (cs0 + hc_sinkhorn_eps)
-        inv_cs1 = 1.0 / (cs1 + hc_sinkhorn_eps)
-        inv_cs2 = 1.0 / (cs2 + hc_sinkhorn_eps)
-        inv_cs3 = 1.0 / (cs3 + hc_sinkhorn_eps)
-        cm_00 *= inv_cs0
-        cm_01 *= inv_cs1
-        cm_02 *= inv_cs2
-        cm_03 *= inv_cs3
-        cm_10 *= inv_cs0
-        cm_11 *= inv_cs1
-        cm_12 *= inv_cs2
-        cm_13 *= inv_cs3
-        cm_20 *= inv_cs0
-        cm_21 *= inv_cs1
-        cm_22 *= inv_cs2
-        cm_23 *= inv_cs3
-        cm_30 *= inv_cs0
-        cm_31 *= inv_cs1
-        cm_32 *= inv_cs2
-        cm_33 *= inv_cs3
-
-    co = pid_n * 16
-    tl.store(comb_mix_ptr + co + 0, cm_00)
-    tl.store(comb_mix_ptr + co + 1, cm_01)
-    tl.store(comb_mix_ptr + co + 2, cm_02)
-    tl.store(comb_mix_ptr + co + 3, cm_03)
-    tl.store(comb_mix_ptr + co + 4, cm_10)
-    tl.store(comb_mix_ptr + co + 5, cm_11)
-    tl.store(comb_mix_ptr + co + 6, cm_12)
-    tl.store(comb_mix_ptr + co + 7, cm_13)
-    tl.store(comb_mix_ptr + co + 8, cm_20)
-    tl.store(comb_mix_ptr + co + 9, cm_21)
-    tl.store(comb_mix_ptr + co + 10, cm_22)
-    tl.store(comb_mix_ptr + co + 11, cm_23)
-    tl.store(comb_mix_ptr + co + 12, cm_30)
-    tl.store(comb_mix_ptr + co + 13, cm_31)
-    tl.store(comb_mix_ptr + co + 14, cm_32)
-    tl.store(comb_mix_ptr + co + 15, cm_33)
-
-    # ══ Pass 2: weighted sum  layer_input = sum_k(pre_mix_k * residual[n, k, :]) ══
-    for h_start in range(0, hidden_size, BLOCK_H):
-        h_offsets = h_start + tl.arange(0, BLOCK_H)
-        h_mask = h_offsets < hidden_size
-        r0 = tl.load(
-            residual_ptr + res_base + 0 * res_stride_i + h_offsets * res_stride_h,
-            mask=h_mask,
-            other=0.0,
-        ).to(tl.float32)
-        r1 = tl.load(
-            residual_ptr + res_base + 1 * res_stride_i + h_offsets * res_stride_h,
-            mask=h_mask,
-            other=0.0,
-        ).to(tl.float32)
-        acc = pre_mix_0 * r0 + pre_mix_1 * r1
-        r2 = tl.load(
-            residual_ptr + res_base + 2 * res_stride_i + h_offsets * res_stride_h,
-            mask=h_mask,
-            other=0.0,
-        ).to(tl.float32)
-        r3 = tl.load(
-            residual_ptr + res_base + 3 * res_stride_i + h_offsets * res_stride_h,
-            mask=h_mask,
-            other=0.0,
-        ).to(tl.float32)
-        acc += pre_mix_2 * r2 + pre_mix_3 * r3
-        tl.store(
-            layer_input_ptr + pid_n * li_stride_n + h_offsets * li_stride_h,
-            acc.to(tl.bfloat16),
-            mask=h_mask,
-        )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
-    ],
-    key=["hidden_size", "num_tokens_bucket"],
-)
-@triton.jit
-def mhc_pre_fused_kernel_hc_mult_4(
-    gemm_out_ptr,  # (num_tokens, hc_mult3), float32
-    hc_scale_ptr,  # (3,), float32
-    hc_base_ptr,  # (hc_mult3,), float32
-    residual_ptr,  # (num_tokens, hc_mult, hidden_size), bfloat16
-    post_mix_ptr,  # (num_tokens, hc_mult), float32
-    comb_mix_ptr,  # (num_tokens, hc_mult*hc_mult), float32
-    layer_input_ptr,  # (num_tokens, hidden_size), bfloat16
-    num_tokens,
-    num_tokens_bucket,
-    res_stride_n,
-    res_stride_i,
-    res_stride_h,
-    li_stride_n,
-    li_stride_h,
-    hidden_size,
-    hc_hidden_size,
-    rms_eps: tl.constexpr,
-    hc_pre_eps: tl.constexpr,
-    hc_sinkhorn_eps: tl.constexpr,
-    hc_post_mult_value: tl.constexpr,
-    sinkhorn_repeat,
-    clamp_logits: tl.constexpr,
-    HC_MULT3: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    _mhc_pre_fused_kernel_hc_mult_4_impl(
-        gemm_out_ptr,
-        hc_scale_ptr,
-        hc_base_ptr,
-        residual_ptr,
-        post_mix_ptr,
-        comb_mix_ptr,
-        layer_input_ptr,
-        num_tokens,
-        num_tokens_bucket,
-        res_stride_n,
-        res_stride_i,
-        res_stride_h,
-        li_stride_n,
-        li_stride_h,
-        hidden_size,
-        hc_hidden_size,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        clamp_logits,
-        HC_MULT3,
-        BLOCK_H,
-    )
-
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_H": 256}, num_warps=4, num_stages=1),
@@ -502,7 +84,7 @@ def mhc_pre_fused_kernel_hc_mult_4(
     key=["hidden_size", "num_tokens_bucket", "HC"],
 )
 @triton.jit
-def mhc_pre_generic_kernel(
+def mhc_pre_generic_clamped_kernel(
     gemm_out_ptr,  # (num_tokens, hc_mult3), float32
     hc_scale_ptr,  # (3,), float32
     hc_base_ptr,  # (hc_mult3,), float32
@@ -732,6 +314,23 @@ def npu_mhc_pre(
         raise NotImplementedError("npu_mhc_pre requires NPU tensors")
     hc_mult, hidden_size, hc_mult3 = _validate_inputs(residual, fn, hc_scale, hc_base)
 
+    # hc==4 shares the tiled epilogue path (ASCEND_TILED), which does not clamp.
+    if hc_mult == 4:
+        from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre as _tiled_mhc_pre
+
+        return _tiled_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+        )
+
     outer_shape = residual.shape[:-2]
     residual_flat = residual.reshape(-1, hc_mult, hidden_size).contiguous()
     num_tokens = residual_flat.shape[0]
@@ -788,14 +387,299 @@ def npu_mhc_pre(
         sinkhorn_repeat=sinkhorn_repeat,
         clamp_logits=True,  # model contract, always on for this operator
     )
-    if hc_mult == 4:
-        mhc_pre_fused_kernel_hc_mult_4[(num_tokens,)](
-            *common, HC_MULT3=hc_mult3, **kwargs
-        )
-    else:
-        mhc_pre_generic_kernel[(num_tokens,)](*common, HC=hc_mult, **kwargs)
+    mhc_pre_generic_clamped_kernel[(num_tokens,)](*common, HC=hc_mult, **kwargs)
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
     comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
     layer_input = layer_input.view(*outer_shape, hidden_size)
     return post_mix, comb_mix, layer_input
+
+
+# Tiled epilogue kernels (proj / mix / reduce): what the generic ``mhc_pre`` runs
+# on Ascend.
+
+
+def _autotune_bench(fn, **kwargs):
+    """Timer for ``triton.autotune`` on Ascend: default timing misses device time here."""
+    try:
+        from triton.backends.ascend.testing import do_bench_npu
+    except Exception:  # noqa: BLE001 - keep the default timing elsewhere
+        return triton.testing.do_bench(fn, **kwargs)
+    return do_bench_npu(fn)
+
+
+@triton.autotune(
+    configs=[
+        # Two loops, two tile widths: the sum-of-squares loop cannot use BLOCK_K>=1024.
+        # A tile that overflows UB silently miscomputes, so each entry below was checked.
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_K": 512, "BLOCK_K_SQ": 256},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_K": 512, "BLOCK_K_SQ": 256},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_K": 512, "BLOCK_K_SQ": 256},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_K": 256, "BLOCK_K_SQ": 256},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_K": 512, "BLOCK_K_SQ": 512},
+            num_warps=4,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_K": 512, "BLOCK_K_SQ": 256},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_K": 512, "BLOCK_K_SQ": 256},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["num_tokens", "hc_hidden_size", "HC_MULT3"],
+    do_bench=_autotune_bench,
+)
+@triton.jit
+def mhc_pre_ascend_proj_kernel(
+    a_ptr,  # (num_tokens, hc_hidden_size) bfloat16
+    bt_ptr,  # (hc_hidden_size, HC_MULT3) bfloat16, fn^T, zero padded to power of 2
+    out_ptr,  # (num_tokens, HC_MULT3) float32
+    sq_ptr,  # (num_tokens,), float32 -- row sums of squares of a
+    num_tokens,
+    hc_hidden_size,
+    a_stride_n,
+    bt_stride_k,
+    bt_stride_j,
+    HC_MULT3: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_K_SQ: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BT_PADDED: tl.constexpr,
+):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    m_mask = offs_m < num_tokens
+    n_mask = offs_n < HC_MULT3
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, hc_hidden_size, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < hc_hidden_size
+        a = tl.load(
+            a_ptr + offs_m[:, None] * a_stride_n + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        # BT_PADDED: the tile really has BLOCK_N columns, so skip the column mask
+        # (unmasked is 3.5x faster at large K: the mask drops the block DMA).
+        if BT_PADDED:
+            b = tl.load(
+                bt_ptr + offs_k[:, None] * bt_stride_k + offs_n[None, :] * bt_stride_j,
+                mask=k_mask[:, None],
+                other=0.0,
+            )
+        else:
+            b = tl.load(
+                bt_ptr + offs_k[:, None] * bt_stride_k + offs_n[None, :] * bt_stride_j,
+                mask=k_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            )
+        # No vector reduction in this loop: it silently corrupts the product or NaNs.
+        acc += tl.dot(a, b)
+    tl.store(
+        out_ptr + offs_m[:, None] * HC_MULT3 + offs_n[None, :],
+        acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+    # The sum of squares needs its own loop: one load cannot feed both units.
+    sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k0 in range(0, hc_hidden_size, BLOCK_K_SQ):
+        offs_k = k0 + tl.arange(0, BLOCK_K_SQ)
+        k_mask = offs_k < hc_hidden_size
+        a = tl.load(
+            a_ptr + offs_m[:, None] * a_stride_n + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        a_f32 = a.to(tl.float32)
+        sq += tl.sum(a_f32 * a_f32, 1)
+    tl.store(sq_ptr + offs_m, sq, mask=m_mask)
+
+
+@triton.jit
+def _mhc_ascend_rms_inv(sq_ptr, idx, tmask, hc_hidden_size, rms_eps: tl.constexpr):
+    """rsqrt(row_sum_of_squares / hidden + eps); idx/tmask are scalars or a token tile."""
+    sq = tl.load(sq_ptr + idx, mask=tmask, other=1.0)
+    return tl.rsqrt(sq / hc_hidden_size + rms_eps)
+
+
+@triton.jit
+def _mhc_ascend_gate(gemm_ptr, hc_base_ptr, base, off, tmask, rms_inv, scale, eps):
+    """sigmoid(mix_logit * rms_inv * scale + base) + eps, shared by both gates."""
+    logit = tl.load(gemm_ptr + base + off, mask=tmask, other=0.0)
+    return tl.sigmoid(logit * rms_inv * scale + tl.load(hc_base_ptr + off)) + eps
+
+
+@triton.autotune(
+    configs=[
+        # Tokens per program: 16 below 2048 tokens, 32 above; 64 exceeds UB.
+        triton.Config({"BLOCK_N": 8}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_N": 16}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_N": 32}, num_warps=1, num_stages=1),
+    ],
+    key=["num_tokens"],
+    do_bench=_autotune_bench,
+)
+@triton.jit
+def mhc_pre_ascend_mix_kernel(
+    gemm_out_ptr,  # (num_tokens, hc_mult3), float32
+    sq_ptr,  # (num_tokens,), float32 -- row sums of squares, from the projection
+    hc_scale_ptr,  # (3,), float32
+    hc_base_ptr,  # (hc_mult3,), float32
+    post_mix_ptr,  # (num_tokens, HC), float32
+    comb_mix_ptr,  # (num_tokens, HC * HC), float32
+    num_tokens,
+    hc_hidden_size,
+    rms_eps: tl.constexpr,
+    hc_pre_eps: tl.constexpr,
+    hc_sinkhorn_eps: tl.constexpr,
+    hc_post_mult_value: tl.constexpr,
+    sinkhorn_repeat,
+    HC: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    t = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    m = t < num_tokens
+    rows = tl.arange(0, HC)
+    cols = tl.arange(0, HC)
+    gemm_base = t * (HC * 2 + HC * HC)
+
+    scale_1 = tl.load(hc_scale_ptr + 1)
+    scale_2 = tl.load(hc_scale_ptr + 2)
+    rms_inv = _mhc_ascend_rms_inv(sq_ptr, t, m, hc_hidden_size, rms_eps)
+
+    comb_off = gemm_base[:, None, None] + (
+        2 * HC + rows[None, :, None] * HC + cols[None, None, :]
+    )
+    comb = tl.load(gemm_out_ptr + comb_off, mask=m[:, None, None], other=0.0)
+    comb = (
+        comb * rms_inv[:, None, None] * scale_2
+        + tl.load(hc_base_ptr + 2 * HC + rows[:, None] * HC + cols[None, :])[None, :, :]
+    )
+    exponents = tl.exp(comb - tl.max(comb, 2)[:, :, None])
+    comb = exponents / tl.sum(exponents, 2)[:, :, None] + hc_sinkhorn_eps
+    comb = comb / (tl.sum(comb, 1)[:, None, :] + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb = comb / (tl.sum(comb, 2)[:, :, None] + hc_sinkhorn_eps)
+        comb = comb / (tl.sum(comb, 1)[:, None, :] + hc_sinkhorn_eps)
+    tl.store(
+        comb_mix_ptr
+        + t[:, None, None] * (HC * HC)
+        + rows[None, :, None] * HC
+        + cols[None, None, :],
+        comb,
+        mask=m[:, None, None],
+    )
+
+    for k in tl.static_range(HC):
+        # No epsilon here; the pre gate is the same expression with eps.
+        post = (
+            _mhc_ascend_gate(
+                gemm_out_ptr, hc_base_ptr, gemm_base, HC + k, m, rms_inv, scale_1, 0.0
+            )
+            * hc_post_mult_value
+        )
+        tl.store(post_mix_ptr + t * HC + k, post, mask=m)
+
+
+@triton.autotune(
+    configs=[
+        # BLOCK_T tokens per program, each with its own (HC, BLOCK_H) tile: a single
+        # 2-D tile is lowered to scalar accesses (83 ms at 8192x4096).
+        triton.Config({"BLOCK_T": 1, "BLOCK_H": 2048}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_T": 1, "BLOCK_H": 1024}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_T": 2, "BLOCK_H": 4096}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_T": 2, "BLOCK_H": 2048}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_T": 4, "BLOCK_H": 4096}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_T": 4, "BLOCK_H": 2048}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_T": 2, "BLOCK_H": 1024}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_T": 4, "BLOCK_H": 1024}, num_warps=4, num_stages=1),
+    ],
+    key=["hidden_size", "num_tokens_bucket"],
+    do_bench=_autotune_bench,
+)
+@triton.jit
+def mhc_pre_ascend_reduce_kernel(
+    gemm_out_ptr,  # (num_tokens, hc_mult3), float32
+    sq_ptr,  # (num_tokens,), float32
+    hc_scale_ptr,  # (3,), float32
+    hc_base_ptr,  # (hc_mult3,), float32
+    residual_ptr,  # (num_tokens, HC, hidden_size), bfloat16
+    layer_input_ptr,  # (num_tokens, hidden_size), bfloat16
+    num_tokens,
+    num_tokens_bucket,
+    res_stride_n,
+    res_stride_i,
+    res_stride_h,
+    li_stride_n,
+    li_stride_h,
+    hidden_size,
+    hc_hidden_size,
+    rms_eps: tl.constexpr,
+    hc_pre_eps: tl.constexpr,
+    HC: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = tl.arange(0, HC)
+    scale_0 = tl.load(hc_scale_ptr + 0)
+
+    for t in tl.static_range(BLOCK_T):
+        pid_n = pid * BLOCK_T + t
+        keep = pid_n < num_tokens
+        res_base = pid_n * res_stride_n
+        gemm_base = pid_n * (HC * 2 + HC * HC)
+
+        rms_inv = _mhc_ascend_rms_inv(sq_ptr, pid_n, keep, hc_hidden_size, rms_eps)
+        pre_mix = _mhc_ascend_gate(
+            gemm_out_ptr,
+            hc_base_ptr,
+            gemm_base,
+            rows,
+            keep,
+            rms_inv,
+            scale_0,
+            hc_pre_eps,
+        )
+
+        for h_start in range(0, hidden_size, BLOCK_H):
+            h_offs = h_start + tl.arange(0, BLOCK_H)
+            h_mask = (h_offs < hidden_size) & keep
+            tile = tl.load(
+                residual_ptr
+                + res_base
+                + rows[:, None] * res_stride_i
+                + h_offs[None, :] * res_stride_h,
+                mask=h_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            acc = tl.sum(pre_mix[:, None] * tile, 0)
+            tl.store(
+                layer_input_ptr + pid_n * li_stride_n + h_offs * li_stride_h,
+                acc.to(tl.bfloat16),
+                mask=h_mask,
+            )
