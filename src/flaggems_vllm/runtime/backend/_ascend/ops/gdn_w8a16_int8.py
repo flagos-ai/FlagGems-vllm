@@ -4,6 +4,7 @@
 
 import hashlib
 import logging
+import math
 import shutil
 import subprocess
 import tempfile
@@ -19,7 +20,17 @@ from triton.runtime.cache import get_cache_manager
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import (
-    chunk_gated_delta_rule_fwd,
+    SINGLE_KERNEL_MAX_TOTAL_CHUNKS,
+    _chunk_gated_delta_rule_fwd_stage5_6_with_intermediates,
+    _get_aic_num,
+    _map_flattened_varlen_block,
+    _transpose_gate_beta_kernel,
+    chunk_gated_delta_rule_fwd_stage0_4,
+    chunk_local_cumsum,
+    merge_pair_16x16_to_64x64_inverse_kernel,
+    safe_exp,
+    solve_tril_16x16_kernel,
+    stage4_chunk_pair_combined128,
 )
 
 try:
@@ -654,6 +665,186 @@ def gdn_w8a16_int8(
     return out, state_int8
 
 
+# INT8-only preprocessing; shared GDN kernels and dispatch remain untouched.
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_G": lambda args: args["g_cumsum"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T", "B"])
+def _int8_prefill_kkt_kernel(
+    k,
+    beta,  # [H, B, T]
+    g_cumsum,  # [H, B, T]
+    A,
+    cu_seqlens,
+    T,
+    B,
+    N,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_G: tl.constexpr,
+):
+    bt_stride = B * T
+    i_t_i, _ = tl.program_id(0), tl.program_id(1)
+
+    if IS_VARLEN:
+        valid, bos, T, i_t = _map_flattened_varlen_block(
+            i_t_i,
+            cu_seqlens,
+            N,
+            BT,
+        )
+    else:
+        valid, bos, i_t = True, 0, i_t_i
+
+    if valid:
+        HEAD_PAIR: tl.constexpr = 2 if H == 2 * Hg else 1
+        for i_group in range(B * H // HEAD_PAIR):
+            i_b = i_group // (H // HEAD_PAIR)
+            first_head = (i_group % (H // HEAD_PAIR)) * HEAD_PAIR
+            i_kh = first_head // (H // Hg)
+            if not IS_VARLEN:
+                bos = i_b * T
+            o_t = tl.arange(0, BT)
+            o_t_fp32 = o_t.to(tl.float32)
+
+            b_gram = tl.zeros([BT, BT], dtype=tl.float32)
+            for i_k in range(tl.cdiv(K, BK)):
+                p_k = tl.make_block_ptr(
+                    k + (bos * Hg + i_kh) * K,
+                    (T, K),
+                    (Hg * K, 1),
+                    (i_t * BT, i_k * BK),
+                    (BT, BK),
+                    (1, 0),
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_gram += tl.dot(b_k, tl.trans(b_k))
+
+            # Value heads in a GQA group share the same K @ K.T tile.
+            for group_head in tl.static_range(HEAD_PAIR):
+                i_h = first_head + group_head
+                b_A = b_gram
+                p_beta = tl.make_block_ptr(
+                    beta + i_h * bt_stride + bos, (T,), (1,), (i_t * BT,), (BT,), (0,)
+                )
+                b_beta = tl.load(p_beta, boundary_check=(0,))
+
+                if USE_G:
+                    p_g = tl.make_block_ptr(
+                        g_cumsum + i_h * bt_stride + bos,
+                        (T,),
+                        (1,),
+                        (i_t * BT,),
+                        (BT,),
+                        (0,),
+                    )
+                    b_g = tl.load(p_g, boundary_check=(0,))
+                    b_g_diff = b_g[:, None] - b_g[None, :]
+                    b_A *= safe_exp(b_g_diff)
+
+                b_A *= b_beta[:, None]
+                b_A = tl.where(o_t_fp32[:, None] > o_t_fp32[None, :], b_A, 0)
+                p_A = tl.make_block_ptr(
+                    A + (bos * H + i_h) * BT,
+                    (T, BT),
+                    (BT * H, 1),
+                    (i_t * BT, 0),
+                    (BT, BT),
+                    (1, 0),
+                )
+                tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+
+
+def _int8_prefill_stage0_4(k, v, g, beta, cu_seqlens):
+    _, tokens, query_heads, reduction = k.shape
+    heads = v.shape[2]
+    sequences = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
+    chunks = triton.cdiv(tokens, 64) + sequences - 1
+    if (
+        cu_seqlens is None
+        or heads != 2 * query_heads
+        or _get_aic_num() != 20
+        or chunks <= SINGLE_KERNEL_MAX_TOTAL_CHUNKS
+    ):
+        return chunk_gated_delta_rule_fwd_stage0_4(
+            k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=64
+        )
+    g_cumsum = chunk_local_cumsum(
+        g, chunk_size=64, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+    )
+    g_perm = torch.empty((heads, 1, tokens), device=g.device, dtype=torch.float32)
+    beta_perm = torch.empty_like(g_perm, dtype=beta.dtype)
+    _transpose_gate_beta_kernel[(triton.cdiv(tokens, 128), 1)](
+        g_cumsum,
+        beta,
+        g_perm,
+        beta_perm,
+        tokens,
+        1,
+        H=heads,
+        BLOCK_T=128,
+        num_warps=4,
+        num_stages=1,
+    )
+    a = torch.empty((1, tokens, heads, 64), device=k.device, dtype=torch.float32)
+    _int8_prefill_kkt_kernel[(chunks, 1)](
+        k,
+        beta_perm,
+        g_perm,
+        a,
+        cu_seqlens,
+        tokens,
+        1,
+        sequences,
+        H=heads,
+        Hg=query_heads,
+        K=reduction,
+        BT=64,
+        BK=128,
+        num_warps=8,
+        num_stages=3,
+        multibuffer=True,
+    )
+    # Retain FP32 inversion; only this INT8 call uses the 1024-row geometry.
+    ad = torch.empty((1, tokens, heads, 16), device=k.device, dtype=torch.float32)
+    solve_tril_16x16_kernel[(triton.cdiv(tokens, 1024) + sequences - 1, heads)](
+        a,
+        ad,
+        cu_seqlens,
+        tokens,
+        heads,
+        sequences,
+        BT=64,
+        LARGE_BLOCK_T=1024,
+        num_warps=1,
+        num_stages=4,
+    )
+    a_inv = torch.empty_like(a, dtype=k.dtype)
+    merge_pair_16x16_to_64x64_inverse_kernel[
+        (triton.cdiv(tokens, 128) + sequences - 1, heads)
+    ](
+        a,
+        ad,
+        a_inv,
+        cu_seqlens,
+        tokens,
+        heads,
+        sequences,
+        BT=64,
+        num_warps=8,
+        num_stages=1,
+    )
+    w, u = stage4_chunk_pair_combined128(k, v, beta_perm, g_perm, a_inv, cu_seqlens)
+    return w, u, g_cumsum
+
+
 def chunk_gated_delta_rule_w8a16_int8(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -731,6 +922,8 @@ def chunk_gated_delta_rule_w8a16_int8(
     if tokens == 0:
         return torch.empty(v.shape, device=q.device, dtype=q.dtype), state_int8
     launch_scale = reduction**-0.5 if scale is None else float(scale)
+    if not math.isfinite(launch_scale):
+        raise ValueError("scale must be finite")
     with torch_device_fn.device(q.device):
         initial = torch.empty(
             (sequences, heads, reduction, columns), device=q.device, dtype=torch.float32
@@ -773,16 +966,17 @@ def chunk_gated_delta_rule_w8a16_int8(
             )
         else:
             cu_long = cu_seqlens
-        _, output, _, final, _, _, _ = chunk_gated_delta_rule_fwd(
+        w, u, g_cumsum = _int8_prefill_stage0_4(k_norm, v, g, beta, cu_long)
+        output, final, _, _ = _chunk_gated_delta_rule_fwd_stage5_6_with_intermediates(
             q_norm,
             k_norm,
-            v,
-            g,
-            beta,
-            launch_scale,
-            initial,
-            True,
-            cu_long,
+            w,
+            u,
+            g_cumsum,
+            scale=launch_scale,
+            initial_state=initial,
+            output_final_state=True,
+            cu_seqlens=cu_long,
         )
         transform_state_kernel[(min(vector_cores(), total),)](
             final,
