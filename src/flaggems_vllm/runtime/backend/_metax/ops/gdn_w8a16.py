@@ -14,6 +14,13 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    gluon = None
+
+
 _WORKSPACE_LIMIT_BYTES = 256 * 1024**2
 _SHORT_MAX_CHUNKS = 64
 _FP32_MAX_CHUNKS = 32
@@ -958,7 +965,76 @@ def _decode(
     tl.store(S + off, state, mask)
 
 
-def _mixed_workspace_plan(tokens, sequences, value_heads):
+if gluon is not None:
+
+    @gluon.jit
+    def _packed_decode_128(
+        Q,
+        K,
+        V,
+        A,
+        B,
+        AL,
+        Bias,
+        S,
+        O,
+        Ids,
+        QS: gl.constexpr,
+        KS: gl.constexpr,
+        VS: gl.constexpr,
+        SCALE: gl.constexpr,
+        WIDE: gl.constexpr,
+        PROJECT: gl.constexpr,
+    ):
+        # Keep Q/K in the state tile's register layout: no shared-memory
+        # layout conversion or CTA barrier between normalization and GEMV.
+        layout: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [1, 1], [1, 0])
+        BV: gl.constexpr = 16
+        pid = gl.program_id(0)
+        tile, h, n = (
+            pid % (128 // BV),
+            (pid // (128 // BV)) % 32,
+            pid // (32 * (128 // BV)),
+        )
+        slot = gl.load(Ids + n).to(gl.int64)
+        if not WIDE:
+            # Preserve every nonpositive int64 padding value before narrowing.
+            slot = gl.where(slot > 0, slot, 0).to(gl.int32)
+        d = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+        vd = tile * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, layout))
+        off = ((slot * 32 + h) * 128 + vd[:, None]) * 128 + d[None, :]
+        # Issue the large state load before computing norms and gates.
+        state = gl.load(S + off, slot > 0, 0)
+        q = gl.load(Q + n * QS + (h // 2) * 128 + d).to(gl.float32)
+        k = gl.load(K + n * KS + (h // 2) * 128 + d).to(gl.float32)
+        q2, k2 = gl.sum(q * q, 0), gl.sum(k * k, 0)
+        q *= gl.rsqrt(q2 + 1e-6)
+        k *= gl.rsqrt(k2 + 1e-6)
+        gate = gl.load(A + n * 32 + h).to(gl.float32) + gl.load(Bias + h)
+        sp = gl.where(gate <= 20, gl.log(1 + gl.exp(gate)), gate)
+        decay = gl.exp(-gl.exp(gl.load(AL + h)) * sp)
+        beta = 1.0 / (1.0 + gl.exp(-gl.load(B + n * 32 + h).to(gl.float32)))
+        beta = beta.to(B.dtype.element_ty).to(gl.float32)
+        v = gl.load(V + n * VS + h * 128 + vd).to(gl.float32)
+        state *= decay
+        if PROJECT:
+            # Project the decayed state before the dependent rank-one update:
+            # (state + residual * k) @ q = state @ q + residual * (k @ q).
+            sk = gl.sum(state * k[None, :], 1)
+            sq = gl.sum(state * (q * SCALE)[None, :], 1)
+            kq = gl.sum(k * (q * SCALE), 0)
+            residual = (v - sk) * beta
+            state += residual[:, None] * k[None, :]
+            out = sq + residual * kq
+        else:
+            residual = (v - gl.sum(state * k[None, :], 1)) * beta
+            state += residual[:, None] * k[None, :]
+            out = gl.sum(state * (q * SCALE)[None, :], 1)
+        gl.store(O + (n * 32 + h) * 128 + vd, gl.where(slot > 0, out, 0.0))
+        gl.store(S + off, state, slot > 0)
+
+
+def _mixed_workspace_plan(tokens, sequences, value_heads, target=64):
     # Sum ceil(length / 64) <= floor((T + 63*N) / 64), including empty requests.
     total = (tokens + 63 * sequences) // 64
     # A + GC + W + U + HS; QK is fused into output; UP aliases U after its last read.
@@ -966,7 +1042,6 @@ def _mixed_workspace_plan(tokens, sequences, value_heads):
     max_slots = _WORKSPACE_LIMIT_BYTES // bytes_per_chunk
     if not max_slots:
         return total, 0, 0
-    target = 64
     if sequences > 1:
         target = ((target + sequences - 1) // sequences) * sequences
     capacity = min(total, target, max_slots)
@@ -983,7 +1058,8 @@ def _run_mixed_chunk(args, scale):
     hv, dv = v.shape[2:]
     n = cu.numel() - 1
     bv = 32 if n <= 2 else 64
-    total, c, _ = _mixed_workspace_plan(t, n, hv)
+    target = 96 if q.dtype == torch.bfloat16 and n == 16 and t >= 4096 else 64
+    total, c, _ = _mixed_workspace_plan(t, n, hv, target=target)
     if not c:
         raise NotImplementedError("GDN chunk workspace cannot fit one chunk")
     wide = (
@@ -1504,6 +1580,42 @@ def _fused_decode(
         raise ValueError("forward-only tensors on the same accelerator required")
     if n and any(out.data_ptr() == t.data_ptr() for t in tensors[:-1]):
         raise ValueError("output must not alias an input")
+    if (
+        n in (1, 3)
+        and q.dtype == torch.bfloat16
+        and gluon is not None
+        and not isinstance(qkv, tuple)
+        and (h, hv, dk, dv) == (16, 32, 128, 128)
+        and normalize
+        and bv is None
+        and warps is None
+        and not factor
+        and not fma
+        and round_beta
+    ):
+        with torch.cuda.device(q.device):
+            _packed_decode_128[(n * hv * 8,)](
+                q,
+                k,
+                v,
+                a,
+                b,
+                alog,
+                bias,
+                state,
+                out,
+                ids,
+                q.stride(1),
+                k.stride(1),
+                v.stride(1),
+                dk**-0.5 if scale is None else scale,
+                state.numel() >= 2**31,
+                n == 3,
+                num_warps=1,
+                num_stages=1,
+                enable_fp_fusion=False,
+            )
+        return out, state
     if bv is None:
         bv = 8 if n < 8 else 64
     if warps is None:
