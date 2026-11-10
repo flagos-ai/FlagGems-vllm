@@ -390,9 +390,12 @@ def _skew_bucket_cached(chunk_offsets: torch.Tensor) -> int:
     N = chunk_offsets.numel() - 1
     if N <= 1:
         return 0
-    nt = chunk_offsets[1:] - chunk_offsets[:-1]
-    stats = torch.stack([nt.max(), nt.sum()])
-    max_nt, sum_nt = stats.tolist()  # One sync per chunk_offsets identity.
+    # This is identity-cached request metadata, not tensor numerical work.
+    # Copy once, then derive integer statistics on the host without launching
+    # subtraction/reduction/stack kernels in the production wrapper.
+    offsets = chunk_offsets.tolist()
+    counts = [end - start for start, end in zip(offsets, offsets[1:])]
+    max_nt, sum_nt = max(counts), sum(counts)
     if sum_nt <= 0:
         return 0
     avg_nt = sum_nt / N
