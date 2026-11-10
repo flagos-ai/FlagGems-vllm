@@ -42,9 +42,7 @@ from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_in
 from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
-from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_matmul import (
-    w8a8_block_matmul,
-)
+from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_matmul import w8a8_block_matmul
 from flaggems_vllm.utils import triton_version_utils
 
 # A missing optional TLE extension must not disable the independent INT8 ops.

@@ -328,7 +328,7 @@ def _prune_gemv_configs(configs, named_args, **kwargs):
     rep=20,
     use_cuda_graph=True,
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_general",
 )
 @triton.jit
@@ -545,7 +545,7 @@ def _w8a8_block_int8_gemv_reduce_core(
     warmup=5,
     rep=20,
     use_cuda_graph=True,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_gemv_block",
     prune_configs_by={"early_config_prune": _prune_gemv_configs},
 )
@@ -849,7 +849,7 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
     use_cuda_graph=True,
     post_hook=_splitk_post_hook,
     prune_configs_by={"early_config_prune": _prune_splitk_configs},
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_splitk",
 )
 @triton.jit

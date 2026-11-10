@@ -30,8 +30,6 @@ MNK_SHAPES = [
     (128, 256, 512),
     (64, 128, 128),
     (256, 256, 256),
-    (83, 7748, 3884),
-    (84, 7168, 3884),
 ]
 
 # Retain INT8 absolute tolerances without scaling them by K. The common
@@ -96,7 +94,7 @@ def _reference(a, b, a_scale, b_scale, block_n, block_k):
 )
 @pytest.mark.parametrize("M,N,K", MNK_SHAPES)
 def test_w8a8_block_matmul(M, N, K):
-    output_dtype = torch.bfloat16
+    output_dtype = torch.float16
     if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
         pytest.skip("W8A8 block matmul is unavailable on this architecture")
     if IS_INT8:

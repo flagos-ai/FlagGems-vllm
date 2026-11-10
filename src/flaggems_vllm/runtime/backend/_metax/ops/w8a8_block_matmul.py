@@ -267,7 +267,7 @@ def _prune_gemv_configs(configs, named_args, **kwargs):
     strategy="default",
     warmup=5,
     rep=20,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_matmul",
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
 )
@@ -336,7 +336,7 @@ def _w8a8_block_int8_kernel_general(
     strategy="default",
     warmup=5,
     rep=20,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_swap",
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
 )
@@ -405,7 +405,7 @@ def _w8a8_block_int8_kernel_swap(
     strategy="default",
     warmup=5,
     rep=20,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_gemv",
     prune_configs_by={"early_config_prune": _prune_gemv_configs},
 )
@@ -504,7 +504,7 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
     rep=20,
     post_hook=_splitk_post_hook,
     prune_configs_by={"early_config_prune": _prune_splitk_configs},
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_splitk",
 )
 @triton.jit

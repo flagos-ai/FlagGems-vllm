@@ -1279,10 +1279,7 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
     flaggems_vllm.vendor_name not in ("thead", "metax", "hygon", "nvidia", "mthreads"),
     reason="No W8A8 block matmul backend",
 )
-def test_perf_w8a8_block_matmul(monkeypatch):
-    from .test_w8a8_block_matmul import configure_w8a8_int8_baseline
-
-    configure_w8a8_int8_baseline(monkeypatch)
+def test_perf_w8a8_block_matmul():
     if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
         pytest.skip("W8A8 block matmul is unavailable on this architecture")
     if flaggems_vllm.vendor_name in ("thead", "metax", "hygon"):

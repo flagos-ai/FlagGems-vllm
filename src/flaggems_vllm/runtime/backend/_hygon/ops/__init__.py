@@ -66,9 +66,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_sca
 from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
-from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_matmul import (
-    w8a8_block_matmul,
-)
+from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16",
