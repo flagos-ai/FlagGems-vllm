@@ -204,7 +204,10 @@ def test_sparse_prefill_all_masked_rows_and_empty_batch_rejection():
 
     def check():
         assert bool((output == 0).all())
-        assert bool(torch.isneginf(lse).all())
+        # FlashMLA uses +inf as the no-valid-key LSE sentinel. The upstream
+        # independent FlashmlaSparseTestKit.ref_fwd maps empty -inf to +inf.
+        assert bool(torch.isposinf(lse).all())
+        assert bool(torch.isneginf(maximum).all())
 
     check_replays(call, lambda value: q.fill_(value), check, outputs=(output, lse))
     output.fill_(17)
