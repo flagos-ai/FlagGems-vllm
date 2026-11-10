@@ -666,8 +666,9 @@ PYTHONPATH=src python -m pytest benchmark/test_causal_conv1d_fn.py --level core 
 * `al.copy(bl.subview(halo, [j,0], [BT,BN], [1,1]), tap)` + `bl.to_tensor(tap)`
   在小规模（BN=64, 4 次迭代）下**逐位正确**，ns=2 + multibuffer 也对；
 * 但把同样的写法放进真实卷积（BN=2304、上万次迭代）后：`extract_slice` 视图
-  版本**不确定地**出错（同一输入两次运行结果不同 → 竞态，不是单纯的 CSE），
-  `al.copy` 版本也会错 3.6M 个元素。
+  版本会**确定性**地读到旧版本（maxerr≈16，两次运行结果相同；早期探针用 `T`
+  当行 stride、只在 `T==C` 时自洽，所以曾误判成竞态），`bind_buffer` 与
+  `al.copy` 两种写法「谁正确」随编译变化。
 
 结论：**不是纯使用问题**。`halo` 缓冲在循环外分配、视图在循环内被当循环不变量
 处理，加上 ns=2 的流水级重叠，导致读到的行可能被下一轮的 DMA/拷贝覆盖；
@@ -684,7 +685,7 @@ PYTHONPATH=src python -m pytest benchmark/test_causal_conv1d_fn.py --level core 
 | `mb=False` + `num_stages=3` + 更高 tile | 268 µs | 更慢 |
 | 满通道 tile 去掉 channel mask | 247 µs | 无变化（mask 免费） |
 | `num_stages=3/4` | 251/250 µs | 无变化 |
-| 单读 + `extract_slice` / `al.copy` 移位 | 142–190 µs | 结果错误/竞态，不可用 |
+| 单读 + `extract_slice` / `al.copy` 移位 | 186–202 µs（1.3–1.4x） | 视图读到旧版本（maxerr≈16）；bind/copy 谁正确随编译变化，搬进真实 kernel 后 96 例中 20–32 例算错 |
 | prologue 用标量 `if rel >= 0` 分支掉无效的 x load | 未测完 | 单核编译时间从 ~2s 涨到 ~30s（96 例矩阵 10 分钟没编完），放弃 |
 | conv_state 回写改成 2D tile（`[W-1, BLOCK_N]` + `tl.trans`） | 263 / 263 / 230 / 837 µs | 比现状（233 / 231 / 204 / 805）**慢 13%**，回退：该 tile 的每行只有 W-1 个 token（6–8 B），DMA 形态比逐行 1D 读更差，`trans` 与双 mask 又添了向量开销 |
 
@@ -709,8 +710,9 @@ channel-first 路径的 peeled tail 原先固定 32 行（`BLOCK_T_TAIL=32`）�
 
 ### 9.4 结论与下一步
 
-要拿到 2.5× 的 MTE2 流量收益，必须先解决 triton-ascend「视图 + `num_stages=2`
-流水」的竞态；这已经是一个可复现的编译器缺陷（同一 kernel 同输入两次运行结果
-不同），建议带着最小复现提给 triton-ascend/FlagTree。在那之前，本算子的最优
+要拿到 2.5× 的 MTE2 流量收益，必须先解决 triton-ascend「多缓冲流水 + 视图」
+的版本跟踪问题：同一写法在不同编译下时对时错，出错时是确定性错值。该问题已
+整理为编译器需求 **R3**（`tools/triton_ascend_probes/gaps/g3_pipelined_ub_view_shift.py`）
+与缺陷复现 D4（`defects/d4_extract_slice_pipeline.py`），并写进该目录 README。在那之前，本算子的最优
 表达仍是 4 次 L2 重读，剩余可挖的空间只有 tail/prologue 这类固定开销（合计
 <10%）和集成侧的 token-major 视图传参。

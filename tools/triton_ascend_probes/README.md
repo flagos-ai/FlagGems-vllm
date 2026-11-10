@@ -25,7 +25,7 @@ Triton 版本当前已严格对齐三段式设计，并实现了源码级 AIV/AI
 对融合版 Prepare 进行 Profiling 剖析显示：`aiv_vec = 75.4%`，`aic_mac = 6.2%`。这表明 **AIV 向量指令依赖链是唯一的关键路径瓶颈**。
 
 > [!IMPORTANT]
-> **评估结论**：经过边界划分与技术解耦，真正阻碍性能对齐的**编译器核心需求仅剩 R1 与 R2**。其余能力 均已验证支持（第 1 节），或属于已有可用绕行方案的软件缺陷（第 3 节）。
+> **评估结论**：经过边界划分与技术解耦，chunk_kda 侧真正阻碍性能对齐的**编译器核心需求为 R1 与 R2**。其余能力均已验证支持（第 1 节），或属于已有可用绕行方案的软件缺陷（第 3 节）。本轮在 `causal_conv1d_fn` 上又定位到一项阻断性需求 **R3**（流水下 tile 行偏移复用），见下文。
 
 ---
 
@@ -103,6 +103,42 @@ c = al.dot(bl.to_tensor(l1), tb, format_a="fractal", format_b="fractal")
 
 支持超长链的分段自动融合（如每 4–8 个操作划为一个融合块），并修复 `vf_fusion_mode=all-op` 的编译崩溃问题。
 
+### R3：流水化 tile 的行偏移复用（P0，阻断性）
+
+#### 需求描述
+
+`causal_conv1d_fn` 这类 depthwise 卷积在每个输出 tile 上需要 `W` 个 tap（`x[t-W+1..t]`）。AscendC 只从 GM 读一份 tile，`W` 个 tap 是同一份 UB 缓冲的行偏移视图；Triton 里对应的写法是一次 `load` + `extract_slice` 取行偏移。但当前在 `num_stages=2` + auto multi-buffer 下，这类视图会读到旧版本缓冲（确定性错值，maxerr 约 16），换 `bind_buffer` 或先 `al.copy` 到独立 UB 缓冲也只是"有时正确"。结果是生产 kernel 只能按行偏移重读 `W` 次，MTE2 流量从 1.375x 变成 5x。
+
+#### AscendC 证据（确认具备硬件能力）
+
+源码参考：`causal_conv1d_tiling_planner.h` 的 `RunSeq` / `RunSeqFnRolling`
+每行输入只从 GM 读一次，`W` 个 tap 在 UB 内按行偏移复用（滚动状态 `s_k` 只用于跨 chunk 的边界），没有重复 GM 访问。`flash-linear-attention-npu` 的因果卷积正是靠这一点领先。
+
+#### Triton 现状与实测分析（`gaps/g3_pipelined_ub_view_shift.py`、`defects/d4_extract_slice_pipeline.py`）
+
+生产配置（`C=9216, T=8192, BLOCK_N=2304, BLOCK_T=4, 32 split`）：
+
+| 写法 | ns=1, mb=False | ns=2, mb=True | 耗时 (ns=2) |
+| --- | --- | --- | ---: |
+| `read4`（四次 GM 读，现网做法） | — | — | 245–273 us |
+| 裸 `extract_slice(tile)` | PASS（0） | **FAIL**（maxerr≈16） | 186–202 us |
+| `bind_buffer` + 视图 | PASS（0） | 不稳定（本轮 PASS / 另一轮 FAIL） | 202–238 us |
+| `al.copy` 到独立 UB 缓冲 | PASS（0） | 不稳定（本轮 FAIL / 另一轮 PASS） | 201–274 us |
+
+- 关掉流水/多缓冲后三种写法都逐位正确，但耗时 272–280 us，已慢于重读，"单读"的收益消失；
+- 把能正确工作的写法搬进 production kernel（带 prologue、tail、多 range 网格）后，96 个回归用例中 20–32 个算错，因此尚未上线。
+
+#### 期望改进
+
+- auto multi-buffer / 软件流水对 `extract_slice`、`insert_slice` 的视图做别名与版本跟踪，保证 `num_stages=2` 下读到的是当前迭代版本；
+- 或提供显式的"行偏移复用"原语（UB 缓冲上的静态行偏移视图，由编译器保证版本正确）。
+
+验收口径：`gaps/g3_pipelined_ub_view_shift.py` 的两种移位写法在 `num_stages=2, multibuffer=True` 下都与 `read4` 逐位一致，且不慢于 `read4`。
+
+#### 收益评估
+
+`causal_conv1d_fn` 在 KDA prefill 形状上 MTE2 流量从 5x 降到 1.375x：token-major 目标约 111 us（现 155 us），channel-first 目标约 120 us（现 232 us）。后者是当前在诚实输入契约（channel-first 连续 layout）下唯一仍落后 AscendC 的路径（0.70x，几何平均 0.75x）；R3 落地后预计翻转为 1.3x 以上。
+
 ## 探针目录结构与验证指南
 
 ### 目录组织
@@ -118,12 +154,13 @@ tools/triton_ascend_probes/
 │   └── s4_manual_cross_core_sync.py # 手工 sync_block_* 跨核同步
 ├── gaps/                          # 【核心需求】Triton 缺失、AscendC 可做
 │   ├── g1_nd2nz_staging.py        # R1：ND→zN 暂存与 UB 内存预算验证
-│   └── g2_vec_chain_fusion.py     # R2：长向量链融合与性能断崖验证
+│   ├── g2_vec_chain_fusion.py     # R2：长向量链融合与性能断崖验证
+│   └── g3_pipelined_ub_view_shift.py # R3：流水下单读 + tile 行偏移复用
 └── defects/                       # 【缺陷】编译器 Bug，已有绕行方案
     ├── d1_scope_auto_sync.py      # D1：scope 崩溃与同步错误
     ├── d2_insert_slice_dot.py     # D2：insert_slice 作 dot 操作数崩溃
     ├── d3_l1_view_2d.py           # D3：2D ND 在 L1 上 view/to_tensor 失败
-    └── d4_extract_slice_pipeline.py # D4：单读 + UB 切片移位读到旧行/竞态
+    └── d4_extract_slice_pipeline.py # D4：单读 + UB 切片移位读到旧版本缓冲
 ```
 
 ### 运行方式
@@ -151,8 +188,9 @@ tools/triton_ascend_probes/
 | **gaps**      | `g1_nd2nz_staging.py plain`                   | **PASS**（基线正常通过）                           |
 | **gaps**      | `g1_nd2nz_staging.py l1a / l1b / l1`          | **FAIL**：UB 内存溢出（3.15 / 3.28 / 2.50 Mbit）  |
 | **gaps**      | `g2_vec_chain_fusion.py`                      | N=4 已融合，N=8/12 出现显著耗时断崖                    |
+| **gaps**      | `g3_pipelined_ub_view_shift.py`               | **GAP**：`read4` 245–273 us；单读+行偏移 1.3–1.4x，但两种写法只有时正确（判定为 0/2–2/2，随编译变化） |
 | **defects**   | `d1_scope_auto_sync.py scope`                 | **FAIL**：SIGSEGV 崩溃                        |
 | **defects**   | `d1_scope_auto_sync.py scope_noauto`          | 编译通过，但计算数值错误（maxerr ≈ 1e2）                 |
 | **defects**   | `d2_insert_slice_dot.py insert / l1_insert`   | **FAIL**：`Unknown PIPE!` 触发 SIGABRT        |
 | **defects**   | `d3_l1_view_2d.py nd / target`                | **FAIL**：报 `cbuf vs ub` 或 `unsupported op` |
-| **defects**   | `d4_extract_slice_pipeline.py`                | **FAIL**：真实 tile 下移位视图全错且两次运行结果不同（竞态）；小规模结果随写法/ns 跳变 |
+| **defects**   | `d4_extract_slice_pipeline.py`                | **FAIL**：`ns=2` 且开多缓冲时裸视图读到旧版本（maxerr≈16，确定性）；bind/copy 写法时对时错 |

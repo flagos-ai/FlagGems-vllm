@@ -37,6 +37,7 @@ run "g1 nd->zN l1a (A panels)"     "$P/gaps/g1_nd2nz_staging.py" l1a
 run "g1 nd->zN l1b (B panels)"     "$P/gaps/g1_nd2nz_staging.py" l1b
 run "g1 nd->zN l1  (all panels)"   "$P/gaps/g1_nd2nz_staging.py" l1
 run "g2 vec chain fusion"          "$P/gaps/g2_vec_chain_fusion.py"
+run "g3 pipelined UB row shift"   "$P/gaps/g3_pipelined_ub_view_shift.py"
 
 echo "################ defects (expect FAIL; workaround exists) ################"
 run "d1 scope (default)"           "$P/defects/d1_scope_auto_sync.py" scope
@@ -45,3 +46,4 @@ run "d2 insert_slice -> dot"       "$P/defects/d2_insert_slice_dot.py" insert
 run "d2 insert_slice -> L1 dot"    "$P/defects/d2_insert_slice_dot.py" l1_insert
 run "d3 2D ND L1 view"             "$P/defects/d3_l1_view_2d.py" nd
 run "d3 L1 target_shape view"      "$P/defects/d3_l1_view_2d.py" target
+run "d4 single-read UB shift"      "$P/defects/d4_extract_slice_pipeline.py"
