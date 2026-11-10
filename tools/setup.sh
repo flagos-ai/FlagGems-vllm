@@ -29,6 +29,11 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 VENV_DIR="${VENV_DIR:-.venv}"
 MIRROR="${PIP_INDEX_URL:-https://pypi.org/simple}"
 
+# Version pins live in conf/ci-pins.yaml (single source of truth). Each
+# variable below keeps an explicit `:-default` only as a fallback for when
+# the pins file is missing or unreadable (e.g. running setup.sh from a
+# checkout that only copied src/). When the file is present, the pins below
+# override these defaults via the awk block that follows.
 VLLM_VERSION="${VLLM_VERSION:-0.20.2}"
 
 # `uv`'s --torch-backend=auto probes the local CUDA driver version and maps
@@ -55,6 +60,33 @@ FLAGOS_PYPI_NVIDIA="${FLAGOS_PYPI_NVIDIA:-https://resource.flagos.net/repository
 # support that some ops here require (e.g. AttributeError on
 # `buffered_tensor.reshape`, WGMMA type/shape assertion failures).
 FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.7.0}"
+
+# ── Read pins from conf/ci-pins.yaml ──────────────────────────
+# Phase-1 extraction (awk, no pyyaml): only fills a variable when the caller
+# has NOT already set it. An explicitly exported VLLM_VERSION still wins,
+# so this block is a no-op for any pin the caller pinned explicitly.
+CI_PINS_FILE="${CI_PINS_FILE:-conf/ci-pins.yaml}"
+if [ -f "${CI_PINS_FILE}" ]; then
+  _pin_value() {
+    # Print the first quoted value after "<key>:" (handles inline scalars).
+    awk -v key="$1" '
+      $0 ~ "^"key":" {
+        sub("^"key":[[:space:]]*", "")
+        gsub(/^"|"$/,"")
+        print
+        exit
+      }
+    ' "${CI_PINS_FILE}"
+  }
+  : "${VLLM_VERSION:=$(_pin_value vllm)}"
+  : "${PYTHON_VERSION:=$(_pin_value python)}"
+  : "${TORCH_VERSION:=$(_pin_value torch)}"
+  : "${TORCHAUDIO_VERSION:=$(_pin_value torchaudio)}"
+  : "${TORCHVISION_VERSION:=$(_pin_value torchvision)}"
+  : "${FLAGTREE_VERSION:=$(_pin_value flagtree)}"
+  unset -f _pin_value
+fi
+
 
 # Whether to replace Triton with FlagTree.
 # For temporary container validation, you can run:
