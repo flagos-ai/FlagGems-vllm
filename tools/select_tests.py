@@ -86,7 +86,8 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/topk_softplus_sqrt.py": [
-        "tests/test_topk_softplus_sqrt_metax.py"
+        "tests/test_topk_softplus_sqrt.py",
+        "tests/test_topk_softplus_sqrt_metax.py",
     ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
