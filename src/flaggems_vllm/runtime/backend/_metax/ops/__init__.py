@@ -55,15 +55,15 @@ from flaggems_vllm.runtime.backend._metax.ops.mqa_logits import mqa_logits
 from flaggems_vllm.runtime.backend._metax.ops.paged_mqa_logits import paged_mqa_logits
 
 __all__ = [
-    "paged_mqa_logits",
-    "mqa_logits",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "mqa_logits",
     "outplace_fused_experts",
+    "paged_mqa_logits",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
