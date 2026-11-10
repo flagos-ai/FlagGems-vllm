@@ -727,3 +727,11 @@ def test_public_qnorm_cache_changed_input_graph(num_tokens):
         k_cache_compare(cache, expected_cache, block, rtol=1e-2, atol=1e-2)
         # The unused extra page remains untouched; state is reset before each replay.
         assert torch.equal(cache[-1], expected_cache[-1])
+
+
+@pytest.fixture(autouse=True)
+def restore_qnorm_rng_state():
+    cpu, gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
+    yield
+    torch.set_rng_state(cpu)
+    torch.cuda.set_rng_state(gpu)
