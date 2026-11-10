@@ -370,9 +370,14 @@ def mhc_pre(
     n_splits: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     logger.debug("GEMS_METAX MHC_PRE")
+    if not residual.is_cuda or any(
+        tensor.device != residual.device for tensor in (fn, hc_scale, hc_base)
+    ):
+        raise ValueError("mHC tensors must share an accelerator device")
     with torch_device_fn.device(residual.device):
         eligible = (
-            residual.ndim >= 3
+            n_splits == 1
+            and residual.ndim >= 3
             and residual.shape[-2:] == (4, 4096)
             and 0 < residual.numel() // 16384 <= 64
             and residual.dtype == torch.bfloat16

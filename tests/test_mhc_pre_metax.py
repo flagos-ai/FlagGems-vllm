@@ -77,3 +77,49 @@ def test_mhc_pre_empty_batch_preserves_shape():
     post, comb, layer = ops.mhc_pre(**data)
     assert post.shape == (0, 4, 1) and comb.shape == (0, 4, 4)
     assert layer.shape == (0, 4096) and layer.dtype == torch.bfloat16
+
+
+@pytest.mark.mhc_pre
+def test_mhc_pre_mixed_device_rejected_before_mutation():
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(1, 4, 4096)
+    data["fn"] = data["fn"].cpu()
+    before = {
+        key: value.clone()
+        for key, value in data.items()
+        if isinstance(value, torch.Tensor)
+    }
+    with pytest.raises(ValueError, match="share an accelerator"):
+        ops.mhc_pre(**data)
+    for key, value in before.items():
+        assert torch.equal(data[key], value)
+
+
+@pytest.mark.mhc_pre
+def test_mhc_pre_nondefault_splits_preserves_common_warning():
+    from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre_ref
+
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(1, 4, 4096)
+    data["n_splits"] = 2
+    with pytest.warns(RuntimeWarning, match="n_splits"):
+        actual = ops.mhc_pre(**data)
+    reference = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in data.items()
+        if key != "n_splits"
+    }
+    for result, expected in zip(actual, mhc_pre_ref(**reference)):
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.fixture(autouse=True)
+def restore_mhc_test_rng_state():
+    # The upstream data helper deliberately seeds globally; contain that effect
+    # within each test rather than leaking it into another operator's tests.
+    cpu, gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
+    yield
+    torch.set_rng_state(cpu)
+    torch.cuda.set_rng_state(gpu)
