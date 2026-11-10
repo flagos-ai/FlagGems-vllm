@@ -66,18 +66,7 @@ class Int8StateGdnBenchmark(Benchmark):
 
     def set_shapes(self, shape_file_path: str):
         # The shared operator ID also covers FP8, whose shape layout differs.
-        is_default = (
-            Path(shape_file_path).resolve()
-            == Path(__file__).with_name("core_shapes.yaml").resolve()
-        )
-        if ASCEND_INT8_STATE and is_default:
-            shape_source = (
-                Path(flaggems_vllm.__file__).parent
-                / "runtime/backend/_ascend/core_shapes.yaml"
-            )
-        else:
-            shape_source = Path(shape_file_path)
-        with open(shape_source) as shape_file:
+        with open(shape_file_path) as shape_file:
             shape_config = yaml.safe_load(shape_file).get("gdn_w8a16_int8")
         if shape_config is None:
             super().set_shapes(shape_file_path)
