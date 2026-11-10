@@ -62,6 +62,11 @@ ascend = [
     "vllm-ascend==0.24.0rc1",
 ]
 
+thead = [
+    "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.23.0+v0.2.0.ppu2.2.0/vllm-0.23.0+cu130torch2.10.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "scikit-learn>=1.5",
+]
+
 [tool.uv]
 exclude-dependencies = [
     # Torch stack: supplied by the backend image, must not be replaced.
