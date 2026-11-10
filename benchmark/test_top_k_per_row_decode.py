@@ -58,8 +58,12 @@ def _torch_topk_ref(
     logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
 ):
     """Pure-PyTorch fallback reference using torch.topk."""
-    seq_len = seq_lens[0].item()
-    valid_logits = logits[:, :seq_len]
+    rows = torch.arange(num_rows, device=logits.device)
+    lengths = seq_lens[rows // next_n]
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    valid_logits = logits.masked_fill(
+        columns[None, :] >= lengths[:, None], -float("inf")
+    )
     _, top_idx = torch.topk(valid_logits, top_k, dim=1, largest=True, sorted=False)
     indices.copy_(top_idx.to(torch.int32))
 
