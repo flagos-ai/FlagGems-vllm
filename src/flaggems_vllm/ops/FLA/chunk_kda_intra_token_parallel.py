@@ -62,17 +62,6 @@ def _prune_ascend_head_tiles(configs, named_args, **kwargs):
     ] or configs
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("chunk_kda_fwd_intra_token_parallel"),
-    key=["H", "HV", "K", "BT", "BC", "IS_VARLEN"],
-    prune_configs_by=(
-        {"early_config_prune": _prune_ascend_head_tiles}
-        if runtime.device.vendor_name == "ascend"
-        else None
-    ),
-    use_cuda_graph=False,
-)
 @triton.jit(do_not_specialize=["T", "N"])
 def _chunk_kda_intra_token_parallel_kernel(
     Q,
@@ -137,6 +126,32 @@ def _chunk_kda_intra_token_parallel_kernel(
         kk = tl.sum(k_beta * weighted_key, axis=1) * tl.where(j < local_t, 1.0, 0.0)
         tl.store(Aqk + (token * HV + heads) * BT + j % BT, qk, heads < HV)
         tl.store(Akk + (token * HV + heads) * BC + j - sub_begin, kk, heads < HV)
+
+
+def _tune_intra_kernel(configs, key, prune_configs_by=None):
+    tuner = libtuner(
+        configs=configs,
+        key=key,
+        prune_configs_by=prune_configs_by,
+        use_cuda_graph=False,
+    )
+    return libentry()(tuner(_chunk_kda_intra_token_parallel_kernel))
+
+
+_tune_keys = ["H", "HV", "K", "BT", "BC", "IS_VARLEN"]
+_configs = runtime.get_tuned_config("chunk_kda_fwd_intra_token_parallel")
+_vendor = runtime.device.vendor_name
+_metax_short_dense_kernel = None
+if _vendor == "metax":
+    # Distinct tuner and launch caches keep a short dense choice from leaking
+    # into long or packed workloads that share the same JIT signature.
+    _metax_short_dense_kernel = _tune_intra_kernel(_configs, [*_tune_keys, "T"])
+    _configs = [config for config in _configs if config.kwargs["BH"] <= 4]
+_intra_kernel = _tune_intra_kernel(
+    _configs,
+    _tune_keys,
+    {"early_config_prune": _prune_ascend_head_tiles} if _vendor == "ascend" else None,
+)
 
 
 def chunk_kda_fwd_intra_token_parallel(
@@ -261,8 +276,17 @@ def chunk_kda_fwd_intra_token_parallel(
     def grid(meta):
         return (B * T, triton.cdiv(HV, meta["BH"]))
 
+    kernel = _intra_kernel
+    if (
+        _metax_short_dense_kernel is not None
+        and cu_seqlens is None
+        and B * T <= 256
+        and HV >= 16
+        and K <= 128
+    ):
+        kernel = _metax_short_dense_kernel
     with torch_device_fn.device(q.device):
-        _chunk_kda_intra_token_parallel_kernel[grid](
+        kernel[grid](
             q,
             k,
             gk,
