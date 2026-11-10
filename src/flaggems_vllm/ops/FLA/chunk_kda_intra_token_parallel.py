@@ -145,8 +145,12 @@ _metax_short_dense_kernel = None
 if _vendor == "metax":
     # Distinct tuner and launch caches keep a short dense choice from leaking
     # into long or packed workloads that share the same JIT signature.
-    _metax_short_dense_kernel = _tune_intra_kernel(_configs, [*_tune_keys, "T"])
-    _configs = [config for config in _configs if config.kwargs["BH"] <= 4]
+    _short_dense_configs = runtime.get_tuned_config(
+        "chunk_kda_fwd_intra_token_parallel_short_dense"
+    )
+    _metax_short_dense_kernel = _tune_intra_kernel(
+        _configs + _short_dense_configs, [*_tune_keys, "T"]
+    )
 _intra_kernel = _tune_intra_kernel(
     _configs,
     _tune_keys,
