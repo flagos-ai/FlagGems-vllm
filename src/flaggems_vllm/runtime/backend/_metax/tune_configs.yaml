@@ -190,3 +190,18 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+silu_and_mul_with_clamp:
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+
+silu_and_mul_with_clamp_linear:
+  - META:
+      BLOCK_SIZE: 1024
+      UNMASKED: false
+    num_warps: 4
+    num_stages: 1
+
+# Single validated launch candidate avoids benchmarking inside zero-warmup graphs.
