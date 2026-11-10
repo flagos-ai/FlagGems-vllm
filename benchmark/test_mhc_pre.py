@@ -14,7 +14,16 @@ from .test_mhc import MHCPreBenchmark
 class MetaXMHCPreBenchmark(MHCPreBenchmark):
     def set_shapes(self, shape_file_path=None):
         # Cover both sides of the fused/split crossing and the generic fallback.
-        self.shapes = [(1, 4096), (64, 4096), (65, 4096), (512, 4096), (3, 128)]
+        self.shapes = [
+            (1, 4096),
+            (64, 4096),
+            (65, 4096),
+            (128, 4096),
+            (129, 4096),
+            (512, 4096),
+            (4096, 4096),
+            (3, 128),
+        ]
 
 
 @pytest.mark.mhc_pre

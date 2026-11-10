@@ -14,8 +14,8 @@
 
 """MetaX C550-optimized mhc_pre.
 
-[KernelGen] Auto-generated and tuned for MetaX C550.
-Historical contribution from PR #755; no performance claim for this source candidate.
+The split fast path is restricted to BF16 [1..128,4,4096].
+Larger batches retain the common implementation; unselected kernels are omitted.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre as _legacy_mhc_pre
+from flaggems_vllm.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
@@ -43,16 +44,9 @@ logger = logging.getLogger(__name__)
 #      comb_mix = sinkhorn(softmax(comb_affine)) with sinkhorn_repeat iters
 #   4. layer_input[t, h] = bf16( sum_i pre_mix[t,i] * residual[t,i,h] )
 #
-# Two kernels:
-#   A (heads): token-tile grid; GEMM + RMS + affine + activations + Sinkhorn,
-#              writes post_out, comb_out, and pre_scratch.
-#   B (layer): (token-tile, hidden-tile) grid; weighted reduction over heads.
-#
-# Column permutation inside the GEMM dot so every epilogue block is aligned:
-#   tile col q <  N^2        -> fn row m = 2N + q   (comb, flat i*N+j)
-#   tile col q in [N^2, M)   -> fn row m = q - N^2  (pre m=q-N^2 then post)
-# Tile width is 2*N^2 (>= M for N >= 2). Comb occupies the first N^2 cols.
-# ---------------------------------------------------------------------------
+# Small-batch pipeline retained from historical PR #755: per-call BF16 cast,
+# four-way partial projection/RMS reduction, combined head epilogue, and
+# weighted layer output. Larger batches use the existing common implementation.
 
 
 @triton.jit
@@ -62,119 +56,6 @@ def _mhc_pre_cast_kernel(fn, fn_b, n, BLOCK: tl.constexpr):
     m = i < n
     v = tl.load(fn + i, mask=m)
     tl.store(fn_b + i, v.to(tl.bfloat16), mask=m)
-
-
-@triton.jit
-def _mhc_pre_heads_kernel(
-    residual,
-    fn_b,
-    hc_scale,
-    hc_base,
-    pre_scratch,
-    post_out,
-    comb_out,
-    T,
-    K,
-    rms_eps,
-    hc_pre_eps,
-    hc_sinkhorn_eps,
-    hc_post_mult_value,
-    N: tl.constexpr,
-    SINK_REP: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    N2: tl.constexpr = N * N
-    M: tl.constexpr = 2 * N + N2  # real fn rows
-    W: tl.constexpr = 2 * N2  # dot tile width (>= M)
-
-    pid = tl.program_id(0)
-    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    tmask = offs_t < T
-
-    # per-head affine scalars
-    s0 = tl.load(hc_scale)  # pre
-    s1 = tl.load(hc_scale + 1)  # post
-    s2 = tl.load(hc_scale + 2)  # comb
-
-    q = tl.arange(0, W)
-    # tile col -> fn row
-    mq = tl.where(q < N2, q + 2 * N, q - N2)
-    qvalid = q < M
-    base_t = tl.load(hc_base + mq, mask=qvalid, other=0.0)  # [W] fp32
-    s_all = tl.where(
-        q < N2, s2, tl.where(q < N2 + N, s0, tl.where(q < N2 + 2 * N, s1, 0.0))
-    )
-
-    acc = tl.zeros((BLOCK_T, W), dtype=tl.float32)
-    sq = tl.zeros((BLOCK_T,), dtype=tl.float32)
-
-    kk = tl.arange(0, BLOCK_K)
-    for k0 in range(0, K, BLOCK_K):
-        kcur = k0 + kk
-        km = kcur < K
-        x = tl.load(
-            residual + offs_t[:, None] * K + kcur[None, :],
-            mask=tmask[:, None] & km[None, :],
-            other=0.0,
-        )  # bf16
-        xf = x.to(tl.float32)
-        sq += tl.sum(xf * xf, axis=1)
-        ft = tl.load(
-            fn_b + mq[:, None] * K + kcur[None, :],
-            mask=qvalid[:, None] & km[None, :],
-            other=0.0,
-        )  # bf16
-        acc = tl.dot(x, tl.trans(ft), acc)
-
-    # RMS factor over the whole flattened row
-    r = tl.rsqrt(sq * (1.0 / K.to(tl.float32)) + rms_eps)
-    mix = acc * r[:, None]
-
-    # affine on the permuted tile: [BLOCK_T, W]
-    aff = mix * s_all[None, :] + base_t[None, :]
-
-    # split: comb = cols [0, N2) (a=0), hp = cols [N2, W) (a=1, pre+post)
-    aff3 = tl.reshape(aff, (BLOCK_T, 2, N2))
-    comb_aff = tl.sum(
-        tl.where((tl.arange(0, 2))[None, :, None] == 0, aff3, 0.0), axis=1
-    )
-    hp_aff = tl.sum(tl.where((tl.arange(0, 2))[None, :, None] == 1, aff3, 0.0), axis=1)
-
-    # ---- comb: softmax over j, then iterated Sinkhorn ----
-    C = tl.reshape(comb_aff, (BLOCK_T, N, N))  # [b, i, j]
-    mx = tl.max(C, axis=2)
-    e = tl.exp(C - mx[:, :, None])
-    C = e / tl.sum(e, axis=2)[:, :, None] + hc_sinkhorn_eps
-    cs = tl.sum(C, axis=1)  # over i (columns)
-    C = C / (cs[:, None, :] + hc_sinkhorn_eps)
-    for _ in tl.static_range(SINK_REP - 1):
-        rs = tl.sum(C, axis=2)  # over j (rows)
-        C = C / (rs[:, :, None] + hc_sinkhorn_eps)
-        cs = tl.sum(C, axis=1)
-        C = C / (cs[:, None, :] + hc_sinkhorn_eps)
-    comb_tile = tl.reshape(C, (BLOCK_T, N2))
-    tl.store(
-        comb_out + offs_t[:, None] * N2 + tl.arange(0, N2)[None, :],
-        comb_tile,
-        mask=tmask[:, None],
-    )
-
-    # ---- pre / post: sigmoid from hp block ----
-    cidx = tl.arange(0, N2)
-    sig = tl.sigmoid(hp_aff)  # [BLOCK_T, N2]
-    pre_val = tl.where(cidx < N, sig + hc_pre_eps, 0.0)
-    tl.store(
-        pre_scratch + offs_t[:, None] * N + cidx[None, :],
-        pre_val,
-        mask=tmask[:, None] & (cidx < N)[None, :],
-    )
-    post_val = tl.where((cidx >= N) & (cidx < 2 * N), sig * hc_post_mult_value, 0.0)
-    tl.store(
-        post_out + offs_t[:, None] * N + (cidx - N)[None, :],
-        post_val,
-        mask=tmask[:, None] & (cidx >= N)[None, :] & (cidx < 2 * N)[None, :],
-    )
 
 
 @triton.jit
@@ -374,142 +255,6 @@ def _mhc_pre_layer_kernel(
     )
 
 
-@triton.jit
-def _mhc_pre_fused_kernel(
-    residual,
-    fn_b,
-    hc_scale,
-    hc_base,
-    post_out,
-    comb_out,
-    layer_out,
-    T,
-    K,
-    H,
-    rms_eps,
-    hc_pre_eps,
-    hc_sinkhorn_eps,
-    hc_post_mult_value,
-    N: tl.constexpr,
-    SINK_REP: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Large-T variant: heads epilogue and layer_input pass in one token-tile grid.
-
-    Pass 1 = GEMM + RMS (same permuted-column dot as _mhc_pre_heads_kernel),
-    writes post_out/comb_out. Pass 2 re-streams the same token rows chunked
-    over hidden so layer_input[t, h] = sum_i pre_mix[t,i] * residual[t,i,h]
-    (fp32 accumulate, single RNE bf16 store) with no pre_scratch round-trip.
-    """
-    N2: tl.constexpr = N * N
-    M: tl.constexpr = 2 * N + N2
-    W: tl.constexpr = 2 * N2
-
-    pid = tl.program_id(0)
-    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    tmask = offs_t < T
-
-    s0 = tl.load(hc_scale)
-    s1 = tl.load(hc_scale + 1)
-    s2 = tl.load(hc_scale + 2)
-
-    q = tl.arange(0, W)
-    mq = tl.where(q < N2, q + 2 * N, q - N2)
-    qvalid = q < M
-    base_t = tl.load(hc_base + mq, mask=qvalid, other=0.0)
-    s_all = tl.where(
-        q < N2, s2, tl.where(q < N2 + N, s0, tl.where(q < N2 + 2 * N, s1, 0.0))
-    )
-
-    # ---- pass 1: GEMM + RMS ----
-    acc = tl.zeros((BLOCK_T, W), dtype=tl.float32)
-    sq = tl.zeros((BLOCK_T,), dtype=tl.float32)
-    kk = tl.arange(0, BLOCK_K)
-    for k0 in range(0, K, BLOCK_K):
-        kcur = k0 + kk
-        km = kcur < K
-        x = tl.load(
-            residual + offs_t[:, None] * K + kcur[None, :],
-            mask=tmask[:, None] & km[None, :],
-            other=0.0,
-        )
-        xf = x.to(tl.float32)
-        sq += tl.sum(xf * xf, axis=1)
-        ft = tl.load(
-            fn_b + mq[:, None] * K + kcur[None, :],
-            mask=qvalid[:, None] & km[None, :],
-            other=0.0,
-        )
-        acc = tl.dot(x, tl.trans(ft), acc)
-
-    r = tl.rsqrt(sq * (1.0 / K.to(tl.float32)) + rms_eps)
-    mix = acc * r[:, None]
-    aff = mix * s_all[None, :] + base_t[None, :]
-
-    aff3 = tl.reshape(aff, (BLOCK_T, 2, N2))
-    comb_aff = tl.sum(
-        tl.where((tl.arange(0, 2))[None, :, None] == 0, aff3, 0.0), axis=1
-    )
-    hp_aff = tl.sum(tl.where((tl.arange(0, 2))[None, :, None] == 1, aff3, 0.0), axis=1)
-
-    # comb softmax + iterated Sinkhorn
-    C = tl.reshape(comb_aff, (BLOCK_T, N, N))
-    mx = tl.max(C, axis=2)
-    e = tl.exp(C - mx[:, :, None])
-    C = e / tl.sum(e, axis=2)[:, :, None] + hc_sinkhorn_eps
-    cs = tl.sum(C, axis=1)
-    C = C / (cs[:, None, :] + hc_sinkhorn_eps)
-    for _ in tl.static_range(SINK_REP - 1):
-        rs = tl.sum(C, axis=2)
-        C = C / (rs[:, :, None] + hc_sinkhorn_eps)
-        cs = tl.sum(C, axis=1)
-        C = C / (cs[:, None, :] + hc_sinkhorn_eps)
-    comb_tile = tl.reshape(C, (BLOCK_T, N2))
-    tl.store(
-        comb_out + offs_t[:, None] * N2 + tl.arange(0, N2)[None, :],
-        comb_tile,
-        mask=tmask[:, None],
-    )
-
-    # pre / post sigmoid
-    cidx = tl.arange(0, N2)
-    sigp = tl.sigmoid(hp_aff) + hc_pre_eps
-    sigm = tl.sigmoid(hp_aff) * hc_post_mult_value
-    post_val = tl.where((cidx >= N) & (cidx < 2 * N), sigm, 0.0)
-    tl.store(
-        post_out + offs_t[:, None] * N + (cidx - N)[None, :],
-        post_val,
-        mask=tmask[:, None] & (cidx >= N)[None, :] & (cidx < 2 * N)[None, :],
-    )
-
-    # ---- pass 2: layer_input ----
-    # pre tile [BT, N] is the (a=0) plane of sigp reshaped to [BT, N, N]
-    p_tile = tl.sum(
-        tl.reshape(tl.where(cidx[None, :] < N, sigp, 0.0), (BLOCK_T, N, N)), axis=1
-    )  # [BT, N]
-    nidx = tl.arange(0, N)
-    hoffs = tl.arange(0, BLOCK_H)
-    for h0 in range(0, H, BLOCK_H):
-        hcur = h0 + hoffs
-        hm = hcur < H
-        x3 = tl.load(
-            residual
-            + offs_t[:, None, None] * K
-            + nidx[None, :, None] * H
-            + hcur[None, None, :],
-            mask=tmask[:, None, None] & hm[None, None, :],
-            other=0.0,
-        )
-        accL = tl.sum(x3.to(tl.float32) * p_tile[:, :, None], axis=1)  # [BT, BH]
-        tl.store(
-            layer_out + offs_t[:, None] * H + hcur[None, :],
-            accL,
-            mask=tmask[:, None] & hm[None, :],
-        )
-
-
 _BT_B = 32
 _BH_B = 128
 _WARPS_B = 8
@@ -531,9 +276,10 @@ def run(
     N2 = N * N
     M = 2 * N + N2
 
-    assert N >= 2 and (N & (N - 1)) == 0, "N must be a power of two >= 2"
-    assert fn.shape == (M, K)
-    assert residual.is_contiguous() and fn.is_contiguous()
+    if not (0 < T <= 128 and N == 4 and H == 4096):
+        raise ValueError("MetaX small-batch mHC requires 1..128 rows of [4,4096]")
+    if fn.shape != (M, K) or not (residual.is_contiguous() and fn.is_contiguous()):
+        raise ValueError("Invalid mHC weight shape or layout")
 
     device = residual.device
     fn_b = torch.empty((M, K), dtype=torch.bfloat16, device=device)
@@ -550,179 +296,59 @@ def run(
         num_warps=4,
     )
 
-    if T >= 16384:
-        # fused heads + layer pass in one token-tile grid (saves launch,
-        # pre_scratch round-trip, and the layer kernel's fixed costs)
-        bh_f = 64 if T >= 20480 else 128
-        _mhc_pre_fused_kernel[(triton.cdiv(T, 32),)](
-            residual,
-            fn_b,
-            hc_scale,
-            hc_base,
-            post_out,
-            comb_out,
-            layer_out,
-            T,
-            K,
-            H,
-            float(rms_eps),
-            float(hc_pre_eps),
-            float(hc_sinkhorn_eps),
-            float(hc_post_mult_value),
-            N=N,
-            SINK_REP=int(sinkhorn_repeat),
-            BLOCK_T=32,
-            BLOCK_K=128,
-            BLOCK_H=bh_f,
-            num_warps=4,
-        )
-    elif T == 4096:
-        # fused wins over the 3-kernel split at this grid size
-        _mhc_pre_fused_kernel[(triton.cdiv(T, 16),)](
-            residual,
-            fn_b,
-            hc_scale,
-            hc_base,
-            post_out,
-            comb_out,
-            layer_out,
-            T,
-            K,
-            H,
-            float(rms_eps),
-            float(hc_pre_eps),
-            float(hc_sinkhorn_eps),
-            float(hc_post_mult_value),
-            N=N,
-            SINK_REP=int(sinkhorn_repeat),
-            BLOCK_T=16,
-            BLOCK_K=128,
-            BLOCK_H=128,
-            num_warps=4,
-        )
-    elif T <= 2048:
-        # Few token-tile programs leave long serial K-chains as the wall;
-        # split the flattened row across SPLIT programs (one launch), then
-        # sum the partials and run the head epilogue, then the layer kernel.
-        pre_scratch = torch.empty((T, N), dtype=torch.float32, device=device)
-        if T <= 128:
-            bt_s, SPLIT = 16, 4
-        elif T <= 1024:
-            bt_s, SPLIT = 16, 2
-        else:
-            bt_s, SPLIT = 32, 2
-        KP = K // SPLIT
-        assert K % (SPLIT * 256) == 0, "K must be divisible by SPLIT*256"
-        acc_scratch = torch.empty(
-            (SPLIT, T, N2 * 2), dtype=torch.float32, device=device
-        )
-        sq_scratch = torch.empty((SPLIT, T), dtype=torch.float32, device=device)
-        _mhc_pre_partial_kernel[(triton.cdiv(T, bt_s), SPLIT)](
-            residual,
-            fn_b,
-            acc_scratch,
-            sq_scratch,
-            T,
-            K,
-            KP,
-            N=N,
-            SPLIT=SPLIT,
-            BLOCK_T=bt_s,
-            BLOCK_K=256,
-            num_warps=4,
-        )
-        _mhc_pre_combine_kernel[(triton.cdiv(T, bt_s),)](
-            acc_scratch,
-            sq_scratch,
-            hc_scale,
-            hc_base,
-            pre_scratch,
-            post_out,
-            comb_out,
-            T,
-            K,
-            float(rms_eps),
-            float(hc_pre_eps),
-            float(hc_sinkhorn_eps),
-            float(hc_post_mult_value),
-            N=N,
-            SINK_REP=int(sinkhorn_repeat),
-            SPLIT=SPLIT,
-            BLOCK_T=bt_s,
-            num_warps=4,
-        )
-        _mhc_pre_layer_kernel[(triton.cdiv(T, _BT_B), triton.cdiv(H, _BH_B))](
-            pre_scratch,
-            residual,
-            layer_out,
-            T,
-            K,
-            H,
-            N=N,
-            BLOCK_T=_BT_B,
-            BLOCK_H=_BH_B,
-            num_warps=_WARPS_B,
-        )
-    elif T >= 8192:
-        # fused heads + layer pass in one token-tile grid (saves launch,
-        # pre_scratch round-trip, and the layer kernel's fixed costs)
-        _mhc_pre_fused_kernel[(triton.cdiv(T, 32),)](
-            residual,
-            fn_b,
-            hc_scale,
-            hc_base,
-            post_out,
-            comb_out,
-            layer_out,
-            T,
-            K,
-            H,
-            float(rms_eps),
-            float(hc_pre_eps),
-            float(hc_sinkhorn_eps),
-            float(hc_post_mult_value),
-            N=N,
-            SINK_REP=int(sinkhorn_repeat),
-            BLOCK_T=32,
-            BLOCK_K=128,
-            BLOCK_H=128,
-            num_warps=4,
-        )
-    else:
-        pre_scratch = torch.empty((T, N), dtype=torch.float32, device=device)
-        _mhc_pre_heads_kernel[(triton.cdiv(T, 32),)](
-            residual,
-            fn_b,
-            hc_scale,
-            hc_base,
-            pre_scratch,
-            post_out,
-            comb_out,
-            T,
-            K,
-            float(rms_eps),
-            float(hc_pre_eps),
-            float(hc_sinkhorn_eps),
-            float(hc_post_mult_value),
-            N=N,
-            SINK_REP=int(sinkhorn_repeat),
-            BLOCK_T=32,
-            BLOCK_K=256,
-            num_warps=4,
-        )
-
-        _mhc_pre_layer_kernel[(triton.cdiv(T, _BT_B), triton.cdiv(H, _BH_B))](
-            pre_scratch,
-            residual,
-            layer_out,
-            T,
-            K,
-            H,
-            N=N,
-            BLOCK_T=_BT_B,
-            BLOCK_H=_BH_B,
-            num_warps=_WARPS_B,
-        )
+    pre_scratch = torch.empty((T, N), dtype=torch.float32, device=device)
+    bt_s, SPLIT = 16, 4
+    KP = K // SPLIT
+    if K % (SPLIT * 256):
+        raise ValueError("K must be divisible by SPLIT*256")
+    acc_scratch = torch.empty((SPLIT, T, N2 * 2), dtype=torch.float32, device=device)
+    sq_scratch = torch.empty((SPLIT, T), dtype=torch.float32, device=device)
+    _mhc_pre_partial_kernel[(triton.cdiv(T, bt_s), SPLIT)](
+        residual,
+        fn_b,
+        acc_scratch,
+        sq_scratch,
+        T,
+        K,
+        KP,
+        N=N,
+        SPLIT=SPLIT,
+        BLOCK_T=bt_s,
+        BLOCK_K=256,
+        num_warps=4,
+    )
+    _mhc_pre_combine_kernel[(triton.cdiv(T, bt_s),)](
+        acc_scratch,
+        sq_scratch,
+        hc_scale,
+        hc_base,
+        pre_scratch,
+        post_out,
+        comb_out,
+        T,
+        K,
+        float(rms_eps),
+        float(hc_pre_eps),
+        float(hc_sinkhorn_eps),
+        float(hc_post_mult_value),
+        N=N,
+        SINK_REP=int(sinkhorn_repeat),
+        SPLIT=SPLIT,
+        BLOCK_T=bt_s,
+        num_warps=4,
+    )
+    _mhc_pre_layer_kernel[(triton.cdiv(T, _BT_B), triton.cdiv(H, _BH_B))](
+        pre_scratch,
+        residual,
+        layer_out,
+        T,
+        K,
+        H,
+        N=N,
+        BLOCK_T=_BT_B,
+        BLOCK_H=_BH_B,
+        num_warps=_WARPS_B,
+    )
 
     return (
         post_out.view(T, N, 1),
@@ -744,26 +370,54 @@ def mhc_pre(
     n_splits: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     logger.debug("GEMS_METAX MHC_PRE")
-    eligible = (
-        residual.ndim >= 3
-        and residual.shape[-2:] == (4, 4096)
-        and residual.dtype == torch.bfloat16
-        and residual.is_cuda
-        and residual.is_contiguous()
-        and fn.shape == (24, 16384)
-        and fn.dtype == torch.float32
-        and fn.is_contiguous()
-        and hc_scale.shape == (3,)
-        and hc_base.shape == (24,)
-        and hc_scale.dtype == hc_base.dtype == torch.float32
-        and hc_scale.is_contiguous()
-        and hc_base.is_contiguous()
-        and fn.device == hc_scale.device == hc_base.device == residual.device
-        and sinkhorn_repeat >= 1
-    )
-    if not eligible:
-        return _legacy_mhc_pre(
-            residual,
+    with torch_device_fn.device(residual.device):
+        eligible = (
+            residual.ndim >= 3
+            and residual.shape[-2:] == (4, 4096)
+            and 0 < residual.numel() // 16384 <= 128
+            and residual.dtype == torch.bfloat16
+            and residual.is_cuda
+            and residual.is_contiguous()
+            and fn.shape == (24, 16384)
+            and fn.dtype == torch.float32
+            and fn.is_contiguous()
+            and hc_scale.shape == (3,)
+            and hc_base.shape == (24,)
+            and hc_scale.dtype == hc_base.dtype == torch.float32
+            and hc_scale.is_contiguous()
+            and hc_base.is_contiguous()
+            and fn.device == hc_scale.device == hc_base.device == residual.device
+            and sinkhorn_repeat >= 1
+        )
+        if not eligible:
+            return _legacy_mhc_pre(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
+        outer = residual.shape[:-2]
+        flat = residual.reshape(-1, 4, 4096)
+        if flat.shape[0] == 0:
+            return (
+                torch.empty(
+                    (*outer, 4, 1), device=residual.device, dtype=torch.float32
+                ),
+                torch.empty(
+                    (*outer, 4, 4), device=residual.device, dtype=torch.float32
+                ),
+                torch.empty(
+                    (*outer, 4096), device=residual.device, dtype=torch.bfloat16
+                ),
+            )
+        post, comb, layer = run(
+            flat,
             fn,
             hc_scale,
             hc_base,
@@ -772,25 +426,9 @@ def mhc_pre(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            n_splits,
         )
-    outer = residual.shape[:-2]
-    flat = residual.reshape(-1, 4, 4096)
-    if flat.shape[0] == 0:
         return (
-            torch.empty((*outer, 4, 1), device=residual.device, dtype=torch.float32),
-            torch.empty((*outer, 4, 4), device=residual.device, dtype=torch.float32),
-            torch.empty((*outer, 4096), device=residual.device, dtype=torch.bfloat16),
+            post.view(*outer, 4, 1),
+            comb.view(*outer, 4, 4),
+            layer.view(*outer, 4096),
         )
-    post, comb, layer = run(
-        flat,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-    )
-    return post.view(*outer, 4, 1), comb.view(*outer, 4, 4), layer.view(*outer, 4096)

@@ -29,7 +29,9 @@ def check_replays(call, update, check, outputs=()):
 
 
 @pytest.mark.mhc_pre
-@pytest.mark.parametrize("rows,hidden", [(1, 4096), (65, 4096), (3, 128)])
+@pytest.mark.parametrize(
+    "rows,hidden", [(1, 4096), (65, 4096), (128, 4096), (129, 4096), (3, 128)]
+)
 def test_public_mhc_pre_reference_and_new_input_replay(rows, hidden):
     from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre_ref
 
@@ -64,3 +66,13 @@ def test_public_mhc_pre_reference_and_new_input_replay(rows, hidden):
         graph.replay()
         torch.cuda.synchronize()
         check()
+
+
+@pytest.mark.mhc_pre
+def test_mhc_pre_empty_batch_preserves_shape():
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(0, 4, 4096)
+    post, comb, layer = ops.mhc_pre(**data)
+    assert post.shape == (0, 4, 1) and comb.shape == (0, 4, 4)
+    assert layer.shape == (0, 4096) and layer.dtype == torch.bfloat16
