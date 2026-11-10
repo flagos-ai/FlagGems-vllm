@@ -302,9 +302,7 @@ def make_case(
         else (
             max(0, c - 3)
             if scenario == "pad"
-            else c + 5
-            if scenario == "truncate"
-            else c
+            else c + 5 if scenario == "truncate" else c
         )
     )
     if name == "_pack_sampler_output_kernel":
@@ -313,9 +311,7 @@ def make_case(
             (
                 source_cols
                 if source_cols is not None
-                else max(0, k - 2)
-                if scenario == "pad"
-                else k
+                else max(0, k - 2) if scenario == "pad" else k
             ),
         )
         packed = buffer((n, k + 2 + int(with_nans)), torch.int64, strided, True)
