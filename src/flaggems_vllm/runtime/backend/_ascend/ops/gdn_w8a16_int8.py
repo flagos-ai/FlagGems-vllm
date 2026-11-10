@@ -132,13 +132,14 @@ def transform_state_kernel(
 
 @triton.jit(do_not_specialize=["ROWS"])
 def normalize_qk_kernel(q, k, q_out, k_out, ROWS, K: tl.constexpr, BK: tl.constexpr):
-    for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
-        offsets = row * K + tl.arange(0, BK)
-        mask = tl.arange(0, BK) < K
+    for block in range(tl.program_id(0), tl.cdiv(ROWS, 32), tl.num_programs(0)):
+        rows = block * 32 + tl.arange(0, 32)
+        offsets = rows[:, None] * K + tl.arange(0, BK)[None, :]
+        mask = (rows[:, None] < ROWS) & (tl.arange(0, BK)[None, :] < K)
         query = tl.load(q + offsets, mask, 0).to(tl.float32)
         key = tl.load(k + offsets, mask, 0).to(tl.float32)
-        query *= tl.rsqrt(tl.sum(query * query, 0) + 1e-6)
-        key *= tl.rsqrt(tl.sum(key * key, 0) + 1e-6)
+        query *= tl.rsqrt(tl.sum(query * query, 1) + 1e-6)[:, None]
+        key *= tl.rsqrt(tl.sum(key * key, 1) + 1e-6)[:, None]
         tl.store(q_out + offsets, query, mask)
         tl.store(k_out + offsets, key, mask)
 
@@ -749,7 +750,9 @@ def chunk_gated_delta_rule_w8a16_int8(
         )
         if use_qk_l2norm_in_kernel:
             q_norm, k_norm = torch.empty_like(q), torch.empty_like(k)
-            normalize_qk_kernel[(min(vector_cores(), tokens * query_heads),)](
+            normalize_qk_kernel[
+                (min(vector_cores(), triton.cdiv(tokens * query_heads, 32)),)
+            ](
                 q,
                 k,
                 q_norm,
