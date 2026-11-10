@@ -54,13 +54,13 @@ else:
 from flaggems_vllm.runtime.backend._metax.ops.mhc_pre import mhc_pre
 
 __all__ = [
-    "mhc_pre",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "mhc_pre",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
