@@ -85,10 +85,7 @@ VENDOR_SUBDIRS = ("ops", "fused", "FLA")
 # Per-file exemptions for torch compute calls that dispatch to a vendor-native
 # kernel rather than falling back to CPU/CUDA.  Key: path suffix (posix);
 # value: set of fully-qualified call names that are allowed in that file.
-FILE_ALLOWLIST: dict[str, set[str]] = {
-    # torch.mm on NPU tensors dispatches to CANN native GEMM, not a soft fallback.
-    "runtime/backend/_ascend/ops/mhc_pre.py": {"torch.mm"},
-}
+FILE_ALLOWLIST: dict[str, set[str]] = {}
 
 
 def dotted(node: ast.AST) -> str | None:
