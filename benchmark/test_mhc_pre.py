@@ -16,6 +16,8 @@ class MetaXMHCPreBenchmark(MHCPreBenchmark):
         # Cover both sides of the fused/split crossing and the generic fallback.
         self.shapes = [
             (1, 4096),
+            (16, 4096),
+            (32, 4096),
             (64, 4096),
             (65, 4096),
             (128, 4096),

@@ -14,7 +14,7 @@
 
 """MetaX C550-optimized mhc_pre.
 
-The split fast path is restricted to BF16 [1..128,4,4096].
+The split fast path is restricted to BF16 [1..64,4,4096].
 Larger batches retain the common implementation; unselected kernels are omitted.
 """
 
@@ -276,8 +276,8 @@ def run(
     N2 = N * N
     M = 2 * N + N2
 
-    if not (0 < T <= 128 and N == 4 and H == 4096):
-        raise ValueError("MetaX small-batch mHC requires 1..128 rows of [4,4096]")
+    if not (0 < T <= 64 and N == 4 and H == 4096):
+        raise ValueError("MetaX small-batch mHC requires 1..64 rows of [4,4096]")
     if fn.shape != (M, K) or not (residual.is_contiguous() and fn.is_contiguous()):
         raise ValueError("Invalid mHC weight shape or layout")
 
@@ -374,7 +374,7 @@ def mhc_pre(
         eligible = (
             residual.ndim >= 3
             and residual.shape[-2:] == (4, 4096)
-            and 0 < residual.numel() // 16384 <= 128
+            and 0 < residual.numel() // 16384 <= 64
             and residual.dtype == torch.bfloat16
             and residual.is_cuda
             and residual.is_contiguous()
@@ -404,18 +404,6 @@ def mhc_pre(
             )
         outer = residual.shape[:-2]
         flat = residual.reshape(-1, 4, 4096)
-        if flat.shape[0] == 0:
-            return (
-                torch.empty(
-                    (*outer, 4, 1), device=residual.device, dtype=torch.float32
-                ),
-                torch.empty(
-                    (*outer, 4, 4), device=residual.device, dtype=torch.float32
-                ),
-                torch.empty(
-                    (*outer, 4096), device=residual.device, dtype=torch.bfloat16
-                ),
-            )
         post, comb, layer = run(
             flat,
             fn,

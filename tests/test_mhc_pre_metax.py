@@ -30,7 +30,8 @@ def check_replays(call, update, check, outputs=()):
 
 @pytest.mark.mhc_pre
 @pytest.mark.parametrize(
-    "rows,hidden", [(1, 4096), (65, 4096), (128, 4096), (129, 4096), (3, 128)]
+    "rows,hidden",
+    [(1, 4096), (32, 4096), (64, 4096), (65, 4096), (128, 4096), (129, 4096), (3, 128)],
 )
 def test_public_mhc_pre_reference_and_new_input_replay(rows, hidden):
     from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre_ref
