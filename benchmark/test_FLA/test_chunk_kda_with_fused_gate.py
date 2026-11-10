@@ -2,6 +2,7 @@
 """No-Graph public-host latency; reset the aliased value outside every event."""
 
 import json
+import math
 import os
 import statistics
 from pathlib import Path
@@ -95,39 +96,52 @@ def _measure(shape, dtype, gems, args, kwargs, measure_native):
     result = gems(*args, **kwargs)
     check(result[0], expected[0], dtype)
     check(result[1], expected[1], dtype)
+    gems_expected = (
+        tuple(value.detach().cpu().clone() for value in result)
+        if measure_native
+        else None
+    )
     samples = _latency(gems, args, kwargs, saved)
+    gems_ms = statistics.median(samples)
+    if not math.isfinite(gems_ms) or gems_ms <= 0:
+        raise ValueError(f"invalid Gems latency: {gems_ms}")
     row = dict(
         shape=shape,
         dtype=str(dtype),
         graph=False,
         gems_samples_ms=samples,
-        gems_ms=statistics.median(samples),
+        gems_ms=gems_ms,
         native_ms=None,
         selected_source=None,
     )
     if measure_native:
         try:
             native = _resolve_native()
-        except (ImportError, AttributeError) as error:
-            row["native_unavailable"] = repr(error)
-        else:
+            if native is gems:
+                raise ValueError("native resolves to the Gems candidate")
             args[2].copy_(saved)
             native_result = native(*args, **kwargs)
             check(native_result[0], expected[0], dtype)
             check(native_result[1], expected[1], dtype)
-            # Materialize the aliased native output before the next call.
-            native_expected = native_result[0].clone(), native_result[1].clone()
-            args[2].copy_(saved)
-            result = gems(*args, **kwargs)
-            check(result[0], native_expected[0].cpu(), dtype)
-            check(result[1], native_expected[1].cpu(), dtype)
+            for actual, candidate in zip(native_result, gems_expected, strict=True):
+                check(actual, candidate, dtype)
             native_samples = _latency(native, args, kwargs, saved)
+            native_ms = statistics.median(native_samples)
+            if not math.isfinite(native_ms) or native_ms <= 0:
+                raise ValueError(f"invalid native latency: {native_ms}")
+        except Exception as error:
+            row["native_unavailable"] = (
+                f"native resolution, validation or timing: {error!r}"
+            )
+        else:
             row.update(
                 native_samples_ms=native_samples,
-                native_ms=statistics.median(native_samples),
+                native_ms=native_ms,
                 selected_source="native",
+                native_speedup=native_ms / row["gems_ms"],
             )
-            row["native_speedup"] = row["native_ms"] / row["gems_ms"]
+        finally:
+            args[2].copy_(saved)
     else:
         row["native_unavailable"] = "native timing disabled by --metrics"
     path = os.environ.get("FG_KDA_PERF_RAW")
@@ -161,8 +175,14 @@ class ChunkKDAFusedGateBenchmark(Benchmark):
             raise ValueError("Fused-gate KDA uses --mode kernel with no-Graph events")
         super().init_user_config()
 
+    def run(self):
+        with pytest.MonkeyPatch.context() as config:
+            if Config.user_desired_metrics == ["latency"]:
+                config.setattr(Config, "base_data", None)
+            super().run()
+
     def get_input_iter(self, dtype):
-        unavailable = set()
+        misses = []
         self.dtype = dtype
         for b, t, h, dk, dv, *lengths in self.shapes:
             self.case = (b, t, h, dk, dv, tuple(lengths) or None)
@@ -170,19 +190,24 @@ class ChunkKDAFusedGateBenchmark(Benchmark):
             args, kwargs = build(self.case, dtype)
             yield (*args, kwargs)
             if self.row and self.row.get("native_unavailable"):
-                unavailable.add(self.row["native_unavailable"])
-        if unavailable:
+                misses.append(
+                    dict(shape=self.case, reason=self.row["native_unavailable"])
+                )
+        if misses:
             # The weekly parser uses this metadata to accept missing speedups.
             update_result(
                 self.op_name,
                 dict(
                     dtype=str(dtype),
-                    native_baseline_skip_reason="; ".join(sorted(unavailable)),
+                    native_baseline_skip_reason="; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    native_baseline_misses=misses,
                 ),
             )
 
     def record_shapes(self, *args, **kwargs):
-        return self.case
+        return dict(case=self.case, inputs=super().record_shapes(*args, **kwargs))
 
     def get_latency(self, op, *args, **kwargs):
         # Use one oracle and snapshot for both providers and keep the aliased
