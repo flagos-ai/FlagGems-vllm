@@ -12,6 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+fused_recurrent_gated_delta_rule:
+  # Resolve names through baseline.PERF_CASES to preserve the full workloads.
+  shapes:
+    - [decode1]
+    - [decode16]
+    - [decode64]
+    - [decode256]
+    - [strided]
+    - [mtp]
+    - [ragged]
+    - [tail]
+  shape_desc: "case (baseline.PERF_CASES)"
+fused_recurrent_gated_delta_rule_packed_decode:
+  shapes:
+    - [1, 8, 16, 128, 128]
+    - [4, 8, 16, 128, 128]
+    - [16, 8, 16, 128, 128]
+    - [64, 8, 16, 128, 128]
+    - [256, 8, 16, 128, 128]
+    - [9, 4, 12, 64, 32]
+    - [3, 2, 4, 17, 23]
+    - [1, 16, 64, 128, 128]
+  shape_desc: "B, H, HV, K, V"
+fused_indexer_weight_scale:
+  # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
+  shapes:
+    - [4, 32]  # count=1079584
+    - [8, 32]  # count=177584
+    - [35, 32]  # count=158752
+    - [65, 32]  # count=158576
+    - [18, 32]  # count=90288
+    - [46, 32]  # count=90112
+    - [13, 32]  # count=86064
+    - [51, 32]  # count=85888
+    - [24, 32]  # count=20064
+    - [76, 32]  # count=19712
+  shape_desc: "tokens, heads"
+
+gdn_w8a16:
+  shapes:
+    - [1, 1, 2, 4, 128, 128]
+    - [32, 1, 2, 4, 128, 128]
+    - [128, 1, 2, 6, 128, 128]
+    - [1024, 1, 2, 6, 128, 128]
+    - [8192, 1, 2, 6, 128, 128]
+    - [1, 8, 2, 4, 128, 128]
+    - [2, 192, 2, 6, 128, 128]
+    - [16, 128, 2, 4, 128, 128]
+  shape_desc: "N, T, H, HV, K, V"
+
 concat_mla_q:
   shapes:
     - [1, 64, 512, 64]
@@ -154,6 +204,14 @@ BlasBenchmark:
     - [16, 4096, 4096, 4096]
   shape_desc: "B, M, N, K"   # shapes are defined as (B, M, N, K)
 
+# Complete dtype/weight/layout bindings live in baseline/grouped_gemma_rmsnorm.py.
+grouped_gemma_rmsnorm:
+  # Keep one wide decode reduction and one model-sized grouped prefill in core.
+  # set_more_shapes() restores the complete baseline matrix in comprehensive.
+  shapes:
+    - [1, 8192, 1]
+    - [128, 10240, 4]
+  shape_desc: "N, DIM, num_groups"
 groupmm:
   shapes:
     - [16, 512, 2048]
@@ -524,9 +582,63 @@ swiglu:
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
 
+flash_mla_with_kvcache_w8a8:
+  shape_desc: "batch, queries, length, heads, varlen"
+  shapes:
+    - [128, 1, 4096, 16, false]
+    - [128, 1, 4096, 16, true]
+    - [128, 1, 4096, 128, false]
+    - [128, 1, 4096, 128, true]
+    - [128, 2, 4096, 128, false]
+    - [128, 2, 4096, 128, true]
+    - [128, 1, 8192, 64, false]
+    - [128, 1, 8192, 64, true]
+    - [128, 2, 8192, 64, false]
+    - [128, 2, 8192, 64, true]
+    - [128, 1, 8192, 128, false]
+    - [128, 1, 8192, 128, true]
+    - [128, 2, 8192, 128, false]
+    - [128, 2, 8192, 128, true]
+    - [128, 2, 16384, 32, false]
+    - [128, 2, 16384, 32, true]
+    - [128, 1, 16384, 128, false]
+    - [128, 1, 16384, 128, true]
+    - [128, 2, 16384, 128, false]
+    - [128, 2, 16384, 128, true]
+fused_allreduce_rms_norm:
+  shapes:
+    - [6, 6144]
+    - [138, 6144]
+  shape_desc: "M, H"
+
 bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]
     - [2, 64, 128, 256]
     - [4, 129, 17, 257]
   shape_desc: "B, M, N, K"
+
+gdn_w8a16_int8:
+  shapes:
+    - [1, 8192, 32, 128]
+    - [3, 8192, 32, 128]
+    - [49, 8192, 32, 128]
+    - [2, 8192, 32, 128]
+    - [31, 8192, 32, 128]
+    - [7, 8192, 32, 128]
+    - [33, 8192, 32, 128]
+    - [29, 8192, 32, 128]
+    - [35, 8192, 32, 128]
+    - [51, 8192, 32, 128]
+  shape_desc: "decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N"
+
+gate_sigmoid_mul:
+  # Full dtype/layout sweep is defined in baseline/gate_sigmoid_mul.py.
+  shapes:
+    - [1, 1536, contiguous]
+    - [16, 3072, split_gate]
+    - [256, 6144, contiguous]
+    - [511, 12288, split_gate]
+    - [512, 12288, contiguous]
+    - [4096, 12288, split_gate]
+  shape_desc: "tokens, width, gate_layout"

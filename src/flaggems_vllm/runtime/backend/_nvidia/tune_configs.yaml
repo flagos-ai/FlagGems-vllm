@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+grouped_gemma_rmsnorm:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
 w8a8_block_fp8_bmm:
   - gen: true
     param_map:
@@ -556,6 +564,19 @@ scaled_int8_quant_dynamic_main_tail:
       - 2
       - 3
 
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 512
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 16
@@ -756,6 +777,21 @@ fused_marlin_moe_w8a16_fp8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 2
 
 fused_marlin_moe_w8a16_int8_gateup_silu_large:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
@@ -790,6 +826,18 @@ fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
@@ -810,6 +858,24 @@ fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
@@ -821,6 +887,15 @@ fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
     num_warps: 4
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_gateup:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
@@ -880,6 +955,39 @@ fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
@@ -1131,4 +1239,171 @@ concat_mla_q:
     num_stages: 1
   - META: {BLOCK: 1024}
     num_warps: 8
+    num_stages: 1
+
+flash_mla_fp8_copy_table:
+  - META: {BLOCK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+
+ckfg_inter:
+  - META:
+      BK: 32
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BK: 64
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BK: 32
+    num_warps: 1
+    num_stages: 4
+  - META:
+      BK: 32
+    num_warps: 2
+    num_stages: 3
+
+ckfg_intra:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+
+ckfg_inverse:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+
+ckfg_recompute:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+
+ckfg_output:
+  - META:
+      BK: 32
+      BV: 64
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BK: 64
+      BV: 64
+    num_warps: 4
+    num_stages: 2
+
+ckfg_gate:
+  - META:
+      BD: 32
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BD: 64
+    num_warps: 4
+    num_stages: 2
+
+ckfg_state:
+  - META:
+      BV: 32
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BV: 64
+    num_warps: 4
+    num_stages: 2
+
+ckfg_norm:
+  - META:
+      ROWS: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      ROWS: 32
+    num_warps: 4
+    num_stages: 2
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 1
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 8
+    num_warps: 1
+    num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+    warps:
+      - 4
+      - 8
+    stages:
+      - 1
+
+hc_combine:
+  - META: {BLOCK_D: 128, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 128, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, LOOP: true}
+    num_warps: 4
     num_stages: 1
