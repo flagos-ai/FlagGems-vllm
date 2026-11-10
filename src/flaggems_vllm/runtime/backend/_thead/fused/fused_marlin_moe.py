@@ -49,6 +49,8 @@ from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
 _PPU_DENSE_MIN_TOKENS = 4096
+_PPU_DENSE_GATE_TILE = 256
+_PPU_DENSE_DOWN_TILE = 2048
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
@@ -2028,7 +2030,6 @@ def run_dense_w8a16(
     topk_weights: torch.Tensor,
     output: torch.Tensor,
     topk_ids: torch.Tensor,
-    chunk_tokens: int,
     scale_safe1: Optional[torch.Tensor],
     scale_safe2: Optional[torch.Tensor],
     is_fp8: bool,
@@ -2041,48 +2042,32 @@ def run_dense_w8a16(
 
     m, k = hidden_states.shape
     e, n2, _ = w1.shape
-    n, topk = n2 // 2, topk_weights.shape[1]
+    n, topk = n2 // 2, topk_ids.shape[1]
+    tile = _PPU_DENSE_GATE_TILE
+    down_tile = _PPU_DENSE_DOWN_TILE
     scratch = torch.empty(
-        (max(w1.numel(), w2.numel()),),
+        (e * max(min(n2, tile) * k, min(k, down_tile) * n),),
         device=hidden_states.device,
         dtype=torch.bfloat16,
     )
-    cache13 = torch.empty(
-        (chunk_tokens * topk * max(n2, k),),
+    # Reuse projection storage after every gate/up value has fed SiLU.
+    cache = torch.empty(
+        (m * topk * max(n2, min(k, down_tile)),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    c2 = torch.empty(
+    gateup = cache[: m * topk * n2].view(m, topk, n2)
+    intermediate = torch.empty(
         (m * topk, n), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    routing = _align_grouped_tokens(topk_ids, 64, e) if chunk_tokens == m else None
-    b1 = scratch[: w1.numel()].view(e, k, n2).transpose(1, 2)
-    b2 = scratch[: w2.numel()].view(e, n, k).transpose(1, 2)
-    for index, (quantized_weight, scales, decoded_weight, scale_safe) in enumerate(
-        ((w1, w1_scale, b1, scale_safe1), (w2, w2_scale, b2, scale_safe2))
+    down = cache[: m * topk * min(k, down_tile)].view(m, topk, min(k, down_tile))
+    sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, 64, e)
+    for index, (weight, scales, safe) in enumerate(
+        ((w1, w1_scale, scale_safe1), (w2, w2_scale, scale_safe2))
     ):
-        output_size, reduction = quantized_weight.shape[1:]
-        for fast in (True, False) if is_fp8 else (True,):
-            decode_bank[(triton.cdiv(output_size, 64), triton.cdiv(reduction, 128), e)](
-                quantized_weight.view(torch.uint8),
-                scales,
-                scratch,
-                scale_safe,
-                output_size,
-                reduction,
-                e,
-                *quantized_weight.stride(),
-                *scales.stride(),
-                is_fp8,
-                fast,
-                64,
-                128,
-                num_warps=4,
-                num_stages=1,
-            )
         first = index == 0
+        output_size, reduction = weight.shape[1:]
         config = get_default_config(
-            # Token alignment also uses 64 rows for the final, shorter chunk.
             max(m, _PPU_DENSE_MIN_TOKENS),
             e,
             output_size,
@@ -2091,25 +2076,43 @@ def run_dense_w8a16(
             "bf16",
             gemm_stage="gemm1" if first else "gemm2",
         )
-        for start in range(0, m, chunk_tokens):
-            end = min(start + chunk_tokens, m)
-            rows = end - start
-            sorted_ids, experts, padded = (
-                routing
-                if routing is not None
-                else _align_grouped_tokens(topk_ids[start:end], 64, e)
+        tile = _PPU_DENSE_GATE_TILE if first else down_tile
+        for col in range(0, output_size, tile):
+            stop = min(col + tile, output_size)
+            width = stop - col
+            qw, ss = weight[:, col:stop], scales[:, col:stop]
+            # Decode only the output columns consumed by this GEMM launch.
+            for fast in (True, False) if is_fp8 else (True,):
+                decode_bank[(triton.cdiv(width, 64), triton.cdiv(reduction, 128), e)](
+                    qw.view(torch.uint8),
+                    ss,
+                    scratch,
+                    safe,
+                    width,
+                    reduction,
+                    e,
+                    *qw.stride(),
+                    *ss.stride(),
+                    is_fp8,
+                    fast,
+                    64,
+                    128,
+                    num_warps=4,
+                    num_stages=1,
+                )
+            decoded = (
+                scratch[: e * reduction * width]
+                .view(e, reduction, width)
+                .transpose(1, 2)
             )
-            intermediate = c2[start * topk : end * topk]
-            projected = cache13[: rows * topk * output_size].view(
-                rows, topk, output_size
-            )
+            projected = gateup[:, :, col:stop] if first else down[:, :, :width]
             invoke_fused_moe_triton_kernel(
-                hidden_states[start:end] if first else intermediate,
-                decoded_weight,
+                hidden_states if first else intermediate,
+                decoded,
                 projected,
                 None,
                 None,
-                topk_weights[start:end],
+                topk_weights,
                 sorted_ids,
                 experts,
                 padded,
@@ -2122,11 +2125,11 @@ def run_dense_w8a16(
                 config,
                 tl.bfloat16,
             )
-            if first:
-                flat = projected.view(rows * topk, n2)
-                silu_and_mul_out(flat[:, :n], flat[:, n:], intermediate)
-            else:
-                moe_sum(projected, output[start:end])
+            if not first:
+                moe_sum(projected, output[:, col:stop])
+        if first:
+            flat = gateup.view(m * topk, n2)
+            silu_and_mul_out(flat[:, :n], flat[:, n:], intermediate)
     return output
 
 
@@ -2205,31 +2208,31 @@ def _fused_marlin_moe_impl(
             and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
             and max(w1.numel(), w2.numel()) * 2 <= _PPU_DENSE_MAX_DECODE_BYTES
         ):
-            decode_bytes = max(w1.numel(), w2.numel()) * 2
-            # Reserve alignment workspace, padded routes and both FP8 safety scans.
+            decode_bytes = (
+                e
+                * max(
+                    min(2 * n, _PPU_DENSE_GATE_TILE) * k,
+                    min(k, _PPU_DENSE_DOWN_TILE) * n,
+                )
+                * 2
+            )
             fixed_bytes = decode_bytes + 4 * (e + 1) ** 2 + 16 * 63 * e + 8
             if quant_type_id == QUANT_TYPE_FP8_E4M3:
                 fixed_bytes += 8 * (e + 1) + 4 * e * max(
                     triton.cdiv(2 * n * (k // group_size), 256),
                     triton.cdiv(k * (n // group_size), 256),
                 )
-            available_bytes = _PPU_DENSE_MAX_WORKSPACE_BYTES - fixed_bytes
-            # Keep the SiLU intermediates across projections to decode each bank once.
-            batch_tokens = min(m, available_bytes // (4 * topk * n))
+            # Column tiles share projection storage; the activation survives both GEMMs.
+            bytes_per_token = topk * (
+                2 * (max(2 * n, min(k, _PPU_DENSE_DOWN_TILE)) + n) + 12
+            )
+            batch_tokens = min(
+                m, (_PPU_DENSE_MAX_WORKSPACE_BYTES - fixed_bytes) // bytes_per_token
+            )
             if batch_tokens < 1:
                 raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
             for start in range(0, m, batch_tokens):
                 end = min(start + batch_tokens, m)
-                rows = end - start
-                chunk_tokens = min(
-                    rows,
-                    (available_bytes - rows * topk * n * 2)
-                    // (topk * (2 * max(2 * n, k) + 12)),
-                )
-                if chunk_tokens < 1:
-                    raise NotImplementedError(
-                        "PPU dense MoE workspace exceeds its budget"
-                    )
                 run_dense_w8a16(
                     hidden_states[start:end],
                     w1,
@@ -2239,7 +2242,6 @@ def _fused_marlin_moe_impl(
                     topk_weights[start:end],
                     out[start:end],
                     topk_ids[start:end],
-                    chunk_tokens,
                     stage1.scale_safe,
                     stage2.scale_safe,
                     quant_type_id == QUANT_TYPE_FP8_E4M3,

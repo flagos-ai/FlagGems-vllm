@@ -1669,6 +1669,44 @@ def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_fused_marlin_moe_w8a16_projection_tiles_ppu(
+    monkeypatch, precision, apply_router_weight_on_input, inplace
+):
+    make_inputs = (
+        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+        4097, 4, 2176, 384, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    kwargs = dict(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        w1_scale=s1,
+        w2_scale=s2,
+        bias1=None,
+        bias2=None,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=(
+            QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128
+        ),
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    with monkeypatch.context() as full_projection:
+        full_projection.setattr(backend, "_PPU_DENSE_GATE_TILE", w1.shape[1])
+        full_projection.setattr(backend, "_PPU_DENSE_DOWN_TILE", w2.shape[1])
+        reference = flaggems_vllm.fused_marlin_moe(**kwargs)
+    actual = flaggems_vllm.fused_marlin_moe(**kwargs, inplace=inplace)
+    gems_assert_equal(actual, reference)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
     monkeypatch, apply_router_weight_on_input
