@@ -190,3 +190,35 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+scaled_int8_quant_static:
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+
+# Single validated launch candidate avoids benchmarking inside zero-warmup graphs.
+
+scaled_int8_quant_dynamic:
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+
+# Single validated launch candidate avoids benchmarking inside zero-warmup graphs.
+
+scaled_int8_quant_dynamic_single:
+  - META:
+      PLACEHOLDER_UNUSED: 1
+    num_warps: 4
+    num_stages: 1
+
+# Single validated launch candidate avoids benchmarking inside zero-warmup graphs.
+
+scaled_int8_quant_dynamic_main_tail:
+  - META:
+      PLACEHOLDER_UNUSED: 1
+    num_warps: 4
+    num_stages: 1
+
+# Shared BF16 MQA: one config avoids online benchmarking; GPU graph checks pending.

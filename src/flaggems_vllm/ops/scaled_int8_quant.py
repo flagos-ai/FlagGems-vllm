@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
 from flaggems_vllm import runtime
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 I8_MIN_VAL = tl.constexpr(-128.0)
 I8_MAX_VAL = tl.constexpr(127.0)
@@ -30,6 +35,8 @@ NEG_INF_VAL = tl.constexpr(-1e30)
 
 @triton.jit
 def _round_i8_sat(x):
+    # Define NaN-to-integer behavior before clamp/libdevice can erase the NaN.
+    x = tl.where(x == x, x, 0.0)
     return tl.clamp(tldevice.nearbyint(x), I8_MIN_VAL, I8_MAX_VAL).to(tl.int8)
 
 
@@ -447,6 +454,69 @@ def _token_bucket(num_tokens):
 
 
 def scaled_int8_quant(
+    input: torch.Tensor,
+    scale: torch.Tensor | None = None,
+    azp: torch.Tensor | None = None,
+    symmetric: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    logger.debug("GEMS SCALED_INT8_QUANT")
+    if input.device.type != runtime.device.name or input.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        raise TypeError(
+            "INT8 quantization requires a floating tensor on the active device"
+        )
+    if input.ndim == 0 or input.shape[-1] == 0:
+        raise ValueError("INT8 quantization requires nonempty row width")
+    if not isinstance(symmetric, bool):
+        raise TypeError("symmetric must be a Python bool for graph-safe selection")
+    if scale is not None:
+        if (
+            scale.device != input.device
+            or scale.dtype != torch.float32
+            or scale.numel() != 1
+        ):
+            raise ValueError(
+                "Static scale must be one FP32 element on the input device"
+            )
+        if not symmetric and (
+            azp is None
+            or azp.device != input.device
+            or azp.dtype != torch.int32
+            or azp.numel() != 1
+        ):
+            raise ValueError(
+                "Asymmetric static quantization requires one device INT32 zero point"
+            )
+    shape = input.shape
+    matrix = input.reshape(-1, shape[-1]).contiguous()
+    with torch_device_fn.device(input.device):
+        if matrix.shape[0] == 0:
+            output = torch.empty_like(matrix, dtype=torch.int8)
+            output_scale = (
+                scale
+                if scale is not None
+                else torch.empty((0, 1), device=input.device, dtype=torch.float32)
+            )
+            output_azp = (
+                azp
+                if scale is not None
+                else (
+                    None
+                    if symmetric
+                    else torch.empty((0, 1), device=input.device, dtype=torch.int32)
+                )
+            )
+        else:
+            output, output_scale, output_azp = _scaled_int8_quant_contiguous(
+                matrix, scale, azp, symmetric
+            )
+    return output.reshape(shape), output_scale, output_azp
+
+
+def _scaled_int8_quant_contiguous(
     input: torch.Tensor,
     scale: torch.Tensor | None = None,
     azp: torch.Tensor | None = None,

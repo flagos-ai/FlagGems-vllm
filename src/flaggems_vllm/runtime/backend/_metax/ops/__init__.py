@@ -38,7 +38,6 @@ from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
-from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_int8_quant
 from flaggems_vllm.runtime.backend._metax.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
@@ -66,7 +65,6 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
-    "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
     "top_k_top_p",
     "w8a8_block_int8_bmm",
