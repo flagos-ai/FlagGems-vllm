@@ -147,7 +147,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     a stateful operation. Configuration experiments use externally restored
     state and no-Graph timing (see the accompanying benchmark).
     """
-    if device.vendor_name in ("nvidia", "hygon", "thead"):
+    if device.vendor_name in ("nvidia", "hygon", "thead", "metax"):
         return _packed_decode_gpu(
             mixed_qkv,
             a,

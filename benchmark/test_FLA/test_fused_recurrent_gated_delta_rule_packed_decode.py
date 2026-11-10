@@ -97,12 +97,19 @@ class PackedDecodeBenchmark(base.Benchmark):
 
     def _measure_pair(self, data):
         state0 = data["initial_state"].clone()
+        data["out"].fill_(float("nan"))
+        out0 = data["out"].clone()
+
+        def restore():
+            data["initial_state"].copy_(state0)
+            data["out"].copy_(out0)
+
         expected = self.reference(data, True)
         functions = {"gems": self.gems_op}
         if self.torch_op is not None:
             functions["native"] = self.torch_op
         for name, fn in list(functions.items()):
-            data["initial_state"].copy_(state0)
+            restore()
             try:
                 fn(**data, use_qk_l2norm_in_kernel=True)
                 self.assert_result(data, expected, self._dtype)
@@ -119,7 +126,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         for name, fn in list(functions.items()):
             try:
                 for _ in range(self.warmup):
-                    data["initial_state"].copy_(state0)
+                    restore()
                     fn(**data, use_qk_l2norm_in_kernel=True)
             except Exception as exc:
                 if name == "gems":
@@ -131,7 +138,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         for i in range(self.repetitions):
             names = list(functions) if i % 2 == 0 else list(reversed(functions))
             for name in names:
-                data["initial_state"].copy_(state0)
+                restore()
                 torch_device_fn.synchronize()
                 try:
                     start = torch_device_fn.Event(enable_timing=True)
@@ -150,7 +157,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         # Recheck each implementation separately; native must not invalidate a
         # correct Gems row if its state update becomes unstable after warmup.
         for name, fn in functions.items():
-            data["initial_state"].copy_(state0)
+            restore()
             try:
                 fn(**data, use_qk_l2norm_in_kernel=True)
                 self.assert_result(data, expected, self._dtype)
