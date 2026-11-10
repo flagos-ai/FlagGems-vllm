@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the public Hopper MegaMoE entry point."""
+"""Tests for the public MegaMoE entry points."""
 
 from __future__ import annotations
 
+import json
 import os
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import TestCase
 
 _IS_ACCURACY_WORKER = "--accuracy-worker" in sys.argv
 if _IS_ACCURACY_WORKER:
@@ -41,15 +42,25 @@ if _IS_ACCURACY_WORKER:
 # The worker cache and CUDA device must be selected before these imports.
 # isort: off
 import flaggems_vllm  # noqa: E402
-from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (  # noqa: E402
-    megamoe as hopper_megamoe,
-)
+
+_IS_ASCEND = flaggems_vllm.vendor_name == "ascend"
+if not _IS_ASCEND:
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
+        megamoe as hopper_megamoe,
+    )
 from flaggems_vllm.testing.megamoe import StandaloneNvshmem  # noqa: E402
 from flaggems_vllm.testing.megamoe import (  # noqa: E402
+    ascend_reference,
+    check_ascend_output,
     configure_descriptor_allocator,
     interleave_l1_gate_up_rows,
+    make_ascend_inputs,
     make_context,
     pool_tokens,
+    require_ascend,
+    run_ascend_workers,
+    run_workers,
+    shmem_rendezvous,
 )
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle  # noqa: E402
 
@@ -59,7 +70,11 @@ pytestmark = pytest.mark.megamoe
 
 
 def _is_hopper():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+    return (
+        not _IS_ASCEND
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+    )
 
 
 @pytest.mark.skipif(
@@ -303,28 +318,170 @@ def test_megamoe_fp8_accuracy():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two visible Hopper GPUs")
 
-    command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--rdzv-backend",
-        "c10d",
-        "--rdzv-endpoint",
-        "127.0.0.1:0",
-        "--nproc-per-node",
-        "2",
+    run_workers(
+        2,
         str(Path(__file__).resolve()),
         "--accuracy-worker",
-    ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
+        rendezvous=("--rdzv-backend", "c10d", "--rdzv-endpoint", "127.0.0.1:0"),
         timeout=900,
     )
-    if completed.returncode:
-        pytest.fail(completed.stdout + completed.stderr)
 
 
-if __name__ == "__main__" and _IS_ACCURACY_WORKER:
-    _run_accuracy_worker()
+@pytest.mark.skipif(not _IS_ASCEND, reason="requires Ascend")
+def test_megamoe_is_exported():
+    require_ascend(1)
+    import flaggems_vllm as fg
+    from flaggems_vllm.runtime.backend._ascend.ops.megamoe import (
+        megamoe,
+        prepare_megamoe,
+    )
+
+    assert fg.megamoe is megamoe
+    assert fg.prepare_megamoe is prepare_megamoe
+    assert {"megamoe", "prepare_megamoe"}.isdisjoint(
+        name for name, _ in fg._FULL_CONFIG
+    )
+
+
+@pytest.mark.skipif(not _IS_ASCEND, reason="requires Ascend")
+@pytest.mark.parametrize("ep", [2, 4], ids=["ep2", "ep4"])
+def test_megamoe_accuracy(tmp_path, ep):
+    require_ascend(ep)
+    run_ascend_workers(ep, __name__, tmp_path)
+    expected = sorted(
+        (name, f"torch.{dtype}", graph)
+        for name, tokens, _, _, _, _, strided, _ in _ASCEND_CASES
+        for dtype in ("float32", "bfloat16", "float16")
+        if name == "strided" or dtype == "float32"
+        for graph in ((False, True) if strided and tokens else (False,))
+    )
+    for rank in range(ep):
+        report = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert sorted((r["case"], r["dtype"], r["graph"]) for r in report) == expected
+
+
+# name, tokens, hidden, intermediate, local experts, topk, strided, ragged
+_ASCEND_CASES = [
+    ("aligned", 7, 256, 128, 2, 2, False, False),
+    ("strided", 7, 257, 129, 2, 2, True, False),
+    ("tiny", 1, 1, 1, 2, 1, True, False),
+    ("empty", 0, 257, 129, 2, 2, True, False),
+    ("ragged", 7, 257, 129, 2, 2, True, True),
+    ("wide_topk", 1, 256, 128, 20, 33, True, False),
+    ("large_tokens", 16385, 256, 128, 1, 1, False, False),
+    ("balanced", 7, 256, 128, 2, 2, False, False),
+    ("remote", 7, 256, 128, 2, 2, False, False),
+    ("hotspot", 7, 256, 128, 2, 2, False, False),
+    ("atomic", 128, 256, 128, 2, 2, False, False),
+]
+
+
+def _strided(value):
+    import torch
+
+    backing = torch.empty(
+        (value.shape[1] * 2, value.shape[0] * 2), dtype=value.dtype, device=value.device
+    )
+    view = backing[::2, ::2].t()
+    view.copy_(value)
+    return view
+
+
+def _run_ascend_accuracy_worker(directory):
+    import torch.distributed as dist
+    import torch_npu  # noqa: F401
+
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(rank)
+    dist.init_process_group("hccl")
+    import flaggems_vllm as fg
+    from tests.accuracy_utils import gems_log_logger, gems_log_prefix
+
+    ep = dist.get_world_size()
+    entry = fg.megamoe
+    dispatch_log = f"{gems_log_prefix(entry)} MEGAMOE"
+    records = []
+    try:
+        for name, tokens, h, i, e, k, layout, ragged in _ASCEND_CASES:
+            t = 0 if ragged and rank == 0 else tokens
+            shape = (t, h, i, e * ep, k, ep)
+            x, ids, probabilities, w1, w2 = make_ascend_inputs(
+                shape,
+                0,
+                rank,
+                name if name in ("balanced", "remote", "hotspot") else "random",
+            )
+            if layout:
+                x, ids = _strided(x), _strided(ids.long())
+                w1, w2 = ([_strided(w) for w in values] for values in (w1, w2))
+            if name == "aligned":
+                with pytest.raises(ValueError, match="capacity_tokens"):
+                    fg.prepare_megamoe(
+                        w1, w2, group=dist.group.WORLD, capacity_tokens=0, topk=shape[4]
+                    )
+            ws = fg.prepare_megamoe(
+                w1,
+                w2,
+                group=dist.group.WORLD,
+                capacity_tokens=max(1, tokens),
+                topk=shape[4],
+                rendezvous=shmem_rendezvous(),
+            )
+            try:
+                if name == "aligned":
+                    with pytest.raises(RuntimeError, match="compile collectively"):
+                        entry(x, ids, probabilities, ws)
+                dtypes = (
+                    (torch.float32, torch.bfloat16, torch.float16)
+                    if name == "strided"
+                    else (torch.float32,)
+                )
+                for dtype in dtypes:
+                    probs = probabilities.to(dtype)
+                    if layout:
+                        probs = _strided(probs)
+                    inputs = (x, ids, probs, w1, w2)
+                    ws.compile(x, ids, probs)
+                    with TestCase().assertLogs(gems_log_logger(entry), "DEBUG") as logs:
+                        result = entry(x, ids, probs, ws)
+                    assert dispatch_log in [
+                        record.getMessage() for record in logs.records
+                    ]
+                    torch.npu.synchronize()
+                    check = check_ascend_output(
+                        result, ascend_reference(inputs, shape, rank), inputs
+                    )
+                    records.append(
+                        dict(case=name, dtype=str(dtype), graph=False, **check)
+                    )
+                    if layout and tokens:
+                        graph = torch.npu.NPUGraph()
+                        with torch.npu.graph(graph):
+                            result = entry(x, ids, probs, ws)
+                        x.mul_(0.5)
+                        ids.add_(1).remainder_(e * ep)
+                        probs.mul_(0.75)
+                        expected = ascend_reference(inputs, shape, rank)
+                        graph.replay()
+                        torch.npu.synchronize()
+                        check = check_ascend_output(result, expected, inputs)
+                        records.append(
+                            dict(case=name, dtype=str(dtype), graph=True, **check)
+                        )
+                        del result, graph
+                    assert not bool(ws.errors.any())
+                with pytest.raises(NotImplementedError, match="rank-two strided"):
+                    entry(x.flatten(), ids, probs, ws)
+            finally:
+                ws.close()
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        (Path(directory) / f"rank{rank}.json").write_text(json.dumps(records, indent=2))
+    finally:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    if _IS_ACCURACY_WORKER:
+        _run_accuracy_worker()
+    elif "--ascend-worker" in sys.argv:
+        _run_ascend_accuracy_worker(sys.argv[-1])

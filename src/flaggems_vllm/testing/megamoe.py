@@ -12,14 +12,73 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone multi-rank test support for the Hopper MegaMoE operator."""
+"""Standalone multi-rank test support for MegaMoE."""
 
 from __future__ import annotations
 
 import ctypes
 import os
+import signal
+import socket
+import subprocess
+import sys
+from contextlib import nullcontext, suppress
+from pathlib import Path
 
 import torch
+
+SHAPE_DESC = "tokens_per_rank, hidden, intermediate, num_experts, topk, ep_size"
+
+
+def run_workers(
+    ep, *worker_args, timeout=1800, rendezvous=("--standalone",), log_path=None
+):
+    """Run a single-node torchrun job and reap its process group on timeout."""
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        *rendezvous,
+        f"--nproc-per-node={ep}",
+        *worker_args,
+    ]
+    if log_path is None:
+        output = nullcontext(subprocess.PIPE)
+    else:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        output = log_path.open("w")
+    with output as stdout:
+        with subprocess.Popen(
+            command,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        ) as process:
+            try:
+                log, _ = process.communicate(timeout=timeout)
+            except BaseException:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                raise
+    if process.returncode:
+        detail = f"see {log_path}" if log_path is not None else log
+        raise RuntimeError(f"MegaMoE workers failed ({process.returncode}): {detail}")
+    return log
+
+
+def run_ascend_workers(ep, module, directory):
+    directory = Path(directory)
+    run_workers(
+        ep,
+        "-m",
+        module,
+        "--ascend-worker",
+        str(directory),
+        rendezvous=("--standalone", "--local-addr=127.0.0.1"),
+        log_path=directory / "workers.log",
+    )
 
 
 class StandaloneNvshmem:
@@ -249,10 +308,169 @@ def configure_descriptor_allocator(device: torch.device) -> None:
     triton.set_allocator(allocate)
 
 
+def require_ascend(ep):
+    import pytest
+
+    try:
+        import shmem  # noqa: F401
+        import torch_npu  # noqa: F401
+    except ModuleNotFoundError as error:
+        pytest.skip(f"optional MegaMoE dependency missing: {error.name}")
+    if not torch.npu.is_available() or torch.npu.device_count() < ep:
+        pytest.skip(f"MegaMoE requires {ep} visible NPUs")
+
+
+def load_ascend_shapes(path):
+    import yaml
+
+    with open(path) as stream:
+        document = yaml.safe_load(stream)
+    if not isinstance(document, dict) or "megamoe" not in document:
+        raise ValueError("shape file must contain a megamoe section")
+    section = document["megamoe"]
+    if not isinstance(section, dict) or section.get("dtype", "bfloat16") != "bfloat16":
+        raise ValueError("megamoe supports BF16 shape files only")
+    shapes = section.get("shapes")
+    if not isinstance(shapes, (list, tuple)) or not shapes:
+        raise ValueError("megamoe requires a non-empty shape list")
+    result = []
+    for shape in shapes:
+        if (
+            not isinstance(shape, (list, tuple))
+            or len(shape) != 6
+            or any(type(value) is not int for value in shape)
+            or shape[0] < 0
+            or any(value <= 0 for value in shape[1:])
+        ):
+            raise ValueError(
+                f"expected nonnegative tokens and five positive integers ({SHAPE_DESC}): {shape}"
+            )
+        _, _, _, experts, topk, ep = shape
+        if ep not in (2, 4, 8) or experts % ep or topk > experts:
+            raise ValueError(f"invalid expert partition/topk/EP: {shape}")
+        if tuple(shape) in result:
+            raise ValueError(f"duplicate megamoe shape: {shape}")
+        result.append(tuple(shape))
+    return result
+
+
+def shmem_rendezvous():
+    """Choose a free single-node SHMEM port and share it with all workers."""
+    import torch.distributed as dist
+
+    endpoint = [None]
+    if dist.get_rank() == 0:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            endpoint[0] = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+    dist.broadcast_object_list(endpoint, src=0)
+    return endpoint[0]
+
+
+def make_ascend_inputs(shape, seed, rank, routing="random"):
+
+    tokens, hidden, intermediate, experts, topk, ep = shape
+    generator = torch.Generator(device="cpu").manual_seed(seed + 1200 + rank)
+    w1 = [
+        torch.randn(hidden, intermediate * 2, generator=generator, dtype=torch.bfloat16)
+        * 0.02
+        for _ in range(experts // ep)
+    ]
+    w2 = [
+        torch.randn(intermediate, hidden, generator=generator, dtype=torch.bfloat16)
+        * 0.02
+        for _ in range(experts // ep)
+    ]
+    x = torch.randn(tokens, hidden, generator=generator, dtype=torch.bfloat16) * 0.1
+    ids = (
+        torch.rand(tokens, experts, generator=generator).topk(topk, dim=1).indices.int()
+    )
+    if routing == "balanced":
+        ids = (
+            (torch.arange(tokens)[:, None] * topk + torch.arange(topk)) % experts
+        ).int()
+    elif routing in ("remote", "hotspot"):
+        if topk > experts // ep:
+            raise ValueError("single-rank routing requires topk <= local experts")
+        target = (rank + 1) % ep if routing == "remote" else 0
+        ids = torch.arange(topk) + target * (experts // ep)
+        ids = ids.expand(tokens, topk).contiguous().int()
+    probs = torch.softmax(torch.randn(tokens, topk, generator=generator), dim=1)
+    # CPU fixtures keep device RNG out of accuracy/benchmark setup.
+    return (
+        x.to("npu"),
+        ids.to("npu"),
+        probs.to("npu"),
+        [w.to("npu") for w in w1],
+        [w.to("npu") for w in w2],
+    )
+
+
+def ascend_reference(inputs, shape, rank):
+    """Compute every output from original tensors in FP32, independent of CANN."""
+    import torch.distributed as dist
+
+    x, ids, probs, w1, w2 = inputs
+    _, hidden, _, experts, _, ep = shape
+    gathered = [None] * ep
+    dist.all_gather_object(gathered, tuple(t.cpu() for t in (x, ids, probs)))
+    lengths = [values[0].shape[0] for values in gathered]
+    gathered = [
+        torch.cat([values[j] for values in gathered]).to(x.device) for j in range(3)
+    ]
+    xs, routes, weights = gathered
+    output = torch.zeros(sum(lengths), hidden, dtype=torch.float32, device=x.device)
+    for local in range(experts // ep):
+        row, slot = torch.where(routes == rank * (experts // ep) + local)
+        if row.numel():
+            gate, up = (xs[row].float() @ w1[local].float()).chunk(2, dim=1)
+            partial = (torch.nn.functional.silu(gate) * up) @ w2[local].float()
+            output.index_add_(0, row, partial * weights[row, slot, None])
+    if sum(lengths):
+        dist.all_reduce(output)
+    counts = torch.bincount(routes.flatten().long(), minlength=experts).int()
+    return (
+        output[sum(lengths[:rank]) : sum(lengths[: rank + 1])],
+        counts[rank * (experts // ep) : (rank + 1) * (experts // ep)],
+    )
+
+
+def check_ascend_output(result, expected, inputs):
+
+    output, counts = result
+    reference_output, reference_counts = expected
+    assert output.shape == inputs[0].shape and output.dtype == torch.bfloat16
+    assert torch.isfinite(output).all().item(), "non-finite output"
+    assert counts.dtype == torch.int32 and counts.shape == reference_counts.shape
+    assert counts.device == output.device
+    assert torch.equal(counts, reference_counts), "expert counts differ"
+    delta = output.float() - reference_output
+    error = (delta.norm() / reference_output.norm().clamp_min(1e-12)).item()
+    assert error < 0.03, f"relative L2 {error} >= 0.03"
+    row_errors = delta.norm(dim=1) / reference_output.norm(dim=1).clamp_min(1e-12)
+    maxrow = float(row_errors.max()) if output.shape[0] else 0.0
+    assert maxrow < 0.03, f"maximum row relative L2 {maxrow} >= 0.03"
+    return {
+        "relative_l2": error,
+        "max_row_relative_l2": maxrow,
+        "expert_counts_match": True,
+        "all_outputs_finite": True,
+    }
+
+
 __all__ = [
+    "SHAPE_DESC",
     "StandaloneNvshmem",
+    "ascend_reference",
+    "check_ascend_output",
     "configure_descriptor_allocator",
     "interleave_l1_gate_up_rows",
+    "load_ascend_shapes",
+    "make_ascend_inputs",
     "make_context",
     "pool_tokens",
+    "require_ascend",
+    "run_ascend_workers",
+    "run_workers",
+    "shmem_rendezvous",
 ]
