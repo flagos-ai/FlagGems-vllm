@@ -31,7 +31,7 @@ _TPP = 8
 _NUM_WARPS = 4
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens", "num_tokens_insert"])
 def _tiled_kernel(
     q,
     kv,
@@ -182,7 +182,8 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     cache_block_size: int,
 ):
     """See the generic implementation for the layout contract."""
-    assert q.is_contiguous() and kv.is_contiguous()
+    if not (q.is_contiguous() and kv.is_contiguous()):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
     num_tokens, num_heads, head_dims = q.shape
 
     if num_tokens < _TILED_MIN_TOKENS:
@@ -202,18 +203,29 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             cache_block_size,
         )
 
-    assert head_dims == 512
-    assert kv.shape == (num_tokens, 512)
-    assert q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
-    assert k_cache.dtype == torch.uint8
-    assert slot_mapping.dim() == 1
+    if not (head_dims == 512):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (kv.shape == (num_tokens, 512)):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (k_cache.dtype == torch.uint8):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (slot_mapping.dim() == 1):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
     num_tokens_insert = slot_mapping.shape[0]
-    assert num_tokens_insert <= num_tokens
-    assert slot_mapping.dtype == torch.int64
-    assert position_ids.shape == (num_tokens,)
-    assert position_ids.dtype == torch.int64
-    assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64
-    assert cos_sin_cache.dtype == torch.float32
+    if not (num_tokens_insert <= num_tokens):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (slot_mapping.dtype == torch.int64):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (position_ids.shape == (num_tokens,)):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (position_ids.dtype == torch.int64):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
+    if not (cos_sin_cache.dtype == torch.float32):
+        raise ValueError("Invalid QNorm/RoPE layout or parameter")
 
     grid = triton.cdiv(num_tokens, _TPP) * (num_heads + 1)
     _tiled_kernel[(grid,)](
