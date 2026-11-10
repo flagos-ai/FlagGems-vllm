@@ -734,6 +734,7 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
         eps,
         block_size,
     )
+    del q_ref, kv_ref  # handle torch.OutOfMemoryError
     q_out_res = fused_impl(
         q,
         kv,
