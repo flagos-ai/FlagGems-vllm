@@ -84,6 +84,20 @@ ops:
       - Math
     stages:
       - alpha: '5.4'
+  - id: bf16_paged_mqa_logits
+    description: |
+      Compute multi-head weighted ReLU attention logits on paged BF16 KV cache.
+      Uses shape-specialized Triton kernels for H=32 and H=64 with
+      zero-constexpr dispatch for decode-phase inference.
+    for:
+      - bf16_paged_mqa_logits
+    labels:
+      - fused
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: bincount
     description: Count the frequency of each value in an array of non-negative integers.
     for:
@@ -96,6 +110,17 @@ ops:
       - Reduction
     stages:
       - stable: '5.0'
+  - id: bmm_w8a8
+    description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
+    for:
+      - bmm_w8a8_int8
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
   - id: bucket_sort_topk
     description: A wrapper of the TLE version and the Triton version bucket-sort topk
       operation.
@@ -160,6 +185,39 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: chunk_kda_fwd_intra_token_parallel
+    description: |
+      Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
+      Writes Aqk/Akk in place and preserves their unwritten regions.
+    for:
+      - chunk_kda_fwd_intra_token_parallel
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: chunk_kda_scaled_dot_kkt_fwd
+    description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_scaled_dot_kkt_fwd
+    labels: [fused, FLA]
+    kind: [Attention]
+    stages:
+      - alpha: '5.4'
+  - id: chunk_kda_with_fused_gate
+    description: |
+      KDA prefill with fused softplus gate and 64-token chunks; V-first final state and aliased value output.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_with_fused_gate
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - beta: '0.3'
   - id: combine_topk_swa_indices
     description: |
       Combines compressed top-k sparse attention indices with sliding-window attention indices
@@ -326,6 +384,17 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: expand_pools_and_append_tail
+    description: Expand identity-mapped history pools and append an incomplete token tail.
+    for:
+      - vllm.models.glm5next.nvidia.ops.kpool_compress.expand_pools_and_append_tail
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Indexing
+    stages:
+      - beta: '0.3'
   - id: flash_attention_forward
     description: Forward pass of FlashAttention computing scaled dot-product attention.
     for:
@@ -357,8 +426,9 @@ ops:
       W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
       FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
       and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
-      Hygon DCU and PPU).
+      Hygon DCU, PPU, MetaX, and Ascend).
     for:
+      - flash_attn_varlen_func_w8a8
       - flash_attn_varlen_func_w8a8_int8
     labels:
       - NoCPU
@@ -416,6 +486,18 @@ ops:
       - fused
       - Attention
       - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: flash_mla_with_kvcache_w8a8
+    description: |
+      Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific implementations.
+    for:
+      - flash_mla_with_kvcache_w8a8
+    labels:
+      - fused
+      - Attention
     kind:
       - NeuralNetwork
     stages:
@@ -521,6 +603,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.4'
+  - id: fused_indexer_weight_scale
+    description: |
+      Scale floating-point indexer weights by FP32 query scales and a scalar.
+      Returns FP32 per-token, per-head weights on Ascend and MThreads.
+    for:
+      - fused_indexer_weight_scale
+      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: fused_inv_rope_fp8_quant
     description: |
       Apply inverse RoPE and group-wise quantization to attention output.
@@ -590,9 +686,11 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule_fwd
+  - id: fused_recurrent_gated_delta_rule
     description: |
-      The forward case for `fused_recurrent_gated_delta_rule` used in Flash Linear Attention (FLA).
+      Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
+      variable-length sequences and speculative-decoding state tables.
+      Supports FP16/BF16/FP32; non-inplace mode returns per-token states.
     for:
       - fused_recurrent_gated_delta_rule_fwd
     labels:
@@ -603,6 +701,63 @@ ops:
     stages:
       - alpha: '5.0'
       - beta: '5.3'
+  - id: fused_recurrent_gated_delta_rule_packed_decode
+    description: vLLM 0.24.0 packed single-token gated delta rule decode.
+    for:
+      - fused_recurrent_gated_delta_rule_packed_decode
+    labels:
+      - fused
+    kind:
+      - FLA
+    stages:
+      - alpha: '5.4'
+  - id: fused_recurrent_kda
+    description: |
+      Independent Triton KDA decode with key-wise gate decay, optional QK L2
+      normalization, scalar/vector beta and FP32 value-major recurrent state.
+      Supports varlen, per-token state tables and strided inputs.
+    for:
+      - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
+  - id: gate_sigmoid_mul
+    description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
+    for:
+      - vllm.models.kimi_k3.nvidia.mla._gate_sigmoid_mul
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '0.3'
+
+  - id: gdn_w8a16
+    description: |
+      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
+      per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
+      FP8 supports decode, prefill and speculative state-slot updates.
+      INT8 supports packed decode and chunked prefill on PPU and Hygon.
+    for:
+      - gdn_w8a16
+      - gdn_w8a16_int8
+      - chunk_gated_delta_rule_w8a16_int8
+      - quantize_gdn_state_int8
+    labels:
+      - fused
+      - FLA
+      - Attention
+      - Quantization
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
   - id: geglu
     description: Gaussian Error Gated Linear Unit with GELU activation instead of
       sigmoid function.
@@ -659,6 +814,18 @@ ops:
       - Reduction
     stages:
       - alpha: '5.4'
+  - id: grouped_gemma_rmsnorm
+    description: Grouped Gemma RMS normalization with shared or per-group affine weights.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.hc.grouped_gemma_rmsnorm
+    labels:
+      - fused
+      - vLLM
+      - Normalization
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '0.3'
   - id: grouped_topk
     description: |
       A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
@@ -673,6 +840,16 @@ ops:
       - MoE
     stages:
       - stable: '5.0'
+  - id: hc_combine
+    description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
+    for:
+      - hc_combine
+    labels:
+      - fused
+    kind:
+      - Pointwise
+    stages:
+      - beta: '0.3'
   - id: hc_head_fused_kernel
     description: |
       The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
@@ -931,6 +1108,36 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: minimax_m3_sparse_attn
+    description: |
+      MiniMax M3 block-sparse GQA prefill attention over packed paged KV
+      (one 128-token page per sparse block). Dispatches to FlagAttention's
+      flag_attn.minimax_sparse_attention kernels.
+    for:
+      - vllm.models.minimax_m3.common.ops.sparse_attn
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: minimax_m3_sparse_attn_decode
+    description: |
+      MiniMax M3 block-sparse GQA decode attention; split-K over the selected
+      blocks with an LSE merge. Dispatches to FlagAttention's
+      flag_attn.minimax_sparse_attention kernels.
+    for:
+      - vllm.models.minimax_m3.common.ops.sparse_attn
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: moe_align_block_size_triton
     description: |
       Aligns the token distribution across experts to be compatible with block size
@@ -960,6 +1167,19 @@ ops:
       - MoE
     stages:
       - stable: '4.2'
+  - id: mrope
+    description: |
+      Applies multi-modal rotary positional embeddings to query and key tensors,
+      using temporal, height, and width sections.
+    for:
+      - mrope
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: mul
     description: Multiplies `input` by `other`.
     for:
@@ -1242,6 +1462,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: sparse_flash_attention
+    description: |
+      Ascend shared-KV MLA with the vLLM-Ascend SFA interface and tuple outputs.
+      FP16/BF16, BSND/TND and paged caches, block sparsity and right-down causal
+      masking; dimensions 512+64. value must alias key; forward inference only.
+    for:
+      - _C_ascend.npu_sparse_flash_attention
+    labels:
+      - fused
+      - vLLM
+      - Ascend
+    kind:
+      - DSA
+    stages:
+      - alpha: '0.1.0'
   - id: sparse_mla_fwd_interface
     description: |
       A generic interface for sparse MLA (Multi-head Latent Attention) for DeepSeek v3/v3.2.
@@ -1309,6 +1544,25 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: top_k_top_p
+    description: |
+      Per-row top-k / top-p filtering of [batch, vocab] sampling logits: masked
+      positions become -inf and kept positions keep their logit values.
+      Returns a new tensor and preserves the input. The shared argument order
+      is (logits, p=None, k=None). Ascend uses sorted top-L candidates; MetaX
+      uses single-row integer-key tile/merge sorting and batched counting/radix
+      sorting for contiguous FP32 with batch <= 64 and vocab <= 262144.
+      Ascend launch overrides remain
+      backend-specific.
+    for:
+      - torch_npu.npu_top_k_top_p
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: topk_softmax
     description: |
       Selects the k most likely next-token candicates, sets all others to zero,
@@ -1361,6 +1615,18 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: w8a8_block_matmul
+    description: Matrix multiplication with block-wise scaled INT8 or FP8 activations and weights.
+    for:
+      - w8a8_block_matmul
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.5'
+    cpp: '5.5'
   - id: weight_norm
     description: |
       Reparameterizes a module's weight tensor by decoupling its magnitude (g)

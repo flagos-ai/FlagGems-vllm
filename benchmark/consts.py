@@ -430,13 +430,13 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None)
     try:
         op_entry = _resolve_op_entry(base_data, op_name, variant)
         if not op_entry:
-            return None, f"baseline 中没有算子 '{op_name}'"
+            return None, f"operator '{op_name}' not found in baseline"
         shapes = op_entry.get("shapes", {})
         first_shape = _first_tensor_shape(shape_detail)
         if first_shape is None:
             return None, (
-                f"算子 '{op_name}' 的 shape 无法表达为张量维度 "
-                f"(shape_detail={shape_detail})"
+                f"operator '{op_name}' shape cannot be expressed as tensor "
+                f"dims (shape_detail={shape_detail})"
             )
         # 优先按原始 key（str(第一个张量 shape)）直查——简单算子的 key_shape 恰为
         # 第一个张量 shape，命中率高且无歧义。
@@ -461,15 +461,15 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None)
             and shapes[str(first_shape)].get(str(dtype)) is None
         ):
             return None, (
-                f"算子 '{op_name}' shape {first_shape} 在 baseline 中没有 "
-                f"对应的 dtype {dtype}"
+                f"operator '{op_name}' shape {first_shape} has no matching "
+                f"dtype {dtype} in baseline"
             )
         return None, (
-            f"算子 '{op_name}' 在 baseline 中没有匹配的 shape"
-            f"（第一个张量={first_shape}，已尝试张量签名回退）"
+            f"operator '{op_name}' has no matching shape in baseline "
+            f"(first tensor={first_shape}, tensor-signature fallback tried)"
         )
     except (AttributeError, TypeError) as e:
-        return None, f"baseline 查找 '{op_name}' 时出错: {e}"
+        return None, f"error looking up '{op_name}' in baseline: {e}"
 
 
 def lookup_base_record(base_data, op_name, dtype, shape_detail, variant=None):

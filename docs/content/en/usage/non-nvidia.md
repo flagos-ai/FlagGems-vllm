@@ -5,7 +5,7 @@ weight: 40
 
 # Running on Non-NVIDIA Backends
 
-FlagGems-vllm supports **18 hardware backends** beyond NVIDIA GPUs.
+FlagGems-vllm supports **17 hardware backends** (NVIDIA plus 16 non-NVIDIA backends).
 
 ## Supported Backends
 
@@ -18,7 +18,7 @@ FlagGems-vllm supports **18 hardware backends** beyond NVIDIA GPUs.
 - **Kunlunxin** (Baidu): XPU series
 - **MetaX**: C-series accelerators
 - **Moore Threads**: MTT GPUs
-- And more...
+- **AIPU**, **ARM**, **Biren**, **SpacemiT**, **Sunrise**, **T-Head**, **Tsingmicro**
 
 See `src/flaggems_vllm/runtime/backend/` for the complete list.
 
@@ -86,6 +86,32 @@ pip install flagtree
 export USE_FLAGTREE=1
 ```
 
+#### Tests using vLLM-Ascend custom ops
+
+Sparse flash attention tests and benchmarks use vLLM-Ascend as their reference.
+Enable its pytest plugin explicitly when running these files from the repository
+root:
+
+```bash
+python -m pytest -p tools.ascend.pytest_custom_ops -q tests/test_sparse_flash_attention.py
+python -m pytest -p tools.ascend.pytest_custom_ops -q benchmark/test_sparse_flash_attention.py
+```
+
+The plugin calls vLLM-Ascend's `enable_custom_op()` before pytest loads the common
+`conftest.py` files. CANN must discover the vendor implementations before device
+initialization; loading them later in a test or fixture can select the built-in
+implementation instead. The installed vLLM-Ascend package configures its own
+custom-op paths; no installation path needs to be set manually.
+
+The plugin lives under `tools/ascend/` so vendor initialization stays outside the
+shared tests directory. Importing its package does not import FlagGems or
+initialize the device runtime.
+
+`tools/run_tests.py` enables this plugin automatically for Ascend
+`sparse_flash_attention` workers. Other operator tests do not load it implicitly.
+If running a larger Ascend test selection that includes sparse flash attention,
+pass the same `-p tools.ascend.pytest_custom_ops` option for that session.
+
 ### Other Vendors
 
 Each vendor typically requires:
@@ -98,7 +124,7 @@ Consult your hardware vendor's documentation for PyTorch installation.
 ## Compiler: Triton vs FlagTree
 
 - **OpenAI Triton**: Works on NVIDIA, AMD (ROCm)
-- **FlagTree**: Supports all 18+ backends via vendor-specific codegen
+- **FlagTree**: Supports all 17 backends via vendor-specific codegen
 
 To use FlagTree:
 
@@ -182,14 +208,14 @@ Some operators may not work on all backends:
 To add a new backend:
 
 1. Create `src/flaggems_vllm/runtime/backend/_<vendor>/`
-2. Add device detection in `runtime/device_finder.py`
+2. Add device detection in `src/flaggems_vllm/runtime/backend/device_finder.py`
 3. Test core operators on target hardware
 4. Submit PR with test results
 
-See the [backend development guide](../contribution/backend/) for details.
+See the [backend development guide](../contribution/backend.md) for details.
 
 ## Next Steps
 
-- [Backend development guide](/FlagGems-vllm/contribution/backend/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Backend development guide](../contribution/backend.md)
+- [Testing guide](../testing/unittest.md)
+- [Performance benchmarking](../performance/benchmark.md)

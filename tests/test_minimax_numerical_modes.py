@@ -1,8 +1,9 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-import flaggems_vllm as fgv
 import pytest
 import torch
+
+import flaggems_vllm as fgv
 from flaggems_vllm.ops.fused_moe import MoEActivation, apply_moe_activation
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -117,6 +118,7 @@ def test_initial_baseline_cases():
     from functools import partial
 
     import torch
+
     from flaggems_vllm import fused_minimax_m3_qknorm_rope_kv_insert
 
     op = partial(fused_minimax_m3_qknorm_rope_kv_insert, numerics="bf16_staged")

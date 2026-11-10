@@ -5,9 +5,10 @@
 import importlib
 from unittest.mock import patch
 
-import flaggems_vllm as fgv
 import pytest
 import torch
+
+import flaggems_vllm as fgv
 from flaggems_vllm.ops.fused_moe import MoEActivation, apply_moe_activation
 from flaggems_vllm.runtime import device
 

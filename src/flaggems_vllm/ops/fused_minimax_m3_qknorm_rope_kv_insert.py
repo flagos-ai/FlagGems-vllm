@@ -11,6 +11,7 @@ uses no vLLM compiled extension and does not quantize query tensors.
 import torch
 import triton
 import triton.language as tl
+
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import libentry
 
