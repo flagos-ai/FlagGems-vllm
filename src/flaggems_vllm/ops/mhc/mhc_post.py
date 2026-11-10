@@ -433,5 +433,8 @@ def mhc_post_ref(
             f"got {type(mix_layout).__name__}"
         )
     mix = comb_res_mix.mT if mix_layout is MixLayout.TRANSPOSED else comb_res_mix
-    y = x.unsqueeze(-2) * post_layer_mix + torch.bmm(mix, residual.float())
+    # Independent test reference; production mhc_post never calls this function.
+    y = x.unsqueeze(-2) * post_layer_mix + torch.bmm(  # allow-torch-compute
+        mix, residual.float()
+    )
     return y.type_as(x)
