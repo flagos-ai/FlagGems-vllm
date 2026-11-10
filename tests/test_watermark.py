@@ -211,7 +211,7 @@ def test_plain_triton_path(monkeypatch):
 @pytest.mark.draft_watermarking_mask
 def test_cpu_is_unsupported():
     inputs = tuple(t.cpu() for t in make_inputs(1, 8, 4))
-    with pytest.raises((NotImplementedError, ValueError), match="requires|cpu tensor"):
+    with pytest.raises(NotImplementedError, match="requires an accelerator"):
         draft_watermarking_mask(*inputs, 8192, False)
 
 

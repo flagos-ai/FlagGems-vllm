@@ -136,6 +136,8 @@ def draft_watermarking_mask(
     buffers have unit column stride. Steps may be a stride-zero broadcast.
     Each step is in ``[0, prior_contexts.shape[1])``.
     """
+    if contexts.device.type == "cpu":
+        raise NotImplementedError("draft_watermarking_mask requires an accelerator")
     if max_history is not None and max_history < 1:
         raise ValueError("max_history must be positive or None")
     if prior_contexts.stride(-1) != 1:
