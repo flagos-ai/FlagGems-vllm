@@ -56,13 +56,13 @@ from flaggems_vllm.runtime.backend._metax.ops.moe_align_block_size import (
 )
 
 __all__ = [
-    "moe_align_block_size_no_tle",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "moe_align_block_size_no_tle",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
