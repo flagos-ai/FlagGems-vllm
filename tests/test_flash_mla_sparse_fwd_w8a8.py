@@ -191,7 +191,7 @@ def test_flash_mla_sparse_flashmla(shape):
     inputs = make_sparse_inputs(shape)
     inputs[2][0].fill_(-1)
     reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*inputs)
-    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
         *quantize_sparse_fp8_fixture(*inputs)
     )
     assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)

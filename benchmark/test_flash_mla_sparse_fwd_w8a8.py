@@ -37,7 +37,7 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             flashmla_reference().flash_mla_sparse_fwd,
             [torch.bfloat16],
         )
-        self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8)
+        self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:

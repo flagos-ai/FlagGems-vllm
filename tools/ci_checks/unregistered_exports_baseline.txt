@@ -8,7 +8,6 @@ concat_query
 contiguous_copy
 copy_to
 flash_attn_varlen_func_w8a8_fp8
-flash_mla_sparse_fwd_w8a8_fp8  # Registered under the kanban ID flash_mla_sparse_fwd_w8a8.
 fp32_router_gemm
 fp8_fp4_paged_mqa_logits_graph
 fused_allreduce_rms_norm

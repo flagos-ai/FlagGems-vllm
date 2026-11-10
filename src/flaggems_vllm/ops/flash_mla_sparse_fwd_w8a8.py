@@ -2546,7 +2546,7 @@ def launch_sparse_entry(
     runner(*arguments, *trailing)
 
 
-def flash_mla_sparse_fwd_w8a8_fp8(
+def flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_cache_lora: torch.Tensor,

@@ -55,6 +55,7 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "SUPPORTED_FP8_DTYPE",
     "cp_gather_indexer_k_quant_cache",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
