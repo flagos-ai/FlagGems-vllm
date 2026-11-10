@@ -283,8 +283,14 @@ class ExpandPoolsBenchmark(Benchmark):
                 "use latency_base/latency/speedup, or --metrics latency for the candidate"
             )
 
+    def run(self):
+        with pytest.MonkeyPatch.context() as config:
+            if self.gems_only:
+                config.setattr(benchmark_config.Config, "base_data", None)
+            super().run()
+
     def get_input_iter(self, dtype):
-        native_reasons = set()
+        misses = []
         for binding in self.shapes:
             self.binding = binding
             self.current_dtype = dtype
@@ -296,13 +302,21 @@ class ExpandPoolsBenchmark(Benchmark):
             args, kwargs = baseline.build_inputs(binding, dtype, flaggems_vllm.device)
             yield (*args, kwargs)
             if self.row_native_reason:
-                native_reasons.add(self.row_native_reason)
-        if native_reasons:
+                misses.append(
+                    dict(
+                        shape=self.record_shapes(*args, **kwargs),
+                        reason=self.row_native_reason,
+                    )
+                )
+        if misses:
             benchmark_config.update_result(
                 self.op_name,
                 dict(
                     dtype=str(dtype),
-                    native_baseline_skip_reason="; ".join(sorted(native_reasons)),
+                    native_baseline_skip_reason="; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    native_baseline_misses=misses,
                 ),
             )
 
@@ -314,7 +328,11 @@ class ExpandPoolsBenchmark(Benchmark):
         config["inputs"]["seq_lens"]["dtype"] = str(args[1].dtype)
         config["inputs"]["pool_size"] = {"scalar": args[2]}
         self.case_config = config
-        return {"case": baseline.key_shape(self.binding), "config": config}
+        return dict(
+            case=baseline.key_shape(self.binding),
+            config=config,
+            inputs=super().record_shapes(*args, **kwargs),
+        )
 
     @staticmethod
     def _settings():
