@@ -24,6 +24,7 @@ from flaggems_vllm.utils import libentry, libtuner
 logger = logging.getLogger(__name__)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_RANK = 8
+_IS_ASCEND = runtime.device.vendor_name == "ascend"
 
 
 @libentry()
@@ -67,6 +68,19 @@ def _gate_sigmoid_mul_kernel(
     # The pinned function slice compiles with an FP32 sigmoid intermediate.
     sigmoid = 1.0 / (1.0 + tl.exp(-g))
     tl.store(O + index, a * sigmoid, mask=mask)
+
+
+@triton.jit(do_not_specialize=["WIDTH", "A_ROW_STRIDE", "G_ROW_STRIDE"])
+def _gate_sigmoid_mul_row_kernel(
+    A, G, Out, WIDTH, A_ROW_STRIDE, G_ROW_STRIDE, BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col < WIDTH
+    a = tl.load(A + row * A_ROW_STRIDE + col, mask=mask, other=0).to(tl.float32)
+    g = tl.load(G + row * G_ROW_STRIDE + col, mask=mask, other=0).to(tl.float32)
+    sigmoid = 1.0 / (1.0 + tl.exp(-g))
+    tl.store(Out + row * WIDTH + col, a * sigmoid, mask=mask)
 
 
 def gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -117,6 +131,27 @@ def gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor
     width = shape[-1] if shape else 1
     layout_key = f"{shape}:{a_strides}:{g_strides}:{flat}"
     with runtime.torch_device_fn.device(attn_out.device):
+        if (
+            _IS_ASCEND
+            and rank == 2
+            and a_shape == g_shape
+            and a_stride[-1] == g_stride[-1] == 1
+            and not flat
+        ):
+            # Row-aligned tiles keep the split projection's loads affine.
+            block_size = 1024
+            _gate_sigmoid_mul_row_kernel[(shape[0], triton.cdiv(width, block_size))](
+                attn_out,
+                gate,
+                output,
+                width,
+                a_stride[0],
+                g_stride[0],
+                block_size,
+                num_warps=4,
+                num_stages=1,
+            )
+            return output
         _gate_sigmoid_mul_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)](
             attn_out,
             gate,
