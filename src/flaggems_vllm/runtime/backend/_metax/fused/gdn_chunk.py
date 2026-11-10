@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 FLA_CHUNK_SIZE = 64
 
 
+def _supports_tle_load():
+    # Attribute presence is insufficient: FlagTree can expose primitives that
+    # the selected backend cannot lower. Use its actual capability registry.
+    try:
+        from triton.experimental.tle import get_supported_primitives
+    except ImportError:
+        return False
+    return "load" in get_supported_primitives("metax")
+
+
 # ---------------------------------------------------------------------------
 # 1. Fused cumsum + scaled_dot_kkt + solve_tril
 # ---------------------------------------------------------------------------
@@ -1137,7 +1147,7 @@ def chunk_gated_delta_rule_fwd(
     chunk_offsets: torch.Tensor | None = None,
     **kwargs,
 ):
-    logger.debug("METAX GDN CHUNK FWD (V-major, fused cumsum+kkt+solve_tril)")
+    logger.debug("GEMS_METAX CHUNK_GATED_DELTA_RULE_FWD")
     # Ensure contiguity.
     if not q.is_contiguous():
         q = q.contiguous()
@@ -1171,6 +1181,7 @@ def chunk_gated_delta_rule_fwd(
         A=A,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        use_tle=_supports_tle_load(),
     )
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_vmajor(

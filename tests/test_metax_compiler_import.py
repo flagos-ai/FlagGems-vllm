@@ -70,9 +70,10 @@ def test_gdn_after_compiler_isolation_reference_and_graph(tokens):
         expected, _ = naive_chunk_gated_delta_rule_fwd(
             q.cpu(), k.cpu(), v.cpu(), g.cpu(), beta.cpu(), 64**-0.5, None
         )
-        # Match the established CUDA/native test tolerance; do not change its gate.
+        # The bounded normalized-input case admits a stricter BF16 check than
+        # the upstream unnormalized recurrence stress cases.
         torch.testing.assert_close(
-            result[0].cpu().float(), expected, rtol=1e-1, atol=2e-1
+            result[0].cpu().float(), expected, rtol=2e-2, atol=2e-3
         )
         assert bool(torch.isfinite(result[0]).all())
 
@@ -83,9 +84,66 @@ def test_gdn_after_compiler_isolation_reference_and_graph(tokens):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         call()
+    previous = result[0].clone()
     for value in (0.125, -0.25):
         v.fill_(value)
         result[0].fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         check()
+        assert not torch.equal(result[0], previous)
+        previous = result[0].clone()
+
+
+@pytest.mark.chunk_gated_delta_rule_fwd
+@pytest.mark.skipif(ops.vendor_name != "metax", reason="MetaX compiler contract")
+def test_recompute_native_optout_preserves_default_selection(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    module = importlib.import_module("flaggems_vllm.ops.FLA.wy_fast")
+    calls = []
+
+    class Launch:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def run(**kwargs):
+                calls.append(self.name)
+
+            return run
+
+    monkeypatch.setattr(module, "_use_tle_recompute_w_u", lambda _: True)
+    monkeypatch.setattr(module, "recompute_w_u_fwd_kernel", Launch("native"))
+    monkeypatch.setattr(
+        module, "recompute_w_u_fwd_tle_kernel", Launch("tle"), raising=False
+    )
+    monkeypatch.setattr(module.torch, "empty_like", lambda _: object())
+    k = SimpleNamespace(shape=(1, 64, 2, 64), new_empty=lambda *a: object())
+    v = SimpleNamespace(shape=(1, 64, 2, 64))
+    a = SimpleNamespace(shape=(1, 64, 2, 64))
+    module.recompute_w_u_fwd(k, v, None, None, a, None, use_tle=False)
+    assert calls == ["native"]
+    calls.clear()
+    module.recompute_w_u_fwd(k, v, None, None, a, None)
+    assert calls == ["tle"]
+
+
+@pytest.mark.chunk_gated_delta_rule_fwd
+@pytest.mark.skipif(ops.vendor_name != "metax", reason="MetaX compiler contract")
+def test_gdn_tle_load_capability_guard(monkeypatch):
+    import importlib
+
+    tle = importlib.import_module("triton.experimental.tle")
+    gdn = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.fused.gdn_chunk"
+    )
+    monkeypatch.setattr(
+        tle, "get_supported_primitives", lambda backend: frozenset({"load"})
+    )
+    assert gdn._supports_tle_load()
+    monkeypatch.setattr(tle, "get_supported_primitives", lambda backend: frozenset())
+    assert not gdn._supports_tle_load()
+    monkeypatch.delattr(tle, "get_supported_primitives")
+    assert not gdn._supports_tle_load()
