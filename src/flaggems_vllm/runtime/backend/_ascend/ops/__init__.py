@@ -30,6 +30,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     compressor_prepared,
     prepare_compressor_workspace,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
+    cp_gather_indexer_k_quant_cache,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -103,11 +106,18 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
+    silu_and_mul_with_clamp,
+    silu_and_mul_with_clamp_out,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
     compute_slot_mapping_parallel,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention import (
+    sparse_flash_attention,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
@@ -123,6 +133,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
+    "cp_gather_indexer_k_quant_cache",
+    "dequantize_and_gather_k_cache",
+    "SUPPORTED_FP8_DTYPE",
     "add_rms_norm",
     "build_compressor_metadata",
     "causal_conv1d_fn",
@@ -167,7 +180,10 @@ __all__ = [
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",
+    "silu_and_mul_with_clamp",
+    "silu_and_mul_with_clamp_out",
     "sparse_attn_sharedkv",
+    "sparse_flash_attention",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
     "top_k_per_row_decode",
