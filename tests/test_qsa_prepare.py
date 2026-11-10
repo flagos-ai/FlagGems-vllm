@@ -283,12 +283,24 @@ def _main_inputs(case: "QsaPrepareCase", fp8_cache: bool) -> dict:
         torch.randn(2, MAIN_HEAD_DIM, dtype=torch.bfloat16, device=case.device) * 0.2
     )
     qkv_width = 2 * (MAIN_QUERY_HEADS + MAIN_KV_HEADS) * MAIN_HEAD_DIM
-    qkv = torch.randn(
-        num_tokens,
-        qkv_width + (QUERY_HEADS + 1) * HEAD_DIM,
-        dtype=torch.bfloat16,
-        device=case.device,
-    )[:, :qkv_width]
+    row_width = qkv_width + (QUERY_HEADS + 1) * HEAD_DIM
+    offset = getattr(case, "main_qkv_offset", 0)
+    if offset:
+        # vLLM hands over a view into a wider fused projection, so the packed QKV
+        # buffer carries a non-zero storage_offset.  Reproduce that layout here.
+        base = torch.randn(
+            num_tokens * row_width + offset,
+            dtype=torch.bfloat16,
+            device=case.device,
+        )
+        qkv = base[offset:].view(num_tokens, row_width)[:, :qkv_width]
+    else:
+        qkv = torch.randn(
+            num_tokens,
+            row_width,
+            dtype=torch.bfloat16,
+            device=case.device,
+        )[:, :qkv_width]
     return dict(
         main_qkv=qkv,
         main_q_norm_weight=norm_weights[0],
@@ -316,9 +328,11 @@ class QsaPrepareCase:
         is_2d_positions: bool = True,
         cache_rope_positions: bool = True,
         indexer_dtype: torch.dtype = torch.bfloat16,
+        main_qkv_offset: int = 0,
         device: str = "cuda",
     ) -> None:
         self.device = device
+        self.main_qkv_offset = main_qkv_offset
         self.state_size = state_size
         self.mrope = mrope
         self.is_2d_positions = is_2d_positions
@@ -837,3 +851,19 @@ def test_qsa_prepare_matches_vllm(
     torch.cuda.synchronize()
     expected = (*outputs, main_q_out, main_gate_out, case.main["main_kv_cache"])
     _assert_matches(actual, expected)
+
+
+@pytest.mark.qsa_prepare
+def test_qwen_qsa_prepare_main_qkv_storage_offset() -> None:
+    """The gate output must follow the source view's own storage offset."""
+
+    case = QsaPrepareCase(
+        seq_lens=MIXED_BATCH[0],
+        query_lens=MIXED_BATCH[1],
+        history_lens=MIXED_BATCH[2],
+        main_qkv_offset=256,
+    )
+    qkv = case.main["main_qkv"]
+    assert qkv.storage_offset() == 256, qkv.storage_offset()
+    assert qkv.stride(-1) == 1
+    _assert_matches(case.run_kernel(), case.run_reference())

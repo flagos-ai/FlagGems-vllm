@@ -758,7 +758,7 @@ def _qsa_prepare_uncached(
     main_gate_out = main_qkv.as_strided(
         (num_tokens, num_main_q_heads, main_head_dim),
         (main_qkv.stride(0), 2 * main_head_dim, 1),
-        main_head_dim,
+        main_qkv.storage_offset() + main_head_dim,
     )
     if num_tokens == 0:
         return main_q_out, main_gate_out, None, None, None
@@ -934,6 +934,45 @@ def _qsa_prepare_uncached(
 
 
 _HOST_CACHE: dict = {}
+# Steady-state serving resolves to a handful of entries; the cap only bounds
+# pathological shape churn from a caller that reallocates its buffers.
+_HOST_CACHE_LIMIT = 64
+
+
+def _static_args(direct_args):
+    """direct_args with every tensor slot blanked, so the cache holds no tensors."""
+
+    return tuple(
+        None if isinstance(value, torch.Tensor) else value for value in direct_args
+    )
+
+
+def _tensor_slots(watched, direct_args, num_outputs):
+    """Split tensor slots into cached inputs and per-call outputs.
+
+    A slot whose tensor is one of `watched` is an input that is refilled from the
+    current call.  Any other tensor belongs to the uncached builder's own output
+    allocation (the wrapper keeps a separate pair that it returns), and is
+    refilled from the wrapper's outputs instead.
+    """
+
+    position = {id(tensor): index for index, tensor in enumerate(watched)}
+    inputs = []
+    outputs = []
+    for slot, value in enumerate(direct_args):
+        if not isinstance(value, torch.Tensor):
+            continue
+        index = position.get(id(value))
+        if index is None:
+            outputs.append(slot)
+        else:
+            inputs.append((slot, index))
+    if len(outputs) != num_outputs:
+        raise RuntimeError(
+            "qsa_prepare host cache expected %d output slots, found %d"
+            % (num_outputs, len(outputs))
+        )
+    return tuple(inputs), tuple(outputs)
 
 
 def qsa_prepare(
@@ -982,31 +1021,11 @@ def qsa_prepare(
     main_gate_out = main_qkv.as_strided(
         (num_tokens, num_main_q_heads, main_head_dim),
         (main_qkv.stride(0), 2 * main_head_dim, 1),
-        main_head_dim,
+        main_qkv.storage_offset() + main_head_dim,
     )
     if num_tokens == 0:
         return main_q_out, main_gate_out
     cache_key = (
-        id(q),
-        id(k),
-        id(positions),
-        id(cos_sin_cache),
-        id(q_norm_weight),
-        id(k_norm_weight),
-        id(q_out),
-        id(state_cache),
-        id(state_slots),
-        id(state_block_table),
-        id(query_start_loc),
-        id(logical_positions),
-        id(compressed_cache),
-        id(compressed_slots),
-        id(k_work_metadata),
-        id(main_qkv),
-        id(main_q_norm_weight),
-        id(main_k_norm_weight),
-        id(main_kv_cache),
-        id(main_slot_mapping),
         q.shape,
         k.shape,
         positions.ndim,
@@ -1032,6 +1051,22 @@ def qsa_prepare(
         k.dtype,
         positions.dtype,
         cos_sin_cache.dtype,
+        q_norm_weight.dtype,
+        k_norm_weight.dtype,
+        q_out.dtype,
+        state_cache.dtype,
+        state_slots.dtype,
+        state_block_table.dtype,
+        query_start_loc.dtype,
+        logical_positions.dtype,
+        compressed_cache.dtype,
+        compressed_slots.dtype,
+        k_work_metadata.dtype,
+        main_qkv.dtype,
+        main_q_norm_weight.dtype,
+        main_k_norm_weight.dtype,
+        main_kv_cache.dtype,
+        main_slot_mapping.dtype,
         compress_ratio,
         mrope_section,
         rope_pos_offset,
@@ -1040,13 +1075,47 @@ def qsa_prepare(
         main_k_scale,
         main_v_scale,
     )
+    watched = (
+        q,
+        k,
+        positions,
+        cos_sin_cache,
+        q_norm_weight,
+        k_norm_weight,
+        q_out,
+        state_cache,
+        state_slots,
+        state_block_table,
+        query_start_loc,
+        logical_positions,
+        compressed_cache,
+        compressed_slots,
+        k_work_metadata,
+        main_qkv,
+        main_q_norm_weight,
+        main_k_norm_weight,
+        main_kv_cache,
+        main_slot_mapping,
+        main_q_out,
+        main_gate_out,
+    )
+
     cached = _HOST_CACHE.get(cache_key)
     if cached is not None:
-        direct_args, grid_index, grid_main = cached
-        args = list(direct_args)
-        args[48] = main_q_out
-        args[49] = main_gate_out
-        ck_index, ck_main = _HOST_CACHE[(cache_key, "ck")]
+        (
+            static_args,
+            input_slots,
+            output_slots,
+            grid_index,
+            grid_main,
+            ck_index,
+            ck_main,
+        ) = cached
+        args = list(static_args)
+        for slot, source in input_slots:
+            args[slot] = watched[source]
+        for slot, value in zip(output_slots, (main_q_out, main_gate_out)):
+            args[slot] = value
         ck_index[(grid_index, 1, 1)](*(args + [0]))
         ck_main[(grid_main, 1, 1)](*(args + [1]))
         return main_q_out, main_gate_out
@@ -1087,8 +1156,17 @@ def qsa_prepare(
         main_k_scale=main_k_scale,
         main_v_scale=main_v_scale,
     )
-    _HOST_CACHE[cache_key] = (direct_args, grid_index, grid_main)
-    _HOST_CACHE[(cache_key, "ck")] = (ck_index, ck_main)
+    if len(_HOST_CACHE) >= _HOST_CACHE_LIMIT and cache_key not in _HOST_CACHE:
+        # Insertion order is the eviction order.
+        del _HOST_CACHE[next(iter(_HOST_CACHE))]
+    _HOST_CACHE[cache_key] = (
+        _static_args(direct_args),
+        *_tensor_slots(watched, direct_args, 2),
+        grid_index,
+        grid_main,
+        ck_index,
+        ck_main,
+    )
     return main_q_out, main_gate_out
 
 
