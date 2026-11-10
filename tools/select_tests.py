@@ -222,6 +222,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "benchmark/test_gdn_w8a16_int8.py": ["benchmark/test_gdn_w8a16.py"],
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "benchmark/test_gdn_w8a16.py"
     ],
