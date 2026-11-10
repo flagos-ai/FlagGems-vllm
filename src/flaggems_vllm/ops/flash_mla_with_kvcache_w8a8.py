@@ -169,33 +169,73 @@ LSE_FINALIZE_BLOCK = 256
 
 if HAS_TLE:
 
-    # Saturating FP8 publication also supplies the bound for scaled probabilities.
+    @triton.constexpr_function
+    def p128_publication_asm(asm, prequantized):
+        input_registers = 8 if prequantized else 32
+        first_base = 64 + input_registers * 2
+        halves = []
+        for half in range(2):
+            block = asm.replace(
+                f"${32 + input_registers}", f"${first_base + half * 64}"
+            )
+            for operand in range(31 + input_registers, 31, -1):
+                block = block.replace(
+                    f"${operand}", f"${operand + 32 + half * input_registers}"
+                )
+            halves.append(block)
+        return "".join(halves)
+
+
+if HAS_TLE:
+
     @triton.jit
-    def publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
-        """CUDA-native P publication; V repack carries the matching K permutation."""
+    def publish_p_fp8_sw64_coupled_stmatrix(
+        s_p, p, PREQUANTIZED: tl.constexpr = False, s_p1=None
+    ):
         base = tle.gpu.local_ptr(s_p, (0, 0))
         base_u32 = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[base],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
+            "mov.u32 $0, $1;", "=r,r", [base], dtype=tl.uint32, is_pure=True, pack=1
         )
-        return tl.inline_asm_elementwise(
-            asm=(
-                "{\n"
+        if PREQUANTIZED:
+            declaration: tl.constexpr = ""
+            conversion: tl.constexpr = (
+                "prmt.b32 a0, $32, $33, 0x5410;\n"
+                "prmt.b32 a1, $32, $33, 0x7632;\n"
+                "prmt.b32 a2, $34, $35, 0x5410;\n"
+                "prmt.b32 a3, $34, $35, 0x7632;\n"
+                "prmt.b32 b0, $36, $37, 0x5410;\n"
+                "prmt.b32 b1, $36, $37, 0x7632;\n"
+                "prmt.b32 b2, $38, $39, 0x5410;\n"
+                "prmt.b32 b3, $38, $39, 0x7632;\n"
+            )
+            publication: tl.constexpr = (
+                "shr.u32 tmp, common, 7;\n"
+                "and.b32 tmp, tmp, 3;\n"
+                "shl.b32 tmp, tmp, 4;\n"
+                "xor.b32 phys0, common, tmp;\n"
+                "add.u32 common, common, 32;\n"
+                "shr.u32 tmp, common, 7;\n"
+                "and.b32 tmp, tmp, 3;\n"
+                "shl.b32 tmp, tmp, 4;\n"
+                "xor.b32 phys1, common, tmp;\n"
+                "add.u32 addr0, $40, phys0;\n"
+                "add.u32 addr1, $40, phys1;\n"
+                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
+                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
+                "fence.proxy.async.shared::cta;\n"
+                "mov.u32 $0, $40;\n"
+                "}"
+            )
+            constraints: tl.constexpr = (
+                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                "=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+            )
+        else:
+            declaration: tl.constexpr = (
                 ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
-                ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
-                ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
-                "mov.u32 tid, %tid.x;\n"
-                "and.b32 warp_off, tid, 96;\n"
-                "shl.b32 warp_off, warp_off, 5;\n"
-                "and.b32 row_off, tid, 15;\n"
-                "shl.b32 row_off, row_off, 6;\n"
-                "or.b32 common, warp_off, row_off;\n"
-                "and.b32 tmp, tid, 16;\n"
-                "or.b32 common, common, tmp;\n"
+            )
+            conversion: tl.constexpr = (
                 "cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;\n"
                 "cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;\n"
                 "cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;\n"
@@ -220,6 +260,8 @@ if HAS_TLE:
                 "mov.b32 b1, {h9, h11};\n"
                 "mov.b32 b2, {h12, h14};\n"
                 "mov.b32 b3, {h13, h15};\n"
+            )
+            publication: tl.constexpr = (
                 "shr.u32 tmp, common, 7;\n"
                 "and.b32 tmp, tmp, 3;\n"
                 "shl.b32 tmp, tmp, 4;\n"
@@ -236,17 +278,68 @@ if HAS_TLE:
                 "fence.proxy.async.shared::cta;\n"
                 "mov.u32 $0, $64;\n"
                 "}"
-            ),
-            constraints=(
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
-            ),
-            args=[p, base_u32],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=32,
+            )
+            constraints: tl.constexpr = (
+                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                "=r,=r,=r,=r,=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+                "f,f,f,f,f,f,f,f,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                "r,r,r,r"
+            )
+        asm: tl.constexpr = (
+            "{\n"
+            + declaration
+            + (
+                (
+                    ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
+                    ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+                    "mov.u32 tid, %tid.x;\n"
+                    "and.b32 warp_off, tid, 96;\n"
+                    "shl.b32 warp_off, warp_off, 5;\n"
+                    "and.b32 row_off, tid, 15;\n"
+                    "shl.b32 row_off, row_off, 6;\n"
+                    "or.b32 common, warp_off, row_off;\n"
+                    "and.b32 tmp, tid, 16;\n"
+                    "or.b32 common, common, tmp;\n"
+                )
+            )
+            + conversion
+            + publication
         )
+        if s_p1 is None:
+            return tl.inline_asm_elementwise(
+                asm, constraints, [p, base_u32], dtype=tl.uint32, is_pure=False, pack=32
+            )
+        else:
+            base1 = tle.gpu.local_ptr(s_p1, (0, 0))
+            if PREQUANTIZED:
+                constraints128: tl.constexpr = (
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+                )
+            else:
+                constraints128: tl.constexpr = (
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+                    "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+                )
+            return tl.inline_asm_elementwise(
+                p128_publication_asm(asm, PREQUANTIZED),
+                constraints128,
+                [p, base_u32, base1.to(tl.uint64).to(tl.uint32)],
+                dtype=tl.uint32,
+                is_pure=False,
+                pack=64,
+            )
 
 
 if HAS_TLE:
