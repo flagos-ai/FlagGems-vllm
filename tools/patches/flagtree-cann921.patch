@@ -1,0 +1,75 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# FlagTree 0.6.0+ascend.gitf56cd1bd (Triton 3.5.1) only.
+# Use CANN 9.2.1 bishengir-opt/compile without the CANN 9.1 IR reader.
+# Apply once in the Python site-packages directory: patch -p1 < this-file
+# This narrow serialization bridge does not replace the upstream LLVM fix:
+# https://github.com/triton-lang/triton-ascend/pull/2417
+--- a/triton/backends/ascend/compiler.py
++++ b/triton/backends/ascend/compiler.py
+@@ -244,10 +244,2 @@
+-def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
+-    """
+-    Convert MLIR Bytecode to MLIR text format using bishengir-opt.
+-    Args:
+-        bc_data: Bytecode data as bytes
+-        metadata: Compilation metadata
+-        opt: Compilation options
+-    Returns:
+-        MLIR text as string
+-    """
++def linalg_to_bishengir_text(linalg: str, metadata, opt):
++    """Bridge LLVM 22 text to CANN 9.2 text without an older IR reader."""
+@@ -255 +247 @@
+-        bc_path = os.path.join(tmpdir, "kernel.mlirbc")
++        adapter_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
+@@ -258,3 +250,17 @@
+-        # Write bytecode data to temporary file
+-        with open(bc_path, "wb") as f:
+-            f.write(bc_data)
++        Path(adapter_path).write_text(linalg)
++        generic_path = os.path.join(tmpdir, "kernel.generic.mlir")
++        subprocess.run([
++            _get_triton_mlir_opt_path(), adapter_path, "--mlir-print-op-generic",
++            "--mlir-print-debuginfo", "-o", generic_path,
++        ], capture_output=True, check=True, text=True)
++        generic = Path(generic_path).read_text()
++        # LLVM 19 has no arith.trunci overflow property. Omit only the
++        # default wrapping flags; never drop non-default overflow semantics.
++        generic = re.sub(
++            r'("arith\.trunci"\([^\n]*?\)) <\{overflowFlags = #arith\.overflow<none>\}>',
++            r'\1', generic,
++        )
++        # LLVM 22 renamed to_memref to to_buffer; the typed generic form
++        # preserves the operand, result layout, attributes and address space.
++        generic = generic.replace('"bufferization.to_buffer"(', '"bufferization.to_memref"(')
++        Path(generic_path).write_text(generic)
+@@ -266 +272 @@
+-            bc_path,
++            generic_path,
+@@ -1112 +1117,0 @@
+-            # Support BC mode: convert Linalg IR to Bytecode format, then back to MLIR
+@@ -1114,4 +1119 @@
+-                # Step 1: Convert Linalg IR to Bytecode using triton-mlir-opt
+-                stages["mlirbc"] = lambda src, metadata: linalg_to_bc_by_triton_mlir_opt(src, metadata, options)
+-                # Step 2: Convert Bytecode back to MLIR text using bishengir-opt
+-                stages["bcmlir"] = lambda src, metadata: bc_to_linalg_by_bishengir_opt(src, metadata, options)
++                stages["bcmlir"] = lambda src, metadata: linalg_to_bishengir_text(src, metadata, options)
