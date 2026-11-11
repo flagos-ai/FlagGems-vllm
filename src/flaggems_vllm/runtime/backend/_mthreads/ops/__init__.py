@@ -30,11 +30,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.fused_indexer_weight_scale impo
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
+from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import fused_experts_impl
 from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16 import (
     chunk_gated_delta_rule_w8a16_fp8,
     gated_delta_rule_decode_w8a16_fp8,
@@ -85,9 +81,7 @@ __all__ = [
     "gemma_rms_norm",
     "grouped_topk",
     "hc_combine",
-    "inplace_fused_experts",
     "mhc_pre_broadcast",
-    "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
