@@ -1785,3 +1785,17 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: deepseek_v4_sparse_attention
+    description: |
+      Ascend shared-KV attention over sliding-window and compressed paged
+      caches with explicit request/position metadata, optional sink logits,
+      FP16/BF16/FP32 data and strided layouts. Returns a new output tensor.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
