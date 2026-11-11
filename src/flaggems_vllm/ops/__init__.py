@@ -24,6 +24,7 @@ from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -52,6 +53,7 @@ from flaggems_vllm.ops.FLA import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_kda,
 )
+from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
@@ -85,6 +87,9 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
+from flaggems_vllm.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
@@ -126,7 +131,6 @@ from flaggems_vllm.ops.qwen4 import (
     qsa_compress_norm_mrope_store_groups,
     qsa_mqa_paged,
     qsa_sparse_paged_attention,
-    qsa_sparse_split_count,
     qsa_store_cache_rows,
     qsa_store_kv_cache_rows,
     qwen4_hc_combine_norm,
@@ -269,6 +273,7 @@ __all__ = [
     "concat_mla_q",
     "concat_query",
     "contiguous_copy",
+    "cooperative_topk",
     "copy_to",
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",
@@ -277,6 +282,7 @@ __all__ = [
     "dgeglu",
     "dispatch_fused_moe_kernel",
     "dreglu",
+    "dsv41_o_proj",
     "dswiglu",
     "expand_pools_and_append_tail",
     "flash_attention_forward",
@@ -297,6 +303,7 @@ __all__ = [
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
     "fused_minimax_m3_qknorm_rope_kv_insert",
@@ -368,7 +375,6 @@ __all__ = [
     "qsa_mqa_paged",
     "qsa_prepare",
     "qsa_sparse_paged_attention",
-    "qsa_sparse_split_count",
     "qsa_store_cache_rows",
     "qsa_store_kv_cache_rows",
     "qwen4_compress_norm_mrope_store_groups",
