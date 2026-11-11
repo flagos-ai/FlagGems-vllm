@@ -5,9 +5,13 @@
 # The upstream file includes MIT-licensed flash-linear-attention code:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -148,6 +152,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     a stateful operation. Configuration experiments use externally restored
     state and no-Graph timing (see the accompanying benchmark).
     """
+    logger.debug("GEMS_ASCEND FUSED_RECURRENT_GATED_DELTA_RULE_PACKED_DECODE")
     float_types = (torch.float16, torch.bfloat16, torch.float32)
     tensors = (mixed_qkv, a, b, A_log, dt_bias, initial_state, out)
     if any(t.dtype not in float_types for t in tensors):
