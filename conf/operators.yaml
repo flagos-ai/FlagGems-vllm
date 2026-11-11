@@ -265,6 +265,18 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: compute_topk_scores
+    description: |
+      Collect sampled and top-k token scores and sampled-token ranks for vLLM.
+    for:
+      - vllm.v1.worker.gpu.sample.logprob.compute_topk_scores
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '0.3'
   - id: concat_and_cache_mla
     description: |
       Writes the latent and RoPE value into KV cache for Multi-head Latent Attention forward case.

@@ -56,12 +56,13 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 # PyTorch dispatch by enable()/only_enable().
 _LIBRARY_ONLY_OPS = frozenset(
     {
+        "compute_topk_scores",
         "fused_indexer_weight_scale",
         "grouped_gemma_rmsnorm",
         "hc_combine",
-        "top_k_top_p",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
+        "top_k_top_p",
     }
 )
 
