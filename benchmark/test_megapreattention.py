@@ -251,9 +251,7 @@ _SESSION = None
 
 
 def _library():
-    source = (
-        Path(__file__).resolve().parents[1] / "tests" / "megapreattention_dushmem.hip"
-    )
+    source = Path(__file__).resolve().with_name("megapreattention_dushmem.hip")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     output = Path(tempfile.gettempdir()) / f"mpa-dushmem-{digest[:16]}.so"
     with output.with_suffix(".lock").open("a") as lock:

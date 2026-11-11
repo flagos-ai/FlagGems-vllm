@@ -18,11 +18,9 @@ Oracle is derived from frozen NV PR #1007; it gathers original hidden shards
 and never reads candidate communication buffers or intermediate projections.
 """
 import hashlib
-import importlib.util
 import json
 import os
 import statistics
-import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
@@ -260,20 +258,9 @@ def changed(x, **kw):
 
 
 def implementation():
-    # Direct module loading keeps this distributed adapter independent of vLLM
-    # and unrelated optional operators. Public-export coverage lives in pytest.
-    if "megapreattention_hy_test_impl" not in sys.modules:
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "src/flaggems_vllm/runtime/backend/_hygon/ops/megapreattention.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "megapreattention_hy_test_impl", path
-        )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-    return sys.modules["megapreattention_hy_test_impl"]
+    from flaggems_vllm.runtime.backend._hygon.mega.megapreattention import api
+
+    return api
 
 
 def candidate(x):
@@ -948,7 +935,9 @@ def test_megapreattention_address_offsets():
     import triton
     import triton.language as tl
 
-    row_offset = implementation()._row_offset
+    from flaggems_vllm.runtime.backend._hygon.mega.megapreattention.megapreattention_kernel import (
+        _row_offset as row_offset,
+    )
 
     @triton.jit
     def offsets_kernel(rows, strides, columns, output, BLOCK: tl.constexpr):
