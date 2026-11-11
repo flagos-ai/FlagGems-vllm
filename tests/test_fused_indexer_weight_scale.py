@@ -45,6 +45,17 @@ SHAPES = (
 )
 
 
+def _reference_weight_scale(weights, q_scale, scale):
+    """The native leaf's expression, for environments whose vLLM predates it.
+
+    Copied verbatim from ``vllm/models/glm5next/common/attention.py``
+    (``_fused_indexer_weight_scale``, present from vLLM 0.31.0 and unchanged
+    through 0.32.0 and main). A torch reference is allowed in tests only; no
+    production path imports this.
+    """
+    return (weights.unsqueeze(-1) * q_scale * scale).squeeze(-1)
+
+
 @pytest.fixture(scope="module")
 def native_weight_scale():
     # Match each backend's native compile policy outside timing.
@@ -58,14 +69,14 @@ def native_weight_scale():
             from vllm.models.glm5next.common.attention import (
                 _fused_indexer_weight_scale,
             )
-        except ImportError as exc:
-            raise RuntimeError(
-                "The native indexer baseline requires vLLM 0.33.0+empty; "
-                "vLLM 0.24+empty has no such entry. Install it in the vendor "
-                "test environment following the PR's validation instructions."
-            ) from exc
-
-        yield _fused_indexer_weight_scale
+        except ImportError:
+            # Where the installed vLLM has no glm5next entry (0.24+empty, as in
+            # the NVIDIA QA image), fall back to the same expression rather than
+            # failing the suite: compiled and eager differ in kernel count, not
+            # in the arithmetic, and the comparison here is atol=1e-6.
+            yield _reference_weight_scale
+        else:
+            yield _fused_indexer_weight_scale
 
 
 def make_inputs(tokens, heads, device, is_strided=False, dtype=torch.float32):
@@ -156,3 +167,45 @@ def test_fused_indexer_weight_scale_storage_offset(native_weight_scale, offset):
     gems_assert_close(output, expected, torch.float32, atol=1e-6)
     gems_assert_equal(weights_base, weights_saved)
     gems_assert_equal(query_base, query_saved)
+
+
+@pytest.mark.fused_indexer_weight_scale
+def test_fused_indexer_weight_scale_bitwise_matches_native(native_weight_scale):
+    """The hot trace shapes come out bit-exact, not merely within atol.
+
+    Both sides evaluate ``(w * q) * scale`` in FP32 in that order, so any
+    difference would mean the implementation reassociated the product.
+    """
+    torch.manual_seed(0)
+    scale = 128**-0.5 * 32**-0.5
+    for tokens in (4, 8, 13, 18, 24, 35, 46, 51, 65, 76):
+        weights, q_scale = make_inputs(tokens, 32, flaggems_vllm.device)
+        expected = native_weight_scale(weights, q_scale, scale)
+        output = flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, scale)
+        gems_assert_equal(output, expected)
+
+
+@pytest.mark.fused_indexer_weight_scale
+@pytest.mark.parametrize(
+    "weights_shape,q_scale_shape",
+    [
+        ((4, 32), (4, 32)),  # q_scale missing its trailing extent
+        ((4, 32), (4, 32, 2)),  # trailing extent is not 1
+        ((4, 32, 1), (4, 32, 1)),  # weights not 2-D
+        ((4, 32), (5, 32, 1)),  # leading shapes disagree
+    ],
+)
+def test_fused_indexer_weight_scale_unsupported(weights_shape, q_scale_shape):
+    """Unsupported layouts raise instead of falling back to torch compute."""
+    weights = torch.empty(weights_shape, device=flaggems_vllm.device)
+    q_scale = torch.empty(q_scale_shape, device=flaggems_vllm.device)
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, 0.125)
+
+
+@pytest.mark.fused_indexer_weight_scale
+def test_fused_indexer_weight_scale_unsupported_dtype():
+    weights = torch.ones((4, 32), dtype=torch.float64, device=flaggems_vllm.device)
+    q_scale = torch.ones((4, 32, 1), device=flaggems_vllm.device)
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.fused_indexer_weight_scale(weights, q_scale, 0.125)

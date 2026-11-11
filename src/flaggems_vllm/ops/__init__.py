@@ -16,6 +16,7 @@
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
@@ -84,6 +85,9 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
+from flaggems_vllm.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
@@ -98,7 +102,7 @@ from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
-from flaggems_vllm.ops.logprob import LogprobTokenIdsState, compute_topk_scores
+from flaggems_vllm.ops.logprob import compute_topk_scores
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -298,6 +302,7 @@ __all__ = [
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
     "fused_minimax_m3_qknorm_rope_kv_insert",
@@ -406,6 +411,7 @@ __all__ = [
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "top_k_top_p",
     "topk_sigmoid",
     "topk_softmax",
     "topk_softplus_sqrt",
