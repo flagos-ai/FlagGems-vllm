@@ -92,6 +92,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
@@ -163,6 +164,7 @@ __all__ = [
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
+    "mhc_post",
     "npu_mhc_pre",
     "outplace_fused_experts",
     "pack_seq_triton",
