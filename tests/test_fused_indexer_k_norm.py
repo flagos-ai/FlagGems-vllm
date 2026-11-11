@@ -459,17 +459,13 @@ def test_h20z_d128_launcher_dispatches_fast_path_and_fallback(monkeypatch):
     calls.clear()
     weight_parent = torch.empty((256,), dtype=torch.float32, device=DEVICE)
     strided_weight = weight_parent[::2]
-    module._launch_fused_indexer_k_norm(
-        x, strided_weight, bias, out, _eps32(1e-6)
-    )
+    module._launch_fused_indexer_k_norm(x, strided_weight, bias, out, _eps32(1e-6))
     assert [call[0] for call in calls] == ["fallback"]
     assert "BLOCK_M" not in calls[0][3]
     grid = calls[0][1]
     assert callable(grid)
     for block_m in (1, 4, 8):
-        assert grid({"BLOCK_M": block_m}) == (
-            (x.shape[0] + block_m - 1) // block_m,
-        )
+        assert grid({"BLOCK_M": block_m}) == ((x.shape[0] + block_m - 1) // block_m,)
 
 
 @pytest.mark.parametrize("rows", (1, 8))
@@ -675,9 +671,7 @@ def test_h20z_d128_real_layout_configs(rows, dtype):
     out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
 
     assert x.stride() == (192, 1)
-    assert module._use_h20z_d128_fast_path(
-        rows, 128, 192, 1, 1, 1, x.device.index
-    )
+    assert module._use_h20z_d128_fast_path(rows, 128, 192, 1, 1, 1, x.device.index)
     _assert_close(out, cpu_fp64_oracle(x, weight, bias, 1e-6), dtype)
     _assert_fresh_contiguous(out, x, weight, bias)
 
@@ -700,9 +694,7 @@ def test_h20z_d128_non_aligned_offsets_use_fast_path(dtype):
     assert x.data_ptr() % 16 != 0
     assert weight.data_ptr() % 16 != 0
     assert bias.data_ptr() % 16 != 0
-    assert module._use_h20z_d128_fast_path(
-        17, 128, 192, 1, 1, 1, x.device.index
-    )
+    assert module._use_h20z_d128_fast_path(17, 128, 192, 1, 1, 1, x.device.index)
 
     out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
 
@@ -803,9 +795,7 @@ def test_h20z_d128_nan_inf_source_parity_for_bm1_and_bm8(rows):
     if not _h20z_d128_fast_path_runtime_available(module):
         pytest.skip("H20Z/Triton-specific production fast path")
     x, weight, bias, _ = _h20z_fast_path_offset_case(rows, torch.float32)
-    assert module._use_h20z_d128_fast_path(
-        rows, 128, 192, 1, 1, 1, x.device.index
-    )
+    assert module._use_h20z_d128_fast_path(rows, 128, 192, 1, 1, 1, x.device.index)
 
     x[0, 3] = float("nan")
     x[min(rows - 1, 1), 7] = float("inf")
@@ -816,9 +806,7 @@ def test_h20z_d128_nan_inf_source_parity_for_bm1_and_bm8(rows):
     finite_x, weight, bias, _ = _h20z_fast_path_offset_case(rows, torch.float32)
     weight[11] = float("nan")
     bias[29] = float("inf")
-    out = flaggems_vllm.fused_indexer_k_norm(
-        finite_x, weight, bias, 128, 1e-6
-    )
+    out = flaggems_vllm.fused_indexer_k_norm(finite_x, weight, bias, 128, 1e-6)
     _assert_source_parity(
         out, source_shadow_reference(finite_x, weight, bias, 1e-6), finite_x.dtype
     )
@@ -1080,3 +1068,191 @@ def test_subnormal_and_normal_variance_nonconstant(dtype, eps):
     bias = torch.linspace(-0.25, 0.25, 128, device=DEVICE, dtype=torch.float32)
     out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, eps)
     _assert_close(out, cpu_fp64_oracle(x, weight, bias, eps), dtype)
+
+
+ROW_TAIL_D128_CASES = (
+    (7, 0),
+    (9, 16),
+    (63, 0),
+    (65, 16),
+    (4095, 0),
+    (4097, 16),
+)
+
+
+def _d128_offset_inputs(rows, row_gap, dtype, seed):
+    torch.manual_seed(seed)
+    parent = torch.randn((rows + 1, 128 + row_gap), dtype=dtype, device=DEVICE)
+    # Both layouts have a nonzero storage offset.  Their row strides are 128
+    # and 144 respectively, so this checks gap=0 and gap=16 without a view
+    # that changes the logical D=128 input.
+    x = parent[1:, :128]
+    weight_parent = torch.randn((130,), dtype=torch.float32, device=DEVICE)
+    bias_parent = torch.randn((131,), dtype=torch.float32, device=DEVICE)
+    weight = weight_parent[1:129]
+    bias = bias_parent[2:130]
+    assert x.shape == (rows, 128)
+    assert x.stride() == (128 + row_gap, 1)
+    assert x.storage_offset() > 0
+    assert weight.storage_offset() > 0
+    assert bias.storage_offset() > 0
+    return x, weight, bias, (parent, weight_parent, bias_parent)
+
+
+def _call_d128_with_optional_out(x, weight, bias, provided):
+    before = tuple(t.clone() for t in (x, weight, bias))
+    supplied = torch.full_like(x, float("nan")) if provided else None
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6, out=supplied)
+    if supplied is None:
+        _assert_fresh_contiguous(out, x, weight, bias)
+    else:
+        assert out is supplied
+        assert out.data_ptr() == supplied.data_ptr()
+        assert out.is_contiguous()
+    for actual, expected in zip((x, weight, bias), before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    return out
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("rows,row_gap", ROW_TAIL_D128_CASES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("provided", (False, True))
+def test_d128_row_tail_offsets_all_dtypes_and_out_modes(rows, row_gap, dtype, provided):
+    x, weight, bias, parents = _d128_offset_inputs(
+        rows, row_gap, dtype, seed=6100 + rows + row_gap
+    )
+    parents_before = tuple(parent.clone() for parent in parents)
+
+    out = _call_d128_with_optional_out(x, weight, bias, provided)
+
+    _assert_close(out, cpu_fp64_oracle(x, weight, bias, 1e-6), dtype)
+    for actual, expected in zip(parents, parents_before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("provided", (False, True))
+@pytest.mark.parametrize("rows", (9, 129, 1025, 4097))
+def test_d128_fp32_nonconstant_tiny_eps_row_tail(provided, rows):
+    x, weight, bias, _ = _d128_offset_inputs(rows, 16, torch.float32, seed=6201)
+    signs = torch.where(
+        torch.arange(128, device=DEVICE) % 2 == 0,
+        torch.ones(128, device=DEVICE),
+        -torch.ones(128, device=DEVICE),
+    )
+    patterns = torch.stack((signs * 2.0**-70, signs * 2.0**-63))
+    x.copy_(patterns.repeat((rows + 1) // 2, 1)[:rows])
+    supplied = torch.empty_like(x) if provided else None
+
+    out = flaggems_vllm.fused_indexer_k_norm(
+        x, weight, bias, 128, 2.0**-149, out=supplied
+    )
+
+    if supplied is not None:
+        assert out is supplied
+    _assert_close(out, cpu_fp64_oracle(x, weight, bias, 2.0**-149), torch.float32)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("provided", (False, True))
+@pytest.mark.parametrize("rows", (65, 129, 1025, 4097))
+def test_d128_fp32_high_finite_c1_row_tail(provided, rows):
+    x, weight, bias, _ = _d128_offset_inputs(rows, 16, torch.float32, seed=6301)
+    signs = torch.where(
+        torch.arange(128, device=DEVICE) % 2 == 0,
+        torch.ones(128, device=DEVICE),
+        -torch.ones(128, device=DEVICE),
+    )
+    alternating = signs * float(2**125)
+    mixed = torch.full((128,), float(2**100), dtype=torch.float32, device=DEVICE)
+    mixed[0] = float(2**125)
+    x.copy_(torch.stack((alternating, mixed)).repeat((rows + 1) // 2, 1)[:rows])
+    supplied = torch.empty_like(x) if provided else None
+
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6, out=supplied)
+
+    if supplied is not None:
+        assert out is supplied
+    # Each row repeats one of two known input patterns. Compute the independent
+    # scalar FP32 oracle once per pattern, then repeat its expected rows.
+    expected = cpu_fp32_semantics_oracle(x[:2], weight, bias, 1e-6)
+    expected = expected.repeat((rows + 1) // 2, 1)[:rows]
+    _assert_close(out, expected, torch.float32)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("provided", (False, True))
+@pytest.mark.parametrize("rows", (129, 4097))
+def test_d128_nonfinite_rows_across_tiles(dtype, provided, rows):
+    x, weight, bias, _ = _d128_offset_inputs(rows, 16, dtype, seed=6401)
+    x[64, 17] = float("inf")
+    x[-1, 31] = float("nan")
+    supplied = torch.empty_like(x) if provided else None
+
+    out = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6, out=supplied)
+
+    if supplied is not None:
+        assert out is supplied
+    _assert_source_parity(out, source_shadow_reference(x, weight, bias, 1e-6), dtype)
+    _assert_close(out[:1], cpu_fp64_oracle(x[:1], weight, bias, 1e-6), dtype)
+
+
+@pytest.mark.fused_indexer_k_norm
+@DEVICE_REQUIRED
+@pytest.mark.skipif(
+    flaggems_vllm.runtime.device.vendor_name != "ascend",
+    reason="Ascend shared-tile dispatch coverage",
+)
+@torch.inference_mode()
+def test_ascend_shared_tile_dispatch_and_compatibility(monkeypatch):
+    shared = importlib.import_module("flaggems_vllm.ops.fused_indexer_k_norm")
+    ascend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_k_norm"
+    )
+    x, weight, bias, _ = _d128_offset_inputs(129, 16, torch.float32, seed=6501)
+    if not ascend._shared_tile_validated_device(x.device.index):
+        pytest.skip("shared tile is not enabled for this device/compiler")
+    expected = cpu_fp64_oracle(x, weight, bias, 1e-6)
+    calls = []
+
+    class ForwardingKernel:
+        def __init__(self, name, kernel):
+            self.name = name
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append(self.name)
+                return self.kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(
+        shared,
+        "_fused_indexer_k_norm_kernel",
+        ForwardingKernel("shared", shared._fused_indexer_k_norm_kernel),
+    )
+    monkeypatch.setattr(
+        ascend,
+        "_ascend_fused_indexer_k_norm_kernel",
+        ForwardingKernel("compatibility", ascend._ascend_fused_indexer_k_norm_kernel),
+    )
+    actual = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+    assert calls == ["shared"]
+    _assert_close(actual, expected, torch.float32)
+
+    calls.clear()
+    monkeypatch.setattr(ascend, "_shared_tile_validated_device", lambda _index: False)
+    actual = flaggems_vllm.fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+    assert calls == ["compatibility"]
+    _assert_close(actual, expected, torch.float32)
