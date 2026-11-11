@@ -716,3 +716,105 @@ channel-first 路径的 peeled tail 原先固定 32 行（`BLOCK_T_TAIL=32`）�
 与缺陷复现 D4（`defects/d4_extract_slice_pipeline.py`），并写进该目录 README。在那之前，本算子的最优
 表达仍是 4 次 L2 重读，剩余可挖的空间只有 tail/prologue 这类固定开销（合计
 <10%）和集成侧的 token-major 视图传参。
+
+---
+
+## 10. 2026-11-11：压掉固定开销 + 分档 tile（0.75x → 0.80x）
+
+第 9 节的结论是「剩余空间只有 tail/prologue 这类固定开销（合计 <10%）」。
+这一轮先把 kernel 拆开量了固定开销，再分别处理，最后重新扫了 channel-first
+的 tile。
+
+### 10.1 逐段耗时（device kernel time，µs）
+
+在 kernel 里加 `EXP` 位开关（跳过 full-tile 主循环 / tail / 前导 / state 回写），
+用 `torch_npu.profiler` 只统计主 kernel：
+
+| shape | kernel 总 | 4-tap 主循环 | 前导 W-1 输出 | tail | 其它 |
+|---|---|---|---|---|---|
+| T=8192, dim=9216 | 233.2 | 200.0 | 10.3 | 17.7 | 8.5 |
+| T=24576, dim=2304 | 200.6 | 153.8 | 27.7 | 20.6 | 13.0 |
+| T=32768, dim=9216 | 799.7 | 777.7 | 6.8 | 13.2 | 7.8 |
+
+两处固定开销在短 shape 上合计 23–48 µs（10–14%）。旧的前导是 AscendC 那种
+`s_k <- s_{k+1} + w_k x_t` 滚动递推，每个 program 串行走 3 个
+load/compute/store 小步；在 576 个 program、9 波的情形下，这条依赖链本身
+就要 10–28 µs。
+
+### 10.2 改动
+
+1. **前导输出改成并行组合。** 第 `i` 个前导输出
+   `y_i = Σ_k w_k · x[tk_start + i - (W-1) + k]` 只依赖 `W-1` 个历史行和
+   区间内前 `W-1` 行，输出之间没有递推关系，直接按 `i` 展开成 `W-1` 个固定
+   组合即可。滚动状态 `s0..s3` 原本只服务于这段前导，主循环完全不使用，
+   一并删除。
+2. **tail 并入最后一个 full tile。** 主循环改成
+   `n_full = ceil((tk_end - t_first) / BLOCK_T)`，最后一次迭代的起点
+   标量回夹到 `tk_end - BLOCK_T`；重叠的几行重算同值（卷积是 `x` 的纯函数）。
+   起点是标量，所有 tap 地址仍是 affine；只有「区间短于一个完整 tile」时
+   才回落到原来的逐 lane mask 短 tile。这样 tail 从「2×128 行」变成
+   「1×BLOCK_T 行」。
+3. **channel-first tile 分档。** 重新用 profiler 扫（不是 wall-clock）后，
+   长区间用 `16×512`（1 KB 行）、短区间用 `32×256`：
+
+   | max_seqlen | 32×256 | 16×512 |
+   |---|---|---|
+   | 4096 | **112.0** | 116.6 |
+   | 8192 | 221.4 | **199.0** |
+   | 16384 | 424.1 | **376.1** |
+
+   （dim=9216、单请求；dim=2304/4608 同趋势。）分界取 `max_seqlen >= 8192`。
+   更长的行在长区间上把 4 次 tap 读的 DMA 描述符开销摊薄；短区间上
+   channel tile 减半会让 program 数翻倍，前导/收尾摊不回来。
+4. **顺带修掉 width=5。** 旧 `wrows` 只有 4 行，`wrows[KERNEL_WIDTH - 1]`
+   在 W=5 时越界，W=5 实际不可用（单测只覆盖 W=4）。现在补上第 5 行权重，
+   并让 W=5 固定用 16 宽通道 tile（32 宽 + 5 个 tap buffer 会 UB 溢出：
+   32×128 需要 2.28 Mbit，超出 1.77 Mbit；16×256 可编译）。
+
+### 10.3 结果（同一脚本、同一轮 profiler，µs）
+
+| shape | 第 9 节 | **本次** | AscendC | speedup |
+|---|---|---|---|---|
+| T=8192, seqs=2, dim=9216 | 232.5 | **221.4** | 162.9 | 0.74x |
+| T=16384, seqs=4, dim=4608 | 231.4 | **217.7** | 238.9 | 1.10x |
+| T=24576, seqs=8, dim=2304 | 203.4 | **189.3** | 115.3 | 0.61x |
+| T=32768, seqs=2, dim=9216 | 807.9 | **749.4** | 637.0 | 0.85x |
+| **几何平均** | 0.75x | | | **0.80x** |
+
+* `tests/test_causal_conv1d_fn.py` 96/96 通过。
+* `tools/test_kda_vs_vllm_ascend.py --ops conv_prefill` 4/4 PASS，
+  输出 `max_rel ≤ 6.2e-4`，`conv_state` 逐位一致。
+* width 2/3/4/5 均与 torch 参考对齐（新增 W=5 覆盖）。
+
+### 10.4 为什么还是 0.73x / 0.61x
+
+固定开销已经压到 3–10%，剩余差距回到 4 次 tap 读。同一 tile 形态的
+microbench（只保留 full-tile 循环）给出：
+
+| shape | 1 次 tap + 写 | 4 次 tap + 写 | 增量 |
+|---|---|---|---|
+| T=8192, dim=9216 | 145.9 | 186.3 | +40.4 |
+| T=24576, dim=2304 | 107.0 | 134.5 | +27.5 |
+
+即后 3 次重读确实命中 L2（1→4 tap 只多 28%，不是 3×），但仍要付约
+30–40 µs 的 L2 带宽。Silu 在 microbench 里完全免费（186.3 → 186.0）。
+想再进一步只能把「每次 x 行读 4 次」变成 1 次：
+
+* `al.extract_slice` 行移位：`num_stages=2` 下确定性读旧缓冲（D4）；
+  `num_stages=1` 正确但串行，且 channel-first 末轴 2 B 偏移会退化成逐元素
+  移位（第 8 节实测 1083 µs）。
+* `tl.gather`：语义正确，但同 tile 实测 893–3648 µs，是 4 次重读的 4.5–5 倍。
+* extension 的 depthwise `conv1d`（`triton.language.extra.cann.extension`）：
+  非 depthwise 可编译；depthwise（groups=C）在 A5 regbase pipeline 下
+  UB 溢出，`C×L≈4096` 以上就编不过，最大只能到 16×256 量级的 tile，
+  对 KDA 的 dim 太小。
+
+因此这一版仍是「4 次 L2 重读」的正确最优形态；真正的 2.5× 流量收益要等
+R3（流水化 UB 行偏移视图）落地。
+
+### 10.5 复现
+
+```bash
+PYTHONPATH=src:FlagGems/src python tools/test_kda_vs_vllm_ascend.py --ops conv_prefill
+PYTHONPATH=src python -m pytest tests/test_causal_conv1d_fn.py -q
+```

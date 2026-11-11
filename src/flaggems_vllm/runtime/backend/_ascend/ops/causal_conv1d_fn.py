@@ -5,10 +5,10 @@ The launch geometry and inner loop mirror ``fla_npu``'s AscendC
 ``causal_conv1d_fn`` (``causal_conv1d_tiling_planner.h`` plus
 ``RunSeq``/``RunSeqFnRolling``):
 
-* The host splits every request into contiguous token ranges so that
-  ``#ranges x #channel_tiles`` is about one wave over the AIV cores.  A fixed
-  per-chunk grid launched several sequential waves on the KDA shapes and
-  re-paid the per-program prologue on every one of them.
+* The host splits every request into contiguous token ranges, so
+  ``#ranges x #channel_tiles`` is about one wave over the AIV cores when the
+  channel tile is wide enough.  The narrow channel-first tiles run several
+  waves, but every program still streams one whole range.
 * A program streams its whole token range in ``BLOCK_T``-token tiles.  The
   ``W`` taps are the same tile re-read at row offsets ``0 .. W-1``: the repeats
   of one iteration overlap almost completely and are served from L2, and the
@@ -16,15 +16,16 @@ The launch geometry and inner loop mirror ``fla_npu``'s AscendC
   here -- a per-token loop tops out near 0.5 TB/s on Ascend950DT, while a wide
   tile reaches ~2 TB/s, at the AscendC kernel's own bandwidth.
 * The ``W-1`` leading tokens of a range have a window that reaches outside it
-  (conv_state history or the previous range), so they use the register rolling
-  recurrence of AscendC's fast path (``s_k <- s_{k+1} + w_k x_t``).  The tiled
-  loop therefore needs no masked history correction at all.
-* The ragged tail is peeled out of the loop and walked in short
-  ``BLOCK_T_TAIL``-row tiles whose *start* is scalar-clamped to
-  ``tk_end - BLOCK_T_TAIL``.  A per-lane clamped row makes the address
-  non-affine and triton-ascend answers that with one DMA per element; keeping
-  the start scalar keeps the tail affine, in bounds, and mask-free (the last
-  tile re-covers a few rows, which recomputes identical values).
+  (conv_state history or the previous range), so they read those history rows
+  explicitly.  Each leading output is a fixed sum of ``W`` rows and none feeds
+  the next, so they are computed independently.  The tiled loop then needs no
+  masked history correction at all, and no rolling state is carried into it.
+* The ragged tail is absorbed by the last full tile, whose *start* is
+  scalar-clamped backwards to ``tk_end - BLOCK_T``.  A per-lane clamped row
+  makes the address non-affine and triton-ascend answers that with one DMA per
+  element; keeping the start scalar keeps every tap affine and in bounds (the
+  last tile re-covers a few rows, which recomputes identical values).  Only a
+  range shorter than one full tile uses the short ``BLOCK_T_TAIL`` fallback.
 
 Two input layouts are consumed without a copy, chosen by strides:
 
@@ -39,15 +40,20 @@ Two input layouts are consumed without a copy, chosen by strides:
   ``_pick_tiles_channel_first`` trades channel width for row length.
 * Anything else (neither axis unit-strided) is made contiguous once.
 
-The channel tile is the dominant knob (``_pick_tiles``): it sets the bytes per
-row transfer, and it should divide ``dim`` so no program pays a masked tail.
+The tile is the dominant knob (``_pick_tiles`` / ``_pick_tiles_channel_first``):
+it sets the bytes per row transfer, and it should divide ``dim`` so no program
+pays a masked tail.  On the channel-first path the token axis is the contiguous
+one, so long ranges trade channel width for row length (``16 x 512``) while
+short ranges keep shorter rows and a wider channel tile (``32 x 256``).
 One read per row plus a UB row shift was also implemented and measured ~9%
 faster (``extract_slice`` of ``BLOCK_T + W - 1`` rows), but the triton-ascend
 software pipeline (``num_stages=2``) mis-versions the extracted views and
 silently returns stale rows -- with ``num_stages=1`` the same kernel is
 correct and ~35% slower, and an explicitly bound UB buffer does not fix the
-pipeliner.  Re-reading from L2 is therefore the fastest correct formulation on
-this toolchain.
+pipeliner.  ``tl.gather`` on the same views compiled but measured 4.5x slower,
+and the extension's depthwise ``conv1d`` exceeds UB on a useful tile.
+Re-reading from L2 is therefore the fastest correct formulation on this
+toolchain.
 """
 
 import numpy as np
@@ -286,12 +292,20 @@ def _causal_conv1d_fwd_kernel(
             _weight_row(w_ptr, idx_feats, m_feat, 1, stride_w_width, stride_w_dim),
             _weight_row(w_ptr, idx_feats, m_feat, 2, stride_w_width, stride_w_dim),
         ]
+    elif KERNEL_WIDTH == 4:
+        wrows = [
+            _weight_row(w_ptr, idx_feats, m_feat, 0, stride_w_width, stride_w_dim),
+            _weight_row(w_ptr, idx_feats, m_feat, 1, stride_w_width, stride_w_dim),
+            _weight_row(w_ptr, idx_feats, m_feat, 2, stride_w_width, stride_w_dim),
+            _weight_row(w_ptr, idx_feats, m_feat, 3, stride_w_width, stride_w_dim),
+        ]
     else:
         wrows = [
             _weight_row(w_ptr, idx_feats, m_feat, 0, stride_w_width, stride_w_dim),
             _weight_row(w_ptr, idx_feats, m_feat, 1, stride_w_width, stride_w_dim),
             _weight_row(w_ptr, idx_feats, m_feat, 2, stride_w_width, stride_w_dim),
             _weight_row(w_ptr, idx_feats, m_feat, 3, stride_w_width, stride_w_dim),
+            _weight_row(w_ptr, idx_feats, m_feat, 4, stride_w_width, stride_w_dim),
         ]
 
     if HAS_BIAS:
@@ -300,11 +314,16 @@ def _causal_conv1d_fwd_kernel(
         bias_v = tl.zeros((BLOCK_N,), tl.float32)
 
     # ------------------------------------------------------------------ #
-    # rolling prologue: the W-1 tokens whose window leaves this range.
-    # h_i = x[tk_start - (W-1) + i] and weight row i multiplies h_{i+k}.
+    # W-1 leading outputs.  Their windows reach before ``tk_start``: the taps
+    # left of it come from the conv_state history (or the previous range of
+    # the same sequence).  Each of the W-1 outputs is a fixed sum of those
+    # history rows and the first W-1 rows inside the range, and none feeds
+    # the next, so compute them independently.  The old rolling form made a
+    # chain of W-1 tiny load/compute/store steps per program, which cost
+    # 10-28 us per call on the KDA shapes (576 programs there).
     # ------------------------------------------------------------------ #
     rel0 = tk_start - state_len
-    h0 = _history_row(
+    _h0 = _history_row(
         x_ptr,
         initial_states_ptr,
         idx_feats,
@@ -322,7 +341,7 @@ def _causal_conv1d_fwd_kernel(
         HAS_CONV_STATES,
     )
     if KERNEL_WIDTH >= 3:
-        h1 = _history_row(
+        _h1 = _history_row(
             x_ptr,
             initial_states_ptr,
             idx_feats,
@@ -340,7 +359,7 @@ def _causal_conv1d_fwd_kernel(
             HAS_CONV_STATES,
         )
     if KERNEL_WIDTH >= 4:
-        h2 = _history_row(
+        _h2 = _history_row(
             x_ptr,
             initial_states_ptr,
             idx_feats,
@@ -358,7 +377,7 @@ def _causal_conv1d_fwd_kernel(
             HAS_CONV_STATES,
         )
     if KERNEL_WIDTH >= 5:
-        h3 = _history_row(
+        _h3 = _history_row(
             x_ptr,
             initial_states_ptr,
             idx_feats,
@@ -375,60 +394,172 @@ def _causal_conv1d_fwd_kernel(
             stride_istate_dim,
             HAS_CONV_STATES,
         )
-
-    if KERNEL_WIDTH == 2:
-        s0 = wrows[0] * h0 + bias_v
-    elif KERNEL_WIDTH == 3:
-        s0 = wrows[0] * h0 + wrows[1] * h1 + bias_v
-        s1 = wrows[0] * h1 + bias_v
-    elif KERNEL_WIDTH == 4:
-        s0 = wrows[0] * h0 + wrows[1] * h1 + wrows[2] * h2 + bias_v
-        s1 = wrows[0] * h1 + wrows[1] * h2 + bias_v
-        s2 = wrows[0] * h2 + bias_v
-    else:
-        s0 = wrows[0] * h0 + wrows[1] * h1 + wrows[2] * h2 + wrows[3] * h3 + bias_v
-        s1 = wrows[0] * h1 + wrows[1] * h2 + wrows[2] * h3 + bias_v
-        s2 = wrows[0] * h2 + wrows[1] * h3 + bias_v
-        s3 = wrows[0] * h3 + bias_v
-
-    for i in tl.static_range(KERNEL_WIDTH - 1):
-        row = tk_start + i
-        safe = tl.minimum(row, seq_len - 1)
-        m_cur = (i < tk_len) & m_feat
-        xt = tl.load(
+    _x0 = tl.load(
+        x_ptr
+        + (sequence_start_index + tk_start) * stride_x_token
+        + idx_feats * stride_x_dim,
+        mask=m_feat,
+        other=0.0,
+    ).to(tl.float32)
+    if KERNEL_WIDTH >= 3:
+        _x1 = tl.load(
             x_ptr
-            + (sequence_start_index + safe) * stride_x_token
+            + (sequence_start_index + tl.minimum(tk_start + 1, seq_len - 1))
+            * stride_x_token
             + idx_feats * stride_x_dim,
-            mask=m_cur,
+            mask=(1 < tk_len) & m_feat,
             other=0.0,
         ).to(tl.float32)
-        y = s0 + wrows[KERNEL_WIDTH - 1] * xt
+    if KERNEL_WIDTH >= 4:
+        _x2 = tl.load(
+            x_ptr
+            + (sequence_start_index + tl.minimum(tk_start + 2, seq_len - 1))
+            * stride_x_token
+            + idx_feats * stride_x_dim,
+            mask=(2 < tk_len) & m_feat,
+            other=0.0,
+        ).to(tl.float32)
+    if KERNEL_WIDTH >= 5:
+        _x3 = tl.load(
+            x_ptr
+            + (sequence_start_index + tl.minimum(tk_start + 3, seq_len - 1))
+            * stride_x_token
+            + idx_feats * stride_x_dim,
+            mask=(3 < tk_len) & m_feat,
+            other=0.0,
+        ).to(tl.float32)
+    if KERNEL_WIDTH == 2:
+        _y = bias_v + wrows[0] * _h0 + wrows[1] * _x0
         if SILU_ACTIVATION:
-            y = y / (1 + tl.exp(-y))
+            _y = _y / (1 + tl.exp(-_y))
         tl.store(
             o_ptr
-            + (sequence_start_index + safe) * stride_o_token
+            + (sequence_start_index + tk_start) * stride_o_token
             + idx_feats * stride_o_dim,
-            y.to(o_ptr.dtype.element_ty),
-            mask=m_cur,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=m_feat,
         )
-        if KERNEL_WIDTH == 2:
-            s0 = wrows[0] * xt
-        elif KERNEL_WIDTH == 3:
-            ns0 = wrows[1] * xt + s1
-            ns1 = wrows[0] * xt
-            s0, s1 = ns0, ns1
-        elif KERNEL_WIDTH == 4:
-            ns0 = wrows[2] * xt + s1
-            ns1 = wrows[1] * xt + s2
-            ns2 = wrows[0] * xt
-            s0, s1, s2 = ns0, ns1, ns2
-        else:
-            ns0 = wrows[3] * xt + s1
-            ns1 = wrows[2] * xt + s2
-            ns2 = wrows[1] * xt + s3
-            ns3 = wrows[0] * xt
-            s0, s1, s2, s3 = ns0, ns1, ns2, ns3
+    elif KERNEL_WIDTH == 3:
+        _y = bias_v + wrows[0] * _h0 + wrows[1] * _h1 + wrows[2] * _x0
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=m_feat,
+        )
+        _y = bias_v + wrows[0] * _h1 + wrows[1] * _x0 + wrows[2] * _x1
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start + 1) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=(1 < tk_len) & m_feat,
+        )
+    elif KERNEL_WIDTH == 4:
+        _y = bias_v + wrows[0] * _h0 + wrows[1] * _h1 + wrows[2] * _h2 + wrows[3] * _x0
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=m_feat,
+        )
+        _y = bias_v + wrows[0] * _h1 + wrows[1] * _h2 + wrows[2] * _x0 + wrows[3] * _x1
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start + 1) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=(1 < tk_len) & m_feat,
+        )
+        _y = bias_v + wrows[0] * _h2 + wrows[1] * _x0 + wrows[2] * _x1 + wrows[3] * _x2
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start + 2) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=(2 < tk_len) & m_feat,
+        )
+    elif KERNEL_WIDTH == 5:
+        _y = (
+            bias_v
+            + wrows[0] * _h0
+            + wrows[1] * _h1
+            + wrows[2] * _h2
+            + wrows[3] * _h3
+            + wrows[4] * _x0
+        )
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=m_feat,
+        )
+        _y = (
+            bias_v
+            + wrows[0] * _h1
+            + wrows[1] * _h2
+            + wrows[2] * _h3
+            + wrows[3] * _x0
+            + wrows[4] * _x1
+        )
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start + 1) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=(1 < tk_len) & m_feat,
+        )
+        _y = (
+            bias_v
+            + wrows[0] * _h2
+            + wrows[1] * _h3
+            + wrows[2] * _x0
+            + wrows[3] * _x1
+            + wrows[4] * _x2
+        )
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start + 2) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=(2 < tk_len) & m_feat,
+        )
+        _y = (
+            bias_v
+            + wrows[0] * _h3
+            + wrows[1] * _x0
+            + wrows[2] * _x1
+            + wrows[3] * _x2
+            + wrows[4] * _x3
+        )
+        if SILU_ACTIVATION:
+            _y = _y / (1 + tl.exp(-_y))
+        tl.store(
+            o_ptr
+            + (sequence_start_index + tk_start + 3) * stride_o_token
+            + idx_feats * stride_o_dim,
+            _y.to(o_ptr.dtype.element_ty),
+            mask=(3 < tk_len) & m_feat,
+        )
 
     # ------------------------------------------------------------------ #
     # tiled main loop: taps are the same tile at a row/token offset, so this
@@ -439,14 +570,22 @@ def _causal_conv1d_fwd_kernel(
     # ------------------------------------------------------------------ #
     rr = tl.arange(0, BLOCK_T)
     t_first = tk_start + state_len
-    n_full = tl.maximum((tk_end - t_first) // BLOCK_T, 0)
+    # The ragged tail is absorbed by one backwards-clamped tile: the last
+    # iteration starts at ``tk_end - BLOCK_T`` and re-covers a few rows the
+    # previous one already wrote (the convolution is a pure function of
+    # ``x``, so those values are identical).  The clamped start is a *scalar*,
+    # so every tap address stays affine; a per-lane clamp is what degrades to
+    # one DMA per element.  Only a range shorter than one full tile falls back
+    # to the lane-masked tail below.
+    full_tile = tk_end - t_first >= BLOCK_T
+    n_full = tl.where(full_tile, tl.cdiv(tk_end - t_first, BLOCK_T), 0)
 
     if CHANNEL_FIRST:
         m_chan = m_feat[:, None]
     else:
         m_chan = m_feat[None, :]
     for it in range(0, n_full):
-        rows = t_first + it * BLOCK_T + rr
+        rows = tl.minimum(t_first + it * BLOCK_T, tk_end - BLOCK_T) + rr
         if CHANNEL_FIRST:
             acc = bias_v[:, None] + tl.zeros((BLOCK_N, BLOCK_T), tl.float32)
         else:
@@ -474,17 +613,15 @@ def _causal_conv1d_fwd_kernel(
             )[None, :]
         tl.store(o_ptr + o_off, acc.to(o_ptr.dtype.element_ty), mask=m_chan)
 
-    # Peeled tail tile; fully masked when the range is tile aligned.
-    # Peeled tail.  Its rows can run past the range end and even past the
-    # tensor, and triton-ascend answers a per-lane clamped (non-affine) address
-    # with one DMA per element, so the fast path keeps the tile start scalar and
-    # walks the tail in short ``BLOCK_T_TAIL``-row tiles whose start is clamped
-    # to ``tk_end - BLOCK_T_TAIL``: every row stays in bounds and affine, and
-    # the last tile simply re-covers a few rows the previous one already wrote
-    # (the convolution is a pure function of ``x``, so the values are equal).
+    # Fallback for a range shorter than one full tile: walk it in short
+    # ``BLOCK_T_TAIL``-row tiles whose start is scalar-clamped to
+    # ``tk_end - BLOCK_T_TAIL``.  Rows stay in bounds and affine; the last tile
+    # re-covers a few rows the previous one already wrote.
     rr_t = tl.arange(0, BLOCK_T_TAIL)
     tail_first = t_first + n_full * BLOCK_T
-    n_tail = tl.maximum(tl.cdiv(tk_end - tail_first, BLOCK_T_TAIL), 0)
+    n_tail = tl.where(
+        full_tile, 0, tl.maximum(tl.cdiv(tk_end - tail_first, BLOCK_T_TAIL), 0)
+    )
     if tk_end >= BLOCK_T_TAIL + state_len:
         for it in range(0, n_tail):
             tail_start = tl.minimum(
@@ -632,9 +769,10 @@ def _plan_ranges(seqlens, nct, core_num, align, uniform=None):
     """Split each request into contiguous token ranges.
 
     ``#ranges`` is chosen so ``#ranges * nct`` fits in one wave over the AIV
-    cores, the AscendC tiling planner's ``blockDim <= coreNum`` rule: every
-    extra wave re-pays the per-program prologue, and a partial wave strands
-    most of the cores.
+    cores when ``nct`` allows it (the AscendC tiling planner's
+    ``blockDim <= coreNum`` rule); a narrow channel tile already exceeds the
+    core count, so every request stays one range.  Ranges never cross a
+    request boundary.
     """
     seqlens = [int(s) for s in seqlens]
     n_seq = len(seqlens)
@@ -720,34 +858,56 @@ def _pick_tiles(dim, width=4):
     return block_n, block_t
 
 
+_LONG_SEQ = 8192
+
+
 def _pick_tiles_channel_first(dim, width, max_seqlen):
     """Tile for a channel-first ``[dim, tokens]`` input.
 
     The token axis is the unit-strided one, so one channel row is
     ``BLOCK_T * 2`` bytes of contiguous memory and ``BLOCK_T`` is the bandwidth
     knob; ``BLOCK_N`` only sets how many programs share the row.  On the KDA
-    shapes a ~32-channel x ~256-token tile measured fastest: wider channel
-    tiles shorten the rows faster than they cut the (already cheap) program
-    count, and narrower ones make every program pay its prologue/epilogue on
-    only a few channels.
+    shapes two regimes measured best:
 
-    Two bounds keep other batches sane:
+    * Long ranges (``max_seqlen >= 8192``) amortise the per-program prologue
+      over thousands of tokens, so take the longest rows the UB budget allows
+      (``16 x 512``, 1 KB rows).  The full-tile loop then measured 4.6-9% ahead
+      of ``32 x 256``, and 8-26% ahead for single-request prefill.
+    * Short ranges keep ``32 x 256``: halving the channel tile doubles the
+      program count, and each extra program pays the per-range prologue and
+      epilogue, which the short loop does not amortise.
 
-    * ``BLOCK_T`` never exceeds the request, so the pipelined full-tile loop
-      does the work instead of the clamped tail.
-    * short requests raise ``BLOCK_N`` so a program still gets ~4K elements;
-      otherwise a batch of 8-token requests would explode into tens of
-      thousands of tiny programs.
+    ``BLOCK_T`` never exceeds the request (so the pipelined full-tile loop does
+    the work instead of the fallback tail) and is rounded to a power of two:
+    a non-power-of-two tile height compiled but produced wrong rows on
+    triton-ascend.
     """
     budget = _UB_BYTES // (4 * width + 4)
-    need = 4096 // max(1, max_seqlen)
-    block_n = max(32, triton.next_power_of_2(max(1, need)))
-    # Wide channel tiles are cheap to *load* but not to *describe*: the scalar
-    # helpers around the tile (weights, history vectors, masks) are padded to
-    # the vector fragment shape, and >=1K channels blow the UB budget on their
-    # own (2048 channels x 2 tokens needed 462 KB).  Stay moderate.
-    block_n = min(block_n, 256, triton.next_power_of_2(max(1, dim)))
-    block_t = min(budget // block_n, triton.next_power_of_2(max(1, max_seqlen)))
+    if dim <= 512:
+        # Tiny channel counts: raise the channel tile so a program still gets
+        # ~4K elements (otherwise a batch of 8-token requests explodes into
+        # tens of thousands of tiny programs), capped by dim and the UB budget.
+        need = 4096 // max(1, max_seqlen)
+        block_n = max(32, triton.next_power_of_2(max(1, need)))
+        block_n = min(block_n, 256, triton.next_power_of_2(max(1, dim)))
+        if width >= 5:
+            # Five taps plus the per-channel vectors overflow UB at 32 wide.
+            block_n = min(block_n, 16)
+        block_t = max(
+            2, min(budget // block_n, triton.next_power_of_2(max(1, max_seqlen)))
+        )
+        block_t = 1 << (block_t.bit_length() - 1)
+        return block_n, block_t
+    # ``width == 5`` keeps the narrow channel tile even for short ranges: the
+    # five tap buffers plus the per-channel weight/history vectors do not fit
+    # UB at 32 channels (32x128 overflowed; 16x256 fits).
+    long_range = max_seqlen >= _LONG_SEQ
+    block_n = 16 if (long_range or width >= 5) else 32
+    block_t = min(
+        512 if long_range else 256,
+        triton.next_power_of_2(max(1, max_seqlen)),
+        budget // block_n,
+    )
     block_t = max(2, block_t)
     block_t = 1 << (block_t.bit_length() - 1)
     return block_n, block_t
