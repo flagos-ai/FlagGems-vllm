@@ -28,7 +28,7 @@ Triton 版本已对齐三段式设计，并在本轮把 Gram 从“全矩阵 6 �
 对新的 Gram 内核 Profiling 显示：`aiv_vec = 94%`，`aic_mac = 15%`。AIV 向量链仍是关键路径，AIC 大部分时间在等操作数。
 
 > [!IMPORTANT]
-> **评估结论（本轮更正）**：AscendC 的拷贝方向是 **GM(ND)→L1(zN)**，不是旧版本文档写的 UB→L1；Triton 缺的是 GM→L1 这条通路。但 `chunk_kda` 的 Gram 差距主要来自**算法与数据流**（整块 64×64 vs 因果前缀）以及**CV 重叠**，不是 L1 带宽。改用前缀分块后，Gram 由 2649 μs 降到 1261 μs，UB 峰值降到约 1.0 Mbit，**不再需要 R1 的显式 L1 常驻也能通过编译**。因此 R1 降级为 P2 通用能力需求，当前真正阻碍进一步对齐的是 **R2（向量链融合）与 R4（跨 head CV 流水）**。`causal_conv1d_fn` 侧仍保留阻断性需求 **R3**。
+> **评估结论（本轮更正）**：AscendC 的拷贝方向是 **GM(ND)→L1(zN)**，不是旧版本文档写的 UB→L1；Triton 缺的是 GM→L1 这条通路。但 `chunk_kda` 的 Gram 差距主要来自**算法与数据流**（整块 64×64 vs 因果前缀）以及**CV 重叠**，不是 L1 带宽。改用前缀分块后，Gram 由 2649 μs 降到 1261 μs，UB 峰值降到约 1.0 Mbit，**不再需要 R1 的显式 L1 常驻也能通过编译**。因此 R1 降级为 P2 通用能力需求，当前真正阻碍进一步对齐的是 **R2（向量链融合）与 R4（scope 下的 CV 流水；核心是 D1：scope 需在默认选项下可编译）**。`causal_conv1d_fn` 侧仍保留阻断性需求 **R3**。
 
 ---
 
@@ -130,42 +130,56 @@ Triton 的对应限制是：
 
 本轮前缀分块落地后，Gram 的 `aiv_vec` 仍为 **94%**。即使把面板的 `exp2` 从 7 次降到 2 个 band + 1 个 cross 比值，向量链和每个 `tl` 操作在 UB 上的往返仍是关键路径；R2 的收益不再只是 `exp2` 本身。
 
-### R4：跨 head 的 AIV/AIC 流水（P1，当前剩余主差距）
+### R4：scope 下的 CV 流水与自动核内同步（P1，当前剩余主差距）
 
-#### 需求描述
+#### 需求
 
-AscendC Prepare 以 **4 个 local head 为一组**：V1 生成 Q+/K+ 时，C2 在算上一组的 MMAD；V6 生成 RHS 时，C4/C5 已在读 L1 常驻数据。两侧用 `CrossCoreSetFlag` / `CrossCoreWaitFlag` 和双缓冲槽位显式重叠，AIC 等操作数时 AIV 不会空闲。
+`al.scope("cube"|"vector")` + `al.sync_block_set/wait` 是 Triton 表达 CV 流水的机制。期望语义是：
 
-#### Triton 现状（API 已有，最小 hand-off 已验证）
+1. **程序侧只负责 CV 之间的 hand-off**（cross-core flag、双缓冲槽位）；
+2. **编译器在保留默认 auto block sync 的情况下，自动插入核内不同流（MTE1/MTE2/M/FIX/UB/L1）之间的同步**；
+3. **用户不需要设置 `disable_auto_inject_block_sync=True` 才能编译 scope**。
 
-`al.scope("vector"|"cube")` + `al.sync_block_set/wait` 已经可以表达 CV 双缓冲，见 `supported/s6_scoped_cv_handoff.py`（PASS，maxerr 6.1e-5）。前提是编译选项 `enable_mixed_cv=True, disable_auto_inject_block_sync=True`；默认选项仍会崩溃（`defects/d1_scope_auto_sync.py`）。
+即：**scope 必须能在默认编译选项下工作**。
 
-但把这套用进 Gram 的 7 面板 / 2-chunk 双缓冲时，原型仍有两个问题：
+当前 triton-ascend 3.6.0 不满足：
 
-- **根因不是 scope 本身，而是 scope 强制要求的 `disable_auto_inject_block_sync=True`**：
-  - TTIR 里 `sync_block_wait` 严格排在 7 个 `tt.load` 之前，cube 实际 load 到的面板与 GM 逐位一致（maxerr=0）；
-  - 同一个 6-dot + scale/mask/inverse body，在默认选项或仅 `enable_mixed_cv=True` 时与 torch 一致（maxerr 7e-6）；
-  - 加上 `disable_auto_inject_block_sync=True` 后，**即使不套 scope** 也出现 inf/NaN；1–3 个 dot 的简单 body 不受影响，所以 `s6` 能过；
-  - 按设计，`al.scope` 下程序只负责 CV 同步，核内不同流的同步由编译器自动插入；本环境 3.6.0 的默认 scope 路径仍会崩（D1），只能用 `disable_auto_inject_block_sync=True` 绕过，而这个绕过正好关掉了编译器应自动插入的核内同步，导致 D5。
-  - 因此 D1 与 D5 是同一问题的两面：**修好 D1（scope 保留 auto sync）后，D5 的多 dot body 应恢复正确**；在当前构建上，Gram 的 CV 流水暂时没有正确的构建方式。最小复现见 `defects/d5_noauto_multidot.py`。
-- 即使不考虑正确性，T=4096 下原型 344 μs vs 拆分 169 μs，2× 更慢：每个 chunk-head 多出约 56 KiB 的 GM 写 + 56 KiB 读，而可被隐藏的 cube 时间只有约 190 μs（T=32768 时）。没有 GM→L1 直通（R1）时，这个往返成本吃掉了重叠收益。
+- 默认选项、仅 `enable_mixed_cv=True`、`enable_dynamic_cv_pipeline=False + enable_mixed_cv=True` 都会在 BiShengIR 段崩溃（D1）；
+- 唯一能编译的是 `disable_auto_inject_block_sync=True`，而它正好关掉了第 2 条要求的核内同步；6-dot body 即使不套 scope 也会读脏（D5）；
+- `supported/s6_scoped_cv_handoff.py` 能过，是因为 body 只有 1 个 dot 且显式写了 CV sync，不依赖被关掉的自动同步；Gram 的 7 面板 / 6-dot body 暴露了 D5。
 
-新 Gram 的单 program 仍是 `AIV(面板) -> AIC(dot) -> AIV(后处理)`；`aiv_vec=94%`、`aic_mac=15%` 说明 AIC 大部分时间在等操作数。
+所以 R4 的核心是 **D1**：让 scope 在保留 auto block sync 的默认路径下编译通过。修好后 D5 应自然消失。若短期无法修 D1，则需要暴露可手工插入的核内 pipe barrier/mutex（类似 AscendC 的 `Mutex::Lock<PIPE_MTE1>`）作为退路。
 
 #### AscendC 证据（确认具备硬件能力）
 
 源码参考：`chunk_kda_fwd_prepare_cube.h:130-230`
 
 - `ProcessChunkHeadRange` 每次处理 4 个 head，`kAivToAicPayloadReadyFlagId` / `kAicToAivSlotReusableFlagId` 构成 free/ready 双缓冲；
-- `StageC2` 完成后立即 `CrossCoreSetFlag(scoreReady)`，V3 的 Aqk 后处理与 C4/C5 的下一 head 计算重叠。
+- `StageC2` 完成后立即 `CrossCoreSetFlag(scoreReady)`，V3 的 Aqk 后处理与 C4/C5 的下一 head 计算重叠；
+- AscendC 的核内 L1/L0 复用由 `AscendC::Mutex::Lock<PIPE_MTE1>` 等显式保护，核间 hand-off 由 `CrossCoreSetFlag/WaitFlag` 完成。
+
+#### Triton 现状（最小 hand-off 已验证，多 dot body 尚不可用）
+
+- `s6` 最小两 item hand-off：当前在 `enable_mixed_cv=True, disable_auto_inject_block_sync=True` 下 PASS（maxerr 6.1e-5）；**目标是在默认选项下 PASS，不再需要 noauto**。
+- Gram 的 7 面板 / 2-chunk 双缓冲原型：
+  - 面板写到 GM 后逐位正确，cube 实际 load 到的面板与 GM 逐位一致（maxerr=0）；
+  - 同一个 6-dot body 在默认选项或仅 `enable_mixed_cv=True` 时与 torch 一致（7e-6）；
+  - 加 `disable_auto_inject_block_sync=True` 后，**即使不套 scope** 也出现 inf/NaN（最小复现 `defects/d5_noauto_multidot.py`）；
+  - T=4096 下原型 344 μs vs 拆分 169 μs，2× 更慢：每个 chunk-head 多出约 56 KiB 的 GM 写 + 56 KiB 读，而可被隐藏的 cube 时间只有约 190 μs（T=32768 时）。
+- 新 Gram 的单 program 仍是 `AIV(面板) -> AIC(dot) -> AIV(后处理)`；`aiv_vec=94%`、`aic_mac=15%` 说明 AIC 大部分时间在等操作数。
 
 #### 期望改进
 
-- 修复 `al.scope` 与 auto block sync 的兼容性（D1），让 scope 能保留自动 block sync；或提供可手工插入的核内 pipe barrier（D5）；
-- 支持 GM→L1 直通（R1），让 cube 侧不再经过 UB，降低双缓冲的往返成本；
+- **修 D1（P0）**：scope 在默认选项（保留 auto block sync）下编译通过，程序只写 CV sync；
+- 若短期必须保留 noauto：暴露核内 pipe barrier/mutex，作为 D5 的退路；
+- 支持 GM→L1 直通（R1），降低双缓冲的 GM 往返成本；
 - 或由编译器在相邻 program/迭代之间自动做 CV 重叠。
 
-验收口径：Gram 微基准的 `aic_mac_ratio` 提升到 50% 以上，或 Gram 端到端进入 600–800 μs 区间（当前 1261 μs，AscendC 413 μs）。
+#### 验收口径
+
+- `supported/s6_scoped_cv_handoff.py` 在**默认编译选项**下 PASS（不再需要 `disable_auto_inject_block_sync`）；
+- `defects/d5_noauto_multidot.py` 的 scoped body 在默认选项下 PASS（D1 修复后 D5 消失）；
+- Gram 微基准的 `aic_mac_ratio` 提升到 50% 以上，或 Gram 端到端进入 600–800 μs 区间（当前 1261 μs，AscendC 413 μs）。
 
 ### R3：流水化 tile 的行偏移复用（P0，阻断性）
 
@@ -251,7 +265,7 @@ tools/triton_ascend_probes/
 | **supported** | `s2_l1_resident_dot.py dot / copy`            | **PASS**（maxerr ≤ 6.1e-5）                  |
 | **supported** | `s3_l1_subview_assemble.py`                   | **PASS**（maxerr ≤ 6.1e-5）                  |
 | **supported** | `s4_manual_cross_core_sync.py`                | **PASS**（maxerr ≤ 1.5e-5）                  |
-| **supported** | `s6_scoped_cv_handoff.py`                     | **PASS**（maxerr ≤ 6.1e-5；需 `enable_mixed_cv=True, disable_auto_inject_block_sync=True`） |
+| **supported** | `s6_scoped_cv_handoff.py`                     | **PASS**（maxerr ≤ 6.1e-5；当前需 `enable_mixed_cv=True, disable_auto_inject_block_sync=True`）；**R4 目标是默认选项 PASS** |
 | **gaps**      | `g1_nd2nz_staging.py plain`                   | **PASS**（基线正常通过）                           |
 | **gaps**      | `g1_nd2nz_staging.py l1a / l1b / l1`          | **FAIL**：UB 内存溢出（3.15 / 3.28 / 2.50 Mbit）  |
 | **gaps**      | `g2_vec_chain_fusion.py`                      | N=4 已融合，N=8/12 出现显著耗时断崖                    |
@@ -261,9 +275,11 @@ tools/triton_ascend_probes/
 | **defects**   | `d2_insert_slice_dot.py insert / l1_insert`   | **FAIL**：`Unknown PIPE!` 触发 SIGABRT        |
 | **defects**   | `d3_l1_view_2d.py nd / target`                | **FAIL**：报 `cbuf vs ub` 或 `unsupported op` |
 | **defects**   | `d4_extract_slice_pipeline.py`                | **FAIL**：`ns=2` 且开多缓冲时裸视图读到旧版本（maxerr≈16，确定性）；bind/copy 写法时对时错 |
-| **defects**   | `d5_noauto_multidot.py`                        | **FAIL**：默认/仅 `enable_mixed_cv=True` 时 body 与 torch 一致（7e-6）；加 `disable_auto_inject_block_sync=True` 后连 unscoped 都出现 inf/NaN。scope 必须关 auto sync 才能编译，因此 CV 多 dot body 目前无法正确构建 |
+| **defects**   | `d5_noauto_multidot.py`                        | **FAIL**：默认/仅 `enable_mixed_cv=True` 时 body 与 torch 一致（7e-6）；加 `disable_auto_inject_block_sync=True` 后连 unscoped 都出现 inf/NaN。当前 scope 必须关 auto sync 才能编译，因此 CV 多 dot body 无法正确构建；D1 修复后应消失 |
 
 > [!NOTE]
+> **R4 的验收目标**：`s6` 在默认编译选项下 PASS，`d5` 的 scoped body 在默认选项下 PASS；当前表里的 s6/noauto 结果只是 workaround，不是需求本身。
+
 > `g1` 的 `l1*` 是**旧全矩阵 7 面板公式**的 UB 预算探针，不是“L1 常驻必然溢出”的证据。生产 Gram 已改用 R0 的 32 行前缀分块（7×`[32,128]` 面板，峰值约 1.0 Mbit），无需 R1 的显式 L1 常驻即可通过编译。AscendC 的对应拷贝是 **GM→L1**；`g1` 里的 UB→L1 只是 Triton 当前唯一可写的路径。
 
 生产验证（Ascend950DT，CANN 25.1.rc2 / triton-ascend 3.6.0）：
