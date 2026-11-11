@@ -39,6 +39,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_top
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_compressor import (
+    deepseek_v4_compressor,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
@@ -145,6 +148,7 @@ __all__ = [
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
+    "deepseek_v4_compressor",
     "compute_slot_mapping_parallel",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",

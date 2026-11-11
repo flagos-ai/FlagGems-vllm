@@ -1769,3 +1769,19 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+
+  - id: deepseek_v4_compressor
+    description: |
+      Ascend paged Compressor with explicit device positions, physical input
+      slots and output request/position metadata. Updates caller-owned FP32
+      state in place and applies projection, APE, weighted compression,
+      RMSNorm and RoPE for C4/C128. Physical page zero is valid.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
