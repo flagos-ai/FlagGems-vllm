@@ -16,6 +16,9 @@
 
 """QSA sparse paged attention ported from vLLM f47792af7f.
 
+Source: vllm/models/qwen4_exp/nvidia/ops/qsa.py (qsa_sparse_paged_attention
+and its split-K/merge kernels).
+
 Launch geometry: both the split count and the main kernel's
 BLOCK_N / num_warps / num_stages come from the backend heuristics system
 (`runtime.get_heuristic_config("qsa_sparse_paged_attention")`), which keeps
