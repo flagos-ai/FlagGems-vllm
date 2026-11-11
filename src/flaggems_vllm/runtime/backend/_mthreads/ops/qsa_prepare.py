@@ -1,6 +1,6 @@
 """Fused QSA prepare kernel for Qwen4Exp."""
 
-from flaggems_vllm.ops.qsa_prepare import GENERIC_SPEC, LaunchSpec, build
+from flaggems_vllm.ops.qwen4.qsa_prepare import GENERIC_SPEC, LaunchSpec, build
 
 # Tiling only pays off once the grid is large enough to be launch-bound; below
 # that the per-tile mask and the extra registers cost more than they save.

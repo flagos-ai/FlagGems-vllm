@@ -120,7 +120,6 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     sinkhorn_forward,
 )
-from flaggems_vllm.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.ops.qwen4 import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -146,6 +145,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_compress_qsa_groups,
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
+    qsa_prepare,
 )
 from flaggems_vllm.ops.minimax_m3_sparse_attn import (
     minimax_m3_sparse_attn,
