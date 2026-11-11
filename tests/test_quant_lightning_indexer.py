@@ -23,7 +23,7 @@ import torch
 import flaggems_vllm
 
 pytestmark = [
-    pytest.mark.deepseek_v4_indexer,
+    pytest.mark.quant_lightning_indexer,
     pytest.mark.skipif(flaggems_vllm.device != "npu", reason="Requires Ascend"),
 ]
 
@@ -32,7 +32,7 @@ def implementation():
     import importlib
 
     return importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_indexer"
+        "flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer"
     )
 
 
@@ -69,7 +69,7 @@ def oracle(args):
 
 def invoke(mod, args):
     q, k, w, bt, r, p, le, top, qs, ks = args
-    return mod.deepseek_v4_indexer(
+    return mod.quant_lightning_indexer(
         q, k, w, bt, r, p, le, top, query_scale=qs, key_scale_cache=ks
     )
 
@@ -440,7 +440,7 @@ def test_invalid_contract(mutation, message):
     a = data()
     if mutation == "ratio":
         with pytest.raises(ValueError, match=message):
-            flaggems_vllm.deepseek_v4_indexer(*a[:7], a[7], compress_ratio=128)
+            flaggems_vllm.quant_lightning_indexer(*a[:7], a[7], compress_ratio=128)
         return
     if mutation == "topk":
         a[7] = 0

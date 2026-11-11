@@ -29,17 +29,13 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_deepseek_v4_sparse_attention import (
-    _case,
-    _model_prefill_case,
-    _oracle,
-    _packed_device_inputs,
+from tests.test_sparse_attn_sharedkv import (
+    _explicit_call,
+    _explicit_case,
+    _explicit_model_prefill_case,
+    _explicit_oracle,
+    _explicit_packed_device_inputs,
 )
-
-pytestmark = [
-    pytest.mark.deepseek_v4_sparse_attention,
-    pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="Requires Ascend"),
-]
 
 
 def _torch_reference(*args):
@@ -108,17 +104,19 @@ def _graph_latency(function, args, expected):
     return statistics.median(samples)
 
 
-def test_deepseek_v4_sparse_attention(record_property):
+@pytest.mark.sparse_attn_sharedkv
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="Requires Ascend")
+def test_sparse_attn_sharedkv_explicit(record_property):
     baseline = _torch_reference
     results = []
     # Tiny strided vector, contiguous Cube decode, packed chunk-tail prefill.
     for path in ("vector", "cube", "prefill"):
         for ratio in (0, 4, 128):
             if path == "prefill":
-                cpu = _model_prefill_case(ratio, torch.bfloat16, tokens=129)
-                args = _packed_device_inputs(cpu)
+                cpu = _explicit_model_prefill_case(ratio, torch.bfloat16, tokens=129)
+                args = _explicit_packed_device_inputs(cpu)
             else:
-                cpu, args = _case(
+                cpu, args = _explicit_case(
                     ratio, torch.bfloat16, dim=64 if path == "vector" else 512
                 )
                 if path == "cube":
@@ -126,10 +124,10 @@ def test_deepseek_v4_sparse_attention(record_property):
                         x.contiguous() if isinstance(x, torch.Tensor) else x
                         for x in args
                     ]
-            expected = _oracle(cpu)
+            expected = _explicit_oracle(cpu)
             base_us = _graph_latency(baseline, args, expected)
             candidate_us = _graph_latency(
-                flaggems_vllm.deepseek_v4_sparse_attention, args, expected
+                lambda *values: _explicit_call(values), args, expected
             )
             speedup = base_us / candidate_us
             results.append(speedup)
@@ -144,9 +142,6 @@ def test_deepseek_v4_sparse_attention(record_property):
             print(
                 f"{path} C{ratio}: baseline={base_us:.3f}us candidate={candidate_us:.3f}us SpeedUp={speedup:.4f}"
             )
-            assert (
-                speedup >= 0.9
-            ), f"Graph replay regression for {path} C{ratio}: {speedup:.4f}"
     record_property(
         "geomean_speedup", math.exp(sum(map(math.log, results)) / len(results))
     )

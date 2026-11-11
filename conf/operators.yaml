@@ -239,7 +239,8 @@ ops:
       input with the kv/gate weights, writes kv/score states into the state
       cache, then applies APE, softmax-weighted reduction, RMSNorm and RoPE
       over complete compression groups through dedicated prefill and decode
-      paths.
+      paths. Also supports explicit device metadata for paged state writes
+      and outputs on Ascend.
     for:
       - _C_ascend.compressor
     labels:
@@ -1528,6 +1529,7 @@ ops:
       window over the recent original KV), CFA (window plus the contiguous
       compressed KV prefix) and SCFA (window plus the per-query selected
       compressed KV), with graph-safe decode and chunked-prefill entry points.
+      Ascend also accepts explicit device request, position, and length metadata.
     for:
       - None
     labels:
@@ -1770,36 +1772,7 @@ ops:
     stages:
       - stable: '3.0'
 
-  - id: deepseek_v4_compressor
-    description: |
-      Ascend paged Compressor with explicit device positions, physical input
-      slots and output request/position metadata. Updates caller-owned FP32
-      state in place and applies projection, APE, weighted compression,
-      RMSNorm and RoPE for C4/C128. Physical page zero is valid.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: deepseek_v4_sparse_attention
-    description: |
-      Ascend shared-KV attention over sliding-window and compressed paged
-      caches with explicit request/position metadata, optional sink logits,
-      FP16/BF16/FP32 data and strided layouts. Returns a new output tensor.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: deepseek_v4_indexer
+  - id: quant_lightning_indexer
     description: |
       Ascend paged C4 logical top-k indexer with explicit request positions
       and key lengths. Supports floating or INT8 queries/keys, per-query-head

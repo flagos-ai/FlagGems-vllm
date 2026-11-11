@@ -392,7 +392,7 @@ def _indexer_scores(
     return scores
 
 
-def deepseek_v4_indexer(
+def quant_lightning_indexer(
     query,
     key_cache,
     weights,

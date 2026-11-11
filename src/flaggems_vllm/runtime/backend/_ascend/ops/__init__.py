@@ -39,15 +39,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_top
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_compressor import (
-    deepseek_v4_compressor,
-)
-from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_indexer import (
-    deepseek_v4_indexer,
-)
-from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_sparse_attention import (
-    deepseek_v4_sparse_attention,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
@@ -116,6 +107,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
+    quant_lightning_indexer,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -154,9 +148,7 @@ __all__ = [
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
-    "deepseek_v4_compressor",
-    "deepseek_v4_sparse_attention",
-    "deepseek_v4_indexer",
+    "quant_lightning_indexer",
     "compute_slot_mapping_parallel",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",

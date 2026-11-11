@@ -32,10 +32,10 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_deepseek_v4_indexer import check, data, invoke
+from tests.test_quant_lightning_indexer import check, data, invoke
 
 pytestmark = [
-    pytest.mark.deepseek_v4_indexer,
+    pytest.mark.quant_lightning_indexer,
     pytest.mark.skipif(flaggems_vllm.device != "npu", reason="Requires Ascend"),
 ]
 
@@ -143,8 +143,8 @@ def torch_reference(
     return ids
 
 
-def test_deepseek_v4_indexer_benchmark():
-    baseline = SimpleNamespace(deepseek_v4_indexer=torch_reference)
+def test_quant_lightning_indexer_benchmark():
+    baseline = SimpleNamespace(quant_lightning_indexer=torch_reference)
     speedups = []
     for case in ACTIVE_SET:
         args = make_case(case)
@@ -158,7 +158,7 @@ def test_deepseek_v4_indexer_benchmark():
         print(
             json.dumps(
                 {
-                    "op": "deepseek_v4_indexer",
+                    "op": "quant_lightning_indexer",
                     "shape": case,
                     "reference_ms": base_ms,
                     "flaggems_ms": gems_ms,
@@ -169,6 +169,6 @@ def test_deepseek_v4_indexer_benchmark():
         )
     geomean = math.exp(statistics.mean(math.log(x) for x in speedups))
     print(
-        json.dumps({"op": "deepseek_v4_indexer", "geomean_SpeedUp": geomean}),
+        json.dumps({"op": "quant_lightning_indexer", "geomean_SpeedUp": geomean}),
         flush=True,
     )
