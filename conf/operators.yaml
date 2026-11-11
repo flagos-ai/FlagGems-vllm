@@ -1161,6 +1161,23 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: mhc_shifted_post_pre
+    description: |
+      DSV4.1 shifted mHC boundary: applies the previous sublayer's post/comb
+      coefficients, then emits the next post/comb/pre coefficient set, the
+      collapsed (optionally RMSNorm'd) layer input and the stream mean.
+      Consumes the carried pre-mix instead of the freshly computed one, which is
+      what lets vLLM overlap coefficient generation with the sublayer.
+    for:
+      - vllm.models.deepseek_v41.nvidia.ops.mhc.mhc_shifted_post_pre
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: minimax_m3_sparse_attn
     description: |
       MiniMax M3 block-sparse GQA prefill attention over packed paged KV
