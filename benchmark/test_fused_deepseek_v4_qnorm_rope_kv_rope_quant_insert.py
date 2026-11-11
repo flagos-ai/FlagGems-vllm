@@ -41,6 +41,7 @@ VLLM_REF_AVAILABLE = False
 VLLM_0_22_0_AVAILABLE = False
 VLLM_MUSA_0_1_28_AVAILABLE = False
 IS_MTHREADS = flaggems_vllm.vendor_name == "mthreads"
+IS_ASCEND = flaggems_vllm.vendor_name == "ascend"
 if IS_MTHREADS:
     try:
         from vllm_musa import _custom_ops as _musa_custom_ops
@@ -160,6 +161,37 @@ def cuda_ref_wrapper(
         return q
 
 
+def torch_ref_wrapper(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    num_heads,
+    eps,
+    block_size,
+):
+    import sys
+    from pathlib import Path
+
+    sys.path.append(str(Path(__file__).parent.parent))
+
+    from tests.test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import ref_impl
+
+    return ref_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        num_heads,
+        eps,
+        block_size,
+    )
+
+
 @dataclasses.dataclass
 class TestParam:
     # Instruct pytest to ignore this class
@@ -182,7 +214,11 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-            musa_ref_wrapper if IS_MTHREADS else cuda_ref_wrapper,
+            (
+                torch_ref_wrapper
+                if IS_ASCEND
+                else musa_ref_wrapper if IS_MTHREADS else cuda_ref_wrapper
+            ),
             [torch.bfloat16],
         )
         self.set_gems(flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
@@ -203,6 +239,22 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 
     @staticmethod
     def get_performance_test_params():
+        base_num_tokens = [
+            1,
+            4,
+            17,
+            64,
+            1024,
+            2048,
+            8192,
+            32768,
+            65536,
+            98304,
+        ]
+        if not IS_ASCEND:
+            # skip huge num_tokens, risk NPU OOM
+            base_num_tokens.append(131072)
+
         cases = [
             TestParam(
                 num_tokens,
@@ -212,19 +264,7 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
                 max_pos=4096,
                 eps=1e-6,
             )
-            for num_tokens in [
-                1,
-                4,
-                17,
-                64,
-                1024,
-                2048,
-                8192,
-                32768,
-                65536,
-                98304,
-                131072,
-            ]
+            for num_tokens in base_num_tokens
             for num_heads in [64, 128]
         ]
         return cases
@@ -305,10 +345,6 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(
-    not VLLM_REF_AVAILABLE,
-    reason="The referenced vLLM implementation is not installed",
-)
 @pytest.mark.skipif(
     not is_support_fp8e4nv(),
     reason="Do not support fp8e4nv when capability < 89",
