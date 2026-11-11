@@ -43,16 +43,14 @@ from benchmark.consts import (
 )
 
 from . import consts
-
-try:
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        w8a8_triton_block_scaled_mm as vllm_w8a8_triton_block_scaled_mm,
-    )
-
-    VLLM_W8A8_BLOCK_FP8_AVAILABLE = True
-except Exception:
-    vllm_w8a8_triton_block_scaled_mm = None
-    VLLM_W8A8_BLOCK_FP8_AVAILABLE = False
+from .test_w8a8_block_matmul import (
+    VLLM_W8A8_BLOCK_FP8_AVAILABLE,
+    VLLM_W8A8_BLOCK_INT8_AVAILABLE,
+    W8A8BlockMatmulBenchmark,
+    rand_quantized_tensor,
+    vllm_w8a8_block_int8_matmul,
+    vllm_w8a8_triton_block_scaled_mm,
+)
 
 try:
     from flaggems_vllm.runtime.backend._mthreads.sparse_attention import (
@@ -400,81 +398,6 @@ def router_gemm_input_fn(b, m, n, k, cur_dtype, device, b_column_major):
 
 
 # ============================================================================
-# FP8 utilities (from test_blas_perf.py)
-# ============================================================================
-
-W8A8_BLOCK_FP8_MNK_SHAPES = [
-    (64, 128, 128),
-    (128, 256, 512),
-    (1, 4096, 7168),
-    (16, 4096, 7168),
-    (64, 4096, 7168),
-    (83, 7748, 3884),
-    (84, 7168, 3884),
-]
-W8A8_BLOCK_FP8_BLOCK_SIZE = [128, 128]
-
-
-def rand_fp8_tensor(shape, device, dtype):
-    finfo = torch.finfo(dtype)
-    return (
-        torch.randn(shape, device=device, dtype=torch.float32)
-        .clamp(min=finfo.min, max=finfo.max)
-        .to(dtype)
-    )
-
-
-class W8A8BlockFP8MatmulBenchmark(Benchmark):
-    """
-    Benchmark for w8a8_block_fp8_matmul.
-    """
-
-    DEFAULT_METRICS = DEFAULT_METRICS[:] + ["tflops"]
-
-    def __init__(self, *args, block_size=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.block_size = (
-            W8A8_BLOCK_FP8_BLOCK_SIZE[:] if block_size is None else list(block_size)
-        )
-        self.shape_desc = "M, N, K"
-
-    def set_shapes(self, shape_file_path=None):
-        self.shapes = W8A8_BLOCK_FP8_MNK_SHAPES[:]
-        self.shape_desc = "M, N, K"
-
-    def get_input_iter(self, cur_dtype) -> Generator:
-        block_n, block_k = self.block_size
-        for m, n, k in self.shapes:
-            num_k_groups = (k + block_k - 1) // block_k
-            num_n_groups = (n + block_n - 1) // block_n
-
-            A = rand_fp8_tensor((m, k), self.device, cur_dtype).contiguous()
-            B = rand_fp8_tensor((n, k), self.device, cur_dtype).contiguous()
-            As = (
-                0.01
-                * torch.rand((m, num_k_groups), dtype=torch.float32, device=self.device)
-                + 0.005
-            ).contiguous()
-            Bs = (
-                0.01
-                * torch.rand(
-                    (num_n_groups, num_k_groups),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                + 0.005
-            ).contiguous()
-
-            yield A, B, As, Bs, self.block_size[:], torch.float16
-
-    def get_tflops(self, op, *args, **kwargs):
-        A, B = args[0], args[1]
-        m, k = A.shape
-        n = B.shape[0]
-        return 2 * m * n * k
-
-
-# ============================================================================
 # Parallel benchmark infrastructure
 # ============================================================================
 
@@ -685,7 +608,7 @@ class ParallelBenchmarkMixin:
                 "addmm",
                 "bmm",
                 "baddbmm",
-                "w8a8_block_fp8_matmul",
+                "w8a8_block_matmul",
                 "w8a8_block_fp8_matmul_deepgemm",
                 "router_gemm",
             }:
@@ -703,7 +626,7 @@ class ParallelBenchmarkMixin:
                 if self.op_name in {
                     "mm",
                     "bmm",
-                    "w8a8_block_fp8_matmul",
+                    "w8a8_block_matmul",
                     "router_gemm",
                 }:
                     return m * n * k * 2 + fixed_overhead
@@ -1018,10 +941,18 @@ class ParallelRouterGemmBenchmark(ParallelBenchmarkMixin, RouterGemmBenchmark):
         self.shape_desc = "M, N, K"
 
 
-class ParallelW8A8BlockFP8MatmulBenchmark(
-    ParallelBenchmarkMixin, W8A8BlockFP8MatmulBenchmark
+class ParallelW8A8BlockMatmulBenchmark(
+    ParallelBenchmarkMixin, W8A8BlockMatmulBenchmark
 ):
-    SHAPE_CONFIG_KEYS = ("w8a8_block_fp8_matmul", "BlasBenchmark")
+    SHAPE_CONFIG_KEYS = (
+        "w8a8_block_matmul",
+        (
+            "w8a8_block_int8_matmul"
+            if flaggems_vllm.vendor_name == "thead"
+            else "w8a8_block_fp8_matmul"
+        ),
+        "BlasBenchmark",
+    )
 
     def set_more_shapes(self):
         if os.environ.get(PARALLEL_WORKER_ENV):
@@ -1029,13 +960,11 @@ class ParallelW8A8BlockFP8MatmulBenchmark(
         return BlasBenchmark.set_more_shapes(self)
 
     def should_forward_parallel_dtype(self, dtype_name):
-        # FP8 names come from torch as ``float8_e4m3fn``/``float8_e5m2``.
-        # They are not accepted by the generic --dtypes CLI choices, while
-        # this benchmark already owns the supported list in consts.FP8_DTYPES.
-        # Do not forward the implicit FP8 dtype to worker pytest processes;
-        # let the operator benchmark select its FP8 dtype directly.
+        # INT8 and FP8 are selected here, not through the generic --dtypes CLI.
         if Config.user_desired_dtypes is None and (
-            dtype_name.startswith("fp8") or dtype_name.startswith("float8")
+            dtype_name == "int8"
+            or dtype_name.startswith("fp8")
+            or dtype_name.startswith("float8")
         ):
             return False
         return True
@@ -1075,7 +1004,7 @@ class ParallelW8A8BlockFP8MatmulBenchmark(
                 normalized_shapes.append(shape)
             else:
                 raise ValueError(
-                    "w8a8_block_fp8_matmul benchmark expects shapes in (M, N, K) "
+                    "w8a8_block_matmul benchmark expects shapes in (M, N, K) "
                     "or (B, M, N, K) format."
                 )
 
@@ -1088,7 +1017,9 @@ def _deepgemm_block_scaled_mm(A, B, As_dg, Bs_dg, output):
     return output
 
 
-class ParallelW8A8BlockFP8DeepGemmBenchmark(ParallelW8A8BlockFP8MatmulBenchmark):
+class ParallelW8A8BlockFP8DeepGemmBenchmark(ParallelW8A8BlockMatmulBenchmark):
+    SHAPE_CONFIG_KEYS = ("w8a8_block_matmul", "w8a8_block_fp8_matmul", "BlasBenchmark")
+
     def __init__(self, *args, output_dtype=torch.bfloat16, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_dtype = output_dtype
@@ -1109,8 +1040,8 @@ class ParallelW8A8BlockFP8DeepGemmBenchmark(ParallelW8A8BlockFP8MatmulBenchmark)
             num_k_groups = (k + block_k - 1) // block_k
             num_n_groups = (n + block_n - 1) // block_n
 
-            A = rand_fp8_tensor((m, k), self.device, cur_dtype).contiguous()
-            B = rand_fp8_tensor((n, k), self.device, cur_dtype).contiguous()
+            A = rand_quantized_tensor((m, k), self.device, cur_dtype).contiguous()
+            B = rand_quantized_tensor((n, k), self.device, cur_dtype).contiguous()
             As = (
                 0.01
                 * torch.rand((m, num_k_groups), dtype=torch.float32, device=self.device)
@@ -1343,30 +1274,40 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
     bench.run()
 
 
-@pytest.mark.w8a8_block_fp8_matmul
-def test_perf_w8a8_block_fp8_matmul():
-    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
-        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
-    if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
-        pytest.skip("w8a8_block_fp8_matmul benchmark requires vLLM baseline operator")
-    if len(consts.FP8_DTYPES) == 0:
-        pytest.skip(
-            "w8a8_block_fp8_matmul benchmark requires CUDA device with FP8 support"
-        )
+@pytest.mark.w8a8_block_matmul
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads"),
+    reason="No W8A8 block matmul backend",
+)
+def test_perf_w8a8_block_matmul():
+    if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
+        pytest.skip("W8A8 block matmul is unavailable on this architecture")
+    if flaggems_vllm.vendor_name == "thead":
+        if not VLLM_W8A8_BLOCK_INT8_AVAILABLE:
+            pytest.skip("W8A8 block matmul benchmark requires the vLLM INT8 baseline")
+        torch_op = vllm_w8a8_block_int8_matmul
+        dtypes = [torch.int8]
+    else:
+        if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
+            pytest.skip("W8A8 block matmul benchmark requires the vLLM FP8 baseline")
+        if not consts.FP8_DTYPES:
+            pytest.skip("W8A8 block matmul benchmark requires FP8 support")
+        torch_op = vllm_w8a8_triton_block_scaled_mm
+        dtypes = consts.FP8_DTYPES
 
-    bench = ParallelW8A8BlockFP8MatmulBenchmark(
-        op_name="w8a8_block_fp8_matmul",
-        torch_op=vllm_w8a8_triton_block_scaled_mm,
-        dtypes=consts.FP8_DTYPES,
+    bench = ParallelW8A8BlockMatmulBenchmark(
+        op_name="w8a8_block_matmul",
+        torch_op=torch_op,
+        gems_op=flaggems_vllm.w8a8_block_matmul,
+        dtypes=dtypes,
     )
-    bench.set_gems(flaggems_vllm.w8a8_block_fp8_matmul)
     bench.run()
 
 
 @pytest.mark.w8a8_block_fp8_matmul_deepgemm
 def test_perf_w8a8_block_fp8_matmul_deepgemm():
-    if not hasattr(flaggems_vllm, "w8a8_block_fp8_matmul"):
-        pytest.skip("w8a8_block_fp8_matmul is not included in FlagGems-vllm")
+    if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
+        pytest.skip("w8a8_block_matmul is not included in FlagGems-vllm")
     if not DEEPGEMM_AVAILABLE:
         pytest.skip("DeepGEMM is not available on this platform")
     if len(consts.FP8_DTYPES) == 0:
@@ -1380,7 +1321,7 @@ def test_perf_w8a8_block_fp8_matmul_deepgemm():
         dtypes=consts.FP8_DTYPES,
         output_dtype=torch.bfloat16,
     )
-    bench.set_gems(flaggems_vllm.w8a8_block_fp8_matmul)
+    bench.set_gems(flaggems_vllm.w8a8_block_matmul)
     bench.run()
 
 

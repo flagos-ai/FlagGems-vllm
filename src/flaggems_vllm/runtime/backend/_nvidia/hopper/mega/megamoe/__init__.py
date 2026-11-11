@@ -14,6 +14,9 @@
 
 """Triton/TLE Hopper MegaMoE operator."""
 
-from .api import MegaMoEContext, megamoe_fp8
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe.api import (
+    MegaMoEContext,
+    megamoe_fp8,
+)
 
 __all__ = ["MegaMoEContext", "megamoe_fp8"]
