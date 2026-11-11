@@ -745,12 +745,17 @@ ops:
     kind:
       - FLA
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: fused_recurrent_kda
     description: |
       Independent Triton KDA decode with key-wise gate decay, optional QK L2
       normalization, scalar/vector beta and FP32 value-major recurrent state.
       Supports varlen, per-token state tables and strided inputs.
+      On Ascend it additionally fuses the activations the AscendC
+      recurrent_kda operator fuses, as the Kimi K3 KDA layer requires: the
+      bounded gate lower_bound * sigmoid(exp(A_log) * (g + dt_bias)), beta's
+      sigmoid, and accepted-token seed-column selection for speculative
+      decode.
     for:
       - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
     labels:

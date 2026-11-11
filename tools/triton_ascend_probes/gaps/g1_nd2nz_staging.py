@@ -1,0 +1,191 @@
+"""GAP R1: GM -> L1 zN staging for an L1-resident dot operand (downgraded).
+
+AscendC does this natively: chunk_kda_fwd_prepare_cube.h:258-290 issues
+`AscendC::Nd2NzParams` + `AscendC::DataCopy` for **GM(ND) -> L1(NZ)**
+("后面的四次 MMAD 不再读 GM").  The source is the workspace payload that V6
+wrote to GM; the Cube path never touches UB.
+
+Triton has no such path: `al.copy` only accepts a UB source (or UB->UB), and
+`ascend_address_space` has no GM.  The only way to build a zN tile from a
+loaded 2D ND tile is therefore a UB-side layout conversion
+
+    a_tmp = tl.permute(a.reshape(R, K // 16, 16), (1, 0, 2))
+    a_nz = a_tmp.reshape(K // 16, R // 16, 16, 16)
+    al.copy(bl.to_buffer(a_nz, al.ascend_address_space.UB), l1)
+
+and that conversion materialises a second 4D tile in UB.  In the *old*
+full-matrix KDA Gram formulation each program builds seven [64, 128] bf16
+panels and runs six 64x64 dots, and the extra UB tiles push the kernel over
+the 2.03 Mbit budget:
+
+    MODE=plain  (six tl.dot, 7 panels)                       compiles
+    MODE=l1a    (4 A panels staged in L1, B stays ND)        ub 3.15 Mbit
+    MODE=l1b    (3 shared B panels staged in L1)             ub 3.28 Mbit
+    MODE=l1     (all 7 panels staged in L1)                  ub 2.37 Mbit
+
+The overflow is a property of that seven-[64,128]-panel formulation, not of
+L1 residency in general: the causal-prefix Gram kernel now used in production
+needs only seven [32,128] panels (~1.0 Mbit peak) and no explicit L1 staging.
+R1 is therefore a P2 capability gap, not a chunk_kda blocker.
+
+Triton would need an `al.copy` that accepts a GM source and a 4D zN L1
+destination (or `al.dot` with 2D ND operands plus an internal GM->L1 staging)
+for explicit multi-panel L1 residency.  `supported/s2_l1_resident_dot.py`
+shows the L1->dot half already works.
+
+Usage:
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py plain
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py l1a
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py l1b
+    PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py l1
+"""
+
+import sys
+
+import torch
+import torch_npu  # noqa: F401
+import triton
+import triton.extension.buffer.language as bl
+import triton.language as tl
+from triton.language.extra.cann import extension as al
+
+
+@triton.jit
+def zN_A(a, R: tl.constexpr, K: tl.constexpr):
+    t = tl.permute(a.reshape(R, K // 16, 16), (1, 0, 2))
+    return t.reshape(K // 16, R // 16, 16, 16)
+
+
+@triton.jit
+def zN_B(a, R: tl.constexpr, K: tl.constexpr):
+    at = tl.trans(a)
+    t = tl.permute(at.reshape(K, R // 16, 16), (1, 0, 2))
+    return t.reshape(R // 16, K // 16, 16, 16)
+
+
+@triton.jit
+def kern(
+    x,
+    y,
+    R: tl.constexpr,
+    K: tl.constexpr,
+    DO_A: tl.constexpr,
+    DO_B: tl.constexpr,
+    FA: tl.constexpr,
+    FB: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    o_i = tl.arange(0, R)
+    o_k = tl.arange(0, K)
+    p = (pid % 6) * R * K + o_i[:, None] * K + o_k[None, :]
+    a = tl.load(x + p)
+    b = tl.load(x + R * K + p)
+    gc = tl.load(x + 2 * R * K + p).to(tl.float32)
+    H: tl.constexpr = R // 2
+    in0 = o_i[:, None] < H
+    f0 = tl.where(in0, gc, 0.0)
+    f1 = tl.where(in0, gc * 1.001, -0.5)
+    q0 = (a * tl.math.exp2(f0)).to(tl.bfloat16)
+    q1 = (a * tl.math.exp2(f1)).to(tl.bfloat16)
+    k0 = (b * tl.math.exp2(-f0)).to(tl.bfloat16)
+    k1 = (b * tl.math.exp2(-f1)).to(tl.bfloat16)
+    k0c = (b * tl.math.exp2(-f0) * 1.002).to(tl.bfloat16)
+    kq0 = (b * tl.math.exp2(f0)).to(tl.bfloat16)
+    kq1 = (b * tl.math.exp2(f1)).to(tl.bfloat16)
+
+    if not DO_A and not DO_B:
+        aq = tl.dot(q0, tl.trans(k0), out_dtype=tl.float32)
+        aq += tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)
+        aq += tl.dot(q1, tl.trans(k0c), out_dtype=tl.float32)
+        ak = tl.dot(kq0, tl.trans(k0), out_dtype=tl.float32)
+        ak += tl.dot(kq1, tl.trans(k1), out_dtype=tl.float32)
+        ak += tl.dot(kq1, tl.trans(k0c), out_dtype=tl.float32)
+    else:
+        if DO_B:
+            lk0 = bl.alloc(
+                tl.bfloat16, [R // 16, K // 16, 16, 16], al.ascend_address_space.L1
+            )
+            lk1 = bl.alloc(
+                tl.bfloat16, [R // 16, K // 16, 16, 16], al.ascend_address_space.L1
+            )
+            lkc = bl.alloc(
+                tl.bfloat16, [R // 16, K // 16, 16, 16], al.ascend_address_space.L1
+            )
+            al.copy(bl.to_buffer(zN_B(k0, R, K), al.ascend_address_space.UB), lk0)
+            al.copy(bl.to_buffer(zN_B(k1, R, K), al.ascend_address_space.UB), lk1)
+            al.copy(bl.to_buffer(zN_B(k0c, R, K), al.ascend_address_space.UB), lkc)
+            tk0 = bl.to_tensor(lk0)
+            tk1 = bl.to_tensor(lk1)
+            tkc = bl.to_tensor(lkc)
+        if DO_A:
+            lq0 = bl.alloc(
+                tl.bfloat16, [K // 16, R // 16, 16, 16], al.ascend_address_space.L1
+            )
+            lq1 = bl.alloc(
+                tl.bfloat16, [K // 16, R // 16, 16, 16], al.ascend_address_space.L1
+            )
+            lkq0 = bl.alloc(
+                tl.bfloat16, [K // 16, R // 16, 16, 16], al.ascend_address_space.L1
+            )
+            lkq1 = bl.alloc(
+                tl.bfloat16, [K // 16, R // 16, 16, 16], al.ascend_address_space.L1
+            )
+            al.copy(bl.to_buffer(zN_A(q0, R, K), al.ascend_address_space.UB), lq0)
+            al.copy(bl.to_buffer(zN_A(q1, R, K), al.ascend_address_space.UB), lq1)
+            al.copy(bl.to_buffer(zN_A(kq0, R, K), al.ascend_address_space.UB), lkq0)
+            al.copy(bl.to_buffer(zN_A(kq1, R, K), al.ascend_address_space.UB), lkq1)
+            tq0 = bl.to_tensor(lq0)
+            tq1 = bl.to_tensor(lq1)
+            tkq0 = bl.to_tensor(lkq0)
+            tkq1 = bl.to_tensor(lkq1)
+        a0 = tq0 if DO_A else q0
+        a1 = tq1 if DO_A else q1
+        ak0 = tkq0 if DO_A else kq0
+        ak1 = tkq1 if DO_A else kq1
+        b0 = tk0 if DO_B else tl.trans(k0)
+        b1 = tk1 if DO_B else tl.trans(k1)
+        bc = tkc if DO_B else tl.trans(k0c)
+        aq = al.dot(a0, b0, format_a=FA, format_b=FB)
+        aq += al.dot(a1, b1, format_a=FA, format_b=FB)
+        aq += al.dot(a1, bc, format_a=FA, format_b=FB)
+        ak = al.dot(ak0, b0, format_a=FA, format_b=FB)
+        ak += al.dot(ak1, b1, format_a=FA, format_b=FB)
+        ak += al.dot(ak1, bc, format_a=FA, format_b=FB)
+    tl.store(y + o_i[:, None] * R + o_i[None, :], aq + ak)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "plain"
+    torch.npu.set_device("npu:0")
+    R, K = 64, 128
+    torch.manual_seed(0)
+    x = torch.randn(6 * R * K, device="npu", dtype=torch.bfloat16)
+    y_ref = torch.empty(R * R, device="npu", dtype=torch.float32)
+    y = torch.empty(R * R, device="npu", dtype=torch.float32)
+    grid = (12288,)  # one program per (chunk, head) of the KDA Gram grid
+    do_a, do_b, fa, fb = {
+        "plain": (0, 0, "nd", "nd"),
+        "l1a": (1, 0, "fractal", "nd"),
+        "l1b": (0, 1, "nd", "fractal"),
+        "l1": (1, 1, "fractal", "fractal"),
+    }[mode]
+    with torch.inference_mode():
+        # Reference: the same math with no explicit L1 staging.
+        kern[grid](x, y_ref, R, K, DO_A=0, DO_B=0, FA="nd", FB="nd")
+        if mode == "plain":
+            y = y_ref
+        else:
+            kern[grid](x, y, R, K, DO_A=do_a, DO_B=do_b, FA=fa, FB=fb)
+        torch.npu.synchronize()
+    if mode == "plain":
+        print(f"RESULT: PASS g1_nd2nz_staging mode={mode}")
+    else:
+        maxerr = (y.float() - y_ref.float()).abs().max().item()
+        verdict = "PASS" if maxerr < 1e-2 else "FAIL"
+        print(
+            f"RESULT: {verdict} g1_nd2nz_staging mode={mode} maxerr={maxerr:.6g}"
+        )
+
+
+if __name__ == "__main__":
+    main()
