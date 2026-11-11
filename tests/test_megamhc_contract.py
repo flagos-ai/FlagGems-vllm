@@ -30,9 +30,9 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import (
     MegaMHCWorkspace,
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import api as megamhc_api
-from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import (
-    create_mega_mhc_context,
-    mega_mhc,
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import mega_mhc
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.factory import (
+    _create_context_from_prepared,
 )
 
 
@@ -707,7 +707,7 @@ def test_factory_derives_tokens_and_dispatches_exact_prepared_launcher():
         static_alignments=(32,) * 4,
     )
 
-    context = create_mega_mhc_context(
+    context = _create_context_from_prepared(
         *static_values,
         {1: prepared_t1, 8: prepared_t8},
     )
@@ -731,7 +731,7 @@ def test_factory_rejects_registry_key_token_mismatch():
     prepared = _PreparedLauncher(8, static_values)
 
     with pytest.raises(ValueError, match="registry key T=1"):
-        create_mega_mhc_context(*static_values, {1: prepared})
+        _create_context_from_prepared(*static_values, {1: prepared})
 
 
 def test_factory_rejects_launcher_bound_to_different_static_tensor():
@@ -741,7 +741,7 @@ def test_factory_rejects_launcher_bound_to_different_static_tensor():
     prepared = _PreparedLauncher(1, rebound_values)
 
     with pytest.raises(RuntimeError, match="different static tensors"):
-        create_mega_mhc_context(*static_values, {1: prepared})
+        _create_context_from_prepared(*static_values, {1: prepared})
 
 
 def test_factory_rejects_static_storage_rebind_after_launcher_preparation():
@@ -752,7 +752,7 @@ def test_factory_rejects_static_storage_rebind_after_launcher_preparation():
     tensors["fn"].set_(replacement)
 
     with pytest.raises(RuntimeError, match="changed after launcher preparation"):
-        create_mega_mhc_context(*static_values, {1: prepared})
+        _create_context_from_prepared(*static_values, {1: prepared})
 
 
 def test_factory_rejects_wrong_owner_and_invalid_alignment_contracts():
@@ -762,23 +762,23 @@ def test_factory_rejects_wrong_owner_and_invalid_alignment_contracts():
         1, static_values, owner_thread_id=threading.get_ident() + 1
     )
     with pytest.raises(RuntimeError, match="different host thread"):
-        create_mega_mhc_context(*static_values, {1: wrong_owner})
+        _create_context_from_prepared(*static_values, {1: wrong_owner})
 
     invalid_alignment = _PreparedLauncher(
         1, static_values, dynamic_alignments=(16,) * 7 + (3,)
     )
     with pytest.raises(ValueError, match="powers of two"):
-        create_mega_mhc_context(*static_values, {1: invalid_alignment})
+        _create_context_from_prepared(*static_values, {1: invalid_alignment})
 
 
 def test_factory_rejects_empty_registry_and_missing_token_is_explicit():
     tensors, _, _ = _make_case(tokens=2)
     static_values = _static_values(tensors)
     with pytest.raises(ValueError, match="must not be empty"):
-        create_mega_mhc_context(*static_values, {})
+        _create_context_from_prepared(*static_values, {})
 
     prepared = _PreparedLauncher(1, static_values)
-    context = create_mega_mhc_context(*static_values, {1: prepared})
+    context = _create_context_from_prepared(*static_values, {1: prepared})
     with pytest.raises(NotImplementedError, match="T=2"):
         _invoke(tensors, context)
     assert prepared.runs == []
