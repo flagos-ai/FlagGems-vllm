@@ -14,9 +14,11 @@
 
 """Distributed accuracy, Graph replay and shared synthetic benchmark inputs."""
 
+import importlib.util
 import json
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -28,7 +30,7 @@ import triton
 import triton.language as tl
 
 from . import conftest as cfg
-from .accuracy_utils import gems_assert_close
+from .accuracy_utils import gems_assert_close, to_reference
 
 pytestmark = pytest.mark.megapreattention
 
@@ -50,10 +52,6 @@ class Config:
     @property
     def kv_size(self):
         return self.num_kv_heads * self.head_dim
-
-    @property
-    def packed_size(self):
-        return 2 * (self.q_size + self.kv_size)
 
 
 @dataclass
@@ -140,12 +138,69 @@ def run_candidate(inputs):
     )
 
 
+def make_ascend_cache(cache):
+    blocks, heads, block_size, width = cache.shape
+    return cache.new_full((2, blocks, block_size, heads, width // 2), 0.375)
+
+
+def logical_ascend_cache(cache):
+    # Convert to the reference layout outside the timing window.
+    return torch.cat((cache[0], cache[1]), dim=-1).transpose(1, 2)
+
+
+class AscendCandidateWindow:
+    """Same inputs and native cache layout as the frozen baseline."""
+
+    def __init__(self, inputs, *, capacity=None):
+        from flaggems_vllm.runtime.backend._ascend.ops.megapreattention import (
+            MegaPreAttentionWorkspace,
+        )
+
+        self.group = dist.new_group(
+            ranks=dist.get_process_group_ranks(inputs.group), backend="hccl"
+        )
+        self.workspace = MegaPreAttentionWorkspace(
+            inputs.hidden,
+            inputs.weight.shape[0],
+            self.group,
+            capacity=capacity,
+            rotary_dim=inputs.config.rotary_dim,
+        )
+        self.cache = make_ascend_cache(inputs.cache)
+
+    def __call__(self, inputs):
+        c = inputs.config
+        return Output(
+            *self.workspace(
+                inputs.hidden,
+                inputs.weight,
+                inputs.positions,
+                inputs.q_norm,
+                inputs.k_norm,
+                inputs.rope,
+                self.cache,
+                inputs.slots,
+                self.group,
+                num_heads=c.num_q_heads * inputs.group.size(),
+                num_kv_heads=c.global_kv_heads,
+                head_dim=c.head_dim,
+                rotary_dim=c.rotary_dim,
+                mrope_section=c.mrope_section,
+                eps=c.eps,
+            )
+        )
+
+    def logical_cache(self):
+        return logical_ascend_cache(self.cache)
+
+
 def make_inputs(
     tokens,
     tp,
     rank,
     *,
     edge=False,
+    device="cuda",
     model_dims=(2048, 16, 2),
     head_dim=256,
     rotary_dim=64,
@@ -174,29 +229,29 @@ def make_inputs(
             weights["k_proj.weight"][kv_start : kv_start + config.kv_size],
             weights["v_proj.weight"][kv_start : kv_start + config.kv_size],
         )
-    ).to("cuda")
-    generator = torch.Generator(device="cuda").manual_seed(20261010 + rank + tokens)
+    ).to(device)
+    generator = torch.Generator(device=device).manual_seed(20261010 + rank + tokens)
     hidden = (
         torch.randn(
             (tokens // tp, hidden_size),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=device,
             generator=generator,
         )
         * 0.05
     )
-    position_base = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    position_base = torch.arange(tokens, device=device, dtype=torch.int64)
     positions = position_base.repeat(3, 1)
     slots = position_base.clone()
     if edge:
-        storage = torch.empty((3, tokens + 7), device="cuda", dtype=torch.int64)
+        storage = torch.empty((3, tokens + 7), device=device, dtype=torch.int64)
         positions = storage[:, :tokens]
         positions[0], positions[1], positions[2] = (
             position_base,
             position_base + 13,
             position_base + 29,
         )
-        slot_storage = torch.empty(tokens * 2, device="cuda", dtype=torch.int64)
+        slot_storage = torch.empty(tokens * 2, device=device, dtype=torch.int64)
         slots = slot_storage[::2]
         slots.copy_(position_base * 2 + 15)
         slots[-1] = -1
@@ -205,37 +260,37 @@ def make_inputs(
     cache = torch.full(
         (blocks, config.num_kv_heads, 128, 2 * head_dim),
         0.375,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     if edge:
         cache = torch.full(
             (128, config.num_kv_heads, blocks, 2 * head_dim),
             0.375,
-            device="cuda",
+            device=device,
             dtype=torch.bfloat16,
         ).permute(2, 1, 0, 3)
     rope = MRotaryEmbedding(
         head_dim,
         rotary_dim,
-        262144,
+        tokens + 29 if edge else tokens,
         1.0e7,
         True,
         torch.bfloat16,
         mrope_section=list(mrope_section),
         mrope_interleaved=True,
     )
-    rope.cos_sin_cache = rope.cos_sin_cache.to("cuda")
+    rope.cos_sin_cache = rope.cos_sin_cache.to(device)
     inputs = Inputs(
         hidden,
         local,
         positions,
-        weights["q_norm.weight"].to("cuda"),
-        weights["k_norm.weight"].to("cuda"),
+        weights["q_norm.weight"].to(device),
+        weights["k_norm.weight"].to(device),
         rope.cos_sin_cache,
         cache,
         slots,
-        torch.ones(1, device="cuda"),
+        torch.ones(1, device=device),
         dist.group.WORLD,
         config,
     )
@@ -250,7 +305,7 @@ def independent_reference(inputs):
     qkv = hidden @ inputs.weight.t()
     qgate, key, value = qkv.split((2 * c.q_size, c.kv_size, c.kv_size), dim=-1)
     query, gate = qgate.view(t, c.num_q_heads, 2 * c.head_dim).chunk(2, dim=-1)
-    frequency = torch.arange(c.rotary_dim // 2, device="cuda")
+    frequency = torch.arange(c.rotary_dim // 2, device=qkv.device)
     axis = torch.zeros_like(frequency)
     axis[1 : 3 * c.mrope_section[1] : 3] = 1
     axis[2 : 3 * c.mrope_section[2] : 3] = 2
@@ -260,15 +315,20 @@ def independent_reference(inputs):
 
     def norm_rope(x, weight):
         x = x.float()
-        normalized = (
-            (
-                x
-                * torch.rsqrt(x.square().mean(-1, keepdim=True) + c.eps)
-                * (weight.float() + 1)
+        if x.device.type == "npu":
+            # A2 rounds gamma to BF16 before keeping norm and MRoPE in FP32.
+            normalized = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + c.eps)
+            normalized = normalized * (weight + 1).float()
+        else:
+            normalized = (
+                (
+                    x
+                    * torch.rsqrt(x.square().mean(-1, keepdim=True) + c.eps)
+                    * (weight.float() + 1)
+                )
+                .to(torch.bfloat16)
+                .float()
             )
-            .to(torch.bfloat16)
-            .float()
-        )
         first, second = normalized[..., : c.rotary_dim].chunk(2, dim=-1)
         rotated = torch.cat(
             (first * cos - second * sin, second * cos + first * sin), dim=-1
@@ -294,10 +354,13 @@ BF16_ATOL = 1e-2
 
 
 def check_outputs(actual, expected, actual_cache, expected_cache):
+    atol = 0.03 if actual.query.device.type == "npu" else BF16_ATOL
     for a, b in zip(actual.tensors(), expected.tensors()):
-        gems_assert_close(a, b, torch.bfloat16, atol=BF16_ATOL)
+        gems_assert_close(a, to_reference(b), torch.bfloat16, atol=atol)
         assert torch.isfinite(a).all()
-    gems_assert_close(actual_cache, expected_cache, torch.bfloat16, atol=BF16_ATOL)
+    gems_assert_close(
+        actual_cache, to_reference(expected_cache), torch.bfloat16, atol=atol
+    )
 
 
 def check_unaligned_inputs(inputs):
@@ -338,6 +401,70 @@ def check_unaligned_inputs(inputs):
             graph.reset()
 
 
+@contextmanager
+def worker_context(rank, tp, directory, tokens, mode, device):
+    from vllm.config import VllmConfig
+    from vllm.config.vllm import set_current_vllm_config
+
+    if device.type == "cuda":
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            "nccl",
+            rank=rank,
+            world_size=tp,
+            init_method=f"file://{directory}/rdzv",
+            device_id=device,
+            timeout=timedelta(seconds=180),
+        )
+        try:
+            with set_current_vllm_config(VllmConfig()):
+                yield
+        finally:
+            dist.destroy_process_group()
+        return
+
+    from vllm.config import ParallelConfig
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.forward_context import set_forward_context
+    from vllm_ascend.ascend_config import init_ascend_config
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+    torch.npu.set_device(rank)
+    additional_config = {"enable_flashcomm1": True}
+    if mode != "cudagraph":
+        additional_config["ascend_compilation_config"] = {"enable_npugraph_ex": False}
+    config = VllmConfig(
+        parallel_config=ParallelConfig(tensor_parallel_size=tp),
+        additional_config=additional_config,
+    )
+    try:
+        with set_current_vllm_config(config):
+            init_ascend_config(config)
+            init_device_properties_triton()
+            init_distributed_environment(
+                world_size=tp,
+                rank=rank,
+                local_rank=rank,
+                distributed_init_method=f"file://{directory}/rdzv",
+                backend="hccl",
+                timeout=timedelta(seconds=180),
+            )
+            initialize_model_parallel(tensor_model_parallel_size=tp, backend="hccl")
+            with set_forward_context(None, config, num_tokens=tokens):
+                _EXTRA_CTX.flash_comm_v1_enabled = True
+                _EXTRA_CTX.pad_size = 0
+                yield
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
 def _worker(
     rank,
     tp,
@@ -350,44 +477,90 @@ def _worker(
     directory,
     model_dims,
     kernel_config,
+    check_contract,
+    workspace_capacity,
+    device_type,
 ):
-    import torch
-    import torch.distributed as dist
+    if device_type == "npu":
+        import torch_npu  # noqa: F401
 
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        "nccl",
-        rank=rank,
-        world_size=tp,
-        init_method=f"file://{directory}/rdzv",
-        device_id=torch.device("cuda", rank),
-        timeout=timedelta(seconds=180),
-    )
-    from vllm.config import VllmConfig
-    from vllm.config.vllm import set_current_vllm_config
+    device = torch.device(device_type, rank)
+    with worker_context(rank, tp, directory, tokens, mode, device):
+        _run_worker(
+            rank,
+            tp,
+            tokens,
+            mode,
+            iterations,
+            warmup,
+            edge,
+            check_only,
+            directory,
+            model_dims,
+            kernel_config,
+            check_contract,
+            workspace_capacity,
+            device,
+        )
 
-    native_context = set_current_vllm_config(VllmConfig())
-    native_context.__enter__()
+
+def _run_worker(
+    rank,
+    tp,
+    tokens,
+    mode,
+    iterations,
+    warmup,
+    edge,
+    check_only,
+    directory,
+    model_dims,
+    kernel_config,
+    check_contract,
+    workspace_capacity,
+    device,
+):
+    ascend = device.type == "npu"
+    device_api = torch.npu if ascend else torch.cuda
     source, rope = make_inputs(
-        tokens, tp, rank, edge=edge, model_dims=model_dims, **kernel_config
+        tokens,
+        tp,
+        rank,
+        edge=edge,
+        model_dims=model_dims,
+        device=device,
+        **kernel_config,
     )
-    from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
-        megapreattention as impl,
-    )
+    if not ascend:
+        from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
+            megapreattention as impl,
+        )
 
     names = ["megapreattention"] if check_only else ["native", "megapreattention"]
     inputs = {
         name: replace(source, cache=torch.full_like(source.cache, 0.375))
         for name in names
     }
+    ascend_windows = {}
+    candidate = run_candidate
+    if ascend:
+        candidate = AscendCandidateWindow(
+            inputs["megapreattention"], capacity=workspace_capacity
+        )
+        ascend_windows["megapreattention"] = candidate
+
+    def logical_cache(name):
+        return ascend_windows[name].logical_cache() if ascend else inputs[name].cache
+
+    def clear_cache(name):
+        cache = ascend_windows[name].cache if ascend else inputs[name].cache
+        cache.fill_(0.375)
 
     def candidate_with_other_current_device(value):
-        # Exercise creation, cached calls and Graph capture with a different
-        # current device. The API must restore the caller's device on return.
         other = (rank + 1) % tp
-        with torch.cuda.device(other):
-            result = run_candidate(value)
-            assert torch.cuda.current_device() == other
+        with device_api.device(other):
+            result = candidate(value)
+            assert device_api.current_device() == other
         assert all(tensor.device == value.hidden.device for tensor in result.tensors())
         assert all(
             w.communication.device == value.hidden.device
@@ -397,35 +570,44 @@ def _worker(
 
     functions = {
         "megapreattention": (
-            candidate_with_other_current_device if check_only else run_candidate
+            candidate_with_other_current_device
+            if check_only and not ascend
+            else candidate
         ),
     }
     if not check_only:
         from benchmark.test_megapreattention import (
+            AscendNativeWindow,
             NativeWindow,
             measure_window,
             summarize_samples,
         )
 
-        native = NativeWindow(inputs["native"], rope, edge=edge)
+        if ascend:
+            native = AscendNativeWindow(inputs["native"])
+            ascend_windows["native"] = native
+        else:
+            native = NativeWindow(inputs["native"], rope, edge=edge)
         functions["native"] = native
     # Original-input oracle is independent of both native and candidate scratch.
     oracle_cache = torch.full_like(source.cache, 0.375)
     oracle = independent_reference(replace(source, cache=oracle_cache))
     for name in names:
         actual = functions[name](inputs[name])
-        torch.cuda.synchronize()
-        check_outputs(actual, oracle, inputs[name].cache, oracle_cache)
+        device_api.synchronize()
+        check_outputs(actual, oracle, logical_cache(name), oracle_cache)
     for _ in range(warmup):
         for name in names:
             functions[name](inputs[name])
-    torch.cuda.synchronize()
+            if ascend:
+                device_api.synchronize()
+    device_api.synchronize()
     graphs, outputs = {}, {}
     if mode == "cudagraph":
         for name in names:
             dist.barrier()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            graph = device_api.NPUGraph() if ascend else device_api.CUDAGraph()
+            with device_api.graph(graph, capture_error_mode="global"):
                 outputs[name] = functions[name](inputs[name])
             graphs[name] = graph
 
@@ -442,31 +624,29 @@ def _worker(
         source.hidden.mul_(scale)
         oracle_cache.fill_(0.375)
         oracle = independent_reference(replace(source, cache=oracle_cache))
-        for window in impl._windows.values():
-            window.communication.buffer.fill_(
-                float("nan")
-            )  # test-only, never production
+        if ascend:
+            candidate.workspace.gathered.fill_(float("nan"))
+            # Poison every destination before peers can start writing.
+            device_api.synchronize()
+            dist.barrier()
+        else:
+            for window in impl._windows.values():
+                window.communication.buffer.fill_(float("nan"))
         for name in names:
-            inputs[name].cache.fill_(0.375)
+            clear_cache(name)
             if mode == "cudagraph":
                 graphs[name].replay()
                 actual = outputs[name]
             else:
                 actual = functions[name](inputs[name])
-            torch.cuda.synchronize()
-            check_outputs(actual, oracle, inputs[name].cache, oracle_cache)
+            device_api.synchronize()
+            check_outputs(actual, oracle, logical_cache(name), oracle_cache)
     # Unsupported metadata is rejected before any collective initialization.
     unsupported = {}
-    check_metadata = (
-        check_only
-        and tp == 2
-        and tokens == 1024
-        and model_dims == (2048, 16, 2)
-        and kernel_config["eps"] == 1e-6
-    )
-    if check_metadata:
+    if check_contract and not ascend:
         check_unaligned_inputs(inputs["megapreattention"])
-    for name in ("megapreattention",) if check_metadata else ():
+    if check_contract:
+        name = "megapreattention"
         value = inputs[name]
         bad_cases = {
             "fp32": replace(value, hidden=value.hidden.float()),
@@ -474,7 +654,7 @@ def _worker(
                 value,
                 hidden=torch.empty(
                     (tokens // tp, value.hidden.shape[1] * 2),
-                    device="cuda",
+                    device=device,
                     dtype=torch.bfloat16,
                 )[:, ::2],
             ),
@@ -493,18 +673,33 @@ def _worker(
             ),
         }
         unsupported[name] = {}
+        input_errors = (
+            (AssertionError, NotImplementedError) if ascend else AssertionError
+        )
         for label, bad in bad_cases.items():
             try:
-                run_candidate(bad)
-            except AssertionError:
+                candidate(bad)
+            except input_errors:
                 unsupported[name][label] = True
             else:
                 raise AssertionError(f"{name} silently accepted unsupported {label}")
         del bad_cases
 
+    if ascend and graphs:
+        # Exercise reuse across ranks with no host barrier between replays.
+        for _ in range(4):
+            source.hidden.mul_(0.875)
+            for name in names:
+                calls[name]()
+        oracle_cache.fill_(0.375)
+        oracle = independent_reference(replace(source, cache=oracle_cache))
+        device_api.synchronize()
+        for name in names:
+            check_outputs(outputs[name], oracle, logical_cache(name), oracle_cache)
+
     samples = {name: {"wall": [], "device": []} for name in names}
     if not check_only:
-        samples = measure_window(calls, names, iterations)
+        samples = measure_window(calls, names, iterations, device_api=device_api)
     record = {
         "rank": rank,
         "samples": samples,
@@ -515,19 +710,24 @@ def _worker(
     ranks = [None] * tp
     dist.all_gather_object(ranks, record)
     dist.barrier()
-    torch.cuda.synchronize()
+    device_api.synchronize()
     for graph in graphs.values():
         graph.reset()
     outputs.clear()
     graphs.clear()
     calls.clear()
-    with torch.cuda.device((rank + 1) % tp):
-        impl.clear_megapreattention_cache()
-        assert torch.cuda.current_device() == (rank + 1) % tp
+    if ascend:
+        candidate.workspace.close()
+        dist.destroy_process_group(candidate.group)
+    else:
+        with device_api.device((rank + 1) % tp):
+            impl.clear_megapreattention_cache()
+            assert device_api.current_device() == (rank + 1) % tp
     if rank == 0:
         metrics = {} if check_only else summarize_samples(ranks, names, iterations)
         report = {
             "tp": tp,
+            "backend": device.type,
             "tokens": tokens,
             "mode": mode,
             "edge": edge,
@@ -543,8 +743,6 @@ def _worker(
         (Path(directory) / "report.json").write_text(
             json.dumps(report, indent=2) + "\n"
         )
-    dist.destroy_process_group()
-    native_context.__exit__(None, None, None)
 
 
 def run_distributed(
@@ -557,6 +755,8 @@ def run_distributed(
     rounds=5,
     edge=False,
     check_only=False,
+    check_contract=False,
+    workspace_capacity=None,
     model_dims=(2048, 16, 2),
     head_dim=256,
     rotary_dim=64,
@@ -566,6 +766,7 @@ def run_distributed(
     """Run independent rounds with seeded synthetic inputs."""
     import torch.multiprocessing as mp
 
+    device_type = require_devices(tp)
     model_dims = tuple(model_dims)
     kernel_config = dict(
         head_dim=head_dim,
@@ -589,6 +790,9 @@ def run_distributed(
                     directory,
                     model_dims,
                     kernel_config,
+                    check_contract,
+                    workspace_capacity,
+                    device_type,
                 ),
                 nprocs=tp,
                 join=False,
@@ -616,7 +820,7 @@ def run_distributed(
     if not check_only:
         from benchmark.test_megapreattention import summarize_rounds
 
-        summary = summarize_rounds(reports, mode)
+        summary = summarize_rounds(reports, mode, slowest_rank=device_type == "npu")
     result = {
         "model_dims": model_dims,
         "kernel_config": kernel_config,
@@ -631,37 +835,56 @@ def run_distributed(
     return result
 
 
+def require_devices(tp):
+    if (
+        not torch.cuda.is_available()
+        and importlib.util.find_spec("torch_npu") is not None
+    ):
+        import torch_npu  # noqa: F401
+
+        if torch.npu.is_available():
+            if tp not in (2, 4) or torch.npu.device_count() < tp:
+                pytest.skip(f"requires {tp} Ascend NPUs and TP2/4")
+            return "npu"
+    require_hopper(tp)
+    return "cuda"
+
+
 def require_hopper(tp=1):
     if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
         pytest.skip(f"requires {tp} CUDA GPUs")
     if any(torch.cuda.get_device_capability(i) != (9, 0) for i in range(tp)):
         pytest.skip("requires SM90 GPUs")
+    operator = Path(__file__).parents[1] / (
+        "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/megapreattention.py"
+    )
+    if not operator.is_file():
+        pytest.skip("requires the NVIDIA MegaPreAttention implementation")
 
 
 # The shared worker checks changed-input Graph replay and poisoned transport.
 # Cover each scheduling path without a second private-input test suite.
 CASES = [
-    ((2048, 16, 2), 2, 1024, "cudagraph", True),
-    ((5120, 24, 4), 2, 1024, "cudagraph", False),
-    ((3072, 32, 8), 2, 1024, "cudagraph", True),
+    ((2048, 16, 2), 2, 1024, "cudagraph", True, True),
+    ((5120, 24, 4), 2, 1024, "cudagraph", False, False),
+    ((3072, 32, 8), 2, 1024, "cudagraph", True, False),
 ]
 if not cfg.QUICK_MODE:
     CASES += [
-        ((2048, 16, 2), 2, 1280, "cudagraph", True),
-        ((2048, 16, 2), 2, 32768, "cudagraph", True),
-        ((2048, 16, 2), 4, 1536, "operator", True),
-        ((2048, 16, 2), 4, 32768, "cudagraph", True),
-        ((2048, 16, 2), 8, 2048, "cudagraph", True),
-        ((2048, 16, 2), 8, 32768, "operator", False),
-        ((5120, 24, 4), 4, 1024, "operator", True),
-        ((5120, 24, 4), 8, 32768, "cudagraph", True),
-        ((1024, 32, 16), 4, 1024, "cudagraph", True),
+        ((2048, 16, 2), 2, 1280, "cudagraph", True, False),
+        ((2048, 16, 2), 2, 32768, "cudagraph", True, False),
+        ((2048, 16, 2), 4, 1536, "operator", True, False),
+        ((2048, 16, 2), 4, 32768, "cudagraph", True, False),
+        ((2048, 16, 2), 8, 2048, "cudagraph", True, False),
+        ((2048, 16, 2), 8, 32768, "operator", False, False),
+        ((5120, 24, 4), 4, 1024, "operator", True, False),
+        ((5120, 24, 4), 8, 32768, "cudagraph", True, False),
+        ((1024, 32, 16), 4, 1024, "cudagraph", True, False),
     ]
 
 
-@pytest.mark.parametrize("model_dims,tp,tokens,mode,edge", CASES)
-def test_megapreattention(model_dims, tp, tokens, mode, edge):
-    require_hopper(tp)
+@pytest.mark.parametrize("model_dims,tp,tokens,mode,edge,check_contract", CASES)
+def test_megapreattention(model_dims, tp, tokens, mode, edge, check_contract):
     result = run_distributed(
         tp,
         tokens,
@@ -670,6 +893,7 @@ def test_megapreattention(model_dims, tp, tokens, mode, edge):
         rounds=1,
         edge=edge,
         check_only=True,
+        check_contract=check_contract,
         model_dims=model_dims,
     )
     assert result["correctness_passed"]
@@ -739,7 +963,6 @@ ROPE_CASES = [
 
 @pytest.mark.parametrize("tp,sections,eps", ROPE_CASES)
 def test_megapreattention_rope_parameters(tp, sections, eps):
-    require_hopper(tp)
     result = run_distributed(
         tp,
         1024,
@@ -750,5 +973,37 @@ def test_megapreattention_rope_parameters(tp, sections, eps):
         check_only=True,
         mrope_section=sections,
         eps=eps,
+    )
+    assert result["correctness_passed"]
+
+
+@pytest.mark.parametrize("tp,tokens", ((2, 518), (4, 10780)))
+def test_megapreattention_ascend_tail(tp, tokens):
+    if require_devices(tp) != "npu":
+        pytest.skip("requires Ascend NPUs")
+    result = run_distributed(
+        tp, tokens, "cudagraph", warmup=3, rounds=1, edge=True, check_only=True
+    )
+    assert result["correctness_passed"]
+
+
+def test_megapreattention_ascend_workspace_capacity():
+    tp = 2
+    if require_devices(tp) != "npu":
+        pytest.skip("requires Ascend NPUs")
+    result = run_distributed(
+        tp,
+        518,
+        "cudagraph",
+        rounds=1,
+        warmup=3,
+        edge=True,
+        check_only=True,
+        workspace_capacity=4096,
+        model_dims=(2080, 14, 2),
+        head_dim=128,
+        rotary_dim=32,
+        mrope_section=(6, 5, 5),
+        eps=0,
     )
     assert result["correctness_passed"]

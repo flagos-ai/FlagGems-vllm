@@ -14,8 +14,8 @@
 
 """Paired TP benchmark using the repository shape/metric/reporting framework.
 
-Each iteration uses the maximum latency across ranks. The benchmark averages
-those samples within each round and then averages five independent rounds.
+CUDA aggregates the per-iteration rank maximum. Ascend aggregates the slowest
+rank mean in each round. Both average five independent rounds.
 Inputs are seeded synthetic tensors. --warmup/--iter are counts.
 """
 
@@ -30,9 +30,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm
 
-from tests.test_megapreattention import Output, run_distributed
+from tests.test_megapreattention import (
+    Output,
+    logical_ascend_cache,
+    make_ascend_cache,
+    run_distributed,
+)
 
 from . import base
 from .conftest import Config
@@ -46,6 +50,7 @@ class NativeWindow:
     """
 
     def __init__(self, inputs, rope, *, edge=False):
+        import torch.distributed._symmetric_memory as symm
         from vllm import _custom_ops
         from vllm.model_executor.layers.layernorm import GemmaRMSNorm
         from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
@@ -57,8 +62,13 @@ class NativeWindow:
         knorm = SimpleNamespace(
             weight=inputs.k_norm, variance_epsilon=inputs.config.eps
         )
-        qnorm_call = lambda x: GemmaRMSNorm.forward_native(qnorm, x)
-        knorm_call = lambda x: GemmaRMSNorm.forward_native(knorm, x)
+
+        def qnorm_call(x):
+            return GemmaRMSNorm.forward_native(qnorm, x)
+
+        def knorm_call(x):
+            return GemmaRMSNorm.forward_native(knorm, x)
+
         # The projection method reads .weight even for its fused fast path.
         qnorm_call.weight, qnorm_call.variance_epsilon = (
             inputs.q_norm,
@@ -130,6 +140,127 @@ class NativeWindow:
         return Output(*values, (gathered, products[0]))
 
 
+class AscendNativeWindow:
+    def __init__(self, inputs):
+        import torch_npu
+
+        # Initialize the upstream registry before importing its device adaptor.
+        from vllm_ascend import ops  # noqa: F401
+        from vllm_ascend.device.device_op import BaseDeviceAdaptor
+        from vllm_ascend.ops import register_custom_ops  # noqa: F401
+        from vllm_ascend.ops.linear import AscendQKVParallelLinear
+        from vllm_ascend.ops.linear_op import SequenceColumnParallelOp
+        from vllm_ascend.ops.triton.linearnorm.split_qkv_rmsnorm_mrope import (
+            triton_split_qkv_rmsnorm_mrope,
+        )
+
+        c = self.config = inputs.config
+        with torch.device(inputs.hidden.device):
+            self.layer = AscendQKVParallelLinear(
+                hidden_size=inputs.hidden.shape[1],
+                head_size=c.head_dim,
+                total_num_heads=2 * c.num_q_heads * inputs.group.size(),
+                total_num_kv_heads=c.global_kv_heads,
+                bias=False,
+                params_dtype=inputs.hidden.dtype,
+                prefix="model.layers.3.self_attn.qkv_proj",
+            )
+        assert isinstance(self.layer.custom_op, SequenceColumnParallelOp)
+        assert self.layer.weight.shape == inputs.weight.shape
+        with torch.no_grad():
+            self.layer.weight.copy_(inputs.weight)
+        self.layer.quant_method.process_weights_after_loading(self.layer)
+        self.post = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope
+        self.cache_op = BaseDeviceAdaptor.reshape_and_cache
+        self.cache = make_ascend_cache(inputs.cache)
+        self.source_evidence = {
+            "baseline_kind": "vllm_ascend_a2_flashcomm1",
+            "padding": 0,
+            "post_entry": "torch.ops.vllm.triton_split_qkv_rmsnorm_mrope",
+            "weight_format": torch_npu.get_npu_format(self.layer.weight),
+            "functions": {
+                name: {
+                    "file": inspect.getfile(fn),
+                    "sha256": hashlib.sha256(
+                        inspect.getsource(fn).encode()
+                    ).hexdigest(),
+                }
+                for name, fn in {
+                    "projection": self.layer.forward,
+                    "dispatch": self.layer.custom_op.apply_impl,
+                    "weight_loading": self.layer.quant_method.process_weights_after_loading,
+                    "linear": self.layer.quant_method.apply,
+                    "norm_rope": triton_split_qkv_rmsnorm_mrope,
+                    "cache": self.cache_op,
+                }.items()
+            },
+        }
+        from vllm.config import get_current_vllm_config
+        from vllm_ascend.ascend_config import get_ascend_config
+        from vllm_ascend.compilation.compiler_interface import npugraph_ex_compile
+
+        config = get_current_vllm_config()
+        compilation = get_ascend_config().ascend_compilation_config
+        self.source_evidence["enable_npugraph_ex"] = compilation.enable_npugraph_ex
+        self.forward = self._forward
+        if compilation.enable_npugraph_ex:
+
+            def backend(graph, example_inputs):
+                self.source_evidence["fx_graph"] = str(graph.graph)
+                compiled, _ = npugraph_ex_compile(
+                    graph, example_inputs, {}, config, compilation, None
+                )
+                return compiled
+
+            self.forward = torch.compile(
+                self._forward, backend=backend, fullgraph=True, dynamic=False
+            )
+
+    def __call__(self, inputs):
+        return Output(
+            *self.forward(
+                inputs.hidden,
+                inputs.positions,
+                inputs.q_norm,
+                inputs.k_norm,
+                inputs.rope,
+                inputs.slots,
+            )
+        )
+
+    def _forward(self, hidden, positions, q_norm, k_norm, rope, slots):
+        c = self.config
+        qkv, _ = self.layer(hidden)
+        # Match AscendQwen3NextAttention.forward, including these per-call ops.
+        cos_sin = rope[positions]
+        q, k, v, gate = self.post(
+            qkv=qkv,
+            q_weight=1.0 + q_norm,
+            k_weight=1.0 + k_norm,
+            cos_sin=cos_sin,
+            num_q_heads=c.num_q_heads,
+            num_kv_heads=c.num_kv_heads,
+            head_size=c.head_dim,
+            eps=c.eps,
+            mrope_section=list(c.mrope_section),
+            is_interleaved=True,
+            rope_dim=c.rotary_dim,
+            has_gate=True,
+        )
+        self.cache_op(
+            k.view(-1, c.num_kv_heads, c.head_dim),
+            v.view(-1, c.num_kv_heads, c.head_dim),
+            self.cache[0],
+            self.cache[1],
+            slots,
+        )
+        return q, k, v, gate.view(-1, c.num_q_heads, c.head_dim)
+
+    def logical_cache(self):
+        """Convert only for validation; never include in native latency."""
+        return logical_ascend_cache(self.cache)
+
+
 def distribution(samples):
     ordered = sorted(samples)
 
@@ -150,7 +281,7 @@ def distribution(samples):
     }
 
 
-def measure_window(calls, names, iterations):
+def measure_window(calls, names, iterations, *, device_api=torch.cuda):
     from torch._dynamo.utils import counters as dynamo_counters
     from triton.runtime.jit import JITFunction
 
@@ -168,16 +299,16 @@ def measure_window(calls, names, iterations):
         for repeat in range(iterations):
             shift = repeat % len(names)
             for name in names[shift:] + names[:shift]:
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                start, end = device_api.Event(enable_timing=True), device_api.Event(
                     enable_timing=True
                 )
                 dist.barrier()
-                torch.cuda.synchronize()
+                device_api.synchronize()
                 begin = time.perf_counter_ns()
                 start.record()
                 calls[name]()
                 end.record()
-                torch.cuda.synchronize()
+                device_api.synchronize()
                 samples[name]["wall"].append((time.perf_counter_ns() - begin) / 1.0e6)
                 samples[name]["device"].append(start.elapsed_time(end))
     finally:
@@ -207,12 +338,16 @@ def summarize_samples(ranks, names, iterations):
     return metrics
 
 
-def summarize_rounds(reports, mode):
+def summarize_rounds(reports, mode, *, slowest_rank=False):
     summary = {}
     kind = "wall" if mode == "operator" else "device"
     for name in ("native", "megapreattention"):
         rank_max = [r["metrics"][name][kind]["rank_max_distribution"] for r in reports]
-        times = [samples["mean_ms"] for samples in rank_max]
+        times = (
+            [r["metrics"][name][kind]["slowest_rank_mean_ms"] for r in reports]
+            if slowest_rank
+            else [samples["mean_ms"] for samples in rank_max]
+        )
         summary[name] = {
             "latency_ms": statistics.mean(times),
             "round_latency_ms": times,
@@ -250,10 +385,6 @@ class MegaPreAttentionBenchmark(base.Benchmark):
     def get_latency(
         self, op, tokens, tp, hidden, q_heads, kv_heads, head_dim, rotary_dim
     ):
-        if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
-            pytest.skip(f"requires {tp} CUDA GPUs")
-        if any(torch.cuda.get_device_capability(i) != (9, 0) for i in range(tp)):
-            pytest.skip("requires SM90 GPUs")
         mode = Config.mode.value
         if mode not in ("kernel", "operator", "cudagraph"):
             raise ValueError(
@@ -282,6 +413,7 @@ class MegaPreAttentionBenchmark(base.Benchmark):
             iterations,
         )
         if key not in self.paired_results:
+            section, remainder = divmod(rotary_dim // 2, 3)
             self.paired_results[key] = run_distributed(
                 tp,
                 tokens,
@@ -292,15 +424,7 @@ class MegaPreAttentionBenchmark(base.Benchmark):
                 model_dims=(hidden, q_heads, kv_heads),
                 head_dim=head_dim,
                 rotary_dim=rotary_dim,
-                mrope_section=(
-                    (11, 11, 10)
-                    if rotary_dim == 64
-                    else (
-                        rotary_dim // 6,
-                        rotary_dim // 6,
-                        rotary_dim // 2 - 2 * (rotary_dim // 6),
-                    )
-                ),
+                mrope_section=tuple(section + (axis < remainder) for axis in range(3)),
             )
         name = "native" if op == self.native else "megapreattention"
         return self.paired_results[key]["summary"][name]["latency_ms"]
