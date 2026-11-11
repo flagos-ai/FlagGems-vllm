@@ -434,6 +434,15 @@ AttentionBenchmark:
     - [4, 32, 4096, 128]
     - [4, 32, 8192, 128]
 
+sparse_flash_attention:
+  shapes:
+    - [1, 2560, 2560]
+    - [4, 6400, 2560]
+    - [8, 48000, 2560]
+    - [16, 48000, 2560]
+    - [16, 48000, 48000]
+  shape_desc: "batch, capacity_per_request, valid_kv_length; H=128, D=512+64, topk=2048"
+
 KronBenchmark:
   shapes:
     - [16, 16]
