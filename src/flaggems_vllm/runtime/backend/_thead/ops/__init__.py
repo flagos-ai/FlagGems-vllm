@@ -19,11 +19,7 @@ from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import cooperativ
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
-from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
+from flaggems_vllm.runtime.backend._thead.ops.fused_moe import fused_experts_impl
 from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
     chunk_gated_delta_rule_w8a16_int8,
     gdn_w8a16_int8,
@@ -61,9 +57,7 @@ __all__ = [
     "get_num_sampled_and_rejected",
     "hc_combine",
     "indexer_k_quant_and_cache",
-    "inplace_fused_experts",
     "int8_einsum",
-    "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "qsa_prepare",
