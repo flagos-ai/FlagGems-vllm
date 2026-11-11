@@ -526,6 +526,62 @@ def _project_concat_kernel(
 
 
 @triton.jit
+def _project_strided_pair_kernel(
+    x_ptr,
+    wkv_ptr,
+    wgate_ptr,
+    state_proj_ptr,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    stride_x_b: tl.constexpr,
+    stride_x_s: tl.constexpr,
+    stride_x_h: tl.constexpr,
+    stride_kv_o: tl.constexpr,
+    stride_kv_h: tl.constexpr,
+    stride_gate_o: tl.constexpr,
+    stride_gate_h: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Adapted from FL's FP32 Compressor vector projection. Read original
+    # strides instead of binding a contiguous snapshot during preparation.
+    columns: tl.constexpr = triton.cdiv(K, BLOCK_N)
+    for work in range(tl.program_id(0), T * columns, tl.num_programs(0)):
+        token = (work // columns).to(tl.int64)
+        c0 = (work % columns) * BLOCK_N
+        x_base = (token // SEQ_LEN) * stride_x_b + (token % SEQ_LEN) * stride_x_s
+        acc_kv = tl.zeros((BLOCK_N,), tl.float32)
+        acc_gate = tl.zeros((BLOCK_N,), tl.float32)
+        for block in range(triton.cdiv(H, BLOCK_K)):
+            h = (block * BLOCK_K + tl.arange(0, BLOCK_K)).to(tl.int64)
+            x = tl.load(x_ptr + x_base + h * stride_x_h, h < H, other=0).to(tl.float32)
+            # Flat gathers avoid the Ascend 2D strided-load lowering issue.
+            offsets = tl.arange(0, BLOCK_N * BLOCK_K)
+            c = (c0 + offsets // BLOCK_K).to(tl.int64)
+            wh = (block * BLOCK_K + offsets % BLOCK_K).to(tl.int64)
+            mask = (c < K) & (wh < H)
+            kv = (
+                tl.load(wkv_ptr + c * stride_kv_o + wh * stride_kv_h, mask, other=0)
+                .to(tl.float32)
+                .reshape(BLOCK_N, BLOCK_K)
+            )
+            gate = (
+                tl.load(
+                    wgate_ptr + c * stride_gate_o + wh * stride_gate_h, mask, other=0
+                )
+                .to(tl.float32)
+                .reshape(BLOCK_N, BLOCK_K)
+            )
+            acc_kv += tl.sum(kv * x[None, :], axis=1)
+            acc_gate += tl.sum(gate * x[None, :], axis=1)
+        c = (c0 + tl.arange(0, BLOCK_N)).to(tl.int64)
+        tl.store(state_proj_ptr + token * (2 * K) + c, acc_kv, c < K)
+        tl.store(state_proj_ptr + token * (2 * K) + K + c, acc_gate, c < K)
+
+
+@triton.jit
 def _update_state_batched_kernel(
     state_proj_ptr,
     state_cache_ptr,
@@ -604,7 +660,7 @@ def _update_state_batched_kernel(
                         ).to(tl.int64)
                         blk_ok = (
                             blk_in_tbl
-                            & (cache_block != 0)
+                            & (cache_block > 0)
                             & (cache_block < STATE_BLOCKS)
                         )
 
@@ -806,7 +862,7 @@ def _compress_groups_batched_kernel(
                             ).to(tl.int64)
                             left_vb = (
                                 lt_mask
-                                & (left_cache != 0)
+                                & (left_cache > 0)
                                 & (left_cache < STATE_BLOCKS)
                                 & (left_pos >= 0)
                             )
@@ -846,7 +902,7 @@ def _compress_groups_batched_kernel(
                             ).to(tl.int64)
                             right_vb = (
                                 rt_mask
-                                & (right_cache != 0)
+                                & (right_cache > 0)
                                 & (right_cache < STATE_BLOCKS)
                                 & (right_pos >= 0)
                             )
@@ -907,7 +963,7 @@ def _compress_groups_batched_kernel(
                                 ).to(tl.int64)
                                 valid_block = (
                                     tbl_mask
-                                    & (cache_block != 0)
+                                    & (cache_block > 0)
                                     & (cache_block < STATE_BLOCKS)
                                     & (pos >= 0)
                                 )
@@ -980,6 +1036,32 @@ def _compress_groups_batched_kernel(
 
 
 @triton.jit
+def _projection_page_valid(
+    table_ptr,
+    request,
+    position,
+    BLOCK_SIZE_CACHE: tl.constexpr,
+    STATE_BLOCKS: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    table_stride_0: tl.constexpr,
+    table_stride_1: tl.constexpr,
+    HAS_BLOCK_TABLE: tl.constexpr,
+):
+    block = position.to(tl.int64) // BLOCK_SIZE_CACHE
+    valid = (position >= 0) & (block >= 0)
+    if HAS_BLOCK_TABLE:
+        in_table = valid & (block < TABLE_WIDTH)
+        safe_block = tl.where(in_table, block, 0)
+        page = tl.load(
+            table_ptr + request * table_stride_0 + safe_block * table_stride_1,
+            in_table,
+            other=0,
+        ).to(tl.int64)
+        return in_table & (page > 0) & (page < STATE_BLOCKS)
+    return valid & (block < STATE_BLOCKS)
+
+
+@triton.jit
 def _compress_projection_b1_kernel(
     state_proj_ptr,
     ape_ptr,
@@ -987,6 +1069,7 @@ def _compress_projection_b1_kernel(
     rope_sin_ptr,
     rope_cos_ptr,
     output_ptr,
+    state_block_table_ptr,
     T: tl.constexpr,
     D: tl.constexpr,
     K: tl.constexpr,
@@ -1002,6 +1085,12 @@ def _compress_projection_b1_kernel(
     ROPE_HEAD_DIM: tl.constexpr,
     ROTARY_MODE: tl.constexpr,
     SCORE_HAS_APE: tl.constexpr,
+    BLOCK_SIZE_CACHE: tl.constexpr,
+    STATE_BLOCKS: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    table_stride_0: tl.constexpr,
+    table_stride_1: tl.constexpr,
+    HAS_BLOCK_TABLE: tl.constexpr,
 ):
     """B=1,start=0 prefill compression directly from contiguous projection."""
     pid = tl.program_id(0)
@@ -1037,6 +1126,28 @@ def _compress_projection_b1_kernel(
             right_token = group_start + rng
             left_valid = (left_token >= 0) & (left_token < T)
             right_valid = right_token < T
+            left_valid &= _projection_page_valid(
+                state_block_table_ptr,
+                0,
+                left_token,
+                BLOCK_SIZE_CACHE,
+                STATE_BLOCKS,
+                TABLE_WIDTH,
+                table_stride_0,
+                table_stride_1,
+                HAS_BLOCK_TABLE,
+            )
+            right_valid &= _projection_page_valid(
+                state_block_table_ptr,
+                0,
+                right_token,
+                BLOCK_SIZE_CACHE,
+                STATE_BLOCKS,
+                TABLE_WIDTH,
+                table_stride_0,
+                table_stride_1,
+                HAS_BLOCK_TABLE,
+            )
             left_base = left_token[:, None] * (2 * K)
             right_base = right_token[:, None] * (2 * K)
             left_channel = d[None, :]
@@ -1092,6 +1203,17 @@ def _compress_projection_b1_kernel(
                 bg = g_base + tl.arange(0, INNER_G)
                 token = group_start + bg
                 token_valid = (bg < CMP_RATIO) & (token < T)
+                token_valid &= _projection_page_valid(
+                    state_block_table_ptr,
+                    0,
+                    token,
+                    BLOCK_SIZE_CACHE,
+                    STATE_BLOCKS,
+                    TABLE_WIDTH,
+                    table_stride_0,
+                    table_stride_1,
+                    HAS_BLOCK_TABLE,
+                )
                 base = token[:, None] * (2 * K)
                 channel = d[None, :]
                 mask = token_valid[:, None] & valid_d[None, :]
@@ -1169,6 +1291,7 @@ def _compress_projection_batched_kernel(
     seq_used_ptr,
     output_bases_ptr,
     n_groups_ptr,
+    state_block_table_ptr,
     B: tl.constexpr,
     D: tl.constexpr,
     K: tl.constexpr,
@@ -1186,6 +1309,12 @@ def _compress_projection_batched_kernel(
     ROPE_HEAD_DIM: tl.constexpr,
     ROTARY_MODE: tl.constexpr,
     ZERO_INVALID: tl.constexpr,
+    BLOCK_SIZE_CACHE: tl.constexpr,
+    STATE_BLOCKS: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    table_stride_0: tl.constexpr,
+    table_stride_1: tl.constexpr,
+    HAS_BLOCK_TABLE: tl.constexpr,
 ):
     """Compress current-chunk groups directly from contiguous projection."""
     pid = tl.program_id(0)
@@ -1224,10 +1353,10 @@ def _compress_projection_batched_kernel(
         out_row = output_base + local_group_idx
 
         if valid_group:
+            start = tl.full((), 0, dtype=tl.int64)
+            if HAS_START_POS:
+                start = tl.load(start_pos_ptr + b_idx).to(tl.int64)
             if OFFSET_GROUPS:
-                start = tl.full((), 0, dtype=tl.int64)
-                if HAS_START_POS:
-                    start = tl.load(start_pos_ptr + b_idx).to(tl.int64)
                 group_idx = local_group_idx
                 group_idx += (1 if COFF == 2 else 0) + (start % CMP_RATIO != 0)
                 group_anchor = start + group_idx * CMP_RATIO
@@ -1248,6 +1377,28 @@ def _compress_projection_batched_kernel(
                     right_token = group_start + rng
                     left_valid = (left_token >= 0) & (left_token < seq_len)
                     right_valid = right_token < seq_len
+                left_valid &= _projection_page_valid(
+                    state_block_table_ptr,
+                    b_idx,
+                    start + left_token,
+                    BLOCK_SIZE_CACHE,
+                    STATE_BLOCKS,
+                    TABLE_WIDTH,
+                    table_stride_0,
+                    table_stride_1,
+                    HAS_BLOCK_TABLE,
+                )
+                right_valid &= _projection_page_valid(
+                    state_block_table_ptr,
+                    b_idx,
+                    start + right_token,
+                    BLOCK_SIZE_CACHE,
+                    STATE_BLOCKS,
+                    TABLE_WIDTH,
+                    table_stride_0,
+                    table_stride_1,
+                    HAS_BLOCK_TABLE,
+                )
                 left_base = (token_base + left_token)[:, None] * (2 * K)
                 right_base = (token_base + right_token)[:, None] * (2 * K)
                 left_channel = d[None, :]
@@ -1309,6 +1460,17 @@ def _compress_projection_batched_kernel(
                     else:
                         local_token = group_start + bg
                         token_valid = (bg < CMP_RATIO) & (local_token < seq_len)
+                    token_valid &= _projection_page_valid(
+                        state_block_table_ptr,
+                        b_idx,
+                        start + local_token,
+                        BLOCK_SIZE_CACHE,
+                        STATE_BLOCKS,
+                        TABLE_WIDTH,
+                        table_stride_0,
+                        table_stride_1,
+                        HAS_BLOCK_TABLE,
+                    )
                     base = (token_base + local_token)[:, None] * (2 * K)
                     channel = d[None, :]
                     mask = token_valid[:, None] & valid_d[None, :]
@@ -1471,6 +1633,7 @@ def _update_compress_projection_fused_kernel(
             rope_sin_ptr,
             rope_cos_ptr,
             output_ptr,
+            state_block_table_ptr,
             T=T,
             D=D,
             K=K,
@@ -1486,6 +1649,12 @@ def _update_compress_projection_fused_kernel(
             ROPE_HEAD_DIM=ROPE_HEAD_DIM,
             ROTARY_MODE=ROTARY_MODE,
             SCORE_HAS_APE=False,
+            BLOCK_SIZE_CACHE=BLOCK_SIZE_CACHE,
+            STATE_BLOCKS=STATE_BLOCKS,
+            TABLE_WIDTH=TABLE_WIDTH,
+            table_stride_0=table_stride_0,
+            table_stride_1=table_stride_1,
+            HAS_BLOCK_TABLE=HAS_BLOCK_TABLE,
         )
     else:
         _compress_projection_batched_kernel(
@@ -1500,6 +1669,7 @@ def _update_compress_projection_fused_kernel(
             seq_used_ptr,
             output_bases_ptr,
             n_groups_ptr,
+            state_block_table_ptr,
             B=B,
             D=D,
             K=K,
@@ -1517,6 +1687,12 @@ def _update_compress_projection_fused_kernel(
             ROPE_HEAD_DIM=ROPE_HEAD_DIM,
             ROTARY_MODE=ROTARY_MODE,
             ZERO_INVALID=ZERO_INVALID,
+            BLOCK_SIZE_CACHE=BLOCK_SIZE_CACHE,
+            STATE_BLOCKS=STATE_BLOCKS,
+            TABLE_WIDTH=TABLE_WIDTH,
+            table_stride_0=table_stride_0,
+            table_stride_1=table_stride_1,
+            HAS_BLOCK_TABLE=HAS_BLOCK_TABLE,
         )
 
     padding_d = tl.arange(0, D)
@@ -1592,7 +1768,7 @@ def _decode_update_only_kernel(
                 ).to(tl.int64)
                 valid_block = (
                     table_mask
-                    & (cache_block != 0)
+                    & (cache_block > 0)
                     & (cache_block < STATE_BLOCKS)
                     & (pos >= 0)
                 )
@@ -1701,7 +1877,7 @@ def _decode_fused_kernel(
                 ).to(tl.int64)
                 valid_block = (
                     table_mask
-                    & (cache_block != 0)
+                    & (cache_block > 0)
                     & (cache_block < STATE_BLOCKS)
                     & (pos >= 0)
                 )
@@ -1763,7 +1939,7 @@ def _decode_fused_kernel(
                         other=0,
                     ).to(tl.int64)
                     valid_block_g = (
-                        tbl_mask & (cache_block_g != 0) & (cache_block_g < STATE_BLOCKS)
+                        tbl_mask & (cache_block_g > 0) & (cache_block_g < STATE_BLOCKS)
                     )
                 cache_base_g = (
                     cache_block_g[:, None] * state_stride_0
@@ -1817,7 +1993,7 @@ def _decode_fused_kernel(
                     ).to(tl.int64)
                     left_valid_block = (
                         lt_mask
-                        & (left_cache != 0)
+                        & (left_cache > 0)
                         & (left_cache < STATE_BLOCKS)
                         & (left_pos >= 0)
                     )
@@ -1863,7 +2039,7 @@ def _decode_fused_kernel(
                     ).to(tl.int64)
                     right_valid_block = (
                         rt_mask
-                        & (right_cache != 0)
+                        & (right_cache > 0)
                         & (right_cache < STATE_BLOCKS)
                         & (right_pos >= 0)
                     )
@@ -1938,7 +2114,7 @@ def _decode_fused_kernel(
                         other=0,
                     ).to(tl.int64)
                     valid_block_g = (
-                        tbl_mask & (cache_block_g != 0) & (cache_block_g < STATE_BLOCKS)
+                        tbl_mask & (cache_block_g > 0) & (cache_block_g < STATE_BLOCKS)
                     )
 
                 cache_base_g = (
@@ -2056,16 +2232,11 @@ def _postprocess_kernel(
 
             if ROTARY_MODE == 1:
                 # mode=1: swap halves, sign=-1 for first half
-                half = ROPE_HEAD_DIM // 2
-                kv_2d = tl.reshape(rope_normed, (2, half))
-                first, second = tl.split(kv_2d)
-                sin_2d = tl.reshape(rope_sin, (2, half))
-                s1, s2 = tl.split(sin_2d)
-                cos_2d = tl.reshape(rope_cos, (2, half))
-                c1, c2 = tl.split(cos_2d)
-                r1 = first * c1 - second * s1
-                r2 = second * c2 + first * s2
-                rot_rope = tl.interleave(r1, r2)
+                half: tl.constexpr = ROPE_HEAD_DIM // 2
+                partner = (rope_offs + half) % ROPE_HEAD_DIM
+                swapped = tl.gather(rope_normed, partner, axis=0)
+                rotated = tl.where(rope_offs < half, -swapped, swapped)
+                rot_rope = rope_normed * rope_cos + rotated * rope_sin
 
             else:
                 # mode=2: pairwise even/odd swap
@@ -2621,7 +2792,7 @@ def _bind_compressor_launches(
         zero_launch = _bound_zero_launch(workspace.output)
         return () if zero_launch is None else (zero_launch,)
 
-    x_2d = x.contiguous().reshape(total_tokens, hidden_size)
+    x_2d = x.reshape(total_tokens, hidden_size) if x.is_contiguous() else x
     wkv_t = wkv.contiguous()
     wgate_t = wgate.contiguous()
     ape_t = ape.contiguous()
@@ -2650,7 +2821,32 @@ def _bind_compressor_launches(
     )
     project_programs = 24
     project_blocks_m = _ceil_div(total_tokens, block_m)
-    if total_tokens >= 128:
+    if not x.is_contiguous():
+        vector_cores, _ = _get_npu_core_counts()
+        block_n, block_k = 32, 64
+        tasks = total_tokens * triton.cdiv(proj_dim, block_n)
+        launches.append(
+            partial(
+                _project_strided_pair_kernel[(min(vector_cores, tasks),)],
+                x,
+                wkv_t,
+                wgate_t,
+                workspace.state_proj,
+                total_tokens,
+                hidden_size,
+                proj_dim,
+                x.shape[1] if x.dim() == 3 else total_tokens,
+                x.stride(0) if x.dim() == 3 else 0,
+                x.stride(-2),
+                x.stride(-1),
+                *wkv_t.stride(),
+                *wgate_t.stride(),
+                block_n,
+                block_k,
+                enable_fp_fusion=False,
+            )
+        )
+    elif total_tokens >= 128:
         block_n = 256 if wide_projection else 128
         project_blocks_n = _ceil_div(2 * proj_dim, block_n)
         project_tiles = project_blocks_m * project_blocks_n
@@ -2786,6 +2982,18 @@ def _bind_compressor_launches(
         "table_stride_1": table_stride_1,
         "HAS_BLOCK_TABLE": has_block_table,
         "HAS_START_POS": has_start_pos,
+    }
+
+    projection_cache_args = {
+        key: cache_args[key]
+        for key in (
+            "BLOCK_SIZE_CACHE",
+            "STATE_BLOCKS",
+            "TABLE_WIDTH",
+            "table_stride_0",
+            "table_stride_1",
+            "HAS_BLOCK_TABLE",
+        )
     }
 
     if max_s <= 4:
@@ -3062,6 +3270,7 @@ def _bind_compressor_launches(
                     rope_sin_t,
                     rope_cos_t,
                     workspace.output,
+                    block_table_arg,
                     T=total_tokens,
                     D=head_dim,
                     K=proj_dim,
@@ -3077,6 +3286,7 @@ def _bind_compressor_launches(
                     ROPE_HEAD_DIM=rope_head_dim,
                     ROTARY_MODE=rotary_mode,
                     SCORE_HAS_APE=writeback_ape_scores,
+                    **projection_cache_args,
                 )
             )
         elif compress_from_projection_batched:
@@ -3094,6 +3304,7 @@ def _bind_compressor_launches(
                     workspace.seq_used_t,
                     projection_output_bases_t,
                     projection_n_groups_t,
+                    block_table_arg,
                     B=batch_count,
                     D=head_dim,
                     K=proj_dim,
@@ -3111,6 +3322,7 @@ def _bind_compressor_launches(
                     ROPE_HEAD_DIM=rope_head_dim,
                     ROTARY_MODE=rotary_mode,
                     ZERO_INVALID=x.dim() == 3 and not hybrid_projection_cache,
+                    **projection_cache_args,
                 )
             )
         else:
