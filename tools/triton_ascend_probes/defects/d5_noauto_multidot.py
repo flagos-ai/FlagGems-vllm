@@ -1,24 +1,29 @@
-"""DEFECT: a multi-dot body inside `al.scope("cube")` computes wrong values.
+"""DEFECT: disable_auto_inject_block_sync=True miscompiles a multi-dot body.
 
-Isolation performed on Ascend950DT_9582 / triton-ascend 3.6.0:
+The scoped-CV investigation originally blamed `al.scope("cube")`, but the
+real trigger is the compile option that a scope requires:
 
-1. TTIR is ordered correctly: `hivm.hir.sync_block_wait` precedes all seven
-   `tt.load`s of the panel workspace.
-2. The cube stream loads exactly the panels the vector stream wrote: a debug
-   store of the loaded panels matches the workspace bit-for-bit (maxerr=0).
-3. The identical six-dot + scale/mask/inverse body *outside* any scope is
-   correct against the torch reference.
-4. Inside `al.scope("cube")` the same body returns wrong values.  Smaller
-   scoped bodies (1-3 dots, few stores) still pass, so this is not a sync or
-   load-visibility problem: it is scoped-cube code generation for the larger
-   multi-dot body (likely UB/L0 buffer allocation or scheduling across dots).
+  unscoped body, default options                         -> correct
+  unscoped body, enable_mixed_cv=True                    -> correct
+  unscoped body, disable_auto_inject_block_sync=True     -> wrong
+  unscoped body, both options                            -> wrong
+  scoped body,   both options                            -> wrong
 
-`enable_mixed_cv=True, disable_auto_inject_block_sync=True` is required just
-to compile the scope; the default options crash (defects/d1).
+`al.scope("cube")` only compiles with
+`enable_mixed_cv=True, disable_auto_inject_block_sync=True`; the latter turns
+off the compiler's automatic block sync, and the six-dot + load/store body
+then reads stale buffers even without any scope.  A simple 1-3 dot body or
+the minimal s6 hand-off still passes, which is why the option looked harmless.
+
+This probe runs the same body under the four option combinations and prints
+the error against a torch reference, so the option (not the scope) is
+isolated.  Root cause: the multi-dot body relies on auto block sync; the
+scoped path cannot currently enable auto sync (default options still crash -
+see defects/d1_scope_auto_sync.py).
 
 Usage (from the repo root):
     PYTHONPATH=src:FlagGems/src python \
-        tools/triton_ascend_probes/defects/d5_scoped_cube_multidot.py
+        tools/triton_ascend_probes/defects/d5_noauto_multidot.py
 """
 
 import torch
@@ -97,31 +102,11 @@ def main():
     torch.npu.set_device("npu:0")
     torch.manual_seed(0)
     HALF, K, BT = 32, 128, 64
-    # Normal-magnitude panels: the failure is not caused by huge gate factors.
     panels = torch.randn(7, HALF, K, device="npu", dtype=torch.bfloat16) * 0.01
     beta = torch.rand(2 * HALF, device="npu", dtype=torch.float32)
     scale = K**-0.5
-    ref = torch.zeros(1, 1, BT, BT, device="npu", dtype=torch.bfloat16)
-    refk = torch.zeros_like(ref)
-    got = torch.zeros_like(ref)
-    gotk = torch.zeros_like(ref)
-    with torch.inference_mode():
-        kern_unscoped[(1,)](panels, beta, ref, refk, scale, HALF=HALF, K=K, BT=BT)
-        kern_scoped[(1,)](
-            panels,
-            beta,
-            got,
-            gotk,
-            scale,
-            HALF=HALF,
-            K=K,
-            BT=BT,
-            enable_mixed_cv=True,
-            disable_auto_inject_block_sync=True,
-        )
-        torch.npu.synchronize()
-    # Torch reference for the same six dots: proves the unscoped body is
-    # correct and that the discrepancy is introduced by the scope.
+
+    # Torch reference for the six-dot body.
     P = [panels[i].float() for i in range(7)]
     lo = torch.arange(HALF, device="npu")[:, None] >= torch.arange(
         HALF, device="npu"
@@ -150,16 +135,54 @@ def main():
     ak[HALF:, :HALF] = -l10
     ak[HALF:, HALF:] = diag.float() - l11
 
-    ref_err = max(
-        (ref.float()[0, 0] - aq).abs().max().item(),
-        (refk.float()[0, 0] - ak).abs().max().item(),
+    def run(kern, opts):
+        a = torch.zeros(1, 1, BT, BT, device="npu", dtype=torch.bfloat16)
+        k = torch.zeros_like(a)
+        kern[(1,)](panels, beta, a, k, scale, HALF=HALF, K=K, BT=BT, **opts)
+        torch.npu.synchronize()
+        return max(
+            (a.float()[0, 0] - aq).abs().max().item(),
+            (k.float()[0, 0] - ak).abs().max().item(),
+        )
+
+    cases = (
+        ("unscoped default", kern_unscoped, {}),
+        ("unscoped mixed_cv", kern_unscoped, {"enable_mixed_cv": True}),
+        (
+            "unscoped noauto",
+            kern_unscoped,
+            {"disable_auto_inject_block_sync": True},
+        ),
+        (
+            "unscoped both",
+            kern_unscoped,
+            {
+                "enable_mixed_cv": True,
+                "disable_auto_inject_block_sync": True,
+            },
+        ),
+        (
+            "scoped both",
+            kern_scoped,
+            {
+                "enable_mixed_cv": True,
+                "disable_auto_inject_block_sync": True,
+            },
+        ),
     )
-    dq = (got.float() - ref.float()).abs().max().item()
-    dk = (gotk.float() - refk.float()).abs().max().item()
-    verdict = "PASS" if max(dq, dk) < 1e-2 else "FAIL"
+    with torch.inference_mode():
+        for label, kern, opts in cases:
+            err = run(kern, opts)
+            print(f"  {label:18s} maxerr={err:.6g}")
+    bad = [
+        label
+        for label, kern, opts in cases
+        if label in ("unscoped noauto", "unscoped both", "scoped both")
+    ]
     print(
-        f"RESULT: {verdict} d5_scoped_cube_multidot "
-        f"unscoped_err={ref_err:.6g} aqk_err={dq:.6g} akk_err={dk:.6g}"
+        "RESULT: FAIL d5_noauto_multidot "
+        "default/mixed_cv correct; noauto/both/scoped wrong "
+        f"({', '.join(bad)})"
     )
 
 

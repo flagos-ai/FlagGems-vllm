@@ -48,4 +48,4 @@ run "d2 insert_slice -> L1 dot"    "$P/defects/d2_insert_slice_dot.py" l1_insert
 run "d3 2D ND L1 view"             "$P/defects/d3_l1_view_2d.py" nd
 run "d3 L1 target_shape view"      "$P/defects/d3_l1_view_2d.py" target
 run "d4 single-read UB shift"      "$P/defects/d4_extract_slice_pipeline.py"
-run "d5 scoped cube multidot"      "$P/defects/d5_scoped_cube_multidot.py"
+run "d5 noauto multidot"            "$P/defects/d5_noauto_multidot.py"
