@@ -16,6 +16,7 @@
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
@@ -42,13 +43,16 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 )
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
-    chunk_kda_scaled_dot_kkt_fwd,
     chunk_gated_delta_rule_fwd,
     chunk_kda,
+    chunk_kda_scaled_dot_kkt_fwd,
+    chunk_kda_fwd_intra_token_parallel,
+    chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_kda,
 )
+from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
@@ -84,6 +88,9 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
+from flaggems_vllm.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
@@ -115,6 +122,8 @@ from flaggems_vllm.ops.mhc import (
     sinkhorn_forward,
 )
 from flaggems_vllm.ops.qwen4 import (
+    grouped_gemma_rmsnorm,
+    hc_combine,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -123,7 +132,6 @@ from flaggems_vllm.ops.qwen4 import (
     qsa_compress_norm_mrope_store_groups,
     qsa_mqa_paged,
     qsa_sparse_paged_attention,
-    qsa_sparse_split_count,
     qsa_store_cache_rows,
     qsa_store_kv_cache_rows,
     qwen4_hc_combine_norm,
@@ -256,7 +264,9 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "chunk_kda",
+    "chunk_kda_fwd_intra_token_parallel",
     "chunk_kda_scaled_dot_kkt_fwd",
+    "chunk_kda_with_fused_gate",
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
@@ -293,6 +303,7 @@ __all__ = [
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
+    "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
     "fused_minimax_m3_qknorm_rope_kv_insert",
@@ -301,14 +312,17 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
+    "gate_sigmoid_mul",
     "gather_rows",
     "gather_state_rows",
     "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
+    "hc_combine",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
     "ihc_post",
@@ -361,7 +375,6 @@ __all__ = [
     "qsa_mqa_paged",
     "qsa_prepare",
     "qsa_sparse_paged_attention",
-    "qsa_sparse_split_count",
     "qsa_store_cache_rows",
     "qsa_store_kv_cache_rows",
     "qwen4_compress_norm_mrope_store_groups",
@@ -398,6 +411,7 @@ __all__ = [
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "top_k_top_p",
     "topk_sigmoid",
     "topk_softmax",
     "topk_softplus_sqrt",

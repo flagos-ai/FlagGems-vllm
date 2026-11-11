@@ -37,6 +37,7 @@ NON_TEST_FILES = {
 
 ENV_SMOKE_TRIGGER_FILES = {
     ".github/backend-capabilities.json",
+    ".github/configs/ci-backends.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
     "pyproject.toml",
@@ -48,6 +49,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",
     "tools/select_backends.py",
+    "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
 }
@@ -90,6 +92,15 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "tests/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
+        "tests/test_mhc_post.py",
+    ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "tests/test_bmm_w8a8.py",
@@ -103,6 +114,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_attn_varlen_func.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "tests/test_grouped_gemma_rmsnorm.py",
+        "tests/test_qwen4_self_kernels.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "tests/test_hyperconnection.py",
         "tests/test_qwen4_self_kernels.py",
@@ -223,6 +238,12 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "benchmark/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "benchmark/test_bmm_w8a8.py",
     ],
@@ -235,6 +256,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_flash_attn_varlen_func.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["benchmark/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "benchmark/test_grouped_gemma_rmsnorm.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "benchmark/test_hyperconnection.py",
         "benchmark/test_qwen4_self_kernels.py",
