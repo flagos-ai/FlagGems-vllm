@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Installed / pinned vLLM ``ple_conv`` baseline and shared workload matrix."""
+"""vLLM ``ple_conv`` CUDA baseline collector workload (installed NV interface only)."""
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
-import os
-import sys
-import types
-from pathlib import Path
 
 import torch
 
@@ -20,7 +15,6 @@ IS_INPLACE = True
 MUTATED_INPUTS = (1, 2)
 NATIVE_API = "vllm.models.qwen4_exp.common.ops.ple.ple_conv"
 NATIVE_UNAVAILABLE_REASON = None
-NATIVE_VERSION = None
 
 # mode, rows, channels, fuse_residual
 SHAPES = [
@@ -40,75 +34,15 @@ DILATION = 3
 SPEC_QUERY_LEN = 4
 
 
-def _load_pinned_source(path: Path):
-    """Load upstream ple.py without a full vLLM install (stubs for imports)."""
-    if "vllm" not in sys.modules:
-        sys.modules["vllm"] = types.ModuleType("vllm")
-    if "vllm.platforms" not in sys.modules:
-        platforms = types.ModuleType("vllm.platforms")
-
-        class _Platform:
-            @staticmethod
-            def is_arch_support_pdl():
-                if not torch.cuda.is_available():
-                    return False
-                major, _ = torch.cuda.get_device_capability()
-                return major >= 9
-
-        platforms.current_platform = _Platform()
-        sys.modules["vllm.platforms"] = platforms
-    if "vllm.triton_utils" not in sys.modules:
-        triton_utils = types.ModuleType("vllm.triton_utils")
-        import triton
-        import triton.language as tl
-
-        triton_utils.tl = tl
-        triton_utils.triton = triton
-        sys.modules["vllm.triton_utils"] = triton_utils
-    for name in (
-        "vllm.v1",
-        "vllm.v1.attention",
-        "vllm.v1.attention.backends",
-        "vllm.v1.attention.backends.utils",
-    ):
-        if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
-    utils = sys.modules["vllm.v1.attention.backends.utils"]
-    if not hasattr(utils, "NULL_BLOCK_ID"):
-        utils.NULL_BLOCK_ID = 0
-
-    name = "_fgv_pinned_ple_conv_" + path.resolve().as_posix().replace("/", "_")
-    module = sys.modules.get(name)
-    if module is None:
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(name, None)
-            raise
-    return module
-
-
 def native():
-    """Return upstream ``ple_conv`` or None, retaining the failure reason."""
-    global NATIVE_UNAVAILABLE_REASON, NATIVE_VERSION
-    NATIVE_VERSION = None
-    pinned = os.environ.get("FGV_PLE_NATIVE_SOURCE")
+    """Resolve installed vLLM ``ple_conv``; return None if unavailable."""
+    global NATIVE_UNAVAILABLE_REASON
     try:
-        if pinned:
-            module = _load_pinned_source(Path(pinned).resolve(strict=True))
-            op = getattr(module, "ple_conv")
-            NATIVE_VERSION = f"pinned:{pinned}"
-        else:
-            import vllm
-            from vllm.models.qwen4_exp.common.ops.ple import ple_conv as op
-
-            NATIVE_VERSION = getattr(vllm, "__version__", None)
-    except Exception as exc:  # noqa: BLE001 - resolution failures stay N/A
-        NATIVE_UNAVAILABLE_REASON = f"{NATIVE_API}: {type(exc).__name__}: {exc}"
+        mod = importlib.import_module("vllm.models.qwen4_exp.common.ops.ple")
+    except ImportError as exc:
+        NATIVE_UNAVAILABLE_REASON = f"{NATIVE_API}: ImportError: {exc}"
         return None
+    op = getattr(mod, "ple_conv", None)
     if not callable(op):
         NATIVE_UNAVAILABLE_REASON = f"{NATIVE_API} is not callable"
         return None
@@ -179,9 +113,7 @@ def build_inputs(binding, dtype, device):
         kwargs = {
             "mode": "spec",
             "dilation": dilation,
-            "query_start_loc": torch.arange(
-                rows + 1, dtype=torch.int32, device=device
-            )
+            "query_start_loc": torch.arange(rows + 1, dtype=torch.int32, device=device)
             * query_len,
             "num_accepted_tokens": torch.ones(rows, dtype=torch.int32, device=device),
             "spec_query_len": query_len,
@@ -208,24 +140,26 @@ def config(binding, dtype):
     tokens = rows if mode != "spec" else rows * query_len
     state_len = (binding["kernel_size"] - 1) * binding["dilation"]
     state_width = state_len + (query_len - 1 if mode == "spec" else 0)
+    dt = str(dtype)
     return {
         "inputs": {
-            "inputs": {"shape": [tokens, channels], "dtype": str(dtype)},
-            "residual": {"shape": [tokens, channels], "dtype": str(dtype)},
+            "inputs": {"shape": [tokens, channels], "dtype": dt},
+            "residual": {"shape": [tokens, channels], "dtype": dt, "note": "原地写回"},
             "conv_state": {
                 "shape": [rows + 2, channels, state_width],
-                "dtype": str(dtype),
+                "dtype": dt,
+                "note": "原地写回",
             },
             "conv_weights": {
                 "shape": [channels, binding["kernel_size"]],
-                "dtype": str(dtype),
+                "dtype": dt,
             },
             "state_indices": {
                 "shape": [1 if mode == "prefill" else rows],
                 "dtype": "torch.int32",
             },
             "outer_residual": (
-                {"shape": [tokens, channels], "dtype": str(dtype)}
+                {"shape": [tokens, channels], "dtype": dt}
                 if binding["fuse_residual"]
                 else None
             ),
@@ -233,17 +167,12 @@ def config(binding, dtype):
             "dilation": {"scalar": binding["dilation"]},
         },
         "outputs": {
-            "residual": {"shape": [tokens, channels], "dtype": str(dtype), "inplace": True},
+            "residual": {"shape": [tokens, channels], "dtype": dt},
             "conv_state": {
                 "shape": [rows + 2, channels, state_width],
-                "dtype": str(dtype),
-                "inplace": True,
+                "dtype": dt,
             },
         },
         "dims": dict(binding),
-        "native_version": NATIVE_VERSION,
         "native_api": NATIVE_API,
-        "baseline_kind": "installed-vllm-or-pinned",
-        "mutation": "residual,conv_state",
-        "graph": False,
     }
