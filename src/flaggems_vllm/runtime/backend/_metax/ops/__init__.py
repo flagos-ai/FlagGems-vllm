@@ -57,7 +57,6 @@ else:
 
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
-    "qsa_prepare",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",

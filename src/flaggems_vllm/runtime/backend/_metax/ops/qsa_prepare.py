@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Metax-specialized QSA prepare kernel for Qwen4Exp."""
+"""Metax-specialized QSA prepare kernel for Qwen4Exp.
+
+The indexer and main-attention work run as two grids rather than one fused
+grid, so each path keeps its own register footprint.  That changes the kernel
+body, not just the launch geometry, which is why this backend carries a full
+copy instead of binding a LaunchSpec.
+"""
 
 from __future__ import annotations
 
