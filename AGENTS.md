@@ -127,23 +127,34 @@ Requires Python ≥ 3.8 (CI uses 3.11/3.12), `torch>=2.6.0`, Triton/FlagTree, an
 
 ```shell
 # Build deps
-pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
+pip install -U "setuptools>=64,<82" wheel packaging
 
 # Editable install (dev)
 pip install --no-build-isolation -e .
-# With test extras (pytest, numpy, scipy, cupy-cuda12x)
+# With base test extras (pytest, scipy, einops, distro)
 pip install --no-build-isolation -e '.[test]'
+# NVIDIA also needs the CUDA-only extra
+pip install --no-build-isolation -e '.[test,test-nvidia]'
 ```
 
-Full GPU environment bootstrap (creates a `uv` venv, installs vLLM + matching
-torch, installs this repo, swaps Triton for FlagTree, runs smoke tests):
+Multi-backend environment bootstrap (creates a `uv` venv, installs the vendor
+torch stack + vLLM, installs this repo, optionally swaps Triton for FlagTree,
+runs smoke tests). Profiles live in `src/flaggems_vllm/backends.yaml`:
 
 ```shell
-source tools/setup.sh          # honors DNN_VENDOR, VLLM_VERSION, USE_FLAGTREE, CUDA_HOME, ...
+bash tools/setup.sh --list            # profiles and aliases
+bash tools/setup.sh nvidia            # or ascend, metax, hygon, ...
+source tools/setup.sh nvidia          # create and activate in one step
+bash tools/setup.sh --no-venv ascend  # inside a vendor image
 ```
 
-`DNN_VENDOR` (e.g. `nvidia`) selects the backend. `VLLM_PLUGINS=fl` selects the
-FlagOS plugin when multiple vLLM plugins are installed.
+Backend profiles are selected positionally (or through `DNN_VENDOR` /
+`FLAGGEMS_VENDOR`); `VLLM_PACKAGE`, `VLLM_VERSION`, `COMPILER`, `CUDA_HOME`
+and the other variables in `src/flaggems_vllm/backends.yaml` override the
+defaults. `VLLM_PLUGINS=fl` selects the FlagOS plugin when multiple vLLM
+plugins are installed. See the
+[Installation Guide](docs/content/en/getting-started/install.md) for the
+manual no-venv path.
 
 ## Running tests
 
@@ -293,6 +304,6 @@ stem; non-standard names need an explicit entry in that script).
 | Fast tests | `pytest -q tests --quick` |
 | One test | `pytest -v -s tests/test_<op>.py` |
 | Benchmark smoke | `pytest -q benchmark/test_<op>.py --level core --iter 1 --warmup 1` |
-| Full GPU setup | `source tools/setup.sh` |
+| Full GPU setup | `bash tools/setup.sh <backend>` (or `source` to activate) |
 
 License: Apache 2.0 (`LICENSE`).

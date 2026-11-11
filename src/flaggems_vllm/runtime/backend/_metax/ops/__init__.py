@@ -34,6 +34,9 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import
 from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_int8,
 )
+from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -42,13 +45,13 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.runtime.backend._metax.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._metax.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
-    SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
@@ -68,15 +71,16 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
     "cp_gather_indexer_k_quant_cache",
     "flash_mla_with_kvcache_sparse_w8a8_int8",
     "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "flash_mla_with_kvcache_fwd_w8a8_int8",
     "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "gdn_w8a16",
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
