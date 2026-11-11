@@ -12,7 +12,9 @@ From the repository root, in an environment with FlagTree/TLE and matching
 FlagCX installed, run this standalone test (pytest is not required):
 
 ```bash
-PYTHONPATH=src:../FlagGems/src torchrun --standalone --nproc-per-node=2 \
+PYTHONPATH=src:../FlagGems/src torchrun \
+  --nnodes=1 --node-rank=0 --nproc-per-node=2 \
+  --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
   tests/run_fused_matmul_reduce_scatter.py --dtype bf16 --reduce-op sum
 ```
 
@@ -50,7 +52,9 @@ follows the tutorial and is not bitwise identical to Torch GEMM + NCCL.
 
 ## Supported scope
 
-- NVIDIA CUDA SM90+, FlagTree with TLE, and matching FlagCX host/device runtime.
+- NVIDIA CUDA SM90+, or an experimental HCU/HIP path using FlagTree's tensor
+  descriptor-to-pointer lowering. Both require TLE and matching FlagCX
+  host/device runtime. HCU execution is pending validation on BW hardware.
 - Two-dimensional A/B, matching FP16 or BF16 dtype/device, inference only.
 - `reduce_op` is `sum` or `avg`; `scatter_dim` is exactly 0.
 - At least two group members. Existing groups and TP subgroups are used without
@@ -63,7 +67,7 @@ follows the tutorial and is not bitwise identical to Torch GEMM + NCCL.
   N is divisible by both GEMM `block_n` and RS `rs_block_n`; local K is divisible
   by GEMM `block_k`. Empty matrices and CUDA graph capture are unsupported.
 - A is made contiguous if necessary. B is packed to continuous `[N, local_K]`.
-  Misaligned contiguous views are cloned for TMA's base-pointer alignment.
+  Misaligned contiguous views are cloned to preserve descriptor alignment.
   Packing/copies are part of the public call and benchmark timing.
 
 Unsupported scope raises explicitly; there is no Torch compute fallback.
@@ -114,6 +118,8 @@ CUDA implementation. Disabling registration does not collectively free buffers;
 clear the context cache on every group member before destroying its group.
 The original Python registration's bookkeeping is retained during restoration.
 
+HIP PyTorch still uses the `CUDA` dispatcher key and `torch.cuda` interfaces.
+HCU activation checks FlagTree's selected backend instead of rejecting HIP builds.
 This requires a PyTorch build exposing `Library.impl(allow_override=True)`.
 An older API raises a clear error and leaves the direct library call available.
 Registration itself does not initialize a process group, load TLE, or create a
@@ -174,9 +180,46 @@ flaggems_vllm.configure_fused_matmul_reduce_scatter(tp_group.group_name, config)
 ```
 
 The default is a conservative fixed configuration, not an autotuned result.
+NVIDIA retains a 128x128x64 GEMM tile with two stages. HCU defaults to a
+64x64x32 tile, four warps, and one stage, avoiding the NVIDIA configuration's
+shared-memory estimate exceeding BW's 64 KiB LDS budget. HCU skips installing a
+CUDA TMA descriptor allocator because descriptor lowering removes that need.
 There is no tune-config YAML entry because no independent kernel autotuner is
 used. Future tuning integration must preserve collective candidate ordering and
 reset the protocol state between trials.
+
+## HCU/BW multi-GPU validation
+
+Use a FlagTree HCU build with descriptor-to-pointer lowering and matching
+gfx936 FlagCX device bitcode. Confirm the original import path works:
+`triton.experimental.tle.language`, with `communication.enabled == True`.
+The HCU compatibility changes do not establish a hardware correctness or
+performance result; validate on the actual GPUs before acceptance.
+
+First check whether the HIP device selection variable is honored by this DTK
+build (CUDA_VISIBLE_DEVICES may be ignored):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 python -c \
+  'import torch; print(torch.cuda.device_count())'
+```
+
+Then run the real two-rank correctness entry point. Static rendezvous avoids
+using an unresolvable container hostname for TCPStore bootstrap:
+
+```bash
+FLAGTREE_BACKEND=hcu HIP_VISIBLE_DEVICES=0,1 \
+python -m torch.distributed.run \
+  --nnodes=1 --node-rank=0 --nproc-per-node=2 \
+  --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
+  tests/run_fused_matmul_reduce_scatter.py --dtype bf16 --reduce-op sum --repeat 3
+```
+
+The entry point reports its selected backend, GPU, and configuration before
+testing. Change to `--dtype fp16 --reduce-op avg` for another combination. Native
+Torch's `nccl` process-group name also selects RCCL in a HIP build. For multiple
+nodes, use the same routable master address/port on every node and distinct node
+ranks; the loopback address above is only for the single-node multi-GPU case.
 
 ## Validation and benchmark commands
 

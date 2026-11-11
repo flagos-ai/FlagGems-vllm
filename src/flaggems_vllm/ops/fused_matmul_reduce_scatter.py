@@ -3,8 +3,9 @@
 
 """Inference-only TLE GEMM + reduce-scatter with the PyTorch symm_mem signature.
 
-The initial implementation supports 2D FP16/BF16, scatter_dim=0, sum/avg,
-SM90+, and aligned shapes. Communication uses a private FlagCX communicator
+The implementation supports 2D FP16/BF16, scatter_dim=0, sum/avg, aligned
+shapes, and NVIDIA SM90+ or FlagTree HCU descriptor lowering. The HCU path
+requires validation on target hardware. Communication uses a private FlagCX communicator
 bootstrapped from the existing process group. It never owns the PyTorch group.
 All ranks must call this API, configure, and clear in matching order.
 """
@@ -76,9 +77,44 @@ class GemmReduceScatterConfig:
 
 
 _DEFAULT_CONFIG = GemmReduceScatterConfig()
+_HCU_DEFAULT_CONFIG = GemmReduceScatterConfig(
+    block_m=64,
+    block_n=64,
+    block_k=32,
+    num_warps=4,
+    num_stages=1,
+)
 _CONFIGS = {}
 _CONTEXTS = {}
 _LOCK = threading.RLock()
+
+
+def _get_backend():
+    """HIP exposes torch.cuda tensors; select the actual compiler backend."""
+    if torch.version.hip is None:
+        return "nvidia"
+    try:
+        selected = importlib.import_module("triton._flagtree_backend").FLAGTREE_BACKEND
+    except ImportError:
+        selected = None
+    if selected != "hcu":
+        raise NotImplementedError(
+            "HIP execution requires a FlagTree build with FLAGTREE_BACKEND=hcu"
+        )
+    return "hcu"
+
+
+def _default_config():
+    return _HCU_DEFAULT_CONFIG if _get_backend() == "hcu" else _DEFAULT_CONFIG
+
+
+def _validate_device(device):
+    backend = _get_backend()
+    if backend == "nvidia" and torch.cuda.get_device_capability(device)[0] < 9:
+        raise NotImplementedError(
+            "the NVIDIA persistent TMA path requires SM90 or newer"
+        )
+    return backend
 
 
 def _resolve_group(group_name):
@@ -138,12 +174,12 @@ def _validate_operands(A, B, reduce_op, scatter_dim):
         raise ValueError("A and B must have the same device and dtype")
     if A.dtype not in (torch.float16, torch.bfloat16):
         raise NotImplementedError("the TLE path supports FP16 and BF16")
-    if A.device.type != "cuda" or torch.version.hip is not None:
-        raise NotImplementedError("the TLE path requires NVIDIA CUDA")
+    if A.device.type != "cuda":
+        raise NotImplementedError("the TLE path requires CUDA/HIP device tensors")
     if A.requires_grad or B.requires_grad:
         raise NotImplementedError("this operator supports inference only")
     if min(*A.shape, *B.shape) == 0:
-        raise NotImplementedError("empty matrices are not supported by the TMA path")
+        raise NotImplementedError("empty matrices are not supported by this path")
 
 
 def _validate_shape(m, n, k, world_size, config):
@@ -173,8 +209,9 @@ def _load_tle():
 def fused_matmul_reduce_scatter(A, B, reduce_op, scatter_dim, group_name):
     """Return the rank-local shard of reduce(A @ B).
 
-    Signature matches torch.ops.symm_mem.fused_matmul_reduce_scatter. Currently
-    supports 2D FP16/BF16 sum/avg along dimension 0, without autograd or CUDA graph
+    Signature matches torch.ops.symm_mem.fused_matmul_reduce_scatter. Supports
+    2D FP16/BF16 sum/avg along dimension 0 on NVIDIA SM90+ or experimental HCU,
+    without autograd or graph
     capture. A is [M, local_K], B is [local_K, N], output is [M/group_size, N].
     B transpose packing and A contiguous copying are included in the call.
     Inputs, shape/configuration sequence, and process-group membership must agree
@@ -182,13 +219,12 @@ def fused_matmul_reduce_scatter(A, B, reduce_op, scatter_dim, group_name):
     """
     _validate_operands(A, B, reduce_op, scatter_dim)
     group = _resolve_group(group_name)
-    config = _CONFIGS.get(group, _DEFAULT_CONFIG)
+    config = _CONFIGS.get(group, _default_config())
     m, k = A.shape
     n = B.shape[1]
     _validate_shape(m, n, k, group.size(), config)
     with torch.cuda.device(A.device), _LOCK:
-        if torch.cuda.get_device_capability(A.device)[0] < 9:
-            raise NotImplementedError("persistent TMA GEMM requires SM90 or newer")
+        backend = _validate_device(A.device)
         if torch.cuda.is_current_stream_capturing():
             raise NotImplementedError("CUDA graph capture is not supported yet")
         tle = _load_tle()
@@ -215,8 +251,10 @@ def fused_matmul_reduce_scatter(A, B, reduce_op, scatter_dim, group_name):
         def alloc_descriptor(size, alignment, stream):
             return torch.empty(size, dtype=torch.int8, device=descriptor_device)
 
-        # Required by device-created TMA descriptors. No CPU/GPU compute here.
-        tle.triton.set_allocator(alloc_descriptor)
+        # HCU lowers descriptors to pointer accesses, requiring no CUDA TMA
+        # descriptor allocator. Keep the existing NVIDIA path separate.
+        if backend == "nvidia":
+            tle.triton.set_allocator(alloc_descriptor)
         context.rs_stream.wait_stream(current)
         output = torch.empty((m // group.size(), n), device=A.device, dtype=A.dtype)
         tle.gemm_rs_producer_persistent(

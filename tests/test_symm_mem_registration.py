@@ -4,6 +4,8 @@
 """Real CUDA dispatcher tests; no process group or FlagCX required."""
 
 import importlib
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -63,6 +65,21 @@ def test_scoped_override_and_restoration(dispatch_probe):
         ]
     assert op(*args) is original
     assert (bookkeeping in torch.library._impls) == before
+
+
+def test_hcu_selection_still_registers_the_cuda_dispatch_key(
+    dispatch_probe, monkeypatch
+):
+    # HIP PyTorch tensors dispatch through CUDA. This checks registration routing
+    # with a probe callback, not execution of an HCU GPU kernel on NVIDIA hardware.
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    monkeypatch.setitem(
+        sys.modules, "triton._flagtree_backend", SimpleNamespace(FLAGTREE_BACKEND="hcu")
+    )
+    op, args, original, replacement, _ = dispatch_probe
+    with flaggems_vllm.use_symm_mem():
+        assert op(*args) is replacement
+    assert op(*args) is original
 
 
 def test_nested_scope_and_exception(dispatch_probe):

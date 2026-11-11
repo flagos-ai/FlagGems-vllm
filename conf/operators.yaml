@@ -16,7 +16,8 @@ ops:
   - id: fused_matmul_reduce_scatter
     description: |
       Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
-      Matches the symm_mem argument signature; currently inference-only, SM90+,
+      Matches the symm_mem argument signature; currently inference-only, NVIDIA SM90+
+      or an experimental HCU descriptor-lowering path (pending hardware validation),
       FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
       Uses process-group-scoped communication resources and explicit configuration.
     for:

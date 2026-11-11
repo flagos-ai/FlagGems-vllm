@@ -27,10 +27,10 @@ def _acquire():
     global _LIBRARY, _REFERENCES
     with _LOCK:
         if _REFERENCES == 0:
-            if torch.version.hip is not None:
-                raise NotImplementedError(
-                    "the TLE symm_mem override requires NVIDIA CUDA"
-                )
+            implementation_module = importlib.import_module(
+                "flaggems_vllm.ops.fused_matmul_reduce_scatter"
+            )
+            implementation_module._get_backend()
             # Load PyTorch's schema and original implementations first. Defining
             # a second schema would conflict with later imports by vLLM/PyTorch.
             importlib.import_module("torch.distributed._symmetric_memory")
@@ -42,9 +42,7 @@ def _acquire():
                     "this PyTorch build does not support Library.impl(allow_override=True); "
                     "use a build with this API, or call flaggems_vllm.fused_matmul_reduce_scatter directly"
                 )
-            implementation = importlib.import_module(
-                "flaggems_vllm.ops.fused_matmul_reduce_scatter"
-            ).fused_matmul_reduce_scatter
+            implementation = implementation_module.fused_matmul_reduce_scatter
             library = torch.library.Library("symm_mem", "IMPL")
             original_python_registration = _IMPL_KEY in getattr(
                 torch.library, "_impls", ()

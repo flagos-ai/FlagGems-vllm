@@ -20,7 +20,8 @@ import torch.distributed as dist
 import triton
 
 from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
-    GemmReduceScatterConfig,
+    _default_config,
+    _validate_device,
     clear_fused_matmul_reduce_scatter_cache,
     configure_fused_matmul_reduce_scatter,
 )
@@ -39,7 +40,7 @@ def distributed_context():
     assert torch.cuda.is_available()
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
-    assert torch.cuda.get_device_capability(device)[0] >= 9
+    _validate_device(device)
     importlib.import_module("triton.experimental.tle.language")
     if Config.mode == consts.BenchMode.CUDAGRAPH:
         pytest.skip("the initial TLE implementation does not support graph capture")
@@ -73,7 +74,7 @@ def _score(call, group, device):
 
 
 def _candidates(group, device):
-    default = GemmReduceScatterConfig()
+    default = _default_config()
     configs = [default]
     if os.environ.get("FLAGGEMS_GEMM_RS_TUNE", "0") == "1":
         configs += [

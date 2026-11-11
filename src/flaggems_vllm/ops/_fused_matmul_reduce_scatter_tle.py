@@ -25,6 +25,8 @@
 
 Source revision: ff67c2fb6be1d4651258605f6a5edde533d3a61c.
 Only kernels and scheduling are reused; communicator ownership is library-local.
+On HCU, FlagTree must lower tensor descriptors to ordinary masked pointer
+loads/stores; the descriptor kernels then run without NVIDIA TMA hardware.
 Autotune exemption: this stateful collective must execute the same launch sequence
 on every rank. Use the coordinated benchmark sweep instead of per-rank libtuner.
 """

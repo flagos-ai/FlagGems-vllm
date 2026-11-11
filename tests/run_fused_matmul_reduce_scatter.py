@@ -3,7 +3,8 @@
 
 """Standalone correctness entry point, without pytest.
 
-    torchrun --standalone --nproc-per-node=2 \
+    torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 \
+        --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
         tests/run_fused_matmul_reduce_scatter.py --dtype bf16 --reduce-op sum
 
 Each worker calls torch.ops.symm_mem.fused_matmul_reduce_scatter and compares it
@@ -49,8 +50,8 @@ def main():
     import torch
     import torch.distributed as dist
 
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        parser.error("requires NVIDIA CUDA GPUs")
+    if not torch.cuda.is_available():
+        parser.error("requires GPUs available through torch.cuda (CUDA or HCU/HIP)")
     local_size = int(os.environ["LOCAL_WORLD_SIZE"])
     if torch.cuda.device_count() < local_size:
         parser.error(
@@ -58,8 +59,6 @@ def main():
         )
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
-    if torch.cuda.get_device_capability(device)[0] < 9:
-        parser.error("persistent TMA GEMM requires SM90 or newer")
     try:
         tle = importlib.import_module("triton.experimental.tle.language")
     except ImportError:
@@ -70,11 +69,16 @@ def main():
         parser.error("requires a matching FlagCX host/device runtime")
 
     import flaggems_vllm
-    from flaggems_vllm.ops.fused_matmul_reduce_scatter import _validate_shape
+    from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
+        _default_config,
+        _validate_device,
+        _validate_shape,
+    )
 
     m = args.m if args.m is not None else 256 * world_size
-    config = flaggems_vllm.GemmReduceScatterConfig()
+    config = _default_config()
     try:
+        backend = _validate_device(device)
         _validate_shape(m, args.n, args.local_k, world_size, config)
     except (ValueError, NotImplementedError) as exc:
         parser.error(str(exc))
@@ -82,6 +86,10 @@ def main():
     dist.init_process_group("nccl", device_id=device)
     group = dist.group.WORLD
     try:
+        print(
+            f"[rank {group.rank()}] backend={backend} device={torch.cuda.get_device_name(device)} config={config}",
+            flush=True,
+        )
         torch.manual_seed(1234 + group.rank())
         a = torch.randn((m, args.local_k), device=device, dtype=dtype) * 0.1
         b = torch.randn((args.local_k, args.n), device=device, dtype=dtype) * 0.1

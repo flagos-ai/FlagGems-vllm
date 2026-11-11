@@ -95,6 +95,10 @@ class CollectiveContext:
             f"flaggems-gemm-rs/{sequence}/", c10d._get_process_group_store(group)
         )
         properties = torch.cuda.get_device_properties(device)
+        driver = kernels.triton.runtime.driver.active
+        target = driver.get_current_target()
+        driver_properties = driver.utils.get_device_properties(device.index)
+        shared_limit = driver_properties["max_shared_mem"]
         signature = [
             m,
             n,
@@ -102,6 +106,8 @@ class CollectiveContext:
             str(dtype),
             asdict(config),
             properties.multi_processor_count,
+            str(target),
+            shared_limit,
         ]
         record = {
             "signature": signature,
@@ -128,9 +134,6 @@ class CollectiveContext:
         self.num_gemm_sms = properties.multi_processor_count - reserved_sms
         if self.num_gemm_sms < 1:
             raise ValueError("reduce-scatter SM reservation leaves no SM for GEMM")
-        shared_limit = kernels.triton.runtime.driver.active.utils.get_device_properties(
-            device.index
-        )["max_shared_mem"]
         if config.estimated_shared_memory() > shared_limit:
             raise NotImplementedError(
                 "configured GEMM exceeds the shared-memory budget"

@@ -6,6 +6,7 @@
 import importlib
 import inspect
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,9 @@ from flaggems_vllm.ops._fused_matmul_reduce_scatter_runtime import (
 )
 from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     GemmReduceScatterConfig,
+    _default_config,
+    _get_backend,
+    _validate_device,
     _validate_shape,
     clear_fused_matmul_reduce_scatter_cache,
     configure_fused_matmul_reduce_scatter,
@@ -38,6 +42,34 @@ def test_signature_and_export():
     ]
     assert flaggems_vllm.fused_matmul_reduce_scatter is fused_matmul_reduce_scatter
     assert "fused_matmul_reduce_scatter" in flaggems_vllm._LIBRARY_ONLY_OPS
+
+
+def test_hcu_default_and_device_routing(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    monkeypatch.setitem(
+        sys.modules, "triton._flagtree_backend", SimpleNamespace(FLAGTREE_BACKEND="hcu")
+    )
+    assert _get_backend() == "hcu"
+    config = _default_config()
+    config.validate()
+    assert (config.block_m, config.block_n, config.block_k) == (64, 64, 32)
+    assert config.estimated_shared_memory() <= 65536
+    _validate_shape(512, 256, 256, 2, config)
+
+    def cuda_only_query(*args, **kwargs):
+        pytest.fail("HCU routing must not apply an NVIDIA compute capability gate")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", cuda_only_query)
+    assert _validate_device(torch.device("cuda", 0)) == "hcu"
+
+
+def test_other_hip_compilers_are_not_silently_accepted(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "6.3")
+    monkeypatch.setitem(
+        sys.modules, "triton._flagtree_backend", SimpleNamespace(FLAGTREE_BACKEND="amd")
+    )
+    with pytest.raises(NotImplementedError, match="FLAGTREE_BACKEND=hcu"):
+        _get_backend()
 
 
 @pytest.mark.parametrize(
@@ -147,6 +179,8 @@ def test_tma_producer_and_final_reduction(dtype, subtile):
     kernels = importlib.import_module(
         "flaggems_vllm.ops._fused_matmul_reduce_scatter_tle"
     )
+    if torch.version.hip is not None:
+        pytest.skip("this partial TMA check is NVIDIA-only; use torchrun for HCU")
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("requires SM90+")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -202,7 +236,7 @@ def distributed_context():
     assert torch.cuda.is_available(), "distributed launch requires CUDA"
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
-    assert torch.cuda.get_device_capability(device)[0] >= 9
+    _validate_device(device)
     # An explicit distributed launch should fail visibly if dependencies are absent.
     importlib.import_module("triton.experimental.tle.language")
     owns_group = not dist.is_initialized()
@@ -285,9 +319,7 @@ def test_subgroup_and_configuration(distributed_context):
         for start in range(0, world.size(), 2)
     ]
     group = groups[world.rank() // 2]
-    configure_fused_matmul_reduce_scatter(
-        group.group_name, GemmReduceScatterConfig(block_n=128)
-    )
+    configure_fused_matmul_reduce_scatter(group.group_name, _default_config())
     a = torch.full(
         (512, 64), 0.01 * (world.rank() + 1), device=device, dtype=torch.float16
     )
