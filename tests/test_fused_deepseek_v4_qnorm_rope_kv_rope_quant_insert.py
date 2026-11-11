@@ -200,37 +200,26 @@ def make_cos_sin_cache(max_pos: int, rope_dim: int, dtype, device):
 
 
 def apply_rope_gptj_last_k(
-    x: torch.Tensor,
-    x_f32: torch.Tensor,
+    rope: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
-):
-    """GPT-J-style (interleaved-pair) RoPE on the LAST rope_dim elements.
-    x: [..., head_dim] bfloat16, in place
-    x_f32: result of q RMSNorm
+) -> torch.Tensor:
+    """GPT-J-style (interleaved-pair) RoPE.
+    rope: [..., rope_dim], float
     positions: [num_tokens] int64 (positions[i] corresponds to x[i, ...])
     cos_sin_cache: [max_pos, rope_dim] float (cos|sin layout)
     """
     rope_dim = cos_sin_cache.shape[-1]
     half = rope_dim // 2
-    head_dim = x.shape[-1]
-    nope_dim = head_dim - rope_dim
 
     # Gather cos/sin for each token position: [num_tokens, rope_dim]
     cs = cos_sin_cache[positions].to(torch.float32)  # [N, rope_dim]
     cos = cs[..., :half]  # [N, half]
     sin = cs[..., half:]  # [N, half]
 
-    # Reshape leading dims so we can broadcast: x shape [..., head_dim].
-    # Bring token dim to front; assume x is [num_tokens, ..., head_dim].
-    # We rely on positions being per-token and all other dims sharing the same pos.
-    if x_f32 is None:
-        rope = x[..., nope_dim:].float()  # [..., rope_dim]
-    else:
-        rope = x_f32[..., nope_dim:]
     # Make rope pairs: reshape last dim to [half, 2]
     shape = rope.shape
-    rope = rope.reshape(*shape[:-1], half, 2)
+    rope = rope.reshape(*shape[:-1], half, 2).float()
     even = rope[..., 0]  # [..., half]
     odd = rope[..., 1]
 
@@ -242,11 +231,7 @@ def apply_rope_gptj_last_k(
 
     new_even = even * cos - odd * sin
     new_odd = even * sin + odd * cos
-    rope_rotated = torch.stack((new_even, new_odd), dim=-1).reshape(shape)
-
-    x[..., nope_dim:] = rope_rotated.to(x.dtype)
-    if x_f32 is not None:
-        x[..., :nope_dim] = x_f32[..., :nope_dim].to(x.dtype)
+    return torch.stack((new_even, new_odd), dim=-1).reshape(shape)
 
 
 def rmsnorm_no_weight_f32(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -478,6 +463,10 @@ def ref_impl(
     """The oracle: always this file's torch reference, never vLLM's kernel;
     `test_matches_vllm_reference` cross-checks against vLLM separately.
     """
+    rope_dim = cos_sin_cache.shape[-1]
+    head_dim = q.shape[-1]
+    nope_dim = head_dim - rope_dim
+
     if q_head_padded == 0:
         q_out = q.new_empty([0])
     else:
@@ -489,39 +478,42 @@ def ref_impl(
             if apply_q_norm:
                 q_next = rmsnorm_no_weight_f32(q_chunk, eps)
                 if apply_q_rope:
-                    apply_rope_gptj_last_k(
-                        q_chunk,
-                        q_next,
+                    q_next[..., nope_dim:] = apply_rope_gptj_last_k(
+                        q_next[..., nope_dim:],
                         positions[start : start + step],
                         cos_sin_cache,
-                    )
-                else:
-                    q_chunk = q_next.to(q.dtype)
+                    ).to(q.dtype)
             else:
+                q_next = q_chunk.clone()
                 if apply_q_rope:
-                    apply_rope_gptj_last_k(
-                        q_chunk,
-                        None,
+                    q_next[..., nope_dim:] = apply_rope_gptj_last_k(
+                        q_next[..., nope_dim:].float(),
                         positions[start : start + step],
                         cos_sin_cache,
-                    )
+                    ).to(q.dtype)
             q_out_chunk = q_out[start : start + step]
             if is_q_interleaved:
                 real_step = q_out_chunk.shape[0]
-                q_chunk = q_chunk.reshape(real_step, num_heads * 32, 16)
+                q_next = q_next.reshape(real_step, num_heads * 32, 16)
                 q_out_chunk = q_out_chunk.reshape(real_step, 32, q_head_padded, 16)
                 for i in range(num_heads * 32):
-                    q_out_chunk[:, i // num_heads, i % num_heads, :] = q_chunk[:, i, :]
+                    q_out_chunk[:, i // num_heads, i % num_heads, :] = q_next[:, i, :]
                 q_out_chunk[:, :, num_heads:, :] = 0
             else:
-                q_out_chunk[:, :num_heads, :] = q_chunk
+                q_out_chunk[:, :num_heads, :] = q_next
                 q_out_chunk[:, num_heads:, :] = 0
+
+    kv_next = kv.clone()
     if kv.size(0) > slot_mapping.size(0):
-        kv = kv[: slot_mapping.size(0), :]
+        kv_next = kv_next[: slot_mapping.size(0), :]
         positions = positions[: slot_mapping.size(0)]
-    apply_rope_gptj_last_k(kv, None, positions, cos_sin_cache)
+    kv_next[..., nope_dim:] = apply_rope_gptj_last_k(
+        kv_next[..., nope_dim:].float(),
+        positions,
+        cos_sin_cache,
+    ).to(kv.dtype)
     torch_quantize_and_insert_k_cache(
-        kv, k_cache, slot_mapping, block_size=bs, kv_mxfp8=kv_mxfp8
+        kv_next, k_cache, slot_mapping, block_size=bs, kv_mxfp8=kv_mxfp8
     )
     return q_out
 
@@ -599,20 +591,15 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
-    q_ref = q.clone()
-    kv_ref = kv.clone()
     k_cache_ref = k_cache.clone()
-    slot_mapping_ref = slot_mapping.clone()
-    positions_ref = positions.clone()
-    cos_sin_cache_ref = cos_sin_cache.clone()
 
     q_out_ref = ref_impl(
-        q_ref,
-        kv_ref,
+        q,
+        kv,
         k_cache_ref,
-        slot_mapping_ref,
-        positions_ref,
-        cos_sin_cache_ref,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
         q_head_padded,
         eps,
         bs,
@@ -671,20 +658,15 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
-    q_ref = q.clone()
-    kv_ref = kv.clone()
     k_cache_ref = k_cache.clone()
-    positions_ref = positions.clone()
-    cos_sin_cache_ref = cos_sin_cache.clone()
-    slot_mapping_ref = slot_mapping.clone()
 
     ref_impl(
-        q_ref,
-        kv_ref,
+        q,
+        kv,
         k_cache_ref,
-        slot_mapping_ref,
-        positions_ref,
-        cos_sin_cache_ref,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
         q_head_padded,
         eps,
         block_size,
@@ -736,20 +718,15 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     positions = torch.arange(total, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
-    q_ref = q.clone()
-    kv_ref = kv.clone()
     k_cache_ref = k_cache.clone()
-    positions_ref = positions.clone()
-    cos_sin_cache_ref = cos_sin_cache.clone()
-    slot_mapping_ref = slot_mapping.clone()
 
     ref_impl(
-        q_ref,
-        kv_ref,
+        q,
+        kv,
         k_cache_ref,
-        slot_mapping_ref,
-        positions_ref,
-        cos_sin_cache_ref,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
         q_head_padded,
         eps,
         block_size,
@@ -798,6 +775,9 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
     q_head_padded = 128
 
+    if flaggems_vllm.vendor_name == "ascend" and num_tokens == 131072:
+        pytest.skip(f"skip huge num_tokens ({num_tokens}): risk NPU OOM")
+
     q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
     kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
     k_cache = torch.zeros(
@@ -806,25 +786,19 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
-    q_ref = q.clone()
-    kv_ref = kv.clone()
     k_cache_ref = k_cache.clone()
-    positions_ref = positions.clone()
-    cos_sin_cache_ref = cos_sin_cache.clone()
-    slot_mapping_ref = slot_mapping.clone()
 
     q_out_ref = ref_impl(
-        q_ref,
-        kv_ref,
+        q,
+        kv,
         k_cache_ref,
-        slot_mapping_ref,
-        positions_ref,
-        cos_sin_cache_ref,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
         q_head_padded,
         eps,
         block_size,
     )
-    del q_ref, kv_ref  # handle torch.OutOfMemoryError
     q_out_res = fused_impl(
         q,
         kv,
@@ -876,16 +850,15 @@ def test_backend_override_matches_reference(
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
-
-    q_ref, kv_ref = q.clone(), kv.clone()
     k_cache_ref = k_cache.clone()
+
     q_out_ref = ref_impl(
-        q_ref,
-        kv_ref,
+        q,
+        kv,
         k_cache_ref,
-        slot_mapping.clone(),
-        positions.clone(),
-        cos_sin_cache.clone(),
+        slot_mapping,
+        positions,
+        cos_sin_cache,
         q_head_padded,
         eps,
         block_size,
@@ -934,22 +907,21 @@ def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
-
     k_cache_ref = k_cache.clone()
 
     try:
         vllm_ref_impl = musa_ref_wrapper if IS_MTHREADS else cuda_ref_wrapper
         q_out_ref = vllm_ref_impl(
-            q.clone(),
-            kv.clone(),
+            q.clone(),  # This parameter was in-place in older versions
+            kv,
             (
                 k_cache_ref.view(k_cache_ref.shape[0], -1, HEAD_BYTES)
                 if IS_MTHREADS
                 else k_cache_ref
             ),
-            slot_mapping.clone(),
-            positions.clone(),
-            cos_sin_cache.clone(),
+            slot_mapping,
+            positions,
+            cos_sin_cache,
             q_head_padded,
             eps,
             block_size,
@@ -1000,15 +972,15 @@ def test_kv_mxfp8_and_q_interleaved(
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
-
     k_cache_ref = k_cache.clone()
+
     q_out_ref = ref_impl(
-        q.clone(),
-        kv.clone(),
+        q,
+        kv,
         k_cache_ref,
-        slot_mapping.clone(),
-        positions.clone(),
-        cos_sin_cache.clone(),
+        slot_mapping,
+        positions,
+        cos_sin_cache,
         q_head_padded,
         eps,
         block_size,
