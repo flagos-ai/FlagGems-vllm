@@ -202,6 +202,7 @@ batch 和 `dim` 上重新评估。
 | `chunk_kda` | 为旧的全矩阵 Gram 方案在 L1 常驻 7 个 `[64,128]` panel | 需 2.50–3.28 Mbit UB，超过 2.03 Mbit；改成 32 行因果前缀后只需 7×`[32,128]`（约 1.0 Mbit），无需显式 L1 常驻 |
 | `chunk_kda` | CPT≥2 合并 chunk | CPT=2 为 3.44 ms，CPT=1 为 3.11 ms；该场景不受 launch 数主导 |
 | `chunk_kda` | 融合 prep + Gram，复用 q/k/g 寄存器以省掉二次加载和 norm/beta 重算 | 原型 4088 us vs 拆分 2644 us（1.55× 更慢）；`extract_slice` 引入的布局转换、UB 压力和重新拉长的 AIV→AIC→AIV 依赖链抵消了省下的搬运，拆分结构更优 |
+| `chunk_kda` | `al.scope` + `sync_block_*` 做 Gram 的 7 面板 CV 双缓冲 | 最小 hand-off PASS（`supported/s6_scoped_cv_handoff.py`，需 `enable_mixed_cv=True, disable_auto_inject_block_sync=True`）；完整 Gram 的面板逐位正确，但 cube 侧消费错值（band 0 Aqk 0.026 / band 1 17 / Akk inf），且 T=4096 344 us vs 169 us；scope 内 wait 后的 GM load 排序和 GM 往返成本仍未解决 |
 | `chunk_kda` | Gram 用 CPT=2/4 合并 chunk | 1967/2127 us vs CPT=1 1290 us；每 program 的双份面板与 dot 让 UB/串行链变长 |
 | `chunk_kda` | Gram 调 `vf_merge_level=1..4`、`multibuffer`、`num_stages=1..3` | 全部在 1289–1294 us，无差异；说明 Gram 已到当前代码形态的 AIV 向量下界，进一步收益需要跨 head CV 重叠 |
 | `chunk_kda` | prep 保存 q/k rstd、beta sigmoid 供 Gram 复用 | 上限约 3%（Gram 1268→1228 us）；为 <1% 整算子收益增加 workspace/签名复杂度，暂不做 |

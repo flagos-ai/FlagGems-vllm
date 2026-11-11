@@ -136,7 +136,16 @@ Triton 的对应限制是：
 
 AscendC Prepare 以 **4 个 local head 为一组**：V1 生成 Q+/K+ 时，C2 在算上一组的 MMAD；V6 生成 RHS 时，C4/C5 已在读 L1 常驻数据。两侧用 `CrossCoreSetFlag` / `CrossCoreWaitFlag` 和双缓冲槽位显式重叠，AIC 等操作数时 AIV 不会空闲。
 
-Triton 的 mix kernel 在单个 program 内仍是 `AIV(面板) -> AIC(dot) -> AIV(后处理)` 的串行链，program 之间没有显式的跨 head 流水。新 Gram 的 `aiv_vec = 94%`、`aic_mac = 15%` 说明 AIC 约 85% 的空闲没有被下一 head 的向量工作填满。
+#### Triton 现状（API 已有，最小 hand-off 已验证）
+
+`al.scope("vector"|"cube")` + `al.sync_block_set/wait` 已经可以表达 CV 双缓冲，见 `supported/s6_scoped_cv_handoff.py`（PASS，maxerr 6.1e-5）。前提是编译选项 `enable_mixed_cv=True, disable_auto_inject_block_sync=True`；默认选项仍会崩溃（`defects/d1_scope_auto_sync.py`）。
+
+但把这套用进 Gram 的 7 面板 / 2-chunk 双缓冲时，原型仍有两个问题：
+
+- 面板写到 GM 后逐位正确（与 torch 参考 maxerr=0），但 cube scope 消费时得到错值（band 0 Aqk 误差约 0.026，band 1 约 17，Akk 出现 inf），说明 scope 内 `sync_block_wait` 之后的 GM load 排序/可见性还不完整；
+- 即使不考虑正确性，T=4096 下原型 344 μs vs 拆分 169 μs，2× 更慢：每个 chunk-head 多出约 56 KiB 的 GM 写 + 56 KiB 读，而可被隐藏的 cube 时间只有约 190 μs（T=32768 时）。没有 GM→L1 直通（R1）时，这个往返成本吃掉了重叠收益。
+
+新 Gram 的单 program 仍是 `AIV(面板) -> AIC(dot) -> AIV(后处理)`；`aiv_vec=94%`、`aic_mac=15%` 说明 AIC 大部分时间在等操作数。
 
 #### AscendC 证据（确认具备硬件能力）
 
@@ -147,8 +156,9 @@ Triton 的 mix kernel 在单个 program 内仍是 `AIV(面板) -> AIC(dot) -> AI
 
 #### 期望改进
 
-- 编译器能把相邻迭代（或同一 AIV 上的不同 program）中的纯向量段与 dot 段做跨迭代调度；
-- 或提供显式的 producer/consumer 双缓冲原语，让 Triton 能直接写出 AscendC 的 4-head CV pipeline。
+- 修复 scope 内“wait 之后的 GM load 可见性/排序”，让 `s6` 的模式能安全扩展到多面板；
+- 支持 GM→L1 直通（R1），让 cube 侧不再经过 UB，降低双缓冲的往返成本；
+- 或由编译器在相邻 program/迭代之间自动做 CV 重叠。
 
 验收口径：Gram 微基准的 `aic_mac_ratio` 提升到 50% 以上，或 Gram 端到端进入 600–800 μs 区间（当前 1261 μs，AscendC 413 μs）。
 
@@ -200,7 +210,8 @@ tools/triton_ascend_probes/
 │   ├── s1_slice_dot.py            # 行/列切片作为 dot 操作数（含 L1 zN）
 │   ├── s2_l1_resident_dot.py      # 4D zN + al.dot(fractal) 显式 L1 驻留
 │   ├── s3_l1_subview_assemble.py  # subview + copy 拼装 32 行子块
-│   └── s4_manual_cross_core_sync.py # 手工 sync_block_* 跨核同步
+│   ├── s4_manual_cross_core_sync.py # 手工 sync_block_* 跨核同步
+│   └── s6_scoped_cv_handoff.py    # al.scope + sync_block 的 CV 双缓冲 hand-off
 ├── gaps/                          # 【核心需求】Triton 缺失、AscendC 可做
 │   ├── g1_nd2nz_staging.py        # R1：GM→L1 缺口 / 显式 L1 的 UB 预算验证
 │   ├── g2_vec_chain_fusion.py     # R2：长向量链融合与性能断崖验证
@@ -234,6 +245,7 @@ tools/triton_ascend_probes/
 | **supported** | `s2_l1_resident_dot.py dot / copy`            | **PASS**（maxerr ≤ 6.1e-5）                  |
 | **supported** | `s3_l1_subview_assemble.py`                   | **PASS**（maxerr ≤ 6.1e-5）                  |
 | **supported** | `s4_manual_cross_core_sync.py`                | **PASS**（maxerr ≤ 1.5e-5）                  |
+| **supported** | `s6_scoped_cv_handoff.py`                     | **PASS**（maxerr ≤ 6.1e-5；需 `enable_mixed_cv=True, disable_auto_inject_block_sync=True`） |
 | **gaps**      | `g1_nd2nz_staging.py plain`                   | **PASS**（基线正常通过）                           |
 | **gaps**      | `g1_nd2nz_staging.py l1a / l1b / l1`          | **FAIL**：UB 内存溢出（3.15 / 3.28 / 2.50 Mbit）  |
 | **gaps**      | `g2_vec_chain_fusion.py`                      | N=4 已融合，N=8/12 出现显著耗时断崖                    |

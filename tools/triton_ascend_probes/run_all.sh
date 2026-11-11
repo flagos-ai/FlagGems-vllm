@@ -30,6 +30,7 @@ run "s2 L1-resident dot"           "$P/supported/s2_l1_resident_dot.py" dot
 run "s2 L1 copy alias"             "$P/supported/s2_l1_resident_dot.py" copy
 run "s3 L1 subview assemble"       "$P/supported/s3_l1_subview_assemble.py"
 run "s4 manual cross-core sync"    "$P/supported/s4_manual_cross_core_sync.py"
+run "s6 scoped CV hand-off"        "$P/supported/s6_scoped_cv_handoff.py"
 
 echo "################ gaps (expect FAIL: these are requirements) ################"
 run "g1 nd->zN baseline (plain)"   "$P/gaps/g1_nd2nz_staging.py" plain
