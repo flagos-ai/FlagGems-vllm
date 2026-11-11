@@ -227,6 +227,7 @@ if cfg.QUICK_MODE:
 # --------------------------------------------------------------------------
 # Tests
 # --------------------------------------------------------------------------
+@pytest.mark.dsv41_o_proj  # also on pytestmark; spelled out here for CI marker checks
 @pytest.mark.parametrize("num_tokens", TOKENS)
 @pytest.mark.parametrize("n_groups, hpg, rank", GROUP_CONFIGS)
 def test_dsv41_o_proj_accuracy(num_tokens, n_groups, hpg, rank):
