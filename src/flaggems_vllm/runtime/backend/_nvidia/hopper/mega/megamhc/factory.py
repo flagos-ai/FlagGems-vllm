@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Production context factory for prepared Hopper MegaMHC launchers."""
+"""Production context factory for the single-kernel Hopper MegaMHC path."""
 
 from __future__ import annotations
 
@@ -173,7 +173,7 @@ class MegaMHCPreparedLauncherRegistry:
                 )
             if any(
                 actual is not expected
-                for actual, expected in zip(static_values, static_tensors, strict=True)
+                for actual, expected in zip(static_values, static_tensors)
             ):
                 raise RuntimeError(
                     f"prepared launcher T={token} is bound to different static tensors"
@@ -271,7 +271,7 @@ class MegaMHCPreparedLauncherRegistry:
         )
 
 
-def create_mega_mhc_context(
+def _create_context_from_prepared(
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
@@ -280,7 +280,7 @@ def create_mega_mhc_context(
     *,
     profile: MegaMHCProfile = DEEPSEEK_V4_FLASH_PROFILE,
 ) -> MegaMHCContext:
-    """Create one layer-, stream-, device- and host-thread-owned context.
+    """Bind an internally prepared launcher to one layer and ordered stream.
 
     Compilation and launcher preparation must finish before this function.
     The registry keys are the sole source of admitted token specializations;
@@ -317,8 +317,99 @@ def create_mega_mhc_context(
     )
 
 
+def create_mega_mhc_context(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    profile: MegaMHCProfile = DEEPSEEK_V4_FLASH_PROFILE,
+) -> MegaMHCContext:
+    """Compile and bind one exact-token Hopper MegaMHC specialization.
+
+    This setup API runs outside the operator hot path and outside CUDA Graph
+    capture.  The first four tensors describe the dynamic ABI for one physical
+    token bucket; the four model tensors are retained as layer-static
+    bindings.  Kernel selection, LaunchSpec construction, and FlagTree JIT
+    preparation are entirely internal to FlagGems-vLLM.
+    """
+    if profile != DEEPSEEK_V4_FLASH_PROFILE:
+        raise NotImplementedError(
+            "only the DeepSeek-V4-Flash normal MegaMHC profile is supported"
+        )
+    dynamic_tensors = (x, residual, post_layer_mix, comb_res_mix)
+    static_tensors = (fn, hc_scale, hc_base, norm_weight)
+    if any(
+        not isinstance(tensor, torch.Tensor)
+        for tensor in (*dynamic_tensors, *static_tensors)
+    ):
+        raise TypeError("MegaMHC context inputs must all be torch.Tensor objects")
+    device = x.device
+    if device.type != "cuda":
+        raise ValueError("MegaMHC production context requires CUDA tensors")
+    if any(tensor.device != device for tensor in (*dynamic_tensors, *static_tensors)):
+        raise ValueError("all MegaMHC context tensors must share one CUDA device")
+    # FlagTree resolves both the compilation device and the ordered launch
+    # stream from the current CUDA context.  Prepare under the tensors' device
+    # instead of whichever device the caller happened to leave current.
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MegaMHC context must be prepared before CUDA Graph capture"
+            )
+        capability = torch.cuda.get_device_capability(device)
+        if capability[0] != 9:
+            raise NotImplementedError(
+                f"Hopper MegaMHC requires SM90, got sm_{capability[0]}{capability[1]}"
+            )
+
+        outputs = {
+            "new_residual": torch.empty_like(residual),
+            "new_prev_mix": None,
+            "new_post_mix": torch.empty_like(post_layer_mix),
+            "new_comb_res_mix": torch.empty_like(comb_res_mix),
+            "y_bf16": torch.empty_like(x),
+        }
+        inputs = {
+            "x": x,
+            "residual": residual,
+            "post_mix": post_layer_mix,
+            "comb_res_mix": comb_res_mix,
+            "shifted_prev_mix": None,
+            "fn": fn,
+            "mix_scales": hc_scale,
+            "mix_bases": hc_base,
+            "rmsnorm_weight": norm_weight,
+            "hc_mult": profile.residual_streams,
+            "hc_norm_eps": profile.rms_eps,
+            "hc_pre_eps": profile.hc_pre_eps,
+            "hc_post_scale": profile.hc_post_mult_value,
+            "sinkhorn_eps": profile.hc_sinkhorn_eps,
+            "num_sinkhorn_iters": profile.sinkhorn_repeat,
+            "rmsnorm_eps": profile.norm_eps,
+            "rmsnorm_scale": profile.norm_scale,
+        }
+        from .tle.dispatch import MissingTLECaseError
+        from .tle.isolated_dispatch import prepare_isolated_safe_launcher
+
+        try:
+            prepared = prepare_isolated_safe_launcher(inputs, outputs)
+        except MissingTLECaseError as exc:
+            raise NotImplementedError(str(exc)) from exc
+        return _create_context_from_prepared(
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            {prepared.token_count: prepared},
+            profile=profile,
+        )
+
+
 __all__ = [
-    "MegaMHCPreparedLauncherRegistry",
-    "PreparedMegaMHCLauncher",
     "create_mega_mhc_context",
 ]
