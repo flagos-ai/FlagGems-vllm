@@ -142,7 +142,7 @@ AscendC Prepare 以 **4 个 local head 为一组**：V1 生成 Q+/K+ 时，C2 �
 
 但把这套用进 Gram 的 7 面板 / 2-chunk 双缓冲时，原型仍有两个问题：
 
-- 面板写到 GM 后逐位正确（与 torch 参考 maxerr=0），但 cube scope 消费时得到错值（band 0 Aqk 误差约 0.026，band 1 约 17，Akk 出现 inf），说明 scope 内 `sync_block_wait` 之后的 GM load 排序/可见性还不完整；
+- **不是 sync/load 可见性**：TTIR 里 `sync_block_wait` 严格排在 7 个 `tt.load` 之前；让 cube 把实际 load 到的面板回写 debug buffer，与 GM 逐位一致（maxerr=0）。真正的缺陷是 **`al.scope("cube")` 内多 dot body 的代码生成**：同一个 6-dot + scale/mask/inverse body 不套 scope 时与 torch 一致（maxerr 7e-6），套上 `al.scope("cube")` 后 Aqk/Akk 出现 inf/NaN；缩到 1–3 个 dot、少量 store 的 scoped body 仍正确。最小复现见 `defects/d5_scoped_cube_multidot.py`。
 - 即使不考虑正确性，T=4096 下原型 344 μs vs 拆分 169 μs，2× 更慢：每个 chunk-head 多出约 56 KiB 的 GM 写 + 56 KiB 读，而可被隐藏的 cube 时间只有约 190 μs（T=32768 时）。没有 GM→L1 直通（R1）时，这个往返成本吃掉了重叠收益。
 
 新 Gram 的单 program 仍是 `AIV(面板) -> AIC(dot) -> AIV(后处理)`；`aiv_vec=94%`、`aic_mac=15%` 说明 AIC 大部分时间在等操作数。
@@ -156,7 +156,7 @@ AscendC Prepare 以 **4 个 local head 为一组**：V1 生成 Q+/K+ 时，C2 �
 
 #### 期望改进
 
-- 修复 scope 内“wait 之后的 GM load 可见性/排序”，让 `s6` 的模式能安全扩展到多面板；
+- 修复 cube scope 内多 dot body 的错误代码生成（与 sync/load 无关，见 `d5`）；
 - 支持 GM→L1 直通（R1），让 cube 侧不再经过 UB，降低双缓冲的往返成本；
 - 或由编译器在相邻 program/迭代之间自动做 CV 重叠。
 
@@ -220,7 +220,8 @@ tools/triton_ascend_probes/
     ├── d1_scope_auto_sync.py      # D1：scope 崩溃与同步错误
     ├── d2_insert_slice_dot.py     # D2：insert_slice 作 dot 操作数崩溃
     ├── d3_l1_view_2d.py           # D3：2D ND 在 L1 上 view/to_tensor 失败
-    └── d4_extract_slice_pipeline.py # D4：单读 + UB 切片移位读到旧版本缓冲
+    ├── d4_extract_slice_pipeline.py # D4：单读 + UB 切片移位读到旧版本缓冲
+    └── d5_scoped_cube_multidot.py  # D5：cube scope 内多 dot body 计算错误
 ```
 
 ### 运行方式
@@ -255,6 +256,7 @@ tools/triton_ascend_probes/
 | **defects**   | `d2_insert_slice_dot.py insert / l1_insert`   | **FAIL**：`Unknown PIPE!` 触发 SIGABRT        |
 | **defects**   | `d3_l1_view_2d.py nd / target`                | **FAIL**：报 `cbuf vs ub` 或 `unsupported op` |
 | **defects**   | `d4_extract_slice_pipeline.py`                | **FAIL**：`ns=2` 且开多缓冲时裸视图读到旧版本（maxerr≈16，确定性）；bind/copy 写法时对时错 |
+| **defects**   | `d5_scoped_cube_multidot.py`                  | **FAIL**：unscoped body 与 torch 一致（maxerr≈7e-6），同一 body 套 `al.scope("cube")` 后出现 inf/NaN；确认是 scoped cube 多 dot codegen 问题，不是 sync/load 可见性 |
 
 > [!NOTE]
 > `g1` 的 `l1*` 是**旧全矩阵 7 面板公式**的 UB 预算探针，不是“L1 常驻必然溢出”的证据。生产 Gram 已改用 R0 的 32 行前缀分块（7×`[32,128]` 面板，峰值约 1.0 Mbit），无需 R1 的显式 L1 常驻即可通过编译。AscendC 的对应拷贝是 **GM→L1**；`g1` 里的 UB→L1 只是 Triton 当前唯一可写的路径。
