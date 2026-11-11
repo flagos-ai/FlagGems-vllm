@@ -61,6 +61,11 @@ metax = [
 ascend = [
     "vllm-ascend==0.24.0rc1",
 ]
+iluvatar = [
+    "vllm @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=ca0450ff49eecb2c2954edd6e2350fb4a5bbe63f1512b6160aac8a798440010c",
+    "ixformer @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/ixformer/0.7.0+corex.4.5.0.20260804/ixformer-0.7.0+corex.4.5.0.20260804-cp312-cp312-linux_x86_64.whl#sha256=413fe629b4ee707df83fd99a19366dd35ae757a2f495acdc2cffa7a49be7a688",
+    "numpy<2",
+]
 
 thead = [
     "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.23.0+v0.2.0.ppu2.2.0/vllm-0.23.0+cu130torch2.10.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
