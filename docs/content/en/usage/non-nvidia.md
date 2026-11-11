@@ -69,22 +69,42 @@ Triton should work out-of-the-box with ROCm.
 
 ### Huawei Ascend
 
-Requires Ascend CANN toolkit and Torch-NPU:
+Requires the Ascend CANN toolkit and Torch-NPU. The validated combination is
+the `ascend-cann900` (or `ascend-cann850`) profile in `src/flaggems_vllm/backends.yaml`:
 
 ```bash
-# Install CANN (follow Huawei docs)
-# Install Torch-NPU
-pip install torch-npu
-
-export DNN_VENDOR=ascend
+bash tools/setup.sh ascend
 ```
 
-FlagTree compiler recommended for Ascend (OpenAI Triton has limited support):
+FlagTree is recommended for Ascend (OpenAI Triton has limited support); the
+profile pins a matching `flagtree` build and `tools/setup.sh` installs it by
+default.
+
+#### Tests using vLLM-Ascend custom ops
+
+Sparse flash attention tests and benchmarks use vLLM-Ascend as their reference.
+Enable its pytest plugin explicitly when running these files from the repository
+root:
 
 ```bash
-pip install flagtree
-export USE_FLAGTREE=1
+python -m pytest -p tools.ascend.pytest_custom_ops -q tests/test_sparse_flash_attention.py
+python -m pytest -p tools.ascend.pytest_custom_ops -q benchmark/test_sparse_flash_attention.py
 ```
+
+The plugin calls vLLM-Ascend's `enable_custom_op()` before pytest loads the common
+`conftest.py` files. CANN must discover the vendor implementations before device
+initialization; loading them later in a test or fixture can select the built-in
+implementation instead. The installed vLLM-Ascend package configures its own
+custom-op paths; no installation path needs to be set manually.
+
+The plugin lives under `tools/ascend/` so vendor initialization stays outside the
+shared tests directory. Importing its package does not import FlagGems or
+initialize the device runtime.
+
+`tools/run_tests.py` enables this plugin automatically for Ascend
+`sparse_flash_attention` workers. Other operator tests do not load it implicitly.
+If running a larger Ascend test selection that includes sparse flash attention,
+pass the same `-p tools.ascend.pytest_custom_ops` option for that session.
 
 ### Other Vendors
 
@@ -100,11 +120,16 @@ Consult your hardware vendor's documentation for PyTorch installation.
 - **OpenAI Triton**: Works on NVIDIA, AMD (ROCm)
 - **FlagTree**: Supports all 17 backends via vendor-specific codegen
 
-To use FlagTree:
+To use FlagTree, prefer the backend profile's pinned build; a bare
+`pip install flagtree` may not match the vendor torch stack:
 
 ```bash
-pip install flagtree
-export USE_FLAGTREE=1
+# Install the compiler pinned for the backend
+bash tools/setup.sh ascend
+
+# Or force a compiler when the environment is already prepared
+COMPILER=flagtree bash tools/setup.sh --no-venv ascend
+COMPILER=triton   bash tools/setup.sh --no-venv ascend
 ```
 
 ## Backend Maturity
@@ -127,15 +152,42 @@ Non-NVIDIA backends may have:
 
 Always benchmark on your target hardware.
 
-## Testing on Multiple Backends
+## Setting Up a Backend
 
-The `tools/setup.sh` script supports backend selection:
+`tools/setup.sh` reads the backend registry in `src/flaggems_vllm/backends.yaml` and installs
+the matching torch stack, vLLM package, compiler and test dependencies:
 
 ```bash
-DNN_VENDOR=amd source tools/setup.sh
+# List profiles and aliases
+bash tools/setup.sh --list
+
+# Create .venv and install a profile (prints the activation command)
+bash tools/setup.sh ascend
+
+# ...or create the venv and activate it in the current shell
+source tools/setup.sh metax
 ```
 
-CI includes a multi-backend test matrix (when runners are available).
+Common aliases: `nvidia`, `ascend`, `hygon`, `metax`, `iluvatar`, `mthreads`,
+`cambricon`, `enflame`, `kunlunxin`, `thead`, `tsingmicro`, `biren`,
+`spacemit`, `sunrise`, `amd`. The exact profile name is accepted too
+(e.g. `ascend-cann850`, `metax-maca3720`).
+
+Vendor images already ship a matched torch/triton/vLLM stack. Inside such an
+image, use `--no-venv` so the script only adds FlagGems-vllm and the test
+dependencies without replacing the vendor packages:
+
+```bash
+bash tools/setup.sh --no-venv hygon
+```
+
+The same installation can be done step by step with pip; see
+[Manual Installation Without a Venv](../getting-started/install.md#manual-installation-without-a-venv).
+
+The registry is also the place to add a new backend profile. A profile records
+the Python version, vendor torch dependencies, Triton/FlagTree packages, the
+vLLM source, environment variables, vendor env scripts and backend-specific
+test dependencies.
 
 ## Troubleshooting
 
