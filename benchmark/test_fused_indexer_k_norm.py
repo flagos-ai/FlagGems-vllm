@@ -2,9 +2,9 @@
 # Copyright 2026 FlagOS Contributors
 """Standard kernel-mode benchmark for fused_indexer_k_norm.
 
-Follows the base.Benchmark framework with triton.testing.do_bench
-(duration-based, warm_up/repetition from Config) for consistent timing
-across all backends.  G5 correctness is handled separately in
+Uses base.Benchmark.get_latency, like the other operator benchmarks.
+The shared framework selects the backend timer (do_bench_npu on Ascend).
+G5 correctness is handled separately in
 ``tests/test_fused_indexer_k_norm.py``.
 
 Run with::
@@ -37,6 +37,7 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
         self._out_buffer = None
         _gems = flaggems_vllm.fused_indexer_k_norm
         if use_out_provided:
+
             def _gems_op(x, weight, bias, dim, eps):
                 buf = self._out_buffer
                 if (
@@ -45,13 +46,12 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
                     or buf.dtype != x.dtype
                     or buf.device != x.device
                 ):
-                    buf = torch.empty(
-                        x.shape, dtype=x.dtype, device=x.device
-                    )
+                    buf = torch.empty(x.shape, dtype=x.dtype, device=x.device)
                     self._out_buffer = buf
                 return flaggems_vllm.fused_indexer_k_norm(
                     x, weight, bias, dim, eps, buf
                 )
+
             _gems = _gems_op
         super().__init__(
             op_name="fused_indexer_k_norm",
@@ -61,26 +61,22 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
         )
 
     def init_user_config(self):
-        # G6 of this operator requires --mode kernel with device events.
+        # Use the project's kernel benchmark mode without CUDA Graph.
         if Config.mode != consts.BenchMode.KERNEL:
             raise ValueError(
                 "fused_indexer_k_norm benchmark requires --mode kernel "
-                "with no-Graph device events."
+                "without CUDA Graph."
             )
         super().init_user_config()
 
     def _torch_op(self, x, weight, bias, dim, eps):
-        return F.layer_norm(
-            x.float(), (dim,), weight, bias, eps
-        ).type_as(x)
+        return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             m, d, gap = shape
             gen = torch.Generator(device="cpu").manual_seed(self.SEED)
-            parent_cpu = (
-                torch.rand((m, d + gap), generator=gen) * 6 - 3
-            ).to(dtype)
+            parent_cpu = (torch.rand((m, d + gap), generator=gen) * 6 - 3).to(dtype)
             weight_cpu = torch.rand((d,), generator=gen) * 3 - 1.5
             bias_cpu = torch.rand((d,), generator=gen) * 3 - 1.5
             parent = parent_cpu.to(device=self.device)
