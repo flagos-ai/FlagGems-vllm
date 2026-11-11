@@ -300,6 +300,23 @@ def _eager_pack_plan(
     return plan
 
 
+def _libentry_cache_key(
+    kernel_entry: object,
+    spec_args: list[object],
+    dns_args: list[object],
+    const_args: list[object],
+    launch_kwargs: dict[str, object],
+) -> tuple[object, ...]:
+    """Rebuild the key `LibEntry.run` stored the compiled kernel under.
+
+    Besides the argument key from `LibEntry.key`, an entry is keyed on the
+    compile options of its launch, so both parts are needed for a lookup.
+    """
+    return kernel_entry.key(
+        spec_args, dns_args, const_args
+    ) + kernel_entry._launch_options_key(launch_kwargs)
+
+
 def _launch_cached_eager_kernel(
     kernel_entry: object,
     grid: tuple[int, ...],
@@ -349,7 +366,9 @@ def _launch_cached_eager_kernel(
             if index not in specialize_indices
             and index not in do_not_specialize_indices
         ]
-        entry_key = kernel_entry.key(spec_args, dns_args, const_args)
+        entry_key = _libentry_cache_key(
+            kernel_entry, spec_args, dns_args, const_args, launch_kwargs
+        )
         compiled_kernel = kernel_entry.kernel_cache[device_index][entry_key][0]
         grid3 = (grid + (1, 1))[:3]
         _EAGER_COMPILED_LAUNCHER_CACHE[cache_key] = compiled_kernel[grid3]
@@ -8074,7 +8093,9 @@ def _launch_cached_scfa_score_guard_pipeline(
             if index not in specialize_indices
             and index not in do_not_specialize_indices
         ]
-        entry_key = kernel_entry.key(spec_args, dns_args, const_args)
+        entry_key = _libentry_cache_key(
+            kernel_entry, spec_args, dns_args, const_args, launch_kwargs
+        )
         compiled_kernel = kernel_entry.kernel_cache[device_index][entry_key][0]
         grid3 = (grid + (1, 1))[:3]
         _EAGER_COMPILED_LAUNCHER_CACHE[cache_key] = compiled_kernel[grid3]
