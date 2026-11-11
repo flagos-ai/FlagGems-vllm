@@ -20,8 +20,14 @@ from .api import (
     MegaMHCLauncher,
     MegaMHCProfile,
     MegaMHCStaticBinding,
+    MegaMHCTensorBinding,
     MegaMHCWorkspace,
     mega_mhc,
+)
+from .factory import (
+    MegaMHCPreparedLauncherRegistry,
+    PreparedMegaMHCLauncher,
+    create_mega_mhc_context,
 )
 
 __all__ = [
@@ -29,7 +35,11 @@ __all__ = [
     "MegaMHCContext",
     "MegaMHCLauncher",
     "MegaMHCProfile",
+    "MegaMHCPreparedLauncherRegistry",
     "MegaMHCStaticBinding",
+    "MegaMHCTensorBinding",
     "MegaMHCWorkspace",
+    "PreparedMegaMHCLauncher",
+    "create_mega_mhc_context",
     "mega_mhc",
 ]
