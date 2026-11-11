@@ -30,6 +30,7 @@ from flaggems_vllm.ops.flash_kernel import (
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.random_utils import philox_backend_seed_offset
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 logger = logging.getLogger(__name__)
 _debug = False
@@ -37,6 +38,42 @@ _debug = False
 
 def CHECK_DEVICE(x):
     assert x.device.type == flaggems_vllm.device
+
+
+def paged_kv_num_stages(num_stages, block_m, block_k, num_ctas, num_sms):
+    """Prefetch depth of the paged K/V loop of flash_varlen_fwd_kernel.
+
+    Few resident CTAs per SM leave the loop latency-bound, so a deeper prefetch
+    (5 stages) wins; many CTAs per SM are better served by occupancy (2 stages).
+    ``load`` approximates the CTAs per SM weighted by the K/V tile size (a
+    head_dim of 128 counts once). Thresholds measured on H20 with the load
+    merge in place over decode, chunked prefill and prefill shapes (head_dim
+    64-256, page 16/64).
+    """
+    load = num_ctas * max(block_k, 64) / 128 / max(num_sms, 1)
+    if block_m <= 32:
+        return 5 if load <= 2.5 else 2
+    if block_k > 128:
+        return num_stages
+    if block_m == 64 or load <= 2.5:
+        return 5
+    return num_stages
+
+
+def heuristic_pipeline_options(cfg, args):
+    """FlagTree pipeline options carried by a heuristic config entry.
+
+    A heuristic entry may set per-shape pipeline options next to ``BLOCK_M``
+    and ``num_stages`` (e.g. ``pipeline_merge_loads`` for the 128-row prefill
+    tile).
+    """
+    return pipeline_options(
+        **{
+            name: value(args)
+            for name, value in cfg.items()
+            if name.startswith("pipeline_")
+        }
+    )
 
 
 class fwd_params:
@@ -615,6 +652,17 @@ def mha_varlan_fwd(
                 "num_warps": cfg["num_warps"](args),
                 "num_stages": 1 if not is_paged else cfg["num_stages"](args),
             }
+            if is_paged and pipeline_options(pipeline_merge_loads="all"):
+                cfg_params["num_stages"] = paged_kv_num_stages(
+                    cfg_params["num_stages"],
+                    cfg_params["BLOCK_M"],
+                    cfg_params["BLOCK_K"],
+                    triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
+                    * batch_size
+                    * num_heads,
+                    num_sms,
+                )
+            cfg_params.update(heuristic_pipeline_options(cfg, args))
 
             logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
             kernel(*args, **cfg_params)
@@ -988,6 +1036,18 @@ def mha_varlan_fwd_opt(
             "num_warps": cfg["num_warps"](args),
             "num_stages": 1 if not is_paged else cfg["num_stages"](args),
         }
+        if is_paged and pipeline_options(pipeline_merge_loads="all"):
+            cfg_params["num_stages"] = paged_kv_num_stages(
+                cfg_params["num_stages"],
+                cfg_params["BLOCK_M"],
+                cfg_params["BLOCK_K"],
+                triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
+                * batch_size
+                * num_heads,
+                num_sms,
+            )
+
+        cfg_params.update(heuristic_pipeline_options(cfg, args))
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
         kernel(*args, **cfg_params)

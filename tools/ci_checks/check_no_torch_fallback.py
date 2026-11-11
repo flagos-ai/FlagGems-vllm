@@ -82,6 +82,11 @@ ALLOWED_TORCH_NAMESPACES = {
 PRAGMA = "allow-torch-compute"
 VENDOR_SUBDIRS = ("ops", "fused", "FLA")
 
+# Per-file exemptions for torch compute calls that dispatch to a vendor-native
+# kernel rather than falling back to CPU/CUDA.  Key: path suffix (posix);
+# value: set of fully-qualified call names that are allowed in that file.
+FILE_ALLOWLIST: dict[str, set[str]] = {}
+
 
 def dotted(node: ast.AST) -> str | None:
     parts: list[str] = []
@@ -136,12 +141,18 @@ def check_file(path: Path) -> list[str]:
         return [f"{path}:{exc.lineno}: cannot parse ({exc.msg})"]
     lines = source.splitlines()
     aliases = functional_aliases(tree)
+    posix = path.as_posix()
+    file_allowed = next(
+        (v for k, v in FILE_ALLOWLIST.items() if posix.endswith(k)), set()
+    )
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         name = dotted(node.func)
         if not name or not classify(name, aliases):
+            continue
+        if name in file_allowed:
             continue
         if PRAGMA in lines[node.lineno - 1]:
             continue

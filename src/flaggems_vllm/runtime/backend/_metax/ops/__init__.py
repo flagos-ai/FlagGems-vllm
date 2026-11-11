@@ -18,6 +18,9 @@ from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
+    cp_gather_indexer_k_quant_cache,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -56,6 +59,7 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_deepseek_v4_qnorm_rope_kv_ro
 )
 
 __all__ = [
+    "cp_gather_indexer_k_quant_cache",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
