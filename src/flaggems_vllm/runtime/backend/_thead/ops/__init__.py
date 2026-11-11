@@ -44,9 +44,7 @@ from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_matmul import (
-    w8a8_block_int8_matmul,
-)
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
@@ -54,6 +52,7 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "hc_combine",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "int8_einsum",
@@ -61,10 +60,11 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "quantize_gdn_state_int8",
+    "qwen4_hc_inject_combine",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",
-    "w8a8_block_int8_matmul",
+    "w8a8_block_matmul",
 ]
 
 # Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
@@ -72,3 +72,8 @@ if "mm_w8a8_int8" in vars(flag_gems):
     from flaggems_vllm.runtime.backend._thead.ops.bmm_w8a8_int8 import bmm_w8a8_int8
 
     __all__ += ["bmm_w8a8_int8"]
+
+from flaggems_vllm.runtime.backend._thead.ops.hc_combine import hc_combine
+from flaggems_vllm.runtime.backend._thead.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
+)

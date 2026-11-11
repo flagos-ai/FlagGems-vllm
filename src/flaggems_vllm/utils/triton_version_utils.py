@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import re
 
 import triton
@@ -84,3 +85,33 @@ def has_tle_device_mesh() -> bool:
 
 
 HAS_TLE_DEVICE_MESH = has_tle_device_mesh()
+
+
+@functools.lru_cache(maxsize=None)
+def _pipeline_option_names() -> frozenset:
+    try:
+        from triton.compiler.compiler import make_backend
+        from triton.runtime.driver import driver
+
+        options = make_backend(driver.active.get_current_target()).parse_options({})
+    except Exception:
+        return frozenset()
+    return frozenset(
+        name
+        for name in type(options).__dataclass_fields__
+        if name.startswith("pipeline_")
+    )
+
+
+def pipeline_options(**options) -> dict:
+    """Keep the FlagTree pipeline options the active backend accepts.
+
+    ``pipeline_*`` are per-kernel compile options of the FlagTree software
+    pipeliner, read from the option class of whichever backend is active. One
+    that does not have them rejects them as unknown launch keywords, so they
+    are dropped and the kernel keeps its own configuration. Pass the result as
+    launch keywords or into a ``triton.Config``; where an accepted option
+    takes effect is the compiler's decision.
+    """
+    names = _pipeline_option_names()
+    return {name: value for name, value in options.items() if name in names}

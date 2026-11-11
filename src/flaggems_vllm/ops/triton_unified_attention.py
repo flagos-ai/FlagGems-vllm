@@ -29,6 +29,9 @@ import torch  # noqa: F401
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
+
 
 @triton.jit
 def _paged_attn_fwd(
@@ -224,6 +227,22 @@ def _paged_attn_fwd(
     )
 
 
+def _decode_num_stages(num_stages, num_ctas, max_seqlen_k, device):
+    """Prefetch depth of the decode K/V loop (head_dim <= 128) with FlagTree.
+
+    With few CTAs per SM the loop is latency-bound and 5 stages win once the
+    duplicate page-id loads are merged; from about 2 CTAs per SM on, the deeper
+    prefetch costs occupancy and the fixed configuration is kept. Thresholds
+    measured on H20 (decode, 1-128 requests).
+    """
+    num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
+    if num_ctas > 1.7 * num_sms:
+        return num_stages
+    if num_ctas >= 16 or max_seqlen_k >= 8192:
+        return 5
+    return num_stages
+
+
 def triton_unified_attention(
     q,  # [total_tokens, num_query_heads, head_size]
     k,  # [num_blocks, block_size, num_kv_heads, head_size]
@@ -266,6 +285,10 @@ def triton_unified_attention(
             TILE_KV = 64
             num_warps = 4
             num_stages = 3
+            if pipeline_options(pipeline_merge_loads="all"):
+                num_stages = _decode_num_stages(
+                    num_stages, num_kv_heads * num_seqs, max_seqlen_k, q.device
+                )
         else:
             TILE_KV = 32
             num_warps = 4
