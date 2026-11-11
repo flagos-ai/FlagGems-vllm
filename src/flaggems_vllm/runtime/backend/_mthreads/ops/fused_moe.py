@@ -18,8 +18,8 @@ import os
 from enum import Enum
 from typing import Any, Optional
 
+import flag_gems
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 import yaml
@@ -874,23 +874,22 @@ def apply_moe_activation(
     elif activation == MoEActivation.GELU:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.gelu(gate) * up)
+        output.copy_(flag_gems.gelu(gate, approximate="none") * up)
     elif activation == MoEActivation.SWIGLUSTEP:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(torch.sigmoid(gate) * up)
+        output.copy_(flag_gems.sigmoid(gate) * up)
     elif activation == MoEActivation.RELU2:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.relu(gate).square() * up)
+        output.copy_(flag_gems.relu(gate).square() * up)
 
     elif activation == MoEActivation.SILU_NO_MUL:
-        output.copy_(F.silu(input))
+        output.copy_(flag_gems.silu(input))
     elif activation == MoEActivation.GELU_NO_MUL:
-        output.copy_(F.gelu(input))
+        output.copy_(flag_gems.gelu(input, approximate="none"))
     elif activation == MoEActivation.RELU2_NO_MUL:
-        F.relu(input, inplace=True)
-        torch.square(input, out=output)
+        output.copy_(flag_gems.square(flag_gems.relu(input)))
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -2082,13 +2081,12 @@ def dispatch_fused_moe_kernel(
         )
 
 
-def fused_experts_impl(
+def _fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -2132,7 +2130,6 @@ def fused_experts_impl(
             w2,
             topk_weights,
             topk_ids,
-            inplace=inplace,
             use_fp8_w8a8=True,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -2152,9 +2149,7 @@ def fused_experts_impl(
         w2_bias,
         expert_map,
     ):
-        return nopad_fused_moe(
-            hidden_states, w1, w2, topk_weights, topk_ids, inplace=inplace
-        )
+        return nopad_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids)
 
     logger.debug("GEMS FUSED MOE")
     assert (
@@ -2256,7 +2251,7 @@ def fused_experts_impl(
     else:
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+    out_hidden_states = torch.empty_like(hidden_states)
 
     if ocp_mx_scheme is not None:
         # Dequantize OCP MX weights (TODO: skip on platforms with native MX)
@@ -2295,7 +2290,10 @@ def fused_experts_impl(
         use_int8_w8a16 = False
         use_int4_w4a16 = False
 
-    direct_sum_supported = is_plain_half_config or is_fp8_blockwise
+    # bf16 atomics are not available on every MUSA Triton build.
+    direct_sum_supported = (
+        is_plain_half_config or is_fp8_blockwise
+    ) and hidden_states.dtype != torch.bfloat16
 
     # Check if we can safely fuse the activation with the first GEMM pass
     can_use_fused_silu = (
@@ -2498,7 +2496,7 @@ def fused_experts_impl(
     return out_hidden_states
 
 
-def inplace_fused_experts(
+def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -2510,91 +2508,44 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-) -> None:
-    """
-    In-place fused MoE: writes output directly into ``hidden_states``.
-
-    Same semantics as ``fused_experts_impl(..., inplace=True)``.
-    Returns None (the result is stored in ``hidden_states``).
-    """
-    fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace=True,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        global_num_experts=global_num_experts,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-    )
-
-
-def outplace_fused_experts(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
+    expert_map: torch.Tensor | None = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_shape: list[int] | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Out-of-place fused MoE: allocates and returns a new output tensor.
+    """Fused MoE forward with the vLLM fused_experts_impl signature.
 
-    Same semantics as ``fused_experts_impl(..., inplace=False)``.
+    Always allocates and returns a new output tensor.
     """
-    return fused_experts_impl(
+    return _fused_experts_impl(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation=activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        ocp_mx_scheme=ocp_mx_scheme,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
+        expert_map=expert_map,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
@@ -2602,32 +2553,6 @@ def outplace_fused_experts(
         w2_bias=w2_bias,
     )
 
-
-# =============================================================================
-# Nopad fused MoE (integrated from nopad_moe.py -- 2026-08-14)
-# Independent scheduler (no sentinel rows) for large-M half MoE. See
-# _can_use_nopad_moe above for the routing condition.
-# =============================================================================
-"""
-Pure-Triton nopad grouped-GEMM fused MoE pipeline (no external GEMM library).
-
-Implements the DeepGemm GroupedNoPad scheduling idea in Triton: each program
-handles a contiguous row block of a single expert, with rows indexed through
-``sorted_ids`` and the expert weight base = ``w1 + expert * N * K``. No global
-row padding is introduced (padding only within each expert's tail block).
-
-MUSA engineering optimizations (vs the PPU baseline port):
-- Buffer reuse: meta/data cached by (M, device) key -- no per-call ~300MB alloc
-- Minimal zeroing: only counts/counters cleared per call (~1KB)
-- counts.max().item() called once (shared by gemm1/gemm2 grids)
-- GEMM1 gate+up fused via FUSE_SILU (single launch incl. activation; no
-  separate silu kernel, no second up pass, no column-offset path)
-  -> 6 launches total
-
-Pipeline (all Triton):
-    permute (histogram -> cumsum -> assign) -> nopad gemm1 (+FUSE_SILU)
-      -> nopad gemm2 -> unpermute + top-k weighted reduce
-"""
 
 _HIST_BLOCK = 4096
 _ASSIGN_BLOCK = 1024
@@ -2643,7 +2568,6 @@ _NOPAD_CFG = {
 }
 
 
-@triton.jit
 def _histogram_kernel(topk_ids_ptr, counts_ptr, numel, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -2909,7 +2833,6 @@ def nopad_fused_moe(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    inplace: bool = False,
     cfg_g1=None,
     cfg_g2=None,
     use_fp8_w8a8: bool = False,
@@ -2934,7 +2857,7 @@ def nopad_fused_moe(
     counts, start, counters, sorted_ids, inv_perm, gate, cache3 = _get_buffers(
         M, E, H, n_inter, topk, device, dtype
     )
-    out = hidden_states if inplace else torch.empty((M, H), device=device, dtype=dtype)
+    out = torch.empty((M, H), device=device, dtype=dtype)
 
     ti_flat = topk_ids.reshape(-1)
     _histogram_kernel[(triton.cdiv(numel, _HIST_BLOCK),)](
