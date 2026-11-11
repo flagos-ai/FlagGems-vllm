@@ -16,22 +16,10 @@ import logging
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-
-if has_triton_tle(3, 6, 0):
-    try:
-        import triton.experimental.tle.language as tle
-
-        HAS_TLE = True
-    except ImportError:
-        tle = None
-        HAS_TLE = False
-else:
-    tle = None
-    HAS_TLE = False
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils import triton_lang_extension as ext
