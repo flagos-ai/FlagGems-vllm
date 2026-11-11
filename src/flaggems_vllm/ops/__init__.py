@@ -330,7 +330,6 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
-    "LogprobTokenIdsState",
     "mhc_bwd",
     "mhc_bwd_ref",
     "mhc_fused_post_pre_with_norm",

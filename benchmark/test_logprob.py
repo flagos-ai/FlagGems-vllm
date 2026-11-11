@@ -179,7 +179,7 @@ def _print_summary():
             + " |"
         )
 
-    print("\ncompute_topk_scores performance (eager do_bench GPU time)")
+    print("\ncompute_topk_scores performance (do_bench GPU time)")
     print(f"Device: {flaggems_vllm.device}")
     timer = (
         "Ascend do_bench_npu defaults"

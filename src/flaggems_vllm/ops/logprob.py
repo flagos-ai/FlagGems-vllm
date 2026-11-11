@@ -27,6 +27,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.device_info import get_device_capability
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
@@ -100,7 +101,6 @@ HAS_TLE = _TLE_CLUSTER_SUPPORTED
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
-_FULL_SORT_VOCAB_THRESHOLD = 1024
 _BATCH_CLUSTER_THRESHOLD = 59
 _SMALL_BATCH_CLUSTER_SIZE = 16
 _LARGE_BATCH_CLUSTER_SIZE = 8
@@ -382,7 +382,6 @@ def compute_token_logprobs(
     # max + logsumexp per row and only emits logprobs at `token_ids`.
     batch_size, vocab_size = logits.shape
     assert (sampled_token_ids is None) == (token_ranks is None)
-    token_ids = token_ids.to(torch.int64)
     num_logprobs = token_ids.shape[1]
     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
     # Cap the kernel's per-iteration width so very large num_logprobs requests
@@ -436,11 +435,583 @@ def compute_token_logprobs(
     return logprobs
 
 
-def _topk_indices(logits: torch.Tensor, k: int) -> torch.Tensor:
+@triton.jit
+def _topk_chunk_candidates_kernel(
+    logits_ptr,
+    logits_stride,
+    candidates_ptr,
+    num_chunks,
+    vocab_size,
+    TOPK_PAD: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    values = tl.load(
+        logits_ptr + row * logits_stride + offsets,
+        mask=offsets < vocab_size,
+        other=float("-inf"),
+    ).to(tl.float32)
+    bits = values.to(tl.uint32, bitcast=True)
+    key = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    packed = (key.to(tl.uint64) << 32) | (0xFFFFFFFF - offsets.to(tl.uint64))
+    packed = tl.where(offsets < vocab_size, packed, 0)
+    if TOPK_PAD == 1:
+        selected = tl.max(packed)
+        tl.store(candidates_ptr + row * num_chunks + chunk, selected)
+    else:
+        selected = tl.topk(packed, TOPK_PAD)
+        positions = tl.arange(0, TOPK_PAD)
+        tl.store(
+            candidates_ptr + (row * num_chunks + chunk) * TOPK_PAD + positions,
+            selected,
+        )
+
+
+@triton.jit
+def _topk_merge_candidates_kernel(
+    candidates_ptr,
+    output_ptr,
+    sampled_ptr,
+    num_chunks,
+    num_topk,
+    TOPK_PAD: tl.constexpr,
+    MERGE_SIZE: tl.constexpr,
+    PACK_SAMPLED: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if PACK_SAMPLED:
+        tl.store(
+            output_ptr + row * (num_topk + 1),
+            tl.load(sampled_ptr + row),
+        )
+    positions = tl.arange(0, MERGE_SIZE)
+    candidates = tl.load(
+        candidates_ptr + row * num_chunks * TOPK_PAD + positions,
+        mask=positions < num_chunks * TOPK_PAD,
+        other=0,
+    )
+    if TOPK_PAD == 1:
+        selected = tl.max(candidates)
+        token_id = 0xFFFFFFFF - (selected & 0xFFFFFFFF)
+        tl.store(
+            output_ptr + row * (num_topk + PACK_SAMPLED) + PACK_SAMPLED,
+            token_id.to(tl.int64),
+        )
+    else:
+        selected = tl.topk(candidates, TOPK_PAD)
+        topk_positions = tl.arange(0, TOPK_PAD)
+        token_ids = 0xFFFFFFFF - (selected & 0xFFFFFFFF)
+        tl.store(
+            output_ptr
+            + row * (num_topk + PACK_SAMPLED)
+            + PACK_SAMPLED
+            + topk_positions,
+            token_ids.to(tl.int64),
+            mask=topk_positions < num_topk,
+        )
+
+
+@triton.jit
+def _sort_token_chunks_kernel(
+    logits_ptr,
+    sampled_ptr,
+    logits_stride,
+    sorted_keys_ptr,
+    partial_lse_ptr,
+    sorted_stride,
+    vocab_size,
+    NUM_CHUNKS: tl.constexpr,
+    SORT_CHUNK: tl.constexpr,
+    COMPUTE_LSE: tl.constexpr,
+    COMPUTE_RANK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    offsets = chunk * SORT_CHUNK + tl.arange(0, SORT_CHUNK)
+    values = tl.load(
+        logits_ptr + row * logits_stride + offsets,
+        mask=offsets < vocab_size,
+        other=float("-inf"),
+    ).to(tl.float32)
+    if COMPUTE_RANK:
+        sampled_id = tl.load(sampled_ptr + row)
+        sampled_value = tl.load(logits_ptr + row * logits_stride + sampled_id).to(
+            tl.float32
+        )
+        chunk_rank = tl.sum(
+            ((offsets < vocab_size) & (values >= sampled_value)).to(tl.int32)
+        )
+        tl.store(
+            partial_lse_ptr + (row * 3 + 2) * NUM_CHUNKS + chunk,
+            chunk_rank,
+            mask=chunk < NUM_CHUNKS,
+        )
+    if COMPUTE_LSE:
+        chunk_max = tl.max(values)
+        chunk_sum = tl.sum(tl.exp(values - chunk_max))
+        tl.store(
+            partial_lse_ptr + row * 3 * NUM_CHUNKS + chunk,
+            chunk_max,
+            mask=chunk < NUM_CHUNKS,
+        )
+        tl.store(
+            partial_lse_ptr + (row * 3 + 1) * NUM_CHUNKS + chunk,
+            chunk_sum,
+            mask=chunk < NUM_CHUNKS,
+        )
+    bits = values.to(tl.uint32, bitcast=True)
+    key = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    packed = (key.to(tl.uint64) << 32) | (0xFFFFFFFF - offsets.to(tl.uint64))
+    packed = tl.where(offsets < vocab_size, packed, 0)
+    ordered = tl.sort(packed, descending=True)
+    tl.store(
+        sorted_keys_ptr + row * sorted_stride + offsets,
+        ordered,
+    )
+
+
+@triton.jit
+def _merge_four_sorted_runs_kernel(
+    source_ptr,
+    destination_ptr,
+    sorted_stride,
+    RUN_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offsets = tl.arange(0, 4 * RUN_SIZE)
+    keys = tl.load(source_ptr + row * sorted_stride + group * 4 * RUN_SIZE + offsets)
+    pair_local = offsets % (2 * RUN_SIZE)
+    first_index = (offsets // (2 * RUN_SIZE)) * 2 * RUN_SIZE + tl.where(
+        pair_local < RUN_SIZE,
+        pair_local,
+        3 * RUN_SIZE - 1 - pair_local,
+    )
+    pairs = tl.gather(keys, first_index, axis=0)
+    pairs = tl.reshape(pairs, (2, 2 * RUN_SIZE))
+    pairs = tl.bitonic_merge(pairs, descending=True)
+    pairs = tl.reshape(pairs, (4 * RUN_SIZE,))
+    second_index = tl.where(
+        offsets < 2 * RUN_SIZE,
+        offsets,
+        6 * RUN_SIZE - 1 - offsets,
+    )
+    merged = tl.bitonic_merge(tl.gather(pairs, second_index, axis=0), descending=True)
+    tl.store(
+        destination_ptr + row * sorted_stride + group * 4 * RUN_SIZE + offsets,
+        merged,
+    )
+
+
+@triton.jit
+def _merge_sorted_token_runs_kernel(
+    source_ptr,
+    destination_ptr,
+    output_ptr,
+    sampled_ptr,
+    logits_ptr,
+    logits_stride,
+    scores_ptr,
+    ranks_ptr,
+    partial_lse_ptr,
+    sorted_stride,
+    vocab_size,
+    num_topk,
+    RUN_SIZE: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    PACK_SAMPLED: tl.constexpr,
+    FINAL: tl.constexpr,
+    FUSED_LOGITS: tl.constexpr,
+    FUSED_LOGPROBS: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+    LSE_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    positions = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = positions < vocab_size
+    pair_start = (positions // (2 * RUN_SIZE)) * (2 * RUN_SIZE)
+    first_run = positions - pair_start < RUN_SIZE
+    own_start = tl.where(first_run, pair_start, pair_start + RUN_SIZE)
+    other_start = tl.where(first_run, pair_start + RUN_SIZE, pair_start)
+    own_position = positions - own_start
+    other_count = tl.minimum(RUN_SIZE, tl.maximum(vocab_size - other_start, 0))
+    key = tl.load(source_ptr + row * sorted_stride + positions, mask=valid, other=0)
+    lower = tl.full([BLOCK_SIZE], 0, tl.int32)
+    upper = other_count
+    for _ in tl.static_range(SEARCH_STEPS):
+        middle = (lower + upper) // 2
+        other_key = tl.load(
+            source_ptr + row * sorted_stride + other_start + middle,
+            mask=valid & (middle < other_count),
+            other=0,
+        )
+        greater = (middle < other_count) & (other_key > key)
+        lower = tl.where(greater, middle + 1, lower)
+        upper = tl.where(greater, upper, middle)
+    result_position = pair_start + own_position + lower
+    if FINAL:
+        token_id = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+        tl.store(
+            output_ptr
+            + row * (num_topk + PACK_SAMPLED)
+            + PACK_SAMPLED
+            + result_position,
+            token_id.to(tl.int64),
+            mask=valid & (result_position < num_topk),
+        )
+        if FUSED_LOGITS or FUSED_LOGPROBS:
+            ordered_bits = (key >> 32).to(tl.uint32)
+            score_bits = tl.where(
+                (ordered_bits & 0x80000000) != 0,
+                ordered_bits ^ 0x80000000,
+                ~ordered_bits,
+            )
+            score = score_bits.to(tl.float32, bitcast=True)
+            if FUSED_LOGPROBS:
+                chunks = tl.arange(0, LSE_BLOCK)
+                maxima = tl.load(
+                    partial_lse_ptr + row * 3 * NUM_CHUNKS + chunks,
+                    mask=chunks < NUM_CHUNKS,
+                    other=float("-inf"),
+                )
+                sums = tl.load(
+                    partial_lse_ptr + (row * 3 + 1) * NUM_CHUNKS + chunks,
+                    mask=chunks < NUM_CHUNKS,
+                    other=0,
+                )
+                global_max = tl.max(maxima)
+                logsumexp = global_max + tl.log(
+                    tl.sum(sums * tl.exp(maxima - global_max))
+                )
+                score -= logsumexp
+            tl.store(
+                scores_ptr + row * (vocab_size + 1) + 1 + result_position,
+                score,
+                mask=valid,
+            )
+        if tl.program_id(1) == 0 and PACK_SAMPLED:
+            sampled_id = tl.load(sampled_ptr + row)
+            tl.store(output_ptr + row * (num_topk + 1), sampled_id)
+            if FUSED_LOGITS or FUSED_LOGPROBS:
+                sampled_value = tl.load(
+                    logits_ptr + row * logits_stride + sampled_id
+                ).to(tl.float32)
+                if FUSED_LOGPROBS:
+                    tl.store(
+                        scores_ptr + row * (vocab_size + 1),
+                        sampled_value - logsumexp,
+                    )
+                else:
+                    tl.store(scores_ptr + row * (vocab_size + 1), sampled_value)
+                chunks = tl.arange(0, LSE_BLOCK)
+                partial_ranks = tl.load(
+                    partial_lse_ptr + (row * 3 + 2) * NUM_CHUNKS + chunks,
+                    mask=chunks < NUM_CHUNKS,
+                    other=0,
+                )
+                rank = tl.sum(partial_ranks)
+                rank += tl.where(
+                    sampled_value == float("-inf"),
+                    (8192 - vocab_size % 8192) % 8192,
+                    0,
+                )
+                tl.store(ranks_ptr + row, rank.to(tl.int64))
+    else:
+        tl.store(
+            destination_ptr + row * sorted_stride + result_position,
+            key,
+            mask=valid,
+        )
+
+
+@triton.jit
+def _unpack_sorted_token_indices_kernel(
+    sorted_keys_ptr,
+    sorted_stride,
+    output_ptr,
+    sampled_ptr,
+    vocab_size,
+    num_topk,
+    BLOCK_SIZE: tl.constexpr,
+    PACK_SAMPLED: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if PACK_SAMPLED and tl.program_id(1) == 0:
+        tl.store(
+            output_ptr + row * (num_topk + 1),
+            tl.load(sampled_ptr + row),
+        )
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    keys = tl.load(
+        sorted_keys_ptr + row * sorted_stride + offsets,
+        mask=offsets < num_topk,
+        other=0,
+    )
+    ids = 0xFFFFFFFF - (keys & 0xFFFFFFFF)
+    tl.store(
+        output_ptr + row * (num_topk + PACK_SAMPLED) + PACK_SAMPLED + offsets,
+        ids.to(tl.int64),
+        mask=offsets < num_topk,
+    )
+
+
+@triton.jit
+def _init_topk_ranges_kernel(
+    starts_ptr,
+    ends_ptr,
+    batch_size,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    rows = tl.arange(0, BLOCK_SIZE)
+    tl.store(starts_ptr + rows, 0, mask=rows < batch_size)
+    tl.store(ends_ptr + rows, vocab_size, mask=rows < batch_size)
+
+
+@triton.jit
+def _cast_topk_logits_kernel(
+    input_ptr,
+    output_ptr,
+    input_stride,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    values = tl.load(
+        input_ptr + row * input_stride + offsets,
+        mask=offsets < vocab_size,
+        other=0,
+    )
+    tl.store(
+        output_ptr + row * vocab_size + offsets,
+        values.to(tl.float32),
+        mask=offsets < vocab_size,
+    )
+
+
+@triton.jit
+def _sort_selected_topk_indices_kernel(
+    logits_ptr,
+    logits_stride,
+    selected_ptr,
+    output_ptr,
+    sampled_ptr,
+    num_topk,
+    SORT_SIZE: tl.constexpr,
+    PACK_SAMPLED: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if PACK_SAMPLED:
+        tl.store(
+            output_ptr + row * (num_topk + 1),
+            tl.load(sampled_ptr + row),
+        )
+    positions = tl.arange(0, SORT_SIZE)
+    ids = tl.load(
+        selected_ptr + row * num_topk + positions,
+        mask=positions < num_topk,
+        other=0,
+    )
+    values = tl.load(
+        logits_ptr + row * logits_stride + ids,
+        mask=positions < num_topk,
+        other=float("-inf"),
+    ).to(tl.float32)
+    bits = values.to(tl.uint32, bitcast=True)
+    key = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    packed = (key.to(tl.uint64) << 32) | (0xFFFFFFFF - ids.to(tl.uint64))
+    packed = tl.where(positions < num_topk, packed, 0)
+    ordered = tl.sort(packed, descending=True)
+    token_ids = 0xFFFFFFFF - (ordered & 0xFFFFFFFF)
+    tl.store(
+        output_ptr + row * (num_topk + PACK_SAMPLED) + PACK_SAMPLED + positions,
+        token_ids.to(tl.int64),
+        mask=positions < num_topk,
+    )
+
+
+def _topk_indices(
+    logits: torch.Tensor,
+    k: int,
+    sampled_token_ids: torch.Tensor | None = None,
+    fused_scores: torch.Tensor | None = None,
+    fused_ranks: torch.Tensor | None = None,
+    fused_logprobs: bool = False,
+) -> torch.Tensor:
     vocab_size = logits.shape[-1]
-    if k == vocab_size and vocab_size >= _FULL_SORT_VOCAB_THRESHOLD:
-        return torch.sort(logits, dim=-1, descending=True).indices
-    return torch.topk(logits, k, dim=-1).indices
+    if k > vocab_size:
+        raise RuntimeError("selected index k out of range")
+    pack_sampled = sampled_token_ids is not None
+    if k <= 32:
+        batch_size = logits.shape[0]
+        block_size = 1024
+        topk_pad = triton.next_power_of_2(k)
+        num_chunks = triton.cdiv(vocab_size, block_size)
+        candidates = torch.empty(
+            (batch_size, num_chunks * topk_pad),
+            dtype=torch.uint64,
+            device=logits.device,
+        )
+        indices = torch.empty(
+            (batch_size, k + pack_sampled), dtype=torch.int64, device=logits.device
+        )
+        _topk_chunk_candidates_kernel[(batch_size, num_chunks)](
+            logits,
+            logits.stride(0),
+            candidates,
+            num_chunks,
+            vocab_size,
+            TOPK_PAD=topk_pad,
+            BLOCK_SIZE=block_size,
+        )
+        _topk_merge_candidates_kernel[(batch_size,)](
+            candidates,
+            indices,
+            sampled_token_ids if pack_sampled else indices,
+            num_chunks,
+            k,
+            TOPK_PAD=topk_pad,
+            MERGE_SIZE=triton.next_power_of_2(num_chunks * topk_pad),
+            PACK_SAMPLED=pack_sampled,
+        )
+        return indices
+    if k < vocab_size and k <= 16384:
+        batch_size = logits.shape[0]
+        if logits.dtype == torch.float32:
+            selection_logits = logits
+        else:
+            selection_logits = torch.empty(
+                (batch_size, vocab_size), dtype=torch.float32, device=logits.device
+            )
+            _cast_topk_logits_kernel[(batch_size, triton.cdiv(vocab_size, 1024))](
+                logits,
+                selection_logits,
+                logits.stride(0),
+                vocab_size,
+                BLOCK_SIZE=1024,
+            )
+        starts = torch.empty((batch_size,), dtype=torch.int32, device=logits.device)
+        ends = torch.empty_like(starts)
+        _init_topk_ranges_kernel[(1,)](
+            starts,
+            ends,
+            batch_size,
+            vocab_size,
+            BLOCK_SIZE=triton.next_power_of_2(batch_size),
+        )
+        selected = torch.empty((batch_size, k), dtype=torch.int32, device=logits.device)
+        indices = torch.empty(
+            (batch_size, k + pack_sampled), dtype=torch.int64, device=logits.device
+        )
+        top_k_per_row_prefill(
+            selection_logits,
+            starts,
+            ends,
+            selected,
+            batch_size,
+            selection_logits.stride(0),
+            selection_logits.stride(1),
+            k,
+        )
+        _sort_selected_topk_indices_kernel[(batch_size,)](
+            selection_logits,
+            selection_logits.stride(0),
+            selected,
+            indices,
+            sampled_token_ids if pack_sampled else indices,
+            k,
+            SORT_SIZE=triton.next_power_of_2(k),
+            PACK_SAMPLED=pack_sampled,
+            num_warps=8,
+        )
+        return indices
+    if k <= vocab_size:
+        batch_size = logits.shape[0]
+        sort_chunk = 1024 if batch_size < _BATCH_CLUSTER_THRESHOLD else 512
+        num_chunks = triton.cdiv(vocab_size, sort_chunk)
+        padded_chunks = triton.next_power_of_2(num_chunks)
+        sorted_stride = padded_chunks * sort_chunk
+        partial_lse = (
+            torch.empty(
+                (batch_size, 3, num_chunks),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            if fused_scores is not None
+            else None
+        )
+        source = torch.empty(
+            (batch_size, sorted_stride), dtype=torch.uint64, device=logits.device
+        )
+        destination = torch.empty_like(source)
+        indices = torch.empty(
+            (batch_size, k + pack_sampled), dtype=torch.int64, device=logits.device
+        )
+        _sort_token_chunks_kernel[(batch_size, padded_chunks)](
+            logits,
+            sampled_token_ids if pack_sampled else logits,
+            logits.stride(0),
+            source,
+            partial_lse if fused_scores is not None else source,
+            sorted_stride,
+            vocab_size,
+            NUM_CHUNKS=num_chunks,
+            SORT_CHUNK=sort_chunk,
+            COMPUTE_LSE=fused_logprobs,
+            COMPUTE_RANK=fused_scores is not None,
+            num_warps=8,
+        )
+        run_size = sort_chunk
+        if sorted_stride >= 8 * sort_chunk:
+            _merge_four_sorted_runs_kernel[
+                (batch_size, sorted_stride // (4 * sort_chunk))
+            ](source, destination, sorted_stride, RUN_SIZE=sort_chunk, num_warps=8)
+            source, destination = destination, source
+            run_size = 4 * sort_chunk
+        while run_size < sorted_stride:
+            final = run_size * 2 >= sorted_stride
+            _merge_sorted_token_runs_kernel[(batch_size, triton.cdiv(vocab_size, 128))](
+                source,
+                destination,
+                indices,
+                sampled_token_ids if pack_sampled else indices,
+                logits,
+                logits.stride(0),
+                fused_scores if fused_scores is not None else indices,
+                fused_ranks if fused_ranks is not None else indices,
+                partial_lse if fused_scores is not None else source,
+                sorted_stride,
+                vocab_size,
+                k,
+                RUN_SIZE=run_size,
+                SEARCH_STEPS=run_size.bit_length() + 1,
+                BLOCK_SIZE=128,
+                PACK_SAMPLED=pack_sampled,
+                FINAL=final,
+                FUSED_LOGITS=fused_scores is not None and not fused_logprobs,
+                FUSED_LOGPROBS=fused_logprobs,
+                NUM_CHUNKS=num_chunks,
+                LSE_BLOCK=triton.next_power_of_2(num_chunks),
+            )
+            if not final:
+                source, destination = destination, source
+            run_size *= 2
+        if sorted_stride == sort_chunk:
+            _unpack_sorted_token_indices_kernel[(batch_size, 1)](
+                source,
+                sorted_stride,
+                indices,
+                sampled_token_ids if pack_sampled else indices,
+                vocab_size,
+                k,
+                BLOCK_SIZE=sort_chunk,
+                PACK_SAMPLED=pack_sampled,
+            )
+        return indices
 
 
 def compute_topk_scores(
@@ -456,14 +1027,27 @@ def compute_topk_scores(
     assert num_logprobs >= 0
     batch_size, vocab_size = logits.shape
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
+    fused_full = (
+        max_per_req_token_ids == 0
+        and num_logprobs == vocab_size
+        and vocab_size > (1024 if batch_size < _BATCH_CLUSTER_THRESHOLD else 512)
+    )
+    if fused_full:
+        scores = logits.new_empty((batch_size, vocab_size + 1), dtype=torch.float32)
 
     if max_per_req_token_ids == 0:
         # Fast path: no request asked for custom logprob_token_ids.
         logprob_token_ids = sampled_token_ids.unsqueeze(-1)
         if num_logprobs > 0:
-            topk_indices = _topk_indices(logits, num_logprobs)
-            logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
-        if not logits_mode:
+            logprob_token_ids = _topk_indices(
+                logits,
+                num_logprobs,
+                sampled_token_ids,
+                scores if fused_full else None,
+                token_ranks if fused_full else None,
+                fused_logprobs=fused_full and not logits_mode,
+            )
+        if not logits_mode and not fused_full:
             scores = compute_token_logprobs(
                 logits, logprob_token_ids, sampled_token_ids, token_ranks
             )
@@ -477,7 +1061,6 @@ def compute_topk_scores(
 
         if num_logprobs > 0:
             topk_token_ids = _topk_indices(logits, num_logprobs)
-            topk_token_ids = topk_token_ids.to(torch.int32)
         else:
             # This tensor just used as an int32 pointer, data not accessed.
             topk_token_ids = logprob_token_ids_state.token_ids.gpu
@@ -510,7 +1093,7 @@ def compute_topk_scores(
                 token_ranks,
                 valid_mask,
             )
-    if logits_mode:
+    if logits_mode and not fused_full:
         num_scores = logprob_token_ids.shape[1]
         scores = logits.new_empty((batch_size, num_scores), dtype=torch.float32)
         scores_block_size = min(triton.next_power_of_2(num_scores), _MAX_TOPK_BLOCK)
@@ -603,14 +1186,21 @@ def _fill_logprob_token_ids_kernel(
 
     if num_custom > 0:
         # Override topk with per-request custom tokens.
-        src = per_req_token_ids_ptr + req_state_idx * per_req_token_ids_stride
         valid = col < num_custom
+        tokens = tl.load(
+            per_req_token_ids_ptr + req_state_idx * per_req_token_ids_stride + col,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
     else:
         # Fill with topk indices (no-op when NUM_TOPK == 0).
-        src = topk_indices_ptr + batch_idx * topk_indices_stride
         valid = col < NUM_TOPK
+        tokens = tl.load(
+            topk_indices_ptr + batch_idx * topk_indices_stride + col,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
 
-    tokens = tl.load(src + col, mask=valid, other=0).to(tl.int64)
     tl.store(tid_base + col, tokens, mask=col < NUM_COLS)
     tl.store(mask_base + col, valid, mask=col < NUM_COLS)
 
