@@ -568,8 +568,8 @@ class QsaPrepareCase:
             self.main["main_kv_cache"].clone(),
         )
 
-    def run_kernel(self):
-        outputs = self.outputs()
+    def run_kernel(self, outputs=None):
+        outputs = self.outputs() if outputs is None else outputs
         main_q_out, main_gate_out = qsa_prepare(
             *self._launch_args(outputs),
             compress_ratio=COMPRESS_RATIO,
@@ -867,3 +867,48 @@ def test_qwen_qsa_prepare_main_qkv_storage_offset() -> None:
     assert qkv.storage_offset() == 256, qkv.storage_offset()
     assert qkv.stride(-1) == 1
     _assert_matches(case.run_kernel(), case.run_reference())
+
+
+@pytest.mark.qsa_prepare
+def test_qwen_qsa_prepare_compressed_cache_stride() -> None:
+    """A hit must not reuse stride scalars from a different compressed layout."""
+
+    case = QsaPrepareCase(
+        seq_lens=MIXED_BATCH[0],
+        query_lens=MIXED_BATCH[1],
+        history_lens=MIXED_BATCH[2],
+    )
+    page_elements = COMPRESSED_PAGE_SIZE * HEAD_DIM
+
+    def strided_cache(extra: int) -> torch.Tensor:
+        """Same shape as the case's cache, stride(0) differs by ``extra``."""
+
+        stride0 = page_elements + extra
+        storage = torch.zeros(
+            case.num_compressed_blocks * stride0,
+            dtype=case.base_compressed_cache.dtype,
+            device=case.device,
+        )
+        return torch.as_strided(
+            storage,
+            (case.num_compressed_blocks, COMPRESSED_PAGE_SIZE, 1, HEAD_DIM),
+            (stride0, HEAD_DIM, HEAD_DIM, 1),
+        )
+
+    # Two runs of the same shapes with different compressed strides.  The second
+    # must not reuse the first one's stride scalars.
+    for extra in (16, 32):
+        cache = strided_cache(extra)
+        assert cache.stride(0) == page_elements + extra
+        outputs = (
+            torch.empty(
+                case.num_tokens,
+                QUERY_HEADS,
+                HEAD_DIM,
+                dtype=case.indexer_dtype,
+                device=case.device,
+            ),
+            case.base_raw_cache.clone(),
+            cache,
+        )
+        _assert_matches(case.run_kernel(outputs), case.run_reference())

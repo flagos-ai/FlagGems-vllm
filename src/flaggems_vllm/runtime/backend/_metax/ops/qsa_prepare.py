@@ -1031,57 +1031,7 @@ def qsa_prepare(
     )
     if num_tokens == 0:
         return main_q_out, main_gate_out
-    cache_key = (
-        q.shape,
-        k.shape,
-        positions.ndim,
-        q_out.shape,
-        main_qkv.shape,
-        main_kv_cache.shape,
-        state_cache.shape,
-        compressed_cache.shape,
-        state_slots.shape,
-        compressed_slots.shape,
-        logical_positions.shape,
-        query_start_loc.shape,
-        state_block_table.shape,
-        k_work_metadata.shape,
-        q.stride(),
-        k.stride(),
-        q_out.stride(),
-        state_cache.stride(),
-        main_qkv.stride(),
-        main_kv_cache.stride(),
-        positions.stride(),
-        q.dtype,
-        k.dtype,
-        positions.dtype,
-        cos_sin_cache.dtype,
-        q_norm_weight.dtype,
-        k_norm_weight.dtype,
-        q_out.dtype,
-        state_cache.dtype,
-        state_slots.dtype,
-        state_block_table.dtype,
-        query_start_loc.dtype,
-        logical_positions.dtype,
-        compressed_cache.dtype,
-        compressed_slots.dtype,
-        k_work_metadata.dtype,
-        main_qkv.dtype,
-        main_q_norm_weight.dtype,
-        main_k_norm_weight.dtype,
-        main_kv_cache.dtype,
-        main_slot_mapping.dtype,
-        compress_ratio,
-        mrope_section,
-        rope_pos_offset,
-        eps,
-        main_eps,
-        main_k_scale,
-        main_v_scale,
-    )
-    watched = (
+    inputs = (
         q,
         k,
         positions,
@@ -1102,8 +1052,19 @@ def qsa_prepare(
         main_k_norm_weight,
         main_kv_cache,
         main_slot_mapping,
-        main_q_out,
-        main_gate_out,
+    )
+    # The two outputs are allocated per call, so they stay out of the key.
+    watched = inputs + (main_q_out, main_gate_out)
+
+    cache_key = (
+        tuple((tensor.shape, tensor.stride(), tensor.dtype) for tensor in inputs),
+        compress_ratio,
+        mrope_section,
+        rope_pos_offset,
+        eps,
+        main_eps,
+        main_k_scale,
+        main_v_scale,
     )
 
     cached = _HOST_CACHE.get(cache_key)
