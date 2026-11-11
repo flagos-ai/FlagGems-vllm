@@ -1,30 +1,37 @@
-"""GAP R1: ND -> zN staging for an L1-resident dot operand.
+"""GAP R1: GM -> L1 zN staging for an L1-resident dot operand (downgraded).
 
-F1 is now solved at the API level: 4D zN operands in L1 are consumable via
-`al.dot(..., format_a/b="fractal")` (see supported/s2_l1_resident_dot.py).  But the only way to build
-a zN tile from a 2D ND tile is a UB-side layout conversion
+AscendC does this natively: chunk_kda_fwd_prepare_cube.h:258-290 issues
+`AscendC::Nd2NzParams` + `AscendC::DataCopy` for **GM(ND) -> L1(NZ)**
+("后面的四次 MMAD 不再读 GM").  The source is the workspace payload that V6
+wrote to GM; the Cube path never touches UB.
+
+Triton has no such path: `al.copy` only accepts a UB source (or UB->UB), and
+`ascend_address_space` has no GM.  The only way to build a zN tile from a
+loaded 2D ND tile is therefore a UB-side layout conversion
 
     a_tmp = tl.permute(a.reshape(R, K // 16, 16), (1, 0, 2))
     a_nz = a_tmp.reshape(K // 16, R // 16, 16, 16)
     al.copy(bl.to_buffer(a_nz, al.ascend_address_space.UB), l1)
 
-and that conversion materialises a second 4D tile in UB.  In the KDA Gram
-kernel each program builds seven [64, 128] bf16 panels and runs six dots, and
-the extra UB tiles push the kernel over the 2.03 Mbit budget:
+and that conversion materialises a second 4D tile in UB.  In the *old*
+full-matrix KDA Gram formulation each program builds seven [64, 128] bf16
+panels and runs six 64x64 dots, and the extra UB tiles push the kernel over
+the 2.03 Mbit budget:
 
     MODE=plain  (six tl.dot, 7 panels)                       compiles
     MODE=l1a    (4 A panels staged in L1, B stays ND)        ub 3.15 Mbit
     MODE=l1b    (3 shared B panels staged in L1)             ub 3.28 Mbit
     MODE=l1     (all 7 panels staged in L1)                  ub 2.37 Mbit
-    MODE=l1 two chunks (14 panels in L1)                     ub 3.94 Mbit
 
-AscendC does exactly this natively: chunk_kda_fwd_prepare_cube.h:258-290
-issues `AscendC::Nd2NzParams` + `AscendC::DataCopy` for GM(ND) -> L1(NZ)
-("后面的四次 MMAD 不再读 GM"), so the requirement is confirmed achievable
-there.  Triton needs the equivalent: an `al.copy` that accepts a 2D ND UB
-tile and a 4D zN L1 destination, or `al.dot` with 2D ND operands and an
-internal L1 staging that reuses the compiler's (UB-cheap) ND->zN path.  Then explicit L1 residency becomes usable
-for multi-panel kernels, which is what the cross-chunk pipeline (F4) needs.
+The overflow is a property of that seven-[64,128]-panel formulation, not of
+L1 residency in general: the causal-prefix Gram kernel now used in production
+needs only seven [32,128] panels (~1.0 Mbit peak) and no explicit L1 staging.
+R1 is therefore a P2 capability gap, not a chunk_kda blocker.
+
+Triton would need an `al.copy` that accepts a GM source and a 4D zN L1
+destination (or `al.dot` with 2D ND operands plus an internal GM->L1 staging)
+for explicit multi-panel L1 residency.  `supported/s2_l1_resident_dot.py`
+shows the L1->dot half already works.
 
 Usage:
     PYTHONPATH=src:FlagGems/src python g1_nd2nz_staging.py plain
@@ -151,7 +158,9 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "plain"
     torch.npu.set_device("npu:0")
     R, K = 64, 128
+    torch.manual_seed(0)
     x = torch.randn(6 * R * K, device="npu", dtype=torch.bfloat16)
+    y_ref = torch.empty(R * R, device="npu", dtype=torch.float32)
     y = torch.empty(R * R, device="npu", dtype=torch.float32)
     grid = (12288,)  # one program per (chunk, head) of the KDA Gram grid
     do_a, do_b, fa, fb = {
@@ -161,9 +170,21 @@ def main():
         "l1": (1, 1, "fractal", "fractal"),
     }[mode]
     with torch.inference_mode():
-        kern[grid](x, y, R, K, DO_A=do_a, DO_B=do_b, FA=fa, FB=fb)
+        # Reference: the same math with no explicit L1 staging.
+        kern[grid](x, y_ref, R, K, DO_A=0, DO_B=0, FA="nd", FB="nd")
+        if mode == "plain":
+            y = y_ref
+        else:
+            kern[grid](x, y, R, K, DO_A=do_a, DO_B=do_b, FA=fa, FB=fb)
         torch.npu.synchronize()
-    print(f"RESULT: PASS g1_nd2nz_staging mode={mode}")
+    if mode == "plain":
+        print(f"RESULT: PASS g1_nd2nz_staging mode={mode}")
+    else:
+        maxerr = (y.float() - y_ref.float()).abs().max().item()
+        verdict = "PASS" if maxerr < 1e-2 else "FAIL"
+        print(
+            f"RESULT: {verdict} g1_nd2nz_staging mode={mode} maxerr={maxerr:.6g}"
+        )
 
 
 if __name__ == "__main__":

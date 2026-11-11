@@ -489,14 +489,23 @@ if HAS_TLE_KDA:
                     )
 
                     HALF: tl.constexpr = BT // 2
+                    # Midpoint of each band's valid part (AscendC gRef).
+                    b_valid = tl.minimum(BT, T - i_t * BT)
+                    a0_row = tl.minimum(b_valid, HALF) // 2
+                    a1_row = tl.where(
+                        b_valid > HALF,
+                        (HALF + tl.minimum(b_valid, BT)) // 2,
+                        a0_row,
+                    )
                     in_sb0 = o_i[:, None] < HALF
                     in_sb1 = ~in_sb0
                     b_anchor0 = tl.sum(
-                        tl.where(o_i[:, None] == HALF // 2, b_gc, 0.0), 0
+                        tl.where(o_i[:, None] == a0_row, b_gc, 0.0), 0
                     )[None, :]
                     b_anchor1 = tl.sum(
-                        tl.where(o_i[:, None] == HALF + HALF // 2, b_gc, 0.0), 0
+                        tl.where(o_i[:, None] == a1_row, b_gc, 0.0), 0
                     )[None, :]
+
                     b_reb0 = b_gc - b_anchor0
                     b_reb1 = b_gc - b_anchor1
                     b_cross_corr = exp2(b_anchor1 - b_anchor0)
@@ -562,6 +571,202 @@ if HAS_TLE_KDA:
                         p_Akk + o_i[:, None] * BT + o_i[None, :],
                         b_Ai.to(Akk.dtype.element_ty),
                     )
+
+    # ------------------------------------------------------------------
+    # Kernel 1b: Gram via causal prefix bands (AscendC arch35 layout).
+    #
+    # The AscendC prepare cube does not build full BT x BT Gram matrices from
+    # a rank decomposition.  It stages Q+/K+/K- prefixes in L1 with
+    # GM(ND)->L1(zN) `Nd2Nz` copies and issues one `[2*16,128] @ [128,N]`
+    # MMAD per 16-row band, so each row block only touches its causal prefix.
+    # The full-tile kernel above instead issues six 64x64 dots (3 rank terms
+    # x 2 matrices), i.e. ~4.8x the MACs of the prefix form, and needs seven
+    # [64,128] panels live in UB.
+    #
+    # This kernel keeps the two 32-row bands, but each band only multiplies
+    # its causal prefix, so the six dots become one `[32,128] @ [128,32]`
+    # (band 0) and two more for band 1 (prefix 0 and prefix 1).  MACs drop to
+    # 1/4 and the panels to 7 x [32,128] bf16 (56 KiB), which fits UB without
+    # the UB-side ND->zN staging overflow that blocked the L1-resident
+    # variant.  With NEUMANN_STAGES == 0 (the default) the inverse is exactly
+    # I - L, so the four output quadrants are stored directly and no 64x64
+    # reassembly is needed.  NEUMANN_STAGES > 0 still uses the full kernel.
+    # ------------------------------------------------------------------
+    @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+    @triton.jit(do_not_specialize=["T"])
+    def _ascend_kda_fwd_gram_prefix_kernel(
+        q,
+        k,
+        g_out,
+        beta,
+        Aqk,
+        Akk,
+        chunk_indices,
+        scale,
+        l2norm_eps,
+        cu_seqlens,
+        T,
+        NC,
+        H: tl.constexpr,
+        HV: tl.constexpr,
+        K: tl.constexpr,
+        BT: tl.constexpr,
+        CPT: tl.constexpr,
+        IS_VARLEN: tl.constexpr,
+    ):
+        i_tc, i_bh = tl.program_id(0), tl.program_id(1)
+        i_hv = i_bh % HV
+        i_h = i_hv // (HV // H)
+        HALF: tl.constexpr = BT // 2
+
+        for c in tl.static_range(CPT):
+            i_tg = i_tc * CPT + c
+            if IS_VARLEN:
+                i_n = tl.load(chunk_indices + i_tg * 2).to(tl.int32)
+                i_t = tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32)
+                bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+                T = tl.load(cu_seqlens + i_n + 1).to(tl.int32) - bos
+            else:
+                i_t = i_tg
+                bos = i_bh // HV * T
+
+            if i_t * BT < T:
+                p_q = q + (bos * H + i_h).to(tl.int64) * K
+                p_k = k + (bos * H + i_h).to(tl.int64) * K
+                p_g_out = g_out + (bos * HV + i_hv).to(tl.int64) * K
+                p_beta = beta + bos * HV + i_hv
+                p_Aqk = Aqk + (i_tg.to(tl.int64) * HV + i_hv) * BT * BT
+                p_Akk = Akk + (i_tg.to(tl.int64) * HV + i_hv) * BT * BT
+
+                o_h = tl.arange(0, HALF)
+                o_k = tl.arange(0, K)
+                c0 = i_t * BT + o_h
+                c1 = i_t * BT + HALF + o_h
+                m0 = c0 < T
+                m1 = c1 < T
+
+                pq0 = c0[:, None] * (H * K) + o_k[None, :]
+                pg0 = c0[:, None] * (HV * K) + o_k[None, :]
+                pq1 = c1[:, None] * (H * K) + o_k[None, :]
+                pg1 = c1[:, None] * (HV * K) + o_k[None, :]
+
+                b_q0 = tl.load(p_q + pq0, mask=m0[:, None], other=0.0).to(
+                    tl.float32
+                )
+                b_k0 = tl.load(p_k + pq0, mask=m0[:, None], other=0.0).to(
+                    tl.float32
+                )
+                b_gc0 = tl.load(p_g_out + pg0, mask=m0[:, None], other=0.0)
+                b_q1 = tl.load(p_q + pq1, mask=m1[:, None], other=0.0).to(
+                    tl.float32
+                )
+                b_k1 = tl.load(p_k + pq1, mask=m1[:, None], other=0.0).to(
+                    tl.float32
+                )
+                b_gc1 = tl.load(p_g_out + pg1, mask=m1[:, None], other=0.0)
+
+                b_qr0 = 1.0 / tl.sqrt(tl.sum(b_q0 * b_q0, 1) + l2norm_eps)
+                b_qr1 = 1.0 / tl.sqrt(tl.sum(b_q1 * b_q1, 1) + l2norm_eps)
+                b_kr0 = 1.0 / tl.sqrt(tl.sum(b_k0 * b_k0, 1) + l2norm_eps)
+                b_kr1 = 1.0 / tl.sqrt(tl.sum(b_k1 * b_k1, 1) + l2norm_eps)
+                b_beta0 = tl.sigmoid(
+                    tl.load(p_beta + c0 * HV, mask=m0, other=0.0).to(tl.float32)
+                )
+                b_beta1 = tl.sigmoid(
+                    tl.load(p_beta + c1 * HV, mask=m1, other=0.0).to(tl.float32)
+                )
+
+                # Per-band anchors at the midpoint of the *valid* part, like
+                # AscendC's gRef (end = min(validRows, bandEnd); ref = (begin
+                # + end) / 2).  For a full 64-row chunk this is row 16 / row
+                # 48; for a tail chunk it keeps the anchor inside the band.
+                # Falling back to a fixed row 48 on a short chunk would put
+                # the anchor past T (gate 0) while the band's rows are deeply
+                # decayed, so kM0 * exp2(a1 - a0) could overflow to inf.
+                b_valid = tl.minimum(BT, T - i_t * BT)
+                a0_row = tl.minimum(b_valid, HALF) // 2
+                a1_row = tl.where(
+                    b_valid > HALF,
+                    (HALF + tl.minimum(b_valid, BT)) // 2,
+                    a0_row,
+                )
+                ref0 = i_t * BT + a0_row
+                ref1 = i_t * BT + a1_row
+                b_a0 = tl.load(
+                    p_g_out + ref0 * (HV * K) + o_k, mask=ref0 < T, other=0.0
+                ).to(tl.float32)[None, :]
+                b_a1 = tl.load(
+                    p_g_out + ref1 * (HV * K) + o_k, mask=ref1 < T, other=0.0
+                ).to(tl.float32)[None, :]
+
+                # One exp2 per band plus the band-to-band ratio; the opposite
+                # direction is a reciprocal.  Mathematically identical to
+                # exp2(+/-x) and cheaper than seven independent exp2 panels.
+                b_e0 = exp2(b_gc0 - b_a0)
+                b_e1 = exp2(b_gc1 - b_a1)
+                b_cross = exp2(b_a1 - b_a0)
+                b_qP0 = (b_q0 * b_e0).to(tl.bfloat16)
+                b_qP1 = (b_q1 * b_e1).to(tl.bfloat16)
+                b_kP0 = (b_k0 * b_e0).to(tl.bfloat16)
+                b_kP1 = (b_k1 * b_e1).to(tl.bfloat16)
+                b_kM0f = b_k0 / b_e0
+                b_kM0 = b_kM0f.to(tl.bfloat16)
+                b_kM10 = (b_kM0f * b_cross).to(tl.bfloat16)
+                b_kM11 = (b_k1 / b_e1).to(tl.bfloat16)
+
+                b_r0q = tl.dot(b_qP0, tl.trans(b_kM0), out_dtype=tl.float32)
+                b_r10q = tl.dot(b_qP1, tl.trans(b_kM10), out_dtype=tl.float32)
+                b_r11q = tl.dot(b_qP1, tl.trans(b_kM11), out_dtype=tl.float32)
+                b_r0k = tl.dot(b_kP0, tl.trans(b_kM0), out_dtype=tl.float32)
+                b_r10k = tl.dot(b_kP1, tl.trans(b_kM10), out_dtype=tl.float32)
+                b_r11k = tl.dot(b_kP1, tl.trans(b_kM11), out_dtype=tl.float32)
+
+                lo = o_h[:, None] >= o_h[None, :]
+                strict = o_h[:, None] > o_h[None, :]
+                diag = o_h[:, None] == o_h[None, :]
+
+                b_aq0 = tl.where(
+                    lo, b_r0q * (scale * b_qr0[:, None] * b_kr0[None, :]), 0.0
+                )
+                # Band 1 rows are all below every band-0 column.
+                b_aq10 = b_r10q * (scale * b_qr1[:, None] * b_kr0[None, :])
+                b_aq11 = tl.where(
+                    lo, b_r11q * (scale * b_qr1[:, None] * b_kr1[None, :]), 0.0
+                )
+
+                b_l0 = tl.where(
+                    strict,
+                    b_r0k * (b_beta0[:, None] * b_kr0[:, None] * b_kr0[None, :]),
+                    0.0,
+                )
+                b_l10 = b_r10k * (
+                    b_beta1[:, None] * b_kr1[:, None] * b_kr0[None, :]
+                )
+                b_l11 = tl.where(
+                    strict,
+                    b_r11k * (b_beta1[:, None] * b_kr1[:, None] * b_kr1[None, :]),
+                    0.0,
+                )
+                # NEUMANN_STAGES == 0: (I + L)^-1 = I - L exactly on the
+                # strictly-lower L (the series terminates because L is
+                # nilpotent, and ||L|| is far below the truncation bound).
+                b_i0 = diag.to(tl.float32) - b_l0
+                b_i11 = diag.to(tl.float32) - b_l11
+
+                st = Aqk.dtype.element_ty
+                r0 = o_h[:, None] * BT + o_h[None, :]
+                r0h = o_h[:, None] * BT + HALF + o_h[None, :]
+                r1 = (HALF + o_h[:, None]) * BT + o_h[None, :]
+                r1h = (HALF + o_h[:, None]) * BT + HALF + o_h[None, :]
+                b_zero = tl.zeros((HALF, HALF), tl.float32).to(st)
+                tl.store(p_Aqk + r0, b_aq0.to(st), mask=m0[:, None])
+                tl.store(p_Aqk + r0h, b_zero, mask=m0[:, None])
+                tl.store(p_Aqk + r1, b_aq10.to(st), mask=m1[:, None])
+                tl.store(p_Aqk + r1h, b_aq11.to(st), mask=m1[:, None])
+                tl.store(p_Akk + r0, b_i0.to(st), mask=m0[:, None])
+                tl.store(p_Akk + r0h, b_zero, mask=m0[:, None])
+                tl.store(p_Akk + r1, (-b_l10).to(st), mask=m1[:, None])
+                tl.store(p_Akk + r1h, b_i11.to(st), mask=m1[:, None])
 
     def _ascend_kda_fwd_intra(
         q,
@@ -635,26 +840,49 @@ if HAS_TLE_KDA:
             CPT=CPT,
             multibuffer=False,
         )
-        _ascend_kda_fwd_gram_kernel[grid](
-            q=q,
-            k=k,
-            g_out=g_out,
-            beta=beta,
-            Aqk=Aqk,
-            Akk=Akk,
-            chunk_indices=chunk_indices,
-            scale=scale,
-            l2norm_eps=1e-6,
-            cu_seqlens=cu_seqlens,
-            T=T_len,
-            NC=NC,
-            H=H,
-            HV=HV,
-            K=K,
-            BT=BT,
-            CPT=CPT,
-            NEUMANN_STAGES=_ascend_neumann_stages(),
-        )
+        neumann_stages = _ascend_neumann_stages()
+        if neumann_stages == 0:
+            _ascend_kda_fwd_gram_prefix_kernel[grid](
+                q=q,
+                k=k,
+                g_out=g_out,
+                beta=beta,
+                Aqk=Aqk,
+                Akk=Akk,
+                chunk_indices=chunk_indices,
+                scale=scale,
+                l2norm_eps=1e-6,
+                cu_seqlens=cu_seqlens,
+                T=T_len,
+                NC=NC,
+                H=H,
+                HV=HV,
+                K=K,
+                BT=BT,
+                CPT=CPT,
+            )
+        else:
+            _ascend_kda_fwd_gram_kernel[grid](
+                q=q,
+                k=k,
+                g_out=g_out,
+                beta=beta,
+                Aqk=Aqk,
+                Akk=Akk,
+                chunk_indices=chunk_indices,
+                scale=scale,
+                l2norm_eps=1e-6,
+                cu_seqlens=cu_seqlens,
+                T=T_len,
+                NC=NC,
+                H=H,
+                HV=HV,
+                K=K,
+                BT=BT,
+                CPT=CPT,
+                NEUMANN_STAGES=neumann_stages,
+            )
+
 
         return ws, Aqk, Akk, g_out, chunk_offsets, NC, NC_global, N
 
