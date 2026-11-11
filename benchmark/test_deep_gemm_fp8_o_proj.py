@@ -106,6 +106,11 @@ except ImportError:
 DEEP_GEMM_READY = HAS_VLLM and NVCC_READY
 
 
+def _is_metax():
+    """MetaX has no vLLM DeepGEMM path, so the benchmark only reports latency."""
+    return flaggems_vllm.vendor_name == "metax"
+
+
 def _identity(flat):
     return flat
 
@@ -177,7 +182,9 @@ def _make_inputs(shape, device, seed=0):
     for group in range(n_groups):
         weight_fp8[group], weight_scale[group] = _per_block_cast_to_fp8(weight[group])
 
-    recipe, tma_aligned = compute_fp8_einsum_recipe()
+    recipe, tma_aligned = (
+        compute_fp8_einsum_recipe() if HAS_VLLM else ((1, 128, 128), False)
+    )
     return (
         o,
         positions,
@@ -264,7 +271,8 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
         for shape in self.shapes:
             args = _make_inputs(shape, device)
             # Compile and tune both implementations outside the timed region.
-            _vllm_o_proj_wrapper(*args)
+            if DEEP_GEMM_READY and HOPPER_AVAILABLE:
+                _vllm_o_proj_wrapper(*args)
             _gems_o_proj_wrapper(*args)
             torch.cuda.synchronize()
             yield args
@@ -279,13 +287,18 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
 
 @pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.skipif(
-    not (DEEP_GEMM_READY and HOPPER_AVAILABLE),
-    reason="requires NVIDIA Hopper, vLLM DeepGEMM support and nvcc",
+    not (HOPPER_AVAILABLE or _is_metax()),
+    reason="requires an NVIDIA Hopper or a MetaX GPU",
 )
 def test_perf_deep_gemm_fp8_o_proj_gems_vs_vllm():
+    # vLLM's op is only importable from a build that ships DeepSeek-V4, and its
+    # DeepGEMM path still needs a working nvcc. Without both, report the
+    # FlagGems latency only (torch_op=None) and, when --base-data is given,
+    # compare against that baseline instead of an in-process vLLM run.
+    torch_op = _vllm_o_proj_wrapper if (DEEP_GEMM_READY and HOPPER_AVAILABLE) else None
     bench = DeepGemmFP8OProjBenchmark(
         op_name="deep_gemm_fp8_o_proj",
-        torch_op=_vllm_o_proj_wrapper,
+        torch_op=torch_op,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_o_proj_wrapper)

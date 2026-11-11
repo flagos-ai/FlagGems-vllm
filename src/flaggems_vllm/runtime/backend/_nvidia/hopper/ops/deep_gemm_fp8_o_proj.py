@@ -37,13 +37,17 @@ stays opt-in.
 """
 
 import os
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence, Union
 
 import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.deep_gemm_fp8_o_proj import _SUPPORTED_RECIPE, _weight_and_scale
+from flaggems_vllm.ops.deep_gemm_fp8_o_proj import (
+    _SUPPORTED_RECIPE,
+    _is_quantized_activation,
+    _weight_and_scale,
+)
 from flaggems_vllm.ops.deep_gemm_fp8_o_proj import (
     deep_gemm_fp8_o_proj as _generic_deep_gemm_fp8_o_proj,
 )
@@ -249,9 +253,18 @@ _FAST_QUANT_MIN_TOKENS = 256
 
 
 def _ws_tile(m, b):
-    """Return ``(BLOCK_M, BLOCK_N, stages, warps, swap_ab)`` for this shape."""
-    if m <= 64:
+    """Return ``(BLOCK_M, BLOCK_N, stages, warps, swap_ab)`` for this shape.
+
+    The tile is picked so the tile grid stays within one wave (``B * M/BLOCK_M *
+    N/BLOCK_N <= 132``): every tile re-reads its ``BLOCK_N x K`` weight slice, so
+    a BLOCK_M smaller than the token count multiplies the weight traffic. That
+    made ``T=64`` read the weights 4-8x and cost 4x the T=128 time until the
+    16-row tile was confined to ``T <= 16``.
+    """
+    if m <= 16:
         return 16, 64, 8, 4, True
+    if m <= 64:
+        return (64, 64, 4, 4, True) if b <= 8 else (128, 128, 4, 8, False)
     if m <= 128 and b <= 8:
         return 128, 64, 4, 4, False
     return 128, 128, 4, 8, False
@@ -805,35 +818,20 @@ def _fused_inv_rope_quant_gemm_kernel(
         tl.store(z_ptrs, acc.to(tl.float32), mask=mask)
 
 
-def _fast_shape(
-    o,
+def _fast_weights(
     wo_a,
     n_groups: int,
     heads_per_group: int,
     nope_dim: int,
     rope_dim: int,
     o_lora_rank: int,
-    max_tokens: int,
-    einsum_recipe: Sequence[int],
-    tma_aligned_scales: bool,
 ):
-    """Return ``(weight, weight_scale)`` when a decode fast path applies."""
-    if tma_aligned_scales or tuple(einsum_recipe) != tuple(_SUPPORTED_RECIPE):
-        return None
-    if not isinstance(o, torch.Tensor) or o.ndim != 3:
-        return None
-    if o.dtype != torch.bfloat16 or o.stride(-1) != 1:
-        return None
-    if not 0 < o.shape[0] <= max_tokens:
-        return None
-
+    """Return ``(weight, weight_scale)`` when the FP8 block layout is supported."""
     head_dim = nope_dim + rope_dim
     rope_offset = nope_dim % _SCALE_BLOCK_N
     if head_dim % _SCALE_BLOCK_N or rope_offset % 2:
         return None
     if rope_offset + rope_dim > _SCALE_BLOCK_N:
-        return None
-    if o.shape[1] != n_groups * heads_per_group or o.shape[2] != head_dim:
         return None
 
     try:
@@ -861,6 +859,36 @@ def _fast_shape(
     ):
         return None
     return weight, weight_scale
+
+
+def _fast_shape(
+    o,
+    wo_a,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+    max_tokens: int,
+    einsum_recipe: Sequence[int],
+    tma_aligned_scales: bool,
+):
+    """Return ``(weight, weight_scale)`` when a decode fast path applies."""
+    if tma_aligned_scales or tuple(einsum_recipe) != tuple(_SUPPORTED_RECIPE):
+        return None
+    if not isinstance(o, torch.Tensor) or o.ndim != 3:
+        return None
+    if o.dtype != torch.bfloat16 or o.stride(-1) != 1:
+        return None
+    if not 0 < o.shape[0] <= max_tokens:
+        return None
+    if o.shape[1] != n_groups * heads_per_group:
+        return None
+    if o.shape[2] != nope_dim + rope_dim:
+        return None
+    return _fast_weights(
+        wo_a, n_groups, heads_per_group, nope_dim, rope_dim, o_lora_rank
+    )
 
 
 @triton.jit
@@ -1058,6 +1086,41 @@ def _quant_lean(
     return fp8_q, scale
 
 
+def _lean_gemm(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    wo_b,
+    n_groups: int,
+    o_lora_rank: int,
+) -> torch.Tensor:
+    """Grouped FP8 GEMM into a preallocated output, without the host wrappers.
+
+    ``x`` / ``x_scale`` are the group-major ``[n_groups, tokens, k]`` activation.
+    """
+    out = torch.empty(
+        (x.shape[1], n_groups, o_lora_rank),
+        device=x.device,
+        dtype=torch.bfloat16,
+    )
+    if _ws_bmm_supported(x, x_scale, weight, weight_scale):
+        _ws_block_fp8_bmm(x, x_scale, weight, weight_scale, out)
+    elif _DIRECT_BMM_KERNEL is not None:
+        _direct_block_fp8_bmm(x, x_scale, weight, weight_scale, out)
+    else:
+        _block_fp8_bmm(
+            x,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size=(_SCALE_BLOCK_N, _SCALE_BLOCK_N),
+            z=out.permute(1, 0, 2),
+            output_dtype=torch.bfloat16,
+        )
+    return wo_b(out.flatten(1))
+
+
 def _lean_decode(
     o,
     positions: torch.Tensor,
@@ -1075,24 +1138,7 @@ def _lean_decode(
     o_fp8, o_scale = _quant_lean(
         o, positions, cos_sin_cache, n_groups, heads_per_group, nope_dim, rope_dim
     )
-    out = torch.empty(
-        (o.shape[0], n_groups, o_lora_rank), device=o.device, dtype=torch.bfloat16
-    )
-    if _ws_bmm_supported(o_fp8, o_scale, weight, weight_scale):
-        _ws_block_fp8_bmm(o_fp8, o_scale, weight, weight_scale, out)
-    elif _DIRECT_BMM_KERNEL is not None:
-        _direct_block_fp8_bmm(o_fp8, o_scale, weight, weight_scale, out)
-    else:
-        _block_fp8_bmm(
-            o_fp8,
-            weight,
-            o_scale,
-            weight_scale,
-            block_size=(_SCALE_BLOCK_N, _SCALE_BLOCK_N),
-            z=out.permute(1, 0, 2),
-            output_dtype=torch.bfloat16,
-        )
-    return wo_b(out.flatten(1))
+    return _lean_gemm(o_fp8, o_scale, weight, weight_scale, wo_b, n_groups, o_lora_rank)
 
 
 def _fused_decode(
@@ -1155,12 +1201,50 @@ def _fused_decode(
     return wo_b(out.flatten(1))
 
 
+def _fast_prequantized(
+    o,
+    wo_a,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+    einsum_recipe: Sequence[int],
+    tma_aligned_scales: bool,
+):
+    """Return ``(x, x_scale, weight, weight_scale)`` for a quantized activation.
+
+    ``x`` / ``x_scale`` are converted to the group-major ``[groups, tokens, k]``
+    layout the GEMM consumes; no copy is needed for the group-major buffers the
+    quantization kernel writes.
+    """
+    if tma_aligned_scales or tuple(einsum_recipe) != tuple(_SUPPORTED_RECIPE):
+        return None
+    weights = _fast_weights(
+        wo_a, n_groups, heads_per_group, nope_dim, rope_dim, o_lora_rank
+    )
+    if weights is None:
+        return None
+    x, x_scale = o.data[:, :n_groups], o.scale[:, :n_groups]
+    if x.ndim != 3 or x.shape[0] == 0:
+        return None
+    if x.shape[1:] != (n_groups, weights[0].shape[2]):
+        return None
+    if x.dtype != torch.float8_e4m3fn or x_scale.dtype != torch.float32:
+        return None
+    if x.stride(-1) != 1:
+        return None
+    if x_scale.shape != (x.shape[0], n_groups, weights[0].shape[2] // _SCALE_BLOCK_N):
+        return None
+    return x.permute(1, 0, 2), x_scale.permute(1, 0, 2), *weights
+
+
 def deep_gemm_fp8_o_proj(
-    o: torch.Tensor,
+    o: Union[torch.Tensor, "QuantizedActivation"],
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     wo_a,
-    wo_b,
+    wo_b: Callable[[torch.Tensor], torch.Tensor],
     *,
     n_groups: int,
     heads_per_group: int,
@@ -1170,7 +1254,26 @@ def deep_gemm_fp8_o_proj(
     einsum_recipe: Optional[Sequence[int]] = _SUPPORTED_RECIPE,
     tma_aligned_scales: bool = False,
 ) -> torch.Tensor:
-    """Hopper entry point: lean decode launches, generic composition otherwise."""
+    """Hopper entry point: lean launches for supported shapes, generic otherwise.
+
+    A pre-quantized ``QuantizedActivation`` (vLLM >= 0.32 already rotated and
+    quantized it inside the attention kernel) skips the quantization step and
+    goes straight to the grouped GEMM.
+    """
+    if _is_quantized_activation(o):
+        prequantized = _fast_prequantized(
+            o,
+            wo_a,
+            n_groups,
+            heads_per_group,
+            nope_dim,
+            rope_dim,
+            o_lora_rank,
+            einsum_recipe,
+            tma_aligned_scales,
+        )
+        if prequantized is not None:
+            return _lean_gemm(*prequantized, wo_b, n_groups, o_lora_rank)
     shape_args = (
         o,
         wo_a,

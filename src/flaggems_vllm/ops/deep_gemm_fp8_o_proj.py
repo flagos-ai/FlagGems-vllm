@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import Optional, Sequence, Tuple, Union
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -32,15 +32,26 @@ def _weight_and_scale(param: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tenso
     """Accept either a quantized linear module or an explicit (weight, scale)."""
     if isinstance(param, (tuple, list)) and len(param) == 2:
         return param[0], param[1]
+    # vLLM 0.32 stores the block scales as `weight_scale`; older releases used
+    # `weight_scale_inv`.
+    if hasattr(param, "weight_scale"):
+        return param.weight, param.weight_scale
     return param.weight, param.weight_scale_inv
 
 
+def _is_quantized_activation(o) -> bool:
+    """Match vLLM's ``QuantizedActivation`` without importing vLLM."""
+    return not isinstance(o, torch.Tensor) and all(
+        hasattr(o, attr) for attr in ("data", "scale")
+    )
+
+
 def deep_gemm_fp8_o_proj(
-    o: torch.Tensor,
+    o: Union[torch.Tensor, "QuantizedActivation"],
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     wo_a: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    wo_b: torch.nn.Module,
+    wo_b: Callable[[torch.Tensor], torch.Tensor],
     *,
     n_groups: int,
     heads_per_group: int,
@@ -59,36 +70,23 @@ def deep_gemm_fp8_o_proj(
 
     Args:
         o: attention output, ``[num_tokens, n_groups * heads_per_group, head_dim]``
-            where ``head_dim == nope_dim + rope_dim``.
+            where ``head_dim == nope_dim + rope_dim``. A pre-quantized
+            ``vllm.model_executor.layers.fusion.quant_activation.QuantizedActivation``
+            is consumed as is (the attention kernel already applied inverse
+            RoPE and the FP8 cast), so ``positions`` / ``cos_sin_cache`` are
+            unused then.
         positions: token positions, ``[num_tokens]``.
         cos_sin_cache: RoPE cache laid out as ``cos || sin``, ``[max_pos, rope_dim]``.
         wo_a: FP8 block-wise weight with shape
             ``[n_groups, o_lora_rank, heads_per_group * head_dim]``; either a
-            module exposing ``weight`` / ``weight_scale_inv`` or a
-            ``(weight, weight_scale_inv)`` tuple.
-        wo_b: linear layer mapping ``n_groups * o_lora_rank`` to the hidden size.
+            module exposing ``weight`` / ``weight_scale`` (vLLM >= 0.32) or
+            ``weight`` / ``weight_scale_inv``, or a ``(weight, scale)`` tuple.
+        wo_b: callable mapping ``n_groups * o_lora_rank`` to the hidden size.
 
     Returns:
         ``[num_tokens, hidden]`` in bfloat16.
     """
     logger.debug("GEMS DEEP GEMM FP8 O PROJ")
-
-    assert o.ndim == 3, "`o` must be [num_tokens, num_heads, head_dim]"
-    assert positions.ndim == 1 and positions.shape[0] == o.shape[0]
-    assert cos_sin_cache.ndim == 2, "`cos_sin_cache` must be 2D"
-    assert o.dtype == torch.bfloat16, "`o` must be bfloat16"
-    assert (
-        o.shape[1] == n_groups * heads_per_group
-    ), "num_heads must equal n_groups * heads_per_group"
-    assert o.shape[-1] == nope_dim + rope_dim, "head_dim must equal nope_dim + rope_dim"
-    assert o_lora_rank % _BLOCK_SIZE[0] == 0, "o_lora_rank must be a multiple of 128"
-
-    weight_a, scale_a = _weight_and_scale(wo_a)
-    reduction = heads_per_group * o.shape[-1]
-    assert weight_a.shape == (n_groups, o_lora_rank, reduction), (
-        "wo_a weight must be [n_groups, o_lora_rank, heads_per_group * head_dim], "
-        f"got {tuple(weight_a.shape)}"
-    )
 
     # The generic path does not implement the SM100 packed-UE8M0 scale layout.
     if tuple(einsum_recipe) != _SUPPORTED_RECIPE or tma_aligned_scales:
@@ -98,20 +96,56 @@ def deep_gemm_fp8_o_proj(
             f"tma_aligned_scales={tma_aligned_scales}"
         )
 
-    o_fp8, o_scale = fused_inv_rope_fp8_quant(
-        o,
-        positions,
-        cos_sin_cache,
-        n_groups,
-        heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        quant_group_size=_BLOCK_SIZE[1],
-        tma_aligned_scales=False,
+    if _is_quantized_activation(o):
+        # Group-major values and scales from the attention kernel: one wo_a
+        # group per slot with the live groups first, so only the padding groups
+        # are sliced off.
+        o_fp8, o_scale = o.data[:, :n_groups], o.scale[:, :n_groups]
+        assert o_fp8.ndim == 3, "`o.data` must be [num_tokens, n_groups, k]"
+        assert o_fp8.dtype == torch.float8_e4m3fn, "`o.data` must be float8_e4m3fn"
+    else:
+        assert o.ndim == 3, "`o` must be [num_tokens, num_heads, head_dim]"
+        assert positions.ndim == 1 and positions.shape[0] == o.shape[0]
+        assert cos_sin_cache.ndim == 2, "`cos_sin_cache` must be 2D"
+        assert o.dtype == torch.bfloat16, "`o` must be bfloat16"
+        assert (
+            o.shape[1] == n_groups * heads_per_group
+        ), "num_heads must equal n_groups * heads_per_group"
+        assert (
+            o.shape[-1] == nope_dim + rope_dim
+        ), "head_dim must equal nope_dim + rope_dim"
+        o_fp8, o_scale = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups,
+            heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            quant_group_size=_BLOCK_SIZE[1],
+            tma_aligned_scales=False,
+        )
+
+    assert o_lora_rank % _BLOCK_SIZE[0] == 0, "o_lora_rank must be a multiple of 128"
+
+    reduction = heads_per_group * (nope_dim + rope_dim)
+    assert o_fp8.shape[1:] == (n_groups, reduction), (
+        "activation must be [num_tokens, n_groups, heads_per_group * head_dim], "
+        f"got {tuple(o_fp8.shape)}"
     )
 
+    weight_a, scale_a = _weight_and_scale(wo_a)
+    assert weight_a.shape == (n_groups, o_lora_rank, reduction), (
+        "wo_a weight must be [n_groups, o_lora_rank, heads_per_group * head_dim], "
+        f"got {tuple(weight_a.shape)}"
+    )
+    if weight_a.dtype != torch.float8_e4m3fn:
+        raise NotImplementedError("only an FP8 wo_a weight is supported")
+
     out = torch.empty(
-        (o.shape[0], n_groups, o_lora_rank), dtype=torch.bfloat16, device=o.device
+        (o_fp8.shape[0], n_groups, o_lora_rank),
+        dtype=torch.bfloat16,
+        device=o_fp8.device,
     )
     fp8_einsum(
         "bhr,hdr->bhd",
