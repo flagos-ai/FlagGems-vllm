@@ -45,6 +45,7 @@ class MegaMHCProfile:
     hc_post_mult_value: float
     sinkhorn_repeat: int
     norm_eps: float
+    norm_scale: float
 
 
 DEEPSEEK_V4_FLASH_PROFILE = MegaMHCProfile(
@@ -60,6 +61,7 @@ DEEPSEEK_V4_FLASH_PROFILE = MegaMHCProfile(
     hc_post_mult_value=2.0,
     sinkhorn_repeat=20,
     norm_eps=1e-6,
+    norm_scale=1.0,
 )
 
 
@@ -369,9 +371,7 @@ def _validate_trusted_context_binding(
     alignments = _normalize_alignments(
         static_alignments, count=4, name="launcher.static_alignments"
     )
-    for (name, tensor, shape, dtype), alignment in zip(
-        expected, alignments, strict=True
-    ):
+    for (name, tensor, shape, dtype), alignment in zip(expected, alignments):
         _require_tensor(name, tensor)
         if tuple(tensor.shape) != shape:
             _unsupported(f"{name}.shape={tuple(tensor.shape)}, expected {shape}")
@@ -490,7 +490,6 @@ def _validate_trusted_call(
     for name, tensor in zip(
         ("x", "residual", "post_layer_mix", "comb_res_mix"),
         dynamic_tensors,
-        strict=True,
     ):
         _require_tensor(name, tensor)
     if x.ndim != 2 or residual.ndim != 3:
@@ -526,7 +525,7 @@ def _validate_trusted_call(
         ),
     )
     for (name, tensor, shape, dtype), alignment in zip(
-        expected, dynamic_alignments[:4], strict=True
+        expected, dynamic_alignments[:4]
     ):
         if tensor.shape != shape:
             _unsupported(f"{name}.shape={tuple(tensor.shape)}, expected {shape}")
@@ -628,7 +627,6 @@ def _validate_profile(
                 "norm_weight",
             ),
             (*dynamic_alignments[:4], *static_alignments),
-            strict=True,
         )
     )
     expected = {
@@ -777,9 +775,7 @@ def _validate_outputs(
     alignments = _normalize_alignments(
         output_alignments, count=4, name="output alignments"
     )
-    for (name, tensor, shape, dtype), alignment in zip(
-        expected, alignments, strict=True
-    ):
+    for (name, tensor, shape, dtype), alignment in zip(expected, alignments):
         if tuple(tensor.shape) != shape:
             raise ValueError(f"{name}.shape must be {shape}")
         if tensor.dtype != dtype:
@@ -810,7 +806,6 @@ def _validate_allocated_output_alignments(
         ("new_residual", "new_post_mix", "new_comb_res_mix", "y_bf16"),
         outputs,
         alignments,
-        strict=True,
     ):
         if tensor.data_ptr() % alignment != 0:
             raise RuntimeError(
