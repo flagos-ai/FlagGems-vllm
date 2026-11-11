@@ -667,6 +667,19 @@ fused_allreduce_rms_norm:
     - [138, 6144]
   shape_desc: "M, H"
 
+mhc_shifted_post_pre:
+  # DSV4/DSV4.1 boundary shapes: decode-sized batches, a small chunk, and the
+  # full 4096-token prefill chunk at both hidden sizes.
+  shapes:
+    - [1, 1280]
+    - [16, 1280]
+    - [512, 1280]
+    - [512, 7168]
+    - [4096, 7168]
+    - [128, 5120]
+    - [2048, 5120]
+  shape_desc: "N, H"
+
 bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]
