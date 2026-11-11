@@ -38,32 +38,122 @@ def is_support_fp8e4nv():
     return major * 10 + minor >= 89
 
 
-OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
-
-HAS_VLLM = False
-try:
-    import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
-
-    HAS_VLLM = True
-except (ImportError, AttributeError, RuntimeError):
-    # RuntimeError too: a misconfigured vLLM (e.g. two platform plugins) raises it
-    # at import, and that should mean "no baseline", not a collection error.
-    pass
-
-VLLM_REF_AVAILABLE = HAS_VLLM and hasattr(torch.ops._C, OP_NAME)
-
-
-if VLLM_REF_AVAILABLE:
+VLLM_REF_AVAILABLE = False
+VLLM_0_22_0_AVAILABLE = False
+VLLM_MUSA_0_1_28_AVAILABLE = False
+IS_MTHREADS = flaggems_vllm.vendor_name == "mthreads"
+if IS_MTHREADS:
     try:
-        from packaging.version import InvalidVersion, Version
+        from vllm_musa import _custom_ops as _musa_custom_ops
 
-        version = getattr(vllm, "__version__", "0.0.0")
-        parsed = Version(version.split("+", 1)[0])
-        VLLM_0_22_0_AVAILABLE = parsed >= Version("0.22.0")
-    except InvalidVersion:
-        VLLM_0_22_0_AVAILABLE = False
+        VLLM_REF_AVAILABLE = hasattr(
+            _musa_custom_ops, "deepseek_v4_qnorm_rope_kv_insert"
+        )
+        if VLLM_REF_AVAILABLE:
+            try:
+                import vllm_musa
+                from packaging.version import InvalidVersion, Version
+
+                version = getattr(vllm_musa, "__version__", "0.0.0")
+                parsed = Version(version.split("+", 1)[0])
+                VLLM_MUSA_0_1_28_AVAILABLE = parsed >= Version("0.1.28")
+            except InvalidVersion:
+                VLLM_MUSA_0_1_28_AVAILABLE = False
+    except (ImportError, AttributeError, RuntimeError):
+        VLLM_REF_AVAILABLE = False
 else:
-    VLLM_0_22_0_AVAILABLE = False
+    try:
+        import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
+
+        VLLM_REF_AVAILABLE = hasattr(
+            torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+        )
+        if VLLM_REF_AVAILABLE:
+            try:
+                import vllm
+                from packaging.version import InvalidVersion, Version
+
+                version = getattr(vllm, "__version__", "0.0.0")
+                parsed = Version(version.split("+", 1)[0])
+                VLLM_0_22_0_AVAILABLE = parsed >= Version("0.22.0")
+            except InvalidVersion:
+                VLLM_0_22_0_AVAILABLE = False
+    except (ImportError, AttributeError, RuntimeError):
+        VLLM_REF_AVAILABLE = False
+
+
+def musa_ref_wrapper(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    num_heads,
+    eps,
+    block_size,
+):
+    if VLLM_MUSA_0_1_28_AVAILABLE:
+        return _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+            num_heads,
+        )
+    else:
+        _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
+        return q
+
+
+def cuda_ref_wrapper(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    num_heads,
+    eps,
+    block_size,
+):
+    if VLLM_0_22_0_AVAILABLE:
+        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            num_heads,
+            eps,
+            block_size,
+        )
+    else:
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
+        return q
 
 
 HEAD_DIM = 512
@@ -845,36 +935,25 @@ def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
 
-    q_ref = q.clone()
-    kv_ref = kv.clone()
     k_cache_ref = k_cache.clone()
 
     try:
-        if VLLM_0_22_0_AVAILABLE:
-            q_out_ref = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-                q_ref,
-                kv_ref,
-                k_cache_ref,
-                slot_mapping.clone(),
-                positions.clone(),
-                cos_sin_cache.clone(),
-                q_head_padded,
-                eps,
-                block_size,
-            )
-        else:
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-                q_ref,
-                kv_ref,
-                k_cache_ref,
-                slot_mapping.clone(),
-                positions.clone(),
-                cos_sin_cache.clone(),
-                eps,
-                block_size,
-            )
-            q_out_ref = q_ref
-
+        vllm_ref_impl = musa_ref_wrapper if IS_MTHREADS else cuda_ref_wrapper
+        q_out_ref = vllm_ref_impl(
+            q.clone(),
+            kv.clone(),
+            (
+                k_cache_ref.view(k_cache_ref.shape[0], -1, HEAD_BYTES)
+                if IS_MTHREADS
+                else k_cache_ref
+            ),
+            slot_mapping.clone(),
+            positions.clone(),
+            cos_sin_cache.clone(),
+            q_head_padded,
+            eps,
+            block_size,
+        )
         torch.zeros(1, device=device).sum()  # a launch is what surfaces the error
         flaggems_vllm.runtime.torch_device_fn.synchronize()
     except Exception as e:  # registered but unlaunchable -- e.g. MetaX C550

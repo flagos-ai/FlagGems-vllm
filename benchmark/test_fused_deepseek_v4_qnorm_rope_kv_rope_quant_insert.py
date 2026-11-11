@@ -37,73 +37,127 @@ def is_support_fp8e4nv():
     return major * 10 + minor >= 89
 
 
-OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
-
-HAS_VLLM = False
-try:
-    import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
-
-    HAS_VLLM = True
-except (ImportError, AttributeError, RuntimeError):
-    # RuntimeError too: a misconfigured vLLM (e.g. two platform plugins) raises it
-    # at import, and that should mean "no baseline", not a collection error.
-    pass
-
-
-if HAS_VLLM:
+VLLM_REF_AVAILABLE = False
+VLLM_0_22_0_AVAILABLE = False
+VLLM_MUSA_0_1_28_AVAILABLE = False
+IS_MTHREADS = flaggems_vllm.vendor_name == "mthreads"
+if IS_MTHREADS:
     try:
-        from packaging.version import InvalidVersion, Version
+        from vllm_musa import _custom_ops as _musa_custom_ops
 
-        version = getattr(vllm, "__version__", "0.0.0")
-        parsed = Version(version.split("+", 1)[0])
-        VLLM_0_22_0_AVAILABLE = parsed >= Version("0.22.0")
-    except InvalidVersion:
-        VLLM_0_22_0_AVAILABLE = False
+        VLLM_REF_AVAILABLE = hasattr(
+            _musa_custom_ops, "deepseek_v4_qnorm_rope_kv_insert"
+        )
+        if VLLM_REF_AVAILABLE:
+            try:
+                import vllm_musa
+                from packaging.version import InvalidVersion, Version
+
+                version = getattr(vllm_musa, "__version__", "0.0.0")
+                parsed = Version(version.split("+", 1)[0])
+                VLLM_MUSA_0_1_28_AVAILABLE = parsed >= Version("0.1.28")
+            except InvalidVersion:
+                VLLM_MUSA_0_1_28_AVAILABLE = False
+    except (ImportError, AttributeError, RuntimeError):
+        VLLM_REF_AVAILABLE = False
 else:
-    VLLM_0_22_0_AVAILABLE = False
+    try:
+        import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
+
+        VLLM_REF_AVAILABLE = hasattr(
+            torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+        )
+        if VLLM_REF_AVAILABLE:
+            try:
+                import vllm
+                from packaging.version import InvalidVersion, Version
+
+                version = getattr(vllm, "__version__", "0.0.0")
+                parsed = Version(version.split("+", 1)[0])
+                VLLM_0_22_0_AVAILABLE = parsed >= Version("0.22.0")
+            except InvalidVersion:
+                VLLM_0_22_0_AVAILABLE = False
+    except (ImportError, AttributeError, RuntimeError):
+        VLLM_REF_AVAILABLE = False
 
 
-def _skip_if_unrunnable(ref, op_name):
-    """Wrap the reference so a registered-but-unlaunchable kernel skips.
-
-    A vendor build can register the op and still fail every launch, as MetaX's
-    mcoplib 0.4.6 does on C550. Skip with the launch error as the reason, rather than
-    failing the benchmark or hiding it as "not installed".
-
-    A failed launch is reported asynchronously, so the first call forces it out with
-    a throwaway kernel launch; synchronize() alone is silent there. `pytest.skip`
-    raises `Skipped`, a BaseException, which passes the harness's `except Exception`.
-    """
-    checked = False
-
-    def wrapper(*args, **kwargs):
-        nonlocal checked
-        if checked:
-            return ref(*args, **kwargs)
-        try:
-            out = ref(*args, **kwargs)
-            torch.zeros(1, device=flaggems_vllm.device).sum()
-            torch_device_fn.synchronize()
-        except Exception as e:
-            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
-            pytest.skip(
-                f"{op_name} is registered but its kernel fails to run: {reason}"
-            )
-        checked = True
-        return out
-
-    return wrapper
-
-
-VLLM_REF_AVAILABLE = HAS_VLLM and hasattr(torch.ops._C, OP_NAME)
-_VENDOR_REF = (
-    _skip_if_unrunnable(getattr(torch.ops._C, OP_NAME), OP_NAME)
-    if VLLM_REF_AVAILABLE
-    else None
-)
 HEAD_DIM = 512
 ROPE_DIM = 64
 HEAD_BYTES = 584
+
+
+def musa_ref_wrapper(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    num_heads,
+    eps,
+    block_size,
+):
+    if VLLM_MUSA_0_1_28_AVAILABLE:
+        return _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+            q,
+            kv,
+            k_cache.view(k_cache.shape[0], -1, HEAD_BYTES),
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+            num_heads,
+        )
+    else:
+        _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+            q,
+            kv,
+            k_cache.view(k_cache.shape[0], -1, HEAD_BYTES),
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
+        return q
+
+
+def cuda_ref_wrapper(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    num_heads,
+    eps,
+    block_size,
+):
+    if VLLM_0_22_0_AVAILABLE:
+        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            num_heads,
+            eps,
+            block_size,
+        )
+    else:
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
+        return q
 
 
 @dataclasses.dataclass
@@ -128,7 +182,7 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-            _VENDOR_REF,
+            musa_ref_wrapper if IS_MTHREADS else cuda_ref_wrapper,
             [torch.bfloat16],
         )
         self.set_gems(flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
@@ -258,10 +312,6 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 @pytest.mark.skipif(
     not is_support_fp8e4nv(),
     reason="Do not support fp8e4nv when capability < 89",
-)
-@pytest.mark.skipif(
-    not VLLM_0_22_0_AVAILABLE,
-    reason="Ensure vLLM version >= 0.22.0",
 )
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert():
     bench = FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark()
