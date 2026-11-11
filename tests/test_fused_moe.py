@@ -293,7 +293,9 @@ def test_thead_fused_moe_weight_reuse_and_update(thead_moe_original_layout, dtyp
 
 @pytest.mark.fused_moe
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("m,hidden", [(1, 128), (8, 1024), (13, 128), (64, 128)])
+@pytest.mark.parametrize(
+    "m,hidden", [(1, 128), (1, 1024), (8, 1024), (13, 128), (64, 128)]
+)
 @pytest.mark.parametrize("padded", [False, True])
 def test_thead_fused_moe_graph_reads_current_weights(
     thead_moe_original_layout, dtype, m, hidden, padded
@@ -332,3 +334,161 @@ def test_thead_fused_moe_graph_reads_current_weights(
         torch.cuda.synchronize()
         torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
         previous = expected
+
+
+def _thead_dense_moe_inputs(m, dtype):
+    x, w1, w2, _, ids = _thead_moe_inputs(m, dtype, padded=True)
+    # Keep padded strides and a nonzero expert storage offset on both weights.
+    w1, w2 = w1[1:9], w2[1:9]
+    ids = ids[:, :2].remainder(8)
+    weights = torch.full((m, 2), 0.5, device="cuda", dtype=torch.float32)
+    return x, w1, w2, weights, ids
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [64, 128, 512])
+def test_thead_fused_moe_dense_routing(thead_moe_original_layout, dtype, m):
+    import flaggems_vllm
+
+    torch.manual_seed(71)
+    inputs = _thead_dense_moe_inputs(m, dtype)
+    assert inputs[1].storage_offset() and inputs[2].storage_offset()
+    actual = flaggems_vllm.ops_experts_impl(*inputs)
+    torch.testing.assert_close(
+        actual.cpu(), _thead_moe_reference(*inputs), rtol=0.05, atol=0.01
+    )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [128, 512])
+def test_thead_fused_moe_dense_graph_reads_current_weights(
+    thead_moe_original_layout, dtype, m
+):
+    import flaggems_vllm
+
+    torch.manual_seed(72)
+    inputs = _thead_dense_moe_inputs(m, dtype)
+    x, w1, w2, _, _ = inputs
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flaggems_vllm.ops_experts_impl(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = flaggems_vllm.ops_experts_impl(*inputs)
+    previous = _thead_moe_reference(*inputs)
+    for _ in range(2):
+        x.copy_(torch.randn_like(x))
+        w1.mul_(0.75)
+        w2.neg_()
+        actual.fill_(float("nan"))
+        expected = _thead_moe_reference(*inputs)
+        assert not torch.allclose(previous, expected, rtol=0.05, atol=0.01)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+        previous = expected
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,e,h", [(1, 8, 4096), (4, 32, 1024), (16, 8, 2048), (4, 8, 2048)]
+)
+def test_thead_fused_moe_long_k_reference(thead_moe_original_layout, dtype, m, e, h):
+    import flaggems_vllm
+
+    torch.manual_seed(73)
+    intermediate, topk = 512, 2
+    x = torch.randn((m, h), device="cuda", dtype=dtype)
+    w1 = torch.randn((e, 2 * intermediate, h), device="cuda", dtype=dtype)
+    w1 *= h**-0.5
+    w2 = torch.randn((e, h, intermediate), device="cuda", dtype=dtype)
+    w2 *= intermediate**-0.5
+    weights = torch.full((m, topk), 0.5, device="cuda", dtype=torch.float32)
+    ids = (torch.arange(m * topk, device="cuda").view(m, topk) % e).int()
+    inputs = x, w1, w2, weights, ids
+    actual = flaggems_vllm.ops_experts_impl(*inputs)
+    torch.testing.assert_close(
+        actual.cpu(), _thead_moe_reference(*inputs), rtol=0.05, atol=0.01
+    )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("quantization", ["use_int8_w8a16", "use_int4_w4a16"])
+def test_thead_fused_moe_dequantized_gemv(
+    thead_moe_original_layout, dtype, quantization
+):
+    import flaggems_vllm
+
+    torch.manual_seed(74)
+    e, hidden, intermediate, topk = 8, 1024, 512, 2
+    limit = 8 if quantization == "use_int4_w4a16" else 32
+    x = torch.randn((1, hidden), device="cuda", dtype=dtype)
+    # T-Head stores W4 unpacked in int8 containers, with the full K dimension.
+    w1 = torch.randint(
+        -limit, limit, (e, 2 * intermediate, hidden), device="cuda", dtype=torch.int8
+    )
+    w2 = torch.randint(
+        -limit, limit, (e, hidden, intermediate), device="cuda", dtype=torch.int8
+    )
+    scale1 = torch.full(
+        (e, 2 * intermediate),
+        (3 / hidden) ** 0.5 / limit,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    scale2 = torch.full(
+        (e, hidden),
+        (3 / intermediate) ** 0.5 / limit,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    weights = torch.full((1, topk), 0.5, device="cuda", dtype=torch.float32)
+    ids = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, topk)
+    kwargs = {quantization: True, "w1_scale": scale1, "w2_scale": scale2}
+
+    def reference():
+        # Match the public contract's dequantization rounding, then use the
+        # independent CPU MoE formula. No production helper is the oracle.
+        q1, q2 = w1.cpu().to(dtype), w2.cpu().to(dtype)
+        s1, s2 = scale1.cpu().to(dtype), scale2.cpu().to(dtype)
+        return _thead_moe_reference(
+            x.cpu(),
+            q1 * s1.unsqueeze(-1),
+            q2 * s2.unsqueeze(-1),
+            weights.cpu(),
+            ids.cpu(),
+        )
+
+    expected = reference()
+    actual = flaggems_vllm.ops_experts_impl(x, w1, w2, weights, ids, **kwargs)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flaggems_vllm.ops_experts_impl(x, w1, w2, weights, ids, **kwargs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = flaggems_vllm.ops_experts_impl(x, w1, w2, weights, ids, **kwargs)
+    for change in ("input", "weights"):
+        previous = expected
+        if change == "input":
+            x.copy_(torch.randn_like(x))
+        else:
+            w2.zero_()
+        expected = reference()
+        assert not torch.allclose(previous, expected, rtol=0.05, atol=0.01)
+        actual.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)

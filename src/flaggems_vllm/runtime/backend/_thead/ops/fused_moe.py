@@ -74,6 +74,7 @@ def try_get_optimal_moe_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
     return_is_embedded: bool = False,
+    use_original_layout: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], bool]:
     if gemm_stage not in ("gemm1", "gemm2"):
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
@@ -101,6 +102,7 @@ def try_get_optimal_moe_config(
             block_shape,
             gemm_stage=gemm_stage,
             enable_gemm_fast_path=enable_gemm_fast_path,
+            use_original_layout=use_original_layout,
         )
         is_embedded = False
     if return_is_embedded:
@@ -188,6 +190,7 @@ def get_default_config(
     block_shape: list[int] | None = None,
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
+    use_original_layout: bool = False,
 ) -> dict[str, Any]:
     """PPU-tuned per-M config (V6 sweep 2026-08-14; small-M re-sweep
     2026-08-17).
@@ -211,6 +214,20 @@ def get_default_config(
         bm, bn, bk = 16, 128, 32
     else:
         bm, bn, bk = 16, 256, 64
+    stages = 4
+    if use_original_layout and dtype in _PLAIN_HALF_CONFIG_DTYPES and 0 < M <= 1024:
+        # Original [E, N, K] weights are contiguous along K. Keep the row tile
+        # small for sparse expert routing and load longer contiguous K spans.
+        bm = 32 if M * topk >= 16 * E else 16
+        bn, bk, stages = 128, 128, 3 if bm == 32 and E <= 32 else 2
+        if M <= 8 and min(N, K) >= 1024:
+            stages = 4
+        if gemm_stage == "gemm1":
+            if N <= 256 and bm == 16 and (M >= 256 or M * topk * 4 <= E):
+                bn = 64
+            elif enable_gemm_fast_path and M > 8 and K >= N >= 1024 and bm == 16:
+                # Fused gate/up projections benefit from a longer K tile.
+                bn, bk = 64, 256
     use_int32 = dtype in ("bf16", "fp16") and max(M * K, M * topk * N, E * N * K) < (
         1 << 31
     )
@@ -220,7 +237,7 @@ def get_default_config(
         "BLOCK_SIZE_K": bk,
         "GROUP_SIZE_M": 8,
         "num_warps": 4,
-        "num_stages": 4,
+        "num_stages": stages,
         # PPU: int32 addressing ~2-3% faster than int64 (V6 exp); gated to
         # plain-half dtypes and overflow-safe shapes.
         "USE_INT32_OFFSETS": use_int32,
@@ -1468,9 +1485,9 @@ def invoke_fused_moe_triton_kernel(
     # PPU small-M naive path: per-row GEMV kernel (mirrors DeepGemm Gemvt).
     # No BLOCK_M tiling -> no 1/16 MMA-row waste for one-token-per-expert
     # routing. Only for plain-half, non-fused, non-direct-sum calls, and only
-    # where per-row work is large enough to amortise the block: >=32 routed
-    # rows and N >= 1024 (measured: wins on M=8/2I=2048, regresses on M=1
-    # and small-N shapes, which keep the tiled kernel).
+    # N >= 1024. For original K-contiguous plain-half weights, narrow N tiles
+    # also make single-token routing profitable; other layouts/dtypes retain
+    # the previous >=32-routed-row crossover.
     if (
         sorted_token_ids is None
         and not FUSE_SILU
@@ -1478,7 +1495,15 @@ def invoke_fused_moe_triton_kernel(
         and not (use_int8_w8a16 or use_int4_w4a16)
         and A_scale is None
         and B_scale is None
-        and num_tokens >= 32
+        and (
+            num_tokens >= 32
+            or (
+                num_tokens > 0
+                and A.dtype == B.dtype
+                and A.dtype in (torch.float16, torch.bfloat16)
+                and B.stride(2) == 1
+            )
+        )
         and actual_N >= 1024
     ):
         _g = _GEMV_CFG
@@ -1487,6 +1512,17 @@ def invoke_fused_moe_triton_kernel(
             gemv_block_k = _g["BLOCK_K"]
             gemv_warps = _g.get("num_warps", 1)
             gemv_stages = _g.get("num_stages", 3)
+        elif (
+            A.dtype == B.dtype
+            and A.dtype in (torch.float16, torch.bfloat16)
+            and B.stride(2) == 1
+        ):
+            # Narrow N tiles coalesce the original K-contiguous weights. With
+            # few routed rows, halve N again to expose enough independent work.
+            gemv_block_n = 8 if num_tokens <= 16 else 16
+            gemv_block_k = 128 if B.size(2) <= 128 else 256
+            gemv_warps = 1
+            gemv_stages = 2
         else:
             gemv_block_n = 128
             gemv_block_k = 32
@@ -1693,7 +1729,7 @@ def fused_experts_impl(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    logger.debug("GEMS FUSED MOE")
+    logger.debug("GEMS_THEAD FUSED_EXPERTS_IMPL")
     assert (
         activation == "silu"
     ), f"Only 'silu' activation is supported, got {activation}"
@@ -1747,6 +1783,15 @@ def fused_experts_impl(
         dtype=hidden_states.dtype,
     )
     is_plain_half_config = config_dtype in _PLAIN_HALF_CONFIG_DTYPES
+    use_original_layout = (
+        is_plain_half_config
+        and hidden_states.dtype == w1.dtype == w2.dtype
+        and not use_int8_w8a8
+        and expert_map is None
+        and w1_bias is None
+        and w2_bias is None
+        and not apply_router_weight_on_input
+    )
     is_fp8_blockwise = config_dtype == "fp8_w8a8" and block_shape is not None
 
     quant_dtype = _get_config_quant_dtype(
@@ -1762,6 +1807,7 @@ def fused_experts_impl(
         block_shape=block_shape,
         E=E,
         return_is_embedded=True,
+        use_original_layout=use_original_layout,
     )
 
     base_config, is_embedded_config = get_moe_config(M)
@@ -1817,6 +1863,9 @@ def fused_experts_impl(
         and activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
+        # For tiny routed batches with large projections, one joint GEMM and
+        # a separate activation outperform the two sequential fused dots.
+        and not (use_original_layout and 0 < num_tokens <= 8 and min(N, K) >= 1024)
     )
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
