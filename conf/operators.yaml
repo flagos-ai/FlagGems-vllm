@@ -1251,6 +1251,17 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: pad_trailing_draft_slots
+    description: Pad trailing stale slot mappings in place for multi-module MTP.
+    for:
+      - pad_trailing_draft_slots
+    labels:
+      - vLLM
+      - SpecDecode
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,
