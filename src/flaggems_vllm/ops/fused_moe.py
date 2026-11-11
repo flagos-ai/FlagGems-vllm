@@ -14,14 +14,12 @@
 
 import functools
 import logging
-import math
-import numbers
 import os
 from enum import Enum
 from typing import Any, Optional
 
+import flag_gems
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 import yaml
@@ -46,12 +44,6 @@ _HALF_GEMM_TILE_M = 128
 _HALF_GEMM_TILE_K = 64
 _HALF_GEMM2_TILE_N = 256
 _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
-
-# Experimental, opt-in W8A8 path.  "quant_oai" fuses the OAI activation into
-# the second per-token quantizer, saving a round trip through the workspace.
-# The per-token quantizers themselves are always the Triton kernels and need
-# no opt-in; only this fusion is gated.
-_W8A8_QUANT_FUSION_MODE = os.environ.get("FLAG_GEMS_W8A8_QUANT_FUSION", "off").lower()
 
 
 _MOE_CONFIG_KEYS_ORDER = (
@@ -650,7 +642,6 @@ class MoEActivation(Enum):
     GELU = "gelu"
     RELU2 = "relu2"
     SWIGLUOAI = "swigluoai"
-    SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
     SWIGLUSTEP = "swiglustep"
 
     # Non-gated: input [..., d] -> output [..., d]
@@ -685,102 +676,10 @@ class MoEActivation(Enum):
         return N if not activation.is_gated else N // 2
 
 
-def _validate_swigluoai_uninterleave_params(
-    gemm1_alpha: float | None,
-    gemm1_beta: float | None,
-    gemm1_clamp_limit: float | None,
-) -> tuple[float, float, float]:
-    """Validate the scalar gate parameters before launching an MoE kernel."""
-    params = {
-        "gemm1_alpha": gemm1_alpha,
-        "gemm1_beta": gemm1_beta,
-        "gemm1_clamp_limit": gemm1_clamp_limit,
-    }
-    validated = {}
-    for name, value in params.items():
-        if not isinstance(value, numbers.Real) or isinstance(value, bool):
-            raise ValueError(
-                f"swigluoai_uninterleave requires a finite scalar {name}, got {value!r}"
-            )
-        try:
-            converted = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"swigluoai_uninterleave requires a finite scalar {name}, got {value!r}"
-            ) from exc
-        # These scalars reach Triton as FP32.  A Python float is FP64, so a
-        # value such as 1e39 passes isfinite here yet overflows to infinity at
-        # that boundary, which would silently disable the clamp.
-        if (
-            not math.isfinite(converted)
-            or abs(converted) > torch.finfo(torch.float32).max
-        ):
-            raise ValueError(
-                f"swigluoai_uninterleave requires a finite FP32 scalar {name}, "
-                f"got {value!r}"
-            )
-        validated[name] = converted
-    if validated["gemm1_clamp_limit"] < 0:
-        raise ValueError("swigluoai_uninterleave requires gemm1_clamp_limit >= 0")
-    return (
-        validated["gemm1_alpha"],
-        validated["gemm1_beta"],
-        validated["gemm1_clamp_limit"],
-    )
-
-
-@triton.jit
-def _swigluoai_uninterleave_kernel(
-    input_ptr,
-    output_ptr,
-    n_inter,
-    stride_im,
-    stride_in,
-    stride_om,
-    stride_on,
-    alpha,
-    beta,
-    clamp_limit,
-    BLOCK_I: tl.constexpr,
-):
-    """Split gate/up layout; compute in FP32 and round on output store."""
-    # Promote before multiplying by a stride: a valid tensor stride can push
-    # the offset past int32 even when the logical activation is small.
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.program_id(1).to(tl.int64) * BLOCK_I + tl.arange(0, BLOCK_I)
-    mask = cols < n_inter
-    gate = tl.load(
-        input_ptr + row * stride_im + cols * stride_in, mask=mask, other=0.0
-    ).to(tl.float32)
-    up = tl.load(
-        input_ptr + row * stride_im + (n_inter + cols) * stride_in,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    # Triton's min/max drop NaN by default, which would silently turn a NaN
-    # activation into the clamp bound.  Keep NaNs observable instead.
-    gate = tl.minimum(gate, clamp_limit, propagate_nan=tl.PropagateNan.ALL)
-    up = tl.minimum(
-        tl.maximum(up, -clamp_limit, propagate_nan=tl.PropagateNan.ALL),
-        clamp_limit,
-        propagate_nan=tl.PropagateNan.ALL,
-    )
-    activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
-    tl.store(
-        output_ptr + row * stride_om + cols * stride_on,
-        activated.to(output_ptr.dtype.element_ty),
-        mask=mask,
-    )
-
-
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
     input: torch.Tensor,
-    *,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
-    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     """Apply MoE activation (pure PyTorch / FlagGems Triton)."""
     assert input.dim() == 2, "Input must be 2D"
@@ -800,50 +699,25 @@ def apply_moe_activation(
         N = output.size(-1)
         x, y = input[:, :N], input[:, N:]
         _silu_and_mul_kernel(x, y, out0=output)
-    elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
-        alpha, beta, limit = _validate_swigluoai_uninterleave_params(
-            gemm1_alpha, gemm1_beta, gemm1_clamp_limit
-        )
-        assert input.dtype == output.dtype and input.device == output.device
-        assert input.size(0) == output.size(0)
-        if output.numel() == 0:
-            return output
-        block_i = 256
-        _swigluoai_uninterleave_kernel[
-            (output.size(0), triton.cdiv(output.size(1), block_i))
-        ](
-            input,
-            output,
-            output.size(1),
-            input.stride(0),
-            input.stride(1),
-            output.stride(0),
-            output.stride(1),
-            alpha,
-            beta,
-            limit,
-            BLOCK_I=block_i,
-        )
     elif activation == MoEActivation.GELU:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.gelu(gate) * up)
+        output.copy_(flag_gems.gelu(gate, approximate="none") * up)
     elif activation == MoEActivation.SWIGLUSTEP:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(torch.sigmoid(gate) * up)
+        output.copy_(flag_gems.sigmoid(gate) * up)
     elif activation == MoEActivation.RELU2:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.relu(gate).square() * up)
+        output.copy_(flag_gems.relu(gate).square() * up)
 
     elif activation == MoEActivation.SILU_NO_MUL:
-        output.copy_(F.silu(input))
+        output.copy_(flag_gems.silu(input))
     elif activation == MoEActivation.GELU_NO_MUL:
-        output.copy_(F.gelu(input))
+        output.copy_(flag_gems.gelu(input, approximate="none"))
     elif activation == MoEActivation.RELU2_NO_MUL:
-        F.relu(input, inplace=True)
-        torch.square(input, out=output)
+        output.copy_(flag_gems.square(flag_gems.relu(input)))
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -1107,90 +981,6 @@ def _int8_quantize_per_token_triton(
                 num_warps=8,
             )
     return A_q, scale
-
-
-@triton.jit
-def _swigluoai_quantize_per_token_kernel(
-    input_ptr,
-    activation_ptr,
-    quant_ptr,
-    scale_ptr,
-    K: tl.constexpr,
-    stride_im: tl.constexpr,
-    stride_ik: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_ok: tl.constexpr,
-    # Runtime arguments, not constexprs: specialising on the scalar values
-    # would recompile the kernel once per distinct alpha/beta/clamp triple.
-    alpha,
-    beta,
-    clamp_limit,
-    BLOCK_K: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK_K).to(tl.int64)
-    valid = cols < K
-    gate = tl.load(input_ptr + row * stride_im + cols * stride_ik, valid, other=0).to(
-        tl.float32
-    )
-    up = tl.load(
-        input_ptr + row * stride_im + (K + cols) * stride_ik, valid, other=0
-    ).to(tl.float32)
-    gate = tl.minimum(gate, clamp_limit, propagate_nan=tl.PropagateNan.ALL)
-    up = tl.minimum(
-        tl.maximum(up, -clamp_limit, propagate_nan=tl.PropagateNan.ALL),
-        clamp_limit,
-        propagate_nan=tl.PropagateNan.ALL,
-    )
-    activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
-    # Retain the observable BF16/FP16 workspace rounding before quant2.
-    activated = activated.to(activation_ptr.dtype.element_ty)
-    tl.store(activation_ptr + row * stride_om + cols * stride_ok, activated, valid)
-    q, scale = _per_token_int8_values(activated, valid, activation_ptr.dtype.element_ty)
-    tl.store(quant_ptr + row * K + cols, q, valid)
-    tl.store(scale_ptr + row, scale)
-
-
-def _swigluoai_quantize_per_token_triton(
-    input: torch.Tensor,
-    activation_output: torch.Tensor,
-    alpha: float,
-    beta: float,
-    clamp_limit: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """OAI + quant2, retaining the rounded activation workspace for inspection."""
-    # Validate the scalars before touching tensor metadata so a bad alpha or
-    # clamp reports itself rather than surfacing as an attribute error.
-    alpha, beta, clamp_limit = _validate_swigluoai_uninterleave_params(
-        alpha, beta, clamp_limit
-    )
-    assert input.ndim == activation_output.ndim == 2
-    assert input.shape == (activation_output.size(0), activation_output.size(1) * 2)
-    assert input.dtype == activation_output.dtype
-    assert input.device == activation_output.device
-    assert input.dtype in (torch.bfloat16, torch.float16)
-    M, K = activation_output.shape
-    assert 0 < K <= 8192
-    q = torch.empty((M, K), device=input.device, dtype=torch.int8)
-    scale = torch.empty((M, 1), device=input.device, dtype=torch.float32)
-    if M:
-        _swigluoai_quantize_per_token_kernel[(M,)](
-            input,
-            activation_output,
-            q,
-            scale,
-            K,
-            input.stride(0),
-            input.stride(1),
-            activation_output.stride(0),
-            activation_output.stride(1),
-            alpha,
-            beta,
-            clamp_limit,
-            BLOCK_K=triton.next_power_of_2(K),
-            num_warps=4 if K <= 2048 else 8,
-        )
-    return q, scale
 
 
 def moe_kernel_quantize_input(
@@ -2311,13 +2101,12 @@ def dispatch_fused_moe_kernel(
         )
 
 
-def fused_experts_impl(
+def _fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -2337,31 +2126,11 @@ def fused_experts_impl(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
-    *,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
-    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     logger.debug("GEMS FUSED MOE")
     activation_enum = MoEActivation.from_str(activation)
-    if activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
-        gemm1_alpha, gemm1_beta, gemm1_clamp_limit = (
-            _validate_swigluoai_uninterleave_params(
-                gemm1_alpha, gemm1_beta, gemm1_clamp_limit
-            )
-        )
-    elif activation_enum == MoEActivation.SILU:
-        if any(
-            value is not None for value in (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
-        ):
-            raise ValueError(
-                "gemm1_alpha/beta/clamp_limit require swigluoai_uninterleave"
-            )
-    else:
-        raise ValueError(
-            f"Only 'silu' and 'swigluoai_uninterleave' activations are supported, "
-            f"got {activation!r}"
-        )
+    if activation_enum != MoEActivation.SILU:
+        raise ValueError(f"Only 'silu' activation is supported, got {activation!r}")
 
     # Check constraints
     if use_int4_w4a16:
@@ -2460,7 +2229,7 @@ def fused_experts_impl(
     else:
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+    out_hidden_states = torch.empty_like(hidden_states)
 
     if ocp_mx_scheme is not None:
         # Dequantize OCP MX weights (TODO: skip on platforms with native MX)
@@ -2622,48 +2391,23 @@ def fused_experts_impl(
             FUSE_SILU=do_fuse_silu,  # Master switch for the kernel
         )
 
-        # 4. Apply OAI and quant2 together only on the opt-in W8A8 path.
-        # The fused kernel still stores the rounded intermediate_cache2.
-        fused_oai_quant2 = (
-            _W8A8_QUANT_FUSION_MODE == "quant_oai"
-            and use_int8_w8a8
-            and per_channel_quant
-            and block_shape is None
-            and ocp_mx_scheme is None
-            and a2_scale is None
-            and activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE
-            and intermediate_cache2.dtype in (torch.bfloat16, torch.float16)
-            and intermediate_cache2.device.type in ("cuda", "musa", "xpu")
-            and 0 < activation_out_dim <= 8192
-        )
-        if fused_oai_quant2:
-            qintermediate_cache2, a2q_scale = _swigluoai_quantize_per_token_triton(
-                intermediate_cache1.view(-1, N),
-                intermediate_cache2,
-                gemm1_alpha,
-                gemm1_beta,
-                gemm1_clamp_limit,
-            )
-        elif not do_fuse_silu:
+        # 4. Apply the activation
+        if not do_fuse_silu:
             apply_moe_activation(
                 activation_enum,
                 intermediate_cache2,
                 intermediate_cache1.view(-1, N),
-                gemm1_alpha=gemm1_alpha,
-                gemm1_beta=gemm1_beta,
-                gemm1_clamp_limit=gemm1_clamp_limit,
             )
 
         # 5. Quantize activated intermediate for GEMM2
-        if not fused_oai_quant2:
-            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-                A=intermediate_cache2,
-                A_scale=a2_scale,
-                quant_dtype=quant_dtype,
-                per_act_token_quant=per_channel_quant,
-                block_shape=block_shape,
-                ocp_mx_scheme=ocp_mx_scheme,
-            )
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            A=intermediate_cache2,
+            A_scale=a2_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+            ocp_mx_scheme=ocp_mx_scheme,
+        )
 
         if expert_map is not None:
             intermediate_cache3.zero_()
@@ -2737,7 +2481,7 @@ def fused_experts_impl(
     return out_hidden_states
 
 
-def inplace_fused_experts(
+def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -2749,108 +2493,47 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-    *,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
-    gemm1_clamp_limit: float | None = None,
-) -> None:
-    """
-    In-place fused MoE: writes output directly into ``hidden_states``.
-
-    Same semantics as ``fused_experts_impl(..., inplace=True)``.
-    Returns None (the result is stored in ``hidden_states``).
-    """
-    fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace=True,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        global_num_experts=global_num_experts,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-    )
-
-
-def outplace_fused_experts(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-    *,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
-    gemm1_clamp_limit: float | None = None,
+    expert_map: torch.Tensor | None = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_shape: list[int] | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Out-of-place fused MoE: allocates and returns a new output tensor.
+    """Fused MoE forward with the vLLM fused_experts_impl signature.
 
-    Same semantics as ``fused_experts_impl(..., inplace=False)``.
+    Always allocates and returns a new output tensor.
     """
-    return fused_experts_impl(
+    return _fused_experts_impl(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation=activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        ocp_mx_scheme=ocp_mx_scheme,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
+        expert_map=expert_map,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
     )

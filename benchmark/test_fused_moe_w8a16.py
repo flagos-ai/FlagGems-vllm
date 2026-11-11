@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
-
 import pytest
 import torch
 
@@ -32,32 +30,15 @@ def is_cuda_available():
 
 CUDA_AVAILABLE = is_cuda_available()
 
-try:
+VENDOR = flaggems_vllm.vendor_name
+
+# Vendors whose vLLM build ships the Triton fused_experts_impl.
+VLLM_NATIVE_VENDORS = {"nvidia", "metax"}
+
+if VENDOR in VLLM_NATIVE_VENDORS:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts_impl as vllm_fused_experts_impl,
     )
-
-    HAS_VLLM_FUSED_MOE = True
-except ImportError:
-    HAS_VLLM_FUSED_MOE = False
-
-
-def _supports_keyword(op, keyword):
-    try:
-        parameters = inspect.signature(op).parameters
-    except (TypeError, ValueError):
-        return False
-    return keyword in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-
-
-# vLLM versions differ: newer ones require ``inplace`` (no default), older ones
-# do not accept the keyword at all.
-VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
-    vllm_fused_experts_impl, "inplace"
-)
 
 
 class FusedMoEMXQW8A16Benchmark(base.Benchmark):
@@ -70,6 +51,15 @@ class FusedMoEMXQW8A16Benchmark(base.Benchmark):
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in ("latency_base", "speedup")
+            ]
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
@@ -236,10 +226,10 @@ def _baseline_w8a16_mxq_wrapper(
     num_experts,
     topk,
 ):
-    """FP16/BF16 reference: run flaggems_vllm.ops_experts_impl pure FP16 path."""
+    """FP16/BF16 reference: run flaggems_vllm.fused_experts_impl pure FP16 path."""
     del w1_q, w2_q, w3_q, w1_scale, w2_scale, w3_scale, num_experts, topk
-    return flaggems_vllm.ops_experts_impl(
-        hidden_states.clone(),
+    return flaggems_vllm.fused_experts_impl(
+        hidden_states,
         w1_fp16,
         w2_fp16,
         topk_weights,
@@ -264,9 +254,8 @@ def _baseline_w8a16_mxq_wrapper_vllm(
 ):
     """Wrapper to call vllm fused_experts_impl with W8A16 quantized weights."""
     del w1_fp16, w2_fp16, w3_q, w3_scale, num_experts, topk
-    kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(
-        hidden_states.clone(),
+        hidden_states,
         w1_q,
         w2_q,
         topk_weights,
@@ -275,7 +264,6 @@ def _baseline_w8a16_mxq_wrapper_vllm(
         use_int8_w8a16=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        **kwargs,
     )
 
 
@@ -321,6 +309,12 @@ def _gems_fused_moe_mxq_w8a16_wrapper(
     )
 
 
+def _get_baseline_op():
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        return _baseline_w8a16_mxq_wrapper_vllm
+    return None
+
+
 @pytest.mark.fused_moe
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
 def test_fused_moe_w8a16_mxq():
@@ -337,7 +331,6 @@ def test_fused_moe_w8a16_mxq():
 
 
 @pytest.mark.fused_moe
-@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
 def test_fused_moe_w8a16_mxq_gems_vs_vllm():
     """
@@ -345,7 +338,7 @@ def test_fused_moe_w8a16_mxq_gems_vs_vllm():
     """
     bench = FusedMoEMXQW8A16Benchmark(
         op_name="fused_moe_w8a16_mxq_gems_vs_vllm",
-        torch_op=_baseline_w8a16_mxq_wrapper_vllm,
+        torch_op=_get_baseline_op(),
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_fused_moe_mxq_w8a16_wrapper)

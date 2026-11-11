@@ -922,19 +922,6 @@ ops:
       - Quantization
     stages:
       - beta: '5.3'
-  - id: inplace_fused_experts
-    description: This operator writes output directly to `hidden_states`.
-    for:
-      - inplace_fused_experts
-    labels:
-      - fused
-      - Activation
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '5.0'
-      - stable: '5.3'
   - id: instance_norm
     description: |
       Apply Instance Normalization independently for each channel in every data sample within a batch.
@@ -1226,19 +1213,6 @@ ops:
       - BLAS
     stages:
       - stable: '2.0'
-  - id: outplace_fused_experts
-    description: This operator allocates and returns a new output tensor.
-    for:
-      - outplace_fused_experts
-    labels:
-      - fused
-      - Activation
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '5.0'
-      - stable: '5.3'
   - id: pack_seq_triton
     description: Pack variable-length token sequences into a padded batched tensor.
     for:

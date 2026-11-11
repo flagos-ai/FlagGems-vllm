@@ -21,11 +21,7 @@ from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
-from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
+from flaggems_vllm.runtime.backend._metax.ops.fused_moe import fused_experts_impl
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
@@ -60,9 +56,7 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "hc_combine",
-    "inplace_fused_experts",
     "int8_einsum",
-    "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
