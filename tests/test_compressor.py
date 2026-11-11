@@ -127,3 +127,167 @@ def test_compressor_matches_ascendc(case_name):
         rtol=RTOL,
         atol=ATOL,
     )
+
+
+def _small_strided_inputs(dtype, layout, cmp_ratio=4, coff=2, rotary_mode=2):
+    batch, length, hidden, head, block = (
+        2 if layout == "batch_strided" else 1,
+        5,
+        512,
+        128,
+        8,
+    )
+    if cmp_ratio == 128:
+        length, block = 129, 256
+    generator = torch.Generator().manual_seed(127)
+    rank3 = layout == "batch_strided"
+    shape = (batch, length, hidden) if rank3 else (length, hidden)
+    source = torch.randn(shape, generator=generator).to(dtype) * 0.1
+    if rank3:
+        storage = torch.empty(
+            (length, batch, hidden * 2), device=flaggems_vllm.device, dtype=dtype
+        )
+        x = storage.permute(1, 0, 2)[..., ::2]
+    elif layout == "column_strided":
+        storage = torch.empty(
+            (length, hidden * 2), device=flaggems_vllm.device, dtype=dtype
+        )
+        x = storage[:, ::2]
+    else:
+        x = torch.empty(shape, device=flaggems_vllm.device, dtype=dtype)
+    x.copy_(source)
+    per_request = (length + cmp_ratio - 1) // cmp_ratio
+    rows = batch * per_request if rank3 else length // cmp_ratio
+    rope_shape = (batch, per_request, 64) if rank3 else (rows, 64)
+    width = coff * head
+    table = torch.arange(1, batch + 1, dtype=torch.int32).reshape(batch, 1)
+    inputs = dict(
+        x=x,
+        wkv=(torch.randn((width, hidden), generator=generator).to(dtype) * 0.1).to(
+            x.device
+        ),
+        wgate=(torch.randn((width, hidden), generator=generator).to(dtype) * 0.1).to(
+            x.device
+        ),
+        state_cache=(
+            torch.randn((batch + 1, block, 2 * width), generator=generator) * 0.01
+        ).to(x.device),
+        ape=(torch.randn((cmp_ratio, width), generator=generator) * 0.01).to(x.device),
+        norm_weight=torch.ones((head,), dtype=dtype, device=x.device),
+        rope_sin=torch.full(rope_shape, 0.1, dtype=dtype, device=x.device),
+        rope_cos=torch.full(rope_shape, 0.9, dtype=dtype, device=x.device),
+        state_block_table=table.to(x.device),
+        cu_seqlens=(
+            None
+            if rank3
+            else torch.tensor([0, length], dtype=torch.int32, device=x.device)
+        ),
+        seqused=None,
+        start_pos=torch.zeros((batch,), dtype=torch.int32, device=x.device),
+        rope_head_dim=64,
+        cmp_ratio=cmp_ratio,
+        coff=coff,
+        norm_eps=1e-6,
+        rotary_mode=rotary_mode,
+        cache_mode=1,
+    )
+    return inputs
+
+
+def _cpu_compressor_inputs(inputs):
+    return {
+        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+
+
+@pytest.mark.compressor
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["contiguous", "column_strided", "batch_strided"])
+@pytest.mark.parametrize(
+    "cmp_ratio,coff,rotary_mode", [(4, 2, 2), (4, 1, 1), (128, 1, 2)]
+)
+def test_compressor_prepared_reads_live_input(
+    dtype, layout, cmp_ratio, coff, rotary_mode
+):
+    import importlib
+
+    implementation = importlib.import_module(flaggems_vllm.compressor.__module__)
+    inputs = _small_strided_inputs(dtype, layout, cmp_ratio, coff, rotary_mode)
+    workspace = implementation.prepare_compressor_workspace(**inputs)
+    initial_state = inputs["state_cache"].clone()
+    source = inputs["x"].cpu()
+    for scale in [0.5, -0.25]:
+        inputs["x"].copy_(source * scale + 0.0625)
+        inputs["state_cache"].copy_(initial_state)
+        reference_inputs = _cpu_compressor_inputs(inputs)
+        expected = compressor_torch(**reference_inputs)
+        actual = implementation.compressor_prepared(workspace)
+        _synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.01, atol=0.01)
+        torch.testing.assert_close(
+            inputs["state_cache"].cpu(),
+            reference_inputs["state_cache"],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+
+@pytest.mark.compressor
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace graph"
+)
+@pytest.mark.parametrize("layout", ["column_strided", "batch_strided"])
+def test_compressor_prepared_strided_graph(layout):
+    import importlib
+
+    implementation = importlib.import_module(flaggems_vllm.compressor.__module__)
+    inputs = _small_strided_inputs(torch.bfloat16, layout)
+    workspace = implementation.prepare_compressor_workspace(**inputs)
+    initial_state = inputs["state_cache"].clone()
+    implementation.compressor_prepared(workspace)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = implementation.compressor_prepared(workspace)
+    source = inputs["x"].cpu()
+    for scale in [0.5, -0.25]:
+        inputs["x"].copy_(source * scale + 0.0625)
+        inputs["state_cache"].copy_(initial_state)
+        reference_inputs = _cpu_compressor_inputs(inputs)
+        expected = compressor_torch(**reference_inputs)
+        actual.fill_(float("nan"))
+        graph.replay()
+        _synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.01, atol=0.01)
+        torch.testing.assert_close(
+            inputs["state_cache"].cpu(),
+            reference_inputs["state_cache"],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+
+@pytest.mark.compressor
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="Ascend cache bounds")
+@pytest.mark.parametrize("page", [-1, 0, 3])
+@pytest.mark.parametrize("tokens,start", [(1, 0), (1, 3), (5, 0)])
+def test_compressor_invalid_page_preserves_backing_storage(page, tokens, start):
+    inputs = _small_strided_inputs(torch.bfloat16, "contiguous")
+    inputs["x"] = inputs["x"][:tokens]
+    inputs["cu_seqlens"] = torch.tensor(
+        [0, tokens], dtype=torch.int32, device=inputs["x"].device
+    )
+    inputs["start_pos"].fill_(start)
+    # A negative physical page lands in this owned prefix, so a regression is
+    # observable without intentionally accessing outside the allocation.
+    backing = torch.full((5, 8, 512), 0.125, device=inputs["x"].device)
+    inputs["state_cache"] = backing[1:4]
+    inputs["state_block_table"].fill_(page)
+    before = backing.cpu()
+    reference_inputs = _cpu_compressor_inputs(inputs)
+    expected = compressor_torch(**reference_inputs)
+    actual = flaggems_vllm.compressor(**inputs)
+    _synchronize()
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.01, atol=0.01)
+    torch.testing.assert_close(backing.cpu(), before, rtol=0, atol=0)
