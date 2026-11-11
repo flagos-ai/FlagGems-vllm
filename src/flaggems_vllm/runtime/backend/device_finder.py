@@ -105,6 +105,8 @@ class DeviceDetector:
             "FLAGGEMS_VENDOR",
             "GEMS_BACKEND",
             "FLAGGEMS_BACKEND",
+            # Documented vendor override (also exported by tools/setup.sh).
+            "DNN_VENDOR",
         )
         for key in env_keys:
             if key in os.environ:
