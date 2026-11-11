@@ -17,6 +17,10 @@ from . import conftest as cfg
 
 pytestmark = [
     pytest.mark.qsa_attention,
+    pytest.mark.skipif(
+        ops.vendor_name != "thead",
+        reason="Legacy QSA ABI is retained only by T-Head; other backends use test_qsa_sparse_paged_attention.py",
+    ),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
 ]
 
@@ -363,14 +367,13 @@ def test_qsa_tile_floor(monkeypatch, group, splits, vendor):
 
 
 def test_qsa_vendor_export_and_abi():
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._thead.fused.qsa_attention"
+    )
+    assert ops.qsa_sparse_paged_attention is backend.qsa_sparse_paged_attention
     assert inspect.signature(ops.qsa_sparse_paged_attention) == inspect.signature(
         generic_ops.qsa_sparse_paged_attention
     )
-    if ops.vendor_name == "thead":
-        backend = importlib.import_module(
-            "flaggems_vllm.runtime.backend._thead.fused.qsa_attention"
-        )
-        assert ops.qsa_sparse_paged_attention is backend.qsa_sparse_paged_attention
 
 
 def test_qsa_cpu_remains_unsupported():
