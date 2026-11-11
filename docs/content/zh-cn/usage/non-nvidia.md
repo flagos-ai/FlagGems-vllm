@@ -68,21 +68,15 @@ ROCm 环境下可直接使用原生 Triton 编译器。
 
 ### 华为昇腾 (Ascend)
 
-需要安装华为 CANN 工具包以及配套的 Torch-NPU：
+需要安装华为 CANN 工具包以及配套的 Torch-NPU。经过验证的组合是
+`src/flaggems_vllm/backends.yaml` 中的 `ascend-cann900`（或 `ascend-cann850`）配置：
 
 ```bash
-# 安装配套的 Torch-NPU
-pip install torch-npu
-
-export DNN_VENDOR=ascend
+bash tools/setup.sh ascend
 ```
 
-在昇腾环境下推荐使用 FlagTree 多芯片统一编译器：
-
-```bash
-pip install flagtree
-export USE_FLAGTREE=1
-```
+昇腾环境推荐使用 FlagTree 多芯片统一编译器；配置中固定了匹配的
+`flagtree` 版本，`tools/setup.sh` 默认会安装它。
 
 ### 其他国产芯片与加速硬件
 
@@ -93,12 +87,52 @@ export USE_FLAGTREE=1
 - **OpenAI Triton**：原生支持 NVIDIA 和 AMD (ROCm)。
 - **FlagTree 编译器**：FlagOS 推出的多架构统一编译器，支持国产多种不同硬件后端。
 
-启用 FlagTree 编译：
+启用 FlagTree 编译时，优先使用配置中固定的版本；直接
+`pip install flagtree` 可能与厂商 torch 栈不匹配：
 
 ```bash
-pip install flagtree
-export USE_FLAGTREE=1
+# 安装该后端固定的编译器
+bash tools/setup.sh ascend
+
+# 环境已准备好时，也可以强制指定编译器
+COMPILER=flagtree bash tools/setup.sh --no-venv ascend
+COMPILER=triton   bash tools/setup.sh --no-venv ascend
 ```
+
+## 多后端环境搭建
+
+`tools/setup.sh` 读取 `src/flaggems_vllm/backends.yaml` 中的后端注册表，安装匹配的
+torch 栈、vLLM 包、编译器和测试依赖：
+
+```bash
+# 查看配置和别名
+bash tools/setup.sh --list
+
+# 创建 .venv 并安装（打印激活命令）
+bash tools/setup.sh ascend
+
+# 或创建 .venv 并在当前 shell 中激活
+source tools/setup.sh metax
+```
+
+常用别名：`nvidia`、`ascend`、`hygon`、`metax`、`iluvatar`、`mthreads`、
+`cambricon`、`enflame`、`kunlunxin`、`thead`、`tsingmicro`、`biren`、
+`spacemit`、`sunrise`、`amd`。也可以直接使用完整配置名（如
+`ascend-cann850`、`metax-maca3720`）。
+
+厂商镜像通常已经提供匹配的 torch/triton/vLLM。在镜像内使用 `--no-venv`，
+只补充 FlagGems-vllm 和测试依赖，不替换厂商包：
+
+```bash
+bash tools/setup.sh --no-venv hygon
+```
+
+也可以按步骤用 pip 手动完成同样的安装，参见
+[不创建虚拟环境的手动安装](../getting-started/install.md#不创建虚拟环境的手动安装)。
+
+新增后端时，在 `src/flaggems_vllm/backends.yaml` 中添加配置即可。配置记录 Python 版本、
+厂商 torch 依赖、Triton/FlagTree 包、vLLM 来源、环境变量、厂商 env 脚本和
+后端专用测试依赖。
 
 ## 硬件后端成熟度一览
 

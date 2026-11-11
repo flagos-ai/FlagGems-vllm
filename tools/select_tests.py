@@ -40,6 +40,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     ".github/configs/ci-backends.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
+    "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
     "pytest.ini",
     "tests/conftest.py",
@@ -52,6 +53,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
+    "tools/source_env_bash.sh",
 }
 
 ENV_SMOKE_TRIGGER_PREFIXES = (
