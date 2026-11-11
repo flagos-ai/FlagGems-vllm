@@ -48,8 +48,6 @@ qsa_compress_groups_with_ratio
 qsa_compress_norm_mrope_store_groups
 qsa_mqa_paged
 qsa_prepare
-qsa_sparse_paged_attention
-qsa_sparse_split_count
 qsa_store_cache_rows
 qsa_store_kv_cache_rows
 qwen4_compress_norm_mrope_store_groups
