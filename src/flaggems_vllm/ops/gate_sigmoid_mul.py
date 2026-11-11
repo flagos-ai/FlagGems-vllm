@@ -27,10 +27,22 @@ _MAX_RANK = 8
 _IS_ASCEND = runtime.device.vendor_name == "ascend"
 
 
+def _prune_ascend_configs(configs, named_args, **kwargs):
+    if not named_args["FLAT"]:
+        smallest = min(configs, key=lambda config: config.kwargs["BLOCK_SIZE"])
+        # Every candidate uses one program here. A larger tile only adds padding.
+        if named_args["N"] <= smallest.kwargs["BLOCK_SIZE"]:
+            return [smallest]
+    return configs
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("gate_sigmoid_mul"),
     key=["N", "WIDTH", "LAYOUT_KEY"],
+    prune_configs_by=(
+        {"early_config_prune": _prune_ascend_configs} if _IS_ASCEND else None
+    ),
     warmup=5,
     rep=20,
     use_cuda_graph=False,
@@ -129,7 +141,6 @@ def gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor
         and gate.is_contiguous()
     )
     width = shape[-1] if shape else 1
-    layout_key = f"{shape}:{a_strides}:{g_strides}:{flat}"
     with runtime.torch_device_fn.device(attn_out.device):
         if (
             _IS_ASCEND
@@ -152,15 +163,25 @@ def gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor
                 num_stages=1,
             )
             return output
+        if _IS_ASCEND and flat:
+            # Flat indexing only uses N. Reuse compiled kernels across shapes
+            # while keeping exact N and dtypes in the tuning key.
+            kernel_width, kernel_shape = 1, ()
+            kernel_a_strides = kernel_g_strides = ()
+            layout_key = ""
+        else:
+            kernel_width, kernel_shape = width, tuple(shape)
+            kernel_a_strides, kernel_g_strides = tuple(a_strides), tuple(g_strides)
+            layout_key = f"{shape}:{a_strides}:{g_strides}:{flat}"
         _gate_sigmoid_mul_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)](
             attn_out,
             gate,
             output,
             n,
-            width,
-            tuple(shape),
-            tuple(a_strides),
-            tuple(g_strides),
+            kernel_width,
+            kernel_shape,
+            kernel_a_strides,
+            kernel_g_strides,
             flat,
             layout_key,
         )
