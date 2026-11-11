@@ -211,6 +211,95 @@ def test_gdn_w8a16_bounded_workspace_replay(monkeypatch, dtype, sequences):
 
 
 @pytest.mark.gdn_w8a16
+def test_gdn_w8a16_compile_hook_reload(monkeypatch):
+    import importlib
+    import importlib.util
+    import sys
+
+    chunk = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16"
+    )
+    calls = []
+
+    def translate(src, mxcc, maca, options):
+        calls.append((src, options))
+        return b"compiled"
+
+    monkeypatch.setattr(chunk.backend.metax, "translate_llvmir_to_mcfatbin", translate)
+    monkeypatch.setattr(chunk.backend, "maca_get_kernel_name", lambda src: src)
+    spec = importlib.util.spec_from_file_location("_gdn_reload_test", chunk.__file__)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    installed = chunk.backend.metax.translate_llvmir_to_mcfatbin
+    # Re-execute the same module namespace, as reload does, without replacing
+    # the public package entry used by other tests.
+    spec.loader.exec_module(module)
+    assert chunk.backend.metax.translate_llvmir_to_mcfatbin is installed
+    for name in ("_gdn_chunk_scan", "_gdn_fp32_chunk_scan", "unrelated_kernel"):
+        assert installed(name, None, None, "-O3") == b"compiled"
+    flag = " -mllvm -metaxgpu-disable-licm=true"
+    assert calls == [
+        ("_gdn_chunk_scan", "-O3" + flag),
+        ("_gdn_fp32_chunk_scan", "-O3" + flag),
+        ("unrelated_kernel", "-O3"),
+    ]
+
+
+@pytest.mark.gdn_w8a16
+def test_gdn_w8a16_mixed_window_replay():
+    import importlib
+
+    chunk = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16"
+    )
+    torch.manual_seed(9616)
+    tokens, sequences = 8191, 16
+    args, bounds = inputs(dict(shape=[1, tokens, 16, 128, 32, 128, sequences]))
+    # Use the stable raw-input distribution of the mixed-precision benchmark.
+    args[0].normal_()
+    args[1].normal_()
+    args[4].div_(128)
+    original = args[5].clone()
+
+    def call():
+        return gdn_w8a16(*args, mixed_precision=True)
+
+    for _ in range(3):
+        call()
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = call()
+    torch.cuda.synchronize()
+    result_bytes = sum(t.numel() * t.element_size() for t in actual)
+    assert (
+        torch.cuda.max_memory_allocated() - allocated
+        <= chunk._WORKSPACE_LIMIT_BYTES + result_bytes + 4096
+    )
+    del actual
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = call()
+    # Same graph, different numbers of active chunks and requests, including
+    # the maximum chunk count and empty requests across the 96-chunk window.
+    for bounds in (
+        bounds,
+        [*range(sequences), tokens],
+        [0] * 8 + [i * tokens // 8 for i in range(9)],
+    ):
+        args[-1].copy_(torch.tensor(bounds, device="cuda", dtype=torch.int32))
+        expected = reference(*args[:6], bounds)
+        for _ in range(2):
+            graph.replay()
+            torch.testing.assert_close(
+                actual[0].float(), expected[0], atol=0.002, rtol=0.02
+            )
+            torch.testing.assert_close(actual[1], expected[1], atol=0.002, rtol=0.02)
+            torch.testing.assert_close(args[5], original, atol=0, rtol=0)
+
+
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_backend_registration():
     import flaggems_vllm
     from flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16 import (

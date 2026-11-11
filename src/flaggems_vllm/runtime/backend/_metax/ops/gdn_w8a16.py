@@ -24,17 +24,27 @@ except ImportError:
 _WORKSPACE_LIMIT_BYTES = 256 * 1024**2
 _SHORT_MAX_CHUNKS = 64
 _FP32_MAX_CHUNKS = 32
-_original_translate = backend.metax.translate_llvmir_to_mcfatbin
 
 
-def _compile_gdn_chunk(src, mxcc, maca, options):
-    # Apply the existing MetaX LICM workaround only to GDN state scans.
-    if backend.maca_get_kernel_name(src) in ("_gdn_chunk_scan", "_gdn_fp32_chunk_scan"):
-        options += " -mllvm -metaxgpu-disable-licm=true"
-    return _original_translate(src, mxcc, maca, options)
+def _install_gdn_compile_hook():
+    translate = backend.metax.translate_llvmir_to_mcfatbin
+    if getattr(translate, "_gdn_w8a16_hook", False):
+        return
+
+    def compile_gdn_chunk(src, mxcc, maca, options):
+        # Capture the original callable so module reload cannot make it recursive.
+        if backend.maca_get_kernel_name(src) in (
+            "_gdn_chunk_scan",
+            "_gdn_fp32_chunk_scan",
+        ):
+            options += " -mllvm -metaxgpu-disable-licm=true"
+        return translate(src, mxcc, maca, options)
+
+    compile_gdn_chunk._gdn_w8a16_hook = True
+    backend.metax.translate_llvmir_to_mcfatbin = compile_gdn_chunk
 
 
-backend.metax.translate_llvmir_to_mcfatbin = _compile_gdn_chunk
+_install_gdn_compile_hook()
 
 
 @tr.jit
