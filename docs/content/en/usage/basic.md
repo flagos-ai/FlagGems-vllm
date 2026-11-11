@@ -58,70 +58,33 @@ output = flaggems_vllm.fused_add_rms_norm(hidden, residual, weight, eps=1e-6)
 
 ## Operator Discovery
 
-List all available operators (requires `enable()` to be called first to populate the registrar):
+Inspect all exported specialized operators directly via `flaggems_vllm.ops.__all__`:
 
 ```python
 import flaggems_vllm
 
-# Enable operators to inspect registered ops
-flaggems_vllm.enable()
-
-# Get all registered operator names
-ops = flaggems_vllm.all_registered_ops()
+ops = flaggems_vllm.ops.__all__
 print(f"Available operators: {len(ops)}")
 print(ops[:10])  # First 10 operators
-
-# Get all registration keys
-keys = flaggems_vllm.all_registered_keys()
-print(f"Registration keys: {len(keys)}")
 ```
 
-## Global Enablement API
+## Direct Invocation Only
 
-FlagGems-vllm provides the same enablement API as FlagGems for consistent usage patterns:
-
-### `enable()` and `flag_gems.enable()`
-
-FlagGems-vllm operators are typically invoked directly. However, because some operators depend on FlagGems internally and inference models utilize standard general operations, the standard practice is:
-
-1. **Call `flag_gems.enable()`**: Registers general PyTorch/Triton operator replacements and activates underlying kernels needed by FlagGems-vllm;
-2. **Call `flaggems_vllm.<op>()`**: Directly executes vLLM-specialized fused kernels;
-3. **Call `flaggems_vllm.enable()` (Optional)**: Further registers FlagGems-vllm operators into the PyTorch dispatch table.
-
-```python
-import flag_gems
-import flaggems_vllm
-
-# 1. Enable FlagGems general operators (required / recommended)
-flag_gems.enable()
-
-# 2. Optionally register FlagGems-vllm dispatch
-flaggems_vllm.enable()
-```
-
-### `only_enable()`
-
-Enable only specific operators:
-
-```python
-import flaggems_vllm
-
-flaggems_vllm.only_enable(include=['grouped_topk', 'moe_align_block_size'])
-```
-
-### `use_gems()` (context manager)
-
-Temporarily enable operators in a scope:
-
-```python
-import torch
-import flaggems_vllm
-
-with flaggems_vllm.use_gems():
-    # FlagGems-vllm operators active here
-    result = some_computation()
-# Operators disabled outside the context
-```
+> [!IMPORTANT]
+> **Design Note**: FlagGems-vllm is designed exclusively for vLLM specialized and fused operators. **It only supports direct invocation (`flaggems_vllm.<op>()`); it does NOT support PyTorch dispatch registration, nor does it support `flaggems_vllm.use_gems`**.
+>
+> PyTorch dispatch registration for general operators is handled by the underlying FlagGems dependency. Simply call `flag_gems.enable()` to initialize the general operator foundation:
+>
+> ```python
+> import flag_gems
+> import flaggems_vllm
+>
+> # Initialize FlagGems general operator foundation
+> flag_gems.enable()
+>
+> # Call FlagGems-vllm specialized fused operators directly
+> output = flaggems_vllm.grouped_topk(...)
+> ```
 
 ## Checking Device and Backend
 
@@ -132,6 +95,27 @@ from flaggems_vllm import runtime
 print(f"Vendor: {flaggems_vllm.vendor_name}")  # e.g., 'nvidia'
 print(f"Device: {flaggems_vllm.device}")        # e.g., 'cuda'
 print(f"Device count: {runtime.device.device_count}")
+```
+
+For multi-backend selection and environment variables, see [Non-NVIDIA Backends](non-nvidia.md).
+
+## C++ Native Extensions Configuration
+
+FlagGems-vllm includes optional C++ operators compiled via pybind11. If dependencies are satisfied during build, they are compiled automatically.
+
+Enable C++ operators at runtime via an environment variable:
+
+```bash
+export USE_C_EXTENSION=1
+```
+
+Check C++ extension status:
+
+```python
+import flaggems_vllm
+
+print("C++ extension available:", flaggems_vllm.config.has_c_extension)
+print("C++ extension enabled:", flaggems_vllm.config.use_c_extension)
 ```
 
 ## Operator Categories
@@ -192,6 +176,6 @@ This is by design (see `NO_TORCH_COMPUTE_FALLBACK` in the contribution guide).
 ## Next Steps
 
 - [vLLM plugin integration](vllm-plugin.md)
-- [Selective operator enablement](selective.md)
+- [Non-NVIDIA hardware platforms](non-nvidia.md)
 - [Debugging and logging](debugging.md)
 - [Performance benchmarking](../performance/benchmark.md)

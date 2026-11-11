@@ -42,7 +42,7 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
 Benchmarks report:
 - **Latency** (ms): Time per operation
 - **Throughput** (tokens/s or GB/s): Processing rate
-- **SpeedUp**: `latency_torch_baseline / latency_flaggems_vllm`
+- **SpeedUp**: `latency_vllm_baseline / latency_flaggems_vllm`
 
 Acceptance target: **SpeedUp ≥ 0.9** for core shapes.
 
