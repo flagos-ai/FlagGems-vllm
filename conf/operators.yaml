@@ -277,6 +277,21 @@ ops:
       - Attention
     stages:
       - beta: '3.0'
+  - id: cooperative_topk
+    description: |
+      Select exact top-k indices from FP32 CUDA logits through vLLM's in-place
+      interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+      and -1 padding for short rows.
+    for:
+      - _C.cooperative_topk
+    labels:
+      - fused
+      - NoCPU
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: cp_gather_indexer_k_quant_cache
     description: This is a fused operator that gathers FP8 K cache values and scales.
     for:
