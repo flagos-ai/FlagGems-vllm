@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for the unexported Hopper MegaMHC host contract."""
+"""CPU tests for the public Hopper MegaMHC host contract."""
 
 from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,14 +26,38 @@ import torch
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import (
     DEEPSEEK_V4_FLASH_PROFILE,
     MegaMHCContext,
+    MegaMHCTensorBinding,
     MegaMHCWorkspace,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import api as megamhc_api
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc import (
+    create_mega_mhc_context,
     mega_mhc,
 )
 
 
 class _RecordingLauncher:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        supported_tokens=frozenset({1}),
+        device=torch.device("cpu"),
+        stream_handle=None,
+        dynamic_alignments=None,
+        static_alignments=(16, 16, 16, 16),
+    ):
         self.calls = []
+        self.supported_tokens = supported_tokens
+        self.device = device
+        self.stream_handle = stream_handle
+        self.owner_thread_id = threading.get_ident()
+        self._dynamic_alignments = {token: (16,) * 8 for token in supported_tokens}
+        if dynamic_alignments is not None:
+            self._dynamic_alignments.update(dynamic_alignments)
+        self.static_alignments = static_alignments
+
+    def dynamic_alignments(self, tokens):
+        return self._dynamic_alignments[tokens]
 
     def launch(self, *args):
         self.calls.append(args)
@@ -42,6 +67,49 @@ class _RaisingLauncher(_RecordingLauncher):
     def launch(self, *args):
         super().launch(*args)
         raise RuntimeError("synthetic launch failure")
+
+
+class _PreparedLauncher:
+    def __init__(
+        self,
+        token_count,
+        static_bound_values,
+        *,
+        dynamic_alignments=(16,) * 8,
+        static_alignments=(16,) * 4,
+        device=torch.device("cpu"),
+        stream_handle=None,
+        owner_thread_id=None,
+    ):
+        self.token_count = token_count
+        self.static_bound_values = static_bound_values
+        self.static_bound_snapshots = tuple(
+            MegaMHCTensorBinding.from_tensor(value) for value in static_bound_values
+        )
+        self.dynamic_alignments = dynamic_alignments
+        self.static_alignments = static_alignments
+        self.device = device
+        self.stream_handle = stream_handle
+        self.owner_thread_id = (
+            threading.get_ident() if owner_thread_id is None else owner_thread_id
+        )
+        self.validation_calls = 0
+        self.static_validation_calls = 0
+        self.runs = []
+
+    def validate_environment(self):
+        self.validation_calls += 1
+
+    def validate_static_bindings(self, values):
+        self.static_validation_calls += 1
+        if any(
+            not snapshot.matches(value)
+            for snapshot, value in zip(self.static_bound_snapshots, values, strict=True)
+        ):
+            raise RuntimeError("static bound value changed after launcher preparation")
+
+    def run_trusted(self, dynamic_values):
+        self.runs.append(tuple(dynamic_values))
 
 
 def _make_case(
@@ -66,7 +134,16 @@ def _make_case(
         "hc_base": torch.empty((projection_outputs,), dtype=torch.float32),
         "norm_weight": torch.empty((hidden,), dtype=torch.bfloat16),
     }
-    launcher = _RecordingLauncher() if launcher is None else launcher
+    launcher = (
+        _RecordingLauncher(
+            supported_tokens=frozenset(
+                {tokens} if supported_tokens is None else supported_tokens
+            ),
+            stream_handle=stream_handle,
+        )
+        if launcher is None
+        else launcher
+    )
     workspace = MegaMHCWorkspace(
         device=torch.device("cpu"),
         stream_handle=stream_handle,
@@ -74,9 +151,6 @@ def _make_case(
     )
     context = MegaMHCContext.bind(
         profile=profile,
-        supported_tokens=frozenset(
-            {tokens} if supported_tokens is None else supported_tokens
-        ),
         fn=tensors["fn"],
         hc_scale=tensors["hc_scale"],
         hc_base=tensors["hc_base"],
@@ -111,6 +185,15 @@ def _make_outputs(tensors):
         torch.empty_like(tensors["post_layer_mix"]),
         torch.empty_like(tensors["comb_res_mix"]),
         torch.empty_like(tensors["x"]),
+    )
+
+
+def _static_values(tensors):
+    return (
+        tensors["fn"],
+        tensors["hc_scale"],
+        tensors["hc_base"],
+        tensors["norm_weight"],
     )
 
 
@@ -181,6 +264,38 @@ def test_trusted_fast_path_rejects_changed_static_object():
         _invoke(tensors, context, fn=tensors["fn"].clone())
 
     assert launcher.calls == []
+
+
+def test_trusted_fast_path_rejects_same_object_with_rebound_storage():
+    tensors, context, launcher = _make_case(trusted_fast_path=True)
+    replacement = torch.empty_like(tensors["fn"])
+    tensors["fn"].set_(replacement)
+
+    with pytest.raises(RuntimeError, match="storage/pointer contract changed"):
+        _invoke(tensors, context)
+
+    assert launcher.calls == []
+
+
+def test_trusted_fast_path_rejects_same_object_with_resized_layout():
+    tensors, context, launcher = _make_case(trusted_fast_path=True)
+    tensors["hc_base"].resize_(12, 2)
+
+    with pytest.raises(RuntimeError, match="storage/pointer contract changed"):
+        _invoke(tensors, context)
+
+    assert launcher.calls == []
+
+
+def test_trusted_fast_path_allows_static_content_update_without_rebinding():
+    tensors, context, launcher = _make_case(trusted_fast_path=True)
+    original_pointer = tensors["hc_base"].data_ptr()
+    tensors["hc_base"].copy_(torch.ones_like(tensors["hc_base"]))
+
+    _invoke(tensors, context)
+
+    assert tensors["hc_base"].data_ptr() == original_pointer
+    assert len(launcher.calls) == 1
 
 
 def test_trusted_fast_path_rejects_unsupported_token_and_scalar():
@@ -329,7 +444,6 @@ def test_trusted_context_validates_static_contract_at_bind():
     with pytest.raises(NotImplementedError, match="norm_weight.dtype"):
         MegaMHCContext.bind(
             profile=DEEPSEEK_V4_FLASH_PROFILE,
-            supported_tokens=frozenset({1}),
             fn=tensors["fn"],
             hc_scale=tensors["hc_scale"],
             hc_base=tensors["hc_base"],
@@ -507,8 +621,27 @@ def test_synchronous_launch_failure_poisons_workspace():
     assert len(failing_launcher.calls) == 1
 
 
+def test_workspace_rejects_different_current_cuda_device(monkeypatch):
+    workspace = MegaMHCWorkspace(
+        device=torch.device("cuda", 2), stream_handle=0xABC, state={}
+    )
+    context = SimpleNamespace(
+        workspace=workspace,
+        owner_thread_id=threading.get_ident(),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+
+    def unexpected_stream_query(_device):
+        raise AssertionError("stream must not be queried on the wrong current device")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_stream_query)
+    with pytest.raises(RuntimeError, match="different CUDA device"):
+        megamhc_api._validate_workspace(context)
+
+
 def test_context_requires_at_least_one_compiled_token_specialization():
-    tensors, _, launcher = _make_case()
+    tensors, _, _ = _make_case()
+    launcher = _RecordingLauncher(supported_tokens=frozenset())
     workspace = MegaMHCWorkspace(
         device=torch.device("cpu"), stream_handle=None, state={}
     )
@@ -516,7 +649,6 @@ def test_context_requires_at_least_one_compiled_token_specialization():
     with pytest.raises(ValueError, match="supported_tokens"):
         MegaMHCContext.bind(
             profile=DEEPSEEK_V4_FLASH_PROFILE,
-            supported_tokens=frozenset(),
             fn=tensors["fn"],
             hc_scale=tensors["hc_scale"],
             hc_base=tensors["hc_base"],
@@ -527,7 +659,8 @@ def test_context_requires_at_least_one_compiled_token_specialization():
 
 
 def test_context_rejects_nonpositive_token_specializations():
-    tensors, _, launcher = _make_case()
+    tensors, _, _ = _make_case()
+    launcher = _RecordingLauncher(supported_tokens=frozenset({0, 1}))
     workspace = MegaMHCWorkspace(
         device=torch.device("cpu"), stream_handle=None, state={}
     )
@@ -535,7 +668,6 @@ def test_context_rejects_nonpositive_token_specializations():
     with pytest.raises(ValueError, match="positive"):
         MegaMHCContext.bind(
             profile=DEEPSEEK_V4_FLASH_PROFILE,
-            supported_tokens=frozenset({0, 1}),
             fn=tensors["fn"],
             hc_scale=tensors["hc_scale"],
             hc_base=tensors["hc_base"],
@@ -546,7 +678,8 @@ def test_context_rejects_nonpositive_token_specializations():
 
 
 def test_context_rejects_fractional_token_specializations():
-    tensors, _, launcher = _make_case()
+    tensors, _, _ = _make_case()
+    launcher = _RecordingLauncher(supported_tokens=frozenset({1.5}))
     workspace = MegaMHCWorkspace(
         device=torch.device("cpu"), stream_handle=None, state={}
     )
@@ -554,7 +687,6 @@ def test_context_rejects_fractional_token_specializations():
     with pytest.raises(TypeError, match="exact integers"):
         MegaMHCContext.bind(
             profile=DEEPSEEK_V4_FLASH_PROFILE,
-            supported_tokens=frozenset({1.5}),
             fn=tensors["fn"],
             hc_scale=tensors["hc_scale"],
             hc_base=tensors["hc_base"],
@@ -562,3 +694,91 @@ def test_context_rejects_fractional_token_specializations():
             workspace=workspace,
             launcher=launcher,
         )
+
+
+def test_factory_derives_tokens_and_dispatches_exact_prepared_launcher():
+    tensors, _, _ = _make_case()
+    static_values = _static_values(tensors)
+    prepared_t1 = _PreparedLauncher(1, static_values)
+    prepared_t8 = _PreparedLauncher(
+        8,
+        static_values,
+        dynamic_alignments=(32,) * 8,
+        static_alignments=(32,) * 4,
+    )
+
+    context = create_mega_mhc_context(
+        *static_values,
+        {1: prepared_t1, 8: prepared_t8},
+    )
+
+    assert context.supported_tokens == frozenset({1, 8})
+    assert context.launcher.dynamic_alignments(1) == (16,) * 8
+    assert context.launcher.dynamic_alignments(8) == (32,) * 8
+    assert context.launcher.static_alignments == (32,) * 4
+    assert prepared_t1.validation_calls == 1
+    assert prepared_t8.validation_calls == 1
+    assert prepared_t1.static_validation_calls == 1
+    assert prepared_t8.static_validation_calls == 1
+    _invoke(tensors, context)
+    assert len(prepared_t1.runs) == 1
+    assert prepared_t8.runs == []
+
+
+def test_factory_rejects_registry_key_token_mismatch():
+    tensors, _, _ = _make_case()
+    static_values = _static_values(tensors)
+    prepared = _PreparedLauncher(8, static_values)
+
+    with pytest.raises(ValueError, match="registry key T=1"):
+        create_mega_mhc_context(*static_values, {1: prepared})
+
+
+def test_factory_rejects_launcher_bound_to_different_static_tensor():
+    tensors, _, _ = _make_case()
+    static_values = _static_values(tensors)
+    rebound_values = (tensors["fn"].clone(), *static_values[1:])
+    prepared = _PreparedLauncher(1, rebound_values)
+
+    with pytest.raises(RuntimeError, match="different static tensors"):
+        create_mega_mhc_context(*static_values, {1: prepared})
+
+
+def test_factory_rejects_static_storage_rebind_after_launcher_preparation():
+    tensors, _, _ = _make_case()
+    static_values = _static_values(tensors)
+    prepared = _PreparedLauncher(1, static_values)
+    replacement = tensors["fn"].clone()
+    tensors["fn"].set_(replacement)
+
+    with pytest.raises(RuntimeError, match="changed after launcher preparation"):
+        create_mega_mhc_context(*static_values, {1: prepared})
+
+
+def test_factory_rejects_wrong_owner_and_invalid_alignment_contracts():
+    tensors, _, _ = _make_case()
+    static_values = _static_values(tensors)
+    wrong_owner = _PreparedLauncher(
+        1, static_values, owner_thread_id=threading.get_ident() + 1
+    )
+    with pytest.raises(RuntimeError, match="different host thread"):
+        create_mega_mhc_context(*static_values, {1: wrong_owner})
+
+    invalid_alignment = _PreparedLauncher(
+        1, static_values, dynamic_alignments=(16,) * 7 + (3,)
+    )
+    with pytest.raises(ValueError, match="powers of two"):
+        create_mega_mhc_context(*static_values, {1: invalid_alignment})
+
+
+def test_factory_rejects_empty_registry_and_missing_token_is_explicit():
+    tensors, _, _ = _make_case(tokens=2)
+    static_values = _static_values(tensors)
+    with pytest.raises(ValueError, match="must not be empty"):
+        create_mega_mhc_context(*static_values, {})
+
+    prepared = _PreparedLauncher(1, static_values)
+    context = create_mega_mhc_context(*static_values, {1: prepared})
+    with pytest.raises(NotImplementedError, match="T=2"):
+        _invoke(tensors, context)
+    assert prepared.runs == []

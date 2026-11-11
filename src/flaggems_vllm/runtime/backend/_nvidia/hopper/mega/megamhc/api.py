@@ -14,10 +14,9 @@
 
 """Host contract for the exact-profile Hopper MegaMHC implementation.
 
-This module intentionally contains no kernel implementation and is not
-exported by the Hopper backend yet. It freezes the public allocation,
-validation, static-binding, and stream-local workspace contract that the TLE
-kernel integration must implement.
+This module intentionally contains no kernel implementation. It freezes the
+public allocation, validation, static-binding, and stream-local workspace
+contract used by the prepared TLE launcher factory.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ from dataclasses import dataclass
 from typing import FrozenSet, NoReturn, Optional, Protocol, Tuple
 
 import torch
-
-_DIRECT_POINTER_ALIGNMENT = 16
 
 
 @dataclass(frozen=True)
@@ -66,24 +63,67 @@ DEEPSEEK_V4_FLASH_PROFILE = MegaMHCProfile(
 )
 
 
-def _tensor_identity(tensor: torch.Tensor) -> Tuple[object, ...]:
-    return (
-        int(tensor.data_ptr()),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.dtype,
-        tensor.device,
-    )
+@dataclass(frozen=True)
+class MegaMHCTensorBinding:
+    """Storage and metadata contract for one layer-static tensor.
+
+    Tensor contents may change in place. Object, storage, pointer and layout
+    changes require rebuilding the compiled context because some launchers
+    retain TensorMap descriptors whose base address is fixed at preparation.
+    """
+
+    object_id: int
+    data_ptr: int
+    storage_base: int
+    storage_nbytes: int
+    storage_offset: int
+    shape: Tuple[int, ...]
+    stride: Tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+    requires_grad: bool
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor) -> "MegaMHCTensorBinding":
+        storage = tensor.untyped_storage()
+        return cls(
+            object_id=id(tensor),
+            data_ptr=int(tensor.data_ptr()),
+            storage_base=int(storage.data_ptr()),
+            storage_nbytes=int(storage.nbytes()),
+            storage_offset=int(tensor.storage_offset()),
+            shape=tuple(tensor.shape),
+            stride=tuple(tensor.stride()),
+            dtype=tensor.dtype,
+            device=tensor.device,
+            requires_grad=bool(tensor.requires_grad),
+        )
+
+    def matches(self, tensor: torch.Tensor) -> bool:
+        """Compare the live tensor without allocating another binding."""
+        storage = tensor.untyped_storage()
+        return bool(
+            self.object_id == id(tensor)
+            and self.data_ptr == int(tensor.data_ptr())
+            and self.storage_base == int(storage.data_ptr())
+            and self.storage_nbytes == int(storage.nbytes())
+            and self.storage_offset == int(tensor.storage_offset())
+            and self.shape == tensor.shape
+            and self.stride == tensor.stride()
+            and self.dtype == tensor.dtype
+            and self.device == tensor.device
+            and self.requires_grad == bool(tensor.requires_grad)
+        )
 
 
 @dataclass(frozen=True)
 class MegaMHCStaticBinding:
     """Identity of layer-static tensors captured by the compiled launcher."""
 
-    fn: Tuple[object, ...]
-    hc_scale: Tuple[object, ...]
-    hc_base: Tuple[object, ...]
-    norm_weight: Tuple[object, ...]
+    fn: MegaMHCTensorBinding
+    hc_scale: MegaMHCTensorBinding
+    hc_base: MegaMHCTensorBinding
+    norm_weight: MegaMHCTensorBinding
 
     @classmethod
     def from_tensors(
@@ -94,10 +134,24 @@ class MegaMHCStaticBinding:
         norm_weight: torch.Tensor,
     ) -> "MegaMHCStaticBinding":
         return cls(
-            fn=_tensor_identity(fn),
-            hc_scale=_tensor_identity(hc_scale),
-            hc_base=_tensor_identity(hc_base),
-            norm_weight=_tensor_identity(norm_weight),
+            fn=MegaMHCTensorBinding.from_tensor(fn),
+            hc_scale=MegaMHCTensorBinding.from_tensor(hc_scale),
+            hc_base=MegaMHCTensorBinding.from_tensor(hc_base),
+            norm_weight=MegaMHCTensorBinding.from_tensor(norm_weight),
+        )
+
+    def matches_tensors(
+        self,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+    ) -> bool:
+        return bool(
+            self.fn.matches(fn)
+            and self.hc_scale.matches(hc_scale)
+            and self.hc_base.matches(hc_base)
+            and self.norm_weight.matches(norm_weight)
         )
 
 
@@ -120,6 +174,23 @@ class MegaMHCWorkspace:
 class MegaMHCLauncher(Protocol):
     """Address-rebindable one-kernel launcher bound to static model tensors."""
 
+    @property
+    def supported_tokens(self) -> FrozenSet[int]: ...
+
+    @property
+    def static_alignments(self) -> Tuple[int, int, int, int]: ...
+
+    @property
+    def device(self) -> torch.device: ...
+
+    @property
+    def stream_handle(self) -> Optional[int]: ...
+
+    @property
+    def owner_thread_id(self) -> int: ...
+
+    def dynamic_alignments(self, tokens: int) -> Tuple[int, ...]: ...
+
     def launch(
         self,
         workspace: MegaMHCWorkspace,
@@ -141,12 +212,11 @@ class MegaMHCContext:
     A production factory must create one context per model layer and per
     ordered CUDA stream on an SM90 device. It compiles every admitted token
     specialization, binds the four layer-static tensors, and gives this
-    context exclusive ownership of one ``MegaMHCWorkspace``. This scaffold
-    also permits a CPU device so its pure host contract can be tested without
-    a GPU; it is not exported from the Hopper backend until a kernel factory
-    exists. ``trusted_fast_path`` is reserved for a production factory that
-    has already validated every dynamic tensor ABI used to compile the
-    launchers. It keeps only cheap per-call semantic and ownership guards.
+    context exclusive ownership of one ``MegaMHCWorkspace``. CPU devices are
+    permitted only so the pure host contract can be tested without a GPU.
+    ``trusted_fast_path`` is reserved for the production factory after every
+    dynamic tensor ABI has been validated. It keeps only cheap per-call
+    semantic and ownership guards.
     """
 
     profile: MegaMHCProfile
@@ -163,7 +233,6 @@ class MegaMHCContext:
         cls,
         *,
         profile: MegaMHCProfile,
-        supported_tokens: FrozenSet[int],
         fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
@@ -172,6 +241,7 @@ class MegaMHCContext:
         launcher: MegaMHCLauncher,
         trusted_fast_path: bool = False,
     ) -> "MegaMHCContext":
+        supported_tokens = launcher.supported_tokens
         if not supported_tokens:
             raise ValueError("supported_tokens must not be empty")
         normalized_values = []
@@ -185,6 +255,14 @@ class MegaMHCContext:
         normalized_tokens = frozenset(normalized_values)
         if any(value <= 0 for value in normalized_tokens):
             raise ValueError("supported_tokens must contain only positive values")
+        if normalized_tokens != supported_tokens:
+            raise TypeError("launcher.supported_tokens must be exact integers")
+        if launcher.device != workspace.device:
+            raise ValueError("launcher and workspace devices differ")
+        if launcher.stream_handle != workspace.stream_handle:
+            raise ValueError("launcher and workspace streams differ")
+        if launcher.owner_thread_id != threading.get_ident():
+            raise RuntimeError("launcher belongs to a different host thread")
         if trusted_fast_path:
             _validate_trusted_context_binding(
                 profile,
@@ -193,6 +271,7 @@ class MegaMHCContext:
                 hc_base,
                 norm_weight,
                 workspace,
+                launcher.static_alignments,
             )
         return cls(
             profile=profile,
@@ -215,13 +294,36 @@ def _unsupported(message: str) -> NoReturn:
     raise NotImplementedError(f"unsupported Hopper MegaMHC profile: {message}")
 
 
-def _require_contiguous(name: str, tensor: torch.Tensor) -> None:
+def _normalize_alignments(values: object, *, count: int, name: str) -> Tuple[int, ...]:
+    try:
+        raw_values = tuple(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an iterable of alignments") from exc
+    if len(raw_values) != count:
+        raise ValueError(f"{name} must contain exactly {count} values")
+    normalized = []
+    for value in raw_values:
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must contain exact integers")
+        try:
+            alignment = int(operator.index(value))
+        except TypeError as exc:
+            raise TypeError(f"{name} must contain exact integers") from exc
+        if alignment <= 0 or alignment & (alignment - 1):
+            raise ValueError(f"{name} values must be positive powers of two")
+        normalized.append(alignment)
+    return tuple(normalized)
+
+
+def _require_contiguous(
+    name: str, tensor: torch.Tensor, pointer_alignment: int
+) -> None:
     if not tensor.is_contiguous():
         _unsupported(f"{name} must be contiguous")
     if tensor.storage_offset() != 0:
         _unsupported(f"{name}.storage_offset must be 0")
-    if tensor.data_ptr() % _DIRECT_POINTER_ALIGNMENT != 0:
-        _unsupported(f"{name} pointer must be {_DIRECT_POINTER_ALIGNMENT}-byte aligned")
+    if tensor.data_ptr() % pointer_alignment != 0:
+        _unsupported(f"{name} pointer must be {pointer_alignment}-byte aligned")
 
 
 def _require_tensor(name: str, tensor: object) -> None:
@@ -245,6 +347,7 @@ def _validate_trusted_context_binding(
     hc_base: torch.Tensor,
     norm_weight: torch.Tensor,
     workspace: MegaMHCWorkspace,
+    static_alignments: Tuple[int, ...],
 ) -> None:
     """Validate layer-static state once before enabling the trusted hot path."""
     if profile != DEEPSEEK_V4_FLASH_PROFILE:
@@ -263,7 +366,12 @@ def _validate_trusted_context_binding(
         ("hc_base", hc_base, (profile.projection_outputs,), torch.float32),
         ("norm_weight", norm_weight, (profile.hidden_size,), torch.bfloat16),
     )
-    for name, tensor, shape, dtype in expected:
+    alignments = _normalize_alignments(
+        static_alignments, count=4, name="launcher.static_alignments"
+    )
+    for (name, tensor, shape, dtype), alignment in zip(
+        expected, alignments, strict=True
+    ):
         _require_tensor(name, tensor)
         if tuple(tensor.shape) != shape:
             _unsupported(f"{name}.shape={tuple(tensor.shape)}, expected {shape}")
@@ -273,7 +381,7 @@ def _validate_trusted_context_binding(
             raise ValueError(f"{name} is not on context device")
         if tensor.requires_grad:
             _unsupported(f"{name} must not require gradients")
-        _require_contiguous(name, tensor)
+        _require_contiguous(name, tensor, alignment)
     if workspace.device.type == "cuda":
         if workspace.device.index is None:
             raise ValueError("CUDA MegaMHC workspace requires an explicit device index")
@@ -376,7 +484,7 @@ def _validate_trusted_call(
     tile_n: int,
     norm_eps: float,
     context: MegaMHCContext,
-) -> int:
+) -> Tuple[int, Tuple[int, ...]]:
     """Run only guards that cannot be delegated to a compiled launcher ABI."""
     dynamic_tensors = (x, residual, post_layer_mix, comb_res_mix)
     for name, tensor in zip(
@@ -390,6 +498,11 @@ def _validate_trusted_call(
     tokens = int(x.shape[0])
     if tokens not in context.supported_tokens:
         _unsupported(f"T={tokens} has no compiled specialization")
+    dynamic_alignments = _normalize_alignments(
+        context.launcher.dynamic_alignments(tokens),
+        count=8,
+        name=f"dynamic alignments for T={tokens}",
+    )
     profile = context.profile
     expected = (
         ("x", x, (tokens, profile.hidden_size), torch.bfloat16),
@@ -412,14 +525,18 @@ def _validate_trusted_call(
             torch.float32,
         ),
     )
-    for name, tensor, shape, dtype in expected:
+    for (name, tensor, shape, dtype), alignment in zip(
+        expected, dynamic_alignments[:4], strict=True
+    ):
         if tensor.shape != shape:
             _unsupported(f"{name}.shape={tuple(tensor.shape)}, expected {shape}")
         if tensor.dtype != dtype:
             _unsupported(f"{name}.dtype={tensor.dtype}, expected {dtype}")
         if tensor.device != context.workspace.device:
             raise ValueError(f"{name} is not on context device")
-        _require_contiguous(name, tensor)
+        if tensor.requires_grad:
+            _unsupported(f"{name} must not require gradients")
+        _require_contiguous(name, tensor, alignment)
     if norm_weight is None:
         _unsupported("norm_weight is required")
     if (
@@ -429,6 +546,10 @@ def _validate_trusted_call(
         or norm_weight is not context.static_tensors[3]
     ):
         raise RuntimeError("layer-static tensor object changed; rebuild context")
+    if not context.static_binding.matches_tensors(fn, hc_scale, hc_base, norm_weight):
+        raise RuntimeError(
+            "layer-static tensor storage/pointer contract changed; rebuild context"
+        )
     _validate_trusted_scalar_contract(
         rms_eps,
         hc_pre_eps,
@@ -440,7 +561,7 @@ def _validate_trusted_call(
         norm_eps,
         context.profile,
     )
-    return tokens
+    return tokens, dynamic_alignments
 
 
 def _validate_profile(
@@ -461,7 +582,7 @@ def _validate_profile(
     tile_n: int,
     norm_eps: float,
     context: MegaMHCContext,
-) -> int:
+) -> Tuple[int, Tuple[int, ...]]:
     profile = context.profile
     if profile != DEEPSEEK_V4_FLASH_PROFILE:
         _unsupported("only DeepSeek-V4-Flash normal mode is admitted")
@@ -484,6 +605,32 @@ def _validate_profile(
     tokens = int(x.shape[0])
     if tokens not in context.supported_tokens:
         _unsupported(f"T={tokens} has no compiled specialization")
+    dynamic_alignments = _normalize_alignments(
+        context.launcher.dynamic_alignments(tokens),
+        count=8,
+        name=f"dynamic alignments for T={tokens}",
+    )
+    static_alignments = _normalize_alignments(
+        context.launcher.static_alignments,
+        count=4,
+        name="launcher.static_alignments",
+    )
+    pointer_alignments = dict(
+        zip(
+            (
+                "x",
+                "residual",
+                "post_layer_mix",
+                "comb_res_mix",
+                "fn",
+                "hc_scale",
+                "hc_base",
+                "norm_weight",
+            ),
+            (*dynamic_alignments[:4], *static_alignments),
+            strict=True,
+        )
+    )
     expected = {
         "x": (x, (tokens, profile.hidden_size), torch.bfloat16),
         "residual": (
@@ -530,7 +677,7 @@ def _validate_profile(
             raise ValueError(f"{name} is not on context device")
         if tensor.requires_grad:
             _unsupported(f"{name} must not require gradients")
-        _require_contiguous(name, tensor)
+        _require_contiguous(name, tensor, pointer_alignments[name])
     _validate_scalar_contract(
         rms_eps,
         hc_pre_eps,
@@ -547,7 +694,7 @@ def _validate_profile(
     )
     if current_binding != context.static_binding:
         raise RuntimeError("layer-static tensor identity changed; rebuild context")
-    return tokens
+    return tokens, dynamic_alignments
 
 
 def _validate_workspace(context: MegaMHCContext) -> None:
@@ -561,6 +708,8 @@ def _validate_workspace(context: MegaMHCContext) -> None:
             raise ValueError("CUDA MegaMHC workspace requires an explicit device index")
         if workspace.stream_handle is None:
             raise ValueError("CUDA MegaMHC workspace requires a stream handle")
+        if torch.cuda.current_device() != workspace.device.index:
+            raise RuntimeError("MegaMHC workspace belongs to a different CUDA device")
         current_stream = torch.cuda.current_stream(workspace.device)
         if int(current_stream.cuda_stream) != int(workspace.stream_handle):
             raise RuntimeError("MegaMHC workspace belongs to a different CUDA stream")
@@ -600,6 +749,7 @@ def _validate_outputs(
     residual: torch.Tensor,
     profile: MegaMHCProfile,
     protected_inputs: Tuple[torch.Tensor, ...],
+    output_alignments: Tuple[int, ...],
 ) -> None:
     if not isinstance(outputs, tuple):
         raise TypeError("out must be a tuple of four tensors")
@@ -624,7 +774,12 @@ def _validate_outputs(
         ),
         ("y_bf16", outputs[3], tuple(x.shape), torch.bfloat16),
     )
-    for name, tensor, shape, dtype in expected:
+    alignments = _normalize_alignments(
+        output_alignments, count=4, name="output alignments"
+    )
+    for (name, tensor, shape, dtype), alignment in zip(
+        expected, alignments, strict=True
+    ):
         if tuple(tensor.shape) != shape:
             raise ValueError(f"{name}.shape must be {shape}")
         if tensor.dtype != dtype:
@@ -635,16 +790,33 @@ def _validate_outputs(
             raise ValueError(f"{name} must be contiguous")
         if tensor.storage_offset() != 0:
             raise ValueError(f"{name}.storage_offset must be 0")
-        if tensor.data_ptr() % _DIRECT_POINTER_ALIGNMENT != 0:
-            raise ValueError(
-                f"{name} pointer must be {_DIRECT_POINTER_ALIGNMENT}-byte aligned"
-            )
+        if tensor.data_ptr() % alignment != 0:
+            raise ValueError(f"{name} pointer must be {alignment}-byte aligned")
     output_storages = [_storage_address(tensor) for tensor in outputs]
     if len(set(output_storages)) != len(output_storages):
         raise ValueError("out tensors must not share storage")
     protected_storages = {_storage_address(tensor) for tensor in protected_inputs}
     if any(address in protected_storages for address in output_storages):
         raise ValueError("out tensors must not alias any input or static tensor")
+
+
+def _validate_allocated_output_alignments(
+    outputs: MegaMHCOutputs, output_alignments: Tuple[int, ...]
+) -> None:
+    alignments = _normalize_alignments(
+        output_alignments, count=4, name="output alignments"
+    )
+    for name, tensor, alignment in zip(
+        ("new_residual", "new_post_mix", "new_comb_res_mix", "y_bf16"),
+        outputs,
+        alignments,
+        strict=True,
+    ):
+        if tensor.data_ptr() % alignment != 0:
+            raise RuntimeError(
+                f"allocator returned {name} below the required "
+                f"{alignment}-byte alignment"
+            )
 
 
 def mega_mhc(
@@ -682,7 +854,7 @@ def mega_mhc(
     output, not the pre-normalization weighted residual sum.
     """
     if context.trusted_fast_path:
-        _validate_trusted_call(
+        tokens, dynamic_alignments = _validate_trusted_call(
             x,
             residual,
             post_layer_mix,
@@ -702,7 +874,7 @@ def mega_mhc(
             context,
         )
     else:
-        _validate_profile(
+        tokens, dynamic_alignments = _validate_profile(
             x,
             residual,
             post_layer_mix,
@@ -727,6 +899,8 @@ def mega_mhc(
         if out is None
         else out
     )
+    if out is None and context.trusted_fast_path:
+        _validate_allocated_output_alignments(outputs, dynamic_alignments[4:])
     if out is not None or not context.trusted_fast_path:
         protected_inputs = (
             x,
@@ -738,7 +912,14 @@ def mega_mhc(
             hc_base,
             norm_weight,
         )
-        _validate_outputs(outputs, x, residual, context.profile, protected_inputs)
+        _validate_outputs(
+            outputs,
+            x,
+            residual,
+            context.profile,
+            protected_inputs,
+            dynamic_alignments[4:],
+        )
     try:
         context.launcher.launch(
             context.workspace,
@@ -765,6 +946,7 @@ __all__ = [
     "MegaMHCLauncher",
     "MegaMHCProfile",
     "MegaMHCStaticBinding",
+    "MegaMHCTensorBinding",
     "MegaMHCWorkspace",
     "mega_mhc",
 ]
