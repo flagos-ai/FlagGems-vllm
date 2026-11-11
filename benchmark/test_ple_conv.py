@@ -2,9 +2,9 @@
 # Copyright 2026 FlagOS Contributors
 """Perf coverage for FlagGems PLE short-conv APIs.
 
-- ``ple_short_conv_`` keeps the historical eager/reference baseline.
-- ``ple_conv`` compares against upstream vLLM native when available
-  (``baseline.ple_conv.native()``), otherwise records gems latency only.
+Formal NV baseline is ``ple_conv`` via ``baseline.ple_conv.native()``.
+Legacy ``ple_short_conv_`` has no matching installed-vLLM entrypoint, so its
+benchmark measures FlagGems latency only (no torch reference baseline).
 """
 
 import pytest
@@ -14,10 +14,13 @@ from baseline import ple_conv as native_workload
 from flaggems_vllm import ple_conv, ple_short_conv_
 
 from . import base
-from .ple_conv_reference import ple_conv_reference
 
 
 class PLEShortConvBenchmark(base.GenericBenchmark):
+    """Legacy FlagGems API smoke latency (no NV native counterpart)."""
+
+    BASELINE_METRICS = ("latency_base", "speedup")
+
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (mode, rows, channels)
@@ -31,6 +34,17 @@ class PLEShortConvBenchmark(base.GenericBenchmark):
             )
         ]
         self.shape_desc = "mode,rows,channels"
+
+    def init_user_config(self):
+        super().init_user_config()
+        # No installed-vLLM API matches ple_short_conv_; do not use a torch
+        # reference as latency_base (see test-capability doc §6.1).
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in self.BASELINE_METRICS
+            ]
 
 
 def short_conv_inputs(shape, dtype, device):
@@ -64,10 +78,14 @@ def short_conv_inputs(shape, dtype, device):
 
 
 class PLEConvNativeBenchmark(base.Benchmark):
-    """Upstream-compatible ``ple_conv`` vs installed/pinned vLLM native."""
+    """Upstream-compatible ``ple_conv`` vs installed vLLM native."""
+
+    BASELINE_METRICS = ("latency_base", "speedup")
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [tuple(native_workload.key_shape(b)) for b in native_workload.grid()]
+        self.shapes = [
+            tuple(native_workload.key_shape(b)) for b in native_workload.grid()
+        ]
         self.shape_desc = "mode,rows,channels,fuse,kernel,dilation"
 
     def get_input_iter(self, dtype):
@@ -90,13 +108,22 @@ class PLEConvNativeBenchmark(base.Benchmark):
             args, kwargs = native_workload.build_inputs(binding, dtype, self.device)
             yield (*args, kwargs)
 
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in self.BASELINE_METRICS
+            ]
+
 
 @pytest.mark.ple_fusion
 def test_ple_short_conv_perf():
     PLEShortConvBenchmark(
         input_fn=short_conv_inputs,
         op_name="ple_short_conv_",
-        torch_op=ple_conv_reference,
+        torch_op=None,
         gems_op=ple_short_conv_,
         dtypes=[torch.bfloat16, torch.float16],
     ).run()
@@ -104,9 +131,10 @@ def test_ple_short_conv_perf():
 
 @pytest.mark.ple_conv
 def test_ple_conv_perf():
+    baseline_op = native_workload.native()
     PLEConvNativeBenchmark(
         op_name="ple_conv",
-        torch_op=native_workload.native(),
+        torch_op=baseline_op,
         gems_op=ple_conv,
         dtypes=native_workload.DTYPES,
         is_inplace=native_workload.IS_INPLACE,
