@@ -185,6 +185,7 @@ from flaggems_vllm.ops.silu_and_mul_with_clamp import (
 )
 from flaggems_vllm.ops.skip_layernorm import skip_layer_norm
 from flaggems_vllm.ops.sparse_attention import sparse_attn_triton
+from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
@@ -354,6 +355,7 @@ __all__ = [
     "outplace_fused_experts",
     "pack_seq_triton",
     "pad_attention_heads",
+    "pad_trailing_draft_slots",
     "paged_mqa_logits",
     "parallel_nsa",
     "parallel_nsa_compression",
