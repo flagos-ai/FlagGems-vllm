@@ -13,6 +13,21 @@
 # limitations under the License.
 
 ops:
+  - id: fused_matmul_reduce_scatter
+    description: |
+      Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+      Matches the symm_mem argument signature; currently inference-only, SM90+,
+      FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
+      Uses process-group-scoped communication resources and explicit configuration.
+    for:
+      - symm_mem.fused_matmul_reduce_scatter
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Distributed
+    stages:
+      - alpha: '5.4'
   - id: act_quant_triton
     description: This is a fused operator.
     for:

@@ -27,6 +27,11 @@ from flaggems_vllm import runtime
 from flaggems_vllm.config import aten_patch_list, resolve_user_setting
 from flaggems_vllm.ops import *  # noqa: F401,F403
 from flaggems_vllm.runtime.register import Register
+from flaggems_vllm.runtime.symm_mem import (
+    disable_symm_mem,
+    enable_symm_mem,
+    use_symm_mem,
+)
 
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name
@@ -57,6 +62,10 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 _LIBRARY_ONLY_OPS = frozenset(
     {
         "dsv41_o_proj",
+        "GemmReduceScatterConfig",
+        "clear_fused_matmul_reduce_scatter_cache",
+        "configure_fused_matmul_reduce_scatter",
+        "fused_matmul_reduce_scatter",
         "fused_indexer_weight_scale",
         "grouped_gemma_rmsnorm",
         "hc_combine",
@@ -250,6 +259,9 @@ def all_registered_keys():
 
 
 __all__ = [
+    "enable_symm_mem",
+    "disable_symm_mem",
+    "use_symm_mem",
     "SUPPORTED_FP8_DTYPE",
     "enable",
     "only_enable",
