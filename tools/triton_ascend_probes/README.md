@@ -146,7 +146,8 @@ AscendC Prepare 以 **4 个 local head 为一组**：V1 生成 Q+/K+ 时，C2 �
   - TTIR 里 `sync_block_wait` 严格排在 7 个 `tt.load` 之前，cube 实际 load 到的面板与 GM 逐位一致（maxerr=0）；
   - 同一个 6-dot + scale/mask/inverse body，在默认选项或仅 `enable_mixed_cv=True` 时与 torch 一致（maxerr 7e-6）；
   - 加上 `disable_auto_inject_block_sync=True` 后，**即使不套 scope** 也出现 inf/NaN；1–3 个 dot 的简单 body 不受影响，所以 `s6` 能过；
-  - `al.scope` 目前只能在这两个选项下编译（默认仍崩，见 D1）。也就是说，scope 需要关闭自动 block sync，而关闭后多 dot body 会读脏，**Gram 的 CV 流水暂时没有正确的构建方式**。最小复现见 `defects/d5_noauto_multidot.py`。
+  - 按设计，`al.scope` 下程序只负责 CV 同步，核内不同流的同步由编译器自动插入；本环境 3.6.0 的默认 scope 路径仍会崩（D1），只能用 `disable_auto_inject_block_sync=True` 绕过，而这个绕过正好关掉了编译器应自动插入的核内同步，导致 D5。
+  - 因此 D1 与 D5 是同一问题的两面：**修好 D1（scope 保留 auto sync）后，D5 的多 dot body 应恢复正确**；在当前构建上，Gram 的 CV 流水暂时没有正确的构建方式。最小复现见 `defects/d5_noauto_multidot.py`。
 - 即使不考虑正确性，T=4096 下原型 344 μs vs 拆分 169 μs，2× 更慢：每个 chunk-head 多出约 56 KiB 的 GM 写 + 56 KiB 读，而可被隐藏的 cube 时间只有约 190 μs（T=32768 时）。没有 GM→L1 直通（R1）时，这个往返成本吃掉了重叠收益。
 
 新 Gram 的单 program 仍是 `AIV(面板) -> AIC(dot) -> AIV(后处理)`；`aiv_vec=94%`、`aic_mac=15%` 说明 AIC 大部分时间在等操作数。

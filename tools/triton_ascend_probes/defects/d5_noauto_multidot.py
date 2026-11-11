@@ -17,9 +17,14 @@ the minimal s6 hand-off still passes, which is why the option looked harmless.
 
 This probe runs the same body under the four option combinations and prints
 the error against a torch reference, so the option (not the scope) is
-isolated.  Root cause: the multi-dot body relies on auto block sync; the
-scoped path cannot currently enable auto sync (default options still crash -
-see defects/d1_scope_auto_sync.py).
+isolated.  Intended model (per the triton-ascend design): inside `al.scope`, the program
+only owns the CV hand-off (sync_block_set/wait); the compiler inserts the
+intra-core pipe synchronization between the different streams.  This build
+(3.6.0) does not reach that state: the default scoped path crashes (D1), and
+the only compiling workaround is `disable_auto_inject_block_sync=True`, which
+removes exactly the intra-core sync the compiler is supposed to provide.  D1
+and D5 are therefore two faces of the same gap: fixing D1 (scope with auto
+sync kept enabled) should also remove the D5 miscompile.
 
 Usage (from the repo root):
     PYTHONPATH=src:FlagGems/src python \
