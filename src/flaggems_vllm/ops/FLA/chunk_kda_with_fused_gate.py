@@ -43,6 +43,7 @@ from flaggems_vllm.utils import libentry, libtuner
 logger = logging.getLogger(__name__)
 
 _ASCEND = runtime.device.vendor_name == "ascend"
+_HYGON = runtime.device.vendor_name == "hygon"
 # Ascend reuses binaries across scalar extents while keeping tile sizes static.
 _SCALAR = None if _ASCEND else tl.constexpr
 # Keep K in LibEntry's dispatch key while sharing binaries across alignments.
@@ -1183,6 +1184,16 @@ def _norm_rows(X, Y, N, K, BLOCK: tl.constexpr, ROWS: tl.constexpr):
 
 
 @libentry()
+@triton.jit(do_not_specialize=["N"])
+def _ckfg_zero_workspace(Akk, Aqk, Inverse, N, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < N
+    tl.store(Akk + offsets, 0, valid)
+    tl.store(Aqk + offsets, 0, valid)
+    tl.store(Inverse + offsets, 0, valid)
+
+
+@libentry()
 @triton.jit(do_not_specialize=["N", "NT", "SENTINEL"] if _ASCEND else [])
 def _metadata_init(
     CU,
@@ -1370,8 +1381,20 @@ def chunk_kda_with_fused_gate(
         BT=_CHUNK,
     )
     matrix_shape = (b, t, h, _CHUNK)
-    akk = fill(torch.empty(matrix_shape, dtype=torch.float32, device=q.device), 0)
-    aqk = fill(torch.empty_like(akk), 0)
+    if _HYGON:
+        # The triangular producers leave some entries unwritten. Initialize all
+        # three workspaces with one launch before running the producers.
+        akk = torch.empty(matrix_shape, dtype=torch.float32, device=q.device)
+        aqk = torch.empty_like(akk)
+        inverse = torch.empty(matrix_shape, dtype=k.dtype, device=q.device)
+        size = akk.numel()
+        block = 512
+        _ckfg_zero_workspace[(triton.cdiv(size, block),)](
+            akk, aqk, inverse, size, block, num_warps=4
+        )
+    else:
+        akk = fill(torch.empty(matrix_shape, dtype=torch.float32, device=q.device), 0)
+        aqk = fill(torch.empty_like(akk), 0)
     common = dict(
         q=q,
         k=k,
@@ -1389,7 +1412,8 @@ def chunk_kda_with_fused_gate(
     )
     _ckfg_inter[nt, 16, b * h](**common, NC=4)
     _ckfg_intra[nt, 4, b * h](**common, BK=max(triton.next_power_of_2(dk), 16))
-    inverse = fill(torch.empty(matrix_shape, dtype=k.dtype, device=q.device), 0)
+    if not _HYGON:
+        inverse = fill(torch.empty(matrix_shape, dtype=k.dtype, device=q.device), 0)
     _ckfg_inverse[nt, b * h](
         A=akk,
         Ai=inverse,

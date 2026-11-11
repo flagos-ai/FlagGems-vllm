@@ -29,10 +29,8 @@ CASES = [
 
 
 def get_op():
-    if os.environ.get("FG_KDA_PROVIDER") == "native":
-        from vllm.model_executor.layers.fla.ops.kda import chunk_kda_with_fused_gate
-    else:
-        from flaggems_vllm import chunk_kda_with_fused_gate
+    from flaggems_vllm import chunk_kda_with_fused_gate
+
     return chunk_kda_with_fused_gate
 
 
@@ -40,9 +38,6 @@ def device_name():
     explicit = os.environ.get("FG_KDA_DEVICE")
     if explicit is not None:
         return explicit
-    if os.environ.get("FG_KDA_PROVIDER") == "native":
-        # The isolated native runner supplies its backend explicitly.
-        return "cuda"
     import flaggems_vllm
 
     return flaggems_vllm.device
