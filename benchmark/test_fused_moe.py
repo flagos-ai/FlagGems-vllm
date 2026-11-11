@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark FlagGems-vllm fused_experts_impl against the vLLM Triton kernel."""
+"""Benchmark FlagGems fused_experts_impl against each platform production MoE entry."""
 
 import pytest
 import torch
@@ -133,11 +133,11 @@ def _build_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
 
 
 def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
-    """Run vLLM's production PPU DeepGEMM experts on the given inputs."""
+    """Run vLLM's production PPU expert method on the given top-k inputs."""
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
 
-    num_tokens, hidden_size = hidden_states.shape
+    _, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     intermediate_size = w2.shape[2]
     topk = topk_ids.shape[1]
@@ -163,21 +163,19 @@ def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
             experts.w2_weight.data.copy_(w2)
             experts.quant_method.process_weights_after_loading(experts)
 
-    # Router logits that select exactly the requested top-k experts.
-    logits = torch.full(
-        (num_tokens, num_experts),
-        float("-inf"),
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
-    logits.scatter_(
-        1,
-        topk_ids.to(torch.long),
-        torch.log(topk_weights.float().clamp_min(1e-12)),
-    )
+    experts = _CACHE["experts"]
     ctx = _CACHE["ctx"]
+    # Call the production expert method with the same top-k inputs as the
+    # FlagGems op, so neither side pays for router reconstruction.
     with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
-        return _CACHE["layer"](hidden_states, logits)
+        return experts.quant_method.apply(
+            layer=experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        )
 
 
 def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
