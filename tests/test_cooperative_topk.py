@@ -68,6 +68,7 @@ def _check(logits, lengths, output, k):
 
 
 @gpu
+@pytest.mark.cooperative_topk
 @pytest.mark.parametrize("k", KS)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_cooperative_topk_random(shape, k):

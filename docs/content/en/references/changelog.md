@@ -13,8 +13,8 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 
 ### Features
 
-- **102 operators** optimized for vLLM inference scenarios
-- **18 backend vendors** supported (NVIDIA, AMD, Ascend, Hygon, Iluvatar, and more)
+- **105 operators** (157 exported ops) optimized for vLLM inference scenarios
+- **17 backend vendors** supported (NVIDIA, AMD, Ascend, Hygon, Iluvatar, and more)
 - **MoE operators**: `moe_align_block_size`, `grouped_topk`, `fused_experts_impl`, `moe_sum`
 - **Flash Attention**: `flash_attention_forward`, `flash_attn_varlen_func`, `flash_mla`, `triton_unified_attention`
 - **Quantization**: FP8, INT8, FP4 operators for activation and weight quantization
@@ -26,7 +26,7 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 - Triton-based operator implementations with FlagTree compiler support
 - Pre-tuned autotune configs for NVIDIA Ampere/Hopper architectures
 - C++ extension support via pybind11 (optional)
-- PyTorch dispatch integration via `enable()` / `use_gems()` API
+- Direct invocation interface designed for seamless vLLM plugin integration
 
 ### Testing & CI
 
@@ -43,7 +43,7 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 
 ### Known Issues
 
-- Some operators are in alpha/beta stage (see [operator list](/FlagGems-vllm/references/operators/))
+- Some operators are in alpha/beta stage (see [operator list](operators.md))
 - Non-NVIDIA backends have less mature autotune configs
 - C++ extension build requires manual `USE_C_EXTENSION=1` flag
 
@@ -59,7 +59,7 @@ Initial release of FlagGems-vllm as a standalone vLLM operator library.
 
 ## Contributing
 
-See the [contribution guide](/FlagGems-vllm/contribution/) for how to contribute to FlagGems-vllm.
+See the [contribution guide](../contribution/_index.md) for how to contribute to FlagGems-vllm.
 
 ## Version Scheme
 
