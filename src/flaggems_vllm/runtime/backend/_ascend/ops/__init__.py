@@ -132,14 +132,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
-    "chunk_gated_delta_rule_w8a16_int8",
-    "gdn_w8a16_int8",
-    "quantize_gdn_state_int8",
     "add_rms_norm",
     "build_compressor_metadata",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule_fwd",
+    "chunk_gated_delta_rule_w8a16_int8",
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
@@ -152,6 +150,7 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
     "group_list_cumsum",
     "grouped_topk",
@@ -172,6 +171,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
+    "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
