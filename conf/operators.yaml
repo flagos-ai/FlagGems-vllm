@@ -1314,6 +1314,18 @@ ops:
       - DataMovement
     stages:
       - beta: '0.3'
+  - id: paged_scatter_supports
+    description: |
+      Metadata-only capability check for paged_scatter_triton, without cache
+      mutation, tensor-data reads or device work.
+    for:
+      - None
+    labels:
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,

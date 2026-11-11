@@ -95,7 +95,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
-from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
+from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import (
+    paged_scatter_supports,
+    paged_scatter_triton,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -168,6 +171,7 @@ __all__ = [
     "npu_mhc_pre",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "paged_scatter_supports",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
     "persistent_topk",
