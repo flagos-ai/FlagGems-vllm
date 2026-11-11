@@ -799,6 +799,16 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: get_num_sampled_and_rejected
+    description: Update sampled and rejected token counts per request.
+    for:
+      - get_num_sampled_and_rejected
+    labels:
+      - fused
+    kind:
+      - Sampling
+    stages:
+      - beta: '0.3'
   - id: group_list_cumsum
     description: |
       Computes expert token-count offsets (cumsum) for expert-parallel MoE
