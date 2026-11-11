@@ -42,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_compressor import (
     deepseek_v4_compressor,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_indexer import (
+    deepseek_v4_indexer,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_sparse_attention import (
     deepseek_v4_sparse_attention,
 )
@@ -153,6 +156,7 @@ __all__ = [
     "compressor_prepared",
     "deepseek_v4_compressor",
     "deepseek_v4_sparse_attention",
+    "deepseek_v4_indexer",
     "compute_slot_mapping_parallel",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",

@@ -1799,3 +1799,17 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: deepseek_v4_indexer
+    description: |
+      Ascend paged C4 logical top-k indexer with explicit request positions
+      and key lengths. Supports floating or INT8 queries/keys, per-query-head
+      scales and per-cache-row key scales without materializing gathered KV.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
