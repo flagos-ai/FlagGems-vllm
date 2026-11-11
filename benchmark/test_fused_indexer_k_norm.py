@@ -95,7 +95,8 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
         return {
             "M": x.shape[0],
             "D": dim,
-            "row_gap": x.shape[1] - dim if x.shape[1] > dim else 0,
+            # Inputs are column-contiguous slices of a padded parent tensor.
+            "row_gap": x.stride(0) - dim,
             "dtype": str(x.dtype),
             "x_stride": list(x.stride()),
         }

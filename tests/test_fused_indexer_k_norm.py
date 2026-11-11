@@ -351,7 +351,9 @@ def test_export_and_library_only_contract():
         "bias",
         "dim",
         "eps",
+        "out",
     )
+    assert inspect.signature(public_op).parameters["out"].default is None
 
 
 def test_nvidia_prune_norm_configs():
@@ -461,6 +463,31 @@ def test_h20z_d128_launcher_dispatches_fast_path_and_fallback(monkeypatch):
         x, strided_weight, bias, out, _eps32(1e-6)
     )
     assert [call[0] for call in calls] == ["fallback"]
+    assert "BLOCK_M" not in calls[0][3]
+    grid = calls[0][1]
+    assert callable(grid)
+    for block_m in (1, 4, 8):
+        assert grid({"BLOCK_M": block_m}) == (
+            (x.shape[0] + block_m - 1) // block_m,
+        )
+
+
+@pytest.mark.parametrize("rows", (1, 8))
+@pytest.mark.parametrize("dim", (127, 128, 129))
+@pytest.mark.parametrize("gap", (0, 16))
+def test_benchmark_records_row_gap(rows, dim, gap):
+    from benchmark.test_fused_indexer_k_norm import FusedIndexerKNormBenchmark
+
+    parent = torch.empty((rows, dim + gap), dtype=torch.float32)
+    x = parent[:, :dim]
+    weight = torch.empty((dim,), dtype=torch.float32)
+    bias = torch.empty_like(weight)
+    metadata = FusedIndexerKNormBenchmark().record_shapes(x, weight, bias, dim, 1e-6)
+
+    assert metadata["M"] == rows
+    assert metadata["D"] == dim
+    assert metadata["row_gap"] == gap
+    assert metadata["x_stride"] == [dim + gap, 1]
 
 
 @pytest.mark.fused_indexer_k_norm
