@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
-
 import pytest
 import torch
 
@@ -41,32 +39,15 @@ _INT8_UNSUPPORTED = {
     "mthreads",  # MUSA Triton has no tl.extra.cuda namespace
 }
 
-try:
+VENDOR = flaggems_vllm.vendor_name
+
+# Vendors whose vLLM build ships the Triton fused_experts_impl.
+VLLM_NATIVE_VENDORS = {"nvidia", "metax"}
+
+if VENDOR in VLLM_NATIVE_VENDORS:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts_impl as vllm_fused_experts_impl,
     )
-
-    HAS_VLLM_FUSED_MOE = True
-except ImportError:
-    HAS_VLLM_FUSED_MOE = False
-
-
-def _supports_keyword(op, keyword):
-    try:
-        parameters = inspect.signature(op).parameters
-    except (TypeError, ValueError):
-        return False
-    return keyword in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-
-
-# vLLM versions differ: newer ones require ``inplace`` (no default), older ones
-# do not accept the keyword at all.
-VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
-    vllm_fused_experts_impl, "inplace"
-)
 
 
 def to_int8(tensor: torch.Tensor):
@@ -83,6 +64,15 @@ class FusedMoEINT8Benchmark(base.Benchmark):
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in ("latency_base", "speedup")
+            ]
 
     def set_shapes(self, shape_file_path=None):
         # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
@@ -193,9 +183,8 @@ def _vllm_fused_moe_int8_wrapper(
     hidden_states, w1, w2, topk_weights, topk_ids, w1_scale, w2_scale
 ):
     """Wrapper to call vllm fused_experts_impl with INT8."""
-    kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(
-        hidden_states.clone(),
+        hidden_states,
         w1,
         w2,
         topk_weights,
@@ -205,7 +194,6 @@ def _vllm_fused_moe_int8_wrapper(
         per_channel_quant=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        **kwargs,
     )
 
 
@@ -213,7 +201,7 @@ def _gems_fused_moe_int8_wrapper(
     hidden_states, w1, w2, topk_weights, topk_ids, w1_scale, w2_scale
 ):
     """Wrapper to call FlagGems fused_experts_impl with INT8."""
-    return flaggems_vllm.ops_experts_impl(
+    return flaggems_vllm.fused_experts_impl(
         hidden_states,
         w1,
         w2,
@@ -226,12 +214,17 @@ def _gems_fused_moe_int8_wrapper(
     )
 
 
+def _get_baseline_op():
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        return _vllm_fused_moe_int8_wrapper
+    return None
+
+
 @pytest.mark.fused_experts_impl
 @pytest.mark.skipif(
-    not (HAS_VLLM_FUSED_MOE and _SUPPORTS_INT8)
-    or flaggems_vllm.vendor_name in _INT8_UNSUPPORTED,
-    reason="vLLM not installed, or no native INT8 support / known unsupported "
-    "on this vendor (per vendor documentation)",
+    not _SUPPORTS_INT8 or flaggems_vllm.vendor_name in _INT8_UNSUPPORTED,
+    reason="no native INT8 support / known unsupported on this vendor "
+    "(per vendor documentation)",
 )
 def test_fused_experts_impl_int8():
     """
@@ -239,7 +232,7 @@ def test_fused_experts_impl_int8():
     """
     bench = FusedMoEINT8Benchmark(
         op_name="fused_experts_impl",
-        torch_op=_vllm_fused_moe_int8_wrapper,
+        torch_op=_get_baseline_op(),
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_fused_moe_int8_wrapper)
