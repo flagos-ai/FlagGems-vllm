@@ -17,6 +17,12 @@ name: basic ci
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the older run so the single H20
+# runner is not occupied by stale commits. Pushes to main are never cancelled.
+concurrency:
+  group: basic-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: ["main"]
@@ -52,6 +58,8 @@ jobs:
     steps:
       - name: check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
 
       - name: set up python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
@@ -72,6 +80,37 @@ jobs:
         run: |
           python -m unittest discover -s tools -p 'test_ci_*.py'
           python tools/check_ci_pins.py
+
+      # Existing code still contains torch compute calls, so only files touched
+      # by this change are checked; new violations are blocked without failing
+      # every PR on the legacy backlog.
+      - name: check no torch compute fallback in changed files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only --diff-filter=d -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+          else
+            git diff-tree --no-commit-id --name-only --diff-filter=d -r -z "${GITHUB_SHA}" > changed_py.bin
+          fi
+          files=()
+          while IFS= read -r -d '' path; do
+            if [[ "${path}" == *.py ]]; then
+              files+=("${path}")
+            fi
+          done < changed_py.bin
+          rm -f changed_py.bin
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No changed Python files."
+            exit 0
+          fi
+          python tools/ci_checks/check_no_torch_fallback.py "${files[@]}"
 
   select-targets:
     name: select ci targets
