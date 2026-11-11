@@ -116,9 +116,7 @@ from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
     fused_experts_impl,
-    inplace_fused_experts,
     invoke_fused_moe_triton_kernel,
-    outplace_fused_experts,
 )
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
@@ -392,7 +390,6 @@ __all__ = [
     "ihc_post_ref",
     "ihc_pre",
     "indexer_k_quant_and_cache",
-    "inplace_fused_experts",
     "instance_norm",
     "invoke_fused_moe_triton_kernel",
     "kpool_compress_and_write_cache",
@@ -420,7 +417,6 @@ __all__ = [
     "mv",
     "NULL_BLOCK_ID",
     "outer",
-    "outplace_fused_experts",
     "pack_seq_triton",
     "pad_attention_heads",
     "pad_indexer_heads",
