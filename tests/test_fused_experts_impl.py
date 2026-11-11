@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 import random
 from math import ceil
 
 import pytest
 import torch
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    fused_experts_impl as vllm_fused_experts_impl,
+)
 
 import flaggems_vllm
 from flaggems_vllm.runtime import torch_device_fn
@@ -26,6 +28,74 @@ from flaggems_vllm.runtime import torch_device_fn
 from .conftest import QUICK_MODE
 
 random.seed(42)
+
+# Vendor-dispatched entry points: flaggems_vllm/__init__.py calls
+# runtime.replace_customized_ops() at import time, so on backends with a
+# specialized implementation (ascend/hygon/metax/mthreads/thead) these names
+# already point at the vendor version; on NVIDIA they are the generic ones.
+fused_experts_impl = flaggems_vllm.ops_experts_impl
+
+device = flaggems_vllm.device
+vendor_name = flaggems_vllm.vendor_name
+
+if vendor_name in ("thead", "metax", "mthreads"):
+    # These vendors' production MoE is not the stock fused_experts_impl.
+    from benchmark.test_fused_moe import production_moe_op
+
+    _vllm_moe_reference = production_moe_op(vendor_name)
+    _VLLM_REF_DTYPES = (
+        [torch.bfloat16] if vendor_name == "thead" else [torch.bfloat16, torch.float16]
+    )
+else:
+    _vllm_moe_reference = vllm_fused_experts_impl
+    _VLLM_REF_DTYPES = [torch.bfloat16, torch.float16]
+
+# Per-vendor native precision, per vendor documentation. Kept in sync with
+# benchmark/test_fused_moe_int8.py::_OFFICIAL_PRECISION; vendors that are not
+# listed are treated as unsupported and their quantized cases are skipped.
+_OFFICIAL_PRECISION = {
+    "nvidia": (True, True),
+    "mthreads": (True, True),
+    "hygon": (False, True),
+    "metax": (False, True),
+    "thead": (False, True),
+    "ascend": (False, True),
+}
+_SUPPORTS_FP8, _SUPPORTS_INT8 = _OFFICIAL_PRECISION.get(vendor_name, (False, False))
+
+
+def _is_hopper_class():
+    if device != "cuda" or not torch.cuda.is_available():
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    sm = major * 10 + minor
+    return 90 <= sm < 100
+
+
+# FP8 additionally requires a real Hopper-class device on NVIDIA: the vendor
+# table records what the vendor can do, not what this particular card has.
+FP8_AVAILABLE = _SUPPORTS_FP8 and (vendor_name != "nvidia" or _is_hopper_class())
+
+# Tolerance per quantization mode: (rtol, atol floor, ratio of |ref|max).
+TOLERANCE = {
+    "plain": (1e-1, 1e-2, 1e-5),
+    "fp8": (5e-1, 2e-1, 1e-1),
+    "fp8_blockwise": (2e-1, 5e-2, 5e-2),
+    "int8": (2e-1, 5e-2, 2e-2),
+    "int8_w8a16": (2e-1, 5e-2, 2e-2),
+    "int4_w4a16": (3e-1, 1e-1, 5e-2),
+}
+
+
+def assert_moe_close(result, ref, mode="plain", msg=""):
+    """Compare a fused MoE result with its reference under the mode's tolerance."""
+    rtol, atol_floor, ratio = TOLERANCE[mode]
+    atol = max(atol_floor, float(ref.abs().max()) * ratio)
+    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol, msg=msg)
+
 
 # Large production-like MoE shapes can allocate tens of GiB for weights alone.
 # Keep the default per-op run bounded; opt in explicitly for stress coverage.
@@ -100,45 +170,6 @@ if RUN_LARGE_MOE_TESTS:
     ]
 
 
-def is_cuda_available():
-    if flaggems_vllm.device != "cuda" or not torch.cuda.is_available():
-        return False
-    try:
-        major, minor = torch.cuda.get_device_capability()
-    except Exception:
-        return False
-    sm_version_num = major * 10 + minor
-    return sm_version_num >= 90 and sm_version_num < 100
-
-
-CUDA_AVAILABLE = is_cuda_available()
-
-
-# FP8 fused MoE tests run on NVIDIA Hopper (CUDA_AVAILABLE) or on any other
-# device whose actual capability supports FP8. The Hygon HCU is excluded by
-# platform property: it has no native FP8 MFMA (flagtree software-emulates
-# fp8 dot, ~10x slower than bf16), and its CUDA capability probe would
-# wrongly match the Hopper check. Other platforms are probed with a real
-# FP8 round-trip; any failure conservatively disables the FP8 tests.
-def _probe_fp8_support() -> bool:
-    if flaggems_vllm.vendor_name == "hygon":
-        return False  # Hygon HCU: no native FP8 compute, skip by platform
-    device = flaggems_vllm.device
-    if device == "cuda":
-        return False  # NVIDIA semantics stay with CUDA_AVAILABLE (Hopper)
-    try:
-        src = torch.ones(8, 8, device=device, dtype=torch.float32)
-        _ = src.to(torch.float8_e4m3fn).to(torch.float32)
-        return True
-    except Exception:
-        return False
-
-
-FP8_AVAILABLE = flaggems_vllm.vendor_name != "hygon" and (
-    CUDA_AVAILABLE or _probe_fp8_support()
-)
-
-
 def make_topk_routing(gating, topk, dtype):
     """Build routing tensors using the production int32 expert-id contract."""
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
@@ -169,26 +200,34 @@ def torch_fused_moe_reference(
         output: (M, K)
     """
     M, K = hidden_states.shape
+    num_experts = w1.shape[0]
     topk = topk_ids.shape[1]
-    output = torch.zeros(M, K, device=hidden_states.device, dtype=hidden_states.dtype)
+    D = w1.shape[1] // 2
 
-    for m in range(M):
-        for j in range(topk):
-            e = topk_ids[m, j].item()
-            weight = topk_weights[m, j]
-            # GEMM1: up-projection  (1, K) @ (K, 2D) -> (1, 2D)
-            z = hidden_states[m].to(torch.float32) @ w1[e].T.to(torch.float32)
-            # SiLU-and-Mul: split into gate and up, apply SwiGLU
-            D = z.shape[-1] // 2
-            gate = z[:D]
-            up = z[D:]
-            s = (gate * torch.sigmoid(gate)) * up  # SiLU(gate) * up
-            # GEMM2: down-projection  (1, D) @ (D, K) -> (1, K)
-            r = s @ w2[e].T.to(torch.float32)
-            # Weighted accumulation
-            output[m] += (weight.to(torch.float32) * r).to(output.dtype)
+    # Expand each token once per routed slot, then run one dense matmul per
+    # expert. This replaces the per-(token, slot) Python loop (M*topk device
+    # syncs) with E loops, independent of the token count.
+    x = hidden_states.to(torch.float32).repeat_interleave(topk, dim=0)
+    flat_ids = topk_ids.reshape(-1).to(torch.int64)
+    flat_weights = topk_weights.reshape(-1).to(torch.float32)
 
-    return output
+    z = torch.empty(M * topk, 2 * D, device=hidden_states.device, dtype=torch.float32)
+    for e in range(num_experts):
+        sel = flat_ids == e
+        if sel.any():
+            z[sel] = x[sel] @ w1[e].to(torch.float32).T
+
+    gate, up = z[:, :D], z[:, D:]
+    act = (gate * torch.sigmoid(gate)) * up  # SiLU(gate) * up
+
+    r = torch.empty(M * topk, K, device=hidden_states.device, dtype=torch.float32)
+    for e in range(num_experts):
+        sel = flat_ids == e
+        if sel.any():
+            r[sel] = act[sel] @ w2[e].to(torch.float32).T
+
+    output = (r * flat_weights[:, None]).view(M, topk, K).sum(dim=1)
+    return output.to(hidden_states.dtype)
 
 
 @pytest.mark.fused_experts_impl
@@ -219,7 +258,7 @@ def test_fused_moe_vs_ref(config, dtype):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems result
-    result = flaggems_vllm.ops_experts_impl(
+    result = fused_experts_impl(
         hidden_states,
         w1,
         w2,
@@ -234,51 +273,17 @@ def test_fused_moe_vs_ref(config, dtype):
 
     # Fused bf16/fp16 kernels accumulate rounding errors across two GEMMs
     # and an activation; use tolerances proportional to output magnitude.
-    rtol = 1e-1
-    atol = max(1e-2, ref.abs().max().item() * 1e-5)
-
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+    assert_moe_close(result, ref)
 
 
-try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts_impl as vllm_fused_experts_impl,
-    )
-
-    HAS_VLLM_FUSED_MOE = True
-except ImportError:
-    HAS_VLLM_FUSED_MOE = False
-
-# On the Hygon HCU backend vLLM's upstream fused_moe kernel (no HCU
-# adaptation) is unreliable for small-E shapes (E<256): it intermittently
-# segfaults (a process-killing crash that cannot be caught by try/except)
-# or produces wrong results, so those comparisons are skipped by platform
-# property rather than probed. E>=256 (Qwen/DeepSeek) is unaffected.
-VLLM_SMALL_E_CRASH = flaggems_vllm.vendor_name == "hygon"
-
-
-def _supports_keyword(op, keyword):
-    try:
-        parameters = inspect.signature(op).parameters
-    except (TypeError, ValueError):
-        return False
-    return keyword in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-
-
-VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
-    vllm_fused_experts_impl, "inplace"
-)
+VLLM_SMALL_E_CRASH = vendor_name == "hygon"
 
 
 @pytest.mark.fused_experts_impl
-@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM is required")
 @pytest.mark.parametrize("config", FUSED_MOE_CONFIGS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", _VLLM_REF_DTYPES)
 def test_fused_moe_vs_vllm(config, dtype):
-    """Test FlagGems fused_moe against a pure PyTorch reference."""
+    """Test FlagGems fused_moe against the vLLM reference implementation."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     if VLLM_SMALL_E_CRASH and num_experts < 256:
         pytest.skip(
@@ -307,29 +312,22 @@ def test_fused_moe_vs_vllm(config, dtype):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems result
-    result = flaggems_vllm.ops_experts_impl(
-        hidden_states, w1, w2, topk_weights, topk_ids
-    )
+    result = fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
 
     # Reference result
-    vllm_kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
-    ref = vllm_fused_experts_impl(
+    ref = _vllm_moe_reference(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        **vllm_kwargs,
     )
 
     torch_device_fn.synchronize()
 
     # Fused bf16/fp16 kernels accumulate rounding errors across two GEMMs
     # and an activation; use tolerances proportional to output magnitude.
-    rtol = 1e-1
-    atol = max(1e-2, ref.abs().max().item() * 1e-5)
-
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+    assert_moe_close(result, ref)
 
 
 @pytest.mark.fused_experts_impl
@@ -398,7 +396,7 @@ def test_accuracy_fused_moe_fp8(config):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems FP8 result
-    result = flaggems_vllm.ops_experts_impl(
+    result = fused_experts_impl(
         hidden_states,
         w1_fp8,
         w2_fp8,
@@ -423,11 +421,9 @@ def test_accuracy_fused_moe_fp8(config):
 
     torch_device_fn.synchronize()
 
-    # FP8 quantization introduces more error than bf16, use wider tolerances.
-    # Two quantized GEMMs + activation create cumulative rounding error.
-    rtol = 5e-1
-    atol = max(2e-1, ref.abs().max().item() * 1e-1)
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+    # FP8 quantization introduces more error than bf16: two quantized GEMMs
+    # plus the activation accumulate rounding error.
+    assert_moe_close(result, ref, "fp8")
 
 
 def _fake_quantize_fp8(tensor: torch.Tensor):
@@ -691,7 +687,7 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
-    result = flaggems_vllm.ops_experts_impl(
+    result = fused_experts_impl(
         hidden_states,
         w1_fp8,
         w2_fp8,
@@ -716,9 +712,7 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
 
     torch_device_fn.synchronize()
 
-    rtol = 2e-1
-    atol = max(5e-2, ref.abs().max().item() * 5e-2)
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+    assert_moe_close(result, ref, "fp8_blockwise")
 
 
 @pytest.mark.fused_experts_impl
@@ -734,6 +728,10 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
         if RUN_LARGE_MOE_TESTS
         else []
     ),
+)
+@pytest.mark.skipif(
+    not _SUPPORTS_INT8,
+    reason="no native INT8 support on this vendor (see _OFFICIAL_PRECISION)",
 )
 def test_fused_moe_int8(config):
     """Test FlagGems fused_moe with INT8 W8A8 per-channel quantization."""
@@ -781,7 +779,7 @@ def test_fused_moe_int8(config):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems INT8 result
-    result = flaggems_vllm.ops_experts_impl(
+    result = fused_experts_impl(
         hidden_states,
         w1_int8,
         w2_int8,
@@ -808,10 +806,7 @@ def test_fused_moe_int8(config):
 
     torch_device_fn.synchronize()
 
-    # INT8 quantization introduces more error, use wider tolerances
-    rtol = 2e-1
-    atol = max(5e-2, ref.abs().max().item() * 2e-2)
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+    assert_moe_close(result, ref, "int8")
 
 
 def torch_fused_moe_weight_only_reference(
@@ -854,6 +849,10 @@ def torch_fused_moe_weight_only_reference(
 
 @pytest.mark.fused_experts_impl
 @pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
+@pytest.mark.skipif(
+    not _SUPPORTS_INT8,
+    reason="no native INT8 support on this vendor (see _OFFICIAL_PRECISION)",
+)
 def test_fused_moe_int8_w8a16(config):
     """Test FlagGems fused_moe with INT8 W8A16 (weight-only) quantization."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -897,7 +896,7 @@ def test_fused_moe_int8_w8a16(config):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems INT8 W8A16 result
-    result = flaggems_vllm.ops_experts_impl(
+    result = fused_experts_impl(
         hidden_states,
         w1_int8,
         w2_int8,
@@ -922,15 +921,17 @@ def test_fused_moe_int8_w8a16(config):
 
     torch_device_fn.synchronize()
 
-    # Weight-only quantization has less error than W8A8 since activations
-    # are full precision, but still has weight quantization rounding error.
-    rtol = 2e-1
-    atol = max(5e-2, ref.abs().max().item() * 2e-2)
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
+    # Weight-only quantization keeps activations in full precision, so only
+    # the weight rounding error remains.
+    assert_moe_close(result, ref, "int8_w8a16")
 
 
 @pytest.mark.fused_experts_impl
 @pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
+@pytest.mark.skipif(
+    not _SUPPORTS_INT8,
+    reason="no native INT8 support on this vendor (see _OFFICIAL_PRECISION)",
+)
 def test_fused_moe_int4_w4a16(config):
     """Test FlagGems fused_moe with INT4 W4A16 (weight-only) quantization."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -976,7 +977,7 @@ def test_fused_moe_int4_w4a16(config):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems INT4 W4A16 result
-    result = flaggems_vllm.ops_experts_impl(
+    result = fused_experts_impl(
         hidden_states,
         w1_int4,
         w2_int4,
@@ -1001,69 +1002,8 @@ def test_fused_moe_int4_w4a16(config):
 
     torch_device_fn.synchronize()
 
-    # INT4 has coarser quantization → wider tolerance
-    rtol = 3e-1
-    atol = max(1e-1, ref.abs().max().item() * 5e-2)
-    torch.testing.assert_close(result, ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.fused_experts_impl
-@pytest.mark.parametrize(
-    "config",
-    [
-        (4, 8, 128, 256, 2),
-        (16, 8, 256, 512, 2),
-    ],
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_moe_inplace(config, dtype):
-    """Test that inplace=True writes output into hidden_states."""
-    num_tokens, num_experts, hidden_size, intermediate_size, topk = config
-    device = flaggems_vllm.device
-
-    torch.manual_seed(0)
-
-    hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-    w1 = torch.randn(
-        num_experts,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=dtype,
-    ) * (1.0 / hidden_size**0.5)
-    w2 = torch.randn(
-        num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
-    ) * (1.0 / intermediate_size**0.5)
-
-    gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
-
-    # Non-inplace reference
-    ref = flaggems_vllm.ops_experts_impl(
-        hidden_states.clone(),
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace=False,
-    )
-
-    # Inplace result
-    hidden_copy = hidden_states.clone()
-    result = flaggems_vllm.ops_experts_impl(
-        hidden_copy,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace=True,
-    )
-
-    torch_device_fn.synchronize()
-
-    # Result should be the same tensor as input
-    assert result.data_ptr() == hidden_copy.data_ptr(), "inplace should reuse input"
-    torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+    # INT4 has a coarser quantum, so it needs the widest tolerance.
+    assert_moe_close(result, ref, "int4_w4a16")
 
 
 @pytest.mark.fused_experts_impl
@@ -1098,7 +1038,7 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
     topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # Default (weight on GEMM2 output)
-    result_default = flaggems_vllm.ops_experts_impl(
+    result_default = fused_experts_impl(
         hidden_states,
         w1,
         w2,
@@ -1108,7 +1048,7 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
     )
 
     # Weight on GEMM1 input
-    result_on_input = flaggems_vllm.ops_experts_impl(
+    result_on_input = fused_experts_impl(
         hidden_states,
         w1,
         w2,
@@ -1123,10 +1063,8 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
     # close to the reference with weight on the respective path.
     ref = torch_fused_moe_reference(hidden_states, w1, w2, topk_weights, topk_ids)
 
-    # The default (weight on output) should match our standard reference
-    rtol = 1e-1
-    atol = max(1e-2, ref.abs().max().item() * 1e-5)
-    torch.testing.assert_close(result_default, ref, rtol=rtol, atol=atol)
+    # The default (weight on output) should match our standard reference.
+    assert_moe_close(result_default, ref)
 
     # The apply_on_input result will differ but should be finite and nonzero
     assert torch.isfinite(
