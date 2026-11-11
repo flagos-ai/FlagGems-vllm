@@ -251,7 +251,7 @@ def _prune_matmul_configs(configs, named_args, **kwargs):
     warmup=5,
     rep=20,
     use_cuda_graph=True,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_matmul",
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
 )
@@ -321,7 +321,7 @@ def _w8a8_block_int8_kernel_general(
     warmup=5,
     rep=20,
     use_cuda_graph=True,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_swap",
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
 )
@@ -391,7 +391,7 @@ def _w8a8_block_int8_kernel_swap(
     warmup=5,
     rep=20,
     use_cuda_graph=True,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_gemv",
 )
 @triton.jit
@@ -480,7 +480,7 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
     rep=20,
     use_cuda_graph=True,
     post_hook=_splitk_post_hook,
-    flagtune_op_name="w8a8_block_int8_matmul",
+    flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_splitk",
     prune_configs_by={"early_config_prune": _prune_splitk_configs},
 )
@@ -559,7 +559,7 @@ _last_validated_signature = None
 _last_validation_key = None
 
 
-def w8a8_block_int8_matmul(
+def w8a8_block_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -665,7 +665,7 @@ def w8a8_block_int8_matmul(
     # original path.  Split count and tile layout are selected by LibTuner.
     if group_k == 128 and K >= 4096 and M <= 128 and N <= 1536 and M * N <= 65536:
         return _splitk_matmul(A, B, As, Bs, M, N, K, group_n, group_k, output_dtype)
-    expand = runtime.flagtune_enabled("w8a8_block_int8_matmul")
+    expand = runtime.flagtune_enabled("w8a8_block_matmul")
     skinny_swap = 2 <= M <= 64 and N <= 1536 and 2304 < K <= 8192
     # PPU's native INT8 MMA favors a 64x128 tile for short rows when N is
     # moderate.  The transposed skinny path has extra layout traffic here;
