@@ -860,7 +860,8 @@ def test_paged_rejects_mixed_contract_before_state_update(field):
     )
     with pytest.raises(ValueError, match="Paged compressor"):
         _paged_public_call(*args, **{field: value})
-    assert torch.equal(args[4], before)
+    # Compare storage bits so unchanged NaN sentinel rows remain equal.
+    assert torch.equal(args[4].cpu().view(torch.uint8), before.cpu().view(torch.uint8))
 
 
 @pytest.mark.compressor
@@ -881,4 +882,5 @@ def test_paged_rejects_incomplete_metadata_before_state_update(field):
     before = args[4].clone()
     with pytest.raises(ValueError, match="complete explicit metadata"):
         _paged_public_call(*args, **{field: None})
-    assert torch.equal(args[4], before)
+    # Compare storage bits so unchanged NaN sentinel rows remain equal.
+    assert torch.equal(args[4].cpu().view(torch.uint8), before.cpu().view(torch.uint8))
