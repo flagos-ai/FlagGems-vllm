@@ -16,6 +16,7 @@ Use --comm-only to check Torch NCCL/RCCL without importing TLE or FlagGems-vllm.
 import argparse
 import importlib
 import os
+from contextlib import contextmanager
 
 
 def _positive_int(value):
@@ -65,6 +66,67 @@ def _check_communication(device, repeat):
         dist.destroy_process_group()
 
 
+def _load_tle(parser):
+    try:
+        tle = importlib.import_module("triton.experimental.tle.language")
+    except ImportError:
+        parser.error("requires FlagTree with TLE; ordinary Triton is unsupported")
+    if not tle.communication.enabled:
+        parser.error("requires a matching FlagCX host/device runtime")
+    return tle
+
+
+def _select_device(parser, local_rank):
+    import torch
+
+    if not torch.cuda.is_available():
+        parser.error("requires GPUs available through torch.cuda (CUDA or HCU/HIP)")
+    local_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    if torch.cuda.device_count() < local_size:
+        parser.error(
+            f"this node needs {local_size} visible GPUs, found {torch.cuda.device_count()}"
+        )
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    return device
+
+
+@contextmanager
+def _operator_group(parser, local_rank, bootstrap):
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        parser.error("start this standalone runner in fresh torchrun workers")
+    if bootstrap == "torch":
+        device = _select_device(parser, local_rank)
+        group = _init_nccl_group(device)
+        try:
+            yield group, device
+        finally:
+            dist.destroy_process_group()
+        return
+
+    rank = os.environ["RANK"]
+    print(f"[rank {rank}] TLE tutorial bootstrap begin", flush=True)
+    # Import TLE before touching CUDA, exactly as the tutorial does. Its
+    # get_mem_pool owns lazy NCCL setup, GPU ID broadcast, and FlagCX bootstrap.
+    tle = _load_tle(parser)
+    try:
+        if tle.get_mem_pool() is None:
+            parser.error("TLE tutorial bootstrap did not provide a memory pool")
+        device = _select_device(parser, local_rank)
+        print(f"[rank {rank}] TLE tutorial bootstrap complete", flush=True)
+        yield dist.group.WORLD, device
+    finally:
+        try:
+            tle.cleanup_communicator()
+        finally:
+            # Covers partial bootstrap failures. Normal TLE cleanup already
+            # destroys its group, so do not destroy it twice.
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
@@ -81,6 +143,12 @@ def main():
     )
     parser.add_argument("--repeat", type=_positive_int, default=3)
     parser.add_argument(
+        "--bootstrap",
+        choices=("torch", "tle"),
+        default="torch",
+        help="tle reuses the original tutorial's get_mem_pool initialization",
+    )
+    parser.add_argument(
         "--comm-only",
         action="store_true",
         help="only check Torch NCCL/RCCL init and all-reduce; skip TLE and FlagGems-vllm",
@@ -94,28 +162,12 @@ def main():
         )
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    import torch
-    import torch.distributed as dist
-
-    if not torch.cuda.is_available():
-        parser.error("requires GPUs available through torch.cuda (CUDA or HCU/HIP)")
-    local_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    if torch.cuda.device_count() < local_size:
-        parser.error(
-            f"this node needs {local_size} visible GPUs, found {torch.cuda.device_count()}"
-        )
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
     if args.comm_only:
+        device = _select_device(parser, local_rank)
         _check_communication(device, args.repeat)
         return
-    # Match the known-good comm-only bootstrap before loading FlagCX adaptors
-    # or installing operator registrations through package imports.
-    group = _init_nccl_group(device)
-    try:
+    with _operator_group(parser, local_rank, args.bootstrap) as (group, device):
         _check_operator(args, parser, group, device)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_operator(args, parser, group, device):
@@ -124,14 +176,7 @@ def _check_operator(args, parser, group, device):
 
     world_size = group.size()
     print(f"[rank {group.rank()}] importing TLE", flush=True)
-    try:
-        tle = importlib.import_module("triton.experimental.tle.language")
-    except ImportError:
-        parser.error(
-            "requires FlagTree with TLE; ordinary Triton does not provide this backend"
-        )
-    if not tle.communication.enabled:
-        parser.error("requires a matching FlagCX host/device runtime")
+    _load_tle(parser)
 
     print(f"[rank {group.rank()}] importing FlagGems-vllm", flush=True)
     import flaggems_vllm

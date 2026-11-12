@@ -29,4 +29,4 @@ exec python -m torch.distributed.run \
   --rdzv-backend=static \
   --master-addr="${MASTER_ADDR:-127.0.0.1}" \
   --master-port="${MASTER_PORT:-29501}" \
-  -- tests/run_fused_matmul_reduce_scatter.py "$@"
+  -- tests/run_fused_matmul_reduce_scatter.py --bootstrap tle "$@"
