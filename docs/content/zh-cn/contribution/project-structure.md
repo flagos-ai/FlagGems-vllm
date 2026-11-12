@@ -13,6 +13,7 @@ FlagGems-vllm 仓库组织与模块架构。
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python 核心包
 │   ├── __init__.py         # 顶层导出与公开算子暴露
+│   ├── backends.yaml       # 后端注册表（Python/torch/triton/vLLM 版本）
 │   ├── config.py           # 配置与 C 扩展检测
 │   ├── ops/                # 算子实现
 │   ├── runtime/            # 后端管理、设备检测、自动调优配置
@@ -120,7 +121,8 @@ conf/
 tools/
 ├── ci_checks/              # CI 校验脚本（YAML 完整性、导出排序、标记等）
 ├── gpu_check_<vendor>.sh   # 13 款芯片厂商硬件环境检测脚本
-├── setup.sh                # 完整 GPU 运行环境一键部署
+├── setup.sh                # 多后端环境一键部署
+├── source_env_bash.sh      # 将厂商 env 脚本重新导出到 activate
 ├── select_tests.py         # CI：根据改动文件映射测试目标
 ├── select_backends.py      # CI：多后端测试目标过滤
 └── run_ci_targets.py       # CI：执行筛选后的测试与 Benchmark
@@ -138,9 +140,12 @@ tools/
 ## 打包元数据 (`pyproject.toml`)
 
 - 包名：`flaggems_vllm`
-- 构建系统：`scikit-build-core`（通过 pybind11 编译可选 C++ 扩展）
-- 依赖项：`torch>=2.6.0`, `pyyaml`, `triton` 或 `flagtree`
-- 可选测试依赖：`[test]` (pytest, numpy, scipy, cupy)
+- 构建系统：`setuptools`
+- 依赖项：`flag-gems`、`packaging`、`pybind11`、`PyYAML`、`sqlalchemy`
+  （torch/triton/vLLM 由厂商环境提供）
+- 可选测试 extras：`[test]`（pytest、scipy、einops、distro）和
+  `[test-nvidia]`（cupy-cuda12x）
+- 含厂商 vLLM 包的 extra：`[nvidia]`、`[metax]`、`[ascend]`、`[thead]`
 
 ## 下一步
 
