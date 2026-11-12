@@ -1276,7 +1276,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
                 lane_partial1,
                 lane_partial2,
             )
-            _ = _store_shared3_f32(
+            shared_store3_token = _store_shared3_f32(  # noqa: F841
                 _shared_address_u32(
                     tle.gpu.local_ptr(scratch4, (reduction_warp, channel0 + 0))
                 ),
@@ -1420,7 +1420,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
             projection_offset = (
                 token * NUM_OUTPUT_TILES * NUM_SPLITS + output_tile * NUM_SPLITS + split
             ) * OUTPUT_TILE_BLOCK
-        _ = _store_tid4_partials_f32(
+        partial_store4_token = _store_tid4_partials_f32(  # noqa: F841
             tl.cast(projection_partials_ptr + projection_offset, tl.uint64),
             tl.cast(
                 sqsum_partials_ptr + token * NUM_SPLITS + split,
@@ -1519,7 +1519,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
         projection_offset = (
             token * NUM_OUTPUT_TILES * NUM_SPLITS + output_tile * NUM_SPLITS + split
         ) * OUTPUT_TILE_BLOCK
-        _ = _store_tid7_partials_f32(
+        partial_store7_token = _store_tid7_partials_f32(  # noqa: F841
             tl.cast(projection_partials_ptr + projection_offset, tl.uint64),
             tl.cast(
                 sqsum_partials_ptr + token * NUM_SPLITS + split,
@@ -1577,7 +1577,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
         )
         channel0 = local_hidden * 0
         if USE_TID5_REDUCTION:
-            _ = _store_shared5_f32(
+            shared_store5_token = _store_shared5_f32(  # noqa: F841
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (channel0 + 0, warp))),
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (channel0 + 1, warp))),
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (channel0 + 2, warp))),
@@ -1640,7 +1640,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (thread, channel0 + 7))),
                 thread,
             )
-            _ = _store_tid5_partials_f32(
+            partial_store5_token = _store_tid5_partials_f32(  # noqa: F841
                 tl.cast(
                     projection_partials_ptr + projection_offset,
                     tl.uint64,
