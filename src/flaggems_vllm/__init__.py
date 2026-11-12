@@ -61,9 +61,9 @@ _LIBRARY_ONLY_OPS = frozenset(
         "grouped_gemma_rmsnorm",
         "hc_combine",
         "top_k_top_p",
-        "qsa_sparse_paged_attention_unpacked",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
+        "qsa_sparse_paged_attention_unpacked",
     }
 )
 
