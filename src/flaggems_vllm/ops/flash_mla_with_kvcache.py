@@ -25,6 +25,7 @@ from typing import Callable, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):

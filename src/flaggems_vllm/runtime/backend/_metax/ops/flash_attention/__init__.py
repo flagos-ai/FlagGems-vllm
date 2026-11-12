@@ -19,7 +19,8 @@
 # other MetaX architectures.
 
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.launcher import (
+    flash_attn_varlen_func_w8a8_int8,
     launch_attention,
 )
 
-__all__ = ["launch_attention"]
+__all__ = ["launch_attention", "flash_attn_varlen_func_w8a8_int8"]
