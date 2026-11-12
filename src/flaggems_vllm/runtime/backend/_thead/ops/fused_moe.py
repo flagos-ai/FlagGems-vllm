@@ -1070,7 +1070,7 @@ def fused_moe_kernel(
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
-            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            + (offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk)
         )
 
         if use_int8_w8a16:
@@ -1116,7 +1116,7 @@ def fused_moe_kernel(
             # Eliminate masking overhead when K is perfectly aligned with BLOCK_SIZE_K.
             if K_DIVISIBLE_BY_BLOCK_K:
                 a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
-                b = tl.load(b_ptrs)
+                b = tl.trans(tl.load(b_ptrs))
             else:
                 k_remaining = K - k * BLOCK_SIZE_K
                 a = tl.load(
@@ -1124,7 +1124,9 @@ def fused_moe_kernel(
                     mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
                     other=0.0,
                 )
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+                b = tl.trans(
+                    tl.load(b_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+                )
 
             if use_int8_w8a16:
                 accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
