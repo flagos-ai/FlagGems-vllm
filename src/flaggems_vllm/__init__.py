@@ -65,6 +65,7 @@ _LIBRARY_ONLY_OPS = frozenset(
         "ihc_post",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
+        "pad_indexer_heads",
     }
 )
 

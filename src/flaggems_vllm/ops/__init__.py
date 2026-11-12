@@ -244,6 +244,7 @@ from flaggems_vllm.ops.mhc_with_norm import (
     mhc_pre_with_norm,
     mhc_rms_norm,
 )
+from flaggems_vllm.ops.pad_indexer_heads import pad_indexer_heads
 from flaggems_vllm.ops.paged_mqa import paged_mqa_logits
 from flaggems_vllm.ops.topk_sigmoid import topk_sigmoid
 from flaggems_vllm.ops.vit_attention import (
@@ -363,6 +364,7 @@ __all__ = [
     "outplace_fused_experts",
     "pack_seq_triton",
     "pad_attention_heads",
+    "pad_indexer_heads",
     "paged_mqa_logits",
     "parallel_nsa",
     "parallel_nsa_compression",
