@@ -1654,20 +1654,6 @@ def dispatch_fused_moe_kernel(
 _GEMV_CFG = None  # optional gemv tuning override: {"BLOCK_N":..,"BLOCK_K":..}
 
 
-def prepack_fused_moe_weights(
-    w1: torch.Tensor, w2: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return N-contiguous (E, N, K) copies of the expert weights."""
-    from flaggems_vllm.ops.permute_copy import permute_copy
-
-    def _pack(w):
-        E, N, K = w.shape
-        transposed = permute_copy(w, (0, 2, 1))
-        return transposed.as_strided((E, N, K), (K * N, 1, N))
-
-    return _pack(w1), _pack(w2)
-
-
 def _fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1721,8 +1707,8 @@ def _fused_experts_impl(
 
     assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.stride(-1) == 1 or w1.stride(1) == 1, "w1 layout"
-    assert w2.stride(-1) == 1 or w2.stride(1) == 1, "w2 layout"
+    assert w1.stride(-1) == 1, "w1 layout"
+    assert w2.stride(-1) == 1, "w2 layout"
 
     # GEMM and GEMV consume the caller's weight strides directly. An implicit
     # transpose backed by a bounded cache thrashes across MoE layers and can
