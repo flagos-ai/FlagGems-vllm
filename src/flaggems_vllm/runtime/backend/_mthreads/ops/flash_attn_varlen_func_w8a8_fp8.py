@@ -42,6 +42,34 @@ if HAS_TLE:
 else:
     tle = None
 
+HAS_TME = False
+HAS_LLC_OPT = False
+HAS_FP8_BURST2 = False
+TensorDescriptor = None
+try:
+    from triton.backends.mthreads.compiler import MUSAOptions
+
+    HAS_LLC_OPT = "enable_llc_opt" in MUSAOptions.__dataclass_fields__
+    HAS_FP8_BURST2 = "enable_fp8_burst2" in MUSAOptions.__dataclass_fields__
+except (ImportError, AttributeError):
+    pass
+if HAS_TLE and has_triton_tle_attrs(("pipe",), 3, 6, 0):
+    try:
+        from triton._C.libtriton import mthreads as _mthreads_native
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        HAS_TME = hasattr(TensorDescriptor, "from_tensor") and all(
+            hasattr(_mthreads_native.passes.ttgpuir, name)
+            for name in (
+                "add_tle_lower_pipe",
+                "add_tle_lower_barrier_allocations",
+                "add_tle_lower_tme_transactions",
+                "add_tle_lower_barrier_operations",
+            )
+        )
+    except (ImportError, AttributeError):
+        HAS_TME = False
+
 
 _FWD_PARAM_INDEX = {name: i for i, name in enumerate(fwd_params.__slots__)}
 
@@ -183,6 +211,68 @@ def _pad_fp8_qkv(q, k, v):
 
 
 @triton.jit
+def _cast_v_fp16(
+    V,
+    TV,
+    ROWS: tl.constexpr,
+    HEADS: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    D: tl.constexpr,
+    PAD_D: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    col = x % PAD_D
+    head = x // PAD_D % HEADS
+    row = x // (HEADS * PAD_D)
+    valid = x < ROWS * HEADS * PAD_D
+    value = tl.load(V + row * S0 + head * S1 + col, valid & (col < D), other=0.0).to(
+        tl.float16
+    )
+    tl.store(TV + x, value, valid)
+
+
+def _prepare_v_fp16(v):
+    d = v.shape[-1]
+    pad_d = triton.cdiv(d, 16) * 16
+    backing = torch.empty(
+        (v.shape[0], v.shape[1], pad_d), dtype=torch.float16, device=v.device
+    )
+    if backing.numel():
+        _cast_v_fp16[(triton.cdiv(backing.numel(), 256),)](
+            v,
+            backing,
+            v.shape[0],
+            v.shape[1],
+            v.stride(0),
+            v.stride(1),
+            d,
+            pad_d,
+            256,
+            num_warps=4,
+            num_stages=1,
+        )
+    return backing.as_strided(v.shape, (v.shape[1] * pad_d, pad_d, 1))
+
+
+@triton.jit
+def _fp16_pv_dot(
+    P,
+    V,
+    acc,
+    v_descale,
+    fp8_p_max: tl.constexpr,
+    fp8_dtype: tl.constexpr,
+    precise_p: tl.constexpr = False,
+):
+    # The generic QK dot still consumes FP8. E4M3 probabilities already
+    # carry the factor of 256, which cancels during row normalization.
+    pv = tl.dot(P.to(tl.float16), V.to(tl.float16), out_dtype=tl.float32)
+    return acc + pv * v_descale
+
+
+@triton.jit
 def _quantize_probability(P):
     P_fp8 = P.to(tl.float8e4nv)
     P_residual = ((P - P_fp8.to(tl.float32)) * 32.0).to(tl.float8e4nv)
@@ -279,6 +369,8 @@ def flash_varlen_fwd_kernel_tle(
     page_table_batch_stride: tl.constexpr,
     block_size: tl.constexpr,
     k_page_stride,
+    K_TME_DESC,
+    V_TME_DESC,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -289,6 +381,8 @@ def flash_varlen_fwd_kernel_tle(
     num_stages: tl.constexpr,
     PV_DOT: tl.constexpr = None,
     PADDED_D: tl.constexpr = 0,
+    USE_TME_KV: tl.constexpr = False,
+    PV_HALF: tl.constexpr = False,
 ):
     tl.static_assert(
         PADDED_D == 0 or (PADDED_D >= d and PADDED_D % 16 == 0 and PADDED_D <= BLOCK_K)
@@ -303,7 +397,10 @@ def flash_varlen_fwd_kernel_tle(
     tl.static_assert(fp8_p_max == 448.0)
     tl.static_assert(q_ptr.dtype.element_ty == tl.float8e4nv)
     tl.static_assert(k_ptr.dtype.element_ty == tl.float8e4nv)
-    tl.static_assert(v_ptr.dtype.element_ty == tl.float8e4nv)
+    tl.static_assert(
+        v_ptr.dtype.element_ty == (tl.float16 if PV_HALF else tl.float8e4nv)
+    )
+    tl.static_assert(not USE_TME_KV or PV_HALF)
     tl.static_assert(BLOCK_M >= 16 and BLOCK_M % 16 == 0)
     tl.static_assert(BLOCK_N == 32 or BLOCK_N == 64 or BLOCK_N == 128)
     tl.static_assert(
@@ -313,6 +410,70 @@ def flash_varlen_fwd_kernel_tle(
         BLOCK_D == 32 or BLOCK_D == 64 or BLOCK_D == 128 or (BLOCK_D == 256)
     )
     tl.static_assert(128 % BLOCK_M == 0 and 128 % BLOCK_N == 0)
+    # Pipe storage must dominate the uniform early returns. The constexpr
+    # branches retain the original pointer-only shared-memory path as well.
+    sQ = tle.gpu.alloc(
+        (BLOCK_M, BLOCK_K), tl.float8e4nv, scope=tle.gpu.smem, nv_mma_shared_layout=True
+    )
+    if PV_HALF:
+        sP = tle.gpu.alloc(
+            (BLOCK_M, BLOCK_N),
+            tl.float16,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
+        )
+    else:
+        sP = tle.gpu.alloc(
+            (BLOCK_M, BLOCK_N),
+            tl.float8e4nv,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
+        )
+        sPr = tle.gpu.alloc(
+            (BLOCK_M, BLOCK_N),
+            tl.float8e4nv,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
+        )
+    if USE_TME_KV:
+        sK_ring = tle.gpu.alloc(
+            (1, BLOCK_N, BLOCK_K),
+            tl.float8e4nv,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
+        )
+        sV_ring = tle.gpu.alloc(
+            (1, BLOCK_N, BLOCK_D),
+            tl.float16,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
+        )
+        kv_pipe = tle.pipe(
+            capacity=1, scope="cta", name="attention_kv", k=sK_ring, v=sV_ring
+        )
+        kv_writer = kv_pipe.writer()
+        kv_reader = kv_pipe.reader()
+    else:
+        sK = tle.gpu.alloc(
+            (BLOCK_N, BLOCK_K),
+            tl.float8e4nv,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=True,
+        )
+        if PV_HALF:
+            sV = tle.gpu.alloc(
+                (BLOCK_N, BLOCK_D),
+                tl.float16,
+                scope=tle.gpu.smem,
+                nv_mma_shared_layout=True,
+            )
+        else:
+            sV = tle.gpu.alloc(
+                (BLOCK_N, BLOCK_D),
+                tl.float8e4nv,
+                scope=tle.gpu.smem,
+                nv_mma_shared_layout=True,
+            )
     m_block = tl.program_id(0)
     bid = tl.program_id(1)
     hd = tl.program_id(2)
@@ -329,8 +490,6 @@ def flash_varlen_fwd_kernel_tle(
     k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
     k_len_cache = k_eos - k_bos
     k_len = k_len_cache
-    if (k_len <= 128) != PRECISE_SHORT_K:
-        return
     if m_block * BLOCK_M >= q_len:
         return
     is_even_mn: tl.constexpr = False
@@ -352,24 +511,7 @@ def flash_varlen_fwd_kernel_tle(
     kv_hid = hid // h_hk_ratio
     k_row_offset = kv_hid * k_head_stride
     k_ptr_base = k_ptr + k_row_offset
-    v_ptr_base = v_ptr + k_row_offset
-    # Keep shared-memory copies and SQMMA in this scope: the TLE layout pass
-    # does not propagate shared-memory type changes across copy helper calls.
-    sQ = tle.gpu.alloc(
-        (BLOCK_M, BLOCK_K), tl.float8e4nv, scope=tle.gpu.smem, nv_mma_shared_layout=True
-    )
-    sK = tle.gpu.alloc(
-        (BLOCK_N, BLOCK_K), tl.float8e4nv, scope=tle.gpu.smem, nv_mma_shared_layout=True
-    )
-    sV = tle.gpu.alloc(
-        (BLOCK_N, BLOCK_D), tl.float8e4nv, scope=tle.gpu.smem, nv_mma_shared_layout=True
-    )
-    sP = tle.gpu.alloc(
-        (BLOCK_M, BLOCK_N), tl.float8e4nv, scope=tle.gpu.smem, nv_mma_shared_layout=True
-    )
-    sPr = tle.gpu.alloc(
-        (BLOCK_M, BLOCK_N), tl.float8e4nv, scope=tle.gpu.smem, nv_mma_shared_layout=True
-    )
+    v_ptr_base = v_ptr + kv_hid * v_head_stride
     q_rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
     q_cols = tl.arange(0, BLOCK_K)
     # Masked pointer copies write zero to every masked shared-memory element.
@@ -405,22 +547,36 @@ def flash_varlen_fwd_kernel_tle(
         col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
         start_n = n_block * BLOCK_N
         k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-        v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+        v_ptr_seq = v_ptr_base + k_bos * v_row_stride
         kv_rows = start_n + tl.arange(0, BLOCK_N)
         k_cols = tl.arange(0, BLOCK_K)
         v_cols = d_start + tl.arange(0, BLOCK_D)
-        tle.gpu.copy(
-            k_ptr_seq + kv_rows[:, None] * k_row_stride + k_cols[None, :],
-            sK,
-            (BLOCK_N, BLOCK_K),
-            mask=(kv_rows[:, None] < k_len) & (k_cols[None, :] < LOAD_D),
-        )
-        tle.gpu.copy(
-            v_ptr_seq + kv_rows[:, None] * k_row_stride + v_cols[None, :],
-            sV,
-            (BLOCK_N, BLOCK_D),
-            mask=(kv_rows[:, None] < k_len) & (v_cols[None, :] < LOAD_D),
-        )
+        if USE_TME_KV:
+            kv_iteration = n_block_max - 1 - n_block
+            kv_slot = kv_writer.acquire(kv_iteration)
+            tle.gpu.copy(
+                K_TME_DESC, kv_slot.k, (BLOCK_N, BLOCK_K), (k_bos + start_n, kv_hid * d)
+            )
+            tle.gpu.copy(
+                V_TME_DESC,
+                kv_slot.v,
+                (BLOCK_N, BLOCK_D),
+                (k_bos + start_n, kv_hid * d + d_start),
+            )
+            kv_writer.commit(kv_iteration)
+        else:
+            tle.gpu.copy(
+                k_ptr_seq + kv_rows[:, None] * k_row_stride + k_cols[None, :],
+                sK,
+                (BLOCK_N, BLOCK_K),
+                mask=(kv_rows[:, None] < k_len) & (k_cols[None, :] < LOAD_D),
+            )
+            tle.gpu.copy(
+                v_ptr_seq + kv_rows[:, None] * v_row_stride + v_cols[None, :],
+                sV,
+                (BLOCK_N, BLOCK_D),
+                mask=(kv_rows[:, None] < k_len) & (v_cols[None, :] < LOAD_D),
+            )
         (q_descale, k_descale, v_descale) = _load_fp8_block_descales(
             q_descale_ptr,
             k_descale_ptr,
@@ -440,8 +596,25 @@ def flash_varlen_fwd_kernel_tle(
             m_block * BLOCK_M,
             n_block * BLOCK_N,
         )
-        tl.debug_barrier()
-        S = tle.gpu.wgmma(sQ, sK, trans_b=True)
+        if USE_TME_KV:
+            kv_ready = kv_reader.wait(kv_iteration)
+            k_tile = kv_ready.slot.k
+            v_tile = kv_ready.slot.v
+        else:
+            tl.debug_barrier()
+            k_tile = sK
+            v_tile = sV
+        # QK always uses the native FP8 SQMMA operands.
+        S = tle.gpu.wgmma(sQ, k_tile, trans_b=True)
+        if USE_TME_KV:
+            # Descriptor rows may enter the next request. Zero its V rows;
+            # QK only reads K, and the P publication barrier below also
+            # publishes these V writes before PV (including NaN neighbors).
+            tl.store(
+                tle.gpu.local_ptr(v_tile),
+                tl.full((BLOCK_N, BLOCK_D), 0.0, v_ptr.dtype.element_ty),
+                mask=kv_rows[:, None] >= k_len,
+            )
         S = tle.gpu.wgmma_wait(0, S)
         S *= q_descale * k_descale
         S = apply_softcap(S, softcap, is_softcap)
@@ -476,17 +649,25 @@ def flash_varlen_fwd_kernel_tle(
             is_border=True,
             fp8_p_max=fp8_p_max,
         )
-        (P_fp8, P_residual) = _quantize_probability(P)
-        tl.store(tle.gpu.local_ptr(sP), P_fp8)
-        tl.store(tle.gpu.local_ptr(sPr), P_residual)
-        tl.debug_barrier()
-        pv_main = tle.gpu.wgmma(sP, sV)
-        pv_main = tle.gpu.wgmma_wait(0, pv_main)
-        pv_residual = tle.gpu.wgmma(sPr, sV)
-        pv_residual = tle.gpu.wgmma_wait(0, pv_residual)
-        pv_main += pv_residual * (1.0 / 32.0)
+        if PV_HALF:
+            tl.store(tle.gpu.local_ptr(sP), P.to(tl.float16))
+            tl.debug_barrier()
+            pv_main = tle.gpu.wgmma(sP, v_tile)
+            pv_main = tle.gpu.wgmma_wait(0, pv_main)
+        else:
+            (P_fp8, P_residual) = _quantize_probability(P)
+            tl.store(tle.gpu.local_ptr(sP), P_fp8)
+            tl.store(tle.gpu.local_ptr(sPr), P_residual)
+            tl.debug_barrier()
+            pv_main = tle.gpu.wgmma(sP, v_tile)
+            pv_main = tle.gpu.wgmma_wait(0, pv_main)
+            pv_residual = tle.gpu.wgmma(sPr, v_tile)
+            pv_residual = tle.gpu.wgmma_wait(0, pv_residual)
+            pv_main += pv_residual * (1.0 / 32.0)
         acc_ += pv_main * v_descale
         tl.debug_barrier()
+        if USE_TME_KV:
+            kv_reader.release(kv_iteration)
         n_block -= 1
     for n_block in tl.range(
         n_block_max - n_masking_steps - 1,
@@ -497,22 +678,36 @@ def flash_varlen_fwd_kernel_tle(
         col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
         start_n = n_block * BLOCK_N
         k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-        v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+        v_ptr_seq = v_ptr_base + k_bos * v_row_stride
         kv_rows = start_n + tl.arange(0, BLOCK_N)
         k_cols = tl.arange(0, BLOCK_K)
         v_cols = d_start + tl.arange(0, BLOCK_D)
-        tle.gpu.copy(
-            k_ptr_seq + kv_rows[:, None] * k_row_stride + k_cols[None, :],
-            sK,
-            (BLOCK_N, BLOCK_K),
-            mask=(kv_rows[:, None] < k_len) & (k_cols[None, :] < LOAD_D),
-        )
-        tle.gpu.copy(
-            v_ptr_seq + kv_rows[:, None] * k_row_stride + v_cols[None, :],
-            sV,
-            (BLOCK_N, BLOCK_D),
-            mask=(kv_rows[:, None] < k_len) & (v_cols[None, :] < LOAD_D),
-        )
+        if USE_TME_KV:
+            kv_iteration = n_block_max - 1 - n_block
+            kv_slot = kv_writer.acquire(kv_iteration)
+            tle.gpu.copy(
+                K_TME_DESC, kv_slot.k, (BLOCK_N, BLOCK_K), (k_bos + start_n, kv_hid * d)
+            )
+            tle.gpu.copy(
+                V_TME_DESC,
+                kv_slot.v,
+                (BLOCK_N, BLOCK_D),
+                (k_bos + start_n, kv_hid * d + d_start),
+            )
+            kv_writer.commit(kv_iteration)
+        else:
+            tle.gpu.copy(
+                k_ptr_seq + kv_rows[:, None] * k_row_stride + k_cols[None, :],
+                sK,
+                (BLOCK_N, BLOCK_K),
+                mask=(kv_rows[:, None] < k_len) & (k_cols[None, :] < LOAD_D),
+            )
+            tle.gpu.copy(
+                v_ptr_seq + kv_rows[:, None] * v_row_stride + v_cols[None, :],
+                sV,
+                (BLOCK_N, BLOCK_D),
+                mask=(kv_rows[:, None] < k_len) & (v_cols[None, :] < LOAD_D),
+            )
         (q_descale, k_descale, v_descale) = _load_fp8_block_descales(
             q_descale_ptr,
             k_descale_ptr,
@@ -532,8 +727,16 @@ def flash_varlen_fwd_kernel_tle(
             m_block * BLOCK_M,
             n_block * BLOCK_N,
         )
-        tl.debug_barrier()
-        S = tle.gpu.wgmma(sQ, sK, trans_b=True)
+        if USE_TME_KV:
+            kv_ready = kv_reader.wait(kv_iteration)
+            k_tile = kv_ready.slot.k
+            v_tile = kv_ready.slot.v
+        else:
+            tl.debug_barrier()
+            k_tile = sK
+            v_tile = sV
+        # QK always uses the native FP8 SQMMA operands.
+        S = tle.gpu.wgmma(sQ, k_tile, trans_b=True)
         S = tle.gpu.wgmma_wait(0, S)
         S *= q_descale * k_descale
         S = apply_softcap(S, softcap, is_softcap)
@@ -568,17 +771,25 @@ def flash_varlen_fwd_kernel_tle(
             is_border=is_local,
             fp8_p_max=fp8_p_max,
         )
-        (P_fp8, P_residual) = _quantize_probability(P)
-        tl.store(tle.gpu.local_ptr(sP), P_fp8)
-        tl.store(tle.gpu.local_ptr(sPr), P_residual)
-        tl.debug_barrier()
-        pv_main = tle.gpu.wgmma(sP, sV)
-        pv_main = tle.gpu.wgmma_wait(0, pv_main)
-        pv_residual = tle.gpu.wgmma(sPr, sV)
-        pv_residual = tle.gpu.wgmma_wait(0, pv_residual)
-        pv_main += pv_residual * (1.0 / 32.0)
+        if PV_HALF:
+            tl.store(tle.gpu.local_ptr(sP), P.to(tl.float16))
+            tl.debug_barrier()
+            pv_main = tle.gpu.wgmma(sP, v_tile)
+            pv_main = tle.gpu.wgmma_wait(0, pv_main)
+        else:
+            (P_fp8, P_residual) = _quantize_probability(P)
+            tl.store(tle.gpu.local_ptr(sP), P_fp8)
+            tl.store(tle.gpu.local_ptr(sPr), P_residual)
+            tl.debug_barrier()
+            pv_main = tle.gpu.wgmma(sP, v_tile)
+            pv_main = tle.gpu.wgmma_wait(0, pv_main)
+            pv_residual = tle.gpu.wgmma(sPr, v_tile)
+            pv_residual = tle.gpu.wgmma_wait(0, pv_residual)
+            pv_main += pv_residual * (1.0 / 32.0)
         acc_ += pv_main * v_descale
         tl.debug_barrier()
+        if USE_TME_KV:
+            kv_reader.release(kv_iteration)
     lse = tl.where(
         (rowsum_ == 0) | (rowsum_ != rowsum_),
         float("inf"),
@@ -661,6 +872,15 @@ def _fits_varlen_tle_indexing(args, head_size):
     return True
 
 
+def _use_small_pv_half(q, max_seqlen_q, is_paged):
+    return (
+        not is_paged
+        and q.dtype == torch.float8_e4m3fn
+        and q.shape[-1] == 64
+        and max_seqlen_q <= 1024
+    )
+
+
 def _get_varlen_fwd_config(
     args,
     head_size,
@@ -688,6 +908,16 @@ def _get_varlen_fwd_config(
     }
     if head_size not in (64, 128) and not is_paged:
         cfg_params.update(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=1)
+    max_seqlen_q = args[_FWD_PARAM_INDEX["seqlen_q"]]
+    if _use_small_pv_half(args[0], max_seqlen_q, is_paged):
+        # The ordinary kernel preserves FP8 QK and uses the selected half PV
+        # callback for short D64 workloads. It keeps its short-KV dispatch.
+        cfg_params.update(
+            BLOCK_M=32, BLOCK_N=64, BLOCK_D=64, SPLIT_D=False, num_warps=4, num_stages=1
+        )
+        if HAS_FP8_BURST2:
+            cfg_params["enable_fp8_burst2"] = True
+        return cfg_params
     if (
         HAS_TLE
         and not is_paged
@@ -698,17 +928,15 @@ def _get_varlen_fwd_config(
         and torch_device_fn.get_device_capability(args[0].device) == (3, 1)
         and _fits_varlen_tle_indexing(args, head_size)
     ):
-        # Stage FP8 operands directly in shared memory for native SQMMA.
-        # E5M2 and paged KV retain the common Triton implementation.
         cfg_params["kernel"] = flash_varlen_fwd_kernel_tle
+        # Both PV modes already provide the precision needed by short KV.
+        cfg_params["split_short_k"] = False
         cfg_params.update(BLOCK_M=32, BLOCK_N=64, num_warps=4, num_stages=1)
         if head_size >= 128:
             cfg_params["BLOCK_D"] = 128
         if head_size > 128:
             cfg_params.update(BLOCK_M=64, num_warps=8)
         if head_size % 16:
-            # A byte-copy kernel pads the physical head stride and zeros its
-            # tail. Logical dimensions, descales and the output stay intact.
             padded = _pad_fp8_qkv(*args[:3])
             prepared = list(args)
             for name, tensor in zip(("q", "k", "v"), padded):
@@ -718,16 +946,56 @@ def _get_varlen_fwd_config(
             cfg_params["args"] = tuple(prepared)
             cfg_params["PADDED_D"] = triton.cdiv(head_size, 16) * 16
         cfg_params["SPLIT_D"] = head_size > cfg_params["BLOCK_D"]
+        prepared = list(cfg_params.get("args", args))
+        q, k, v = prepared[:3]
+        use_tme = (
+            HAS_TME
+            and head_size in (64, 128, 256)
+            and max_seqlen_q > 1024
+            and q.is_contiguous()
+            and k.is_contiguous()
+            and v.is_contiguous()
+            and k.shape[0] > 0
+            and all(t.data_ptr() % 16 == 0 for t in (q, k, v))
+        )
+        k_desc = v_desc = None
+        if use_tme:
+            # Exact FP8 -> half conversion, fully inside each API invocation.
+            # Q/K remain FP8. No input, converted-value, or result cache.
+            v = _prepare_v_fp16(v)
+            prepared[_FWD_PARAM_INDEX["v_ptr"]] = v
+            prepared[_FWD_PARAM_INDEX["v_row_stride"]] = v.stride(0)
+            prepared[_FWD_PARAM_INDEX["v_head_stride"]] = v.stride(1)
+            k_desc = TensorDescriptor.from_tensor(
+                k.view(k.shape[0], -1), [cfg_params["BLOCK_N"], cfg_params["BLOCK_K"]]
+            )
+            v_desc = TensorDescriptor.from_tensor(
+                v.view(v.shape[0], -1), [cfg_params["BLOCK_N"], cfg_params["BLOCK_D"]]
+            )
+            cfg_params.update(USE_TME_KV=True, PV_HALF=True)
+        elif (
+            HAS_LLC_OPT and head_size >= 96 and head_size % 32 == 0 and head_size != 256
+        ):
+            cfg_params["enable_llc_opt"] = True
+        # Existing libentry supports descriptor hashing in positional args.
+        cfg_params["args"] = tuple(prepared) + (k_desc, v_desc)
     return cfg_params
 
 
 def _mha_varlan_fwd(*args, **kwargs):
+    # The shared public wrapper supplies q, page_table and max_seqlen_q at
+    # these fixed positions. Paged and E5M2 keep the existing FP8 callback.
+    pv_dot = (
+        _fp16_pv_dot
+        if _use_small_pv_half(args[0], args[10], args[8] is not None)
+        else _fp8_pv_dot
+    )
     return mha_varlan_fwd(
         *args,
         **kwargs,
         window_normalizer=_normalize_varlen_window,
         get_config=_get_varlen_fwd_config,
-        pv_dot=_fp8_pv_dot,
+        pv_dot=pv_dot,
         allow_group_swap=False,
     )
 
