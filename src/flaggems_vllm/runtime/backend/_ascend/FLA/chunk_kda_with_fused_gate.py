@@ -19,14 +19,16 @@ from flaggems_vllm.ops.FLA.chunk_kda_with_fused_gate import (
     _CHUNK,
     _RCP_LN2,
     _SUBCHUNK,
+    _chunk_layout_args,
     _ckfg_gate,
     _ckfg_inter,
     _ckfg_intra,
     _ckfg_inverse,
     _ckfg_output,
     _ckfg_recompute,
+    _gate_bias_args,
     _metadata,
-    _norm_kernel,
+    _norm_rows,
     _stage_bench,
     _validate,
 )
@@ -36,20 +38,29 @@ logger = logging.getLogger(__name__)
 
 
 @libentry()
-@triton.heuristics(
-    {
-        "VARLEN": lambda a: a["cu_seqlens"] is not None,
-        "INITIAL": lambda a: a["h0"] is not None,
-        "FINAL": lambda a: a["ht"] is not None,
-    }
-)
+@triton.jit(do_not_specialize=["N"])
+def _ckfg_zero_matrices_ascend(Akk, Aqk, Ai, N, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < N
+    tl.store(Akk + i, 0, mask)
+    tl.store(Aqk + i, 0, mask)
+    tl.store(Ai + i, 0, mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N", "K"])
+def _ckfg_norm_ascend(X, Y, N, K, BLOCK: tl.constexpr, ROWS: tl.constexpr):
+    _norm_rows(X, Y, N, K, BLOCK, ROWS)
+
+
+@libentry()
 @libtuner(
     configs=runtime.get_tuned_config("ckfg_state_ascend"),
     key=["T", "H", "K", "V", "BT"],
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["chunk"])
+@triton.jit(do_not_specialize=["chunk", "T", "K", "V", "INITIAL", "FINAL"])
 def _ckfg_state_ascend(
     k,
     v,
@@ -63,17 +74,17 @@ def _ckfg_state_ascend(
     cu_seqlens,
     chunk_offsets,
     chunk,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
+    K,
+    V,
+    INITIAL,
+    FINAL,
     BT: tl.constexpr,
     CHUNKS: tl.constexpr,
     BV: tl.constexpr,
     BK: tl.constexpr,
-    VARLEN: tl.constexpr,
-    INITIAL: tl.constexpr,
-    FINAL: tl.constexpr,
+    VARLEN,
 ):
     iv, nh = tl.program_id(0), tl.program_id(1)
     seq, head = nh // H, nh % H
@@ -192,9 +203,17 @@ def chunk_kda_with_fused_gate(
         return (v, final)
     if use_qk_l2norm_in_kernel:
         qn, kn = (torch.empty_like(q), torch.empty_like(k))
+        rows = 32
         for x, y in ((q, qn), (k, kn)):
-            _norm_kernel[lambda meta: (triton.cdiv(b * t * h, meta["ROWS"]),)](
-                x, y, b * t * h, dk, triton.next_power_of_2(dk)
+            _ckfg_norm_ascend[(triton.cdiv(b * t * h, rows),)](
+                x,
+                y,
+                b * t * h,
+                dk,
+                triton.next_power_of_2(dk),
+                rows,
+                num_warps=4,
+                num_stages=2,
             )
         q, k = (qn, kn)
     cu = contiguous_copy(cu_seqlens) if cu_seqlens is not None else None
@@ -204,14 +223,14 @@ def chunk_kda_with_fused_gate(
     else:
         indices, offsets = _metadata(cu, t, q.device)
         nt = indices.shape[0]
+    packing = _chunk_layout_args(cu, indices, q.device)
     gate = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     _ckfg_gate[lambda meta: (triton.cdiv(dk, meta["BD"]), nt, b * h)](
         g=raw_g,
         A=a,
         y=gate,
-        g_bias=bias,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **_gate_bias_args(bias, a),
+        **packing,
         cumsum_scale=_RCP_LN2,
         beta=1.0,
         threshold=20.0,
@@ -221,8 +240,12 @@ def chunk_kda_with_fused_gate(
         BT=_CHUNK,
     )
     matrix_shape = (b, t, h, _CHUNK)
-    akk = fill(torch.empty(matrix_shape, dtype=torch.float32, device=q.device), 0)
-    aqk = fill(torch.empty_like(akk), 0)
+    akk = torch.empty(matrix_shape, dtype=torch.float32, device=q.device)
+    aqk = torch.empty_like(akk)
+    inverse = torch.empty(matrix_shape, dtype=k.dtype, device=q.device)
+    _ckfg_zero_matrices_ascend[(triton.cdiv(akk.numel(), 512),)](
+        akk, aqk, inverse, akk.numel(), 512, num_warps=4, num_stages=2
+    )
     common = dict(
         q=q,
         k=k,
@@ -231,8 +254,7 @@ def chunk_kda_with_fused_gate(
         A=akk,
         Aqk=aqk,
         scale=scale,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         T=t,
         H=h,
         K=dk,
@@ -241,12 +263,10 @@ def chunk_kda_with_fused_gate(
     )
     _ckfg_inter[nt, 16, b * h](**common, NC=4)
     _ckfg_intra[nt, 4, b * h](**common, BK=max(triton.next_power_of_2(dk), 16))
-    inverse = fill(torch.empty(matrix_shape, dtype=k.dtype, device=q.device), 0)
     _ckfg_inverse[nt, b * h](
         A=akk,
         Ai=inverse,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         T=t,
         H=h,
         BT=_CHUNK,
@@ -265,8 +285,7 @@ def chunk_kda_with_fused_gate(
         u=u,
         A=inverse,
         gk=gate,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         T=t,
         H=h,
         K=dk,
@@ -285,10 +304,9 @@ def chunk_kda_with_fused_gate(
         v_new=v_new,
         gk=gate,
         h=history,
-        h0=state,
-        ht=final,
-        cu_seqlens=cu,
-        chunk_offsets=offsets,
+        cu_seqlens=packing["cu_seqlens"],
+        chunk_offsets=packing["chunk_indices"] if offsets is None else offsets,
+        VARLEN=cu is not None,
         T=t,
         H=h,
         K=dk,
@@ -302,13 +320,21 @@ def chunk_kda_with_fused_gate(
             for _ in range(2)
         )
     )
-    state_chunks = min(8, triton.cdiv(t, _CHUNK))
-    for chunk in range(0, triton.cdiv(t, _CHUNK), state_chunks):
+    total_chunks = triton.cdiv(t, _CHUNK)
+    # Reuse static unrolls across adjacent chunk counts. The kernel masks the tail.
+    state_chunks = min(8, max(2, triton.next_power_of_2(total_chunks)))
+    for chunk in range(0, total_chunks, state_chunks):
         group = chunk // state_chunks
-        state_args["h0"] = state if group == 0 else buffers[(group - 1) % 2]
+        current = buffers[group % 2]
+        previous = state if group == 0 else buffers[(group - 1) % 2]
         _ckfg_state_ascend[state_grid](
             **state_args,
-            S=buffers[group % 2],
+            # These pointers are only dereferenced under their respective flags.
+            h0=current if previous is None else previous,
+            ht=current if final is None else final,
+            S=current,
+            INITIAL=previous is not None,
+            FINAL=final is not None,
             chunk=chunk,
             CHUNKS=state_chunks,
             BK=max(16, triton.next_power_of_2(dk)),
@@ -320,8 +346,7 @@ def chunk_kda_with_fused_gate(
         h=history,
         o=v,
         A=aqk,
-        cu_seqlens=cu,
-        chunk_indices=indices,
+        **packing,
         scale=scale,
         T=t,
         H=h,
