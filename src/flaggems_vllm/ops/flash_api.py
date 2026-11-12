@@ -40,7 +40,7 @@ def CHECK_DEVICE(x):
     assert x.device.type == flaggems_vllm.device
 
 
-def paged_kv_num_stages(num_stages, block_m, block_k, num_ctas, num_sms):
+def paged_kv_num_stages(num_stages, block_m, block_k, num_ctas, num_sms, kv_iters):
     """Prefetch depth of the paged K/V loop of flash_varlen_fwd_kernel.
 
     Few resident CTAs per SM leave the loop latency-bound, so a deeper prefetch
@@ -49,10 +49,17 @@ def paged_kv_num_stages(num_stages, block_m, block_k, num_ctas, num_sms):
     head_dim of 128 counts once). Thresholds measured on H20 with the load
     merge in place over decode, chunked prefill and prefill shapes (head_dim
     64-256, page 16/64).
+
+    On the decode tiles (``block_m`` up to 32) the deep prefetch needs a loop
+    long enough to use it and room for its buffers: with fewer than 16 K/V
+    tiles (``kv_iters``, of the longest sequence) five stages are 3-16% behind
+    two, and with a head_dim above 128 they leave one CTA per SM, so past
+    ``load`` 2 the launch takes another wave (0.6-0.8x).
     """
     load = num_ctas * max(block_k, 64) / 128 / max(num_sms, 1)
     if block_m <= 32:
-        return 5 if load <= 2.5 else 2
+        deep = kv_iters >= 16 and load <= (2.0 if block_k > 128 else 2.5)
+        return 5 if deep else 2
     if block_k > 128:
         return num_stages
     if block_m == 64 or load <= 2.5:
@@ -661,6 +668,7 @@ def mha_varlan_fwd(
                     * batch_size
                     * num_heads,
                     num_sms,
+                    triton.cdiv(max_seqlen_k, cfg_params["BLOCK_N"]),
                 )
             cfg_params.update(heuristic_pipeline_options(cfg, args))
 
@@ -1045,6 +1053,7 @@ def mha_varlan_fwd_opt(
                 * batch_size
                 * num_heads,
                 num_sms,
+                triton.cdiv(max_seqlen_k, cfg_params["BLOCK_N"]),
             )
 
         cfg_params.update(heuristic_pipeline_options(cfg, args))
