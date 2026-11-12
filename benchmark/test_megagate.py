@@ -80,8 +80,8 @@ _ROUTING_BASELINE_CONTRACTS = {
     },
 }
 # Core keeps one representative per model profile. Comprehensive covers one
-# small and one large token count per profile; the full 50-shape acceptance
-# matrix remains in the dedicated Hopper validation harness.
+# representative for every production leaf family; the full 50-shape
+# acceptance matrix remains in the dedicated Hopper validation harness.
 CORE_SHAPES = (
     (4096, 256, 6, 1028),
     (7168, 256, 8, 1028),
@@ -90,12 +90,22 @@ CORE_SHAPES = (
 )
 COMPREHENSIVE_SHAPES = (
     (4096, 256, 6, 1028),
-    (4096, 256, 6, 16384),
+    (4096, 256, 6, 13021),
     (7168, 256, 8, 1028),
-    (7168, 256, 8, 16384),
+    (7168, 256, 8, 12292),
+    (7168, 256, 8, 14305),
     (2048, 256, 8, 1034),
+    (2048, 256, 8, 4107),
+    (2048, 256, 8, 4434),
+    (2048, 256, 8, 9309),
     (2048, 256, 8, 16384),
     (4096, 512, 10, 1035),
+    (4096, 512, 10, 2048),
+    (4096, 512, 10, 4107),
+    (4096, 512, 10, 4434),
+    (4096, 512, 10, 5240),
+    (4096, 512, 10, 8214),
+    (4096, 512, 10, 13421),
     (4096, 512, 10, 16384),
 )
 
@@ -257,7 +267,6 @@ def _candidate(
         correction_bias,
         context=context,
         routed_scaling_factor=context.profile_spec.routed_scaling_factor,
-        out=None,
     )
 
 

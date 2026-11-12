@@ -16,8 +16,8 @@
 
 This module exposes the admitted DSV4 kernel selection through a functional
 operator boundary: every invocation binds the current input, weight and bias,
-allocates fresh semantic outputs when ``out`` is omitted, and submits exactly
-one fused kernel without CUDA Graph capture or replay.
+allocates fresh semantic outputs, and submits exactly one fused kernel without
+CUDA Graph capture or replay.
 
 Compilation and the SM90 architecture probe belong to :meth:`prepare`.
 Steady-state calls perform an O(1) exact-T lookup and reuse only internal,
@@ -264,32 +264,6 @@ def _validate_runtime_inputs(
     if not math.isfinite(scale) or scale != ROUTED_SCALING_FACTOR:
         raise ValueError("routed_scaling_factor must be exactly 1.5")
     return tokens, device
-
-
-def _validate_outputs(
-    outputs: tuple[torch.Tensor, torch.Tensor],
-    *,
-    tokens: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(outputs, tuple) or len(outputs) != 2:
-        raise TypeError("out must be a (topk_weights, topk_indices) tuple")
-    topk_weights, topk_indices = outputs
-    _require_tensor(
-        topk_weights,
-        name="topk_weights",
-        shape=(tokens, TOPK),
-        dtype=torch.float32,
-        device=device,
-    )
-    _require_tensor(
-        topk_indices,
-        name="topk_indices",
-        shape=(tokens, TOPK),
-        dtype=torch.int64,
-        device=device,
-    )
-    return topk_weights, topk_indices
 
 
 class MegaGateContext:
@@ -582,7 +556,6 @@ class MegaGateContext:
         correction_bias: torch.Tensor,
         *,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens, device = _validate_runtime_inputs(
             x, gate_weight, correction_bias, routed_scaling_factor
@@ -617,15 +590,8 @@ class MegaGateContext:
         self._last_workspace_entry = (workspace_key, workspace)
         weight_desc = self._weight_desc(common, gate_weight, spec, device_index)
         x_desc = self._x_desc(common, workspace, x, tokens)
-        if out is None:
-            topk_weights = torch.empty(
-                (tokens, TOPK), device=device, dtype=torch.float32
-            )
-            topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int64)
-        else:
-            topk_weights, topk_indices = _validate_outputs(
-                out, tokens=tokens, device=device
-            )
+        topk_weights = torch.empty((tokens, TOPK), device=device, dtype=torch.float32)
+        topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int64)
 
         if leaf.implementation == "clusterless":
             state = workspace.state
@@ -664,7 +630,6 @@ def megagate(
     *,
     context: MegaGateContext,
     routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch one prepared DSV4 leaf as one eager, functional fused kernel."""
 
@@ -675,7 +640,6 @@ def megagate(
         gate_weight,
         correction_bias,
         routed_scaling_factor=routed_scaling_factor,
-        out=out,
     )
 
 

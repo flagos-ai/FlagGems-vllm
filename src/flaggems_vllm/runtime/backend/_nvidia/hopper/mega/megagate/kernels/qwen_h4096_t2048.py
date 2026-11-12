@@ -34,7 +34,52 @@ from .routing_primitives import warp_min_u32 as routing__warp_min_u32
 def v370__halfwarp16_stable_best_expert(score_key, expert):
     """CUDA-v020 stable argmax in two independent width-16 subwarps."""
     return tl.inline_asm_elementwise(
-        "\n        {\n            .reg .b32 best_key, best_expert, peer_key, peer_expert;\n            .reg .pred p_key_gt, p_idx_lt, p_tie, p_take;\n            mov.u32 best_key, $1;\n            mov.u32 best_expert, $2;\n\n            shfl.sync.down.b32 peer_key, best_key, 8, 0x100f, 0xffffffff;\n            shfl.sync.down.b32 peer_expert, best_expert, 8, 0x100f, 0xffffffff;\n            setp.gt.u32 p_key_gt, peer_key, best_key;\n            setp.lt.u32 p_idx_lt, peer_expert, best_expert;\n            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;\n            or.pred p_take, p_key_gt, p_tie;\n            selp.u32 best_key, peer_key, best_key, p_take;\n            selp.u32 best_expert, peer_expert, best_expert, p_take;\n\n            shfl.sync.down.b32 peer_key, best_key, 4, 0x100f, 0xffffffff;\n            shfl.sync.down.b32 peer_expert, best_expert, 4, 0x100f, 0xffffffff;\n            setp.gt.u32 p_key_gt, peer_key, best_key;\n            setp.lt.u32 p_idx_lt, peer_expert, best_expert;\n            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;\n            or.pred p_take, p_key_gt, p_tie;\n            selp.u32 best_key, peer_key, best_key, p_take;\n            selp.u32 best_expert, peer_expert, best_expert, p_take;\n\n            shfl.sync.down.b32 peer_key, best_key, 2, 0x100f, 0xffffffff;\n            shfl.sync.down.b32 peer_expert, best_expert, 2, 0x100f, 0xffffffff;\n            setp.gt.u32 p_key_gt, peer_key, best_key;\n            setp.lt.u32 p_idx_lt, peer_expert, best_expert;\n            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;\n            or.pred p_take, p_key_gt, p_tie;\n            selp.u32 best_key, peer_key, best_key, p_take;\n            selp.u32 best_expert, peer_expert, best_expert, p_take;\n\n            shfl.sync.down.b32 peer_key, best_key, 1, 0x100f, 0xffffffff;\n            shfl.sync.down.b32 peer_expert, best_expert, 1, 0x100f, 0xffffffff;\n            setp.gt.u32 p_key_gt, peer_key, best_key;\n            setp.lt.u32 p_idx_lt, peer_expert, best_expert;\n            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;\n            or.pred p_take, p_key_gt, p_tie;\n            selp.u32 best_key, peer_key, best_key, p_take;\n            selp.u32 best_expert, peer_expert, best_expert, p_take;\n\n            shfl.sync.idx.b32 $0, best_expert, 0, 0x100f, 0xffffffff;\n        }\n        ",
+        """
+        {
+            .reg .b32 best_key, best_expert, peer_key, peer_expert;
+            .reg .pred p_key_gt, p_idx_lt, p_tie, p_take;
+            mov.u32 best_key, $1;
+            mov.u32 best_expert, $2;
+
+            shfl.sync.down.b32 peer_key, best_key, 8, 0x100f, 0xffffffff;
+            shfl.sync.down.b32 peer_expert, best_expert, 8, 0x100f, 0xffffffff;
+            setp.gt.u32 p_key_gt, peer_key, best_key;
+            setp.lt.u32 p_idx_lt, peer_expert, best_expert;
+            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;
+            or.pred p_take, p_key_gt, p_tie;
+            selp.u32 best_key, peer_key, best_key, p_take;
+            selp.u32 best_expert, peer_expert, best_expert, p_take;
+
+            shfl.sync.down.b32 peer_key, best_key, 4, 0x100f, 0xffffffff;
+            shfl.sync.down.b32 peer_expert, best_expert, 4, 0x100f, 0xffffffff;
+            setp.gt.u32 p_key_gt, peer_key, best_key;
+            setp.lt.u32 p_idx_lt, peer_expert, best_expert;
+            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;
+            or.pred p_take, p_key_gt, p_tie;
+            selp.u32 best_key, peer_key, best_key, p_take;
+            selp.u32 best_expert, peer_expert, best_expert, p_take;
+
+            shfl.sync.down.b32 peer_key, best_key, 2, 0x100f, 0xffffffff;
+            shfl.sync.down.b32 peer_expert, best_expert, 2, 0x100f, 0xffffffff;
+            setp.gt.u32 p_key_gt, peer_key, best_key;
+            setp.lt.u32 p_idx_lt, peer_expert, best_expert;
+            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;
+            or.pred p_take, p_key_gt, p_tie;
+            selp.u32 best_key, peer_key, best_key, p_take;
+            selp.u32 best_expert, peer_expert, best_expert, p_take;
+
+            shfl.sync.down.b32 peer_key, best_key, 1, 0x100f, 0xffffffff;
+            shfl.sync.down.b32 peer_expert, best_expert, 1, 0x100f, 0xffffffff;
+            setp.gt.u32 p_key_gt, peer_key, best_key;
+            setp.lt.u32 p_idx_lt, peer_expert, best_expert;
+            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;
+            or.pred p_take, p_key_gt, p_tie;
+            selp.u32 best_key, peer_key, best_key, p_take;
+            selp.u32 best_expert, peer_expert, best_expert, p_take;
+
+            shfl.sync.idx.b32 $0, best_expert, 0, 0x100f, 0xffffffff;
+        }
+        """,
         "=r,r,r",
         [score_key.to(tl.uint32), expert.to(tl.uint32)],
         dtype=tl.uint32,
@@ -46,7 +91,14 @@ def v370__halfwarp16_stable_best_expert(score_key, expert):
 @triton.jit
 def v370__halfwarp16_broadcast_f32(value, source_lane):
     return tl.inline_asm_elementwise(
-        "\n        {\n            .reg .b32 input_bits, output_bits;\n            mov.b32 input_bits, $1;\n            shfl.sync.idx.b32 output_bits, input_bits, $2, 0x100f, 0xffffffff;\n            mov.b32 $0, output_bits;\n        }\n        ",
+        """
+        {
+            .reg .b32 input_bits, output_bits;
+            mov.b32 input_bits, $1;
+            shfl.sync.idx.b32 output_bits, input_bits, $2, 0x100f, 0xffffffff;
+            mov.b32 $0, output_bits;
+        }
+        """,
         "=f,f,r",
         [value, source_lane.to(tl.uint32)],
         dtype=tl.float32,
@@ -59,7 +111,37 @@ def v370__halfwarp16_broadcast_f32(value, source_lane):
 def v370__halfwarp16_sum_f32(value):
     """Reduce and broadcast one sum independently in each width-16 group."""
     return tl.inline_asm_elementwise(
-        "\n        {\n            .reg .f32 current, peer;\n            .reg .b32 current_bits, peer_bits;\n            mov.f32 current, $1;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 8, 0x100f, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 current, current, peer;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 4, 0x100f, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 current, current, peer;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 2, 0x100f, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 current, current, peer;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 1, 0x100f, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 current, current, peer;\n\n            mov.b32 current_bits, current;\n            shfl.sync.idx.b32 peer_bits, current_bits, 0, 0x100f, 0xffffffff;\n            mov.b32 $0, peer_bits;\n        }\n        ",
+        """
+        {
+            .reg .f32 current, peer;
+            .reg .b32 current_bits, peer_bits;
+            mov.f32 current, $1;
+
+            mov.b32 current_bits, current;
+            shfl.sync.down.b32 peer_bits, current_bits, 8, 0x100f, 0xffffffff;
+            mov.b32 peer, peer_bits;
+            add.rn.f32 current, current, peer;
+
+            mov.b32 current_bits, current;
+            shfl.sync.down.b32 peer_bits, current_bits, 4, 0x100f, 0xffffffff;
+            mov.b32 peer, peer_bits;
+            add.rn.f32 current, current, peer;
+
+            mov.b32 current_bits, current;
+            shfl.sync.down.b32 peer_bits, current_bits, 2, 0x100f, 0xffffffff;
+            mov.b32 peer, peer_bits;
+            add.rn.f32 current, current, peer;
+
+            mov.b32 current_bits, current;
+            shfl.sync.down.b32 peer_bits, current_bits, 1, 0x100f, 0xffffffff;
+            mov.b32 peer, peer_bits;
+            add.rn.f32 current, current, peer;
+
+            mov.b32 current_bits, current;
+            shfl.sync.idx.b32 peer_bits, current_bits, 0, 0x100f, 0xffffffff;
+            mov.b32 $0, peer_bits;
+        }
+        """,
         "=f,f",
         [value],
         dtype=tl.float32,
@@ -157,7 +239,14 @@ def v388__store_packed_candidate_word(ptr, score, local_expert, valid):
     score_bits = score.to(tl.uint32, bitcast=True)
     packed = score_bits & 4294901760 | local_expert.to(tl.uint32) & 255
     _ = tl.inline_asm_elementwise(
-        "\n        {\n            .reg .pred p;\n            setp.ne.u32 p, $3, 0;\n            @p st.global.u32 [$1], $2;\n            mov.u32 $0, $3;\n        }\n        ",
+        """
+        {
+            .reg .pred p;
+            setp.ne.u32 p, $3, 0;
+            @p st.global.u32 [$1], $2;
+            mov.u32 $0, $3;
+        }
+        """,
         "=r,l,r,r,~{memory}",
         [address, packed, valid.to(tl.uint32)],
         dtype=tl.uint32,
@@ -274,7 +363,14 @@ def v400__load_packed_candidate_word_l1(ptr, valid):
     """Load one compact head while retaining its 40-byte list in L1."""
     address = ptr.to(tl.uint64)
     packed = tl.inline_asm_elementwise(
-        "\n        {\n            .reg .pred p;\n            mov.u32 $0, 0xff8000ff;\n            setp.ne.u32 p, $2, 0;\n            @p ld.weak.global.L1::evict_last.b32 $0, [$1];\n        }\n        ",
+        """
+        {
+            .reg .pred p;
+            mov.u32 $0, 0xff8000ff;
+            setp.ne.u32 p, $2, 0;
+            @p ld.weak.global.L1::evict_last.b32 $0, [$1];
+        }
+        """,
         "=r,l,r,~{memory}",
         [address, valid.to(tl.uint32)],
         dtype=tl.uint32,

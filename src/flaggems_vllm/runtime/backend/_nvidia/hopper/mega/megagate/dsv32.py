@@ -267,32 +267,6 @@ def _validate_runtime_inputs(
     return tokens, device
 
 
-def _validate_outputs(
-    outputs: tuple[torch.Tensor, torch.Tensor],
-    *,
-    tokens: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(outputs, tuple) or len(outputs) != 2:
-        raise TypeError("out must be a (topk_weights, topk_indices) tuple")
-    topk_weights, topk_indices = outputs
-    _require_tensor(
-        topk_weights,
-        name="topk_weights",
-        shape=(tokens, TOPK),
-        dtype=torch.float32,
-        device=device,
-    )
-    _require_tensor(
-        topk_indices,
-        name="topk_indices",
-        shape=(tokens, TOPK),
-        dtype=torch.int32,
-        device=device,
-    )
-    return topk_weights, topk_indices
-
-
 class MegaGateContext:
     """Compiled exact leaves plus per-device/per-stream internal workspaces."""
 
@@ -584,7 +558,6 @@ class MegaGateContext:
         correction_bias: torch.Tensor | None,
         *,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens, device = _validate_runtime_inputs(
             x, gate_weight, correction_bias, routed_scaling_factor
@@ -625,15 +598,8 @@ class MegaGateContext:
             device_index=device_index,
         )
         x_desc = self._x_desc(workspace, x, tokens)
-        if out is None:
-            topk_weights = torch.empty(
-                (tokens, TOPK), device=device, dtype=torch.float32
-            )
-            topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int32)
-        else:
-            topk_weights, topk_indices = _validate_outputs(
-                out, tokens=tokens, device=device
-            )
+        topk_weights = torch.empty((tokens, TOPK), device=device, dtype=torch.float32)
+        topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int32)
 
         # correction_bias is deliberately the tensor from this invocation;
         # unlike the old Plan it is never retained as a bound launch pointer.
@@ -675,7 +641,6 @@ def megagate(
     *,
     context: MegaGateContext,
     routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch one exact-T functional DSV3.2 fused kernel without a Graph."""
 
@@ -686,7 +651,6 @@ def megagate(
         gate_weight,
         correction_bias,
         routed_scaling_factor=routed_scaling_factor,
-        out=out,
     )
 
 

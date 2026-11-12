@@ -170,13 +170,10 @@ def megagate(
     *,
     context: MegaGateContext,
     routed_scaling_factor: float | None = None,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch one prepared profile-specific fused MegaGate kernel.
 
-    Returns ``(topk_weights, topk_indices)``.  When ``out`` is provided, it
-    must contain reusable tensors in that same order; the returned tuple then
-    contains those tensors rather than newly allocated outputs.
+    Returns newly allocated ``(topk_weights, topk_indices)`` tensors.
     """
 
     if not isinstance(context, MegaGateContext):
@@ -192,7 +189,6 @@ def megagate(
         correction_bias,
         context=context._inner,
         routed_scaling_factor=scaling,
-        out=out,
     )
 
 

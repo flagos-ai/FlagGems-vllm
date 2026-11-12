@@ -543,32 +543,6 @@ def _validate_runtime_inputs(
     return tokens, device
 
 
-def _validate_outputs(
-    outputs: tuple[torch.Tensor, torch.Tensor],
-    *,
-    tokens: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(outputs, tuple) or len(outputs) != 2:
-        raise TypeError("out must be a (topk_weights, topk_indices) tuple")
-    topk_weights, topk_indices = outputs
-    _require_tensor(
-        topk_weights,
-        name="topk_weights",
-        shape=(tokens, TOPK),
-        dtype=torch.float32,
-        device=device,
-    )
-    _require_tensor(
-        topk_indices,
-        name="topk_indices",
-        shape=(tokens, TOPK),
-        dtype=torch.int32,
-        device=device,
-    )
-    return topk_weights, topk_indices
-
-
 def _compiled_abi_arg_names(compiled: Any) -> tuple[str, ...]:
     try:
         names = tuple(str(name) for name in compiled.src.fn.arg_names)
@@ -986,7 +960,6 @@ class MegaGateContext:
         correction_bias: torch.Tensor | None = None,
         *,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens, device = _validate_runtime_inputs(
             x,
@@ -1022,15 +995,8 @@ class MegaGateContext:
             )
         weight_descriptor = self._weight_desc(leaf, gate_weight)
         x_descriptors = self._x_descs(leaf, workspace, x)
-        if out is None:
-            topk_weights = torch.empty(
-                (tokens, TOPK), device=device, dtype=torch.float32
-            )
-            topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int32)
-        else:
-            topk_weights, topk_indices = _validate_outputs(
-                out, tokens=tokens, device=device
-            )
+        topk_weights = torch.empty((tokens, TOPK), device=device, dtype=torch.float32)
+        topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int32)
         launch_args = self._launch_args(
             leaf,
             workspace,
@@ -1050,7 +1016,6 @@ def megagate(
     *,
     context: MegaGateContext,
     routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch and launch one exact final50 functional MegaGate leaf."""
 
@@ -1061,7 +1026,6 @@ def megagate(
         gate_weight,
         correction_bias,
         routed_scaling_factor=routed_scaling_factor,
-        out=out,
     )
 
 

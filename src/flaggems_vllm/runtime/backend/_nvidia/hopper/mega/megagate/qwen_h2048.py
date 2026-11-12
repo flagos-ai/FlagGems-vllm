@@ -18,8 +18,8 @@ The historical v375 dispatcher returns address-bound plans.  This module
 keeps its exact 18-shape leaf mapping while exposing the operator lifecycle
 required by FlagGems operator-mode benchmarking: JIT compilation is done by
 ``prepare``; every measured call performs exact-T host dispatch, binds the
-current X and weight storage, allocates fresh semantic outputs when ``out``
-is omitted, and submits exactly one fused kernel on the current CUDA stream.
+current X and weight storage, allocates fresh semantic outputs, and submits
+exactly one fused kernel on the current CUDA stream.
 
 Internal logits, tickets, candidate lists, and compiler global scratch are
 owned per device, stream, and exact T.  The v364 lowering's global scratch is
@@ -267,32 +267,6 @@ def _validate_runtime_inputs(
     if not math.isfinite(scale) or scale != ROUTED_SCALING_FACTOR:
         raise ValueError("routed_scaling_factor must be exactly 1.0")
     return tokens, device
-
-
-def _validate_outputs(
-    outputs: tuple[torch.Tensor, torch.Tensor],
-    *,
-    tokens: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(outputs, tuple) or len(outputs) != 2:
-        raise TypeError("out must be a (topk_weights, topk_indices) tuple")
-    topk_weights, topk_indices = outputs
-    _require_tensor(
-        topk_weights,
-        name="topk_weights",
-        shape=(tokens, TOPK),
-        dtype=torch.float32,
-        device=device,
-    )
-    _require_tensor(
-        topk_indices,
-        name="topk_indices",
-        shape=(tokens, TOPK),
-        dtype=torch.int32,
-        device=device,
-    )
-    return topk_weights, topk_indices
 
 
 def _compiled_abi_arg_names(compiled: Any) -> tuple[str, ...]:
@@ -805,7 +779,6 @@ class MegaGateContext:
         correction_bias: torch.Tensor | None = None,
         *,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens, device = _validate_runtime_inputs(
             x, gate_weight, correction_bias, routed_scaling_factor
@@ -844,15 +817,8 @@ class MegaGateContext:
             block_experts=leaf.weight_block,
             device_index=device_index,
         )
-        if out is None:
-            topk_weights = torch.empty(
-                (tokens, TOPK), device=device, dtype=torch.float32
-            )
-            topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int32)
-        else:
-            topk_weights, topk_indices = _validate_outputs(
-                out, tokens=tokens, device=device
-            )
+        topk_weights = torch.empty((tokens, TOPK), device=device, dtype=torch.float32)
+        topk_indices = torch.empty((tokens, TOPK), device=device, dtype=torch.int32)
 
         if leaf.family == "v366":
             state = workspace.state
@@ -965,7 +931,6 @@ def megagate(
     *,
     context: MegaGateContext,
     routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch one exact-T functional Qwen-H2048 fused kernel without Graph."""
 
@@ -976,7 +941,6 @@ def megagate(
         gate_weight,
         correction_bias,
         routed_scaling_factor=routed_scaling_factor,
-        out=out,
     )
 
 

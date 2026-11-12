@@ -76,7 +76,14 @@ def v369__store_candidate_record_with_key(ptr, score, expert, ordered_key, valid
     address = ptr.to(tl.uint64)
     score_bits = score.to(tl.uint32, bitcast=True)
     _ = tl.inline_asm_elementwise(
-        "\n        {\n            .reg .pred p;\n            setp.ne.u32 p, $5, 0;\n            @p st.global.v4.u32 [$1], {$2, $2, $3, $4};\n            mov.u32 $0, $5;\n        }\n        ",
+        """
+        {
+            .reg .pred p;
+            setp.ne.u32 p, $5, 0;
+            @p st.global.v4.u32 [$1], {$2, $2, $3, $4};
+            mov.u32 $0, $5;
+        }
+        """,
         "=r,l,r,r,r,r,~{memory}",
         [
             address,
@@ -221,7 +228,24 @@ def v369__publish_local_top10_e256_role(
 @triton.jit
 def v369__pair2_stable_best_expert(score_key, expert):
     return tl.inline_asm_elementwise(
-        "\n        {\n            .reg .b32 best_key, best_expert, peer_key, peer_expert;\n            .reg .pred p_key_gt, p_idx_lt, p_tie, p_take;\n            mov.u32 best_key, $1;\n            mov.u32 best_expert, $2;\n\n            shfl.sync.down.b32 peer_key, best_key, 1, 0x1e01, 0xffffffff;\n            shfl.sync.down.b32 peer_expert, best_expert, 1, 0x1e01, 0xffffffff;\n            setp.gt.u32 p_key_gt, peer_key, best_key;\n            setp.lt.u32 p_idx_lt, peer_expert, best_expert;\n            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;\n            or.pred p_take, p_key_gt, p_tie;\n            selp.u32 best_expert, peer_expert, best_expert, p_take;\n\n            shfl.sync.idx.b32 $0, best_expert, 0, 0x1e01, 0xffffffff;\n        }\n        ",
+        """
+        {
+            .reg .b32 best_key, best_expert, peer_key, peer_expert;
+            .reg .pred p_key_gt, p_idx_lt, p_tie, p_take;
+            mov.u32 best_key, $1;
+            mov.u32 best_expert, $2;
+
+            shfl.sync.down.b32 peer_key, best_key, 1, 0x1e01, 0xffffffff;
+            shfl.sync.down.b32 peer_expert, best_expert, 1, 0x1e01, 0xffffffff;
+            setp.gt.u32 p_key_gt, peer_key, best_key;
+            setp.lt.u32 p_idx_lt, peer_expert, best_expert;
+            setp.eq.and.u32 p_tie, peer_key, best_key, p_idx_lt;
+            or.pred p_take, p_key_gt, p_tie;
+            selp.u32 best_expert, peer_expert, best_expert, p_take;
+
+            shfl.sync.idx.b32 $0, best_expert, 0, 0x1e01, 0xffffffff;
+        }
+        """,
         "=r,r,r",
         [score_key.to(tl.uint32), expert.to(tl.uint32)],
         dtype=tl.uint32,
@@ -382,7 +406,20 @@ def v370__load_candidate_record(ptr, valid):
     """Load one CUDA-v020 16-byte candidate in a single instruction."""
     address = ptr.to(tl.uint64)
     ranking, unbiased, expert, ordered = tl.inline_asm_elementwise(
-        "\n        {\n            .reg .pred p;\n            .reg .b64 cache_hint;\n            mov.u32 $0, 0xff800000;\n            mov.u32 $1, 0xff800000;\n            mov.u32 $2, 0xffffffff;\n            mov.u32 $3, 0;\n            mov.u64 cache_hint, 0x12f0000000000000;\n            setp.ne.u32 p, $5, 0;\n            @p ld.weak.global.L1::no_allocate.L2::cache_hint.v4.b32\n                {$0, $1, $2, $3}, [$4], cache_hint;\n        }\n        ",
+        """
+        {
+            .reg .pred p;
+            .reg .b64 cache_hint;
+            mov.u32 $0, 0xff800000;
+            mov.u32 $1, 0xff800000;
+            mov.u32 $2, 0xffffffff;
+            mov.u32 $3, 0;
+            mov.u64 cache_hint, 0x12f0000000000000;
+            setp.ne.u32 p, $5, 0;
+            @p ld.weak.global.L1::no_allocate.L2::cache_hint.v4.b32
+                {$0, $1, $2, $3}, [$4], cache_hint;
+        }
+        """,
         "=r,=r,=r,=r,l,r,~{memory}",
         [address, valid.to(tl.uint32)],
         dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),

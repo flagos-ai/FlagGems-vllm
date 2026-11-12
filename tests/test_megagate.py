@@ -165,12 +165,10 @@ def test_megagate_api_signatures_keep_prepare_outside_hot_path() -> None:
         "correction_bias",
         "context",
         "routed_scaling_factor",
-        "out",
     ]
     assert hot_path["context"].kind is inspect.Parameter.KEYWORD_ONLY
     assert hot_path["context"].default is inspect.Parameter.empty
     assert hot_path["routed_scaling_factor"].default is None
-    assert hot_path["out"].default is None
 
 
 def test_megagate_rejects_unknown_profile() -> None:
@@ -257,20 +255,15 @@ def test_megagate_dsv4_hopper_correctness_and_public_export(tokens: int) -> None
     )
     assert context.prepared_tokens == (tokens,)
 
-    weights_out = torch.empty((tokens, TOPK), dtype=torch.float32, device="cuda")
-    indices_out = torch.empty((tokens, TOPK), dtype=torch.int64, device="cuda")
     weights, indices = flaggems_vllm.megagate(
         x,
         gate_weight,
         correction_bias,
         context=context,
         routed_scaling_factor=ROUTED_SCALING_FACTOR,
-        out=(weights_out, indices_out),
     )
     torch.cuda.synchronize()
 
-    assert weights is weights_out
-    assert indices is indices_out
     assert tuple(weights.shape) == (tokens, TOPK)
     assert tuple(indices.shape) == (tokens, TOPK)
     assert weights.dtype == torch.float32
@@ -309,8 +302,6 @@ def test_megagate_dsv4_hopper_correctness_and_public_export(tokens: int) -> None
         rebound_x = x.clone()
         rebound_weight = gate_weight.clone()
         rebound_bias = correction_bias.clone()
-        rebound_weights = torch.empty_like(weights)
-        rebound_indices = torch.empty_like(indices)
 
         # Clearing address-bound descriptors and preparing an already-compiled
         # leaf must fully rebind both X and W before the next hot-path call.
@@ -323,7 +314,6 @@ def test_megagate_dsv4_hopper_correctness_and_public_export(tokens: int) -> None
             rebound_bias,
             context=context,
             routed_scaling_factor=ROUTED_SCALING_FACTOR,
-            out=(rebound_weights, rebound_indices),
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(actual_weights, weights, rtol=0, atol=0)
@@ -520,14 +510,6 @@ def test_megagate_requires_prepare_on_each_cuda_stream(
     other_stream = torch.cuda.Stream()
     other_stream.wait_stream(default_stream)
     with torch.cuda.stream(other_stream):
-        outputs = (
-            torch.empty((tokens, profile.topk), dtype=torch.float32, device="cuda"),
-            torch.empty(
-                (tokens, profile.topk),
-                dtype=torch.int64 if profile_name == "dsv4_flash" else torch.int32,
-                device="cuda",
-            ),
-        )
         with pytest.raises(UnpreparedShapeError, match="current CUDA stream"):
             megagate(
                 x,
@@ -535,7 +517,6 @@ def test_megagate_requires_prepare_on_each_cuda_stream(
                 correction_bias,
                 context=context,
                 routed_scaling_factor=profile.routed_scaling_factor,
-                out=outputs,
             )
         context.prepare(
             x,
@@ -549,11 +530,10 @@ def test_megagate_requires_prepare_on_each_cuda_stream(
             correction_bias,
             context=context,
             routed_scaling_factor=profile.routed_scaling_factor,
-            out=outputs,
         )
     default_stream.wait_stream(other_stream)
-    assert weights is outputs[0]
-    assert indices is outputs[1]
+    assert tuple(weights.shape) == (tokens, profile.topk)
+    assert tuple(indices.shape) == (tokens, profile.topk)
     context.close()
 
 

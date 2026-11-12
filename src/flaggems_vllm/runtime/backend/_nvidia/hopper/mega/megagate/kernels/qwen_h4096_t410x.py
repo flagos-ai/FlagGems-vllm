@@ -157,7 +157,14 @@ def v402__store_packed_candidate_word(ptr, score, local_expert, valid):
     score_bits = score.to(tl.uint32, bitcast=True)
     packed = score_bits & 4294901760 | local_expert.to(tl.uint32) & 255
     _ = tl.inline_asm_elementwise(
-        "\n        {\n            .reg .pred p;\n            setp.ne.u32 p, $3, 0;\n            @p st.global.u32 [$1], $2;\n            mov.u32 $0, $3;\n        }\n        ",
+        """
+        {
+            .reg .pred p;
+            setp.ne.u32 p, $3, 0;
+            @p st.global.u32 [$1], $2;
+            mov.u32 $0, $3;
+        }
+        """,
         "=r,l,r,r,~{memory}",
         [address, packed, valid.to(tl.uint32)],
         dtype=tl.uint32,
@@ -171,7 +178,14 @@ def v402__load_packed_candidate_word_l1(ptr, valid):
     """Load one compact head while retaining its 40-byte list in L1."""
     address = ptr.to(tl.uint64)
     packed = tl.inline_asm_elementwise(
-        "\n        {\n            .reg .pred p;\n            mov.u32 $0, 0xff8000ff;\n            setp.ne.u32 p, $2, 0;\n            @p ld.weak.global.L1::evict_last.b32 $0, [$1];\n        }\n        ",
+        """
+        {
+            .reg .pred p;
+            mov.u32 $0, 0xff8000ff;
+            setp.ne.u32 p, $2, 0;
+            @p ld.weak.global.L1::evict_last.b32 $0, [$1];
+        }
+        """,
         "=r,l,r,~{memory}",
         [address, valid.to(tl.uint32)],
         dtype=tl.uint32,

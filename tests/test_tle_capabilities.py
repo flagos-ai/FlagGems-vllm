@@ -69,9 +69,12 @@ def _named_barrier_components():
     def api(*args, **kwargs):
         raise AssertionError("feature probe executed a compiler API")
 
+    def reserve(_semantic, count, _generator=None):
+        raise AssertionError("feature probe executed the frontend allocator")
+
     core = SimpleNamespace(
         _FIRST_VIRTUAL_NAMED_BARRIER_ID=16,
-        _reserve_named_barrier_ids=api,
+        _reserve_named_barrier_ids=reserve,
     )
     libtriton = SimpleNamespace(
         tle=SimpleNamespace(
@@ -81,7 +84,7 @@ def _named_barrier_components():
     return core, libtriton
 
 
-def test_module_wide_named_barrier_probe_requires_both_compiler_halves():
+def test_module_wide_named_barrier_probe_requires_fixed_frontend_contract_and_pass_binding():
     core, libtriton = _named_barrier_components()
     assert _has_module_wide_named_barrier_support(core, libtriton)
 
@@ -89,6 +92,13 @@ def test_module_wide_named_barrier_probe_requires_both_compiler_halves():
     assert not _has_module_wide_named_barrier_support(core, libtriton)
     core._FIRST_VIRTUAL_NAMED_BARRIER_ID = 16
 
+    def legacy_reserve(_semantic, count):
+        raise AssertionError("feature probe executed the legacy allocator")
+
+    core._reserve_named_barrier_ids = legacy_reserve
+    assert not _has_module_wide_named_barrier_support(core, libtriton)
+
+    core, libtriton = _named_barrier_components()
     core._reserve_named_barrier_ids = object()
     assert not _has_module_wide_named_barrier_support(core, libtriton)
     core, libtriton = _named_barrier_components()
