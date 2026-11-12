@@ -351,3 +351,14 @@ chunk_kda_fwd_intra_token_parallel:
       - 8
     stages:
       - 1
+# Start with the NVIDIA candidate warp counts, using synchronous Hygon loads.
+apply_bad_words:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1

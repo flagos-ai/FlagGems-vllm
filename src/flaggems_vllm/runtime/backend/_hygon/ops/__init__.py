@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._hygon.ops.bad_words import apply_bad_words
 from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -68,6 +69,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
 )
 
 __all__ = [
+    "apply_bad_words",
     "chunk_gated_delta_rule_w8a16",
     "chunk_gated_delta_rule_w8a16_int8",
     "fused_add_rms_norm",

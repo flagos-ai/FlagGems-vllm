@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._mthreads.ops.bad_words import apply_bad_words
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -60,6 +61,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
 )
 
 __all__ = [
+    "apply_bad_words",
     "dequantize_and_gather_k_cache",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",
