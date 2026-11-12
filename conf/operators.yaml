@@ -133,6 +133,19 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: cast_sigmoid
+    description: |
+      Element-wise sigmoid with explicit output and compute dtype, used for
+      vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.
+    for:
+      - None
+    labels:
+      - vLLM
+      - pointwise
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: causal_conv1d_fn
     description: |
       Causal depthwise conv1d over variable-length token sequences with

@@ -21,6 +21,7 @@ from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
+from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
@@ -268,6 +269,7 @@ __all__ = [
     "bf16_paged_mqa_logits",
     "bincount",
     "bucket_sort_topk",
+    "cast_sigmoid",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule",

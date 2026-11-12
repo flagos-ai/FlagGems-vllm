@@ -56,8 +56,9 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 # PyTorch dispatch by enable()/only_enable().
 _LIBRARY_ONLY_OPS = frozenset(
     {
-        "fused_indexer_k_norm",
+        "cast_sigmoid",
         "dsv41_o_proj",
+        "fused_indexer_k_norm",
         "fused_indexer_weight_scale",
         "grouped_gemma_rmsnorm",
         "hc_combine",
