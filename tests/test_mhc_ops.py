@@ -44,7 +44,54 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout, mhc_post, mhc_post_ref
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
+from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
+
+
+def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
+    x = x.softmax(-1) + eps
+    x = x / (x.sum(-2, keepdim=True) + eps)
+    for _ in range(repeat - 1):
+        x = x / (x.sum(-1, keepdim=True) + eps)
+        x = x / (x.sum(-2, keepdim=True) + eps)
+    return x
+
+
+def mhc_pre_ref(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PyTorch reference implementation of mhc_pre."""
+    hc_mult = residual.shape[-2]
+    residual_flat = residual.flatten(-2, -1).float()
+    sqrsum = residual_flat.square().sum(-1)
+    mixes = (
+        residual_flat @ fn.T * (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
+    )
+    hc_scale_expanded = torch.cat(
+        [
+            hc_scale[0].expand(hc_mult),
+            hc_scale[1].expand(hc_mult),
+            hc_scale[2].expand(hc_mult * hc_mult),
+        ]
+    )
+    mixes = mixes * hc_scale_expanded + hc_base
+    pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
+    post_mix = (
+        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
+    ).unsqueeze(-1)
+    res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
+    res_mix = sinkhorn_normalize_ref(
+        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+    )
+    layer_input = (residual * pre_mix).sum(-2).bfloat16()
+    return post_mix, res_mix, layer_input
 
 
 def generate_mhc_post_data(
