@@ -80,6 +80,7 @@ def _input_fn(shape, dtype, device):
     )
     gating = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights.to(dtype)
     yield hidden_states, w1, w2, topk_weights, topk_ids
@@ -202,7 +203,12 @@ def mthreads_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     Importing vllm_musa patches vLLM fused_experts_impl to its MUSA
     dispatch, which is what the registered OOT method calls at runtime.
     """
+    # vLLM's model executor must be imported before vllm_musa so the
+    # vendor patch can replace fused_experts_impl in place; importing the
+    # plugin alone does NOT activate the MUSA dispatcher.
+    import vllm.model_executor.layers.fused_moe.fused_moe  # noqa: F401
     import vllm_musa  # noqa: F401
+    import vllm_musa.model_executor  # noqa: F401
 
     try:  # MoE custom ops live in the in-tree extension on MUSA.
         import vllm._moe_C  # noqa: F401
