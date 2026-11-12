@@ -2568,6 +2568,7 @@ _NOPAD_CFG = {
 }
 
 
+@triton.jit
 def _histogram_kernel(topk_ids_ptr, counts_ptr, numel, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
