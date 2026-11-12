@@ -58,8 +58,12 @@ def _torch_topk_ref(
     logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
 ):
     """Pure-PyTorch fallback reference using torch.topk."""
-    seq_len = seq_lens[0].item()
-    valid_logits = logits[:, :seq_len]
+    rows = torch.arange(num_rows, device=logits.device)
+    lengths = seq_lens[rows // next_n]
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    valid_logits = logits.masked_fill(
+        columns[None, :] >= lengths[:, None], -float("inf")
+    )
     _, top_idx = torch.topk(valid_logits, top_k, dim=1, largest=True, sorted=False)
     indices.copy_(top_idx.to(torch.int32))
 
@@ -119,6 +123,43 @@ def test_top_k_per_row_decode():
     bench = TopKPerRowDecodeBenchmark(
         op_name="top_k_per_row_decode",
         torch_op=baseline_op,
+        gems_op=flaggems_vllm.top_k_per_row_decode,
+        dtypes=[torch.float32],
+    )
+    bench.run()
+
+
+class TopKPerRowDecodeBoundedBenchmark(base.Benchmark):
+    """Model-domain matrix, separate from the unchanged full-length core matrix."""
+
+    DEFAULT_SHAPE_DESC = "num_rows, vocab_size, valid_length, top_k"
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (rows, 16640, valid, 512)
+            for rows in (1, 8, 64)
+            for valid in (128, 4096, 16640)
+        ]
+
+    def get_input_iter(self, dtype):
+        for rows, width, valid, top_k in self.shapes:
+            torch.manual_seed(42)
+            logits = torch.randn((rows, width), dtype=dtype, device=self.device)
+            lengths = torch.full((rows,), valid, dtype=torch.int32, device=self.device)
+            output = torch.empty((rows, top_k), dtype=torch.int32, device=self.device)
+            yield logits, 1, lengths, output, rows, logits.stride(0), logits.stride(
+                1
+            ), top_k
+
+
+@pytest.mark.top_k_per_row_decode
+@pytest.mark.skipif(
+    not HAS_VLLM, reason="Native SDK comparator is required for the bounded matrix"
+)
+def test_top_k_per_row_decode_bounded():
+    bench = TopKPerRowDecodeBoundedBenchmark(
+        op_name="top_k_per_row_decode",
+        torch_op=_vllm_top_k_per_row_decode,
         gems_op=flaggems_vllm.top_k_per_row_decode,
         dtypes=[torch.float32],
     )
