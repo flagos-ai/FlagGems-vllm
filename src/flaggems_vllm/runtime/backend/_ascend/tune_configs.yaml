@@ -247,6 +247,17 @@ moe_sum_general:
     num_warps: 8
     num_stages: 2
 
+triton_reshape_and_cache_flash:
+  - META: {TILE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 1024}
+    num_warps: 8
+    num_stages: 1
+
 expand_pools_and_append_tail:
   - META:
       BLOCK_COLS: 128
