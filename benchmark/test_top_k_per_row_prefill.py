@@ -164,3 +164,18 @@ def test_top_k_per_row_prefill():
         dtypes=[torch.float32],
     )
     bench.run()
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX public wrapper")
+def test_metax_public_prefill_vs_complete_portable_contract():
+    # The older raw-kernel comparator above omits CANONICAL_OUTPUT/NUM_ROWS.
+    # Compare complete public semantics as a separate, explicitly named series;
+    # keep the raw-kernel series visible rather than replacing its measurements.
+    bench = TopKPerRowPrefillBenchmark(
+        op_name="top_k_per_row_prefill_portable_contract",
+        torch_op=_top_k_per_row_prefill_module.top_k_per_row_prefill,
+        gems_op=flaggems_vllm.top_k_per_row_prefill,
+        dtypes=[torch.float32],
+    )
+    bench.run()

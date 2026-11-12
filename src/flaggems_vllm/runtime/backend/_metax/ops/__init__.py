@@ -58,6 +58,10 @@ if triton_version_utils.has_triton_tle():
 else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
+from flaggems_vllm.runtime.backend._metax.ops.top_k_per_row_prefill import (
+    top_k_per_row_prefill,
+)
+
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "fused_experts_impl",
@@ -78,6 +82,7 @@ __all__ = [
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
+    "top_k_per_row_prefill",
     "top_k_top_p",
     "w8a8_block_int8_bmm",
 ]

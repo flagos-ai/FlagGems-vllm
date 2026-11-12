@@ -1344,7 +1344,7 @@ def _standard_topk_entry(kernel):
 
 
 @_standard_topk_entry
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_ROWS"])
 def non_tle_top_k_per_row_prefill(
     logits_ptr,
     out_indices_ptr,
@@ -1359,7 +1359,7 @@ def non_tle_top_k_per_row_prefill(
     s_threshold_bin_idx_ptr,
     s_final_bin_size_ptr,
     s_found_topk_values_ptr,
-    NUM_ROWS: tl.constexpr,
+    NUM_ROWS,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     CANONICAL_OUTPUT: tl.constexpr,
