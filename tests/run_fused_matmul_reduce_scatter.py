@@ -138,6 +138,21 @@ def main():
     if args.comm_only:
         _check_communication(device, args.repeat)
         return
+    # Match the known-good comm-only bootstrap before loading FlagCX adaptors
+    # or installing operator registrations through package imports.
+    group = _init_nccl_group(device)
+    try:
+        _check_operator(args, parser, group, device)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_operator(args, parser, group, device):
+    import torch
+    import torch.distributed as dist
+
+    world_size = group.size()
+    print(f"[rank {group.rank()}] importing TLE", flush=True)
     try:
         tle = importlib.import_module("triton.experimental.tle.language")
     except ImportError:
@@ -147,6 +162,7 @@ def main():
     if not tle.communication.enabled:
         parser.error("requires a matching FlagCX host/device runtime")
 
+    print(f"[rank {group.rank()}] importing FlagGems-vllm", flush=True)
     import flaggems_vllm
     from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
         _default_config,
@@ -154,6 +170,7 @@ def main():
         _validate_shape,
     )
 
+    print(f"[rank {group.rank()}] operator imports complete", flush=True)
     m = args.m if args.m is not None else 256 * world_size
     config = _default_config()
     try:
@@ -164,7 +181,6 @@ def main():
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     rtol = 0.04 if dtype == torch.bfloat16 else 0.01
     atol = 0.005 if dtype == torch.bfloat16 else 0.001
-    group = _init_nccl_group(device)
     try:
         if group.rank() == 0 and backend == "hcu":
             keys = (
@@ -228,10 +244,7 @@ def main():
                     flush=True,
                 )
     finally:
-        try:
-            flaggems_vllm.clear_fused_matmul_reduce_scatter_cache(group.group_name)
-        finally:
-            dist.destroy_process_group()
+        flaggems_vllm.clear_fused_matmul_reduce_scatter_cache(group.group_name)
 
 
 if __name__ == "__main__":
