@@ -123,63 +123,6 @@ JIT_CANDIDATE_EXPERT_WORD = tl.constexpr(CANDIDATE_EXPERT_WORD)
 JIT_CANDIDATE_RECORD_WORDS = tl.constexpr(CANDIDATE_RECORD_WORDS)
 JIT_TIE_MASK = tl.constexpr(0xFFFF)
 
-CUDA_V018_PATCH: Final = (
-    "v018_qwen_halfwarp_two_token/" "0014-sm90-qwen-halfwarp-two-token.patch"
-)
-CUDA_V018_SHA256: Final = (
-    "3849eedf22c41c9957fc62655195c33df" "1a78c7fb5f553a810ca7564286ee65b"
-)
-CUDA_V036_PATCH: Final = (
-    "v036_qwen_h2048_restore_v018_leaf/" "0031-sm90-qwen-h2048-restore-v018-leaf.patch"
-)
-CUDA_V036_SHA256: Final = (
-    "6136b5b25d5f14a2b03c11a7865900e3" "d75e4dd712c0a1c13576accfd9a8a1e4"
-)
-
-SCHEDULE: Final = {
-    "backend": "tle_sm90_qwen_h2048_v018_v036_single_list",
-    "lineage": "cuda_v018_halfwarp_two_token_plus_v036_single_list_restore",
-    "release_status": "formal_2026_11_11_no_graph_admitted",
-    "kernel_count": 1,
-    "device_kernel_count": 1,
-    "runtime_kernel_launch_count": 1,
-    "hidden": HIDDEN,
-    "experts": EXPERTS,
-    "topk": TOPK,
-    "tokens": SUPPORTED_TOKENS,
-    "block_tokens": BLOCK_TOKENS,
-    "experts_per_cta": EXPERTS_PER_CTA,
-    "logical_expert_ctas": LOGICAL_EXPERT_CTAS,
-    "cluster_size": 1,
-    "block_k": BLOCK_K,
-    "pipe_stages": PIPE_STAGES,
-    "roles": ("tma_then_route", "wgmma_then_publish_route", "route"),
-    "tokens_per_role_batch": TOKENS_PER_ROLE_BATCH,
-    "tokens_per_route_round": TOKENS_PER_ROUTE_ROUND,
-    "route_rounds": NUM_ROUTE_ROUNDS,
-    "threads": TOTAL_THREADS,
-    "register_budget": REGISTER_BUDGET,
-    "nominal_pipe_bytes": NOMINAL_PIPE_BYTES,
-    "score": "bf16_boundary_stable_softmax_top8_selected_renorm",
-    "candidate_abi": "separate_one_sorted_top8_list_per_e64_producer",
-    "candidate_workspace": "[T,4,16] fp32",
-    "workspace_contract": "full_fp32_logits_plus_candidate_scratch",
-    "synchronization": "gpu_acq_rel_four_producer_last_arriver",
-    "routing_owner": "fourth_arriving_cta_all_three_static_roles",
-    "padding": False,
-    "fallback": False,
-    "concurrent_replay_safe": False,
-    "registered": True,
-    "default_dispatch": True,
-    "release_allowlist": True,
-    "source_cuda_patches": (CUDA_V018_PATCH, CUDA_V036_PATCH),
-    "source_cuda_patch_sha256": (CUDA_V018_SHA256, CUDA_V036_SHA256),
-    "topology_equivalent_except": (
-        "TLE vectorizes eight rows per static role; CUDA v018 uses two "
-        "width16 half-warps per physical warp"
-    ),
-}
-
 
 @triton.jit
 def _publish_local_single_list(

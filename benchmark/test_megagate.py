@@ -27,7 +27,6 @@ import importlib
 import os
 import tempfile
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -37,6 +36,9 @@ import flaggems_vllm
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.registry import (
     PROFILES as _REGISTERED_PROFILES,
 )
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.registry import (
+    MegaGateProfile,
+)
 from flaggems_vllm.utils.tle_capabilities import (
     supports_megagate_tle,
     supports_module_wide_named_barriers,
@@ -45,67 +47,9 @@ from flaggems_vllm.utils.tle_capabilities import (
 from . import base, consts
 from .conftest import Config
 
-
-@dataclass(frozen=True)
-class _Profile:
-    name: str
-    hidden: int
-    experts: int
-    topk: int
-    routed_scaling_factor: float
-    scoring_func: str
-    correction_bias: bool
-    linear_kind: str
-    num_expert_group: int | None = None
-    topk_group: int | None = None
-
-
-_PROFILES = (
-    _Profile(
-        "dsv4_flash",
-        4096,
-        256,
-        6,
-        1.5,
-        "sqrtsoftplus",
-        True,
-        "GateLinear",
-    ),
-    _Profile(
-        "dsv32",
-        7168,
-        256,
-        8,
-        2.5,
-        "sigmoid",
-        True,
-        "GateLinear",
-        num_expert_group=8,
-        topk_group=4,
-    ),
-    _Profile(
-        "qwen_h2048_e256_k8",
-        2048,
-        256,
-        8,
-        1.0,
-        "softmax",
-        False,
-        "ReplicatedLinear",
-    ),
-    _Profile(
-        "qwen_h4096_e512_k10",
-        4096,
-        512,
-        10,
-        1.0,
-        "softmax",
-        False,
-        "ReplicatedLinear",
-    ),
-)
 _PROFILE_BY_SIGNATURE = {
-    (profile.hidden, profile.experts, profile.topk): profile for profile in _PROFILES
+    (profile.hidden, profile.experts, profile.topk): profile
+    for profile in _REGISTERED_PROFILES.values()
 }
 
 # ``MegaGateProfile.routing`` is the production semantic contract.  Keep the
@@ -135,50 +79,23 @@ _ROUTING_BASELINE_CONTRACTS = {
         "topk_group": None,
     },
 }
-for _profile in _PROFILES:
-    _registered = _REGISTERED_PROFILES[_profile.name]
-    assert (_profile.hidden, _profile.experts, _profile.topk) == (
-        _registered.hidden,
-        _registered.experts,
-        _registered.topk,
-    )
-    assert _profile.routed_scaling_factor == _registered.routed_scaling_factor
-    _contract = _ROUTING_BASELINE_CONTRACTS[_registered.routing]
-    assert {
-        "scoring_func": _profile.scoring_func,
-        "correction_bias": _profile.correction_bias,
-        "linear_kind": _profile.linear_kind,
-        "num_expert_group": _profile.num_expert_group,
-        "topk_group": _profile.topk_group,
-    } == _contract
-
-# Core keeps one representative per model profile. Comprehensive adds one
-# shape per admitted schedule family; adjacent T values sharing a schedule are
-# deliberately omitted from the shared benchmark.
+# Core keeps one representative per model profile. Comprehensive covers one
+# small and one large token count per profile; the full 50-shape acceptance
+# matrix remains in the dedicated Hopper validation harness.
 CORE_SHAPES = (
     (4096, 256, 6, 1028),
-    (7168, 256, 8, 12292),
-    (2048, 256, 8, 4434),
-    (4096, 512, 10, 8214),
+    (7168, 256, 8, 1028),
+    (2048, 256, 8, 1034),
+    (4096, 512, 10, 1035),
 )
 COMPREHENSIVE_SHAPES = (
     (4096, 256, 6, 1028),
     (4096, 256, 6, 16384),
     (7168, 256, 8, 1028),
-    (7168, 256, 8, 12292),
     (7168, 256, 8, 16384),
     (2048, 256, 8, 1034),
-    (2048, 256, 8, 4107),
-    (2048, 256, 8, 4434),
-    (2048, 256, 8, 9309),
     (2048, 256, 8, 16384),
     (4096, 512, 10, 1035),
-    (4096, 512, 10, 2048),
-    (4096, 512, 10, 4107),
-    (4096, 512, 10, 4434),
-    (4096, 512, 10, 5240),
-    (4096, 512, 10, 8214),
-    (4096, 512, 10, 13421),
     (4096, 512, 10, 16384),
 )
 
@@ -296,9 +213,11 @@ def _cleanup_vllm_single_rank() -> None:
 
 
 def _construct_vllm_gate(
-    vllm_api: dict[str, Any], weight: torch.Tensor, profile: _Profile
+    vllm_api: dict[str, Any], weight: torch.Tensor, profile: MegaGateProfile
 ) -> Any:
-    linear_type = vllm_api[profile.linear_kind]
+    contract = _ROUTING_BASELINE_CONTRACTS[profile.routing]
+    linear_kind = contract["linear_kind"]
+    linear_type = vllm_api[linear_kind]
     kwargs: dict[str, Any] = {
         "input_size": profile.hidden,
         "output_size": profile.experts,
@@ -306,7 +225,7 @@ def _construct_vllm_gate(
         "params_dtype": torch.bfloat16,
         "prefix": f"benchmark.megagate.{profile.name}",
     }
-    if profile.linear_kind == "GateLinear":
+    if linear_kind == "GateLinear":
         # DSV4 fixes FP32 router logits. DSV3.2 leaves out_dtype unset and
         # follows GateLinear's model-faithful producer precision policy.
         kwargs["out_dtype"] = torch.float32 if profile.name == "dsv4_flash" else None
@@ -393,11 +312,12 @@ def _megagate_inputs(
     gate_weight = torch.randn(
         (experts, hidden), dtype=dtype, device=device, generator=generator
     ).mul_(hidden**-0.5)
+    contract = _ROUTING_BASELINE_CONTRACTS[profile.routing]
     correction_bias = (
         torch.randn(
             (experts,), dtype=torch.float32, device=device, generator=generator
         ).mul_(0.01)
-        if profile.correction_bias
+        if contract["correction_bias"]
         else None
     )
 
@@ -416,23 +336,23 @@ def _megagate_inputs(
 
         def run_vllm() -> tuple[torch.Tensor, torch.Tensor]:
             logits = _unwrap_linear_output(layer(x))
-            if profile.num_expert_group is not None:
+            if contract["num_expert_group"] is not None:
                 return VLLM_GATE_API["grouped_topk"](
                     hidden_states=x,
                     gating_output=logits,
                     topk=profile.topk,
                     renormalize=True,
-                    num_expert_group=profile.num_expert_group,
-                    topk_group=profile.topk_group,
-                    scoring_func=profile.scoring_func,
+                    num_expert_group=contract["num_expert_group"],
+                    topk_group=contract["topk_group"],
+                    scoring_func=contract["scoring_func"],
                     routed_scaling_factor=profile.routed_scaling_factor,
                     e_score_correction_bias=correction_bias,
                 )
-            if profile.correction_bias:
+            if contract["correction_bias"]:
                 return VLLM_GATE_API["fused_topk_bias"](
                     hidden_states=x,
                     gating_output=logits,
-                    scoring_func=profile.scoring_func,
+                    scoring_func=contract["scoring_func"],
                     e_score_correction_bias=correction_bias,
                     topk=profile.topk,
                     renormalize=True,
@@ -447,7 +367,7 @@ def _megagate_inputs(
                 topk=profile.topk,
                 renormalize=True,
                 indices_type=None,
-                scoring_func=profile.scoring_func,
+                scoring_func=contract["scoring_func"],
             )
             return weights, indices
 

@@ -21,104 +21,13 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 from triton.language.extra import libdevice
 
-
-@triton.jit
-def routing__ordered_score_key(score):
-    score = tl.where(score == score, score, -float("inf"))
-    bits = score.to(tl.uint32, bitcast=True)
-    bits = tl.where(score == 0.0, 0, bits)
-    return tl.where(bits & 2147483648 != 0, ~bits, bits ^ 2147483648)
-
-
-@triton.jit
-def routing__subwarp8_sum_f32(value):
-    """Reduce four independent eight-lane groups in one physical warp."""
-    return tl.inline_asm_elementwise(
-        "\n        {\n            .reg .f32 current, peer;\n            .reg .b32 current_bits, peer_bits;\n            mov.f32 current, $1;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 4, 0x1807, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 current, current, peer;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 2, 0x1807, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 current, current, peer;\n\n            mov.b32 current_bits, current;\n            shfl.sync.down.b32 peer_bits, current_bits, 1, 0x1807, 0xffffffff;\n            mov.b32 peer, peer_bits;\n            add.rn.f32 $0, current, peer;\n        }\n        ",
-        "=f,f",
-        [value],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def routing__warp_max_u32(value):
-    return tl.inline_asm_elementwise(
-        "redux.sync.max.u32 $0, $1, 0xffffffff;",
-        "=r,r",
-        [value.to(tl.uint32)],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def routing__warp_min_u32(value):
-    return tl.inline_asm_elementwise(
-        "redux.sync.min.u32 $0, $1, 0xffffffff;",
-        "=r,r",
-        [value.to(tl.uint32)],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def routing__warp_broadcast_f32(value, source_lane):
-    return tl.inline_asm_elementwise(
-        "\n        {\n            .reg .b32 input_bits, output_bits;\n            mov.b32 input_bits, $1;\n            shfl.sync.idx.b32 output_bits, input_bits, $2, 0x1f, 0xffffffff;\n            mov.b32 $0, output_bits;\n        }\n        ",
-        "=f,f,r",
-        [value, source_lane.to(tl.uint32)],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def v166__compare_swap_local(lhs_score, lhs_offset, rhs_score, rhs_offset):
-    take_rhs = (rhs_score > lhs_score) | (rhs_score == lhs_score) & (
-        rhs_offset < lhs_offset
-    )
-    return (
-        tl.where(take_rhs, rhs_score, lhs_score),
-        tl.where(take_rhs, rhs_offset, lhs_offset),
-        tl.where(take_rhs, lhs_score, rhs_score),
-        tl.where(take_rhs, lhs_offset, rhs_offset),
-    )
-
-
-@triton.jit
-def v166__sort4_pack(s0, s1, s2, s3):
-    """CUDA sort4 network with offsets retired into one packed register."""
-    i0 = tl.zeros((128,), dtype=tl.uint32)
-    i1 = tl.full((128,), 1, dtype=tl.uint32)
-    i2 = tl.full((128,), 2, dtype=tl.uint32)
-    i3 = tl.full((128,), 3, dtype=tl.uint32)
-    s0, i0, s1, i1 = v166__compare_swap_local(s0, i0, s1, i1)
-    s2, i2, s3, i3 = v166__compare_swap_local(s2, i2, s3, i3)
-    s0, i0, s2, i2 = v166__compare_swap_local(s0, i0, s2, i2)
-    s1, i1, s3, i3 = v166__compare_swap_local(s1, i1, s3, i3)
-    s1, i1, s2, i2 = v166__compare_swap_local(s1, i1, s2, i2)
-    permutation = i0 | i1 << 2 | i2 << 4 | i3 << 6
-    return (s0, s1, s2, s3, permutation)
-
-
-@triton.jit
-def v166__sorted_head(cursor, s0, s1, s2, s3):
-    return tl.where(
-        cursor == 0,
-        s0,
-        tl.where(
-            cursor == 1,
-            s1,
-            tl.where(cursor == 2, s2, tl.where(cursor == 3, s3, -float("inf"))),
-        ),
-    )
+from .qwen_h4096_primitives import sort4_pack as v166__sort4_pack
+from .qwen_h4096_primitives import sorted_head as v166__sorted_head
+from .routing_primitives import ordered_score_key as routing__ordered_score_key
+from .routing_primitives import subwarp8_sum_f32 as routing__subwarp8_sum_f32
+from .routing_primitives import warp_broadcast_f32 as routing__warp_broadcast_f32
+from .routing_primitives import warp_max_u32 as routing__warp_max_u32
+from .routing_primitives import warp_min_u32 as routing__warp_min_u32
 
 
 @triton.jit

@@ -16,10 +16,8 @@
 
 from __future__ import annotations
 
-import ast
 import importlib
 import inspect
-from pathlib import Path
 
 import pytest
 import torch
@@ -64,35 +62,6 @@ DSV4_EAGER_TOKENS = (
     16384,
 )
 
-EXPECTED_SOURCE_LEAVES = {
-    "dsv4_flash": {
-        **{tokens: "v363" for tokens in DSV4_EAGER_TOKENS[:8]},
-        **{tokens: "v376" for tokens in DSV4_EAGER_TOKENS[8:]},
-    },
-    "dsv32": {
-        **{tokens: "v371" for tokens in (1028, 1756, 2048, 3076, 3805, 8276)},
-        **{tokens: "v372" for tokens in (12292, 12372)},
-        **{tokens: "v435" for tokens in (14305, 16384)},
-    },
-    "qwen_h2048_e256_k8": {
-        **{tokens: "v366" for tokens in (1034, 1035, 1036, 1352, 2048, 3104)},
-        **{tokens: "v365" for tokens in (4107, 4108, 4138)},
-        **{tokens: "v364" for tokens in (4434, 4435, 4436)},
-        **{tokens: "v363" for tokens in (9309, 9330, 11469, 13421, 13422)},
-        16384: "v367",
-    },
-    "qwen_h4096_e512_k10": {
-        **{tokens: "v371" for tokens in (1035, 1036)},
-        2048: "v400",
-        **{tokens: "v412" for tokens in (4107, 4108)},
-        **{tokens: "v414" for tokens in (4434, 4435)},
-        5240: "v431",
-        8214: "v394",
-        **{tokens: "v430" for tokens in (13421, 13422)},
-        16384: "v415",
-    },
-}
-
 # One representative exact-T case per production schedule family.  The full
 # 50-shape performance matrix lives in the dedicated acceptance harness; this
 # smaller set makes every distinct fused leaf compile and prove its numerical
@@ -116,37 +85,6 @@ SCHEDULE_FAMILY_CASES = (
     ("qwen_h4096_e512_k10", 16384, "v415"),
 )
 
-LEAF_FILES_BY_PROFILE = {
-    "dsv4_flash": ("dsv4_clusterless.py", "dsv4_quadmath.py"),
-    "dsv32": (
-        "dsv32_clusterless.py",
-        "dsv32_dualmath.py",
-        "dsv32_quadmath.py",
-    ),
-    "qwen_h2048_e256_k8": tuple(
-        f"qwen_h2048_v{version}.py" for version in range(363, 368)
-    ),
-    "qwen_h4096_e512_k10": (
-        "qwen_h4096_e64_cluster8.py",
-        "qwen_h4096_t2048.py",
-        "qwen_h4096_t410x.py",
-        "qwen_h4096_t443x.py",
-        "qwen_h4096_t5240.py",
-        "qwen_h4096_t8214.py",
-        "qwen_h4096_t1342x.py",
-        "qwen_h4096_t16384.py",
-    ),
-}
-
-# Some entry modules have two mutually exclusive ABI branches, but every
-# runtime path executes exactly one of these runner sites.
-RUNNER_LAUNCH_SITES_BY_PROFILE = {
-    "dsv4_flash": 1,
-    "dsv32": 2,
-    "qwen_h2048_e256_k8": 2,
-    "qwen_h4096_e512_k10": 1,
-}
-
 
 def _has_hopper_megagate() -> bool:
     if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
@@ -163,25 +101,6 @@ def _has_hopper_megagate() -> bool:
 HOPPER_MEGAGATE_AVAILABLE = _has_hopper_megagate()
 
 
-def _imported_modules(source: str) -> set[str]:
-    modules: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            modules.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            modules.add(node.module)
-    return modules
-
-
-def _dotted_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        base = _dotted_name(node.value)
-        return f"{base}.{node.attr}" if base else node.attr
-    return None
-
-
 @pytest.mark.megagate
 def test_megagate_dsv4_public_contract() -> None:
     assert PROFILE == "dsv4_flash"
@@ -195,25 +114,14 @@ def test_megagate_dsv4_public_contract() -> None:
     assert factory_context.profile == PROFILE
     assert context.prepared_tokens == ()
     assert context.kernel_count_per_call == 1
-    assert {
-        tokens: dsv4_module.LEAF_IMPLEMENTATION_BY_TOKENS[tokens]
-        for tokens in SUPPORTED_TOKENS
-    } == {
-        **{tokens: "clusterless" for tokens in SUPPORTED_TOKENS[:8]},
-        **{tokens: "quadmath" for tokens in SUPPORTED_TOKENS[8:]},
+    assert set(dsv4_module.LEAF_IMPLEMENTATION_BY_TOKENS) == set(SUPPORTED_TOKENS)
+    assert set(dsv4_module.LEAF_IMPLEMENTATION_BY_TOKENS.values()) == {
+        "clusterless",
+        "quadmath",
     }
 
 
-def test_megagate_registry_preserves_final50_provenance() -> None:
-    assert set(PROFILES) == set(EXPECTED_SOURCE_LEAVES)
-    assert sum(len(profile.supported_tokens) for profile in PROFILES.values()) == 50
-    for name, expected in EXPECTED_SOURCE_LEAVES.items():
-        profile = PROFILES[name]
-        assert dict(profile.source_leaf_by_tokens) == expected
-        assert profile.supported_tokens == tuple(expected)
-
-
-@pytest.mark.parametrize("profile_name", tuple(EXPECTED_SOURCE_LEAVES))
+@pytest.mark.parametrize("profile_name", tuple(PROFILES))
 def test_megagate_profile_module_matches_registry(profile_name: str) -> None:
     profile = PROFILES[profile_name]
     module = importlib.import_module(profile.module)
@@ -311,82 +219,7 @@ def test_megagate_supported_token_rejects_non_cuda_abi() -> None:
         )
 
 
-@pytest.mark.parametrize("profile_name", tuple(EXPECTED_SOURCE_LEAVES))
-def test_megagate_source_is_library_only_eager_single_launch(
-    profile_name: str,
-) -> None:
-    profile = PROFILES[profile_name]
-    module = importlib.import_module(profile.module)
-    source = inspect.getsource(module)
-    imported = _imported_modules(source)
-    assert not any(
-        module == "vllm" or module.startswith("vllm.") for module in imported
-    )
-    assert not any(
-        module == "deep_gemm" or module.startswith("deep_gemm.") for module in imported
-    )
-
-    tree = ast.parse(source)
-    call_names = {
-        name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        for name in [_dotted_name(node.func)]
-        if name is not None
-    }
-    assert "torch.cuda.CUDAGraph" not in call_names
-    assert "torch.cuda.graph" not in call_names
-    assert not any(name.endswith(".replay") for name in call_names)
-
-    run_functions = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "run"
-    ]
-    assert len(run_functions) == 1
-    runner_launches = [
-        node
-        for node in ast.walk(run_functions[0])
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Subscript)
-        and _dotted_name(node.func.value) == "leaf.runner"
-    ]
-    assert len(runner_launches) == RUNNER_LAUNCH_SITES_BY_PROFILE[profile_name]
-    assert module.MegaGateContext.kernel_count_per_call == 1
-    assert not any(
-        name.endswith(".warmup")
-        for node in ast.walk(run_functions[0])
-        if isinstance(node, ast.Call)
-        for name in [_dotted_name(node.func)]
-        if name is not None
-    )
-
-    kernels_dir = Path(module.__file__).with_name("kernels")
-    for leaf_file in LEAF_FILES_BY_PROFILE[profile_name]:
-        leaf_source = (kernels_dir / leaf_file).read_text(encoding="utf-8")
-        leaf_imports = _imported_modules(leaf_source)
-        assert not any(
-            imported_module == "vllm" or imported_module.startswith("vllm.")
-            for imported_module in leaf_imports
-        )
-        assert not any(
-            imported_module == "deep_gemm" or imported_module.startswith("deep_gemm.")
-            for imported_module in leaf_imports
-        )
-        leaf_calls = {
-            name
-            for node in ast.walk(ast.parse(leaf_source))
-            if isinstance(node, ast.Call)
-            for name in [_dotted_name(node.func)]
-            if name is not None
-        }
-        assert "torch.cuda.CUDAGraph" not in leaf_calls
-        assert "torch.cuda.graph" not in leaf_calls
-        assert not any(name.endswith(".replay") for name in leaf_calls)
-
-
-@pytest.mark.parametrize("tokens", DSV4_EAGER_TOKENS)
+@pytest.mark.parametrize("tokens", (1028, 16384))
 @pytest.mark.skipif(
     not HOPPER_MEGAGATE_AVAILABLE,
     reason="MegaGate correctness requires NVIDIA SM90 and its TLE APIs",

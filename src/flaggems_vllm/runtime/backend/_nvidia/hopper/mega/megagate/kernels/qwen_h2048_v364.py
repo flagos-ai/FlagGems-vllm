@@ -45,7 +45,6 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from . import qwen_h2048_helpers as _packed
-from . import qwen_h2048_helpers as _v369_helpers
 from . import qwen_h2048_helpers as _v370_helpers
 from .routing_primitives import ordered_score_key as _ordered_score_key
 from .routing_primitives import warp_broadcast_f32 as _warp_broadcast_f32
@@ -72,17 +71,6 @@ NUM_ROUTE_ROUNDS: Final = (
 ) // TOKENS_PER_ROUTE_ROUND
 CANDIDATE_WORDS: Final = 4
 CANDIDATE_RECORD_WORDS: Final = LOCAL_TOPK * CANDIDATE_WORDS
-TOKENS_PER_TERMINAL_WARP: Final = 2
-TERMINAL_TOKENS_PER_ROUND: Final = (
-    LOGICAL_ROLES * PHYSICAL_WARPS_PER_ROLE * TOKENS_PER_TERMINAL_WARP
-)
-NUM_TERMINAL_MERGE_ROUNDS: Final = (
-    BLOCK_TOKENS + TERMINAL_TOKENS_PER_ROUND - 1
-) // TERMINAL_TOKENS_PER_ROUND
-TOKENS_PER_WIDTH2_WARP: Final = 16
-TERMINAL_MERGE_WARPS: Final = (
-    BLOCK_TOKENS + TOKENS_PER_WIDTH2_WARP - 1
-) // TOKENS_PER_WIDTH2_WARP
 LOADER_MAXNREG: Final = 64
 MATH_MAXNREG: Final = 176
 ROUTE_MAXNREG: Final = 96
@@ -112,9 +100,6 @@ assert TOKENS_PER_ROUTE_ROUND == 16
 assert NUM_ROUTE_ROUNDS == 5
 assert CANDIDATE_RECORD_WORDS == 32
 assert CANDIDATE_RECORD_WORDS <= EXPERTS_PER_CTA
-assert TERMINAL_TOKENS_PER_ROUND == 32
-assert NUM_TERMINAL_MERGE_ROUNDS == 3
-assert TERMINAL_MERGE_WARPS == 5
 assert REGISTER_BUDGET == 65_536
 assert PIPE_BYTES_PER_STAGE == 53_248
 assert NOMINAL_PIPE_BYTES == 212_992
@@ -137,59 +122,11 @@ JIT_TOKENS_PER_ROUTE_ROUND = tl.constexpr(TOKENS_PER_ROUTE_ROUND)
 JIT_NUM_ROUTE_ROUNDS = tl.constexpr(NUM_ROUTE_ROUNDS)
 JIT_CANDIDATE_WORDS = tl.constexpr(CANDIDATE_WORDS)
 JIT_CANDIDATE_RECORD_WORDS = tl.constexpr(CANDIDATE_RECORD_WORDS)
-JIT_NUM_TERMINAL_MERGE_ROUNDS = tl.constexpr(NUM_TERMINAL_MERGE_ROUNDS)
-JIT_TERMINAL_MERGE_WARPS = tl.constexpr(TERMINAL_MERGE_WARPS)
 JIT_MATH_MAXNREG = tl.constexpr(MATH_MAXNREG)
 JIT_ROUTE_MAXNREG = tl.constexpr(ROUTE_MAXNREG)
 JIT_STATE_WORDS_PER_TILE = tl.constexpr(STATE_WORDS_PER_TILE)
 JIT_TICKET_WORD = tl.constexpr(TICKET_WORD)
 JIT_NUM_PRODUCERS_PER_TILE = tl.constexpr(NUM_PRODUCERS_PER_TILE)
-
-CUDA_V030_PATCH: Final = (
-    "v030_qwen_h2048_b80_e128_clusterless/"
-    "0025-sm90-qwen-h2048-b80-e128-clusterless.patch"
-)
-CUDA_V030_SHA256: Final = (
-    "85dfc676c58f29a350f0b8a782397972" "8c4b0a8976eaa5d1f9e3f90659737f24"
-)
-
-SCHEDULE: Final = {
-    "backend": "tle_sm90_qwen_h2048_b80_e128_clusterless",
-    "lineage": "cuda_v036_b80_e128_clusterless_native_m64n80k16",
-    "release_status": "formal_2026_11_11_no_graph_admitted",
-    "kernel_count": 1,
-    "hidden": HIDDEN,
-    "experts": EXPERTS,
-    "topk": TOPK,
-    "tokens": SUPPORTED_TOKENS,
-    "block_tokens": BLOCK_TOKENS,
-    "experts_per_cta": EXPERTS_PER_CTA,
-    "logical_expert_ctas": LOGICAL_EXPERT_CTAS,
-    "cluster_size": 1,
-    "block_k": BLOCK_K,
-    "pipe_stages": PIPE_STAGES,
-    "physical_wgmma_shape": "m64n80k16",
-    "wgmma_wait_group": 0,
-    "weight_tma": "single_e128_then_e64_smem_subslice",
-    "tma_copies_per_k_tile": 2,
-    "role_layout": (
-        "loader+local_top8+merge0 / math0+local_top8+merge1 / "
-        "math1+local_top8+arrival+merge2 / local_top8+merge3"
-    ),
-    "route_loop": ("producer_local_top8_then_terminal_two_list_halfwarp16_merge"),
-    "threads": TOTAL_THREADS,
-    "register_budget": REGISTER_BUDGET,
-    "nominal_pipe_bytes": NOMINAL_PIPE_BYTES,
-    "score": "bf16_boundary_fp32_softmax_stable_top8_renorm",
-    "candidate_abi": "separate_cuda_v030_16B_candidate_x8_per_e128",
-    "candidate_workspace": "[T,2,32] fp32",
-    "workspace_contract": "full_fp32_logits_plus_candidate_scratch",
-    "synchronization": ("u32_gpu_release_inc_two_producer_last_arriver_then_acquire"),
-    "padding": False,
-    "fallback": False,
-    "source_cuda_patch": CUDA_V030_PATCH,
-    "source_cuda_patch_sha256": CUDA_V030_SHA256,
-}
 
 
 @triton.jit
@@ -515,152 +452,6 @@ def _publish_local_top8_role(
             selected_expert,
             valid_token & (lane < JIT_LOCAL_TOPK),
         )
-
-
-@triton.jit
-def _merge_two_local_top8_width2_role(
-    candidate_scratch_ptr,
-    topk_indices_ptr,
-    topk_weights_ptr,
-    terminal_smem,
-    token_base,
-    tokens: tl.constexpr,
-    role_id: tl.constexpr,
-):
-    """Merge the two producer-local lists with 16 tokens per warp."""
-
-    if role_id * JIT_PHYSICAL_WARPS_PER_ROLE < JIT_TERMINAL_MERGE_WARPS:
-        terminal = tl.load(tle.gpu.local_ptr(terminal_smem, (0,)))
-        if terminal != 0:
-            route = tl.arange(0, 128)
-            routing_warp = route // 32
-            lane = route % 32
-            token_group = lane // 2
-            subwarp_lane = lane % 2
-            terminal_warp = role_id * JIT_PHYSICAL_WARPS_PER_ROLE + routing_warp
-            active_warp = terminal_warp < JIT_TERMINAL_MERGE_WARPS
-            local_token = terminal_warp * 16 + token_group
-            token = token_base + local_token
-            valid_token = (
-                active_warp & (local_token < JIT_BLOCK_TOKENS) & (token < tokens)
-            )
-            safe_token = tl.where(valid_token, token, token_base)
-            producer = subwarp_lane.to(tl.uint32)
-            candidate = (
-                candidate_scratch_ptr
-                + (safe_token * JIT_LOGICAL_EXPERT_CTAS + producer)
-                * JIT_CANDIDATE_RECORD_WORDS
-            )
-            head_score, head_expert = _load_packed_candidate_word(
-                candidate, valid_token
-            )
-            head_key = _ordered_score_key(head_score).to(tl.uint32)
-            cursor = tl.zeros((128,), dtype=tl.uint32)
-            selected_score0 = tl.zeros((128,), dtype=tl.float32)
-            selected_score1 = tl.zeros((128,), dtype=tl.float32)
-            selected_score2 = tl.zeros((128,), dtype=tl.float32)
-            selected_score3 = tl.zeros((128,), dtype=tl.float32)
-            selected_expert0 = tl.zeros((128,), dtype=tl.uint32)
-            selected_expert1 = tl.zeros((128,), dtype=tl.uint32)
-            selected_expert2 = tl.zeros((128,), dtype=tl.uint32)
-            selected_expert3 = tl.zeros((128,), dtype=tl.uint32)
-            top1 = tl.zeros((128,), dtype=tl.float32)
-
-            for output_idx in tl.static_range(0, JIT_TOPK):
-                best_expert = _v369_helpers._pair2_stable_best_expert(
-                    head_key, head_expert
-                )
-                source_list = best_expert // JIT_EXPERTS_PER_CTA
-                best_score = _v369_helpers._pair2_broadcast_f32(head_score, source_list)
-                if output_idx == 0:
-                    top1 = best_score
-                output_slot = output_idx // 2
-                owns_output = subwarp_lane == (output_idx & 1)
-                if output_slot == 0:
-                    selected_score0 = tl.where(owns_output, best_score, selected_score0)
-                    selected_expert0 = tl.where(
-                        owns_output, best_expert, selected_expert0
-                    )
-                elif output_slot == 1:
-                    selected_score1 = tl.where(owns_output, best_score, selected_score1)
-                    selected_expert1 = tl.where(
-                        owns_output, best_expert, selected_expert1
-                    )
-                elif output_slot == 2:
-                    selected_score2 = tl.where(owns_output, best_score, selected_score2)
-                    selected_expert2 = tl.where(
-                        owns_output, best_expert, selected_expert2
-                    )
-                else:
-                    selected_score3 = tl.where(owns_output, best_score, selected_score3)
-                    selected_expert3 = tl.where(
-                        owns_output, best_expert, selected_expert3
-                    )
-                owns_best = head_expert == best_expert
-                if output_idx + 1 < JIT_TOPK:
-                    cursor += owns_best.to(tl.uint32)
-                    next_candidate = (
-                        candidate_scratch_ptr
-                        + (safe_token * JIT_LOGICAL_EXPERT_CTAS + producer)
-                        * JIT_CANDIDATE_RECORD_WORDS
-                        + cursor * JIT_CANDIDATE_WORDS
-                    )
-                    next_score, next_expert = _load_packed_candidate_word(
-                        next_candidate, valid_token & owns_best
-                    )
-                    next_key = _ordered_score_key(next_score).to(tl.uint32)
-                    head_score = tl.where(owns_best, next_score, head_score)
-                    head_expert = tl.where(owns_best, next_expert, head_expert)
-                    head_key = tl.where(owns_best, next_key, head_key)
-
-            has_finite = top1 != -float("inf")
-            exp0 = tl.where(has_finite, libdevice.exp(selected_score0 - top1), 0.0)
-            exp1 = tl.where(has_finite, libdevice.exp(selected_score1 - top1), 0.0)
-            exp2 = tl.where(has_finite, libdevice.exp(selected_score2 - top1), 0.0)
-            exp3 = tl.where(has_finite, libdevice.exp(selected_score3 - top1), 0.0)
-            local_sum = (exp0 + exp2) + (exp1 + exp3)
-            denominator = _v369_helpers._pair2_sum_f32(local_sum) + 1.0e-20
-            output_base = token * JIT_TOPK + subwarp_lane
-            tl.store(
-                topk_indices_ptr + output_base,
-                selected_expert0.to(tl.int32),
-                mask=valid_token,
-            )
-            tl.store(
-                topk_weights_ptr + output_base,
-                exp0 / denominator,
-                mask=valid_token,
-            )
-            tl.store(
-                topk_indices_ptr + output_base + 2,
-                selected_expert1.to(tl.int32),
-                mask=valid_token,
-            )
-            tl.store(
-                topk_weights_ptr + output_base + 2,
-                exp1 / denominator,
-                mask=valid_token,
-            )
-            tl.store(
-                topk_indices_ptr + output_base + 4,
-                selected_expert2.to(tl.int32),
-                mask=valid_token,
-            )
-            tl.store(
-                topk_weights_ptr + output_base + 4,
-                exp2 / denominator,
-                mask=valid_token,
-            )
-            tl.store(
-                topk_indices_ptr + output_base + 6,
-                selected_expert3.to(tl.int32),
-                mask=valid_token,
-            )
-            tl.store(
-                topk_weights_ptr + output_base + 6,
-                exp3 / denominator,
-                mask=valid_token,
-            )
 
 
 @triton.jit

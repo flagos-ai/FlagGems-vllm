@@ -102,38 +102,6 @@ JIT_NUM_ROUTE_ROUNDS = tl.constexpr(NUM_ROUTE_ROUNDS)
 JIT_TIE_MASK = tl.constexpr(0xFFFF)
 
 
-SCHEDULE: Final = {
-    "backend": "tle_sm90_v367_qwen_h2048_e256_t16384_b128_compile_light",
-    "lineage": "v363_without_nonpower_fragment_graph",
-    "source_cuda": "v032_qwen_h2048_single_producer_direct_finalize",
-    "kernel_count": 1,
-    "tokens": TOKENS,
-    "block_tokens": BLOCK_TOKENS,
-    "experts_per_cta": EXPERTS,
-    "experts_per_math_warpgroup": EXPERTS_PER_MATH,
-    "math_warpgroups": PHYSICAL_MATH_ROLES,
-    "logical_expert_atoms": EXPERT_ATOMS,
-    "threads": TOTAL_THREADS,
-    "route_loop": "five_roles_x_four_warps_direct_finalize",
-    "cluster_size": 1,
-    "pipe_stages": PIPE_STAGES,
-    "x_fragments": (BLOCK_TOKENS,),
-    "score": "bf16_boundary_stable_top8_selected_logit_renorm",
-    "candidate_workspace": False,
-    "workspace_contract": "full_fp32_logits_no_candidate_workspace",
-    "padding": False,
-    "fallback": False,
-    "resource_fix": (
-        "packed_e256_weight_field_native_layout_store_removes_transpose_scratch"
-    ),
-    "lowering_workaround": (
-        "avoid_split_field_first_b_descriptor_mis_lowering_without_patching_flagtree"
-    ),
-    "thread_fix": "independent_loader_plus_four_balanced_single_math_wg",
-    "release_status": "formal_2026_11_11_no_graph_admitted",
-}
-
-
 @triton.jit
 def _load_ticket_b128(
     writer,

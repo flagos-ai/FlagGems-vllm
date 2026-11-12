@@ -15,16 +15,14 @@
 """Small SM90 routing primitives shared by TLE MegaGate variants.
 
 The functions deliberately preserve the instruction-level behavior used by
-the validated T=1 and T=512 routing selectors: precise sqrt-softplus, an
-ordered unsigned score key, warp-wide integer reductions, one-lane broadcast,
-and an eight-lane FP32 sum.
+the validated routing selectors: an ordered unsigned score key, warp-wide
+integer reductions, one-lane broadcast, and an eight-lane FP32 sum.
 """
 
 from __future__ import annotations
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -37,13 +35,6 @@ def ordered_score_key(score):
         ~bits,
         bits ^ 0x80000000,
     )
-
-
-@triton.jit
-def precise_sqrt_softplus(raw):
-    exponential = libdevice.exp(raw)
-    softplus = libdevice.log1p(exponential)
-    return libdevice.sqrt(tl.where(raw > 20.0, raw, softplus))
 
 
 @triton.jit

@@ -114,69 +114,6 @@ CLUSTER4_MESH = tle.device_mesh(
     tle.MeshConfig(block_cluster=[("cluster_x", CLUSTER_SIZE)])
 )
 
-CUDA_V014_PATCH: Final = (
-    "v014_qwen_eager_prepared_plan/" "0010-sm90-qwen-eager-prepared-plan.patch"
-)
-CUDA_V014_SHA256: Final = (
-    "8c27b45b3c4d82d0e60b361b643cc435" "58a929a4c23c6c79314ae58cec3b39b4"
-)
-CUDA_V016_PATCH: Final = (
-    "v016_qwen_producer_local_topk_terminal/"
-    "0012-sm90-qwen-producer-local-topk-terminal.patch"
-)
-CUDA_V016_SHA256: Final = (
-    "c6b237e42432dc052686f95f331dd6d42" "de4d9a4b1289129c4faef57da11820b"
-)
-CUDA_V017_PATCH: Final = (
-    "v017_qwen_producer_local_topk_bf16_fix/"
-    "0013-sm90-qwen-producer-local-topk-bf16-fix.patch"
-)
-CUDA_V017_SHA256: Final = (
-    "38d3fcf8e9f7d46d45e42f9e5d14fcf6" "38cb9cc9e19a27e359ace0c779fc9391"
-)
-V014C_RUNTIME: Final = "qwen_h2048_small6_v014c_runtime_gpu0/runtime_common.py"
-V014C_RUNTIME_SHA256: Final = (
-    "ca2e48a6141c685040582a89609aaba3" "98d59c1347259e3596adfebaa3784317"
-)
-
-SCHEDULE: Final = {
-    "backend": "tle_sm90_qwen_h2048_v014c_small6_cluster4",
-    "lineage": "cuda_v014c_prepared_generic_b128_e64_cluster4",
-    "release_status": "formal_2026_11_11_no_graph_admitted",
-    "kernel_count": 1,
-    "device_kernel_count": 1,
-    "runtime_kernel_launch_count": 1,
-    "hidden": HIDDEN,
-    "experts": EXPERTS,
-    "topk": TOPK,
-    "tokens": SUPPORTED_TOKENS,
-    "block_tokens": BLOCK_TOKENS,
-    "experts_per_cta": EXPERTS_PER_CTA,
-    "cluster_size": CLUSTER_SIZE,
-    "block_k": BLOCK_K,
-    "pipe_stages": PIPE_STAGES,
-    "compile_time_leaf": {
-        **{tokens: "direct_math_route_256_threads" for tokens in DIRECT_TOKENS},
-        3104: "pipeline_dedicated_route_384_threads",
-    },
-    "score": "bf16_boundary_fp32_softmax_stable_top8_renorm",
-    "candidate_workspace": False,
-    "workspace_contract": "full_fp32_logits_no_candidate_workspace",
-    "synchronization": "cluster4_global_monotonic_ticket_ready",
-    "padding": False,
-    "fallback": False,
-    "concurrent_replay_safe": False,
-    "registered": True,
-    "default_dispatch": True,
-    "release_allowlist": True,
-    "source_cuda_patches": (
-        CUDA_V014_PATCH,
-        CUDA_V016_PATCH,
-        CUDA_V017_PATCH,
-    ),
-    "source_runtime_contract": V014C_RUNTIME,
-}
-
 
 @triton.jit
 def _loader_role(writer, weight_desc, x_desc, expert_base, token_base):
