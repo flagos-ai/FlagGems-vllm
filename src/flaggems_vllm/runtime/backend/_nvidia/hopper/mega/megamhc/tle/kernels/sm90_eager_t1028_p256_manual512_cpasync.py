@@ -48,7 +48,6 @@ TAIL_PHASE = 3
 TAIL_BATCHES = 32
 TAIL_MODE = "x8"
 TAIL_CHUNK = 128
-USE_FN_TMA = False
 MAXNREG = 64
 
 JIT_TOKENS = tl.constexpr(TOKENS)
@@ -64,7 +63,6 @@ JIT_TAIL_PHASE = tl.constexpr(TAIL_PHASE)
 JIT_TAIL_BATCHES = tl.constexpr(TAIL_BATCHES)
 JIT_X8_TAIL = tl.constexpr(True)
 JIT_TAIL_CHUNK = tl.constexpr(TAIL_CHUNK)
-JIT_USE_FN_TMA = tl.constexpr(USE_FN_TMA)
 
 
 @triton.jit
@@ -204,7 +202,6 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
     new_post_mix_ptr,
     new_comb_res_mix_ptr,
     y_bf16_ptr,
-    fn_tensormap_ptr,
     debug_partials_ptr,
     partials_ptr,
     tile_states_ptr,
@@ -215,7 +212,6 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
     sinkhorn_eps,
     rmsnorm_eps,
     rmsnorm_scale,
-    ENABLE_TAIL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     full_grid = JIT_FULL_M_TILES * JIT_FULL_TILE_SPLITS
@@ -260,13 +256,6 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
     projection_shared = tle.gpu.alloc(
         [JIT_BLOCK_M, JIT_BLOCK_N],
         dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    fn_tma_barriers = tle.gpu.alloc(
-        [8],
-        dtype=tl.uint64,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
@@ -321,218 +310,210 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
         _shared_address(tle.gpu.local_ptr(projection_shared, (0, 0))),
         tile,
         active_k64_blocks,
-        tl.cast(fn_tensormap_ptr, tl.uint64),
-        _shared_address(tle.gpu.local_ptr(fn_tma_barriers, (0,))),
-        JIT_USE_FN_TMA,
         JIT_TOKENS,
     )
 
-    if ENABLE_TAIL:
-        # The isolated projection PTX has already converged all sixteen warps
-        # and written columns 0..24 directly into the compact split plane.
-        # All 136 CTAs fit concurrently (2 blocks/SM x 132 SMs = 264).
-        # The acquire/release barrier makes all eight split partials visible
-        # before split zero performs this tile's uniform manual512 tail.
-        _tile_split_barrier(tile_states_ptr + tile * 2, num_splits - 1)
-        if JIT_X8_TAIL:
-            physical_thread = _physical_thread_id_x()
-            physical_warp = physical_thread // 32
-            lane = physical_thread % 32
-            pre_base = (
-                partials_ptr + (tile * JIT_MAX_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 25
-            )
-            if JIT_TAIL_PHASE >= 2:
-                # Eight warp owners per split route disjoint rows.  The eight
-                # split CTAs therefore cover all 64 tokens concurrently.
-                if physical_warp < rows_per_split:
-                    route_row = split * rows_per_split + physical_warp
-                    packed_route = 0.0
-                    for source_split in tl.static_range(0, JIT_MAX_SPLITS):
-                        source_offset = (
-                            (tile * JIT_MAX_SPLITS + source_split) * JIT_BLOCK_M
-                            + route_row
-                        ) * JIT_BLOCK_N + lane
-                        packed_route += tl.load(
-                            partials_ptr + source_offset,
-                            mask=(lane <= 24) & (source_split < num_splits),
-                            other=0.0,
-                        )
-                    route_token = tile * JIT_BLOCK_M + route_row
-                    if route_token < JIT_TOKENS:
-                        _routing_finalize_no_barrier(
-                            pre_base + route_row * JIT_BLOCK_N,
-                            mix_scales_ptr,
-                            mix_bases_ptr,
-                            new_post_mix_ptr + route_token * JIT_HC_MULT,
-                            new_comb_res_mix_ptr
-                            + route_token * JIT_HC_MULT * JIT_HC_MULT,
-                            packed_route,
-                            lane,
-                            hc_norm_eps,
-                            hc_pre_eps,
-                            hc_post_scale,
-                            sinkhorn_eps,
-                        )
-                _manual512_cta_sync()
+    # The isolated projection PTX has already converged all sixteen warps
+    # and written columns 0..24 directly into the compact split plane.
+    # All 136 CTAs fit concurrently (2 blocks/SM x 132 SMs = 264).
+    # The acquire/release barrier makes all eight split partials visible
+    # before split zero performs this tile's uniform manual512 tail.
+    _tile_split_barrier(tile_states_ptr + tile * 2, num_splits - 1)
+    if JIT_X8_TAIL:
+        physical_thread = _physical_thread_id_x()
+        physical_warp = physical_thread // 32
+        lane = physical_thread % 32
+        pre_base = (
+            partials_ptr + (tile * JIT_MAX_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 25
+        )
+        if JIT_TAIL_PHASE >= 2:
+            # Eight warp owners per split route disjoint rows.  The eight
+            # split CTAs therefore cover all 64 tokens concurrently.
+            if physical_warp < rows_per_split:
+                route_row = split * rows_per_split + physical_warp
+                packed_route = 0.0
+                for source_split in tl.static_range(0, JIT_MAX_SPLITS):
+                    source_offset = (
+                        (tile * JIT_MAX_SPLITS + source_split) * JIT_BLOCK_M + route_row
+                    ) * JIT_BLOCK_N + lane
+                    packed_route += tl.load(
+                        partials_ptr + source_offset,
+                        mask=(lane <= 24) & (source_split < num_splits),
+                        other=0.0,
+                    )
+                route_token = tile * JIT_BLOCK_M + route_row
+                if route_token < JIT_TOKENS:
+                    _routing_finalize_no_barrier(
+                        pre_base + route_row * JIT_BLOCK_N,
+                        mix_scales_ptr,
+                        mix_bases_ptr,
+                        new_post_mix_ptr + route_token * JIT_HC_MULT,
+                        new_comb_res_mix_ptr + route_token * JIT_HC_MULT * JIT_HC_MULT,
+                        packed_route,
+                        lane,
+                        hc_norm_eps,
+                        hc_pre_eps,
+                        hc_post_scale,
+                        sinkhorn_eps,
+                    )
+            _manual512_cta_sync()
 
-            if JIT_TAIL_PHASE >= 3:
-                # Each routing owner keeps at most four rows and processes all
-                # H4096 columns.  The retired 64KiB projection ring stores the
-                # complete BF16 boundary, so no second cross-CTA barrier or
-                # eight-way square reduction is needed.
-                owned_row_base = split * rows_per_split
-                owned_rows = tl.maximum(
-                    0, tl.minimum(rows_per_split, live_rows - owned_row_base)
-                )
-                owned_token_base = tile * JIT_BLOCK_M + owned_row_base
-                owned_pre_base = pre_base + owned_row_base * JIT_BLOCK_N
-                residual_base = (
-                    new_residual_ptr + owned_token_base * JIT_HC_MULT * JIT_HIDDEN
-                )
-                y_base = y_bf16_ptr + owned_token_base * JIT_HIDDEN
-                square_base = tail_squares_ptr + pid * 4 * 16
-                _token_shard_combine_bf16x8_ptx(
-                    owned_pre_base,
-                    residual_base,
-                    q_stages.slot(0),
-                    square_base,
-                    physical_thread,
-                    0,
-                    64,
-                    owned_rows,
-                    4096,
-                    256,
-                    0,
-                    8,
-                    1,
-                    128,
-                    64,
-                )
-                _token_shard_combine_bf16x8_ptx(
-                    owned_pre_base,
-                    residual_base,
-                    q_stages.slot(0),
-                    square_base,
-                    physical_thread,
-                    256,
-                    64,
-                    owned_rows,
-                    4096,
-                    2304,
-                    4,
-                    8,
-                    1,
-                    128,
-                    64,
-                )
-                _token_shard_combine_bf16x8_ptx(
-                    owned_pre_base,
-                    residual_base,
-                    fn_stages.slot(0),
-                    square_base,
-                    physical_thread,
-                    512,
-                    64,
-                    owned_rows,
-                    4096,
-                    256,
-                    8,
-                    8,
-                    1,
-                    128,
-                    64,
-                )
-                _token_shard_combine_bf16x8_ptx(
-                    owned_pre_base,
-                    residual_base,
-                    fn_stages.slot(0),
-                    square_base,
-                    physical_thread,
-                    768,
-                    64,
-                    owned_rows,
-                    4096,
-                    2304,
-                    12,
-                    8,
-                    1,
-                    128,
-                    64,
-                )
-                _manual512_cta_sync()
-                tail_rows = tl.arange(0, 4)
-                square_columns = tl.arange(0, 16)
-                square_values = tl.load(
-                    square_base + tail_rows[:, None] * 16 + square_columns[None, :],
-                    mask=tail_rows[:, None] < owned_rows,
-                    other=0.0,
-                )
-                total_square = tl.sum(square_values, axis=1)
-                row_norm = (
-                    tl.rsqrt(total_square / JIT_HIDDEN + rmsnorm_eps) * rmsnorm_scale
-                )
-                tl.store(
-                    square_base + tail_rows,
-                    row_norm,
-                    mask=tail_rows < owned_rows,
-                )
-                _manual512_cta_sync()
-                _token_shard_normalize_bf16x8_ptx(
-                    q_stages.slot(0),
-                    y_base,
-                    rmsnorm_weight_ptr,
-                    square_base,
-                    physical_thread,
-                    0,
-                    64,
-                    owned_rows,
-                    4096,
-                    256,
-                    8,
-                    1,
-                )
-                _token_shard_normalize_bf16x8_ptx(
-                    q_stages.slot(0),
-                    y_base,
-                    rmsnorm_weight_ptr,
-                    square_base,
-                    physical_thread,
-                    256,
-                    64,
-                    owned_rows,
-                    4096,
-                    2304,
-                    8,
-                    1,
-                )
-                _token_shard_normalize_bf16x8_ptx(
-                    fn_stages.slot(0),
-                    y_base,
-                    rmsnorm_weight_ptr,
-                    square_base,
-                    physical_thread,
-                    512,
-                    64,
-                    owned_rows,
-                    4096,
-                    256,
-                    8,
-                    1,
-                )
-                _token_shard_normalize_bf16x8_ptx(
-                    fn_stages.slot(0),
-                    y_base,
-                    rmsnorm_weight_ptr,
-                    square_base,
-                    physical_thread,
-                    768,
-                    64,
-                    owned_rows,
-                    4096,
-                    2304,
-                    8,
-                    1,
-                )
+        if JIT_TAIL_PHASE >= 3:
+            # Each routing owner keeps at most four rows and processes all
+            # H4096 columns.  The retired 64KiB projection ring stores the
+            # complete BF16 boundary, so no second cross-CTA barrier or
+            # eight-way square reduction is needed.
+            owned_row_base = split * rows_per_split
+            owned_rows = tl.maximum(
+                0, tl.minimum(rows_per_split, live_rows - owned_row_base)
+            )
+            owned_token_base = tile * JIT_BLOCK_M + owned_row_base
+            owned_pre_base = pre_base + owned_row_base * JIT_BLOCK_N
+            residual_base = (
+                new_residual_ptr + owned_token_base * JIT_HC_MULT * JIT_HIDDEN
+            )
+            y_base = y_bf16_ptr + owned_token_base * JIT_HIDDEN
+            square_base = tail_squares_ptr + pid * 4 * 16
+            _token_shard_combine_bf16x8_ptx(
+                owned_pre_base,
+                residual_base,
+                q_stages.slot(0),
+                square_base,
+                physical_thread,
+                0,
+                64,
+                owned_rows,
+                4096,
+                256,
+                0,
+                8,
+                1,
+                128,
+                64,
+            )
+            _token_shard_combine_bf16x8_ptx(
+                owned_pre_base,
+                residual_base,
+                q_stages.slot(0),
+                square_base,
+                physical_thread,
+                256,
+                64,
+                owned_rows,
+                4096,
+                2304,
+                4,
+                8,
+                1,
+                128,
+                64,
+            )
+            _token_shard_combine_bf16x8_ptx(
+                owned_pre_base,
+                residual_base,
+                fn_stages.slot(0),
+                square_base,
+                physical_thread,
+                512,
+                64,
+                owned_rows,
+                4096,
+                256,
+                8,
+                8,
+                1,
+                128,
+                64,
+            )
+            _token_shard_combine_bf16x8_ptx(
+                owned_pre_base,
+                residual_base,
+                fn_stages.slot(0),
+                square_base,
+                physical_thread,
+                768,
+                64,
+                owned_rows,
+                4096,
+                2304,
+                12,
+                8,
+                1,
+                128,
+                64,
+            )
+            _manual512_cta_sync()
+            tail_rows = tl.arange(0, 4)
+            square_columns = tl.arange(0, 16)
+            square_values = tl.load(
+                square_base + tail_rows[:, None] * 16 + square_columns[None, :],
+                mask=tail_rows[:, None] < owned_rows,
+                other=0.0,
+            )
+            total_square = tl.sum(square_values, axis=1)
+            row_norm = tl.rsqrt(total_square / JIT_HIDDEN + rmsnorm_eps) * rmsnorm_scale
+            tl.store(
+                square_base + tail_rows,
+                row_norm,
+                mask=tail_rows < owned_rows,
+            )
+            _manual512_cta_sync()
+            _token_shard_normalize_bf16x8_ptx(
+                q_stages.slot(0),
+                y_base,
+                rmsnorm_weight_ptr,
+                square_base,
+                physical_thread,
+                0,
+                64,
+                owned_rows,
+                4096,
+                256,
+                8,
+                1,
+            )
+            _token_shard_normalize_bf16x8_ptx(
+                q_stages.slot(0),
+                y_base,
+                rmsnorm_weight_ptr,
+                square_base,
+                physical_thread,
+                256,
+                64,
+                owned_rows,
+                4096,
+                2304,
+                8,
+                1,
+            )
+            _token_shard_normalize_bf16x8_ptx(
+                fn_stages.slot(0),
+                y_base,
+                rmsnorm_weight_ptr,
+                square_base,
+                physical_thread,
+                512,
+                64,
+                owned_rows,
+                4096,
+                256,
+                8,
+                1,
+            )
+            _token_shard_normalize_bf16x8_ptx(
+                fn_stages.slot(0),
+                y_base,
+                rmsnorm_weight_ptr,
+                square_base,
+                physical_thread,
+                768,
+                64,
+                owned_rows,
+                4096,
+                2304,
+                8,
+                1,
+            )
 
 
 def _require_tensor(value, *, name, shape, dtype):
@@ -559,7 +540,6 @@ class EagerT1028P256Manual512ProjectionPlan:
     scalars: tuple[float, ...]
     metadata: dict[str, object]
     maxnreg: int
-    tail_enabled: bool
 
     @property
     def grid_ctas(self) -> int:
@@ -573,7 +553,6 @@ class EagerT1028P256Manual512ProjectionPlan:
             self.tile_states,
             self.tail_squares,
             *self.scalars,
-            self.tail_enabled,
         )
 
     def compile(self):
@@ -674,10 +653,6 @@ def prepare_tle_sm90_projection(
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("all tensors must be on one CUDA device")
 
-    fn_tensormap_storage = torch.empty(
-        (1,), dtype=torch.uint8, device=tensors[0].device
-    )
-    kernel_tensors = (*tensors, fn_tensormap_storage)
     maxnreg = MAXNREG
     device = tensors[0].device
     debug_partials = torch.empty(
@@ -690,7 +665,6 @@ def prepare_tle_sm90_projection(
     )
     tile_states = torch.zeros((NUM_M_TILES, 2), dtype=torch.uint32, device=device)
     tail_squares = torch.empty((GRID_CTAS, 4, 16), dtype=torch.float32, device=device)
-    tail_enabled = True
     metadata: dict[str, object] = {
         "model": "DeepSeek-V4-Flash@60d8d707",
         "execution_mode": "eager",
@@ -717,8 +691,8 @@ def prepare_tle_sm90_projection(
         "a_storage": "K64 BF16 128B-swizzled shared",
         "fn_storage": "four-route cp.async FP32 ring",
         "wgmma": "persistent TF32 RS M64N32, internal K32 halves",
-        "projection_only": not tail_enabled,
-        "tail_enabled": tail_enabled,
+        "projection_only": False,
+        "tail_enabled": True,
         "tail_schedule": "token-sharded x8 PTX",
         "tail_mode": TAIL_MODE,
         "tail_chunk": TAIL_CHUNK,
@@ -728,7 +702,7 @@ def prepare_tle_sm90_projection(
         "dispatch_enabled": True,
     }
     return EagerT1028P256Manual512ProjectionPlan(
-        tensors=kernel_tensors,
+        tensors=tensors,
         debug_partials=debug_partials,
         partials=partials,
         tile_states=tile_states,
@@ -743,7 +717,6 @@ def prepare_tle_sm90_projection(
         ),
         metadata=metadata,
         maxnreg=maxnreg,
-        tail_enabled=tail_enabled,
     )
 
 
@@ -751,10 +724,7 @@ def prepare_tle_sm90_mega_mhc(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT1028P256Manual512ProjectionPlan:
     """Shape-exact production seam for the formally admitted full tail."""
-    plan = prepare_tle_sm90_projection(inputs, outputs)
-    if not plan.tail_enabled:
-        raise RuntimeError("the admitted T=1028 dispatch requires full tail")
-    return plan
+    return prepare_tle_sm90_projection(inputs, outputs)
 
 
 __all__ = [

@@ -1,4 +1,11 @@
-"""Raw M64N24K8 WGMMA helpers used by the production T=400 kernel."""
+"""Raw WGMMA helpers for the exact production ``T=400`` specialization.
+
+The sole admitted caller is DeepSeek-V4-Flash Normal BF16 with
+``H=4096, R=4, P=24``.  Its CTA topology is fixed at sixteen producer warps
+plus four math warps, and this helper performs the persistent M64N24 K64
+accumulation used by that one-kernel path.  No other T or experimental
+configuration is supported here.
+"""
 
 from __future__ import annotations
 

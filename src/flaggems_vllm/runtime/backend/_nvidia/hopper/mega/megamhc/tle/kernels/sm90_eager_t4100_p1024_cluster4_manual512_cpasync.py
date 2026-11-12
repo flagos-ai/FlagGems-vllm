@@ -65,10 +65,7 @@ def prepare_tle_sm90_mega_mhc(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT4100P1024Cluster4Manual512ProjectionPlan:
     """Shape-exact full-operator seam; still exactly one TLE launch."""
-    plan = prepare_tle_sm90_projection(inputs, outputs)
-    if not plan.tail_enabled:
-        raise RuntimeError("the T=4100 cluster4 experiment requires full tail")
-    return plan
+    return prepare_tle_sm90_projection(inputs, outputs)
 
 
 __all__ = [
