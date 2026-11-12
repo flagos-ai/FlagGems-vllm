@@ -21,6 +21,9 @@ from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
+from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -29,6 +32,7 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.runtime.backend._metax.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
@@ -57,8 +61,10 @@ else:
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "gdn_w8a16",
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",

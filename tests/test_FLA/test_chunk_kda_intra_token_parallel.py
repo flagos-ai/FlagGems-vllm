@@ -1,7 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 import itertools
 
 import pytest
@@ -354,20 +353,6 @@ def test_chunk_kda_intra_token_parallel_invalid(invalid):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.chunk_kda_fwd_intra_token_parallel
-def test_chunk_kda_intra_token_parallel_fla_reference(dtype, packed):
-    # Optional external cross-check; the independent oracle above is mandatory.
-    pytest.importorskip("fla")
-    native = importlib.import_module(
-        "fla.ops.kda.chunk_intra_token_parallel"
-    ).chunk_kda_fwd_intra_token_parallel
+def test_chunk_kda_intra_token_parallel_grouped_heads(dtype, packed):
     case = ((1, 17, 35) if packed else (65,), packed, 2, 6, 33, 64, 16)
-    args, cu, _ = _inputs(case, dtype)
-    q, k, g, beta, a, b = args
-    na, nb = a.clone(), b.clone()
-    native(q, k, g, beta, na, nb, 0.5, cu_seqlens=cu, use_graph=False)
-    op(*args, 0.5, cu_seqlens=cu)
-    for actual, expected in ((a, na), (b, nb)):
-        rtol, atol = TOLERANCES[actual.dtype]
-        torch.testing.assert_close(
-            actual, expected, rtol=rtol, atol=atol, equal_nan=True
-        )
+    _check(case, dtype, scale=0.5)

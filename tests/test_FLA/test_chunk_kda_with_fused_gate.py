@@ -7,6 +7,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+DENSE_FLAG_CASE = (1, 64, 2, 128, 128, None)
+PACKED_FLAG_CASE = (1, 198, 2, 128, 128, (63, 64, 71))
+
 CASES = [
     (1, 1, 2, 64, 64, None),
     (2, 15, 2, 64, 32, None),
@@ -14,22 +17,20 @@ CASES = [
     (1, 17, 2, 33, 40, None),
     (1, 31, 2, 64, 64, None),
     (1, 32, 2, 128, 128, None),
-    (1, 33, 2, 64, 80, None),
-    (1, 63, 2, 128, 64, None),
-    (1, 64, 2, 128, 128, None),
+    (1, 33, 2, 64, 64, None),
+    (1, 63, 2, 128, 128, None),
+    DENSE_FLAG_CASE,
     (1, 65, 2, 128, 128, None),
     (1, 127, 2, 256, 80, None),
     (1, 129, 2, 64, 96, None),
     (1, 83, 2, 64, 64, (65, 1, 17)),
-    (1, 198, 2, 128, 128, (63, 64, 71)),
+    PACKED_FLAG_CASE,
 ]
 
 
 def get_op():
-    if os.environ.get("FG_KDA_PROVIDER") == "native":
-        from vllm.model_executor.layers.fla.ops.kda import chunk_kda_with_fused_gate
-    else:
-        from flaggems_vllm import chunk_kda_with_fused_gate
+    from flaggems_vllm import chunk_kda_with_fused_gate
+
     return chunk_kda_with_fused_gate
 
 
@@ -37,9 +38,6 @@ def device_name():
     explicit = os.environ.get("FG_KDA_DEVICE")
     if explicit is not None:
         return explicit
-    if os.environ.get("FG_KDA_PROVIDER") == "native":
-        # The isolated native runner supplies its backend explicitly.
-        return "cuda"
     import flaggems_vllm
 
     return flaggems_vllm.device
@@ -135,8 +133,18 @@ def check(actual, expected, dtype):
 
 @pytest.mark.chunk_kda_with_fused_gate
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("case", CASES)
-@pytest.mark.parametrize("flags", [False, True])
+@pytest.mark.parametrize(
+    ("case", "flags"),
+    [
+        # Independent flag coverage lives in test_chunk_kda_with_fused_gate_independent_flags.
+        pytest.param(case, True, id=f"all-flags-case{index}")
+        for index, case in enumerate(CASES)
+    ]
+    + [
+        pytest.param(DENSE_FLAG_CASE, False, id="no-flags-dense"),
+        pytest.param(PACKED_FLAG_CASE, False, id="no-flags-packed"),
+    ],
+)
 def test_chunk_kda_with_fused_gate_reference(case, dtype, flags):
     args, kw = build(case, dtype, norm=flags, state=flags, bias=flags, final=flags)
     expected = reference(args, kw)
@@ -191,7 +199,9 @@ def test_chunk_kda_with_fused_gate_beta_zero(dtype):
 
 @pytest.mark.chunk_kda_with_fused_gate
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("flags", range(16))
+# Even parity covers every triple of flags. The reference matrix also tests
+# all flags enabled and all flags disabled on dense and packed inputs.
+@pytest.mark.parametrize("flags", [0, 3, 5, 6, 9, 10, 12, 15])
 def test_chunk_kda_with_fused_gate_independent_flags(dtype, flags):
     args, kw = build(
         (1, 65, 2, 64, 40, None),
@@ -265,13 +275,13 @@ def test_chunk_kda_with_fused_gate_wide_key_metadata(dtype, lengths, noncontig):
 
 @pytest.mark.chunk_kda_with_fused_gate
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("flags", [False, True])
 @pytest.mark.parametrize(
-    "case",
+    "case,flags",
     [
-        (1, 17, 2, 1, 1, None),
-        (1, 65, 2, 7, 9, None),
-        (1, 83, 2, 16, 17, (65, 0, 18)),
+        ((1, 17, 2, 1, 1, None), False),
+        ((1, 17, 2, 1, 1, None), True),
+        ((1, 65, 2, 7, 9, None), True),
+        ((1, 83, 2, 16, 17, (65, 0, 18)), False),
     ],
 )
 def test_chunk_kda_with_fused_gate_small_dimensions(case, dtype, flags):

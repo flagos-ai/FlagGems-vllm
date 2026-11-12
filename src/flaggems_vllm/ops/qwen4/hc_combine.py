@@ -58,16 +58,33 @@ def _hc_combine_kernel(
                 value = block
             tl.store(O + row * HC * D + h * D + d, res + value, d < D)
     else:
-        h = tl.arange(0, triton.next_power_of_2(HC))
-        offsets = h[:, None] * D + d[None, :]
-        mask = (h[:, None] < HC) & (d[None, :] < D)
-        res = tl.load(R + row * SR + offsets, mask, other=0).to(tl.float32)
-        if HAS_INJECTION:
-            inj = tl.load(I + row * SI + h, h < HC, other=0).to(tl.float32)
-            value = block[None, :] * (2.0 * tl.sigmoid(inj / HC))[:, None]
-        else:
-            value = block[None, :]
-        tl.store(O + row * HC * D + offsets, res + value, mask)
+        _hc_combine_vectorized(R, I, O, block, row, d, D, SR, SI, HC, HAS_INJECTION)
+
+
+@triton.jit
+def _hc_combine_vectorized(
+    residual,
+    injection,
+    output,
+    block,
+    row,
+    d,
+    D,
+    SR,
+    SI,
+    HC: tl.constexpr,
+    HAS_INJECTION: tl.constexpr,
+):
+    h = tl.arange(0, triton.next_power_of_2(HC))
+    offsets = h[:, None] * D + d[None, :]
+    mask = (h[:, None] < HC) & (d[None, :] < D)
+    res = tl.load(residual + row * SR + offsets, mask, other=0).to(tl.float32)
+    if HAS_INJECTION:
+        inj = tl.load(injection + row * SI + h, h < HC, other=0).to(tl.float32)
+        value = block[None, :] * (2.0 * tl.sigmoid(inj / HC))[:, None]
+    else:
+        value = block[None, :]
+    tl.store(output + row * HC * D + offsets, res + value, mask)
 
 
 def _combine(residual, block_output, injection_logits, hc_count, *, legacy=False):
@@ -127,13 +144,33 @@ def _combine(residual, block_output, injection_logits, hc_count, *, legacy=False
     if residual.numel() == 0:
         return output
     n = shape[0] if rank == 2 else residual.numel() // width
-    _hc_combine_kernel[lambda meta: (n, (d + meta["BLOCK_D"] - 1) // meta["BLOCK_D"])](
-        R=residual,
-        B=block_output,
-        I=injection_logits,
-        O=output,
-        SHAPE=(n, d, hc_count, rs[-2], bs[-2], si, has_injection),
-    )
+    if runtime.device.vendor_name == "ascend":
+        from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import (
+            _launch_hc_combine,
+        )
+
+        _launch_hc_combine(
+            residual,
+            block_output,
+            injection_logits,
+            output,
+            n,
+            d,
+            hc_count,
+            rs[-2],
+            bs[-2],
+            si,
+        )
+    else:
+        _hc_combine_kernel[
+            lambda meta: (n, (d + meta["BLOCK_D"] - 1) // meta["BLOCK_D"])
+        ](
+            R=residual,
+            B=block_output,
+            I=injection_logits,
+            O=output,
+            SHAPE=(n, d, hc_count, rs[-2], bs[-2], si, has_injection),
+        )
     return output
 
 

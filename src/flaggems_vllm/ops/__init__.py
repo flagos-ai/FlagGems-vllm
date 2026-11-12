@@ -51,7 +51,6 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_recurrent_kda,
 )
 from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
@@ -65,6 +64,9 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8 import (
+    flash_mla_sparse_fwd_w8a8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     flash_mla_with_kvcache_w8a8,
 )
@@ -92,6 +94,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
+from flaggems_vllm.ops.fused_indexer_k_norm import fused_indexer_k_norm
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
 from flaggems_vllm.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
@@ -113,6 +116,7 @@ from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
+    triton_ihc_post,
     ihc_pre,
     ihc_pre_ref,
 )
@@ -181,6 +185,9 @@ from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
+from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash,
+)
 from flaggems_vllm.ops.rotary_embedding import apply_rotary_pos_emb
 from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
@@ -230,6 +237,7 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -246,6 +254,7 @@ from flaggems_vllm.ops.mhc_with_norm import (
     mhc_pre_with_norm,
     mhc_rms_norm,
 )
+from flaggems_vllm.ops.pad_indexer_heads import pad_indexer_heads
 from flaggems_vllm.ops.paged_mqa import paged_mqa_logits
 from flaggems_vllm.ops.topk_sigmoid import topk_sigmoid
 from flaggems_vllm.ops.vit_attention import (
@@ -301,6 +310,7 @@ __all__ = [
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "flash_mla_sparse_fwd_w8a8",
     "flash_mla_with_kvcache",
     "flash_mla_with_kvcache_w8a8",
     "fp32_router_gemm",
@@ -312,6 +322,7 @@ __all__ = [
     "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
+    "fused_indexer_k_norm",
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
@@ -368,6 +379,7 @@ __all__ = [
     "outplace_fused_experts",
     "pack_seq_triton",
     "pad_attention_heads",
+    "pad_indexer_heads",
     "paged_mqa_logits",
     "parallel_nsa",
     "parallel_nsa_compression",
@@ -425,6 +437,8 @@ __all__ = [
     "topk_sigmoid",
     "topk_softmax",
     "topk_softplus_sqrt",
+    "triton_ihc_post",
+    "triton_reshape_and_cache_flash",
     "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",
