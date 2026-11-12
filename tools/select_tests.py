@@ -40,6 +40,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     ".github/configs/ci-backends.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
+    "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
     "pytest.ini",
     "tests/conftest.py",
@@ -52,6 +53,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
+    "tools/source_env_bash.sh",
 }
 
 ENV_SMOKE_TRIGGER_PREFIXES = (
@@ -106,6 +108,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         ]
         for name in ("__init__", "common", "attention", "pipeline")
     },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
+        "tests/test_mhc_post.py",
+    ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "tests/test_bmm_w8a8.py",
