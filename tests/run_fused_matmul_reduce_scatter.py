@@ -86,6 +86,21 @@ def main():
     dist.init_process_group("nccl", device_id=device)
     group = dist.group.WORLD
     try:
+        if group.rank() == 0 and backend == "hcu":
+            keys = (
+                "FLAGCX_USE_HETERO_COMM",
+                "FLAGCX_MEM_ENABLE",
+                "FLAGCX_VMM_ENABLE",
+                "FLAGCX_P2P_DISABLE",
+                "FLAGCX_IB_HCA",
+                "NCCL_SOCKET_IFNAME",
+                "AMDGCN_USE_BUFFER_OPS",
+            )
+            print(
+                "HCU environment: "
+                + " ".join(f"{key}={os.getenv(key, '<unset>')}" for key in keys),
+                flush=True,
+            )
         print(
             f"[rank {group.rank()}] backend={backend} device={torch.cuda.get_device_name(device)} config={config}",
             flush=True,
