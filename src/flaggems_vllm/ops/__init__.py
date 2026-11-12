@@ -84,6 +84,12 @@ from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
 from flaggems_vllm.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
 )
+from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
+    GemmReduceScatterConfig,
+    clear_fused_matmul_reduce_scatter_cache,
+    configure_fused_matmul_reduce_scatter,
+    fused_matmul_reduce_scatter,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -257,6 +263,10 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "GemmReduceScatterConfig",
+    "clear_fused_matmul_reduce_scatter_cache",
+    "configure_fused_matmul_reduce_scatter",
+    "fused_matmul_reduce_scatter",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
