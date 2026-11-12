@@ -187,6 +187,9 @@ from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
 from flaggems_vllm.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.ops.select_candidate_blocks_cooperative import (
+    select_candidate_blocks_cooperative,
+)
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
 from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
@@ -411,6 +414,7 @@ __all__ = [
     "scaled_int8_quant",
     "scatter_decode_tokens",
     "scatter_state_rows",
+    "select_candidate_blocks_cooperative",
     "silu_and_mul",
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",

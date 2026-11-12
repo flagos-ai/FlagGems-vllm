@@ -1450,6 +1450,23 @@ ops:
     stages:
       - stable: '4.1'
     cpp: '4.0'
+  - id: select_candidate_blocks_cooperative
+    description: |
+      DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM's
+      select_candidate_blocks_cooperative: per-block NaN-propagating max with
+      the newest block pinned, top-k over each row's valid block prefix (the
+      Triton persistent_topk / cooperative_topk in place of the CUDA
+      cooperative_topk), then -inf / out-of-range ids dropped to -1.
+    for:
+      - vllm.models.deepseek_v41.nvidia.specialized_decode.attention.candidate_topk.select_candidate_blocks_cooperative
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: silu_and_mul
     description: A custom operator in vLLM as activation function for SwiGLU.
     for:
