@@ -210,16 +210,16 @@ class GroupedTopKBenchmark(base.Benchmark):
         self.scoring_func = scoring_func
 
     def set_shapes(self, shape_file_path=None):
-        grouped_topk_configs = [
+        # num_tokens, num_experts, n_group, topk_group, topk
+        self.shapes = [
             # Deepseek-3.2
-            (num_tokens, num_experts, n_group, topk_group, topk)
+            (num_tokens, 256, 8, 4, 8)
             for num_tokens in [1, 8, 32, 64, 128, 256, 496, 512, 16384]
-            for num_experts in [256]
-            for n_group in [8]
-            for topk_group in [4]
-            for topk in [8]
+        ] + [
+            # GLM-5.2
+            (num_tokens, 256, 1, 1, 8)
+            for num_tokens in [1, 8, 64, 193, 449, 16384]
         ]
-        self.shapes = grouped_topk_configs
 
     def get_input_iter(self, dtype):
         for config in self.shapes:

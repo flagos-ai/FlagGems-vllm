@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
+    fused_recurrent_gated_delta_rule_fwd,
+)
+
 # The MetaX builder does not support TLE grid distributed_barrier.
 # Route the inplace helper directly to its existing non-TLE implementation.
 from flaggems_vllm.ops.moe_align_block_size import (
@@ -20,15 +24,22 @@ from flaggems_vllm.ops.moe_align_block_size import (
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
+    cp_gather_indexer_k_quant_cache,
+)
+from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16 import gdn_w8a16
+from flaggems_vllm.runtime.backend._metax.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -41,6 +52,7 @@ from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter
 from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._metax.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
@@ -53,9 +65,13 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "cp_gather_indexer_k_quant_cache",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "gdn_w8a16",
+    "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
     "moe_align_block_size_triton",
@@ -69,5 +85,6 @@ __all__ = [
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
+    "top_k_top_p",
     "w8a8_block_int8_bmm",
 ]

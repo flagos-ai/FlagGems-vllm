@@ -89,7 +89,7 @@ except NotImplementedError as e:
 
 ### 3. Performance Slower Than Expected
 
-**Symptom**: FlagGems-vllm slower than torch baseline.
+**Symptom**: FlagGems-vllm slower than the vLLM baseline.
 
 **Cause**: Missing autotune, poor shape, or cold start.
 
@@ -259,6 +259,6 @@ If you're stuck:
 
 ## Next Steps
 
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
-- [Contribution guide](/FlagGems-vllm/contribution/overview/)
+- [Testing guide](../testing/unittest.md)
+- [Performance benchmarking](../performance/benchmark.md)
+- [Contribution guide](../contribution/overview.md)
