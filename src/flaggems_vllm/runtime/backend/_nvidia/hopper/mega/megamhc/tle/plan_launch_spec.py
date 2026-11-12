@@ -150,7 +150,10 @@ ADMITTED_PLAN_ADAPTERS: Mapping[str, PlanAdapter] = {
     ),
     # T=3805/4100 alias this class after mutating the pinned fresh-process
     # constants, so one exact adapter covers all three admitted buckets.
-    f"{_PREFIX}.kernels.sm90_eager_t3076_p256_cluster16_manual512_cpasync.EagerT3076P256Cluster16Manual512ProjectionPlan": PlanAdapter(
+    (
+        f"{_PREFIX}.kernels.sm90_eager_t3076_p256_cluster16_manual512_cpasync."
+        "EagerT3076P256Cluster16Manual512ProjectionPlan"
+    ): PlanAdapter(
         "cluster_eager",
         "_sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel",
     ),

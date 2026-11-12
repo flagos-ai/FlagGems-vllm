@@ -308,8 +308,6 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
     if ENABLE_TAIL:
         # The isolated projection PTX has already converged all sixteen warps
         # and written columns 0..24 directly into the compact split plane.
-        rows = tl.arange(0, JIT_BLOCK_M)
-        columns = tl.arange(0, JIT_BLOCK_N)
         # All 256 CTAs fit concurrently (2 blocks/SM x 132 SMs = 264).
         # The acquire/release barrier makes all eight split partials visible
         # before split zero performs this tile's uniform manual512 tail.
