@@ -1,0 +1,551 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# FlagGems-vllm backend registry
+# ==============================
+#
+# Single source of truth for `tools/setup.sh`.
+#
+# The vendor toolchain entries (python / deps / triton / flagtree / env /
+# env_source) are kept aligned with FlagGems' `src/flag_gems/backends.yaml`.
+# FlagGems-vllm is installed on top of the same vendor environment, so the
+# two projects must agree on the torch, compiler and driver versions.
+#
+# Fields
+# ------
+# python:        Python version for the virtual environment.
+# vendor:        Vendor name used by `flaggems_vllm.runtime` (the directory
+#                suffix under `src/flaggems_vllm/runtime/backend/_<vendor>`).
+# deps:          Vendor torch stack and accelerator libraries. Installed from
+#                `pypi_base` before FlagGems / vLLM so the vendor build wins.
+# triton:        Vendor Triton package (used when COMPILER=triton).
+# flagtree:      FlagTree package (used when COMPILER=flagtree). Preferred
+#                whenever the backend publishes one.
+# triton_post_install: Extra packages installed after the vendor Triton build.
+# vllm:          vLLM packages that carry the reference kernels used by the
+#                tests/benchmarks. Backends without an entry here normally get
+#                vLLM from the vendor image; use `tools/setup.sh --no-venv`
+#                inside that image, or set VLLM_PACKAGE explicitly.
+# vllm_note:     Human-readable explanation printed when `vllm` is empty.
+# test_deps:     Extra backend-specific test packages (for example the
+#                NVIDIA-only cupy-cuda12x). The base set is `test_deps` at the
+#                top level and matches the `[test]` extra.
+# env:           Environment variables written into `.venv/bin/activate`.
+#                `$PATH`, `$LD_LIBRARY_PATH`, ... are expanded on activation.
+# env_source:    Vendor scripts sourced during setup and on activation.
+#
+# The PyPI index URL is generated as:
+#   pypi_base.format(vendor=<vendor derived from the backend key>)
+# Override the derived vendor with an explicit `vendor:` field.
+#
+# Compiler selection (`COMPILER`):
+#   flagtree  -> install the `flagtree:` package (default when available)
+#   triton    -> install the `triton:` package
+#   keep      -> leave the environment's existing compiler untouched
+#   unset     -> flagtree when available, otherwise triton; in `--no-venv`
+#                mode the default is `keep`
+
+default_backend: nvidia-cuda133
+python: "3.12"
+pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
+# FlagGems is published to the shared hosted index (also mirrored in the
+# per-vendor indexes). Pin the release that this repository's tests target.
+flag_gems_version: "5.4.0"
+flag_gems_index: "https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
+# PyPI is the default fallback index. Set PIP_INDEX_URL (for example to
+# https://mirrors.aliyun.com/pypi/simple) on networks where PyPI is slow.
+mirror: "https://pypi.org/simple"
+
+# Test dependencies installed independently of the project metadata. They
+# mirror the `test` extra in pyproject.toml; NVIDIA profiles add cupy-cuda12x
+# through their own `test_deps`. Installing them explicitly lets
+# tools/setup.sh install FlagGems-vllm with --no-deps, so flag-gems' strict
+# transitive pins (numpy, packaging, ...) cannot replace the vendor stack.
+test_deps:
+  - "pytest>=7.1.0"
+  - "scipy>=1.14,<1.18.0"
+  - "einops>=0.6"
+  - "distro>=1.9.0"
+
+# Pure-Python runtime dependencies of this repository (see pyproject.toml).
+# Installed explicitly because the project itself is installed with --no-deps.
+runtime_deps:
+  - "packaging"
+  - "pybind11"
+  - "PyYAML>=6.0"
+  - "sqlalchemy"
+
+# Short vendor names accepted on the command line (setup.sh <alias>).
+aliases:
+  nvidia: nvidia-cuda133
+  ascend: ascend-cann900
+  hygon: hygon-dtk2604
+  metax: metax-maca3810
+  iluvatar: iluvatar-corex450
+  mthreads: mthreads-musa520
+  cambricon: cambricon-neuware472
+  enflame: enflame-tops1106
+  kunlunxin: kunlunxin-xre5371
+  thead: thead-ppu210
+  tsingmicro: tsingmicro-tsm260610
+  biren: biren-br2xx
+  spacemit: spacemit-xxx
+  sunrise: sunrise-tangrt120
+  amd: amd-rocm
+
+backends:
+  # ---------------------------------------------------------------------------
+  # NVIDIA
+  # ---------------------------------------------------------------------------
+  nvidia-cuda128:
+    vendor: nvidia
+    python: "3.12"
+    triton: triton==3.6.0
+    flagtree: flagtree==0.6.1
+    vllm:
+      - vllm==0.20.2
+    test_deps:
+      - "cupy-cuda12x>=12.0.0,<14.0.0"
+    env:
+      PATH: /usr/local/cuda/bin:$PATH
+      LD_LIBRARY_PATH: /usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    deps:
+      - numpy==1.26.4
+      - torch==2.10.0+cu128
+      - torchaudio==2.10.0+cu128
+      - torchvision==0.25.0+cu128
+
+  nvidia-cuda133:
+    vendor: nvidia
+    python: "3.12"
+    triton: triton==3.6.0
+    flagtree: flagtree==0.7.0
+    vllm:
+      - vllm==0.20.2
+    test_deps:
+      - "cupy-cuda12x>=12.0.0,<14.0.0"
+    env:
+      PATH: /usr/local/cuda/bin:$PATH
+      LD_LIBRARY_PATH: /usr/local/cuda/lib64:$LD_LIBRARY_PATH
+      USE_FLAGCX: "OFF"
+    deps:
+      - flagcx==0.14.0rc2.post2+cuda13.3
+      - numpy==1.26.4
+      - torch==2.11.0+cu130
+      - torchaudio==2.11.0+cu130
+      - torchvision==0.26.0+cu130
+
+  # ---------------------------------------------------------------------------
+  # Huawei Ascend
+  # ---------------------------------------------------------------------------
+  ascend-cann850:
+    vendor: ascend
+    python: "3.11"
+    triton: triton-ascend==3.2.0
+    flagtree: flagtree==0.6.0+ascend3.2
+    vllm:
+      - vllm-ascend==0.24.0rc1
+    env_source:
+      - /usr/local/Ascend/cann/set_env.sh
+    deps:
+      - torch==2.9.0+cpu
+      - torch-npu==2.9.0
+      - decorator==5.1.1
+      - attrs==24.2.0
+      - psutil==6.0.0
+
+  ascend-cann900:
+    vendor: ascend
+    python: "3.11"
+    triton: triton==3.5.0
+    triton_post_install:
+      - triton_ascend==3.2.1
+    flagtree: flagtree==0.7.1a1+ascend3.5
+    vllm:
+      - vllm-ascend==0.24.0rc1
+    env_source:
+      - /usr/local/Ascend/cann/set_env.sh
+    deps:
+      - cann-shmem==1.6.0
+      - torch==2.10.0+cpu
+      - torch-npu==2.10.0
+      - decorator==5.2.1
+      - attrs==25.3.0
+      - psutil==7.0.0
+
+  # ---------------------------------------------------------------------------
+  # Hygon DCU
+  # ---------------------------------------------------------------------------
+  hygon-dtk2604:
+    vendor: hygon
+    python: "3.10"
+    triton: triton==3.5.1+das.opt1.dtk2604.torch290
+    flagtree: flagtree==0.7.0+hcu3.6
+    vllm_note: >-
+      Hygon vLLM is shipped by the vendor image (e.g. the DTK 26.04 vLLM
+      image). Run `tools/setup.sh --no-venv hygon` inside that image, or pass
+      VLLM_PACKAGE=<vendor package>.
+    env_source:
+      - /opt/dtk-26.04/env.sh
+    env:
+      TRITON_HIP_CLANG_PATH: /opt/dtk-26.04/aillvm/bin/clang-18
+    deps:
+      - torch==2.9.0+das.opt1.dtk2604
+      - flash_attn==2.8.3+das.opt1.dtk2604.torch290
+
+  # ---------------------------------------------------------------------------
+  # MetaX (Muxi)
+  # ---------------------------------------------------------------------------
+  metax-maca3810:
+    vendor: metax
+    python: "3.12"
+    triton: triton==3.6.0+metax3.8.1.0
+    flagtree: flagtree==0.7.0+metax3.6
+    vllm:
+      - mcoplib @ https://repos.metax-tech.com/r/maca-pypi/packages/mcoplib/0.4.9+g8b5bd8b.maca3.8.0.25.torch2.10/mcoplib-0.4.9+g8b5bd8b.maca3.8.0.25.torch2.10-cp312-cp312-linux_x86_64.whl
+      - vllm-metax @ https://repos.metax-tech.com/r/maca-pypi/packages/vllm-metax/0.24.0+g436274.d20260813.maca3.8.2.5.torch2.10.0/vllm_metax-0.24.0+g436274.d20260813.maca3.8.2.5.torch2.10.0-cp312-cp312-linux_x86_64.whl
+    env:
+      MACA_PATH: /opt/maca
+      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
+      LD_LIBRARY_PATH: /opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+    deps:
+      - apex==0.1+metax3.8.1.0
+      - flash_attn==2.6.3+metax3.8.1.0torch2.10
+      - flashinfer==0.2.6+metax3.8.1.0torch2.10
+      - flash_linear_attention==0.5.0+metax3.8.1.0torch2.10
+      - flash_mla==1.0.1+metax3.8.1.0torch2.10
+      - numpy==2.3.5
+      - torch==2.10.0+metax3.8.1.0
+      - torchcodec==0.6.0+metax3.8.1.0
+      - torchaudio==2.4.1+metax3.8.1.0
+      - torchvision==0.25.0+metax3.8.1.0
+
+  metax-maca3720:
+    vendor: metax
+    python: "3.12"
+    triton: triton==3.0.0+metax3.7.2.0
+    flagtree: flagtree==3.1.0+metax3.7.2.0
+    vllm_note: >-
+      No vLLM package is published for MACA 3.7.2. Install the vendor vLLM
+      build first and use `--no-venv`, or set VLLM_PACKAGE.
+    env:
+      MACA_PATH: /opt/maca
+      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
+      LD_LIBRARY_PATH: /opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.8.0+metax3.7.2.0
+      - torchaudio==2.4.1+metax3.7.2.0
+      - torchvision==0.15.1+metax3.7.2.0
+      - flash_attn==2.6.3+metax3.7.2.0torch2.8
+      - numpy==2.3.5
+
+  # ---------------------------------------------------------------------------
+  # Iluvatar CoreX
+  # ---------------------------------------------------------------------------
+  iluvatar-corex450:
+    vendor: iluvatar
+    python: "3.12"
+    triton: triton==3.2.0+corex.4.5.0.20260804
+    flagtree: flagtree==0.7.0+iluvatar3.6
+    vllm_note: >-
+      Iluvatar vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv iluvatar` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      COREX_ROOT: /usr/local/corex
+      PATH: $COREX_ROOT/bin:$PATH
+      LD_LIBRARY_PATH: $COREX_ROOT/lib:$LD_LIBRARY_PATH
+      CPATH: /usr/local/cuda-10.2/include
+    deps:
+      - torch==2.10.0+corex.4.5.0.20260804
+      - torchaudio==2.10.0+corex.4.5.0.20260804
+      - torchvision==0.25.0+corex.4.5.0.20260804
+      - numpy<2
+
+  # ---------------------------------------------------------------------------
+  # Moore Threads (MUSA)
+  # ---------------------------------------------------------------------------
+  mthreads-musa520:
+    vendor: mthreads
+    python: "3.10"
+    triton: triton==3.6.0
+    flagtree: flagtree==0.7.0+mthreads3.6
+    vllm_note: >-
+      Moore Threads vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv mthreads` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      MUSA_HOME: /usr/local/musa
+      PATH: $MUSA_HOME/bin:$PATH
+      LD_LIBRARY_PATH: $VIRTUAL_ENV/lib:$MUSA_HOME/lib:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.9.1+musa5.2.0
+      - torch_musa==2.9.1
+      - mkl==2024.0.0
+      - torchada==0.1.54
+
+  mthreads-musa436:
+    vendor: mthreads
+    python: "3.10"
+    triton: triton==3.6.0+git89458660
+    flagtree: flagtree==0.6.0+mthreads3.6
+    vllm_note: >-
+      Moore Threads vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv mthreads` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      MUSA_HOME: /usr/local/musa
+      PATH: $MUSA_HOME/bin:$PATH
+      LD_LIBRARY_PATH: $VIRTUAL_ENV/lib:$MUSA_HOME/lib:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.9.0+musa.4.3.6
+      - torch_musa==2.9.0
+      - mkl==2024.0.0
+
+  # ---------------------------------------------------------------------------
+  # Cambricon MLU
+  # ---------------------------------------------------------------------------
+  cambricon-neuware472:
+    vendor: cambricon
+    python: "3.12"
+    triton: triton==3.4.0+mlu2.1.1
+    vllm_note: >-
+      Cambricon vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv cambricon` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      NEUWARE_HOME: /usr/local/neuware
+      PATH: /usr/local/neuware/bin:$PATH
+      LD_LIBRARY_PATH: /usr/local/neuware/lib64:$LD_LIBRARY_PATH
+    deps:
+      - numpy==2.2.6
+      - pandas==3.0.5
+      - torch==2.11.0+cpu
+      - torch-mlu==1.33.1+torch2.11.0
+      - torch-mlu-ops==1.12.1+torch2.11.0
+
+  cambricon-neuware443:
+    vendor: cambricon
+    python: "3.10"
+    triton: triton==3.2.0+mlu1.7.2
+    vllm_note: >-
+      Cambricon vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv cambricon` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      NEUWARE_HOME: /usr/local/neuware
+      PATH: /usr/local/neuware/bin:$PATH
+      LD_LIBRARY_PATH: /usr/local/neuware/lib64:$LD_LIBRARY_PATH
+    deps:
+      - cambricon_dali==0.13.0
+      - torch==2.7.1+cpu
+      - torch-mlu==1.29.2+torch2.7.1
+      - torch-mlu-ops==1.8.0+torch2.7.1
+      - numpy==2.2.6
+
+  # ---------------------------------------------------------------------------
+  # Enflame GCU
+  # ---------------------------------------------------------------------------
+  enflame-tops1106:
+    vendor: enflame
+    python: "3.12"
+    triton: triton==3.6.0
+    triton_post_install:
+      - triton-gcu==3.6.0+1.0.20260722
+    flagtree: flagtree==0.7.0+enflame3.6
+    vllm_note: >-
+      Enflame vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv enflame` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      LD_LIBRARY_PATH: /opt/OpenCloudOS/gcc-toolset-14/root/usr/lib64:$LD_LIBRARY_PATH
+      TORCH_GCU_ENABLE_INT64_AND_UINT64: "1"
+      ENABLE_I64_CHECK: "0"
+      TORCHGCU_INDUCTOR_ENABLE: "1"
+    deps:
+      - enflame-modelopt==3.6.20260615+torch.2.11.0
+      - numpy==2.3.5
+      - pyefml==1.10.6
+      - torch==2.11.0+cpu
+      - torchaudio==2.11.0+cpu
+      - torchvision==0.26.0+cpu
+      - torch-gcu==2.11.0+3.8.20260713
+      - torchcodec==3.8.20260624+torch.2.11.0
+      - flash-attn==2.7.2+torch.2.11.0.gcu.3.8.20260706
+      - tops-extension==3.6.20260529+torch.2.11.0
+      - topstx==1.10.6
+
+  enflame-tops1910:
+    vendor: enflame
+    python: "3.12"
+    triton: triton==3.6.0
+    triton_post_install:
+      - triton-gcu==3.6.0+1.0.20260521.cc.1.9.10
+    flagtree: flagtree==0.6.0+enflame3.6
+    vllm_note: >-
+      Enflame vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv enflame` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      LD_LIBRARY_PATH: /opt/OpenCloudOS/gcc-toolset-14/root/usr/lib64:$LD_LIBRARY_PATH
+      TORCH_GCU_ENABLE_INT64_AND_UINT64: "1"
+      ENABLE_I64_CHECK: "0"
+    deps:
+      - pyefml==1.9.10
+      - torch==2.10.0+cpu
+      - torchaudio==2.10.0+cpu
+      - torchvision==0.25.0+cpu
+      - torch-gcu==2.10.0+3.7.20260408
+      - flash-attn==2.7.2+torch.2.10.0.gcu.3.4.20260506
+
+  # ---------------------------------------------------------------------------
+  # Kunlunxin XPU
+  # ---------------------------------------------------------------------------
+  kunlunxin-xre5371:
+    vendor: kunlunxin
+    python: "3.10"
+    triton: triton==3.6.0+gitcd2d6c1b
+    flagtree: flagtree==0.7.0+xpu3.6
+    vllm_note: >-
+      Kunlunxin vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv kunlunxin` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      PATH: /usr/local/xpu/bin:$PATH
+      XPU_EVENT_KL3_ENABLE: "1"
+      LD_LIBRARY_PATH: /usr/local/xcudart/lib:/usr/local/xpu/lib:/usr/local/cuda/lib64
+    deps:
+      - apex==0.1
+      - benchflow==1.0.0
+      - colorama==0.4.6
+      - flash_attn==2.4.2+7e2dd4d
+      - hydrax==0.1.0
+      - hyperparameter==0.5.6
+      - psutil==6.1.0
+      - regex==2026.4.4
+      - torch==2.9.0+cu129
+      - torchaudio==2.9.0+cu129
+      - torchvision==0.24.0+cu129
+      - torch_plugin==0.1.0
+      - torch_xray==2.0.4
+      - xformers==0.0.29+1e7a8ec.d20260114
+      - xmlir==1.0.0.1
+
+  # ---------------------------------------------------------------------------
+  # T-Head PPU
+  # ---------------------------------------------------------------------------
+  thead-ppu210:
+    vendor: thead
+    python: "3.12"
+    triton: triton==3.6.0+v0.2.0.ppu2.1.1
+    flagtree: flagtree==0.7.0+ppu3.6
+    vllm:
+      - vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.23.0+v0.2.0.ppu2.2.0/vllm-0.23.0+cu130torch2.10.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl
+      - scikit-learn>=1.5
+    env_source:
+      - /usr/local/PPU_SDK/envsetup.sh
+    deps:
+      - torch==2.10.0+v0.1.0.ppu2.1.1
+
+  # ---------------------------------------------------------------------------
+  # TsingMicro
+  # ---------------------------------------------------------------------------
+  tsingmicro-tsm260610:
+    vendor: tsingmicro
+    python: "3.10"
+    triton: triton==3.6.0.post2026072919+git8f5b0609
+    flagtree: flagtree==0.7.0+tsingmicro3.6
+    vllm_note: >-
+      TsingMicro vLLM is shipped by the vendor image. Run
+      `tools/setup.sh --no-venv tsingmicro` inside that image, or set
+      VLLM_PACKAGE.
+    env:
+      KUIPER_PATH: /usr/local/kuiper
+      TX8_DEPS_ROOT: /usr/local/tx8_deps
+      PATH: /usr/local/kuiper/bin:${PATH}
+      LLVM_SYSPATH: /usr/local/llvm
+      LLVM_BINARY_DIR: ${LLVM_SYSPATH}/bin
+      PYTHONPATH: ${LLVM_SYSPATH}/python_packages/mlir_core
+      LD_LIBRARY_PATH: /usr/local/kuiper/lib:/usr/local/kuiper/tsm8-profiler/lib:${TX8_DEPS_ROOT}/lib:${LD_LIBRARY_PATH}
+      USE_TORCH_XLA: "0"
+      TORCH_COMPILE_DISABLE: "1"
+    deps:
+      - flagcx==0.14.0+tsm260610
+      - numpy==1.26.4
+      - torch==2.11.0+cpu
+      - torchvision==0.26.0+cpu
+      - torchaudio==2.11.0+cpu
+      - torch_txda==0.1.0+20260728.f6fbdb71
+      - txops==0.1.0+20260716.e94d9509
+
+  # ---------------------------------------------------------------------------
+  # Biren
+  # ---------------------------------------------------------------------------
+  biren-br2xx:
+    vendor: biren
+    python: "3.10"
+    triton: triton==3.4.0+br2xx
+    vllm_note: >-
+      Biren vLLM is shipped by the vendor SDK/image. Run
+      `tools/setup.sh --no-venv biren` inside that image, or set
+      VLLM_PACKAGE.
+    env_source:
+      - /usr/local/birensupa/all/latest/scripts/brsw_set_env.sh
+    deps:
+      - torch==2.12.0+cpu
+      - torch-supa==1.0.0.21200+br2xx
+
+  # ---------------------------------------------------------------------------
+  # SpacemiT / Sunrise
+  # ---------------------------------------------------------------------------
+  spacemit-xxx:
+    vendor: spacemit
+    python: "3.12"
+    triton: triton==3.6.0+spacemit.a5
+    vllm_note: >-
+      No vLLM package is published for SpacemiT. Use the vendor image with
+      `--no-venv`, or set VLLM_PACKAGE.
+    deps:
+      - torch==2.8.0+spacemit.0
+
+  sunrise-tangrt120:
+    vendor: sunrise
+    python: "3.10"
+    triton: triton==3.6.0.1+git0a5cfb35
+    vllm_note: >-
+      No vLLM package is published for Sunrise. Use the vendor image with
+      `--no-venv`, or set VLLM_PACKAGE.
+    env:
+      LD_LIBRARY_PATH: /usr/local/tangrt/targets/linux-x86_64/lib:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.11.0+cpu
+      - torchaudio==2.11.0+cpu
+      - torchvision==0.26.0+cpu
+      - torch-ptpu==0.2.3+torch2.11
+
+  # ---------------------------------------------------------------------------
+  # AMD ROCm
+  # ---------------------------------------------------------------------------
+  amd-rocm:
+    vendor: amd
+    python: "3.12"
+    # ROCm PyTorch and vLLM are not published on the FlagOS index. Install the
+    # ROCm builds with the vendor instructions, then run this script with
+    # --no-venv. Listing them here would risk replacing a working ROCm stack
+    # with the CPU/CUDA wheel of the same version.
+    deps: []
+    vllm_note: >-
+      AMD ROCm torch/triton/vLLM are not on the FlagOS index. Install the
+      ROCm PyTorch and vLLM builds first, then run
+      `tools/setup.sh --no-venv amd`.

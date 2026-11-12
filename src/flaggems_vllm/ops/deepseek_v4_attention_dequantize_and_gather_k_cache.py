@@ -27,6 +27,9 @@ def _default_scale_slots(nope_dim: int) -> int:
     return triton.cdiv(nope_dim, 64) + (1 if nope_dim % 64 == 0 else 0)
 
 
+_DEFAULT_TUNE_CONFIGS = [triton.Config({"num_workers": 128})]
+
+
 def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
     if k_cache.ndim == 2:
         return k_cache
@@ -43,7 +46,8 @@ def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("dequantize_and_gather_k_cache"),
+    configs=runtime.get_tuned_config("dequantize_and_gather_k_cache")
+    or _DEFAULT_TUNE_CONFIGS,
     key=["num_tokens", "max_gather_len"],
     strategy=["log", "log"],
 )
@@ -166,6 +170,7 @@ def dequantize_and_gather_k_cache(
     # device length tensors. Batch size alone cannot distinguish short/long rows.
     max_gather_len = max(1, out.shape[1] - offset)
     num_tokens = num_reqs * max_gather_len
+    # num_workers is tuner-owned, so resolve the grid from its meta-parameters.
     grid = lambda meta: (num_reqs, meta["num_workers"])
     with torch_device_fn.device(out.device):
         _dequantize_and_gather_k_cache_kernel[grid](

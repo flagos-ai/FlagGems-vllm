@@ -17,6 +17,12 @@ name: basic ci
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the older run so the single H20
+# runner is not occupied by stale commits. Pushes to main are never cancelled.
+concurrency:
+  group: basic-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: ["main"]
@@ -52,6 +58,8 @@ jobs:
     steps:
       - name: check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
 
       - name: set up python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
@@ -73,6 +81,37 @@ jobs:
           python -m unittest discover -s tools -p 'test_ci_*.py'
           python tools/check_ci_pins.py
 
+      # Existing code still contains torch compute calls, so only files touched
+      # by this change are checked; new violations are blocked without failing
+      # every PR on the legacy backlog.
+      - name: check no torch compute fallback in changed files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only --diff-filter=d -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+          else
+            git diff-tree --no-commit-id --name-only --diff-filter=d -r -z "${GITHUB_SHA}" > changed_py.bin
+          fi
+          files=()
+          while IFS= read -r -d '' path; do
+            if [[ "${path}" == *.py ]]; then
+              files+=("${path}")
+            fi
+          done < changed_py.bin
+          rm -f changed_py.bin
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No changed Python files."
+            exit 0
+          fi
+          python tools/ci_checks/check_no_torch_fallback.py "${files[@]}"
+
   select-targets:
     name: select ci targets
     needs: code-style
@@ -84,6 +123,8 @@ jobs:
       should_run: ${{ steps.select.outputs.should_run }}
       non_nvidia_matrix: ${{ steps.select-backends.outputs.matrix }}
       has_non_nvidia_backends: ${{ steps.select-backends.outputs.has_backends }}
+      container_matrix: ${{ steps.select-ci-backends.outputs.matrix }}
+      has_container_backends: ${{ steps.select-ci-backends.outputs.has_backends }}
     env:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv-select
 
@@ -128,6 +169,9 @@ jobs:
           python --version
           test -x "${VIRTUAL_ENV}/bin/python"
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+          # select_tests.py and select_backends.py are stdlib-only;
+          # select_ci_backends.py reads YAML.
+          python -m pip install --quiet 'PyYAML>=6.0'
 
       - name: collect ci selection inputs
         shell: bash
@@ -212,6 +256,18 @@ jobs:
           fi
           python tools/select_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
+      # Separate from select-backends above: that step routes backends whose
+      # environment FlagGems' setup.sh builds on a bare runner, while this one
+      # resolves backends that run inside a vendor-provided vLLM image.
+      - id: select-ci-backends
+        name: select container ci backends
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/select_ci_backends.py \
+            --config .github/configs/ci-backends.yaml \
+            --format github | tee -a "${GITHUB_OUTPUT}"
+
   nvidia-tests:
     name: nvidia tests and benchmarks
     needs: select-targets
@@ -231,6 +287,12 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}/src
       VENV_DIR: ${{ github.workspace }}/.venv
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
+      # h20 is a persistent, non-ephemeral runner: uv's global package cache
+      # survives across jobs. A stale/partially-evicted cache entry can make
+      # `uv pip install` report success without actually installing into the
+      # freshly recreated venv (see tools/setup.sh for details), so force
+      # cache revalidation here.
+      UV_REFRESH: "1"
 
     steps:
       - name: check out repository
@@ -264,6 +326,9 @@ jobs:
           if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
             echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           fi
+          if [[ -n "${USE_FLAGCX:-}" ]]; then
+            echo "USE_FLAGCX=${USE_FLAGCX}" >> "$GITHUB_ENV"
+          fi
           python --version
 
       - name: run portable backend preflight
@@ -272,7 +337,7 @@ jobs:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
           source "${VENV_DIR}/bin/activate"
-          python tools/check_backend_env.py --expected-vendor nvidia
+          python tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
 
       - name: run selected tests and benchmarks
         shell: bash
@@ -311,6 +376,79 @@ jobs:
     # caller's read-only token instead of exposing a long-lived runner SSH key.
     secrets:
       RUNNER_SSH_KEY: ${{ secrets.GITHUB_TOKEN }}
+
+  # Container-based PR smoke tests for self-hosted vendor runners that ship a
+  # vendor-provided vLLM base image instead of going through FlagGems'
+  # setup.sh. The runner/image pairings live in
+  # `.github/configs/ci-backends.yaml` (schema mirrored from FlagOps'
+  # resource_map.yaml) rather than in FlagGems' backend registry, because
+  # those vendor images do not fit the registry's "run FlagGems setup.sh on a
+  # bare runner" contract. NVIDIA deliberately stays out of this lane and
+  # keeps running directly on the H20 host.
+  #
+  # Bring-up status: observation period. Each platform is still proving out
+  # its runner and image, so this job is intentionally excluded from
+  # multi-backend-summary's needs: and every step tolerates failure
+  # (continue-on-error) so a flaky or unready runner cannot block a PR.
+  # Promote a platform into the required summary path only after it has been
+  # green for a sustained period.
+  vendor-container-tests:
+    name: ${{ matrix.platform }} container smoke test
+    needs: select-targets
+    if: >-
+      needs.select-targets.outputs.should_run == 'true'
+      && needs.select-targets.outputs.has_container_backends == 'true'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.user.login != 'dependabot[bot]')
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-targets.outputs.container_matrix) }}
+    runs-on: ${{ matrix.runner_labels }}
+    timeout-minutes: 60
+    container:
+      image: ${{ matrix.container_image }}
+      options: ${{ matrix.container_options }}
+      volumes: ${{ matrix.container_volumes }}
+    env:
+      FLAGGEMS_VENDOR: ${{ matrix.platform }}
+      PYTHONPATH: ${{ github.workspace }}/src
+      BACKEND: ${{ matrix.backend }}
+      CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
+    steps:
+      - name: check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+        continue-on-error: true
+
+      - name: install FlagGems-vllm into the vendor image
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # The image already ships a vendor-patched torch/triton/vLLM stack.
+          # Install this repository only, so pip cannot pull a generic
+          # PyPI torch over the vendor build.
+          python3 -m pip install --no-build-isolation --no-deps -e .
+          python3 -m pip install --no-build-isolation pytest einops
+          python3 --version
+
+      - name: check gpu availability
+        shell: bash
+        continue-on-error: true
+        env:
+          GPU_CHECK_SCRIPT: ${{ matrix.gpu_check_script }}
+        run: bash "${GPU_CHECK_SCRIPT}"
+
+      - name: run selected tests
+        shell: bash
+        continue-on-error: true
+        env: ${{ fromJSON(matrix.test_env) }}
+        run: |
+          python3 tools/run_ci_targets.py \
+            --backend "${BACKEND}" \
+            --capabilities .github/backend-capabilities.json
 
   multi-backend-summary:
     name: multi-backend summary

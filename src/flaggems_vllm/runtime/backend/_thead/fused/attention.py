@@ -132,6 +132,8 @@ def _flash_int8_pack_kv(
         else:
             nk = N
             page = n // PAGE
+        # Shared with MetaX: page IDs are int32, but cache offsets may not fit.
+        page = page.to(tl.int64)
         k = tl.load(
             K + page[:, None] * PK + (n[:, None] % PAGE) * SK + h * HK + d[None, :],
             n[:, None] < nk,
