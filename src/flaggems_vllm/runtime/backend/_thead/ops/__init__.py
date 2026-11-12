@@ -15,6 +15,7 @@
 
 import flag_gems
 
+import flaggems_vllm.utils as _utils
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -32,7 +33,6 @@ from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_no
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
-from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -40,9 +40,6 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
-)
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
-    w8a8_block_int8_bmm,
 )
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_block_matmul
 
@@ -55,7 +52,6 @@ __all__ = [
     "hc_combine",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
-    "int8_einsum",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
@@ -63,12 +59,13 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
-    "w8a8_block_int8_bmm",
     "w8a8_block_matmul",
 ]
 
 # Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
-if "mm_w8a8_int8" in vars(flag_gems):
+if "mm_w8a8_int8" in vars(flag_gems) and _utils.has_triton_tle_attrs(
+    ("load",), 3, 6, 0
+):
     from flaggems_vllm.runtime.backend._thead.ops.bmm_w8a8_int8 import bmm_w8a8_int8
 
     __all__ += ["bmm_w8a8_int8"]
@@ -77,3 +74,12 @@ from flaggems_vllm.runtime.backend._thead.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._thead.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+
+# AIU block-INT8 kernels are optional; older compilers retain ordinary operators.
+if _utils.has_triton_tle_attrs(("load",), 3, 6, 0):
+    from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
+    from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
+        w8a8_block_int8_bmm,
+    )
+
+    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]

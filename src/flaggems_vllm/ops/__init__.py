@@ -123,6 +123,9 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     sinkhorn_forward,
 )
+from flaggems_vllm.ops.qwen4.qsa_attention import (
+    qsa_sparse_paged_attention as qsa_sparse_paged_attention_unpacked,
+)
 from flaggems_vllm.ops.qwen4 import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -382,6 +385,7 @@ __all__ = [
     "qsa_mqa_paged",
     "qsa_prepare",
     "qsa_sparse_paged_attention",
+    "qsa_sparse_paged_attention_unpacked",
     "qsa_store_cache_rows",
     "qsa_store_kv_cache_rows",
     "qwen4_compress_norm_mrope_store_groups",
@@ -452,18 +456,15 @@ if _runtime.device.vendor_name == "hygon":
     ]
 
 elif _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead import ops as _thead_ops
     from flaggems_vllm.runtime.backend._thead.fused import attention as thead_attention
-    from flaggems_vllm.runtime.backend._thead.ops import (
-        int8_einsum,
-        w8a8_block_int8_bmm,
-    )
 
     flash_attn_varlen_func_w8a8_int8 = thead_attention.flash_attn_varlen_func_w8a8_int8
-    __all__ += [
-        "flash_attn_varlen_func_w8a8_int8",
-        "int8_einsum",
-        "w8a8_block_int8_bmm",
-    ]
+    __all__.append("flash_attn_varlen_func_w8a8_int8")
+    for _op_name in ("int8_einsum", "w8a8_block_int8_bmm"):
+        if _op_name in _thead_ops.__all__:
+            globals()[_op_name] = getattr(_thead_ops, _op_name)
+            __all__.append(_op_name)
 
 if _runtime.device.vendor_name == "metax":
 

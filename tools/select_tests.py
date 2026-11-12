@@ -87,6 +87,18 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/ops/concat_and_cache_mla.py": [
+        "tests/test_concat_and_cache_mla.py",
+        "tests/test_concat_and_cache_mla_padding.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_post.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_post_graph.py",
+    ],
+    "src/flaggems_vllm/ops/fused_allreduce_rms_norm.py": [
+        "tests/test_fused_allreduce_rms_norm.py",
+        "tests/test_optional_runtime_imports.py",
+    ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
         "tests/test_flash_mla_with_kvcache_w8a8.py",
@@ -128,7 +140,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_qwen4_self_kernels.py",
         "tests/test_qsa_attention.py",
     ],
-    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": ["tests/test_qsa_attention.py"],
+    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": [
+        "tests/test_qsa_attention.py",
+        "tests/test_qsa_sparse_paged_attention_unpacked.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_fusion.py": ["tests/test_ple_fusion.py"],
     "src/flaggems_vllm/ops/kda_bounded.py": [
         "tests/test_kda_bounded.py",
@@ -269,7 +284,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_qwen4_self_kernels.py",
         "benchmark/test_qsa_attention.py",
     ],
-    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": ["benchmark/test_qsa_attention.py"],
+    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": [
+        "benchmark/test_qsa_attention.py",
+        "benchmark/test_qsa_sparse_paged_attention_unpacked.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_fusion.py": ["benchmark/test_ple_fusion.py"],
     "src/flaggems_vllm/ops/kda_bounded.py": ["benchmark/test_kda_bounded_perf.py"],
     "src/flaggems_vllm/ops/kda64.py": ["benchmark/test_kda_bounded_perf.py"],

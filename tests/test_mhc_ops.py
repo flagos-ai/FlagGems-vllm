@@ -499,3 +499,63 @@ def test_hc_head_fused_kernel_vs_vllm(n, hidden_size, hc_mult):
     out_triton = hc_head_fused_kernel(**data)
     out_ref = _hc_head_fused_kernel_ref(**data_ref)
     torch.testing.assert_close(out_triton, out_ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.mhc_post
+@pytest.mark.parametrize("vendor", ["thead", "nvidia"])
+@pytest.mark.parametrize("initial_adjust_block_size", [None, False, True])
+@pytest.mark.parametrize("execution_error", [False, True])
+def test_mhc_post_optional_compiler_knob_restored(
+    monkeypatch, vendor, initial_adjust_block_size, execution_error
+):
+    import importlib
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    module = importlib.import_module("flaggems_vllm.ops.mhc.mhc_post")
+    # Only dependency selection is simulated here; numerical tests run real kernels.
+    name = "flaggems_vllm.runtime.backend._thead.ops.mhc_post"
+    thead = ModuleType(name)
+    thead.mhc_post_hc4_tokloop = None
+    monkeypatch.setitem(sys.modules, name, thead)
+    has_adjust_block_size = initial_adjust_block_size is not None
+    knobs = SimpleNamespace()
+    if has_adjust_block_size:
+        knobs.adjust_block_size = initial_adjust_block_size
+    monkeypatch.setattr(module.triton.knobs, "autotuning", knobs)
+    monkeypatch.setattr(module.runtime, "device", SimpleNamespace(vendor_name=vendor))
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append(1)
+        if has_adjust_block_size:
+            assert knobs.adjust_block_size is False
+        else:
+            assert not hasattr(knobs, "adjust_block_size")
+        if execution_error:
+            raise RuntimeError("launch failed")
+        args[4].zero_()
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return launch
+
+    monkeypatch.setattr(thead, "mhc_post_hc4_tokloop", launch)
+    monkeypatch.setattr(module, "mhc_post_kernel_hc_mult_4", Kernel())
+    data = dict(
+        x=torch.zeros((1, 128), dtype=torch.bfloat16, device=flaggems_vllm.device),
+        residual=torch.zeros(
+            (1, 4, 128), dtype=torch.bfloat16, device=flaggems_vllm.device
+        ),
+        post_layer_mix=torch.zeros((1, 4, 1), device=flaggems_vllm.device),
+        comb_res_mix=torch.zeros((1, 4, 4), device=flaggems_vllm.device),
+    )
+    if execution_error:
+        with pytest.raises(RuntimeError, match="launch failed"):
+            flaggems_vllm.mhc_post(**data)
+    else:
+        flaggems_vllm.mhc_post(**data)
+    assert calls == [1]
+    assert hasattr(knobs, "adjust_block_size") is has_adjust_block_size
+    if has_adjust_block_size:
+        assert knobs.adjust_block_size is initial_adjust_block_size

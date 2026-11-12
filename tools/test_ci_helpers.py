@@ -82,6 +82,23 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
             ["tests/deep/nested/test_second.py", "tests/test_first.py"],
         )
 
+    def test_qsa_mapping_keeps_existing_and_public_compatibility_regressions(self):
+        targets = [
+            "tests/test_qsa_attention.py",
+            "tests/test_qsa_sparse_paged_attention_unpacked.py",
+        ]
+        benchmarks = [
+            "benchmark/test_qsa_attention.py",
+            "benchmark/test_qsa_sparse_paged_attention_unpacked.py",
+        ]
+        for target in targets + benchmarks:
+            self.make_file(target)
+        _, tests, selected_benchmarks = select_tests.select_targets(
+            self.repo_root, ["src/flaggems_vllm/ops/qwen4/qsa_attention.py"]
+        )
+        self.assertEqual(tests, targets)
+        self.assertEqual(selected_benchmarks, benchmarks)
+
     def test_backend_operator_change_selects_matching_test(self):
         self.make_file("tests/test_mul.py")
 
@@ -821,6 +838,8 @@ class CiSummaryTest(unittest.TestCase):
             "SELECT_TARGETS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
+            "PPU_EXPECTED": "false",
+            "PPU_RESULT": "skipped",
             "SHOULD_RUN": "false",
             "HAS_NON_NVIDIA_BACKENDS": "false",
             "EVENT_NAME": "push",
@@ -867,6 +886,7 @@ class CiSummaryTest(unittest.TestCase):
                 "NVIDIA_RUN_ALLOWED": "false",
                 "NON_NVIDIA_RUN_ALLOWED": "false",
             },
+            "required_ppu_passed": {"PPU_EXPECTED": "true", "PPU_RESULT": "success"},
             "no_targets": {},
         }
 
@@ -889,6 +909,13 @@ class CiSummaryTest(unittest.TestCase):
                 "NON_NVIDIA_RESULT": "failure",
             },
             "unexpected_backend_run": {"NON_NVIDIA_RESULT": "success"},
+            "unexpected_ppu_run": {"PPU_RESULT": "success"},
+            "required_ppu_failure": {"PPU_EXPECTED": "true", "PPU_RESULT": "failure"},
+            "required_ppu_skipped": {"PPU_EXPECTED": "true", "PPU_RESULT": "skipped"},
+            "required_ppu_cancelled": {
+                "PPU_EXPECTED": "true",
+                "PPU_RESULT": "cancelled",
+            },
         }
 
         for name, values in cases.items():

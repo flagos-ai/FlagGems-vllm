@@ -119,8 +119,14 @@ class ConcatAndCacheMla(torch.autograd.Function):
             kv_cache = kv_cache.squeeze(2)
         if kv_c.ndim != 2 or k_pe.ndim != 2 or kv_cache.ndim != 3:
             raise ValueError("MLA cache expects KV[N,D], RoPE[N,R] and paged [B,P,D+R]")
-        if k_pe.shape[0] != kv_c.shape[0] or slot_mapping.shape != (kv_c.shape[0],):
-            raise ValueError("MLA cache inputs need one slot per token")
+        # Graph inputs may have padded rows. Slots describe only the leading
+        # actual tokens; the kernel grid is bounded by their count below.
+        if (
+            k_pe.shape[0] != kv_c.shape[0]
+            or slot_mapping.ndim != 1
+            or slot_mapping.shape[0] > kv_c.shape[0]
+        ):
+            raise ValueError("MLA cache inputs need one input row per slot")
         if k_pe.dtype != kv_c.dtype or slot_mapping.dtype not in (
             torch.int32,
             torch.int64,

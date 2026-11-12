@@ -89,11 +89,12 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}...${PR_HEAD_SHA}" > changed_py.bin
           elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             git diff --name-only --diff-filter=d -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_py.bin
           else
@@ -178,10 +179,11 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            git diff --name-only -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_files.bin
+            git diff --name-only -z "${PR_BASE_SHA}...${PR_HEAD_SHA}" > changed_files.bin
           elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             git diff --name-only -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_files.bin
           else
@@ -377,6 +379,49 @@ jobs:
     secrets:
       RUNNER_SSH_KEY: ${{ secrets.GITHUB_TOKEN }}
 
+  # Required operator contracts; the full-vendor smoke lane stays advisory.
+  ppu-compatibility:
+    name: PPU compatibility regressions
+    needs: [code-style, select-targets]
+    if: >-
+      needs.select-targets.outputs.should_run == 'true'
+      && (contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_thead_optional_imports.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_optional_runtime_imports.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_post_graph.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_ops.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_concat_and_cache_mla_padding.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_qsa_sparse_paged_attention_unpacked.py'))
+      && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]')
+    runs-on: flagcicd-810e
+    timeout-minutes: 30
+    container:
+      image: harbor.baai.ac.cn/flagos-dev/vllm-plugin-fl:v0.24.0-thead-ci
+      options: >-
+        --shm-size=8g --ulimit memlock=-1 --ulimit stack=67108864 --user root
+        --device /dev/alixpu --device /dev/alixpu_ctl
+        --device /dev/alixpu_ppu0
+    env:
+      GEMS_VENDOR: thead
+      FLAGGEMS_VENDOR: thead
+      VLLM_PLUGINS: fl
+      CUDA_VISIBLE_DEVICES: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out proposed operator source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install proposed library without changing the vendor runtime
+        run: python3 -m pip install --no-deps --no-build-isolation .
+      - name: Run required installed-package regressions
+        run: python3 tools/run_ppu_compat_tests.py --output-dir "${RUNNER_TEMP}/ppu-compatibility"
+      - name: Retain exact-scope results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-compatibility
+          path: ${{ runner.temp }}/ppu-compatibility/
+
   # Container-based PR smoke tests for self-hosted vendor runners that ship a
   # vendor-provided vLLM base image instead of going through FlagGems'
   # setup.sh. The runner/image pairings live in
@@ -458,12 +503,23 @@ jobs:
       - select-targets
       - nvidia-tests
       - non-nvidia-tests
+      - ppu-compatibility
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: check ci results
         shell: bash
         env:
+          PPU_RESULT: ${{ needs.ppu-compatibility.result }}
+          PPU_EXPECTED: >-
+            ${{ needs.select-targets.outputs.should_run == 'true'
+                && (contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_thead_optional_imports.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_optional_runtime_imports.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_post_graph.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_ops.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_concat_and_cache_mla_padding.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_qsa_sparse_paged_attention_unpacked.py'))
+                && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]') }}
           CODE_STYLE_RESULT: ${{ needs.code-style.result }}
           SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
           NVIDIA_RESULT: ${{ needs.nvidia-tests.result }}
@@ -518,3 +574,5 @@ jobs:
           check_accelerator_result nvidia "${expect_nvidia}" "${NVIDIA_RESULT}"
           check_accelerator_result \
             non-nvidia "${expect_non_nvidia}" "${NON_NVIDIA_RESULT}"
+
+          check_accelerator_result ppu "${PPU_EXPECTED}" "${PPU_RESULT}"
