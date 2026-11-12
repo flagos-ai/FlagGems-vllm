@@ -9,6 +9,7 @@
 
 Each worker calls torch.ops.symm_mem.fused_matmul_reduce_scatter and compares it
 against Torch GEMM + NCCL reduce-scatter. Any rank's mismatch fails every worker.
+Use --comm-only to check Torch NCCL/RCCL without importing TLE or FlagGems-vllm.
 """
 
 import argparse
@@ -21,6 +22,46 @@ def _positive_int(value):
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _init_nccl_group(device):
+    import torch.distributed as dist
+
+    rank = os.environ["RANK"]
+    print(
+        f"[rank {rank}] NCCL init begin pid={os.getpid()} device={device} "
+        f"NCCL_IB_DISABLE={os.getenv('NCCL_IB_DISABLE', '<unset>')} "
+        f"HSA_FORCE_FINE_GRAIN_PCIE={os.getenv('HSA_FORCE_FINE_GRAIN_PCIE', '<unset>')}",
+        flush=True,
+    )
+    dist.init_process_group("nccl", device_id=device)
+    print(f"[rank {rank}] NCCL init complete", flush=True)
+    return dist.group.WORLD
+
+
+def _check_communication(device, repeat):
+    import torch
+    import torch.distributed as dist
+
+    group = _init_nccl_group(device)
+    try:
+        value = torch.empty((1,), dtype=torch.float32, device=device)
+        expected = group.size() * (group.size() + 1) // 2
+        for iteration in range(repeat):
+            value.fill_(group.rank() + 1)
+            dist.all_reduce(value, group=group)
+            actual = value.item()
+            if actual != expected:
+                raise AssertionError(
+                    f"all-reduce returned {actual}, expected {expected}"
+                )
+            print(
+                f"[rank {group.rank()}] COMM PASS iteration={iteration + 1}/{repeat} "
+                f"all_reduce={actual}",
+                flush=True,
+            )
+    finally:
+        dist.destroy_process_group()
 
 
 def _report_fp32_errors(a, b, output, baseline, reduce_op, group, rtol, atol):
@@ -68,6 +109,11 @@ def main():
         help="K already local to each rank",
     )
     parser.add_argument("--repeat", type=_positive_int, default=3)
+    parser.add_argument(
+        "--comm-only",
+        action="store_true",
+        help="only check Torch NCCL/RCCL init and all-reduce; skip TLE and FlagGems-vllm",
+    )
     args = parser.parse_args()
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -89,6 +135,9 @@ def main():
         )
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    if args.comm_only:
+        _check_communication(device, args.repeat)
+        return
     try:
         tle = importlib.import_module("triton.experimental.tle.language")
     except ImportError:
@@ -115,8 +164,7 @@ def main():
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     rtol = 0.04 if dtype == torch.bfloat16 else 0.01
     atol = 0.005 if dtype == torch.bfloat16 else 0.001
-    dist.init_process_group("nccl", device_id=device)
-    group = dist.group.WORLD
+    group = _init_nccl_group(device)
     try:
         if group.rank() == 0 and backend == "hcu":
             keys = (
