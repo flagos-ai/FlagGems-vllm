@@ -59,6 +59,7 @@ BOUNDARY_KV_TILE = tl.constexpr(16)
 SHORT_QUERY_LIMIT = tl.constexpr(16)
 WORKLIST_TILE = tl.constexpr(128)
 WORKLIST_INTERLEAVE_MAX_BATCH = 64
+TRANSPOSE_V_MIN_QUERY_LENGTH = 1024
 DECODE_KV_SPLITS = tl.constexpr(2)
 SPLIT_KV_MIN_LENGTH = tl.constexpr(512)
 SPLIT_KV_MAX_PARALLEL_HEADS = tl.constexpr(64)
@@ -126,6 +127,7 @@ def _flash_int8_pack_kv(
     SV: tl.constexpr,
     HV: tl.constexpr,
     LOGICAL: tl.constexpr,
+    TRANSPOSE_V: tl.constexpr,
     SKIP_SHORT: tl.constexpr,
 ):
     n = tl.program_id(0) * PACK_TILE + tl.arange(0, PACK_TILE)
@@ -159,7 +161,12 @@ def _flash_int8_pack_kv(
         )
         off = ((batch * HEADS + h) * N + n[:, None]) * D + d[None, :]
         tl.store(KP + off, k, n[:, None] < N)
-        tl.store(VP + off, v.to(tl.float16), n[:, None] < N)
+        v_off = (
+            ((batch * HEADS + h) * D + d[None, :]) * N + n[:, None]
+            if TRANSPOSE_V
+            else off
+        )
+        tl.store(VP + v_off, v.to(tl.float16), n[:, None] < N)
 
 
 @libentry()
@@ -186,6 +193,7 @@ def _flash_int8_fwd(
     pk: tl.constexpr,
     sv: tl.constexpr,
     hv: tl.constexpr,
+    dv: tl.constexpr,
     pv: tl.constexpr,
     so: tl.constexpr,
     ho: tl.constexpr,
@@ -302,8 +310,18 @@ def _flash_int8_fwd(
     for query_index in range(query_iterations):
         current_tile = query_index if SHORT_ONLY else tile
         rows = current_tile * BM + tl.arange(0, BM)
-        m = rows // GROUP if FOLD else rows
-        h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
+        if ASYNC_K and FOLD:
+            # Keep one head's query rows together in the matrix-warp layout.
+            local_rows = tl.arange(0, BM)
+            m = current_tile * query_tile + local_rows % query_tile
+            h = kv_head * GROUP + local_rows // query_tile
+        else:
+            m = rows // GROUP if FOLD else rows
+            h = (
+                kv_head * GROUP + rows % GROUP
+                if FOLD
+                else tl.full((BM,), head, tl.int32)
+            )
         d = tl.arange(0, D)
         if active & (current_tile * query_tile < nq):
             q = tl.load(
@@ -463,25 +481,33 @@ def _flash_int8_fwd(
                             p_int8 = (
                                 (p * PROB_QUANT_LEVELS + 0.5).to(tl.int32) - 128
                             ).to(tl.int8)
-                    if COMPENSATE_PV and ASYNC_K and use_dense and mask_phase == 0:
-                        # Avoid per-element addresses while the extra PV operands are live.
+                    if (
+                        (COMPENSATE_PV or dv != 1)
+                        and ASYNC_K
+                        and use_dense
+                        and mask_phase == 0
+                    ):
+                        # Transposed V keeps the reduction dimension contiguous
+                        # for AIU copies; compensation also benefits on the old layout.
+                        # AIU derives pitch from shape, so describe the packed
+                        # allocation, including padding for shorter requests.
                         v_ptr = tl.make_block_ptr(
                             V + batch * pv + kv_head * hv,
-                            shape=(nk, D),
-                            strides=(sv, 1),
+                            shape=(dv if dv != 1 else nk, D),
+                            strides=(sv, dv),
                             offsets=(start * phase_blocks[mask_phase], 0),
                             block_shape=(phase_blocks[mask_phase], D),
-                            order=(1, 0),
+                            order=(0, 1) if dv != 1 else (1, 0),
                         )
                         v = tle.load(v_ptr, is_async=True)
                     elif not use_dense or mask_phase == 1:
                         v = tl.load(
-                            V + v_row[:, None] + kv_head * hv + d[None, :],
+                            V + v_row[:, None] + kv_head * hv + d[None, :] * dv,
                             n[:, None] < nk,
                             0,
                         )
                     else:
-                        v = tl.load(V + v_row[:, None] + kv_head * hv + d[None, :])
+                        v = tl.load(V + v_row[:, None] + kv_head * hv + d[None, :] * dv)
                     if HALF_PV:
                         p_scaled = p * PV_SCALE if COMPENSATE_PV or SCALED_PV else p
                         p_hi = p_scaled.to(tl.float16)
@@ -614,9 +640,11 @@ def flash_attn_varlen_func_w8a8_int8(
     logical KV positions while staying within the physical-cache workspace
     budget; other long-query paths preserve physical page indices. When the
     compiler provides PPU AIU loading, dense tiles use asynchronous INT8 K
-    copies. Compensated PV also uses asynchronous FP16 V block copies to reduce
-    address-register pressure; masked boundary tiles retain regular loads.
-    Dense causal prefill interleaves heads and visits query tiles in descending order. Small mixed
+    copies. Long logical-query paths pack V with a contiguous reduction dimension
+    for asynchronous FP16 V copies. Smaller queries keep the original V layout;
+    compensated PV uses asynchronous V copies on either layout. Masked boundary
+    tiles retain regular loads. Folded AIU tiles group query rows by head.
+    Dense causal prefill visits query tiles in descending order. Small mixed
     batches interleave the long-request worklist by query tile. Packed FP16-PV
     boundary blocks use 16 KV positions when the query tile is narrower than
     the dense KV block. Dense blocks keep their original width. Selected
@@ -679,6 +707,8 @@ def flash_attn_varlen_func_w8a8_int8(
         and batch * max_seqlen_k <= k.shape[0] * k.shape[1]
     )
     use_aiu_k = logical_kv and HAS_AIU_K
+    # Transposed V amortizes its pipeline setup only beyond small prefill tiles.
+    transpose_v = use_aiu_k and max_seqlen_q >= TRANSPOSE_V_MIN_QUERY_LENGTH
     reorder_causal = use_aiu_k and causal and left < 0 and right < 0
     block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
     fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
@@ -779,7 +809,10 @@ def flash_attn_varlen_func_w8a8_int8(
                 packed_shape, packed_stride, dtype=torch.int8, device=k.device
             )
             vp = torch.empty_strided(
-                packed_shape, packed_stride, dtype=torch.float16, device=v.device
+                packed_shape,
+                (kv_heads * n * dim, 1, n * dim, n) if transpose_v else packed_stride,
+                dtype=torch.float16,
+                device=v.device,
             )
             _flash_int8_pack_kv[pack_grid](
                 k,
@@ -797,6 +830,7 @@ def flash_attn_varlen_func_w8a8_int8(
                 *k.stride()[:3],
                 *v.stride()[:3],
                 LOGICAL=logical_kv,
+                TRANSPOSE_V=transpose_v,
                 SKIP_SHORT=split_queries,
             )
             k, v = kp, vp
@@ -849,6 +883,7 @@ def flash_attn_varlen_func_w8a8_int8(
                     k.stride(0) if paged else 0,
                     v.stride(-3),
                     v.stride(-2),
+                    v.stride(-1),
                     v.stride(0) if paged else 0,
                     kernel_out.stride(-3),
                     kernel_out.stride(-2),
