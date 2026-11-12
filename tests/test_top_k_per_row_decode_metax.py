@@ -100,3 +100,68 @@ def test_topk_empty_width_cpu_rejected_before_output_write():
     with pytest.raises(ValueError, match="is_cuda"):
         _decode_topk_tree(logits, lengths, output)
     assert bool((output == 77).all())
+
+
+@pytest.mark.top_k_per_row_decode
+@pytest.mark.parametrize(
+    "top_k,width", [(1, 513), (63, 1024), (512, 16640), (1024, 4096), (1024, 32768)]
+)
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_shared_selector_exact_ties_and_changed_input_graph(top_k, width, length_dtype):
+    from importlib import import_module
+
+    vendor = import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.top_k_per_row_decode"
+    )
+    if not vendor._SHARED_SELECTOR_AVAILABLE:
+        pytest.skip("MetaX shared selector requires the existing TLE capability")
+    assert ops.top_k_per_row_decode is vendor.top_k_per_row_decode
+    rows = 6
+    backing = torch.empty((rows, 2 * width + 3), dtype=torch.float32, device="cuda")
+    logits = backing[:, 1 : 2 * width + 1 : 2]
+    columns = torch.arange(width, device="cuda", dtype=torch.float32)
+    logits.copy_(columns.remainder(37).expand(rows, -1))
+    lengths = torch.tensor(
+        [0, 1, top_k - 1, top_k, top_k + 1, width], dtype=length_dtype, device="cuda"
+    )
+    output = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+
+    def call():
+        assert (
+            ops.top_k_per_row_decode(
+                logits,
+                1,
+                lengths,
+                output,
+                rows,
+                logits.stride(0),
+                logits.stride(1),
+                top_k,
+            )
+            is None
+        )
+
+    def check():
+        for row, length in enumerate(lengths.cpu().tolist()):
+            expected = torch.full((top_k,), -1, dtype=torch.int32)
+            count = min(length, top_k)
+            selected = (
+                torch.argsort(logits[row, :length].cpu(), descending=True, stable=True)[
+                    :count
+                ]
+                .sort()
+                .values
+            )
+            expected[:count] = selected.to(torch.int32)
+            torch.testing.assert_close(output[row].cpu(), expected, atol=0, rtol=0)
+        previous = output.clone()
+        call()
+        torch.testing.assert_close(output, previous, atol=0, rtol=0)
+
+    def update(value):
+        logits[:, -1].fill_(value)
+        lengths[0] = width if value > 0 else 0
+
+    call()
+    check()
+    check_replays(call, update, check, outputs=(output,))

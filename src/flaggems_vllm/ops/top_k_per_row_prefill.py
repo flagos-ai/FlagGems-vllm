@@ -1232,13 +1232,18 @@ def tle_top_k_per_row_prefill(
     BLOCK_SIZE: tl.constexpr,
     USE_RADIX_FINAL: tl.constexpr,
     ROW_OFFSET: tl.constexpr,
+    CANONICAL_OUTPUT: tl.constexpr = False,
+    ROW_START_ZERO: tl.constexpr = False,
 ):
     NUM_FILNAL_ITEMS: tl.constexpr = 2048
     NUM_BINS: tl.constexpr = 2048
     VEC: tl.constexpr = 4
 
     row_id = tl.program_id(0) + ROW_OFFSET
-    row_start = tl.load(row_starts + row_id)
+    if ROW_START_ZERO:
+        row_start = 0
+    else:
+        row_start = tl.load(row_starts + row_id)
     row_end = tl.load(row_ends + row_id)
     logits_ptr += row_id * stride0
     # float4 align
@@ -1320,13 +1325,13 @@ def tle_top_k_per_row_prefill(
         s_threshold_bin_idx_ptr,
         s_final_bin_size_ptr,
         s_found_topk_values_ptr,
-        s_out_indices_ptr,
+        out_indices_ptr if CANONICAL_OUTPUT else s_out_indices_ptr,
         None,
         TOPK=TOPK,
         BLOCK_SIZE=BLOCK_SIZE,
         USE_RADIX_FINAL=USE_RADIX_FINAL,
-        HAS_TLE=True,
-        CANONICAL_OUTPUT=False,
+        HAS_TLE=not CANONICAL_OUTPUT,
+        CANONICAL_OUTPUT=CANONICAL_OUTPUT,
         MULTIPLE_BLOCKS_PER_ROW=False,
         MERGE_BLOCKS=False,
     )

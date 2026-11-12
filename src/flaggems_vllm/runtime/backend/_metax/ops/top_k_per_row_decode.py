@@ -3,17 +3,59 @@
 """MetaX implementation of the common per-row decode Top-k contract."""
 
 import logging
+import os
+from importlib import import_module
 
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+from flaggems_vllm.runtime.backend._metax.fused.top_k_per_row_decode import _SHIM
 from flaggems_vllm.runtime.backend._metax.fused.top_k_per_row_decode import (
     top_k_per_row_decode as _general_top_k_per_row_decode,
 )
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import fill_tensor
 
 logger = logging.getLogger(__name__)
+_selector = import_module("flaggems_vllm.ops.top_k_per_row_prefill")
+# Reuse the common selector mathematics, without changing Prefill dispatch.
+_SHARED_SELECTOR_AVAILABLE = (
+    runtime.device.vendor_name == "metax"
+    and _SHIM is not None
+    and os.environ.get("FLAGGEMS_METAX_TLE", "").strip().lower()
+    not in {"0", "false", "off", "no"}
+)
+if _SHARED_SELECTOR_AVAILABLE:
+    _selector.tle = _SHIM
+
+
+def _stable_topk_shared(logits, row_starts, row_ends, output, num_rows, top_k=512):
+    """Share the canonical selector, including the zero-start decode case."""
+    starts = (
+        row_starts.to(dtype=torch.int32).contiguous()
+        if row_starts is not None
+        else None
+    )
+    ends = row_ends.to(dtype=torch.int32).contiguous()
+    with runtime.torch_device_fn.device(logits.device):
+        _selector.tle_top_k_per_row_prefill[(num_rows,)](
+            logits,
+            output,
+            starts,
+            ends,
+            logits.stride(0),
+            logits.stride(1),
+            logits.shape[1],
+            TOPK=top_k,
+            TOPKP=triton.next_power_of_2(top_k),
+            BLOCK_SIZE=512,
+            CANONICAL_OUTPUT=True,
+            ROW_START_ZERO=starts is None,
+            USE_RADIX_FINAL=False,
+            ROW_OFFSET=0,
+            num_warps=_selector._num_warps(512),
+        )
 
 
 def top_k_per_row_decode(
@@ -21,17 +63,18 @@ def top_k_per_row_decode(
 ):
     """Mutate indices and return None, as the common NVIDIA-facing API does.
 
-    The existing stable tree is used only for its validated one-query K512
-    domain. All other domains retain the previous MetaX public implementation.
+    The shared selector handles the validated one-query bounded Top-k domain.
+    Other shapes retain the stable tree or previous public implementation.
     Selection happens before either implementation writes or launches work.
     """
     logger.debug("GEMS_METAX TOP_K_PER_ROW_DECODE")
     if (
         next_n == 1
-        and top_k == 512
+        and isinstance(top_k, int)
+        and not isinstance(top_k, bool)
+        and 0 < top_k <= 1024
         and logits.ndim == 2
         and logits.dtype == torch.float32
-        and logits.stride(1) == 1
         and num_rows == logits.shape[0]
         and (stride0, stride1) == logits.stride()
         and seq_lens.shape == (num_rows,)
@@ -42,8 +85,25 @@ def top_k_per_row_decode(
         and indices.dtype == torch.int32
         and seq_lens.device == logits.device == indices.device
     ):
-        _decode_topk_tree(logits, seq_lens, indices, k=top_k)
-        return None
+        # Keep the existing stable tree outside the measured selector domain.
+        # INT32 normalization is lossless for native lengths bounded by N.
+        # Select capability before launching work; never retry runtime errors.
+        if (
+            0 < logits.shape[1] <= 0x7FFFFFFF
+            and (top_k != 512 or logits.shape[1] <= 16640)
+            and num_rows > 0
+            and indices.shape[1] == top_k
+            and indices.is_contiguous()
+            and _SHARED_SELECTOR_AVAILABLE
+        ):
+            if logits.stride(1) != 1 or logits.stride(0) < logits.shape[1]:
+                logits = logits.contiguous()
+            return _stable_topk_shared(
+                logits, None, seq_lens, indices, num_rows, top_k=top_k
+            )
+        if top_k == 512 and logits.stride(1) == 1:
+            _decode_topk_tree(logits, seq_lens, indices, k=top_k)
+            return None
     return _general_top_k_per_row_decode(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
     )
