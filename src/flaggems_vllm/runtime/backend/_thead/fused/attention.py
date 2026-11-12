@@ -39,6 +39,19 @@ LN2 = tl.constexpr(0.6931471805599453)
 PROB_QUANT_LEVELS = tl.constexpr(255)
 # Two signed bytes represent hi * 256 + lo without overflowing the high byte.
 PRECISE_PROB_LEVELS = tl.constexpr(127 * 256)
+# A power-of-two scale preserves P's significand and keeps its maximum in FP16 range.
+PV_SCALE = tl.constexpr(2.0**15)
+PV_UNSCALE = tl.constexpr(2.0**-15)
+# Budget for the absolute output contribution from probability rounding only.
+PV_ROUNDING_BUDGET = tl.constexpr(2.0**-8)
+# FP16 round-to-nearest bounds; the PPU dot preserves subnormal operands.
+PV_RELATIVE_ROUNDING = tl.constexpr(2.0**-11)
+PV_ABSOLUTE_ROUNDING = tl.constexpr(2.0**-25)
+# Keep scaling when accumulated subnormal error would tighten the fast-path limit.
+PV_UNSCALED_MAX_LENGTH = (
+    int(PV_RELATIVE_ROUNDING.value / PV_ABSOLUTE_ROUNDING.value) + 1
+)
+PV_SCALED_UNDERFLOW_BOUND = tl.constexpr(2.0**-29)
 # Descales are indexed by logical sequence position in blocks of DESCALE_BLOCK.
 DESCALE_BLOCK = tl.constexpr(128)
 PACK_TILE = tl.constexpr(32)
@@ -200,6 +213,8 @@ def _flash_int8_fwd(
     HAS_ALIBI: tl.constexpr,
     WRITE_LSE: tl.constexpr,
     HALF_PV: tl.constexpr,
+    COMPENSATE_PV: tl.constexpr,
+    SCALED_PV: tl.constexpr,
     PRECISE_PV: tl.constexpr,
     ASYNC_K: tl.constexpr,
     REORDER_CAUSAL: tl.constexpr,
@@ -262,6 +277,24 @@ def _flash_int8_fwd(
     else:
         k_start = tl.load(CUK + batch)
         nk = tl.load(CUK + batch + 1) - k_start
+    if HALF_PV and vs2 == 0:
+        v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
+        # A maximum probability is exactly 1, so its FP16 cast has no error.
+        # For D = sum(P) >= 1, the remaining error divided by D is bounded by
+        # max(u, (nk - 1) * epsilon), since u * (D - 1) + (nk - 1) * epsilon
+        # bounds the unnormalized error. |V_int8| <= 128 then bounds each output.
+        if SCALED_PV:
+            probability_error = PV_RELATIVE_ROUNDING + nk * PV_SCALED_UNDERFLOW_BOUND
+        else:
+            probability_error = tl.maximum(
+                PV_RELATIVE_ROUNDING, tl.maximum(nk - 1, 0) * PV_ABSOLUTE_ROUNDING
+            )
+        rounding_bound = 128.0 * tl.abs(v_scale) * probability_error
+        needs_compensation = rounding_bound > PV_ROUNDING_BUDGET
+        if COMPENSATE_PV:
+            active &= needs_compensation
+        else:
+            active &= ~needs_compensation
     if SHORT_ONLY:
         query_iterations = tl.where(active, tl.cdiv(nq, query_tile), 0)
     else:
@@ -430,7 +463,18 @@ def _flash_int8_fwd(
                             p_int8 = (
                                 (p * PROB_QUANT_LEVELS + 0.5).to(tl.int32) - 128
                             ).to(tl.int8)
-                    if not use_dense or mask_phase == 1:
+                    if COMPENSATE_PV and ASYNC_K and use_dense and mask_phase == 0:
+                        # Avoid per-element addresses while the extra PV operands are live.
+                        v_ptr = tl.make_block_ptr(
+                            V + batch * pv + kv_head * hv,
+                            shape=(nk, D),
+                            strides=(sv, 1),
+                            offsets=(start * phase_blocks[mask_phase], 0),
+                            block_shape=(phase_blocks[mask_phase], D),
+                            order=(1, 0),
+                        )
+                        v = tle.load(v_ptr, is_async=True)
+                    elif not use_dense or mask_phase == 1:
                         v = tl.load(
                             V + v_row[:, None] + kv_head * hv + d[None, :],
                             n[:, None] < nk,
@@ -439,21 +483,29 @@ def _flash_int8_fwd(
                     else:
                         v = tl.load(V + v_row[:, None] + kv_head * hv + d[None, :])
                     if HALF_PV:
+                        p_scaled = p * PV_SCALE if COMPENSATE_PV or SCALED_PV else p
+                        p_hi = p_scaled.to(tl.float16)
+                        if COMPENSATE_PV:
+                            p_lo = (p_scaled - p_hi.to(tl.float32)).to(tl.float16)
                         if vs2 == 0:
                             if BM >= 128:
-                                # Rescale before materializing P to shorten large-tile live ranges.
+                                # Rescale the large-tile accumulator before the dot.
                                 acc = acc * alpha[:, None]
-                                acc = tl.dot(p.to(tl.float16), v.to(tl.float16), acc)
+                                acc = tl.dot(p_hi, v.to(tl.float16), acc)
                             else:
                                 acc = tl.dot(
-                                    p.to(tl.float16),
+                                    p_hi,
                                     v.to(tl.float16),
                                     acc * alpha[:, None],
                                 )
+                            if COMPENSATE_PV:
+                                acc = tl.dot(p_lo, v.to(tl.float16), acc)
                         else:
                             partial = tl.dot(
-                                p.to(tl.float16), v.to(tl.float16), out_dtype=tl.float32
+                                p_hi, v.to(tl.float16), out_dtype=tl.float32
                             )
+                            if COMPENSATE_PV:
+                                partial = tl.dot(p_lo, v.to(tl.float16), partial)
                             acc = acc * alpha[:, None] + partial * vs
                     else:
                         if PRECISE_PV:
@@ -473,14 +525,26 @@ def _flash_int8_fwd(
                             ).to(tl.float32)
                         acc = acc * alpha[:, None] + partial * (p_scale * vs)[:, None]
                     maximum = new_max
-            if KV_SPLITS > 1:
-                # Defer normalization to the merge instead of rounding twice.
-                result = acc
+            if HALF_PV and vs2 == 0 and KV_SPLITS == 1:
+                # Fold the head scale into the row factor before scaling the tile.
+                output_scale = v_scale * (
+                    PV_UNSCALE if COMPENSATE_PV or SCALED_PV else 1.0
+                )
+                output_scale = output_scale / tl.where(denom > 0, denom, 1)
+                result = acc * output_scale[:, None]
             else:
-                result = acc / tl.where(denom > 0, denom, 1)[:, None]
-            if HALF_PV and vs2 == 0:
-                v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
-                result *= v_scale
+                if KV_SPLITS > 1:
+                    # Defer normalization to the merge instead of rounding twice.
+                    result = acc
+                else:
+                    result = acc / tl.where(denom > 0, denom, 1)[:, None]
+                if HALF_PV:
+                    if vs2 == 0:
+                        result *= v_scale * (
+                            PV_UNSCALE if COMPENSATE_PV or SCALED_PV else 1.0
+                        )
+                    elif COMPENSATE_PV or SCALED_PV:
+                        result *= PV_UNSCALE
             tl.store(
                 O
                 + split_id * OUT_SPLIT_STRIDE
@@ -550,8 +614,9 @@ def flash_attn_varlen_func_w8a8_int8(
     logical KV positions while staying within the physical-cache workspace
     budget; other long-query paths preserve physical page indices. When the
     compiler provides PPU AIU loading, dense tiles use asynchronous INT8 K
-    copies; masked boundary tiles retain regular loads. Dense causal prefill
-    interleaves heads and visits query tiles in descending order. Small mixed
+    copies. Compensated PV also uses asynchronous FP16 V block copies to reduce
+    address-register pressure; masked boundary tiles retain regular loads.
+    Dense causal prefill interleaves heads and visits query tiles in descending order. Small mixed
     batches interleave the long-request worklist by query tile. Packed FP16-PV
     boundary blocks use 16 KV positions when the query tile is narrower than
     the dense KV block. Dense blocks keep their original width. Selected
@@ -756,78 +821,88 @@ def flash_attn_varlen_func_w8a8_int8(
                 grid = (1, batch, kv_heads)
             reorder_phase = reorder_causal and not short_phase
             launch_grid = (grid[2], grid[1], grid[0]) if reorder_phase else grid
-            _flash_int8_fwd[launch_grid](
-                q,
-                k,
-                v,
-                kernel_out,
-                kernel_stats,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_k,
-                block_table,
-                work,
-                q_descale,
-                k_descale,
-                v_descale,
-                alibi_slopes,
-                q.stride(0),
-                q.stride(1),
-                k.stride(-3),
-                k.stride(-2),
-                k.stride(0) if paged else 0,
-                v.stride(-3),
-                v.stride(-2),
-                v.stride(0) if paged else 0,
-                kernel_out.stride(-3),
-                kernel_out.stride(-2),
-                *q_descale.stride(),
-                *k_descale.stride(),
-                *v_descale.stride(),
-                block_table.stride(0) if paged else 0,
-                (
-                    alibi_slopes.stride(0)
-                    if alibi_slopes is not None and alibi_slopes.ndim == 2
-                    else 0
-                ),
-                total,
-                heads // k.shape[-2],
-                dim,
-                k.shape[1] if paged else 0,
-                paged,
-                causal,
-                left,
-                right,
-                softcap,
-                dim**-0.5 if softmax_scale is None else softmax_scale,
-                alibi_slopes is not None,
-                return_softmax_lse or split_kv,
-                HALF_PV=half_pv,
-                ASYNC_K=use_aiu_k and not short_phase,
-                REORDER_CAUSAL=reorder_phase,
-                TAIL_N=BOUNDARY_KV_TILE.value,
-                KV_SPLITS=DECODE_KV_SPLITS.value if split_kv else 1,
-                OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
-                LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
-                PRECISE_PV=(
-                    common_gqa
-                    and max_seqlen_q <= 2
-                    and max_seqlen_k <= 2 * DESCALE_BLOCK.value
-                ),
-                SEPARATE_MASK=common_gqa,
-                LOGICAL_KV=logical_kv,
-                BATCH=batch,
-                COMPACT=compact,
-                USE_WORKLIST=split_queries and not short_phase,
-                WORK_CAPACITY=work_capacity if split_queries and not short_phase else 0,
-                TILE_PITCH=tile_pitch if split_queries and not short_phase else 1,
-                SHORT_ONLY=short_phase,
-                FOLD=fold,
-                BM=block_m,
-                BN=block_n,
-                num_warps=num_warps,
-                num_stages=num_stages,
+            # Uniform head scales admit a cheap error bound before either loop.
+            # The launches have complementary guards, so each CTA writes only once.
+            pv_passes = (
+                (False, True) if half_pv and v_descale.stride(2) == 0 else (True,)
             )
+            for compensate_pv in pv_passes:
+                _flash_int8_fwd[launch_grid](
+                    q,
+                    k,
+                    v,
+                    kernel_out,
+                    kernel_stats,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    block_table,
+                    work,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    alibi_slopes,
+                    q.stride(0),
+                    q.stride(1),
+                    k.stride(-3),
+                    k.stride(-2),
+                    k.stride(0) if paged else 0,
+                    v.stride(-3),
+                    v.stride(-2),
+                    v.stride(0) if paged else 0,
+                    kernel_out.stride(-3),
+                    kernel_out.stride(-2),
+                    *q_descale.stride(),
+                    *k_descale.stride(),
+                    *v_descale.stride(),
+                    block_table.stride(0) if paged else 0,
+                    (
+                        alibi_slopes.stride(0)
+                        if alibi_slopes is not None and alibi_slopes.ndim == 2
+                        else 0
+                    ),
+                    total,
+                    heads // k.shape[-2],
+                    dim,
+                    k.shape[1] if paged else 0,
+                    paged,
+                    causal,
+                    left,
+                    right,
+                    softcap,
+                    dim**-0.5 if softmax_scale is None else softmax_scale,
+                    alibi_slopes is not None,
+                    return_softmax_lse or split_kv,
+                    HALF_PV=half_pv,
+                    COMPENSATE_PV=compensate_pv,
+                    SCALED_PV=max_seqlen_k > PV_UNSCALED_MAX_LENGTH,
+                    ASYNC_K=use_aiu_k and not short_phase,
+                    REORDER_CAUSAL=reorder_phase,
+                    TAIL_N=BOUNDARY_KV_TILE.value,
+                    KV_SPLITS=DECODE_KV_SPLITS.value if split_kv else 1,
+                    OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
+                    LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
+                    PRECISE_PV=(
+                        common_gqa
+                        and max_seqlen_q <= 2
+                        and max_seqlen_k <= 2 * DESCALE_BLOCK.value
+                    ),
+                    SEPARATE_MASK=common_gqa,
+                    LOGICAL_KV=logical_kv,
+                    BATCH=batch,
+                    COMPACT=compact,
+                    USE_WORKLIST=split_queries and not short_phase,
+                    WORK_CAPACITY=(
+                        work_capacity if split_queries and not short_phase else 0
+                    ),
+                    TILE_PITCH=tile_pitch if split_queries and not short_phase else 1,
+                    SHORT_ONLY=short_phase,
+                    FOLD=fold,
+                    BM=block_m,
+                    BN=block_n,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                )
         if split_kv:
             _flash_int8_merge_splits[(total, heads)](
                 kernel_out,
