@@ -216,9 +216,9 @@ class MegaMHCContext:
     specialization, binds the four layer-static tensors, and gives this
     context exclusive ownership of one ``MegaMHCWorkspace``. CPU devices are
     permitted only so the pure host contract can be tested without a GPU.
-    ``trusted_fast_path`` is reserved for the production factory after every
-    dynamic tensor ABI has been validated. It keeps only cheap per-call
-    semantic and ownership guards.
+    The production factory validates layer-static tensors once at bind time.
+    Calls retain the cheap dynamic ABI, ownership, stream, and pointer guards
+    that cannot be delegated to the prepared launcher.
     """
 
     profile: MegaMHCProfile
@@ -265,16 +265,15 @@ class MegaMHCContext:
             raise ValueError("launcher and workspace streams differ")
         if launcher.owner_thread_id != threading.get_ident():
             raise RuntimeError("launcher belongs to a different host thread")
-        if trusted_fast_path:
-            _validate_trusted_context_binding(
-                profile,
-                fn,
-                hc_scale,
-                hc_base,
-                norm_weight,
-                workspace,
-                launcher.static_alignments,
-            )
+        _validate_trusted_context_binding(
+            profile,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            workspace,
+            launcher.static_alignments,
+        )
         return cls(
             profile=profile,
             supported_tokens=normalized_tokens,
@@ -285,7 +284,9 @@ class MegaMHCContext:
             workspace=workspace,
             launcher=launcher,
             owner_thread_id=threading.get_ident(),
-            trusted_fast_path=trusted_fast_path,
+            # Keep the field for source compatibility with early adopters,
+            # but every admitted context now uses the one production path.
+            trusted_fast_path=True,
         )
 
 
@@ -331,15 +332,6 @@ def _require_contiguous(
 def _require_tensor(name: str, tensor: object) -> None:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
-
-
-def _exact_integer(name: str, value: object) -> int:
-    if isinstance(value, bool):
-        _unsupported(f"{name} must be an exact integer, got {value!r}")
-    try:
-        return int(operator.index(value))
-    except TypeError:
-        _unsupported(f"{name} must be an exact integer, got {value!r}")
 
 
 def _validate_trusted_context_binding(
@@ -389,41 +381,6 @@ def _validate_trusted_context_binding(
             raise ValueError("CUDA MegaMHC workspace requires a stream handle")
     elif workspace.stream_handle is not None:
         raise ValueError("non-CUDA test workspace must not carry a CUDA stream handle")
-
-
-def _validate_scalar_contract(
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    n_splits: int,
-    tile_n: int,
-    norm_eps: float,
-    profile: MegaMHCProfile,
-) -> None:
-    scalar_contract = (
-        ("rms_eps", float(rms_eps), profile.rms_eps),
-        ("hc_pre_eps", float(hc_pre_eps), profile.hc_pre_eps),
-        ("hc_sinkhorn_eps", float(hc_sinkhorn_eps), profile.hc_sinkhorn_eps),
-        (
-            "hc_post_mult_value",
-            float(hc_post_mult_value),
-            profile.hc_post_mult_value,
-        ),
-        ("norm_eps", float(norm_eps), profile.norm_eps),
-    )
-    for name, value, required in scalar_contract:
-        if value != required:
-            _unsupported(f"{name}={value}, expected {required}")
-    if _exact_integer("sinkhorn_repeat", sinkhorn_repeat) != profile.sinkhorn_repeat:
-        _unsupported(
-            f"sinkhorn_repeat={sinkhorn_repeat}, expected {profile.sinkhorn_repeat}"
-        )
-    if _exact_integer("n_splits", n_splits) != 1:
-        _unsupported(f"n_splits={n_splits}, expected 1")
-    if _exact_integer("tile_n", tile_n) != 1:
-        _unsupported(f"tile_n={tile_n}, expected 1")
 
 
 def _validate_trusted_scalar_contract(
@@ -560,138 +517,6 @@ def _validate_trusted_call(
         norm_eps,
         context.profile,
     )
-    return tokens, dynamic_alignments
-
-
-def _validate_profile(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_weight: Optional[torch.Tensor],
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    n_splits: int,
-    tile_n: int,
-    norm_eps: float,
-    context: MegaMHCContext,
-) -> Tuple[int, Tuple[int, ...]]:
-    profile = context.profile
-    if profile != DEEPSEEK_V4_FLASH_PROFILE:
-        _unsupported("only DeepSeek-V4-Flash normal mode is admitted")
-    if norm_weight is None:
-        _unsupported("norm_weight is required")
-    named_tensors = (
-        ("x", x),
-        ("residual", residual),
-        ("post_layer_mix", post_layer_mix),
-        ("comb_res_mix", comb_res_mix),
-        ("fn", fn),
-        ("hc_scale", hc_scale),
-        ("hc_base", hc_base),
-        ("norm_weight", norm_weight),
-    )
-    for name, tensor in named_tensors:
-        _require_tensor(name, tensor)
-    if x.ndim != 2 or residual.ndim != 3:
-        raise ValueError("x/residual ranks must be 2/3")
-    tokens = int(x.shape[0])
-    if tokens not in context.supported_tokens:
-        _unsupported(f"T={tokens} has no compiled specialization")
-    dynamic_alignments = _normalize_alignments(
-        context.launcher.dynamic_alignments(tokens),
-        count=8,
-        name=f"dynamic alignments for T={tokens}",
-    )
-    static_alignments = _normalize_alignments(
-        context.launcher.static_alignments,
-        count=4,
-        name="launcher.static_alignments",
-    )
-    pointer_alignments = dict(
-        zip(
-            (
-                "x",
-                "residual",
-                "post_layer_mix",
-                "comb_res_mix",
-                "fn",
-                "hc_scale",
-                "hc_base",
-                "norm_weight",
-            ),
-            (*dynamic_alignments[:4], *static_alignments),
-        )
-    )
-    expected = {
-        "x": (x, (tokens, profile.hidden_size), torch.bfloat16),
-        "residual": (
-            residual,
-            (tokens, profile.residual_streams, profile.hidden_size),
-            torch.bfloat16,
-        ),
-        "post_layer_mix": (
-            post_layer_mix,
-            (tokens, profile.residual_streams, 1),
-            torch.float32,
-        ),
-        "comb_res_mix": (
-            comb_res_mix,
-            (tokens, profile.residual_streams, profile.residual_streams),
-            torch.float32,
-        ),
-        "fn": (
-            fn,
-            (
-                profile.projection_outputs,
-                profile.residual_streams * profile.hidden_size,
-            ),
-            torch.float32,
-        ),
-        "hc_scale": (hc_scale, (3,), torch.float32),
-        "hc_base": (
-            hc_base,
-            (profile.projection_outputs,),
-            torch.float32,
-        ),
-        "norm_weight": (
-            norm_weight,
-            (profile.hidden_size,),
-            torch.bfloat16,
-        ),
-    }
-    for name, (tensor, shape, dtype) in expected.items():
-        if tuple(tensor.shape) != shape:
-            _unsupported(f"{name}.shape={tuple(tensor.shape)}, expected {shape}")
-        if tensor.dtype != dtype:
-            _unsupported(f"{name}.dtype={tensor.dtype}, expected {dtype}")
-        if tensor.device != context.workspace.device:
-            raise ValueError(f"{name} is not on context device")
-        if tensor.requires_grad:
-            _unsupported(f"{name} must not require gradients")
-        _require_contiguous(name, tensor, pointer_alignments[name])
-    _validate_scalar_contract(
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-        tile_n,
-        norm_eps,
-        profile,
-    )
-    current_binding = MegaMHCStaticBinding.from_tensors(
-        fn, hc_scale, hc_base, norm_weight
-    )
-    if current_binding != context.static_binding:
-        raise RuntimeError("layer-static tensor identity changed; rebuild context")
     return tokens, dynamic_alignments
 
 
@@ -848,55 +673,34 @@ def mega_mhc(
     new_comb_res_mix, y_bf16)``; ``y_bf16`` is the final RMS-normalized BF16
     output, not the pre-normalization weighted residual sum.
     """
-    if context.trusted_fast_path:
-        tokens, dynamic_alignments = _validate_trusted_call(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            norm_weight,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            tile_n,
-            norm_eps,
-            context,
-        )
-    else:
-        tokens, dynamic_alignments = _validate_profile(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            norm_weight,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            tile_n,
-            norm_eps,
-            context,
-        )
+    tokens, dynamic_alignments = _validate_trusted_call(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        tile_n,
+        norm_eps,
+        context,
+    )
     _validate_workspace(context)
     outputs = (
         _allocate_outputs(x, residual, context.profile.residual_streams)
         if out is None
         else out
     )
-    if out is None and context.trusted_fast_path:
+    if out is None:
         _validate_allocated_output_alignments(outputs, dynamic_alignments[4:])
-    if out is not None or not context.trusted_fast_path:
+    if out is not None:
         protected_inputs = (
             x,
             residual,

@@ -1,46 +1,27 @@
-"""Raw PTX M64N24K8 WGMMA probe for the Graph RS shared layout."""
+"""Raw M64N24K8 WGMMA helpers used by the T=400 production kernel."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import torch
 import triton
-import triton.experimental.tle.language as tle
 import triton.language as tl
-
-from .sm90_eager_quad_layout_probe import _shared_address
-
-M, K, N, PADDED_N = 64, 64, 24, 32
-ROOT_WARPS, MATH_WARPS = 16, 4
-JIT_M, JIT_K = tl.constexpr(M), tl.constexpr(K)
-JIT_N, JIT_PADDED_N = tl.constexpr(N), tl.constexpr(PADDED_N)
-JIT_THREADS = tl.constexpr((ROOT_WARPS + MATH_WARPS) * 32)
-JIT_MATH_WARPS = tl.constexpr(MATH_WARPS)
-
-
-@triton.jit
-def _raw_n24_root(q_ptr, fn_ptr, q_shared, fn_shared, ready):
-    m, k = tl.arange(0, JIT_M), tl.arange(0, JIT_K)
-    n = tl.arange(0, JIT_PADDED_N)
-    tl.store(
-        tle.gpu.local_ptr(q_shared),
-        tl.load(q_ptr + m[:, None] * JIT_K + k[None, :]),
-    )
-    tl.store(
-        tle.gpu.local_ptr(fn_shared),
-        tl.load(
-            fn_ptr + n[:, None] * JIT_K + k[None, :],
-            mask=n[:, None] < JIT_N,
-            other=0.0,
-        ),
-    )
-    tle.gpu.barrier_wait(ready)
 
 
 @triton.jit
 def _raw_m64n24k64_accumulate(
-    q_shared_address, fn_shared_address,
-    c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11,
+    q_shared_address,
+    fn_shared_address,
+    c0,
+    c1,
+    c2,
+    c3,
+    c4,
+    c5,
+    c6,
+    c7,
+    c8,
+    c9,
+    c10,
+    c11,
 ):
     return tl.inline_asm_elementwise(
         asm="""
@@ -138,8 +119,22 @@ def _raw_m64n24k64_accumulate(
             "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
             "r,r,f,f,f,f,f,f,f,f,f,f,f,f"
         ),
-        args=[q_shared_address, fn_shared_address,
-              c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11],
+        args=[
+            q_shared_address,
+            fn_shared_address,
+            c0,
+            c1,
+            c2,
+            c3,
+            c4,
+            c5,
+            c6,
+            c7,
+            c8,
+            c9,
+            c10,
+            c11,
+        ],
         dtype=(tl.float32,) * 12,
         is_pure=False,
         pack=1,
@@ -147,42 +142,9 @@ def _raw_m64n24k64_accumulate(
 
 
 @triton.jit
-def _store_raw_n24(output_address, values):
-    c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11 = values
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .u32 tid,mtid,lane,warp,row0,row1,odd,pair,col,off;
-          .reg .u64 a0,a1,cb;
-          mov.u32 tid,%tid.x; sub.u32 mtid,tid,512;
-          and.b32 lane,mtid,31; shr.u32 warp,mtid,5;
-          shr.u32 row0,lane,2; mad.lo.u32 row0,warp,16,row0;
-          add.u32 row1,row0,8; shr.u32 odd,lane,1;
-          and.b32 odd,odd,1; and.b32 pair,lane,1;
-          shl.b32 col,odd,2; shl.b32 off,pair,1; add.u32 col,col,off;
-          mad.wide.u32 a0,row0,96,$1; mad.wide.u32 a1,row1,96,$1;
-          cvt.u64.u32 cb,col; shl.b64 cb,cb,2;
-          add.u64 a0,a0,cb; add.u64 a1,a1,cb;
-          st.global.v2.f32 [a0],{$2,$3}; st.global.v2.f32 [a1],{$4,$5};
-          st.global.v2.f32 [a0+32],{$6,$7}; st.global.v2.f32 [a1+32],{$8,$9};
-          st.global.v2.f32 [a0+64],{$10,$11}; st.global.v2.f32 [a1+64],{$12,$13};
-          mov.u32 $0,0;
-        }
-        """,
-        constraints="=r,l,f,f,f,f,f,f,f,f,f,f,f,f",
-        args=[output_address,c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _store_raw_n24_partials(
-    partials_address, tile, token_limit, values
-):
+def _store_raw_n24_partials(partials_address, tile, token_limit, values):
     """Store c<12> into a global [T,32] split plane with tail masks."""
-    c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11 = values
+    c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = values
     return tl.inline_asm_elementwise(
         asm="""
         {
@@ -210,72 +172,30 @@ def _store_raw_n24_partials(
         }
         """,
         constraints="=r,l,r,r,f,f,f,f,f,f,f,f,f,f,f,f",
-        args=[partials_address,tile,token_limit,
-              c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11],
+        args=[
+            partials_address,
+            tile,
+            token_limit,
+            c0,
+            c1,
+            c2,
+            c3,
+            c4,
+            c5,
+            c6,
+            c7,
+            c8,
+            c9,
+            c10,
+            c11,
+        ],
         dtype=tl.uint32,
         is_pure=False,
         pack=1,
     )
 
 
-@triton.jit
-def _raw_n24_math(q_shared, fn_shared, output_ptr, ready):
-    tle.gpu.barrier_wait(ready)
-    values = _raw_m64n24k64_accumulate(
-        _shared_address(tle.gpu.local_ptr(q_shared, (0, 0))),
-        _shared_address(tle.gpu.local_ptr(fn_shared, (0, 0))),
-        0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
-    )
-    _ = _store_raw_n24(tl.cast(output_ptr, tl.uint64), values)
-
-
-@triton.jit
-def _sm90_wgmma_m64n24_raw_probe_kernel(q_ptr, fn_ptr, output_ptr):
-    q_shared = tle.gpu.alloc(
-        [JIT_M,JIT_K], dtype=tl.bfloat16, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=True,
-    )
-    fn_shared = tle.gpu.alloc(
-        [JIT_PADDED_N,JIT_K], dtype=tl.float32, layout=None,
-        scope=tle.gpu.smem, nv_mma_shared_layout=True,
-    )
-    ready = tle.gpu.alloc_barrier(arrive_count=JIT_THREADS)
-    tle.gpu.warp_specialize(
-        [(_raw_n24_root,(q_ptr,fn_ptr,q_shared,fn_shared,ready)),
-         (_raw_n24_math,(q_shared,fn_shared,output_ptr,ready))],
-        [JIT_MATH_WARPS], [96],
-    )
-
-
-@dataclass(frozen=True)
-class RawM64N24ProbePlan:
-    q: torch.Tensor
-    fn: torch.Tensor
-    output: torch.Tensor
-    def compile(self):
-        return _sm90_wgmma_m64n24_raw_probe_kernel.warmup(
-            self.q,self.fn,self.output,grid=(1,),num_warps=ROOT_WARPS,
-            num_stages=1,num_ctas=1,
-        )
-    def run(self):
-        _sm90_wgmma_m64n24_raw_probe_kernel[(1,)](
-            self.q,self.fn,self.output,num_warps=ROOT_WARPS,
-            num_stages=1,num_ctas=1,
-        )
-
-
-def prepare_raw_m64n24_probe(q, fn):
-    if tuple(q.shape)!=(M,K) or q.dtype!=torch.bfloat16 or not q.is_contiguous():
-        raise ValueError("q must be contiguous BF16 [64,64]")
-    if tuple(fn.shape)!=(N,K) or fn.dtype!=torch.float32 or not fn.is_contiguous():
-        raise ValueError("fn must be contiguous FP32 [24,64]")
-    return RawM64N24ProbePlan(
-        q,fn,torch.empty((M,N),device=q.device,dtype=torch.float32)
-    )
-
-
 __all__ = [
     "_raw_m64n24k64_accumulate",
     "_store_raw_n24_partials",
-    "prepare_raw_m64n24_probe",
 ]

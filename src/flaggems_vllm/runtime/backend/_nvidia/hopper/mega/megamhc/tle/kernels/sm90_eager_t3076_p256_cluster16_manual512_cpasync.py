@@ -18,22 +18,9 @@ import os
 from dataclasses import dataclass
 from typing import Mapping
 
-USE_EXACT1024_TAIL = (
-    os.environ.get(
-        "DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_EXACT1024_TAIL", "1"
-    )
-    == "1"
-)
-USE_FUSED4096_TAIL = (
-    os.environ.get(
-        "DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_FUSED4096_TAIL", "0"
-    )
-    == "1"
-)
-USE_ROW_BARRIER = (
-    os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_ROW_BARRIER", "0")
-    == "1"
-)
+USE_EXACT1024_TAIL = True
+USE_FUSED4096_TAIL = False
+
 USE_GLOBAL_TILE_BARRIER = (
     os.environ.get(
         "DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_GLOBAL_TILE_BARRIER",
@@ -42,39 +29,22 @@ USE_GLOBAL_TILE_BARRIER = (
     == "1"
 )
 
-import torch
-import triton
-import triton.experimental.tle.language as tle
-import triton.language as tl
+import torch  # noqa: E402
+import triton  # noqa: E402
+import triton.experimental.tle.language as tle  # noqa: E402
+import triton.language as tl  # noqa: E402
 
-from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
-    _token_shard_combine_fused4096_bf16x8_ptx,
-    _token_shard_normalize_fused4096_bf16x8_ptx,
-)
-from .sm90_eager_p256_routing import (
-    _routing_finalize_no_barrier,
-)
-from .sm90_small_family import _physical_thread_id_x
-
-if USE_EXACT1024_TAIL:
-    from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
-        _cache_rms_weights_4096_bf16x8_ptx,
-    )
-    from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
-        _token_shard_combine_exact1024_bf16x8_ptx as _token_shard_combine_bf16x8_ptx,
-    )
-    from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
-        _token_shard_normalize_exact1024_bf16x8_ptx as _token_shard_normalize_bf16x8_ptx,
-    )
-else:
-    from .sm90_eager_t1028_p256_manual512_token_tail_ptx import (
-        _token_shard_combine_bf16x8_ptx,
-        _token_shard_normalize_bf16x8_ptx,
-    )
-
-from .sm90_eager_p256_manual512_projection_split_tma_ptx import (
+from .sm90_eager_p256_manual512_projection_split_tma_ptx import (  # noqa: E402
     _manual512_p256_projection_split_tma_ptx,
 )
+from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (  # noqa: E402
+    _token_shard_combine_exact1024_bf16x8_ptx as _token_shard_combine_bf16x8_ptx,
+)
+from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (  # noqa: E402
+    _token_shard_normalize_exact1024_bf16x8_ptx as _token_shard_normalize_bf16x8_ptx,
+)
+from .sm90_eager_p256_routing import _routing_finalize_no_barrier  # noqa: E402
+from .sm90_small_family import _physical_thread_id_x  # noqa: E402
 
 TOKENS = 3076
 HIDDEN = 4096
@@ -129,8 +99,6 @@ JIT_TAIL_BATCHES = tl.constexpr(TAIL_BATCHES)
 JIT_X8_TAIL = tl.constexpr(True)
 JIT_TAIL_CHUNK = tl.constexpr(TAIL_CHUNK)
 JIT_USE_FN_TMA = tl.constexpr(USE_FN_TMA)
-JIT_USE_FUSED4096_TAIL = tl.constexpr(USE_FUSED4096_TAIL)
-JIT_USE_ROW_BARRIER = tl.constexpr(USE_ROW_BARRIER)
 JIT_USE_GLOBAL_TILE_BARRIER = tl.constexpr(USE_GLOBAL_TILE_BARRIER)
 
 
@@ -141,28 +109,6 @@ def _manual512_cta_sync():
         asm="{ bar.sync 0, 512; mov.u32 $0, 0; }",
         constraints="=r",
         args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _manual512_row_sync(physical_thread):
-    """Rendezvous the four warps that consume one owned token row."""
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .u32 warp, barrier_id;
-          shr.u32 warp, $1, 5;
-          and.b32 barrier_id, warp, 3;
-          add.u32 barrier_id, barrier_id, 1;
-          barrier.cta.sync barrier_id, 128;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r",
-        args=[physical_thread],
         dtype=tl.uint32,
         is_pure=False,
         pack=1,
@@ -580,8 +526,6 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
     if ENABLE_TAIL:
         # The isolated projection PTX has already converged all sixteen warps
         # and written columns 0..24 directly into the compact split plane.
-        rows = tl.arange(0, JIT_BLOCK_M)
-        columns = tl.arange(0, JIT_BLOCK_N)
         # The hardware cluster barrier publishes all sixteen split partials
         # without requiring full-grid residency.
         if JIT_USE_GLOBAL_TILE_BARRIER:
@@ -627,10 +571,7 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
                             hc_post_scale,
                             sinkhorn_eps,
                         )
-                if JIT_USE_ROW_BARRIER:
-                    _manual512_row_sync(physical_thread)
-                else:
-                    _manual512_cta_sync()
+                _manual512_cta_sync()
 
             if JIT_TAIL_PHASE >= 3:
                 # Each routing owner keeps at most four rows and processes all
@@ -648,85 +589,74 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
                 )
                 y_base = y_bf16_ptr + owned_token_base * JIT_HIDDEN
                 square_base = tail_squares_ptr + pid * 4 * 16
-                if JIT_USE_FUSED4096_TAIL:
-                    _token_shard_combine_fused4096_bf16x8_ptx(
-                        owned_pre_base,
-                        residual_base,
-                        q_stages.slot(0),
-                        fn_stages.slot(0),
-                        square_base,
-                        physical_thread,
-                        owned_rows,
-                    )
-                else:
-                    _token_shard_combine_bf16x8_ptx(
-                        owned_pre_base,
-                        residual_base,
-                        q_stages.slot(0),
-                        square_base,
-                        physical_thread,
-                        0,
-                        64,
-                        owned_rows,
-                        4096,
-                        256,
-                        0,
-                        8,
-                        1,
-                        128,
-                        64,
-                    )
-                    _token_shard_combine_bf16x8_ptx(
-                        owned_pre_base,
-                        residual_base,
-                        q_stages.slot(0),
-                        square_base,
-                        physical_thread,
-                        256,
-                        64,
-                        owned_rows,
-                        4096,
-                        2304,
-                        4,
-                        8,
-                        1,
-                        128,
-                        64,
-                    )
-                    _token_shard_combine_bf16x8_ptx(
-                        owned_pre_base,
-                        residual_base,
-                        fn_stages.slot(0),
-                        square_base,
-                        physical_thread,
-                        512,
-                        64,
-                        owned_rows,
-                        4096,
-                        256,
-                        8,
-                        8,
-                        1,
-                        128,
-                        64,
-                    )
-                    _token_shard_combine_bf16x8_ptx(
-                        owned_pre_base,
-                        residual_base,
-                        fn_stages.slot(0),
-                        square_base,
-                        physical_thread,
-                        768,
-                        64,
-                        owned_rows,
-                        4096,
-                        2304,
-                        12,
-                        8,
-                        1,
-                        128,
-                        64,
-                    )
+                _token_shard_combine_bf16x8_ptx(
+                    owned_pre_base,
+                    residual_base,
+                    q_stages.slot(0),
+                    square_base,
+                    physical_thread,
+                    0,
+                    64,
+                    owned_rows,
+                    4096,
+                    256,
+                    0,
+                    8,
+                    1,
+                    128,
+                    64,
+                )
+                _token_shard_combine_bf16x8_ptx(
+                    owned_pre_base,
+                    residual_base,
+                    q_stages.slot(0),
+                    square_base,
+                    physical_thread,
+                    256,
+                    64,
+                    owned_rows,
+                    4096,
+                    2304,
+                    4,
+                    8,
+                    1,
+                    128,
+                    64,
+                )
+                _token_shard_combine_bf16x8_ptx(
+                    owned_pre_base,
+                    residual_base,
+                    fn_stages.slot(0),
+                    square_base,
+                    physical_thread,
+                    512,
+                    64,
+                    owned_rows,
+                    4096,
+                    256,
+                    8,
+                    8,
+                    1,
+                    128,
+                    64,
+                )
+                _token_shard_combine_bf16x8_ptx(
+                    owned_pre_base,
+                    residual_base,
+                    fn_stages.slot(0),
+                    square_base,
+                    physical_thread,
+                    768,
+                    64,
+                    owned_rows,
+                    4096,
+                    2304,
+                    12,
+                    8,
+                    1,
+                    128,
+                    64,
+                )
                 _manual512_cta_sync()
                 if JIT_HIDDEN_PHASE >= 2:
                     tail_rows = tl.arange(0, 4)
@@ -748,95 +678,84 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
                     )
                     _manual512_cta_sync()
                 if JIT_HIDDEN_PHASE >= 3:
-                    if JIT_USE_FUSED4096_TAIL:
-                        _token_shard_normalize_fused4096_bf16x8_ptx(
-                            q_stages.slot(0),
-                            fn_stages.slot(0),
-                            y_base,
-                            rmsnorm_weight_ptr,
-                            square_base,
-                            physical_thread,
-                            owned_rows,
-                        )
-                    else:
-                        _token_shard_normalize_bf16x8_ptx(
-                            q_stages.slot(0),
-                            y_base,
-                            rmsnorm_weight_ptr,
-                            square_base,
-                            physical_thread,
-                            0,
-                            64,
-                            owned_rows,
-                            4096,
-                            256,
-                            8,
-                            1,
-                        )
-                        _token_shard_normalize_bf16x8_ptx(
-                            q_stages.slot(0),
-                            y_base,
-                            rmsnorm_weight_ptr,
-                            square_base,
-                            physical_thread,
-                            256,
-                            64,
-                            owned_rows,
-                            4096,
-                            2304,
-                            8,
-                            1,
-                        )
-                        _token_shard_normalize_bf16x8_ptx(
-                            fn_stages.slot(0),
-                            y_base,
-                            rmsnorm_weight_ptr,
-                            square_base,
-                            physical_thread,
-                            512,
-                            64,
-                            owned_rows,
-                            4096,
-                            256,
-                            8,
-                            1,
-                        )
-                        _token_shard_normalize_bf16x8_ptx(
-                            fn_stages.slot(0),
-                            y_base,
-                            rmsnorm_weight_ptr,
-                            square_base,
-                            physical_thread,
-                            768,
-                            64,
-                            owned_rows,
-                            4096,
-                            2304,
-                            8,
-                            1,
-                        )
-                        if JIT_NUM_SPLITS == 4:
-                            _manual512_cta_sync()
-                            for extra_batch in tl.static_range(1, 4):
-                                extra_row_base = owned_row_base + extra_batch * 4
-                                extra_rows = tl.maximum(
-                                    0,
-                                    tl.minimum(4, live_rows - extra_row_base),
-                                )
-                                _run_extra_four_row_hidden_tail(
-                                    owned_pre_base + extra_batch * 4 * JIT_BLOCK_N,
-                                    residual_base
-                                    + extra_batch * 4 * JIT_HC_MULT * JIT_HIDDEN,
-                                    y_base + extra_batch * 4 * JIT_HIDDEN,
-                                    square_base,
-                                    q_stages.slot(0),
-                                    fn_stages.slot(0),
-                                    rmsnorm_weight_ptr,
-                                    physical_thread,
-                                    extra_rows,
-                                    rmsnorm_eps,
-                                    rmsnorm_scale,
-                                )
+                    _token_shard_normalize_bf16x8_ptx(
+                        q_stages.slot(0),
+                        y_base,
+                        rmsnorm_weight_ptr,
+                        square_base,
+                        physical_thread,
+                        0,
+                        64,
+                        owned_rows,
+                        4096,
+                        256,
+                        8,
+                        1,
+                    )
+                    _token_shard_normalize_bf16x8_ptx(
+                        q_stages.slot(0),
+                        y_base,
+                        rmsnorm_weight_ptr,
+                        square_base,
+                        physical_thread,
+                        256,
+                        64,
+                        owned_rows,
+                        4096,
+                        2304,
+                        8,
+                        1,
+                    )
+                    _token_shard_normalize_bf16x8_ptx(
+                        fn_stages.slot(0),
+                        y_base,
+                        rmsnorm_weight_ptr,
+                        square_base,
+                        physical_thread,
+                        512,
+                        64,
+                        owned_rows,
+                        4096,
+                        256,
+                        8,
+                        1,
+                    )
+                    _token_shard_normalize_bf16x8_ptx(
+                        fn_stages.slot(0),
+                        y_base,
+                        rmsnorm_weight_ptr,
+                        square_base,
+                        physical_thread,
+                        768,
+                        64,
+                        owned_rows,
+                        4096,
+                        2304,
+                        8,
+                        1,
+                    )
+                    if JIT_NUM_SPLITS == 4:
+                        _manual512_cta_sync()
+                        for extra_batch in tl.static_range(1, 4):
+                            extra_row_base = owned_row_base + extra_batch * 4
+                            extra_rows = tl.maximum(
+                                0,
+                                tl.minimum(4, live_rows - extra_row_base),
+                            )
+                            _run_extra_four_row_hidden_tail(
+                                owned_pre_base + extra_batch * 4 * JIT_BLOCK_N,
+                                residual_base
+                                + extra_batch * 4 * JIT_HC_MULT * JIT_HIDDEN,
+                                y_base + extra_batch * 4 * JIT_HIDDEN,
+                                square_base,
+                                q_stages.slot(0),
+                                fn_stages.slot(0),
+                                rmsnorm_weight_ptr,
+                                physical_thread,
+                                extra_rows,
+                                rmsnorm_eps,
+                                rmsnorm_scale,
+                            )
 
 
 def _require_tensor(value, *, name, shape, dtype):
@@ -1098,7 +1017,7 @@ def prepare_tle_sm90_projection(
         "hidden_phase": HIDDEN_PHASE,
         "exact1024_tail": USE_EXACT1024_TAIL,
         "fused4096_tail": USE_FUSED4096_TAIL,
-        "row_barrier": USE_ROW_BARRIER,
+        "row_barrier": False,
         "tail_batches": TAIL_BATCHES,
         "experimental": not dispatch_enabled,
         "dispatch_enabled": dispatch_enabled,
