@@ -51,6 +51,10 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
     if _target in globals():
         globals()[_alias] = globals()[_target]
 
+_DIRECT_ONLY_OPS = frozenset(
+    {"rms_scaled_int8_quant", "supports_rms_scaled_int8_quant"}
+)
+
 # Callable library APIs that deliberately have no ATen schema to override.
 # They stay importable as `flaggems_vllm.<op>` but are never registered into
 # PyTorch dispatch by enable()/only_enable().
@@ -76,7 +80,7 @@ _FULL_CONFIG = tuple(
     for op_name in getattr(_ops_module, "__all__", [])
     if op_name in globals()
     and callable(globals()[op_name])
-    and op_name not in _LIBRARY_ONLY_OPS
+    and op_name not in (_DIRECT_ONLY_OPS | _LIBRARY_ONLY_OPS)
 )
 
 if "weight_norm_interface" in globals():
@@ -255,11 +259,13 @@ def all_registered_keys():
 
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
+    "all_registered_keys",
+    "all_registered_ops",
     "enable",
     "only_enable",
+    "rms_scaled_int8_quant",
+    "SUPPORTED_FP8_DTYPE",
+    "supports_rms_scaled_int8_quant",
     "use_dnn",
     "use_gems",
-    "all_registered_ops",
-    "all_registered_keys",
 ]

@@ -15,6 +15,10 @@
 # isort: off
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.ops.rms_scaled_int8_quant import (
+    rms_scaled_int8_quant,
+    supports_rms_scaled_int8_quant,
+)
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
 from flaggems_vllm.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.ops.attn_res import attn_res
@@ -403,6 +407,7 @@ __all__ = [
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
+    "rms_scaled_int8_quant",
     "router_gemm",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
@@ -420,6 +425,7 @@ __all__ = [
     "sparse_attn_triton",
     "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
+    "supports_rms_scaled_int8_quant",
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
