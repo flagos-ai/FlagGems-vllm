@@ -11,6 +11,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_offsets
 from flaggems_vllm.ops.FLA.utils import check_shared_mem
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -493,6 +494,10 @@ def chunk_fwd_h(
     def grid(meta):
         return (triton.cdiv(K, meta["BK"]), triton.cdiv(V, meta["BV"]), N * H)
 
+    # The chunk loop reads the decay of a chunk in two layouts and only one
+    # copy is prefetched; "any" also folds the synchronous copy into the
+    # prefetched one (measured on H20, B 1-8, T 1024-16384).
+    launch_options = pipeline_options(pipeline_merge_loads="any")
     chunk_fwd_kernel_h[grid](
         k=k,
         v=v,
@@ -516,6 +521,7 @@ def chunk_fwd_h(
         USE_GK=gk is not None,
         USE_GV=gv is not None,
         STATE_V_FIRST=state_v_first,
+        **launch_options,
     )
     return h, ht
 

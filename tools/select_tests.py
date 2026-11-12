@@ -37,8 +37,10 @@ NON_TEST_FILES = {
 
 ENV_SMOKE_TRIGGER_FILES = {
     ".github/backend-capabilities.json",
+    ".github/configs/ci-backends.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
+    "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
     "pytest.ini",
     "tests/conftest.py",
@@ -48,8 +50,10 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",
     "tools/select_backends.py",
+    "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
+    "tools/source_env_bash.sh",
 }
 
 ENV_SMOKE_TRIGGER_PREFIXES = (
@@ -87,7 +91,39 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_moe_align_block_size.py",
         "tests/test_moe_align_small_routes.py",
     ],
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "tests/test_flash_mla.py",
+        "tests/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "tests/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
+        "tests/test_mhc_post.py",
+    ],
+    "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
+        "tests/test_bmm_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/direct.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "tests/test_grouped_gemma_rmsnorm.py",
+        "tests/test_qwen4_self_kernels.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "tests/test_hyperconnection.py",
         "tests/test_qwen4_self_kernels.py",
@@ -130,6 +166,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_mla_sparse_fwd.py",
         "tests/test_glm_state_rows.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flashmla_sparse.py": [
+        "tests/test_flash_mla_sparse_fwd.py",
+        "tests/test_glm_state_rows.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -142,6 +182,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/attention.py": [
         "tests/test_flash_attn_varlen_func.py",
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_scaled_dot_product_attention.py",
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
@@ -151,6 +192,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
+        "tests/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
@@ -195,7 +237,34 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "benchmark/test_flash_mla.py",
+        "benchmark/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "benchmark/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
+        "benchmark/test_bmm_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+        "benchmark/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/direct.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+        "benchmark/test_flash_attn_varlen_func.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["benchmark/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "benchmark/test_grouped_gemma_rmsnorm.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "benchmark/test_hyperconnection.py",
         "benchmark/test_qwen4_self_kernels.py",
@@ -240,11 +309,15 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_int8_bmm.py": [
         "benchmark/test_int8_einsum.py",
+        "benchmark/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
     ],
     "src/flaggems_vllm/ops/flashmla_sparse.py": [
+        "benchmark/test_flash_mla_sparse_fwd.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flashmla_sparse.py": [
         "benchmark/test_flash_mla_sparse_fwd.py"
     ],
     "src/flaggems_vllm/ops/fused_moe.py": [
@@ -375,7 +448,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/FLA/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -402,7 +475,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/FLA/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -439,7 +512,7 @@ def _is_operator_implementation(path: str) -> bool:
 
     # Vendor-specific operator / fused-kernel implementations.
     if path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/FLA/" in path
     ):
         return True
 
