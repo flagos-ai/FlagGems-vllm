@@ -273,7 +273,7 @@ def _ascend_native_mhc_pre():
 # Every entry is a (module, attribute) pair; ascend is resolved by a special case
 # in _get_baseline_mhc_pre_op because torch_npu does not bind aclnnMhcPreSinkhorn.
 _NATIVE_MHC_PRE = {
-    "nvidia": ("vllm._custom_ops", "mhc_pre"),
+    "nvidia": ("vllm.model_executor.kernels.mhc", "mhc_pre_tilelang"),
     "hygon": ("aiter", "mhc_pre"),
     "thead": ("vllm.model_executor.layers.mhc", "mhc_pre"),
     "mthreads": ("mate", "mhc_pre"),
