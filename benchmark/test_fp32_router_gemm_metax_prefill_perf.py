@@ -14,9 +14,10 @@ import sys
 import time
 from pathlib import Path
 
-import flaggems_vllm
 import torch
 import triton
+
+import flaggems_vllm
 
 
 def paired_calls(native, candidate, rounds=7):

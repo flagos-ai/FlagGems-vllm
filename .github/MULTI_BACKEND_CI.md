@@ -55,7 +55,7 @@ vendor/Iluvatar
 vendor/Kunlunxin
 vendor/MetaX
 vendor/MooreThreads
-vendor/SpaceMit
+vendor/SpacemiT
 vendor/Sunrise
 vendor/THead
 vendor/TsingMicro
@@ -89,8 +89,8 @@ first hardware validation; a failure must be fixed or the candidate removed,
 not hidden by widening or bypassing the policy.
 
 The generic preflight is not a substitute for a vendor health query. In
-particular, the current SpaceMit descriptor exposes a CPU-compatible device
-name. Enflame, SpaceMit, and Sunrise should gain dedicated `gpu_check` scripts
+particular, the current SpacemiT descriptor exposes a CPU-compatible device
+name. Enflame, SpacemiT, and Sunrise should gain dedicated `gpu_check` scripts
 in FlagGems before their hardware availability is considered fully verified.
 
 ## Reuse contract
@@ -112,9 +112,66 @@ FlagGems remains the source of truth for backend profiles and runner routing:
    the FlagGems-vllm tests proven on each backend. It is not a second backend
    registry.
 
-Do not add a hand-maintained vendor matrix or copy vendor setup scripts into
-FlagGems-vllm. Add or change a backend in FlagGems first, then advance all
-three pinned FlagGems references together.
+For the `non-nvidia-tests` lane, do not add a hand-maintained vendor matrix or
+copy vendor setup scripts into FlagGems-vllm. Add or change a backend in
+FlagGems first, then advance all three pinned FlagGems references together.
+
+That rule is scoped to the lane above, whose contract is "FlagGems' setup.sh
+builds the vendor environment on a bare runner". It does not cover backends
+delivered as a vendor-provided container image, because such an image already
+contains the torch/triton/vLLM stack that setup.sh would otherwise build, and
+the pinned reusable workflow has no `container:` support to run it in. Those
+backends are routed by the separate `vendor-container-tests` lane described
+below.
+
+## Container CI lane and FlagOps consolidation
+
+`vendor-container-tests` in `basic-ci.yml` runs per-PR smoke tests inside
+vendor-published vLLM images. Its runner/image data lives in
+`.github/configs/ci-backends.yaml` and is resolved by
+`tools/select_ci_backends.py`.
+
+Three config sets now coexist, and they are deliberately not merged:
+
+| File | Drives | Runners / images |
+| --- | --- | --- |
+| FlagGems' `.github/backends.json` (pinned) | `non-nvidia-tests` | bare runners, env built by FlagGems setup.sh |
+| `.github/configs/ci-backends.yaml` | `vendor-container-tests` | specific runners, vendor vLLM images |
+| `.github/configs/backends/*.yaml` | `ops-test.yaml` (periodic full suite) | `*-flaggems-weekly` runners, internal harbor images |
+
+Keeping them apart is intentional: a per-PR smoke test and a multi-hour weekly
+sweep differ in runner, image, timeout and blast radius, so one shared file
+would couple two lanes that need to fail independently.
+
+The duplication worth removing is between *repositories*, not between these
+lanes. `flagos-ai/FlagOps` is the designated home for org-wide CI assets; its
+`actions/setup-project/action.yml` is already described as "Generalized from
+FlagGems setup-flaggems for org-wide reuse", and `.github/workflows/ci-shared.yml`
+is a reserved placeholder. Consolidate in this order, highest certainty first:
+
+1. **GPU health checks.** `tools/gpu_check_*.sh` are near-identical copies of
+   FlagGems' versions. Move them to FlagOps and reference them from both
+   repositories. This is pure duplication with no caller-specific behavior.
+2. **Runner/image data.** `ci-backends.yaml` intentionally mirrors the
+   `platforms.<name>` schema of FlagOps'
+   `flagos-user-tests/resource_map.yaml`, so promoting it to FlagOps means
+   changing the read path in `select_ci_backends.py`, not rewriting the
+   workflow.
+3. **Job skeleton.** Fill `FlagOps/.github/workflows/ci-shared.yml` with the
+   "resolve targets -> start container -> install -> test -> summarize"
+   skeleton, leaving each caller to supply its backend config and test command.
+
+Two cautions learned from the current layout:
+
+- Do **not** replace `.github/actions/checkout-retry` with FlagOps'
+  same-named action. The local copy pins the immutable `github.sha`, sets
+  `persist-credentials: false`, and skips a completed checkout; the FlagOps
+  version uses `github.ref` and keeps credentials. Swapping it is a security
+  regression for fork pull requests. Reconcile by hardening the FlagOps action
+  first.
+- Do not pull NVIDIA into the container lane. `nvidia-tests` runs on the H20
+  host through `tools/setup.sh` and benefits from the uv cache and FlagTree
+  swap that script performs; containerizing it would buy nothing and lose that.
 
 The current pin includes FlagGems' split of optional native extensions from
 the default pure-Python package and its compatible setuptools-scm constraint.
@@ -266,7 +323,7 @@ FlagGems-vllm checkout
   -> allowlisted FlagGems-vllm operator tests
 ```
 
-Enflame, SpaceMit, and Sunrise currently have no dedicated `gpu_check` entry.
+Enflame, SpacemiT, and Sunrise currently have no dedicated `gpu_check` entry.
 Add those checks in FlagGems before treating their generic tensor preflight as
 a complete hardware health check.
 

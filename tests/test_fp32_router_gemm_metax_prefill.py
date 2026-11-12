@@ -1,8 +1,9 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-import flaggems_vllm as fgv
 import pytest
 import torch
+
+import flaggems_vllm as fgv
 from flaggems_vllm.runtime import device
 
 pytestmark = pytest.mark.skipif(
