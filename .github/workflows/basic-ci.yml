@@ -17,6 +17,12 @@ name: basic ci
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the older run so the single H20
+# runner is not occupied by stale commits. Pushes to main are never cancelled.
+concurrency:
+  group: basic-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: ["main"]
