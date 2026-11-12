@@ -26,6 +26,10 @@ from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     configure_fused_matmul_reduce_scatter,
 )
 from flaggems_vllm.runtime.symm_mem import use_symm_mem
+from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
+    assert_close,
+    make_reference,
+)
 
 from . import consts
 from .conftest import Config, emit_record_logger, update_result
@@ -110,7 +114,7 @@ def test_fused_matmul_reduce_scatter(distributed_context, rows, n, k, dtype):
         dist.reduce_scatter_tensor(out, partial, group=group)
         return out
 
-    expected = baseline()
+    expected, tolerance = make_reference(a, b, "sum", group)
     baseline_ms = _score(baseline, group, device)
     trials = []
     try:
@@ -127,12 +131,12 @@ def test_fused_matmul_reduce_scatter(distributed_context, rows, n, k, dtype):
                 )
 
             actual = implementation()
-            error = torch.tensor(
-                int(not torch.allclose(actual, expected, rtol=0.04, atol=0.001)),
-                device=device,
-            )
-            dist.all_reduce(error, op=dist.ReduceOp.MAX, group=group)
-            assert error.item() == 0, f"candidate failed correctness: {config}"
+            try:
+                assert_close(actual, expected, tolerance, group, dtype=dtype)
+            except AssertionError as error:
+                raise AssertionError(
+                    f"candidate failed correctness: {config}"
+                ) from error
             milliseconds = _score(implementation, group, device)
             trials.append((milliseconds, config))
         best_ms, best_config = min(trials, key=lambda item: item[0])

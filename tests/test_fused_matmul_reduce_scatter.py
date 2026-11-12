@@ -28,8 +28,37 @@ from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     configure_fused_matmul_reduce_scatter,
     fused_matmul_reduce_scatter,
 )
+from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
+    assert_close as assert_rs_close,
+)
+from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
+    error_metrics,
+    make_exact_case,
+    make_reference,
+    roundoff_tolerance,
+)
 
 pytestmark = pytest.mark.fused_matmul_reduce_scatter
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fp32_reference_budget_rejects_corruption_and_nonfinite_values(dtype):
+    generator = torch.Generator().manual_seed(71)
+    partials = torch.randn((8, 128, 64), generator=generator)
+    expected = partials.sum(dim=0)
+    tolerance = roundoff_tolerance(expected, partials.abs().sum(dim=0), dtype)
+    # Independent arithmetic example with three low-precision storage rounds.
+    stored = partials.to(dtype).float()
+    subtotals = stored.reshape(2, 4, 128, 64).sum(dim=1).to(dtype).float()
+    rounded = subtotals.sum(dim=0).to(dtype)
+    assert error_metrics(rounded, expected, tolerance)["outside_budget"] == 0
+    for corrupted in (torch.zeros_like(rounded), rounded.roll(1, 0), rounded / 8):
+        metrics = error_metrics(corrupted, expected, tolerance)
+        assert metrics["outside_budget"] > rounded.numel() // 2
+    for invalid in (float("nan"), float("inf"), -float("inf")):
+        corrupted = rounded.clone()
+        corrupted[0, 0] = invalid
+        assert error_metrics(corrupted, expected, tolerance)["outside_budget"] > 0
 
 
 def test_signature_and_export():
@@ -293,20 +322,18 @@ def distributed_context():
         dist.destroy_process_group()
 
 
-def _assert_all_ranks_close(actual, expected, group):
-    failure = None
-    try:
-        torch.testing.assert_close(
-            actual,
-            expected,
-            rtol=0.04 if actual.dtype == torch.bfloat16 else 0.01,
-            atol=0.005 if actual.dtype == torch.bfloat16 else 0.001,
-        )
-    except AssertionError as exc:
-        failure = str(exc)
-    failed = torch.tensor(int(failure is not None), device=actual.device)
-    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
-    assert not failed.item(), failure or "a peer rank failed correctness validation"
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("reduce_op", ["sum", "avg"])
+def test_exact_rank_and_shard_identity(distributed_context, dtype, reduce_op):
+    group, device = distributed_context
+    if group.size() not in (2, 4, 8):
+        pytest.skip("exact encoding covers 2, 4 or 8 ranks")
+    a, b, expected = make_exact_case(group, device, dtype, reduce_op)
+    actual = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+        a, b, reduce_op, 0, group.group_name
+    )
+    assert_rs_close(actual, expected, torch.zeros_like(expected), group, dtype=dtype)
+    clear_fused_matmul_reduce_scatter_cache(group.group_name)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -338,17 +365,13 @@ def test_fused_matmul_reduce_scatter(
             actual = torch.ops.symm_mem.fused_matmul_reduce_scatter(
                 a, b, reduce_op, 0, group.group_name
             )
-            partial = a @ b
-            reference = torch.empty_like(actual)
-            dist.reduce_scatter_tensor(reference, partial, group=group)
-            if reduce_op == "avg":
-                reference.div_(group.size())
+            reference, tolerance = make_reference(a, b, reduce_op, group)
         torch.cuda.current_stream(device).wait_stream(selected)
         stream.wait_stream(torch.cuda.current_stream(device))
-        _assert_all_ranks_close(actual, reference, group)
-        for previous, expected in saved:
-            _assert_all_ranks_close(previous, expected, group)
-        saved.append((actual, reference))
+        assert_rs_close(actual, reference, tolerance, group, dtype=dtype)
+        for previous, expected, budget in saved:
+            assert_rs_close(previous, expected, budget, group, dtype=dtype)
+        saved.append((actual, reference, tolerance))
     clear_fused_matmul_reduce_scatter_cache(group.group_name)
     assert dist.get_world_size(group) == group.size()
 
@@ -368,9 +391,8 @@ def test_subgroup_and_configuration(distributed_context):
     )
     b = torch.full((64, 256), 0.02, device=device, dtype=torch.float16)
     actual = fused_matmul_reduce_scatter(a, b, "sum", 0, group.group_name)
-    expected = torch.empty_like(actual)
-    dist.reduce_scatter_tensor(expected, a @ b, group=group)
-    _assert_all_ranks_close(actual, expected, group)
+    expected, tolerance = make_reference(a, b, "sum", group)
+    assert_rs_close(actual, expected, tolerance, group, dtype=a.dtype)
     with pytest.raises(RuntimeError, match="clear"):
         configure_fused_matmul_reduce_scatter(
             group.group_name, GemmReduceScatterConfig()

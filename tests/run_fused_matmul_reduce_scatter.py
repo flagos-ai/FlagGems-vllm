@@ -8,7 +8,8 @@
         tests/run_fused_matmul_reduce_scatter.py --dtype bf16 --reduce-op sum
 
 Each worker calls torch.ops.symm_mem.fused_matmul_reduce_scatter and compares it
-against Torch GEMM + NCCL reduce-scatter. Any rank's mismatch fails every worker.
+against an FP32 mathematical reference with a low-precision roundoff budget.
+Any rank's mismatch fails every worker.
 Use --comm-only to check Torch NCCL/RCCL without importing TLE or FlagGems-vllm.
 """
 
@@ -62,36 +63,6 @@ def _check_communication(device, repeat):
             )
     finally:
         dist.destroy_process_group()
-
-
-def _report_fp32_errors(a, b, output, baseline, reduce_op, group, rtol, atol):
-    """Diagnose both low-precision paths against the same FP32 oracle."""
-    import torch
-    import torch.distributed as dist
-
-    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        partial = a.float() @ b.float()
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
-    oracle = torch.empty(output.shape, dtype=torch.float32, device=output.device)
-    dist.reduce_scatter_tensor(oracle, partial, group=group)
-    if reduce_op == "avg":
-        oracle.div_(group.size())
-    tolerance = atol + rtol * oracle.abs()
-    summaries = []
-    for name, value in (("implementation", output), ("torch_baseline", baseline)):
-        delta = (value.float() - oracle).abs()
-        summaries.append(
-            f"{name}: max_abs={delta.max().item():.8g} "
-            f"rms={delta.square().mean().sqrt().item():.8g} "
-            f"outside_tol={(delta > tolerance).sum().item()}/{delta.numel()}"
-        )
-    print(
-        f"[rank {group.rank()}] FP32 diagnostic: " + "; ".join(summaries),
-        flush=True,
-    )
 
 
 def main():
@@ -169,6 +140,12 @@ def _check_operator(args, parser, group, device):
         _validate_device,
         _validate_shape,
     )
+    from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
+        assert_close,
+        error_metrics,
+        make_exact_case,
+        make_reference,
+    )
 
     print(f"[rank {group.rank()}] operator imports complete", flush=True)
     m = args.m if args.m is not None else 256 * world_size
@@ -179,8 +156,6 @@ def _check_operator(args, parser, group, device):
     except (ValueError, NotImplementedError) as exc:
         parser.error(str(exc))
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-    rtol = 0.04 if dtype == torch.bfloat16 else 0.01
-    atol = 0.005 if dtype == torch.bfloat16 else 0.001
     try:
         if group.rank() == 0 and backend == "hcu":
             keys = (
@@ -205,42 +180,51 @@ def _check_operator(args, parser, group, device):
         a = torch.randn((m, args.local_k), device=device, dtype=dtype) * 0.1
         b = torch.randn((args.local_k, args.n), device=device, dtype=dtype) * 0.1
         with flaggems_vllm.use_symm_mem():
+            if group.size() in (2, 4, 8):
+                exact_a, exact_b, exact_expected = make_exact_case(
+                    group, device, dtype, args.reduce_op
+                )
+                exact_output = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                    exact_a, exact_b, args.reduce_op, 0, group.group_name
+                )
+                assert_close(
+                    exact_output,
+                    exact_expected,
+                    torch.zeros_like(exact_expected),
+                    group,
+                    dtype=dtype,
+                )
+                print(f"[rank {group.rank()}] EXACT PASS tolerance=0", flush=True)
+                flaggems_vllm.clear_fused_matmul_reduce_scatter_cache(group.group_name)
             for iteration in range(args.repeat):
                 a.add_(0.001)
                 output = torch.ops.symm_mem.fused_matmul_reduce_scatter(
                     a, b, args.reduce_op, 0, group.group_name
                 )
 
-                # Reference computation is confined to this test entry point.
-                reference = torch.empty_like(output)
-                dist.reduce_scatter_tensor(reference, a @ b, group=group)
-                if args.reduce_op == "avg":
-                    reference.div_(group.size())
-                error = None
+                reference, tolerance = make_reference(a, b, args.reduce_op, group)
                 try:
-                    torch.testing.assert_close(
-                        output,
-                        reference,
-                        rtol=rtol,
-                        atol=atol,
+                    assert_close(output, reference, tolerance, group, dtype=dtype)
+                except AssertionError:
+                    # All ranks fail together, so this diagnostic collective
+                    # cannot leave peers waiting in a different code path.
+                    baseline = torch.empty_like(output)
+                    dist.reduce_scatter_tensor(baseline, a @ b, group=group)
+                    if args.reduce_op == "avg":
+                        baseline.div_(group.size())
+                    print(
+                        f"[rank {group.rank()}] FP32 diagnostic: "
+                        f"implementation={error_metrics(output, reference, tolerance)}; "
+                        f"torch_baseline={error_metrics(baseline, reference, tolerance)}",
+                        flush=True,
                     )
-                except AssertionError as exc:
-                    error = str(exc)
-                failed = torch.tensor(int(error is not None), device=device)
-                dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
-                if failed.item():
-                    # All ranks enter this diagnostic collective together. Keep
-                    # the original failure and acceptance tolerances unchanged.
-                    _report_fp32_errors(
-                        a, b, output, reference, args.reduce_op, group, rtol, atol
-                    )
-                    raise AssertionError(
-                        error or "a peer rank failed correctness validation"
-                    )
+                    raise
+                metrics = error_metrics(output, reference, tolerance)
                 print(
                     f"[rank {group.rank()}] PASS iteration={iteration + 1}/{args.repeat} "
                     f"dtype={args.dtype} reduce_op={args.reduce_op} "
-                    f"A={tuple(a.shape)} B={tuple(b.shape)} output={tuple(output.shape)}",
+                    f"A={tuple(a.shape)} B={tuple(b.shape)} output={tuple(output.shape)} "
+                    f"reference=fp32 metrics={metrics}",
                     flush=True,
                 )
     finally:
