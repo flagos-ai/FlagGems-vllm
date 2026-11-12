@@ -690,3 +690,124 @@ def test_thead_fused_moe_keeps_quantized_swap_rejection(thead_moe_original_layou
             True,
             None,
         )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("topk", [8, 9])
+def test_thead_fused_moe_sparse_gm_policy_boundary(
+    thead_moe_original_layout, monkeypatch, dtype, topk
+):
+    """Public R=E / R>E policy boundary for the sparse G1 group order."""
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(111)
+        m, e, h, i = 16, 128, 3072, 1024
+        x = torch.randn((m, h), device="cuda", dtype=dtype)
+        storage1 = torch.randn((e, 2 * i + 1, h + 16), device="cuda", dtype=dtype)
+        storage2 = torch.randn((e, h + 1, i + 16), device="cuda", dtype=dtype)
+        w1 = storage1[:, : 2 * i, 8 : 8 + h]
+        w2 = storage2[:, :h, 8 : 8 + i]
+        w1.mul_(h**-0.5)
+        w2.mul_(i**-0.5)
+        weights = torch.full((m, topk), 1 / topk, device="cuda")
+        ids = (torch.arange(m * topk, device="cuda").view(m, topk) % 8).int()
+        values = x, w1, w2, weights, ids
+        expected = _thead_moe_reference(*values)
+
+        mod = thead_moe_original_layout
+        dispatch = mod.dispatch_fused_moe_kernel
+        seen = []
+
+        def observe(*args, **kwargs):
+            seen.append(args)
+            return dispatch(*args, **kwargs)
+
+        with monkeypatch.context() as context:
+            context.setattr(mod, "dispatch_fused_moe_kernel", observe)
+            actual = flaggems_vllm.ops_experts_impl(*values)
+        assert len(seen) == 2
+        g1, g2 = seen[0][12], seen[1][12]
+        assert g1["GROUP_SIZE_M"] == (1 if m * topk <= e else 8)
+        assert g2["GROUP_SIZE_M"] == 8
+        assert seen[0][1] is w1 and seen[1][1] is w2
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_thead_fused_moe_long_k_three_live_banks(
+    thead_moe_original_layout, monkeypatch, dtype
+):
+    """Three live weight banks, changed state, and public graph replay."""
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(112)
+        m, e, h, i, k = 16, 128, 3072, 1024, 4
+        banks = []
+        for _ in range(3):
+            x = torch.randn((m, h), device="cuda", dtype=dtype)
+            w1 = torch.randn((e, 2 * i, h), device="cuda", dtype=dtype) * (h**-0.5)
+            w2 = torch.randn((e, h, i), device="cuda", dtype=dtype) * (i**-0.5)
+            weights = torch.full((m, k), 1 / k, device="cuda")
+            ids = (torch.arange(m * k, device="cuda").view(m, k) % 256).int()
+            banks.append([x, w1, w2, weights, ids])
+        originals = [[t.clone() for t in bank] for bank in banks]
+
+        mod = thead_moe_original_layout
+        dispatch = mod.dispatch_fused_moe_kernel
+        seen = []
+
+        def observe(*args, **kwargs):
+            if args[1].size(1) == 2 * i:
+                seen.append(args[1])
+            return dispatch(*args, **kwargs)
+
+        def run():
+            return [flaggems_vllm.ops_experts_impl(*bank) for bank in banks]
+
+        with monkeypatch.context() as context:
+            context.setattr(mod, "dispatch_fused_moe_kernel", observe)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    run()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = run()
+
+        # Warmups and graph capture may all pass through the observer; every
+        # GEMM1 weight must reference one of the three live caller banks.
+        assert len(seen) >= 9
+        bank_w1 = [bank[1] for bank in banks]
+        used = set()
+        for b in seen:
+            assert any(b is w for w in bank_w1)
+            used.add(next(i for i, w in enumerate(bank_w1) if b is w))
+        assert used == {0, 1, 2}
+
+        for step, active in enumerate((256, 2, 8)):
+            expected = []
+            for bank in banks:
+                bank[0].copy_(torch.randn_like(bank[0]))
+                bank[1].mul_(0.75)
+                bank[2].neg_()
+                bank[4].copy_(
+                    (torch.arange(m * k, device="cuda").view(m, k) % active).int()
+                )
+                expected.append(_thead_moe_reference(*bank))
+            for out in outputs:
+                out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for out, ref in zip(outputs, expected):
+                torch.testing.assert_close(out.cpu(), ref, rtol=0.05, atol=0.01)
+
+        for bank, original in zip(banks, originals):
+            for value, saved in zip(bank, original):
+                value.copy_(saved)

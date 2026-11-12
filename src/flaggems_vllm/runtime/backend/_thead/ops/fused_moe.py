@@ -216,6 +216,7 @@ def get_default_config(
         bm, bn, bk = 16, 256, 64
     stages, warps = 4, 4
     use_swap = False
+    group_size_m = 8
     if use_original_layout and dtype in _PLAIN_HALF_CONFIG_DTYPES and 0 < M <= 1024:
         # Original [E, N, K] weights are contiguous along K. Keep the row tile
         # small for sparse expert routing and load longer contiguous K spans.
@@ -248,6 +249,9 @@ def get_default_config(
         and N % 256 == 0
     ):
         bn, bk, stages, warps = 64, 256, 2, 2
+        # Sparse routed rows: expert-local N tiles improve locality; dense
+        # workloads retain the prior grouped order.
+        group_size_m = 1 if M * topk <= E else 8
         use_swap = True
     if (
         use_original_layout
@@ -271,7 +275,7 @@ def get_default_config(
         "BLOCK_SIZE_M": bm,
         "BLOCK_SIZE_N": bn,
         "BLOCK_SIZE_K": bk,
-        "GROUP_SIZE_M": 8,
+        "GROUP_SIZE_M": group_size_m,
         "num_warps": warps,
         "num_stages": stages,
         # PPU: int32 addressing ~2-3% faster than int64 (V6 exp); gated to
