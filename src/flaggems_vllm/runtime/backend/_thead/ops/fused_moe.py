@@ -214,7 +214,8 @@ def get_default_config(
         bm, bn, bk = 16, 128, 32
     else:
         bm, bn, bk = 16, 256, 64
-    stages = 4
+    stages, warps = 4, 4
+    use_swap = False
     if use_original_layout and dtype in _PLAIN_HALF_CONFIG_DTYPES and 0 < M <= 1024:
         # Original [E, N, K] weights are contiguous along K. Keep the row tile
         # small for sparse expert routing and load longer contiguous K spans.
@@ -228,20 +229,58 @@ def get_default_config(
             elif enable_gemm_fast_path and M > 8 and K >= N >= 1024 and bm == 16:
                 # Fused gate/up projections benefit from a longer K tile.
                 bn, bk = 64, 256
+    # For sparse long-K projections, the existing transposed-dot schedule
+    # keeps original weights contiguous without materializing a packed copy.
+    # Partial tiles regress; small projections become host-bound in eager
+    # execution after the separate activation, so retain their vendor path.
+    # Limit the new schedule to the measured token and routed-row range.
+    if (
+        use_original_layout
+        and dtype in _PLAIN_HALF_CONFIG_DTYPES
+        and gemm_stage == "gemm1"
+        and 16 <= M <= 256
+        and M * topk >= 64
+        and E >= 128
+        and E < 4 * M * topk <= 32 * E
+        and K >= N >= 2048
+        and K >= 3072
+        and K % 256 == 0
+        and N % 256 == 0
+    ):
+        bn, bk, stages, warps = 64, 256, 2, 2
+        use_swap = True
+    if (
+        use_original_layout
+        and dtype in _PLAIN_HALF_CONFIG_DTYPES
+        and gemm_stage == "gemm2"
+        and 16 <= M <= 256
+        and M * topk >= 64
+        and E >= 128
+        and E < 4 * M * topk <= 32 * E
+        and N >= 2 * K >= 2048
+        and N >= 3072
+        and N % 256 == 0
+        and K % 128 == 0
+    ):
+        bn, bk, stages, warps = 128, 128, 2, 2
+        use_swap = True
     use_int32 = dtype in ("bf16", "fp16") and max(M * K, M * topk * N, E * N * K) < (
         1 << 31
     )
-    return {
+    config = {
         "BLOCK_SIZE_M": bm,
         "BLOCK_SIZE_N": bn,
         "BLOCK_SIZE_K": bk,
         "GROUP_SIZE_M": 8,
-        "num_warps": 4,
+        "num_warps": warps,
         "num_stages": stages,
         # PPU: int32 addressing ~2-3% faster than int64 (V6 exp); gated to
         # plain-half dtypes and overflow-safe shapes.
         "USE_INT32_OFFSETS": use_int32,
     }
+    if use_swap:
+        config["SWAP_AB"] = True
+    return config
 
 
 def _get_config_dtype_str(
@@ -1341,8 +1380,29 @@ def invoke_fused_moe_triton_kernel(
     direct_sum: bool = False,
     out_top_k: int = 1,
 ) -> None:
-    """Select bounded W8A8 GEMM1/GEMM2, otherwise keep the vendor schedule."""
-    if _use_gemm2_int32(
+    """Select bounded half/W8A8 schedules, otherwise keep the vendor schedule."""
+    use_half_swap = (
+        config.get("SWAP_AB", False)
+        and A.dtype == B.dtype == C.dtype
+        and A.dtype in (torch.float16, torch.bfloat16)
+        and A_scale is None
+        and B_scale is None
+        and B_bias is None
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and sorted_token_ids is not None
+        and not (FUSE_SILU or direct_sum)
+    )
+    if (
+        config.get("SWAP_AB", False)
+        and not use_half_swap
+        and A.dtype == B.dtype == C.dtype
+        and A.dtype in (torch.float16, torch.bfloat16)
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+    ):
+        # SWAP_AB is generic-only; preserve vendor dispatch for other contracts.
+        config = dict(config)
+        config.pop("SWAP_AB")
+    if use_half_swap or _use_gemm2_int32(
         A,
         B,
         C,
@@ -1865,7 +1925,23 @@ def fused_experts_impl(
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
         # For tiny routed batches with large projections, one joint GEMM and
         # a separate activation outperform the two sequential fused dots.
-        and not (use_original_layout and 0 < num_tokens <= 8 and min(N, K) >= 1024)
+        and not (
+            use_original_layout
+            and min(N, K) >= 1024
+            and (
+                0 < num_tokens <= 8
+                or (
+                    16 <= num_tokens <= 256
+                    and num_tokens * top_k_num >= 64
+                    and E >= 128
+                    and E < 4 * num_tokens * top_k_num <= 32 * E
+                    and K >= N >= 2048
+                    and K >= 3072
+                    and K % 256 == 0
+                    and N % 256 == 0
+                )
+            )
+        )
     )
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
