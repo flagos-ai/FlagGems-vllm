@@ -393,7 +393,9 @@ ops:
       run in one kernel launch. A BF16 wo_a takes vLLM's non-quantizing path
       (BF16 inverse RoPE + grouped BF16 GEMM, one Triton kernel). Hopper uses
       tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
-      8.0 for BF16) use plain Triton kernels.
+      8.0 for BF16) use plain Triton kernels. On Hygon BW1000, which has no FP8
+      compute, an FP8 wo_a runs in INT8 with the same per-128 activation scales,
+      and a BF16 wo_a is read in place without a full copy.
     for:
       - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
     labels:

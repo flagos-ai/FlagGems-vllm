@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""dsv41_o_proj (wo_a part) vs vLLM ``deep_gemm_fp8_o_proj`` on Hopper.
+"""dsv41_o_proj (wo_a part) against each vendor's native path.
 
-Both sides run inverse RoPE + FP8 quant + grouped FP8 GEMM; wo_b is an identity
-callback on the vLLM side, so only the wo_a stage is timed.
+Hopper: vLLM ``deep_gemm_fp8_o_proj``. Both sides run inverse RoPE + FP8 quant +
+grouped FP8 GEMM; wo_b is an identity callback on the vLLM side, so only the wo_a
+stage is timed. Small batches take one kernel launch and large ones two; see
+``dsv41_o_proj``.
 
-Small batches take one kernel launch and large ones two; see ``dsv41_o_proj``. Also
-run ``--mode operator``: it counts the CPU launch time the default mode partly hides.
+Hygon: no matching native path. vllm_hcu (HYGON-AI/vllm-plugin-das) runs this
+projection in BF16 without quantization, and its FP8 branch is unreachable on the
+ROCm-type HCU platform. The baseline therefore comes from ``--base-data``; inputs
+are the same FP8 tensors as on Hopper, so the shapes match that baseline.
+
+Also run ``--mode operator``: it counts the CPU launch time the default mode partly
+hides.
 """
 
 import math
@@ -161,6 +168,39 @@ def test_perf_dsv41_o_proj_gems_vs_vllm():
     bench = Dsv41OProjBenchmark(
         op_name="dsv41_o_proj",
         torch_op=_vllm_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_wrapper)
+    bench.run()
+
+
+# ---------------------------------------------------------------------------
+# Hygon DCU
+# ---------------------------------------------------------------------------
+HYGON = flaggems_vllm.vendor_name == "hygon" and torch.cuda.is_available()
+
+
+class HygonDsv41OProjBenchmark(Dsv41OProjBenchmark):
+    """Same shapes and FP8 inputs as on Hopper; only the gems side runs here."""
+
+    def get_input_iter(self, cur_dtype):
+        del cur_dtype
+        device = flaggems_vllm.device
+        for t, g, h, r in self.shapes:
+            inputs = _make_inputs(t, g, h, r, device)
+            # Compile, and build the cached INT8 weight, outside the timed region.
+            _gems_wrapper(*inputs)
+            torch.cuda.synchronize()
+            yield inputs
+
+
+@pytest.mark.dsv41_o_proj
+@pytest.mark.skipif(not HYGON, reason="requires Hygon DCU")
+def test_perf_dsv41_o_proj_hygon():
+    bench = HygonDsv41OProjBenchmark(
+        op_name="dsv41_o_proj",
+        # No matching native implementation: --base-data supplies the baseline.
+        torch_op=None,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_wrapper)
