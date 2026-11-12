@@ -115,7 +115,12 @@ otherwise a vectorized torch reference.
 
 Measured on H20, non-graph (eager) CUDA-event timing, median -- matching the
 graph-disabled methodology of the `baseline/` native collectors.
-`SpeedUp = latency_native / latency_gems`.
+`SpeedUp = latency_native / latency_gems`. This op does not modify
+`persistent_topk`; numbers are taken with the companion `persistent_topk`
+sampled-dispatch PR applied (the stacked plan lands it first). Only the two
+`num_rows<=32` x 1M shapes are sensitive to it -- on plain `main` they take the
+cooperative radix path instead of the sampled one and measure ~5% slower (still
+~0.62x); the other ten shapes are dispatch-independent.
 
 | rows | seq_len | k    | native (ms) | this op (ms) | SpeedUp |
 | ---: | ------: | ---: | ----------: | -----------: | ------: |
@@ -142,11 +147,13 @@ ultra-long context (256K-1M)** -- and profiling shows these are *not* a
 launch-overhead problem the trims can reach:
 
 - **1/1M, 4/1M (GPU-bound).** Host submit is ~0.046 ms; the GPU work is
-  ~0.053 ms, of which the cooperative radix top-k is the bulk. That kernel is
-  already near its occupancy plateau (raising `ctas_per_group` past the default
-  gains <6% and then regresses on barrier overhead), so our GPU time alone is
-  close to native's *entire* latency. Matching native here needs a faster
-  multi-CTA top-k algorithm, not a dispatch/occupancy tweak.
+  ~0.053 ms, dominated by the row-prefix top-k. For thin batch x long context
+  the top-k runs effectively one CTA per row (the sampled path under the
+  companion dispatch; plain `main`'s cooperative radix path is similarly
+  launch-limited -- ~16 CTAs for a single row, near its occupancy plateau where
+  adding CTAs gains <6%), so it cannot fill the ~78 SMs and our GPU time alone
+  approaches native's *entire* latency. Matching native here needs a
+  multi-CTA-per-row top-k algorithm, not a host/dispatch tweak.
 - **14/256K (host-bound).** GPU work is only ~0.029 ms; the row length sits at
   the kernel's single-CTA histogram threshold, so it runs one CTA/row and the
   gap is residual host overhead already near the trimmed floor.
