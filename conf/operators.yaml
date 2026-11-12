@@ -1138,6 +1138,23 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: megagate
+    description: |
+      Hopper TLE fusion of the BF16 router projection and model-specific
+      DeepSeek/Qwen top-k routing in one eager kernel launch.
+    for:
+      - None
+    labels:
+      - fused
+      - TLE
+      - vLLM
+      - MoE
+      - DeepSeek
+      - Qwen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).

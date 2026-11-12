@@ -87,6 +87,10 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/utils/tle_capabilities.py": [
+        "tests/test_tle_capabilities.py",
+        "tests/test_megagate.py",
+    ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
         "tests/test_flash_mla_with_kvcache_w8a8.py",
@@ -438,6 +442,11 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
 
+    if path.startswith(
+        "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/megagate/"
+    ):
+        return ["tests/test_megagate.py"] if "tests/test_megagate.py" in tests else []
+
     if path.startswith("src/flaggems_vllm/ops/mhc/"):
         return ["tests/test_mhc_ops.py"] if "tests/test_mhc_ops.py" in tests else []
 
@@ -459,6 +468,15 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
             for benchmark in EXPLICIT_SOURCE_TO_BENCHMARKS[path]
             if benchmark in benchmarks
         ]
+
+    if path.startswith(
+        "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/megagate/"
+    ):
+        return (
+            ["benchmark/test_megagate.py"]
+            if "benchmark/test_megagate.py" in benchmarks
+            else []
+        )
 
     if path.startswith("src/flaggems_vllm/ops/DSA/"):
         return []
