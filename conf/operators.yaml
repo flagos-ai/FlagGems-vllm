@@ -799,6 +799,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '0.3'
+  - id: gather_conv_state
+    description: |
+      Stages the rows used by a batch out of the block-strided Kimi Delta
+      Attention (KDA) short-convolution state cache into a contiguous buffer
+      for the AscendC conv operator, emitting local row indices with PAD
+      markers in a single kernel.
+    for:
+      - None
+    labels:
+      - fused
+      - FLA
+    kind:
+      - Attention
+    stages:
+      - alpha: '5.4'
 
   - id: gdn_w8a16
     description: |
@@ -1017,21 +1032,6 @@ ops:
       - stable: '2.2'
       - removed: '3.0'
       - beta: '5.3'
-  - id: kda_conv_gather
-    description: |
-      Stages the rows used by a batch out of the block-strided Kimi Delta
-      Attention (KDA) short-convolution state cache into a contiguous buffer
-      for the AscendC conv operator, emitting local row indices with PAD
-      markers in a single kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
   - id: kda_conv_scatter
     description: |
       Restores the staged rows back into the block-strided KDA
