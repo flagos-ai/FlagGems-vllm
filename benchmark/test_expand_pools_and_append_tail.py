@@ -204,13 +204,19 @@ class ExpandPoolsBenchmark(Benchmark):
         self.native_op = None
         self.native_reason = None
         self.native_provenance = None
+        self.gems_only = (
+            self.entry == "candidate"
+            and benchmark_config.Config.user_desired_metrics == ["latency"]
+        )
         self.external_path = os.environ.get("EXPAND_STANDARD_NATIVE_RESULTS")
         self.external_rows = {}
         self.external_reason = None
         try:
             if self.entry == "candidate":
                 self.selected = flaggems_vllm.expand_pools_and_append_tail
-                if self.external_path:
+                if self.gems_only:
+                    self.native_reason = "native timing disabled by --metrics"
+                elif self.external_path:
                     self._load_external()
                 else:
                     try:
@@ -270,12 +276,21 @@ class ExpandPoolsBenchmark(Benchmark):
             raise ValueError(
                 "the frozen expansion matrix requires both int32 and int64"
             )
-        if set(self.to_bench_metrics) != set(self.DEFAULT_METRICS):
+        if not self.gems_only and set(self.to_bench_metrics) != set(
+            self.DEFAULT_METRICS
+        ):
             raise ValueError(
-                "the standard adapter requires latency_base/latency/speedup"
+                "use latency_base/latency/speedup, or --metrics latency for the candidate"
             )
 
+    def run(self):
+        with pytest.MonkeyPatch.context() as config:
+            if self.gems_only:
+                config.setattr(benchmark_config.Config, "base_data", None)
+            super().run()
+
     def get_input_iter(self, dtype):
+        misses = []
         for binding in self.shapes:
             self.binding = binding
             self.current_dtype = dtype
@@ -286,6 +301,24 @@ class ExpandPoolsBenchmark(Benchmark):
             self.row_native_callable = None
             args, kwargs = baseline.build_inputs(binding, dtype, flaggems_vllm.device)
             yield (*args, kwargs)
+            if self.row_native_reason:
+                misses.append(
+                    dict(
+                        shape=self.record_shapes(*args, **kwargs),
+                        reason=self.row_native_reason,
+                    )
+                )
+        if misses:
+            benchmark_config.update_result(
+                self.op_name,
+                dict(
+                    dtype=str(dtype),
+                    native_baseline_skip_reason="; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    native_baseline_misses=misses,
+                ),
+            )
 
     def record_shapes(self, *args, **kwargs):
         config = baseline.config(self.binding, self.current_dtype)
@@ -295,7 +328,11 @@ class ExpandPoolsBenchmark(Benchmark):
         config["inputs"]["seq_lens"]["dtype"] = str(args[1].dtype)
         config["inputs"]["pool_size"] = {"scalar": args[2]}
         self.case_config = config
-        return {"case": baseline.key_shape(self.binding), "config": config}
+        return dict(
+            case=baseline.key_shape(self.binding),
+            config=config,
+            inputs=super().record_shapes(*args, **kwargs),
+        )
 
     @staticmethod
     def _settings():

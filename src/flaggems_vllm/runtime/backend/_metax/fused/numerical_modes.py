@@ -245,6 +245,20 @@ def sequential_moe_sum(input, output):
     input_stride = input.stride()
     output_stride = output.stride()
     elem_size = input.element_size()
+    # Keep the accepted narrow indexing only when every logical offset fits.
+    # Other callers retain the shared kernel's safe int64 default.
+    max_input_offset = (
+        (num_tokens - 1) * input_stride[0]
+        + (topk - 1) * input_stride[1]
+        + (hidden_size - 1) * input_stride[2]
+    )
+    max_output_offset = (num_tokens - 1) * output_stride[0] + (
+        hidden_size - 1
+    ) * output_stride[1]
+    use_int64_index = (
+        max(num_tokens - 1, max_input_offset, max_output_offset) >= 2**31
+        or min(*input_stride, *output_stride) < 0
+    )
     grid = lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_SIZE"]))
     _moe_sum_general_kernel[grid](
         input,
@@ -258,4 +272,5 @@ def sequential_moe_sum(input, output):
         output_stride[0],
         output_stride[1],
         ELEM_SIZE=elem_size,
+        USE_INT64_INDEX=use_int64_index,
     )

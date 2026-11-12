@@ -277,6 +277,21 @@ ops:
       - Attention
     stages:
       - beta: '3.0'
+  - id: cooperative_topk
+    description: |
+      Select exact top-k indices from FP32 CUDA logits through vLLM's in-place
+      interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+      and -1 padding for short rows.
+    for:
+      - _C.cooperative_topk
+    labels:
+      - fused
+      - NoCPU
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: cp_gather_indexer_k_quant_cache
     description: This is a fused operator that gathers FP8 K cache values and scales.
     for:
@@ -370,6 +385,26 @@ ops:
     stages:
       - alpha: '4.2'
       - beta: '5.3'
+  - id: dsv41_o_proj
+    description: |
+      DeepSeek-V4.1 attention output projection (wo_a stage): inverse GPT-J
+      RoPE + per-128 FP8 quant + grouped block-scaled FP8 GEMM. Hopper recipe
+      (1, 128, 128); wo_b is an optional caller-supplied callback. Small batches
+      run in one kernel launch. A BF16 wo_a takes vLLM's non-quantizing path
+      (BF16 inverse RoPE + grouped BF16 GEMM, one Triton kernel). Hopper uses
+      tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
+      8.0 for BF16) use plain Triton kernels.
+    for:
+      - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: dswiglu
     description: |
       Swish-Gated Linear Unit, a variant of GLU with the Swish activation function.
@@ -477,6 +512,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: flash_mla_sparse_fwd_w8a8
+    description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and shared key/value.
+    for:
+      - flash_mla_sparse_fwd_w8a8
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: flash_mla_with_kvcache
     description: Dense and sparse Multi-head Latent Attention decoding with a paged
       KV cache.
@@ -588,6 +635,22 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: fused_indexer_k_norm
+    description: |
+      GLM5Next indexer FP32 LayerNorm with FP32 weight and bias, followed by
+      a cast to the input dtype. Supports two-dimensional FP16/BF16/FP32
+      inputs with nonnegative strides and widths from 1 through 4096.
+      Forward inference only; returns a fresh contiguous tensor.
+    for:
+      - vllm.models.glm5next.common.attention._fused_indexer_k_norm
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_indexer_q_rope_quant
     description: |
       Applies RoPE to sparse indexer Q, quantizes it to FP8 or MXFP4, and folds
@@ -606,7 +669,7 @@ ops:
   - id: fused_indexer_weight_scale
     description: |
       Scale floating-point indexer weights by FP32 query scales and a scalar.
-      Returns FP32 per-token, per-head weights on Ascend and MThreads.
+      Returns FP32 per-token, per-head weights.
     for:
       - fused_indexer_weight_scale
       - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
@@ -741,8 +804,14 @@ ops:
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
+      Supports decode, prefill and speculative state-slot updates.
+      MetaX uses a backend-specific core interface with precomputed FP32 gates
+      and immutable FP32 state, returning output and final state. Its opt-in mixed_precision=True chunk path
+      uses BF16/FP16 intermediates with FP32 accumulation and bounded workspace.
+      MetaX decode=True accepts raw gates and packed/separate QKV and updates
+      indexed FP32 state slots in place with fused normalization and gating.
       FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU and Hygon.
+      INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
     for:
       - gdn_w8a16
       - gdn_w8a16_int8
@@ -1108,6 +1177,23 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: mhc_shifted_post_pre
+    description: |
+      DSV4.1 shifted mHC boundary: applies the previous sublayer's post/comb
+      coefficients, then emits the next post/comb/pre coefficient set, the
+      collapsed (optionally RMSNorm'd) layer input and the stream mean.
+      Consumes the carried pre-mix instead of the freshly computed one, which is
+      what lets vLLM overlap coefficient generation with the sublayer.
+    for:
+      - vllm.models.deepseek_v41.nvidia.ops.mhc.mhc_shifted_post_pre
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
   - id: minimax_m3_sparse_attn
     description: |
       MiniMax M3 block-sparse GQA prefill attention over packed paged KV
@@ -1251,6 +1337,16 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: pad_indexer_heads
+    description: Append zero heads to GLM5Next FP8 queries and per-head weights with bit-preserving copies.
+    for:
+      - None
+    labels:
+      - vLLM
+    kind:
+      - DataMovement
+    stages:
+      - beta: '0.3'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,
@@ -1296,6 +1392,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: qsa_sparse_paged_attention
+    description: |
+      Computes sparse grouped-query attention over paged BF16 or FP8 KV caches
+      using packed token indices, with fused output gating.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.qsa.qsa_sparse_paged_attention
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: reglu
     description: |
       Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of the sigmoid function for gating.
@@ -1590,6 +1700,17 @@ ops:
       - MoE
     stages:
       - beta: '5.3'
+  - id: triton_ihc_post
+    description: iHC gated residual scatter with unfused FP32 multiply and addition.
+    for:
+      - triton_ihc_post
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.4'
   - id: triton_lighting_indexer_k_tiled_interface
     description: Part of FP8 MQA framework. It is currently not exposed as an operator
       for use.
@@ -1602,6 +1723,17 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: triton_reshape_and_cache_flash
+    description: In-place Flash 4D and head-major KV writes with ordinary or global E4M3 FP8 storage.
+    for:
+      - triton_reshape_and_cache_flash
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '0.1'
   - id: unpack_seq_triton
     description: Unpack a packed sequence tensor back to its original variable-length
       form.

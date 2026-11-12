@@ -76,6 +76,7 @@ def test_public_modes_reach_metax_implementation():
         fgv.fused_minimax_m3_qknorm_rope_kv_insert(*qkv_args(), numerics="bf16_staged")
         torch.cuda.synchronize()
         assert (len(sw.calls), len(sm.calls), len(qk.calls)) == (1, 1, 2)
+        assert sm.calls[0][1]["USE_INT64_INDEX"] is False
         assert all(meta["num_warps"] == 4 for _, meta in qk.calls)
 
 
@@ -176,3 +177,41 @@ def test_empty_staged_qkv_does_not_launch():
     with patch.object(backend, "launch_staged_qkv") as launch:
         fgv.fused_minimax_m3_qknorm_rope_kv_insert(*qkv_args(0), numerics="bf16_staged")
         launch.assert_not_called()
+
+
+@pytest.mark.parametrize("tokens,wide", [(43690, False), (43691, True)])
+def test_sequential_sum_index_range_boundary(tokens, wide):
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.fused.numerical_modes"
+    )
+    x = torch.empty(tokens, 8, 6144, device="meta", dtype=torch.bfloat16)
+    out = torch.empty(tokens, 6144, device="meta", dtype=x.dtype)
+    with patch.object(backend, "_moe_sum_general_kernel") as kernel:
+        backend.sequential_moe_sum(x, out)
+        assert (
+            kernel.__getitem__.return_value.call_args.kwargs["USE_INT64_INDEX"] is wide
+        )
+
+
+@pytest.mark.parametrize("strided", ["input", "output"])
+def test_sequential_sum_large_stride_uses_wide_index(strided):
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.fused.numerical_modes"
+    )
+    x = torch.empty_strided(
+        (2, 8, 4),
+        (2**31, 4, 1) if strided == "input" else (32, 4, 1),
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    out = torch.empty_strided(
+        (2, 4),
+        (2**31, 1) if strided == "output" else (4, 1),
+        device="meta",
+        dtype=x.dtype,
+    )
+    with patch.object(backend, "_moe_sum_general_kernel") as kernel:
+        backend.sequential_moe_sum(x, out)
+        assert (
+            kernel.__getitem__.return_value.call_args.kwargs["USE_INT64_INDEX"] is True
+        )
