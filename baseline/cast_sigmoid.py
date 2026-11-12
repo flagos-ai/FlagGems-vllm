@@ -1,32 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Pinned cast_sigmoid workloads and exact native resolution.
+"""Pinned cast_sigmoid workloads and exact vLLM native resolution.
 
-The native symbol is vLLM's ``_cast_sigmoid`` (grouped-topk gating scores).
-It only exists on vLLM builds that ship the GLM-5-Next model package, so
-``native()`` may legitimately return ``None``; that is recorded in
-``NATIVE_UNAVAILABLE_REASON`` and never worked around with an eager
-expression.
+The native symbol is vLLM's ``_cast_sigmoid``, the fused FP32-cast + sigmoid
+leaf used for the KDA / grouped-topk gating scores:
+
+    @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+    def _cast_sigmoid(x: torch.Tensor) -> torch.Tensor:
+        return x.float().sigmoid()
+
+It therefore always returns FP32 and only exists on vLLM builds that ship
+``vllm/models/glm5next`` (v0.33.0 and newer). On older builds the import fails,
+so ``native()`` returns ``None`` with ``NATIVE_UNAVAILABLE_REASON`` set and the
+benchmark picks ``torch.sigmoid`` instead. ``native()`` never fabricates a
+proxy callable for a missing symbol, so "native available" stays verifiable.
 """
 
-import hashlib
 import importlib
 import inspect
 from functools import lru_cache
 from importlib import metadata
-from pathlib import Path
 
 import torch
 
 OP_NAME = "cast_sigmoid"
+# vLLM calls _cast_sigmoid on the KDA beta tensor, whose dtype follows the
+# model dtype; FP32 is supported as a no-op cast.
 DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 IS_INPLACE = False
 MUTATED_INPUTS = ()
-NATIVE_UNAVAILABLE_REASON = None
-NATIVE_ARTIFACT = None
 NATIVE_MODULE = "vllm.models.glm5next.common.kda"
 NATIVE_NAME = "_cast_sigmoid"
 NATIVE_OUT_DTYPE = torch.float32
+NATIVE_UNAVAILABLE_REASON = None
+NATIVE_ARTIFACT = None
 
 # Small / medium / large, mirrored from benchmark/core_shapes.yaml.
 SHAPES = (
@@ -41,7 +48,7 @@ SHAPES = (
 
 @lru_cache(maxsize=1)
 def native():
-    """Never substitute an eager or source-sliced expression for native."""
+    """Resolve ``vllm.models.glm5next.common.kda._cast_sigmoid``."""
     global NATIVE_UNAVAILABLE_REASON, NATIVE_ARTIFACT
     try:
         module = importlib.import_module(NATIVE_MODULE)
@@ -67,15 +74,11 @@ def native():
     except Exception as exc:
         NATIVE_ARTIFACT["version_error"] = f"{type(exc).__name__}: {exc}"
     try:
-        source_file = inspect.getsourcefile(original) or getattr(
-            module, "__file__", None
-        )
-        NATIVE_ARTIFACT["source_file"] = source_file
-        NATIVE_ARTIFACT["source_sha256"] = hashlib.sha256(
-            Path(source_file).read_bytes()
-        ).hexdigest()
+        # vLLM decorates the leaf with torch.compile, so unwrap back to the
+        # Python function before inspecting its source.
+        NATIVE_ARTIFACT["callable_source"] = inspect.getsource(original).strip()
     except Exception as exc:
-        NATIVE_ARTIFACT["source_error"] = f"{type(exc).__name__}: {exc}"
+        NATIVE_ARTIFACT["callable_source_error"] = f"{type(exc).__name__}: {exc}"
     return op
 
 
@@ -85,7 +88,8 @@ def grid():
 
 
 def key_shape(binding):
-    return "x".join(str(dim) for dim in binding["shape"]) or "scalar"
+    """Simple unary op: the key is the first tensor's dimensions."""
+    return list(binding["shape"])
 
 
 def build_inputs(binding, dtype, device):
@@ -106,8 +110,9 @@ def config(binding, dtype):
                 "dtype": str(dtype),
             }
         },
-        "output": {"shape": shape, "dtype": str(NATIVE_OUT_DTYPE)},
-        "attributes": {"out_dtype": str(NATIVE_OUT_DTYPE)},
+        # The native op always writes FP32, whatever the input dtype.
+        "outputs": {"output": {"shape": shape, "dtype": str(NATIVE_OUT_DTYPE)}},
+        "dims": {"numel": int(torch.tensor(shape).prod().item())},
     }
 
 
