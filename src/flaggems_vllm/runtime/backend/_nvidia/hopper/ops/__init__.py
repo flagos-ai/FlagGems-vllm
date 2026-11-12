@@ -27,5 +27,16 @@ if _triton_version_utils.has_triton_tle(3, 6, 0):
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megamoe import (  # noqa: F401
         megamoe_fp8,
     )
+    from flaggems_vllm.utils.tle_capabilities import (
+        supports_module_wide_named_barriers as _supports_module_wide_named_barriers,
+    )
 
     __all__.append("megamoe_fp8")
+
+    if _supports_module_wide_named_barriers():
+        from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megagate import (  # noqa: F401
+            create_megagate_context,
+            megagate,
+        )
+
+        __all__.extend(["create_megagate_context", "megagate"])
