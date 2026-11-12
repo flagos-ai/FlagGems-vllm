@@ -1,8 +1,9 @@
 """Shared Normal-MHC routing tail for the eager Hopper P256 kernels.
 
-The admitted P256 kernels need only this routing fragment from the historical
-split-tail research kernels.  Keeping it here avoids importing two complete
-shape-exact prototypes into the production path.
+Formal callers are ``T in {1028, 2048, 3076, 3805, 4100}`` at
+``H=4096, R=4, P=24``.  They use 12 producer and four RS-WGMMA warps with the
+fixed phase-3 x8 routing/hidden tail.  This leaf module has no independent
+dispatch or tuning mode.
 """
 
 from __future__ import annotations

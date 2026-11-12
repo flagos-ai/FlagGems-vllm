@@ -1,6 +1,6 @@
 """Explicit LaunchSpec adapters for admitted Hopper MegaMHC Plans.
 
-The research kernels predate :mod:`prepared_launcher` and expose dataclass
+The kernel families predate :mod:`prepared_launcher` and expose dataclass
 ``Plan`` objects whose ``run`` methods spell out the JIT launch.  Repeating
 that launch ABI in every kernel file makes review difficult, while inferring
 it by monkeypatching ``JITFunction.run`` is not production safe.  This module
@@ -327,26 +327,9 @@ def _base_kwargs(warps: int) -> dict[str, object]:
 
 
 def _persistent_wgmma_kwargs(plan: object, warps: int) -> dict[str, object]:
+    """Return the single admitted M64 production specialization."""
     kwargs = _base_kwargs(warps)
-    kwargs.update(
-        {
-            "launch_cooperative_grid": True,
-            "USE_STAGED_WGMMA": plan.use_staged_wgmma,
-            "USE_EXPLICIT_WGMMA": plan.use_explicit_wgmma,
-            "USE_WARP_OVERLAP": plan.use_warp_overlap,
-            "USE_DIRECT_ROUTING_TAIL": plan.use_direct_routing_tail,
-            "USE_DIRECT_TAIL_ILP4": plan.use_direct_tail_ilp4,
-            "USE_PERSISTENT_WS": plan.use_persistent_ws,
-            "USE_PERSISTENT_ROUTE4": plan.use_persistent_route4,
-            "USE_ROUTE4_WINDOW4": plan.persistent_route4_reduction == "window4",
-            "USE_ROUTE4_ILP2": plan.persistent_route4_reduction == "ilp2",
-            "USE_ROUTE4_ILP4": plan.persistent_route4_reduction == "ilp4",
-            "USE_ROUTE4_WARP0_FINALIZE": plan.use_route4_warp0_finalize,
-            "USE_SPLIT128_PAIR_ROUTE": plan.use_split128_pair_route,
-            "USE_EARLY_PRE_SYNC": plan.use_early_pre_sync,
-            "ENABLE_PHASE_PROFILE": plan.enable_phase_profile,
-        }
-    )
+    kwargs["launch_cooperative_grid"] = True
     return kwargs
 
 
@@ -362,30 +345,13 @@ def _small_spec(
         plan.rmsnorm_scale,
     )
     direct = tuple(getattr(plan, name) for name in _KERNEL_TENSOR_FIELD_NAMES)
-    if plan.use_t32_token_pair:
-        kernel = getattr(module, "_tle_sm90_mega_mhc_t32_pair_kernel")
-        args = (
-            *direct,
-            plan.projection_partials,
-            plan.sqsum_partials,
-            plan.arrival_counter,
-            *scalars,
-        )
-        kwargs = _base_kwargs(int(module.FULL_NUM_WARPS))
-        kwargs["COUNTER_STRIDE_ELEMENTS"] = plan.counter_stride_elements
-        grid = (plan.grid_ctas,)
-    elif plan.schedule.startswith("split") and "_tile" in plan.schedule:
+    if plan.schedule.startswith("split") and "_tile" in plan.schedule:
         kernel = getattr(module, "_tle_sm90_mega_mhc_t1_split_kernel")
         args = (
             *direct,
             plan.projection_partials,
             plan.sqsum_partials,
             plan.arrival_counter,
-            (
-                plan.phase_profile
-                if plan.phase_profile is not None
-                else plan.arrival_counter
-            ),
             *scalars,
         )
         kwargs = _base_kwargs(plan.split_num_warps)
@@ -405,34 +371,16 @@ def _small_spec(
                 "USE_TID4_REDUCTION": plan.use_tid4_reduction,
                 "USE_TID5_REDUCTION": plan.use_tid5_reduction,
                 "USE_TID7_REDUCTION": plan.use_tid7_reduction,
-                "USE_TID9_REDUCTION": plan.use_tid9_reduction,
-                "USE_TID13_REDUCTION": plan.use_tid13_reduction,
-                "USE_TID25_REDUCTION": plan.use_tid25_reduction,
-                "USE_WARP_SINKHORN": plan.use_warp_sinkhorn,
-                "USE_FAST_RCP": plan.use_fast_rcp,
                 "USE_WARP_OVERLAP": plan.use_warp_overlap,
-                "USE_CUSTOM_HANDOFF": plan.use_custom_handoff,
                 "USE_CONTIGUOUS_PARTIALS": plan.use_contiguous_partials,
                 "USE_T2_PROJECTION_ILP": plan.use_t2_projection_ilp,
-                "USE_T2_SQSUM_TREE": plan.use_t2_sqsum_tree,
-                "USE_T32_PROJECTION_ILP": plan.use_t32_projection_ilp,
-                "USE_T32_PROJECTION_ILP2": plan.use_t32_projection_ilp2,
-                "USE_T32_CUSTOM_STORE1": plan.use_t32_custom_store1,
-                "USE_T32_PACK_SQSUM": plan.use_t32_pack_sqsum,
-                "USE_T32_SKIP_EPILOGUE_BARRIER": (plan.use_t32_skip_epilogue_barrier),
-                "USE_T32_PREMIX_DIRECT_BCAST": plan.use_t32_premix_direct_bcast,
-                "USE_T32_PREMIX_SHARED_BRIDGE": (plan.use_t32_premix_shared_bridge),
-                "USE_T32_WARP0_HANDOFF_BARRIER": (plan.use_t32_warp0_handoff_barrier),
-                "USE_T32_FN_CACHE_CG": plan.use_t32_fn_cache_cg,
-                "ENABLE_PHASE_PROFILING": plan.phase_profiling,
             }
         )
         grid = (plan.grid_ctas,)
     else:
-        kernel = getattr(module, "_tle_sm90_mega_mhc_t1_single_cta_kernel")
-        args = (*direct, *scalars)
-        kwargs = _base_kwargs(int(module.FULL_NUM_WARPS))
-        grid = (1,)
+        raise PreparedLaunchContractError(
+            f"{label} is not an admitted small-family split-tile schedule"
+        )
     return _make_launch_spec(
         plan,
         adapter,
@@ -447,8 +395,8 @@ def _small_spec(
 def launch_spec_for_plan(plan: object) -> LaunchSpec:
     """Return the exact launch contract for one dispatch-admitted Plan.
 
-    Unknown classes and compile-only probe configurations raise before JIT
-    compilation.  No Plan ``run`` method is invoked.
+    Unknown classes and unsupported configurations raise before JIT
+    compilation. No Plan ``run`` method is invoked.
     """
     key = _qualified_type(plan)
     try:
@@ -488,12 +436,11 @@ def launch_spec_for_plan(plan: object) -> LaunchSpec:
         kwargs["maxnreg"] = int(plan.maxnreg)
         if adapter.kind == "p384_tma" and (
             module.ACTIVE_K64_BLOCKS != module.NUM_K64_BLOCKS
-            or module.PROBE_PHASE != 1
             or module.TAIL_BATCHES != 22
             or module.TAIL_WORK_PHASE != 3
         ):
             raise PreparedLaunchContractError(
-                f"{key} is a compile-only p384 probe configuration"
+                f"{key} does not match the admitted P384 production configuration"
             )
     elif adapter.kind == "cluster_eager":
         kwargs["maxnreg"] = int(plan.maxnreg)

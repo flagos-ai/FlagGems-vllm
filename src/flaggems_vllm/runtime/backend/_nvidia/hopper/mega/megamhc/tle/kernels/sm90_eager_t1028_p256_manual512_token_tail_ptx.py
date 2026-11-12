@@ -1,8 +1,8 @@
-"""Token-sharded manual512 PTX tail helpers for the T=1028 p256 candidate.
+"""Production token-sharded manual512 PTX tail for exact eager ``T=1028``.
 
-These helpers are deliberately isolated from the hash-pinned recovered formal
-kernel.  They generalize only the row-wave mapping and global row strides used
-by the manual512 x8 tail; historical call sites retain their original source.
+The admitted caller fixes the x8 schedule, phase 3, and a 128-element chunk.
+The helper remains isolated from the P384 and Graph families because T=1028
+has a real four-row final tile and a distinct row-wave mapping.
 """
 
 from __future__ import annotations

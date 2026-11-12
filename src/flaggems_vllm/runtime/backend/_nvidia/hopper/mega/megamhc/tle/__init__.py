@@ -1,9 +1,8 @@
 """Hopper TLE implementations for MegaMHC.
 
-The stable kernel families are imported lazily.  Several research kernels
-specialize their geometry from environment variables at module import time;
-eagerly importing one family here would therefore make an unrelated family's
-configuration depend on import order.
+The production kernel families are imported lazily because their exact token
+geometry is specialized at module import time. Eagerly importing one family
+here would make an unrelated family's configuration depend on import order.
 """
 
 from __future__ import annotations

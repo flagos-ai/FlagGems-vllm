@@ -1,4 +1,8 @@
-"""Compatibility wrapper for the exact eager ``T=16384`` P384 bucket."""
+"""Production exact-``T=16384`` facade for the shared P384 eager kernel.
+
+Uses the fixed ``H=4096, R=4, P=24`` manual512 configuration: 12 producer +
+4 RS-WGMMA warps, four K64 stages, TMA Fn staging, route12 tail, maxnreg 64.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,6 @@ GRID_CTAS = NUM_M_TILES
 NUM_WARPS = _base.NUM_WARPS
 NUM_K64_BLOCKS = _base.NUM_K64_BLOCKS
 ACTIVE_K64_BLOCKS = _base.ACTIVE_K64_BLOCKS
-PROBE_PHASE = _base.PROBE_PHASE
 TAIL_BATCHES = _base.TAIL_BATCHES
 TAIL_WORK_PHASE = _base.TAIL_WORK_PHASE
 

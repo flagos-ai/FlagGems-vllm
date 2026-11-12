@@ -1,20 +1,19 @@
-"""T=2048 p256 projection probe using the proven manual512 cp.async pipe.
+"""Production SM90 eager MegaMHC specialization for exact ``T=2048``.
 
-This module is deliberately independent from the production dispatch and the
-older p256 manual-ring experiments.  One ordinary 16-warp CTA owns one
-``M64 x H512`` split: physical warps 0..11 produce BF16 A and four FP32 Fn
-routes while physical warps 12..15 execute the persistent K32-half RS-WGMMA
-loop.  The grid contains ``32 token tiles x 8 hidden splits`` CTAs and enqueues
-exactly one CUDA kernel.
+The admitted DeepSeek-V4-Flash Normal-BF16 configuration is fixed at
+``H=4096, R=4, P=24``.  The 256-CTA grid contains 32 complete M64 token tiles
+and eight H512 projection splits per tile.  In every 16-warp CTA, warps 0..11
+produce BF16 A and four FP32 Fn routes while warps 12..15 execute the
+persistent RS-WGMMA loop; projection, routing, and the RMSNorm tail remain in
+one kernel launch.
 
-The role-aware projection and tail PTX bodies are local to this module family.
-The admitted implementation intentionally exposes only the validated x8 tail;
-it has no runtime dependency on the still-experimental p384 source.
+Production uses the complete phase-3 x8 tail, a 128-element tail chunk,
+cp.async Fn staging, and ``maxnreg=64``.  Historical phase, tail-mode, and
+register-count experiment switches are intentionally not exposed here.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -26,9 +25,7 @@ import triton.language as tl
 from .sm90_eager_p256_manual512_projection_n32_ptx import (
     _manual512_p256_projection_n32_ptx,
 )
-from .sm90_eager_p256_routing import (
-    _routing_finalize_no_barrier,
-)
+from .sm90_eager_p256_routing import _routing_finalize_no_barrier
 from .sm90_eager_t2048_p256_manual512_tail_ptx import (
     _split_hidden_combine_bf16x8_ptx,
     _split_hidden_normalize_bf16x8_ptx,
@@ -47,20 +44,11 @@ NUM_SPLITS = HIDDEN // SPLIT_HIDDEN
 NUM_M_TILES = TOKENS // BLOCK_M
 GRID_CTAS = NUM_M_TILES * NUM_SPLITS
 NUM_WARPS = 16
-TAIL_PHASE = int(
-    os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL_PHASE", "3")
-)
-if TAIL_PHASE not in (1, 2, 3):
-    raise ValueError("manual512 tail phase must be 1/2/3")
+TAIL_PHASE = 3
 TAIL_BATCHES = 32
-TAIL_MODE = os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL_MODE", "x8")
-if TAIL_MODE != "x8":
-    raise ValueError("the admitted manual512 implementation requires x8 tail")
-TAIL_CHUNK = int(
-    os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL_CHUNK", "128")
-)
-if TAIL_CHUNK not in (32, 64, 128, 256):
-    raise ValueError("manual512 tail chunk must be 32/64/128/256")
+TAIL_MODE = "x8"
+TAIL_CHUNK = 128
+MAXNREG = 64
 
 JIT_TOKENS = tl.constexpr(TOKENS)
 JIT_HIDDEN = tl.constexpr(HIDDEN)
@@ -519,11 +507,7 @@ class EagerT2048P256Manual512ProjectionPlan:
 def prepare_tle_sm90_projection(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT2048P256Manual512ProjectionPlan:
-    """Prepare the opt-in, exact-one-kernel projection experiment."""
-    if os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512", "0") != "1":
-        raise RuntimeError(
-            "set DG_TLE_MHC_EAGER_T2048_P256_MANUAL512=1 to enable this probe"
-        )
+    """Prepare the admitted exact-one-kernel T=2048 implementation."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("prepare the eager projection plan outside capture")
 
@@ -598,9 +582,7 @@ def prepare_tle_sm90_projection(
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("all tensors must be on one CUDA device")
 
-    maxnreg = int(os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_MAXNREG", "64"))
-    if maxnreg not in (48, 56, 64, 72, 80):
-        raise ValueError("manual512 maxnreg must be 48/56/64/72/80")
+    maxnreg = MAXNREG
     device = tensors[0].device
     debug_partials = torch.empty(
         (NUM_SPLITS, TOKENS, 2048), dtype=torch.float32, device=device
@@ -611,12 +593,7 @@ def prepare_tle_sm90_projection(
         device=device,
     )
     tile_states = torch.zeros((NUM_M_TILES, 2), dtype=torch.uint32, device=device)
-    tail_enabled = (
-        os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL", "0") == "1"
-    )
-    dispatch_enabled = (
-        os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_ADMITTED", "0") == "1"
-    )
+    tail_enabled = True
     metadata: dict[str, object] = {
         "model": "DeepSeek-V4-Flash@60d8d707",
         "execution_mode": "eager",
@@ -643,17 +620,13 @@ def prepare_tle_sm90_projection(
         "wgmma": "persistent TF32 RS M64N32, internal K32 halves",
         "projection_only": not tail_enabled,
         "tail_enabled": tail_enabled,
-        "tail_schedule": (
-            "split-sharded x8 PTX"
-            if TAIL_MODE == "x8"
-            else "split0 uniform manual512 batch2"
-        ),
+        "tail_schedule": "split-sharded x8 PTX",
         "tail_mode": TAIL_MODE,
         "tail_chunk": TAIL_CHUNK,
         "tail_phase": TAIL_PHASE,
         "tail_batches": TAIL_BATCHES,
-        "experimental": not dispatch_enabled,
-        "dispatch_enabled": dispatch_enabled,
+        "experimental": False,
+        "dispatch_enabled": True,
     }
     return EagerT2048P256Manual512ProjectionPlan(
         tensors=tensors,

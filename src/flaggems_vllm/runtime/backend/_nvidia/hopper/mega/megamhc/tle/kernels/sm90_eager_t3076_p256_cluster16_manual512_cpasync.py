@@ -1,19 +1,23 @@
-"""T=3076 p256 cluster-sixteen manual512 eager research kernel.
+"""Production SM90 eager MegaMHC base for ``T=3076, 3805, 4100``.
 
-Each M64 token tile launches one non-portable Hopper cluster containing sixteen
-H256 projection splits.  Physical warps 0..11 produce BF16 A and four FP32 Fn
-routes while physical warps 12..15 execute the persistent K32-half RS-WGMMA
-loop.  A release/acquire cluster barrier publishes all sixteen split partials,
-so this one-kernel path does not require full-grid residency.
+All admitted cases use the DeepSeek-V4-Flash Normal-BF16 profile
+``H=4096, R=4, P=24``, sixteen physical warps (12 producer + 4 RS-WGMMA),
+the complete phase-3 x8 tail, a 128-element tail chunk, cp.async Fn staging,
+and ``maxnreg=64``.  The exact shape facades select one of two real launch
+topologies:
 
-The four-row token tail is the formally validated T=1028 helper.  This module
-remains outside production dispatch until strict correctness, resource,
-one-activity, replay, and bidirectional performance checks pass.
+* T=3076: cluster16 with H256 splits and a release/acquire cluster barrier;
+* T=3805: cluster4 with H1024 splits and a cluster barrier; and
+* T=4100: four H1024 splits with a resident global tile barrier.
+
+Projection, routing, and the BF16-boundary RMSNorm tail execute in one kernel.
+Only the topology selector remains import-time configurable because it changes
+the launch contract; historical tail, TMA, and register experiments are fixed
+to their admitted values.
 """
 
 from __future__ import annotations
 
-import ctypes
 import os
 from dataclasses import dataclass
 from typing import Mapping
@@ -59,30 +63,13 @@ SPLIT_HIDDEN = HIDDEN // NUM_SPLITS
 MAX_SPLITS = NUM_SPLITS
 GRID_CTAS = NUM_M_TILES * NUM_SPLITS
 NUM_WARPS = 16
-TAIL_PHASE = int(
-    os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_TAIL_PHASE", "3")
-)
-if TAIL_PHASE not in (1, 2, 3):
-    raise ValueError("manual512 tail phase must be 1/2/3")
-HIDDEN_PHASE = int(
-    os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_HIDDEN_PHASE", "3")
-)
-if HIDDEN_PHASE not in (1, 2, 3):
-    raise ValueError("manual512 hidden phase must be 1/2/3")
+TAIL_PHASE = 3
+HIDDEN_PHASE = 3
 TAIL_BATCHES = 32
-TAIL_MODE = os.environ.get(
-    "DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_TAIL_MODE", "x8"
-)
-if TAIL_MODE != "x8":
-    raise ValueError("the admitted manual512 implementation requires x8 tail")
-TAIL_CHUNK = int(
-    os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_TAIL_CHUNK", "128")
-)
-if TAIL_CHUNK not in (32, 64, 128, 256):
-    raise ValueError("manual512 tail chunk must be 32/64/128/256")
-USE_FN_TMA = (
-    os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_FN_TMA", "0") == "1"
-)
+TAIL_MODE = "x8"
+TAIL_CHUNK = 128
+USE_FN_TMA = False
+MAXNREG = 64
 
 JIT_TOKENS = tl.constexpr(TOKENS)
 JIT_HIDDEN = tl.constexpr(HIDDEN)
@@ -772,31 +759,6 @@ def _require_tensor(value, *, name, shape, dtype):
     return value
 
 
-def _encode_global_tensor_map(fn: torch.Tensor) -> torch.Tensor:
-    """Encode the validated 128B-swizzled FP32 N32xK32 Fn map."""
-    import triton.runtime.driver as driver_module
-
-    tensor_map = driver_module.active.utils.fill_tma_descriptor(
-        fn.data_ptr(),
-        3,
-        4,
-        7,
-        [32, 32],
-        list(fn.shape),
-        list(fn.stride()),
-        0,
-    )
-    object_address = id(tensor_map)
-    if object_address % 128 != 0:
-        raise RuntimeError("PyCUtensorMap lost its 128-byte alignment")
-    raw = ctypes.string_at(object_address + 128, 128)
-    host = torch.tensor(list(raw), dtype=torch.uint8)
-    device = host.to(device=fn.device)
-    if device.data_ptr() % 128 != 0:
-        raise RuntimeError("device tensor-map storage must be 128-byte aligned")
-    return device
-
-
 @dataclass(frozen=True)
 class EagerT3076P256Cluster16Manual512ProjectionPlan:
     tensors: tuple[torch.Tensor, ...]
@@ -867,11 +829,7 @@ class EagerT3076P256Cluster16Manual512ProjectionPlan:
 def prepare_tle_sm90_projection(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT3076P256Cluster16Manual512ProjectionPlan:
-    """Prepare the opt-in, exact-one-kernel projection experiment."""
-    if os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512", "0") != "1":
-        raise RuntimeError(
-            "set DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512=1 to enable this probe"
-        )
+    """Prepare one admitted exact-shape P256 eager implementation."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("prepare the eager projection plan outside capture")
 
@@ -946,17 +904,11 @@ def prepare_tle_sm90_projection(
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("all tensors must be on one CUDA device")
 
-    fn_tensormap_storage = (
-        _encode_global_tensor_map(tensors[4])
-        if USE_FN_TMA
-        else torch.empty((1,), dtype=torch.uint8, device=tensors[0].device)
+    fn_tensormap_storage = torch.empty(
+        (1,), dtype=torch.uint8, device=tensors[0].device
     )
     kernel_tensors = (*tensors, fn_tensormap_storage)
-    maxnreg = int(
-        os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_MAXNREG", "64")
-    )
-    if maxnreg not in (48, 56, 64, 72, 80):
-        raise ValueError("manual512 maxnreg must be 48/56/64/72/80")
+    maxnreg = MAXNREG
     device = tensors[0].device
     debug_partials = torch.empty((1,), dtype=torch.float32, device=device)
     partials = torch.empty(
@@ -966,14 +918,7 @@ def prepare_tle_sm90_projection(
     )
     tile_states = torch.zeros((NUM_M_TILES, 2), dtype=torch.uint32, device=device)
     tail_squares = torch.empty((GRID_CTAS, 4, 16), dtype=torch.float32, device=device)
-    tail_enabled = (
-        os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_TAIL", "0")
-        == "1"
-    )
-    dispatch_enabled = (
-        os.environ.get("DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_ADMITTED", "0")
-        == "1"
-    )
+    tail_enabled = True
     metadata: dict[str, object] = {
         "model": "DeepSeek-V4-Flash@60d8d707",
         "execution_mode": "eager",
@@ -1002,11 +947,7 @@ def prepare_tle_sm90_projection(
         "math_warps": 4,
         "target_registers_per_thread": maxnreg,
         "a_storage": "K64 BF16 128B-swizzled shared",
-        "fn_storage": (
-            "four-route raw-global TMA FP32 ring"
-            if USE_FN_TMA
-            else "four-route cp.async FP32 ring"
-        ),
+        "fn_storage": "four-route cp.async FP32 ring",
         "wgmma": "persistent TF32 RS M64N24, internal K32 halves",
         "projection_only": not tail_enabled,
         "tail_enabled": tail_enabled,
@@ -1019,8 +960,8 @@ def prepare_tle_sm90_projection(
         "fused4096_tail": USE_FUSED4096_TAIL,
         "row_barrier": False,
         "tail_batches": TAIL_BATCHES,
-        "experimental": not dispatch_enabled,
-        "dispatch_enabled": dispatch_enabled,
+        "experimental": False,
+        "dispatch_enabled": True,
     }
     return EagerT3076P256Cluster16Manual512ProjectionPlan(
         tensors=kernel_tensors,
@@ -1048,7 +989,7 @@ def prepare_tle_sm90_mega_mhc(
     """Shape-exact production seam for the formally admitted full tail."""
     plan = prepare_tle_sm90_projection(inputs, outputs)
     if not plan.tail_enabled:
-        raise RuntimeError("the T=3076 cluster16 experiment requires full tail")
+        raise RuntimeError("the admitted P256 eager path requires the full tail")
     return plan
 
 

@@ -1,10 +1,11 @@
-"""SM90 split-16 large-Graph MegaMHC with BF16 producer and RS-WGMMA.
+"""Production SM90 split-16 large-Graph MegaMHC shared kernel body.
 
 This shape-strict family covers the H4096 DeepSeek-V4-Flash Graph buckets
-T=400..512.  T432 is production-admitted after a 24-round stability audit;
-the other buckets remain research-only.  It keeps the proven one-kernel
-cooperative tail from the large Graph experiment, but replaces its FP32
-shared-A projection with the CUDA winner's producer geometry:
+``T in {400, 416, 432, 448, 464, 496, 512}`` at ``R=4, P=24``.  T432 and
+T448 use this body directly; the other admitted buckets wrap it with their
+exact non-striped tail ownership.  It keeps the proven one-kernel cooperative
+tail but replaces its FP32 shared-A projection with the CUDA winner's producer
+geometry:
 
 * 512 root threads each produce two naturally aligned BF16x4 quads per K64;
 * the BF16 boundary is written once to both ``new_residual`` and shared A;
@@ -14,13 +15,15 @@ shared-A projection with the CUDA winner's producer geometry:
   restriction on inline-PTX BF16x4 stores while preserving producer/math
   overlap across adjacent K64 bundles.
 
-Production dispatch selects only the audited T432 specialization.
+All admitted variants fix split-16, 16 producer warps, four RS-WGMMA warps,
+eight pipeline stages, and 128 math registers.  The complete grid contains
+only producer CTAs; historical consumer-only and register-sweep variants are
+not part of the production contract.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from typing import Mapping
 
 import torch
@@ -28,27 +31,16 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from . import sm90_eager_quad_layout_probe as _quad
-from . import sm90_eager_t1028_p256_wgmma as _eager
-from . import sm90_fn_cp_async_stage_probe as _fn_cp
-from . import sm90_large_graph_role4_k32_wgmma as _base
 from .. import fused_post_gemm_t64 as _t64
-
+from . import sm90_cp_async_helpers as _fn_cp
+from . import sm90_eager_t1028_p256_wgmma as _eager
+from . import sm90_large_graph_role4_k32_wgmma as _base
+from . import sm90_shared_memory_helpers as _quad
 
 if _base.LOGICAL_TOKENS < 400:
     raise ValueError("split16 RS family requires a T=400..512 bucket")
 if _base.NUM_SPLITS != 16:
     raise ValueError("split16 RS family requires exactly 16 K splits")
-if _base.USE_WEIGHT_CACHE:
-    raise ValueError("first split16 RS family requires weight cache disabled")
-if _base.USE_ROLE_OVERLAP:
-    raise ValueError("first split16 RS family requires full-CTA Pre release")
-if not _base.USE_EARLY_PRE_SYNC:
-    raise ValueError("split16 RS family requires early Pre synchronization")
-if not _base.USE_PTX_SINKHORN:
-    raise ValueError("split16 RS family requires the warp-local Sinkhorn loop")
-
-
 TOKENS = _base.LOGICAL_TOKENS
 HIDDEN = 4096
 HC_MULT = 4
@@ -60,7 +52,7 @@ BLOCK_K = 64
 NUM_SPLITS = 16
 NUM_M_TILES = (TOKENS + BLOCK_M - 1) // BLOCK_M
 PRODUCER_CTAS = NUM_M_TILES * NUM_SPLITS
-GRID_CTAS = 132 if TOKENS == 400 else PRODUCER_CTAS
+GRID_CTAS = PRODUCER_CTAS
 PIPE_STAGES = 8
 ROOT_WARPS = 16
 ROOT_THREADS = ROOT_WARPS * 32
@@ -68,13 +60,7 @@ MATH_WARPS = 4
 # Keep enough registers for the four RS-WGMMA warps; the scalar producer is
 # kept below the complementary 96-register budget by incrementally publishing
 # its row-square partials instead of carrying them across all K64 bundles.
-MATH_REGS = int(
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_SPLIT16_RS_MATH_REGS", "128")
-)
-if MATH_REGS not in (96, 112, 128):
-    raise ValueError(
-        "DG_TLE_MHC_LARGE_GRAPH_SPLIT16_RS_MATH_REGS must be 96, 112, or 128"
-    )
+MATH_REGS = 128
 PHYSICAL_THREADS = ROOT_THREADS + MATH_WARPS * 32
 HIDDEN_BLOCKS_PER_SPLIT = HIDDEN // BLOCK_K // NUM_SPLITS
 
@@ -95,7 +81,6 @@ JIT_MATH_WARPS = tl.constexpr(MATH_WARPS)
 JIT_MATH_REGS = tl.constexpr(MATH_REGS)
 JIT_PHYSICAL_THREADS = tl.constexpr(PHYSICAL_THREADS)
 JIT_HIDDEN_BLOCKS_PER_SPLIT = tl.constexpr(HIDDEN_BLOCKS_PER_SPLIT)
-JIT_PROBE_PHASE = _base.JIT_PROBE_PHASE
 
 
 @triton.jit
@@ -164,10 +149,7 @@ def _issue_fn_cp_async_k64(
     valid_row = row < JIT_PROJECTION_OUTPUTS
     safe_row = tl.where(valid_row, row, 0)
     global_address = tl.cast(
-        fn_ptr
-        + safe_row * JIT_FLAT_HIDDEN
-        + flat_hidden_base
-        + column,
+        fn_ptr + safe_row * JIT_FLAT_HIDDEN + flat_hidden_base + column,
         tl.uint64,
     )
     shared_address = _quad._shared_address(
@@ -224,7 +206,6 @@ def _split16_rs_root(
     coeff_ready,
     post_shared,
     comb_shared,
-    weight_dummy,
     pre_shared,
     rmsnorm_weight_ptr,
     y_bf16_ptr,
@@ -248,9 +229,7 @@ def _split16_rs_root(
         tl.store(
             tle.gpu.local_ptr(post_shared),
             tl.load(
-                post_mix_ptr
-                + tokens[:, None] * JIT_HC_MULT
-                + post_column[None, :],
+                post_mix_ptr + tokens[:, None] * JIT_HC_MULT + post_column[None, :],
                 mask=tokens[:, None] < JIT_TOKENS,
                 other=0.0,
             ),
@@ -273,9 +252,7 @@ def _split16_rs_root(
             # then publish N.  This ordering is essential: publishing N
             # before joining done(N-1) would leave root waiting at ready(N)
             # while math waits at done(N-1).
-            hidden_base = (
-                split * JIT_HIDDEN_BLOCKS_PER_SPLIT + hb
-            ) * JIT_BLOCK_K
+            hidden_base = (split * JIT_HIDDEN_BLOCKS_PER_SPLIT + hb) * JIT_BLOCK_K
             _issue_fn_cp_async_k64(
                 fn_ptr,
                 fn_stages,
@@ -326,74 +303,94 @@ def _split16_rs_root(
                 )
                 r10, r11, r12, r13 = _eager._load_global_bf16x4_masked(
                     tl.cast(
-                        residual_ptr + token * JIT_FLAT_HIDDEN
-                        + JIT_HIDDEN + hidden_quad,
+                        residual_ptr
+                        + token * JIT_FLAT_HIDDEN
+                        + JIT_HIDDEN
+                        + hidden_quad,
                         tl.uint64,
                     ),
                     token_active,
                 )
                 r20, r21, r22, r23 = _eager._load_global_bf16x4_masked(
                     tl.cast(
-                        residual_ptr + token * JIT_FLAT_HIDDEN
-                        + 2 * JIT_HIDDEN + hidden_quad,
+                        residual_ptr
+                        + token * JIT_FLAT_HIDDEN
+                        + 2 * JIT_HIDDEN
+                        + hidden_quad,
                         tl.uint64,
                     ),
                     token_active,
                 )
                 r30, r31, r32, r33 = _eager._load_global_bf16x4_masked(
                     tl.cast(
-                        residual_ptr + token * JIT_FLAT_HIDDEN
-                        + 3 * JIT_HIDDEN + hidden_quad,
+                        residual_ptr
+                        + token * JIT_FLAT_HIDDEN
+                        + 3 * JIT_HIDDEN
+                        + hidden_quad,
                         tl.uint64,
                     ),
                     token_active,
                 )
                 quad_square = 0.0
                 for channel in tl.static_range(0, JIT_HC_MULT):
-                    post = tl.load(
-                        tle.gpu.local_ptr(post_shared, (row, channel))
-                    )
-                    comb0 = tl.load(
-                        tle.gpu.local_ptr(comb_shared, (row, channel))
-                    )
+                    post = tl.load(tle.gpu.local_ptr(post_shared, (row, channel)))
+                    comb0 = tl.load(tle.gpu.local_ptr(comb_shared, (row, channel)))
                     comb1 = tl.load(
-                        tle.gpu.local_ptr(
-                            comb_shared, (row, channel + JIT_HC_MULT)
-                        )
+                        tle.gpu.local_ptr(comb_shared, (row, channel + JIT_HC_MULT))
                     )
                     comb2 = tl.load(
-                        tle.gpu.local_ptr(
-                            comb_shared, (row, channel + 2 * JIT_HC_MULT)
-                        )
+                        tle.gpu.local_ptr(comb_shared, (row, channel + 2 * JIT_HC_MULT))
                     )
                     comb3 = tl.load(
-                        tle.gpu.local_ptr(
-                            comb_shared, (row, channel + 3 * JIT_HC_MULT)
-                        )
+                        tle.gpu.local_ptr(comb_shared, (row, channel + 3 * JIT_HC_MULT))
                     )
-                    q0 = x0 * post + r00 * comb0 + r10 * comb1 + r20 * comb2 + r30 * comb3
-                    q1 = x1 * post + r01 * comb0 + r11 * comb1 + r21 * comb2 + r31 * comb3
-                    q2 = x2 * post + r02 * comb0 + r12 * comb1 + r22 * comb2 + r32 * comb3
-                    q3 = x3 * post + r03 * comb0 + r13 * comb1 + r23 * comb2 + r33 * comb3
-                    quad_square += (
-                        _round_store_global_shared_bf16x4_square(
-                            tl.cast(
-                                new_residual_ptr
-                                + token * JIT_FLAT_HIDDEN
-                                + channel * JIT_HIDDEN
-                                + hidden_quad,
-                                tl.uint64,
-                            ),
-                            _quad._shared_address(
-                                tle.gpu.local_ptr(
-                                    q_stages.slot(
-                                        (hb % 2) * JIT_HC_MULT + channel
-                                    ),
-                                    (row, column),
-                                )
-                            ),
-                            q0, q1, q2, q3, token_active,
-                        )
+                    q0 = (
+                        x0 * post
+                        + r00 * comb0
+                        + r10 * comb1
+                        + r20 * comb2
+                        + r30 * comb3
+                    )
+                    q1 = (
+                        x1 * post
+                        + r01 * comb0
+                        + r11 * comb1
+                        + r21 * comb2
+                        + r31 * comb3
+                    )
+                    q2 = (
+                        x2 * post
+                        + r02 * comb0
+                        + r12 * comb1
+                        + r22 * comb2
+                        + r32 * comb3
+                    )
+                    q3 = (
+                        x3 * post
+                        + r03 * comb0
+                        + r13 * comb1
+                        + r23 * comb2
+                        + r33 * comb3
+                    )
+                    quad_square += _round_store_global_shared_bf16x4_square(
+                        tl.cast(
+                            new_residual_ptr
+                            + token * JIT_FLAT_HIDDEN
+                            + channel * JIT_HIDDEN
+                            + hidden_quad,
+                            tl.uint64,
+                        ),
+                        _quad._shared_address(
+                            tle.gpu.local_ptr(
+                                q_stages.slot((hb % 2) * JIT_HC_MULT + channel),
+                                (row, column),
+                            )
+                        ),
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                        token_active,
                     )
                 reduced_square = _eager._half_warp_reduce16_sum(quad_square)
                 _ = _eager._accumulate_global_row_square(
@@ -429,26 +426,22 @@ def _split16_rs_root(
         tle.gpu.barrier_wait(done1)
 
     tle.gpu.barrier_wait(producer_ready)
-    if JIT_PROBE_PHASE >= 2:
-        _ = _base._monotonic_grid_arrive_and_wait(
-            tl.cast(grid_counter_ptr, tl.uint64), physical_thread
-        )
-        tle.gpu.barrier_wait(grid_acquire_ready)
-        if JIT_PROBE_PHASE >= 3:
-            _base._full_tail_barrier_sync()
-            if JIT_PROBE_PHASE >= 4:
-                _base._pipe_role4_hidden_tail(
-                    weight_dummy,
-                    pre_shared,
-                    new_residual_ptr,
-                    rmsnorm_weight_ptr,
-                    y_bf16_ptr,
-                    pid,
-                    tile,
-                    split,
-                    rmsnorm_eps,
-                    rmsnorm_scale,
-                )
+    _ = _base._monotonic_grid_arrive_and_wait(
+        tl.cast(grid_counter_ptr, tl.uint64), physical_thread
+    )
+    tle.gpu.barrier_wait(grid_acquire_ready)
+    _base._full_tail_barrier_sync()
+    _base._pipe_role4_hidden_tail(
+        pre_shared,
+        new_residual_ptr,
+        rmsnorm_weight_ptr,
+        y_bf16_ptr,
+        pid,
+        tile,
+        split,
+        rmsnorm_eps,
+        rmsnorm_scale,
+    )
 
 
 @triton.jit
@@ -485,17 +478,11 @@ def _split16_rs_math(
                 tle.gpu.barrier_wait(ready1)
             for channel in tl.static_range(0, JIT_HC_MULT):
                 q_registers = tl.load(
-                    tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * JIT_HC_MULT + channel
-                        )
-                    )
+                    tle.gpu.local_ptr(q_stages.slot((hb % 2) * JIT_HC_MULT + channel))
                 ).to(tl.float32)
                 accumulator = tle.gpu.wgmma(
                     q_registers,
-                    fn_stages.slot(
-                        (hb % 2) * JIT_HC_MULT + channel
-                    ),
+                    fn_stages.slot((hb % 2) * JIT_HC_MULT + channel),
                     accumulator,
                     input_precision="tf32",
                     trans_b=True,
@@ -511,56 +498,45 @@ def _split16_rs_math(
         tl.store(
             partials_ptr
             + split * JIT_TOKENS * JIT_BLOCK_N
-            + m[:, None] * JIT_BLOCK_N + n[None, :],
+            + m[:, None] * JIT_BLOCK_N
+            + n[None, :],
             accumulator,
-            mask=(m[:, None] < JIT_TOKENS)
-            & (n[None, :] < JIT_PROJECTION_OUTPUTS),
+            mask=(m[:, None] < JIT_TOKENS) & (n[None, :] < JIT_PROJECTION_OUTPUTS),
         )
 
     tle.gpu.barrier_wait(producer_ready)
-    if JIT_PROBE_PHASE >= 2:
-        tle.gpu.barrier_wait(grid_acquire_ready)
-        if JIT_PROBE_PHASE >= 3:
-            physical_thread = _t64._physical_thread_id_x()
-            lane = physical_thread % 32
-            role = (physical_thread - JIT_ROOT_THREADS) // 32
-            token = pid + role * JIT_GRID_CTAS
-            token_active = token < JIT_TOKENS
-            packed_sum = 0.0
-            for source_split in tl.static_range(0, JIT_NUM_SPLITS):
-                packed_sum += tl.load(
-                    partials_ptr
-                    + source_split * JIT_TOKENS * JIT_BLOCK_N
-                    + token * JIT_BLOCK_N + lane,
-                    mask=token_active & (lane <= JIT_PROJECTION_OUTPUTS),
-                    other=0.0,
-                )
-            _base._pipe_role4_routing_finalize(
-                pre_shared,
-                # Role-overlap is disabled for this family, so the helper's
-                # role flag and per-role barriers are compile-time dead.  Pass
-                # existing storage/barriers to keep this research candidate
-                # aligned with the current base-helper signature without
-                # increasing its shared-memory footprint.
-                pre_shared,
-                producer_ready,
-                producer_ready,
-                producer_ready,
-                producer_ready,
-                mix_scales_ptr,
-                mix_bases_ptr,
-                new_post_mix_ptr,
-                new_comb_res_mix_ptr,
-                packed_sum,
-                token,
-                role,
-                lane,
-                token_active,
-                hc_norm_eps,
-                hc_pre_eps,
-                hc_post_scale,
-                sinkhorn_eps,
-            )
+    tle.gpu.barrier_wait(grid_acquire_ready)
+    physical_thread = _t64._physical_thread_id_x()
+    lane = physical_thread % 32
+    role = (physical_thread - JIT_ROOT_THREADS) // 32
+    token = pid + role * JIT_GRID_CTAS
+    token_active = token < JIT_TOKENS
+    packed_sum = 0.0
+    for source_split in tl.static_range(0, JIT_NUM_SPLITS):
+        packed_sum += tl.load(
+            partials_ptr
+            + source_split * JIT_TOKENS * JIT_BLOCK_N
+            + token * JIT_BLOCK_N
+            + lane,
+            mask=token_active & (lane <= JIT_PROJECTION_OUTPUTS),
+            other=0.0,
+        )
+    _base._pipe_role4_routing_finalize(
+        pre_shared,
+        mix_scales_ptr,
+        mix_bases_ptr,
+        new_post_mix_ptr,
+        new_comb_res_mix_ptr,
+        packed_sum,
+        token,
+        role,
+        lane,
+        token_active,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+    )
 
 
 @triton.jit
@@ -629,10 +605,6 @@ def _sm90_large_graph_split16_rs_wgmma_kernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    weight_dummy = tle.gpu.alloc(
-        [1], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
     producer_ready = tle.gpu.alloc_barrier(arrive_count=JIT_PHYSICAL_THREADS)
     grid_acquire_ready = tle.gpu.alloc_barrier(arrive_count=JIT_PHYSICAL_THREADS)
     coeff_ready = tle.gpu.alloc_barrier(arrive_count=JIT_ROOT_THREADS)
@@ -646,24 +618,61 @@ def _sm90_large_graph_split16_rs_wgmma_kernel(
             (
                 _split16_rs_root,
                 (
-                    x_ptr, residual_ptr, post_mix_ptr, comb_res_mix_ptr,
-                    fn_ptr, new_residual_ptr, partials_ptr, q_stages,
-                    fn_stages, ready0, ready1, done0, done1, producer_ready,
-                    grid_acquire_ready, coeff_ready, post_shared, comb_shared,
-                    weight_dummy, pre_shared, rmsnorm_weight_ptr, y_bf16_ptr,
-                    grid_counter_ptr, tile, split, pid, is_producer,
-                    rmsnorm_eps, rmsnorm_scale,
+                    x_ptr,
+                    residual_ptr,
+                    post_mix_ptr,
+                    comb_res_mix_ptr,
+                    fn_ptr,
+                    new_residual_ptr,
+                    partials_ptr,
+                    q_stages,
+                    fn_stages,
+                    ready0,
+                    ready1,
+                    done0,
+                    done1,
+                    producer_ready,
+                    grid_acquire_ready,
+                    coeff_ready,
+                    post_shared,
+                    comb_shared,
+                    pre_shared,
+                    rmsnorm_weight_ptr,
+                    y_bf16_ptr,
+                    grid_counter_ptr,
+                    tile,
+                    split,
+                    pid,
+                    is_producer,
+                    rmsnorm_eps,
+                    rmsnorm_scale,
                 ),
             ),
             (
                 _split16_rs_math,
                 (
-                    partials_ptr, q_stages, fn_stages, ready0, ready1,
-                    done0, done1, producer_ready,
-                    grid_acquire_ready, pre_shared, mix_scales_ptr,
-                    mix_bases_ptr, new_post_mix_ptr, new_comb_res_mix_ptr,
-                    tile, split, pid, is_producer, hc_norm_eps, hc_pre_eps,
-                    hc_post_scale, sinkhorn_eps,
+                    partials_ptr,
+                    q_stages,
+                    fn_stages,
+                    ready0,
+                    ready1,
+                    done0,
+                    done1,
+                    producer_ready,
+                    grid_acquire_ready,
+                    pre_shared,
+                    mix_scales_ptr,
+                    mix_bases_ptr,
+                    new_post_mix_ptr,
+                    new_comb_res_mix_ptr,
+                    tile,
+                    split,
+                    pid,
+                    is_producer,
+                    hc_norm_eps,
+                    hc_pre_eps,
+                    hc_post_scale,
+                    sinkhorn_eps,
                 ),
             ),
         ],
@@ -722,23 +731,25 @@ def prepare_tle_sm90_mega_mhc(
 ) -> LargeGraphSplit16RSPlan:
     base = _base.prepare_tle_sm90_mega_mhc(inputs, outputs)
     metadata = dict(base.metadata)
-    metadata.update({
-        "kernel_symbol": "_sm90_large_graph_split16_rs_wgmma_kernel",
-        "pipeline_implementation": (
-            "explicit BF16-A ring + Fn cp.async + RS-WGMMA"
-        ),
-        "pipeline_k": BLOCK_K,
-        "pipeline_slots": PIPE_STAGES,
-        "producer_quad_width": 4,
-        "producer_quads_per_thread_per_k64": 2,
-        "projection_wgmma_operand_mode": "register-A/shared-B TF32",
-        "coefficient_cache_bytes": BLOCK_M * (HC_MULT + HC_MULT * HC_MULT) * 4,
-        "audited_spill_admission": TOKENS == 432,
-        "expected_spills": 2 if TOKENS == 432 else 0,
-        "expected_local_bytes_per_thread": 8 if TOKENS == 432 else 0,
-        "experimental": TOKENS != 432,
-        "dispatch_enabled": TOKENS == 432,
-    })
+    metadata.update(
+        {
+            "kernel_symbol": "_sm90_large_graph_split16_rs_wgmma_kernel",
+            "pipeline_implementation": (
+                "explicit BF16-A ring + Fn cp.async + RS-WGMMA"
+            ),
+            "pipeline_k": BLOCK_K,
+            "pipeline_slots": PIPE_STAGES,
+            "producer_quad_width": 4,
+            "producer_quads_per_thread_per_k64": 2,
+            "projection_wgmma_operand_mode": "register-A/shared-B TF32",
+            "coefficient_cache_bytes": BLOCK_M * (HC_MULT + HC_MULT * HC_MULT) * 4,
+            "audited_spill_admission": TOKENS == 432,
+            "expected_spills": 2 if TOKENS == 432 else 0,
+            "expected_local_bytes_per_thread": 8 if TOKENS == 432 else 0,
+            "experimental": False,
+            "dispatch_enabled": TOKENS == 432,
+        }
+    )
     return LargeGraphSplit16RSPlan(base=base, metadata=metadata)
 
 

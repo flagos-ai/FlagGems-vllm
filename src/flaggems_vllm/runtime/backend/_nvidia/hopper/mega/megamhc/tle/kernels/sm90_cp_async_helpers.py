@@ -1,11 +1,16 @@
-"""Classic ``cp.async`` helper used by production Hopper kernels."""
+"""Classic ``cp.async`` helpers for the production large-Graph kernels.
+
+Formal callers cover ``T=272..512`` at ``H=4096, R=4, P=24`` and use these
+leaf helpers for K64 Fn staging in the 16-producer/4-RS-WGMMA topology.  This
+module has no independently dispatchable specialization or tuning switch.
+"""
 
 from __future__ import annotations
 
 import triton
 import triton.language as tl
 
-from .sm90_eager_quad_layout_probe import _shared_address
+from .sm90_shared_memory_helpers import _shared_address
 
 
 @triton.jit

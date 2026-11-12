@@ -7,45 +7,26 @@ but skip projection reduction, Sinkhorn, and hidden/RMSNorm work after
 publishing the required tail-barrier arrival.
 
 All 128 CTAs are projection producers; the exact kernel makes that fact a
-compile-time constant and removes the generic consumer branch.  Logical T is
-an import-time/JIT constant.  Compatibility facades retain the established
-T496 and T512 module/class/symbol names without duplicating this device body.
+compile-time constant and removes the generic consumer branch.  Production
+dispatch selects ``T in {464, 496, 512}`` at ``H=4096, R=4, P=24`` with eight
+M64 tiles, split-16, sixteen producer warps, four RS-WGMMA warps, eight stages,
+128 math registers, and CTA-local non-striped ownership.  Logical T is an
+import-time/JIT constant.  Compatibility facades retain the established T496
+and T512 module/class/symbol names without duplicating this device body.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Mapping
 
 _TOKENS_TEXT = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_ROLE4_LOGICAL_TOKENS", "464")
 if _TOKENS_TEXT not in ("464", "496", "512"):
     raise ValueError("exact all-producer split16 RS requires T=464, 496, or 512")
 TOKENS = int(_TOKENS_TEXT)
-_EXPECTED_IMPLEMENTATION_SHA256 = (
-    "9aca5026b6bfdd29f54278a9971c06ddb26a8b49b01082e7433bc39a6c5460cc"
-)
 _EXACT_ENVIRONMENT = {
-    "DG_TLE_MHC_LARGE_GRAPH_ROLE4": "1",
     "DG_TLE_MHC_LARGE_GRAPH_ROLE4_LOGICAL_TOKENS": str(TOKENS),
-    "DG_TLE_MHC_LARGE_GRAPH_GRID_CTAS": "128",
-    "DG_TLE_MHC_LARGE_GRAPH_TRUE_K64_STAGE": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_COEFF_CACHE": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_WEIGHT_CACHE": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_PTX_SINKHORN": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_NON_STRIPED_TAIL": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_EARLY_PRE_SYNC": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_PROBE_PHASE": "4",
-    "DG_TLE_MHC_LARGE_GRAPH_ROLE_OVERLAP": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_ALLOCATED_ROLE_BARRIERS": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_SHARED_ROLE_FLAGS": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_TILE_LOCAL_BARRIER": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_FAST_GRID_BARRIER": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_EXACT_T448": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_EXACT_T512": "1" if TOKENS == 512 else "0",
-    "DG_TLE_MHC_LARGE_GRAPH_SPLIT16_RS_MATH_REGS": "128",
 }
 
 
@@ -65,13 +46,6 @@ from .. import fused_post_gemm_t64 as _t64  # noqa: E402
 from . import sm90_large_graph_split16_rs_wgmma as _implementation  # noqa: E402
 
 _base = _implementation._base
-_IMPLEMENTATION_SOURCE = Path(_implementation.__file__).resolve()
-_IMPLEMENTATION_SHA256 = hashlib.sha256(_IMPLEMENTATION_SOURCE.read_bytes()).hexdigest()
-if _IMPLEMENTATION_SHA256 != _EXPECTED_IMPLEMENTATION_SHA256:
-    raise RuntimeError(
-        f"T{TOKENS} admission pins split16 RS implementation SHA256 "
-        f"{_EXPECTED_IMPLEMENTATION_SHA256}, got {_IMPLEMENTATION_SHA256}"
-    )
 if _implementation.TOKENS != TOKENS:
     raise RuntimeError(
         f"T{TOKENS} admission imported " f"T={_implementation.TOKENS} implementation"
@@ -117,7 +91,6 @@ def _t464_tile_barrier(counter_base, thread):
 
 @triton.jit
 def _t464_active_cta_hidden_tail(
-    weight_shared,
     pre_shared,
     new_residual_ptr,
     rmsnorm_weight_ptr,
@@ -131,7 +104,6 @@ def _t464_active_cta_hidden_tail(
     first_token = tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
     if first_token < _implementation.JIT_TOKENS:
         _original_hidden_tail(
-            weight_shared,
             pre_shared,
             new_residual_ptr,
             rmsnorm_weight_ptr,
@@ -213,53 +185,44 @@ def _t464_nonstriped_math(
         )
 
     _implementation.tle.gpu.barrier_wait(producer_ready)
-    if _implementation.JIT_PROBE_PHASE >= 2:
-        _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
-        if _implementation.JIT_PROBE_PHASE >= 3:
-            physical_thread = _t64._physical_thread_id_x()
-            lane = physical_thread % 32
-            role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
-            first_token = (
-                tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
+    _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
+    physical_thread = _t64._physical_thread_id_x()
+    lane = physical_thread % 32
+    role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
+    first_token = tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
+    if first_token < _implementation.JIT_TOKENS:
+        token = first_token + role
+        packed_sum = 0.0
+        for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
+            packed_sum += tl.load(
+                partials_ptr
+                + source_split
+                * _implementation.JIT_TOKENS
+                * _implementation.JIT_BLOCK_N
+                + token * _implementation.JIT_BLOCK_N
+                + lane,
+                mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
+                other=0.0,
             )
-            if first_token < _implementation.JIT_TOKENS:
-                token = first_token + role
-                packed_sum = 0.0
-                for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
-                    packed_sum += tl.load(
-                        partials_ptr
-                        + source_split
-                        * _implementation.JIT_TOKENS
-                        * _implementation.JIT_BLOCK_N
-                        + token * _implementation.JIT_BLOCK_N
-                        + lane,
-                        mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
-                        other=0.0,
-                    )
-                _base._pipe_role4_routing_finalize(
-                    pre_shared,
-                    pre_shared,
-                    producer_ready,
-                    producer_ready,
-                    producer_ready,
-                    producer_ready,
-                    mix_scales_ptr,
-                    mix_bases_ptr,
-                    new_post_mix_ptr,
-                    new_comb_res_mix_ptr,
-                    packed_sum,
-                    token,
-                    role,
-                    lane,
-                    True,
-                    hc_norm_eps,
-                    hc_pre_eps,
-                    hc_post_scale,
-                    sinkhorn_eps,
-                )
-            else:
-                # Root still waits at the full-tail barrier in every CTA.
-                _base._full_tail_barrier_arrive()
+        _base._pipe_role4_routing_finalize(
+            pre_shared,
+            mix_scales_ptr,
+            mix_bases_ptr,
+            new_post_mix_ptr,
+            new_comb_res_mix_ptr,
+            packed_sum,
+            token,
+            role,
+            lane,
+            True,
+            hc_norm_eps,
+            hc_pre_eps,
+            hc_post_scale,
+            sinkhorn_eps,
+        )
+    else:
+        # Root still waits at the full-tail barrier in every CTA.
+        _base._full_tail_barrier_arrive()
 
 
 _base._pipe_role4_hidden_tail = _t464_active_cta_hidden_tail
@@ -340,13 +303,6 @@ def _t464_allproducer_kernel(
         scope=_implementation.tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    weight_dummy = _implementation.tle.gpu.alloc(
-        [1],
-        dtype=tl.bfloat16,
-        layout=None,
-        scope=_implementation.tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
     producer_ready = _implementation.tle.gpu.alloc_barrier(
         arrive_count=_implementation.JIT_PHYSICAL_THREADS
     )
@@ -392,7 +348,6 @@ def _t464_allproducer_kernel(
                     coeff_ready,
                     post_shared,
                     comb_shared,
-                    weight_dummy,
                     pre_shared,
                     rmsnorm_weight_ptr,
                     y_bf16_ptr,
@@ -488,9 +443,6 @@ def prepare_tle_sm90_mega_mhc(
     metadata.update(
         {
             "admission_shape": f"T{TOKENS}",
-            "admission_source": str(Path(__file__).resolve()),
-            "implementation_source": str(_IMPLEMENTATION_SOURCE),
-            "implementation_source_sha256": _IMPLEMENTATION_SHA256,
             "pipeline_variant": (
                 f"t{TOKENS}-allproducer-nonstriped-active-cta-skip-tilebar"
             ),
