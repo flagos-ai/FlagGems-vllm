@@ -247,16 +247,11 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_gather_mla_row_reductions"] = False
     if "ppu_unique_mla_scale_writers" in available:
         defaults["ppu_unique_mla_scale_writers"] = False
-    if "ppu_unique_mla_final_rows" in available:
-        defaults["ppu_unique_mla_final_rows"] = False
     if "ppu_reuse_mla_split_kv" in available:
         defaults["ppu_reuse_mla_split_kv"] = False
     if "ppu_mla_kr_joint_copy" in available:
         defaults["ppu_mla_kr_joint_copy"] = False
-    if "ppu_mla_logit_scale_fold" in available:
-        defaults["ppu_mla_logit_scale_fold"] = False
-    if "ppu_mla_low_probability_layout" in available:
-        defaults["ppu_mla_low_probability_layout"] = False
+    defaults["FOLD_LOGIT_SCALE"] = False
     if "ppu_mla_h16_kv_pipeline" in available:
         defaults["ppu_mla_h16_kv_pipeline"] = False
     if "ppu_mla_h16_kr_copy" in available:
@@ -266,10 +261,6 @@ def dense_mla_configs() -> list[triton.Config]:
     if "ppu_mla_score_guard" in available:
         defaults["ppu_mla_score_guard"] = 0
         defaults["INTERIOR_SCORE_HINT"] = False
-    if "ppu_mla_q2_tail" in available:
-        defaults["ppu_mla_q2_tail"] = False
-    if "ppu_mla_full_tiles" in available:
-        defaults["ppu_mla_full_tiles"] = False
     if "ppu_mla_uniform_request_sort" in available:
         defaults["SORT_SKIP_EQUAL"] = False
         defaults["ppu_mla_uniform_request_sort"] = False
@@ -319,17 +310,6 @@ def dense_mla_configs() -> list[triton.Config]:
                 }
                 enabled.append(candidate)
         normalized.extend(enabled)
-    if "ppu_unique_mla_final_rows" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs["ppu_mla_h32_k128"]:
-                candidate = copy.copy(config)
-                candidate.kwargs = {
-                    **config.kwargs,
-                    "ppu_unique_mla_final_rows": True,
-                }
-                enabled.append(candidate)
-        normalized.extend(enabled)
     if "ppu_reuse_mla_split_kv" in available:
         for config in normalized:
             kwargs = config.kwargs
@@ -367,23 +347,13 @@ def dense_mla_configs() -> list[triton.Config]:
                 candidate.kwargs = {**kwargs, "ppu_mla_kr_joint_copy": True}
                 enabled.append(candidate)
         normalized.extend(enabled)
-    if "ppu_mla_logit_scale_fold" in available:
+    if "ppu_mla_kr_joint_copy" in available:
         for config in normalized:
             kwargs = config.kwargs
-            if (
-                kwargs["ppu_mla_kr_joint_copy"]
-                and not kwargs["ppu_unique_mla_final_rows"]
-            ):
+            if kwargs["ppu_mla_kr_joint_copy"]:
                 candidate = copy.copy(config)
-                candidate.kwargs = {**kwargs, "ppu_mla_logit_scale_fold": True}
+                candidate.kwargs = {**kwargs, "FOLD_LOGIT_SCALE": True}
                 normalized.append(candidate)
-                if "ppu_mla_low_probability_layout" in available:
-                    repacked = copy.copy(candidate)
-                    repacked.kwargs = {
-                        **candidate.kwargs,
-                        "ppu_mla_low_probability_layout": True,
-                    }
-                    normalized.append(repacked)
                 break
     if "ppu_mla_h16_kv_pipeline" in available:
         enabled = []
@@ -412,8 +382,7 @@ def dense_mla_configs() -> list[triton.Config]:
         for config in normalized:
             kwargs = config.kwargs
             if kwargs["SORT_REQUESTS"] and (
-                kwargs.get("ppu_reuse_mla_split_kv")
-                or kwargs.get("ppu_mla_logit_scale_fold")
+                kwargs.get("ppu_reuse_mla_split_kv") or kwargs.get("FOLD_LOGIT_SCALE")
             ):
                 candidate = copy.copy(config)
                 candidate.kwargs = {
@@ -431,27 +400,13 @@ def dense_mla_configs() -> list[triton.Config]:
                 candidate.kwargs = {**config.kwargs, "ppu_mla_row_subgroups": True}
                 enabled.append(candidate)
         normalized.extend(enabled)
-    if "ppu_mla_full_tiles" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs.get("ppu_mla_row_subgroups") and config.kwargs.get(
-                "ppu_mla_kr_joint_copy"
-            ):
-                candidate = copy.copy(config)
-                candidate.kwargs = {**config.kwargs, "ppu_mla_full_tiles": True}
-                enabled.append(candidate)
-                if "ppu_mla_q2_tail" in available:
-                    tail = copy.copy(candidate)
-                    tail.kwargs = {**candidate.kwargs, "ppu_mla_q2_tail": True}
-                    enabled.append(tail)
-        normalized.extend(enabled)
     if "ppu_mla_score_guard" in available:
         enabled = []
         for config in normalized:
             if config.kwargs.get("ppu_mla_row_subgroups") and config.kwargs.get(
                 "ppu_mla_kr_joint_copy"
             ):
-                modes = (1, 2, 3)
+                modes = (3,)
             elif config.kwargs.get("ppu_mla_h16_kr_copy"):
                 modes = (3,)
             else:
@@ -468,36 +423,9 @@ def dense_mla_configs() -> list[triton.Config]:
     return normalized
 
 
-def _prune_mla_configs(configs, named_args, **kwargs):
-    heads = named_args["H"]
-    heads_per_query = named_args["HEADS_PER_QUERY"]
-    single_query = heads == heads_per_query
-    return [
-        config
-        for config in configs
-        if (not config.kwargs.get("ppu_mla_q2_tail") or heads == 2 * heads_per_query)
-        and (
-            not config.kwargs.get("ppu_mla_low_probability_layout")
-            or (single_query and heads == 32)
-        )
-        and (
-            not config.kwargs.get("SORT_SKIP_EQUAL")
-            or (
-                heads in (heads_per_query, 2 * heads_per_query)
-                and heads_per_query in (16, 32, 64, 128)
-                and (
-                    config.kwargs["BH"] == min(32, heads)
-                    or config.kwargs.get("ppu_mla_h16_kv_pipeline")
-                )
-            )
-        )
-    ]
-
-
 @libentry()
 @libtuner(
     configs=dense_mla_configs(),
-    prune_configs_by={"early_config_prune": _prune_mla_configs},
     key=["B", "H", "HEADS_PER_QUERY", "SPLITS", "TABLE_STRIDE", "CAUSAL"],
     warmup=30,
     rep=80,
@@ -542,6 +470,7 @@ def dense_int8_mla_kernel(
     PROBABILITY_RADIX: tl.constexpr = 127,
     SORT_SKIP_EQUAL: tl.constexpr = False,
     INTERIOR_SCORE_HINT: tl.constexpr = False,
+    FOLD_LOGIT_SCALE: tl.constexpr = False,
 ):
     tl.static_assert(
         PROBABILITY_RADIX == 127
@@ -693,12 +622,20 @@ def dense_int8_mla_kernel(
         # Separating the dot chains avoids replicated QK warps on older compilers.
         qk = content_scores + rope_scores
         qk = tl.trans(qk) if COLUMN_SOFTMAX else qk
-        scores = (
-            qk
-            * tl.expand_dims(qs, reduction_axis)
-            * tl.expand_dims(ks, 1 - reduction_axis)
-            * (SCALE * 1.4426950408889634)
-        )
+        if FOLD_LOGIT_SCALE and h32_k128 and SCALE == 576**-0.5:
+            scaled_ks = ks * (SCALE * 1.4426950408889634)
+            scores = (
+                qk
+                * tl.expand_dims(qs, reduction_axis)
+                * tl.expand_dims(scaled_ks, 1 - reduction_axis)
+            )
+        else:
+            scores = (
+                qk
+                * tl.expand_dims(qs, reduction_axis)
+                * tl.expand_dims(ks, 1 - reduction_axis)
+                * (SCALE * 1.4426950408889634)
+            )
         visible = (
             page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
             < tl.expand_dims(query_limit, reduction_axis)
