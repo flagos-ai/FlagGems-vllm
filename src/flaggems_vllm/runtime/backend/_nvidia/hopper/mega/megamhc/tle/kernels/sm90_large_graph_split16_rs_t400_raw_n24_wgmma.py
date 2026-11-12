@@ -52,7 +52,7 @@ if _RAW_HELPER_SHA256 != _EXPECTED_RAW_HELPER_SHA256:
 _TAIL_HELPER_SOURCE = Path(_tail_helper_module.__file__).resolve()
 _TAIL_HELPER_SHA256 = hashlib.sha256(_TAIL_HELPER_SOURCE.read_bytes()).hexdigest()
 _EXPECTED_TAIL_HELPER_SHA256 = (
-    "abd3f72dbc66fcfd2e3d527df98c7e4bfb430f919c7a388214385054013623f0"
+    "3507caadf1195a029c3fd2d84320a65c7f98b79d33a1a13ae22f79de32d587a7"
 )
 if _TAIL_HELPER_SHA256 != _EXPECTED_TAIL_HELPER_SHA256:
     raise RuntimeError(

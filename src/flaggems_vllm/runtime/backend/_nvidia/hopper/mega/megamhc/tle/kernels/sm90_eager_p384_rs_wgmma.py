@@ -76,18 +76,12 @@ class P384CompileConfig:
     cta_mode: str = "manual512"
     num_warps: int = 16
     math_warps: int = 4
-    math_regs: int = 80
     pipe_stages: int = 4
     wgmma_k: int = 64
     active_k64_blocks: int = 64
-    probe_phase: int = 1
-    tail_batches: int = 22
-    tail_work_phase: int = 3
-    accum_k64_blocks: int = 4
     accum_mode: str = "ptx-persistent"
     producer_mode: str = "ptx-quad"
     fn_stage: str = "tma"
-    handoff: str = "k64"
     tail_schedule: str = "route12"
     manual_hidden_mode: str = "shared-round"
     maxnreg: int = 64
@@ -95,36 +89,23 @@ class P384CompileConfig:
 
 COMPILE_CONFIG = P384CompileConfig()
 CTA_MODE = COMPILE_CONFIG.cta_mode
-MANUAL_CTA512 = True
 NUM_WARPS = COMPILE_CONFIG.num_warps
 MATH_WARPS = COMPILE_CONFIG.math_warps
-MATH_REGS = COMPILE_CONFIG.math_regs
 PIPE_STAGES = COMPILE_CONFIG.pipe_stages
 WGMMA_K = COMPILE_CONFIG.wgmma_k
 WGMMA_K_FRAGMENTS = BLOCK_K // WGMMA_K
 PRODUCER_WARPS = 12
 TOTAL_LOGICAL_THREADS = 512
-PRODUCER_THREADS = PRODUCER_WARPS * 32
 ACTIVE_PRODUCER_WARPS = PRODUCER_WARPS
-ACTIVE_PRODUCER_THREADS = ACTIVE_PRODUCER_WARPS * 32
-PIPE_THREADS = ACTIVE_PRODUCER_THREADS + MATH_WARPS * 32
-PRODUCER_QUADS = BLOCK_M * BLOCK_K // 4
-PRODUCER_QUAD_ITERS = (
-    PRODUCER_QUADS + ACTIVE_PRODUCER_THREADS - 1
-) // ACTIVE_PRODUCER_THREADS
 ACTIVE_K64_BLOCKS = COMPILE_CONFIG.active_k64_blocks
-PROBE_PHASE = COMPILE_CONFIG.probe_phase
-TAIL_BATCHES = COMPILE_CONFIG.tail_batches
-TAIL_WORK_PHASE = COMPILE_CONFIG.tail_work_phase
-ACCUM_K64_BLOCKS = COMPILE_CONFIG.accum_k64_blocks
+# Compatibility constants consumed by the existing exact-shape launch adapters.
+PROBE_PHASE = 1
+TAIL_BATCHES = 22
+TAIL_WORK_PHASE = 3
 ACCUM_MODE = COMPILE_CONFIG.accum_mode
 PRODUCER_MODE = COMPILE_CONFIG.producer_mode
-MANUAL_FN_STAGE = COMPILE_CONFIG.fn_stage
-MANUAL_HANDOFF = COMPILE_CONFIG.handoff
 TAIL_SCHEDULE = COMPILE_CONFIG.tail_schedule
 MANUAL_HIDDEN_MODE = COMPILE_CONFIG.manual_hidden_mode
-PRE_ROWS = BLOCK_M if TAIL_SCHEDULE != "batch3" else HC_MULT
-RMS_WEIGHT_ELEMENTS = HIDDEN if TAIL_SCHEDULE == "shared-round" or MANUAL_CTA512 else 1
 
 JIT_HIDDEN = tl.constexpr(HIDDEN)
 JIT_HC_MULT = tl.constexpr(HC_MULT)
@@ -133,61 +114,11 @@ JIT_FLAT_HIDDEN = tl.constexpr(FLAT_HIDDEN)
 JIT_BLOCK_M = tl.constexpr(BLOCK_M)
 JIT_BLOCK_N = tl.constexpr(BLOCK_N)
 JIT_BLOCK_K = tl.constexpr(BLOCK_K)
-JIT_NUM_K64_BLOCKS = tl.constexpr(NUM_K64_BLOCKS)
 JIT_ACTIVE_K64_BLOCKS = tl.constexpr(ACTIVE_K64_BLOCKS)
-JIT_PROBE_PHASE = tl.constexpr(PROBE_PHASE)
-JIT_TAIL_BATCHES = tl.constexpr(TAIL_BATCHES)
-JIT_TAIL_WORK_PHASE = tl.constexpr(TAIL_WORK_PHASE)
-JIT_ACCUM_K64_BLOCKS = tl.constexpr(ACCUM_K64_BLOCKS)
-JIT_STATIC_PERSISTENT_ACCUM = tl.constexpr(ACCUM_MODE == "static-persistent")
-JIT_PTX_PERSISTENT_ACCUM = tl.constexpr(ACCUM_MODE == "ptx-persistent")
-JIT_PTX_QUAD_PRODUCER = tl.constexpr(PRODUCER_MODE == "ptx-quad")
-JIT_MANUAL_FN_TMA = tl.constexpr(MANUAL_FN_STAGE == "tma")
-JIT_MANUAL_K32_HANDOFF = tl.constexpr(MANUAL_HANDOFF == "k32")
-JIT_ROUTE12_TAIL = tl.constexpr(TAIL_SCHEDULE != "batch3")
-JIT_SHARED_ROUND_TAIL = tl.constexpr(TAIL_SCHEDULE == "shared-round")
-JIT_PRE_ROWS = tl.constexpr(PRE_ROWS)
-JIT_RMS_WEIGHT_ELEMENTS = tl.constexpr(RMS_WEIGHT_ELEMENTS)
-JIT_PIPE_STAGES = tl.constexpr(PIPE_STAGES)
+JIT_PRE_ROWS = tl.constexpr(BLOCK_M)
+JIT_RMS_WEIGHT_ELEMENTS = tl.constexpr(HIDDEN)
 JIT_WGMMA_K = tl.constexpr(WGMMA_K)
 JIT_WGMMA_K_FRAGMENTS = tl.constexpr(WGMMA_K_FRAGMENTS)
-JIT_PRODUCER_THREADS = tl.constexpr(PRODUCER_THREADS)
-JIT_ACTIVE_PRODUCER_THREADS = tl.constexpr(ACTIVE_PRODUCER_THREADS)
-JIT_PIPE_THREADS = tl.constexpr(PIPE_THREADS)
-JIT_PRODUCER_QUADS = tl.constexpr(PRODUCER_QUADS)
-JIT_PRODUCER_QUAD_ITERS = tl.constexpr(PRODUCER_QUAD_ITERS)
-JIT_ROOT16_PROBE = tl.constexpr(NUM_WARPS == 16)
-JIT_MANUAL_CTA512 = tl.constexpr(MANUAL_CTA512)
-JIT_MANUAL_HIDDEN_BATCH2 = tl.constexpr(MANUAL_HIDDEN_MODE == "batch2")
-JIT_MANUAL_HIDDEN_BATCH4 = tl.constexpr(MANUAL_HIDDEN_MODE == "batch4")
-JIT_MANUAL_HIDDEN_X8 = tl.constexpr(MANUAL_HIDDEN_MODE == "shared-round-x8")
-JIT_TOTAL_LOGICAL_THREADS = tl.constexpr(TOTAL_LOGICAL_THREADS)
-JIT_MATH_WARPS = tl.constexpr(MATH_WARPS)
-JIT_MATH_REGS = tl.constexpr(MATH_REGS)
-
-
-@triton.jit
-def _pre_sync():
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync 9, 384; mov.u32 $0, 0; }",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _tail_done_sync():
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync 10, 384; mov.u32 $0, 0; }",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -203,76 +134,6 @@ def _manual512_cta_sync():
 
 
 @triton.jit
-def _route_stage_full_arrive(channel: tl.constexpr, active):
-    """Publish active root arrivals after filling a slot."""
-    barrier_id: tl.constexpr = 8 + channel
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred p;
-          setp.ne.u32 p, $2, 0;
-          @p barrier.cta.arrive $1, $3;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r,r,r",
-        args=[barrier_id, tl.cast(active, tl.uint32), JIT_PIPE_THREADS],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _route_stage_full_sync(channel: tl.constexpr):
-    """Add the math partition's 128 arrivals and wait for a full slot."""
-    barrier_id: tl.constexpr = 8 + channel
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync $1, $2; mov.u32 $0, 0; }",
-        constraints="=r,r,r",
-        args=[barrier_id, JIT_PIPE_THREADS],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _route_stage_empty_arrive(channel: tl.constexpr):
-    """Publish the math partition's 128 retirements after WGMMA wait0."""
-    barrier_id: tl.constexpr = 12 + channel
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.arrive $1, $2; mov.u32 $0, 0; }",
-        constraints="=r,r,r",
-        args=[barrier_id, JIT_PIPE_THREADS],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _route_stage_empty_sync(channel: tl.constexpr, active):
-    """Add active root arrivals and wait before reusing a stage slot."""
-    barrier_id: tl.constexpr = 12 + channel
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred p;
-          setp.ne.u32 p, $2, 0;
-          @p barrier.cta.sync $1, $3;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r,r,r",
-        args=[barrier_id, tl.cast(active, tl.uint32), JIT_PIPE_THREADS],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _shared_address(pointer):
     """Expose a TLE shared pointer as a 32-bit PTX shared address."""
     return tl.inline_asm_elementwise(
@@ -281,265 +142,6 @@ def _shared_address(pointer):
         args=[pointer],
         dtype=tl.uint32,
         is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _persistent_projection_ptx(
-    q_shared_address0,
-    q_shared_address1,
-    q_shared_address2,
-    q_shared_address3,
-    fn_shared_address0,
-    fn_shared_address1,
-    fn_shared_address2,
-    fn_shared_address3,
-    projection_shared_address,
-):
-    """Run the complete H4096 projection in one compact PTX loop.
-
-    The 16 FP32 C registers and two row-square accumulators stay inside one
-    lexical asm scope across all 64 K64 stages.  This mirrors the CUDA p384
-    serial-K32 lifetime while avoiding both FlagTree's dynamic-loop layout
-    conversion and the static-unroll instruction-cache explosion.  The root
-    partition publishes four fixed route slots through named barriers 8..11;
-    this math warpgroup retires them through 12..15.
-
-    A K32 half owns sixteen TF32 A registers.  Four K8 WGMMA operations are
-    committed together, then fully retired before those registers are reused
-    by the second half.  PTX ISA 9.3 sections 9.7.16.5.1.3 and 9.7.16.5.2
-    define the four-register TF32 A fragment, the N/2 accumulator fragment,
-    and the required fence/commit/wait protocol.
-    """
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred pch1, pch2, pch3, more_stage, more_channel;
-          .reg .pred more_half, leader;
-          .reg .u32 tid, lane, warp, row0, row1, elem;
-          .reg .u32 stage, channel, half, half4, load_idx;
-          .reg .u32 q_base, fn_base, row_base, bank, byte_offset, address;
-          .reg .u32 full_id, empty_id, encoded_fn, half_desc32;
-          .reg .u32 odd_pair, pair_in_bank, column, out_address, lane4;
-          .reg .u64 desc_base, desc0, desc1, desc2, desc3, half_desc64;
-          .reg .b16 bh0, bh1, bh2, bh3;
-          .reg .b32 a<16>;
-          .reg .f32 c<16>;
-          .reg .f32 square0, square1, shuffle_tmp;
-
-          mov.u32 tid, %tid.x;
-          and.b32 tid, tid, 127;
-          and.b32 lane, tid, 31;
-          shr.u32 warp, tid, 5;
-          shr.u32 row0, lane, 2;
-          mad.lo.u32 row0, warp, 16, row0;
-          add.u32 row1, row0, 8;
-          and.b32 elem, lane, 3;
-          mov.f32 c0, 0f00000000;
-          mov.f32 c1, 0f00000000;
-          mov.f32 c2, 0f00000000;
-          mov.f32 c3, 0f00000000;
-          mov.f32 c4, 0f00000000;
-          mov.f32 c5, 0f00000000;
-          mov.f32 c6, 0f00000000;
-          mov.f32 c7, 0f00000000;
-          mov.f32 c8, 0f00000000;
-          mov.f32 c9, 0f00000000;
-          mov.f32 c10, 0f00000000;
-          mov.f32 c11, 0f00000000;
-          mov.f32 c12, 0f00000000;
-          mov.f32 c13, 0f00000000;
-          mov.f32 c14, 0f00000000;
-          mov.f32 c15, 0f00000000;
-          mov.f32 square0, 0f00000000;
-          mov.f32 square1, 0f00000000;
-          mov.u32 stage, 0;
-
-        DG_TLE_MHC_P384_PERSISTENT_STAGE:
-          mov.u32 channel, 0;
-        DG_TLE_MHC_P384_PERSISTENT_CHANNEL:
-          add.u32 full_id, channel, 8;
-          barrier.cta.sync full_id, $11;
-          fence.proxy.async.shared::cta;
-
-          mov.u32 q_base, $1;
-          mov.u32 fn_base, $5;
-          setp.eq.u32 pch1, channel, 1;
-          setp.eq.u32 pch2, channel, 2;
-          setp.eq.u32 pch3, channel, 3;
-          @pch1 mov.u32 q_base, $2;
-          @pch2 mov.u32 q_base, $3;
-          @pch3 mov.u32 q_base, $4;
-          @pch1 mov.u32 fn_base, $6;
-          @pch2 mov.u32 fn_base, $7;
-          @pch3 mov.u32 fn_base, $8;
-          mad.lo.u32 row_base, row0, 128, q_base;
-          shl.b32 byte_offset, elem, 1;
-          add.u32 row_base, row_base, byte_offset;
-          bfe.u32 encoded_fn, fn_base, 4, 14;
-          cvt.u64.u32 desc_base, encoded_fn;
-          add.u64 desc_base, desc_base, 0x4000004000000000;
-          mov.u32 half, 0;
-
-        DG_TLE_MHC_P384_PERSISTENT_HALF:
-          shl.b32 half4, half, 2;
-
-          add.u32 load_idx, half4, 0;
-          xor.b32 bank, row0, load_idx;
-          and.b32 bank, bank, 7;
-          shl.b32 byte_offset, bank, 4;
-          add.u32 address, row_base, byte_offset;
-          ld.shared.b16 bh0, [address];
-          ld.shared.b16 bh2, [address+8];
-          ld.shared.b16 bh1, [address+1024];
-          ld.shared.b16 bh3, [address+1032];
-          cvt.f32.bf16 a0, bh0;
-          cvt.f32.bf16 a1, bh1;
-          cvt.f32.bf16 a2, bh2;
-          cvt.f32.bf16 a3, bh3;
-          fma.rn.f32 square0, a0, a0, square0;
-          fma.rn.f32 square0, a2, a2, square0;
-          fma.rn.f32 square1, a1, a1, square1;
-          fma.rn.f32 square1, a3, a3, square1;
-
-          add.u32 load_idx, half4, 1;
-          xor.b32 bank, row0, load_idx;
-          and.b32 bank, bank, 7;
-          shl.b32 byte_offset, bank, 4;
-          add.u32 address, row_base, byte_offset;
-          ld.shared.b16 bh0, [address];
-          ld.shared.b16 bh2, [address+8];
-          ld.shared.b16 bh1, [address+1024];
-          ld.shared.b16 bh3, [address+1032];
-          cvt.f32.bf16 a4, bh0;
-          cvt.f32.bf16 a5, bh1;
-          cvt.f32.bf16 a6, bh2;
-          cvt.f32.bf16 a7, bh3;
-          fma.rn.f32 square0, a4, a4, square0;
-          fma.rn.f32 square0, a6, a6, square0;
-          fma.rn.f32 square1, a5, a5, square1;
-          fma.rn.f32 square1, a7, a7, square1;
-
-          add.u32 load_idx, half4, 2;
-          xor.b32 bank, row0, load_idx;
-          and.b32 bank, bank, 7;
-          shl.b32 byte_offset, bank, 4;
-          add.u32 address, row_base, byte_offset;
-          ld.shared.b16 bh0, [address];
-          ld.shared.b16 bh2, [address+8];
-          ld.shared.b16 bh1, [address+1024];
-          ld.shared.b16 bh3, [address+1032];
-          cvt.f32.bf16 a8, bh0;
-          cvt.f32.bf16 a9, bh1;
-          cvt.f32.bf16 a10, bh2;
-          cvt.f32.bf16 a11, bh3;
-          fma.rn.f32 square0, a8, a8, square0;
-          fma.rn.f32 square0, a10, a10, square0;
-          fma.rn.f32 square1, a9, a9, square1;
-          fma.rn.f32 square1, a11, a11, square1;
-
-          add.u32 load_idx, half4, 3;
-          xor.b32 bank, row0, load_idx;
-          and.b32 bank, bank, 7;
-          shl.b32 byte_offset, bank, 4;
-          add.u32 address, row_base, byte_offset;
-          ld.shared.b16 bh0, [address];
-          ld.shared.b16 bh2, [address+8];
-          ld.shared.b16 bh1, [address+1024];
-          ld.shared.b16 bh3, [address+1032];
-          cvt.f32.bf16 a12, bh0;
-          cvt.f32.bf16 a13, bh1;
-          cvt.f32.bf16 a14, bh2;
-          cvt.f32.bf16 a15, bh3;
-          fma.rn.f32 square0, a12, a12, square0;
-          fma.rn.f32 square0, a14, a14, square0;
-          fma.rn.f32 square1, a13, a13, square1;
-          fma.rn.f32 square1, a15, a15, square1;
-
-          shl.b32 half_desc32, half, 8;
-          cvt.u64.u32 half_desc64, half_desc32;
-          add.u64 desc0, desc_base, half_desc64;
-          add.u64 desc1, desc0, 2;
-          add.u64 desc2, desc0, 4;
-          add.u64 desc3, desc0, 6;
-          wgmma.fence.sync.aligned;
-          wgmma.mma_async.sync.aligned.m64n32k8.f32.tf32.tf32
-            {c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15},
-            {a0,a1,a2,a3}, desc0, 1, 1, 1;
-          wgmma.mma_async.sync.aligned.m64n32k8.f32.tf32.tf32
-            {c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15},
-            {a4,a5,a6,a7}, desc1, 1, 1, 1;
-          wgmma.mma_async.sync.aligned.m64n32k8.f32.tf32.tf32
-            {c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15},
-            {a8,a9,a10,a11}, desc2, 1, 1, 1;
-          wgmma.mma_async.sync.aligned.m64n32k8.f32.tf32.tf32
-            {c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15},
-            {a12,a13,a14,a15}, desc3, 1, 1, 1;
-          wgmma.commit_group.sync.aligned;
-          wgmma.wait_group.sync.aligned 0;
-          add.u32 half, half, 1;
-          setp.lt.u32 more_half, half, 2;
-          @more_half bra.uni DG_TLE_MHC_P384_PERSISTENT_HALF;
-
-          add.u32 empty_id, channel, 12;
-          barrier.cta.arrive empty_id, $11;
-          add.u32 channel, channel, 1;
-          setp.lt.u32 more_channel, channel, 4;
-          @more_channel bra.uni DG_TLE_MHC_P384_PERSISTENT_CHANNEL;
-          add.u32 stage, stage, 1;
-          setp.lt.u32 more_stage, stage, $10;
-          @more_stage bra.uni DG_TLE_MHC_P384_PERSISTENT_STAGE;
-
-          shfl.sync.bfly.b32 shuffle_tmp, square0, 1, 31, -1;
-          add.f32 square0, square0, shuffle_tmp;
-          shfl.sync.bfly.b32 shuffle_tmp, square0, 2, 31, -1;
-          add.f32 square0, square0, shuffle_tmp;
-          shfl.sync.bfly.b32 shuffle_tmp, square1, 1, 31, -1;
-          add.f32 square1, square1, shuffle_tmp;
-          shfl.sync.bfly.b32 shuffle_tmp, square1, 2, 31, -1;
-          add.f32 square1, square1, shuffle_tmp;
-
-          shr.u32 odd_pair, lane, 1;
-          and.b32 odd_pair, odd_pair, 1;
-          and.b32 pair_in_bank, lane, 1;
-          shl.b32 column, odd_pair, 2;
-          shl.b32 byte_offset, pair_in_bank, 1;
-          add.u32 column, column, byte_offset;
-          shl.b32 byte_offset, column, 2;
-          mad.lo.u32 out_address, row0, 128, $9;
-          add.u32 out_address, out_address, byte_offset;
-          st.shared.v2.f32 [out_address], {c0,c1};
-          st.shared.v2.f32 [out_address+1024], {c2,c3};
-          st.shared.v2.f32 [out_address+32], {c4,c5};
-          st.shared.v2.f32 [out_address+1056], {c6,c7};
-          st.shared.v2.f32 [out_address+64], {c8,c9};
-          st.shared.v2.f32 [out_address+1088], {c10,c11};
-
-          and.b32 lane4, lane, 3;
-          setp.eq.u32 leader, lane4, 0;
-          mad.lo.u32 out_address, row0, 128, $9;
-          @leader st.shared.f32 [out_address+96], square0;
-          @leader st.shared.f32 [out_address+1120], square1;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r,r,r,r,r,r,r,r,r,r,r",
-        args=[
-            q_shared_address0,
-            q_shared_address1,
-            q_shared_address2,
-            q_shared_address3,
-            fn_shared_address0,
-            fn_shared_address1,
-            fn_shared_address2,
-            fn_shared_address3,
-            projection_shared_address,
-            JIT_ACTIVE_K64_BLOCKS,
-            JIT_PIPE_THREADS,
-        ],
-        dtype=tl.uint32,
-        is_pure=False,
         pack=1,
     )
 
@@ -572,20 +174,13 @@ def _manual512_b1_projection_ptx(
     write_debug_mirror,
     token_limit: tl.constexpr,
 ):
-    """One-K64 role-aware 12+4-warp projection prototype.
+    """Production K64/TMA role-aware 12+4-warp projection.
 
     All sixteen physical warps enter one lexical PTX scope.  This is
     intentional: a high-level Triton branch around the producer inserts
     implicit ``bar.sync 0`` instructions for shared tensor stores, which can
-    never be reached by the four math warps.  The prototype first establishes
-    correctness and resource safety for the CUDA migration geometry.  It uses
-    ordinary global loads for Fn; later versions can replace those loads with
-    the production TMA ring without changing the role protocol.
-
-    The first 24 FP32 projection values and the BF16-derived square sum are
-    mirrored into the byte storage backing ``debug_projection_ptr``.  That
-    write is probe-only and lets the host validate the otherwise CTA-local
-    projection before the full Normal-MHC tail is attached.
+    never be reached by the four math warps.  The admitted call fixes Fn to
+    TMA staging, K64 handoff, and disables the legacy debug mirror.
     """
     return tl.inline_asm_elementwise(
         asm="""
@@ -1881,509 +1476,6 @@ def _hidden_shared_round_ptx(
 
 
 @triton.jit
-def _hidden_tail_batch2_no_wait(
-    pre_shared0,
-    pre_shared1,
-    new_residual_ptr,
-    rms_weight_shared,
-    y_bf16_ptr,
-    live_rows,
-    rmsnorm_eps,
-    rmsnorm_scale,
-):
-    """Use two uniform eight-warp ownership groups for two H4096 rows."""
-    logical = tl.arange(0, 2 * JIT_HIDDEN)
-    layout_thread = logical % JIT_TOTAL_LOGICAL_THREADS
-    item = logical // JIT_TOTAL_LOGICAL_THREADS
-    token_slot = layout_thread // 256
-    hidden = item * 256 + (layout_thread % 256)
-    active = token_slot < live_rows
-    norm_input = tl.zeros((2 * JIT_HIDDEN,), tl.float32)
-    for channel in tl.static_range(0, JIT_HC_MULT):
-        value = tl.load(
-            new_residual_ptr
-            + token_slot * JIT_FLAT_HIDDEN
-            + channel * JIT_HIDDEN
-            + hidden,
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        pre0 = tl.load(
-            tle.gpu.local_ptr(pre_shared0, (channel,)),
-            mask=live_rows > 0,
-            other=0.0,
-        )
-        pre1 = tl.load(
-            tle.gpu.local_ptr(pre_shared1, (channel,)),
-            mask=live_rows > 1,
-            other=0.0,
-        )
-        pre = tl.where(token_slot == 0, pre0, pre1)
-        norm_input += value * pre
-
-    norm_input_bf16 = norm_input.to(tl.bfloat16, fp_downcast_rounding="rtne")
-    norm_input_fp32 = norm_input_bf16.to(tl.float32)
-    squares = norm_input_fp32 * norm_input_fp32
-    sum0 = tl.sum(tl.where(token_slot == 0, squares, 0.0), axis=0)
-    sum1 = tl.sum(tl.where(token_slot == 1, squares, 0.0), axis=0)
-    total = tl.where(token_slot == 0, sum0, sum1)
-    rms = tl.rsqrt(total / JIT_HIDDEN + rmsnorm_eps)
-    rms_weight = tl.load(tle.gpu.local_ptr(rms_weight_shared, (hidden,))).to(tl.float32)
-    y = norm_input_fp32 * rms * rms_weight * rmsnorm_scale
-    tl.store(
-        y_bf16_ptr + token_slot * JIT_HIDDEN + hidden,
-        y.to(tl.bfloat16, fp_downcast_rounding="rtne"),
-        mask=active,
-    )
-
-
-@triton.jit
-def _hidden_shared_round_x8_ptx(
-    residual_address,
-    weight_shared_address,
-    output_address,
-    pre_shared_address,
-    rounded_shared_address,
-    warp_sums_shared_address,
-    logical_thread,
-    lane,
-    active,
-    barrier_id,
-    rmsnorm_eps,
-    rmsnorm_scale,
-):
-    """CUDA-style contiguous BF16x8 hidden worker.
-
-    Each of the 128 worker threads owns one aligned 16-byte octet per
-    iteration.  Compared with the older two-quad mapping this emits one
-    vector global/shared transaction for all eight elements while retaining
-    the same 32 hidden elements per thread and exact BF16 rounding boundary.
-    """
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred enabled, lane0, lane_lt4, again_oct;
-          .reg .u32 oct_iter, hidden_oct, byte_offset;
-          .reg .u32 rounded_address, weight_address;
-          .reg .u32 sum_address, worker_warp;
-          .reg .u64 global_offset, residual_ptr, output_ptr;
-          .reg .b32 packed<4>, weight<4>;
-          .reg .b16 h<8>, w<8>;
-          .reg .f32 v<8>, coeff<4>, q<8>;
-          .reg .f32 s0, s1, s2, s3, total, temp, norm;
-
-          setp.ne.u32 enabled, $9, 0;
-          mov.f32 s0, 0f00000000;
-          mov.f32 s1, 0f00000000;
-          mov.f32 s2, 0f00000000;
-          mov.f32 s3, 0f00000000;
-          ld.shared.v4.f32 {coeff0, coeff1, coeff2, coeff3}, [$4];
-          mov.u32 oct_iter, 0;
-        DG_TLE_MHC_P384_HIDDEN_X8_COMBINE_LOOP:
-          mad.lo.u32 hidden_oct, oct_iter, 128, $7;
-          mul.lo.u32 byte_offset, hidden_oct, 16;
-          mul.wide.u32 global_offset, hidden_oct, 16;
-          add.u32 rounded_address, $5, byte_offset;
-          mov.f32 q0, 0f00000000;
-          mov.f32 q1, 0f00000000;
-          mov.f32 q2, 0f00000000;
-          mov.f32 q3, 0f00000000;
-          mov.f32 q4, 0f00000000;
-          mov.f32 q5, 0f00000000;
-          mov.f32 q6, 0f00000000;
-          mov.f32 q7, 0f00000000;
-          add.u64 residual_ptr, $1, global_offset;
-
-          // Route 0: one naturally aligned 16-byte vector transaction.
-          mov.b32 packed0, 0;
-          mov.b32 packed1, 0;
-          mov.b32 packed2, 0;
-          mov.b32 packed3, 0;
-          @enabled ld.global.v4.b32
-              {packed0, packed1, packed2, packed3}, [residual_ptr];
-          mov.b32 {h0, h1}, packed0;
-          mov.b32 {h2, h3}, packed1;
-          mov.b32 {h4, h5}, packed2;
-          mov.b32 {h6, h7}, packed3;
-          cvt.f32.bf16 v0, h0;
-          cvt.f32.bf16 v1, h1;
-          cvt.f32.bf16 v2, h2;
-          cvt.f32.bf16 v3, h3;
-          cvt.f32.bf16 v4, h4;
-          cvt.f32.bf16 v5, h5;
-          cvt.f32.bf16 v6, h6;
-          cvt.f32.bf16 v7, h7;
-          fma.rn.f32 q0, v0, coeff0, q0;
-          fma.rn.f32 q1, v1, coeff0, q1;
-          fma.rn.f32 q2, v2, coeff0, q2;
-          fma.rn.f32 q3, v3, coeff0, q3;
-          fma.rn.f32 q4, v4, coeff0, q4;
-          fma.rn.f32 q5, v5, coeff0, q5;
-          fma.rn.f32 q6, v6, coeff0, q6;
-          fma.rn.f32 q7, v7, coeff0, q7;
-
-          // Route 1.
-          add.u64 residual_ptr, residual_ptr, 8192;
-          @enabled ld.global.v4.b32
-              {packed0, packed1, packed2, packed3}, [residual_ptr];
-          mov.b32 {h0, h1}, packed0;
-          mov.b32 {h2, h3}, packed1;
-          mov.b32 {h4, h5}, packed2;
-          mov.b32 {h6, h7}, packed3;
-          cvt.f32.bf16 v0, h0;
-          cvt.f32.bf16 v1, h1;
-          cvt.f32.bf16 v2, h2;
-          cvt.f32.bf16 v3, h3;
-          cvt.f32.bf16 v4, h4;
-          cvt.f32.bf16 v5, h5;
-          cvt.f32.bf16 v6, h6;
-          cvt.f32.bf16 v7, h7;
-          fma.rn.f32 q0, v0, coeff1, q0;
-          fma.rn.f32 q1, v1, coeff1, q1;
-          fma.rn.f32 q2, v2, coeff1, q2;
-          fma.rn.f32 q3, v3, coeff1, q3;
-          fma.rn.f32 q4, v4, coeff1, q4;
-          fma.rn.f32 q5, v5, coeff1, q5;
-          fma.rn.f32 q6, v6, coeff1, q6;
-          fma.rn.f32 q7, v7, coeff1, q7;
-
-          // Route 2.
-          add.u64 residual_ptr, residual_ptr, 8192;
-          @enabled ld.global.v4.b32
-              {packed0, packed1, packed2, packed3}, [residual_ptr];
-          mov.b32 {h0, h1}, packed0;
-          mov.b32 {h2, h3}, packed1;
-          mov.b32 {h4, h5}, packed2;
-          mov.b32 {h6, h7}, packed3;
-          cvt.f32.bf16 v0, h0;
-          cvt.f32.bf16 v1, h1;
-          cvt.f32.bf16 v2, h2;
-          cvt.f32.bf16 v3, h3;
-          cvt.f32.bf16 v4, h4;
-          cvt.f32.bf16 v5, h5;
-          cvt.f32.bf16 v6, h6;
-          cvt.f32.bf16 v7, h7;
-          fma.rn.f32 q0, v0, coeff2, q0;
-          fma.rn.f32 q1, v1, coeff2, q1;
-          fma.rn.f32 q2, v2, coeff2, q2;
-          fma.rn.f32 q3, v3, coeff2, q3;
-          fma.rn.f32 q4, v4, coeff2, q4;
-          fma.rn.f32 q5, v5, coeff2, q5;
-          fma.rn.f32 q6, v6, coeff2, q6;
-          fma.rn.f32 q7, v7, coeff2, q7;
-
-          // Route 3.
-          add.u64 residual_ptr, residual_ptr, 8192;
-          @enabled ld.global.v4.b32
-              {packed0, packed1, packed2, packed3}, [residual_ptr];
-          mov.b32 {h0, h1}, packed0;
-          mov.b32 {h2, h3}, packed1;
-          mov.b32 {h4, h5}, packed2;
-          mov.b32 {h6, h7}, packed3;
-          cvt.f32.bf16 v0, h0;
-          cvt.f32.bf16 v1, h1;
-          cvt.f32.bf16 v2, h2;
-          cvt.f32.bf16 v3, h3;
-          cvt.f32.bf16 v4, h4;
-          cvt.f32.bf16 v5, h5;
-          cvt.f32.bf16 v6, h6;
-          cvt.f32.bf16 v7, h7;
-          fma.rn.f32 q0, v0, coeff3, q0;
-          fma.rn.f32 q1, v1, coeff3, q1;
-          fma.rn.f32 q2, v2, coeff3, q2;
-          fma.rn.f32 q3, v3, coeff3, q3;
-          fma.rn.f32 q4, v4, coeff3, q4;
-          fma.rn.f32 q5, v5, coeff3, q5;
-          fma.rn.f32 q6, v6, coeff3, q6;
-          fma.rn.f32 q7, v7, coeff3, q7;
-
-          cvt.rn.bf16x2.f32 packed0, q1, q0;
-          cvt.rn.bf16x2.f32 packed1, q3, q2;
-          cvt.rn.bf16x2.f32 packed2, q5, q4;
-          cvt.rn.bf16x2.f32 packed3, q7, q6;
-          st.shared.v4.b32
-              [rounded_address], {packed0, packed1, packed2, packed3};
-          mov.b32 {h0, h1}, packed0;
-          mov.b32 {h2, h3}, packed1;
-          mov.b32 {h4, h5}, packed2;
-          mov.b32 {h6, h7}, packed3;
-          cvt.f32.bf16 v0, h0;
-          cvt.f32.bf16 v1, h1;
-          cvt.f32.bf16 v2, h2;
-          cvt.f32.bf16 v3, h3;
-          cvt.f32.bf16 v4, h4;
-          cvt.f32.bf16 v5, h5;
-          cvt.f32.bf16 v6, h6;
-          cvt.f32.bf16 v7, h7;
-          fma.rn.f32 s0, v0, v0, s0;
-          fma.rn.f32 s1, v1, v1, s1;
-          fma.rn.f32 s2, v2, v2, s2;
-          fma.rn.f32 s3, v3, v3, s3;
-          fma.rn.f32 s0, v4, v4, s0;
-          fma.rn.f32 s1, v5, v5, s1;
-          fma.rn.f32 s2, v6, v6, s2;
-          fma.rn.f32 s3, v7, v7, s3;
-          add.u32 oct_iter, oct_iter, 1;
-          setp.lt.u32 again_oct, oct_iter, 4;
-          @again_oct bra.uni DG_TLE_MHC_P384_HIDDEN_X8_COMBINE_LOOP;
-
-          add.rn.f32 total, s0, s1;
-          add.rn.f32 temp, s2, s3;
-          add.rn.f32 total, total, temp;
-          shfl.sync.down.b32 temp, total, 16, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          shfl.sync.down.b32 temp, total, 8, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          shfl.sync.down.b32 temp, total, 4, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          shfl.sync.down.b32 temp, total, 2, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          shfl.sync.down.b32 temp, total, 1, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          setp.eq.u32 lane0, $8, 0;
-          shr.u32 worker_warp, $7, 5;
-          mul.lo.u32 byte_offset, worker_warp, 4;
-          add.u32 sum_address, $6, byte_offset;
-          @lane0 st.shared.f32 [sum_address], total;
-          barrier.cta.sync $10, 128;
-
-          setp.lt.u32 lane_lt4, $8, 4;
-          mov.f32 total, 0f00000000;
-          mul.lo.u32 byte_offset, $8, 4;
-          add.u32 sum_address, $6, byte_offset;
-          @lane_lt4 ld.shared.f32 total, [sum_address];
-          shfl.sync.bfly.b32 temp, total, 2, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          shfl.sync.bfly.b32 temp, total, 1, 31, 0xffffffff;
-          add.rn.f32 total, total, temp;
-          shfl.sync.idx.b32 total, total, 0, 31, 0xffffffff;
-          mul.rn.f32 total, total, 0f39800000;
-          add.rn.f32 total, total, $11;
-          rsqrt.approx.f32 norm, total;
-          mul.rn.f32 norm, norm, $12;
-
-          mov.u32 oct_iter, 0;
-        DG_TLE_MHC_P384_HIDDEN_X8_NORMALIZE_LOOP:
-          mad.lo.u32 hidden_oct, oct_iter, 128, $7;
-          mul.lo.u32 byte_offset, hidden_oct, 16;
-          mul.wide.u32 global_offset, hidden_oct, 16;
-          add.u32 rounded_address, $5, byte_offset;
-          add.u32 weight_address, $2, byte_offset;
-          ld.shared.v4.b32
-              {packed0, packed1, packed2, packed3}, [rounded_address];
-          ld.shared.v4.b32
-              {weight0, weight1, weight2, weight3}, [weight_address];
-          mov.b32 {h0, h1}, packed0;
-          mov.b32 {h2, h3}, packed1;
-          mov.b32 {h4, h5}, packed2;
-          mov.b32 {h6, h7}, packed3;
-          mov.b32 {w0, w1}, weight0;
-          mov.b32 {w2, w3}, weight1;
-          mov.b32 {w4, w5}, weight2;
-          mov.b32 {w6, w7}, weight3;
-          cvt.f32.bf16 v0, h0;
-          cvt.f32.bf16 v1, h1;
-          cvt.f32.bf16 v2, h2;
-          cvt.f32.bf16 v3, h3;
-          cvt.f32.bf16 v4, h4;
-          cvt.f32.bf16 v5, h5;
-          cvt.f32.bf16 v6, h6;
-          cvt.f32.bf16 v7, h7;
-          cvt.f32.bf16 q0, w0;
-          cvt.f32.bf16 q1, w1;
-          cvt.f32.bf16 q2, w2;
-          cvt.f32.bf16 q3, w3;
-          cvt.f32.bf16 q4, w4;
-          cvt.f32.bf16 q5, w5;
-          cvt.f32.bf16 q6, w6;
-          cvt.f32.bf16 q7, w7;
-          mul.rn.f32 v0, v0, norm;
-          mul.rn.f32 v1, v1, norm;
-          mul.rn.f32 v2, v2, norm;
-          mul.rn.f32 v3, v3, norm;
-          mul.rn.f32 v4, v4, norm;
-          mul.rn.f32 v5, v5, norm;
-          mul.rn.f32 v6, v6, norm;
-          mul.rn.f32 v7, v7, norm;
-          mul.rn.f32 v0, v0, q0;
-          mul.rn.f32 v1, v1, q1;
-          mul.rn.f32 v2, v2, q2;
-          mul.rn.f32 v3, v3, q3;
-          mul.rn.f32 v4, v4, q4;
-          mul.rn.f32 v5, v5, q5;
-          mul.rn.f32 v6, v6, q6;
-          mul.rn.f32 v7, v7, q7;
-          cvt.rn.bf16x2.f32 packed0, v1, v0;
-          cvt.rn.bf16x2.f32 packed1, v3, v2;
-          cvt.rn.bf16x2.f32 packed2, v5, v4;
-          cvt.rn.bf16x2.f32 packed3, v7, v6;
-          add.u64 output_ptr, $3, global_offset;
-          @enabled st.global.v4.b32
-              [output_ptr], {packed0, packed1, packed2, packed3};
-          add.u32 oct_iter, oct_iter, 1;
-          setp.lt.u32 again_oct, oct_iter, 4;
-          @again_oct bra.uni DG_TLE_MHC_P384_HIDDEN_X8_NORMALIZE_LOOP;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,l,r,l,r,r,r,r,r,r,r,f,f",
-        args=[
-            residual_address,
-            weight_shared_address,
-            output_address,
-            pre_shared_address,
-            rounded_shared_address,
-            warp_sums_shared_address,
-            logical_thread,
-            lane,
-            tl.cast(active, tl.uint32),
-            barrier_id,
-            rmsnorm_eps,
-            rmsnorm_scale,
-        ],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _hidden_shared_round_selected_ptx(
-    residual_address,
-    weight_shared_address,
-    output_address,
-    pre_shared_address,
-    rounded_shared_address,
-    warp_sums_shared_address,
-    logical_thread,
-    lane,
-    active,
-    barrier_id,
-    rmsnorm_eps,
-    rmsnorm_scale,
-):
-    if JIT_MANUAL_HIDDEN_X8:
-        return _hidden_shared_round_x8_ptx(
-            residual_address,
-            weight_shared_address,
-            output_address,
-            pre_shared_address,
-            rounded_shared_address,
-            warp_sums_shared_address,
-            logical_thread,
-            lane,
-            active,
-            barrier_id,
-            rmsnorm_eps,
-            rmsnorm_scale,
-        )
-    return _hidden_shared_round_ptx(
-        residual_address,
-        weight_shared_address,
-        output_address,
-        pre_shared_address,
-        rounded_shared_address,
-        warp_sums_shared_address,
-        logical_thread,
-        lane,
-        active,
-        barrier_id,
-        rmsnorm_eps,
-        rmsnorm_scale,
-    )
-
-
-@triton.jit
-def _hidden_tail_batch4_no_wait(
-    pre_shared0,
-    pre_shared1,
-    pre_shared2,
-    pre_shared3,
-    new_residual_ptr,
-    rms_weight_shared,
-    y_bf16_ptr,
-    live_rows,
-    rmsnorm_eps,
-    rmsnorm_scale,
-):
-    """Use all sixteen CTA warps for four independent H4096 rows.
-
-    The default 16,384-element layout is ``logical = tid + item * 512``.
-    Splitting the physical CTA into four 128-thread ownership groups gives
-    each token exactly 4,096 hidden elements without a role branch.  All
-    warps therefore execute the same combine, BF16 boundary, row reduction,
-    and RMS/store sequence; no worker-local named barrier is required.
-    """
-    logical = tl.arange(0, 4 * JIT_HIDDEN)
-    layout_thread = logical % JIT_TOTAL_LOGICAL_THREADS
-    item = logical // JIT_TOTAL_LOGICAL_THREADS
-    token_slot = layout_thread // 128
-    hidden = item * 128 + (layout_thread % 128)
-    active = token_slot < live_rows
-    norm_input = tl.zeros((4 * JIT_HIDDEN,), tl.float32)
-    for channel in tl.static_range(0, JIT_HC_MULT):
-        value = tl.load(
-            new_residual_ptr
-            + token_slot * JIT_FLAT_HIDDEN
-            + channel * JIT_HIDDEN
-            + hidden,
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        pre0 = tl.load(
-            tle.gpu.local_ptr(pre_shared0, (channel,)),
-            mask=live_rows > 0,
-            other=0.0,
-        )
-        pre1 = tl.load(
-            tle.gpu.local_ptr(pre_shared1, (channel,)),
-            mask=live_rows > 1,
-            other=0.0,
-        )
-        pre2 = tl.load(
-            tle.gpu.local_ptr(pre_shared2, (channel,)),
-            mask=live_rows > 2,
-            other=0.0,
-        )
-        pre3 = tl.load(
-            tle.gpu.local_ptr(pre_shared3, (channel,)),
-            mask=live_rows > 3,
-            other=0.0,
-        )
-        pre = tl.where(
-            token_slot == 0,
-            pre0,
-            tl.where(
-                token_slot == 1,
-                pre1,
-                tl.where(token_slot == 2, pre2, pre3),
-            ),
-        )
-        norm_input += value * pre
-
-    norm_input_bf16 = norm_input.to(tl.bfloat16, fp_downcast_rounding="rtne")
-    norm_input_fp32 = norm_input_bf16.to(tl.float32)
-    squares = norm_input_fp32 * norm_input_fp32
-    sum0 = tl.sum(tl.where(token_slot == 0, squares, 0.0), axis=0)
-    sum1 = tl.sum(tl.where(token_slot == 1, squares, 0.0), axis=0)
-    sum2 = tl.sum(tl.where(token_slot == 2, squares, 0.0), axis=0)
-    sum3 = tl.sum(tl.where(token_slot == 3, squares, 0.0), axis=0)
-    total = tl.where(
-        token_slot == 0,
-        sum0,
-        tl.where(token_slot == 1, sum1, tl.where(token_slot == 2, sum2, sum3)),
-    )
-    rms = tl.rsqrt(total / JIT_HIDDEN + rmsnorm_eps)
-    rms_weight = tl.load(tle.gpu.local_ptr(rms_weight_shared, (hidden,))).to(tl.float32)
-    y = norm_input_fp32 * rms * rms_weight * rmsnorm_scale
-    tl.store(
-        y_bf16_ptr + token_slot * JIT_HIDDEN + hidden,
-        y.to(tl.bfloat16, fp_downcast_rounding="rtne"),
-        mask=active,
-    )
-
-
-@triton.jit
 def _routing_finalize_predicated(
     pre_shared,
     mix_scales_ptr,
@@ -2510,762 +1602,6 @@ def _routing_finalize_predicated(
 
 
 @triton.jit
-def _p384_root(
-    x_ptr,
-    residual_ptr,
-    post_mix_ptr,
-    comb_res_mix_ptr,
-    fn_ptr,
-    mix_scales_ptr,
-    mix_bases_ptr,
-    rmsnorm_weight_ptr,
-    new_residual_ptr,
-    new_post_mix_ptr,
-    new_comb_res_mix_ptr,
-    y_bf16_ptr,
-    q_stages,
-    fn_stages,
-    post_shared,
-    comb_shared,
-    projection_shared,
-    pre_shared,
-    rms_weight_shared,
-    hidden_warp_sums,
-    coeff_ready,
-    projection_ready,
-    tile,
-    hc_norm_eps,
-    hc_pre_eps,
-    hc_post_scale,
-    sinkhorn_eps,
-    rmsnorm_eps,
-    rmsnorm_scale,
-    token_limit: tl.constexpr,
-):
-    """Eight warps produce all 256 K64 route stages for one M64 tile."""
-    local_m = tl.arange(0, JIT_BLOCK_M)
-    m = tile * JIT_BLOCK_M + local_m
-    token_mask = m < token_limit
-    post_column = tl.arange(0, JIT_HC_MULT)
-    comb_column = tl.arange(0, JIT_HC_MULT * JIT_HC_MULT)
-    tl.store(
-        tle.gpu.local_ptr(post_shared),
-        tl.load(
-            post_mix_ptr + m[:, None] * JIT_HC_MULT + post_column[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        ),
-    )
-    tl.store(
-        tle.gpu.local_ptr(comb_shared),
-        tl.load(
-            comb_res_mix_ptr
-            + m[:, None] * JIT_HC_MULT * JIT_HC_MULT
-            + comb_column[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        ),
-    )
-    tle.gpu.barrier_wait(coeff_ready)
-
-    local_hidden = tl.arange(0, JIT_BLOCK_K)
-    n = tl.arange(0, JIT_BLOCK_N)
-    physical_thread = _small._physical_thread_id_x()
-    active_producer = physical_thread < JIT_ACTIVE_PRODUCER_THREADS
-    # A runtime loop keeps one compact producer body.  Each route publishes
-    # one K64 BF16 A tile; the math partition statically maps its 256 RS
-    # WGMMA instructions because FlagTree cannot currently carry a worker
-    # layout through a dynamic WGMMA loop.
-    for hidden_block64 in tl.range(0, JIT_ACTIVE_K64_BLOCKS):
-        hidden = hidden_block64 * JIT_BLOCK_K + local_hidden
-        matrix_mask = token_mask[:, None]
-        if JIT_PTX_QUAD_PRODUCER:
-            # Reuse is channel-independent because all four slots have one
-            # generation per K64 block.  Retire the previous generation,
-            # stage all weights, then let every producer thread own four
-            # naturally aligned BF16x4 source quads.
-            if hidden_block64 > 0:
-                for channel in tl.static_range(0, JIT_HC_MULT):
-                    _route_stage_empty_sync(channel, active_producer)
-            if JIT_ROOT16_PROBE:
-                # Only the twelve active producer warps stage B.  A scalar
-                # six-way mapping prevents the four resident-idle root warps
-                # from becoming hidden participants in the 512-thread
-                # producer/math full barrier.
-                for channel in tl.static_range(0, JIT_HC_MULT):
-                    for copy_iter in tl.static_range(0, 6):
-                        linear = (
-                            physical_thread + copy_iter * JIT_ACTIVE_PRODUCER_THREADS
-                        )
-                        copy_active = active_producer & (
-                            linear < JIT_BLOCK_N * JIT_BLOCK_K
-                        )
-                        safe_linear = tl.minimum(linear, JIT_BLOCK_N * JIT_BLOCK_K - 1)
-                        fn_n = safe_linear // JIT_BLOCK_K
-                        fn_k = safe_linear % JIT_BLOCK_K
-                        value = tl.load(
-                            fn_ptr
-                            + fn_n * JIT_FLAT_HIDDEN
-                            + channel * JIT_HIDDEN
-                            + hidden_block64 * JIT_BLOCK_K
-                            + fn_k,
-                            mask=copy_active & (fn_n < JIT_PROJECTION_OUTPUTS),
-                            other=0.0,
-                        ).to(tl.float32)
-                        tl.store(
-                            tle.gpu.local_ptr(
-                                fn_stages.slot(channel).slot(
-                                    tl.cast(fn_k // JIT_WGMMA_K, tl.int32)
-                                ),
-                                (fn_n, fn_k % JIT_WGMMA_K),
-                            ),
-                            value,
-                            mask=copy_active,
-                        )
-            else:
-                for channel in tl.static_range(0, JIT_HC_MULT):
-                    for half in tl.static_range(0, JIT_WGMMA_K_FRAGMENTS):
-                        fragment_k = tl.arange(0, JIT_WGMMA_K)
-                        flat_hidden = (
-                            channel * JIT_HIDDEN
-                            + hidden_block64 * JIT_BLOCK_K
-                            + half * JIT_WGMMA_K
-                            + fragment_k
-                        )
-                        fn_tile = tl.load(
-                            fn_ptr
-                            + n[:, None] * JIT_FLAT_HIDDEN
-                            + flat_hidden[None, :],
-                            mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
-                            other=0.0,
-                        ).to(tl.float32)
-                        tl.store(
-                            tle.gpu.local_ptr(fn_stages.slot(channel).slot(half)),
-                            fn_tile,
-                        )
-
-            for iteration in tl.range(0, JIT_PRODUCER_QUAD_ITERS):
-                linear_quad = physical_thread + iteration * JIT_ACTIVE_PRODUCER_THREADS
-                stage_active = active_producer & (linear_quad < JIT_PRODUCER_QUADS)
-                safe_quad = tl.minimum(linear_quad, JIT_PRODUCER_QUADS - 1)
-                row = safe_quad // 16
-                column = (safe_quad % 16) * 4
-                token = tile * JIT_BLOCK_M + row
-                token_valid = stage_active & (token < token_limit)
-                hidden_quad = hidden_block64 * JIT_BLOCK_K + column
-                x_address = tl.cast(x_ptr + token * JIT_HIDDEN + hidden_quad, tl.uint64)
-                residual_address = tl.cast(
-                    residual_ptr + token * JIT_FLAT_HIDDEN + hidden_quad,
-                    tl.uint64,
-                )
-                new_residual_address = tl.cast(
-                    new_residual_ptr + token * JIT_FLAT_HIDDEN + hidden_quad,
-                    tl.uint64,
-                )
-                post_address = _shared_address(tle.gpu.local_ptr(post_shared, (row, 0)))
-                comb_address = _shared_address(tle.gpu.local_ptr(comb_shared, (row, 0)))
-                q_address0 = _shared_address(
-                    tle.gpu.local_ptr(
-                        q_stages.slot(0).slot(tl.cast(column // JIT_WGMMA_K, tl.int32)),
-                        (row, column % JIT_WGMMA_K),
-                    )
-                )
-                q_address1 = _shared_address(
-                    tle.gpu.local_ptr(
-                        q_stages.slot(1).slot(tl.cast(column // JIT_WGMMA_K, tl.int32)),
-                        (row, column % JIT_WGMMA_K),
-                    )
-                )
-                q_address2 = _shared_address(
-                    tle.gpu.local_ptr(
-                        q_stages.slot(2).slot(tl.cast(column // JIT_WGMMA_K, tl.int32)),
-                        (row, column % JIT_WGMMA_K),
-                    )
-                )
-                q_address3 = _shared_address(
-                    tle.gpu.local_ptr(
-                        q_stages.slot(3).slot(tl.cast(column // JIT_WGMMA_K, tl.int32)),
-                        (row, column % JIT_WGMMA_K),
-                    )
-                )
-                _ = _serial_quad_post_ptx(
-                    x_address,
-                    residual_address,
-                    new_residual_address,
-                    post_address,
-                    comb_address,
-                    q_address0,
-                    q_address1,
-                    q_address2,
-                    q_address3,
-                    token_valid,
-                    stage_active,
-                )
-            for channel in tl.static_range(0, JIT_HC_MULT):
-                _route_stage_full_arrive(channel, active_producer)
-        else:
-            token_hidden = m[:, None] * JIT_HIDDEN + hidden[None, :]
-            token_residual = m[:, None] * JIT_FLAT_HIDDEN + hidden[None, :]
-            x = tl.load(x_ptr + token_hidden, mask=matrix_mask, other=0.0).to(
-                tl.float32
-            )
-            r0 = tl.load(residual_ptr + token_residual, mask=matrix_mask, other=0.0).to(
-                tl.float32
-            )
-            r1 = tl.load(
-                residual_ptr + token_residual + JIT_HIDDEN,
-                mask=matrix_mask,
-                other=0.0,
-            ).to(tl.float32)
-            r2 = tl.load(
-                residual_ptr + token_residual + 2 * JIT_HIDDEN,
-                mask=matrix_mask,
-                other=0.0,
-            ).to(tl.float32)
-            r3 = tl.load(
-                residual_ptr + token_residual + 3 * JIT_HIDDEN,
-                mask=matrix_mask,
-                other=0.0,
-            ).to(tl.float32)
-
-            for channel in tl.static_range(0, JIT_HC_MULT):
-                channel_vector = tl.full((JIT_BLOCK_M,), channel, tl.int32)
-                post = tl.load(
-                    tle.gpu.local_ptr(post_shared, (local_m, channel_vector))
-                )[:, None]
-                comb0 = tl.load(
-                    tle.gpu.local_ptr(comb_shared, (local_m, channel_vector))
-                )[:, None]
-                comb1 = tl.load(
-                    tle.gpu.local_ptr(
-                        comb_shared,
-                        (local_m, channel_vector + JIT_HC_MULT),
-                    )
-                )[:, None]
-                comb2 = tl.load(
-                    tle.gpu.local_ptr(
-                        comb_shared,
-                        (local_m, channel_vector + 2 * JIT_HC_MULT),
-                    )
-                )[:, None]
-                comb3 = tl.load(
-                    tle.gpu.local_ptr(
-                        comb_shared,
-                        (local_m, channel_vector + 3 * JIT_HC_MULT),
-                    )
-                )[:, None]
-                q = x * post + r0 * comb0 + r1 * comb1 + r2 * comb2 + r3 * comb3
-                q = tl.where(matrix_mask, q, 0.0)
-                q_bf16 = q.to(tl.bfloat16, fp_downcast_rounding="rtne")
-                tl.store(
-                    new_residual_ptr
-                    + m[:, None] * JIT_FLAT_HIDDEN
-                    + channel * JIT_HIDDEN
-                    + hidden[None, :],
-                    q_bf16,
-                    mask=matrix_mask,
-                )
-                flat_hidden = channel * JIT_HIDDEN + hidden
-                fn_tile = tl.load(
-                    fn_ptr + n[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
-                    mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
-                    other=0.0,
-                ).to(tl.float32)
-                # Four static slots are reused once per K64 block.  Each
-                # barrier is a two-partition full/empty handshake.
-                if hidden_block64 > 0:
-                    _route_stage_empty_sync(channel, True)
-                tl.store(
-                    tle.gpu.local_ptr(q_stages.slot(channel).slot(0)),
-                    q_bf16,
-                )
-                tl.store(
-                    tle.gpu.local_ptr(fn_stages.slot(channel).slot(0)),
-                    fn_tile,
-                )
-                _route_stage_full_arrive(channel, True)
-
-    # Complete the final four empty-barrier generations.  This both waits for
-    # the last WGMMA consumers and makes IDs 8..15 safe to reuse by the tail.
-    for channel in tl.static_range(0, JIT_HC_MULT):
-        _route_stage_empty_sync(channel, active_producer)
-
-    if JIT_SHARED_ROUND_TAIL:
-        # The producer owns the cache fill; projection_ready publishes it to
-        # the math partition after every retired route stage is safe to reuse.
-        weight_h = tl.arange(0, JIT_HIDDEN)
-        tl.store(
-            tle.gpu.local_ptr(rms_weight_shared, (weight_h,)),
-            tl.load(rmsnorm_weight_ptr + weight_h),
-        )
-
-    # The worker has stored the complete projection and squared sum in CTA
-    # shared memory.  Both specialization partitions execute this barrier.
-    if JIT_PROBE_PHASE >= 1:
-        tle.gpu.barrier_wait(projection_ready)
-        physical_thread = _small._physical_thread_id_x()
-        producer_warp = physical_thread // 32
-        lane = physical_thread % 32
-        if JIT_ROUTE12_TAIL:
-            # All twelve physical warps route distinct rows.  Six uniform
-            # rounds cover M64, eliminating the four-way duplicated
-            # Sinkhorn work of the original batch3 schedule.  Pre[64,4]
-            # keeps every row until the bandwidth-oriented hidden tail.
-            for route_batch in tl.range(0, 6):
-                route_row = route_batch * 12 + producer_warp
-                token = tile * JIT_BLOCK_M + route_row
-                route_active = (route_row < JIT_BLOCK_M) & (token < token_limit)
-                packed_sum = tl.load(
-                    tle.gpu.local_ptr(
-                        projection_shared,
-                        (route_row, lane),
-                    ),
-                    mask=(lane <= JIT_PROJECTION_OUTPUTS) & route_active,
-                    other=0.0,
-                )
-                if JIT_TAIL_WORK_PHASE >= 2:
-                    _routing_finalize_predicated(
-                        pre_shared.slot(tl.cast(route_row, tl.int32)),
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        new_post_mix_ptr + token * JIT_HC_MULT,
-                        new_comb_res_mix_ptr + token * JIT_HC_MULT * JIT_HC_MULT,
-                        packed_sum,
-                        lane,
-                        route_active,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                    )
-            _pre_sync()
-            if JIT_SHARED_ROUND_TAIL:
-                worker_idx = producer_warp // 4
-                worker_thread = (producer_warp % 4) * 32 + lane
-                rounded_address = _shared_address(
-                    tle.gpu.local_ptr(
-                        q_stages.slot(tl.cast(worker_idx, tl.int32)).slot(0),
-                        (0, 0),
-                    )
-                )
-                weight_address = _shared_address(
-                    tle.gpu.local_ptr(rms_weight_shared, (0,))
-                )
-                warp_sums_address = _shared_address(
-                    tle.gpu.local_ptr(
-                        hidden_warp_sums.slot(tl.cast(worker_idx, tl.int32)),
-                        (0,),
-                    )
-                )
-                for batch_index in tl.range(0, JIT_TAIL_BATCHES):
-                    route_row = batch_index * 3 + worker_idx
-                    token = tile * JIT_BLOCK_M + route_row
-                    active = (route_row < JIT_BLOCK_M) & (token < token_limit)
-                    if JIT_TAIL_WORK_PHASE >= 3:
-                        _ = _hidden_shared_round_selected_ptx(
-                            tl.cast(
-                                new_residual_ptr + token * JIT_FLAT_HIDDEN,
-                                tl.uint64,
-                            ),
-                            weight_address,
-                            tl.cast(
-                                y_bf16_ptr + token * JIT_HIDDEN,
-                                tl.uint64,
-                            ),
-                            _shared_address(
-                                tle.gpu.local_ptr(
-                                    pre_shared.slot(tl.cast(route_row, tl.int32)),
-                                    (0,),
-                                )
-                            ),
-                            rounded_address,
-                            warp_sums_address,
-                            worker_thread,
-                            lane,
-                            active,
-                            12 + worker_idx,
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-            else:
-                for batch_index in tl.range(0, JIT_TAIL_BATCHES):
-                    batch_base = batch_index * 3
-                    token = tile * JIT_BLOCK_M + batch_base
-                    live_rows = tl.maximum(
-                        0,
-                        tl.minimum(
-                            3,
-                            tl.minimum(
-                                JIT_BLOCK_M - batch_base,
-                                token_limit - token,
-                            ),
-                        ),
-                    )
-                    if JIT_TAIL_WORK_PHASE >= 3:
-                        _common._hidden_tail_batch2_no_wait(
-                            pre_shared.slot(tl.cast(batch_base, tl.int32)),
-                            pre_shared.slot(tl.cast(batch_base + 1, tl.int32)),
-                            new_residual_ptr + token * JIT_FLAT_HIDDEN,
-                            rmsnorm_weight_ptr,
-                            y_bf16_ptr + token * JIT_HIDDEN,
-                            tl.minimum(live_rows, 2),
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-                    _tail_done_sync()
-        else:
-            route_owner = producer_warp // 4
-            for batch_index in tl.range(0, JIT_TAIL_BATCHES):
-                batch_base = batch_index * 3
-                token = tile * JIT_BLOCK_M + batch_base
-                # A CTA owns exactly one M64 tile.  The 22nd batch starts at
-                # row 63 and therefore contains one local row.
-                live_rows = tl.maximum(
-                    0,
-                    tl.minimum(
-                        3,
-                        tl.minimum(JIT_BLOCK_M - batch_base, token_limit - token),
-                    ),
-                )
-                if JIT_TAIL_WORK_PHASE >= 2:
-                    packed_sum = tl.load(
-                        tle.gpu.local_ptr(
-                            projection_shared,
-                            (batch_base + route_owner, lane),
-                        ),
-                        mask=(lane <= JIT_PROJECTION_OUTPUTS)
-                        & (route_owner < live_rows),
-                        other=0.0,
-                    )
-                    _routing_finalize_predicated(
-                        pre_shared.slot(tl.cast(route_owner, tl.int32)),
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        new_post_mix_ptr + (token + route_owner) * JIT_HC_MULT,
-                        new_comb_res_mix_ptr
-                        + (token + route_owner) * JIT_HC_MULT * JIT_HC_MULT,
-                        packed_sum,
-                        lane,
-                        route_owner < live_rows,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                    )
-                _pre_sync()
-                if JIT_TAIL_WORK_PHASE >= 3:
-                    _common._hidden_tail_batch2_no_wait(
-                        pre_shared.slot(tl.cast(0, tl.int32)),
-                        pre_shared.slot(tl.cast(1, tl.int32)),
-                        new_residual_ptr + token * JIT_FLAT_HIDDEN,
-                        rmsnorm_weight_ptr,
-                        y_bf16_ptr + token * JIT_HIDDEN,
-                        tl.minimum(live_rows, 2),
-                        rmsnorm_eps,
-                        rmsnorm_scale,
-                    )
-                _tail_done_sync()
-
-
-@triton.jit
-def _p384_math(
-    mix_scales_ptr,
-    mix_bases_ptr,
-    rmsnorm_weight_ptr,
-    new_residual_ptr,
-    new_post_mix_ptr,
-    new_comb_res_mix_ptr,
-    y_bf16_ptr,
-    q_stages,
-    fn_stages,
-    projection_shared,
-    pre_shared,
-    rms_weight_shared,
-    hidden_warp_sums,
-    projection_ready,
-    tile,
-    hc_norm_eps,
-    hc_pre_eps,
-    hc_post_scale,
-    sinkhorn_eps,
-    rmsnorm_eps,
-    rmsnorm_scale,
-    token_limit: tl.constexpr,
-):
-    """Four warps consume BF16 A as FP32 registers and finish row three."""
-    rows = tl.arange(0, JIT_BLOCK_M)
-    columns = tl.arange(0, JIT_BLOCK_N)
-    token_active = tile * JIT_BLOCK_M + rows < token_limit
-    if JIT_PTX_PERSISTENT_ACCUM:
-        _ = _persistent_projection_ptx(
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(0).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(1).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(2).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(3).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(0).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(1).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(2).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(3).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(projection_shared, (0, 0))),
-        )
-    elif JIT_STATIC_PERSISTENT_ACCUM:
-        # Exact fixed-shape path: keep one FP32 projection accumulator and
-        # one row-square vector across all 64 K64 stages.  Static expansion
-        # avoids FlagTree's worker-layout loop-backedge conversion and removes
-        # every intermediate projection_shared fold.
-        accumulator = tl.zeros((JIT_BLOCK_M, JIT_BLOCK_N), tl.float32)
-        squared_sum = tl.zeros((JIT_BLOCK_M,), tl.float32)
-        for hidden_block64 in tl.static_range(0, JIT_ACTIVE_K64_BLOCKS):
-            for channel in tl.static_range(0, JIT_HC_MULT):
-                _route_stage_full_sync(channel)
-                for half in tl.static_range(0, JIT_WGMMA_K_FRAGMENTS):
-                    q_registers = tl.load(
-                        tle.gpu.local_ptr(q_stages.slot(channel).slot(half))
-                    ).to(tl.float32)
-                    squared_sum += tl.sum(q_registers * q_registers, axis=1)
-                    accumulator = tle.gpu.wgmma(
-                        q_registers,
-                        fn_stages.slot(channel).slot(half),
-                        accumulator,
-                        input_precision="tf32",
-                        trans_b=True,
-                    )
-                    accumulator = tle.gpu.wgmma_wait(0, accumulator)
-                _route_stage_empty_arrive(channel)
-        tl.store(
-            tle.gpu.local_ptr(projection_shared),
-            accumulator,
-            mask=token_active[:, None] & (columns[None, :] < JIT_PROJECTION_OUTPUTS),
-        )
-        tl.store(
-            tle.gpu.local_ptr(
-                projection_shared,
-                (
-                    rows,
-                    tl.full((JIT_BLOCK_M,), JIT_PROJECTION_OUTPUTS, tl.int32),
-                ),
-            ),
-            squared_sum,
-            mask=token_active,
-        )
-    else:
-        # FlagTree cannot carry a worker-layout accumulator through a dynamic
-        # loop.  The compact fallback folds a short static chunk into shared.
-        for chunk_index in tl.range(0, JIT_ACTIVE_K64_BLOCKS // JIT_ACCUM_K64_BLOCKS):
-            chunk_accumulator = tl.zeros((JIT_BLOCK_M, JIT_BLOCK_N), tl.float32)
-            chunk_squared_sum = tl.zeros((JIT_BLOCK_M,), tl.float32)
-            for block_in_chunk in tl.static_range(0, JIT_ACCUM_K64_BLOCKS):
-                for channel in tl.static_range(0, JIT_HC_MULT):
-                    _route_stage_full_sync(channel)
-                    for half in tl.static_range(0, JIT_WGMMA_K_FRAGMENTS):
-                        q_registers = tl.load(
-                            tle.gpu.local_ptr(q_stages.slot(channel).slot(half))
-                        ).to(tl.float32)
-                        chunk_squared_sum += tl.sum(q_registers * q_registers, axis=1)
-                        chunk_accumulator = tle.gpu.wgmma(
-                            q_registers,
-                            fn_stages.slot(channel).slot(half),
-                            chunk_accumulator,
-                            input_precision="tf32",
-                            trans_b=True,
-                        )
-                        chunk_accumulator = tle.gpu.wgmma_wait(0, chunk_accumulator)
-                    _route_stage_empty_arrive(channel)
-
-            if chunk_index == 0:
-                folded_accumulator = chunk_accumulator
-                folded_squared_sum = chunk_squared_sum
-            else:
-                folded_accumulator = (
-                    tl.load(tle.gpu.local_ptr(projection_shared)) + chunk_accumulator
-                )
-                folded_squared_sum = (
-                    tl.load(
-                        tle.gpu.local_ptr(
-                            projection_shared,
-                            (
-                                rows,
-                                tl.full(
-                                    (JIT_BLOCK_M,),
-                                    JIT_PROJECTION_OUTPUTS,
-                                    tl.int32,
-                                ),
-                            ),
-                        )
-                    )
-                    + chunk_squared_sum
-                )
-            tl.store(
-                tle.gpu.local_ptr(projection_shared),
-                folded_accumulator,
-                mask=token_active[:, None]
-                & (columns[None, :] < JIT_PROJECTION_OUTPUTS),
-            )
-            tl.store(
-                tle.gpu.local_ptr(
-                    projection_shared,
-                    (
-                        rows,
-                        tl.full(
-                            (JIT_BLOCK_M,),
-                            JIT_PROJECTION_OUTPUTS,
-                            tl.int32,
-                        ),
-                    ),
-                ),
-                folded_squared_sum,
-                mask=token_active,
-            )
-
-    if JIT_PROBE_PHASE >= 1:
-        tle.gpu.barrier_wait(projection_ready)
-
-        physical_thread = _small._physical_thread_id_x()
-        physical_warp = physical_thread // 32
-        lane = physical_thread % 32
-        if JIT_ROUTE12_TAIL:
-            for route_batch in tl.range(0, 6):
-                route_row = route_batch * 12 + physical_warp
-                token = tile * JIT_BLOCK_M + route_row
-                route_active = (route_row < JIT_BLOCK_M) & (token < token_limit)
-                packed_sum = tl.load(
-                    tle.gpu.local_ptr(projection_shared, (route_row, lane)),
-                    mask=(lane <= JIT_PROJECTION_OUTPUTS) & route_active,
-                    other=0.0,
-                )
-                if JIT_TAIL_WORK_PHASE == 1:
-                    tl.store(
-                        new_post_mix_ptr + token * JIT_HC_MULT + lane,
-                        tl.cast(route_row, tl.float32) + lane,
-                        mask=(lane < JIT_HC_MULT) & route_active,
-                    )
-                if JIT_TAIL_WORK_PHASE >= 2:
-                    _routing_finalize_predicated(
-                        pre_shared.slot(tl.cast(route_row, tl.int32)),
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        new_post_mix_ptr + token * JIT_HC_MULT,
-                        new_comb_res_mix_ptr + token * JIT_HC_MULT * JIT_HC_MULT,
-                        packed_sum,
-                        lane,
-                        route_active,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                    )
-            _pre_sync()
-            if JIT_SHARED_ROUND_TAIL:
-                worker_idx = 2
-                worker_thread = (physical_warp - 8) * 32 + lane
-                rounded_address = _shared_address(
-                    tle.gpu.local_ptr(q_stages.slot(2).slot(0), (0, 0))
-                )
-                weight_address = _shared_address(
-                    tle.gpu.local_ptr(rms_weight_shared, (0,))
-                )
-                warp_sums_address = _shared_address(
-                    tle.gpu.local_ptr(hidden_warp_sums.slot(2), (0,))
-                )
-                for batch_index in tl.range(0, JIT_TAIL_BATCHES):
-                    route_row = batch_index * 3 + worker_idx
-                    token = tile * JIT_BLOCK_M + route_row
-                    active = (route_row < JIT_BLOCK_M) & (token < token_limit)
-                    if JIT_TAIL_WORK_PHASE >= 3:
-                        _ = _hidden_shared_round_selected_ptx(
-                            tl.cast(
-                                new_residual_ptr + token * JIT_FLAT_HIDDEN,
-                                tl.uint64,
-                            ),
-                            weight_address,
-                            tl.cast(
-                                y_bf16_ptr + token * JIT_HIDDEN,
-                                tl.uint64,
-                            ),
-                            _shared_address(
-                                tle.gpu.local_ptr(
-                                    pre_shared.slot(tl.cast(route_row, tl.int32)),
-                                    (0,),
-                                )
-                            ),
-                            rounded_address,
-                            warp_sums_address,
-                            worker_thread,
-                            lane,
-                            active,
-                            12 + worker_idx,
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-            else:
-                for batch_index in tl.range(0, JIT_TAIL_BATCHES):
-                    batch_base = batch_index * 3
-                    token = tile * JIT_BLOCK_M + batch_base
-                    live_rows = tl.maximum(
-                        0,
-                        tl.minimum(
-                            3,
-                            tl.minimum(
-                                JIT_BLOCK_M - batch_base,
-                                token_limit - token,
-                            ),
-                        ),
-                    )
-                    if (JIT_TAIL_WORK_PHASE >= 3) & (live_rows > 2):
-                        _common._hidden_tail_no_wait(
-                            pre_shared.slot(tl.cast(batch_base + 2, tl.int32)),
-                            new_residual_ptr + (token + 2) * JIT_FLAT_HIDDEN,
-                            rmsnorm_weight_ptr,
-                            y_bf16_ptr + (token + 2) * JIT_HIDDEN,
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-                    _tail_done_sync()
-        else:
-            for batch_index in tl.range(0, JIT_TAIL_BATCHES):
-                batch_base = batch_index * 3
-                token = tile * JIT_BLOCK_M + batch_base
-                live_rows = tl.maximum(
-                    0,
-                    tl.minimum(
-                        3,
-                        tl.minimum(JIT_BLOCK_M - batch_base, token_limit - token),
-                    ),
-                )
-                if JIT_TAIL_WORK_PHASE >= 2:
-                    packed_sum = tl.load(
-                        tle.gpu.local_ptr(projection_shared, (batch_base + 2, lane)),
-                        mask=(lane <= JIT_PROJECTION_OUTPUTS) & (live_rows > 2),
-                        other=0.0,
-                    )
-                    _routing_finalize_predicated(
-                        pre_shared.slot(tl.cast(2, tl.int32)),
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        new_post_mix_ptr + (token + 2) * JIT_HC_MULT,
-                        new_comb_res_mix_ptr + (token + 2) * JIT_HC_MULT * JIT_HC_MULT,
-                        packed_sum,
-                        lane,
-                        live_rows > 2,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                    )
-                _pre_sync()
-                if (JIT_TAIL_WORK_PHASE >= 3) & (live_rows > 2):
-                    _common._hidden_tail_no_wait(
-                        pre_shared.slot(tl.cast(2, tl.int32)),
-                        new_residual_ptr + (token + 2) * JIT_FLAT_HIDDEN,
-                        rmsnorm_weight_ptr,
-                        y_bf16_ptr + (token + 2) * JIT_HIDDEN,
-                        rmsnorm_eps,
-                        rmsnorm_scale,
-                    )
-                _tail_done_sync()
-
-
-@triton.jit
 def _sm90_eager_p384_rs_wgmma_kernel(
     x_ptr,
     residual_ptr,
@@ -3363,270 +1699,134 @@ def _sm90_eager_p384_rs_wgmma_kernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    if JIT_MANUAL_CTA512:
-        # Every physical warp cooperates in the coefficient cache fill.  The
-        # role-aware PTX scope publishes it with a full-CTA barrier before
-        # assigning warps 0..11 to Post/Fn and warps 12..15 to WGMMA.
-        local_m = tl.arange(0, JIT_BLOCK_M)
-        m = tile * JIT_BLOCK_M + local_m
-        token_mask = m < token_limit
-        post_column = tl.arange(0, JIT_HC_MULT)
-        comb_column = tl.arange(0, JIT_HC_MULT * JIT_HC_MULT)
-        tl.store(
-            tle.gpu.local_ptr(post_shared),
-            tl.load(
-                post_mix_ptr + m[:, None] * JIT_HC_MULT + post_column[None, :],
-                mask=token_mask[:, None],
-                other=0.0,
-            ),
+    # Every physical warp cooperates in the coefficient cache fill.  The
+    # role-aware PTX scope publishes it with a full-CTA barrier before
+    # assigning warps 0..11 to Post/Fn and warps 12..15 to WGMMA.
+    local_m = tl.arange(0, JIT_BLOCK_M)
+    m = tile * JIT_BLOCK_M + local_m
+    token_mask = m < token_limit
+    post_column = tl.arange(0, JIT_HC_MULT)
+    comb_column = tl.arange(0, JIT_HC_MULT * JIT_HC_MULT)
+    tl.store(
+        tle.gpu.local_ptr(post_shared),
+        tl.load(
+            post_mix_ptr + m[:, None] * JIT_HC_MULT + post_column[None, :],
+            mask=token_mask[:, None],
+            other=0.0,
+        ),
+    )
+    tl.store(
+        tle.gpu.local_ptr(comb_shared),
+        tl.load(
+            comb_res_mix_ptr
+            + m[:, None] * JIT_HC_MULT * JIT_HC_MULT
+            + comb_column[None, :],
+            mask=token_mask[:, None],
+            other=0.0,
+        ),
+    )
+    _ = _manual512_b1_projection_ptx(
+        x_ptr,
+        residual_ptr,
+        fn_ptr,
+        new_residual_ptr,
+        y_bf16_ptr,
+        _shared_address(tle.gpu.local_ptr(post_shared, (0, 0))),
+        _shared_address(tle.gpu.local_ptr(comb_shared, (0, 0))),
+        _shared_address(tle.gpu.local_ptr(q_stages.slot(0).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(q_stages.slot(1).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(q_stages.slot(2).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(q_stages.slot(3).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(fn_stages.slot(0).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(fn_stages.slot(1).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(fn_stages.slot(2).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(fn_stages.slot(3).slot(0), (0, 0))),
+        _shared_address(tle.gpu.local_ptr(projection_shared, (0, 0))),
+        tile,
+        JIT_ACTIVE_K64_BLOCKS,
+        tl.cast(fn_tensormap_ptr, tl.uint64),
+        _shared_address(tle.gpu.local_ptr(fn_tma_barriers, (0,))),
+        1,
+        _shared_address(tle.gpu.local_ptr(q_handoff_barriers, (0,))),
+        0,
+        tl.cast(0, tl.uint32),
+        token_limit,
+    )
+    # All sixteen warps are now converged.  Cache the BF16 RMS row, route
+    # four tokens per warp, then assign each four-warp group one hidden worker.
+    physical_thread = _small._physical_thread_id_x()
+    physical_warp = physical_thread // 32
+    lane = physical_thread % 32
+    for route_batch in tl.static_range(0, 4):
+        route_row = route_batch * 16 + physical_warp
+        token = tile * JIT_BLOCK_M + route_row
+        route_active = token < token_limit
+        packed_sum = tl.load(
+            tle.gpu.local_ptr(projection_shared, (route_row, lane)),
+            mask=(lane <= JIT_PROJECTION_OUTPUTS) & route_active,
+            other=0.0,
         )
-        tl.store(
-            tle.gpu.local_ptr(comb_shared),
-            tl.load(
-                comb_res_mix_ptr
-                + m[:, None] * JIT_HC_MULT * JIT_HC_MULT
-                + comb_column[None, :],
-                mask=token_mask[:, None],
-                other=0.0,
-            ),
+        _routing_finalize_predicated(
+            pre_shared.slot(tl.cast(route_row, tl.int32)),
+            mix_scales_ptr,
+            mix_bases_ptr,
+            new_post_mix_ptr + token * JIT_HC_MULT,
+            new_comb_res_mix_ptr + token * JIT_HC_MULT * JIT_HC_MULT,
+            packed_sum,
+            lane,
+            route_active,
+            hc_norm_eps,
+            hc_pre_eps,
+            hc_post_scale,
+            sinkhorn_eps,
         )
-        _ = _manual512_b1_projection_ptx(
-            x_ptr,
-            residual_ptr,
-            fn_ptr,
-            new_residual_ptr,
-            y_bf16_ptr,
-            _shared_address(tle.gpu.local_ptr(post_shared, (0, 0))),
-            _shared_address(tle.gpu.local_ptr(comb_shared, (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(0).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(1).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(2).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(q_stages.slot(3).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(0).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(1).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(2).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(fn_stages.slot(3).slot(0), (0, 0))),
-            _shared_address(tle.gpu.local_ptr(projection_shared, (0, 0))),
-            tile,
-            JIT_ACTIVE_K64_BLOCKS,
-            tl.cast(fn_tensormap_ptr, tl.uint64),
-            _shared_address(tle.gpu.local_ptr(fn_tma_barriers, (0,))),
-            JIT_MANUAL_FN_TMA,
-            _shared_address(tle.gpu.local_ptr(q_handoff_barriers, (0,))),
-            JIT_MANUAL_K32_HANDOFF,
-            tl.cast(JIT_TAIL_WORK_PHASE < 3, tl.uint32),
-            token_limit,
+    _manual512_cta_sync()
+    # Projection is dead after routing.  Fill the cache only now so shared
+    # liveness reuse cannot overwrite packed C/square values before lane 24
+    # broadcasts the projection norm.
+    weight_h = tl.arange(0, JIT_HIDDEN)
+    tl.store(
+        tle.gpu.local_ptr(rms_weight_shared, (weight_h,)),
+        tl.load(rmsnorm_weight_ptr + weight_h),
+    )
+    _manual512_cta_sync()
+    worker_idx = physical_warp // 4
+    worker_thread = (physical_warp % 4) * 32 + lane
+    rounded_address = _shared_address(
+        tle.gpu.local_ptr(
+            q_stages.slot(tl.cast(worker_idx, tl.int32)).slot(0),
+            (0, 0),
         )
-        if JIT_PROBE_PHASE >= 1:
-            # All sixteen warps are now converged.  Cache the BF16 RMS row,
-            # route four tokens per warp, then map each aligned four-warp
-            # group to one bandwidth-oriented hidden worker.  The worker
-            # reuses one retired A slot for the exact BF16 rounding boundary.
-            physical_thread = _small._physical_thread_id_x()
-            physical_warp = physical_thread // 32
-            lane = physical_thread % 32
-            for route_batch in tl.static_range(0, 4):
-                route_row = route_batch * 16 + physical_warp
-                token = tile * JIT_BLOCK_M + route_row
-                route_active = token < token_limit
-                packed_sum = tl.load(
-                    tle.gpu.local_ptr(projection_shared, (route_row, lane)),
-                    mask=(lane <= JIT_PROJECTION_OUTPUTS) & route_active,
-                    other=0.0,
+    )
+    weight_address = _shared_address(tle.gpu.local_ptr(rms_weight_shared, (0,)))
+    warp_sums_address = _shared_address(
+        tle.gpu.local_ptr(
+            hidden_warp_sums.slot(tl.cast(worker_idx, tl.int32)),
+            (0,),
+        )
+    )
+    for hidden_batch in tl.range(0, 16):
+        route_row = hidden_batch * 4 + worker_idx
+        token = tile * JIT_BLOCK_M + route_row
+        active = token < token_limit
+        _ = _hidden_shared_round_ptx(
+            tl.cast(new_residual_ptr + token * JIT_FLAT_HIDDEN, tl.uint64),
+            weight_address,
+            tl.cast(y_bf16_ptr + token * JIT_HIDDEN, tl.uint64),
+            _shared_address(
+                tle.gpu.local_ptr(
+                    pre_shared.slot(tl.cast(route_row, tl.int32)),
+                    (0,),
                 )
-                if JIT_TAIL_WORK_PHASE >= 2:
-                    _routing_finalize_predicated(
-                        pre_shared.slot(tl.cast(route_row, tl.int32)),
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        new_post_mix_ptr + token * JIT_HC_MULT,
-                        new_comb_res_mix_ptr + token * JIT_HC_MULT * JIT_HC_MULT,
-                        packed_sum,
-                        lane,
-                        route_active,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                    )
-            _manual512_cta_sync()
-            # Projection is dead after routing.  Fill the cache only now so
-            # shared-liveness reuse cannot overwrite packed C/square values
-            # before lane 24 broadcasts the projection norm.
-            weight_h = tl.arange(0, JIT_HIDDEN)
-            tl.store(
-                tle.gpu.local_ptr(rms_weight_shared, (weight_h,)),
-                tl.load(rmsnorm_weight_ptr + weight_h),
-            )
-            _manual512_cta_sync()
-            if JIT_TAIL_WORK_PHASE >= 3:
-                if JIT_MANUAL_HIDDEN_BATCH4:
-                    for hidden_batch in tl.range(0, 16):
-                        batch_base = hidden_batch * 4
-                        hidden_token = tile * JIT_BLOCK_M + batch_base
-                        live_rows = tl.maximum(
-                            0,
-                            tl.minimum(
-                                4,
-                                tl.minimum(
-                                    JIT_BLOCK_M - batch_base,
-                                    token_limit - hidden_token,
-                                ),
-                            ),
-                        )
-                        _hidden_tail_batch4_no_wait(
-                            pre_shared.slot(tl.cast(batch_base, tl.int32)),
-                            pre_shared.slot(tl.cast(batch_base + 1, tl.int32)),
-                            pre_shared.slot(tl.cast(batch_base + 2, tl.int32)),
-                            pre_shared.slot(tl.cast(batch_base + 3, tl.int32)),
-                            new_residual_ptr + hidden_token * JIT_FLAT_HIDDEN,
-                            rms_weight_shared,
-                            y_bf16_ptr + hidden_token * JIT_HIDDEN,
-                            live_rows,
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-                elif JIT_MANUAL_HIDDEN_BATCH2:
-                    for hidden_batch in tl.range(0, 32):
-                        batch_base = hidden_batch * 2
-                        hidden_token = tile * JIT_BLOCK_M + batch_base
-                        live_rows = tl.maximum(
-                            0,
-                            tl.minimum(
-                                2,
-                                tl.minimum(
-                                    JIT_BLOCK_M - batch_base,
-                                    token_limit - hidden_token,
-                                ),
-                            ),
-                        )
-                        _hidden_tail_batch2_no_wait(
-                            pre_shared.slot(tl.cast(batch_base, tl.int32)),
-                            pre_shared.slot(tl.cast(batch_base + 1, tl.int32)),
-                            new_residual_ptr + hidden_token * JIT_FLAT_HIDDEN,
-                            rms_weight_shared,
-                            y_bf16_ptr + hidden_token * JIT_HIDDEN,
-                            live_rows,
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-                else:
-                    worker_idx = physical_warp // 4
-                    worker_thread = (physical_warp % 4) * 32 + lane
-                    rounded_address = _shared_address(
-                        tle.gpu.local_ptr(
-                            q_stages.slot(tl.cast(worker_idx, tl.int32)).slot(0),
-                            (0, 0),
-                        )
-                    )
-                    weight_address = _shared_address(
-                        tle.gpu.local_ptr(rms_weight_shared, (0,))
-                    )
-                    warp_sums_address = _shared_address(
-                        tle.gpu.local_ptr(
-                            hidden_warp_sums.slot(tl.cast(worker_idx, tl.int32)),
-                            (0,),
-                        )
-                    )
-                    for hidden_batch in tl.range(0, 16):
-                        route_row = hidden_batch * 4 + worker_idx
-                        token = tile * JIT_BLOCK_M + route_row
-                        active = token < token_limit
-                        _ = _hidden_shared_round_selected_ptx(
-                            tl.cast(
-                                new_residual_ptr + token * JIT_FLAT_HIDDEN,
-                                tl.uint64,
-                            ),
-                            weight_address,
-                            tl.cast(
-                                y_bf16_ptr + token * JIT_HIDDEN,
-                                tl.uint64,
-                            ),
-                            _shared_address(
-                                tle.gpu.local_ptr(
-                                    pre_shared.slot(tl.cast(route_row, tl.int32)),
-                                    (0,),
-                                )
-                            ),
-                            rounded_address,
-                            warp_sums_address,
-                            worker_thread,
-                            lane,
-                            active,
-                            1 + worker_idx,
-                            rmsnorm_eps,
-                            rmsnorm_scale,
-                        )
-    else:
-        coeff_ready = tle.gpu.alloc_barrier(arrive_count=JIT_PRODUCER_THREADS)
-        projection_ready = tle.gpu.alloc_barrier(arrive_count=JIT_TOTAL_LOGICAL_THREADS)
-        tle.gpu.warp_specialize(
-            [
-                (
-                    _p384_root,
-                    (
-                        x_ptr,
-                        residual_ptr,
-                        post_mix_ptr,
-                        comb_res_mix_ptr,
-                        fn_ptr,
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        rmsnorm_weight_ptr,
-                        new_residual_ptr,
-                        new_post_mix_ptr,
-                        new_comb_res_mix_ptr,
-                        y_bf16_ptr,
-                        q_stages,
-                        fn_stages,
-                        post_shared,
-                        comb_shared,
-                        projection_shared,
-                        pre_shared,
-                        rms_weight_shared,
-                        hidden_warp_sums,
-                        coeff_ready,
-                        projection_ready,
-                        tile,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                        rmsnorm_eps,
-                        rmsnorm_scale,
-                        token_limit,
-                    ),
-                ),
-                (
-                    _p384_math,
-                    (
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        rmsnorm_weight_ptr,
-                        new_residual_ptr,
-                        new_post_mix_ptr,
-                        new_comb_res_mix_ptr,
-                        y_bf16_ptr,
-                        q_stages,
-                        fn_stages,
-                        projection_shared,
-                        pre_shared,
-                        rms_weight_shared,
-                        hidden_warp_sums,
-                        projection_ready,
-                        tile,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                        rmsnorm_eps,
-                        rmsnorm_scale,
-                        token_limit,
-                    ),
-                ),
-            ],
-            [JIT_MATH_WARPS],
-            [JIT_MATH_REGS],
+            ),
+            rounded_address,
+            warp_sums_address,
+            worker_thread,
+            lane,
+            active,
+            1 + worker_idx,
+            rmsnorm_eps,
+            rmsnorm_scale,
         )
 
 
@@ -3660,13 +1860,6 @@ class P384Plan:
         )
 
     def run(self) -> None:
-        if (
-            ACTIVE_K64_BLOCKS != NUM_K64_BLOCKS
-            or PROBE_PHASE != 1
-            or TAIL_BATCHES != 22
-            or TAIL_WORK_PHASE != 3
-        ):
-            raise RuntimeError("compile-only probe configurations cannot be launched")
         self.run_probe()
 
     def run_probe(self) -> None:
@@ -3680,42 +1873,13 @@ class P384Plan:
         )
 
 
-def _validate_environment(shape_config: P384ShapeConfig) -> tuple[int, bool]:
+def _validate_environment(shape_config: P384ShapeConfig) -> bool:
     prefix = shape_config.env_prefix
     enable_name = f"{prefix}_P384"
     if os.environ.get(enable_name, "0") != "1":
         raise RuntimeError(f"set {enable_name}=1 to enable this exact path")
 
-    expected = {
-        "CTA_MODE": CTA_MODE,
-        "ROOT_WARPS": "12",
-        "WGMMA_K": str(WGMMA_K),
-        "K64_BLOCKS": str(ACTIVE_K64_BLOCKS),
-        "PROBE_PHASE": str(PROBE_PHASE),
-        "TAIL_BATCHES": str(TAIL_BATCHES),
-        "TAIL_WORK_PHASE": str(TAIL_WORK_PHASE),
-        "ACCUM_K64_BLOCKS": str(ACCUM_K64_BLOCKS),
-        "ACCUM_MODE": ACCUM_MODE,
-        "PRODUCER": PRODUCER_MODE,
-        "FN_STAGE": MANUAL_FN_STAGE,
-        "HANDOFF": MANUAL_HANDOFF,
-        "TAIL_SCHEDULE": TAIL_SCHEDULE,
-        "MANUAL_HIDDEN": MANUAL_HIDDEN_MODE,
-    }
-    for suffix, value in expected.items():
-        name = f"{prefix}_{suffix}"
-        actual = os.environ.get(name)
-        if actual not in (None, value):
-            raise RuntimeError(
-                f"{name}={actual!r}, but the admitted P384 path requires " f"{value!r}"
-            )
-
-    maxnreg_name = f"{prefix}_MAXNREG"
-    maxnreg = int(os.environ.get(maxnreg_name, str(COMPILE_CONFIG.maxnreg)))
-    if maxnreg not in (40, 44, 48, 56, 64, 72, 80, 84):
-        raise ValueError(f"{maxnreg_name} must be 40/44/48/56/64/72/80/84")
-    dispatch_enabled = os.environ.get(f"{prefix}_ADMITTED", "0") == "1"
-    return maxnreg, dispatch_enabled
+    return os.environ.get(f"{prefix}_ADMITTED", "0") == "1"
 
 
 def prepare_p384_plan(
@@ -3726,7 +1890,8 @@ def prepare_p384_plan(
     plan_type: type[P384Plan] = P384Plan,
 ) -> P384Plan:
     """Validate the complete pinned profile; allocate no device workspace."""
-    maxnreg, dispatch_enabled = _validate_environment(shape_config)
+    dispatch_enabled = _validate_environment(shape_config)
+    maxnreg = COMPILE_CONFIG.maxnreg
     tokens = shape_config.tokens
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("prepare the eager p384 plan outside capture")
@@ -3805,20 +1970,11 @@ def prepare_p384_plan(
     )
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("all tensors must be on one CUDA device")
-    if MANUAL_FN_STAGE == "tma":
-        # PTX permits the opaque tensor map in global memory.  Encoding and
-        # the 128-byte H2D copy happen during plan preparation, never in the
-        # timed one-kernel interval.
-        from .sm90_global_tensormap_inline_probe import (
-            _encode_global_tensor_map,
-        )
+    # Encoding and the 128-byte H2D copy happen during plan preparation,
+    # never in the timed one-kernel interval.
+    from .sm90_global_tensormap_inline_probe import _encode_global_tensor_map
 
-        fn_tensormap_storage = _encode_global_tensor_map(tensors[4])
-    else:
-        # Preserve one stable kernel signature for the cp.async A/B.
-        fn_tensormap_storage = torch.empty(
-            (1,), dtype=torch.uint8, device=tensors[0].device
-        )
+    fn_tensormap_storage = _encode_global_tensor_map(tensors[4])
     kernel_tensors = (*tensors, fn_tensormap_storage)
 
     expected_scalars = {
@@ -3867,14 +2023,10 @@ def prepare_p384_plan(
         "target_registers_per_thread": maxnreg,
         "producer_pipeline_stages": PIPE_STAGES,
         "producer_mode": PRODUCER_MODE,
-        "fn_stage_mode": MANUAL_FN_STAGE,
-        "fn_tensormap_storage_bytes": (128 if MANUAL_FN_STAGE == "tma" else 0),
+        "fn_stage_mode": COMPILE_CONFIG.fn_stage,
+        "fn_tensormap_storage_bytes": 128,
         "active_k64_blocks": ACTIVE_K64_BLOCKS,
-        "accum_k64_blocks": ACCUM_K64_BLOCKS,
         "accum_mode": ACCUM_MODE,
-        "probe_phase": PROBE_PHASE,
-        "tail_batches": TAIL_BATCHES,
-        "tail_work_phase": TAIL_WORK_PHASE,
         "a_storage": "bf16_shared_to_fp32_register",
         "wgmma": f"RS TF32 M64N32K{WGMMA_K} serial wait0",
         "synchronization": "cta_local_named_full_empty_ring",
