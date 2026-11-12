@@ -1220,6 +1220,19 @@ ops:
       - MoE
     stages:
       - stable: '4.2'
+  - id: mqa_logits
+    description: Weighted MQA logits with explicit shared or per-query key storage
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+      - MetaX
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
+
   - id: mrope
     description: |
       Applies multi-modal rotary positional embeddings to query and key tensors,
@@ -1304,6 +1317,18 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: paged_mqa_logits
+    description: Paged MQA logits with common FP8 and MetaX BF16 query contracts
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+      - MetaX
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,

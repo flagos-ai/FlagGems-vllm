@@ -58,6 +58,9 @@ if triton_version_utils.has_triton_tle():
 else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
+from flaggems_vllm.runtime.backend._metax.ops.mqa_logits import mqa_logits
+from flaggems_vllm.runtime.backend._metax.ops.paged_mqa_logits import paged_mqa_logits
+
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "fused_experts_impl",
@@ -68,7 +71,9 @@ __all__ = [
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "mqa_logits",
     "outplace_fused_experts",
+    "paged_mqa_logits",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",

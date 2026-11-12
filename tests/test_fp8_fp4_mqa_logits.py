@@ -18,6 +18,10 @@ import torch
 try:
     from vllm.platforms import current_platform
     from vllm.third_party.deep_gemm.utils import per_custom_dims_cast_to_fp8
+    from vllm.third_party.deep_gemm.utils.math import (
+        cast_back_from_fp4,
+        per_token_cast_to_fp4,
+    )
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits as vllm_fp8_fp4_mqa_logits
 
     VLLM_AVAILABLE = True
@@ -26,10 +30,6 @@ except ImportError:
     VLLM_AVAILABLE = False
     SM90_AVAILABLE = False
 
-from vllm.third_party.deep_gemm.utils.math import (
-    cast_back_from_fp4,
-    per_token_cast_to_fp4,
-)
 
 import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits

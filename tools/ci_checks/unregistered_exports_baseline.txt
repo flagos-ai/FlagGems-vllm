@@ -34,7 +34,6 @@ mhc_rms_norm
 moe_align_block_size
 moe_align_block_size_no_tle
 pad_attention_heads
-paged_mqa_logits
 parallel_nsa
 parallel_nsa_compression
 permute_copy
