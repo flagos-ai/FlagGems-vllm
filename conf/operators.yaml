@@ -512,6 +512,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: flash_mla_sparse_fwd_w8a8
+    description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and shared key/value.
+    for:
+      - flash_mla_sparse_fwd_w8a8
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: flash_mla_with_kvcache
     description: Dense and sparse Multi-head Latent Attention decoding with a paged
       KV cache.
@@ -1292,6 +1304,16 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: pad_indexer_heads
+    description: Append zero heads to GLM5Next FP8 queries and per-head weights with bit-preserving copies.
+    for:
+      - None
+    labels:
+      - vLLM
+    kind:
+      - DataMovement
+    stages:
+      - beta: '0.3'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,
@@ -1645,6 +1667,17 @@ ops:
       - MoE
     stages:
       - beta: '5.3'
+  - id: triton_ihc_post
+    description: iHC gated residual scatter with unfused FP32 multiply and addition.
+    for:
+      - triton_ihc_post
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.4'
   - id: triton_lighting_indexer_k_tiled_interface
     description: Part of FP8 MQA framework. It is currently not exposed as an operator
       for use.

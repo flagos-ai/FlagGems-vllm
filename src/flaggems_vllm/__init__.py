@@ -60,10 +60,13 @@ _LIBRARY_ONLY_OPS = frozenset(
         "fused_indexer_weight_scale",
         "grouped_gemma_rmsnorm",
         "hc_combine",
+        "ihc_post",
         "top_k_top_p",
         "triton_reshape_and_cache_flash",
+        "triton_ihc_post",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
+        "pad_indexer_heads",
     }
 )
 

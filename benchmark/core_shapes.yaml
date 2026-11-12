@@ -663,6 +663,29 @@ bmm_w8a8:
     - [4, 129, 17, 257]
   shape_desc: "B, M, N, K"
 
+flash_mla_sparse_fwd_w8a8:
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV, sink, topk_length, seed"
+  shapes:
+    - [16, 64, 512, 1114624, 1, 640, 512, false, false, 0]
+    - [16, 64, 512, 98816, 1, 8320, 512, false, false, 1]
+    - [4112, 64, 512, 1114624, 1, 640, 512, false, false, 2]
+    - [4112, 64, 512, 98816, 1, 8320, 512, false, false, 3]
+    - [4, 64, 512, 1114624, 1, 640, 512, false, false, 4]
+    - [4, 64, 512, 98816, 1, 8320, 512, false, false, 5]
+    - [16, 64, 512, 66048, 1, 128, 512, false, false, 6]
+    - [16384, 64, 512, 1114624, 1, 640, 512, false, false, 7]
+    - [4100, 64, 512, 1114624, 1, 640, 512, false, false, 8]
+    - [16384, 64, 512, 98816, 1, 8320, 512, false, false, 9]
+    - [4100, 64, 512, 98816, 1, 8320, 512, false, false, 10]
+    - [1028, 64, 512, 1114624, 1, 640, 512, false, false, 11]
+    - [1028, 64, 512, 98816, 1, 8320, 512, false, false, 12]
+    - [4047, 64, 512, 1114624, 1, 640, 512, false, false, 13]
+    - [16383, 64, 512, 1114624, 1, 640, 512, false, false, 14]
+    - [4047, 64, 512, 98816, 1, 8320, 512, false, false, 15]
+    - [16383, 64, 512, 98816, 1, 8320, 512, false, false, 16]
+    - [12, 64, 512, 1114624, 1, 640, 512, false, false, 17]
+    - [12, 64, 512, 98816, 1, 8320, 512, false, false, 18]
+    - [4112, 64, 512, 66048, 1, 128, 512, false, false, 19]
 qsa_sparse_paged_attention:
   shapes:
     # From Qwen3.8-Flash-Next-FP8 production captures.
