@@ -1046,7 +1046,7 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
-  - id: kda_gate_cumsum
+  - id: kda_gate_cumsum_triton
     description: |
       Fused Triton replacement for the AscendC kda_gate_cumsum operator:
       computes the safe sigmoid gates of Kimi Delta Attention and their
