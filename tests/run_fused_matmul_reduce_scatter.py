@@ -11,6 +11,8 @@ Each worker calls torch.ops.symm_mem.fused_matmul_reduce_scatter and compares it
 against an FP32 mathematical reference with a low-precision roundoff budget.
 Any rank's mismatch fails every worker.
 Use --comm-only to check Torch NCCL/RCCL without importing TLE or FlagGems-vllm.
+Use --bootstrap tle --benchmark [pytest options] to run the benchmark suite after
+the same TLE initialization; benchmark shapes and dtypes are defined by the suite.
 """
 
 import argparse
@@ -20,6 +22,7 @@ import os
 import signal
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
 
 def _positive_int(value):
@@ -130,6 +133,19 @@ def _operator_group(parser, local_rank, bootstrap):
                 dist.destroy_process_group()
 
 
+def _run_benchmark(pytest_args):
+    # Import pytest and its conftest/operator dependencies only after bootstrap.
+    import pytest
+
+    benchmark = (
+        Path(__file__).resolve().parents[1]
+        / "benchmark"
+        / "test_fused_matmul_reduce_scatter.py"
+    )
+    print(f"[rank {os.environ['RANK']}] benchmark begin (reusing group)", flush=True)
+    return pytest.main(["-q", "-s", str(benchmark), *pytest_args])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
@@ -151,10 +167,16 @@ def main():
         default="torch",
         help="tle reuses the original tutorial's get_mem_pool initialization",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--comm-only",
         action="store_true",
         help="only check Torch NCCL/RCCL init and all-reduce; skip TLE and FlagGems-vllm",
+    )
+    mode.add_argument(
+        "--benchmark",
+        nargs=argparse.REMAINDER,
+        help="run the benchmark suite after bootstrap; forward all remaining options to pytest",
     )
     args = parser.parse_args()
 
@@ -181,8 +203,14 @@ def main():
         device = _select_device(parser, local_rank)
         _check_communication(device, args.repeat)
         return
+    exit_code = 0
     with _operator_group(parser, local_rank, args.bootstrap) as (group, device):
-        _check_operator(args, parser, group, device)
+        if args.benchmark is not None:
+            exit_code = _run_benchmark(args.benchmark)
+        else:
+            _check_operator(args, parser, group, device)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 def _check_operator(args, parser, group, device):

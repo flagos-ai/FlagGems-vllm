@@ -51,11 +51,15 @@ def distributed_context():
     owns_group = not dist.is_initialized()
     if owns_group:
         dist.init_process_group("nccl", device_id=device)
-    with use_symm_mem():
-        yield dist.group.WORLD, device
-    clear_fused_matmul_reduce_scatter_cache()
-    if owns_group:
-        dist.destroy_process_group()
+    try:
+        with use_symm_mem():
+            yield dist.group.WORLD, device
+    finally:
+        try:
+            clear_fused_matmul_reduce_scatter_cache()
+        finally:
+            if owns_group:
+                dist.destroy_process_group()
 
 
 def _score(call, group, device):
