@@ -52,6 +52,11 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+chunk_kda_fwd_intra_token_parallel:
+  shapes:
+    - [1, 32, 128]
+    - [1, 32, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
+  shape_desc: "B, H, sequence_lengths... (packed when multiple)"
 fused_indexer_weight_scale:
   # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
   shapes:
