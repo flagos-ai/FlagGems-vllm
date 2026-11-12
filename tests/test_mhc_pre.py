@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Accuracy tests for the Ascend standalone ``npu_mhc_pre`` operator.
+"""Shared mHC pre contract tests with explicit backend-specific coverage.
 
-Style mirrors the other platform-operator tests (e.g.
-tests/test_scaled_int8_quant.py): call through the package-level name
-``flaggems_vllm.npu_mhc_pre`` so the vendor registry resolution is what is
-actually exercised, guarded by ``flaggems_vllm.vendor_name``.
-
-``flaggems_vllm.mhc_pre`` stays the generic variant on Ascend (``npu_mhc_pre``
-registers under its own name), so the existing generic tests are unaffected.
-
+Ascend's standalone npu_mhc_pre uses its clamped model contract; the MetaX
+public mhc_pre path is checked against the independent generic CPU reference.
+Backend requirements are attached to individual tests, never the whole module.
 """
 
 import pytest
@@ -262,3 +257,113 @@ def test_npu_mhc_pre_generic_parity(n, hidden_size, hc_mult):
     _assert_close(out_post, post_ref, case + "/post")
     _assert_close(out_comb, comb_ref, case + "/comb")
     _assert_close(out_li, li_ref, case + "/li")
+
+
+# MetaX graph/layout checks share this file with the Ascend accuracy cases.
+requires_metax = pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX public-path contract"
+)
+
+
+@requires_metax
+@pytest.mark.mhc_pre
+@pytest.mark.parametrize(
+    "rows,hidden",
+    [(1, 4096), (32, 4096), (64, 4096), (65, 4096), (128, 4096), (129, 4096), (3, 128)],
+)
+def test_public_mhc_pre_reference_and_new_input_replay(rows, hidden):
+    from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre_ref
+
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(rows, 4, hidden)
+    result = []
+
+    def call():
+        result[:] = flaggems_vllm.mhc_pre(**data)
+
+    def check():
+        cpu = {
+            k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in data.items()
+        }
+        expected = mhc_pre_ref(**cpu)
+        for actual, reference in zip(result, expected):
+            torch.testing.assert_close(actual.cpu(), reference, rtol=1e-2, atol=1e-2)
+
+    call()
+    check()
+    for _ in range(3):
+        call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for value in (0.5, -0.75):
+        data["residual"].fill_(value)
+        for output in result:
+            output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+
+
+@requires_metax
+@pytest.mark.mhc_pre
+def test_mhc_pre_empty_batch_preserves_shape():
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(0, 4, 4096)
+    post, comb, layer = flaggems_vllm.mhc_pre(**data)
+    assert post.shape == (0, 4, 1) and comb.shape == (0, 4, 4)
+    assert layer.shape == (0, 4096) and layer.dtype == torch.bfloat16
+
+
+@requires_metax
+@pytest.mark.mhc_pre
+def test_mhc_pre_mixed_device_rejected_before_mutation():
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(1, 4, 4096)
+    data["fn"] = data["fn"].cpu()
+    before = {
+        key: value.clone()
+        for key, value in data.items()
+        if isinstance(value, torch.Tensor)
+    }
+    with pytest.raises(ValueError, match="share an accelerator"):
+        flaggems_vllm.mhc_pre(**data)
+    for key, value in before.items():
+        assert torch.equal(data[key], value)
+
+
+@requires_metax
+@pytest.mark.mhc_pre
+def test_mhc_pre_nondefault_splits_preserves_common_warning():
+    from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre_ref
+
+    from .test_mhc_ops import generate_mhc_pre_data
+
+    data = generate_mhc_pre_data(1, 4, 4096)
+    data["n_splits"] = 2
+    with pytest.warns(RuntimeWarning, match="n_splits"):
+        actual = flaggems_vllm.mhc_pre(**data)
+    reference = {
+        key: value.cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in data.items()
+        if key != "n_splits"
+    }
+    for result, expected in zip(actual, mhc_pre_ref(**reference)):
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.fixture(autouse=True)
+def restore_mhc_test_rng_state():
+    # The upstream data helper deliberately seeds globally; contain that effect
+    # within each test rather than leaking it into another operator's tests.
+    if flaggems_vllm.vendor_name != "metax":
+        yield
+        return
+    cpu, gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
+    yield
+    torch.set_rng_state(cpu)
+    torch.cuda.set_rng_state(gpu)
