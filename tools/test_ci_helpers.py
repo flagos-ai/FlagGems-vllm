@@ -821,6 +821,8 @@ class CiSummaryTest(unittest.TestCase):
             "SELECT_TARGETS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
+            "PPU_EXPECTED": "false",
+            "PPU_RESULT": "skipped",
             "SHOULD_RUN": "false",
             "HAS_NON_NVIDIA_BACKENDS": "false",
             "EVENT_NAME": "push",
@@ -867,6 +869,7 @@ class CiSummaryTest(unittest.TestCase):
                 "NVIDIA_RUN_ALLOWED": "false",
                 "NON_NVIDIA_RUN_ALLOWED": "false",
             },
+            "required_ppu_passed": {"PPU_EXPECTED": "true", "PPU_RESULT": "success"},
             "no_targets": {},
         }
 
@@ -889,6 +892,13 @@ class CiSummaryTest(unittest.TestCase):
                 "NON_NVIDIA_RESULT": "failure",
             },
             "unexpected_backend_run": {"NON_NVIDIA_RESULT": "success"},
+            "unexpected_ppu_run": {"PPU_RESULT": "success"},
+            "required_ppu_failure": {"PPU_EXPECTED": "true", "PPU_RESULT": "failure"},
+            "required_ppu_skipped": {"PPU_EXPECTED": "true", "PPU_RESULT": "skipped"},
+            "required_ppu_cancelled": {
+                "PPU_EXPECTED": "true",
+                "PPU_RESULT": "cancelled",
+            },
         }
 
         for name, values in cases.items():

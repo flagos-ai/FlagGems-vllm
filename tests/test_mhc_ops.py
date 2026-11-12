@@ -456,10 +456,10 @@ def test_hc_head_fused_kernel_vs_vllm(n, hidden_size, hc_mult):
 
 @pytest.mark.mhc_post
 @pytest.mark.parametrize("vendor", ["thead", "nvidia"])
-@pytest.mark.parametrize("has_adjust_block_size", [False, True])
+@pytest.mark.parametrize("initial_adjust_block_size", [None, False, True])
 @pytest.mark.parametrize("execution_error", [False, True])
 def test_mhc_post_optional_compiler_knob_restored(
-    monkeypatch, vendor, has_adjust_block_size, execution_error
+    monkeypatch, vendor, initial_adjust_block_size, execution_error
 ):
     import importlib
     import sys
@@ -471,9 +471,10 @@ def test_mhc_post_optional_compiler_knob_restored(
     thead = ModuleType(name)
     thead.mhc_post_hc4_tokloop = None
     monkeypatch.setitem(sys.modules, name, thead)
+    has_adjust_block_size = initial_adjust_block_size is not None
     knobs = SimpleNamespace()
     if has_adjust_block_size:
-        knobs.adjust_block_size = True
+        knobs.adjust_block_size = initial_adjust_block_size
     monkeypatch.setattr(module.triton.knobs, "autotuning", knobs)
     monkeypatch.setattr(module.runtime, "device", SimpleNamespace(vendor_name=vendor))
     calls = []
@@ -510,4 +511,4 @@ def test_mhc_post_optional_compiler_knob_restored(
     assert calls == [1]
     assert hasattr(knobs, "adjust_block_size") is has_adjust_block_size
     if has_adjust_block_size:
-        assert knobs.adjust_block_size is True
+        assert knobs.adjust_block_size is initial_adjust_block_size

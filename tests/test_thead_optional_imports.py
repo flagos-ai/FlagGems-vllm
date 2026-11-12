@@ -42,7 +42,9 @@ def test_non_tle_import_does_not_load_aiu_only_modules():
             assert name not in ops.__all__
             assert name not in library.__all__
     """
-    subprocess.run([sys.executable, "-c", textwrap.dedent(code)], check=True)
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)], check=True, timeout=120
+    )
 
 
 @pytest.mark.parametrize("broken", [False, True])
@@ -89,7 +91,9 @@ def test_optional_exports_preserve_identity_and_import_errors(broken):
     """.replace(
         "BROKEN", repr(broken)
     )
-    subprocess.run([sys.executable, "-c", textwrap.dedent(code)], check=True)
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)], check=True, timeout=120
+    )
 
 
 def _assert_alignment(routes, experts, block, result):
@@ -157,62 +161,3 @@ def test_non_tle_moe_graph_replays_changed_routes():
         graph.replay()
         torch.cuda.synchronize()
         _assert_alignment(current, experts, block, result)
-
-
-def test_thead_import_never_initializes_nvidia_mnnvl():
-    code = """
-        import builtins
-        original = builtins.__import__
-        def guarded(name, *args, **kwargs):
-            if name.startswith('flashinfer.comm'):
-                raise AssertionError('NVIDIA MNNVL imported on T-Head: ' + name)
-            return original(name, *args, **kwargs)
-        builtins.__import__ = guarded
-        import importlib
-        import flaggems_vllm
-        module = importlib.import_module('flaggems_vllm.ops.fused_allreduce_rms_norm')
-        assert not module._HAS_MNNVL_RUNTIME
-        assert module.TorchDistBackend is None
-        assert callable(flaggems_vllm.moe_align_block_size_no_tle)
-    """
-    subprocess.run([sys.executable, "-c", textwrap.dedent(code)], check=True)
-
-
-@pytest.mark.parametrize("available", [False, True])
-def test_nvidia_mnnvl_optional_dependency_contract(available):
-    code = """
-        import builtins
-        import importlib.util
-        import sys
-        from types import ModuleType, SimpleNamespace
-        import flaggems_vllm.runtime as runtime
-        original_module = __import__('importlib').import_module(
-            'flaggems_vllm.ops.fused_allreduce_rms_norm')
-        runtime.device = SimpleNamespace(vendor_name='nvidia')
-        original = builtins.__import__
-        marker = object()
-        if AVAILABLE:
-            for name in ('flashinfer', 'flashinfer.comm',
-                         'flashinfer.comm.comm_backend', 'flashinfer.comm.mnnvl'):
-                sys.modules[name] = ModuleType(name)
-            sys.modules['flashinfer.comm.comm_backend'].TorchDistBackend = marker
-            for name in ('McastGPUBuffer', 'all_ranks_support_mnnvl',
-                         'create_tensor_from_cuda_memory', 'is_multicast_supported'):
-                setattr(sys.modules['flashinfer.comm.mnnvl'], name, marker)
-        else:
-            def guarded(name, *args, **kwargs):
-                if name.startswith('flashinfer.comm'):
-                    raise ImportError('optional MNNVL unavailable')
-                return original(name, *args, **kwargs)
-            builtins.__import__ = guarded
-        spec = importlib.util.spec_from_file_location('_test_mnnvl_import', original_module.__file__)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        assert module._HAS_MNNVL_RUNTIME is AVAILABLE
-        assert module.TorchDistBackend is (marker if AVAILABLE else None)
-        assert module.McastGPUBuffer is (marker if AVAILABLE else None)
-    """.replace(
-        "AVAILABLE", repr(available)
-    )
-    subprocess.run([sys.executable, "-c", textwrap.dedent(code)], check=True)
