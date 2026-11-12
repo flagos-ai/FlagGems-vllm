@@ -18,12 +18,11 @@ is research-only and is never selected by production dispatch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
-
 
 TOKENS = 400
 _EXPECTED_IMPLEMENTATION_SHA256 = (
@@ -55,8 +54,7 @@ for _name, _expected in _EXACT_ENVIRONMENT.items():
     _actual = os.environ.get(_name)
     if _actual not in (None, _expected):
         raise RuntimeError(
-            f"{_name}={_actual!r}, but T400 non-striped requires "
-            f"{_expected!r}"
+            f"{_name}={_actual!r}, but T400 non-striped requires " f"{_expected!r}"
         )
     os.environ[_name] = _expected
 
@@ -65,17 +63,13 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 from .. import fused_post_gemm_t64 as _t64  # noqa: E402
+from . import sm90_eager_p384_rs_wgmma as _p384_tail_helpers  # noqa: E402
 from . import sm90_large_graph_split16_rs_wgmma as _implementation  # noqa: E402
-from .sm90_eager_t12991_p384_rs_wgmma import (  # noqa: E402
-    _serial_quad_post_ptx as _t400_tail_quad_post_ptx,
-)
-
 
 _base = _implementation._base
+_t400_tail_quad_post_ptx = _p384_tail_helpers._serial_quad_post_ptx
 _IMPLEMENTATION_SOURCE = Path(_implementation.__file__).resolve()
-_IMPLEMENTATION_SHA256 = hashlib.sha256(
-    _IMPLEMENTATION_SOURCE.read_bytes()
-).hexdigest()
+_IMPLEMENTATION_SHA256 = hashlib.sha256(_IMPLEMENTATION_SOURCE.read_bytes()).hexdigest()
 if _IMPLEMENTATION_SHA256 != _EXPECTED_IMPLEMENTATION_SHA256:
     raise RuntimeError(
         "T400 admission pins split16 RS implementation SHA256 "
@@ -136,16 +130,11 @@ def _t400_issue_fn_cp_async_n24(
         row = thread // 16
         column = (thread % 16) * 4
         global_address = tl.cast(
-            fn_ptr
-            + row * _implementation.JIT_FLAT_HIDDEN
-            + flat_hidden_base
-            + column,
+            fn_ptr + row * _implementation.JIT_FLAT_HIDDEN + flat_hidden_base + column,
             tl.uint64,
         )
         shared_address = _implementation._quad._shared_address(
-            _implementation.tle.gpu.local_ptr(
-                fn_stages.slot(stage), (row, column)
-            )
+            _implementation.tle.gpu.local_ptr(fn_stages.slot(stage), (row, column))
         )
         _ = _implementation._fn_cp._cp_async_cg_16b_zero_fill(
             shared_address, global_address, 16
@@ -208,12 +197,35 @@ def _t400_exact_tail_root(
     # eight live warps and zero-fill warps without intra-warp divergence.
     if tile < 6:
         _original_root(
-            x_ptr, residual_ptr, post_mix_ptr, comb_res_mix_ptr, fn_ptr,
-            new_residual_ptr, partials_ptr, q_stages, fn_stages, ready0,
-            ready1, done0, done1, producer_ready, grid_acquire_ready,
-            coeff_ready, post_shared, comb_shared, weight_dummy, pre_shared,
-            rmsnorm_weight_ptr, y_bf16_ptr, grid_counter_ptr, tile, split,
-            pid, is_producer, rmsnorm_eps, rmsnorm_scale,
+            x_ptr,
+            residual_ptr,
+            post_mix_ptr,
+            comb_res_mix_ptr,
+            fn_ptr,
+            new_residual_ptr,
+            partials_ptr,
+            q_stages,
+            fn_stages,
+            ready0,
+            ready1,
+            done0,
+            done1,
+            producer_ready,
+            grid_acquire_ready,
+            coeff_ready,
+            post_shared,
+            comb_shared,
+            weight_dummy,
+            pre_shared,
+            rmsnorm_weight_ptr,
+            y_bf16_ptr,
+            grid_counter_ptr,
+            tile,
+            split,
+            pid,
+            is_producer,
+            rmsnorm_eps,
+            rmsnorm_scale,
         )
     else:
         physical_thread = _t64._physical_thread_id_x()
@@ -229,9 +241,7 @@ def _t400_exact_tail_root(
         comb_rows = local_m[:, None] + 0 * comb_column[None, :]
         comb_columns = 0 * local_m[:, None] + comb_column[None, :]
         tl.store(
-            _implementation.tle.gpu.local_ptr(
-                post_shared, (post_rows, post_columns)
-            ),
+            _implementation.tle.gpu.local_ptr(post_shared, (post_rows, post_columns)),
             tl.load(
                 post_mix_ptr
                 + tokens[:, None] * _implementation.JIT_HC_MULT
@@ -239,9 +249,7 @@ def _t400_exact_tail_root(
             ),
         )
         tl.store(
-            _implementation.tle.gpu.local_ptr(
-                comb_shared, (comb_rows, comb_columns)
-            ),
+            _implementation.tle.gpu.local_ptr(comb_shared, (comb_rows, comb_columns)),
             tl.load(
                 comb_res_mix_ptr
                 + tokens[:, None]
@@ -252,30 +260,34 @@ def _t400_exact_tail_root(
         )
         _implementation.tle.gpu.barrier_wait(coeff_ready)
 
-        for hb in tl.static_range(
-            0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT
-        ):
+        for hb in tl.static_range(0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT):
             hidden_base = (
                 split * _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT + hb
             ) * _implementation.JIT_BLOCK_K
             _implementation._issue_fn_cp_async_k64(
-                fn_ptr, fn_stages,
+                fn_ptr,
+                fn_stages,
                 (hb % 2) * _implementation.JIT_HC_MULT,
-                hidden_base, physical_thread,
+                hidden_base,
+                physical_thread,
             )
             _implementation._issue_fn_cp_async_k64(
-                fn_ptr, fn_stages,
+                fn_ptr,
+                fn_stages,
                 (hb % 2) * _implementation.JIT_HC_MULT + 1,
-                _implementation.JIT_HIDDEN + hidden_base, physical_thread,
+                _implementation.JIT_HIDDEN + hidden_base,
+                physical_thread,
             )
             _implementation._issue_fn_cp_async_k64(
-                fn_ptr, fn_stages,
+                fn_ptr,
+                fn_stages,
                 (hb % 2) * _implementation.JIT_HC_MULT + 2,
                 2 * _implementation.JIT_HIDDEN + hidden_base,
                 physical_thread,
             )
             _implementation._issue_fn_cp_async_k64(
-                fn_ptr, fn_stages,
+                fn_ptr,
+                fn_stages,
                 (hb % 2) * _implementation.JIT_HC_MULT + 3,
                 3 * _implementation.JIT_HIDDEN + hidden_base,
                 physical_thread,
@@ -293,40 +305,31 @@ def _t400_exact_tail_root(
                 hidden_quad = hidden_base + column
                 q_address0 = _implementation._quad._shared_address(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT
-                        ),
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT),
                         (row, column),
                     )
                 )
                 q_address1 = _implementation._quad._shared_address(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT + 1
-                        ),
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + 1),
                         (row, column),
                     )
                 )
                 q_address2 = _implementation._quad._shared_address(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT + 2
-                        ),
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + 2),
                         (row, column),
                     )
                 )
                 q_address3 = _implementation._quad._shared_address(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT + 3
-                        ),
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + 3),
                         (row, column),
                     )
                 )
                 _ = _t400_tail_quad_post_ptx(
                     tl.cast(
-                        x_ptr + token * _implementation.JIT_HIDDEN
-                        + hidden_quad,
+                        x_ptr + token * _implementation.JIT_HIDDEN + hidden_quad,
                         tl.uint64,
                     ),
                     tl.cast(
@@ -342,37 +345,31 @@ def _t400_exact_tail_root(
                         tl.uint64,
                     ),
                     _implementation._quad._shared_address(
-                        _implementation.tle.gpu.local_ptr(
-                            post_shared, (row, 0)
-                        )
+                        _implementation.tle.gpu.local_ptr(post_shared, (row, 0))
                     ),
                     _implementation._quad._shared_address(
-                        _implementation.tle.gpu.local_ptr(
-                            comb_shared, (row, 0)
-                        )
+                        _implementation.tle.gpu.local_ptr(comb_shared, (row, 0))
                     ),
-                    q_address0, q_address1, q_address2, q_address3,
-                    True, True,
+                    q_address0,
+                    q_address1,
+                    q_address2,
+                    q_address3,
+                    True,
+                    True,
                 )
                 quad_square = 0.0
-                for channel in tl.static_range(
-                    0, _implementation.JIT_HC_MULT
-                ):
-                    v0, v1, v2, v3 = (
-                        _implementation._eager._load_global_bf16x4_masked(
-                            tl.cast(
-                                new_residual_ptr
-                                + token * _implementation.JIT_FLAT_HIDDEN
-                                + channel * _implementation.JIT_HIDDEN
-                                + hidden_quad,
-                                tl.uint64,
-                            ),
-                            True,
-                        )
+                for channel in tl.static_range(0, _implementation.JIT_HC_MULT):
+                    v0, v1, v2, v3 = _implementation._eager._load_global_bf16x4_masked(
+                        tl.cast(
+                            new_residual_ptr
+                            + token * _implementation.JIT_FLAT_HIDDEN
+                            + channel * _implementation.JIT_HIDDEN
+                            + hidden_quad,
+                            tl.uint64,
+                        ),
+                        True,
                     )
-                    quad_square += (
-                        v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3
-                    )
+                    quad_square += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3
                 reduced_square = _implementation._eager._half_warp_reduce16_sum(
                     quad_square
                 )
@@ -414,9 +411,16 @@ def _t400_exact_tail_root(
                 _base._full_tail_barrier_sync()
                 if _implementation.JIT_PROBE_PHASE >= 4:
                     _base._pipe_role4_hidden_tail(
-                        weight_dummy, pre_shared, new_residual_ptr,
-                        rmsnorm_weight_ptr, y_bf16_ptr, pid, tile, split,
-                        rmsnorm_eps, rmsnorm_scale,
+                        weight_dummy,
+                        pre_shared,
+                        new_residual_ptr,
+                        rmsnorm_weight_ptr,
+                        y_bf16_ptr,
+                        pid,
+                        tile,
+                        split,
+                        rmsnorm_eps,
+                        rmsnorm_scale,
                     )
 
 
@@ -433,10 +437,7 @@ def _t400_active_cta_hidden_tail(
     rmsnorm_eps,
     rmsnorm_scale,
 ):
-    first_token = (
-        tile * _implementation.JIT_BLOCK_M
-        + split * _base.JIT_NUM_ROLES
-    )
+    first_token = tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
     if first_token < _implementation.JIT_TOKENS:
         _original_hidden_tail(
             weight_shared,
@@ -482,9 +483,7 @@ def _t400_nonstriped_math(
         tl.float32,
     )
     if is_producer:
-        for hb in tl.static_range(
-            0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT
-        ):
+        for hb in tl.static_range(0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT):
             if hb % 2 == 0:
                 _implementation.tle.gpu.barrier_wait(ready0)
             else:
@@ -492,38 +491,29 @@ def _t400_nonstriped_math(
             for channel in tl.static_range(0, _implementation.JIT_HC_MULT):
                 q_registers = tl.load(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT + channel
-                        )
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + channel)
                     )
                 ).to(tl.float32)
                 accumulator = _implementation.tle.gpu.wgmma(
                     q_registers,
-                    fn_stages.slot(
-                        (hb % 2) * _implementation.JIT_HC_MULT + channel
-                    ),
+                    fn_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + channel),
                     accumulator,
                     input_precision="tf32",
                     trans_b=True,
                 )
-                accumulator = _implementation.tle.gpu.wgmma_wait(
-                0, accumulator
-                )
+                accumulator = _implementation.tle.gpu.wgmma_wait(0, accumulator)
             if hb % 2 == 0:
                 _implementation.tle.gpu.barrier_wait(done0)
             else:
                 _implementation.tle.gpu.barrier_wait(done1)
 
-        m = (
-            tile * _implementation.JIT_BLOCK_M
-            + tl.arange(0, _implementation.JIT_BLOCK_M)
+        m = tile * _implementation.JIT_BLOCK_M + tl.arange(
+            0, _implementation.JIT_BLOCK_M
         )
         n = tl.arange(0, _implementation.JIT_BLOCK_N)
         tl.store(
             partials_ptr
-            + split
-            * _implementation.JIT_TOKENS
-            * _implementation.JIT_BLOCK_N
+            + split * _implementation.JIT_TOKENS * _implementation.JIT_BLOCK_N
             + m[:, None] * _implementation.JIT_BLOCK_N
             + n[None, :],
             accumulator,
@@ -534,25 +524,18 @@ def _t400_nonstriped_math(
     _implementation.tle.gpu.barrier_wait(producer_ready)
     if _implementation.JIT_PROBE_PHASE >= 2:
         physical_thread = _t64._physical_thread_id_x()
-        _ = _t400_tile_barrier(
-            tl.cast(partials_ptr, tl.uint64), physical_thread
-        )
+        _ = _t400_tile_barrier(tl.cast(partials_ptr, tl.uint64), physical_thread)
         _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
         if _implementation.JIT_PROBE_PHASE >= 3:
             lane = physical_thread % 32
-            role = (
-                physical_thread - _implementation.JIT_ROOT_THREADS
-            ) // 32
+            role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
             first_token = (
-                tile * _implementation.JIT_BLOCK_M
-                + split * _base.JIT_NUM_ROLES
+                tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
             )
             if first_token < _implementation.JIT_TOKENS:
                 token = first_token + role
                 packed_sum = 0.0
-                for source_split in tl.static_range(
-                    0, _implementation.JIT_NUM_SPLITS
-                ):
+                for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
                     packed_sum += tl.load(
                         partials_ptr
                         + source_split
@@ -560,8 +543,7 @@ def _t400_nonstriped_math(
                         * _implementation.JIT_BLOCK_N
                         + token * _implementation.JIT_BLOCK_N
                         + lane,
-                        mask=lane
-                        <= _implementation.JIT_PROJECTION_OUTPUTS,
+                        mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
                         other=0.0,
                     )
                 _base._pipe_role4_routing_finalize(
@@ -702,23 +684,61 @@ def _t400_allproducer_kernel(
             (
                 _t400_exact_tail_root,
                 (
-                    x_ptr, residual_ptr, post_mix_ptr, comb_res_mix_ptr,
-                    fn_ptr, new_residual_ptr, partials_ptr, q_stages,
-                    fn_stages, ready0, ready1, done0, done1, producer_ready,
-                    grid_acquire_ready, coeff_ready, post_shared, comb_shared,
-                    weight_dummy, pre_shared, rmsnorm_weight_ptr, y_bf16_ptr,
-                    grid_counter_ptr, tile, split, pid, True,
-                    rmsnorm_eps, rmsnorm_scale,
+                    x_ptr,
+                    residual_ptr,
+                    post_mix_ptr,
+                    comb_res_mix_ptr,
+                    fn_ptr,
+                    new_residual_ptr,
+                    partials_ptr,
+                    q_stages,
+                    fn_stages,
+                    ready0,
+                    ready1,
+                    done0,
+                    done1,
+                    producer_ready,
+                    grid_acquire_ready,
+                    coeff_ready,
+                    post_shared,
+                    comb_shared,
+                    weight_dummy,
+                    pre_shared,
+                    rmsnorm_weight_ptr,
+                    y_bf16_ptr,
+                    grid_counter_ptr,
+                    tile,
+                    split,
+                    pid,
+                    True,
+                    rmsnorm_eps,
+                    rmsnorm_scale,
                 ),
             ),
             (
                 _t400_nonstriped_math,
                 (
-                    partials_ptr, q_stages, fn_stages, ready0, ready1,
-                    done0, done1, producer_ready, grid_acquire_ready,
-                    pre_shared, mix_scales_ptr, mix_bases_ptr,
-                    new_post_mix_ptr, new_comb_res_mix_ptr, tile, split, pid,
-                    True, hc_norm_eps, hc_pre_eps, hc_post_scale,
+                    partials_ptr,
+                    q_stages,
+                    fn_stages,
+                    ready0,
+                    ready1,
+                    done0,
+                    done1,
+                    producer_ready,
+                    grid_acquire_ready,
+                    pre_shared,
+                    mix_scales_ptr,
+                    mix_bases_ptr,
+                    new_post_mix_ptr,
+                    new_comb_res_mix_ptr,
+                    tile,
+                    split,
+                    pid,
+                    True,
+                    hc_norm_eps,
+                    hc_pre_eps,
+                    hc_post_scale,
                     sinkhorn_eps,
                 ),
             ),
@@ -775,30 +795,30 @@ def prepare_tle_sm90_mega_mhc(
 ) -> LargeGraphSplit16RST400Plan:
     implementation = _implementation.prepare_tle_sm90_mega_mhc(inputs, outputs)
     metadata = dict(implementation.metadata)
-    metadata.update({
-        "admission_shape": "T400",
-        "admission_source": str(Path(__file__).resolve()),
-        "implementation_source": str(_IMPLEMENTATION_SOURCE),
-        "implementation_source_sha256": _IMPLEMENTATION_SHA256,
-        "pipeline_variant": (
-            "t400-allproducer-nonstriped-ptx-m16-producer-tail"
-        ),
-        "kernel_symbol": "_t400_allproducer_kernel",
-        "CTA": _implementation.PRODUCER_CTAS,
-        "grid_ctas": _implementation.PRODUCER_CTAS,
-        "required_total_resident_ctas": _implementation.PRODUCER_CTAS,
-        "consumer_only_ctas": 0,
-        "uses_cuda_cluster": False,
-        "requires_full_grid_residency": True,
-        "full_grid_residency_required": True,
-        "cooperative_launch": True,
-        "launch_cooperative_grid": True,
-        "audited_spill_admission": False,
-        "expected_spills": 2,
-        "expected_local_bytes_per_thread": 8,
-        "experimental": True,
-        "dispatch_enabled": False,
-    })
+    metadata.update(
+        {
+            "admission_shape": "T400",
+            "admission_source": str(Path(__file__).resolve()),
+            "implementation_source": str(_IMPLEMENTATION_SOURCE),
+            "implementation_source_sha256": _IMPLEMENTATION_SHA256,
+            "pipeline_variant": ("t400-allproducer-nonstriped-ptx-m16-producer-tail"),
+            "kernel_symbol": "_t400_allproducer_kernel",
+            "CTA": _implementation.PRODUCER_CTAS,
+            "grid_ctas": _implementation.PRODUCER_CTAS,
+            "required_total_resident_ctas": _implementation.PRODUCER_CTAS,
+            "consumer_only_ctas": 0,
+            "uses_cuda_cluster": False,
+            "requires_full_grid_residency": True,
+            "full_grid_residency_required": True,
+            "cooperative_launch": True,
+            "launch_cooperative_grid": True,
+            "audited_spill_admission": False,
+            "expected_spills": 2,
+            "expected_local_bytes_per_thread": 8,
+            "experimental": True,
+            "dispatch_enabled": False,
+        }
+    )
     return LargeGraphSplit16RST400Plan(
         implementation=implementation,
         metadata=metadata,

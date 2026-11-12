@@ -14,8 +14,8 @@ it has no runtime dependency on the still-experimental p384 source.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Mapping
 
 import torch
@@ -23,18 +23,17 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .sm90_small_family import _physical_thread_id_x
-from .sm90_eager_t2048_p256_k32_split_tail_best_recovered import (
+from .sm90_eager_p256_manual512_projection_n32_ptx import (
+    _manual512_p256_projection_n32_ptx,
+)
+from .sm90_eager_p256_routing import (
     _routing_finalize_no_barrier,
 )
 from .sm90_eager_t2048_p256_manual512_tail_ptx import (
     _split_hidden_combine_bf16x8_ptx,
     _split_hidden_normalize_bf16x8_ptx,
 )
-from .sm90_eager_t2048_p256_manual512_projection_ptx import (
-    _manual512_p256_projection_compact_ptx,
-)
-
+from .sm90_small_family import _physical_thread_id_x
 
 TOKENS = 2048
 HIDDEN = 4096
@@ -54,9 +53,7 @@ TAIL_PHASE = int(
 if TAIL_PHASE not in (1, 2, 3):
     raise ValueError("manual512 tail phase must be 1/2/3")
 TAIL_BATCHES = 32
-TAIL_MODE = os.environ.get(
-    "DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL_MODE", "x8"
-)
+TAIL_MODE = os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL_MODE", "x8")
 if TAIL_MODE != "x8":
     raise ValueError("the admitted manual512 implementation requires x8 tail")
 TAIL_CHUNK = int(
@@ -280,11 +277,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
     comb_column = tl.arange(0, JIT_HC_MULT * JIT_HC_MULT)
     tl.store(
         tle.gpu.local_ptr(post_shared),
-        tl.load(
-            post_mix_ptr
-            + m[:, None] * JIT_HC_MULT
-            + post_column[None, :]
-        ),
+        tl.load(post_mix_ptr + m[:, None] * JIT_HC_MULT + post_column[None, :]),
     )
     tl.store(
         tle.gpu.local_ptr(comb_shared),
@@ -297,12 +290,9 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
 
     hidden_base = split * JIT_SPLIT_HIDDEN
     compact_partial_base = (
-        partials_ptr
-        + (tile * JIT_NUM_SPLITS + split)
-        * JIT_BLOCK_M
-        * JIT_BLOCK_N
+        partials_ptr + (tile * JIT_NUM_SPLITS + split) * JIT_BLOCK_M * JIT_BLOCK_N
     )
-    _ = _manual512_p256_projection_compact_ptx(
+    _ = _manual512_p256_projection_n32_ptx(
         x_ptr + hidden_base,
         residual_ptr + hidden_base,
         fn_ptr + hidden_base,
@@ -324,6 +314,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
         0,
         0,
         0,
+        JIT_TOKENS,
     )
 
     if ENABLE_TAIL:
@@ -340,9 +331,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
             physical_warp = physical_thread // 32
             lane = physical_thread % 32
             pre_base = (
-                partials_ptr
-                + (tile * JIT_NUM_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N
-                + 25
+                partials_ptr + (tile * JIT_NUM_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 25
             )
             if JIT_TAIL_PHASE >= 2:
                 # Eight warp owners per split route disjoint rows.  The eight
@@ -352,14 +341,9 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
                     packed_route = 0.0
                     for source_split in tl.static_range(0, JIT_NUM_SPLITS):
                         source_offset = (
-                            (
-                                (tile * JIT_NUM_SPLITS + source_split)
-                                * JIT_BLOCK_M
-                                + route_row
-                            )
-                            * JIT_BLOCK_N
-                            + lane
-                        )
+                            (tile * JIT_NUM_SPLITS + source_split) * JIT_BLOCK_M
+                            + route_row
+                        ) * JIT_BLOCK_N + lane
                         packed_route += tl.load(
                             partials_ptr + source_offset,
                             mask=lane <= 24,
@@ -371,8 +355,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
                         mix_scales_ptr,
                         mix_bases_ptr,
                         new_post_mix_ptr + route_token * JIT_HC_MULT,
-                        new_comb_res_mix_ptr
-                        + route_token * JIT_HC_MULT * JIT_HC_MULT,
+                        new_comb_res_mix_ptr + route_token * JIT_HC_MULT * JIT_HC_MULT,
                         packed_route,
                         lane,
                         hc_norm_eps,
@@ -389,8 +372,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
                 # eliminating the four idle warps in the old 12x6 mapping.
                 _tile_split_barrier(tile_states_ptr + tile * 2)
                 residual_base = (
-                    new_residual_ptr
-                    + tile * JIT_BLOCK_M * JIT_HC_MULT * JIT_HIDDEN
+                    new_residual_ptr + tile * JIT_BLOCK_M * JIT_HC_MULT * JIT_HIDDEN
                 )
                 y_base = y_bf16_ptr + tile * JIT_BLOCK_M * JIT_HIDDEN
                 square_base = compact_partial_base + 24
@@ -441,8 +423,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
                         + tail_rows * JIT_BLOCK_N
                     )
                 row_norm = (
-                    tl.rsqrt(total_square / JIT_HIDDEN + rmsnorm_eps)
-                    * rmsnorm_scale
+                    tl.rsqrt(total_square / JIT_HIDDEN + rmsnorm_eps) * rmsnorm_scale
                 )
                 tl.store(tle.gpu.local_ptr(norm_shared), row_norm)
                 _manual512_cta_sync()
@@ -474,6 +455,7 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
                     16,
                     4,
                 )
+
 
 def _require_tensor(value, *, name, shape, dtype):
     if not isinstance(value, torch.Tensor):
@@ -616,9 +598,7 @@ def prepare_tle_sm90_projection(
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("all tensors must be on one CUDA device")
 
-    maxnreg = int(
-        os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_MAXNREG", "64")
-    )
+    maxnreg = int(os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_MAXNREG", "64"))
     if maxnreg not in (48, 56, 64, 72, 80):
         raise ValueError("manual512 maxnreg must be 48/56/64/72/80")
     device = tensors[0].device
@@ -630,18 +610,12 @@ def prepare_tle_sm90_projection(
         dtype=torch.float32,
         device=device,
     )
-    tile_states = torch.zeros(
-        (NUM_M_TILES, 2), dtype=torch.uint32, device=device
-    )
+    tile_states = torch.zeros((NUM_M_TILES, 2), dtype=torch.uint32, device=device)
     tail_enabled = (
-        os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL", "0")
-        == "1"
+        os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_TAIL", "0") == "1"
     )
     dispatch_enabled = (
-        os.environ.get(
-            "DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_ADMITTED", "0"
-        )
-        == "1"
+        os.environ.get("DG_TLE_MHC_EAGER_T2048_P256_MANUAL512_ADMITTED", "0") == "1"
     )
     metadata: dict[str, object] = {
         "model": "DeepSeek-V4-Flash@60d8d707",
@@ -653,9 +627,7 @@ def prepare_tle_sm90_projection(
         "P": PROJECTION_OUTPUTS,
         "kernel_count": 1,
         "expected_cuda_kernel_activities": 1,
-        "kernel_symbol": (
-            "_sm90_eager_t2048_p256_manual512_cpasync_kernel"
-        ),
+        "kernel_symbol": ("_sm90_eager_t2048_p256_manual512_cpasync_kernel"),
         "grid_ctas": GRID_CTAS,
         "num_m_tiles": NUM_M_TILES,
         "num_splits": NUM_SPLITS,
@@ -672,7 +644,8 @@ def prepare_tle_sm90_projection(
         "projection_only": not tail_enabled,
         "tail_enabled": tail_enabled,
         "tail_schedule": (
-            "split-sharded x8 PTX" if TAIL_MODE == "x8"
+            "split-sharded x8 PTX"
+            if TAIL_MODE == "x8"
             else "split0 uniform manual512 batch2"
         ),
         "tail_mode": TAIL_MODE,

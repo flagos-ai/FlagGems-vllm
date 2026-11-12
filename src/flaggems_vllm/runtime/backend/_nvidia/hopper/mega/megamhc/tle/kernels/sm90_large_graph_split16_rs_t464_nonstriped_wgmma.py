@@ -1,28 +1,29 @@
-"""Production T=464 split16 RS variant with CTA-local token ownership.
+"""Production T=464/496/512 split16 RS exact all-producer family.
 
-T=464 leaves 48 inactive rows in the eighth M64 tile.  The generic
-split16 kernel uses striped role ownership, which spreads those inactive rows
-over many CTAs and prevents a CTA-uniform tail skip.  This probe maps each
-split's four routing/hidden roles to four adjacent rows.  The twelve empty
-splits in the final tile still join both cooperative rendezvous, but skip the
-projection reduction, Sinkhorn, and hidden/RMSNorm work after publishing the
-required tail-barrier arrival.
+The generic split16 kernel uses striped role ownership.  This family instead
+maps each split's four routing/hidden roles to four adjacent rows.  In a
+partial final tile, empty split CTAs still join both cooperative rendezvous
+but skip projection reduction, Sinkhorn, and hidden/RMSNorm work after
+publishing the required tail-barrier arrival.
 
 All 128 CTAs are projection producers; the exact kernel makes that fact a
-compile-time constant and removes the generic consumer branch.  Production
-dispatch selects this module only for the exact T=464 Graph bucket.
+compile-time constant and removes the generic consumer branch.  Logical T is
+an import-time/JIT constant.  Compatibility facades retain the established
+T496 and T512 module/class/symbol names without duplicating this device body.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-
-TOKENS = 464
+_TOKENS_TEXT = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_ROLE4_LOGICAL_TOKENS", "464")
+if _TOKENS_TEXT not in ("464", "496", "512"):
+    raise ValueError("exact all-producer split16 RS requires T=464, 496, or 512")
+TOKENS = int(_TOKENS_TEXT)
 _EXPECTED_IMPLEMENTATION_SHA256 = (
     "9aca5026b6bfdd29f54278a9971c06ddb26a8b49b01082e7433bc39a6c5460cc"
 )
@@ -43,7 +44,7 @@ _EXACT_ENVIRONMENT = {
     "DG_TLE_MHC_LARGE_GRAPH_TILE_LOCAL_BARRIER": "1",
     "DG_TLE_MHC_LARGE_GRAPH_FAST_GRID_BARRIER": "0",
     "DG_TLE_MHC_LARGE_GRAPH_EXACT_T448": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_EXACT_T512": "0",
+    "DG_TLE_MHC_LARGE_GRAPH_EXACT_T512": "1" if TOKENS == 512 else "0",
     "DG_TLE_MHC_LARGE_GRAPH_SPLIT16_RS_MATH_REGS": "128",
 }
 
@@ -52,8 +53,7 @@ for _name, _expected in _EXACT_ENVIRONMENT.items():
     _actual = os.environ.get(_name)
     if _actual not in (None, _expected):
         raise RuntimeError(
-            f"{_name}={_actual!r}, but T464 non-striped requires "
-            f"{_expected!r}"
+            f"{_name}={_actual!r}, but T{TOKENS} non-striped requires " f"{_expected!r}"
         )
     os.environ[_name] = _expected
 
@@ -64,20 +64,17 @@ import triton.language as tl  # noqa: E402
 from .. import fused_post_gemm_t64 as _t64  # noqa: E402
 from . import sm90_large_graph_split16_rs_wgmma as _implementation  # noqa: E402
 
-
 _base = _implementation._base
 _IMPLEMENTATION_SOURCE = Path(_implementation.__file__).resolve()
-_IMPLEMENTATION_SHA256 = hashlib.sha256(
-    _IMPLEMENTATION_SOURCE.read_bytes()
-).hexdigest()
+_IMPLEMENTATION_SHA256 = hashlib.sha256(_IMPLEMENTATION_SOURCE.read_bytes()).hexdigest()
 if _IMPLEMENTATION_SHA256 != _EXPECTED_IMPLEMENTATION_SHA256:
     raise RuntimeError(
-        "T464 admission pins split16 RS implementation SHA256 "
+        f"T{TOKENS} admission pins split16 RS implementation SHA256 "
         f"{_EXPECTED_IMPLEMENTATION_SHA256}, got {_IMPLEMENTATION_SHA256}"
     )
 if _implementation.TOKENS != TOKENS:
     raise RuntimeError(
-        f"T464 admission imported T={_implementation.TOKENS} implementation"
+        f"T{TOKENS} admission imported " f"T={_implementation.TOKENS} implementation"
     )
 # Keep the eight projection tiles x sixteen splits as the complete grid.
 _implementation.GRID_CTAS = _implementation.PRODUCER_CTAS
@@ -131,10 +128,7 @@ def _t464_active_cta_hidden_tail(
     rmsnorm_eps,
     rmsnorm_scale,
 ):
-    first_token = (
-        tile * _implementation.JIT_BLOCK_M
-        + split * _base.JIT_NUM_ROLES
-    )
+    first_token = tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
     if first_token < _implementation.JIT_TOKENS:
         _original_hidden_tail(
             weight_shared,
@@ -180,9 +174,7 @@ def _t464_nonstriped_math(
         tl.float32,
     )
     if is_producer:
-        for hb in tl.static_range(
-            0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT
-        ):
+        for hb in tl.static_range(0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT):
             if hb % 2 == 0:
                 _implementation.tle.gpu.barrier_wait(ready0)
             else:
@@ -190,38 +182,29 @@ def _t464_nonstriped_math(
             for channel in tl.static_range(0, _implementation.JIT_HC_MULT):
                 q_registers = tl.load(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT + channel
-                        )
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + channel)
                     )
                 ).to(tl.float32)
                 accumulator = _implementation.tle.gpu.wgmma(
                     q_registers,
-                    fn_stages.slot(
-                        (hb % 2) * _implementation.JIT_HC_MULT + channel
-                    ),
+                    fn_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + channel),
                     accumulator,
                     input_precision="tf32",
                     trans_b=True,
                 )
-                accumulator = _implementation.tle.gpu.wgmma_wait(
-                    0, accumulator
-                )
+                accumulator = _implementation.tle.gpu.wgmma_wait(0, accumulator)
             if hb % 2 == 0:
                 _implementation.tle.gpu.barrier_wait(done0)
             else:
                 _implementation.tle.gpu.barrier_wait(done1)
 
-        m = (
-            tile * _implementation.JIT_BLOCK_M
-            + tl.arange(0, _implementation.JIT_BLOCK_M)
+        m = tile * _implementation.JIT_BLOCK_M + tl.arange(
+            0, _implementation.JIT_BLOCK_M
         )
         n = tl.arange(0, _implementation.JIT_BLOCK_N)
         tl.store(
             partials_ptr
-            + split
-            * _implementation.JIT_TOKENS
-            * _implementation.JIT_BLOCK_N
+            + split * _implementation.JIT_TOKENS * _implementation.JIT_BLOCK_N
             + m[:, None] * _implementation.JIT_BLOCK_N
             + n[None, :],
             accumulator,
@@ -235,19 +218,14 @@ def _t464_nonstriped_math(
         if _implementation.JIT_PROBE_PHASE >= 3:
             physical_thread = _t64._physical_thread_id_x()
             lane = physical_thread % 32
-            role = (
-                physical_thread - _implementation.JIT_ROOT_THREADS
-            ) // 32
+            role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
             first_token = (
-                tile * _implementation.JIT_BLOCK_M
-                + split * _base.JIT_NUM_ROLES
+                tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
             )
             if first_token < _implementation.JIT_TOKENS:
                 token = first_token + role
                 packed_sum = 0.0
-                for source_split in tl.static_range(
-                    0, _implementation.JIT_NUM_SPLITS
-                ):
+                for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
                     packed_sum += tl.load(
                         partials_ptr
                         + source_split
@@ -255,8 +233,7 @@ def _t464_nonstriped_math(
                         * _implementation.JIT_BLOCK_N
                         + token * _implementation.JIT_BLOCK_N
                         + lane,
-                        mask=lane
-                        <= _implementation.JIT_PROJECTION_OUTPUTS,
+                        mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
                         other=0.0,
                     )
                 _base._pipe_role4_routing_finalize(
@@ -397,23 +374,61 @@ def _t464_allproducer_kernel(
             (
                 _implementation._split16_rs_root,
                 (
-                    x_ptr, residual_ptr, post_mix_ptr, comb_res_mix_ptr,
-                    fn_ptr, new_residual_ptr, partials_ptr, q_stages,
-                    fn_stages, ready0, ready1, done0, done1, producer_ready,
-                    grid_acquire_ready, coeff_ready, post_shared, comb_shared,
-                    weight_dummy, pre_shared, rmsnorm_weight_ptr, y_bf16_ptr,
-                    grid_counter_ptr, tile, split, pid, True,
-                    rmsnorm_eps, rmsnorm_scale,
+                    x_ptr,
+                    residual_ptr,
+                    post_mix_ptr,
+                    comb_res_mix_ptr,
+                    fn_ptr,
+                    new_residual_ptr,
+                    partials_ptr,
+                    q_stages,
+                    fn_stages,
+                    ready0,
+                    ready1,
+                    done0,
+                    done1,
+                    producer_ready,
+                    grid_acquire_ready,
+                    coeff_ready,
+                    post_shared,
+                    comb_shared,
+                    weight_dummy,
+                    pre_shared,
+                    rmsnorm_weight_ptr,
+                    y_bf16_ptr,
+                    grid_counter_ptr,
+                    tile,
+                    split,
+                    pid,
+                    True,
+                    rmsnorm_eps,
+                    rmsnorm_scale,
                 ),
             ),
             (
                 _t464_nonstriped_math,
                 (
-                    partials_ptr, q_stages, fn_stages, ready0, ready1,
-                    done0, done1, producer_ready, grid_acquire_ready,
-                    pre_shared, mix_scales_ptr, mix_bases_ptr,
-                    new_post_mix_ptr, new_comb_res_mix_ptr, tile, split, pid,
-                    True, hc_norm_eps, hc_pre_eps, hc_post_scale,
+                    partials_ptr,
+                    q_stages,
+                    fn_stages,
+                    ready0,
+                    ready1,
+                    done0,
+                    done1,
+                    producer_ready,
+                    grid_acquire_ready,
+                    pre_shared,
+                    mix_scales_ptr,
+                    mix_bases_ptr,
+                    new_post_mix_ptr,
+                    new_comb_res_mix_ptr,
+                    tile,
+                    split,
+                    pid,
+                    True,
+                    hc_norm_eps,
+                    hc_pre_eps,
+                    hc_post_scale,
                     sinkhorn_eps,
                 ),
             ),
@@ -470,25 +485,27 @@ def prepare_tle_sm90_mega_mhc(
 ) -> LargeGraphSplit16RST464Plan:
     implementation = _implementation.prepare_tle_sm90_mega_mhc(inputs, outputs)
     metadata = dict(implementation.metadata)
-    metadata.update({
-        "admission_shape": "T464",
-        "admission_source": str(Path(__file__).resolve()),
-        "implementation_source": str(_IMPLEMENTATION_SOURCE),
-        "implementation_source_sha256": _IMPLEMENTATION_SHA256,
-        "pipeline_variant": (
-            "t464-allproducer-nonstriped-active-cta-skip-tilebar"
-        ),
-        "kernel_symbol": "_t464_allproducer_kernel",
-        "CTA": _implementation.PRODUCER_CTAS,
-        "grid_ctas": _implementation.PRODUCER_CTAS,
-        "required_total_resident_ctas": _implementation.PRODUCER_CTAS,
-        "consumer_only_ctas": 0,
-        "audited_spill_admission": True,
-        "expected_spills": 2,
-        "expected_local_bytes_per_thread": 8,
-        "experimental": False,
-        "dispatch_enabled": True,
-    })
+    metadata.update(
+        {
+            "admission_shape": f"T{TOKENS}",
+            "admission_source": str(Path(__file__).resolve()),
+            "implementation_source": str(_IMPLEMENTATION_SOURCE),
+            "implementation_source_sha256": _IMPLEMENTATION_SHA256,
+            "pipeline_variant": (
+                f"t{TOKENS}-allproducer-nonstriped-active-cta-skip-tilebar"
+            ),
+            "kernel_symbol": "_t464_allproducer_kernel",
+            "CTA": _implementation.PRODUCER_CTAS,
+            "grid_ctas": _implementation.PRODUCER_CTAS,
+            "required_total_resident_ctas": _implementation.PRODUCER_CTAS,
+            "consumer_only_ctas": 0,
+            "audited_spill_admission": True,
+            "expected_spills": 2,
+            "expected_local_bytes_per_thread": 8,
+            "experimental": False,
+            "dispatch_enabled": True,
+        }
+    )
     return LargeGraphSplit16RST464Plan(
         implementation=implementation,
         metadata=metadata,

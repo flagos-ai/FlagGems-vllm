@@ -1,8 +1,8 @@
-"""P256-local manual512 projection PTX with compact partial output.
+"""Shared P256 manual512 N32 projection PTX with compact partial output.
 
-This is an isolated migration of the proven p384 12-producer/4-math body.  It
-keeps that source untouched and changes only the validation mirror layout from
-a T-wide debug plane to the caller-provided M64xN32 compact workspace.
+The T=1028 and T=2048 eager kernels use the same 12-producer/4-math WGMMA
+body.  ``token_limit`` preserves the masked final tile needed by T=1028 while
+remaining true for every row in the full-tile T=2048 schedule.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _manual512_p256_projection_compact_masked_ptx(
+def _manual512_p256_projection_n32_ptx(
     x_ptr,
     residual_ptr,
     fn_ptr,
