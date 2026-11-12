@@ -162,7 +162,11 @@ def _validate_inputs_cached(x_sig, w_sig, b_sig, dim, eps):
 
 
 def _validate_inputs_full(x_sig, w_sig, b_sig, dim, eps):
-    if x_sig[5] != "torch.strided" or w_sig[5] != "torch.strided" or b_sig[5] != "torch.strided":
+    if (
+        x_sig[5] != "torch.strided"
+        or w_sig[5] != "torch.strided"
+        or b_sig[5] != "torch.strided"
+    ):
         raise NotImplementedError("fused_indexer_k_norm requires strided tensors")
 
     if len(x_sig[0]) != 2:
@@ -200,10 +204,9 @@ def _validate_inputs_full(x_sig, w_sig, b_sig, dim, eps):
                 "fused_indexer_k_norm does not support negative strides"
             )
         if (
-            sig[0] and sum(
-                (size - 1) * stride
-                for size, stride in zip(sig[0], sig[1])
-            ) > _MAX_OFFSET
+            sig[0]
+            and sum((size - 1) * stride for size, stride in zip(sig[0], sig[1]))
+            > _MAX_OFFSET
         ):
             raise NotImplementedError(
                 "fused_indexer_k_norm tensor offsets exceed int64"
@@ -214,7 +217,8 @@ def _validate_inputs_full(x_sig, w_sig, b_sig, dim, eps):
         raise NotImplementedError("fused_indexer_k_norm supports inference only")
     if (
         runtime.device.vendor_name not in _SUPPORTED_VENDORS
-        or x_sig[3].startswith("cpu") or x_sig[3].startswith("meta")
+        or x_sig[3].startswith("cpu")
+        or x_sig[3].startswith("meta")
     ):
         raise NotImplementedError(
             "fused_indexer_k_norm requires a supported accelerator"
@@ -283,11 +287,13 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
                 from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_k_norm import (
                     _launch_ascend,
                 )
+
                 _launch_ascend(x, weight, bias, out, eps)
             elif runtime.device.vendor_name == "mthreads":
                 from flaggems_vllm.runtime.backend._mthreads.ops.fused_indexer_k_norm import (
                     _launch_musa,
                 )
+
                 _launch_musa(x, weight, bias, out, eps)
             elif runtime.device.vendor_name == "metax":
                 # MetaX inline path is handled in fused_indexer_k_norm() to
@@ -301,12 +307,7 @@ def _launch_fused_indexer_k_norm(x, weight, bias, out, eps):
             else:
                 # Generic thin launcher for remaining backends (PPU, etc.)
                 # on D=128 aligned fast path.
-                if (
-                    dim == 128
-                    and stride_xd == 1
-                    and stride_w == 1
-                    and stride_b == 1
-                ):
+                if dim == 128 and stride_xd == 1 and stride_w == 1 and stride_b == 1:
                     _fused_indexer_k_norm_kernel[(rows,)](
                         *args,
                         BLOCK_M=1,
@@ -346,16 +347,23 @@ def fused_indexer_k_norm(x, weight, bias, dim, eps, out=None):
             from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_k_norm import (
                 _launch_ascend,
             )
+
             _launch_ascend(x, weight, bias, out, eps)
         elif runtime.device.vendor_name == "metax":
             # Inline fast path to avoid _launch_fused_indexer_k_norm overhead.
             from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_k_norm import (
                 _launch_metax_fast,
             )
+
             _launch_metax_fast(x, weight, bias, out, eps)
         elif _IS_NVIDIA and _use_h20z_d128_fast_path(
-            x.shape[0], dim, x.stride(0), x.stride(1),
-            weight.stride(0), bias.stride(0), x.device.index,
+            x.shape[0],
+            dim,
+            x.stride(0),
+            x.stride(1),
+            weight.stride(0),
+            bias.stride(0),
+            x.device.index,
         ):
             # Inline fast path for H20Z to avoid _launch_fused_indexer_k_norm
             # dispatcher overhead (~0.004-0.006ms per call).
@@ -364,9 +372,16 @@ def fused_indexer_k_norm(x, weight, bias, dim, eps, out=None):
             stride_w = weight.stride(0)
             stride_b = bias.stride(0)
             args = (
-                x, weight, bias, out,
-                rows, dim,
-                stride_xm, stride_xd, stride_w, stride_b,
+                x,
+                weight,
+                bias,
+                out,
+                rows,
+                dim,
+                stride_xm,
+                stride_xd,
+                stride_w,
+                stride_b,
                 eps,
             )
             block_m, num_warps = _h20z_d128_config(rows)

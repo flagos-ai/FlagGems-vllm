@@ -16,9 +16,16 @@ def _launch_musa(x, weight, bias, out, eps):
     stride_w = weight.stride(0)
     stride_b = bias.stride(0)
     args = (
-        x, weight, bias, out,
-        rows, dim,
-        stride_xm, stride_xd, stride_w, stride_b,
+        x,
+        weight,
+        bias,
+        out,
+        rows,
+        dim,
+        stride_xm,
+        stride_xd,
+        stride_w,
+        stride_b,
         eps,
     )
     # Fast path: D=128 with unit strides
@@ -26,9 +33,8 @@ def _launch_musa(x, weight, bias, out, eps):
         block_m = 1
         if rows > 1024:
             block_m = 4
-        from flaggems_vllm.ops.fused_indexer_k_norm import (
-            _fused_indexer_k_norm_kernel,
-        )
+        from flaggems_vllm.ops.fused_indexer_k_norm import _fused_indexer_k_norm_kernel
+
         _fused_indexer_k_norm_kernel[(triton.cdiv(rows, block_m),)](
             *args,
             BLOCK_M=block_m,
@@ -37,6 +43,7 @@ def _launch_musa(x, weight, bias, out, eps):
         )
     else:
         from flaggems_vllm.ops.fused_indexer_k_norm import _norm_kernel
+
         block_m = 1
         if rows > 1024:
             block_m = 4
