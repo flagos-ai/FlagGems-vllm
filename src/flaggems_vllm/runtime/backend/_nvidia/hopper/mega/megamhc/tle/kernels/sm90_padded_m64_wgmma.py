@@ -1,10 +1,11 @@
-"""SM90 small-bucket MegaMHC padded-BM64 TF32-WGMMA single kernel.
+"""SM90 MegaMHC M64 TF32-WGMMA single-kernel family.
 
 This module is an opt-in structural prototype for the revision-pinned
 DeepSeek-V4-Flash Normal BF16 cases
-``T in {16, 24, 32, 40, 48, 56}, H=4096, R=4, P=24``.  It reuses
-the admitted T=64 kernel's coarse geometry instead of extending the older
-per-token SIMT migration:
+``T in {16, 24, 32, 40, 48, 56, 64}, H=4096, R=4, P=24``.  One shared
+device implementation covers both the internally padded small buckets and
+the exact T=64 bucket; ``LOGICAL_TOKENS`` is an import-time/JIT constant, so
+the exact-T64 specialization removes the padding predicates at compile time.
 
 * one internally padded M64 tile and either 64 or 128 K-split producer CTAs;
 * every CTA forms a ``64 x 32`` projection partial from four hidden slices;
@@ -76,8 +77,8 @@ remains the nonblocking arrival.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 import torch
@@ -85,14 +86,11 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-
-_LOGICAL_TOKENS_TEXT = os.environ.get(
-    "DG_TLE_MHC_PADDED_WGMMA_LOGICAL_TOKENS", "32"
-)
-if _LOGICAL_TOKENS_TEXT not in ("16", "24", "32", "40", "48", "56"):
+_LOGICAL_TOKENS_TEXT = os.environ.get("DG_TLE_MHC_PADDED_WGMMA_LOGICAL_TOKENS", "32")
+if _LOGICAL_TOKENS_TEXT not in ("16", "24", "32", "40", "48", "56", "64"):
     raise ValueError(
         "DG_TLE_MHC_PADDED_WGMMA_LOGICAL_TOKENS must be one of "
-        "16, 24, 32, 40, 48, or 56"
+        "16, 24, 32, 40, 48, 56, or 64"
     )
 LOGICAL_TOKENS = int(_LOGICAL_TOKENS_TEXT)
 # WGMMA remains M64.  TOKENS is also the split-major partial-workspace stride;
@@ -124,9 +122,7 @@ if _NUM_WARPS_TEXT not in ("8", "16"):
     raise ValueError("DG_TLE_MHC_T32_WGMMA_NUM_WARPS must be 8 or 16")
 NUM_WARPS = int(_NUM_WARPS_TEXT)
 CTA_THREADS = NUM_WARPS * 32
-_STAGED_MATH_REGS_TEXT = os.environ.get(
-    "DG_TLE_MHC_T32_WGMMA_STAGED_MATH_REGS", "168"
-)
+_STAGED_MATH_REGS_TEXT = os.environ.get("DG_TLE_MHC_T32_WGMMA_STAGED_MATH_REGS", "168")
 if _STAGED_MATH_REGS_TEXT not in (
     "48",
     "64",
@@ -386,19 +382,13 @@ def _overlap_hidden_tail(
     h = tl.arange(0, JIT_HIDDEN)
     norm_input = tl.zeros((JIT_HIDDEN,), tl.float32)
     for channel in tl.static_range(0, JIT_HC_MULT):
-        value = tl.load(
-            new_residual_ptr + channel * JIT_HIDDEN + h
-        ).to(tl.float32)
+        value = tl.load(new_residual_ptr + channel * JIT_HIDDEN + h).to(tl.float32)
         pre_scalar = tl.load(tle.gpu.local_ptr(pre_shared, (channel,)))
         norm_input += value * pre_scalar
-    norm_input_bf16 = norm_input.to(
-        tl.bfloat16, fp_downcast_rounding="rtne"
-    )
+    norm_input_bf16 = norm_input.to(tl.bfloat16, fp_downcast_rounding="rtne")
     norm_input_fp32 = norm_input_bf16.to(tl.float32)
     rms = tl.rsqrt(
-        tl.sum(norm_input_fp32 * norm_input_fp32, axis=0)
-        / JIT_HIDDEN
-        + rmsnorm_eps
+        tl.sum(norm_input_fp32 * norm_input_fp32, axis=0) / JIT_HIDDEN + rmsnorm_eps
     )
     rms_weight = tl.load(rmsnorm_weight_ptr + h).to(tl.float32)
     y = norm_input_fp32 * rms * rms_weight * rmsnorm_scale
@@ -488,9 +478,7 @@ def _overlap_routing_tail(
     )
     tle.gpu.barrier_arrive(pre_ready)
 
-    routing_mask = (
-        (lane >= 2 * JIT_HC_MULT) & (lane < JIT_PROJECTION_OUTPUTS)
-    )
+    routing_mask = (lane >= 2 * JIT_HC_MULT) & (lane < JIT_PROJECTION_OUTPUTS)
     sinkhorn = tl.where(routing_mask, mixes, 0.0)
     row_max = _warp_reduce4_max(sinkhorn)
     sinkhorn = tl.exp(sinkhorn - row_max)
@@ -544,19 +532,13 @@ def _direct_hidden_tail(
     h = tl.arange(0, JIT_HIDDEN)
     norm_input = tl.zeros((JIT_HIDDEN,), tl.float32)
     for channel in tl.static_range(0, JIT_HC_MULT):
-        value = tl.load(
-            new_residual_ptr + channel * JIT_HIDDEN + h
-        ).to(tl.float32)
+        value = tl.load(new_residual_ptr + channel * JIT_HIDDEN + h).to(tl.float32)
         pre_scalar = tl.load(tle.gpu.local_ptr(pre_shared, (channel,)))
         norm_input += value * pre_scalar
-    norm_input_bf16 = norm_input.to(
-        tl.bfloat16, fp_downcast_rounding="rtne"
-    )
+    norm_input_bf16 = norm_input.to(tl.bfloat16, fp_downcast_rounding="rtne")
     norm_input_fp32 = norm_input_bf16.to(tl.float32)
     rms = tl.rsqrt(
-        tl.sum(norm_input_fp32 * norm_input_fp32, axis=0)
-        / JIT_HIDDEN
-        + rmsnorm_eps
+        tl.sum(norm_input_fp32 * norm_input_fp32, axis=0) / JIT_HIDDEN + rmsnorm_eps
     )
     rms_weight = tl.load(rmsnorm_weight_ptr + h).to(tl.float32)
     y = norm_input_fp32 * rms * rms_weight * rmsnorm_scale
@@ -595,9 +577,7 @@ def _direct_routing_finalize(
     """
     projection_mask = routing_active & (lane < JIT_PROJECTION_OUTPUTS)
     token_squared_sum = _warp_broadcast_lane24_f32(packed_sum)
-    projection_norm = tl.rsqrt(
-        token_squared_sum / JIT_FLAT_HIDDEN + hc_norm_eps
-    )
+    projection_norm = tl.rsqrt(token_squared_sum / JIT_FLAT_HIDDEN + hc_norm_eps)
     category_scale = tl.where(
         lane < JIT_HC_MULT,
         tl.load(mix_scales_ptr),
@@ -1538,7 +1518,7 @@ def _direct_routing_tail(
         else:
             tl.static_assert(JIT_NUM_SPLITS == 64)
             worker_sum = tl.inline_asm_elementwise(
-            asm="""
+                asm="""
             {
               .reg .u32 packed;
               .reg .u64 address;
@@ -1596,21 +1576,17 @@ def _direct_routing_tail(
               add.rn.f32 $0, $0, value;
             }
             """,
-            constraints="=f,l,r,r,r",
-            args=[partials_base, worker_warp, token, lane],
-            dtype=tl.float32,
-            is_pure=False,
-            pack=1,
+                constraints="=f,l,r,r,r",
+                args=[partials_base, worker_warp, token, lane],
+                dtype=tl.float32,
+                is_pure=False,
+                pack=1,
             )
-        worker_sum = tl.where(
-            lane <= JIT_PROJECTION_OUTPUTS, worker_sum, 0.0
-        )
+        worker_sum = tl.where(lane <= JIT_PROJECTION_OUTPUTS, worker_sum, 0.0)
         # Every lane writes a defined value.  Lanes 25..31 are zero rather
         # than stale shared data, although worker warp zero masks them during
         # the merge and subsequent projection/Sinkhorn work.
-        route4_store_pointer = tle.gpu.local_ptr(
-            route4_shared, (worker_warp, lane)
-        )
+        route4_store_pointer = tle.gpu.local_ptr(route4_shared, (worker_warp, lane))
         route4_store_address = tl.inline_asm_elementwise(
             asm="mov.u32 $0, $1;",
             constraints="=r,r",
@@ -1640,9 +1616,8 @@ def _direct_routing_tail(
         # barrier in this nested warp-specialized region.  Reserve hardware
         # barrier 5 explicitly; generated TLE barriers occupy IDs 0..4.  All
         # four worker warps execute it, while only worker warp zero loads.
-        quarter0, quarter1, quarter2, quarter3 = (
-            tl.inline_asm_elementwise(
-                asm="""
+        quarter0, quarter1, quarter2, quarter3 = tl.inline_asm_elementwise(
+            asm="""
                 {
                   .reg .pred active;
                   bar.sync 5, 128;
@@ -1657,20 +1632,19 @@ def _direct_routing_tail(
                   @active ld.shared.f32 $3, [$4+384];
                 }
                 """,
-                constraints="=&f,=&f,=&f,=&f,r,r",
-                args=[
-                    route4_row0_address,
-                    tl.cast(packed_mask, tl.uint32),
-                ],
-                dtype=(
-                    tl.float32,
-                    tl.float32,
-                    tl.float32,
-                    tl.float32,
-                ),
-                is_pure=False,
-                pack=1,
-            )
+            constraints="=&f,=&f,=&f,=&f,r,r",
+            args=[
+                route4_row0_address,
+                tl.cast(packed_mask, tl.uint32),
+            ],
+            dtype=(
+                tl.float32,
+                tl.float32,
+                tl.float32,
+                tl.float32,
+            ),
+            is_pure=False,
+            pack=1,
         )
         packed_sum = (quarter0 + quarter1) + (quarter2 + quarter3)
     elif USE_DIRECT_TAIL_ILP4:
@@ -1712,9 +1686,7 @@ def _direct_routing_tail(
                 mask=packed_mask,
                 other=0.0,
             )
-        packed_sum = (packed_sum0 + packed_sum1) + (
-            packed_sum2 + packed_sum3
-        )
+        packed_sum = (packed_sum0 + packed_sum1) + (packed_sum2 + packed_sum3)
     else:
         packed_sum = 0.0
         # Preserve the CUDA winner's increasing-split accumulation order.
@@ -1839,31 +1811,40 @@ def _staged_wgmma_producer(
     token_hidden = m[:, None] * JIT_HIDDEN + hidden[None, :]
     token_residual = m[:, None] * JIT_FLAT_HIDDEN + hidden[None, :]
 
-    x = tl.load(
-        x_ptr + token_hidden,
-        mask=valid_m[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    r0 = tl.load(
-        residual_ptr + token_residual,
-        mask=valid_m[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    r1 = tl.load(
-        residual_ptr + token_residual + JIT_HIDDEN,
-        mask=valid_m[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    r2 = tl.load(
-        residual_ptr + token_residual + 2 * JIT_HIDDEN,
-        mask=valid_m[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    r3 = tl.load(
-        residual_ptr + token_residual + 3 * JIT_HIDDEN,
-        mask=valid_m[:, None],
-        other=0.0,
-    ).to(tl.float32)
+    if JIT_LOGICAL_TOKENS == JIT_TOKENS:
+        # Preserve the admitted exact-T64 producer rather than relying on a
+        # later optimizer to prove every M-row predicate true.
+        x = tl.load(x_ptr + token_hidden).to(tl.float32)
+        r0 = tl.load(residual_ptr + token_residual).to(tl.float32)
+        r1 = tl.load(residual_ptr + token_residual + JIT_HIDDEN).to(tl.float32)
+        r2 = tl.load(residual_ptr + token_residual + 2 * JIT_HIDDEN).to(tl.float32)
+        r3 = tl.load(residual_ptr + token_residual + 3 * JIT_HIDDEN).to(tl.float32)
+    else:
+        x = tl.load(
+            x_ptr + token_hidden,
+            mask=valid_m[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        r0 = tl.load(
+            residual_ptr + token_residual,
+            mask=valid_m[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        r1 = tl.load(
+            residual_ptr + token_residual + JIT_HIDDEN,
+            mask=valid_m[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        r2 = tl.load(
+            residual_ptr + token_residual + 2 * JIT_HIDDEN,
+            mask=valid_m[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        r3 = tl.load(
+            residual_ptr + token_residual + 3 * JIT_HIDDEN,
+            mask=valid_m[:, None],
+            other=0.0,
+        ).to(tl.float32)
     squared_sum = tl.zeros((JIT_BLOCK_M,), tl.float32)
 
     for channel in tl.static_range(0, JIT_HC_MULT):
@@ -1872,54 +1853,73 @@ def _staged_wgmma_producer(
             # slot from the preceding route; its nonblocking arrive combines
             # with this default partition's wait at the named barrier.
             tle.gpu.barrier_wait(stage_empty)
-        post = tl.load(
-            post_mix_ptr + m[:, None] * JIT_HC_MULT + channel,
-            mask=valid_m[:, None],
-            other=0.0,
-        ).to(tl.float32)
+        if JIT_LOGICAL_TOKENS == JIT_TOKENS:
+            post = tl.load(post_mix_ptr + m[:, None] * JIT_HC_MULT + channel).to(
+                tl.float32
+            )
+        else:
+            post = tl.load(
+                post_mix_ptr + m[:, None] * JIT_HC_MULT + channel,
+                mask=valid_m[:, None],
+                other=0.0,
+            ).to(tl.float32)
         comb_base = m[:, None] * JIT_HC_MULT * JIT_HC_MULT + channel
-        q = (
-            x * post
-            + r0
-            * tl.load(
-                comb_res_mix_ptr + comb_base,
-                mask=valid_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            + r1
-            * tl.load(
-                comb_res_mix_ptr + comb_base + JIT_HC_MULT,
-                mask=valid_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            + r2
-            * tl.load(
-                comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT,
-                mask=valid_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            + r3
-            * tl.load(
-                comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT,
-                mask=valid_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
-        )
+        if JIT_LOGICAL_TOKENS == JIT_TOKENS:
+            q = (
+                x * post
+                + r0 * tl.load(comb_res_mix_ptr + comb_base).to(tl.float32)
+                + r1
+                * tl.load(comb_res_mix_ptr + comb_base + JIT_HC_MULT).to(tl.float32)
+                + r2
+                * tl.load(comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT).to(tl.float32)
+                + r3
+                * tl.load(comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT).to(tl.float32)
+            )
+        else:
+            q = (
+                x * post
+                + r0
+                * tl.load(
+                    comb_res_mix_ptr + comb_base,
+                    mask=valid_m[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                + r1
+                * tl.load(
+                    comb_res_mix_ptr + comb_base + JIT_HC_MULT,
+                    mask=valid_m[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                + r2
+                * tl.load(
+                    comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT,
+                    mask=valid_m[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                + r3
+                * tl.load(
+                    comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT,
+                    mask=valid_m[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+            )
         q_bf16 = q.to(tl.bfloat16, fp_downcast_rounding="rtne")
         q_fp32 = q_bf16.to(tl.float32)
         flat_hidden = channel * JIT_HIDDEN + hidden
-        tl.store(
-            new_residual_ptr
-            + m[:, None] * JIT_FLAT_HIDDEN
-            + flat_hidden[None, :],
-            q_bf16,
-            mask=valid_m[:, None],
-        )
+        if JIT_LOGICAL_TOKENS == JIT_TOKENS:
+            tl.store(
+                new_residual_ptr + m[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
+                q_bf16,
+            )
+        else:
+            tl.store(
+                new_residual_ptr + m[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
+                q_bf16,
+                mask=valid_m[:, None],
+            )
         tl.store(tle.gpu.local_ptr(q_shared), q_fp32)
 
-        fn_offsets = (
-            n[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :]
-        )
+        fn_offsets = n[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :]
         fn_tile = tl.load(
             fn_ptr + fn_offsets,
             mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
@@ -1933,9 +1933,7 @@ def _staged_wgmma_producer(
     # references the single shared slot.
     tle.gpu.barrier_wait(stage_empty)
     sq_offsets = (
-        split * JIT_TOKENS * JIT_BLOCK_N
-        + m * JIT_BLOCK_N
-        + JIT_PROJECTION_OUTPUTS
+        split * JIT_TOKENS * JIT_BLOCK_N + m * JIT_BLOCK_N + JIT_PROJECTION_OUTPUTS
     )
     tl.store(partials_ptr + sq_offsets, squared_sum)
 
@@ -1950,9 +1948,7 @@ def _staged_wgmma_math(
     split,
 ):
     """Four-warp consumer: accumulate four shared/shared TF32 WGMMAs."""
-    accumulator = tl.zeros(
-        (JIT_BLOCK_M, JIT_BLOCK_N), dtype=tl.float32
-    )
+    accumulator = tl.zeros((JIT_BLOCK_M, JIT_BLOCK_N), dtype=tl.float32)
     for route in tl.static_range(0, JIT_HC_MULT):
         tle.gpu.barrier_wait(stage_full)
         accumulator = tle.gpu.wgmma(
@@ -1969,9 +1965,7 @@ def _staged_wgmma_math(
     m = tl.arange(0, JIT_BLOCK_M)
     n = tl.arange(0, JIT_BLOCK_N)
     workspace_offsets = (
-        split * JIT_TOKENS * JIT_BLOCK_N
-        + m[:, None] * JIT_BLOCK_N
-        + n[None, :]
+        split * JIT_TOKENS * JIT_BLOCK_N + m[:, None] * JIT_BLOCK_N + n[None, :]
     )
     tl.store(
         partials_ptr + workspace_offsets,
@@ -2192,21 +2186,16 @@ def _t32_wgmma_bm64_split_tf32_kernel(
         | (JIT_LOGICAL_TOKENS == 40)
         | (JIT_LOGICAL_TOKENS == 48)
         | (JIT_LOGICAL_TOKENS == 56)
+        | (JIT_LOGICAL_TOKENS == 64)
     )
     tl.static_assert(JIT_HIDDEN == 4096)
     tl.static_assert(JIT_HC_MULT == 4)
     tl.static_assert(JIT_PROJECTION_OUTPUTS == 24)
     tl.static_assert((JIT_NUM_SPLITS == 64) | (JIT_NUM_SPLITS == 128))
-    tl.static_assert(
-        (JIT_HIDDEN_PER_SPLIT == 64) | (JIT_HIDDEN_PER_SPLIT == 32)
-    )
-    tl.static_assert(
-        (JIT_FLAT_K_PER_SPLIT == 256) | (JIT_FLAT_K_PER_SPLIT == 128)
-    )
+    tl.static_assert((JIT_HIDDEN_PER_SPLIT == 64) | (JIT_HIDDEN_PER_SPLIT == 32))
+    tl.static_assert((JIT_FLAT_K_PER_SPLIT == 256) | (JIT_FLAT_K_PER_SPLIT == 128))
     tl.static_assert(JIT_GRID_CTAS == JIT_NUM_SPLITS)
-    tl.static_assert(
-        (JIT_CTA_THREADS == 256) | (JIT_CTA_THREADS == 512)
-    )
+    tl.static_assert((JIT_CTA_THREADS == 256) | (JIT_CTA_THREADS == 512))
     if USE_EARLY_PRE_SYNC:
         tl.static_assert(JIT_NUM_SPLITS == 128)
         tl.static_assert(USE_STAGED_WGMMA)
@@ -2248,12 +2237,8 @@ def _t32_wgmma_bm64_split_tf32_kernel(
             scope=tle.gpu.smem,
             nv_mma_shared_layout=True,
         )
-        stage_full = tle.gpu.alloc_barrier(
-            arrive_count=JIT_STAGED_LOGICAL_THREADS
-        )
-        stage_empty = tle.gpu.alloc_barrier(
-            arrive_count=JIT_STAGED_LOGICAL_THREADS
-        )
+        stage_full = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
+        stage_empty = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
         if USE_PERSISTENT_WS:
             tl.static_assert(USE_DIRECT_ROUTING_TAIL)
             tl.static_assert(USE_WARP_OVERLAP)
@@ -2491,52 +2476,32 @@ def _t32_wgmma_bm64_split_tf32_kernel(
             # extending the WGMMA partition's register lifetime.
             x = tl.load(x_ptr + token_hidden).to(tl.float32)
             r0 = tl.load(residual_ptr + token_residual).to(tl.float32)
-            r1 = tl.load(
-                residual_ptr + token_residual + JIT_HIDDEN
-            ).to(tl.float32)
-            r2 = tl.load(
-                residual_ptr + token_residual + 2 * JIT_HIDDEN
-            ).to(tl.float32)
-            r3 = tl.load(
-                residual_ptr + token_residual + 3 * JIT_HIDDEN
-            ).to(tl.float32)
-            post = tl.load(
-                post_mix_ptr + m[:, None] * JIT_HC_MULT + channel
-            ).to(tl.float32)
-            comb_base = (
-                m[:, None] * JIT_HC_MULT * JIT_HC_MULT + channel
+            r1 = tl.load(residual_ptr + token_residual + JIT_HIDDEN).to(tl.float32)
+            r2 = tl.load(residual_ptr + token_residual + 2 * JIT_HIDDEN).to(tl.float32)
+            r3 = tl.load(residual_ptr + token_residual + 3 * JIT_HIDDEN).to(tl.float32)
+            post = tl.load(post_mix_ptr + m[:, None] * JIT_HC_MULT + channel).to(
+                tl.float32
             )
+            comb_base = m[:, None] * JIT_HC_MULT * JIT_HC_MULT + channel
             q = (
                 x * post
-                + r0
-                * tl.load(comb_res_mix_ptr + comb_base).to(tl.float32)
+                + r0 * tl.load(comb_res_mix_ptr + comb_base).to(tl.float32)
                 + r1
-                * tl.load(
-                    comb_res_mix_ptr + comb_base + JIT_HC_MULT
-                ).to(tl.float32)
+                * tl.load(comb_res_mix_ptr + comb_base + JIT_HC_MULT).to(tl.float32)
                 + r2
-                * tl.load(
-                    comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT
-                ).to(tl.float32)
+                * tl.load(comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT).to(tl.float32)
                 + r3
-                * tl.load(
-                    comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT
-                ).to(tl.float32)
+                * tl.load(comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT).to(tl.float32)
             )
             q_bf16 = q.to(tl.bfloat16, fp_downcast_rounding="rtne")
             q_fp32 = q_bf16.to(tl.float32)
             flat_hidden = channel * JIT_HIDDEN + hidden
             tl.store(
-                new_residual_ptr
-                + m[:, None] * JIT_FLAT_HIDDEN
-                + flat_hidden[None, :],
+                new_residual_ptr + m[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
                 q_bf16,
             )
 
-            fn_offsets = (
-                n[:, None] * JIT_FLAT_HIDDEN
-                + flat_hidden[None, :]
-            )
+            fn_offsets = n[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :]
             fn_tile = tl.load(
                 fn_ptr + fn_offsets,
                 mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
@@ -2554,67 +2519,40 @@ def _t32_wgmma_bm64_split_tf32_kernel(
             accumulator = tle.gpu.wgmma_wait(0, accumulator)
             squared_sum += tl.sum(q_fp32 * q_fp32, axis=1)
     else:
-        for k_base in tl.static_range(
-            0, JIT_FLAT_K_PER_SPLIT, JIT_BLOCK_K
-        ):
+        for k_base in tl.static_range(0, JIT_FLAT_K_PER_SPLIT, JIT_BLOCK_K):
             local_flat = k_base + tl.arange(0, JIT_BLOCK_K)
             channel = local_flat // JIT_HIDDEN_PER_SPLIT
-            hidden = (
-                split * JIT_HIDDEN_PER_SPLIT
-                + local_flat % JIT_HIDDEN_PER_SPLIT
-            )
+            hidden = split * JIT_HIDDEN_PER_SPLIT + local_flat % JIT_HIDDEN_PER_SPLIT
             token_hidden = m[:, None] * JIT_HIDDEN + hidden[None, :]
-            token_residual = (
-                m[:, None] * JIT_FLAT_HIDDEN + hidden[None, :]
-            )
+            token_residual = m[:, None] * JIT_FLAT_HIDDEN + hidden[None, :]
             token_state = m[:, None] * JIT_HC_MULT + channel[None, :]
 
             x = tl.load(x_ptr + token_hidden).to(tl.float32)
             r0 = tl.load(residual_ptr + token_residual).to(tl.float32)
-            r1 = tl.load(
-                residual_ptr + token_residual + JIT_HIDDEN
-            ).to(tl.float32)
-            r2 = tl.load(
-                residual_ptr + token_residual + 2 * JIT_HIDDEN
-            ).to(tl.float32)
-            r3 = tl.load(
-                residual_ptr + token_residual + 3 * JIT_HIDDEN
-            ).to(tl.float32)
+            r1 = tl.load(residual_ptr + token_residual + JIT_HIDDEN).to(tl.float32)
+            r2 = tl.load(residual_ptr + token_residual + 2 * JIT_HIDDEN).to(tl.float32)
+            r3 = tl.load(residual_ptr + token_residual + 3 * JIT_HIDDEN).to(tl.float32)
             post = tl.load(post_mix_ptr + token_state).to(tl.float32)
-            comb_base = (
-                m[:, None] * JIT_HC_MULT * JIT_HC_MULT
-                + channel[None, :]
-            )
+            comb_base = m[:, None] * JIT_HC_MULT * JIT_HC_MULT + channel[None, :]
             q = (
                 x * post
-                + r0
-                * tl.load(comb_res_mix_ptr + comb_base).to(tl.float32)
+                + r0 * tl.load(comb_res_mix_ptr + comb_base).to(tl.float32)
                 + r1
-                * tl.load(
-                    comb_res_mix_ptr + comb_base + JIT_HC_MULT
-                ).to(tl.float32)
+                * tl.load(comb_res_mix_ptr + comb_base + JIT_HC_MULT).to(tl.float32)
                 + r2
-                * tl.load(
-                    comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT
-                ).to(tl.float32)
+                * tl.load(comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT).to(tl.float32)
                 + r3
-                * tl.load(
-                    comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT
-                ).to(tl.float32)
+                * tl.load(comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT).to(tl.float32)
             )
             q_bf16 = q.to(tl.bfloat16, fp_downcast_rounding="rtne")
             q_fp32 = q_bf16.to(tl.float32)
             flat_hidden = channel * JIT_HIDDEN + hidden
             tl.store(
-                new_residual_ptr
-                + m[:, None] * JIT_FLAT_HIDDEN
-                + flat_hidden[None, :],
+                new_residual_ptr + m[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
                 q_bf16,
             )
 
-            fn_offsets = (
-                flat_hidden[:, None] + n[None, :] * JIT_FLAT_HIDDEN
-            )
+            fn_offsets = flat_hidden[:, None] + n[None, :] * JIT_FLAT_HIDDEN
             fn_tile = tl.load(
                 fn_ptr + fn_offsets,
                 mask=n[None, :] < JIT_PROJECTION_OUTPUTS,
@@ -2631,9 +2569,7 @@ def _t32_wgmma_bm64_split_tf32_kernel(
 
     if not USE_STAGED_WGMMA:
         workspace_offsets = (
-            split * JIT_TOKENS * JIT_BLOCK_N
-            + m[:, None] * JIT_BLOCK_N
-            + n[None, :]
+            split * JIT_TOKENS * JIT_BLOCK_N + m[:, None] * JIT_BLOCK_N + n[None, :]
         )
         workspace_values = tl.where(
             n[None, :] < JIT_PROJECTION_OUTPUTS,
@@ -2853,22 +2789,17 @@ def _t32_wgmma_bm64_split_tf32_kernel(
                 return
             pre_mix = tl.sigmoid(mixes) + hc_pre_eps
             next_post_mix = tl.sigmoid(mixes) * hc_post_scale
-            post_mask = (
-                (projection_lane >= JIT_HC_MULT)
-                & (projection_lane < 2 * JIT_HC_MULT)
+            post_mask = (projection_lane >= JIT_HC_MULT) & (
+                projection_lane < 2 * JIT_HC_MULT
             )
             tl.store(
-                new_post_mix_ptr
-                + token_state_base
-                + projection_lane
-                - JIT_HC_MULT,
+                new_post_mix_ptr + token_state_base + projection_lane - JIT_HC_MULT,
                 next_post_mix,
                 mask=post_mask,
             )
 
-            routing_mask = (
-                (projection_lane >= 2 * JIT_HC_MULT)
-                & (projection_lane < JIT_PROJECTION_OUTPUTS)
+            routing_mask = (projection_lane >= 2 * JIT_HC_MULT) & (
+                projection_lane < JIT_PROJECTION_OUTPUTS
             )
             # The first structural smoke showed that the warp-shuffle 4x4
             # mapping is not preserved once this mixed tl.dot/tail kernel is
@@ -2878,28 +2809,18 @@ def _t32_wgmma_bm64_split_tf32_kernel(
             sinkhorn = tl.zeros((JIT_BLOCK_N,), tl.float32)
             for row in tl.static_range(0, JIT_HC_MULT):
                 row_mask = routing_mask & (
-                    (projection_lane - 2 * JIT_HC_MULT) // JIT_HC_MULT
-                    == row
+                    (projection_lane - 2 * JIT_HC_MULT) // JIT_HC_MULT == row
                 )
-                row_max = tl.max(
-                    tl.where(row_mask, mixes, -float("inf")), axis=0
-                )
-                exponent = tl.where(
-                    row_mask, tl.exp(mixes - row_max), 0.0
-                )
+                row_max = tl.max(tl.where(row_mask, mixes, -float("inf")), axis=0)
+                exponent = tl.where(row_mask, tl.exp(mixes - row_max), 0.0)
                 row_sum = tl.sum(exponent, axis=0)
-                sinkhorn += tl.where(
-                    row_mask, exponent / row_sum + sinkhorn_eps, 0.0
-                )
+                sinkhorn += tl.where(row_mask, exponent / row_sum + sinkhorn_eps, 0.0)
             normalized = tl.zeros((JIT_BLOCK_N,), tl.float32)
             for column in tl.static_range(0, JIT_HC_MULT):
                 column_mask = routing_mask & (
-                    (projection_lane - 2 * JIT_HC_MULT) % JIT_HC_MULT
-                    == column
+                    (projection_lane - 2 * JIT_HC_MULT) % JIT_HC_MULT == column
                 )
-                column_sum = tl.sum(
-                    tl.where(column_mask, sinkhorn, 0.0), axis=0
-                )
+                column_sum = tl.sum(tl.where(column_mask, sinkhorn, 0.0), axis=0)
                 normalized += tl.where(
                     column_mask,
                     sinkhorn / (column_sum + sinkhorn_eps),
@@ -2910,13 +2831,9 @@ def _t32_wgmma_bm64_split_tf32_kernel(
                 normalized = tl.zeros((JIT_BLOCK_N,), tl.float32)
                 for row in tl.static_range(0, JIT_HC_MULT):
                     row_mask = routing_mask & (
-                        (projection_lane - 2 * JIT_HC_MULT)
-                        // JIT_HC_MULT
-                        == row
+                        (projection_lane - 2 * JIT_HC_MULT) // JIT_HC_MULT == row
                     )
-                    row_sum = tl.sum(
-                        tl.where(row_mask, sinkhorn, 0.0), axis=0
-                    )
+                    row_sum = tl.sum(tl.where(row_mask, sinkhorn, 0.0), axis=0)
                     normalized += tl.where(
                         row_mask,
                         sinkhorn / (row_sum + sinkhorn_eps),
@@ -2926,13 +2843,9 @@ def _t32_wgmma_bm64_split_tf32_kernel(
                 normalized = tl.zeros((JIT_BLOCK_N,), tl.float32)
                 for column in tl.static_range(0, JIT_HC_MULT):
                     column_mask = routing_mask & (
-                        (projection_lane - 2 * JIT_HC_MULT)
-                        % JIT_HC_MULT
-                        == column
+                        (projection_lane - 2 * JIT_HC_MULT) % JIT_HC_MULT == column
                     )
-                    column_sum = tl.sum(
-                        tl.where(column_mask, sinkhorn, 0.0), axis=0
-                    )
+                    column_sum = tl.sum(tl.where(column_mask, sinkhorn, 0.0), axis=0)
                     normalized += tl.where(
                         column_mask,
                         sinkhorn / (column_sum + sinkhorn_eps),
@@ -2965,13 +2878,10 @@ def _t32_wgmma_bm64_split_tf32_kernel(
                     + h
                 ).to(tl.float32)
                 norm_input += residual_value * pre_scalar
-            norm_input_bf16 = norm_input.to(
-                tl.bfloat16, fp_downcast_rounding="rtne"
-            )
+            norm_input_bf16 = norm_input.to(tl.bfloat16, fp_downcast_rounding="rtne")
             norm_input_fp32 = norm_input_bf16.to(tl.float32)
             rms = tl.rsqrt(
-                tl.sum(norm_input_fp32 * norm_input_fp32, axis=0)
-                / JIT_HIDDEN
+                tl.sum(norm_input_fp32 * norm_input_fp32, axis=0) / JIT_HIDDEN
                 + rmsnorm_eps
             )
             rms_weight = tl.load(rmsnorm_weight_ptr + h).to(tl.float32)
@@ -3079,15 +2989,9 @@ class PaddedM64WGMMAPlan:
             USE_DIRECT_TAIL_ILP4=self.use_direct_tail_ilp4,
             USE_PERSISTENT_WS=self.use_persistent_ws,
             USE_PERSISTENT_ROUTE4=self.use_persistent_route4,
-            USE_ROUTE4_WINDOW4=(
-                self.persistent_route4_reduction == "window4"
-            ),
-            USE_ROUTE4_ILP2=(
-                self.persistent_route4_reduction == "ilp2"
-            ),
-            USE_ROUTE4_ILP4=(
-                self.persistent_route4_reduction == "ilp4"
-            ),
+            USE_ROUTE4_WINDOW4=(self.persistent_route4_reduction == "window4"),
+            USE_ROUTE4_ILP2=(self.persistent_route4_reduction == "ilp2"),
+            USE_ROUTE4_ILP4=(self.persistent_route4_reduction == "ilp4"),
             USE_ROUTE4_WARP0_FINALIZE=self.use_route4_warp0_finalize,
             USE_SPLIT128_PAIR_ROUTE=self.use_split128_pair_route,
             USE_EARLY_PRE_SYNC=self.use_early_pre_sync,
@@ -3109,15 +3013,9 @@ class PaddedM64WGMMAPlan:
             USE_DIRECT_TAIL_ILP4=self.use_direct_tail_ilp4,
             USE_PERSISTENT_WS=self.use_persistent_ws,
             USE_PERSISTENT_ROUTE4=self.use_persistent_route4,
-            USE_ROUTE4_WINDOW4=(
-                self.persistent_route4_reduction == "window4"
-            ),
-            USE_ROUTE4_ILP2=(
-                self.persistent_route4_reduction == "ilp2"
-            ),
-            USE_ROUTE4_ILP4=(
-                self.persistent_route4_reduction == "ilp4"
-            ),
+            USE_ROUTE4_WINDOW4=(self.persistent_route4_reduction == "window4"),
+            USE_ROUTE4_ILP2=(self.persistent_route4_reduction == "ilp2"),
+            USE_ROUTE4_ILP4=(self.persistent_route4_reduction == "ilp4"),
             USE_ROUTE4_WARP0_FINALIZE=self.use_route4_warp0_finalize,
             USE_SPLIT128_PAIR_ROUTE=self.use_split128_pair_route,
             USE_EARLY_PRE_SYNC=self.use_early_pre_sync,
@@ -3154,10 +3052,7 @@ def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
 def _validate_no_overlap(
     named_tensors: Iterable[tuple[str, torch.Tensor]],
 ) -> None:
-    intervals = [
-        (*_byte_interval(tensor), name)
-        for name, tensor in named_tensors
-    ]
+    intervals = [(*_byte_interval(tensor), name) for name, tensor in named_tensors]
     intervals.sort()
     for (_, previous_end, previous_name), (
         current_begin,
@@ -3165,9 +3060,7 @@ def _validate_no_overlap(
         current_name,
     ) in zip(intervals, intervals[1:]):
         if current_begin < previous_end:
-            raise ValueError(
-                f"{previous_name} and {current_name} must not overlap"
-            )
+            raise ValueError(f"{previous_name} and {current_name} must not overlap")
 
 
 def prepare_tle_sm90_mega_mhc(
@@ -3183,22 +3076,16 @@ def prepare_tle_sm90_mega_mhc(
             "the experimental BM64 TF32 path is disabled; set "
             "DG_TLE_MHC_T32_WGMMA_BM64_DOT=1 explicitly"
         )
-    explicit_wgmma_text = os.environ.get(
-        "DG_TLE_MHC_T32_WGMMA_EXPLICIT_WGMMA", "0"
-    )
+    explicit_wgmma_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_EXPLICIT_WGMMA", "0")
     if explicit_wgmma_text not in ("0", "1"):
         raise ValueError("DG_TLE_MHC_T32_WGMMA_EXPLICIT_WGMMA must be 0 or 1")
     use_explicit_wgmma = explicit_wgmma_text == "1"
-    staged_wgmma_text = os.environ.get(
-        "DG_TLE_MHC_T32_WGMMA_STAGED_WGMMA", "0"
-    )
+    staged_wgmma_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_STAGED_WGMMA", "0")
     if staged_wgmma_text not in ("0", "1"):
         raise ValueError("DG_TLE_MHC_T32_WGMMA_STAGED_WGMMA must be 0 or 1")
     use_staged_wgmma = staged_wgmma_text == "1"
     if use_staged_wgmma and not use_explicit_wgmma:
-        raise ValueError(
-            "staged WGMMA requires DG_TLE_MHC_T32_WGMMA_EXPLICIT_WGMMA=1"
-        )
+        raise ValueError("staged WGMMA requires DG_TLE_MHC_T32_WGMMA_EXPLICIT_WGMMA=1")
     if use_staged_wgmma and NUM_WARPS != 16:
         raise ValueError("staged WGMMA requires 16 default warps")
     overlap_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_WARP_OVERLAP", "0")
@@ -3216,9 +3103,7 @@ def prepare_tle_sm90_mega_mhc(
         "DG_TLE_MHC_T32_WGMMA_DIRECT_ROUTING_TAIL", "0"
     )
     if direct_routing_tail_text not in ("0", "1"):
-        raise ValueError(
-            "DG_TLE_MHC_T32_WGMMA_DIRECT_ROUTING_TAIL must be 0 or 1"
-        )
+        raise ValueError("DG_TLE_MHC_T32_WGMMA_DIRECT_ROUTING_TAIL must be 0 or 1")
     use_direct_routing_tail = direct_routing_tail_text == "1"
     if use_direct_routing_tail and not (
         use_staged_wgmma and use_warp_overlap and NUM_WARPS == 16
@@ -3227,9 +3112,7 @@ def prepare_tle_sm90_mega_mhc(
             "direct routing tail requires staged WGMMA, warp overlap, and "
             "16 default warps"
         )
-    direct_tail_ilp4_text = os.environ.get(
-        "DG_TLE_MHC_T32_WGMMA_DIRECT_TAIL_ILP4", "0"
-    )
+    direct_tail_ilp4_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_DIRECT_TAIL_ILP4", "0")
     if direct_tail_ilp4_text not in ("0", "1"):
         raise ValueError("DG_TLE_MHC_T32_WGMMA_DIRECT_TAIL_ILP4 must be 0 or 1")
     use_direct_tail_ilp4 = direct_tail_ilp4_text == "1"
@@ -3237,9 +3120,7 @@ def prepare_tle_sm90_mega_mhc(
         raise ValueError(
             "direct-tail ILP4 requires DG_TLE_MHC_T32_WGMMA_DIRECT_ROUTING_TAIL=1"
         )
-    persistent_ws_text = os.environ.get(
-        "DG_TLE_MHC_T32_WGMMA_PERSISTENT_WS", "0"
-    )
+    persistent_ws_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_PERSISTENT_WS", "0")
     if persistent_ws_text not in ("0", "1"):
         raise ValueError("DG_TLE_MHC_T32_WGMMA_PERSISTENT_WS must be 0 or 1")
     use_persistent_ws = persistent_ws_text == "1"
@@ -3280,10 +3161,7 @@ def prepare_tle_sm90_mega_mhc(
             "DG_TLE_MHC_T32_WGMMA_PERSISTENT_ROUTE4_REDUCTION must be serial, "
             "window4, ilp2, or ilp4"
         )
-    if (
-        persistent_route4_reduction != "serial"
-        and not use_persistent_route4
-    ):
+    if persistent_route4_reduction != "serial" and not use_persistent_route4:
         raise ValueError(
             "non-serial route4 reduction requires "
             "DG_TLE_MHC_T32_WGMMA_PERSISTENT_ROUTE4=1"
@@ -3301,22 +3179,17 @@ def prepare_tle_sm90_mega_mhc(
         "DG_TLE_MHC_T32_WGMMA_ROUTE4_WARP0_FINALIZE", "0"
     )
     if route4_warp0_finalize_text not in ("0", "1"):
-        raise ValueError(
-            "DG_TLE_MHC_T32_WGMMA_ROUTE4_WARP0_FINALIZE must be 0 or 1"
-        )
+        raise ValueError("DG_TLE_MHC_T32_WGMMA_ROUTE4_WARP0_FINALIZE must be 0 or 1")
     use_route4_warp0_finalize = route4_warp0_finalize_text == "1"
     if use_route4_warp0_finalize and not use_persistent_route4:
         raise ValueError(
-            "route4 warp0 finalize requires "
-            "DG_TLE_MHC_T32_WGMMA_PERSISTENT_ROUTE4=1"
+            "route4 warp0 finalize requires " "DG_TLE_MHC_T32_WGMMA_PERSISTENT_ROUTE4=1"
         )
     split128_pair_route_text = os.environ.get(
         "DG_TLE_MHC_T32_WGMMA_SPLIT128_PAIR_ROUTE", "0"
     )
     if split128_pair_route_text not in ("0", "1"):
-        raise ValueError(
-            "DG_TLE_MHC_T32_WGMMA_SPLIT128_PAIR_ROUTE must be 0 or 1"
-        )
+        raise ValueError("DG_TLE_MHC_T32_WGMMA_SPLIT128_PAIR_ROUTE must be 0 or 1")
     use_split128_pair_route = split128_pair_route_text == "1"
     if use_split128_pair_route and not (
         NUM_SPLITS == 128
@@ -3336,9 +3209,7 @@ def prepare_tle_sm90_mega_mhc(
             "split128 pair-route is admitted only for the exact validated "
             "split128 staged-WGMMA persistent route4-serial plan"
         )
-    early_pre_sync_text = os.environ.get(
-        "DG_TLE_MHC_T32_WGMMA_EARLY_PRE_SYNC", "0"
-    )
+    early_pre_sync_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_EARLY_PRE_SYNC", "0")
     if early_pre_sync_text not in ("0", "1"):
         raise ValueError("DG_TLE_MHC_T32_WGMMA_EARLY_PRE_SYNC must be 0 or 1")
     use_early_pre_sync = early_pre_sync_text == "1"
@@ -3362,9 +3233,7 @@ def prepare_tle_sm90_mega_mhc(
             "staged-WGMMA persistent route4-serial plan with pair-route and "
             "warp0-finalize disabled"
         )
-    phase_profile_text = os.environ.get(
-        "DG_TLE_MHC_T32_WGMMA_PHASE_PROFILE", "0"
-    )
+    phase_profile_text = os.environ.get("DG_TLE_MHC_T32_WGMMA_PHASE_PROFILE", "0")
     if phase_profile_text not in ("0", "1"):
         raise ValueError("DG_TLE_MHC_T32_WGMMA_PHASE_PROFILE must be 0 or 1")
     enable_phase_profile = phase_profile_text == "1"
@@ -3526,9 +3395,7 @@ def prepare_tle_sm90_mega_mhc(
     devices = {tensor.device for tensor, _, _, _ in tensor_specs}
     if len(devices) != 1:
         raise ValueError("all MegaMHC tensors must share a device")
-    _validate_no_overlap(
-        (name, tensor) for tensor, name, _, _ in tensor_specs
-    )
+    _validate_no_overlap((name, tensor) for tensor, name, _, _ in tensor_specs)
 
     expected_scalars = {
         "hc_mult": HC_MULT,
@@ -3545,14 +3412,11 @@ def prepare_tle_sm90_mega_mhc(
         if isinstance(actual, bool) or not isinstance(actual, (int, float)):
             raise TypeError(f"inputs.{name} must be a Python scalar")
         if actual != expected:
-            raise ValueError(
-                f"inputs.{name}={actual!r}, expected {expected!r}"
-            )
+            raise ValueError(f"inputs.{name}={actual!r}, expected {expected!r}")
 
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "prepare the BM64 workspace and zero counter before CUDA Graph "
-            "capture"
+            "prepare the BM64 workspace and zero counter before CUDA Graph " "capture"
         )
     device = inputs["x"].device
     partials = torch.empty(
@@ -3584,16 +3448,12 @@ def prepare_tle_sm90_mega_mhc(
     )
     workspace_tensors = {"projection_and_sqsum_partials": partials}
     if use_split128_pair_route:
-        workspace_tensors[
-            "split128_pair_route_partials"
-        ] = pair_route_partials
+        workspace_tensors["split128_pair_route_partials"] = pair_route_partials
     if enable_phase_profile:
         workspace_tensors["phase_profile_ns"] = phase_profile
     counter_tensors = {"monotonic_grid_barrier": grid_counter}
     if use_split128_pair_route:
-        counter_tensors[
-            "split128_pair_route_epochs"
-        ] = pair_route_epochs
+        counter_tensors["split128_pair_route_epochs"] = pair_route_epochs
     expected_physical_threads_per_cta = CTA_THREADS
     if use_staged_wgmma:
         expected_physical_threads_per_cta += STAGED_MATH_THREADS
@@ -3638,27 +3498,19 @@ def prepare_tle_sm90_mega_mhc(
         "dot_accumulator": "float32",
         "explicit_wgmma": use_explicit_wgmma,
         "staged_wgmma": use_staged_wgmma,
-        "staged_wgmma_math_warps": (
-            STAGED_MATH_WARPS if use_staged_wgmma else 0
-        ),
-        "staged_wgmma_math_registers": (
-            STAGED_MATH_REGS if use_staged_wgmma else 0
-        ),
+        "staged_wgmma_math_warps": (STAGED_MATH_WARPS if use_staged_wgmma else 0),
+        "staged_wgmma_math_registers": (STAGED_MATH_REGS if use_staged_wgmma else 0),
         "staged_wgmma_logical_threads": (
             STAGED_LOGICAL_THREADS if use_staged_wgmma else 0
         ),
-        "explicit_wgmma_k_tile": (
-            HIDDEN_PER_SPLIT if use_explicit_wgmma else None
-        ),
+        "explicit_wgmma_k_tile": (HIDDEN_PER_SPLIT if use_explicit_wgmma else None),
         "explicit_wgmma_wait_groups": (
             "wait_group_0_per_route" if use_explicit_wgmma else None
         ),
         "num_warps": NUM_WARPS,
         "threads_per_cta": CTA_THREADS,
         "default_partition_threads": CTA_THREADS,
-        "expected_physical_threads_per_cta": (
-            expected_physical_threads_per_cta
-        ),
+        "expected_physical_threads_per_cta": (expected_physical_threads_per_cta),
         "warp_overlap": use_warp_overlap,
         "direct_routing_tail": use_direct_routing_tail,
         "direct_tail_ilp4": use_direct_tail_ilp4,
@@ -3670,8 +3522,7 @@ def prepare_tle_sm90_mega_mhc(
         "split128_pair_route_enabled": use_split128_pair_route,
         "early_pre_sync_enabled": use_early_pre_sync,
         "pre_ready_worker_sync_mode": (
-            "route4_row0_relay_store_then_blocking_wait_then_"
-            "reload_for_sinkhorn"
+            "route4_row0_relay_store_then_blocking_wait_then_" "reload_for_sinkhorn"
             if use_early_pre_sync
             else "nonblocking_arrive_after_pre_store"
         ),
@@ -3682,13 +3533,10 @@ def prepare_tle_sm90_mega_mhc(
             else None
         ),
         "early_pre_sync_relay_location": (
-            "persistent_route4_shared_row0_lanes8_23"
-            if use_early_pre_sync
-            else None
+            "persistent_route4_shared_row0_lanes8_23" if use_early_pre_sync else None
         ),
         "early_pre_sync_relay_order": (
-            "store_raw_mixes_f32_then_pre_ready_wait_then_load_f32_"
-            "for_sinkhorn"
+            "store_raw_mixes_f32_then_pre_ready_wait_then_load_f32_" "for_sinkhorn"
             if use_early_pre_sync
             else None
         ),
@@ -3696,11 +3544,11 @@ def prepare_tle_sm90_mega_mhc(
         "warp_specialization_regions": (
             1
             if use_persistent_ws
-            else 2
-            if use_staged_wgmma and use_direct_routing_tail
-            else 1
-            if use_staged_wgmma or use_warp_overlap
-            else 0
+            else (
+                2
+                if use_staged_wgmma and use_direct_routing_tail
+                else 1 if use_staged_wgmma or use_warp_overlap else 0
+            )
         ),
         "persistent_default_role": (
             (
@@ -3714,23 +3562,25 @@ def prepare_tle_sm90_mega_mhc(
         "persistent_worker_role": (
             "wgmma_grid_acquire_pair_reduce_helper_publish_owner_finalize"
             if use_split128_pair_route
-            else "wgmma_grid_acquire_route4_reduce_then_warp0_finalize"
-            if use_route4_warp0_finalize
-            else "wgmma_grid_acquire_route4_reduce_then_masked_finalize"
-            if use_persistent_route4
-            else "wgmma_grid_acquire_routing_warp0"
-            if use_persistent_ws
-            else None
+            else (
+                "wgmma_grid_acquire_route4_reduce_then_warp0_finalize"
+                if use_route4_warp0_finalize
+                else (
+                    "wgmma_grid_acquire_route4_reduce_then_masked_finalize"
+                    if use_persistent_route4
+                    else (
+                        "wgmma_grid_acquire_routing_warp0"
+                        if use_persistent_ws
+                        else None
+                    )
+                )
+            )
         ),
         "persistent_barrier_arrive_count": (
             STAGED_LOGICAL_THREADS if use_persistent_ws else None
         ),
         "persistent_named_barrier_count": (
-            6
-            if use_persistent_route4
-            else 5
-            if use_persistent_ws
-            else 0
+            6 if use_persistent_route4 else 5 if use_persistent_ws else 0
         ),
         "persistent_named_barrier_contract": (
             {
@@ -3749,49 +3599,49 @@ def prepare_tle_sm90_mega_mhc(
             else None
         ),
         "persistent_routing_active_warps": (
-            4
-            if use_persistent_route4
-            else 1
-            if use_persistent_ws
-            else None
+            4 if use_persistent_route4 else 1 if use_persistent_ws else None
         ),
-        "persistent_routing_finalize_warps": (
-            1 if use_persistent_ws else None
-        ),
+        "persistent_routing_finalize_warps": (1 if use_persistent_ws else None),
         "persistent_route4_nonfinalize_warps": (
             STAGED_MATH_WARPS - 1 if use_persistent_route4 else None
         ),
         "persistent_route4_nonfinalize_action": (
             "owner_masked_finalize_arrive_or_helper_pair_publish"
             if use_split128_pair_route
-            else "masked_finalize_with_pre_ready_wait"
-            if use_early_pre_sync
-            else "pre_ready_arrive_only"
-            if use_route4_warp0_finalize
-            else "masked_finalize_with_pre_ready_arrive"
-            if use_persistent_route4
-            else None
+            else (
+                "masked_finalize_with_pre_ready_wait"
+                if use_early_pre_sync
+                else (
+                    "pre_ready_arrive_only"
+                    if use_route4_warp0_finalize
+                    else (
+                        "masked_finalize_with_pre_ready_arrive"
+                        if use_persistent_route4
+                        else None
+                    )
+                )
+            )
         ),
         "persistent_route4_finalize_branch": (
             "cta_uniform_helper_publish_or_owner_masked_finalize"
             if use_split128_pair_route
-            else "warp_uniform_worker_warp0"
-            if use_route4_warp0_finalize
-            else "all_worker_warps_masked_by_routing_active"
-            if use_persistent_route4
-            else None
+            else (
+                "warp_uniform_worker_warp0"
+                if use_route4_warp0_finalize
+                else (
+                    "all_worker_warps_masked_by_routing_active"
+                    if use_persistent_route4
+                    else None
+                )
+            )
         ),
         "persistent_route4_finalize_issue_warps": (
             1
             if use_route4_warp0_finalize
-            else STAGED_MATH_WARPS
-            if use_persistent_route4
-            else None
+            else STAGED_MATH_WARPS if use_persistent_route4 else None
         ),
         "persistent_route4_shared_shape": (
-            [STAGED_MATH_WARPS, BLOCK_N]
-            if use_persistent_route4
-            else None
+            [STAGED_MATH_WARPS, BLOCK_N] if use_persistent_route4 else None
         ),
         "persistent_route4_barrier_arrive_count": (
             STAGED_MATH_THREADS if use_persistent_route4 else None
@@ -3799,39 +3649,29 @@ def prepare_tle_sm90_mega_mhc(
         "persistent_route4_sync": (
             "inline_ptx_bar_sync_5_plus_helper_bar_warp_sync"
             if use_split128_pair_route
-            else "inline_ptx_bar_sync_5"
-            if use_persistent_route4
-            else None
+            else "inline_ptx_bar_sync_5" if use_persistent_route4 else None
         ),
         "persistent_route4_reduction_mode": (
             persistent_route4_reduction if use_persistent_route4 else None
         ),
         "persistent_route4_reduction_load_window": (
             4
-            if use_persistent_route4
-            and persistent_route4_reduction != "serial"
-            else 1
-            if use_persistent_route4
-            else None
+            if use_persistent_route4 and persistent_route4_reduction != "serial"
+            else 1 if use_persistent_route4 else None
         ),
         "persistent_route4_reduction_accumulators": (
             4
-            if use_persistent_route4
-            and persistent_route4_reduction == "ilp4"
-            else 2
-            if use_persistent_route4
-            and persistent_route4_reduction == "ilp2"
-            else 1
-            if use_persistent_route4
-            else None
+            if use_persistent_route4 and persistent_route4_reduction == "ilp4"
+            else (
+                2
+                if use_persistent_route4 and persistent_route4_reduction == "ilp2"
+                else 1 if use_persistent_route4 else None
+            )
         ),
         "persistent_route4_reduction_stride_bytes": (
             32768
-            if use_persistent_route4
-            and persistent_route4_reduction != "serial"
-            else 8192
-            if use_persistent_route4
-            else None
+            if use_persistent_route4 and persistent_route4_reduction != "serial"
+            else 8192 if use_persistent_route4 else None
         ),
         "persistent_route4_reduction_split_stride_bytes": (
             8192 if use_persistent_route4 else None
@@ -3839,72 +3679,89 @@ def prepare_tle_sm90_mega_mhc(
         "persistent_route4_splits_per_worker_warp": (
             PAIR_ROUTE_SPLITS_PER_WARP
             if use_split128_pair_route
-            else ROUTE4_SPLITS_PER_WARP
-            if use_persistent_route4
-            else None
+            else ROUTE4_SPLITS_PER_WARP if use_persistent_route4 else None
         ),
         "persistent_route4_quarter_stride_bytes": (
             PAIR_ROUTE_SPLITS_PER_WARP * TOKENS * BLOCK_N * 4
             if use_split128_pair_route
-            else ROUTE4_SPLITS_PER_WARP * TOKENS * BLOCK_N * 4
-            if use_persistent_route4
-            else None
+            else (
+                ROUTE4_SPLITS_PER_WARP * TOKENS * BLOCK_N * 4
+                if use_persistent_route4
+                else None
+            )
         ),
         "persistent_route4_reduction_bitwise_equivalent_to_route4_serial": (
             False
             if use_split128_pair_route
-            else persistent_route4_reduction in ("serial", "window4")
-            if use_persistent_route4
-            else None
+            else (
+                persistent_route4_reduction in ("serial", "window4")
+                if use_persistent_route4
+                else None
+            )
         ),
         "tail_partial_reduction": (
             "paired_ctas_each_four_worker_warps_contiguous16_then_"
             "balanced_half_merge_then_owner_add_packed25"
             if use_split128_pair_route
-            else f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
-            "ilp4_then_balanced_merge_packed25"
-            if use_persistent_route4
-            and persistent_route4_reduction == "ilp4"
-            else
-            f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
-            "ilp2_then_balanced_merge_packed25"
-            if use_persistent_route4
-            and persistent_route4_reduction == "ilp2"
-            else
-            f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
-            "window4_then_balanced_merge_packed25"
-            if use_persistent_route4
-            and persistent_route4_reduction == "window4"
-            else
-            f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
-            "then_balanced_merge_packed25"
-            if use_persistent_route4
-            else "single_routing_warp_mod4_ilp_packed25"
-            if use_direct_tail_ilp4
-            else "single_routing_warp_increasing_split_packed25"
-            if use_direct_routing_tail
-            else "default_partition_triton_sum"
+            else (
+                f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
+                "ilp4_then_balanced_merge_packed25"
+                if use_persistent_route4 and persistent_route4_reduction == "ilp4"
+                else (
+                    f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
+                    "ilp2_then_balanced_merge_packed25"
+                    if use_persistent_route4 and persistent_route4_reduction == "ilp2"
+                    else (
+                        f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
+                        "window4_then_balanced_merge_packed25"
+                        if use_persistent_route4
+                        and persistent_route4_reduction == "window4"
+                        else (
+                            f"four_worker_warps_contiguous{ROUTE4_SPLITS_PER_WARP}_"
+                            "then_balanced_merge_packed25"
+                            if use_persistent_route4
+                            else (
+                                "single_routing_warp_mod4_ilp_packed25"
+                                if use_direct_tail_ilp4
+                                else (
+                                    "single_routing_warp_increasing_split_packed25"
+                                    if use_direct_routing_tail
+                                    else "default_partition_triton_sum"
+                                )
+                            )
+                        )
+                    )
+                )
+            )
         ),
         "tail_reduction_association": (
             "two_64_split_halves_each_four_contiguous_16_term_serial_"
             "quarters_then_balanced_merge_then_owner_add"
             if use_split128_pair_route
-            else f"four_contiguous_{ROUTE4_SPLITS_PER_WARP}_term_mod4_"
-            "quarters_then_balanced_merge"
-            if use_persistent_route4
-            and persistent_route4_reduction == "ilp4"
-            else f"four_contiguous_{ROUTE4_SPLITS_PER_WARP}_term_mod2_"
-            "quarters_then_balanced_merge"
-            if use_persistent_route4
-            and persistent_route4_reduction == "ilp2"
-            else f"four_contiguous_{ROUTE4_SPLITS_PER_WARP}_term_serial_"
-            "quarters_then_balanced_merge"
-            if use_persistent_route4
-            else "mod4_16_terms_then_balanced_2_level_merge"
-            if use_direct_tail_ilp4
-            else "increasing_split_serial"
-            if use_direct_routing_tail
-            else "compiler_defined"
+            else (
+                f"four_contiguous_{ROUTE4_SPLITS_PER_WARP}_term_mod4_"
+                "quarters_then_balanced_merge"
+                if use_persistent_route4 and persistent_route4_reduction == "ilp4"
+                else (
+                    f"four_contiguous_{ROUTE4_SPLITS_PER_WARP}_term_mod2_"
+                    "quarters_then_balanced_merge"
+                    if use_persistent_route4 and persistent_route4_reduction == "ilp2"
+                    else (
+                        f"four_contiguous_{ROUTE4_SPLITS_PER_WARP}_term_serial_"
+                        "quarters_then_balanced_merge"
+                        if use_persistent_route4
+                        else (
+                            "mod4_16_terms_then_balanced_2_level_merge"
+                            if use_direct_tail_ilp4
+                            else (
+                                "increasing_split_serial"
+                                if use_direct_routing_tail
+                                else "compiler_defined"
+                            )
+                        )
+                    )
+                )
+            )
         ),
         "tail_reduction_bitwise_equivalent_to_serial": (
             not (use_direct_tail_ilp4 or use_persistent_route4)
@@ -3912,24 +3769,31 @@ def prepare_tle_sm90_mega_mhc(
         "tail_pre_publication": (
             "pair_owner_acquire_then_all_workers_masked_finalize_arrive"
             if use_split128_pair_route
-            else "persistent_route4_relay_store_then_all_workers_pre_ready_"
-            "wait_then_sinkhorn_relay_load"
-            if use_early_pre_sync
-            else "persistent_route4_worker_warp0_finalize_"
-            "nonowners_arrive_only"
-            if use_route4_warp0_finalize
-            else "persistent_route4_all_workers_masked_finalize_arrive"
-            if use_persistent_route4
-            else "persistent_worker_warp0_shared4_group_arrive"
-            if use_persistent_ws
-            else "routing_warp_shared4_nonblocking_arrive"
-            if use_warp_overlap
-            else "default_partition"
+            else (
+                "persistent_route4_relay_store_then_all_workers_pre_ready_"
+                "wait_then_sinkhorn_relay_load"
+                if use_early_pre_sync
+                else (
+                    "persistent_route4_worker_warp0_finalize_" "nonowners_arrive_only"
+                    if use_route4_warp0_finalize
+                    else (
+                        "persistent_route4_all_workers_masked_finalize_arrive"
+                        if use_persistent_route4
+                        else (
+                            "persistent_worker_warp0_shared4_group_arrive"
+                            if use_persistent_ws
+                            else (
+                                "routing_warp_shared4_nonblocking_arrive"
+                                if use_warp_overlap
+                                else "default_partition"
+                            )
+                        )
+                    )
+                )
+            )
         ),
         "phase_profile_enabled": enable_phase_profile,
-        "overlap_routing_warps": (
-            OVERLAP_ROUTING_WARPS if use_warp_overlap else 0
-        ),
+        "overlap_routing_warps": (OVERLAP_ROUTING_WARPS if use_warp_overlap else 0),
         "schedule": (
             "bm64_n32_split128_pair_route_tf32_grid_barrier"
             if use_split128_pair_route
@@ -3940,9 +3804,11 @@ def prepare_tle_sm90_mega_mhc(
         "tail_nonowner_policy": (
             "producer_exit_worker_publish_pair_partial_after_grid_acquire"
             if use_split128_pair_route
-            else "exit_both_persistent_partitions_after_grid_acquire"
-            if GRID_CTAS > TAIL_OWNER_CTAS
-            else "none"
+            else (
+                "exit_both_persistent_partitions_after_grid_acquire"
+                if GRID_CTAS > TAIL_OWNER_CTAS
+                else "none"
+            )
         ),
         "tokens_per_tail_owner": TOKENS_PER_TAIL_OWNER,
         "cluster_ctas": 1,
@@ -3964,24 +3830,16 @@ def prepare_tle_sm90_mega_mhc(
             TAIL_OWNER_CTAS if use_split128_pair_route else None
         ),
         "split128_pair_route_splits_per_cta": (
-            PAIR_ROUTE_SPLITS_PER_CTA
-            if use_split128_pair_route
-            else None
+            PAIR_ROUTE_SPLITS_PER_CTA if use_split128_pair_route else None
         ),
         "split128_pair_route_splits_per_worker_warp": (
-            PAIR_ROUTE_SPLITS_PER_WARP
-            if use_split128_pair_route
-            else None
+            PAIR_ROUTE_SPLITS_PER_WARP if use_split128_pair_route else None
         ),
         "split128_pair_route_workspace_key": (
-            "split128_pair_route_partials"
-            if use_split128_pair_route
-            else None
+            "split128_pair_route_partials" if use_split128_pair_route else None
         ),
         "split128_pair_route_workspace_shape": (
-            list(pair_route_partials.shape)
-            if use_split128_pair_route
-            else None
+            list(pair_route_partials.shape) if use_split128_pair_route else None
         ),
         "split128_pair_route_workspace_allocated_bytes": (
             pair_route_partials.numel() * pair_route_partials.element_size()
@@ -3989,14 +3847,10 @@ def prepare_tle_sm90_mega_mhc(
             else 0
         ),
         "split128_pair_route_counter_key": (
-            "split128_pair_route_epochs"
-            if use_split128_pair_route
-            else None
+            "split128_pair_route_epochs" if use_split128_pair_route else None
         ),
         "split128_pair_route_counter_shape": (
-            list(pair_route_epochs.shape)
-            if use_split128_pair_route
-            else None
+            list(pair_route_epochs.shape) if use_split128_pair_route else None
         ),
         "split128_pair_route_counter_allocated_bytes": (
             pair_route_epochs.numel() * pair_route_epochs.element_size()
@@ -4029,9 +3883,7 @@ def prepare_tle_sm90_mega_mhc(
         "workspace_shape": list(partials.shape),
         "workspace_allocated_bytes": partials.numel() * partials.element_size(),
         "counter_shape": list(grid_counter.shape),
-        "counter_allocated_bytes": (
-            grid_counter.numel() * grid_counter.element_size()
-        ),
+        "counter_allocated_bytes": (grid_counter.numel() * grid_counter.element_size()),
         "bf16_rounding_boundaries": [
             "new_residual",
             "norm_input",
@@ -4043,9 +3895,11 @@ def prepare_tle_sm90_mega_mhc(
         "result_scope": (
             "small_padded_bm64_split128_pair_route_tf32_structural_prototype"
             if use_split128_pair_route
-            else "small_padded_bm64_tf32_structural_prototype"
-            if NUM_SPLITS == 64
-            else "small_padded_bm64_split128_tf32_structural_prototype"
+            else (
+                "small_padded_bm64_tf32_structural_prototype"
+                if NUM_SPLITS == 64
+                else "small_padded_bm64_split128_tf32_structural_prototype"
+            )
         ),
         "occupancy_validated": False,
         "residency_precondition": {
@@ -4055,8 +3909,7 @@ def prepare_tle_sm90_mega_mhc(
             "minimum_resident_ctas_per_sm": 1,
             "required_total_resident_ctas": GRID_CTAS,
             "admission_equation": (
-                "active_blocks_per_sm * multiprocessor_count >= "
-                f"{GRID_CTAS}"
+                "active_blocks_per_sm * multiprocessor_count >= " f"{GRID_CTAS}"
             ),
             "must_query_compiled_kernel_occupancy_before_launch": True,
             "watchdog_required": True,
@@ -4079,8 +3932,7 @@ def prepare_tle_sm90_mega_mhc(
             ),
             "threads_per_cta": expected_physical_threads_per_cta,
             "global_synchronization": (
-                "cooperative_launch_with_monotonic_u64_"
-                "release_acquire_spin"
+                "cooperative_launch_with_monotonic_u64_" "release_acquire_spin"
             ),
             "projection_core": (
                 "TLE_warp_specialized_SS_WGMMA_TF32"

@@ -15,14 +15,13 @@ from typing import Mapping
 import triton
 import triton.language as tl
 
+from . import sm90_eager_p384_rs_wgmma as _tail_helper_module
 from . import sm90_large_graph_split16_rs_t400_nonstriped_wgmma as _t400
-from . import sm90_eager_t12991_p384_rs_wgmma as _tail_helper_module
 from . import sm90_wgmma_m64n24_raw_probe as _raw_module
 from .sm90_wgmma_m64n24_raw_probe import (
     _raw_m64n24k64_accumulate,
     _store_raw_n24_partials,
 )
-
 
 TOKENS = _t400.TOKENS
 _implementation = _t400._implementation
@@ -31,7 +30,7 @@ _t64 = _t400._t64
 _T400_SOURCE = Path(_t400.__file__).resolve()
 _T400_SHA256 = hashlib.sha256(_T400_SOURCE.read_bytes()).hexdigest()
 _EXPECTED_T400_SHA256 = (
-    "26d9e8447e0338b6067618caa47f74f62d03adbf488118b412c9cee9f3c9240d"
+    "74b1da8bf6bff10cce9a8f54fedf0165df211c823e62cf34eed9aac857de2602"
 )
 if _T400_SHA256 != _EXPECTED_T400_SHA256:
     raise RuntimeError(
@@ -51,11 +50,9 @@ if _RAW_HELPER_SHA256 != _EXPECTED_RAW_HELPER_SHA256:
     )
 
 _TAIL_HELPER_SOURCE = Path(_tail_helper_module.__file__).resolve()
-_TAIL_HELPER_SHA256 = hashlib.sha256(
-    _TAIL_HELPER_SOURCE.read_bytes()
-).hexdigest()
+_TAIL_HELPER_SHA256 = hashlib.sha256(_TAIL_HELPER_SOURCE.read_bytes()).hexdigest()
 _EXPECTED_TAIL_HELPER_SHA256 = (
-    "1f0d2918f21b8f563e93337801a2bbd4a727e90a99d462b9c010f830303dfaa7"
+    "abd3f72dbc66fcfd2e3d527df98c7e4bfb430f919c7a388214385054013623f0"
 )
 if _TAIL_HELPER_SHA256 != _EXPECTED_TAIL_HELPER_SHA256:
     raise RuntimeError(
@@ -89,11 +86,9 @@ def _t400_raw_n24_math(
     hc_post_scale,
     sinkhorn_eps,
 ):
-    values = (0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)
+    values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     if is_producer:
-        for hb in tl.static_range(
-            0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT
-        ):
+        for hb in tl.static_range(0, _implementation.JIT_HIDDEN_BLOCKS_PER_SPLIT):
             if hb % 2 == 0:
                 _implementation.tle.gpu.barrier_wait(ready0)
             else:
@@ -101,9 +96,7 @@ def _t400_raw_n24_math(
             for channel in tl.static_range(0, _implementation.JIT_HC_MULT):
                 q_address = _implementation._quad._shared_address(
                     _implementation.tle.gpu.local_ptr(
-                        q_stages.slot(
-                            (hb % 2) * _implementation.JIT_HC_MULT + channel
-                        ),
+                        q_stages.slot((hb % 2) * _implementation.JIT_HC_MULT + channel),
                         (0, 0),
                     )
                 )
@@ -118,9 +111,18 @@ def _t400_raw_n24_math(
                 values = _raw_m64n24k64_accumulate(
                     q_address,
                     fn_address,
-                    values[0],values[1],values[2],values[3],
-                    values[4],values[5],values[6],values[7],
-                    values[8],values[9],values[10],values[11],
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                    values[4],
+                    values[5],
+                    values[6],
+                    values[7],
+                    values[8],
+                    values[9],
+                    values[10],
+                    values[11],
                 )
             if hb % 2 == 0:
                 _implementation.tle.gpu.barrier_wait(done0)
@@ -129,9 +131,7 @@ def _t400_raw_n24_math(
 
         split_partials = (
             partials_ptr
-            + split
-            * _implementation.JIT_TOKENS
-            * _implementation.JIT_BLOCK_N
+            + split * _implementation.JIT_TOKENS * _implementation.JIT_BLOCK_N
         )
         _ = _store_raw_n24_partials(
             tl.cast(split_partials, tl.uint64),
@@ -143,25 +143,18 @@ def _t400_raw_n24_math(
     _implementation.tle.gpu.barrier_wait(producer_ready)
     if _implementation.JIT_PROBE_PHASE >= 2:
         physical_thread = _t64._physical_thread_id_x()
-        _ = _t400._t400_tile_barrier(
-            tl.cast(partials_ptr, tl.uint64), physical_thread
-        )
+        _ = _t400._t400_tile_barrier(tl.cast(partials_ptr, tl.uint64), physical_thread)
         _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
         if _implementation.JIT_PROBE_PHASE >= 3:
             lane = physical_thread % 32
-            role = (
-                physical_thread - _implementation.JIT_ROOT_THREADS
-            ) // 32
+            role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
             first_token = (
-                tile * _implementation.JIT_BLOCK_M
-                + split * _base.JIT_NUM_ROLES
+                tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
             )
             if first_token < _implementation.JIT_TOKENS:
                 token = first_token + role
                 packed_sum = 0.0
-                for source_split in tl.static_range(
-                    0, _implementation.JIT_NUM_SPLITS
-                ):
+                for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
                     packed_sum += tl.load(
                         partials_ptr
                         + source_split
@@ -169,8 +162,7 @@ def _t400_raw_n24_math(
                         * _implementation.JIT_BLOCK_N
                         + token * _implementation.JIT_BLOCK_N
                         + lane,
-                        mask=lane
-                        <= _implementation.JIT_PROJECTION_OUTPUTS,
+                        mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
                         other=0.0,
                     )
                 _base._pipe_role4_routing_finalize(
