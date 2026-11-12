@@ -180,21 +180,76 @@ def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
 
 
 def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
-    """Run the MetaX production MoE entry on the given inputs.
+    """Run vLLM-MetaX's production unquantized MoE method."""
+    import vllm_metax
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
 
-    Vendor experts need the MACA mctlass extension; flagos builds ship
-    their own dispatched Triton path instead, so fall back to it.
-    """
+    # The flagos MetaX image does not ship the mctlass extension.  Without
+    # it the vendor TritonExperts path asserts in its BF16 block-size
+    # override, so keep the available MetaX Triton path selected.
     try:
         import mctlassEx  # noqa: F401
-        from vllm_metax.model_executor.layers.fused_moe.fused_moe import (
-            fused_experts_impl as vendor_impl,
-        )
-    except ImportError:
-        from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts_impl
+    except Exception:
+        import vllm_metax.envs as _mx_envs
 
-        return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
-    return vendor_impl(hidden_states, w1, w2, topk_weights, topk_ids, False)
+        _mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE = False
+        _mx_envs.MACA_VLLM_ENABLE_MCTLASS_PYTHON_API = False
+
+    # The plugin's OOT method is registered by this entry point; importing
+    # vllm_metax alone leaves FusedMoE on the upstream Triton fallback.
+    if not _CACHE.get("metax_registered"):
+        vllm_metax.register_customized()
+        _CACHE["metax_registered"] = True
+
+    # Keep subsequent FlagGems allocations on the same device; _build_layer
+    # constructs the vLLM layer under an explicit default device.
+    torch.set_default_device(hidden_states.device)
+
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    hidden_size = w2.shape[1]
+    topk = topk_ids.shape[1]
+    topk_ids = topk_ids.to(torch.int32)
+    struct_key = (
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        topk,
+        hidden_states.dtype,
+    )
+    # Reuse the layer for every token count sharing the same expert geometry;
+    # rebuilding it per shape retains too much vLLM workspace on 64 GiB C550s.
+    if struct_key != _CACHE.get("metax_struct"):
+        _CACHE["layer"] = None
+        torch.cuda.empty_cache()
+        _build_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["metax_struct"] = struct_key
+        _CACHE["metax_weight_key"] = None
+
+    experts = _CACHE["experts"]
+    weight_key = (w1.data_ptr(), w2.data_ptr(), hidden_states.dtype)
+    if weight_key != _CACHE.get("metax_weight_key"):
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data = w1
+            experts.w2_weight.data = w2
+            experts.quant_method.process_weights_after_loading(experts)
+            if hasattr(experts, "ensure_moe_quant_config_init"):
+                experts.ensure_moe_quant_config_init()
+        _CACHE["metax_weight_key"] = weight_key
+
+    ctx = _CACHE["ctx"]
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return experts.quant_method.apply(
+            layer=experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        )
 
 
 def mthreads_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
