@@ -2566,9 +2566,12 @@ def persistent_topk(
     sampled_min_len = (
         K_MIN_SAMPLED_LENGTH_K512 if k == 512 else K_MIN_SAMPLED_LENGTH_OTHER
     )
+    # The sampled path is correct and faster than the cooperative
+    # (num_rows<=32) path across 1..64 rows for long contexts, so it is
+    # gated only on context length (via sampled_min_len, which scales
+    # with k) and shared-memory capacity -- not on a hard num_rows>32.
     if (
-        num_rows > 32
-        and max_seq_len >= sampled_min_len
+        max_seq_len >= sampled_min_len
         and max_smem_per_block >= SAMPLED_SMEM_BYTES
     ):
         _sampled_topk_kernel[(num_rows,)](
