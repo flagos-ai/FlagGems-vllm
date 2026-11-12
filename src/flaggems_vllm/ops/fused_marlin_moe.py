@@ -103,6 +103,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 # ----------------------------------------------------------------------------
 # Local quantization tags for native expert-major tensors, not packed Marlin IDs.
@@ -2625,13 +2626,38 @@ def _launch_w8a16_int8_gemv(x, w1, w2, s1, s2, weights, ids, output):
     )
 
 
-def _w8a16_tuned_kernel(kernel, config_name, key, **kwargs):
-    """Share JIT bodies while keeping each precision's library tuning cache."""
-    return libentry()(
-        libtuner(configs=runtime.get_tuned_config(config_name), key=key, **kwargs)(
-            kernel
+def _with_hoist_off(configs):
+    """Add the pipelined candidates once more with ``pipeline_hoist_copy`` off.
+
+    Issuing the next block's prefetch before the WGMMA wait costs registers;
+    on the FP8 down kernel at 3 stages that lowers the occupancy, and whether
+    the hoist pays off depends on the shape (H20: faster at T >= 256, slower on
+    a Mixtral-8x7B decode shape), so the tuning library decides per shape.
+    Every candidate carries the key so the persisted tuning table has one
+    column set.
+    """
+    off = pipeline_options(pipeline_hoist_copy=False)
+    if not off:
+        return configs
+
+    def with_option(c, value):
+        return triton.Config(
+            dict(c.kwargs, pipeline_hoist_copy=value),
+            num_warps=c.num_warps,
+            num_stages=c.num_stages,
         )
-    )
+
+    return [with_option(c, True) for c in configs] + [
+        with_option(c, False) for c in configs if c.num_stages >= 2
+    ]
+
+
+def _w8a16_tuned_kernel(kernel, config_name, key, hoist_dimension=False, **kwargs):
+    """Share JIT bodies while keeping each precision's library tuning cache."""
+    configs = runtime.get_tuned_config(config_name)
+    if hoist_dimension:
+        configs = _with_hoist_off(configs)
+    return libentry()(libtuner(configs=configs, key=key, **kwargs)(kernel))
 
 
 @triton.jit
@@ -3375,9 +3401,10 @@ def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
 
 # Share kernel bodies while tuning INT8 and FP8 independently. The tuning
 # library picks the stage count per shape; on FP8 decode shapes the deeper
-# pipelines pay off (down 1.12x, unified 1.18x, gateup_silu 1.67x over
-# num_stages=1). INT8 down keeps num_stages=1 only: deeper stages measured
-# 0.69-0.72x at T <= 64.
+# pipelines pay off. INT8 down has no candidate above one stage: deeper stages
+# measured 0.66-0.77x (T <= 64) on H20. INT8 gateup_silu keeps the three-stage
+# candidates of its tuned table, which the tuner rejects per shape where they
+# lose (0.94x on Mixtral-8x7B T=4).
 _fused_moe_kernel_w8a16_gateup_fp8 = _w8a16_tuned_kernel(
     fused_moe_kernel_w8a16_gateup,
     "fused_marlin_moe_w8a16_fp8_gateup",
@@ -3394,6 +3421,7 @@ _fused_moe_kernel_w8a16_down_fp8 = _w8a16_tuned_kernel(
     fused_moe_kernel_w8a16_down,
     "fused_marlin_moe_w8a16_fp8_down",
     key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
+    hoist_dimension=True,
     reset_to_zero=["OUT"],
 )
 

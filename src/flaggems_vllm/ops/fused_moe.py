@@ -30,6 +30,7 @@ from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import pointwise_dynamic
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +417,20 @@ def get_moe_wna16_block_config(
         block_size_k = _ensure_block_size_k_divisible(size_k, block_size_k, group_size)
 
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
+
+
+def get_moe_pipeline_config(size_k: int, block_size_k: int) -> dict[str, Any]:
+    """Per-kernel FlagTree pipeline options of the fused MoE K loop.
+
+    Keeping the wgmma accumulator in flight across the K-loop iterations costs
+    a prologue and an epilogue wait. With one or two iterations there is nothing
+    to overlap, and the kernel loses ~16% on the small tiles (K=128 with
+    BLOCK_SIZE_K=64 measured 0.83x on H20), so the carry is switched off there.
+    """
+    iterations = size_k // max(block_size_k, 1)
+    if iterations <= 2:
+        return pipeline_options(pipeline_wgmma_carry=False)
+    return {}
 
 
 def get_default_config(
@@ -2127,6 +2142,7 @@ def invoke_fused_moe_triton_kernel(
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+    config.update(get_moe_pipeline_config(B.size(2), BLOCK_SIZE_K))
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
 
