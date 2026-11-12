@@ -169,7 +169,7 @@ def test_npu_mhc_pre_regular_shapes(num_tokens, hc_mult, hidden_size):
 @requires_ascend
 def test_npu_mhc_pre_shape_validation():
     """Invalid shapes must raise ValueError; hc_mult=6 must be accepted
-    (the npu_mhc_post hc_mult==4 restriction does not apply here)."""
+    (the mhc_post hc_mult==4 restriction does not apply here)."""
     data = generate_mhc_pre_data(8, 4, 1280)
     passed = failed = 0
 
@@ -210,7 +210,7 @@ def test_npu_mhc_pre_shape_validation():
         residual=data["residual"][0],
     )
 
-    # hc_mult=6: accepted and numerically sound (no npu_mhc_post reuse)
+    # hc_mult=6: accepted and numerically sound (no mhc_post reuse)
     device = data["fn"].device
     torch.manual_seed(7)
     hc_mult, hidden = 6, 64
