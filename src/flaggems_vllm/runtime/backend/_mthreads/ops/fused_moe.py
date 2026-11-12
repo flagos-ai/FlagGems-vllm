@@ -2567,6 +2567,17 @@ _NOPAD_CFG = {
     "num_stages": 2,
 }
 
+# I>=256: one 128x128 GEMM over 2*I (single accumulator), then SiLU*up.
+_NOPAD_SPLIT_CFG = {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 32,
+    "GROUP_M": 8,
+    "num_warps": 4,
+    "num_stages": 3,
+    "SPLIT_ACT": True,
+}
+
 
 @triton.jit
 def _histogram_kernel(topk_ids_ptr, counts_ptr, numel, BLOCK: tl.constexpr):
@@ -2611,6 +2622,29 @@ def _assign_kernel(
     j = offs % topk
     tl.store(sorted_ids_ptr + pos, t, mask=mask)
     tl.store(inv_perm_ptr + t * topk + j, pos, mask=mask)
+
+
+@triton.jit
+def _silu_mul_kernel(
+    src_ptr,
+    dst_ptr,
+    total,
+    n_inter: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    row = offs // n_inter
+    col = offs % n_inter
+    gate = tl.load(src_ptr + row * (2 * n_inter) + col, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(
+        src_ptr + row * (2 * n_inter) + n_inter + col, mask=mask, other=0.0
+    ).to(tl.float32)
+    y = gate * tl.sigmoid(gate) * up
+    tl.store(dst_ptr + offs, y.to(dst_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -2803,7 +2837,7 @@ def _transposed(w, cache):
     return t
 
 
-def _get_buffers(M, E, H, n_inter, topk, device, dtype):
+def _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=False):
     """Reusable meta/data buffers (keyed by shape); only counts/counters cleared."""
     numel = M * topk
     key = (M, E, H, n_inter, topk, device, dtype)
@@ -2812,7 +2846,8 @@ def _get_buffers(M, E, H, n_inter, topk, device, dtype):
             3 * E + 1 + 2 * numel + M * topk, dtype=torch.int32, device=device
         )
         _META_CACHE[key] = meta
-        data = torch.empty(2 * numel * n_inter + numel * H, dtype=dtype, device=device)
+        data_numel = (3 if need_gate_up else 1) * numel * n_inter + numel * H
+        data = torch.empty(data_numel, dtype=dtype, device=device)
         _DATA_CACHE[key] = data
     else:
         meta = _META_CACHE[key]
@@ -2825,7 +2860,22 @@ def _get_buffers(M, E, H, n_inter, topk, device, dtype):
     inv_perm = meta[3 * E + 1 + 2 * numel :].view(M, topk)
     gate = data[: numel * n_inter].view(numel, n_inter)
     cache3 = data[numel * n_inter : numel * n_inter + numel * H].view(numel, H)
-    return counts, start, counters, sorted_ids, inv_perm, gate, cache3
+    gate_up = None
+    if need_gate_up:
+        gate_up = data[
+            numel * n_inter + numel * H :
+            numel * n_inter + numel * H + 2 * numel * n_inter
+        ].view(numel, 2 * n_inter)
+    return (
+        counts,
+        start,
+        counters,
+        sorted_ids,
+        inv_perm,
+        gate,
+        cache3,
+        gate_up,
+    )
 
 
 def nopad_fused_moe(
@@ -2850,13 +2900,23 @@ def nopad_fused_moe(
     numel = M * topk
     device = hidden_states.device
 
+    split_shape = n_inter >= 256
     if cfg_g1 is None:
-        cfg_g1 = dict(_NOPAD_CFG)
+        cfg_g1 = dict(_NOPAD_SPLIT_CFG if split_shape else _NOPAD_CFG)
     if cfg_g2 is None:
-        cfg_g2 = dict(_NOPAD_CFG)
+        cfg_g2 = dict(_NOPAD_SPLIT_CFG if split_shape else _NOPAD_CFG)
 
-    counts, start, counters, sorted_ids, inv_perm, gate, cache3 = _get_buffers(
-        M, E, H, n_inter, topk, device, dtype
+    (
+        counts,
+        start,
+        counters,
+        sorted_ids,
+        inv_perm,
+        gate,
+        cache3,
+        gate_up,
+    ) = _get_buffers(
+        M, E, H, n_inter, topk, device, dtype, need_gate_up=split_shape
     )
     out = torch.empty((M, H), device=device, dtype=dtype)
 
@@ -2899,11 +2959,14 @@ def nopad_fused_moe(
     # output = activated intermediate written to `gate`). Kernel N argument is
     # the full 2*I so n_out = N//2 = I inside.
     nmt = triton.cdiv(cnt_max, cfg_g1["BLOCK_M"])
-    grid1 = (E * triton.cdiv(n_inter, cfg_g1["BLOCK_N"]) * nmt,)
+    split_act = bool(cfg_g1.get("SPLIT_ACT", False)) and not fp8_quant
+    g1_out_n = 2 * n_inter if split_act else n_inter
+    g1_out = gate_up if split_act else gate
+    grid1 = (E * triton.cdiv(g1_out_n, cfg_g1["BLOCK_N"]) * nmt,)
     _nopad_fused_moe_kernel[grid1](
         a_quant,
         w1T,
-        gate,
+        g1_out,
         start,
         counts,
         None,
@@ -2924,12 +2987,12 @@ def nopad_fused_moe(
         w1T.stride(0),
         w1T.stride(1),
         w1T.stride(2),
-        gate.stride(0),
-        gate.stride(1),
+        g1_out.stride(0),
+        g1_out.stride(1),
         GATHER=True,
         NUM_M_TILES=nmt,
         top_k=topk,
-        FUSE_SILU=True,
+        FUSE_SILU=not split_act,
         FP8_QUANT=fp8_quant,
         BLOCK_M=cfg_g1["BLOCK_M"],
         BLOCK_N=cfg_g1["BLOCK_N"],
@@ -2938,6 +3001,16 @@ def nopad_fused_moe(
         num_warps=cfg_g1["num_warps"],
         num_stages=cfg_g1["num_stages"],
     )
+
+    if split_act:
+        _silu_mul_kernel[(triton.cdiv(numel * n_inter, 1024),)](
+            gate_up,
+            gate,
+            numel * n_inter,
+            n_inter=n_inter,
+            BLOCK=1024,
+            num_warps=4,
+        )
 
     # GEMM2: contiguous a (activated gate), single pass
     if fp8_quant:
