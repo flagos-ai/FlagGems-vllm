@@ -207,7 +207,6 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
     sinkhorn_eps,
     rmsnorm_eps,
     rmsnorm_scale,
-    ENABLE_TAIL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tile = pid // JIT_NUM_SPLITS
@@ -299,148 +298,139 @@ def _sm90_eager_t2048_p256_manual512_cpasync_kernel(
         _shared_address(tle.gpu.local_ptr(projection_shared, (0, 0))),
         tile,
         JIT_ACTIVE_K64_BLOCKS,
-        0,
-        0,
-        0,
         JIT_TOKENS,
     )
 
-    if ENABLE_TAIL:
-        # The isolated projection PTX has already converged all sixteen warps
-        # and written columns 0..24 directly into the compact split plane.
-        # All 256 CTAs fit concurrently (2 blocks/SM x 132 SMs = 264).
-        # The acquire/release barrier makes all eight split partials visible
-        # before split zero performs this tile's uniform manual512 tail.
-        _tile_split_barrier(tile_states_ptr + tile * 2)
-        if JIT_X8_TAIL:
-            physical_thread = _physical_thread_id_x()
-            physical_warp = physical_thread // 32
-            lane = physical_thread % 32
-            pre_base = (
-                partials_ptr + (tile * JIT_NUM_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 25
-            )
-            if JIT_TAIL_PHASE >= 2:
-                # Eight warp owners per split route disjoint rows.  The eight
-                # split CTAs therefore cover all 64 tokens concurrently.
-                if physical_warp < 8:
-                    route_row = split * 8 + physical_warp
-                    packed_route = 0.0
-                    for source_split in tl.static_range(0, JIT_NUM_SPLITS):
-                        source_offset = (
-                            (tile * JIT_NUM_SPLITS + source_split) * JIT_BLOCK_M
-                            + route_row
-                        ) * JIT_BLOCK_N + lane
-                        packed_route += tl.load(
-                            partials_ptr + source_offset,
-                            mask=lane <= 24,
-                            other=0.0,
-                        )
-                    route_token = tile * JIT_BLOCK_M + route_row
-                    _routing_finalize_no_barrier(
-                        pre_base + route_row * JIT_BLOCK_N,
-                        mix_scales_ptr,
-                        mix_bases_ptr,
-                        new_post_mix_ptr + route_token * JIT_HC_MULT,
-                        new_comb_res_mix_ptr + route_token * JIT_HC_MULT * JIT_HC_MULT,
-                        packed_route,
-                        lane,
-                        hc_norm_eps,
-                        hc_pre_eps,
-                        hc_post_scale,
-                        sinkhorn_eps,
-                    )
-                _manual512_cta_sync()
-
-            if JIT_TAIL_PHASE >= 3:
-                # Publish all Pre rows, then let each split CTA own H512.  The
-                # barrier-free BF16x8 PTX uses all sixteen warps in four row
-                # waves.  This preserves the exact BF16/FMA order while
-                # eliminating the four idle warps in the old 12x6 mapping.
-                _tile_split_barrier(tile_states_ptr + tile * 2)
-                residual_base = (
-                    new_residual_ptr + tile * JIT_BLOCK_M * JIT_HC_MULT * JIT_HIDDEN
-                )
-                y_base = y_bf16_ptr + tile * JIT_BLOCK_M * JIT_HIDDEN
-                square_base = compact_partial_base + 24
-                hidden_quad_offset = split * 128
-                _split_hidden_combine_bf16x8_ptx(
-                    pre_base,
-                    residual_base,
-                    q_stages.slot(0),
-                    square_base,
-                    physical_thread,
-                    hidden_quad_offset,
-                    64,
-                    JIT_BLOCK_M,
-                    512,
-                    0,
-                    0,
-                    16,
-                    4,
-                )
-                _split_hidden_combine_bf16x8_ptx(
-                    pre_base,
-                    residual_base,
-                    fn_stages.slot(0),
-                    square_base,
-                    physical_thread,
-                    hidden_quad_offset + 64,
-                    64,
-                    JIT_BLOCK_M,
-                    512,
-                    0,
-                    1,
-                    16,
-                    4,
-                )
-                _manual512_cta_sync()
-                _tile_split_barrier(tile_states_ptr + tile * 2)
-                square_tile_base = (
-                    partials_ptr
-                    + (tile * JIT_NUM_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N
-                    + 24
-                )
-                tail_rows = tl.arange(0, JIT_BLOCK_M)
-                total_square = tl.zeros((JIT_BLOCK_M,), tl.float32)
+    # The isolated projection PTX has already converged all sixteen warps
+    # and written columns 0..24 directly into the compact split plane.
+    # All 256 CTAs fit concurrently (2 blocks/SM x 132 SMs = 264).
+    # The acquire/release barrier makes all eight split partials visible
+    # before split zero performs this tile's uniform manual512 tail.
+    _tile_split_barrier(tile_states_ptr + tile * 2)
+    if JIT_X8_TAIL:
+        physical_thread = _physical_thread_id_x()
+        physical_warp = physical_thread // 32
+        lane = physical_thread % 32
+        pre_base = (
+            partials_ptr + (tile * JIT_NUM_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 25
+        )
+        if JIT_TAIL_PHASE >= 2:
+            # Eight warp owners per split route disjoint rows.  The eight
+            # split CTAs therefore cover all 64 tokens concurrently.
+            if physical_warp < 8:
+                route_row = split * 8 + physical_warp
+                packed_route = 0.0
                 for source_split in tl.static_range(0, JIT_NUM_SPLITS):
-                    total_square += tl.load(
-                        square_tile_base
-                        + source_split * JIT_BLOCK_M * JIT_BLOCK_N
-                        + tail_rows * JIT_BLOCK_N
+                    source_offset = (
+                        (tile * JIT_NUM_SPLITS + source_split) * JIT_BLOCK_M + route_row
+                    ) * JIT_BLOCK_N + lane
+                    packed_route += tl.load(
+                        partials_ptr + source_offset,
+                        mask=lane <= 24,
+                        other=0.0,
                     )
-                row_norm = (
-                    tl.rsqrt(total_square / JIT_HIDDEN + rmsnorm_eps) * rmsnorm_scale
+                route_token = tile * JIT_BLOCK_M + route_row
+                _routing_finalize_no_barrier(
+                    pre_base + route_row * JIT_BLOCK_N,
+                    mix_scales_ptr,
+                    mix_bases_ptr,
+                    new_post_mix_ptr + route_token * JIT_HC_MULT,
+                    new_comb_res_mix_ptr + route_token * JIT_HC_MULT * JIT_HC_MULT,
+                    packed_route,
+                    lane,
+                    hc_norm_eps,
+                    hc_pre_eps,
+                    hc_post_scale,
+                    sinkhorn_eps,
                 )
-                tl.store(tle.gpu.local_ptr(norm_shared), row_norm)
-                _manual512_cta_sync()
-                _split_hidden_normalize_bf16x8_ptx(
-                    q_stages.slot(0),
-                    y_base,
-                    rmsnorm_weight_ptr,
-                    norm_shared,
-                    physical_thread,
-                    hidden_quad_offset,
-                    64,
-                    JIT_BLOCK_M,
-                    512,
-                    0,
-                    16,
-                    4,
+            _manual512_cta_sync()
+
+        if JIT_TAIL_PHASE >= 3:
+            # Publish all Pre rows, then let each split CTA own H512.  The
+            # barrier-free BF16x8 PTX uses all sixteen warps in four row
+            # waves.  This preserves the exact BF16/FMA order while
+            # eliminating the four idle warps in the old 12x6 mapping.
+            _tile_split_barrier(tile_states_ptr + tile * 2)
+            residual_base = (
+                new_residual_ptr + tile * JIT_BLOCK_M * JIT_HC_MULT * JIT_HIDDEN
+            )
+            y_base = y_bf16_ptr + tile * JIT_BLOCK_M * JIT_HIDDEN
+            square_base = compact_partial_base + 24
+            hidden_quad_offset = split * 128
+            _split_hidden_combine_bf16x8_ptx(
+                pre_base,
+                residual_base,
+                q_stages.slot(0),
+                square_base,
+                physical_thread,
+                hidden_quad_offset,
+                64,
+                JIT_BLOCK_M,
+                512,
+                0,
+                0,
+                16,
+                4,
+            )
+            _split_hidden_combine_bf16x8_ptx(
+                pre_base,
+                residual_base,
+                fn_stages.slot(0),
+                square_base,
+                physical_thread,
+                hidden_quad_offset + 64,
+                64,
+                JIT_BLOCK_M,
+                512,
+                0,
+                1,
+                16,
+                4,
+            )
+            _manual512_cta_sync()
+            _tile_split_barrier(tile_states_ptr + tile * 2)
+            square_tile_base = (
+                partials_ptr + (tile * JIT_NUM_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 24
+            )
+            tail_rows = tl.arange(0, JIT_BLOCK_M)
+            total_square = tl.zeros((JIT_BLOCK_M,), tl.float32)
+            for source_split in tl.static_range(0, JIT_NUM_SPLITS):
+                total_square += tl.load(
+                    square_tile_base
+                    + source_split * JIT_BLOCK_M * JIT_BLOCK_N
+                    + tail_rows * JIT_BLOCK_N
                 )
-                _split_hidden_normalize_bf16x8_ptx(
-                    fn_stages.slot(0),
-                    y_base,
-                    rmsnorm_weight_ptr,
-                    norm_shared,
-                    physical_thread,
-                    hidden_quad_offset + 64,
-                    64,
-                    JIT_BLOCK_M,
-                    512,
-                    0,
-                    16,
-                    4,
-                )
+            row_norm = tl.rsqrt(total_square / JIT_HIDDEN + rmsnorm_eps) * rmsnorm_scale
+            tl.store(tle.gpu.local_ptr(norm_shared), row_norm)
+            _manual512_cta_sync()
+            _split_hidden_normalize_bf16x8_ptx(
+                q_stages.slot(0),
+                y_base,
+                rmsnorm_weight_ptr,
+                norm_shared,
+                physical_thread,
+                hidden_quad_offset,
+                64,
+                JIT_BLOCK_M,
+                512,
+                0,
+                16,
+                4,
+            )
+            _split_hidden_normalize_bf16x8_ptx(
+                fn_stages.slot(0),
+                y_base,
+                rmsnorm_weight_ptr,
+                norm_shared,
+                physical_thread,
+                hidden_quad_offset + 64,
+                64,
+                JIT_BLOCK_M,
+                512,
+                0,
+                16,
+                4,
+            )
 
 
 def _require_tensor(value, *, name, shape, dtype):
@@ -466,7 +456,6 @@ class EagerT2048P256Manual512ProjectionPlan:
     scalars: tuple[float, ...]
     metadata: dict[str, object]
     maxnreg: int
-    tail_enabled: bool
 
     @property
     def grid_ctas(self) -> int:
@@ -479,7 +468,6 @@ class EagerT2048P256Manual512ProjectionPlan:
             self.partials,
             self.tile_states,
             *self.scalars,
-            self.tail_enabled,
         )
 
     def compile(self):
@@ -591,7 +579,6 @@ def prepare_tle_sm90_projection(
         device=device,
     )
     tile_states = torch.zeros((NUM_M_TILES, 2), dtype=torch.uint32, device=device)
-    tail_enabled = True
     metadata: dict[str, object] = {
         "model": "DeepSeek-V4-Flash@60d8d707",
         "execution_mode": "eager",
@@ -616,8 +603,8 @@ def prepare_tle_sm90_projection(
         "a_storage": "K64 BF16 128B-swizzled shared",
         "fn_storage": "four-route cp.async FP32 ring",
         "wgmma": "persistent TF32 RS M64N32, internal K32 halves",
-        "projection_only": not tail_enabled,
-        "tail_enabled": tail_enabled,
+        "projection_only": False,
+        "tail_enabled": True,
         "tail_schedule": "split-sharded x8 PTX",
         "tail_mode": TAIL_MODE,
         "tail_chunk": TAIL_CHUNK,
@@ -641,7 +628,6 @@ def prepare_tle_sm90_projection(
         ),
         metadata=metadata,
         maxnreg=maxnreg,
-        tail_enabled=tail_enabled,
     )
 
 
@@ -649,10 +635,7 @@ def prepare_tle_sm90_mega_mhc(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT2048P256Manual512ProjectionPlan:
     """Shape-exact production seam for the formally admitted full tail."""
-    plan = prepare_tle_sm90_projection(inputs, outputs)
-    if not plan.tail_enabled:
-        raise RuntimeError("the admitted T=2048 dispatch requires full tail")
-    return plan
+    return prepare_tle_sm90_projection(inputs, outputs)
 
 
 __all__ = [

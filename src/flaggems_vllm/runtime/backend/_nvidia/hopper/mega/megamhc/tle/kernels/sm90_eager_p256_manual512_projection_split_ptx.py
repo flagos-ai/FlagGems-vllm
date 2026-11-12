@@ -2,9 +2,8 @@
 
 The admitted callers use 12 producer and 4 RS-WGMMA warps with cp.async Fn
 staging.  The split coordinate supports the H256 cluster16 topology at T=3076
-and the H1024 four-split topologies at T=3805/4100.  The shared PTX body keeps
-the TMA branch for ABI compatibility with the validated helper, while every
-production caller passes its selector as a compile-time false value.
+and the H1024 four-split topologies at T=3805/4100.  No experimental TMA
+staging ABI remains in this production helper.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _manual512_p256_projection_split_tma_ptx(
+def _manual512_p256_projection_split_ptx(
     x_ptr,
     residual_ptr,
     fn_ptr,
@@ -33,11 +32,7 @@ def _manual512_p256_projection_split_tma_ptx(
     projection_shared_address,
     tile,
     active_k64_blocks,
-    fn_tensormap_address,
-    fn_tma_barrier_address,
-    use_fn_tma,
     token_limit,
-    fn_hidden_base,
 ):
     """Role-aware 12+4-warp projection with compact M64xN32 output.
 
@@ -45,9 +40,8 @@ def _manual512_p256_projection_split_tma_ptx(
     intentional: a high-level Triton branch around the producer inserts
     implicit ``bar.sync 0`` instructions for shared tensor stores, which can
     never be reached by the four math warps.  The prototype first establishes
-    correctness and resource safety for the CUDA migration geometry.  It uses
-    ordinary global loads for Fn; later versions can replace those loads with
-    the production TMA ring without changing the role protocol.
+    correctness and resource safety for the CUDA migration geometry.  The
+    production implementation uses cp.async global-to-shared Fn staging.
 
     The first 24 FP32 projection values and the BF16-derived square sum are
     mirrored into the byte storage backing ``debug_projection_ptr``.  That
@@ -57,20 +51,17 @@ def _manual512_p256_projection_split_tma_ptx(
     return tl.inline_asm_elementwise(
         asm="""
         {
-          .reg .pred producer, math, active, valid, n_valid, again;
-          .reg .pred ch0, ch1, ch2, ch3, more_channel, more_half, leader;
-          .reg .pred use_tma, init_tma, complete;
+          .reg .pred producer, active, valid, again;
+          .reg .pred ch1, ch2, ch3, more_channel, more_half, leader;
           .reg .pred first_stage, more_stage;
           .reg .pred row0_valid, row1_valid;
-          .reg .u32 tid, mtid, lane, warp, linear, channel, rem, n, k;
+          .reg .u32 tid, mtid, lane, warp, linear, channel, n, k;
           .reg .u32 half, k_low, n_row, n_swizzle, k_swizzle, smem_offset;
-          .reg .u32 safe_n, source_bytes;
           .reg .u32 fn_base, q_base, quad, row, column, load_idx, bank;
           .reg .u32 elem, byte_offset, post_address, comb_address;
           .reg .u32 row0, row1, row_base, half4, address, encoded_fn;
           .reg .u32 half_desc32, odd_pair, pair_in_bank, out_column;
           .reg .u32 lane4, token, token0, token1, stage, barrier_id;
-          .reg .u32 tma_bar, tma_coord, tma_smem1, tma_phase;
           .reg .u64 global_address, global_offset, desc_base;
           .reg .u64 desc0, desc1, desc2, desc3, half_desc64;
           .reg .u64 x_address, residual_address, new_residual_address;
@@ -96,20 +87,8 @@ def _manual512_p256_projection_split_tma_ptx(
           .reg .f32 square0, square1, shuffle_tmp;
 
           mov.u32 tid, %tid.x;
-          setp.ne.u32 use_tma, $21, 0;
-          setp.eq.u32 init_tma, tid, 0;
-          and.pred init_tma, init_tma, use_tma;
-          @init_tma mbarrier.init.shared::cta.b64 [$20], 1;
-          @init_tma mbarrier.init.shared::cta.b64 [$20+8], 1;
-          @init_tma mbarrier.init.shared::cta.b64 [$20+16], 1;
-          @init_tma mbarrier.init.shared::cta.b64 [$20+24], 1;
-          // A host-encoded tensor map is copied to device global before the
-          // launch.  CUDA kernel entry does not acquire the tensormap proxy,
-          // so the sole TMA issuer performs that acquire exactly once.
-          @init_tma fence.proxy.tensormap::generic.acquire.gpu [$19], 128;
           // Every warp executes this rendezvous.  It publishes the uniform
-          // coefficient fill and TMA-barrier initialization before the role
-          // split below.
+          // coefficient fill before the role split below.
           bar.sync 0, 512;
           setp.lt.u32 producer, tid, 384;
           @!producer bra.uni DG_TLE_MHC_T12991_MANUAL_B1_MATH;
@@ -123,7 +102,6 @@ def _manual512_p256_projection_split_tma_ptx(
           add.u32 barrier_id, channel, 12;
           barrier.cta.sync barrier_id, 512;
         DG_TLE_MHC_T12991_MANUAL_B1_FN_COPY:
-          @use_tma bra.uni DG_TLE_MHC_T12991_MANUAL_B1_FN_TMA_COPY;
           // N24 needs exactly 384 naturally aligned FP32x4 vectors.  All
           // twelve producer warps issue one vector; unlike the old N32 path,
           // no warp emits zero-fill copies for unused rows 24..31.
@@ -162,37 +140,6 @@ def _manual512_p256_projection_split_tma_ptx(
           add.u32 address, fn_base, smem_offset;
           cp.async.cg.shared.global [address], [global_address], 16;
           cp.async.commit_group;
-          bra.uni DG_TLE_MHC_T12991_MANUAL_B1_FN_CHANNEL_DONE;
-
-        DG_TLE_MHC_T12991_MANUAL_B1_FN_TMA_COPY:
-          // The 128B-swizzled K64 tile is two legal N32xK32 TMA boxes.
-          // Only physical thread zero issues them; Post arithmetic below
-          // overlaps their transfer exactly as in the CUDA producer.
-          setp.eq.u32 leader, tid, 0;
-          @!leader bra DG_TLE_MHC_T12991_MANUAL_B1_FN_TMA_DONE;
-          shl.b32 byte_offset, channel, 3;
-          add.u32 tma_bar, $20, byte_offset;
-          mbarrier.arrive.expect_tx.shared::cta.b64
-            _, [tma_bar], 8192;
-          mov.u32 fn_base, $12;
-          setp.eq.u32 ch0, channel, 0;
-          setp.eq.u32 ch1, channel, 1;
-          setp.eq.u32 ch2, channel, 2;
-          setp.eq.u32 ch3, channel, 3;
-          @ch1 mov.u32 fn_base, $13;
-          @ch2 mov.u32 fn_base, $14;
-          @ch3 mov.u32 fn_base, $15;
-          shl.b32 tma_coord, channel, 12;
-          shl.b32 byte_offset, stage, 6;
-          add.u32 tma_coord, tma_coord, byte_offset;
-          add.u32 tma_coord, tma_coord, $23;
-          cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes
-            [fn_base], [$19, {tma_coord, 0}], [tma_bar];
-          add.u32 tma_coord, tma_coord, 32;
-          add.u32 tma_smem1, fn_base, 4096;
-          cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes
-            [tma_smem1], [$19, {tma_coord, 0}], [tma_bar];
-        DG_TLE_MHC_T12991_MANUAL_B1_FN_TMA_DONE:
 
         DG_TLE_MHC_T12991_MANUAL_B1_FN_CHANNEL_DONE:
           add.u32 channel, channel, 1;
@@ -209,7 +156,7 @@ def _manual512_p256_projection_split_tma_ptx(
           and.b32 column, quad, 15;
           shl.b32 column, column, 2;
           mad.lo.u32 token, $17, 64, row;
-          setp.lt.u32 valid, token, $22;
+          setp.lt.u32 valid, token, $19;
 
           mul.wide.u32 global_offset, token, 8192;
           cvt.u64.u32 global_address, column;
@@ -338,7 +285,6 @@ def _manual512_p256_projection_split_tma_ptx(
           bra.uni DG_TLE_MHC_T12991_MANUAL_B1_QUAD_LOOP;
 
         DG_TLE_MHC_T12991_MANUAL_B1_QUAD_DONE:
-          @use_tma bra.uni DG_TLE_MHC_T12991_MANUAL_B1_FN_TMA_RETIRE;
           // Retire and publish the four route groups independently.  This
           // allows math to consume route 0 while later groups are still in
           // flight instead of imposing one all-route wait per hidden block.
@@ -354,18 +300,6 @@ def _manual512_p256_projection_split_tma_ptx(
           cp.async.wait_group 0;
           fence.proxy.async.shared::cta;
           barrier.cta.arrive 11, 512;
-          bra.uni DG_TLE_MHC_T12991_MANUAL_B1_FN_RETIRE_DONE;
-
-        DG_TLE_MHC_T12991_MANUAL_B1_FN_TMA_RETIRE:
-          // Full barriers publish producer-written Q only.  Math observes Fn
-          // completion directly on each TMA mbarrier before WGMMA, so no
-          // producer-side TMA wait or 384-thread rendezvous is required.
-          barrier.cta.arrive 8, 512;
-          barrier.cta.arrive 9, 512;
-          barrier.cta.arrive 10, 512;
-          barrier.cta.arrive 11, 512;
-
-        DG_TLE_MHC_T12991_MANUAL_B1_FN_RETIRE_DONE:
           add.u32 stage, stage, 1;
           setp.lt.u32 more_stage, stage, $18;
           @more_stage bra.uni DG_TLE_MHC_T12991_MANUAL_B1_PRODUCER_STAGE;
@@ -400,15 +334,6 @@ def _manual512_p256_projection_split_tma_ptx(
         DG_TLE_MHC_T12991_MANUAL_B1_MATH_CHANNEL:
           add.u32 barrier_id, channel, 8;
           barrier.cta.sync barrier_id, 512;
-          @!use_tma bra.uni DG_TLE_MHC_T12991_MANUAL_B1_MATH_TMA_READY;
-          shl.b32 byte_offset, channel, 3;
-          add.u32 tma_bar, $20, byte_offset;
-          and.b32 tma_phase, stage, 1;
-        DG_TLE_MHC_T12991_MANUAL_B1_MATH_TMA_WAIT:
-          mbarrier.try_wait.parity.shared::cta.b64
-            complete, [tma_bar], tma_phase;
-          @!complete bra.uni DG_TLE_MHC_T12991_MANUAL_B1_MATH_TMA_WAIT;
-        DG_TLE_MHC_T12991_MANUAL_B1_MATH_TMA_READY:
           fence.proxy.async.shared::cta;
           mov.u32 q_base, $8;
           mov.u32 fn_base, $12;
@@ -602,7 +527,7 @@ def _manual512_p256_projection_split_tma_ptx(
           mov.u32 $0, 0;
         }
         """,
-        constraints="=r,l,l,l,l,l,r,r,r,r,r,r,r,r,r,r,r,r,r,l,r,r,r,r",
+        constraints="=r,l,l,l,l,l,r,r,r,r,r,r,r,r,r,r,r,r,r,r",
         args=[
             tl.cast(x_ptr, tl.uint64),
             tl.cast(residual_ptr, tl.uint64),
@@ -622,11 +547,7 @@ def _manual512_p256_projection_split_tma_ptx(
             projection_shared_address,
             tile,
             active_k64_blocks,
-            fn_tensormap_address,
-            fn_tma_barrier_address,
-            tl.cast(use_fn_tma, tl.uint32),
             token_limit,
-            fn_hidden_base,
         ],
         dtype=tl.uint32,
         is_pure=False,
