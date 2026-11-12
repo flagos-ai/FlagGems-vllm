@@ -18,10 +18,11 @@ import pytest
 import torch
 
 import flaggems_vllm
+from baseline.w8a8_block_matmul import torch_w8a8_block_matmul
 
 from . import accuracy_utils as utils
 
-IS_INT8 = flaggems_vllm.vendor_name == "thead"
+IS_INT8 = flaggems_vllm.vendor_name in ("thead", "ascend")
 MNK_SHAPES = [
     (1, 65, 130),
     (7, 129, 257),
@@ -91,7 +92,7 @@ def _reference(a, b, a_scale, b_scale, block_n, block_k):
 
 @pytest.mark.w8a8_block_matmul
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads"),
+    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads", "ascend"),
     reason="No W8A8 block matmul backend",
 )
 @pytest.mark.parametrize("M,N,K", MNK_SHAPES)
@@ -123,6 +124,16 @@ def test_w8a8_block_matmul(M, N, K):
         M, N, K, dtype, block_size, scale_offset=0.0 if IS_INT8 else 0.005
     )
     ref_out = _reference(A, B, As, Bs, block_n, block_k).to(output_dtype)
+    if flaggems_vllm.vendor_name == "ascend":
+        baseline_out = torch_w8a8_block_matmul(A, B, As, Bs, block_size, output_dtype)
+        assert baseline_out.dtype == output_dtype
+        utils.gems_assert_close(
+            baseline_out.cpu(),
+            ref_out,
+            dtype=output_dtype,
+            reduce_dim=1,
+            atol=INT8_ATOL,
+        )
     with nullcontext() if IS_INT8 else flaggems_vllm.use_gems():
         res_out = flaggems_vllm.w8a8_block_matmul(
             A, B, As, Bs, block_size, output_dtype=output_dtype

@@ -132,6 +132,11 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.w8a8_block_int8_matmul import (
+    w8a8_block_int8_matmul,
+)
+
+w8a8_block_matmul = w8a8_block_int8_matmul
 
 __all__ = [
     "add_rms_norm",
@@ -191,4 +196,6 @@ __all__ = [
     "top_k_top_p",
     "topk_softplus_sqrt",
     "unpack_seq_triton",
+    "w8a8_block_int8_matmul",
+    "w8a8_block_matmul",
 ]
