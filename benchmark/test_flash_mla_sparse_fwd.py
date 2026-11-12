@@ -280,3 +280,56 @@ class FlashmlaSparseBenchmark(base.Benchmark):
 def test_flash_mla_sparse_fwd():
     bench = FlashmlaSparseBenchmark()
     bench.run()
+
+
+def _padded_small_heads_reference(q, kv, indices, sm_scale):
+    """Allocation-inclusive H64 workaround for providers that cannot consume H4."""
+    padded = torch.zeros((q.shape[0], 64, q.shape[2]), dtype=q.dtype, device=q.device)
+    padded[:, :4].copy_(q)
+    output, maximum, lse = flaggems_vllm.flash_mla_sparse_fwd(
+        padded, kv, indices, sm_scale
+    )
+    return output[:, :4], maximum[:, :4], lse[:, :4]
+
+
+class SmallHeadsFlashmlaBenchmark(base.Benchmark):
+    def __init__(self):
+        super().__init__(
+            "flash_mla_sparse_fwd", _padded_small_heads_reference, [torch.bfloat16]
+        )
+        self.set_gems(flaggems_vllm.flash_mla_sparse_fwd)
+
+    def set_shapes(self, shape_file_path=None):
+        self.shape_desc = "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+        self.shapes = [
+            (rows, 4, dim, 256, 1, width, 512)
+            for rows in [1, 8, 64]
+            for dim in [512, 576]
+            for width in [17, 128]
+        ]
+
+    def get_input_iter(self, dtype):
+        for rows, heads, dim, tokens, _, width, _ in self.shapes:
+            q = (
+                torch.randn(
+                    (rows, heads, dim), device=flaggems_vllm.device, dtype=dtype
+                )
+                * 0.1
+            )
+            kv = (
+                torch.randn((tokens, 1, dim), device=flaggems_vllm.device, dtype=dtype)
+                * 0.1
+            )
+            indices = torch.arange(
+                width, device=flaggems_vllm.device, dtype=torch.int32
+            ).repeat(rows, 1, 1)
+            yield q, kv, indices, 0.5
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_small_heads_flash_mla_sparse_fwd():
+    if 4 not in getattr(
+        flaggems_vllm.flash_mla_sparse_fwd, "supported_query_heads", ()
+    ):
+        pytest.skip("The selected provider does not advertise four query heads")
+    SmallHeadsFlashmlaBenchmark().run()

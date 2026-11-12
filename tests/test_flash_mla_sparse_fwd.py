@@ -496,3 +496,175 @@ def test_flash_mla_sparse_vendor_export_and_abi():
         out, max_logits, lse = op(q, kv, indices, 512**-0.5)
         assert out.shape == (0, 64, 512) and out.dtype == torch.bfloat16
         assert max_logits.shape == (0, 64) and lse.shape == (0, 64)
+
+
+@pytest.fixture
+def small_heads_rng():
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        yield
+
+
+def _assert_small_heads_result(actual, expected):
+    torch.testing.assert_close(actual[0].cpu(), expected[0], atol=8e-4, rtol=3.01 / 128)
+    for result, reference in zip(actual[1:], expected[1:]):
+        torch.testing.assert_close(
+            result.cpu(), reference, atol=1e-6, rtol=2.01 / 65536
+        )
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize(
+    "rows,width,optional",
+    [(0, 17, False), (1, 1, False), (8, 65, True), (17, 128, True)],
+)
+@pytest.mark.parametrize("offset", [False, True])
+def test_small_heads_compact_storage_and_cpu_oracle(
+    small_heads_rng, dim, rows, width, optional, offset
+):
+    q_cpu = (torch.randn(rows, 4, dim) * 0.1).bfloat16()
+    kv_cpu = (torch.randn(37, 1, dim) * 0.1).bfloat16()
+    idx_cpu = torch.arange(width, dtype=torch.int32).repeat(rows, 1, 1)
+    if rows:
+        idx_cpu[0].fill_(-1)
+    sink_cpu = (
+        torch.tensor([0.0, -float("inf"), float("inf"), 0.3]) if optional else None
+    )
+    len_cpu = torch.arange(rows, dtype=torch.int32) % (width + 1) if optional else None
+    q, kv, idx = q_cpu.cuda(), kv_cpu.cuda(), idx_cpu.cuda()
+    if offset:
+
+        def shifted(tensor):
+            storage = torch.empty(
+                tensor.numel() + 7, device=tensor.device, dtype=tensor.dtype
+            )
+            view = storage[7:].view(tensor.shape)
+            view.copy_(tensor)
+            return view
+
+        q, kv, idx = (shifted(value) for value in (q, kv, idx))
+    sink = sink_cpu.cuda() if optional else None
+    lengths = len_cpu.cuda() if optional else None
+    result = flaggems_vllm.flash_mla_sparse_fwd(q, kv, idx, 0.5, 512, sink, lengths)
+    for output, shape, dtype in zip(
+        result,
+        [(rows, 4, 512), (rows, 4), (rows, 4)],
+        [torch.bfloat16, torch.float32, torch.float32],
+    ):
+        assert output.shape == shape and output.dtype == dtype
+        assert (
+            output.untyped_storage().nbytes() == output.numel() * output.element_size()
+        )
+    if rows:
+        expected = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+            rows,
+            37,
+            4,
+            1,
+            dim,
+            width,
+            q_cpu,
+            kv_cpu,
+            idx_cpu,
+            0.5,
+            512,
+            sink_cpu,
+            len_cpu,
+        )
+        _assert_small_heads_result(result, expected)
+    assert torch.equal(q.cpu(), q_cpu) and torch.equal(kv.cpu(), kv_cpu)
+    assert torch.equal(idx.cpu(), idx_cpu)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize("rows,heads", [(1, 4), (8, 4), (1, 64), (1, 128)])
+@pytest.mark.parametrize("dim", [512, 576])
+def test_small_heads_dynamic_graph_replays(small_heads_rng, rows, heads, dim):
+    op = flaggems_vllm.flash_mla_sparse_fwd
+    if not getattr(op, "supports_single_token_decode_graph", False):
+        pytest.skip(
+            "The selected provider does not advertise single-token decode graph support"
+        )
+    q = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn(96, 1, dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.arange(65, dtype=torch.int32, device="cuda").repeat(rows, 1, 1)
+    lengths = torch.full((rows,), 65, dtype=torch.int32, device="cuda")
+    sink = torch.zeros(heads, dtype=torch.float32, device="cuda")
+    for _ in range(2):
+        op(q, kv, indices, 0.5, attn_sink=sink, topk_length=lengths)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = op(q, kv, indices, 0.5, attn_sink=sink, topk_length=lengths)
+    for step in range(2):
+        q.normal_(std=0.1)
+        kv.normal_(std=0.1)
+        indices.copy_(
+            (torch.arange(65, device="cuda", dtype=torch.int32) + step * 7).repeat(
+                rows, 1, 1
+            )
+        )
+        lengths.fill_(65 if step == 0 else 17)
+        sink.fill_(step * 0.1)
+        for output in result:
+            output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+            rows,
+            96,
+            heads,
+            1,
+            dim,
+            65,
+            q.cpu(),
+            kv.cpu(),
+            indices.cpu(),
+            0.5,
+            512,
+            sink.cpu(),
+            lengths.cpu(),
+        )
+        _assert_small_heads_result(result, expected)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("dim", [512, 576])
+def test_small_heads_change_preserves_large_heads(small_heads_rng, heads, dim):
+    q_cpu = (torch.randn(1, heads, dim) * 0.1).bfloat16()
+    kv_cpu = (torch.randn(64, 1, dim) * 0.1).bfloat16()
+    idx_cpu = torch.arange(17, dtype=torch.int32).reshape(1, 1, 17)
+    result = flaggems_vllm.flash_mla_sparse_fwd(
+        q_cpu.cuda(), kv_cpu.cuda(), idx_cpu.cuda(), 0.5
+    )
+    expected = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        1, 64, heads, 1, dim, 17, q_cpu, kv_cpu, idx_cpu, 0.5, 512, None, None
+    )
+    _assert_small_heads_result(result, expected)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize("heads", [1, 8, 32])
+def test_small_heads_reject_unsupported_head_count(heads):
+    q = torch.empty((0, heads, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.empty((16, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.empty((0, 1, 17), device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="Unsupported h_q"):
+        flaggems_vllm.flash_mla_sparse_fwd(q, kv, indices, 0.5)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_small_heads_capabilities_and_tle_selection():
+    from flaggems_vllm.ops import flashmla_sparse as generic
+
+    assert generic.flash_mla_sparse_fwd.supported_query_heads == (4, 64, 128)
+    assert generic.flash_mla_sparse_fwd.supports_single_token_decode_graph is False
+    if flaggems_vllm.vendor_name == "thead":
+        assert flaggems_vllm.flash_mla_sparse_fwd.supports_single_token_decode_graph
+        assert flaggems_vllm.flash_mla_sparse_fwd.supported_query_heads == (4, 64, 128)
+    q = torch.empty((8, 4, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.empty((128, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.empty((8, 1, 128), device="cuda", dtype=torch.int32)
+    assert not generic._can_use_tle_flash_mla_sparse_fwd(q, kv, indices, 512, None)
