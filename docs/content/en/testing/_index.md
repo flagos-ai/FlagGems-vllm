@@ -10,8 +10,8 @@ FlagGems-vllm includes comprehensive functional tests to validate operator corre
 
 ## Topics
 
-- [Unit Tests](unittest/) - Running functional tests
-- [Test Coverage](coverage/) - Coverage reporting
+- [Unit Tests](unittest.md) - Running functional tests
+- [Test Coverage](coverage.md) - Coverage reporting
 
 ## Quick Start
 
@@ -47,5 +47,5 @@ Each test:
 
 ## Next Steps
 
-- [Unit test guide](unittest/)
-- [Coverage reporting](coverage/)
+- [Unit test guide](unittest.md)
+- [Coverage reporting](coverage.md)
