@@ -68,6 +68,14 @@ jobs:
         continue-on-error: true
         run: python3 tools/ci_checks/check_init_exports.py
 
+      # Unlike check_operators_yaml.py above, which only validates operators
+      # already present in the registry, this check catches ops exported
+      # from __all__ but never registered at all (see the script docstring).
+      - name: Check exported ops are registered
+        id: check-exported-ops-registered
+        continue-on-error: true
+        run: python3 tools/ci_checks/check_exported_ops_registered.py
+
       - name: Check operator test files and markers
         id: check-operator-markers
         if: steps.derive.outputs.has_changes == 'true'
@@ -100,7 +108,7 @@ jobs:
           STEPS_JSON: ${{ toJSON(steps) }}
         run: |
           failed=0
-          for step_id in check-operators-yaml check-init-exports check-operator-markers check-aten-operators; do
+          for step_id in check-operators-yaml check-init-exports check-exported-ops-registered check-operator-markers check-aten-operators; do
             result=$(echo "$STEPS_JSON" | jq -r --arg id "$step_id" '.[$id].outcome // "skipped"')
             echo "$step_id: $result"
             if [ "$result" = "failure" ]; then

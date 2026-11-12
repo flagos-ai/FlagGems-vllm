@@ -82,6 +82,7 @@ def flash_varlen_fwd_d256_tn_prefix_kernel(
     FAST_CAUSAL_ALIGNED: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    TN_SCENARIO: tl.constexpr,
     BULK_TAIL: tl.constexpr = False,
     TAIL_ROWS: tl.constexpr = 0,
     TAIL_UNALIGNED_ONLY: tl.constexpr = False,
@@ -381,6 +382,7 @@ def flash_varlen_fwd_d256_tn_aligned_kernel(
     FAST_CAUSAL_ALIGNED: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    TN_SCENARIO: tl.constexpr,
     BULK_TAIL: tl.constexpr = False,
     TAIL_ROWS: tl.constexpr = 0,
     TAIL_UNALIGNED_ONLY: tl.constexpr = False,
@@ -772,6 +774,8 @@ def launch_tail_split(
         "pipeline_load_num": -1,
         "inner_stages": (0, 0),
     }
+    # Specialize LibEntry on the same scenario used for compilation.
+    cfg["TN_SCENARIO"] = cfg["scenario"]
     logger.debug("Running D256 async-TN Split-KV with config: %s", cfg)
     kernel = flash_varlen_fwd_d256_tn_kernel
     if single_tile:

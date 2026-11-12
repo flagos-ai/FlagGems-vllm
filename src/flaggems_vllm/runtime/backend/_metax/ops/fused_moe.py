@@ -344,6 +344,62 @@ def _is_qwen_moe_shape(
     return False
 
 
+def _is_qwenvl_tp2_moe_shape(
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: str | None,
+    gemm_stage: str,
+    block_shape: list[int] | None = None,
+    use_int8_w8a8: bool = False,
+) -> bool:
+    return (
+        dtype in _PLAIN_HALF_CONFIG_DTYPES
+        and E == 128
+        and topk == 8
+        and (gemm_stage, N, K) in (("gemm1", 768, 2048), ("gemm2", 2048, 384))
+        and block_shape is None
+        and not use_int8_w8a8
+        and _get_device_name() == "MetaX_C550"
+        and not bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0")))
+    )
+
+
+def _qwenvl_tp2_config(M: int, gemm_stage: str) -> dict[str, Any]:
+    """Retained C550 TP2 configs for the matching Qwen-VL E128 geometry."""
+    # Both stages share one token alignment and must use the same block M.
+    if M <= 7:
+        block_m, block_n, block_k = 16, 128, 64
+        group_m, num_warps, num_stages = 1, 4, 1
+    elif M <= 64:
+        block_m, block_n, block_k = 16, 64, 128
+        group_m, num_warps = 1, 4
+        num_stages = 3 if gemm_stage == "gemm1" else 1
+    elif M <= 544:
+        block_m, block_n, block_k = 16, 128, 32
+        group_m, num_warps, num_stages = 4, 2, 3
+    else:
+        block_m, block_n, block_k = 128, 128, 64
+        group_m, num_warps, num_stages = 1, 4, 1
+        if gemm_stage == "gemm1":
+            if 4096 <= M <= 8192:
+                num_warps = 8
+            elif M >= 8193:
+                group_m = 8
+        elif M >= 4209:
+            group_m = 8
+    # Preserve nearest-M selection, including ties at 544 and 4208.
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": group_m,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -354,7 +410,20 @@ def get_default_config(
     block_shape: list[int] | None = None,
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
+    use_int8_w8a8: bool = False,
 ) -> dict[str, Any]:
+    if _is_qwenvl_tp2_moe_shape(
+        E,
+        N,
+        K,
+        topk,
+        dtype,
+        gemm_stage,
+        block_shape=block_shape,
+        use_int8_w8a8=use_int8_w8a8,
+    ):
+        return _qwenvl_tp2_config(M, gemm_stage)
+
     if _is_qwen_tp2_moe_shape(E, N, K, topk, dtype, gemm_stage):
         return _qwen_tp2_config(M, gemm_stage, enable_gemm_fast_path)
 
@@ -688,6 +757,12 @@ def dequant_mxfp6(
 # Activation quantization helpers
 
 
+@functools.lru_cache(maxsize=8)
+def _get_shared_memory_limit(device_index: int) -> int:
+    """Cache the actual per-block shared-memory limit for each MetaX device."""
+    return torch_device_fn.get_device_properties(device_index).shared_memory_per_block
+
+
 @functools.lru_cache(maxsize=1)
 def _get_device_name() -> str:
     """Return the normalised device name (spaces replaced by underscores).
@@ -771,6 +846,7 @@ def try_get_optimal_moe_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
     return_is_embedded: bool = False,
+    use_int8_w8a8: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], bool]:
     if gemm_stage not in ("gemm1", "gemm2"):
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
@@ -798,6 +874,7 @@ def try_get_optimal_moe_config(
             block_shape,
             gemm_stage=gemm_stage,
             enable_gemm_fast_path=enable_gemm_fast_path,
+            use_int8_w8a8=use_int8_w8a8,
         )
         is_embedded = False
     if return_is_embedded:
@@ -994,8 +1071,13 @@ def _generic_get_default_config(
             group_m = 2
             num_stages = 4
 
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+        smem_limit = _get_shared_memory_limit(torch_device_fn.current_device())
+        # Select the actual layout before estimating its shared-memory footprint.
+        # The paired layout needs over 64 KiB even with one stage.
+        pair_gate_up_dot = use_gemm1_fast_path and smem_limit > 64 * 1024
+        weight_tiles = 2 if pair_gate_up_dot else 1
+        smem_per_stage = (block_m * block_k + weight_tiles * block_k * block_n) * 2
+        while num_stages > 1 and smem_per_stage * num_stages > smem_limit:
             num_stages -= 1
 
         config = {
@@ -1007,7 +1089,7 @@ def _generic_get_default_config(
             "num_stages": num_stages,
         }
         if use_gemm1_fast_path:
-            config["PAIR_GATE_UP_DOT"] = True
+            config["PAIR_GATE_UP_DOT"] = pair_gate_up_dot
     else:
         tokens_per_expert = M // max(E, 1)
 
@@ -1046,8 +1128,10 @@ def _generic_get_default_config(
         num_warps = 4 if M <= 128 else 8
         num_stages = 3
 
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+        element_bytes = 4 if dtype == "float32" else 2
+        smem_per_stage = (block_m * block_k + block_k * block_n) * element_bytes
+        smem_limit = _get_shared_memory_limit(torch_device_fn.current_device())
+        while num_stages > 1 and smem_per_stage * num_stages > smem_limit:
             num_stages -= 1
 
         config = {
@@ -2516,6 +2600,8 @@ def fused_experts_impl(
         block_shape=block_shape,
         E=E,
         return_is_embedded=True,
+        # The config dtype key alone does not distinguish INT8 W8A8 from half.
+        use_int8_w8a8=use_int8_w8a8,
     )
 
     base_config, is_embedded_config = get_moe_config(M)
