@@ -29,11 +29,13 @@ TARGETS = (
     "tests/test_thead_optional_imports.py",
     "tests/test_concat_and_cache_mla_padding.py",
     "tests/test_mhc_post_graph.py",
+    "tests/test_qsa_sparse_paged_attention_unpacked.py",
     "tests/test_mhc_ops.py::test_mhc_post_optional_compiler_knob_restored",
 )
 REQUIRED_FAMILIES = (
     "test_nvidia_mnnvl_optional_dependency_contract",
     "test_mhc_post_changed_input_graph",
+    "test_unpacked_qsa_public_changed_input_graph",
     "test_padded_rows_graph_replay_changed_inputs",
     "test_non_tle_moe_graph_replays_changed_routes",
     "test_mhc_post_optional_compiler_knob_restored",

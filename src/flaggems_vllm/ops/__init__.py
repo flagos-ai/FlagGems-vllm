@@ -122,6 +122,9 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     sinkhorn_forward,
 )
+from flaggems_vllm.ops.qwen4.qsa_attention import (
+    qsa_sparse_paged_attention as qsa_sparse_paged_attention_unpacked,
+)
 from flaggems_vllm.ops.qwen4 import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -379,6 +382,7 @@ __all__ = [
     "qsa_mqa_paged",
     "qsa_prepare",
     "qsa_sparse_paged_attention",
+    "qsa_sparse_paged_attention_unpacked",
     "qsa_store_cache_rows",
     "qsa_store_kv_cache_rows",
     "qwen4_compress_norm_mrope_store_groups",

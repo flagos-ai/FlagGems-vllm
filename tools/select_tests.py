@@ -140,7 +140,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_qwen4_self_kernels.py",
         "tests/test_qsa_attention.py",
     ],
-    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": ["tests/test_qsa_attention.py"],
+    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": [
+        "tests/test_qsa_attention.py",
+        "tests/test_qsa_sparse_paged_attention_unpacked.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_fusion.py": ["tests/test_ple_fusion.py"],
     "src/flaggems_vllm/ops/kda_bounded.py": [
         "tests/test_kda_bounded.py",

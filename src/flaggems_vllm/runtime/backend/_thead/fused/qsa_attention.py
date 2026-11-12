@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from flaggems_vllm.ops.qwen4.qsa_attention import _qsa_sparse_paged_attention
+
+logger = logging.getLogger(__name__)
 
 
 def qsa_sparse_paged_attention(
@@ -27,6 +31,7 @@ def qsa_sparse_paged_attention(
     retain their power-of-two tile, and all validation/ABI semantics remain
     shared with the generic implementation.
     """
+    logger.debug("GEMS THEAD QSA unpacked attention (minimum dot rows: 16)")
     return _qsa_sparse_paged_attention(
         q,
         k_cache,

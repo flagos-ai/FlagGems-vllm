@@ -389,7 +389,8 @@ jobs:
                 || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_optional_runtime_imports.py')
                 || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_post_graph.py')
                 || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_ops.py')
-                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_concat_and_cache_mla_padding.py'))
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_concat_and_cache_mla_padding.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_qsa_sparse_paged_attention_unpacked.py'))
       && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: flagcicd-810e
     timeout-minutes: 30
@@ -516,7 +517,8 @@ jobs:
                 || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_optional_runtime_imports.py')
                 || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_post_graph.py')
                 || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_mhc_ops.py')
-                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_concat_and_cache_mla_padding.py'))
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_concat_and_cache_mla_padding.py')
+                || contains(fromJSON(needs.select-targets.outputs.targets).tests, 'tests/test_qsa_sparse_paged_attention_unpacked.py'))
                 && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]') }}
           CODE_STYLE_RESULT: ${{ needs.code-style.result }}
           SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}

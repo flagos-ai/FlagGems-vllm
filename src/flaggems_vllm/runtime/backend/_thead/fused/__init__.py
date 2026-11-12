@@ -25,6 +25,9 @@ from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 from flaggems_vllm.runtime.backend._thead.fused.qsa_attention import (
     qsa_sparse_paged_attention,
 )
+from flaggems_vllm.runtime.backend._thead.fused.qsa_attention import (
+    qsa_sparse_paged_attention as qsa_sparse_paged_attention_unpacked,
+)
 
 __all__ = [
     "flash_attn_varlen_func_w8a8_int8",
@@ -32,4 +35,5 @@ __all__ = [
     "fused_inv_rope_fp8_quant",
     "moe_sum",
     "qsa_sparse_paged_attention",
+    "qsa_sparse_paged_attention_unpacked",
 ]

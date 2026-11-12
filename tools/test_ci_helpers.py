@@ -82,6 +82,18 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
             ["tests/deep/nested/test_second.py", "tests/test_first.py"],
         )
 
+    def test_qsa_mapping_keeps_existing_and_public_compatibility_regressions(self):
+        targets = [
+            "tests/test_qsa_attention.py",
+            "tests/test_qsa_sparse_paged_attention_unpacked.py",
+        ]
+        for target in targets:
+            self.make_file(target)
+        _, tests, _ = select_tests.select_targets(
+            self.repo_root, ["src/flaggems_vllm/ops/qwen4/qsa_attention.py"]
+        )
+        self.assertEqual(tests, targets)
+
     def test_backend_operator_change_selects_matching_test(self):
         self.make_file("tests/test_mul.py")
 
