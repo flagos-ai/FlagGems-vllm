@@ -6,6 +6,8 @@ Uses base.Benchmark.get_latency, like the other operator benchmarks.
 The shared framework selects the backend timer (do_bench_npu on Ascend).
 G5 correctness is handled separately in
 ``tests/test_fused_indexer_k_norm.py``.
+JSON records merge both output modes per dtype, with ``out_mode`` identifying
+each detail. The summary's dtype-level speedup averages both output modes.
 
 Run with::
 
@@ -21,7 +23,7 @@ import torch.nn.functional as F
 
 import flaggems_vllm
 from benchmark import base, consts
-from benchmark.conftest import Config
+from benchmark.conftest import TEST_RESULTS, Config
 
 
 class FusedIndexerKNormBenchmark(base.Benchmark):
@@ -69,6 +71,23 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
             )
         super().init_user_config()
 
+    def run(self):
+        super().run()
+        if not Config.record_json or Config.query:
+            return
+
+        # The summary parser retains only the last record per dtype. Merge the
+        # two tests' results so all out_mode-tagged details survive parsing.
+        records = TEST_RESULTS.get(self.op_name, {}).get("details", [])
+        merged = {}
+        for record in records:
+            key = (record["dtype"], record["mode"], record["level"])
+            if key in merged:
+                merged[key]["result"].extend(record["result"])
+            else:
+                merged[key] = record
+        records[:] = merged.values()
+
     def _torch_op(self, x, weight, bias, dim, eps):
         return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
 
@@ -95,6 +114,7 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
             "row_gap": x.stride(0) - dim,
             "dtype": str(x.dtype),
             "x_stride": list(x.stride()),
+            "out_mode": "out_provided" if self._use_out_provided else "default",
         }
 
 
