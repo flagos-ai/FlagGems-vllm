@@ -116,7 +116,15 @@ def _silu_clamp_value(x, y, limit):
     # collapses to the upper bound).
     gate = _fmin_nan_propagating(x, limit)
     up = _fmin_nan_propagating(_fmax_nan_propagating(y, -limit), limit)
-    return tl.fdiv(gate, 1.0 + tl.exp(-gate)) * up
+    result = tl.fdiv(gate, 1.0 + tl.exp(-gate)) * up
+    # Fast-math lowering may canonicalize a zero product to +0. Restore the
+    # IEEE sign of SiLU(gate) * up, including a negative SiLU underflow. Keep
+    # this selection in integer bits so signed-zero folding cannot erase it.
+    zero_sign = (
+        gate.to(tl.int32, bitcast=True) ^ up.to(tl.int32, bitcast=True)
+    ) & -2147483648
+    bits = tl.where(result == 0.0, zero_sign, result.to(tl.int32, bitcast=True))
+    return bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit

@@ -23,6 +23,51 @@ SILU_AND_MUL_WITH_CLAMP_LIMITS = [3.0, 7.0]
 
 
 @pytest.mark.silu_and_mul_with_clamp
+@pytest.mark.silu_and_mul_with_clamp_out
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["linear", "strided-nd", "packed-2d"])
+def test_clamped_silu_signed_zero_and_special_values(dtype, layout):
+    edges = torch.tensor(
+        [
+            -float("inf"),
+            -100.0,
+            -10.0,
+            -0.0,
+            0.0,
+            10.0,
+            100.0,
+            float("inf"),
+            float("nan"),
+        ],
+        device=flaggems_vllm.device,
+        dtype=dtype,
+    )
+    gate, up = torch.meshgrid(edges, edges, indexing="ij")
+    if layout == "packed-2d":
+        packed = torch.cat((gate, up), dim=-1)
+        gate, up = packed[:, :9], packed[:, 9:]
+    else:
+        gate, up = gate.reshape(-1), up.reshape(-1)
+        if layout == "strided-nd":
+            packed = torch.stack((gate, up), dim=-1)
+            gate, up = packed[:, :1], packed[:, 1:]
+    ref_gate, ref_up = gate.cpu(), up.cpu()
+    expected = torch.nn.functional.silu(ref_gate.clamp(max=10.0)) * ref_up.clamp(
+        -10.0, 10.0
+    )
+    allocated = flaggems_vllm.silu_and_mul_with_clamp(gate, up, 10.0)
+    out = torch.full_like(allocated, 73.0)
+    ret = flaggems_vllm.silu_and_mul_with_clamp_out(gate, up, out, 10.0)
+    assert ret is out
+    zero = torch.isfinite(expected) & (expected == 0)
+    for actual in (allocated, out):
+        actual = actual.cpu()
+        utils.gems_assert_close(actual, expected, dtype, equal_nan=True)
+        assert torch.equal(torch.signbit(actual[zero]), torch.signbit(expected[zero]))
+        assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+
+
+@pytest.mark.silu_and_mul_with_clamp
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("limit", SILU_AND_MUL_WITH_CLAMP_LIMITS)
@@ -80,3 +125,51 @@ def test_silu_and_mul_with_clamp_out(shape, dtype, limit):
 
     assert ret is out
     utils.gems_assert_close(out, ref_out, dtype)
+
+
+@pytest.mark.silu_and_mul_with_clamp
+@pytest.mark.silu_and_mul_with_clamp_out
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["linear", "strided", "packed"])
+def test_clamped_silu_changed_input_graph(dtype, layout):
+    device = flaggems_vllm.device
+    storage = torch.randn(17, 1026, device=device, dtype=dtype)
+    if layout == "packed":
+        gate, up = storage[:, :513], storage[:, 513:]
+    elif layout == "strided":
+        gate, up = storage[:, ::2], storage[:, 1::2]
+    else:
+        gate, up = storage[:, :513].contiguous(), storage[:, 513:].contiguous()
+    out = torch.empty_like(gate)
+    result = []
+
+    def call():
+        allocated = flaggems_vllm.silu_and_mul_with_clamp(gate, up, 7.0)
+        returned = flaggems_vllm.silu_and_mul_with_clamp_out(gate, up, out, 7.0)
+        assert returned is out
+        result[:] = [allocated, returned]
+
+    for _ in range(3):
+        call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for value in (0.125, -0.25):
+        gate.copy_(torch.randn_like(gate) * value)
+        up.copy_(torch.randn_like(up) + value)
+        gate[0, 0], up[0, 0] = -0.0, 1.0
+        expected = torch.nn.functional.silu(gate.cpu().clamp(max=7.0)) * up.cpu().clamp(
+            -7.0, 7.0
+        )
+        for output in result:
+            output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for output in result:
+            actual = output.cpu()
+            utils.gems_assert_close(actual, expected, dtype, equal_nan=True)
+            zeros = expected == 0
+            assert torch.equal(
+                torch.signbit(actual[zeros]), torch.signbit(expected[zeros])
+            )
