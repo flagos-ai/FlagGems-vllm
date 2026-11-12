@@ -633,6 +633,12 @@ chunk_gdn2:
     - [8, 1024, 8, 64, 64]
     - [8, 2048, 32, 256, 256]
 
+chunk_kda_scaled_dot_kkt_fwd:
+  shapes:
+    - [1, 65, 4, 128, 64]
+    - [1, 513, 4, 128, 64, 17, 0, 64, 432]
+  shape_desc: "B, T, H, K, BT, optional packed sequence lengths"
+
 chunk_gated_delta_rule_fwd:
   shapes:
     - [2, 16384, 16, 128, 128]
@@ -758,3 +764,9 @@ gate_sigmoid_mul:
     - [512, 12288, contiguous]
     - [4096, 12288, split_gate]
   shape_desc: "tokens, width, gate_layout"
+
+chunk_kda_with_fused_gate:
+  shapes:
+    - [1, 64, 8, 64, 64]
+    - [1, 512, 8, 128, 128, 129, 127, 256]
+  shape_desc: "B, T, H, K, V, optional packed sequence lengths"
