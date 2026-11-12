@@ -3,8 +3,14 @@
 The public factory admits only the four production-dispatched DeepSeek-V4-
 Flash Normal BF16 buckets, ``T in {1, 2, 4, 8}``, at ``H=4096, R=4, P=24``.
 Each prepared plan owns its workspaces and enqueues exactly one specialized
-Triton/TLE kernel.  Historical bring-up probes and non-production schedules
-live outside this production module.
+Triton/TLE kernel. Historical bring-up code and non-production schedules are
+not part of this production module.
+
+The fixed production schedules are: T1 split16/tile4 with eight producer
+warps and warp overlap; T2 split8/tile3 with sixteen producer warps,
+contiguous partials, and projection ILP; and T4/T8 split8/tile6 with eight
+producer warps.  The table near ``_SMALL_PRODUCTION_CONFIGS`` is the complete
+admitted configuration set rather than an autotuning search space.
 """
 
 from __future__ import annotations
@@ -875,7 +881,6 @@ def _tle_mhc_overlap_routing_tail(
     hc_pre_eps,
     hc_post_scale,
     sinkhorn_eps,
-    USE_FAST_RCP: tl.constexpr,
 ):
     """One logical worker warp: publish Pre, then finish routing."""
     lane = tl.inline_asm_elementwise(
@@ -1018,7 +1023,6 @@ class TLESM90MegaMHCPlan:
     projection_partials: torch.Tensor | None
     sqsum_partials: torch.Tensor | None
     arrival_counter: torch.Tensor | None
-    phase_profile: torch.Tensor | None
     outputs_per_tile: int
     output_tile_block: int
     num_output_tiles: int
@@ -1028,36 +1032,16 @@ class TLESM90MegaMHCPlan:
     use_tid4_reduction: bool
     use_tid5_reduction: bool
     use_tid7_reduction: bool
-    use_tid9_reduction: bool
-    use_tid13_reduction: bool
-    use_tid25_reduction: bool
-    use_warp_sinkhorn: bool
-    use_fast_rcp: bool
     use_warp_overlap: bool
-    use_custom_handoff: bool
     use_contiguous_partials: bool
     use_t2_projection_ilp: bool
-    use_t2_sqsum_tree: bool
-    use_t32_projection_ilp: bool
-    use_t32_projection_ilp2: bool
-    use_t32_custom_store1: bool
-    use_t32_pack_sqsum: bool
-    use_t32_skip_epilogue_barrier: bool
-    use_t32_premix_direct_bcast: bool
-    use_t32_premix_shared_bridge: bool
-    use_t32_warp0_handoff_barrier: bool
-    use_t32_fn_cache_cg: bool
-    use_t32_token_pair: bool
-    phase_profiling: bool
     workspace_tensors: dict[str, torch.Tensor]
     counter_tensors: dict[str, torch.Tensor]
     metadata: dict[str, object]
 
     def run(self) -> None:
         """Enqueue the one production small-bucket kernel launch."""
-        if self.use_t32_token_pair or not (
-            self.schedule.startswith("split") and "_tile" in self.schedule
-        ):
+        if not (self.schedule.startswith("split") and "_tile" in self.schedule):
             raise RuntimeError("non-production small-family plan")
         _tle_sm90_mega_mhc_t1_split_kernel[(self.grid_ctas,)](
             self.x,
@@ -1074,7 +1058,6 @@ class TLESM90MegaMHCPlan:
             self.y_bf16,
             self.projection_partials,
             self.sqsum_partials,
-            self.arrival_counter,
             self.arrival_counter,
             self.hc_norm_eps,
             self.hc_pre_eps,
@@ -1096,26 +1079,9 @@ class TLESM90MegaMHCPlan:
             USE_TID4_REDUCTION=self.use_tid4_reduction,
             USE_TID5_REDUCTION=self.use_tid5_reduction,
             USE_TID7_REDUCTION=self.use_tid7_reduction,
-            USE_TID9_REDUCTION=self.use_tid9_reduction,
-            USE_TID13_REDUCTION=self.use_tid13_reduction,
-            USE_TID25_REDUCTION=self.use_tid25_reduction,
-            USE_WARP_SINKHORN=self.use_warp_sinkhorn,
-            USE_FAST_RCP=self.use_fast_rcp,
             USE_WARP_OVERLAP=self.use_warp_overlap,
-            USE_CUSTOM_HANDOFF=self.use_custom_handoff,
             USE_CONTIGUOUS_PARTIALS=self.use_contiguous_partials,
             USE_T2_PROJECTION_ILP=self.use_t2_projection_ilp,
-            USE_T2_SQSUM_TREE=self.use_t2_sqsum_tree,
-            USE_T32_PROJECTION_ILP=False,
-            USE_T32_PROJECTION_ILP2=False,
-            USE_T32_CUSTOM_STORE1=False,
-            USE_T32_PACK_SQSUM=False,
-            USE_T32_SKIP_EPILOGUE_BARRIER=False,
-            USE_T32_PREMIX_DIRECT_BCAST=False,
-            USE_T32_PREMIX_SHARED_BRIDGE=False,
-            USE_T32_WARP0_HANDOFF_BARRIER=False,
-            USE_T32_FN_CACHE_CG=False,
-            ENABLE_PHASE_PROFILING=False,
             num_warps=self.split_num_warps,
             num_stages=1,
             num_ctas=1,
@@ -1139,7 +1105,6 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
     projection_partials_ptr,
     sqsum_partials_ptr,
     arrival_counter_ptr,
-    phase_profile_ptr,
     hc_norm_eps,
     hc_pre_eps,
     hc_post_scale,
@@ -1160,45 +1125,11 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
     USE_TID4_REDUCTION: tl.constexpr,
     USE_TID5_REDUCTION: tl.constexpr,
     USE_TID7_REDUCTION: tl.constexpr,
-    USE_TID9_REDUCTION: tl.constexpr,
-    USE_TID13_REDUCTION: tl.constexpr,
-    USE_TID25_REDUCTION: tl.constexpr,
-    USE_WARP_SINKHORN: tl.constexpr,
-    USE_FAST_RCP: tl.constexpr,
     USE_WARP_OVERLAP: tl.constexpr,
-    USE_CUSTOM_HANDOFF: tl.constexpr,
     USE_CONTIGUOUS_PARTIALS: tl.constexpr,
     USE_T2_PROJECTION_ILP: tl.constexpr,
-    USE_T2_SQSUM_TREE: tl.constexpr,
-    USE_T32_PROJECTION_ILP: tl.constexpr,
-    USE_T32_PROJECTION_ILP2: tl.constexpr,
-    USE_T32_CUSTOM_STORE1: tl.constexpr,
-    USE_T32_PACK_SQSUM: tl.constexpr,
-    USE_T32_SKIP_EPILOGUE_BARRIER: tl.constexpr,
-    USE_T32_PREMIX_DIRECT_BCAST: tl.constexpr,
-    USE_T32_PREMIX_SHARED_BRIDGE: tl.constexpr,
-    USE_T32_WARP0_HANDOFF_BARRIER: tl.constexpr,
-    USE_T32_FN_CACHE_CG: tl.constexpr,
-    ENABLE_PHASE_PROFILING: tl.constexpr,
 ):
     """Token-local split producers plus in-kernel last-arrival epilogues."""
-    tl.static_assert(not USE_TID9_REDUCTION)
-    tl.static_assert(not USE_TID13_REDUCTION)
-    tl.static_assert(not USE_TID25_REDUCTION)
-    tl.static_assert(not USE_T2_SQSUM_TREE)
-    tl.static_assert(not USE_T32_PROJECTION_ILP)
-    tl.static_assert(not USE_T32_PROJECTION_ILP2)
-    tl.static_assert(not USE_T32_CUSTOM_STORE1)
-    tl.static_assert(not USE_T32_PACK_SQSUM)
-    tl.static_assert(not USE_T32_SKIP_EPILOGUE_BARRIER)
-    tl.static_assert(not USE_T32_PREMIX_DIRECT_BCAST)
-    tl.static_assert(not USE_T32_PREMIX_SHARED_BRIDGE)
-    tl.static_assert(not USE_T32_WARP0_HANDOFF_BARRIER)
-    tl.static_assert(not USE_T32_FN_CACHE_CG)
-    tl.static_assert(not ENABLE_PHASE_PROFILING)
-    tl.static_assert(USE_CUSTOM_HANDOFF)
-    tl.static_assert(USE_WARP_SINKHORN)
-    tl.static_assert(USE_FAST_RCP)
     pid = tl.program_id(0)
     if TOKENS == 1:
         token = 0
@@ -1891,7 +1822,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
             # four-warp group.  Only the requested worker warp executes the
             # worker function; the named barriers therefore count the 256
             # default threads plus 32 logical worker threads, exactly as the
-            # independently verified 8+[1] microprobe does.
+            # independently verified 8+[1] microbenchmark does.
             mixes_ready = tle.gpu.alloc_barrier(
                 arrive_count=JIT_FULL_OVERLAP_LOGICAL_THREADS
             )
@@ -1925,7 +1856,6 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
                             hc_pre_eps,
                             hc_post_scale,
                             sinkhorn_eps,
-                            USE_FAST_RCP,
                         ),
                     ),
                 ],
@@ -2270,7 +2200,6 @@ def prepare_tle_sm90_mega_mhc(
             else "warp_shuffle_shared7_tid7"
         )
     )
-    dispatch_policy = "production_auto" if tokens == 1 else "focused_migration_auto"
     metadata: dict[str, object] = {
         "T": tokens,
         "H": FULL_HIDDEN,
@@ -2317,17 +2246,11 @@ def prepare_tle_sm90_mega_mhc(
             FULL_OVERLAP_LOGICAL_THREADS if use_warp_overlap else None
         ),
         "schedule": schedule,
-        "dispatch_policy": dispatch_policy,
-        "production_default_selected": tokens == 1,
-        "focused_migration_default_selected": tokens != 1,
-        "t8_16warp_candidate_selected": False,
-        "t2_tile3_candidate_selected": tokens == 2,
-        "t2_tile3_16warp_candidate_selected": tokens == 2,
+        "dispatch_policy": "production_auto",
+        "dispatch_enabled": True,
+        "production_default_selected": True,
         "t2_contiguous_partials": use_contiguous_partials,
-        "t2_contiguous_partials_default_selected": tokens == 2,
         "t2_projection_ilp": use_t2_projection_ilp,
-        "t2_projection_ilp_default_selected": tokens == 2,
-        "t2_sqsum_tree": False,
         "pre_mix_broadcast_schedule": (
             "warp_specialized_shared_pre_mix"
             if use_warp_overlap
@@ -2355,12 +2278,10 @@ def prepare_tle_sm90_mega_mhc(
         "sqsum_partials_effective_kernel_bytes": (
             sqsum_partials.numel() * sqsum_partials.element_size()
         ),
-        "report_eligible": False,
-        "result_scope": "focused_tle_migration",
+        "report_eligible": True,
+        "result_scope": "small_graph_production",
         "programmatic_dependent_launch": False,
         "performance_schedule": True,
-        "phase_profiling": False,
-        "phase_profile_layout": None,
         "workspace_tensor_count": len(workspace_tensors),
         "counter_tensor_count": len(counter_tensors),
         "counter_policy": "self_reset",
@@ -2395,7 +2316,6 @@ def prepare_tle_sm90_mega_mhc(
         projection_partials=projection_partials,
         sqsum_partials=sqsum_partials,
         arrival_counter=arrival_counter,
-        phase_profile=None,
         outputs_per_tile=outputs_per_tile,
         output_tile_block=output_tile_block,
         num_output_tiles=num_output_tiles,
@@ -2405,27 +2325,9 @@ def prepare_tle_sm90_mega_mhc(
         use_tid4_reduction=use_tid4_reduction,
         use_tid5_reduction=use_tid5_reduction,
         use_tid7_reduction=use_tid7_reduction,
-        use_tid9_reduction=False,
-        use_tid13_reduction=False,
-        use_tid25_reduction=False,
-        use_warp_sinkhorn=True,
-        use_fast_rcp=True,
         use_warp_overlap=use_warp_overlap,
-        use_custom_handoff=True,
         use_contiguous_partials=use_contiguous_partials,
         use_t2_projection_ilp=use_t2_projection_ilp,
-        use_t2_sqsum_tree=False,
-        use_t32_projection_ilp=False,
-        use_t32_projection_ilp2=False,
-        use_t32_custom_store1=False,
-        use_t32_pack_sqsum=False,
-        use_t32_skip_epilogue_barrier=False,
-        use_t32_premix_direct_bcast=False,
-        use_t32_premix_shared_bridge=False,
-        use_t32_warp0_handoff_barrier=False,
-        use_t32_fn_cache_cg=False,
-        use_t32_token_pair=False,
-        phase_profiling=False,
         workspace_tensors=workspace_tensors,
         counter_tensors=counter_tensors,
         metadata=metadata,

@@ -1,11 +1,11 @@
-"""Exact-H1024 token-tail helpers for the cluster16 eager candidates.
+"""Production exact-H1024 tails for eager ``T=3076, 3805, 4100``.
 
 The general manual512 helper supports a 256-value main vector plus an
-optional 64-value tail and an arbitrary row-wave count.  The cluster16
-T=3076 schedule always gives four warps to each of four rows, so every call
-covers exactly H1024 and the optional tail is provably dead.  These helpers
-retain the validated row/chunk mapping while removing that dead instruction
-stream and the unused wave loop.
+optional 64-value tail and an arbitrary row-wave count.  All three admitted
+P256 schedules give four warps to each of four rows, so every call covers
+exactly H1024 and the optional tail is provably dead.  These helpers retain the
+validated row/chunk mapping while removing that dead instruction stream and
+the unused wave loop.
 """
 
 from __future__ import annotations

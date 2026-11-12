@@ -1,9 +1,13 @@
-"""Exact-T496 facade for the shared split16 RS all-producer kernel."""
+"""Production exact-T496 facade for the shared split16 RS all-producer kernel.
+
+The selected configuration is H4096/R4/P24, eight M64 tiles, split-16, 128
+producer CTAs, sixteen producer warps, four RS-WGMMA warps, and 128 math
+registers.  No device body is duplicated here.
+"""
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Mapping
 
 TOKENS = 496
@@ -38,7 +42,6 @@ def prepare_tle_sm90_mega_mhc(
     metadata.update(
         {
             "admission_shape": "T496",
-            "admission_source": str(Path(__file__).resolve()),
             "kernel_symbol": "_t496_allproducer_kernel",
             "pipeline_variant": ("t496-allproducer-nonstriped-active-cta-skip-tilebar"),
         }

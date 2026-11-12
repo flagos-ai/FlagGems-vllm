@@ -1,8 +1,10 @@
-"""Shared Hopper PTX helpers retained from the old P256 WGMMA prototype.
+"""Shared Hopper PTX helpers for the production split16 Graph family.
 
-The prototype kernel and host-side preparation path were not reachable from
-production dispatch.  Graph kernels still reuse these three leaf helpers, so
-this compatibility module preserves their implementation and import path.
+Formal callers cover ``T in {400, 416, 432, 448, 464, 496, 512}`` at
+``H=4096, R=4, P=24`` with split-16, 16 producer warps, and four RS-WGMMA
+warps.  The prototype kernel and host preparation path were unreachable and
+are omitted; only the three production-used leaf helpers keep this import
+path.
 """
 
 from __future__ import annotations

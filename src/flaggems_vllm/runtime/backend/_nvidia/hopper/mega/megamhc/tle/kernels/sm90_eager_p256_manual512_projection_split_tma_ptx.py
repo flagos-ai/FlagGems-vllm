@@ -1,9 +1,10 @@
-"""P256 manual512 projection PTX with split-aware Fn TMA coordinates.
+"""Production split-aware P256 projection PTX for ``T=3076, 3805, 4100``.
 
-This copy keeps the hash-pinned projection body intact except for adding the
-CTA hidden-base coordinate to TensorMap loads.  The original global-load path
-is byte-for-byte equivalent; the TMA path now addresses each H256/H512 split
-instead of repeatedly loading split zero.
+The admitted callers use 12 producer and 4 RS-WGMMA warps with cp.async Fn
+staging.  The split coordinate supports the H256 cluster16 topology at T=3076
+and the H1024 four-split topologies at T=3805/4100.  The shared PTX body keeps
+the TMA branch for ABI compatibility with the validated helper, while every
+production caller passes its selector as a compile-time false value.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def _manual512_p256_projection_split_tma_ptx(
 
     The first 24 FP32 projection values and the BF16-derived square sum are
     mirrored into the byte storage backing ``debug_projection_ptr``.  That
-    write is probe-only and lets the host validate the otherwise CTA-local
+    write is debug-only and lets the host validate the otherwise CTA-local
     projection before the full Normal-MHC tail is attached.
     """
     return tl.inline_asm_elementwise(

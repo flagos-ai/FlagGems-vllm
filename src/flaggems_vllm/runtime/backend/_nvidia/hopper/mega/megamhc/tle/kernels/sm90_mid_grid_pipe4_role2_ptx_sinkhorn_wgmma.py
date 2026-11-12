@@ -1,9 +1,11 @@
-"""Clean role2 kernel with a compact warp-local PTX Sinkhorn loop.
+"""Production role2 kernel with a compact warp-local PTX Sinkhorn loop.
 
 This follows the production grid geometry for the pinned DeepSeek-V4-Flash
-Normal BF16 profile at logical ``T=136..256``.  It does not participate in
-production dispatch unless its explicit experiment switch is set.  The
-cooperative grid is mapped as::
+Normal BF16 profile at logical ``T=136..256`` in steps of eight, with
+``H=4096, R=4, P=24``.  Production dispatch fixes split-32, sixteen producer
+warps, four WGMMA warps, four pipeline stages, 128 WGMMA registers, role2
+ownership, early-Pre ILP4, and the PTX Sinkhorn loop.  The cooperative grid
+is mapped as::
 
     tile  = program_id // 32
     split = program_id % 32
@@ -267,7 +269,7 @@ def _role2_hidden_tail(
     # The pinned TLE runtime has no public BlockEncoding API.  Its default
     # H8192 ownership is logical = tid + item * 512.  This permutation makes
     # root warps 0..7 own token0/H4096 and 8..15 own token1/H4096 exactly
-    # once; sm90_role2_subgroup_probe.py audits that contract and canaries.
+    # once; the subgroup validation suite audits that contract and its canaries.
     logical = tl.arange(0, JIT_ROLE2_TOKENS * JIT_HIDDEN)
     layout_thread = logical % JIT_CTA_THREADS
     item = logical // JIT_CTA_THREADS
@@ -1038,10 +1040,6 @@ def prepare_tle_sm90_mega_mhc(
     outputs: Mapping[str, object],
 ) -> MidGridPipe4Role2Plan:
     """Validate the fixed profile and allocate capture-stable state."""
-    if os.environ.get("DG_TLE_MHC_MID_GRID_PIPE4_ROLE2", "0") != "1":
-        raise RuntimeError(
-            "set DG_TLE_MHC_MID_GRID_PIPE4_ROLE2=1 to enable this experiment"
-        )
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("prepare the plan before CUDA Graph capture")
     if inputs.get("shifted_prev_mix") is not None:
@@ -1190,8 +1188,8 @@ def prepare_tle_sm90_mega_mhc(
         "workspace_shape": list(partials.shape),
         "workspace_bytes": partials.numel() * partials.element_size(),
         "padding_requires_extra_kernel": False,
-        "experimental": True,
-        "dispatch_enabled": False,
+        "experimental": False,
+        "dispatch_enabled": True,
     }
     return MidGridPipe4Role2Plan(
         x=tensors[0],

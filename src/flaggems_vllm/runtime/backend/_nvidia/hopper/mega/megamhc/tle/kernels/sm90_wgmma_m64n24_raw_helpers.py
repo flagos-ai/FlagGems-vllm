@@ -1,4 +1,4 @@
-"""Raw M64N24K8 WGMMA helpers used by the T=400 production kernel."""
+"""Raw M64N24K8 WGMMA helpers used by the production T=400 kernel."""
 
 from __future__ import annotations
 

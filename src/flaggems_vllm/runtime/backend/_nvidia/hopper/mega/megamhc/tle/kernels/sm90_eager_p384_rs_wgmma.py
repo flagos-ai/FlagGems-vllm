@@ -1,6 +1,7 @@
 """Shared exact-shape SM90 TLE MegaMHC kernel for eager P384 buckets.
 
-This is an independent, opt-in migration of the CUDA p384 split-1 family.
+This is the production migration of the CUDA P384 split-1 family for exact
+``T in {12991, 13005, 13021, 16384}`` at ``H=4096, R=4, P=24``.
 One M64 CTA owns the complete H4096 reduction for its token tile, so the
 kernel has no grid-wide barrier, counter, cooperative launch, or auxiliary
 workspace.  The admitted CTA contains twelve producer warps and four WGMMA
@@ -14,14 +15,16 @@ same CTA and the prepared plan enqueues exactly one kernel.  The hidden tail
 keeps two consecutive route loads in flight so the HBM load-use latency is
 overlapped without adding a second kernel or workspace.
 
-The implementation is shared by the four admitted eager token buckets.  The
+The fixed production configuration is manual512 with twelve producer warps,
+four math warps, a four-stage K64 ring, TMA Fn staging, route12 tail scheduling,
+shared-round hidden processing, and ``maxnreg=64``.  The implementation is
+shared by the four admitted eager token buckets.  The
 token count remains a ``tl.constexpr`` kernel argument, so every bucket keeps
 an independent compiled specialization without copying this source file.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -61,10 +64,6 @@ class P384ShapeConfig:
         return (self.tokens + BLOCK_M - 1) // BLOCK_M
 
     @property
-    def env_prefix(self) -> str:
-        return f"DG_TLE_MHC_EAGER_T{self.tokens}"
-
-    @property
     def kernel_symbol(self) -> str:
         return f"_sm90_eager_t{self.tokens}_p384_rs_wgmma_kernel"
 
@@ -99,7 +98,6 @@ TOTAL_LOGICAL_THREADS = 512
 ACTIVE_PRODUCER_WARPS = PRODUCER_WARPS
 ACTIVE_K64_BLOCKS = COMPILE_CONFIG.active_k64_blocks
 # Compatibility constants consumed by the existing exact-shape launch adapters.
-PROBE_PHASE = 1
 TAIL_BATCHES = 22
 TAIL_WORK_PHASE = 3
 ACCUM_MODE = COMPILE_CONFIG.accum_mode
@@ -1860,10 +1858,7 @@ class P384Plan:
         )
 
     def run(self) -> None:
-        self.run_probe()
-
-    def run_probe(self) -> None:
-        """Launch the selected phase; callers must provide a watchdog."""
+        """Launch the complete production kernel."""
         _sm90_eager_p384_rs_wgmma_kernel[(self.grid_ctas,)](
             *self._kernel_args(),
             num_warps=NUM_WARPS,
@@ -1871,15 +1866,6 @@ class P384Plan:
             num_ctas=1,
             maxnreg=self.maxnreg,
         )
-
-
-def _validate_environment(shape_config: P384ShapeConfig) -> bool:
-    prefix = shape_config.env_prefix
-    enable_name = f"{prefix}_P384"
-    if os.environ.get(enable_name, "0") != "1":
-        raise RuntimeError(f"set {enable_name}=1 to enable this exact path")
-
-    return os.environ.get(f"{prefix}_ADMITTED", "0") == "1"
 
 
 def prepare_p384_plan(
@@ -1890,7 +1876,6 @@ def prepare_p384_plan(
     plan_type: type[P384Plan] = P384Plan,
 ) -> P384Plan:
     """Validate the complete pinned profile; allocate no device workspace."""
-    dispatch_enabled = _validate_environment(shape_config)
     maxnreg = COMPILE_CONFIG.maxnreg
     tokens = shape_config.tokens
     if torch.cuda.is_current_stream_capturing():
@@ -1972,7 +1957,7 @@ def prepare_p384_plan(
         raise ValueError("all tensors must be on one CUDA device")
     # Encoding and the 128-byte H2D copy happen during plan preparation,
     # never in the timed one-kernel interval.
-    from .sm90_global_tensormap_inline_probe import _encode_global_tensor_map
+    from .sm90_global_tensormap_helpers import _encode_global_tensor_map
 
     fn_tensormap_storage = _encode_global_tensor_map(tensors[4])
     kernel_tensors = (*tensors, fn_tensormap_storage)
@@ -2041,8 +2026,8 @@ def prepare_p384_plan(
         "tail_schedule": TAIL_SCHEDULE,
         "manual_hidden_mode": MANUAL_HIDDEN_MODE,
         "manual_hidden_quad_ilp": (2 if MANUAL_HIDDEN_MODE == "shared-round" else None),
-        "experimental": not dispatch_enabled,
-        "dispatch_enabled": dispatch_enabled,
+        "experimental": False,
+        "dispatch_enabled": True,
         "shape_specialization": (
             "shared P384 source with an exact constexpr token limit"
         ),
@@ -2072,7 +2057,6 @@ __all__ = [
     "NUM_WARPS",
     "P384Plan",
     "P384ShapeConfig",
-    "PROBE_PHASE",
     "SUPPORTED_TOKENS",
     "TAIL_BATCHES",
     "TAIL_WORK_PHASE",

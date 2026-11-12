@@ -1,9 +1,11 @@
-"""Experimental SM90 padded-M128 tile-by-split MegaMHC Graph kernel.
+"""Production SM90 padded-M128 tile-by-split MegaMHC Graph kernel.
 
 This generalizes the fixed-T128 winner to the pinned DeepSeek-V4-Flash
-Normal BF16 profile for logical ``T=72..128``.  It does not participate in
-production dispatch unless its explicit experiment switch is set.  The
-128-CTA cooperative grid is mapped as::
+Normal BF16 profile for logical
+``T in {72, 80, 88, 96, 104, 112, 120, 128}`` at
+``H=4096, R=4, P=24``.  Production dispatch fixes two M64 tiles, 64 hidden
+splits, sixteen producer warps, four WGMMA warps, and 128 WGMMA registers.
+The 128-CTA cooperative grid is mapped as::
 
     tile  = program_id // 64
     split = program_id % 64
@@ -25,8 +27,8 @@ CUfunction before launch; otherwise the software rendezvous can deadlock.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Mapping
 
 import torch
@@ -35,7 +37,6 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from .. import fused_post_gemm_t64 as _t64
-
 
 PADDED_TOKENS = 128
 LOGICAL_TOKEN_BUCKETS = (72, 80, 88, 96, 104, 112, 120, 128)
@@ -84,9 +85,7 @@ JIT_CTA_THREADS = tl.constexpr(NUM_WARPS * 32)
 JIT_STAGED_MATH_WARPS = tl.constexpr(STAGED_MATH_WARPS)
 JIT_STAGED_MATH_THREADS = tl.constexpr(STAGED_MATH_WARPS * 32)
 JIT_STAGED_MATH_REGS = tl.constexpr(STAGED_MATH_REGS)
-JIT_STAGED_LOGICAL_THREADS = tl.constexpr(
-    NUM_WARPS * 32 + STAGED_MATH_WARPS * 32
-)
+JIT_STAGED_LOGICAL_THREADS = tl.constexpr(NUM_WARPS * 32 + STAGED_MATH_WARPS * 32)
 
 
 @triton.jit
@@ -124,9 +123,9 @@ def _tile_split64_producer(
     token_hidden = m[:, None] * JIT_HIDDEN + hidden[None, :]
     token_residual = m[:, None] * JIT_FLAT_HIDDEN + hidden[None, :]
 
-    x = tl.load(
-        x_ptr + token_hidden, mask=token_active[:, None], other=0.0
-    ).to(tl.float32)
+    x = tl.load(x_ptr + token_hidden, mask=token_active[:, None], other=0.0).to(
+        tl.float32
+    )
     r0 = tl.load(
         residual_ptr + token_residual,
         mask=token_active[:, None],
@@ -189,9 +188,7 @@ def _tile_split64_producer(
         q_fp32 = q_bf16.to(tl.float32)
         flat_hidden = channel * JIT_HIDDEN + hidden
         tl.store(
-            new_residual_ptr
-            + m[:, None] * JIT_FLAT_HIDDEN
-            + flat_hidden[None, :],
+            new_residual_ptr + m[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
             q_bf16,
             mask=token_active[:, None],
         )
@@ -261,9 +258,7 @@ def _tile_split64_math_and_routing(
     sinkhorn_eps,
 ):
     """Four WGMMA warps produce one tile, then reduce 64 partials."""
-    accumulator = tl.zeros(
-        (JIT_BLOCK_M, JIT_BLOCK_N), dtype=tl.float32
-    )
+    accumulator = tl.zeros((JIT_BLOCK_M, JIT_BLOCK_N), dtype=tl.float32)
     for _ in tl.static_range(0, JIT_HC_MULT):
         tle.gpu.barrier_wait(stage_full)
         accumulator = tle.gpu.wgmma(
@@ -281,15 +276,12 @@ def _tile_split64_math_and_routing(
     token_active = m < JIT_LOGICAL_TOKENS
     n = tl.arange(0, JIT_BLOCK_N)
     workspace_offsets = (
-        split * JIT_PADDED_TOKENS * JIT_BLOCK_N
-        + m[:, None] * JIT_BLOCK_N
-        + n[None, :]
+        split * JIT_PADDED_TOKENS * JIT_BLOCK_N + m[:, None] * JIT_BLOCK_N + n[None, :]
     )
     tl.store(
         partials_ptr + workspace_offsets,
         accumulator,
-        mask=token_active[:, None]
-        & (n[None, :] < JIT_PROJECTION_OUTPUTS),
+        mask=token_active[:, None] & (n[None, :] < JIT_PROJECTION_OUTPUTS),
     )
 
     tle.gpu.barrier_wait(producer_ready)
@@ -400,12 +392,8 @@ def _sm90_padded_m128_tile_split64_wgmma_kernel(
     )
     stage_full = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
     stage_empty = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
-    producer_ready = tle.gpu.alloc_barrier(
-        arrive_count=JIT_STAGED_LOGICAL_THREADS
-    )
-    grid_acquire_ready = tle.gpu.alloc_barrier(
-        arrive_count=JIT_STAGED_LOGICAL_THREADS
-    )
+    producer_ready = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
+    grid_acquire_ready = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
     pre_ready = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
 
     tle.gpu.warp_specialize(
@@ -566,10 +554,6 @@ def prepare_tle_sm90_mega_mhc(
     outputs: Mapping[str, object],
 ) -> PaddedM128TileSplit64Plan:
     """Validate the fixed profile and allocate capture-stable state."""
-    if os.environ.get("DG_TLE_MHC_PADDED_M128_TILE_SPLIT64", "0") != "1":
-        raise RuntimeError(
-            "set DG_TLE_MHC_PADDED_M128_TILE_SPLIT64=1 to enable this experiment"
-        )
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("prepare the plan before CUDA Graph capture")
     if inputs.get("shifted_prev_mix") is not None:
@@ -702,8 +686,8 @@ def prepare_tle_sm90_mega_mhc(
         "workspace_shape": list(partials.shape),
         "workspace_bytes": partials.numel() * partials.element_size(),
         "padding_requires_extra_kernel": False,
-        "experimental": True,
-        "dispatch_enabled": False,
+        "experimental": False,
+        "dispatch_enabled": True,
     }
     return PaddedM128TileSplit64Plan(
         x=tensors[0],

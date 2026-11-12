@@ -1,8 +1,9 @@
-"""Shared P256 manual512 N32 projection PTX with compact partial output.
+"""Production P256 manual512 N32 projection PTX for ``T=1028, 2048``.
 
 The T=1028 and T=2048 eager kernels use the same 12-producer/4-math WGMMA
 body.  ``token_limit`` preserves the masked final tile needed by T=1028 while
-remaining true for every row in the full-tile T=2048 schedule.
+remaining true for every row in the full-tile T=2048 schedule.  Both admitted
+callers select cp.async Fn staging and the persistent M64N32 RS-WGMMA path.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ def _manual512_p256_projection_n32_ptx(
 
     The first 24 FP32 projection values and the BF16-derived square sum are
     mirrored into the byte storage backing ``debug_projection_ptr``.  That
-    write is probe-only and lets the host validate the otherwise CTA-local
+    write is debug-only and lets the host validate the otherwise CTA-local
     projection before the full Normal-MHC tail is attached.
     """
     return tl.inline_asm_elementwise(

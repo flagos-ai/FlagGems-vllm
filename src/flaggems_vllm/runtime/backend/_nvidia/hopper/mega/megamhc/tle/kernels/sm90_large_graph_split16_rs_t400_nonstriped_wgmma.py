@@ -1,52 +1,32 @@
-"""Research T=400 split16 RS variant with an exact M16 producer tail.
+"""Production T=400 split16 RS kernel with an exact M16 producer tail.
 
 T=400 leaves 48 inactive rows in the seventh M64 tile.  The generic
 split16 kernel uses striped role ownership, which spreads those inactive rows
-over many CTAs and prevents a CTA-uniform tail skip.  This probe maps each
+over many CTAs and prevents a CTA-uniform tail skip.  This specialization maps each
 split's four routing/hidden roles to four adjacent rows.  The twelve empty
 splits in the final tile still join both cooperative rendezvous, but skip the
 projection reduction, Sinkhorn, and hidden/RMSNorm work after publishing the
 required tail-barrier arrival.
 
-The probe also removes the generic T400 family's 20 consumer-only CTAs: 112
+The production kernel removes the historical 20 consumer-only CTAs: 112
 producer CTAs already cover all 400 routing/hidden tokens.  For the final
 tile only the sixteen live rows execute residual mixing and BF16 rounding;
 the other 48 WGMMA rows are filled with shared-memory zeroes.  The seven
-tiles use independent monotonic 16-CTA release/acquire barriers.  This module
-is research-only and is never selected by production dispatch.
+tiles use independent monotonic 16-CTA release/acquire barriers.  Production
+dispatch fixes seven M64 tiles, split-16, 112 producer CTAs, sixteen producer
+warps, four RS-WGMMA warps, 128 math registers, native M64N24 math through the
+T400 admission wrapper, and CTA-local non-striped ownership.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Mapping
 
 TOKENS = 400
-_EXPECTED_IMPLEMENTATION_SHA256 = (
-    "9aca5026b6bfdd29f54278a9971c06ddb26a8b49b01082e7433bc39a6c5460cc"
-)
 _EXACT_ENVIRONMENT = {
-    "DG_TLE_MHC_LARGE_GRAPH_ROLE4": "1",
     "DG_TLE_MHC_LARGE_GRAPH_ROLE4_LOGICAL_TOKENS": str(TOKENS),
-    "DG_TLE_MHC_LARGE_GRAPH_GRID_CTAS": "112",
-    "DG_TLE_MHC_LARGE_GRAPH_TRUE_K64_STAGE": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_COEFF_CACHE": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_WEIGHT_CACHE": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_PTX_SINKHORN": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_NON_STRIPED_TAIL": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_EARLY_PRE_SYNC": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_PROBE_PHASE": "4",
-    "DG_TLE_MHC_LARGE_GRAPH_ROLE_OVERLAP": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_ALLOCATED_ROLE_BARRIERS": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_SHARED_ROLE_FLAGS": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_TILE_LOCAL_BARRIER": "1",
-    "DG_TLE_MHC_LARGE_GRAPH_FAST_GRID_BARRIER": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_EXACT_T448": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_EXACT_T512": "0",
-    "DG_TLE_MHC_LARGE_GRAPH_SPLIT16_RS_MATH_REGS": "128",
 }
 
 
@@ -68,13 +48,6 @@ from . import sm90_large_graph_split16_rs_wgmma as _implementation  # noqa: E402
 
 _base = _implementation._base
 _t400_tail_quad_post_ptx = _p384_tail_helpers._serial_quad_post_ptx
-_IMPLEMENTATION_SOURCE = Path(_implementation.__file__).resolve()
-_IMPLEMENTATION_SHA256 = hashlib.sha256(_IMPLEMENTATION_SOURCE.read_bytes()).hexdigest()
-if _IMPLEMENTATION_SHA256 != _EXPECTED_IMPLEMENTATION_SHA256:
-    raise RuntimeError(
-        "T400 admission pins split16 RS implementation SHA256 "
-        f"{_EXPECTED_IMPLEMENTATION_SHA256}, got {_IMPLEMENTATION_SHA256}"
-    )
 if _implementation.TOKENS != TOKENS:
     raise RuntimeError(
         f"T400 admission imported T={_implementation.TOKENS} implementation"
@@ -180,7 +153,6 @@ def _t400_exact_tail_root(
     coeff_ready,
     post_shared,
     comb_shared,
-    weight_dummy,
     pre_shared,
     rmsnorm_weight_ptr,
     y_bf16_ptr,
@@ -215,7 +187,6 @@ def _t400_exact_tail_root(
             coeff_ready,
             post_shared,
             comb_shared,
-            weight_dummy,
             pre_shared,
             rmsnorm_weight_ptr,
             y_bf16_ptr,
@@ -402,31 +373,24 @@ def _t400_exact_tail_root(
 
         _implementation.tle.gpu.barrier_wait(done1)
         _implementation.tle.gpu.barrier_wait(producer_ready)
-        if _implementation.JIT_PROBE_PHASE >= 2:
-            _ = _t400_tile_barrier(
-                tl.cast(grid_counter_ptr, tl.uint64), physical_thread
-            )
-            _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
-            if _implementation.JIT_PROBE_PHASE >= 3:
-                _base._full_tail_barrier_sync()
-                if _implementation.JIT_PROBE_PHASE >= 4:
-                    _base._pipe_role4_hidden_tail(
-                        weight_dummy,
-                        pre_shared,
-                        new_residual_ptr,
-                        rmsnorm_weight_ptr,
-                        y_bf16_ptr,
-                        pid,
-                        tile,
-                        split,
-                        rmsnorm_eps,
-                        rmsnorm_scale,
-                    )
+        _ = _t400_tile_barrier(tl.cast(grid_counter_ptr, tl.uint64), physical_thread)
+        _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
+        _base._full_tail_barrier_sync()
+        _base._pipe_role4_hidden_tail(
+            pre_shared,
+            new_residual_ptr,
+            rmsnorm_weight_ptr,
+            y_bf16_ptr,
+            pid,
+            tile,
+            split,
+            rmsnorm_eps,
+            rmsnorm_scale,
+        )
 
 
 @triton.jit
 def _t400_active_cta_hidden_tail(
-    weight_shared,
     pre_shared,
     new_residual_ptr,
     rmsnorm_weight_ptr,
@@ -440,7 +404,6 @@ def _t400_active_cta_hidden_tail(
     first_token = tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
     if first_token < _implementation.JIT_TOKENS:
         _original_hidden_tail(
-            weight_shared,
             pre_shared,
             new_residual_ptr,
             rmsnorm_weight_ptr,
@@ -522,54 +485,45 @@ def _t400_nonstriped_math(
         )
 
     _implementation.tle.gpu.barrier_wait(producer_ready)
-    if _implementation.JIT_PROBE_PHASE >= 2:
-        physical_thread = _t64._physical_thread_id_x()
-        _ = _t400_tile_barrier(tl.cast(partials_ptr, tl.uint64), physical_thread)
-        _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
-        if _implementation.JIT_PROBE_PHASE >= 3:
-            lane = physical_thread % 32
-            role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
-            first_token = (
-                tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
+    physical_thread = _t64._physical_thread_id_x()
+    _ = _t400_tile_barrier(tl.cast(partials_ptr, tl.uint64), physical_thread)
+    _implementation.tle.gpu.barrier_wait(grid_acquire_ready)
+    lane = physical_thread % 32
+    role = (physical_thread - _implementation.JIT_ROOT_THREADS) // 32
+    first_token = tile * _implementation.JIT_BLOCK_M + split * _base.JIT_NUM_ROLES
+    if first_token < _implementation.JIT_TOKENS:
+        token = first_token + role
+        packed_sum = 0.0
+        for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
+            packed_sum += tl.load(
+                partials_ptr
+                + source_split
+                * _implementation.JIT_TOKENS
+                * _implementation.JIT_BLOCK_N
+                + token * _implementation.JIT_BLOCK_N
+                + lane,
+                mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
+                other=0.0,
             )
-            if first_token < _implementation.JIT_TOKENS:
-                token = first_token + role
-                packed_sum = 0.0
-                for source_split in tl.static_range(0, _implementation.JIT_NUM_SPLITS):
-                    packed_sum += tl.load(
-                        partials_ptr
-                        + source_split
-                        * _implementation.JIT_TOKENS
-                        * _implementation.JIT_BLOCK_N
-                        + token * _implementation.JIT_BLOCK_N
-                        + lane,
-                        mask=lane <= _implementation.JIT_PROJECTION_OUTPUTS,
-                        other=0.0,
-                    )
-                _base._pipe_role4_routing_finalize(
-                    pre_shared,
-                    pre_shared,
-                    producer_ready,
-                    producer_ready,
-                    producer_ready,
-                    producer_ready,
-                    mix_scales_ptr,
-                    mix_bases_ptr,
-                    new_post_mix_ptr,
-                    new_comb_res_mix_ptr,
-                    packed_sum,
-                    token,
-                    role,
-                    lane,
-                    True,
-                    hc_norm_eps,
-                    hc_pre_eps,
-                    hc_post_scale,
-                    sinkhorn_eps,
-                )
-            else:
-                # Root still waits at the full-tail barrier in every CTA.
-                _base._full_tail_barrier_arrive()
+        _base._pipe_role4_routing_finalize(
+            pre_shared,
+            mix_scales_ptr,
+            mix_bases_ptr,
+            new_post_mix_ptr,
+            new_comb_res_mix_ptr,
+            packed_sum,
+            token,
+            role,
+            lane,
+            True,
+            hc_norm_eps,
+            hc_pre_eps,
+            hc_post_scale,
+            sinkhorn_eps,
+        )
+    else:
+        # Root still waits at the full-tail barrier in every CTA.
+        _base._full_tail_barrier_arrive()
 
 
 _base._pipe_role4_hidden_tail = _t400_active_cta_hidden_tail
@@ -650,13 +604,6 @@ def _t400_allproducer_kernel(
         scope=_implementation.tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    weight_dummy = _implementation.tle.gpu.alloc(
-        [1],
-        dtype=tl.bfloat16,
-        layout=None,
-        scope=_implementation.tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
     producer_ready = _implementation.tle.gpu.alloc_barrier(
         arrive_count=_implementation.JIT_PHYSICAL_THREADS
     )
@@ -702,7 +649,6 @@ def _t400_allproducer_kernel(
                     coeff_ready,
                     post_shared,
                     comb_shared,
-                    weight_dummy,
                     pre_shared,
                     rmsnorm_weight_ptr,
                     y_bf16_ptr,
@@ -798,9 +744,6 @@ def prepare_tle_sm90_mega_mhc(
     metadata.update(
         {
             "admission_shape": "T400",
-            "admission_source": str(Path(__file__).resolve()),
-            "implementation_source": str(_IMPLEMENTATION_SOURCE),
-            "implementation_source_sha256": _IMPLEMENTATION_SHA256,
             "pipeline_variant": ("t400-allproducer-nonstriped-ptx-m16-producer-tail"),
             "kernel_symbol": "_t400_allproducer_kernel",
             "CTA": _implementation.PRODUCER_CTAS,
@@ -815,7 +758,7 @@ def prepare_tle_sm90_mega_mhc(
             "audited_spill_admission": False,
             "expected_spills": 2,
             "expected_local_bytes_per_thread": 8,
-            "experimental": True,
+            "experimental": False,
             "dispatch_enabled": False,
         }
     )

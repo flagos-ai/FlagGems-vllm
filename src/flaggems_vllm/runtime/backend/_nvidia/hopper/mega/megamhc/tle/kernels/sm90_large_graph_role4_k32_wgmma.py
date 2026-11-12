@@ -1,9 +1,12 @@
-"""SM90 large-Graph MegaMHC role-4 K32 pipeline experiment.
+"""Production SM90 large-Graph MegaMHC role-4 K64 pipeline family.
 
 This is a shape-strict TileLang/TLE migration of the production CUDA direct
-cooperative path for the DeepSeek-V4-Flash Normal-BF16 profile.  It covers the
-16 CUDA-Graph buckets from T=272 through T=512.  The launch geometry mirrors
-the CUDA winner instead of padding every shape to one synthetic topology:
+cooperative path for the DeepSeek-V4-Flash Normal-BF16 profile at
+``H=4096, R=4, P=24``.  Production dispatch selects this module directly for
+``T in {272, 288, 304, 320, 336, 352, 368, 384, 480}``; the split16 exact-T
+modules reuse its common producer and tail helpers for T=400..512.  The launch
+geometry mirrors the CUDA winner instead of padding every shape to one
+synthetic topology:
 
 * T=272..320: five M64 tiles, split-26, grid 130;
 * T=336..384: six M64 tiles, split-22, grid 132;
@@ -12,13 +15,18 @@ the CUDA winner instead of padding every shape to one synthetic topology:
 * T=464..512: eight M64 tiles, split-16, grid 128.
 
 Phase one assigns the default four-warp partition to WGMMA and four additional
-four-warp partitions to disjoint M16 producer stripes.  Eight K32 stages keep
+four-warp partitions to disjoint M16 producer stripes.  Eight K64 stages keep
 the BF16-rounded Post values and FP32 Fn slices below 100 KiB of shared memory.
 After the cooperative release/acquire rendezvous, the four math warps route
 four striped tokens while the four producer partitions independently run the
 matching hidden/RMSNorm work.  The prepared plan enqueues exactly one kernel.
 
-The module is experimental and is never selected without its explicit switch.
+Production configuration is derived only from the exact T bucket: coefficient
+cache is enabled for T=272..384, T480 uses non-striped owners and 96 math
+registers, all other direct buckets use striped owners and 128 math registers.
+All production variants use true-K64 staging, PTX Sinkhorn, early-Pre sync,
+phase-4 completion, and no role-overlap or diagnostic phase switches.  The
+``k32`` filename is retained temporarily for import compatibility.
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from .. import fused_post_gemm_t64 as _t64
-from . import sm90_fn_cp_async_stage_probe as _fn_cp
+from . import sm90_cp_async_helpers as _fn_cp
 
 LOGICAL_TOKEN_BUCKETS = (
     272,
@@ -66,111 +74,12 @@ if LOGICAL_TOKENS not in LOGICAL_TOKEN_BUCKETS:
         f"{LOGICAL_TOKEN_BUCKETS}, got {LOGICAL_TOKENS}"
     )
 
-# Research-only phase seam.  The default value is the complete operator.
-# Values 1..3 compile progressively larger prefixes so that a Graph replay
-# can attribute the critical path without adding clock instrumentation to the
-# full candidate:
-#   1 = Post/Pre + projection producer/WGMMA + partial stores
-#   2 = phase 1 + cooperative grid rendezvous
-#   3 = phase 2 + routing reduction/finalize
-#   4 = complete operator, including the hidden/RMSNorm tail
-_PROBE_PHASE_TEXT = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_PROBE_PHASE", "4")
-try:
-    PROBE_PHASE = int(_PROBE_PHASE_TEXT)
-except ValueError as exc:  # pragma: no cover - import-time contract
-    raise ValueError("DG_TLE_MHC_LARGE_GRAPH_PROBE_PHASE must be an integer") from exc
-if PROBE_PHASE not in (1, 2, 3, 4):
-    raise ValueError("DG_TLE_MHC_LARGE_GRAPH_PROBE_PHASE must be 1, 2, 3, or 4")
-USE_WEIGHT_CACHE = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_WEIGHT_CACHE", "1") == "1"
-USE_ROLE_OVERLAP = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_ROLE_OVERLAP", "0") == "1"
-USE_ALLOCATED_ROLE_BARRIERS = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_ALLOCATED_ROLE_BARRIERS", "0") == "1"
-)
-if USE_ALLOCATED_ROLE_BARRIERS and not USE_ROLE_OVERLAP:
-    raise ValueError("allocated role barriers require role overlap")
-USE_SHARED_ROLE_FLAGS = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_SHARED_ROLE_FLAGS", "0") == "1"
-)
-if USE_SHARED_ROLE_FLAGS and not USE_ROLE_OVERLAP:
-    raise ValueError("shared role flags require role overlap")
-if USE_SHARED_ROLE_FLAGS and USE_ALLOCATED_ROLE_BARRIERS:
-    raise ValueError("shared flags and allocated role barriers are exclusive")
-USE_EARLY_PRE_SYNC = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_EARLY_PRE_SYNC", "1") == "1"
-USE_TRUE_K64_STAGE = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_TRUE_K64_STAGE", "0") == "1"
-USE_K128_PIPE4 = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_K128_PIPE4", "0") == "1"
-if USE_K128_PIPE4 and LOGICAL_TOKENS < 400:
-    raise ValueError("K128/pipe4 requires the split-16 T>=400 family")
-USE_FN_CP_ASYNC = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_FN_CP_ASYNC", "0") == "1"
-if USE_FN_CP_ASYNC and not USE_TRUE_K64_STAGE:
-    raise ValueError("Fn cp.async staging requires the true-K64 pipeline")
-if USE_K128_PIPE4 and USE_FN_CP_ASYNC:
-    raise ValueError("K128/pipe4 does not support the K64 Fn cp.async probe")
-USE_BF16_RS_PIPE = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_BF16_RS_PIPE", "0") == "1"
-USE_MINIMAL_SCRATCH = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_MINIMAL_SCRATCH", "0") == "1"
-)
-USE_COEFF_CACHE = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_COEFF_CACHE", "0") == "1"
-USE_PTX_SINKHORN = os.environ.get("DG_TLE_MHC_LARGE_GRAPH_PTX_SINKHORN", "0") == "1"
-USE_NON_STRIPED_TAIL = (
-    os.environ.get(
-        "DG_TLE_MHC_LARGE_GRAPH_NON_STRIPED_TAIL",
-        "1" if LOGICAL_TOKENS >= 464 else "0",
-    )
-    == "1"
-)
-USE_EXACT_T512 = (
-    os.environ.get(
-        "DG_TLE_MHC_LARGE_GRAPH_EXACT_T512",
-        "0",
-    )
-    == "1"
-)
-if USE_EXACT_T512 and LOGICAL_TOKENS != 512:
-    raise ValueError("exact-T512 specialization requires T=512")
-USE_EXACT_T448 = (
-    os.environ.get(
-        "DG_TLE_MHC_LARGE_GRAPH_EXACT_T448",
-        "0",
-    )
-    == "1"
-)
-if USE_EXACT_T448 and LOGICAL_TOKENS != 448:
-    raise ValueError("exact-T448 specialization requires T=448")
-if USE_EXACT_T448 and not USE_NON_STRIPED_TAIL:
-    raise ValueError("exact-T448 specialization requires non-striped owners")
-USE_EXACT_FULL_TILE = USE_EXACT_T448 or USE_EXACT_T512
-if USE_MINIMAL_SCRATCH and not USE_EXACT_FULL_TILE:
-    raise ValueError("minimal scratch requires an exact full-tile specialization")
-USE_MANUAL_ROLE4_TAIL = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_MANUAL_ROLE4_TAIL", "0") == "1"
-)
-USE_PACKED_MANUAL_ROLE4_TAIL = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_PACKED_MANUAL_TAIL", "0") == "1"
-)
-if USE_PACKED_MANUAL_ROLE4_TAIL and not USE_MANUAL_ROLE4_TAIL:
-    raise ValueError("packed manual tail requires manual role-4 tail")
-USE_FAST_GRID_BARRIER = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_FAST_GRID_BARRIER", "0") == "1"
-)
-USE_TILE_LOCAL_BARRIER = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_TILE_LOCAL_BARRIER", "0") == "1"
-)
-USE_TILE_LOCAL_FAST_BARRIER = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_TILE_LOCAL_FAST_BARRIER", "0") == "1"
-)
-if USE_TILE_LOCAL_FAST_BARRIER and not USE_TILE_LOCAL_BARRIER:
-    raise ValueError("tile-local fast barrier requires tile-local barrier")
-if USE_TILE_LOCAL_BARRIER and USE_FAST_GRID_BARRIER:
-    raise ValueError("tile-local and fast global barriers are exclusive")
-USE_PTX_BF16X8_TAIL = (
-    os.environ.get("DG_TLE_MHC_LARGE_GRAPH_PTX_BF16X8_TAIL", "0") == "1"
-)
-if USE_PTX_BF16X8_TAIL and USE_MANUAL_ROLE4_TAIL:
-    raise ValueError("PTX BF16x8 and tensor-manual tails are exclusive")
-if USE_MINIMAL_SCRATCH and (
-    USE_WEIGHT_CACHE or USE_COEFF_CACHE or USE_MANUAL_ROLE4_TAIL or USE_PTX_BF16X8_TAIL
-):
-    raise ValueError("minimal scratch requires uncached default hidden-tail storage")
+# Token-dependent production choices correspond one-to-one with dispatch.py
+# and the admitted exact-T wrapper modules.
+USE_COEFF_CACHE = LOGICAL_TOKENS <= 384
+USE_NON_STRIPED_TAIL = LOGICAL_TOKENS in (400, 416, 464, 480, 496, 512)
+USE_EXACT_FULL_TILE = LOGICAL_TOKENS == 512
+USE_TILE_LOCAL_BARRIER = LOGICAL_TOKENS in (400, 416, 464, 496, 512)
 
 HIDDEN = 4096
 HC_MULT = 4
@@ -179,8 +88,8 @@ FLAT_HIDDEN = HIDDEN * HC_MULT
 SINKHORN_ITERS = 20
 BLOCK_M = 64
 BLOCK_N = 32
-K_STAGE = 128 if USE_K128_PIPE4 else 64
-K_HALF = K_STAGE if (USE_TRUE_K64_STAGE or USE_K128_PIPE4) else 32
+K_STAGE = 64
+K_HALF = 64
 NUM_K_HALVES = K_STAGE // K_HALF
 NUM_HIDDEN_BLOCKS = HIDDEN // K_STAGE
 NUM_M_TILES = (LOGICAL_TOKENS + BLOCK_M - 1) // BLOCK_M
@@ -189,34 +98,12 @@ BASE_HIDDEN_BLOCKS = NUM_HIDDEN_BLOCKS // NUM_SPLITS
 REMAIN_HIDDEN_BLOCKS = NUM_HIDDEN_BLOCKS % NUM_SPLITS
 MAX_HIDDEN_BLOCKS_PER_SPLIT = BASE_HIDDEN_BLOCKS + (1 if REMAIN_HIDDEN_BLOCKS else 0)
 PRODUCER_CTAS = NUM_M_TILES * NUM_SPLITS
-_DEFAULT_GRID_CTAS = 132 if LOGICAL_TOKENS == 400 else PRODUCER_CTAS
-_GRID_CTAS_TEXT = os.environ.get(
-    "DG_TLE_MHC_LARGE_GRAPH_GRID_CTAS", str(_DEFAULT_GRID_CTAS)
-)
-try:
-    GRID_CTAS = int(_GRID_CTAS_TEXT)
-except ValueError as exc:  # pragma: no cover - import-time contract
-    raise ValueError("DG_TLE_MHC_LARGE_GRAPH_GRID_CTAS must be an integer") from exc
-if not (PRODUCER_CTAS <= GRID_CTAS <= 132):
-    raise ValueError(
-        "DG_TLE_MHC_LARGE_GRAPH_GRID_CTAS must keep every producer and fit "
-        f"the 132-SM cooperative grid, got {GRID_CTAS} for {PRODUCER_CTAS=}"
-    )
-if not USE_NON_STRIPED_TAIL and GRID_CTAS * 4 < LOGICAL_TOKENS:
-    raise ValueError(
-        "striped role-4 ownership requires 4 * GRID_CTAS >= LOGICAL_TOKENS"
-    )
-if USE_TILE_LOCAL_BARRIER and (not USE_NON_STRIPED_TAIL or GRID_CTAS != PRODUCER_CTAS):
-    raise ValueError(
-        "tile-local barrier requires non-striped owners and an all-producer grid"
-    )
+GRID_CTAS = PRODUCER_CTAS
 PADDED_TOKENS = LOGICAL_TOKENS
-NUM_PIPE_STAGES = 4 if USE_K128_PIPE4 else 8
+NUM_PIPE_STAGES = 8
 ROOT_WARPS = 16
 MATH_WARPS = 4
-MATH_REGS = int(os.environ.get("DG_TLE_MHC_LARGE_GRAPH_MATH_REGS", "128"))
-if MATH_REGS not in (80, 96, 112, 128):
-    raise ValueError("DG_TLE_MHC_LARGE_GRAPH_MATH_REGS must be 80, 96, 112, or 128")
+MATH_REGS = 96 if LOGICAL_TOKENS == 480 else 128
 ROLE_WARPS = 4
 NUM_ROLES = 4
 PHYSICAL_WARPS = MATH_WARPS + NUM_ROLES * ROLE_WARPS
@@ -254,28 +141,10 @@ JIT_ROLE_WARPS = tl.constexpr(ROLE_WARPS)
 JIT_ROLE_THREADS = tl.constexpr(ROLE_THREADS)
 JIT_TAIL_HIDDEN_CHUNK = tl.constexpr(TAIL_HIDDEN_CHUNK)
 JIT_TAIL_ITEMS = tl.constexpr(TAIL_ITEMS)
-JIT_PROBE_PHASE = tl.constexpr(PROBE_PHASE)
-JIT_USE_WEIGHT_CACHE = tl.constexpr(USE_WEIGHT_CACHE)
-JIT_USE_ROLE_OVERLAP = tl.constexpr(USE_ROLE_OVERLAP)
-JIT_USE_ALLOCATED_ROLE_BARRIERS = tl.constexpr(USE_ALLOCATED_ROLE_BARRIERS)
-JIT_USE_SHARED_ROLE_FLAGS = tl.constexpr(USE_SHARED_ROLE_FLAGS)
-JIT_USE_EARLY_PRE_SYNC = tl.constexpr(USE_EARLY_PRE_SYNC)
-JIT_USE_K128_PIPE4 = tl.constexpr(USE_K128_PIPE4)
-JIT_USE_FN_CP_ASYNC = tl.constexpr(USE_FN_CP_ASYNC)
-JIT_USE_BF16_RS_PIPE = tl.constexpr(USE_BF16_RS_PIPE)
-JIT_USE_MINIMAL_SCRATCH = tl.constexpr(USE_MINIMAL_SCRATCH)
 JIT_USE_COEFF_CACHE = tl.constexpr(USE_COEFF_CACHE)
-JIT_USE_PTX_SINKHORN = tl.constexpr(USE_PTX_SINKHORN)
 JIT_USE_NON_STRIPED_TAIL = tl.constexpr(USE_NON_STRIPED_TAIL)
-JIT_USE_EXACT_T512 = tl.constexpr(USE_EXACT_T512)
-JIT_USE_EXACT_T448 = tl.constexpr(USE_EXACT_T448)
 JIT_USE_EXACT_FULL_TILE = tl.constexpr(USE_EXACT_FULL_TILE)
-JIT_USE_MANUAL_ROLE4_TAIL = tl.constexpr(USE_MANUAL_ROLE4_TAIL)
-JIT_USE_PACKED_MANUAL_ROLE4_TAIL = tl.constexpr(USE_PACKED_MANUAL_ROLE4_TAIL)
-JIT_USE_FAST_GRID_BARRIER = tl.constexpr(USE_FAST_GRID_BARRIER)
 JIT_USE_TILE_LOCAL_BARRIER = tl.constexpr(USE_TILE_LOCAL_BARRIER)
-JIT_USE_TILE_LOCAL_FAST_BARRIER = tl.constexpr(USE_TILE_LOCAL_FAST_BARRIER)
-JIT_USE_PTX_BF16X8_TAIL = tl.constexpr(USE_PTX_BF16X8_TAIL)
 
 
 @triton.jit
@@ -321,215 +190,6 @@ def _sinkhorn_nineteen_warp_iterations(value, epsilon):
 
 
 @triton.jit
-def _role_barrier_arrive(role):
-    """Publish one routing warp to its four root warps without waiting.
-
-    PTX ``barrier.cta.arrive`` is intentionally the non-``.aligned`` form:
-    only the five warps in this 160-thread role execute a given barrier.
-    Barrier IDs 12..15 are disjoint from TLE's generated IDs 0..5.
-    """
-    barrier_id = role + 12
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.arrive $1, 160; mov.u32 $0, 0; }",
-        constraints="=r,r",
-        args=[barrier_id],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _role_barrier_sync(role):
-    """Wait for one routing warp plus its four 128-thread root warps."""
-    barrier_id = role + 12
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync $1, 160; mov.u32 $0, 0; }",
-        constraints="=r,r",
-        args=[barrier_id],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _allocated_role_barrier_arrive(role, b0, b1, b2, b3):
-    """Publish one routing warp through a TLE-allocated 160-thread barrier."""
-    if role == 0:
-        tle.gpu.barrier_arrive(b0, phaseIdx=0)
-    elif role == 1:
-        tle.gpu.barrier_arrive(b1, phaseIdx=0)
-    elif role == 2:
-        tle.gpu.barrier_arrive(b2, phaseIdx=0)
-    else:
-        tle.gpu.barrier_arrive(b3, phaseIdx=0)
-
-
-@triton.jit
-def _allocated_role_barrier_wait(role, b0, b1, b2, b3):
-    """Join four root warps with their matching routing warp."""
-    if role == 0:
-        tle.gpu.barrier_arrive(b0, phaseIdx=0)
-        tle.gpu.barrier_wait(b0, phaseIdx=0)
-    elif role == 1:
-        tle.gpu.barrier_arrive(b1, phaseIdx=0)
-        tle.gpu.barrier_wait(b1, phaseIdx=0)
-    elif role == 2:
-        tle.gpu.barrier_arrive(b2, phaseIdx=0)
-        tle.gpu.barrier_wait(b2, phaseIdx=0)
-    else:
-        tle.gpu.barrier_arrive(b3, phaseIdx=0)
-        tle.gpu.barrier_wait(b3, phaseIdx=0)
-
-
-@triton.jit
-def _shared_role_flag_publish(role_flags, role, lane):
-    flag_pointer = tle.gpu.local_ptr(role_flags, (0,)) + role
-    flag_address = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, $1;",
-        constraints="=r,r",
-        args=[flag_pointer],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred leader;
-          bar.warp.sync 0xffffffff;
-          setp.eq.u32 leader, $2, 0;
-          @leader st.release.cta.shared.u32 [$1], 1;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r,r",
-        args=[flag_address, lane],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _shared_role_flags_reset(role_flags, thread):
-    base_pointer = tle.gpu.local_ptr(role_flags, (0,))
-    base_address = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, $1;",
-        constraints="=r,r",
-        args=[base_pointer],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred active;
-          .reg .u32 offset, address;
-          setp.lt.u32 active, $2, 4;
-          shl.b32 offset, $2, 2;
-          add.u32 address, $1, offset;
-          @active st.shared.u32 [address], 0;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r,r",
-        args=[base_address, thread],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _shared_role_flag_wait(role_flags, role):
-    flag_pointer = tle.gpu.local_ptr(role_flags, (0,)) + role
-    flag_address = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, $1;",
-        constraints="=r,r",
-        args=[flag_pointer],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred pending;
-          .reg .u32 value;
-        DG_TLE_MHC_LARGE_ROLE_FLAG_WAIT:
-          ld.acquire.cta.shared.u32 value, [$1];
-          setp.eq.u32 pending, value, 0;
-          @pending bra DG_TLE_MHC_LARGE_ROLE_FLAG_WAIT;
-          mov.u32 $0, value;
-        }
-        """,
-        constraints="=r,r",
-        args=[flag_address],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _root_barrier_sync():
-    """Make the shared BF16 weight row visible across sixteen root warps."""
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync 11, 512; mov.u32 $0, 0; }",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _manual_role4_hidden_sum_sync(physical_thread):
-    """Synchronize each independent four-warp hidden worker."""
-    worker = physical_thread // JIT_ROLE_THREADS
-    barrier_id = worker + 12
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync $1, 128; mov.u32 $0, 0; }",
-        constraints="=r,r",
-        args=[barrier_id],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _warp_reduce32_sum(value):
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .f32 t;
-          mov.f32 $0, $1;
-          shfl.sync.down.b32 t, $0, 16, 31, 0xffffffff;
-          add.f32 $0, $0, t;
-          shfl.sync.down.b32 t, $0, 8, 31, 0xffffffff;
-          add.f32 $0, $0, t;
-          shfl.sync.down.b32 t, $0, 4, 31, 0xffffffff;
-          add.f32 $0, $0, t;
-          shfl.sync.down.b32 t, $0, 2, 31, 0xffffffff;
-          add.f32 $0, $0, t;
-          shfl.sync.down.b32 t, $0, 1, 31, 0xffffffff;
-          add.f32 $0, $0, t;
-        }
-        """,
-        constraints="=f,f",
-        args=[value],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _full_tail_barrier_arrive():
     """Publish Pre from the four math warps without waiting for root."""
     _ = tl.inline_asm_elementwise(
@@ -553,66 +213,6 @@ def _full_tail_barrier_sync():
         is_pure=False,
         pack=1,
     )
-
-
-@triton.jit
-def _barrier_wait_slot(
-    slot: tl.constexpr,
-    b0,
-    b1,
-    b2,
-    b3,
-    b4,
-    b5,
-    b6,
-    b7,
-):
-    if slot == 0:
-        tle.gpu.barrier_wait(b0)
-    elif slot == 1:
-        tle.gpu.barrier_wait(b1)
-    elif slot == 2:
-        tle.gpu.barrier_wait(b2)
-    elif slot == 3:
-        tle.gpu.barrier_wait(b3)
-    elif slot == 4:
-        tle.gpu.barrier_wait(b4)
-    elif slot == 5:
-        tle.gpu.barrier_wait(b5)
-    elif slot == 6:
-        tle.gpu.barrier_wait(b6)
-    else:
-        tle.gpu.barrier_wait(b7)
-
-
-@triton.jit
-def _barrier_arrive_slot(
-    slot: tl.constexpr,
-    b0,
-    b1,
-    b2,
-    b3,
-    b4,
-    b5,
-    b6,
-    b7,
-):
-    if slot == 0:
-        tle.gpu.barrier_arrive(b0)
-    elif slot == 1:
-        tle.gpu.barrier_arrive(b1)
-    elif slot == 2:
-        tle.gpu.barrier_arrive(b2)
-    elif slot == 3:
-        tle.gpu.barrier_arrive(b3)
-    elif slot == 4:
-        tle.gpu.barrier_arrive(b4)
-    elif slot == 5:
-        tle.gpu.barrier_arrive(b5)
-    elif slot == 6:
-        tle.gpu.barrier_arrive(b6)
-    else:
-        tle.gpu.barrier_arrive(b7)
 
 
 @triton.jit
@@ -741,179 +341,8 @@ def _tile_monotonic_arrive_and_wait(counter_base, tile, thread):
 
 
 @triton.jit
-def _tile_fast_arrive_and_wait(counter_base, tile, thread):
-    """Two-word reusable barrier for one tile's resident split CTAs."""
-    tile_state = counter_base + tile * 32
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred leader, pending, last;
-          .reg .u32 old, generation, next_generation, current;
-          .reg .u64 generation_address;
-          setp.eq.u32 leader, $2, 0;
-          setp.ne.u32 pending, $2, $2;
-          mov.u32 old, 0;
-          mov.u32 generation, 0;
-          add.u64 generation_address, $1, 4;
-          @leader ld.acquire.gpu.global.u32 generation, [generation_address];
-          @leader atom.acq_rel.gpu.global.inc.u32 old, [$1], $3;
-          @leader setp.eq.u32 last, old, $3;
-          @leader add.u32 next_generation, generation, 1;
-          @last st.release.gpu.global.u32 [generation_address], next_generation;
-        DG_TLE_MHC_LARGE_TILE_FAST_WAIT:
-          @leader ld.acquire.gpu.global.u32 current, [generation_address];
-          @leader setp.eq.u32 pending, current, generation;
-          @pending bra DG_TLE_MHC_LARGE_TILE_FAST_WAIT;
-          mov.u32 $0, old;
-        }
-        """,
-        constraints="=r,l,r,r",
-        args=[
-            tl.cast(tile_state, tl.uint64),
-            thread,
-            JIT_NUM_SPLITS - 1,
-        ],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _fast_grid_arrive_and_wait(counter_base, thread):
-    """Reusable 32-bit arrival/generation barrier for Graph replay.
-
-    Word zero is an ``atom.inc`` arrival counter that wraps at the physical
-    grid size.  Word one is a monotonically increasing generation.  The
-    acquire-release RMW chain publishes every CTA's partial stores to the last
-    arrival; its release generation store then publishes that chain to every
-    waiter.  Sequential CUDA Graph replays cannot enter the next generation
-    until every CTA has returned from the current kernel.
-    """
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred leader, pending, last;
-          .reg .u32 old, generation, next_generation, current, limit;
-          .reg .u64 generation_address;
-          setp.eq.u32 leader, $2, 0;
-          setp.ne.u32 pending, $2, $2;
-          mov.u32 old, 0;
-          mov.u32 generation, 0;
-          add.u64 generation_address, $1, 4;
-          add.u32 limit, $3, 0xffffffff;
-          @leader ld.acquire.gpu.global.u32 generation, [generation_address];
-          @leader atom.acq_rel.gpu.global.inc.u32 old, [$1], limit;
-          @leader setp.eq.u32 last, old, limit;
-          @leader add.u32 next_generation, generation, 1;
-          @last st.release.gpu.global.u32 [generation_address], next_generation;
-        DG_TLE_MHC_LARGE_FAST_GRID_WAIT:
-          @leader ld.acquire.gpu.global.u32 current, [generation_address];
-          @leader setp.eq.u32 pending, current, generation;
-          @pending bra DG_TLE_MHC_LARGE_FAST_GRID_WAIT;
-          mov.u32 $0, old;
-        }
-        """,
-        constraints="=r,l,r,r",
-        args=[counter_base, thread, JIT_GRID_CTAS],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _role4_routing_finalize(
-    pre_ready,
-    pre_shared,
-    mix_scales_ptr,
-    mix_bases_ptr,
-    new_post_mix_ptr,
-    new_comb_res_mix_ptr,
-    packed_sum,
-    token,
-    role,
-    lane,
-    token_active,
-    hc_norm_eps,
-    hc_pre_eps,
-    hc_post_scale,
-    sinkhorn_eps,
-):
-    projection_mask = token_active & (lane < JIT_PROJECTION_OUTPUTS)
-    token_squared_sum = _t64._warp_broadcast_lane24_f32(packed_sum)
-    projection_norm = tl.rsqrt(token_squared_sum / JIT_FLAT_HIDDEN + hc_norm_eps)
-    category_scale = tl.where(
-        lane < JIT_HC_MULT,
-        tl.load(mix_scales_ptr),
-        tl.where(
-            lane < 2 * JIT_HC_MULT,
-            tl.load(mix_scales_ptr + 1),
-            tl.load(mix_scales_ptr + 2),
-        ),
-    )
-    base = tl.load(
-        mix_bases_ptr + lane,
-        mask=projection_mask,
-        other=0.0,
-    ).to(tl.float32)
-    mixes = tl.where(
-        projection_mask,
-        packed_sum * projection_norm * category_scale + base,
-        0.0,
-    )
-    sigmoid = tl.sigmoid(mixes)
-    pre_mix = sigmoid + hc_pre_eps
-    post_mix = sigmoid * hc_post_scale
-    tl.store(
-        tle.gpu.local_ptr(pre_shared, (role, lane)),
-        pre_mix,
-        mask=token_active & (lane < JIT_HC_MULT),
-    )
-    # All four routing warps and all four hidden partitions share one
-    # rendezvous.  This releases hidden work only after every live Pre vector
-    # has been published, while Post/Sinkhorn continue after the nonblocking
-    # math-partition arrival.
-    tle.gpu.barrier_arrive(pre_ready)
-    tl.store(
-        new_post_mix_ptr + token * JIT_HC_MULT + (lane - JIT_HC_MULT),
-        post_mix,
-        mask=token_active & (lane >= JIT_HC_MULT) & (lane < 2 * JIT_HC_MULT),
-    )
-
-    routing_mask = token_active & (
-        (lane >= 2 * JIT_HC_MULT) & (lane < JIT_PROJECTION_OUTPUTS)
-    )
-    sinkhorn = tl.where(routing_mask, mixes, 0.0)
-    row_max = _t64._warp_reduce4_max(sinkhorn)
-    sinkhorn = tl.exp(sinkhorn - row_max)
-    row_sum = _t64._warp_reduce4_sum(sinkhorn)
-    sinkhorn = sinkhorn * _t64._fast_rcp_ftz_f32(row_sum)
-    sinkhorn += sinkhorn_eps
-    column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
-    sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    for _ in tl.range(1, JIT_SINKHORN_ITERS):
-        row_sum = _t64._warp_reduce4_sum(sinkhorn) + sinkhorn_eps
-        sinkhorn *= _t64._fast_rcp_ftz_f32(row_sum)
-        column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
-        sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    tl.store(
-        new_comb_res_mix_ptr
-        + token * JIT_HC_MULT * JIT_HC_MULT
-        + (lane - 2 * JIT_HC_MULT),
-        sinkhorn,
-        mask=routing_mask,
-    )
-
-
-@triton.jit
 def _pipe_role4_routing_finalize(
     pre_shared,
-    role_flags,
-    role_pre0,
-    role_pre1,
-    role_pre2,
-    role_pre3,
     mix_scales_ptr,
     mix_bases_ptr,
     new_post_mix_ptr,
@@ -988,20 +417,10 @@ def _pipe_role4_routing_finalize(
         is_pure=False,
         pack=1,
     )
-    if JIT_USE_ROLE_OVERLAP:
-        if JIT_USE_SHARED_ROLE_FLAGS:
-            _shared_role_flag_publish(role_flags, role, lane)
-        elif JIT_USE_ALLOCATED_ROLE_BARRIERS:
-            _allocated_role_barrier_arrive(
-                role, role_pre0, role_pre1, role_pre2, role_pre3
-            )
-        else:
-            _role_barrier_arrive(role)
-    elif JIT_USE_EARLY_PRE_SYNC:
-        # The four routing warps publish Pre and arrive without waiting.  The
-        # sixteen root warps wait on the same 640-thread TLE barrier, then run
-        # hidden/RMSNorm while routing continues through Post and Sinkhorn.
-        _full_tail_barrier_arrive()
+    # The four routing warps publish Pre and arrive without waiting. The
+    # sixteen root warps wait on the same 640-thread TLE barrier, then run
+    # hidden/RMSNorm while routing continues through Post and Sinkhorn.
+    _full_tail_barrier_arrive()
     post_base = tl.cast(
         new_post_mix_ptr + token * JIT_HC_MULT,
         tl.uint64,
@@ -1046,14 +465,7 @@ def _pipe_role4_routing_finalize(
     sinkhorn += sinkhorn_eps
     column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
     sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    if JIT_USE_PTX_SINKHORN:
-        sinkhorn = _sinkhorn_nineteen_warp_iterations(sinkhorn, sinkhorn_eps)
-    else:
-        for _ in tl.range(1, JIT_SINKHORN_ITERS):
-            row_sum = _t64._warp_reduce4_sum(sinkhorn) + sinkhorn_eps
-            sinkhorn *= _t64._fast_rcp_ftz_f32(row_sum)
-            column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
-            sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
+    sinkhorn = _sinkhorn_nineteen_warp_iterations(sinkhorn, sinkhorn_eps)
     comb_base = tl.cast(
         new_comb_res_mix_ptr + token * JIT_HC_MULT * JIT_HC_MULT,
         tl.uint64,
@@ -1091,7 +503,6 @@ def _pipe_role4_routing_finalize(
 
 @triton.jit
 def _pipe_role4_hidden_tail(
-    weight_shared,
     pre_shared,
     new_residual_ptr,
     rmsnorm_weight_ptr,
@@ -1143,72 +554,13 @@ def _pipe_role4_hidden_tail(
     rounded_f32 = rounded.to(tl.float32)
     squares = tl.where(token_active, rounded_f32 * rounded_f32, 0.0)
     rms = tl.rsqrt(tl.sum(squares, axis=1) / JIT_HIDDEN + rmsnorm_eps)
-    if JIT_USE_WEIGHT_CACHE:
-        weight = tl.load(tle.gpu.local_ptr(weight_shared, (0,)) + hidden).to(tl.float32)
-    else:
-        weight = tl.load(rmsnorm_weight_ptr + hidden).to(tl.float32)
+    weight = tl.load(rmsnorm_weight_ptr + hidden).to(tl.float32)
     y = rounded_f32 * rms[:, None] * weight * rmsnorm_scale
     tl.store(
         y_bf16_ptr + token * JIT_HIDDEN + hidden,
         y.to(tl.bfloat16, fp_downcast_rounding="rtne"),
         mask=token_active,
     )
-
-
-@triton.jit
-def _k128_compute_channel_half(
-    post_mix_ptr,
-    comb_res_mix_ptr,
-    new_residual_ptr,
-    m,
-    hidden,
-    token_active,
-    x,
-    r0,
-    r1,
-    r2,
-    r3,
-    CHANNEL: tl.constexpr,
-):
-    """Compute/store one channel K64 half before K128 pipe staging."""
-    post = tl.load(
-        post_mix_ptr + m[:, None] * JIT_HC_MULT + CHANNEL,
-        mask=token_active[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    comb_base = m[:, None] * JIT_HC_MULT * JIT_HC_MULT + CHANNEL
-    c0 = tl.load(
-        comb_res_mix_ptr + comb_base,
-        mask=token_active[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    c1 = tl.load(
-        comb_res_mix_ptr + comb_base + JIT_HC_MULT,
-        mask=token_active[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    c2 = tl.load(
-        comb_res_mix_ptr + comb_base + 2 * JIT_HC_MULT,
-        mask=token_active[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    c3 = tl.load(
-        comb_res_mix_ptr + comb_base + 3 * JIT_HC_MULT,
-        mask=token_active[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    q = x * post + r0 * c0 + r1 * c1 + r2 * c2 + r3 * c3
-    q_bf16 = q.to(tl.bfloat16, fp_downcast_rounding="rtne")
-    q_fp32 = q_bf16.to(tl.float32)
-    tl.store(
-        new_residual_ptr
-        + m[:, None] * JIT_FLAT_HIDDEN
-        + CHANNEL * JIT_HIDDEN
-        + hidden[None, :],
-        q_bf16,
-        mask=token_active[:, None],
-    )
-    return tl.sum(q_fp32 * q_fp32, axis=1)
 
 
 @triton.jit
@@ -1223,16 +575,9 @@ def _pipe8_root_producer(
     pipe_writer,
     producer_ready,
     grid_acquire_ready,
-    tail_ready,
-    role_flags,
-    role_pre0,
-    role_pre1,
-    role_pre2,
-    role_pre3,
     coeff_ready,
     post_coeff_shared,
     comb_coeff_shared,
-    weight_shared,
     pre_shared,
     warp_sqr_sums,
     rmsnorm_weight_ptr,
@@ -1246,9 +591,6 @@ def _pipe8_root_producer(
     rmsnorm_scale,
 ):
     """Sixteen root warps produce one M64 tile through an eight-slot pipe."""
-    if JIT_USE_SHARED_ROLE_FLAGS:
-        init_thread = _t64._physical_thread_id_x()
-        _shared_role_flags_reset(role_flags, init_thread)
     m = tile * JIT_BLOCK_M + tl.arange(0, JIT_BLOCK_M)
     if JIT_USE_EXACT_FULL_TILE:
         token_active = tl.full((JIT_BLOCK_M,), True, tl.int1)
@@ -1289,96 +631,9 @@ def _pipe8_root_producer(
         )
         tle.gpu.barrier_wait(coeff_ready)
 
-    # A K128 stage cuts pipe handoffs in half.  Compute every channel from one
-    # K64 x/residual load and write the BF16 rounding boundary first.  After a
-    # root-partition barrier, each K128 pipe slot is staged by reloading those
-    # rounded values.  This keeps the same global x/residual traffic as K64,
-    # avoids K128 register live ranges, and preserves the pipe verifier's
-    # acquire->payload copies->commit lifecycle.
     for hb in tl.static_range(0, JIT_MAX_HIDDEN_BLOCKS):
-        if JIT_USE_K128_PIPE4 and is_producer & (hb < hidden_blocks):
-            for subhalf in tl.static_range(0, 2):
-                hidden = (
-                    (hidden_block_offset + hb) * JIT_K_STAGE
-                    + subhalf * 64
-                    + tl.arange(0, 64)
-                )
-                token_hidden = m[:, None] * JIT_HIDDEN + hidden[None, :]
-                token_residual = m[:, None] * JIT_FLAT_HIDDEN + hidden[None, :]
-                x = tl.load(
-                    x_ptr + token_hidden,
-                    mask=token_active[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                r0 = tl.load(
-                    residual_ptr + token_residual,
-                    mask=token_active[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                r1 = tl.load(
-                    residual_ptr + token_residual + JIT_HIDDEN,
-                    mask=token_active[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                r2 = tl.load(
-                    residual_ptr + token_residual + 2 * JIT_HIDDEN,
-                    mask=token_active[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                r3 = tl.load(
-                    residual_ptr + token_residual + 3 * JIT_HIDDEN,
-                    mask=token_active[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                for channel in tl.static_range(0, JIT_HC_MULT):
-                    squared_sum += _k128_compute_channel_half(
-                        post_mix_ptr,
-                        comb_res_mix_ptr,
-                        new_residual_ptr,
-                        m,
-                        hidden,
-                        token_active,
-                        x,
-                        r0,
-                        r1,
-                        r2,
-                        r3,
-                        CHANNEL=channel,
-                    )
-
-    if JIT_USE_K128_PIPE4:
-        tle.gpu.barrier_wait(coeff_ready)
-        for hb in tl.static_range(0, JIT_MAX_HIDDEN_BLOCKS):
-            if is_producer & (hb < hidden_blocks):
-                hidden = (hidden_block_offset + hb) * JIT_K_STAGE + tl.arange(
-                    0, JIT_K_HALF
-                )
-                for channel in tl.static_range(0, JIT_HC_MULT):
-                    iteration = hb * JIT_HC_MULT + channel
-                    slot = pipe_writer.acquire(iteration)
-                    rounded = tl.load(
-                        new_residual_ptr
-                        + m[:, None] * JIT_FLAT_HIDDEN
-                        + channel * JIT_HIDDEN
-                        + hidden[None, :],
-                        mask=token_active[:, None],
-                        other=0.0,
-                    ).to(tl.float32)
-                    fn_tile = tl.load(
-                        fn_ptr
-                        + n[:, None] * JIT_FLAT_HIDDEN
-                        + channel * JIT_HIDDEN
-                        + hidden[None, :],
-                        mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
-                        other=0.0,
-                    ).to(tl.float32)
-                    tl.store(tle.gpu.local_ptr(slot.q), rounded)
-                    tl.store(tle.gpu.local_ptr(slot.fn), fn_tile)
-                    pipe_writer.commit(iteration)
-
-    for hb in tl.static_range(0, JIT_MAX_HIDDEN_BLOCKS):
-        if (not JIT_USE_K128_PIPE4) and is_producer & (hb < hidden_blocks):
-            # K32 uses two physical stages per H64; the experimental true-K64
+        if is_producer & (hb < hidden_blocks):
+            # The former K32 path used two physical stages per H64; true-K64
             # mode uses one.  Pipe endpoint operations stay inline in both
             # worker partitions because helper specialization can corrupt the
             # stage/phase state in this TLE revision.
@@ -1422,18 +677,6 @@ def _pipe8_root_producer(
                         + channel
                     )
                     slot = pipe_writer.acquire(iteration)
-                    if JIT_USE_FN_CP_ASYNC:
-                        flat_hidden_base = (
-                            channel * JIT_HIDDEN
-                            + (hidden_block_offset + hb) * JIT_K_STAGE
-                            + half * JIT_K_HALF
-                        )
-                        _issue_fn_cp_async_k64(
-                            fn_ptr,
-                            slot.fn,
-                            flat_hidden_base,
-                        )
-                        _ = _cp_async_commit_group()
                     if JIT_USE_COEFF_CACHE:
                         post = tl.load(
                             tle.gpu.local_ptr(post_coeff_shared, (0, 0))
@@ -1498,22 +741,16 @@ def _pipe8_root_producer(
                         mask=token_active[:, None],
                     )
                     squared_sum += tl.sum(q_fp32 * q_fp32, axis=1)
-                    if JIT_USE_FN_CP_ASYNC:
-                        _ = _cp_async_wait_group_zero()
-                    else:
-                        fn_tile = tl.load(
-                            fn_ptr
-                            + n[:, None] * JIT_FLAT_HIDDEN
-                            + channel * JIT_HIDDEN
-                            + hidden[None, :],
-                            mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
-                            other=0.0,
-                        ).to(tl.float32)
-                        tl.store(tle.gpu.local_ptr(slot.fn), fn_tile)
-                    if JIT_USE_BF16_RS_PIPE:
-                        tl.store(tle.gpu.local_ptr(slot.q), q_bf16)
-                    else:
-                        tl.store(tle.gpu.local_ptr(slot.q), q_fp32)
+                    fn_tile = tl.load(
+                        fn_ptr
+                        + n[:, None] * JIT_FLAT_HIDDEN
+                        + channel * JIT_HIDDEN
+                        + hidden[None, :],
+                        mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
+                        other=0.0,
+                    ).to(tl.float32)
+                    tl.store(tle.gpu.local_ptr(slot.fn), fn_tile)
+                    tl.store(tle.gpu.local_ptr(slot.q), q_fp32)
                     pipe_writer.commit(iteration)
 
     if is_producer:
@@ -1532,87 +769,26 @@ def _pipe8_root_producer(
                 mask=m < JIT_LOGICAL_TOKENS,
             )
     tle.gpu.barrier_wait(producer_ready)
-    if JIT_PROBE_PHASE >= 2:
-        physical_thread = _t64._physical_thread_id_x()
-        if JIT_USE_TILE_LOCAL_BARRIER:
-            if JIT_USE_TILE_LOCAL_FAST_BARRIER:
-                _ = _tile_fast_arrive_and_wait(grid_counter_ptr, tile, physical_thread)
-            else:
-                _ = _tile_monotonic_arrive_and_wait(
-                    grid_counter_ptr, tile, physical_thread
-                )
-        elif JIT_USE_FAST_GRID_BARRIER:
-            _ = _fast_grid_arrive_and_wait(
-                tl.cast(grid_counter_ptr, tl.uint64), physical_thread
-            )
-        else:
-            _ = _monotonic_grid_arrive_and_wait(
-                tl.cast(grid_counter_ptr, tl.uint64), physical_thread
-            )
-        tle.gpu.barrier_wait(grid_acquire_ready)
-        if JIT_PROBE_PHASE >= 3:
-            if JIT_PROBE_PHASE >= 4 and JIT_USE_WEIGHT_CACHE:
-                weight_hidden = tl.arange(0, JIT_HIDDEN)
-                tl.store(
-                    tle.gpu.local_ptr(weight_shared, (0,)) + weight_hidden,
-                    tl.load(rmsnorm_weight_ptr + weight_hidden),
-                )
-                if JIT_USE_ROLE_OVERLAP:
-                    _root_barrier_sync()
-            if JIT_USE_ROLE_OVERLAP:
-                root_role = physical_thread // JIT_ROLE_THREADS
-                if JIT_USE_SHARED_ROLE_FLAGS:
-                    _shared_role_flag_wait(role_flags, root_role)
-                elif JIT_USE_ALLOCATED_ROLE_BARRIERS:
-                    _allocated_role_barrier_wait(
-                        root_role,
-                        role_pre0,
-                        role_pre1,
-                        role_pre2,
-                        role_pre3,
-                    )
-                else:
-                    _role_barrier_sync(root_role)
-            elif JIT_USE_EARLY_PRE_SYNC:
-                _full_tail_barrier_sync()
-            else:
-                tle.gpu.barrier_wait(tail_ready)
-            if JIT_PROBE_PHASE >= 4:
-                _pipe_role4_hidden_tail(
-                    weight_shared,
-                    pre_shared,
-                    new_residual_ptr,
-                    rmsnorm_weight_ptr,
-                    y_bf16_ptr,
-                    pid,
-                    tile,
-                    split,
-                    rmsnorm_eps,
-                    rmsnorm_scale,
-                )
-
-
-@triton.jit
-def _pipe8_k32_math_body(pipe_reader, NUM_HIDDEN_BLOCKS: tl.constexpr):
-    """Consume K32 stages, draining once per H64 block."""
-    accumulator = tl.zeros((JIT_BLOCK_M, JIT_BLOCK_N), tl.float32)
-    for hb in tl.static_range(0, NUM_HIDDEN_BLOCKS):
-        for stage in tl.static_range(0, 2 * JIT_HC_MULT):
-            iteration = hb * 2 * JIT_HC_MULT + stage
-            wait = pipe_reader.wait(iteration)
-            accumulator = tle.gpu.wgmma(
-                wait.slot.q,
-                wait.slot.fn,
-                accumulator,
-                input_precision="tf32",
-                trans_b=True,
-            )
-            if stage > 0:
-                accumulator = tle.gpu.wgmma_wait(1, accumulator)
-                pipe_reader.release(iteration - 1)
-        accumulator = tle.gpu.wgmma_wait(0, accumulator)
-        pipe_reader.release((hb + 1) * 2 * JIT_HC_MULT - 1)
-    return accumulator
+    physical_thread = _t64._physical_thread_id_x()
+    if JIT_USE_TILE_LOCAL_BARRIER:
+        _ = _tile_monotonic_arrive_and_wait(grid_counter_ptr, tile, physical_thread)
+    else:
+        _ = _monotonic_grid_arrive_and_wait(
+            tl.cast(grid_counter_ptr, tl.uint64), physical_thread
+        )
+    tle.gpu.barrier_wait(grid_acquire_ready)
+    _full_tail_barrier_sync()
+    _pipe_role4_hidden_tail(
+        pre_shared,
+        new_residual_ptr,
+        rmsnorm_weight_ptr,
+        y_bf16_ptr,
+        pid,
+        tile,
+        split,
+        rmsnorm_eps,
+        rmsnorm_scale,
+    )
 
 
 @triton.jit
@@ -1621,12 +797,6 @@ def _pipe8_math_and_routing(
     pipe_reader,
     producer_ready,
     grid_acquire_ready,
-    tail_ready,
-    role_flags,
-    role_pre0,
-    role_pre1,
-    role_pre2,
-    role_pre3,
     pre_shared,
     mix_scales_ptr,
     mix_bases_ptr,
@@ -1654,14 +824,8 @@ def _pipe8_math_and_routing(
                     stage = half * JIT_HC_MULT + channel
                     iteration = hb * JIT_NUM_K_HALVES * JIT_HC_MULT + stage
                     wait = pipe_reader.wait(iteration)
-                    if JIT_USE_BF16_RS_PIPE:
-                        q_operand = tl.load(tle.gpu.local_ptr(wait.slot.q)).to(
-                            tl.float32
-                        )
-                    else:
-                        q_operand = wait.slot.q
                     accumulator = tle.gpu.wgmma(
-                        q_operand,
+                        wait.slot.q,
                         wait.slot.fn,
                         accumulator,
                         input_precision="tf32",
@@ -1697,60 +861,51 @@ def _pipe8_math_and_routing(
             )
 
     tle.gpu.barrier_wait(producer_ready)
-    if JIT_PROBE_PHASE >= 2:
-        tle.gpu.barrier_wait(grid_acquire_ready)
-        if JIT_PROBE_PHASE >= 3:
-            physical_thread = _t64._physical_thread_id_x()
-            lane = tl.inline_asm_elementwise(
-                asm="mov.u32 $0, %laneid;",
-                constraints="=r",
-                args=[],
-                dtype=tl.int32,
-                is_pure=True,
-                pack=1,
-            )
-            role = (physical_thread - JIT_ROOT_THREADS) // 32
-            if JIT_USE_NON_STRIPED_TAIL:
-                token = tile * JIT_BLOCK_M + split * JIT_NUM_ROLES + role
-            else:
-                token = pid + role * JIT_GRID_CTAS
-            if JIT_USE_EXACT_FULL_TILE:
-                token_active = tl.constexpr(True)
-            else:
-                token_active = token < JIT_LOGICAL_TOKENS
-            packed_sum = 0.0
-            for source_split in tl.static_range(0, JIT_NUM_SPLITS):
-                packed_sum += tl.load(
-                    partials_ptr
-                    + source_split * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                    + token * JIT_BLOCK_N
-                    + lane,
-                    mask=token_active & (lane <= JIT_PROJECTION_OUTPUTS),
-                    other=0.0,
-                )
-            _pipe_role4_routing_finalize(
-                pre_shared,
-                role_flags,
-                role_pre0,
-                role_pre1,
-                role_pre2,
-                role_pre3,
-                mix_scales_ptr,
-                mix_bases_ptr,
-                new_post_mix_ptr,
-                new_comb_res_mix_ptr,
-                packed_sum,
-                token,
-                role,
-                lane,
-                token_active,
-                hc_norm_eps,
-                hc_pre_eps,
-                hc_post_scale,
-                sinkhorn_eps,
-            )
-            if not JIT_USE_ROLE_OVERLAP and not JIT_USE_EARLY_PRE_SYNC:
-                tle.gpu.barrier_wait(tail_ready)
+    tle.gpu.barrier_wait(grid_acquire_ready)
+    physical_thread = _t64._physical_thread_id_x()
+    lane = tl.inline_asm_elementwise(
+        asm="mov.u32 $0, %laneid;",
+        constraints="=r",
+        args=[],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    role = (physical_thread - JIT_ROOT_THREADS) // 32
+    if JIT_USE_NON_STRIPED_TAIL:
+        token = tile * JIT_BLOCK_M + split * JIT_NUM_ROLES + role
+    else:
+        token = pid + role * JIT_GRID_CTAS
+    if JIT_USE_EXACT_FULL_TILE:
+        token_active = tl.constexpr(True)
+    else:
+        token_active = token < JIT_LOGICAL_TOKENS
+    packed_sum = 0.0
+    for source_split in tl.static_range(0, JIT_NUM_SPLITS):
+        packed_sum += tl.load(
+            partials_ptr
+            + source_split * JIT_PADDED_TOKENS * JIT_BLOCK_N
+            + token * JIT_BLOCK_N
+            + lane,
+            mask=token_active & (lane <= JIT_PROJECTION_OUTPUTS),
+            other=0.0,
+        )
+    _pipe_role4_routing_finalize(
+        pre_shared,
+        mix_scales_ptr,
+        mix_bases_ptr,
+        new_post_mix_ptr,
+        new_comb_res_mix_ptr,
+        packed_sum,
+        token,
+        role,
+        lane,
+        token_active,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+    )
 
 
 @triton.jit
@@ -1785,30 +940,18 @@ def _sm90_large_graph_role4_k32_wgmma_kernel(
         producer_pid = tl.where(is_producer, pid, 0)
     tile = producer_pid // JIT_NUM_SPLITS
     split = producer_pid % JIT_NUM_SPLITS
-    tl.static_assert(
-        (JIT_USE_K128_PIPE4 and JIT_NUM_PIPE_STAGES == 4)
-        or (not JIT_USE_K128_PIPE4 and JIT_NUM_PIPE_STAGES == 8)
-    )
+    tl.static_assert(JIT_NUM_PIPE_STAGES == 8)
     tl.static_assert(JIT_GRID_CTAS <= 132)
     tl.static_assert(JIT_PRODUCER_CTAS <= JIT_GRID_CTAS)
     tl.static_assert(JIT_PHYSICAL_THREADS == 640)
 
-    if JIT_USE_BF16_RS_PIPE:
-        q_stages = tle.gpu.alloc(
-            [JIT_NUM_PIPE_STAGES, JIT_BLOCK_M, JIT_K_HALF],
-            dtype=tl.bfloat16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=True,
-        )
-    else:
-        q_stages = tle.gpu.alloc(
-            [JIT_NUM_PIPE_STAGES, JIT_BLOCK_M, JIT_K_HALF],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=True,
-        )
+    q_stages = tle.gpu.alloc(
+        [JIT_NUM_PIPE_STAGES, JIT_BLOCK_M, JIT_K_HALF],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=True,
+    )
     fn_stages = tle.gpu.alloc(
         [JIT_NUM_PIPE_STAGES, JIT_BLOCK_N, JIT_K_HALF],
         dtype=tl.float32,
@@ -1830,89 +973,30 @@ def _sm90_large_graph_role4_k32_wgmma_kernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    role_flags = tle.gpu.alloc(
-        [JIT_NUM_ROLES],
-        dtype=tl.uint32,
+    post_coeff_shared = tle.gpu.alloc(
+        [JIT_BLOCK_M, JIT_HC_MULT],
+        dtype=tl.float32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    if JIT_USE_MINIMAL_SCRATCH:
-        weight_shared = tle.gpu.alloc(
-            [1],
-            dtype=tl.bfloat16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        post_coeff_shared = tle.gpu.alloc(
-            [1, 1],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        comb_coeff_shared = tle.gpu.alloc(
-            [1, 1],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        warp_sqr_sums = tle.gpu.alloc(
-            [1, 1],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-    else:
-        weight_shared = tle.gpu.alloc(
-            [JIT_HIDDEN],
-            dtype=tl.bfloat16,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        post_coeff_shared = tle.gpu.alloc(
-            [JIT_BLOCK_M, JIT_HC_MULT],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        comb_coeff_shared = tle.gpu.alloc(
-            [JIT_BLOCK_M, JIT_HC_MULT * JIT_HC_MULT],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        warp_sqr_sums = tle.gpu.alloc(
-            [JIT_NUM_ROLES, JIT_ROLE_WARPS],
-            dtype=tl.float32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
+    comb_coeff_shared = tle.gpu.alloc(
+        [JIT_BLOCK_M, JIT_HC_MULT * JIT_HC_MULT],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    warp_sqr_sums = tle.gpu.alloc(
+        [JIT_NUM_ROLES, JIT_ROLE_WARPS],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
     producer_ready = tle.gpu.alloc_barrier(arrive_count=JIT_PHYSICAL_THREADS)
     grid_acquire_ready = tle.gpu.alloc_barrier(arrive_count=JIT_PHYSICAL_THREADS)
-    if JIT_USE_MINIMAL_SCRATCH:
-        tail_ready = producer_ready
-        coeff_ready = producer_ready
-    else:
-        tail_ready = tle.gpu.alloc_barrier(arrive_count=JIT_PHYSICAL_THREADS)
-        coeff_ready = tle.gpu.alloc_barrier(arrive_count=JIT_ROOT_THREADS)
-    if JIT_USE_ALLOCATED_ROLE_BARRIERS:
-        role_pre0 = tle.gpu.alloc_barrier(arrive_count=160)
-        role_pre1 = tle.gpu.alloc_barrier(arrive_count=160)
-        role_pre2 = tle.gpu.alloc_barrier(arrive_count=160)
-        role_pre3 = tle.gpu.alloc_barrier(arrive_count=160)
-    else:
-        role_pre0 = tail_ready
-        role_pre1 = tail_ready
-        role_pre2 = tail_ready
-        role_pre3 = tail_ready
+    coeff_ready = tle.gpu.alloc_barrier(arrive_count=JIT_ROOT_THREADS)
     tle.gpu.warp_specialize(
         [
             (
@@ -1928,16 +1012,9 @@ def _sm90_large_graph_role4_k32_wgmma_kernel(
                     projection_pipe.writer(),
                     producer_ready,
                     grid_acquire_ready,
-                    tail_ready,
-                    role_flags,
-                    role_pre0,
-                    role_pre1,
-                    role_pre2,
-                    role_pre3,
                     coeff_ready,
                     post_coeff_shared,
                     comb_coeff_shared,
-                    weight_shared,
                     pre_shared,
                     warp_sqr_sums,
                     rmsnorm_weight_ptr,
@@ -1958,12 +1035,6 @@ def _sm90_large_graph_role4_k32_wgmma_kernel(
                     projection_pipe.reader(),
                     producer_ready,
                     grid_acquire_ready,
-                    tail_ready,
-                    role_flags,
-                    role_pre0,
-                    role_pre1,
-                    role_pre2,
-                    role_pre3,
                     pre_shared,
                     mix_scales_ptr,
                     mix_bases_ptr,
@@ -2079,10 +1150,7 @@ def prepare_tle_sm90_mega_mhc(
     inputs: Mapping[str, object],
     outputs: Mapping[str, object],
 ) -> LargeGraphRole4Plan:
-    if os.environ.get("DG_TLE_MHC_LARGE_GRAPH_ROLE4", "0") != "1":
-        raise RuntimeError(
-            "set DG_TLE_MHC_LARGE_GRAPH_ROLE4=1 to enable this experiment"
-        )
+    """Prepare the exact production specialization selected by dispatch."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("prepare the plan before CUDA Graph capture")
     if inputs.get("shifted_prev_mix") is not None:
@@ -2183,17 +1251,14 @@ def prepare_tle_sm90_mega_mhc(
     )
     if USE_TILE_LOCAL_BARRIER:
         grid_counter = torch.zeros(
-            (
-                NUM_M_TILES,
-                32 if USE_TILE_LOCAL_FAST_BARRIER else 16,
-            ),
-            dtype=(torch.uint32 if USE_TILE_LOCAL_FAST_BARRIER else torch.uint64),
+            (NUM_M_TILES, 16),
+            dtype=torch.uint64,
             device=device,
         )
     else:
         grid_counter = torch.zeros(
-            (2,) if USE_FAST_GRID_BARRIER else (1,),
-            dtype=torch.uint32 if USE_FAST_GRID_BARRIER else torch.uint64,
+            (1,),
+            dtype=torch.uint64,
             device=device,
         )
     metadata: dict[str, object] = {
@@ -2217,26 +1282,13 @@ def prepare_tle_sm90_mega_mhc(
         "remain_hidden_blocks": REMAIN_HIDDEN_BLOCKS,
         "pipeline_k": K_HALF,
         "pipeline_slots": NUM_PIPE_STAGES,
-        "true_k64_stage": USE_TRUE_K64_STAGE,
-        "k128_pipe4": USE_K128_PIPE4,
-        "fn_cp_async_stage": USE_FN_CP_ASYNC,
-        "bf16_rs_pipe": USE_BF16_RS_PIPE,
-        "minimal_scratch": USE_MINIMAL_SCRATCH,
         "coefficient_cache_bytes": (
             BLOCK_M * (HC_MULT + HC_MULT * HC_MULT) * 4 if USE_COEFF_CACHE else 0
         ),
-        "ptx_sinkhorn_loop": USE_PTX_SINKHORN,
         "non_striped_tail": USE_NON_STRIPED_TAIL,
-        "exact_t512": USE_EXACT_T512,
-        "exact_t448": USE_EXACT_T448,
         "exact_full_tile": USE_EXACT_FULL_TILE,
-        "manual_role4_tail": USE_MANUAL_ROLE4_TAIL,
-        "packed_manual_role4_tail": USE_PACKED_MANUAL_ROLE4_TAIL,
-        "fast_grid_barrier": USE_FAST_GRID_BARRIER,
         "tile_local_barrier": USE_TILE_LOCAL_BARRIER,
-        "tile_local_fast_barrier": USE_TILE_LOCAL_FAST_BARRIER,
         "tile_counter_stride_bytes": 128 if USE_TILE_LOCAL_BARRIER else 0,
-        "ptx_bf16x8_tail": USE_PTX_BF16X8_TAIL,
         "cross_h64_wgmma_pipeline": False,
         "pipeline_implementation": "tle.pipe",
         "root_warps": ROOT_WARPS,
@@ -2245,17 +1297,6 @@ def prepare_tle_sm90_mega_mhc(
         "tail_roles": NUM_ROLES,
         "tail_hidden_chunk": TAIL_HIDDEN_CHUNK,
         "tail_shared_bytes": 0,
-        "rms_weight_cache_bytes": HIDDEN * 2 if USE_WEIGHT_CACHE else 0,
-        "role_overlap": USE_ROLE_OVERLAP,
-        "allocated_role_barriers": USE_ALLOCATED_ROLE_BARRIERS,
-        "shared_role_flags": USE_SHARED_ROLE_FLAGS,
-        "role_barrier_ids": (
-            [12, 13, 14, 15]
-            if USE_ROLE_OVERLAP and not USE_ALLOCATED_ROLE_BARRIERS
-            else []
-        ),
-        "early_pre_sync": USE_EARLY_PRE_SYNC,
-        "research_probe_phase": PROBE_PHASE,
         "physical_cta_threads": PHYSICAL_THREADS,
         "cooperative_launch": True,
         "full_grid_residency_required": True,
@@ -2263,8 +1304,8 @@ def prepare_tle_sm90_mega_mhc(
         "occupancy_query_required_before_first_launch": True,
         "workspace_shape": list(partials.shape),
         "workspace_bytes": partials.numel() * partials.element_size(),
-        "experimental": True,
-        "dispatch_enabled": False,
+        "experimental": False,
+        "dispatch_enabled": True,
     }
     return LargeGraphRole4Plan(
         x=tensors[0],

@@ -4,8 +4,9 @@ Historically T=64 and padded T=16..56 carried byte-near-identical 4k-line
 device implementations.  The canonical body now lives in
 ``kernels.sm90_padded_m64_wgmma``.  This module retains the established T64
 module, Plan type, kernel symbol, and legacy environment contract consumed by
-the prepared-launch registry; shape selection remains setup-only and the hot
-path still launches the same single specialized kernel directly.
+the prepared-launch registry. Shape selection remains setup-only and the hot
+path still launches the same single specialized kernel directly. Production
+configuration is owned by the shared M64 family; this facade only fixes T=64.
 """
 
 from __future__ import annotations
@@ -22,47 +23,6 @@ if _logical_tokens not in (None, "64"):
         "requires '64'"
     )
 os.environ[_LOGICAL_TOKENS_ENV] = "64"
-
-# Preserve the old public tuning contract without duplicating the device
-# implementation.  Dispatch still sets the T64 names; the canonical module
-# consumes the corresponding padded-family names before it is imported.
-_LEGACY_ENV_ALIASES = {
-    "DG_TLE_MHC_T32_WGMMA_BM64_DOT": "DG_TLE_MHC_T64_BM64_DOT",
-    "DG_TLE_MHC_T32_WGMMA_NUM_SPLITS": "DG_TLE_MHC_T64_NUM_SPLITS",
-    "DG_TLE_MHC_T32_WGMMA_NUM_WARPS": "DG_TLE_MHC_T64_NUM_WARPS",
-    "DG_TLE_MHC_T32_WGMMA_STAGED_MATH_REGS": ("DG_TLE_MHC_T64_STAGED_MATH_REGS"),
-    "DG_TLE_MHC_T32_WGMMA_EXPLICIT_WGMMA": ("DG_TLE_MHC_T64_EXPLICIT_WGMMA"),
-    "DG_TLE_MHC_T32_WGMMA_STAGED_WGMMA": "DG_TLE_MHC_T64_STAGED_WGMMA",
-    "DG_TLE_MHC_T32_WGMMA_WARP_OVERLAP": "DG_TLE_MHC_T64_WARP_OVERLAP",
-    "DG_TLE_MHC_T32_WGMMA_DIRECT_ROUTING_TAIL": ("DG_TLE_MHC_T64_DIRECT_ROUTING_TAIL"),
-    "DG_TLE_MHC_T32_WGMMA_DIRECT_TAIL_ILP4": ("DG_TLE_MHC_T64_DIRECT_TAIL_ILP4"),
-    "DG_TLE_MHC_T32_WGMMA_PERSISTENT_WS": "DG_TLE_MHC_T64_PERSISTENT_WS",
-    "DG_TLE_MHC_T32_WGMMA_PERSISTENT_ROUTE4": ("DG_TLE_MHC_T64_PERSISTENT_ROUTE4"),
-    "DG_TLE_MHC_T32_WGMMA_PERSISTENT_ROUTE4_REDUCTION": (
-        "DG_TLE_MHC_T64_PERSISTENT_ROUTE4_REDUCTION"
-    ),
-    "DG_TLE_MHC_T32_WGMMA_ROUTE4_WARP0_FINALIZE": (
-        "DG_TLE_MHC_T64_ROUTE4_WARP0_FINALIZE"
-    ),
-    "DG_TLE_MHC_T32_WGMMA_SPLIT128_PAIR_ROUTE": ("DG_TLE_MHC_T64_SPLIT128_PAIR_ROUTE"),
-    "DG_TLE_MHC_T32_WGMMA_EARLY_PRE_SYNC": ("DG_TLE_MHC_T64_EARLY_PRE_SYNC"),
-    "DG_TLE_MHC_T32_WGMMA_PHASE_PROFILE": "DG_TLE_MHC_T64_PHASE_PROFILE",
-}
-
-for _canonical_name, _legacy_name in _LEGACY_ENV_ALIASES.items():
-    _value = os.environ.get(_legacy_name)
-    if _value is None and _legacy_name == "DG_TLE_MHC_T64_PHASE_PROFILE":
-        _value = os.environ.get("DG_TLE_MHC_PHASE_PROFILE")
-    if _value is None:
-        continue
-    _current = os.environ.get(_canonical_name)
-    if _current not in (None, _value):
-        raise RuntimeError(
-            f"{_canonical_name}={_current!r}, but {_legacy_name} requires "
-            f"{_value!r}"
-        )
-    os.environ[_canonical_name] = _value
-
 
 from .kernels import sm90_padded_m64_wgmma as _base  # noqa: E402
 

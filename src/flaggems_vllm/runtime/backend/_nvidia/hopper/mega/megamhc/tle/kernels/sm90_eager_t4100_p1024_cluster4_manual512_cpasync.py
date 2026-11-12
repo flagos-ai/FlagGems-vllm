@@ -1,4 +1,11 @@
-"""T=4100 H1024/cluster4 specialization of the admitted eager kernel."""
+"""Production eager MegaMHC facade for exact ``T=4100``.
+
+The fixed Normal-BF16 profile is ``H=4096, R=4, P=24``.  Four resident CTAs
+split H4096 into H1024 ranges and synchronize through the admitted global tile
+barrier; the final M64 tile contains four live rows.  The shared P256 base uses
+12 producer and 4 RS-WGMMA warps, phase-3 x8 tails, cp.async Fn staging, and
+``maxnreg=64``.  The complete operator remains one kernel launch.
+"""
 
 from __future__ import annotations
 

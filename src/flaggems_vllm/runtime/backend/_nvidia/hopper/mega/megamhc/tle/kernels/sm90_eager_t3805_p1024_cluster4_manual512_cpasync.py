@@ -1,9 +1,10 @@
-"""T=3805 H1024/cluster4 projection-routing specialization.
+"""Production eager MegaMHC facade for exact ``T=3805``.
 
-Four CTAs split H4096 into H1024 ranges.  With 60 M64 tiles this launches
-240 physical CTAs, fitting the measured 264-CTA two-block-per-SM capacity on
-H800.  The initial research path stops after routing; a full tail is attached
-only if this migration geometry creates enough headroom over vLLM.
+The fixed Normal-BF16 profile is ``H=4096, R=4, P=24``.  Four clustered CTAs
+split H4096 into H1024 ranges; 60 M64 tiles launch 240 physical CTAs.  The
+shared P256 base uses 12 producer and 4 RS-WGMMA warps per CTA, phase-3 x8
+routing/hidden tails, cp.async Fn staging, and ``maxnreg=64``.  Projection,
+routing, and the full RMSNorm tail execute in one kernel launch.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ EagerT3805P1024Cluster4Manual512ProjectionPlan = (
 def prepare_tle_sm90_projection(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT3805P1024Cluster4Manual512ProjectionPlan:
-    """Prepare the shape-exact H1024 split projection/routing probe."""
+    """Prepare the admitted shape-exact H1024 split implementation."""
     plan = _base.prepare_tle_sm90_projection(inputs, outputs)
     plan.metadata.update(
         {
@@ -63,7 +64,7 @@ def prepare_tle_sm90_projection(
 def prepare_tle_sm90_mega_mhc(
     inputs: Mapping[str, object], outputs: Mapping[str, object]
 ) -> EagerT3805P1024Cluster4Manual512ProjectionPlan:
-    """Research seam; phase2 intentionally omits the hidden tail."""
+    """Prepare the admitted full operator; the base always enables its tail."""
     return prepare_tle_sm90_projection(inputs, outputs)
 
 

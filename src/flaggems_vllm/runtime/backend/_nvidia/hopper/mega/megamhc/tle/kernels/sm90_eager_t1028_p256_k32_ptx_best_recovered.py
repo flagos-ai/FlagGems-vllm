@@ -1,10 +1,10 @@
-"""Shared Hopper helpers retained from the recovered P256 prototype.
+"""Shared routing/hidden helpers for the production eager P384 family.
 
-The original module also contained an opt-in research kernel, plan, and
-workspace factory that were never reachable from production dispatch.  P384
-still imports these numerically validated routing and hidden-tail helpers, so
-the compatibility module name remains stable while the dead prototype is
-omitted.
+Formal callers are ``T in {12991, 13005, 13021, 16384}`` at
+``H=4096, R=4, P=24`` using the manual512, 12-producer/4-math P384 topology.
+The original bring-up kernel, plan, and workspace factory were not reachable
+from production dispatch and are omitted; only numerically validated leaf
+helpers remain under the compatibility import path.
 """
 
 from __future__ import annotations

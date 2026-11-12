@@ -1,8 +1,8 @@
-"""Manual512-local PTX tail helpers for the T=2048 p256 candidate.
+"""Production split-hidden manual512 PTX tail for exact eager ``T=2048``.
 
-These helpers are deliberately isolated from the hash-pinned recovered formal
-kernel.  They generalize only the row-wave mapping and global row strides used
-by the manual512 x8 tail; historical call sites retain their original source.
+The admitted caller fixes the x8 schedule, phase 3, and a 128-element chunk.
+All 32 token tiles are full M64 tiles, so this helper keeps the split-hidden
+combine/normalize mapping separate from the T=1028 partial-tile tail.
 """
 
 from __future__ import annotations
