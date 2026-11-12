@@ -344,14 +344,18 @@ def _ring_reduce_tma_kernel(
         row = tile_m * BLOCK_M
         col = tile_n * BLOCK_N
         source_rank = (LOCAL_RANK + 1) % WORLD_SIZE
-        accum = scatter_desc.load([row + source_rank * M_per_rank, col])
+        # Retain small contributions during cancellation. Accumulating in the
+        # communication dtype rounds after every peer instead of only at store.
+        accum = scatter_desc.load([row + source_rank * M_per_rank, col]).to(tl.float32)
 
         for i in range(1, WORLD_SIZE):
             source_rank = (LOCAL_RANK + i + 1) % WORLD_SIZE
-            accum += scatter_desc.load([row + source_rank * M_per_rank, col])
+            accum += scatter_desc.load([row + source_rank * M_per_rank, col]).to(
+                tl.float32
+            )
         if SCALE != 1.0:
-            accum = (accum.to(tl.float32) * SCALE).to(output_ptr.dtype.element_ty)
-        output_desc.store([row, col], accum)
+            accum *= SCALE
+        output_desc.store([row, col], accum.to(output_ptr.dtype.element_ty))
 
 
 def reduce_scatter_for_each_node(

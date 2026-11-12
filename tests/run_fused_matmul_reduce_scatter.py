@@ -23,6 +23,36 @@ def _positive_int(value):
     return parsed
 
 
+def _report_fp32_errors(a, b, output, baseline, reduce_op, group, rtol, atol):
+    """Diagnose both low-precision paths against the same FP32 oracle."""
+    import torch
+    import torch.distributed as dist
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        partial = a.float() @ b.float()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    oracle = torch.empty(output.shape, dtype=torch.float32, device=output.device)
+    dist.reduce_scatter_tensor(oracle, partial, group=group)
+    if reduce_op == "avg":
+        oracle.div_(group.size())
+    tolerance = atol + rtol * oracle.abs()
+    summaries = []
+    for name, value in (("implementation", output), ("torch_baseline", baseline)):
+        delta = (value.float() - oracle).abs()
+        summaries.append(
+            f"{name}: max_abs={delta.max().item():.8g} "
+            f"rms={delta.square().mean().sqrt().item():.8g} "
+            f"outside_tol={(delta > tolerance).sum().item()}/{delta.numel()}"
+        )
+    print(
+        f"[rank {group.rank()}] FP32 diagnostic: " + "; ".join(summaries),
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
@@ -83,6 +113,8 @@ def main():
     except (ValueError, NotImplementedError) as exc:
         parser.error(str(exc))
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    rtol = 0.04 if dtype == torch.bfloat16 else 0.01
+    atol = 0.005 if dtype == torch.bfloat16 else 0.001
     dist.init_process_group("nccl", device_id=device)
     group = dist.group.WORLD
     try:
@@ -125,14 +157,19 @@ def main():
                     torch.testing.assert_close(
                         output,
                         reference,
-                        rtol=0.04 if dtype == torch.bfloat16 else 0.01,
-                        atol=0.005 if dtype == torch.bfloat16 else 0.001,
+                        rtol=rtol,
+                        atol=atol,
                     )
                 except AssertionError as exc:
                     error = str(exc)
                 failed = torch.tensor(int(error is not None), device=device)
                 dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
                 if failed.item():
+                    # All ranks enter this diagnostic collective together. Keep
+                    # the original failure and acceptance tolerances unchanged.
+                    _report_fp32_errors(
+                        a, b, output, reference, args.reduce_op, group, rtol, atol
+                    )
                     raise AssertionError(
                         error or "a peer rank failed correctness validation"
                     )

@@ -225,8 +225,51 @@ def test_tma_producer_and_final_reduction(dtype, subtile):
         SCALE=0.5,
         num_warps=4,
     )
-    expected = ((output[:256] + output[256:]).float() * 0.5).to(dtype)
+    expected = ((output[:256].float() + output[256:].float()) * 0.5).to(dtype)
     torch.testing.assert_close(reduced, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("local_rank", range(4))
+@pytest.mark.parametrize("scale", [1.0, 0.25])
+def test_reduction_preserves_small_terms_during_cancellation(dtype, local_rank, scale):
+    pytest.importorskip("triton.experimental.tle.language")
+    kernels = importlib.import_module(
+        "flaggems_vllm.ops._fused_matmul_reduce_scatter_tle"
+    )
+    if torch.version.hip is not None:
+        pytest.skip(
+            "this descriptor unit check requires NVIDIA; validate HCU with torchrun"
+        )
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("requires SM90+")
+    device = torch.device("cuda", torch.cuda.current_device())
+    kernels.triton.set_allocator(
+        lambda size, alignment, stream: torch.empty(
+            size, device=device, dtype=torch.int8
+        )
+    )
+    # All terms and the exact result are representable in either input dtype.
+    # A low-precision running sum loses unit contributions for some rank orders.
+    terms = torch.tensor([4096.0, 1.0, -4096.0, 1.0], dtype=dtype, device=device)
+    source = terms[:, None, None].expand(4, 256, 64).contiguous().view(1024, 64)
+    output = torch.empty((256, 64), dtype=dtype, device=device)
+    kernels._ring_reduce_tma_kernel[(2,)](
+        source,
+        output,
+        256,
+        64,
+        LOCAL_RANK=local_rank,
+        WORLD_SIZE=4,
+        BLOCK_M=128,
+        BLOCK_N=64,
+        SCALE=scale,
+        num_warps=4,
+    )
+    torch.testing.assert_close(
+        output, torch.full_like(output, 2.0 * scale), rtol=0, atol=0
+    )
 
 
 @pytest.fixture(scope="module")
