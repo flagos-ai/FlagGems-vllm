@@ -40,6 +40,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     ".github/configs/ci-backends.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
+    "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
     "pytest.ini",
     "tests/conftest.py",
@@ -52,6 +53,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
+    "tools/source_env_bash.sh",
 }
 
 ENV_SMOKE_TRIGGER_PREFIXES = (
@@ -95,6 +97,15 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "tests/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
+        "tests/test_mhc_post.py",
     ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
@@ -233,6 +244,12 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "benchmark/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "benchmark/test_bmm_w8a8.py",
     ],
