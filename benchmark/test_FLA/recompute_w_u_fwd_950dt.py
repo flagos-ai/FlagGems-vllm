@@ -39,6 +39,20 @@ class RecomputeWUFwd950dtBenchmark(Benchmark):
         self.shapes = self.DEFAULT_SHAPES
         self.shape_desc = self.DEFAULT_SHAPE_DESC
 
+    def get_latency(self, op, *args, **kwargs):
+        """Device kernel time via the toolchain's do_bench_npu.
+
+        The base class's OPERATOR/WRAPPER modes time a host loop, which on
+        this device charges ~45 us of per-call launch work to every sample
+        against 5-20 us of kernel work. See the comment above
+        ``kernel_latency_ms`` in the baseline module.
+        """
+        side = "mine" if op is self.gems_op else "ref"
+        return workload.kernel_latency_ms(
+            lambda: op(*args, **kwargs),
+            target_kernel_name=workload.KERNEL_NAMES["recompute_w_u"][side][0],
+        )
+
     def get_input_iter(self, cur_dtype):
         del cur_dtype
         for case in self.shapes:

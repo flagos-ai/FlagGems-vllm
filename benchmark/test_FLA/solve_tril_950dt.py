@@ -39,6 +39,20 @@ class SolveTril950dtBenchmark(Benchmark):
         self.shapes = self.DEFAULT_SHAPES
         self.shape_desc = self.DEFAULT_SHAPE_DESC
 
+    def get_latency(self, op, *args, **kwargs):
+        """Device kernel time via the toolchain's do_bench_npu.
+
+        The kernel name depends on BT: solve_tril dispatches on
+        ``A.shape[-1]`` alone, so the 16/32/64 cases each reach a different
+        kernel and the target name has to follow.
+        """
+        side = "mine" if op is self.gems_op else "ref"
+        bt = kwargs["A"].shape[-1]
+        return workload.kernel_latency_ms(
+            lambda: op(*args, **kwargs),
+            target_kernel_name=workload.solve_tril_kernel_name(side, bt),
+        )
+
     def get_input_iter(self, cur_dtype):
         del cur_dtype
         for case in self.shapes:

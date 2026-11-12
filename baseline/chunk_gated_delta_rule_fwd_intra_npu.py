@@ -273,3 +273,67 @@ def build_inputs_solve_tril(binding, dtype, device):
 def build_inputs_recompute_w_u(binding, dtype, device):
     del dtype
     return (), build_recompute_w_u(binding["case"], device)
+
+
+# --------------------------------------------------------------------------
+# Kernel-duration timing
+#
+# Uses the toolchain's own do_bench_npu, the same function base.Benchmark
+# calls in KERNEL mode. It needs target_kernel_name here: without it the
+# call prefers mspti, whose python package is absent on this image, and the
+# torch_npu.profiler fallback it then takes fails to collect ("No profiling
+# data found ... may have failed to collect device tasks"). Passing a kernel
+# name forces the profiler path that does work, and has the side benefit of
+# excluding the incidental ops a call also dispatches (ZerosLike for the
+# output buffer, for one).
+#
+# Host-loop timing is not an option for these operators: the base class's
+# OPERATOR/WRAPPER modes charge about 45 us of per-call launch work to every
+# sample, against 5-20 us of actual kernel work, and no burst size removes
+# it because it is paid per call rather than per timed region. Measured on
+# solve_tril at BT=64, that reads 1.19x where the kernel time is 1.79x.
+# --------------------------------------------------------------------------
+
+# Kernel-name substrings per operator, reference side and ours. The lists
+# are ordered so the first match wins; BT decides which solve_tril kernel a
+# call actually dispatches.
+KERNEL_NAMES = {
+    "kkt": {
+        "ref": ("chunk_scaled_dot_kkt_fwd_kernel",),
+        "mine": ("_kkt_fwd_kernel",),
+    },
+    "solve_tril": {
+        "ref": (
+            "solve_tril_16x16_kernel_npu",
+            "merge_16x16_to_32x32_inverse_kernel_npu",
+            "merge_16x16_to_64x64_inverse_kernel_npu",
+        ),
+        "mine": (
+            "_solve_tril_16_kernel",
+            "_solve_tril_32_kernel",
+            "_solve_tril_64_kernel",
+        ),
+    },
+    "recompute_w_u": {
+        # The reference kernel carries the _npu suffix on this backend;
+        # do_bench_npu matches the name exactly, not as a substring, so
+        # dropping it yields ProfilerResultMismatchError.
+        "ref": ("recompute_w_u_fwd_kernel_npu",),
+        "mine": ("_recompute_w_u_kernel",),
+    },
+}
+
+
+def solve_tril_kernel_name(side, bt):
+    """The solve_tril kernel a given BT dispatches to, per side."""
+    index = {16: 0, 32: 1, 64: 2}[bt]
+    return KERNEL_NAMES["solve_tril"][side][index]
+
+
+def kernel_latency_ms(fn, target_kernel_name, warmup=5, active=20):
+    """Device kernel time in ms via the toolchain's do_bench_npu."""
+    from triton.backends.ascend.testing import do_bench_npu
+
+    return do_bench_npu(
+        fn, warmup=warmup, active=active, target_kernel_name=target_kernel_name
+    )
