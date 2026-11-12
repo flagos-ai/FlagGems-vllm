@@ -1577,7 +1577,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
         )
         channel0 = local_hidden * 0
         if USE_TID5_REDUCTION:
-            shared_store_token = _store_shared5_f32(
+            _ = _store_shared5_f32(
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (channel0 + 0, warp))),
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (channel0 + 1, warp))),
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (channel0 + 2, warp))),
@@ -1640,7 +1640,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
                 _shared_address_u32(tle.gpu.local_ptr(scratch, (thread, channel0 + 7))),
                 thread,
             )
-            partial_store_token = _store_tid5_partials_f32(
+            _ = _store_tid5_partials_f32(
                 tl.cast(
                     projection_partials_ptr + projection_offset,
                     tl.uint64,
