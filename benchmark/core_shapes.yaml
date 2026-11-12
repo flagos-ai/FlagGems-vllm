@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+cooperative_topk: &cooperative_topk_shapes
+  shapes:
+    - [1, 127, 512]
+    - [4, 4097, 512]
+    - [16, 16383, 1024]
+    - [16, 16384, 1024]
+    - [16, 16385, 1024]
+    - [4, 65539, 2048]
+    - [1, 262144, 512]
+    - [64, 262144, 2048]
+    - [1, 1048576, 1024]
+  shape_desc: "rows, width, k"
+
+# Keep the native-vLLM comparison on exactly the same workloads.
+cooperative_topk_vllm:
+  <<: *cooperative_topk_shapes
+
 fused_recurrent_gated_delta_rule:
   # Resolve names through baseline.PERF_CASES to preserve the full workloads.
   shapes:
@@ -35,6 +52,11 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+chunk_kda_fwd_intra_token_parallel:
+  shapes:
+    - [1, 32, 128]
+    - [1, 32, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
+  shape_desc: "B, H, sequence_lengths... (packed when multiple)"
 fused_indexer_weight_scale:
   # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
   shapes:
@@ -69,6 +91,25 @@ concat_mla_q:
     - [128, 64, 512, 64]
     - [8192, 64, 512, 64]
   shape_desc: "tokens, heads, nope_width, rope_width"
+
+dsv41_o_proj:
+  shapes:
+    - [1, 8, 8, 1024]
+    - [32, 8, 8, 1024]
+    - [64, 8, 8, 1024]
+    - [128, 8, 8, 1024]
+    - [257, 8, 8, 1024]
+    - [512, 8, 8, 1024]
+    - [4096, 8, 8, 1024]
+    - [1, 16, 8, 1024]
+    - [32, 16, 8, 1024]
+    - [128, 16, 8, 1024]
+    - [4096, 16, 8, 1024]
+    - [1, 1, 8, 1024]
+    - [32, 1, 8, 1024]
+    - [128, 1, 8, 1024]
+    - [1024, 1, 8, 1024]
+  shape_desc: "num_tokens, n_groups, heads_per_group, o_lora_rank"
 
 fp8_einsum:
   shapes:
@@ -434,6 +475,15 @@ AttentionBenchmark:
     - [4, 32, 4096, 128]
     - [4, 32, 8192, 128]
 
+sparse_flash_attention:
+  shapes:
+    - [1, 2560, 2560]
+    - [4, 6400, 2560]
+    - [8, 48000, 2560]
+    - [16, 48000, 2560]
+    - [16, 48000, 48000]
+  shape_desc: "batch, capacity_per_request, valid_kv_length; H=128, D=512+64, topk=2048"
+
 KronBenchmark:
   shapes:
     - [16, 16]
@@ -565,6 +615,12 @@ chunk_gdn2:
     - [8, 1024, 8, 64, 64]
     - [8, 2048, 32, 256, 256]
 
+chunk_kda_scaled_dot_kkt_fwd:
+  shapes:
+    - [1, 65, 4, 128, 64]
+    - [1, 513, 4, 128, 64, 17, 0, 64, 432]
+  shape_desc: "B, T, H, K, BT, optional packed sequence lengths"
+
 chunk_gated_delta_rule_fwd:
   shapes:
     - [2, 16384, 16, 128, 128]
@@ -618,6 +674,54 @@ bmm_w8a8:
     - [4, 129, 17, 257]
   shape_desc: "B, M, N, K"
 
+flash_mla_sparse_fwd_w8a8:
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV, sink, topk_length, seed"
+  shapes:
+    - [16, 64, 512, 1114624, 1, 640, 512, false, false, 0]
+    - [16, 64, 512, 98816, 1, 8320, 512, false, false, 1]
+    - [4112, 64, 512, 1114624, 1, 640, 512, false, false, 2]
+    - [4112, 64, 512, 98816, 1, 8320, 512, false, false, 3]
+    - [4, 64, 512, 1114624, 1, 640, 512, false, false, 4]
+    - [4, 64, 512, 98816, 1, 8320, 512, false, false, 5]
+    - [16, 64, 512, 66048, 1, 128, 512, false, false, 6]
+    - [16384, 64, 512, 1114624, 1, 640, 512, false, false, 7]
+    - [4100, 64, 512, 1114624, 1, 640, 512, false, false, 8]
+    - [16384, 64, 512, 98816, 1, 8320, 512, false, false, 9]
+    - [4100, 64, 512, 98816, 1, 8320, 512, false, false, 10]
+    - [1028, 64, 512, 1114624, 1, 640, 512, false, false, 11]
+    - [1028, 64, 512, 98816, 1, 8320, 512, false, false, 12]
+    - [4047, 64, 512, 1114624, 1, 640, 512, false, false, 13]
+    - [16383, 64, 512, 1114624, 1, 640, 512, false, false, 14]
+    - [4047, 64, 512, 98816, 1, 8320, 512, false, false, 15]
+    - [16383, 64, 512, 98816, 1, 8320, 512, false, false, 16]
+    - [12, 64, 512, 1114624, 1, 640, 512, false, false, 17]
+    - [12, 64, 512, 98816, 1, 8320, 512, false, false, 18]
+    - [4112, 64, 512, 66048, 1, 128, 512, false, false, 19]
+qsa_sparse_paged_attention:
+  shapes:
+    # From Qwen3.8-Flash-Next-FP8 production captures.
+    - [1, 6, 1, 784, false, 1, true, 88, 2712]
+    - [16, 6, 1, 784, false, 16, true, 88, 512]
+    - [32, 6, 1, 784, false, 32, true, 88, 2712]
+    - [40, 6, 1, 784, false, 40, true, 88, 512]
+    - [64, 6, 1, 784, false, 64, true, 88, 512]
+    - [72, 6, 1, 784, false, 72, true, 88, 2712]
+    - [128, 6, 1, 784, false, 128, true, 88, 512]
+    - [136, 6, 1, 784, false, 136, true, 88, 512]
+    - [272, 6, 1, 784, false, 272, true, 88, 512]
+    - [336, 6, 1, 784, false, 336, true, 88, 512]
+    - [512, 6, 1, 784, false, 512, true, 88, 2712]
+    - [902, 6, 1, 784, true, 451, true, 88, 2712]
+    - [2369, 6, 1, 784, true, 54, true, 88, 2712]
+    - [6177, 6, 1, 784, true, 57, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 1, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 16, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 30, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 31, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 57, true, 88, 2712]
+    - [16384, 6, 1, 784, true, 2048, true, 88, 2712]
+  shape_desc: "T, Hq, Hkv, page_size, prefill_config, requests, fp8, pages_per_req, pool_blocks"
+
 gdn_w8a16_int8:
   shapes:
     - [1, 8192, 32, 128]
@@ -642,3 +746,9 @@ gate_sigmoid_mul:
     - [512, 12288, contiguous]
     - [4096, 12288, split_gate]
   shape_desc: "tokens, width, gate_layout"
+
+chunk_kda_with_fused_gate:
+  shapes:
+    - [1, 64, 8, 64, 64]
+    - [1, 512, 8, 128, 128, 129, 127, 256]
+  shape_desc: "B, T, H, K, V, optional packed sequence lengths"
