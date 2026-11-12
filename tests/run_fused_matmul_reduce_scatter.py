@@ -14,8 +14,11 @@ Use --comm-only to check Torch NCCL/RCCL without importing TLE or FlagGems-vllm.
 """
 
 import argparse
+import faulthandler
 import importlib
 import os
+import signal
+import sys
 from contextlib import contextmanager
 
 
@@ -162,6 +165,18 @@ def main():
         )
     local_rank = int(os.environ["LOCAL_RANK"])
 
+    # Dump the interrupted Python stacks even if SIGTERM arrives while a native
+    # extension or import is running. Chaining preserves normal termination and
+    # torchrun's signal exit status instead of converting it into a test error.
+    faulthandler.register(signal.SIGTERM, all_threads=True, chain=True)
+    print(
+        f"[rank {os.environ['RANK']}] worker pid={os.getpid()} "
+        f"python={sys.executable} "
+        f"FLAGTREE_BACKEND={os.getenv('FLAGTREE_BACKEND', '<unset>')} "
+        f"GEMS_VENDOR={os.getenv('GEMS_VENDOR', '<unset>')}",
+        flush=True,
+    )
+
     if args.comm_only:
         device = _select_device(parser, local_rank)
         _check_communication(device, args.repeat)
@@ -180,6 +195,8 @@ def _check_operator(args, parser, group, device):
 
     print(f"[rank {group.rank()}] importing FlagGems-vllm", flush=True)
     import flaggems_vllm
+
+    print(f"[rank {group.rank()}] FlagGems-vllm import complete", flush=True)
     from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
         _default_config,
         _validate_device,
