@@ -35,6 +35,42 @@ backend/
 
 ## 新增后端的标准步骤
 
+### 步骤 0：添加环境搭建配置
+
+在 `src/flaggems_vllm/backends.yaml` 中新增条目，`tools/setup.sh` 会据此构建厂商环境。
+配置记录 Python 版本、厂商 torch/加速库、Triton/FlagTree、vLLM 来源、环境变量、
+厂商 env 脚本和后端专用测试依赖：
+
+```yaml
+backends:
+  myvendor-myhw:
+    vendor: myvendor
+    python: "3.12"
+    deps:
+      - torch==2.10.0+myvendor
+      - myvendor-torch==1.2.3
+    triton: triton==3.6.0+myvendor
+    flagtree: flagtree==0.7.0+myvendor
+    # 如果厂商镜像自带 vLLM，可省略；在镜像内使用 --no-venv
+    vllm:
+      - vllm-myvendor==0.24.0
+    env:
+      MYVENDOR_HOME: /opt/myvendor
+      LD_LIBRARY_PATH: $MYVENDOR_HOME/lib:$LD_LIBRARY_PATH
+    env_source:
+      - /opt/myvendor/set_env.sh
+    # 可选的后端专用测试依赖（NVIDIA 用它安装 cupy）
+    test_deps:
+      - "some-vendor-test-helper>=1.0"
+```
+
+如需通过厂商名直接选择该配置，在 `aliases:` 下添加别名。然后验证：
+
+```bash
+bash tools/setup.sh --list
+bash tools/setup.sh --dry-run myvendor
+```
+
 ### 步骤 1：创建后端目录
 
 ```bash

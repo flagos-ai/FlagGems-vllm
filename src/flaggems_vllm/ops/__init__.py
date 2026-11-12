@@ -24,6 +24,7 @@ from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -50,8 +51,8 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_recurrent_kda,
 )
+from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.attention import (
@@ -63,6 +64,9 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8 import (
+    flash_mla_sparse_fwd_w8a8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     flash_mla_with_kvcache_w8a8,
 )
@@ -222,6 +226,7 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -271,6 +276,7 @@ __all__ = [
     "concat_mla_q",
     "concat_query",
     "contiguous_copy",
+    "cooperative_topk",
     "copy_to",
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",
@@ -279,6 +285,7 @@ __all__ = [
     "dgeglu",
     "dispatch_fused_moe_kernel",
     "dreglu",
+    "dsv41_o_proj",
     "dswiglu",
     "expand_pools_and_append_tail",
     "flash_attention_forward",
@@ -287,6 +294,7 @@ __all__ = [
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "flash_mla_sparse_fwd_w8a8",
     "flash_mla_with_kvcache",
     "flash_mla_with_kvcache_w8a8",
     "fp32_router_gemm",

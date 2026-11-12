@@ -13,6 +13,7 @@ FlagGems-vllm repository organization.
 FlagGems-vllm/
 ├── src/flaggems_vllm/      # Python package
 │   ├── __init__.py         # Top-level exports and public operator APIs
+│   ├── backends.yaml       # Backend registry (python/torch/triton/vLLM pins)
 │   ├── config.py           # Configuration, C extension detection
 │   ├── ops/                # Operator implementations
 │   ├── runtime/            # Backend, device, autotune config
@@ -120,7 +121,8 @@ conf/
 tools/
 ├── ci_checks/              # CI verification scripts (YAML, exports, markers)
 ├── gpu_check_<vendor>.sh   # Hardware check scripts for 13 vendor chips
-├── setup.sh                # Full GPU environment bootstrap
+├── setup.sh                # Multi-backend environment bootstrap
+├── source_env_bash.sh      # Re-export vendor env scripts for activate
 ├── select_tests.py         # CI: map changed files → test targets
 ├── select_backends.py      # CI: multi-backend test selection
 └── run_ci_targets.py       # CI: run selected tests/benchmarks
@@ -138,9 +140,13 @@ Mandatory operator development protocol with hard gates (G0–G7):
 ## Package Metadata (`pyproject.toml`)
 
 - Package name: `flaggems_vllm`
-- Build system: `scikit-build-core` (C++ extensions via pybind11)
-- Dependencies: `torch>=2.6.0`, `pyyaml`, `triton` or `flagtree`
-- Optional extras: `[test]` (pytest, numpy, scipy, cupy)
+- Build system: `setuptools`
+- Dependencies: `flag-gems`, `packaging`, `pybind11`, `PyYAML`, `sqlalchemy`
+  (torch/triton/vLLM are provided by the vendor environment)
+- Optional test extras: `[test]` (pytest, scipy, einops, distro) and
+  `[test-nvidia]` (cupy-cuda12x)
+- Backend extras with vendor vLLM packages: `[nvidia]`, `[metax]`, `[ascend]`,
+  `[thead]`
 
 ## Next Steps
 
