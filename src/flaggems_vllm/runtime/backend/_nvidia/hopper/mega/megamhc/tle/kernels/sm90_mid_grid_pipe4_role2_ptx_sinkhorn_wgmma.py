@@ -26,8 +26,8 @@ CUfunction before launch; otherwise the software rendezvous can deadlock.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Mapping
 
 import torch
@@ -37,15 +37,26 @@ import triton.language as tl
 
 from .. import fused_post_gemm_t64 as _t64
 
-
 PADDED_TOKENS = 256
 LOGICAL_TOKEN_BUCKETS = (
-    136, 144, 152, 160, 168, 176, 184, 192,
-    200, 208, 216, 224, 232, 240, 248, 256,
+    136,
+    144,
+    152,
+    160,
+    168,
+    176,
+    184,
+    192,
+    200,
+    208,
+    216,
+    224,
+    232,
+    240,
+    248,
+    256,
 )
-_TOKENS_TEXT = os.environ.get(
-    "DG_TLE_MHC_MID_GRID_PIPE4_ROLE2_LOGICAL_TOKENS", "192"
-)
+_TOKENS_TEXT = os.environ.get("DG_TLE_MHC_MID_GRID_PIPE4_ROLE2_LOGICAL_TOKENS", "192")
 try:
     LOGICAL_TOKENS = int(_TOKENS_TEXT)
 except ValueError as exc:  # pragma: no cover - import-time contract
@@ -71,9 +82,7 @@ HIDDEN_CHUNK = 64
 NUM_HIDDEN_CHUNKS = HIDDEN_PER_SPLIT // HIDDEN_CHUNK
 GRID_CTAS = NUM_M_TILES * NUM_SPLITS
 TAIL_OWNER_CTAS = GRID_CTAS
-TOKENS_PER_OWNER = (
-    LOGICAL_TOKENS + TAIL_OWNER_CTAS - 1
-) // TAIL_OWNER_CTAS
+TOKENS_PER_OWNER = (LOGICAL_TOKENS + TAIL_OWNER_CTAS - 1) // TAIL_OWNER_CTAS
 NUM_WARPS = 16
 STAGED_MATH_WARPS = 4
 STAGED_MATH_REGS = 128
@@ -105,22 +114,13 @@ JIT_STAGED_MATH_WARPS = tl.constexpr(STAGED_MATH_WARPS)
 JIT_STAGED_MATH_THREADS = tl.constexpr(STAGED_MATH_WARPS * 32)
 JIT_STAGED_MATH_REGS = tl.constexpr(STAGED_MATH_REGS)
 JIT_PIPE_STAGES = tl.constexpr(PIPE_STAGES)
-JIT_STAGED_LOGICAL_THREADS = tl.constexpr(
-    NUM_WARPS * 32 + STAGED_MATH_WARPS * 32
-)
+JIT_STAGED_LOGICAL_THREADS = tl.constexpr(NUM_WARPS * 32 + STAGED_MATH_WARPS * 32)
 JIT_ROLE2_TOKENS = tl.constexpr(ROLE2_TOKENS)
-JIT_ROLE2_ROOT_THREADS = tl.constexpr(
-    ROLE2_ROOT_WARPS_PER_TOKEN * 32
-)
+JIT_ROLE2_ROOT_THREADS = tl.constexpr(ROLE2_ROOT_WARPS_PER_TOKEN * 32)
 JIT_ROLE2_RUN_ROUTE = tl.constexpr(True)
 JIT_ROLE2_RUN_SYNC = tl.constexpr(False)
 JIT_ROLE2_RUN_HIDDEN = tl.constexpr(True)
 JIT_ROLE2_EARLY_PRE = tl.constexpr(True)
-JIT_ROLE2_ILP4 = tl.constexpr(True)
-JIT_ROLE2_ILP8 = tl.constexpr(False)
-JIT_ROLE2_PAIR2 = tl.constexpr(False)
-JIT_ROLE2_RMS_CACHE = tl.constexpr(False)
-JIT_ROLE2_COEFF_CACHE = tl.constexpr(False)
 
 
 @triton.jit
@@ -249,59 +249,6 @@ def _role2_wait_early_pre(physical_thread):
 
 
 @triton.jit
-def _role2_cache_rms_weights(rms_weight_shared, rmsnorm_weight_ptr):
-    """Load H4096 BF16 weights once with root warps 0..7."""
-    logical = tl.arange(0, JIT_ROLE2_TOKENS * JIT_HIDDEN)
-    layout_thread = logical % JIT_CTA_THREADS
-    item = logical // JIT_CTA_THREADS
-    token_slot = layout_thread // JIT_ROLE2_ROOT_THREADS
-    hidden = item * JIT_ROLE2_ROOT_THREADS + (
-        layout_thread % JIT_ROLE2_ROOT_THREADS
-    )
-    weight = tl.load(
-        rmsnorm_weight_ptr + hidden,
-        mask=token_slot == 0,
-        other=0.0,
-    )
-    weight_pointer = tle.gpu.local_ptr(rms_weight_shared, (hidden,))
-    weight_address = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, $1;",
-        constraints="=r,r",
-        args=[weight_pointer],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred p;
-          setp.ne.u32 p, $3, 0;
-          @p st.shared.b16 [$2], $1;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,h,r,r",
-        args=[
-            weight,
-            weight_address,
-            tl.cast(token_slot == 0, tl.uint32),
-        ],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync 11, 512; mov.u32 $0, 0; }",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _role2_hidden_tail(
     pre_shared0,
     pre_shared1,
@@ -325,20 +272,13 @@ def _role2_hidden_tail(
     layout_thread = logical % JIT_CTA_THREADS
     item = logical // JIT_CTA_THREADS
     token_slot = layout_thread // JIT_ROLE2_ROOT_THREADS
-    hidden = item * JIT_ROLE2_ROOT_THREADS + (
-        layout_thread % JIT_ROLE2_ROOT_THREADS
-    )
+    hidden = item * JIT_ROLE2_ROOT_THREADS + (layout_thread % JIT_ROLE2_ROOT_THREADS)
     token = tl.where(token_slot == 0, token0, token1)
-    token_active = tl.where(
-        token_slot == 0, token0_active, token1_active
-    )
+    token_active = tl.where(token_slot == 0, token0_active, token1_active)
     norm_input = tl.zeros((JIT_ROLE2_TOKENS * JIT_HIDDEN,), tl.float32)
     for channel in tl.static_range(0, JIT_HC_MULT):
         value = tl.load(
-            new_residual_ptr
-            + token * JIT_FLAT_HIDDEN
-            + channel * JIT_HIDDEN
-            + hidden,
+            new_residual_ptr + token * JIT_FLAT_HIDDEN + channel * JIT_HIDDEN + hidden,
             mask=token_active,
             other=0.0,
         ).to(tl.float32)
@@ -355,17 +295,11 @@ def _role2_hidden_tail(
         pre = tl.where(token_slot == 0, pre0, pre1)
         norm_input += value * pre
 
-    norm_input_bf16 = norm_input.to(
-        tl.bfloat16, fp_downcast_rounding="rtne"
-    )
+    norm_input_bf16 = norm_input.to(tl.bfloat16, fp_downcast_rounding="rtne")
     norm_input_fp32 = norm_input_bf16.to(tl.float32)
     squares = norm_input_fp32 * norm_input_fp32
-    sum0 = tl.sum(
-        tl.where(token_slot == 0, squares, 0.0), axis=0
-    )
-    sum1 = tl.sum(
-        tl.where(token_slot == 1, squares, 0.0), axis=0
-    )
+    sum0 = tl.sum(tl.where(token_slot == 0, squares, 0.0), axis=0)
+    sum1 = tl.sum(tl.where(token_slot == 1, squares, 0.0), axis=0)
     rms0 = tl.rsqrt(sum0 / JIT_HIDDEN + rmsnorm_eps)
     rms1 = tl.rsqrt(sum1 / JIT_HIDDEN + rmsnorm_eps)
     rms = tl.where(token_slot == 0, rms0, rms1)
@@ -375,83 +309,6 @@ def _role2_hidden_tail(
         y_bf16_ptr + token * JIT_HIDDEN + hidden,
         y.to(tl.bfloat16, fp_downcast_rounding="rtne"),
         mask=token_active,
-    )
-
-
-@triton.jit
-def _cache_projection_coefficients(
-    post_mix_ptr,
-    comb_res_mix_ptr,
-    post_coeff_shared,
-    comb_coeff_shared,
-    tile,
-):
-    """Cache one M64 tile's 5KiB FP32 post/comb coefficients."""
-    physical_thread = _t64._physical_thread_id_x()
-    if physical_thread < 256:
-        row = physical_thread % JIT_BLOCK_M
-        channel = physical_thread // JIT_BLOCK_M
-        token = tile * JIT_BLOCK_M + row
-        token_active = token < JIT_LOGICAL_TOKENS
-        post_value = tl.load(
-            post_mix_ptr + token * JIT_HC_MULT + channel,
-            mask=token_active,
-            other=0.0,
-        ).to(tl.float32)
-        post_pointer = tle.gpu.local_ptr(
-            post_coeff_shared, (channel, row)
-        )
-        post_address = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[post_pointer],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-        _ = tl.inline_asm_elementwise(
-            asm="{ st.shared.f32 [$1], $2; mov.u32 $0, 0; }",
-            constraints="=r,r,f",
-            args=[post_address, post_value],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
-        for route in tl.static_range(0, JIT_HC_MULT):
-            comb_value = tl.load(
-                comb_res_mix_ptr
-                + token * JIT_HC_MULT * JIT_HC_MULT
-                + channel
-                + route * JIT_HC_MULT,
-                mask=token_active,
-                other=0.0,
-            ).to(tl.float32)
-            comb_pointer = tle.gpu.local_ptr(
-                comb_coeff_shared, (channel, route, row)
-            )
-            comb_address = tl.inline_asm_elementwise(
-                asm="mov.u32 $0, $1;",
-                constraints="=r,r",
-                args=[comb_pointer],
-                dtype=tl.uint32,
-                is_pure=True,
-                pack=1,
-            )
-            _ = tl.inline_asm_elementwise(
-                asm="{ st.shared.f32 [$1], $2; mov.u32 $0, 0; }",
-                constraints="=r,r,f",
-                args=[comb_address, comb_value],
-                dtype=tl.uint32,
-                is_pure=False,
-                pack=1,
-            )
-    _ = tl.inline_asm_elementwise(
-        asm="{ barrier.cta.sync 10, 512; mov.u32 $0, 0; }",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
     )
 
 
@@ -529,9 +386,7 @@ def _tile_split32_producer(
                 mask=token_active[:, None],
                 other=0.0,
             ).to(tl.float32)
-            comb_base = (
-                m[:, None] * JIT_HC_MULT * JIT_HC_MULT + channel
-            )
+            comb_base = m[:, None] * JIT_HC_MULT * JIT_HC_MULT + channel
             q = (
                 x * post
                 + r0
@@ -563,15 +418,11 @@ def _tile_split32_producer(
             q_fp32 = q_bf16.to(tl.float32)
             flat_hidden = channel * JIT_HIDDEN + hidden
             tl.store(
-                new_residual_ptr
-                + m[:, None] * JIT_FLAT_HIDDEN
-                + flat_hidden[None, :],
+                new_residual_ptr + m[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :],
                 q_bf16,
                 mask=token_active[:, None],
             )
-            fn_offsets = (
-                n[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :]
-            )
+            fn_offsets = n[:, None] * JIT_FLAT_HIDDEN + flat_hidden[None, :]
             fn_tile = tl.load(
                 fn_ptr + fn_offsets,
                 mask=n[:, None] < JIT_PROJECTION_OUTPUTS,
@@ -610,6 +461,7 @@ def _tile_split32_producer(
         rmsnorm_eps,
         rmsnorm_scale,
     )
+
 
 @triton.jit
 def _sinkhorn_nineteen_warp_iterations(value, epsilon):
@@ -672,9 +524,7 @@ def _role2_routing_finalize_explicit(
     """Finalize one routing token and release its hidden subgroup."""
     projection_mask = lane < JIT_PROJECTION_OUTPUTS
     token_squared_sum = _t64._warp_broadcast_lane24_f32(packed_sum)
-    projection_norm = tl.rsqrt(
-        token_squared_sum / JIT_FLAT_HIDDEN + hc_norm_eps
-    )
+    projection_norm = tl.rsqrt(token_squared_sum / JIT_FLAT_HIDDEN + hc_norm_eps)
     category_scale = tl.where(
         lane < JIT_HC_MULT,
         tl.load(mix_scales_ptr),
@@ -709,9 +559,7 @@ def _role2_routing_finalize_explicit(
         is_pure=True,
         pack=1,
     )
-    _role2_store_pre_and_optionally_arrive(
-        pre_address, pre_mix, lane, ROLE
-    )
+    _role2_store_pre_and_optionally_arrive(pre_address, pre_mix, lane, ROLE)
     post_base = tl.cast(new_post_mix_ptr, tl.uint64)
     _ = tl.inline_asm_elementwise(
         asm="""
@@ -742,22 +590,16 @@ def _role2_routing_finalize_explicit(
         is_pure=False,
         pack=1,
     )
-    routing_mask = (
-        lane >= 2 * JIT_HC_MULT
-    ) & (lane < JIT_PROJECTION_OUTPUTS)
+    routing_mask = (lane >= 2 * JIT_HC_MULT) & (lane < JIT_PROJECTION_OUTPUTS)
     sinkhorn = tl.where(routing_mask, mixes, 0.0)
     row_max = _t64._warp_reduce4_max(sinkhorn)
     sinkhorn = tl.exp(sinkhorn - row_max)
     row_sum = _t64._warp_reduce4_sum(sinkhorn)
     sinkhorn = sinkhorn * _t64._fast_rcp_ftz_f32(row_sum)
     sinkhorn += sinkhorn_eps
-    column_sum = (
-        _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
-    )
+    column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
     sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    sinkhorn = _sinkhorn_nineteen_warp_iterations(
-        sinkhorn, sinkhorn_eps
-    )
+    sinkhorn = _sinkhorn_nineteen_warp_iterations(sinkhorn, sinkhorn_eps)
     comb_base = tl.cast(new_comb_res_mix_ptr, tl.uint64)
     _ = tl.inline_asm_elementwise(
         asm="""
@@ -808,121 +650,50 @@ def _role2_route_one_token(
     ROLE: tl.constexpr,
 ):
     safe_token = tl.where(token_active, token, 0)
-    if JIT_ROLE2_ILP8:
-        sum0 = 0.0
-        sum1 = 0.0
-        sum2 = 0.0
-        sum3 = 0.0
-        sum4 = 0.0
-        sum5 = 0.0
-        sum6 = 0.0
-        sum7 = 0.0
-        for group in tl.static_range(0, JIT_NUM_SPLITS // 8):
-            base_split = group * 8
-            common_offset = safe_token * JIT_BLOCK_N + lane
-            mask = (lane <= JIT_PROJECTION_OUTPUTS) & token_active
-            sum0 += tl.load(
-                partials_ptr
-                + (base_split + 0) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum1 += tl.load(
-                partials_ptr
-                + (base_split + 1) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum2 += tl.load(
-                partials_ptr
-                + (base_split + 2) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum3 += tl.load(
-                partials_ptr
-                + (base_split + 3) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum4 += tl.load(
-                partials_ptr
-                + (base_split + 4) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum5 += tl.load(
-                partials_ptr
-                + (base_split + 5) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum6 += tl.load(
-                partials_ptr
-                + (base_split + 6) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-            sum7 += tl.load(
-                partials_ptr
-                + (base_split + 7) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset, mask=mask, other=0.0,
-            )
-        packed_sum = (
-            ((sum0 + sum1) + (sum2 + sum3))
-            + ((sum4 + sum5) + (sum6 + sum7))
+    # Production fixes the routing reduction to ILP4.
+    sum0 = 0.0
+    sum1 = 0.0
+    sum2 = 0.0
+    sum3 = 0.0
+    for group in tl.static_range(0, JIT_NUM_SPLITS // 4):
+        base_split = group * 4
+        common_offset = safe_token * JIT_BLOCK_N + lane
+        mask = (lane <= JIT_PROJECTION_OUTPUTS) & token_active
+        sum0 += tl.load(
+            partials_ptr
+            + (base_split + 0) * JIT_PADDED_TOKENS * JIT_BLOCK_N
+            + common_offset,
+            mask=mask,
+            other=0.0,
         )
-    elif JIT_ROLE2_ILP4:
-        sum0 = 0.0
-        sum1 = 0.0
-        sum2 = 0.0
-        sum3 = 0.0
-        for group in tl.static_range(0, JIT_NUM_SPLITS // 4):
-            base_split = group * 4
-            common_offset = safe_token * JIT_BLOCK_N + lane
-            mask = (lane <= JIT_PROJECTION_OUTPUTS) & token_active
-            sum0 += tl.load(
-                partials_ptr
-                + (base_split + 0) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset,
-                mask=mask,
-                other=0.0,
-            )
-            sum1 += tl.load(
-                partials_ptr
-                + (base_split + 1) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset,
-                mask=mask,
-                other=0.0,
-            )
-            sum2 += tl.load(
-                partials_ptr
-                + (base_split + 2) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset,
-                mask=mask,
-                other=0.0,
-            )
-            sum3 += tl.load(
-                partials_ptr
-                + (base_split + 3) * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + common_offset,
-                mask=mask,
-                other=0.0,
-            )
-        packed_sum = (sum0 + sum1) + (sum2 + sum3)
-    else:
-        packed_sum = 0.0
-        for source_split in tl.static_range(0, JIT_NUM_SPLITS):
-            route_offset = (
-                source_split * JIT_PADDED_TOKENS * JIT_BLOCK_N
-                + safe_token * JIT_BLOCK_N
-                + lane
-            )
-            packed_sum += tl.load(
-                partials_ptr + route_offset,
-                mask=(lane <= JIT_PROJECTION_OUTPUTS) & token_active,
-                other=0.0,
-            )
+        sum1 += tl.load(
+            partials_ptr
+            + (base_split + 1) * JIT_PADDED_TOKENS * JIT_BLOCK_N
+            + common_offset,
+            mask=mask,
+            other=0.0,
+        )
+        sum2 += tl.load(
+            partials_ptr
+            + (base_split + 2) * JIT_PADDED_TOKENS * JIT_BLOCK_N
+            + common_offset,
+            mask=mask,
+            other=0.0,
+        )
+        sum3 += tl.load(
+            partials_ptr
+            + (base_split + 3) * JIT_PADDED_TOKENS * JIT_BLOCK_N
+            + common_offset,
+            mask=mask,
+            other=0.0,
+        )
+    packed_sum = (sum0 + sum1) + (sum2 + sum3)
     _role2_routing_finalize_explicit(
         pre_shared,
         mix_scales_ptr,
         mix_bases_ptr,
         new_post_mix_ptr + safe_token * JIT_HC_MULT,
-        new_comb_res_mix_ptr
-        + safe_token * JIT_HC_MULT * JIT_HC_MULT,
+        new_comb_res_mix_ptr + safe_token * JIT_HC_MULT * JIT_HC_MULT,
         packed_sum,
         lane,
         hc_norm_eps,
@@ -932,141 +703,6 @@ def _role2_route_one_token(
         token_active,
         ROLE,
     )
-
-
-@triton.jit
-def _role2_pair_sync(ROLE: tl.constexpr):
-    if ROLE == 0:
-        _ = tl.inline_asm_elementwise(
-            asm="{ barrier.cta.sync 12, 64; mov.u32 $0, 0; }",
-            constraints="=r",
-            args=[],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
-    else:
-        tl.static_assert(ROLE == 1)
-        _ = tl.inline_asm_elementwise(
-            asm="{ barrier.cta.sync 13, 64; mov.u32 $0, 0; }",
-            constraints="=r",
-            args=[],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
-
-
-@triton.jit
-def _role2_route_pair_token(
-    partials_ptr,
-    route_pair_shared,
-    pre_shared,
-    mix_scales_ptr,
-    mix_bases_ptr,
-    new_post_mix_ptr,
-    new_comb_res_mix_ptr,
-    token,
-    token_active,
-    lane,
-    hc_norm_eps,
-    hc_pre_eps,
-    hc_post_scale,
-    sinkhorn_eps,
-    ROLE: tl.constexpr,
-    HALF: tl.constexpr,
-):
-    """Reduce one 16-split half and let the pair owner finalize."""
-    safe_token = tl.where(token_active, token, 0)
-    packed_half = 0.0
-    for local_split in tl.static_range(0, JIT_NUM_SPLITS // 2):
-        source_split = HALF * (JIT_NUM_SPLITS // 2) + local_split
-        route_offset = (
-            source_split * JIT_PADDED_TOKENS * JIT_BLOCK_N
-            + safe_token * JIT_BLOCK_N
-            + lane
-        )
-        packed_half += tl.load(
-            partials_ptr + route_offset,
-            mask=(lane <= JIT_PROJECTION_OUTPUTS) & token_active,
-            other=0.0,
-        )
-
-    row = ROLE * 2 + HALF
-    half_pointer = tle.gpu.local_ptr(route_pair_shared, (row, lane))
-    half_address = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, $1;",
-        constraints="=r,r",
-        args=[half_pointer],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="{ st.shared.f32 [$1], $2; mov.u32 $0, 0; }",
-        constraints="=r,r,f",
-        args=[half_address, packed_half],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-    _role2_pair_sync(ROLE)
-
-    if HALF == 0:
-        first_pointer = tle.gpu.local_ptr(
-            route_pair_shared, (ROLE * 2, lane)
-        )
-        second_pointer = tle.gpu.local_ptr(
-            route_pair_shared, (ROLE * 2 + 1, lane)
-        )
-        first_address = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[first_pointer],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-        second_address = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[second_pointer],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-        first_half = tl.inline_asm_elementwise(
-            asm="ld.shared.f32 $0, [$1];",
-            constraints="=f,r",
-            args=[first_address],
-            dtype=tl.float32,
-            is_pure=False,
-            pack=1,
-        )
-        second_half = tl.inline_asm_elementwise(
-            asm="ld.shared.f32 $0, [$1];",
-            constraints="=f,r",
-            args=[second_address],
-            dtype=tl.float32,
-            is_pure=False,
-            pack=1,
-        )
-        _role2_routing_finalize_explicit(
-            pre_shared,
-            mix_scales_ptr,
-            mix_bases_ptr,
-            new_post_mix_ptr + safe_token * JIT_HC_MULT,
-            new_comb_res_mix_ptr
-            + safe_token * JIT_HC_MULT * JIT_HC_MULT,
-            first_half + second_half,
-            lane,
-            hc_norm_eps,
-            hc_pre_eps,
-            hc_post_scale,
-            sinkhorn_eps,
-            token_active,
-            ROLE,
-        )
 
 
 @triton.jit
@@ -1089,9 +725,7 @@ def _tile_split32_math_and_routing(
     sinkhorn_eps,
 ):
     """Four WGMMA warps produce one tile, then reduce 32 partials."""
-    accumulator = tl.zeros(
-        (JIT_BLOCK_M, JIT_BLOCK_N), dtype=tl.float32
-    )
+    accumulator = tl.zeros((JIT_BLOCK_M, JIT_BLOCK_N), dtype=tl.float32)
     first = pipe_reader.wait(0)
     accumulator = tle.gpu.wgmma(
         first.slot.q,
@@ -1100,9 +734,7 @@ def _tile_split32_math_and_routing(
         input_precision="tf32",
         trans_b=True,
     )
-    for iteration in tl.static_range(
-        1, JIT_NUM_HIDDEN_CHUNKS * JIT_HC_MULT
-    ):
+    for iteration in tl.static_range(1, JIT_NUM_HIDDEN_CHUNKS * JIT_HC_MULT):
         wait = pipe_reader.wait(iteration)
         accumulator = tle.gpu.wgmma(
             wait.slot.q,
@@ -1121,15 +753,12 @@ def _tile_split32_math_and_routing(
     token_active = m < JIT_LOGICAL_TOKENS
     n = tl.arange(0, JIT_BLOCK_N)
     workspace_offsets = (
-        split * JIT_PADDED_TOKENS * JIT_BLOCK_N
-        + m[:, None] * JIT_BLOCK_N
-        + n[None, :]
+        split * JIT_PADDED_TOKENS * JIT_BLOCK_N + m[:, None] * JIT_BLOCK_N + n[None, :]
     )
     tl.store(
         partials_ptr + workspace_offsets,
         accumulator,
-        mask=token_active[:, None]
-        & (n[None, :] < JIT_PROJECTION_OUTPUTS),
+        mask=token_active[:, None] & (n[None, :] < JIT_PROJECTION_OUTPUTS),
     )
 
     tle.gpu.barrier_wait(producer_ready)
@@ -1181,6 +810,7 @@ def _tile_split32_math_and_routing(
             sinkhorn_eps,
             1,
         )
+
 
 @triton.jit
 def _sm90_mid_grid_pipe4_role2_wgmma_kernel(
@@ -1255,12 +885,8 @@ def _sm90_mid_grid_pipe4_role2_wgmma_kernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    producer_ready = tle.gpu.alloc_barrier(
-        arrive_count=JIT_STAGED_LOGICAL_THREADS
-    )
-    grid_acquire_ready = tle.gpu.alloc_barrier(
-        arrive_count=JIT_STAGED_LOGICAL_THREADS
-    )
+    producer_ready = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
+    grid_acquire_ready = tle.gpu.alloc_barrier(arrive_count=JIT_STAGED_LOGICAL_THREADS)
     tle.gpu.warp_specialize(
         [
             (
@@ -1549,16 +1175,10 @@ def prepare_tle_sm90_mega_mhc(
         "tail_role2": True,
         "tail_role2_phase": ROLE2_PHASE,
         "tail_root_warps_per_token": ROLE2_ROOT_WARPS_PER_TOKEN,
-        "tail_routing_warps_per_token": (
-            2 if ROLE2_PHASE == "early_pre_pair2" else 1
-        ),
-        "tail_full_sync_threads": (
-            NUM_WARPS + STAGED_MATH_WARPS
-        ) * 32,
+        "tail_routing_warps_per_token": (2 if ROLE2_PHASE == "early_pre_pair2" else 1),
+        "tail_full_sync_threads": (NUM_WARPS + STAGED_MATH_WARPS) * 32,
         "tail_early_pre_overlap": ROLE2_PHASE.startswith("early_pre"),
-        "tail_layout_contract": (
-            "default_h8192_permuted_to_two_h4096_subgroups"
-        ),
+        "tail_layout_contract": ("default_h8192_permuted_to_two_h4096_subgroups"),
         "staged_math_regs": STAGED_MATH_REGS,
         "cta_mapping": "tile=pid//32,split=pid%32",
         "threads_per_cta_expected": (NUM_WARPS + STAGED_MATH_WARPS) * 32,

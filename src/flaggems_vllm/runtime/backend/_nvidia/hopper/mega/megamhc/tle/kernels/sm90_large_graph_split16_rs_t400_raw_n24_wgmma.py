@@ -41,7 +41,7 @@ if _T400_SHA256 != _EXPECTED_T400_SHA256:
 _RAW_HELPER_SOURCE = Path(_raw_module.__file__).resolve()
 _RAW_HELPER_SHA256 = hashlib.sha256(_RAW_HELPER_SOURCE.read_bytes()).hexdigest()
 _EXPECTED_RAW_HELPER_SHA256 = (
-    "6804f1e15c3461ea69e411ffcdba6a126617d2b74cd7dbe42354aa9fb5186e9a"
+    "550e368ed415c45f04c87112b10f3c261c6ff3c239f3613d0a384c881f887a5f"
 )
 if _RAW_HELPER_SHA256 != _EXPECTED_RAW_HELPER_SHA256:
     raise RuntimeError(

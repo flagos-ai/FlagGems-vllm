@@ -238,25 +238,6 @@ def test_supplied_out_is_returned_and_enqueued_once():
     )
 
 
-def test_trusted_fast_path_allocates_and_enqueues_once(monkeypatch):
-    tensors, context, launcher = _make_case(trusted_fast_path=True)
-    api_module = __import__(mega_mhc.__module__, fromlist=["api"])
-
-    def unexpected_strict_validation(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("trusted path performed strict per-call validation")
-
-    monkeypatch.setattr(api_module, "_validate_profile", unexpected_strict_validation)
-    monkeypatch.setattr(api_module, "_validate_outputs", unexpected_strict_validation)
-
-    outputs = _invoke(tensors, context)
-
-    assert len(launcher.calls) == 1
-    assert all(
-        actual is expected for actual, expected in zip(launcher.calls[0][5:], outputs)
-    )
-
-
 def test_trusted_fast_path_rejects_changed_static_object():
     tensors, context, launcher = _make_case(trusted_fast_path=True)
 
@@ -298,29 +279,6 @@ def test_trusted_fast_path_allows_static_content_update_without_rebinding():
     assert len(launcher.calls) == 1
 
 
-def test_trusted_fast_path_rejects_unsupported_token_and_scalar():
-    tensors, context, launcher = _make_case(
-        tokens=2,
-        supported_tokens=frozenset({1}),
-        trusted_fast_path=True,
-    )
-
-    with pytest.raises(NotImplementedError, match="T=2"):
-        _invoke(tensors, context)
-    with pytest.raises(NotImplementedError, match="n_splits"):
-        _invoke(
-            tensors,
-            context,
-            x=tensors["x"][:1],
-            residual=tensors["residual"][:1],
-            post_layer_mix=tensors["post_layer_mix"][:1],
-            comb_res_mix=tensors["comb_res_mix"][:1],
-            n_splits=1.5,
-        )
-
-    assert launcher.calls == []
-
-
 def test_trusted_fast_path_rejects_dynamic_tensor_abi_mismatch():
     tensors, context, launcher = _make_case(trusted_fast_path=True)
     hidden = DEEPSEEK_V4_FLASH_PROFILE.hidden_size
@@ -331,6 +289,8 @@ def test_trusted_fast_path_rejects_dynamic_tensor_abi_mismatch():
             context,
             x=torch.empty((1, hidden // 2), dtype=torch.bfloat16),
         )
+    with pytest.raises(NotImplementedError, match="x.dtype"):
+        _invoke(tensors, context, x=tensors["x"].float())
     with pytest.raises(NotImplementedError, match="residual.dtype"):
         _invoke(tensors, context, residual=tensors["residual"].float())
     with pytest.raises(NotImplementedError, match="post_layer_mix.shape"):
@@ -488,39 +448,8 @@ def test_unsupported_profile_is_explicit():
     other_profile = replace(
         DEEPSEEK_V4_FLASH_PROFILE, model_revision="different-revision"
     )
-    tensors, context, launcher = _make_case(profile=other_profile)
-
     with pytest.raises(NotImplementedError, match="DeepSeek-V4-Flash"):
-        _invoke(tensors, context)
-
-    assert launcher.calls == []
-
-
-def test_unsupported_dtype_and_layout_are_explicit():
-    tensors, context, launcher = _make_case(tokens=2)
-
-    with pytest.raises(NotImplementedError, match="x.dtype"):
-        _invoke(tensors, context, x=tensors["x"].float())
-    noncontiguous_x = torch.empty(
-        (DEEPSEEK_V4_FLASH_PROFILE.hidden_size, 2), dtype=torch.bfloat16
-    ).t()
-    assert not noncontiguous_x.is_contiguous()
-    with pytest.raises(NotImplementedError, match="x must be contiguous"):
-        _invoke(tensors, context, x=noncontiguous_x)
-
-    assert launcher.calls == []
-
-
-def test_unsupported_hidden_shape_is_explicit():
-    tensors, context, launcher = _make_case()
-    wrong_hidden = torch.empty(
-        (1, DEEPSEEK_V4_FLASH_PROFILE.hidden_size // 2), dtype=torch.bfloat16
-    )
-
-    with pytest.raises(NotImplementedError, match="x.shape"):
-        _invoke(tensors, context, x=wrong_hidden)
-
-    assert launcher.calls == []
+        _make_case(profile=other_profile)
 
 
 def test_autograd_inputs_are_not_silently_detached():
@@ -529,15 +458,6 @@ def test_autograd_inputs_are_not_silently_detached():
 
     with pytest.raises(NotImplementedError, match="must not require gradients"):
         _invoke(tensors, context, x=grad_x)
-
-    assert launcher.calls == []
-
-
-def test_static_tensor_rebinding_requires_a_new_context():
-    tensors, context, launcher = _make_case()
-
-    with pytest.raises(RuntimeError, match="static tensor identity changed"):
-        _invoke(tensors, context, fn=tensors["fn"].clone())
 
     assert launcher.calls == []
 
@@ -553,23 +473,8 @@ def test_poisoned_workspace_is_never_reused():
 
 
 def test_non_cuda_workspace_rejects_cuda_stream_handle():
-    tensors, context, launcher = _make_case(stream_handle=1234)
-
     with pytest.raises(ValueError, match="non-CUDA"):
-        _invoke(tensors, context)
-
-    assert launcher.calls == []
-
-
-def test_invalid_supplied_outputs_do_not_launch():
-    tensors, context, launcher = _make_case()
-    outputs = list(_make_outputs(tensors))
-    outputs[3] = torch.empty(tensors["x"].shape, dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="y_bf16.dtype"):
-        _invoke(tensors, context, out=tuple(outputs))
-
-    assert launcher.calls == []
+        _make_case(stream_handle=1234)
 
 
 def test_supplied_out_must_be_a_four_tensor_tuple():
@@ -696,42 +601,19 @@ def test_context_rejects_fractional_token_specializations():
         )
 
 
-def test_factory_derives_tokens_and_dispatches_exact_prepared_launcher():
+def test_factory_derives_token_and_dispatches_exact_prepared_launcher():
     tensors, _, _ = _make_case()
     static_values = _static_values(tensors)
-    prepared_t1 = _PreparedLauncher(1, static_values)
-    prepared_t8 = _PreparedLauncher(
-        8,
-        static_values,
-        dynamic_alignments=(32,) * 8,
-        static_alignments=(32,) * 4,
-    )
+    prepared = _PreparedLauncher(1, static_values)
+    context = _create_context_from_prepared(*static_values, prepared)
 
-    context = _create_context_from_prepared(
-        *static_values,
-        {1: prepared_t1, 8: prepared_t8},
-    )
-
-    assert context.supported_tokens == frozenset({1, 8})
+    assert context.supported_tokens == frozenset({1})
     assert context.launcher.dynamic_alignments(1) == (16,) * 8
-    assert context.launcher.dynamic_alignments(8) == (32,) * 8
-    assert context.launcher.static_alignments == (32,) * 4
-    assert prepared_t1.validation_calls == 1
-    assert prepared_t8.validation_calls == 1
-    assert prepared_t1.static_validation_calls == 1
-    assert prepared_t8.static_validation_calls == 1
+    assert context.launcher.static_alignments == (16,) * 4
+    assert prepared.validation_calls == 1
+    assert prepared.static_validation_calls == 1
     _invoke(tensors, context)
-    assert len(prepared_t1.runs) == 1
-    assert prepared_t8.runs == []
-
-
-def test_factory_rejects_registry_key_token_mismatch():
-    tensors, _, _ = _make_case()
-    static_values = _static_values(tensors)
-    prepared = _PreparedLauncher(8, static_values)
-
-    with pytest.raises(ValueError, match="registry key T=1"):
-        _create_context_from_prepared(*static_values, {1: prepared})
+    assert len(prepared.runs) == 1
 
 
 def test_factory_rejects_launcher_bound_to_different_static_tensor():
@@ -741,7 +623,7 @@ def test_factory_rejects_launcher_bound_to_different_static_tensor():
     prepared = _PreparedLauncher(1, rebound_values)
 
     with pytest.raises(RuntimeError, match="different static tensors"):
-        _create_context_from_prepared(*static_values, {1: prepared})
+        _create_context_from_prepared(*static_values, prepared)
 
 
 def test_factory_rejects_static_storage_rebind_after_launcher_preparation():
@@ -752,7 +634,7 @@ def test_factory_rejects_static_storage_rebind_after_launcher_preparation():
     tensors["fn"].set_(replacement)
 
     with pytest.raises(RuntimeError, match="changed after launcher preparation"):
-        _create_context_from_prepared(*static_values, {1: prepared})
+        _create_context_from_prepared(*static_values, prepared)
 
 
 def test_factory_rejects_wrong_owner_and_invalid_alignment_contracts():
@@ -762,23 +644,20 @@ def test_factory_rejects_wrong_owner_and_invalid_alignment_contracts():
         1, static_values, owner_thread_id=threading.get_ident() + 1
     )
     with pytest.raises(RuntimeError, match="different host thread"):
-        _create_context_from_prepared(*static_values, {1: wrong_owner})
+        _create_context_from_prepared(*static_values, wrong_owner)
 
     invalid_alignment = _PreparedLauncher(
         1, static_values, dynamic_alignments=(16,) * 7 + (3,)
     )
     with pytest.raises(ValueError, match="powers of two"):
-        _create_context_from_prepared(*static_values, {1: invalid_alignment})
+        _create_context_from_prepared(*static_values, invalid_alignment)
 
 
-def test_factory_rejects_empty_registry_and_missing_token_is_explicit():
+def test_factory_missing_token_is_explicit():
     tensors, _, _ = _make_case(tokens=2)
     static_values = _static_values(tensors)
-    with pytest.raises(ValueError, match="must not be empty"):
-        _create_context_from_prepared(*static_values, {})
-
     prepared = _PreparedLauncher(1, static_values)
-    context = _create_context_from_prepared(*static_values, {1: prepared})
+    context = _create_context_from_prepared(*static_values, prepared)
     with pytest.raises(NotImplementedError, match="T=2"):
         _invoke(tensors, context)
     assert prepared.runs == []

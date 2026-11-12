@@ -849,127 +849,6 @@ def _direct_routing_finalize(
 
 
 @triton.jit
-def _split128_pair_publish(
-    pair_partials_ptr,
-    pair_epochs_ptr,
-    grid_counter_ptr,
-    packed_sum,
-    token,
-    lane,
-    worker_warp,
-):
-    """Publish one helper CTA's packed half-sum with a release epoch.
-
-    Only worker warp zero owns the 25 meaningful lanes.  Its lanes first
-    write the global pair workspace, then the complete warp executes
-    ``bar.warp.sync``.  The barrier's warp memory ordering makes every lane's
-    store happen before lane zero publishes the current 128-step grid target
-    with a GPU-scope release store.  Reusing the grid target as the epoch
-    makes every token counter advance by exactly 128 per ordered replay.
-    """
-    partials_base = tl.cast(pair_partials_ptr, tl.uint64)
-    epochs_base = tl.cast(pair_epochs_ptr, tl.uint64)
-    grid_counter_base = tl.cast(grid_counter_ptr, tl.uint64)
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred warp0, lane0, lane25, store_lane, leader;
-          .reg .u32 packed;
-          .reg .u64 partial_offset, partial_address;
-          .reg .u64 epoch_offset, epoch_address, grid_target;
-          setp.eq.u32 warp0, $7, 0;
-          setp.eq.u32 lane0, $6, 0;
-          setp.le.u32 lane25, $6, 24;
-          and.pred store_lane, warp0, lane25;
-          and.pred leader, warp0, lane0;
-          mad.lo.u32 packed, $5, 32, $6;
-          mul.wide.u32 partial_offset, packed, 4;
-          add.u64 partial_address, $1, partial_offset;
-          @store_lane st.global.f32 [partial_address], $4;
-          bar.warp.sync 0xffffffff;
-          mul.wide.u32 epoch_offset, $5, 8;
-          add.u64 epoch_address, $2, epoch_offset;
-          @leader ld.relaxed.gpu.global.u64 grid_target, [$3];
-          @leader st.release.gpu.global.u64 [epoch_address], grid_target;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,l,l,l,f,r,r,r",
-        args=[
-            partials_base,
-            epochs_base,
-            grid_counter_base,
-            packed_sum,
-            token,
-            lane,
-            worker_warp,
-        ],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _split128_pair_acquire_and_merge(
-    pair_partials_ptr,
-    pair_epochs_ptr,
-    grid_counter_ptr,
-    packed_sum,
-    token,
-    lane,
-    routing_active,
-):
-    """Acquire the helper epoch, then merge its corresponding packed lane."""
-    partials_base = tl.cast(pair_partials_ptr, tl.uint64)
-    epochs_base = tl.cast(pair_epochs_ptr, tl.uint64)
-    grid_counter_base = tl.cast(grid_counter_ptr, tl.uint64)
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred owner, lane25, active, pending;
-          .reg .u32 packed;
-          .reg .u64 partial_offset, partial_address;
-          .reg .u64 epoch_offset, epoch_address, target, current;
-          .reg .f32 helper;
-          setp.ne.u32 owner, $7, 0;
-          setp.le.u32 lane25, $6, 24;
-          and.pred active, owner, lane25;
-          setp.ne.u32 pending, $6, $6;
-          mad.lo.u32 packed, $5, 32, $6;
-          mul.wide.u32 partial_offset, packed, 4;
-          add.u64 partial_address, $1, partial_offset;
-          mul.wide.u32 epoch_offset, $5, 8;
-          add.u64 epoch_address, $2, epoch_offset;
-          mov.u64 target, 0;
-          mov.u64 current, 0;
-          mov.f32 helper, 0f00000000;
-          @active ld.relaxed.gpu.global.u64 target, [$3];
-        DG_TLE_MHC_SPLIT128_PAIR_WAIT:
-          @active ld.acquire.gpu.global.u64 current, [epoch_address];
-          @active setp.lt.u64 pending, current, target;
-          @pending bra DG_TLE_MHC_SPLIT128_PAIR_WAIT;
-          @active ld.global.f32 helper, [partial_address];
-          add.rn.f32 $0, $4, helper;
-        }
-        """,
-        constraints="=f,l,l,l,f,r,r,r",
-        args=[
-            partials_base,
-            epochs_base,
-            grid_counter_base,
-            packed_sum,
-            token,
-            lane,
-            tl.cast(routing_active, tl.uint32),
-        ],
-        dtype=tl.float32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _direct_routing_tail(
     pre_ready,
     pre_shared,
@@ -1031,760 +910,273 @@ def _direct_routing_tail(
     else:
         routing_active = True
     packed_mask = routing_active & (lane <= JIT_PROJECTION_OUTPUTS)
-    # The staged producer writes projection lanes 0..23 and sqsum lane 24
-    # only; lanes 25..31 are masked because they may contain stale workspace
-    # data from an earlier Graph replay.  The opt-in ILP4 variant keeps four
-    # independent FP32 chains while retaining consecutive split loads in each
-    # loop iteration.  It changes the FP32 association, so it remains an
-    # explicitly benchmarked specialization rather than the default path.
-    if USE_PERSISTENT_ROUTE4:
-        tl.static_assert(PERSISTENT_WORKER_GROUP)
-        tl.static_assert(JIT_STAGED_MATH_WARPS == 4)
-        tl.static_assert(JIT_NUM_SPLITS % JIT_STAGED_MATH_WARPS == 0)
-        partials_base = tl.cast(partials_ptr, tl.uint64)
-        # Keep the whole quarter chain in one inline-PTX region.  Besides using
-        # one accumulator and one load temporary, this makes the quarter stride
-        # explicit in bytes.  FlagTree otherwise reassociates the dynamic
-        # worker-warp term in pointer arithmetic and has generated a 0x8000
-        # quarter stride instead of the required 0x20000 bytes.
-        if USE_ROUTE4_ILP4:
-            # Four independent accumulators expose both load- and arithmetic-
-            # level parallelism.  Each four-load group maps v0..v3 onto
-            # a0..a3; the final merge is (a0+a1)+(a2+a3).
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
-                {
-                  .reg .u32 packed;
-                  .reg .u64 address;
-                  .reg .f32 a0, a1, a2, a3;
-                  .reg .f32 v0, v1, v2, v3;
-                  mad.lo.u32 packed, $3, 32, $4;
-                  mad.wide.u32 address, $2, 131072, $1;
-                  mad.wide.u32 address, packed, 4, address;
-                  mov.f32 a0, 0f00000000;
-                  mov.f32 a1, 0f00000000;
-                  mov.f32 a2, 0f00000000;
-                  mov.f32 a3, 0f00000000;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a2, a2, v2;
-                  add.rn.f32 a3, a3, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a2, a2, v2;
-                  add.rn.f32 a3, a3, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a2, a2, v2;
-                  add.rn.f32 a3, a3, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a2, a2, v2;
-                  add.rn.f32 a3, a3, v3;
-                  add.rn.f32 a0, a0, a1;
-                  add.rn.f32 a2, a2, a3;
-                  add.rn.f32 $0, a0, a2;
-                }
-                """,
-                constraints="=f,l,r,r,r",
-                args=[partials_base, worker_warp, token, lane],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        elif USE_ROUTE4_ILP2:
-            # Two accumulators alternate within each four-load group:
-            # a0+=v0, a1+=v1, a0+=v2, a1+=v3.  Four groups cover the
-            # contiguous 16-split quarter before the final a0+a1 merge.
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
-                {
-                  .reg .u32 packed;
-                  .reg .u64 address;
-                  .reg .f32 a0, a1;
-                  .reg .f32 v0, v1, v2, v3;
-                  mad.lo.u32 packed, $3, 32, $4;
-                  mad.wide.u32 address, $2, 131072, $1;
-                  mad.wide.u32 address, packed, 4, address;
-                  mov.f32 a0, 0f00000000;
-                  mov.f32 a1, 0f00000000;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a0, a0, v2;
-                  add.rn.f32 a1, a1, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a0, a0, v2;
-                  add.rn.f32 a1, a1, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a0, a0, v2;
-                  add.rn.f32 a1, a1, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 a0, a0, v0;
-                  add.rn.f32 a1, a1, v1;
-                  add.rn.f32 a0, a0, v2;
-                  add.rn.f32 a1, a1, v3;
-                  add.rn.f32 $0, a0, a1;
-                }
-                """,
-                constraints="=f,l,r,r,r",
-                args=[partials_base, worker_warp, token, lane],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        elif USE_ROUTE4_WINDOW4 and JIT_NUM_SPLITS == 128:
-            # Split128 doubles each warp's quarter to 32 terms.  Issue eight
-            # independent four-load windows, but consume every value in
-            # strictly increasing split order into the same accumulator.  The
-            # FP32 association therefore remains bitwise-equivalent to the
-            # stable serial quarter reducer while exposing global-memory MLP.
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
-                {
-                  .reg .u32 packed;
-                  .reg .u64 address;
-                  .reg .f32 v0, v1, v2, v3;
-                  mad.lo.u32 packed, $3, 32, $4;
-                  mad.wide.u32 address, $2, 262144, $1;
-                  mad.wide.u32 address, packed, 4, address;
-                  mov.f32 $0, 0f00000000;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                }
-                """,
-                constraints="=f,l,r,r,r",
-                args=[partials_base, worker_warp, token, lane],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        elif USE_ROUTE4_WINDOW4:
-            # Issue a four-load window, then consume v0..v3 in strictly
-            # increasing split order into the same accumulator.  This exposes
-            # memory-level parallelism without changing the serial 16-add
-            # association of the stable route4 quarter reducer.
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
-                {
-                  .reg .u32 packed;
-                  .reg .u64 address;
-                  .reg .f32 v0, v1, v2, v3;
-                  mad.lo.u32 packed, $3, 32, $4;
-                  mad.wide.u32 address, $2, 131072, $1;
-                  mad.wide.u32 address, packed, 4, address;
-                  mov.f32 $0, 0f00000000;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                  add.u64 address, address, 32768;
-                  ld.global.f32 v0, [address];
-                  ld.global.f32 v1, [address+8192];
-                  ld.global.f32 v2, [address+16384];
-                  ld.global.f32 v3, [address+24576];
-                  add.rn.f32 $0, $0, v0;
-                  add.rn.f32 $0, $0, v1;
-                  add.rn.f32 $0, $0, v2;
-                  add.rn.f32 $0, $0, v3;
-                }
-                """,
-                constraints="=f,l,r,r,r",
-                args=[partials_base, worker_warp, token, lane],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        elif USE_SPLIT128_PAIR_ROUTE:
-            # Pair-route gives each CTA only one 64-split half.  Four worker
-            # warps reduce contiguous 16-split quarters: owner CTA t reads
-            # splits 0..63 and helper CTA t+64 reads splits 64..127.
-            tl.static_assert(JIT_NUM_SPLITS == 128)
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
-                {
-                  .reg .u32 packed, half;
-                  .reg .u64 address;
-                  .reg .f32 value;
-                  mad.lo.u32 packed, $3, 32, $4;
-                  shr.u32 half, $5, 6;
-                  mad.wide.u32 address, half, 524288, $1;
-                  mad.wide.u32 address, $2, 131072, address;
-                  mad.wide.u32 address, packed, 4, address;
-                  mov.f32 $0, 0f00000000;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                }
-                """,
-                constraints="=f,l,r,r,r,r",
-                args=[partials_base, worker_warp, token, lane, split],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        elif JIT_NUM_SPLITS == 128:
-            # Split-128 assigns one contiguous 32-split quarter to each worker
-            # warp.  Keep the entire chain in PTX so the dynamic worker-warp
-            # base cannot be reassociated into the split-64 quarter stride.
-            # One accumulator preserves increasing-split association inside
-            # each quarter.
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
-                {
-                  .reg .u32 packed;
-                  .reg .u64 address;
-                  .reg .f32 value;
-                  mad.lo.u32 packed, $3, 32, $4;
-                  mad.wide.u32 address, $2, 262144, $1;
-                  mad.wide.u32 address, packed, 4, address;
-                  mov.f32 $0, 0f00000000;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                  add.u64 address, address, 8192;
-                  ld.global.f32 value, [address];
-                  add.rn.f32 $0, $0, value;
-                }
-                """,
-                constraints="=f,l,r,r,r",
-                args=[partials_base, worker_warp, token, lane],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        else:
-            tl.static_assert(JIT_NUM_SPLITS == 64)
-            worker_sum = tl.inline_asm_elementwise(
-                asm="""
+    # Production admits only split128 persistent route4-serial.
+    tl.static_assert(PERSISTENT_WORKER_GROUP)
+    tl.static_assert(JIT_STAGED_MATH_WARPS == 4)
+    tl.static_assert(JIT_NUM_SPLITS == 128)
+    partials_base = tl.cast(partials_ptr, tl.uint64)
+    # Split-128 assigns one contiguous 32-split quarter to each worker
+    # warp.  Keep the entire chain in PTX so the dynamic worker-warp
+    # base cannot be reassociated into the split-64 quarter stride.
+    # One accumulator preserves increasing-split association inside
+    # each quarter.
+    worker_sum = tl.inline_asm_elementwise(
+        asm="""
+        {
+          .reg .u32 packed;
+          .reg .u64 address;
+          .reg .f32 value;
+          mad.lo.u32 packed, $3, 32, $4;
+          mad.wide.u32 address, $2, 262144, $1;
+          mad.wide.u32 address, packed, 4, address;
+          mov.f32 $0, 0f00000000;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+          add.u64 address, address, 8192;
+          ld.global.f32 value, [address];
+          add.rn.f32 $0, $0, value;
+        }
+        """,
+        constraints="=f,l,r,r,r",
+        args=[partials_base, worker_warp, token, lane],
+        dtype=tl.float32,
+        is_pure=False,
+        pack=1,
+    )
+    worker_sum = tl.where(lane <= JIT_PROJECTION_OUTPUTS, worker_sum, 0.0)
+    # Every lane writes a defined value.  Lanes 25..31 are zero rather
+    # than stale shared data, although worker warp zero masks them during
+    # the merge and subsequent projection/Sinkhorn work.
+    route4_store_pointer = tle.gpu.local_ptr(route4_shared, (worker_warp, lane))
+    route4_store_address = tl.inline_asm_elementwise(
+        asm="mov.u32 $0, $1;",
+        constraints="=r,r",
+        args=[route4_store_pointer],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    _ = tl.inline_asm_elementwise(
+        asm="st.shared.f32 [$1], $2; mov.u32 $0, 0;",
+        constraints="=r,r,f",
+        args=[route4_store_address, worker_sum],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+    route4_row0_pointer = tle.gpu.local_ptr(route4_shared, (0, lane))
+    route4_row0_address = tl.inline_asm_elementwise(
+        asm="mov.u32 $0, $1;",
+        constraints="=r,r",
+        args=[route4_row0_pointer],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    # TLE currently aliases an extra alloc_barrier with a live persistent
+    # barrier in this nested warp-specialized region.  Reserve hardware
+    # barrier 5 explicitly; generated TLE barriers occupy IDs 0..4.  All
+    # four worker warps execute it, while only worker warp zero loads.
+    quarter0, quarter1, quarter2, quarter3 = tl.inline_asm_elementwise(
+        asm="""
             {
-              .reg .u32 packed;
-              .reg .u64 address;
-              .reg .f32 value;
-              mad.lo.u32 packed, $3, 32, $4;
-              mad.wide.u32 address, $2, 131072, $1;
-              mad.wide.u32 address, packed, 4, address;
+              .reg .pred active;
+              bar.sync 5, 128;
+              setp.ne.u32 active, $5, 0;
               mov.f32 $0, 0f00000000;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
-              add.u64 address, address, 8192;
-              ld.global.f32 value, [address];
-              add.rn.f32 $0, $0, value;
+              mov.f32 $1, 0f00000000;
+              mov.f32 $2, 0f00000000;
+              mov.f32 $3, 0f00000000;
+              @active ld.shared.f32 $0, [$4];
+              @active ld.shared.f32 $1, [$4+128];
+              @active ld.shared.f32 $2, [$4+256];
+              @active ld.shared.f32 $3, [$4+384];
             }
             """,
-                constraints="=f,l,r,r,r",
-                args=[partials_base, worker_warp, token, lane],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
-        worker_sum = tl.where(lane <= JIT_PROJECTION_OUTPUTS, worker_sum, 0.0)
-        # Every lane writes a defined value.  Lanes 25..31 are zero rather
-        # than stale shared data, although worker warp zero masks them during
-        # the merge and subsequent projection/Sinkhorn work.
-        route4_store_pointer = tle.gpu.local_ptr(route4_shared, (worker_warp, lane))
-        route4_store_address = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[route4_store_pointer],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
+        constraints="=&f,=&f,=&f,=&f,r,r",
+        args=[
+            route4_row0_address,
+            tl.cast(packed_mask, tl.uint32),
+        ],
+        dtype=(
+            tl.float32,
+            tl.float32,
+            tl.float32,
+            tl.float32,
+        ),
+        is_pure=False,
+        pack=1,
+    )
+    packed_sum = (quarter0 + quarter1) + (quarter2 + quarter3)
+    _direct_routing_finalize(
+        pre_ready,
+        pre_shared,
+        route4_shared,
+        mix_scales_ptr,
+        mix_bases_ptr,
+        new_post_mix_ptr,
+        new_comb_res_mix_ptr,
+        packed_sum,
+        lane,
+        routing_active,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+        PERSISTENT_WORKER_GROUP,
+        USE_EARLY_PRE_SYNC,
+    )
+
+
+@triton.jit
+def _direct_routing_tail_single_warp(
+    pre_ready,
+    pre_shared,
+    partials_ptr,
+    mix_scales_ptr,
+    mix_bases_ptr,
+    new_post_mix_ptr,
+    new_comb_res_mix_ptr,
+    token,
+    hc_norm_eps,
+    hc_pre_eps,
+    hc_post_scale,
+    sinkhorn_eps,
+):
+    """Compile-only fallback for the non-persistent structural branch.
+
+    Production dispatch always selects the persistent route4 specialization,
+    but FlagTree still compiles this sibling warp-specialized region.  Keep
+    its original increasing-split reduction without reintroducing the removed
+    research variants.
+    """
+    lane = tl.inline_asm_elementwise(
+        asm="mov.u32 $0, %laneid;",
+        constraints="=r",
+        args=[],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    packed_mask = lane <= JIT_PROJECTION_OUTPUTS
+    packed_sum = 0.0
+    for source_split in tl.static_range(0, JIT_NUM_SPLITS):
+        packed_sum += tl.load(
+            partials_ptr
+            + source_split * JIT_TOKENS * JIT_BLOCK_N
+            + token * JIT_BLOCK_N
+            + lane,
+            mask=packed_mask,
+            other=0.0,
         )
-        _ = tl.inline_asm_elementwise(
-            asm="st.shared.f32 [$1], $2; mov.u32 $0, 0;",
-            constraints="=r,r,f",
-            args=[route4_store_address, worker_sum],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
-        route4_row0_pointer = tle.gpu.local_ptr(route4_shared, (0, lane))
-        route4_row0_address = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[route4_row0_pointer],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-        # TLE currently aliases an extra alloc_barrier with a live persistent
-        # barrier in this nested warp-specialized region.  Reserve hardware
-        # barrier 5 explicitly; generated TLE barriers occupy IDs 0..4.  All
-        # four worker warps execute it, while only worker warp zero loads.
-        quarter0, quarter1, quarter2, quarter3 = tl.inline_asm_elementwise(
-            asm="""
-                {
-                  .reg .pred active;
-                  bar.sync 5, 128;
-                  setp.ne.u32 active, $5, 0;
-                  mov.f32 $0, 0f00000000;
-                  mov.f32 $1, 0f00000000;
-                  mov.f32 $2, 0f00000000;
-                  mov.f32 $3, 0f00000000;
-                  @active ld.shared.f32 $0, [$4];
-                  @active ld.shared.f32 $1, [$4+128];
-                  @active ld.shared.f32 $2, [$4+256];
-                  @active ld.shared.f32 $3, [$4+384];
-                }
-                """,
-            constraints="=&f,=&f,=&f,=&f,r,r",
-            args=[
-                route4_row0_address,
-                tl.cast(packed_mask, tl.uint32),
-            ],
-            dtype=(
-                tl.float32,
-                tl.float32,
-                tl.float32,
-                tl.float32,
-            ),
-            is_pure=False,
-            pack=1,
-        )
-        packed_sum = (quarter0 + quarter1) + (quarter2 + quarter3)
-    elif USE_DIRECT_TAIL_ILP4:
-        tl.static_assert(JIT_NUM_SPLITS % 4 == 0)
-        packed_sum0 = 0.0
-        packed_sum1 = 0.0
-        packed_sum2 = 0.0
-        packed_sum3 = 0.0
-        for source_split in tl.static_range(0, JIT_NUM_SPLITS, 4):
-            packed_sum0 += tl.load(
-                partials_ptr
-                + source_split * JIT_TOKENS * JIT_BLOCK_N
-                + token * JIT_BLOCK_N
-                + lane,
-                mask=packed_mask,
-                other=0.0,
-            )
-            packed_sum1 += tl.load(
-                partials_ptr
-                + (source_split + 1) * JIT_TOKENS * JIT_BLOCK_N
-                + token * JIT_BLOCK_N
-                + lane,
-                mask=packed_mask,
-                other=0.0,
-            )
-            packed_sum2 += tl.load(
-                partials_ptr
-                + (source_split + 2) * JIT_TOKENS * JIT_BLOCK_N
-                + token * JIT_BLOCK_N
-                + lane,
-                mask=packed_mask,
-                other=0.0,
-            )
-            packed_sum3 += tl.load(
-                partials_ptr
-                + (source_split + 3) * JIT_TOKENS * JIT_BLOCK_N
-                + token * JIT_BLOCK_N
-                + lane,
-                mask=packed_mask,
-                other=0.0,
-            )
-        packed_sum = (packed_sum0 + packed_sum1) + (packed_sum2 + packed_sum3)
-    else:
-        packed_sum = 0.0
-        # Preserve the CUDA winner's increasing-split accumulation order.
-        for source_split in tl.static_range(0, JIT_NUM_SPLITS):
-            packed_sum += tl.load(
-                partials_ptr
-                + source_split * JIT_TOKENS * JIT_BLOCK_N
-                + token * JIT_BLOCK_N
-                + lane,
-                mask=packed_mask,
-                other=0.0,
-            )
-    if USE_SPLIT128_PAIR_ROUTE:
-        tl.static_assert(JIT_NUM_SPLITS == 128)
-        tl.static_assert(USE_PERSISTENT_ROUTE4)
-        if split >= JIT_TAIL_OWNER_CTAS:
-            _split128_pair_publish(
-                pair_route_partials_ptr,
-                pair_route_epochs_ptr,
-                grid_counter_ptr,
-                packed_sum,
-                token,
-                lane,
-                worker_warp,
-            )
-        else:
-            packed_sum = _split128_pair_acquire_and_merge(
-                pair_route_partials_ptr,
-                pair_route_epochs_ptr,
-                grid_counter_ptr,
-                packed_sum,
-                token,
-                lane,
-                routing_active,
-            )
-            _direct_routing_finalize(
-                pre_ready,
-                pre_shared,
-                route4_shared,
-                mix_scales_ptr,
-                mix_bases_ptr,
-                new_post_mix_ptr,
-                new_comb_res_mix_ptr,
-                packed_sum,
-                lane,
-                routing_active,
-                hc_norm_eps,
-                hc_pre_eps,
-                hc_post_scale,
-                sinkhorn_eps,
-                PERSISTENT_WORKER_GROUP,
-                USE_EARLY_PRE_SYNC,
-            )
-    elif USE_PERSISTENT_ROUTE4 and USE_ROUTE4_WARP0_FINALIZE:
-        # ``worker_warp`` is uniform within each physical warp.  The three
-        # non-owner warps contribute their 96 arrivals immediately and leave
-        # all routing-finalize math to warp zero.  Warp zero's helper call adds
-        # the remaining 32 arrivals after publishing Pre.
-        if worker_warp == 0:
-            _direct_routing_finalize(
-                pre_ready,
-                pre_shared,
-                route4_shared,
-                mix_scales_ptr,
-                mix_bases_ptr,
-                new_post_mix_ptr,
-                new_comb_res_mix_ptr,
-                packed_sum,
-                lane,
-                True,
-                hc_norm_eps,
-                hc_pre_eps,
-                hc_post_scale,
-                sinkhorn_eps,
-                True,
-                USE_EARLY_PRE_SYNC,
-            )
-        else:
-            tle.gpu.barrier_arrive(pre_ready)
-    else:
-        _direct_routing_finalize(
-            pre_ready,
-            pre_shared,
-            route4_shared,
-            mix_scales_ptr,
-            mix_bases_ptr,
-            new_post_mix_ptr,
-            new_comb_res_mix_ptr,
-            packed_sum,
-            lane,
-            routing_active,
-            hc_norm_eps,
-            hc_pre_eps,
-            hc_post_scale,
-            sinkhorn_eps,
-            PERSISTENT_WORKER_GROUP,
-            USE_EARLY_PRE_SYNC,
-        )
+    _direct_routing_finalize(
+        pre_ready,
+        pre_shared,
+        pre_shared,
+        mix_scales_ptr,
+        mix_bases_ptr,
+        new_post_mix_ptr,
+        new_comb_res_mix_ptr,
+        packed_sum,
+        lane,
+        True,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+        False,
+        False,
+    )
 
 
 @triton.jit
@@ -2028,7 +1420,7 @@ def _persistent_staged_producer_hidden(
             _read_globaltimer_ns(),
         )
     physical_thread = _physical_thread_id_x()
-    _ = _monotonic_grid_arrive_and_wait(
+    barrier_ticket = _monotonic_grid_arrive_and_wait(  # noqa: F841
         tl.cast(grid_counter_ptr, tl.uint64), physical_thread
     )
     # Workers arrive here before waiting.  The default partition reaches the
@@ -2590,7 +1982,7 @@ def _t32_wgmma_bm64_split_tf32_kernel(
             _read_globaltimer_ns(),
         )
     physical_thread = _physical_thread_id_x()
-    barrier_ticket = _monotonic_grid_arrive_and_wait(
+    barrier_ticket = _monotonic_grid_arrive_and_wait(  # noqa: F841
         tl.cast(grid_counter_ptr, tl.uint64), physical_thread
     )
     # The leader performs the acquire poll above.  Propagate that acquire to
@@ -2644,7 +2036,7 @@ def _t32_wgmma_bm64_split_tf32_kernel(
                             ),
                         ),
                         (
-                            _direct_routing_tail,
+                            _direct_routing_tail_single_warp,
                             (
                                 pre_ready,
                                 pre_shared,
@@ -2654,24 +2046,10 @@ def _t32_wgmma_bm64_split_tf32_kernel(
                                 new_post_mix_ptr + token_state_base,
                                 new_comb_res_mix_ptr + token_comb_base,
                                 token,
-                                split,
                                 hc_norm_eps,
                                 hc_pre_eps,
                                 hc_post_scale,
                                 sinkhorn_eps,
-                                pre_shared,
-                                partials_ptr,
-                                grid_counter_ptr,
-                                grid_counter_ptr,
-                                USE_DIRECT_TAIL_ILP4,
-                                False,
-                                False,
-                                False,
-                                False,
-                                False,
-                                False,
-                                False,
-                                False,
                             ),
                         ),
                     ],

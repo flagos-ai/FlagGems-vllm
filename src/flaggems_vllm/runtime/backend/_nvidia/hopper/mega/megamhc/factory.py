@@ -18,10 +18,7 @@ from __future__ import annotations
 
 import operator
 import threading
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -30,25 +27,11 @@ from .api import (
     MegaMHCContext,
     MegaMHCProfile,
     MegaMHCWorkspace,
+    _normalize_alignments,
 )
 
-
-class PreparedMegaMHCLauncher(Protocol):
-    """Exact ABI exposed by a launch-free prepared TLE specialization."""
-
-    token_count: int
-    dynamic_alignments: Tuple[int, ...]
-    static_bound_values: Tuple[object, ...]
-    static_alignments: Tuple[int, ...]
-    device: object
-    stream_handle: Optional[int]
-    owner_thread_id: int
-
-    def validate_environment(self) -> None: ...
-
-    def validate_static_bindings(self, values: Sequence[object]) -> None: ...
-
-    def run_trusted(self, dynamic_values: Sequence[object]) -> None: ...
+if TYPE_CHECKING:
+    from .tle.prepared_launcher import PreparedCompiledLauncher
 
 
 def _exact_token(value: object, name: str) -> int:
@@ -61,27 +44,6 @@ def _exact_token(value: object, name: str) -> int:
     if token <= 0:
         raise ValueError(f"{name} must be positive")
     return token
-
-
-def _alignments(values: object, count: int, name: str) -> Tuple[int, ...]:
-    try:
-        raw_values = tuple(values)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise TypeError(f"{name} must be an iterable") from exc
-    if len(raw_values) != count:
-        raise ValueError(f"{name} must contain exactly {count} values")
-    result = []
-    for value in raw_values:
-        if isinstance(value, bool):
-            raise TypeError(f"{name} must contain exact integers")
-        try:
-            alignment = int(operator.index(value))
-        except TypeError as exc:
-            raise TypeError(f"{name} must contain exact integers") from exc
-        if alignment <= 0 or alignment & (alignment - 1):
-            raise ValueError(f"{name} values must be positive powers of two")
-        result.append(alignment)
-    return tuple(result)
 
 
 def _device(value: object) -> torch.device:
@@ -111,130 +73,66 @@ def _stream_handle(value: object, device: torch.device) -> Optional[int]:
     return handle
 
 
-@dataclass(frozen=True)
-class _TokenBinding:
-    prepared: PreparedMegaMHCLauncher
-    dynamic_alignments: Tuple[int, ...]
-
-
-class MegaMHCPreparedLauncherRegistry:
-    """Immutable O(1) exact-token dispatch over prepared launchers."""
+class _ExactPreparedLauncher:
+    """Adapt one prepared token specialization to the public launcher ABI."""
 
     def __init__(
         self,
-        prepared_launchers: Mapping[int, PreparedMegaMHCLauncher],
+        prepared: PreparedCompiledLauncher,
         static_tensors: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> None:
-        if not isinstance(prepared_launchers, Mapping):
-            raise TypeError("prepared_launchers must be a mapping")
-        if not prepared_launchers:
-            raise ValueError("prepared_launchers must not be empty")
-
+        token = _exact_token(prepared.token_count, "prepared launcher token_count")
+        prepared.validate_environment()
         owner_thread_id = threading.get_ident()
-        bindings = {}
-        registry_device = None
-        registry_stream = None
-        static_alignment_rows = []
-        for raw_token, prepared in prepared_launchers.items():
-            token = _exact_token(raw_token, "prepared launcher registry key")
-            prepared_token = _exact_token(
-                prepared.token_count, "prepared launcher token_count"
-            )
-            if prepared_token != token:
-                raise ValueError(
-                    f"registry key T={token} != launcher token_count={prepared_token}"
-                )
-            if token in bindings:
-                raise ValueError(f"duplicate prepared launcher for T={token}")
-            prepared.validate_environment()
-            launcher_owner = _exact_token(
-                prepared.owner_thread_id, "prepared launcher owner_thread_id"
-            )
-            if launcher_owner != owner_thread_id:
-                raise RuntimeError(
-                    "prepared launcher belongs to a different host thread"
-                )
-            launcher_device = _device(prepared.device)
-            launcher_stream = _stream_handle(prepared.stream_handle, launcher_device)
-            if registry_device is None:
-                registry_device = launcher_device
-                registry_stream = launcher_stream
-            elif (
-                launcher_device != registry_device or launcher_stream != registry_stream
-            ):
-                raise ValueError(
-                    "all prepared launchers must share one device and CUDA stream"
-                )
-
-            static_values = tuple(prepared.static_bound_values)
-            if len(static_values) != 4:
-                raise ValueError(
-                    "prepared launcher static_bound_values must contain four tensors"
-                )
-            if any(
-                actual is not expected
-                for actual, expected in zip(static_values, static_tensors)
-            ):
-                raise RuntimeError(
-                    f"prepared launcher T={token} is bound to different static tensors"
-                )
-            static_validator = getattr(prepared, "validate_static_bindings", None)
-            if not callable(static_validator):
-                raise TypeError(
-                    "prepared launcher must expose validate_static_bindings()"
-                )
-            static_validator(static_tensors)
-            dynamic_alignments = _alignments(
-                prepared.dynamic_alignments,
-                8,
-                f"prepared launcher T={token} dynamic_alignments",
-            )
-            static_alignment_rows.append(
-                _alignments(
-                    prepared.static_alignments,
-                    4,
-                    f"prepared launcher T={token} static_alignments",
-                )
-            )
-            bindings[token] = _TokenBinding(prepared, dynamic_alignments)
-
-        self._bindings = MappingProxyType(bindings)
-        self._supported_tokens = frozenset(bindings)
-        self._device = registry_device
-        self._stream_handle = registry_stream
-        self._owner_thread_id = owner_thread_id
-        self._static_alignments = tuple(
-            max(row[index] for row in static_alignment_rows) for index in range(4)
+        launcher_owner = _exact_token(
+            prepared.owner_thread_id, "prepared launcher owner_thread_id"
         )
+        if launcher_owner != owner_thread_id:
+            raise RuntimeError("prepared launcher belongs to a different host thread")
 
-    @property
-    def supported_tokens(self) -> frozenset[int]:
-        return self._supported_tokens
+        device = _device(prepared.device)
+        stream_handle = _stream_handle(prepared.stream_handle, device)
+        static_values = tuple(prepared.static_bound_values)
+        if len(static_values) != 4:
+            raise ValueError(
+                "prepared launcher static_bound_values must contain four tensors"
+            )
+        if any(
+            actual is not expected
+            for actual, expected in zip(static_values, static_tensors)
+        ):
+            raise RuntimeError(
+                f"prepared launcher T={token} is bound to different static tensors"
+            )
+        static_validator = getattr(prepared, "validate_static_bindings", None)
+        if not callable(static_validator):
+            raise TypeError("prepared launcher must expose validate_static_bindings()")
+        static_validator(static_tensors)
 
-    @property
-    def static_alignments(self) -> Tuple[int, int, int, int]:
-        return self._static_alignments  # type: ignore[return-value]
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
-
-    @property
-    def stream_handle(self) -> Optional[int]:
-        return self._stream_handle
-
-    @property
-    def owner_thread_id(self) -> int:
-        return self._owner_thread_id
+        self._prepared = prepared
+        self._token = token
+        self.supported_tokens = frozenset((token,))
+        self._dynamic_alignments = _normalize_alignments(
+            prepared.dynamic_alignments,
+            count=8,
+            name=f"prepared launcher T={token} dynamic_alignments",
+        )
+        self.static_alignments = _normalize_alignments(
+            prepared.static_alignments,
+            count=4,
+            name=f"prepared launcher T={token} static_alignments",
+        )
+        self.device = device
+        self.stream_handle = stream_handle
+        self.owner_thread_id = owner_thread_id
 
     def dynamic_alignments(self, tokens: int) -> Tuple[int, ...]:
-        try:
-            return self._bindings[tokens].dynamic_alignments
-        except KeyError as exc:
+        if tokens != self._token:
             raise NotImplementedError(
                 f"unsupported Hopper MegaMHC profile: T={tokens} has no "
                 "compiled specialization"
-            ) from exc
+            )
+        return self._dynamic_alignments
 
     def launch(
         self,
@@ -250,14 +148,12 @@ class MegaMHCPreparedLauncherRegistry:
     ) -> None:
         del workspace
         tokens = int(x.shape[0])
-        try:
-            binding = self._bindings[tokens]
-        except KeyError as exc:
+        if tokens != self._token:
             raise NotImplementedError(
                 f"unsupported Hopper MegaMHC profile: T={tokens} has no "
                 "compiled specialization"
-            ) from exc
-        binding.prepared.run_trusted(
+            )
+        self._prepared.run_trusted(
             (
                 x,
                 residual,
@@ -276,34 +172,31 @@ def _create_context_from_prepared(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
     norm_weight: torch.Tensor,
-    prepared_launchers: Mapping[int, PreparedMegaMHCLauncher],
+    prepared: PreparedCompiledLauncher,
     *,
     profile: MegaMHCProfile = DEEPSEEK_V4_FLASH_PROFILE,
 ) -> MegaMHCContext:
     """Bind an internally prepared launcher to one layer and ordered stream.
 
     Compilation and launcher preparation must finish before this function.
-    The registry keys are the sole source of admitted token specializations;
-    callers cannot provide a divergent ``supported_tokens`` set.
+    The prepared launcher's token count is the sole admitted specialization.
     """
     static_tensors = (fn, hc_scale, hc_base, norm_weight)
-    registry = MegaMHCPreparedLauncherRegistry(prepared_launchers, static_tensors)
-    if registry.device.type == "cuda":
-        capability = torch.cuda.get_device_capability(registry.device)
+    launcher = _ExactPreparedLauncher(prepared, static_tensors)
+    if launcher.device.type == "cuda":
+        capability = torch.cuda.get_device_capability(launcher.device)
         if capability[0] != 9:
             raise NotImplementedError(
                 "unsupported Hopper MegaMHC profile: prepared launchers "
                 f"require SM90, got sm_{capability[0]}{capability[1]}"
             )
-        current_stream = torch.cuda.current_stream(registry.device)
-        if int(current_stream.cuda_stream) != registry.stream_handle:
-            raise RuntimeError(
-                "prepared launcher registry belongs to a different CUDA stream"
-            )
+        current_stream = torch.cuda.current_stream(launcher.device)
+        if int(current_stream.cuda_stream) != launcher.stream_handle:
+            raise RuntimeError("prepared launcher belongs to a different CUDA stream")
     workspace = MegaMHCWorkspace(
-        device=registry.device,
-        stream_handle=registry.stream_handle,
-        state=registry,
+        device=launcher.device,
+        stream_handle=launcher.stream_handle,
+        state=launcher,
     )
     return MegaMHCContext.bind(
         profile=profile,
@@ -312,7 +205,7 @@ def _create_context_from_prepared(
         hc_base=hc_base,
         norm_weight=norm_weight,
         workspace=workspace,
-        launcher=registry,
+        launcher=launcher,
         trusted_fast_path=True,
     )
 
@@ -405,7 +298,7 @@ def create_mega_mhc_context(
             hc_scale,
             hc_base,
             norm_weight,
-            {prepared.token_count: prepared},
+            prepared,
             profile=profile,
         )
 
