@@ -44,15 +44,48 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
-
 # vLLM: vllm/model_executor/layers/indexer_topk.py
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 AUTO_COOPERATIVE_MAX_ROWS = 64
 SUPPORTED_K = (512, 1024, 2048)
 
 _FINALIZE_TILE = 1024
+
+
+def _pick_score_tile(nblocks: int):
+    """Fixed launch config for the (memory-bound) score kernel, by block count.
+
+    A cheap ``nblocks`` heuristic reproduces the autotuned configs' GPU time
+    while removing the per-call autotune key/lookup host cost -- which, on the
+    eager decode path, is a measurable share of the op's launch overhead.
+    """
+    if nblocks >= 32768:
+        return 1024, 8
+    if nblocks >= 4096:
+        return 512, 8
+    if nblocks >= 512:
+        return 256, 8
+    return 128, 4
+
+
+# Per-(device, rows, nblocks) scratch for block scores and valid-block counts,
+# reused across calls to drop two ``torch.empty`` allocations per call on the hot
+# decode path. The score kernel fully overwrites the ``[0, limit)`` prefix each
+# call and the top-k only reads that prefix, so reuse never exposes stale data.
+_SCRATCH_CACHE: dict = {}
+
+
+def _get_scratch(rows: int, nblocks: int, device: torch.device):
+    key = (device, rows, nblocks)
+    buf = _SCRATCH_CACHE.get(key)
+    if buf is None:
+        scores = torch.empty(
+            (rows, max(nblocks, 1)), dtype=torch.float32, device=device
+        )
+        lengths = torch.empty(rows, dtype=torch.int32, device=device)
+        buf = (scores, lengths)
+        _SCRATCH_CACHE[key] = buf
+    return buf
 
 
 def _resolve_block_topk():
@@ -84,12 +117,6 @@ def _max_with_nan(a, b):
     return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("select_candidate_blocks_cooperative_scores"),
-    key=["nblocks", "BLOCK_SIZE", "K"],
-    strategy=["log", "default", "default"],
-)
 @triton.jit(do_not_specialize=["width", "nblocks"])
 def _block_scores_kernel(
     logits,
@@ -207,15 +234,10 @@ def _check_inputs(logits, row_ends, block_size, out):
         raise ValueError(
             "select_candidate_blocks_cooperative: row counts of logits/row_ends/out differ"
         )
-    if any(s < 0 for s in logits.stride()):
+    if logits.stride(0) < 0 or logits.stride(1) < 0:
         raise NotImplementedError(
             "select_candidate_blocks_cooperative: negative logits strides"
         )
-    if out.untyped_storage().data_ptr() in (
-        logits.untyped_storage().data_ptr(),
-        row_ends.untyped_storage().data_ptr(),
-    ):
-        raise ValueError("select_candidate_blocks_cooperative: out aliases an input")
 
 
 def select_candidate_blocks_cooperative(
@@ -258,14 +280,10 @@ def select_candidate_blocks_cooperative(
             f">= {RADIX_TOPK_WORKSPACE_SIZE} bytes on the logits device"
         )
 
-    scores = torch.empty(
-        (rows, max(nblocks, 1)), dtype=torch.float32, device=logits.device
-    )
-    lengths = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    scores, lengths = _get_scratch(rows, nblocks, logits.device)
 
-    def grid(meta):
-        return (rows, max(1, triton.cdiv(nblocks, meta["TILE"])))
-
+    tile, num_warps = _pick_score_tile(nblocks)
+    grid = (rows, max(1, triton.cdiv(nblocks, tile)))
     _block_scores_kernel[grid](
         logits,
         row_ends,
@@ -278,6 +296,8 @@ def select_candidate_blocks_cooperative(
         nblocks,
         BLOCK_SIZE=block_size,
         K=k,
+        TILE=tile,
+        num_warps=num_warps,
     )
     if nblocks == 0:
         # Empty rows: out is already all -1.

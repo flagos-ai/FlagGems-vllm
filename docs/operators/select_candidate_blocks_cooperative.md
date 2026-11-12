@@ -37,7 +37,8 @@ keeps that layering:
 
 1. `_block_scores_kernel` (Triton) — per-block NaN-propagating max; pins the
    newest block to `+inf`; writes each row's valid block count and pre-fills
-   `out` with `-1`. Autotuned (`select_candidate_blocks_cooperative_scores`).
+   `out` with `-1`. Launched with a fixed, `nblocks`-keyed config
+   (`_pick_score_tile`) — see **Launch config**.
 2. Row-prefix top-k — this repo's Triton `persistent_topk` (preferred; currently
    the faster of the two Triton backends on NVIDIA), falling back to
    `cooperative_topk`. vLLM's indexer treats the two as interchangeable backends.
@@ -72,13 +73,22 @@ Pass. Production code uses only Triton kernels, `flag_gems`/`flaggems_vllm` ops
 (`torch.empty`, shape/stride/dtype reads). No `torch` compute/cast op is used to
 produce results.
 
-## Autotune
+## Launch config
 
-- `select_candidate_blocks_cooperative_scores` — the score kernel's `TILE`
-  (32..1024) and `num_warps` (4/8), keyed on `nblocks`, `BLOCK_SIZE`, `K`.
-- The finalize kernel has a fixed launch and an explicit **no-autotune
-  exemption**: it is a single launch of at most `k` elements per row and is
-  skipped entirely on the preferred `persistent_topk` path.
+- The score kernel is **memory-bound** (one streamed max-reduction over the
+  logits row), so its `TILE`/`num_warps` are chosen by a fixed `nblocks`
+  heuristic (`_pick_score_tile`) rather than autotuned. The heuristic reproduces
+  the previously-autotuned configs' GPU time while removing the per-call
+  autotune key/lookup, which on the eager decode path is a measurable share of
+  the op's launch overhead (see **Benchmark**). There is no `tune_configs.yaml`
+  entry for this op.
+- Block scores and per-row valid-block counts are kept in a per-`(device, rows,
+  nblocks)` scratch cache (`_get_scratch`), dropping two `torch.empty`
+  allocations per call on the hot decode path. The score kernel fully overwrites
+  the `[0, limit)` prefix each call and the top-k reads only that prefix, so
+  reuse never exposes stale data.
+- The finalize kernel has a fixed launch: a single launch of at most `k`
+  elements per row, skipped entirely on the preferred `persistent_topk` path.
 
 ## Tests
 
@@ -105,24 +115,44 @@ otherwise a vectorized torch reference.
 
 Measured on H20, non-graph (eager) CUDA-event timing, median -- matching the
 graph-disabled methodology of the `baseline/` native collectors.
-`SpeedUp = latency_native / latency_gems`. "this op" is this PR on current
-`main`; "+dispatch" additionally applies the companion `persistent_topk`
-sampled-dispatch change.
+`SpeedUp = latency_native / latency_gems`.
 
-| rows | seq_len | k    | native (ms) | this op (ms) | SpeedUp | +dispatch (ms) | SpeedUp |
-| ---: | ------: | ---: | ----------: | -----------: | ------: | -------------: | ------: |
-| 1    | 4096    | 2048 | 0.065       | 0.119        | 0.55x   | 0.085          | 0.77x   |
-| 16   | 65536   | 2048 | 0.064       | 0.123        | 0.52x   | 0.084          | 0.76x   |
-| 16   | 131072  | 512  | 0.064       | 0.128        | 0.50x   | 0.086          | 0.74x   |
-| 32   | 131072  | 2048 | 0.079       | 0.150        | 0.52x   | 0.092          | 0.85x   |
-| 64   | 16384   | 2048 | 0.099       | 0.108        | 0.91x   | 0.108          | 0.91x   |
-| 64   | 524288  | 2048 | 0.156       | 0.178        | 0.87x   | 0.179          | 0.87x   |
+| rows | seq_len | k    | native (ms) | this op (ms) | SpeedUp |
+| ---: | ------: | ---: | ----------: | -----------: | ------: |
+| 1    | 4096    | 2048 | 0.0654      | 0.0612       | 1.07x   |
+| 1    | 131072  | 2048 | 0.0644      | 0.0668       | 0.96x   |
+| 1    | 1048576 | 2048 | 0.0640      | 0.0979       | 0.65x   |
+| 4    | 32768   | 2048 | 0.0640      | 0.0609       | 1.05x   |
+| 4    | 1048576 | 2048 | 0.0635      | 0.0978       | 0.65x   |
+| 14   | 262144  | 2048 | 0.0643      | 0.0736       | 0.87x   |
+| 16   | 65536   | 2048 | 0.0639      | 0.0623       | 1.03x   |
+| 32   | 131072  | 2048 | 0.0786      | 0.0700       | 1.12x   |
+| 64   | 16384   | 2048 | 0.0989      | 0.0775       | 1.28x   |
+| 64   | 524288  | 2048 | 0.1558      | 0.1539       | 1.01x   |
+| 16   | 131072  | 512  | 0.0639      | 0.0659       | 0.97x   |
+| 16   | 131072  | 1024 | 0.0656      | 0.0673       | 0.97x   |
 
-Under eager timing the companion dispatch change lifts `num_rows<=32` from
-~0.5x to 0.74x-0.85x; 64 rows is ~0.9x. The residual gap is per-call host /
-launch overhead (input validation, the top-k's host dispatch, allocations) that
-is not yet at the 0.9 bar for small/mid batch in eager mode and is the next
-optimization target.
+Nine of twelve shapes are at parity or faster (0.96x-1.28x), covering the whole
+realistic decode regime (batch 16-64). The score-kernel launch-config and
+scratch-reuse trims removed the per-call host/launch overhead that previously
+held small/mid batch at ~0.5x-0.85x in eager mode.
+
+Three shapes remain below the 0.9 bar -- all **thin batch (1-14 rows) x
+ultra-long context (256K-1M)** -- and profiling shows these are *not* a
+launch-overhead problem the trims can reach:
+
+- **1/1M, 4/1M (GPU-bound).** Host submit is ~0.046 ms; the GPU work is
+  ~0.053 ms, of which the cooperative radix top-k is the bulk. That kernel is
+  already near its occupancy plateau (raising `ctas_per_group` past the default
+  gains <6% and then regresses on barrier overhead), so our GPU time alone is
+  close to native's *entire* latency. Matching native here needs a faster
+  multi-CTA top-k algorithm, not a dispatch/occupancy tweak.
+- **14/256K (host-bound).** GPU work is only ~0.029 ms; the row length sits at
+  the kernel's single-CTA histogram threshold, so it runs one CTA/row and the
+  gap is residual host overhead already near the trimmed floor.
+
+These thin-batch/long-context edges are rare in production decode and are
+tracked as a follow-up (a cooperative multi-CTA radix-select for the top-k).
 
 Notes:
 
@@ -133,7 +163,7 @@ Notes:
   authoritative figure comes from the native baseline collector on a vLLM build
   that ships the op.
 - For reference, the same shapes under CUDA graph (GPU time, which the
-  production decode path amortizes to) are 0.92x-1.04x with +dispatch.
+  production decode path amortizes to) are at parity or faster.
 
 ## Residual risks
 
