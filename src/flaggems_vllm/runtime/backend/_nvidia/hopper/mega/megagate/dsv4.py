@@ -35,6 +35,7 @@ from typing import Any, Final
 
 import torch
 
+from .errors import MegaGateContextError, UnpreparedShapeError
 from .kernels.runtime import ExactGridUnboundCompiledRunner
 
 PROFILE: Final = "dsv4_flash"
@@ -58,14 +59,6 @@ TOPK: Final = 6
 ROUTED_SCALING_FACTOR: Final = 1.5
 BLOCK_TOKENS: Final = 128
 BLOCK_K: Final = 128
-
-
-class MegaGateContextError(RuntimeError):
-    """Base error for the functional DSV4 entry."""
-
-
-class UnpreparedShapeError(MegaGateContextError):
-    """Raised when an exact T or stream was not prepared before a call."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +90,10 @@ _LEAF_SPEC_BY_TOKENS: Final = {
 }
 LEAF_IMPLEMENTATION_BY_TOKENS: Final = {
     tokens: spec.implementation for tokens, spec in _LEAF_SPEC_BY_TOKENS.items()
+}
+TOKEN_TO_LEAF: Final = {
+    **{tokens: "v363" for tokens in CLUSTERLESS_TOKENS},
+    **{tokens: "v376" for tokens in QUADMATH_TOKENS},
 }
 
 
@@ -693,6 +690,7 @@ __all__ = [
     "QUADMATH_TOKENS",
     "ROUTED_SCALING_FACTOR",
     "SUPPORTED_TOKENS",
+    "TOKEN_TO_LEAF",
     "TOPK",
     "UnpreparedShapeError",
     "megagate",

@@ -1140,8 +1140,8 @@ ops:
       - alpha: '5.4'
   - id: megagate
     description: |
-      Hopper TLE fusion of the BF16 router projection and DSV4 bias-aware
-      sqrt-softplus top-k routing in one eager kernel launch.
+      Hopper TLE fusion of the BF16 router projection and model-specific
+      DeepSeek/Qwen top-k routing in one eager kernel launch.
     for:
       - None
     labels:
@@ -1149,7 +1149,8 @@ ops:
       - TLE
       - vLLM
       - MoE
-      - DeepSeekV4
+      - DeepSeek
+      - Qwen
     kind:
       - NeuralNetwork
     stages:

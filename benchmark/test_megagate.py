@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Eager-only DSV4 MegaGate benchmark against the native vLLM chain.
+"""Eager-only multi-profile MegaGate benchmark against native vLLM chains.
 
 ``MegaGateContext.prepare`` runs while constructing each benchmark input and
 is deliberately excluded from timing.  The measured candidate is the public
@@ -27,18 +27,15 @@ import importlib
 import os
 import tempfile
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.api import (
-    EXPERTS,
-    HIDDEN,
-    PROFILE,
-    ROUTED_SCALING_FACTOR,
-    TOPK,
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.registry import (
+    PROFILES as _REGISTERED_PROFILES,
 )
 from flaggems_vllm.utils.tle_capabilities import (
     supports_megagate_tle,
@@ -48,18 +45,141 @@ from flaggems_vllm.utils.tle_capabilities import (
 from . import base, consts
 from .conftest import Config
 
-CORE_TOKENS = (1028, 4100, 16384)
-COMPREHENSIVE_TOKENS = (
-    1028,
-    2048,
-    3076,
-    3805,
-    4100,
-    4835,
-    7884,
-    8221,
-    13021,
-    16384,
+
+@dataclass(frozen=True)
+class _Profile:
+    name: str
+    hidden: int
+    experts: int
+    topk: int
+    routed_scaling_factor: float
+    scoring_func: str
+    correction_bias: bool
+    linear_kind: str
+    num_expert_group: int | None = None
+    topk_group: int | None = None
+
+
+_PROFILES = (
+    _Profile(
+        "dsv4_flash",
+        4096,
+        256,
+        6,
+        1.5,
+        "sqrtsoftplus",
+        True,
+        "GateLinear",
+    ),
+    _Profile(
+        "dsv32",
+        7168,
+        256,
+        8,
+        2.5,
+        "sigmoid",
+        True,
+        "GateLinear",
+        num_expert_group=8,
+        topk_group=4,
+    ),
+    _Profile(
+        "qwen_h2048_e256_k8",
+        2048,
+        256,
+        8,
+        1.0,
+        "softmax",
+        False,
+        "ReplicatedLinear",
+    ),
+    _Profile(
+        "qwen_h4096_e512_k10",
+        4096,
+        512,
+        10,
+        1.0,
+        "softmax",
+        False,
+        "ReplicatedLinear",
+    ),
+)
+_PROFILE_BY_SIGNATURE = {
+    (profile.hidden, profile.experts, profile.topk): profile for profile in _PROFILES
+}
+
+# ``MegaGateProfile.routing`` is the production semantic contract.  Keep the
+# benchmark-only vLLM constructor arguments in one explicit translation table
+# so a registry routing change cannot silently continue timing a different
+# baseline chain.
+_ROUTING_BASELINE_CONTRACTS = {
+    "sqrt_softplus_bias": {
+        "scoring_func": "sqrtsoftplus",
+        "correction_bias": True,
+        "linear_kind": "GateLinear",
+        "num_expert_group": None,
+        "topk_group": None,
+    },
+    "grouped_sigmoid_bias": {
+        "scoring_func": "sigmoid",
+        "correction_bias": True,
+        "linear_kind": "GateLinear",
+        "num_expert_group": 8,
+        "topk_group": 4,
+    },
+    "softmax": {
+        "scoring_func": "softmax",
+        "correction_bias": False,
+        "linear_kind": "ReplicatedLinear",
+        "num_expert_group": None,
+        "topk_group": None,
+    },
+}
+for _profile in _PROFILES:
+    _registered = _REGISTERED_PROFILES[_profile.name]
+    assert (_profile.hidden, _profile.experts, _profile.topk) == (
+        _registered.hidden,
+        _registered.experts,
+        _registered.topk,
+    )
+    assert _profile.routed_scaling_factor == _registered.routed_scaling_factor
+    _contract = _ROUTING_BASELINE_CONTRACTS[_registered.routing]
+    assert {
+        "scoring_func": _profile.scoring_func,
+        "correction_bias": _profile.correction_bias,
+        "linear_kind": _profile.linear_kind,
+        "num_expert_group": _profile.num_expert_group,
+        "topk_group": _profile.topk_group,
+    } == _contract
+
+# Core keeps one representative per model profile. Comprehensive adds one
+# shape per admitted schedule family; adjacent T values sharing a schedule are
+# deliberately omitted from the shared benchmark.
+CORE_SHAPES = (
+    (4096, 256, 6, 1028),
+    (7168, 256, 8, 12292),
+    (2048, 256, 8, 4434),
+    (4096, 512, 10, 8214),
+)
+COMPREHENSIVE_SHAPES = (
+    (4096, 256, 6, 1028),
+    (4096, 256, 6, 16384),
+    (7168, 256, 8, 1028),
+    (7168, 256, 8, 12292),
+    (7168, 256, 8, 16384),
+    (2048, 256, 8, 1034),
+    (2048, 256, 8, 4107),
+    (2048, 256, 8, 4434),
+    (2048, 256, 8, 9309),
+    (2048, 256, 8, 16384),
+    (4096, 512, 10, 1035),
+    (4096, 512, 10, 2048),
+    (4096, 512, 10, 4107),
+    (4096, 512, 10, 4434),
+    (4096, 512, 10, 5240),
+    (4096, 512, 10, 8214),
+    (4096, 512, 10, 13421),
+    (4096, 512, 10, 16384),
 )
 
 _VLLM_CONFIG_CONTEXT: Any | None = None
@@ -79,15 +199,31 @@ def _has_hopper_megagate() -> bool:
     return supports_megagate_tle(tle) and supports_module_wide_named_barriers()
 
 
-def _load_vllm_gate() -> tuple[tuple[type, Callable[..., Any]] | None, str | None]:
+def _load_vllm_gate() -> tuple[dict[str, Any] | None, str | None]:
     try:
         gate_module = importlib.import_module(
             "vllm.model_executor.layers.fused_moe.router.gate_linear"
         )
-        router_module = importlib.import_module(
+        linear_module = importlib.import_module("vllm.model_executor.layers.linear")
+        bias_module = importlib.import_module(
             "vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router"
         )
-        return (gate_module.GateLinear, router_module.fused_topk_bias), None
+        flat_module = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.router.fused_topk_router"
+        )
+        grouped_module = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.router.grouped_topk_router"
+        )
+        return (
+            {
+                "GateLinear": gate_module.GateLinear,
+                "ReplicatedLinear": linear_module.ReplicatedLinear,
+                "fused_topk_bias": bias_module.fused_topk_bias,
+                "fused_topk": flat_module.fused_topk,
+                "grouped_topk": grouped_module.grouped_topk,
+            },
+            None,
+        )
     except Exception as error:  # pragma: no cover - depends on benchmark image
         return None, repr(error)
 
@@ -159,14 +295,23 @@ def _cleanup_vllm_single_rank() -> None:
             _VLLM_STORE_PATH = None
 
 
-def _construct_vllm_gate(gate_linear: type, weight: torch.Tensor) -> Any:
-    layer = gate_linear(
-        input_size=HIDDEN,
-        output_size=EXPERTS,
-        bias=False,
-        out_dtype=torch.float32,
-        params_dtype=torch.bfloat16,
-        prefix="benchmark.megagate.dsv4",
+def _construct_vllm_gate(
+    vllm_api: dict[str, Any], weight: torch.Tensor, profile: _Profile
+) -> Any:
+    linear_type = vllm_api[profile.linear_kind]
+    kwargs: dict[str, Any] = {
+        "input_size": profile.hidden,
+        "output_size": profile.experts,
+        "bias": False,
+        "params_dtype": torch.bfloat16,
+        "prefix": f"benchmark.megagate.{profile.name}",
+    }
+    if profile.linear_kind == "GateLinear":
+        # DSV4 fixes FP32 router logits. DSV3.2 leaves out_dtype unset and
+        # follows GateLinear's model-faithful producer precision policy.
+        kwargs["out_dtype"] = torch.float32 if profile.name == "dsv4_flash" else None
+    layer = linear_type(
+        **kwargs,
     ).cuda()
     layer.eval()
     with torch.no_grad():
@@ -181,7 +326,7 @@ def _unwrap_linear_output(value: Any) -> torch.Tensor:
 def _candidate(
     x: torch.Tensor,
     gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     *,
     context: Any,
     baseline: Callable[[], tuple[torch.Tensor, torch.Tensor]],
@@ -192,7 +337,7 @@ def _candidate(
         gate_weight,
         correction_bias,
         context=context,
-        routed_scaling_factor=ROUTED_SCALING_FACTOR,
+        routed_scaling_factor=context.profile_spec.routed_scaling_factor,
         out=None,
     )
 
@@ -200,7 +345,7 @@ def _candidate(
 def _vllm_baseline(
     x: torch.Tensor,
     gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     *,
     context: Any,
     baseline: Callable[[], tuple[torch.Tensor, torch.Tensor]],
@@ -210,24 +355,24 @@ def _vllm_baseline(
 
 
 class MegaGateBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = [(tokens,) for tokens in CORE_TOKENS]
-    DEFAULT_SHAPE_DESC = "T"
+    DEFAULT_SHAPES = list(CORE_SHAPES)
+    DEFAULT_SHAPE_DESC = "H, E, K, T"
 
     def set_shapes(self, shape_file_path=None) -> None:
         # MegaGate only admits the exact model-derived token counts below. Do
         # not inherit the generic ``Benchmark`` YAML shapes through the MRO.
         del shape_file_path
-        tokens = (
-            COMPREHENSIVE_TOKENS
+        shapes = (
+            COMPREHENSIVE_SHAPES
             if Config.bench_level is consts.BenchLevel.COMPREHENSIVE
-            else CORE_TOKENS
+            else CORE_SHAPES
         )
-        self.shapes = [(tokens_value,) for tokens_value in tokens]
+        self.shapes = list(shapes)
         self.shape_desc = self.DEFAULT_SHAPE_DESC
 
 
 def _megagate_inputs(
-    shape: tuple[int], dtype: torch.dtype, device: str
+    shape: tuple[int, int, int, int], dtype: torch.dtype, device: str
 ) -> Generator[tuple[Any, ...], None, None]:
     if dtype != torch.bfloat16:
         raise ValueError("MegaGate only supports BF16 x and gate_weight")
@@ -238,43 +383,74 @@ def _megagate_inputs(
     ):
         raise RuntimeError("Hopper MegaGate public exports are unavailable")
 
-    tokens = int(shape[0])
+    hidden, experts, topk, tokens = (int(value) for value in shape)
+    try:
+        profile = _PROFILE_BY_SIGNATURE[(hidden, experts, topk)]
+    except KeyError as error:
+        raise ValueError(f"unsupported MegaGate benchmark shape {shape}") from error
     generator = torch.Generator(device=device).manual_seed(20261112 + tokens)
-    x = torch.randn((tokens, HIDDEN), dtype=dtype, device=device, generator=generator)
+    x = torch.randn((tokens, hidden), dtype=dtype, device=device, generator=generator)
     gate_weight = torch.randn(
-        (EXPERTS, HIDDEN), dtype=dtype, device=device, generator=generator
-    ).mul_(HIDDEN**-0.5)
-    correction_bias = torch.randn(
-        (EXPERTS,), dtype=torch.float32, device=device, generator=generator
-    ).mul_(0.01)
+        (experts, hidden), dtype=dtype, device=device, generator=generator
+    ).mul_(hidden**-0.5)
+    correction_bias = (
+        torch.randn(
+            (experts,), dtype=torch.float32, device=device, generator=generator
+        ).mul_(0.01)
+        if profile.correction_bias
+        else None
+    )
 
     # Prepare/compile belongs to model initialization and is intentionally
     # outside both timed callables.
-    context = flaggems_vllm.create_megagate_context(profile=PROFILE)
+    context = flaggems_vllm.create_megagate_context(profile=profile.name)
     context.prepare(
         x,
         gate_weight,
         correction_bias,
-        routed_scaling_factor=ROUTED_SCALING_FACTOR,
+        routed_scaling_factor=profile.routed_scaling_factor,
     )
 
-    gate_linear, fused_topk_bias = VLLM_GATE_API
-    layer = _construct_vllm_gate(gate_linear, gate_weight)
-
-    def run_vllm() -> tuple[torch.Tensor, torch.Tensor]:
-        logits = _unwrap_linear_output(layer(x))
-        return fused_topk_bias(
-            hidden_states=x,
-            gating_output=logits,
-            scoring_func="sqrtsoftplus",
-            e_score_correction_bias=correction_bias,
-            topk=TOPK,
-            renormalize=True,
-            routed_scaling_factor=ROUTED_SCALING_FACTOR,
-            indices_type=torch.int64,
-        )
-
     try:
+        layer = _construct_vllm_gate(VLLM_GATE_API, gate_weight, profile)
+
+        def run_vllm() -> tuple[torch.Tensor, torch.Tensor]:
+            logits = _unwrap_linear_output(layer(x))
+            if profile.num_expert_group is not None:
+                return VLLM_GATE_API["grouped_topk"](
+                    hidden_states=x,
+                    gating_output=logits,
+                    topk=profile.topk,
+                    renormalize=True,
+                    num_expert_group=profile.num_expert_group,
+                    topk_group=profile.topk_group,
+                    scoring_func=profile.scoring_func,
+                    routed_scaling_factor=profile.routed_scaling_factor,
+                    e_score_correction_bias=correction_bias,
+                )
+            if profile.correction_bias:
+                return VLLM_GATE_API["fused_topk_bias"](
+                    hidden_states=x,
+                    gating_output=logits,
+                    scoring_func=profile.scoring_func,
+                    e_score_correction_bias=correction_bias,
+                    topk=profile.topk,
+                    renormalize=True,
+                    routed_scaling_factor=profile.routed_scaling_factor,
+                    indices_type=(
+                        torch.int64 if profile.name == "dsv4_flash" else None
+                    ),
+                )
+            weights, indices, _ = VLLM_GATE_API["fused_topk"](
+                hidden_states=x,
+                gating_output=logits,
+                topk=profile.topk,
+                renormalize=True,
+                indices_type=None,
+                scoring_func=profile.scoring_func,
+            )
+            return weights, indices
+
         yield x, gate_weight, correction_bias, {
             "context": context,
             "baseline": run_vllm,

@@ -15,9 +15,23 @@
 """Triton/TLE Hopper MegaGate operator."""
 
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.api import (
+    PROFILES,
     MegaGateContext,
+    MegaGateContextError,
+    MegaGateProfile,
+    UnpreparedShapeError,
     create_megagate_context,
+    get_profile,
     megagate,
 )
 
-__all__ = ["MegaGateContext", "create_megagate_context", "megagate"]
+__all__ = [
+    "MegaGateContext",
+    "MegaGateContextError",
+    "MegaGateProfile",
+    "PROFILES",
+    "UnpreparedShapeError",
+    "create_megagate_context",
+    "get_profile",
+    "megagate",
+]

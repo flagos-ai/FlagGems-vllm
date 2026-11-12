@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
+from pathlib import Path
 
 import pytest
 import torch
@@ -30,16 +32,17 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import (
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import (
     dsv4 as dsv4_module,
 )
-from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import (
-    megagate,
-)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import megagate
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.api import (
     EXPERTS,
     HIDDEN,
     PROFILE,
+    PROFILES,
     ROUTED_SCALING_FACTOR,
     SUPPORTED_TOKENS,
     TOPK,
+    MegaGateContextError,
+    UnpreparedShapeError,
 )
 from flaggems_vllm.utils.tle_capabilities import (
     supports_megagate_tle,
@@ -60,6 +63,89 @@ DSV4_EAGER_TOKENS = (
     13021,
     16384,
 )
+
+EXPECTED_SOURCE_LEAVES = {
+    "dsv4_flash": {
+        **{tokens: "v363" for tokens in DSV4_EAGER_TOKENS[:8]},
+        **{tokens: "v376" for tokens in DSV4_EAGER_TOKENS[8:]},
+    },
+    "dsv32": {
+        **{tokens: "v371" for tokens in (1028, 1756, 2048, 3076, 3805, 8276)},
+        **{tokens: "v372" for tokens in (12292, 12372)},
+        **{tokens: "v435" for tokens in (14305, 16384)},
+    },
+    "qwen_h2048_e256_k8": {
+        **{tokens: "v366" for tokens in (1034, 1035, 1036, 1352, 2048, 3104)},
+        **{tokens: "v365" for tokens in (4107, 4108, 4138)},
+        **{tokens: "v364" for tokens in (4434, 4435, 4436)},
+        **{tokens: "v363" for tokens in (9309, 9330, 11469, 13421, 13422)},
+        16384: "v367",
+    },
+    "qwen_h4096_e512_k10": {
+        **{tokens: "v371" for tokens in (1035, 1036)},
+        2048: "v400",
+        **{tokens: "v412" for tokens in (4107, 4108)},
+        **{tokens: "v414" for tokens in (4434, 4435)},
+        5240: "v431",
+        8214: "v394",
+        **{tokens: "v430" for tokens in (13421, 13422)},
+        16384: "v415",
+    },
+}
+
+# One representative exact-T case per production schedule family.  The full
+# 50-shape performance matrix lives in the dedicated acceptance harness; this
+# smaller set makes every distinct fused leaf compile and prove its numerical
+# semantics in ordinary Hopper CI.
+SCHEDULE_FAMILY_CASES = (
+    ("dsv32", 1028, "v371"),
+    ("dsv32", 12292, "v372"),
+    ("dsv32", 14305, "v435"),
+    ("qwen_h2048_e256_k8", 1034, "v366"),
+    ("qwen_h2048_e256_k8", 4107, "v365"),
+    ("qwen_h2048_e256_k8", 4434, "v364"),
+    ("qwen_h2048_e256_k8", 9309, "v363"),
+    ("qwen_h2048_e256_k8", 16384, "v367"),
+    ("qwen_h4096_e512_k10", 1035, "v371"),
+    ("qwen_h4096_e512_k10", 2048, "v400"),
+    ("qwen_h4096_e512_k10", 4107, "v412"),
+    ("qwen_h4096_e512_k10", 4434, "v414"),
+    ("qwen_h4096_e512_k10", 5240, "v431"),
+    ("qwen_h4096_e512_k10", 8214, "v394"),
+    ("qwen_h4096_e512_k10", 13421, "v430"),
+    ("qwen_h4096_e512_k10", 16384, "v415"),
+)
+
+LEAF_FILES_BY_PROFILE = {
+    "dsv4_flash": ("dsv4_clusterless.py", "dsv4_quadmath.py"),
+    "dsv32": (
+        "dsv32_clusterless.py",
+        "dsv32_dualmath.py",
+        "dsv32_quadmath.py",
+    ),
+    "qwen_h2048_e256_k8": tuple(
+        f"qwen_h2048_v{version}.py" for version in range(363, 368)
+    ),
+    "qwen_h4096_e512_k10": (
+        "qwen_h4096_e64_cluster8.py",
+        "qwen_h4096_t2048.py",
+        "qwen_h4096_t410x.py",
+        "qwen_h4096_t443x.py",
+        "qwen_h4096_t5240.py",
+        "qwen_h4096_t8214.py",
+        "qwen_h4096_t1342x.py",
+        "qwen_h4096_t16384.py",
+    ),
+}
+
+# Some entry modules have two mutually exclusive ABI branches, but every
+# runtime path executes exactly one of these runner sites.
+RUNNER_LAUNCH_SITES_BY_PROFILE = {
+    "dsv4_flash": 1,
+    "dsv32": 2,
+    "qwen_h2048_e256_k8": 2,
+    "qwen_h4096_e512_k10": 1,
+}
 
 
 def _has_hopper_megagate() -> bool:
@@ -118,6 +204,39 @@ def test_megagate_dsv4_public_contract() -> None:
     }
 
 
+def test_megagate_registry_preserves_final50_provenance() -> None:
+    assert set(PROFILES) == set(EXPECTED_SOURCE_LEAVES)
+    assert sum(len(profile.supported_tokens) for profile in PROFILES.values()) == 50
+    for name, expected in EXPECTED_SOURCE_LEAVES.items():
+        profile = PROFILES[name]
+        assert dict(profile.source_leaf_by_tokens) == expected
+        assert profile.supported_tokens == tuple(expected)
+
+
+@pytest.mark.parametrize("profile_name", tuple(EXPECTED_SOURCE_LEAVES))
+def test_megagate_profile_module_matches_registry(profile_name: str) -> None:
+    profile = PROFILES[profile_name]
+    module = importlib.import_module(profile.module)
+    assert module.PROFILE == profile.name
+    assert (module.HIDDEN, module.EXPERTS, module.TOPK) == (
+        profile.hidden,
+        profile.experts,
+        profile.topk,
+    )
+    assert module.ROUTED_SCALING_FACTOR == profile.routed_scaling_factor
+    assert tuple(module.SUPPORTED_TOKENS) == profile.supported_tokens
+    assert module.TOKEN_TO_LEAF == dict(profile.source_leaf_by_tokens)
+    assert module.MegaGateContextError is MegaGateContextError
+    assert module.UnpreparedShapeError is UnpreparedShapeError
+
+    context = create_megagate_context(profile=profile_name)
+    assert context.profile == profile_name
+    assert context.profile_spec is profile
+    assert context.supported_tokens == profile.supported_tokens
+    assert context.source_leaf_by_tokens == dict(profile.source_leaf_by_tokens)
+    context.close()
+
+
 def test_megagate_api_signatures_keep_prepare_outside_hot_path() -> None:
     prepare = inspect.signature(MegaGateContext.prepare).parameters
     assert list(prepare) == [
@@ -128,7 +247,8 @@ def test_megagate_api_signatures_keep_prepare_outside_hot_path() -> None:
         "routed_scaling_factor",
     ]
     assert prepare["routed_scaling_factor"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert prepare["routed_scaling_factor"].default == ROUTED_SCALING_FACTOR
+    assert prepare["routed_scaling_factor"].default is None
+    assert prepare["correction_bias"].default is None
 
     hot_path = inspect.signature(megagate).parameters
     assert list(hot_path) == [
@@ -141,6 +261,7 @@ def test_megagate_api_signatures_keep_prepare_outside_hot_path() -> None:
     ]
     assert hot_path["context"].kind is inspect.Parameter.KEYWORD_ONLY
     assert hot_path["context"].default is inspect.Parameter.empty
+    assert hot_path["routed_scaling_factor"].default is None
     assert hot_path["out"].default is None
 
 
@@ -190,8 +311,13 @@ def test_megagate_supported_token_rejects_non_cuda_abi() -> None:
         )
 
 
-def test_megagate_source_is_library_only_eager_single_launch() -> None:
-    source = inspect.getsource(dsv4_module)
+@pytest.mark.parametrize("profile_name", tuple(EXPECTED_SOURCE_LEAVES))
+def test_megagate_source_is_library_only_eager_single_launch(
+    profile_name: str,
+) -> None:
+    profile = PROFILES[profile_name]
+    module = importlib.import_module(profile.module)
+    source = inspect.getsource(module)
     imported = _imported_modules(source)
     assert not any(
         module == "vllm" or module.startswith("vllm.") for module in imported
@@ -212,14 +338,52 @@ def test_megagate_source_is_library_only_eager_single_launch() -> None:
     assert "torch.cuda.graph" not in call_names
     assert not any(name.endswith(".replay") for name in call_names)
 
-    runner_launches = [
+    run_functions = [
         node
         for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run"
+    ]
+    assert len(run_functions) == 1
+    runner_launches = [
+        node
+        for node in ast.walk(run_functions[0])
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Subscript)
         and _dotted_name(node.func.value) == "leaf.runner"
     ]
-    assert len(runner_launches) == 1
+    assert len(runner_launches) == RUNNER_LAUNCH_SITES_BY_PROFILE[profile_name]
+    assert module.MegaGateContext.kernel_count_per_call == 1
+    assert not any(
+        name.endswith(".warmup")
+        for node in ast.walk(run_functions[0])
+        if isinstance(node, ast.Call)
+        for name in [_dotted_name(node.func)]
+        if name is not None
+    )
+
+    kernels_dir = Path(module.__file__).with_name("kernels")
+    for leaf_file in LEAF_FILES_BY_PROFILE[profile_name]:
+        leaf_source = (kernels_dir / leaf_file).read_text(encoding="utf-8")
+        leaf_imports = _imported_modules(leaf_source)
+        assert not any(
+            imported_module == "vllm" or imported_module.startswith("vllm.")
+            for imported_module in leaf_imports
+        )
+        assert not any(
+            imported_module == "deep_gemm" or imported_module.startswith("deep_gemm.")
+            for imported_module in leaf_imports
+        )
+        leaf_calls = {
+            name
+            for node in ast.walk(ast.parse(leaf_source))
+            if isinstance(node, ast.Call)
+            for name in [_dotted_name(node.func)]
+            if name is not None
+        }
+        assert "torch.cuda.CUDAGraph" not in leaf_calls
+        assert "torch.cuda.graph" not in leaf_calls
+        assert not any(name.endswith(".replay") for name in leaf_calls)
 
 
 @pytest.mark.parametrize("tokens", DSV4_EAGER_TOKENS)
@@ -344,47 +508,220 @@ def test_megagate_dsv4_hopper_correctness_and_public_export(tokens: int) -> None
         torch.testing.assert_close(allocated_indices, indices, rtol=0, atol=0)
 
 
+def _stable_descending_indices(values: torch.Tensor, topk: int) -> torch.Tensor:
+    """Match the production tie rule: equal scores prefer smaller expert id."""
+
+    return torch.argsort(values, dim=1, descending=True, stable=True)[:, :topk]
+
+
+def _reference_non_dsv4_routing(
+    profile_name: str,
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    profile = PROFILES[profile_name]
+    if profile.routing == "grouped_sigmoid_bias":
+        assert correction_bias is not None
+        # DSV3.2 GateLinear keeps its model BF16 producer boundary.  Routing
+        # itself is FP32, including sigmoid, correction bias, and normalization.
+        logits = torch.mm(x, gate_weight.T).float()
+        raw_scores = logits.sigmoid()
+        ranking = raw_scores + correction_bias
+        group_scores = (
+            ranking.view(x.shape[0], 8, 32)
+            .sort(dim=2, descending=True, stable=True)
+            .values[:, :, :2]
+            .sum(dim=2)
+        )
+        group_indices = _stable_descending_indices(group_scores, 4)
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(1, group_indices, True)
+        expert_mask = group_mask.unsqueeze(2).expand(-1, -1, 32).reshape_as(ranking)
+        ranking = ranking.masked_fill(~expert_mask, float("-inf"))
+        indices = _stable_descending_indices(ranking, profile.topk)
+        weights = raw_scores.gather(1, indices)
+    else:
+        assert profile.routing == "softmax"
+        assert correction_bias is None
+        # Qwen's production baseline is BF16 ReplicatedLinear followed by an
+        # FP32 router.  Preserve that producer boundary before selecting and
+        # normalizing experts; an FP32-accumulator-only oracle can disagree at
+        # top-k boundaries and would not validate the chain being replaced.
+        logits = torch.mm(x, gate_weight.T).float()
+        indices = _stable_descending_indices(logits, profile.topk)
+        # Selecting from the full softmax and then renormalizing is exactly a
+        # softmax over the selected logits, while avoiding a large temporary.
+        weights = torch.softmax(logits.gather(1, indices), dim=1)
+
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    weights = weights * profile.routed_scaling_factor
+    return weights.float(), indices.to(torch.int32)
+
+
+@pytest.mark.parametrize(
+    "profile_name,tokens,source_leaf",
+    SCHEDULE_FAMILY_CASES,
+    ids=[
+        f"{profile_name}-{source_leaf}-T{tokens}"
+        for profile_name, tokens, source_leaf in SCHEDULE_FAMILY_CASES
+    ],
+)
+@pytest.mark.skipif(
+    not HOPPER_MEGAGATE_AVAILABLE,
+    reason="MegaGate correctness requires NVIDIA SM90 and its TLE APIs",
+)
+def test_megagate_new_schedule_family_hopper_correctness(
+    profile_name: str,
+    tokens: int,
+    source_leaf: str,
+) -> None:
+    profile = PROFILES[profile_name]
+    assert profile.source_leaf_by_tokens[tokens] == source_leaf
+    generator = torch.Generator(device="cuda").manual_seed(
+        20261112 + tokens + profile.hidden
+    )
+    x = torch.randn(
+        (tokens, profile.hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    gate_weight = torch.randn(
+        (profile.experts, profile.hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    ).mul_(profile.hidden**-0.5)
+    correction_bias = None
+    if profile.routing == "grouped_sigmoid_bias":
+        correction_bias = torch.randn(
+            (profile.experts,),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        ).mul_(0.01)
+
+    context = create_megagate_context(profile=profile_name)
+    try:
+        context.prepare(
+            x,
+            gate_weight,
+            correction_bias,
+            routed_scaling_factor=profile.routed_scaling_factor,
+        )
+        assert context.prepared_tokens == (tokens,)
+        assert context.source_leaf_by_tokens[tokens] == source_leaf
+
+        actual_weights, actual_indices = megagate(
+            x,
+            gate_weight,
+            correction_bias,
+            context=context,
+            routed_scaling_factor=profile.routed_scaling_factor,
+        )
+        torch.cuda.synchronize()
+        expected_weights, expected_indices = _reference_non_dsv4_routing(
+            profile_name,
+            x,
+            gate_weight,
+            correction_bias,
+        )
+        torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_weights,
+            expected_weights,
+            rtol=2.0e-4,
+            atol=2.0e-4,
+        )
+        torch.testing.assert_close(
+            actual_weights.sum(dim=1),
+            torch.full(
+                (tokens,),
+                profile.routed_scaling_factor,
+                dtype=torch.float32,
+                device="cuda",
+            ),
+            rtol=0,
+            atol=2.0e-3,
+        )
+    finally:
+        context.close()
+
+
 @pytest.mark.skipif(
     not HOPPER_MEGAGATE_AVAILABLE,
     reason="MegaGate stream contract requires NVIDIA SM90 and its TLE APIs",
 )
-def test_megagate_requires_prepare_on_each_cuda_stream() -> None:
-    tokens = DSV4_EAGER_TOKENS[0]
-    x = torch.zeros((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    gate_weight = torch.zeros((EXPERTS, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    correction_bias = torch.zeros((EXPERTS,), dtype=torch.float32, device="cuda")
-    context = create_megagate_context()
-    context.prepare(x, gate_weight, correction_bias)
+@pytest.mark.parametrize(
+    "profile_name,tokens",
+    (
+        ("dsv4_flash", 1028),
+        ("dsv32", 1028),
+        ("qwen_h2048_e256_k8", 4434),
+        ("qwen_h4096_e512_k10", 1035),
+    ),
+)
+def test_megagate_requires_prepare_on_each_cuda_stream(
+    profile_name: str, tokens: int
+) -> None:
+    profile = PROFILES[profile_name]
+    x = torch.zeros((tokens, profile.hidden), dtype=torch.bfloat16, device="cuda")
+    gate_weight = torch.zeros(
+        (profile.experts, profile.hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    correction_bias = (
+        torch.zeros((profile.experts,), dtype=torch.float32, device="cuda")
+        if profile.routing.endswith("_bias")
+        else None
+    )
+    context = create_megagate_context(profile=profile_name)
+    context.prepare(
+        x,
+        gate_weight,
+        correction_bias,
+        routed_scaling_factor=profile.routed_scaling_factor,
+    )
 
     default_stream = torch.cuda.current_stream()
     other_stream = torch.cuda.Stream()
     other_stream.wait_stream(default_stream)
     with torch.cuda.stream(other_stream):
         outputs = (
-            torch.empty((tokens, TOPK), dtype=torch.float32, device="cuda"),
-            torch.empty((tokens, TOPK), dtype=torch.int64, device="cuda"),
+            torch.empty((tokens, profile.topk), dtype=torch.float32, device="cuda"),
+            torch.empty(
+                (tokens, profile.topk),
+                dtype=torch.int64 if profile_name == "dsv4_flash" else torch.int32,
+                device="cuda",
+            ),
         )
-        with pytest.raises(
-            dsv4_module.UnpreparedShapeError, match="current CUDA stream"
-        ):
+        with pytest.raises(UnpreparedShapeError, match="current CUDA stream"):
             megagate(
                 x,
                 gate_weight,
                 correction_bias,
                 context=context,
+                routed_scaling_factor=profile.routed_scaling_factor,
                 out=outputs,
             )
-        context.prepare(x, gate_weight, correction_bias)
+        context.prepare(
+            x,
+            gate_weight,
+            correction_bias,
+            routed_scaling_factor=profile.routed_scaling_factor,
+        )
         weights, indices = megagate(
             x,
             gate_weight,
             correction_bias,
             context=context,
+            routed_scaling_factor=profile.routed_scaling_factor,
             out=outputs,
         )
     default_stream.wait_stream(other_stream)
     assert weights is outputs[0]
     assert indices is outputs[1]
+    context.close()
 
 
 @pytest.mark.skipif(
