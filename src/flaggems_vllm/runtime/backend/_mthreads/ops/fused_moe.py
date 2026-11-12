@@ -2107,6 +2107,30 @@ def _fused_experts_impl(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if (
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and hidden_states.size(0) >= 8192
+        and w1.size(1) >= 512
+        and w1.size(1) % 128 == 0
+        and hidden_states.size(1) % 64 == 0
+        and w2.size(2) % 64 == 0
+        and activation == "silu"
+        and not apply_router_weight_on_input
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and ocp_mx_scheme is None
+        and w1_bias is None
+        and w2_bias is None
+        and expert_map is None
+    ):
+        from .fused_moe_dense import dense_fused_moe
+
+        return dense_fused_moe(
+            hidden_states, w1, w2, topk_weights, topk_ids
+        )
+
     if _can_use_nopad_fp8_moe(
         hidden_states,
         w1,
