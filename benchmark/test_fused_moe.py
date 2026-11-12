@@ -198,25 +198,65 @@ def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
 
 
 def mthreads_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
-    """Run the MUSA production entry on the given inputs.
-
-    Importing vllm_musa patches vLLM fused_experts_impl to its MUSA
-    dispatch, which is what the registered OOT method calls at runtime.
-    """
-    # vLLM's model executor must be imported before vllm_musa so the
-    # vendor patch can replace fused_experts_impl in place; importing the
-    # plugin alone does NOT activate the MUSA dispatcher.
+    """Run vLLM-MUSA's production MoE method on the given top-k inputs."""
+    # vLLM's model executor must be imported before vllm_musa so the vendor
+    # patch and the MusaUnquantizedFusedMoEMethod OOT registration are active.
     import vllm.model_executor.layers.fused_moe.fused_moe  # noqa: F401
     import vllm_musa  # noqa: F401
     import vllm_musa.model_executor  # noqa: F401
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    # Keep subsequent FlagGems allocations on the same device; _build_layer
+    # constructs the vLLM layer under an explicit default device.
+    torch.set_default_device(hidden_states.device)
 
     try:  # MoE custom ops live in the in-tree extension on MUSA.
         import vllm._moe_C  # noqa: F401
     except ImportError:  # pragma: no cover - non-MUSA builds
         pass
-    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts_impl
 
-    return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
+    _, hidden_size = hidden_states.shape
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    topk = topk_ids.shape[1]
+    # Production passes int32 routing ids; the DeepGEMM gate rejects int64.
+    topk_ids = topk_ids.to(torch.int32)
+    key = (
+        hidden_states.shape[0],
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        hidden_states.dtype,
+        w1.data_ptr(),
+        w2.data_ptr(),
+    )
+    if key != _CACHE["key"]:
+        _CACHE["layer"] = None
+        _build_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["key"] = key
+        experts = _CACHE["experts"]
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data.copy_(w1)
+            experts.w2_weight.data.copy_(w2)
+            experts.quant_method.process_weights_after_loading(experts)
+            if hasattr(experts, "ensure_moe_quant_config_init"):
+                experts.ensure_moe_quant_config_init()
+
+    experts = _CACHE["experts"]
+    ctx = _CACHE["ctx"]
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return experts.quant_method.forward_oot(
+            experts,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            None,
+            None,
+        )
 
 
 # Vendors whose production MoE is not the stock vLLM fused_experts_impl.
