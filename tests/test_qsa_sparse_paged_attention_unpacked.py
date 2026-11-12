@@ -22,9 +22,8 @@ import torch
 
 import flaggems_vllm as ops
 
-pytestmark = pytest.mark.qsa_sparse_paged_attention_unpacked
 
-
+@pytest.mark.qsa_sparse_paged_attention_unpacked
 def test_unpacked_qsa_public_abi():
     marker = object()
     inspect.signature(ops.qsa_sparse_paged_attention_unpacked).bind(
@@ -36,6 +35,7 @@ def test_unpacked_qsa_public_abi():
     )
 
 
+@pytest.mark.qsa_sparse_paged_attention_unpacked
 def test_unpacked_qsa_is_library_only():
     assert "qsa_sparse_paged_attention_unpacked" in ops._LIBRARY_ONLY_OPS
     assert all(
@@ -43,6 +43,7 @@ def test_unpacked_qsa_is_library_only():
     )
 
 
+@pytest.mark.qsa_sparse_paged_attention_unpacked
 def test_unpacked_qsa_generic_abi_is_preserved():
     generic = importlib.import_module("flaggems_vllm.ops.qwen4.qsa_attention")
     assert (
@@ -60,6 +61,7 @@ def test_unpacked_qsa_generic_abi_is_preserved():
 @pytest.mark.parametrize("group_size", [1, 3, 17])
 @pytest.mark.parametrize("width", [32, 256])
 @pytest.mark.parametrize("with_gate", [False, True])
+@pytest.mark.qsa_sparse_paged_attention_unpacked
 def test_unpacked_qsa_public_changed_input_graph(
     monkeypatch, group_size, width, with_gate
 ):

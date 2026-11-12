@@ -87,12 +87,17 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
             "tests/test_qsa_attention.py",
             "tests/test_qsa_sparse_paged_attention_unpacked.py",
         ]
-        for target in targets:
+        benchmarks = [
+            "benchmark/test_qsa_attention.py",
+            "benchmark/test_qsa_sparse_paged_attention_unpacked.py",
+        ]
+        for target in targets + benchmarks:
             self.make_file(target)
-        _, tests, _ = select_tests.select_targets(
+        _, tests, selected_benchmarks = select_tests.select_targets(
             self.repo_root, ["src/flaggems_vllm/ops/qwen4/qsa_attention.py"]
         )
         self.assertEqual(tests, targets)
+        self.assertEqual(selected_benchmarks, benchmarks)
 
     def test_backend_operator_change_selects_matching_test(self):
         self.make_file("tests/test_mul.py")

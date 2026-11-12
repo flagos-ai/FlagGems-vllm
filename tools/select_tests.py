@@ -284,7 +284,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_qwen4_self_kernels.py",
         "benchmark/test_qsa_attention.py",
     ],
-    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": ["benchmark/test_qsa_attention.py"],
+    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": [
+        "benchmark/test_qsa_attention.py",
+        "benchmark/test_qsa_sparse_paged_attention_unpacked.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_fusion.py": ["benchmark/test_ple_fusion.py"],
     "src/flaggems_vllm/ops/kda_bounded.py": ["benchmark/test_kda_bounded_perf.py"],
     "src/flaggems_vllm/ops/kda64.py": ["benchmark/test_kda_bounded_perf.py"],
