@@ -1276,7 +1276,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
                 lane_partial1,
                 lane_partial2,
             )
-            shared_store_token = _store_shared3_f32(
+            _ = _store_shared3_f32(
                 _shared_address_u32(
                     tle.gpu.local_ptr(scratch4, (reduction_warp, channel0 + 0))
                 ),
@@ -1420,7 +1420,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
             projection_offset = (
                 token * NUM_OUTPUT_TILES * NUM_SPLITS + output_tile * NUM_SPLITS + split
             ) * OUTPUT_TILE_BLOCK
-        partial_store_token = _store_tid4_partials_f32(
+        _ = _store_tid4_partials_f32(
             tl.cast(projection_partials_ptr + projection_offset, tl.uint64),
             tl.cast(
                 sqsum_partials_ptr + token * NUM_SPLITS + split,
@@ -1519,7 +1519,7 @@ def _tle_sm90_mega_mhc_t1_split_kernel(
         projection_offset = (
             token * NUM_OUTPUT_TILES * NUM_SPLITS + output_tile * NUM_SPLITS + split
         ) * OUTPUT_TILE_BLOCK
-        partial_store_token = _store_tid7_partials_f32(
+        _ = _store_tid7_partials_f32(
             tl.cast(projection_partials_ptr + projection_offset, tl.uint64),
             tl.cast(
                 sqsum_partials_ptr + token * NUM_SPLITS + split,
