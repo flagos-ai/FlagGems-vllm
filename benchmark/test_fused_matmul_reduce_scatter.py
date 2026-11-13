@@ -8,7 +8,6 @@ Packing/copying and result allocation are included; context creation and compile
 time are excluded. This reports composed Torch GEMM+RS as the baseline.
 """
 
-import importlib
 import json
 import os
 import statistics
@@ -21,11 +20,9 @@ import triton
 
 from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     _default_config,
-    _validate_device,
     clear_fused_matmul_reduce_scatter_cache,
     configure_fused_matmul_reduce_scatter,
 )
-from flaggems_vllm.runtime.symm_mem import use_symm_mem
 from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
     assert_close,
     make_reference,
@@ -34,32 +31,13 @@ from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
 from . import consts
 from .conftest import Config, emit_record_logger, update_result
 
-pytestmark = pytest.mark.fused_matmul_reduce_scatter
-
-
-@pytest.fixture(scope="module")
-def distributed_context():
-    if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-        pytest.skip("launch this benchmark with torchrun and at least two GPUs")
-    assert torch.cuda.is_available()
-    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-    torch.cuda.set_device(device)
-    _validate_device(device)
-    importlib.import_module("triton.experimental.tle.language")
-    if Config.mode == consts.BenchMode.CUDAGRAPH:
-        pytest.skip("the initial TLE implementation does not support graph capture")
-    owns_group = not dist.is_initialized()
-    if owns_group:
-        dist.init_process_group("nccl", device_id=device)
-    try:
-        with use_symm_mem():
-            yield dist.group.WORLD, device
-    finally:
-        try:
-            clear_fused_matmul_reduce_scatter_cache()
-        finally:
-            if owns_group:
-                dist.destroy_process_group()
+pytestmark = [
+    pytest.mark.fused_matmul_reduce_scatter,
+    pytest.mark.skipif(
+        Config.mode == consts.BenchMode.CUDAGRAPH,
+        reason="the initial TLE implementation does not support graph capture",
+    ),
+]
 
 
 def _score(call, group, device):
@@ -91,6 +69,7 @@ def _candidates(group, device):
             replace(default, num_stages=3, epilogue_subtile=True),
             replace(default, num_scatter_sms=8, num_reduction_sms=8),
         ]
+    configs = list(dict.fromkeys(configs))
     limit = triton.runtime.driver.active.utils.get_device_properties(device.index)[
         "max_shared_mem"
     ]
@@ -106,8 +85,8 @@ def _candidates(group, device):
     "rows,n,k", [(256, 256, 256), (384, 512, 256), (256, 4096, 2048)]
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_matmul_reduce_scatter(distributed_context, rows, n, k, dtype):
-    group, device = distributed_context
+def test_fused_matmul_reduce_scatter(gemm_rs_context, rows, n, k, dtype):
+    group, device = gemm_rs_context
     torch.manual_seed(8123 + group.rank())
     a = torch.randn((rows * group.size(), k), device=device, dtype=dtype) * 0.01
     b = torch.randn((k, n), device=device, dtype=dtype) * 0.01

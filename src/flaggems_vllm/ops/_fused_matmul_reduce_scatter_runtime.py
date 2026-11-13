@@ -188,8 +188,6 @@ class CollectiveContext:
             self.counters = torch.zeros_like(signals)
             self.rs_stream = torch.cuda.Stream(device=device, priority=-1)
             reduction_stream = torch.cuda.Stream(device=device, priority=-1)
-            scatter_end = m * n
-            reduction_end = scatter_end + per_node_rows * n
             self.rs = kernels.TleReduceScatter2DContext(
                 max_M=m,
                 N=n,
@@ -197,18 +195,10 @@ class CollectiveContext:
                 world_size=group.size(),
                 local_world_size=local_size,
                 dtype=dtype,
-                with_gemm_output=True,
                 comm_buf=comm_buf,
-                gemm_out_buf=self.gemm_out,
-                scatter_buf=comm_buf[:scatter_end].view(m, n),
-                rs_per_node_buf=comm_buf[scatter_end:reduction_end].view(
-                    per_node_rows, n
-                ),
-                p2p_buf=comm_buf[reduction_end:].view(per_node_rows, n),
                 signal_buf=signals,
                 dist_ctx=distributed,
                 reduction_stream=reduction_stream,
-                num_sync_sms=0,
                 num_p2p_sms=1,
                 num_reduction_sms=config.num_reduction_sms,
                 num_scatter_sms=config.num_scatter_sms,

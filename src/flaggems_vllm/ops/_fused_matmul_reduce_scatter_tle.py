@@ -52,18 +52,12 @@ class TleReduceScatter2DContext:
     world_size: int
     local_world_size: int
     dtype: torch.dtype
-    with_gemm_output: bool
     # Scatter, reduction, and P2P share one registered communication buffer.
     comm_buf: torch.Tensor
-    gemm_out_buf: Optional[torch.Tensor]
-    scatter_buf: torch.Tensor
-    rs_per_node_buf: torch.Tensor
-    p2p_buf: torch.Tensor
     signal_buf: torch.Tensor
     dist_ctx: DistributedRtContext
 
     reduction_stream: torch.cuda.Stream
-    num_sync_sms: int
     num_p2p_sms: int
     num_reduction_sms: int
     num_scatter_sms: int
@@ -98,18 +92,6 @@ class TleReduceScatter2DContext:
 
         # GEMM-ready flags; tile counters use a separate workspace.
         self.scatter_signal_buf = self.signal_buf[: self.world_size]
-
-    @property
-    def num_rs_sms(self) -> int:
-        """Return the communication SM budget."""
-        if self.nnodes == 1:
-            return self.num_scatter_sms
-        return (
-            self.num_scatter_sms
-            + self.num_sync_sms
-            + self.num_p2p_sms
-            + self.num_reduction_sms
-        )
 
     @property
     def rs_per_node_offset_elems(self) -> int:

@@ -5,7 +5,7 @@
 
 The implementation supports 2D FP16/BF16, scatter_dim=0, sum/avg, aligned
 shapes, and NVIDIA SM90+ or FlagTree HCU descriptor lowering. The HCU path
-requires validation on target hardware. Communication uses a private FlagCX communicator
+has BF16 sum validation on two BW nodes. Communication uses a private FlagCX communicator
 bootstrapped from the existing process group. It never owns the PyTorch group.
 All ranks must call this API, configure, and clear in matching order.
 """
