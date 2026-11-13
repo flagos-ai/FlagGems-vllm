@@ -1,6 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 """Independent reference and changed-input graph tests for MetaX."""
+import importlib
+from contextlib import ExitStack, contextmanager
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -21,7 +25,7 @@ def check_replays(call, update, check, outputs=()):
         call()
     for value in (0.5, -0.75):
         update(value)
-        for output in outputs:
+        for output in outputs() if callable(outputs) else outputs:
             output.fill_(float("nan") if output.is_floating_point() else -999)
         graph.replay()
         torch.cuda.synchronize()
@@ -30,17 +34,29 @@ def check_replays(call, update, check, outputs=()):
 
 def _cpu_sparse_attention(q, kv, ids, lengths, scale, sink):
     q, kv = q.cpu().double(), kv.cpu().double()
-    output = torch.empty_like(q)
+    output = torch.empty((*q.shape[:-1], 512), dtype=torch.float64)
     lse = torch.empty(q.shape[:-1], dtype=torch.float64)
+    maximum = torch.empty_like(lse)
     for row in range(q.shape[0]):
         selected = ids[row, : int(lengths[row])].cpu().long()
         selected = selected[(selected >= 0) & (selected < kv.shape[0])]
         keys = kv[selected]
         score = (q[row] @ keys.t()) * scale
-        logits = torch.cat((score, sink.cpu().double()[:, None]), dim=1)
-        output[row] = logits.softmax(-1)[:, :-1] @ keys
+        if keys.shape[0] == 0:
+            output[row] = 0
+            lse[row] = float("inf")  # FlashMLA empty-row sentinel
+            maximum[row] = -float("inf")
+            continue
+        logits = (
+            torch.cat((score, sink.cpu().double()[:, None]), dim=1)
+            if sink is not None
+            else score
+        )
+        prob = logits.softmax(-1)[:, : keys.shape[0]]
+        output[row] = prob @ keys[:, :512]
         lse[row] = score.logsumexp(-1)
-    return output.bfloat16(), lse.float()
+        maximum[row] = score.amax(-1)
+    return output.bfloat16(), lse.float(), maximum.float()
 
 
 @pytest.mark.parametrize("rows,topk", [(1, 16), (17, 64)])
@@ -71,7 +87,7 @@ def test_sparse_prefill_local_reference_and_changed_input_graph(rows, topk):
         )
 
     def check():
-        expected, expected_lse = _cpu_sparse_attention(
+        expected, expected_lse, _ = _cpu_sparse_attention(
             q, kv, ids, lengths.cpu(), scale, sink
         )
         torch.testing.assert_close(result.cpu(), expected, atol=2e-3, rtol=2e-2)
@@ -98,12 +114,37 @@ def _model1_cache(pages=2, block=256):
     return cache, dequant
 
 
-@pytest.mark.parametrize("batch", [1, 3])
-@pytest.mark.flash_mla_with_kvcache
-def test_split_decode_model1_reference_workspace_and_replay(batch):
+@contextmanager
+def _record_launches(module, names):
+    """Observe the public dispatch without replacing any GPU computation."""
+    launches = []
+
+    class Recorder:
+        def __init__(self, kernel, name):
+            self.kernel, self.name = kernel, name
+
+        def __getitem__(self, grid):
+            launch = self.kernel[grid]
+
+            def invoke(*args, **kwargs):
+                launches.append(self.name)
+                return launch(*args, **kwargs)
+
+            return invoke
+
+    with ExitStack() as stack:
+        for name in names:
+            stack.enter_context(
+                patch.object(module, name, Recorder(getattr(module, name), name))
+            )
+        yield launches
+
+
+def _decode_case(batch, real_heads):
     torch.manual_seed(104)
     q = (torch.randn(batch, 1, 16, 512, device="cuda") * 0.1).bfloat16()
-    q[:, :, 8:].zero_()
+    if real_heads == 8:
+        q[:, :, 8:].fill_(37)  # Padding must not be used by the folded path.
     cache, decoded = _model1_cache()
     extra_cache, extra_decoded = _model1_cache(pages=1)
     indices = (
@@ -125,49 +166,213 @@ def test_split_decode_model1_reference_workspace_and_replay(batch):
     )
     meta = ops.FlashMLASchedMeta()
     result = torch.empty_like(q)
+    kwargs = dict(
+        q=q,
+        k_cache=cache,
+        block_table=None,
+        cache_seqlens=None,
+        head_dim_v=512,
+        tile_scheduler_metadata=meta,
+        is_fp8_kvcache=True,
+        indices=indices,
+        topk_length=lengths,
+        softmax_scale=512**-0.5,
+        attn_sink=sink,
+        extra_k_cache=extra_cache,
+        extra_indices_in_kvcache=extra_indices,
+        extra_topk_length=extra_lengths,
+        out=result,
+        real_num_heads=8 if real_heads == 8 else None,
+        split_workspace=workspace,
+    )
+    return kwargs, decoded, extra_decoded
+
+
+def _check_split_decode(batch, real_heads):
+    kwargs, decoded, extra_decoded = _decode_case(batch, real_heads)
+    q, result, sink = (kwargs[name] for name in ("q", "out", "attn_sink"))
+    # Non-tile-aligned lengths and masked IDs exercise each split's tail.
+    kwargs["topk_length"] -= torch.arange(batch, device="cuda", dtype=torch.int32) % 7
+    kwargs["extra_topk_length"] -= (
+        torch.arange(batch, device="cuda", dtype=torch.int32) % 5
+    )
+    kwargs["indices"][..., 5] = -1
+    kwargs["extra_indices_in_kvcache"][..., 7] = 9999
     observed = []
 
     def call():
-        _, lse = ops.flash_mla_with_kvcache(
-            q=q,
-            k_cache=cache,
-            block_table=None,
-            cache_seqlens=None,
-            head_dim_v=512,
-            tile_scheduler_metadata=meta,
-            is_fp8_kvcache=True,
-            indices=indices,
-            topk_length=lengths,
-            softmax_scale=512**-0.5,
-            attn_sink=sink,
-            extra_k_cache=extra_cache,
-            extra_indices_in_kvcache=extra_indices,
-            extra_topk_length=extra_lengths,
-            out=result,
-            real_num_heads=8,
-            split_workspace=workspace,
-        )
+        output, lse = ops.flash_mla_with_kvcache(**kwargs)
+        assert output is result
         observed[:] = [lse]
 
     def check():
-        keys = torch.cat((decoded[:256], extra_decoded[:64]))
-        ids = torch.arange(320, dtype=torch.int32).repeat(batch, 1)
-        expected, expected_lse = _cpu_sparse_attention(
-            q[:, 0], keys, ids, [320] * batch, 512**-0.5, sink
+        main_ids = kwargs["indices"][:, 0].cpu()
+        extra_ids = kwargs["extra_indices_in_kvcache"][:, 0].cpu()
+        lengths = kwargs["topk_length"].cpu().tolist()
+        extra_lengths = kwargs["extra_topk_length"].cpu().tolist()
+        ids = torch.full((batch, 640), -1, dtype=torch.int32)
+        for row, (length, extra_length) in enumerate(zip(lengths, extra_lengths)):
+            ids[row, :length] = main_ids[row, :length]
+            extra = extra_ids[row, :extra_length]
+            ids[row, length : length + extra_length] = torch.where(
+                (extra >= 0) & (extra < extra_decoded.shape[0]),
+                extra + decoded.shape[0],
+                -1,
+            )
+        expected, expected_lse, _ = _cpu_sparse_attention(
+            q[:, 0, :real_heads],
+            torch.cat((decoded, extra_decoded)),
+            ids,
+            [a + b for a, b in zip(lengths, extra_lengths)],
+            512**-0.5,
+            sink[:real_heads],
         )
-        # Only the first eight heads are real; the remaining lanes are padding.
         torch.testing.assert_close(
-            result[:, 0, :8].cpu(), expected[:, :8], atol=2e-3, rtol=2e-2
+            result[:, 0, :real_heads].cpu(), expected, atol=2e-3, rtol=2e-2
         )
         torch.testing.assert_close(
-            observed[0][:, :8, 0].cpu(), expected_lse[:, :8], atol=2e-4, rtol=2e-4
+            observed[0][:, :real_heads, 0].cpu(), expected_lse, atol=2e-4, rtol=2e-4
         )
 
-    call()
-    check()
-    check_replays(
-        call, lambda value: q[:, :, :8].fill_(value), check, outputs=(result,)
+    def update(value):
+        q[:, :, :real_heads, :256].fill_(value)
+        q[:, :, :real_heads, 256:].fill_(-value * 0.5)
+        if real_heads == 16:
+            q[:, :, 8:, :256].fill_(value * 1.5)
+
+    module = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.sparse_mla_decode"
     )
+    names = (
+        "_partial_model1_kernel_halfd",
+        "_partial_model1_kernel_halfd_qkfold_blockdiag",
+        "_reduce_split_kernel",
+        "_sparse_decode_model1_kernel",
+    )
+    with _record_launches(module, names) as launches:
+        call()
+        if batch > 64:
+            assert launches == ["_sparse_decode_model1_kernel"]
+        elif real_heads == 8:
+            assert launches == [
+                "_partial_model1_kernel_halfd_qkfold_blockdiag",
+                "_reduce_split_kernel",
+            ]
+        else:
+            assert launches == ["_partial_model1_kernel_halfd"] * 2 + [
+                "_reduce_split_kernel"
+            ]
+        check()
+        check_replays(call, update, check, outputs=lambda: (result, observed[0]))
+
+
+@pytest.mark.parametrize("batch", [1, 3, 64, 65])
+@pytest.mark.flash_mla_with_kvcache
+def test_split_decode_model1_reference_workspace_and_replay(batch):
+    _check_split_decode(batch, real_heads=8)
+
+
+@pytest.mark.parametrize("batch", [1, 3, 64, 65])
+@pytest.mark.flash_mla_with_kvcache
+def test_h16_split_decode_reference_workspace_and_replay(batch):
+    _check_split_decode(batch, real_heads=16)
+
+
+@pytest.mark.parametrize("bad_workspace", ["missing", "shape", "dtype", "layout"])
+@pytest.mark.flash_mla_with_kvcache
+def test_h16_split_decode_rejects_workspace_before_output_write(bad_workspace):
+    kwargs, _, _ = _decode_case(1, real_heads=16)
+    kwargs["out"].fill_(17)
+    workspace = list(kwargs["split_workspace"])
+    if bad_workspace == "missing":
+        kwargs["split_workspace"] = None
+    else:
+        if bad_workspace == "shape":
+            workspace[0] = workspace[0][:1]
+        elif bad_workspace == "dtype":
+            workspace[0] = workspace[0].bfloat16()
+        else:
+            workspace[0] = torch.empty((64, 4, 32), device="cuda")[..., ::2]
+        kwargs["split_workspace"] = tuple(workspace)
+    with pytest.raises(ValueError, match="workspace"):
+        ops.flash_mla_with_kvcache(**kwargs)
+    assert bool((kwargs["out"] == 17).all())
+
+
+@pytest.mark.parametrize(
+    "rows,head_dim,sink_on,all_masked",
+    [
+        (1, 512, True, False),
+        (2, 512, True, False),
+        (17, 512, True, False),
+        (64, 512, False, False),
+        (17, 576, True, False),
+        (17, 512, True, True),
+    ],
+)
+@pytest.mark.flash_mla_sparse_fwd
+def test_h8_prefill_reference_and_changed_input_graph(
+    rows, head_dim, sink_on, all_masked
+):
+    torch.manual_seed(104)
+    q = (torch.randn(rows, 16, head_dim, device="cuda") * 0.1).bfloat16()
+    q[:, 8:].fill_(37)
+    kv = (torch.randn(128, 1, head_dim, device="cuda") * 0.1).bfloat16()
+    ids = torch.arange(64, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    ids[:, 5], ids[:, 17] = -1, 9999
+    lengths = 64 - torch.arange(rows, device="cuda", dtype=torch.int32) % 7
+    if all_masked:
+        ids.fill_(-1)
+        lengths.zero_()
+    sink = torch.linspace(-0.3, 0.9, 16, device="cuda") if sink_on else None
+    output = torch.empty(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
+    maximum = torch.empty(rows, 16, device="cuda")
+    lse = torch.empty_like(maximum)
+    scale = head_dim**-0.5
+
+    def call():
+        result = ops.flash_mla_sparse_fwd(
+            q,
+            kv,
+            ids[:, None],
+            scale,
+            attn_sink=sink,
+            topk_length=lengths,
+            out=output,
+            max_logits_out=maximum,
+            lse_out=lse,
+            real_num_heads=8,
+        )
+        assert result[0] is output and result[1] is maximum and result[2] is lse
+
+    def check():
+        expected, expected_lse, expected_max = _cpu_sparse_attention(
+            q[:, :8],
+            kv[:, 0],
+            ids,
+            lengths.cpu(),
+            scale,
+            sink[:8] if sink is not None else None,
+        )
+        torch.testing.assert_close(output[:, :8].cpu(), expected, atol=2e-3, rtol=2e-2)
+        torch.testing.assert_close(lse[:, :8].cpu(), expected_lse, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(
+            maximum[:, :8].cpu(), expected_max, atol=1e-4, rtol=1e-4
+        )
+
+    def update(value):
+        q[:, :8, :256].fill_(value)
+        q[:, :8, 256:].fill_(-value * 0.5)
+
+    module = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.sparse_mla_prefill"
+    )
+    name = "triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag"
+    with _record_launches(module, (name,)) as launches:
+        call()
+        assert launches == ([name] if rows > 1 else [])
+        check()
+        check_replays(call, update, check, outputs=(output, maximum, lse))
 
 
 @pytest.fixture(autouse=True)

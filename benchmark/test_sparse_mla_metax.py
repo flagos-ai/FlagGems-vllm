@@ -15,7 +15,10 @@ from . import base
 def call_with_policy(enabled, mode, *args, **kwargs):
     previous = policy.DEFAULT_POLICY
     policy.DEFAULT_POLICY = dataclasses.replace(
-        previous, decode_split_topk=enabled, prefill_staged=enabled
+        previous,
+        decode_split_topk=enabled,
+        prefill_staged=enabled,
+        prefill_blockdiag=enabled,
     )
     try:
         fn = (
@@ -41,8 +44,9 @@ def model1_cache(pages, block=256):
 
 
 class SparseMLAMetaXBenchmark(base.Benchmark):
-    def __init__(self, mode):
+    def __init__(self, mode, real_heads):
         self.path = mode
+        self.real_heads = real_heads
         super().__init__(
             "flash_mla_with_kvcache" if mode == "decode" else "flash_mla_sparse_fwd",
             lambda *a, **k: call_with_policy(False, mode, *a, **k),
@@ -54,14 +58,28 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
         self.shapes = (
             [(1, 512), (16, 512), (64, 512), (16, 1024)]
             if self.path == "decode"
-            else [(1, 64), (17, 512), (64, 512), (256, 512)]
+            else [
+                (2 if self.real_heads == 8 else 1, 64),
+                (17, 512),
+                (64, 512),
+                (256, 512),
+            ]
         )
+
+    def record_shapes(self, *args, **kwargs):
+        return {
+            "real_heads": self.real_heads,
+            "path": self.path,
+            "comparator": "retained serial MetaX implementation",
+            "inputs": super().record_shapes(*args, **kwargs),
+        }
 
     def get_input_iter(self, dtype):
         for rows, topk in self.shapes:
             if self.path == "decode":
                 q = (torch.randn(rows, 1, 16, 512, device=self.device) * 0.1).bfloat16()
-                q[:, :, 8:] = 0
+                if self.real_heads == 8:
+                    q[:, :, 8:] = 0
                 cache = model1_cache(8)
                 extra = model1_cache(2)
                 indices = (
@@ -94,7 +112,7 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
                         (rows,), 64, device=self.device, dtype=torch.int32
                     ),
                     out=torch.empty_like(q),
-                    real_num_heads=8,
+                    real_num_heads=8 if self.real_heads == 8 else None,
                     split_workspace=tuple(
                         torch.empty(shape, device=self.device)
                         for shape in [(64, 4, 16), (64, 4, 16), (64, 4, 16, 512)]
@@ -107,6 +125,9 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
                 indices = torch.arange(
                     topk, device=self.device, dtype=torch.int32
                 ).repeat(rows, 1)
+                if self.real_heads == 8:
+                    q[:, 8:] = 0
+                    indices = indices[:, None]
                 args = (q, kv, indices, 512**-0.5)
                 kwargs = dict(
                     attn_sink=torch.randn(16, device=self.device) * 0.1,
@@ -116,6 +137,7 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
                     out=torch.empty_like(q),
                     max_logits_out=torch.empty(rows, 16, device=self.device),
                     lse_out=torch.empty(rows, 16, device=self.device),
+                    real_num_heads=8 if self.real_heads == 8 else None,
                 )
             # Check the two retained arithmetic paths before timing; clone the
             # reference because caller-owned output is reused by both calls.
@@ -124,7 +146,7 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
             ]
             current = call_with_policy(True, self.path, *args, **kwargs)
             for actual, expected in zip(current, baseline):
-                if self.path == "decode":
+                if self.real_heads == 8:
                     actual, expected = (
                         actual[..., :8, :] if actual.ndim == 4 else actual[:, :8]
                     ), (expected[..., :8, :] if expected.ndim == 4 else expected[:, :8])
@@ -134,11 +156,17 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
 
 @pytest.mark.flash_mla_with_kvcache
 @pytest.mark.skipif(ops.vendor_name != "metax", reason="MetaX backend comparison")
-def test_sparse_decode_split_vs_serial():
-    SparseMLAMetaXBenchmark("decode").run()
+@pytest.mark.parametrize("real_heads", [8, 16], ids=["h8", "h16"])
+def test_sparse_decode_split_vs_serial(real_heads):
+    with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+        torch.manual_seed(104)
+        SparseMLAMetaXBenchmark("decode", real_heads).run()
 
 
 @pytest.mark.flash_mla_sparse_fwd
 @pytest.mark.skipif(ops.vendor_name != "metax", reason="MetaX backend comparison")
-def test_sparse_prefill_staged_vs_serial():
-    SparseMLAMetaXBenchmark("prefill").run()
+@pytest.mark.parametrize("real_heads", [8, 16], ids=["h8", "h16"])
+def test_sparse_prefill_optimized_vs_serial(real_heads):
+    with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+        torch.manual_seed(104)
+        SparseMLAMetaXBenchmark("prefill", real_heads).run()
