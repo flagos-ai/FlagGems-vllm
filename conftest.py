@@ -7,6 +7,7 @@ import atexit
 import importlib
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,13 @@ def _init_tle():
         if tle.get_mem_pool() is None:
             raise RuntimeError("TLE bootstrap did not provide a memory pool")
     except BaseException:
+        # Report before collective teardown or torchrun termination can hide it.
+        print(
+            f"[rank {os.getenv('RANK', '?')}] TLE bootstrap failed:",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc()
         _cleanup_tle()
         raise
 
