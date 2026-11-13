@@ -178,6 +178,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
+from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
@@ -325,6 +326,7 @@ __all__ = [
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gate_sigmoid_mul",
+    "gather_draft_sampled",
     "gather_rows",
     "gather_state_rows",
     "gdn_w8a16",
