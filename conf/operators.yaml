@@ -608,6 +608,21 @@ ops:
     stages:
       - stable: '2.0'
     cpp: '4.0'
+  - id: fused_deepseek_v4_kv_rope_insert
+    description: |
+      DeepSeekV4 KV-only GPT-J RoPE and paged cache insertion.
+      Triton implementation matching the native vLLM CUDA semantics.
+      Supports BF16, per-tensor FP8, packed V4 and MXFP8 cache interfaces.
+    for:
+      - torch.ops._C.fused_deepseek_v4_kv_rope_insert
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
     description: |
       Horizontally-fused DeepseekV4-MLA.
