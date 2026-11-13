@@ -89,6 +89,14 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/ops/fp32_router_gemm.py": [
+        "tests/test_fp32_router_gemm.py",
+        "tests/test_fp32_router_gemm_metax_prefill.py",
+    ],
+    "src/flaggems_vllm/ops/router_gemm.py": [
+        "tests/test_router_gemm.py",
+        "tests/test_fp32_router_gemm_metax_prefill.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "tests/test_gdn_w8a16.py"
     ],
