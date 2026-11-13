@@ -511,16 +511,7 @@ class ParallelBenchmarkMixin:
             if self.gems_op:
                 metric.latency = self.get_latency(self.gems_op, *args, **kwargs)
             else:
-                if self.op_name == "zero_":
-                    with flaggems_vllm.use_gems():
-                        metric.latency = self.get_latency(
-                            self.torch_op, *args, **kwargs
-                        )
-                else:
-                    with flaggems_vllm.use_gems(exclude=["zero_"]):
-                        metric.latency = self.get_latency(
-                            self.torch_op, *args, **kwargs
-                        )
+                metric.latency = self.get_latency(self.torch_op, *args, **kwargs)
         if "speedup" in self.to_bench_metrics:
             metric.speedup = metric.latency_base / metric.latency
         if "gbps" in self.to_bench_metrics:

@@ -94,14 +94,13 @@ Call flow: `vLLM -> vllm-plugin-fl -> flag_gems.enable() + flaggems_vllm.<op>()`
 ```
 src/flaggems_vllm/
   __init__.py              # top-level public operator exports
-  config.py                # enable/exclude config resolution, C-extension detection
+  config.py                # C-extension detection
   ops/                     # operator implementations (one file per op, mostly)
     __init__.py            # re-exports every public op + __all__
     <op>.py                # host dispatch + Triton kernels for <op>
     DSA/  FLA/  mhc/        # grouped op families (subpackages)
   runtime/
     __init__.py            # device detection, get_tuned_config(), torch_device_fn
-    register.py            # Register class (PyTorch dispatch registration)
     configloader.py        # loads tune_configs.yaml / heuristics configs
     backend/_<vendor>/     # per-vendor config: tune_configs.yaml, heuristics, arch dirs
   utils/                   # libentry, libtuner, triton helpers, codegen, dtype utils

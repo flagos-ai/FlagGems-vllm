@@ -135,9 +135,12 @@ ops:
       - beta: '5.3'
   - id: causal_conv1d_fn
     description: |
-      Causal depthwise conv1d over variable-length token sequences with
-      continuous batching support, updating the convolution state cache
-      during the forward pass (prefill path, Ascend port of the vLLM operator).
+      Causal depthwise conv1d prefill for vLLM continuous batching with
+      variable-length sequences. The Ascend A5 path reads a [channels, tokens]
+      input in either supported stride layout, [channels, width] weights,
+      optional bias and cached history; it returns same-shape activations and
+      updates the convolution state cache. It supports BF16/FP16 input and
+      matching state dtypes, with FP32 accumulation in the kernel.
     for:
       - causal_conv1d_fn
     labels:
@@ -146,11 +149,14 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: causal_conv1d_update
     description: |
-      Decode-stage causal conv1d with in-place convolution state update for
-      variable-length accepted tokens (Ascend port of the vLLM operator).
+      Causal depthwise conv1d decode for vLLM batched or variable-length
+      tokens, including speculative accepted-token counts and cache indices.
+      The Ascend A5 path returns an output with the input shape and updates
+      the convolution state in place. It supports BF16 input and matching
+      state dtypes, with FP32 accumulation in the kernel.
     for:
       - causal_conv1d_update
     labels:
@@ -159,7 +165,7 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: chunk_gated_delta_rule_fwd
     description: |
       The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear Attention (FLA).
@@ -175,7 +181,12 @@ ops:
       - beta: '5.3'
   - id: chunk_kda
     description: |
-      Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
+      Kimi Delta Attention (KDA) prefill for vLLM inference, with sequence-first
+      Q/K/V, gate and beta inputs, optional initial state and variable-length
+      sequence offsets. The Ascend A5 path uses chunk-major preparation,
+      recurrent state updates and output finalization. It returns attention
+      values and optionally an FP32 final state; FP16/BF16 inputs are supported
+      with FP32 accumulation in the kernels.
     for:
       - chunk_kda
     labels:
@@ -184,7 +195,7 @@ ops:
     kind:
       - Attention
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: chunk_kda_fwd_intra_token_parallel
     description: |
       Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
@@ -776,9 +787,12 @@ ops:
       - alpha: '5.4'
   - id: fused_recurrent_kda
     description: |
-      Independent Triton KDA decode with key-wise gate decay, optional QK L2
-      normalization, scalar/vector beta and FP32 value-major recurrent state.
-      Supports varlen, per-token state tables and strided inputs.
+      Kimi Delta Attention (KDA) decode for vLLM inference with key-wise gate
+      decay, optional QK L2 normalization, scalar/vector beta and an FP32
+      recurrent state. It returns output matching V's shape and dtype and an
+      updated FP32 state. The Ascend A5 path supports variable-length requests,
+      per-token state tables and FP16/BF16/FP32 inputs; it fuses the Kimi K3
+      bounded gate, beta sigmoid and speculative accepted-token selection.
     for:
       - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
     labels:
@@ -787,7 +801,7 @@ ops:
     kind:
       - Attention
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: gate_sigmoid_mul
     description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
     for:
@@ -1138,6 +1152,21 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: megamoe_int8
+    description: |
+      Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
+      combining routing, two expert GEMMs, DUSHMEM communication, and Top-K
+      reduction in one persistent Triton/FlagTree kernel.
+    for:
+      - megamoe_int8
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - MoE
+    stages:
+      - alpha: '5.5'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).
@@ -1390,6 +1419,20 @@ ops:
       - DeepSeekV4
     kind:
       - NeuralNetwork
+    stages:
+      - beta: '5.3'
+  - id: qsa_prepare
+    description: |
+      Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for the
+      indexer Q/K, the compressed-key pool, the state-ring commit, and the main
+      attention QK-norm/RoPE/gate with its paged K/V write, in one launch.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
     stages:
       - beta: '5.3'
   - id: qsa_sparse_paged_attention

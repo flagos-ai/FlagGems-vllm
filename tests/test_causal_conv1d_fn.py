@@ -110,8 +110,17 @@ def causal_conv1d_ref(
 @pytest.mark.parametrize("dim", DIM)
 @pytest.mark.parametrize("with_padding", WITH_PADDING)
 @pytest.mark.parametrize("batch", BATCH)
+@pytest.mark.parametrize("channel_first", [False, True])
 def test_causal_conv1d_varlen(
-    batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
+    batch,
+    with_padding,
+    dim,
+    seqlen,
+    width,
+    has_bias,
+    silu_activation,
+    itype,
+    channel_first,
 ):
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -145,8 +154,13 @@ def test_causal_conv1d_varlen(
     )
 
     # x: (1, dim, seqlen), slice from a wider tensor to avoid contiguity shortcuts.
+    # ``channel_first`` then makes the token axis the unit-strided one, the
+    # operator's own [dim, tokens] contract: the kernel consumes it directly and
+    # fuses the transpose into its tile loads instead of copying up front.
     x = torch.randn(1, seqlen, 4096 + dim + 64, device=device, dtype=itype)
     x = x.transpose(1, 2)[:, 4096 : 4096 + dim, :]
+    if channel_first:
+        x = x.contiguous()
 
     weight = torch.randn(dim, width, device=device, dtype=itype)
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
@@ -222,3 +236,7 @@ def test_causal_conv1d_varlen(
     # 2. mainline output matches the per-sequence reference concatenation
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+    if channel_first:
+        # Fused-transpose path: the result stays in the caller's [dim, tokens]
+        # layout, with no separate transpose copy.
+        assert out.is_contiguous()

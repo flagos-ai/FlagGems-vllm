@@ -45,9 +45,8 @@ def test_add_rms_norm(shape, dtype):
 
     ref_out = _torch_add_rms_norm(ref_inp1, ref_inp2, weight=ref_weight, eps=eps)
 
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.add_rms_norm(
-            inp1, inp2, list(layer_shape), weight=weight, eps=eps
-        )
+    res_out = flaggems_vllm.add_rms_norm(
+        inp1, inp2, list(layer_shape), weight=weight, eps=eps
+    )
 
     utils.gems_assert_close(res_out, ref_out, dtype)

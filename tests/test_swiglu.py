@@ -55,7 +55,6 @@ def test_swiglu(shape: tuple[int, ...], dtype: torch.dtype):
     x1, x2 = input_tensor.float().chunk(2, dim=-1)
     te_forward = utils.to_reference(torch.nn.functional.silu(x1) * x2)
 
-    with flaggems_vllm.use_gems():
-        fg_forward = flaggems_vllm.swiglu(input_tensor, quantizer=None)
+    fg_forward = flaggems_vllm.swiglu(input_tensor, quantizer=None)
 
     utils.gems_assert_close(fg_forward, te_forward, dtype)

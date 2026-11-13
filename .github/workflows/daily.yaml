@@ -1,0 +1,155 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nightly full-range validation on the H20 runner: every functional test plus
+# every benchmark at core level, plus unit-test coverage. Pull requests only run the selected subset
+# (see basic-ci.yml), so this catches regressions that path-based selection
+# misses.
+
+name: daily
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC; starts at 00:03 UTC+8.
+    - cron: '3 16 * * *'
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+jobs:
+  nvidia-full:
+    name: nvidia full tests and benchmarks
+    # Scheduled runs only make sense on the upstream repository.
+    if: github.repository == 'flagos-ai/FlagGems-vllm'
+    runs-on: h20
+    timeout-minutes: 360
+    env:
+      FLAGGEMS_VENDOR: nvidia
+      PYTHONPATH: ${{ github.workspace }}/src
+      VENV_DIR: ${{ github.workspace }}/.venv
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv
+      UV_REFRESH: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: clean generated state from persistent runner
+        run: |
+          set -euo pipefail
+          rm -rf -- .venv build dist
+          find . -maxdepth 2 -type d -name '*.egg-info' -exec rm -rf -- {} +
+
+      - run: nvidia-smi
+
+      - name: install and activate python environment
+        run: |
+          source tools/setup.sh
+          source "${VENV_DIR}/bin/activate"
+          echo "VIRTUAL_ENV=${VENV_DIR}" >> "$GITHUB_ENV"
+          echo "${VENV_DIR}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${CUDA_HOME:-}" ]]; then
+            echo "CUDA_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
+            echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+          fi
+          if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "${USE_FLAGCX:-}" ]]; then
+            echo "USE_FLAGCX=${USE_FLAGCX}" >> "$GITHUB_ENV"
+          fi
+
+      - name: run portable backend preflight
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        run: |
+          source "${VENV_DIR}/bin/activate"
+          python tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
+
+      - name: install coverage tooling
+        run: |
+          source "${VENV_DIR}/bin/activate"
+          uv pip install pytest-cov || python -m pip install pytest-cov
+
+      - name: select all tests and benchmarks
+        run: |
+          source "${VENV_DIR}/bin/activate"
+          python - <<'PY' >> "$GITHUB_ENV"
+          import json, subprocess, sys
+          from pathlib import Path
+
+          out = subprocess.run(
+              [sys.executable, "tools/select_tests.py", "--all-tests", "--format", "github"],
+              check=True, capture_output=True, text=True,
+          ).stdout
+          targets = json.loads(
+              next(l for l in out.splitlines() if l.startswith("targets=")).split("=", 1)[1]
+          )
+          benchmarks = sorted(p.as_posix() for p in Path("benchmark").glob("test_*.py"))
+          dump = lambda d: json.dumps(d, separators=(",", ":"))
+          print(f"TESTS_TARGETS_JSON={dump({**targets, 'benchmarks': []})}")
+          print(f"BENCH_TARGETS_JSON={dump({**targets, 'tests': [], 'benchmarks': benchmarks})}")
+          PY
+
+      # Coverage covers the Python host code only; Triton kernels run on the
+      # GPU and are not traced. Benchmarks are excluded from the measurement.
+      - name: run functional tests with coverage
+        env:
+          CI_TARGETS_JSON: ${{ env.TESTS_TARGETS_JSON }}
+          PYTEST_ADDOPTS: >-
+            --cov=flaggems_vllm --cov-append --cov-report=
+        run: |
+          source "${VENV_DIR}/bin/activate"
+          rm -f .coverage
+          python tools/run_ci_targets.py \
+            --backend nvidia-cuda133 \
+            --capabilities .github/backend-capabilities.json
+
+      - name: report coverage
+        if: always()
+        run: |
+          source "${VENV_DIR}/bin/activate"
+          [[ -f .coverage ]] || { echo "No coverage data was produced."; exit 0; }
+          mkdir -p coverage
+          python -m coverage html -d coverage/htmlcov
+          python -m coverage xml -o coverage/coverage.xml
+          {
+            echo "## Unit test coverage ($(date -u +%F))"
+            echo
+            python -m coverage report --format=markdown
+          } | tee coverage/ut-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ut-coverage-${{ github.run_id }}
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: run benchmarks
+        if: always()
+        env:
+          CI_TARGETS_JSON: ${{ env.BENCH_TARGETS_JSON }}
+        run: |
+          source "${VENV_DIR}/bin/activate"
+          python tools/run_ci_targets.py \
+            --backend nvidia-cuda133 \
+            --capabilities .github/backend-capabilities.json

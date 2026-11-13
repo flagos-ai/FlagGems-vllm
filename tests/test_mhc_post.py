@@ -27,7 +27,6 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout
 from flaggems_vllm.ops.mhc.mhc_post import mhc_post_ref as generic_mhc_post_ref
-from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import _mhc_post_ascend
 
 try:
     import torch_npu  # noqa: F401
@@ -81,6 +80,14 @@ def mhc_post_ref(x, h_res, h_out, h_post):
     outer = hpost.float().unsqueeze(-1) * hout_f.unsqueeze(1)
     y = (mix + outer).to(orig_dtype)
     return y.reshape(shape)
+
+
+def _ascend_entry():
+    # Imported lazily: the Ascend backend needs Triton extensions that other
+    # platforms do not ship, and importing it must not break collection there.
+    from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import _mhc_post_ascend
+
+    return _mhc_post_ascend
 
 
 def _make_generic_data(tokens, hc, hidden, seed=42):
@@ -208,7 +215,7 @@ def test_mhc_post_ascend_variants(dtype, variant):
         "concat_reduce": {"use_concat_reduce": True},
     }[variant]
     data = _make_ascend_data(8, 1024, dtype=dtype)
-    out = _mhc_post_ascend(*data, **kwargs)
+    out = _ascend_entry()(*data, **kwargs)
     torch.npu.synchronize()
     ref = mhc_post_ref(*(t.cpu() for t in data))
     _assert_close(out, ref, variant)
@@ -217,6 +224,7 @@ def test_mhc_post_ascend_variants(dtype, variant):
 @requires_ascend
 def test_mhc_post_ascend_tail_and_4d():
     """The private AscendC entry still supports D tails and BSND inputs."""
+    _mhc_post_ascend = _ascend_entry()
     data = _make_ascend_data(8, 1280)
     out = _mhc_post_ascend(*data)
     ref = mhc_post_ref(*(t.cpu() for t in data))

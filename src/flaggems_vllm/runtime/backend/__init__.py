@@ -189,6 +189,13 @@ class BackendArchEvent(BackendEventBase):
         if not hasattr(_state.vendor_module, "ARCH_MAP"):
             return
         arch_map = _state.vendor_module.ARCH_MAP
+        arch_detector = getattr(_state.vendor_module, "get_arch_key", None)
+        if arch_detector is not None:
+            arch_key = arch_detector(_state.torch_device_object, device)
+            if arch_key in arch_map:
+                self.has_arch = True
+                return arch_map[arch_key]
+            return
         arch_string = os.environ.get("ARCH", "")
         arch_string_num = arch_string.split("_")[-1][0] if arch_string else arch_string
         if not arch_string_num:
