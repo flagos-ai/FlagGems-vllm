@@ -419,3 +419,14 @@ silu_and_mul_with_clamp_linear:
       UNMASKED: false
     num_warps: 4
     num_stages: 1
+
+fused_kimi_k3_mla_kv_concat_ascend:
+  - META: {HEADS_PER_PROGRAM: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {HEADS_PER_PROGRAM: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {HEADS_PER_PROGRAM: 16}
+    num_warps: 4
+    num_stages: 1

@@ -706,6 +706,20 @@ ops:
       - Quantization
     stages:
       - beta: '5.4'
+  - id: fused_kimi_k3_mla_kv_concat
+    description: |
+      Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
+      caller-provided contiguous full-key output, preserving FP16/BF16 bits.
+      No cache, query, RoPE, or quantization work. Output/input overlap rejected.
+    for:
+      - _C.fused_kimi_k3_mla_kv_concat
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - DataMovement
+    stages:
+      - beta: '5.4'
   - id: fused_marlin_moe_w4a16
     description: |
       Fused mixture-of-experts computation with 4-bit weights and 16-bit
