@@ -36,7 +36,7 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
 from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn,
