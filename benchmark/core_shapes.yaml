@@ -794,4 +794,3 @@ cast_sigmoid:
     - [1048576]       # large flat (1M)
     - [4096, 4096]    # large 2D (16M)
   shape_desc: "small: [1], [1,256]; medium: [128,256], [4096,256]; large: [1048576], [4096,4096]"
-

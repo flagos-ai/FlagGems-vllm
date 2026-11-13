@@ -145,7 +145,7 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: causal_conv1d_fn
     description: |
       Causal depthwise conv1d over variable-length token sequences with
