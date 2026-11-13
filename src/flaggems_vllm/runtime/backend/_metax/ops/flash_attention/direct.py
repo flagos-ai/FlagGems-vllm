@@ -632,6 +632,8 @@ def flash_varlen_int8_fwd_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     DECODE_FASTPATH: tl.constexpr = False,
+    RESIDUAL_PATH: tl.constexpr = True,
+    SELECT_RESIDUAL: tl.constexpr = False,
 ):
     program_tile = tl.program_id(0)
     (tile, batch, head) = (
@@ -653,6 +655,15 @@ def flash_varlen_int8_fwd_kernel(
     else:
         k_start = tl.load(CUK + batch)
         nk = tl.load(CUK + batch + 1) - k_start
+    if SELECT_RESIDUAL:
+        # Uniform per-head V scales allow selecting a separately compiled path.
+        # This bounds the omitted P-rounding contribution, including subnormals,
+        # after normalization over the actual KV length.
+        v_magnitude = tl.abs(tl.load(VS + batch * vs0 + kv_head * vs1))
+        rounding_bound = (
+            v_magnitude * 128.0 * (0.00048828125 + nk * 0.000000029802322387695312)
+        )
+        active = active & ((rounding_bound > 0.01) == RESIDUAL_PATH)
     rows = tile * BM + tl.arange(0, BM)
     m = rows // GROUP if FOLD else rows
     h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
@@ -856,17 +867,33 @@ def flash_varlen_int8_fwd_kernel(
                             d[None, :] < HEAD_DIM,
                             0,
                         )
-                    # Preserve the FP32 softmax weights when opposite V rows cancel.
-                    # Each dot uses FP16 operands and accumulates into FP32.
-                    v_t = tl.trans(v.to(tl.float16))
-                    p_hi = probabilities.to(tl.float16)
-                    p_lo = (probabilities - p_hi.to(tl.float32)).to(tl.float16)
-                    pv_lo = tl.dot(v_t, tl.trans(p_lo), out_dtype=tl.float32)
-                    weighted_v = tl.trans(tl.dot(v_t, tl.trans(p_hi), pv_lo))
-                    if vs2 == 0:
-                        acc = acc * alpha[:, None] + weighted_v
+                    if RESIDUAL_PATH:
+                        v_t = tl.trans(v.to(tl.float16))
+                        p_hi = probabilities.to(tl.float16)
+                        p_lo = (probabilities - p_hi.to(tl.float32)).to(tl.float16)
+                        pv_lo = tl.dot(v_t, tl.trans(p_lo), out_dtype=tl.float32)
+                        weighted_v = tl.trans(tl.dot(v_t, tl.trans(p_hi), pv_lo))
+                        if vs2 == 0:
+                            acc = acc * alpha[:, None] + weighted_v
+                        else:
+                            acc = acc * alpha[:, None] + weighted_v * vs
+                    elif vs2 == 0:
+                        acc = tl.trans(
+                            tl.dot(
+                                tl.trans(v.to(tl.float16)),
+                                tl.trans(probabilities.to(tl.float16)),
+                                tl.trans(acc * alpha[:, None]),
+                            )
+                        )
                     else:
-                        acc = acc * alpha[:, None] + weighted_v * vs
+                        partial = tl.trans(
+                            tl.dot(
+                                tl.trans(v.to(tl.float16)),
+                                tl.trans(probabilities.to(tl.float16)),
+                                out_dtype=tl.float32,
+                            )
+                        )
+                        acc = acc * alpha[:, None] + partial * vs
             if KV_SPLITS > 1:
                 result = acc
             else:

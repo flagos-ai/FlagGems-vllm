@@ -417,24 +417,42 @@ def test_long_sequences(dim, causal, qlens, klens):
 
 @pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.parametrize(
-    "seed,query_length,kv_length,is_cancellation",
+    "seed,query_length,kv_length,is_cancellation,value_scale",
     [
-        (0, 512, 512, False),
-        (1, 512, 512, False),
-        (2, 512, 512, False),
-        (3, 512, 512, False),
-        (0, 1024, 2048, True),
-        (0, 2048, 4096, True),
+        (0, 512, 512, False, 1.7),
+        (1, 512, 512, False, 1.7),
+        (2, 512, 512, False, 1.7),
+        (3, 512, 512, False, 1.7),
+        (0, 1024, 2048, True, 1.7),
+        (0, 2048, 4096, True, 1.7),
+        (0, 128, 2048, True, 0.125),
+        (0, 128, 2048, True, 0.25),
+        (0, 128, 2048, True, -1.7),
+        (0, 128, 2048, True, 0.0),
+        (0, 128, 65536, True, 0.125),
+        (0, 128, 2048, True, (0.125, 1.7) * 4),
     ],
-    ids=["random-0", "random-1", "random-2", "random-3", "cancel-short", "cancel-long"],
+    ids=[
+        "random-0",
+        "random-1",
+        "random-2",
+        "random-3",
+        "cancel-short",
+        "cancel-long",
+        "cancel-below-bound",
+        "cancel-above-bound",
+        "cancel-negative-scale",
+        "cancel-zero-scale",
+        "cancel-long-kv",
+        "cancel-mixed-head-scales",
+    ],
 )
 def test_probability_quantization_accuracy(
-    seed, query_length, kv_length, is_cancellation
+    seed, query_length, kv_length, is_cancellation, value_scale
 ):
     if is_cancellation:
         # Opposite V rows expose probability rounding when two logits almost agree.
         score_gap = 0.000244
-        value_scale = 1.7
         device = flaggems_vllm.device
         q = torch.full((query_length, 32, 128), 127, dtype=torch.int8, device=device)
         q[:, :, 0] = 1
@@ -450,7 +468,10 @@ def test_probability_quantization_accuracy(
         ks = torch.full((1, 8, 1), score_gap * math.sqrt(128), device=device).expand(
             1, 8, kv_length // 128
         )
-        vs = torch.full((1, 8, 1), value_scale, device=device).expand_as(ks)
+        v_scales = torch.as_tensor(
+            value_scale, dtype=torch.float32, device=device
+        ).expand(8)
+        vs = v_scales[None, :, None].expand_as(ks)
         cuq = torch.tensor([0, query_length], dtype=torch.int32, device=device)
         used = torch.tensor([kv_length], dtype=torch.int32, device=device)
         table = torch.arange(kv_length // 16, dtype=torch.int32, device=device).reshape(
@@ -472,9 +493,9 @@ def test_probability_quantization_accuracy(
             causal=True,
             out=out,
         )
-        expected = torch.full_like(
-            actual, -127 * value_scale * math.tanh(score_gap / 2), dtype=torch.float32
-        )
+        expected = (-127 * v_scales.repeat_interleave(4) * math.tanh(score_gap / 2))[
+            None, :, None
+        ].expand_as(actual)
         gems_assert_close(actual.float(), expected, dtype=torch.float32, atol=0.025)
         return
     torch.manual_seed(seed)
