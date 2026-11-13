@@ -22,6 +22,7 @@ Two references:
 """
 
 import importlib
+import inspect
 import math
 import random
 import time
@@ -29,6 +30,7 @@ import types
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 
@@ -661,10 +663,61 @@ def test_dsv41_o_proj_wo_b_proj_empty():
     assert res.shape == (0, 128)
 
 
+def _default_vllm_launch_pdl(monkeypatch):
+    """Give vLLM's quant kernel a ``launch_pdl`` default so it can always launch.
+
+    ``_fused_inv_rope_fp8_quant_per_head`` declares ``launch_pdl: tl.constexpr``
+    with no default, and vLLM passes it only when
+    ``current_platform.is_arch_support_pdl()`` is true -- a live CUDA context is
+    needed for that check and every exception in it becomes False. Where it is
+    false the Triton binder is left without the argument and the launch raises
+    TypeError, so the vLLM reference cannot run at all; the FlagOS CI image does
+    that on H800. Default it to False without touching the kernel code; a stack
+    that does pass ``launch_pdl=True`` still gets PDL. Same fix as
+    ``benchmark/test_fused_inv_rope_fp8_quant.py``'s MUSA baseline, and pytest
+    restores the original kernel afterwards, including on failure.
+    """
+    module = importlib.import_module(
+        "vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant"
+    )
+    kernel_name = "_fused_inv_rope_fp8_quant_per_head"
+    kernel = getattr(module, kernel_name, None)
+    if kernel is None:
+        return
+    params = inspect.signature(kernel.fn).parameters
+    pdl = params.get("launch_pdl")
+    if pdl is None or pdl.default is not inspect.Parameter.empty:
+        return
+    if (
+        next(reversed(params)) != "launch_pdl"
+        or pdl.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ):
+        raise RuntimeError("unsupported vLLM launch_pdl signature")
+
+    fn = kernel.fn
+    adapted_fn = types.FunctionType(
+        fn.__code__, fn.__globals__, fn.__name__, (False,), fn.__closure__
+    )
+    adapted_fn.__annotations__ = fn.__annotations__.copy()
+    adapted_fn.__module__ = fn.__module__
+    adapted_fn.__qualname__ = fn.__qualname__
+    adapted_kernel = triton.jit(
+        adapted_fn,
+        do_not_specialize=kernel.do_not_specialize,
+        do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
+        version=kernel.version,
+        debug=kernel.debug,
+        noinline=kernel.noinline,
+        launch_metadata=kernel.launch_metadata,
+    )
+    monkeypatch.setattr(module, kernel_name, adapted_kernel)
+
+
 @pytest.mark.skipif(not HAS_VLLM, reason="requires vLLM with DeepGEMM")
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 63, 65, 257, 1000])
 @pytest.mark.parametrize("n_groups, hpg, rank", [*GROUP_CONFIGS, (1, 8, 1024)])
-def test_dsv41_o_proj_vs_vllm(num_tokens, n_groups, hpg, rank):
+def test_dsv41_o_proj_vs_vllm(num_tokens, n_groups, hpg, rank, monkeypatch):
+    _default_vllm_launch_pdl(monkeypatch)
     attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
     w3 = w.view(n_groups, rank, -1)
     ws3 = ws.view(n_groups, rank // QUANT_BLOCK, -1)
