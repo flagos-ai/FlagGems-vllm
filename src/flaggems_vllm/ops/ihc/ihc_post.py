@@ -26,28 +26,30 @@ per-channel gate [N, hc] produced by ihc_pre. Pure elementwise / streaming:
 bandwidth-bound, no reduction.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
-# All hc channels of one BLOCK_D hidden slice are handled as a single
-# [HC_POW2, BLOCK_D] tile, so the hc residual loads and output stores issue as
-# one 2D access each instead of a static_range of per-channel accesses. The op
-# is pure streaming (18*N*D bytes at hc=4), so at small N it is latency-bound
-# and the wider access window is what hides memory latency; at large N it still
-# wins slightly by sustaining a better access pattern.
-#
-# BLOCK_D=512 / num_warps=4 measured best at every token count on H20
-# (D=6144, hc=4, bf16): 1.30x at N=1, 1.26x at N=8, 1.16x at N=64, 1.11x at
-# N=256, 1.06x at N=1024, 1.05x at N=4096, 1.04x at N=8192 versus the previous
-# BLOCK_D=1024 / num_warps=4 per-channel loop. A narrower tile kept winning even
-# at N=8192 (98304 blocks), so no per-N config split is needed; num_warps was
-# flat within +-1% across 1/2/4/8. Hence the fixed config (no autotune), as in
-# ihc_pre.
-_BLOCK_D = 512
-_NUM_WARPS = 4
+from flaggems_vllm import runtime
+from flaggems_vllm.utils import libentry, libtuner
+
+logger = logging.getLogger(__name__)
 
 
+# Reuse x and post across all HC channels of each hidden slice. Autotuning
+# compares tile sizes and program order on the current device, without Graph.
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("triton_ihc_post"),
+    key=["NUM_TOKENS", "HC_MULT", "HIDDEN_SIZE", "DTYPE_TAG", "LAYOUT_TAG"],
+    warmup=5,
+    rep=10,
+    use_cuda_graph=False,
+)
 @triton.jit
 def _ihc_post_kernel(
     x_ptr,
@@ -58,13 +60,21 @@ def _ihc_post_kernel(
     HC_MULT: tl.constexpr,
     HC_POW2: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    EVEN_D: tl.constexpr,
-    EVEN_HC: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+    DTYPE_TAG: tl.constexpr,
+    LAYOUT_TAG: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
 ):
-    # D-major grid: consecutive programs walk contiguous hidden offsets inside a
-    # token rather than striding hc*D apart across tokens.
-    hidden_block_idx = tl.program_id(0)
-    token_idx = tl.program_id(1).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
+    hidden_blocks = tl.cdiv(HIDDEN_SIZE, BLOCK_D)
+    if TOKEN_MAJOR:
+        token_idx = pid % NUM_TOKENS
+        hidden_block_idx = pid // NUM_TOKENS
+    else:
+        hidden_block_idx = pid % hidden_blocks
+        token_idx = pid // hidden_blocks
+    EVEN_D: tl.constexpr = HIDDEN_SIZE % BLOCK_D == 0
+    EVEN_HC: tl.constexpr = HC_MULT == HC_POW2
 
     hc_idx = tl.arange(0, HC_POW2)[:, None]
     hidden_offsets = (hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D))[None, :]
@@ -113,17 +123,49 @@ def ihc_post(
     Returns:
         out: [num_tokens, hc_mult, hidden_size], x.dtype.
     """
-    assert x.dim() == 2, "x must be [num_tokens, hidden_size]"
-    assert x.is_cuda and residual.is_cuda and post.is_cuda
-    assert post.dtype == torch.float32
+    logger.debug("GEMS IHC_POST")
+    return _ihc_post(x, residual, post)
 
+
+def triton_ihc_post(
+    x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
+) -> torch.Tensor:
+    """Return post[:, :, None] * x[:, None, :] + residual with unfused FP32 arithmetic.
+
+    FP16/BF16 inputs may be noncontiguous or alias each other. No input is
+    mutated; the result always owns fresh storage. HC and D must be positive.
+    """
+    logger.debug("GEMS TRITON_IHC_POST")
+    return _ihc_post(x, residual, post)
+
+
+def _ihc_post(x, residual, post):
+    if not all(isinstance(t, torch.Tensor) for t in (x, residual, post)):
+        raise TypeError("x, residual and post must be tensors")
+    if x.ndim != 2 or residual.ndim != 3 or post.ndim != 2:
+        raise ValueError("expected x[N,D], residual[N,HC,D], post[N,HC]")
+    n, d = x.shape
+    hc = post.shape[1]
+    if d <= 0 or hc <= 0:
+        raise ValueError("D and HC must be positive")
+    if post.shape != (n, hc) or residual.shape != (n, hc, d):
+        raise ValueError("incompatible x, residual and post shapes")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("x must have dtype float16 or bfloat16")
+    if residual.dtype != x.dtype or post.dtype != torch.float32:
+        raise TypeError("residual must match x dtype and post must be float32")
+    if x.device != residual.device or x.device != post.device:
+        raise ValueError("all inputs must be on the same device")
+    if x.device.type != runtime.device.name or x.device.type == "cpu":
+        raise ValueError("inputs must be on the active accelerator device")
+    layout_tag = sum(
+        (not t.is_contiguous()) << i for i, t in enumerate((x, residual, post))
+    )
     x = x.contiguous()
     residual = residual.contiguous()
     post = post.contiguous()
     num_tokens, hidden_size = x.shape
     hc_mult = post.shape[-1]
-    assert residual.shape == (num_tokens, hc_mult, hidden_size)
-    assert post.shape == (num_tokens, hc_mult)
 
     if num_tokens == 0:
         return torch.empty((0, hc_mult, hidden_size), dtype=x.dtype, device=x.device)
@@ -132,22 +174,47 @@ def ihc_post(
         (num_tokens, hc_mult, hidden_size), dtype=x.dtype, device=x.device
     )
     hc_pow2 = triton.next_power_of_2(hc_mult)
-    # enable_fp_fusion=False keeps the fp32 mul and add unfused, so the result
-    # is bitwise identical to the reference (the accuracy test is zero-tolerance).
-    _ihc_post_kernel[(triton.cdiv(hidden_size, _BLOCK_D), num_tokens)](
-        x,
-        residual,
-        post,
-        output,
-        HIDDEN_SIZE=hidden_size,
-        HC_MULT=hc_mult,
-        HC_POW2=hc_pow2,
-        BLOCK_D=_BLOCK_D,
-        EVEN_D=(hidden_size % _BLOCK_D == 0),
-        EVEN_HC=(hc_pow2 == hc_mult),
-        num_warps=_NUM_WARPS,
-        enable_fp_fusion=False,
-    )
+    kernel = _ihc_post_kernel
+    if runtime.device.vendor_name == "metax":
+        from flaggems_vllm.runtime.backend._metax.ops.ihc_post import (
+            _ihc_post_kernel as kernel,
+        )
+    elif runtime.device.vendor_name == "mthreads" and x.dtype == torch.float16:
+        from flaggems_vllm.runtime.backend._mthreads.ops.ihc_post import (
+            _ihc_post_kernel as kernel,
+        )
+    # Keep the native FP32 multiply and addition separate, including rounding.
+    with runtime.torch_device_fn.device(x.device):
+        if runtime.device.vendor_name in (
+            "nvidia",
+            "thead",
+        ) and triton.__version__.startswith("3.6."):
+            if runtime.device.vendor_name == "nvidia":
+                from flaggems_vllm.runtime.backend._nvidia.ops.ihc_post import (
+                    _launch_ihc_post,
+                )
+            else:
+                from flaggems_vllm.runtime.backend._thead.ops.ihc_post import (
+                    _launch_ihc_post,
+                )
+
+            _launch_ihc_post(
+                x, residual, post, output, num_tokens, hc_mult, hidden_size, layout_tag
+            )
+            return output
+        kernel[lambda meta: (num_tokens * triton.cdiv(hidden_size, meta["BLOCK_D"]),)](
+            x,
+            residual,
+            post,
+            output,
+            HIDDEN_SIZE=hidden_size,
+            HC_MULT=hc_mult,
+            HC_POW2=hc_pow2,
+            NUM_TOKENS=num_tokens,
+            DTYPE_TAG=str(x.dtype),
+            LAYOUT_TAG=layout_tag,
+            enable_fp_fusion=False,
+        )
     return output
 
 
