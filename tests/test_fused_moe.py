@@ -320,3 +320,628 @@ def test_oai_fp32_overflow_rejected_before_tensor_access(index, value):
     # tensors still produces the scalar error rather than an AttributeError.
     with pytest.raises(ValueError, match="finite FP32"):
         moe._swigluoai_quantize_per_token_triton(None, None, *params)
+
+
+@pytest.fixture
+def thead_moe_original_layout(monkeypatch):
+    from flaggems_vllm.runtime import device
+
+    if device.vendor_name != "thead":
+        pytest.skip("T-Head weight-layout regression")
+    thead_moe = importlib.import_module(
+        "flaggems_vllm.runtime.backend._thead.ops.fused_moe"
+    )
+    permute = importlib.import_module("flaggems_vllm.ops.permute_copy")
+
+    def unexpected_conversion(*args, **kwargs):
+        pytest.fail("MoE must not copy weights or query free memory")
+
+    monkeypatch.setattr(permute, "permute_copy", unexpected_conversion)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", unexpected_conversion)
+    return thead_moe
+
+
+def _thead_moe_inputs(m, dtype, padded=False, hidden=128):
+    # E/topk keeps M<=12 on the naive path and M>=13 on the aligned path.
+    # I=80 exercises partial K/N tiles. hidden=1024 also covers GEMV at M=8.
+    e, intermediate, topk = 512, 80, 10
+    x = torch.randn((m, hidden), device="cuda", dtype=dtype)
+
+    def weight(n, k):
+        shape = (e, n + 1, k + 16) if padded else (e, n, k)
+        storage = torch.randn(shape, device="cuda", dtype=dtype) * (k**-0.5)
+        return storage[:, :n, :k]
+
+    w1 = weight(2 * intermediate, hidden)
+    w2 = weight(hidden, intermediate)
+    ids = (torch.arange(m * topk, device="cuda").view(m, topk) % e).int()
+    weights = torch.full((m, topk), 1.0 / topk, device="cuda", dtype=torch.float32)
+    return x, w1, w2, weights, ids
+
+
+def _thead_moe_reference(x, w1, w2, weights, ids):
+    # Independent CPU reference; production code never calls this helper.
+    x, w1, w2, weights, ids = [t.cpu() for t in (x, w1, w2, weights, ids)]
+    result = torch.zeros(x.shape, dtype=torch.float32)
+    for rank in range(ids.shape[1]):
+        up = torch.einsum("mh,mnh->mn", x.float(), w1[ids[:, rank]].float())
+        gate, value = up.chunk(2, dim=-1)
+        activated = (torch.nn.functional.silu(gate) * value).to(x.dtype)
+        down = torch.einsum("mi,mhi->mh", activated.float(), w2[ids[:, rank]].float())
+        result += (down * weights[:, rank, None]).to(x.dtype).float()
+    return result.to(x.dtype)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [0, 1, 8, 12, 13, 64, 128, 256])
+@pytest.mark.parametrize("padded", [False, True])
+def test_thead_fused_moe_original_weight_layout(
+    thead_moe_original_layout, dtype, m, padded, monkeypatch
+):
+    torch.manual_seed(67)
+    inputs = _thead_moe_inputs(m, dtype, padded)
+    x, w1, w2, weights, ids = inputs
+    original_strides = (w1.stride(), w2.stride())
+    seen = []
+    dispatch = thead_moe_original_layout.dispatch_fused_moe_kernel
+
+    def check_weight(a, b, *args, **kwargs):
+        expected = (w1, w2)[len(seen) % 2]
+        assert b is expected
+        seen.append(b.stride())
+        return dispatch(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(
+        thead_moe_original_layout, "dispatch_fused_moe_kernel", check_weight
+    )
+    expected = _thead_moe_reference(*inputs)
+    actual = thead_moe_original_layout.fused_experts_impl(*inputs)
+    assert actual.shape == x.shape and actual.dtype == dtype
+    assert (w1.stride(), w2.stride()) == original_strides
+    assert seen == list(original_strides) * bool(m)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_thead_fused_moe_weight_reuse_and_update(thead_moe_original_layout, dtype):
+    torch.manual_seed(68)
+    # Three live pairs exceed the former four-tensor module cache capacity.
+    layers = [_thead_moe_inputs(1, dtype) for _ in range(3)]
+    for _ in range(2):
+        for inputs in layers:
+            actual = thead_moe_original_layout.fused_experts_impl(*inputs)
+            torch.testing.assert_close(
+                actual.cpu(), _thead_moe_reference(*inputs), rtol=0.05, atol=0.01
+            )
+    x, w1, w2, weights, ids = layers[0]
+    w2.neg_()
+    expected = _thead_moe_reference(x, w1, w2, weights, ids)
+    actual = thead_moe_original_layout.fused_experts_impl(
+        x, w1, w2, weights, ids, inplace=True
+    )
+    assert actual is x
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,hidden", [(1, 128), (1, 1024), (8, 1024), (13, 128), (64, 128)]
+)
+@pytest.mark.parametrize("padded", [False, True])
+def test_thead_fused_moe_graph_reads_current_weights(
+    thead_moe_original_layout, dtype, m, hidden, padded
+):
+    torch.manual_seed(69)
+    inputs = _thead_moe_inputs(m, dtype, padded, hidden)
+    x, w1, w2, weights, ids = inputs
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            thead_moe_original_layout.fused_experts_impl(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = thead_moe_original_layout.fused_experts_impl(*inputs)
+
+    # Update inputs and both original weights at their captured addresses.
+    # Graphs must observe each change, not a stale cached transpose.
+    original_w1, original_w2 = w1.clone(), w2.clone()
+    previous = _thead_moe_reference(*inputs)
+    for change in ("input", "weights", "restore", "input"):
+        if change == "input":
+            x.copy_(torch.randn_like(x))
+        elif change == "weights":
+            w1.copy_(original_w1 * 0.5)
+            w2.copy_(-original_w2)
+        else:
+            w1.copy_(original_w1)
+            w2.copy_(original_w2)
+        expected = _thead_moe_reference(*inputs)
+        assert not torch.allclose(previous, expected, rtol=0.05, atol=0.01)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+        previous = expected
+
+
+def _thead_dense_moe_inputs(m, dtype):
+    x, w1, w2, _, ids = _thead_moe_inputs(m, dtype, padded=True)
+    # Keep padded strides and a nonzero expert storage offset on both weights.
+    w1, w2 = w1[1:9], w2[1:9]
+    ids = ids[:, :2].remainder(8)
+    weights = torch.full((m, 2), 0.5, device="cuda", dtype=torch.float32)
+    return x, w1, w2, weights, ids
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [64, 128, 512])
+def test_thead_fused_moe_dense_routing(thead_moe_original_layout, dtype, m):
+    import flaggems_vllm
+
+    torch.manual_seed(71)
+    inputs = _thead_dense_moe_inputs(m, dtype)
+    assert inputs[1].storage_offset() and inputs[2].storage_offset()
+    actual = flaggems_vllm.ops_experts_impl(*inputs)
+    torch.testing.assert_close(
+        actual.cpu(), _thead_moe_reference(*inputs), rtol=0.05, atol=0.01
+    )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [128, 512])
+def test_thead_fused_moe_dense_graph_reads_current_weights(
+    thead_moe_original_layout, dtype, m
+):
+    import flaggems_vllm
+
+    torch.manual_seed(72)
+    inputs = _thead_dense_moe_inputs(m, dtype)
+    x, w1, w2, _, _ = inputs
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flaggems_vllm.ops_experts_impl(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = flaggems_vllm.ops_experts_impl(*inputs)
+    previous = _thead_moe_reference(*inputs)
+    for _ in range(2):
+        x.copy_(torch.randn_like(x))
+        w1.mul_(0.75)
+        w2.neg_()
+        actual.fill_(float("nan"))
+        expected = _thead_moe_reference(*inputs)
+        assert not torch.allclose(previous, expected, rtol=0.05, atol=0.01)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+        previous = expected
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,e,h", [(1, 8, 4096), (4, 32, 1024), (16, 8, 2048), (4, 8, 2048)]
+)
+def test_thead_fused_moe_long_k_reference(thead_moe_original_layout, dtype, m, e, h):
+    import flaggems_vllm
+
+    torch.manual_seed(73)
+    intermediate, topk = 512, 2
+    x = torch.randn((m, h), device="cuda", dtype=dtype)
+    w1 = torch.randn((e, 2 * intermediate, h), device="cuda", dtype=dtype)
+    w1 *= h**-0.5
+    w2 = torch.randn((e, h, intermediate), device="cuda", dtype=dtype)
+    w2 *= intermediate**-0.5
+    weights = torch.full((m, topk), 0.5, device="cuda", dtype=torch.float32)
+    ids = (torch.arange(m * topk, device="cuda").view(m, topk) % e).int()
+    inputs = x, w1, w2, weights, ids
+    actual = flaggems_vllm.ops_experts_impl(*inputs)
+    torch.testing.assert_close(
+        actual.cpu(), _thead_moe_reference(*inputs), rtol=0.05, atol=0.01
+    )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("quantization", ["use_int8_w8a16", "use_int4_w4a16"])
+def test_thead_fused_moe_dequantized_gemv(
+    thead_moe_original_layout, dtype, quantization
+):
+    import flaggems_vllm
+
+    torch.manual_seed(74)
+    e, hidden, intermediate, topk = 8, 1024, 512, 2
+    limit = 8 if quantization == "use_int4_w4a16" else 32
+    x = torch.randn((1, hidden), device="cuda", dtype=dtype)
+    # T-Head stores W4 unpacked in int8 containers, with the full K dimension.
+    w1 = torch.randint(
+        -limit, limit, (e, 2 * intermediate, hidden), device="cuda", dtype=torch.int8
+    )
+    w2 = torch.randint(
+        -limit, limit, (e, hidden, intermediate), device="cuda", dtype=torch.int8
+    )
+    scale1 = torch.full(
+        (e, 2 * intermediate),
+        (3 / hidden) ** 0.5 / limit,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    scale2 = torch.full(
+        (e, hidden),
+        (3 / intermediate) ** 0.5 / limit,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    weights = torch.full((1, topk), 0.5, device="cuda", dtype=torch.float32)
+    ids = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, topk)
+    kwargs = {quantization: True, "w1_scale": scale1, "w2_scale": scale2}
+
+    def reference():
+        # Match the public contract's dequantization rounding, then use the
+        # independent CPU MoE formula. No production helper is the oracle.
+        q1, q2 = w1.cpu().to(dtype), w2.cpu().to(dtype)
+        s1, s2 = scale1.cpu().to(dtype), scale2.cpu().to(dtype)
+        return _thead_moe_reference(
+            x.cpu(),
+            q1 * s1.unsqueeze(-1),
+            q2 * s2.unsqueeze(-1),
+            weights.cpu(),
+            ids.cpu(),
+        )
+
+    expected = reference()
+    actual = flaggems_vllm.ops_experts_impl(x, w1, w2, weights, ids, **kwargs)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flaggems_vllm.ops_experts_impl(x, w1, w2, weights, ids, **kwargs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = flaggems_vllm.ops_experts_impl(x, w1, w2, weights, ids, **kwargs)
+    for change in ("input", "weights"):
+        previous = expected
+        if change == "input":
+            x.copy_(torch.randn_like(x))
+        else:
+            w2.zero_()
+        expected = reference()
+        assert not torch.allclose(previous, expected, rtol=0.05, atol=0.01)
+        actual.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,hidden,intermediate,topk",
+    [
+        (9, 3072, 1024, 4),
+        (16, 3072, 1024, 3),
+        (16, 2048, 1024, 4),
+        (16, 3072, 1024, 4),
+        (16, 3073, 1040, 4),
+    ],
+)
+@pytest.mark.parametrize("padded", [False, True])
+def test_thead_fused_moe_long_k_swap_graph(
+    thead_moe_original_layout, monkeypatch, dtype, m, hidden, intermediate, topk, padded
+):
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(105)
+        experts = 128
+        x = torch.randn((m, hidden), device="cuda", dtype=dtype)
+
+        def weight(n, k):
+            shape = (experts, n + 1, k + 16) if padded else (experts, n, k)
+            storage = torch.randn(shape, device="cuda", dtype=dtype) * (k**-0.5)
+            return storage[:, :n, 8 : 8 + k] if padded else storage
+
+        w1 = weight(2 * intermediate, hidden)
+        w2 = weight(hidden, intermediate)
+        weights = torch.full((m, topk), 1 / topk, device="cuda")
+        ids = (torch.arange(m * topk, device="cuda").view(m, topk) % 8).int()
+        values = x, w1, w2, weights, ids
+        generic = importlib.import_module("flaggems_vllm.ops.fused_moe")
+        invoke = generic.invoke_fused_moe_triton_kernel
+        seen = []
+
+        def observe(a, b, *args, **kwargs):
+            seen.append(b)
+            return invoke(a, b, *args, **kwargs)
+
+        expected = _thead_moe_reference(*values)
+        with monkeypatch.context() as context:
+            context.setattr(generic, "invoke_fused_moe_triton_kernel", observe)
+            actual = flaggems_vllm.ops_experts_impl(*values)
+        if m == 16 and hidden == 3072 and topk == 4:
+            assert len(seen) == 2 and seen[0] is w1 and seen[1] is w2
+        else:
+            # Small workloads and partial tiles retain the vendor schedule.
+            assert not seen
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                flaggems_vllm.ops_experts_impl(*values)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = flaggems_vllm.ops_experts_impl(*values)
+        # Different expert histograms exercise new padded ranges in one graph.
+        for active_experts in (experts, 5, 2):
+            ids.copy_(
+                (
+                    torch.arange(m * topk, device="cuda").view(m, topk) % active_experts
+                ).int()
+            )
+            x.copy_(torch.randn_like(x))
+            w1.mul_(0.75)
+            w2.neg_()
+            expected = _thead_moe_reference(*values)
+            actual.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+        for value in (float("nan"), float("inf"), -float("inf"), 0.0):
+            x[0, 0] = value
+            expected = _thead_moe_reference(*values)
+            actual = flaggems_vllm.ops_experts_impl(*values)
+            torch.testing.assert_close(
+                actual.cpu(), expected, rtol=0.05, atol=0.01, equal_nan=True
+            )
+        expected = _thead_moe_reference(*values)
+        actual = flaggems_vllm.ops_experts_impl(*values, inplace=True)
+        assert actual is x
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("hidden,intermediate", [(1024, 512), (3072, 1024)])
+def test_thead_fused_moe_long_k_swap_upper_batch(
+    thead_moe_original_layout, dtype, hidden, intermediate
+):
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(106)
+        m, experts, topk = 256, 128, 4
+        # Repeat diverse rows to bound CPU-reference memory at the batch limit.
+        x = torch.randn((16, hidden), device="cuda", dtype=dtype).repeat(16, 1)
+        w1 = torch.randn(
+            (experts, 2 * intermediate, hidden), device="cuda", dtype=dtype
+        ) * (hidden**-0.5)
+        w2 = torch.randn(
+            (experts, hidden, intermediate), device="cuda", dtype=dtype
+        ) * (intermediate**-0.5)
+        ids = (
+            (torch.arange(16 * topk, device="cuda").view(16, topk) % experts)
+            .int()
+            .repeat(16, 1)
+        )
+        weights = torch.full((m, topk), 1 / topk, device="cuda")
+        values = x, w1, w2, weights, ids
+        expected = _thead_moe_reference(x[:16], w1, w2, weights[:16], ids[:16]).repeat(
+            16, 1
+        )
+        actual = flaggems_vllm.ops_experts_impl(*values)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_thead_fused_moe_long_k_keeps_naive_gemv(
+    thead_moe_original_layout, monkeypatch, dtype
+):
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(107)
+        m, experts, hidden, intermediate, topk = 16, 128, 3072, 1024, 4
+        x = torch.randn((m, hidden), device="cuda", dtype=dtype)
+        w1 = torch.randn(
+            (experts, 2 * intermediate, hidden), device="cuda", dtype=dtype
+        ) * (hidden**-0.5)
+        w2 = torch.randn(
+            (experts, hidden, intermediate), device="cuda", dtype=dtype
+        ) * (intermediate**-0.5)
+        ids = (torch.arange(m * topk, device="cuda").view(m, topk) % experts).int()
+        weights = torch.full((m, topk), 1 / topk, device="cuda")
+        values = x, w1, w2, weights, ids
+        expected = _thead_moe_reference(*values)
+        generic = importlib.import_module("flaggems_vllm.ops.fused_moe")
+
+        def unexpected_swap(*args, **kwargs):
+            pytest.fail("Naive routing must retain the vendor GEMV path")
+
+        monkeypatch.setattr(generic, "invoke_fused_moe_triton_kernel", unexpected_swap)
+        actual = flaggems_vllm.ops_experts_impl(*values, global_num_experts=1024)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+def test_thead_fused_moe_keeps_quantized_swap_rejection(thead_moe_original_layout):
+    import triton.language as tl
+
+    # Invalid quantized layout flags must keep their pre-existing error contract.
+    # CPU buffers ensure this rejection happens before any device launch.
+    a = torch.empty((16, 16), dtype=torch.int8)
+    b = torch.empty((1, 16, 16), dtype=torch.int8)
+    c = torch.empty((16, 1, 16), dtype=torch.bfloat16)
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 16,
+        "BLOCK_SIZE_K": 16,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2,
+        "INT8_ACCUMULATOR": True,
+        "SWAP_AB": True,
+    }
+    with pytest.raises(ValueError, match="INT8_ACCUMULATOR requires"):
+        thead_moe_original_layout.invoke_fused_moe_triton_kernel(
+            a,
+            b,
+            c,
+            None,
+            None,
+            None,
+            torch.arange(16, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            torch.tensor([16], dtype=torch.int32),
+            False,
+            1,
+            config,
+            tl.bfloat16,
+            False,
+            True,
+            False,
+            False,
+            True,
+            None,
+        )
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("topk", [8, 9])
+def test_thead_fused_moe_sparse_gm_policy_boundary(
+    thead_moe_original_layout, monkeypatch, dtype, topk
+):
+    """Public R=E / R>E policy boundary for the sparse G1 group order."""
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(111)
+        m, e, h, i = 16, 128, 3072, 1024
+        x = torch.randn((m, h), device="cuda", dtype=dtype)
+        storage1 = torch.randn((e, 2 * i + 1, h + 16), device="cuda", dtype=dtype)
+        storage2 = torch.randn((e, h + 1, i + 16), device="cuda", dtype=dtype)
+        w1 = storage1[:, : 2 * i, 8 : 8 + h]
+        w2 = storage2[:, :h, 8 : 8 + i]
+        w1.mul_(h**-0.5)
+        w2.mul_(i**-0.5)
+        weights = torch.full((m, topk), 1 / topk, device="cuda")
+        ids = (torch.arange(m * topk, device="cuda").view(m, topk) % 8).int()
+        values = x, w1, w2, weights, ids
+        expected = _thead_moe_reference(*values)
+
+        mod = thead_moe_original_layout
+        dispatch = mod.dispatch_fused_moe_kernel
+        seen = []
+
+        def observe(*args, **kwargs):
+            seen.append(args)
+            return dispatch(*args, **kwargs)
+
+        with monkeypatch.context() as context:
+            context.setattr(mod, "dispatch_fused_moe_kernel", observe)
+            actual = flaggems_vllm.ops_experts_impl(*values)
+        assert len(seen) == 2
+        g1, g2 = seen[0][12], seen[1][12]
+        assert g1["GROUP_SIZE_M"] == (1 if m * topk <= e else 8)
+        assert g2["GROUP_SIZE_M"] == 8
+        assert seen[0][1] is w1 and seen[1][1] is w2
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.05, atol=0.01)
+
+
+@pytest.mark.fused_moe
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_thead_fused_moe_long_k_three_live_banks(
+    thead_moe_original_layout, monkeypatch, dtype
+):
+    """Three live weight banks, changed state, and public graph replay."""
+    import flaggems_vllm
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(112)
+        m, e, h, i, k = 16, 128, 3072, 1024, 4
+        banks = []
+        for _ in range(3):
+            x = torch.randn((m, h), device="cuda", dtype=dtype)
+            w1 = torch.randn((e, 2 * i, h), device="cuda", dtype=dtype) * (h**-0.5)
+            w2 = torch.randn((e, h, i), device="cuda", dtype=dtype) * (i**-0.5)
+            weights = torch.full((m, k), 1 / k, device="cuda")
+            ids = (torch.arange(m * k, device="cuda").view(m, k) % 256).int()
+            banks.append([x, w1, w2, weights, ids])
+        originals = [[t.clone() for t in bank] for bank in banks]
+
+        mod = thead_moe_original_layout
+        dispatch = mod.dispatch_fused_moe_kernel
+        seen = []
+
+        def observe(*args, **kwargs):
+            if args[1].size(1) == 2 * i:
+                seen.append(args[1])
+            return dispatch(*args, **kwargs)
+
+        def run():
+            return [flaggems_vllm.ops_experts_impl(*bank) for bank in banks]
+
+        with monkeypatch.context() as context:
+            context.setattr(mod, "dispatch_fused_moe_kernel", observe)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    run()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = run()
+
+        # Warmups and graph capture may all pass through the observer; every
+        # GEMM1 weight must reference one of the three live caller banks.
+        assert len(seen) >= 9
+        bank_w1 = [bank[1] for bank in banks]
+        used = set()
+        for b in seen:
+            assert any(b is w for w in bank_w1)
+            used.add(next(i for i, w in enumerate(bank_w1) if b is w))
+        assert used == {0, 1, 2}
+
+        for step, active in enumerate((256, 2, 8)):
+            expected = []
+            for bank in banks:
+                bank[0].copy_(torch.randn_like(bank[0]))
+                bank[1].mul_(0.75)
+                bank[2].neg_()
+                bank[4].copy_(
+                    (torch.arange(m * k, device="cuda").view(m, k) % active).int()
+                )
+                expected.append(_thead_moe_reference(*bank))
+            for out in outputs:
+                out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for out, ref in zip(outputs, expected):
+                torch.testing.assert_close(out.cpu(), ref, rtol=0.05, atol=0.01)
+
+        for bank, original in zip(banks, originals):
+            for value, saved in zip(bank, original):
+                value.copy_(saved)
