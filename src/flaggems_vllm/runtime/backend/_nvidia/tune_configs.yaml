@@ -1588,6 +1588,34 @@ chunk_kda_fwd_intra_token_parallel:
     stages:
       - 1
 
+hc_down_silu_gemv:
+  - META: {BLOCK_N: 1, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 2, BLOCK_K: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 4, BLOCK_K: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 4, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+
+hc_down_silu_gemm:
+  - META: {BLOCK_M: 16, BLOCK_N: 32, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 32, BLOCK_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 64, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 2
+
 hc_combine:
   - META: {BLOCK_D: 128, LOOP: false}
     num_warps: 4
