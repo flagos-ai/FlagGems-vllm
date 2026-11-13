@@ -181,6 +181,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_mhc_ops.py",
         "tests/test_mhc_with_norm.py",
     ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_broadcast.py": [
+        "tests/test_mhc_pre_broadcast.py",
+    ],
     "src/flaggems_vllm/ops/mhc_with_norm.py": [
         "tests/test_mhc_with_norm.py",
     ],
