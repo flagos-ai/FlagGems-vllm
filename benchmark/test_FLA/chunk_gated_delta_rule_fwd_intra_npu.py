@@ -19,6 +19,13 @@ import flaggems_vllm as gems
 from baseline import chunk_gated_delta_rule_fwd_intra_npu as workload
 from benchmark.base import Benchmark
 
+# Collected on every backend's runner, including NVIDIA. The 950-only guard
+# has to sit at module scope so the skip happens before any class body runs.
+pytestmark = pytest.mark.skipif(
+    not workload.IS_SUPPORTED_SOC,
+    reason=workload.unsupported_soc_reason() or "",
+)
+
 
 class ChunkGatedDeltaRuleFwdIntraNpuBenchmark(Benchmark):
     # One sweep entry only: each case pins its own dtype (``fp16`` is a

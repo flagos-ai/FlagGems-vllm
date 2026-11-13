@@ -14,15 +14,14 @@ the same matrix.
 """
 
 import pytest
-import torch
 
 from baseline import chunk_gated_delta_rule_fwd_intra_npu as workload
 
 pytestmark = [
     pytest.mark.recompute_w_u_fwd_950dt,
     pytest.mark.skipif(
-        not (hasattr(torch, "npu") and torch.npu.is_available()),
-        reason="Ascend NPU required",
+        not workload.IS_SUPPORTED_SOC,
+        reason=workload.unsupported_soc_reason() or "",
     ),
 ]
 

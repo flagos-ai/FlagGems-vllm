@@ -32,6 +32,40 @@ DTYPES = [torch.bfloat16, torch.float16]
 
 NATIVE_UNAVAILABLE_REASON = None
 
+# These operators are written against the 950 (A5 / arch35) part specifically:
+# the BV tiling targets its ~248 KB unified buffer, the grid targets its 64
+# vector cores, and the kernels use arch35-only primitives. On any other chip
+# -- including other Ascend generations, and NVIDIA where CI collects these
+# files -- the right outcome is a skip, not a failure.
+REQUIRED_SOC_PREFIX = "Ascend950"
+
+
+def soc_name():
+    """Chip name, or ``None`` when no Ascend NPU is present.
+
+    Deliberately exception-safe: this is called at pytest collection time on
+    runners that have no ``torch.npu`` at all.
+    """
+    try:
+        if not (hasattr(torch, "npu") and torch.npu.is_available()):
+            return None
+        return torch.npu.get_device_name(0)
+    except Exception:  # pragma: no cover - driver/runtime variability
+        return None
+
+
+def unsupported_soc_reason():
+    """Skip reason when the current chip is not a 950, else ``None``."""
+    name = soc_name()
+    if name is None:
+        return "Ascend NPU required"
+    if not name.startswith(REQUIRED_SOC_PREFIX):
+        return f"Ascend 950 (A5/arch35) required, found {name}"
+    return None
+
+
+IS_SUPPORTED_SOC = unsupported_soc_reason() is None
+
 # name -> (B, T, H, HV, D, dtype, chunk_size, seqs or None)
 #
 # ``chunk_size`` is a deliberate axis, not a free parameter: ``solve_tril``
