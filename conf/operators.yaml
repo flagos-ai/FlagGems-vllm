@@ -716,6 +716,8 @@ ops:
       Independent Triton KDA decode with key-wise gate decay, optional QK L2
       normalization, scalar/vector beta and FP32 value-major recurrent state.
       Supports varlen, per-token state tables and strided inputs.
+      On Ascend A5 it also fuses the Kimi K3 bounded gate, beta sigmoid, and
+      accepted-token seed-column selection for speculative decoding.
     for:
       - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
     labels:
