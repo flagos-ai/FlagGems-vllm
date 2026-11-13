@@ -24,7 +24,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.A5 import (
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import (
         chunk_gated_delta_rule_fwd_intra_npu_fused,
     )
 

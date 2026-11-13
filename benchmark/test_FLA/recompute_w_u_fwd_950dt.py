@@ -78,7 +78,7 @@ def test_perf_recompute_w_u_fwd_950dt():
     native = workload.native_recompute_w_u()
     if native is None:
         pytest.skip(f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}")
-    from flaggems_vllm.runtime.backend._ascend.A5 import recompute_w_u_fwd_950dt
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import recompute_w_u_fwd_950dt
 
     bench = RecomputeWUFwd950dtBenchmark(
         op_name="recompute_w_u_fwd_950dt",

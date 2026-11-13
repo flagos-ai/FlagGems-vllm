@@ -25,7 +25,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.A5 import (
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import (
         chunk_gated_delta_rule_fwd_intra_npu_unfused,
     )
 
@@ -61,7 +61,7 @@ def test_stages_match_their_reference_counterparts(case):
     from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
     from fla.ops.utils import solve_tril
 
-    from flaggems_vllm.runtime.backend._ascend.A5 import (
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import (
         chunk_scaled_dot_kkt_fwd_950dt,
         recompute_w_u_fwd_950dt,
         solve_tril_950dt,

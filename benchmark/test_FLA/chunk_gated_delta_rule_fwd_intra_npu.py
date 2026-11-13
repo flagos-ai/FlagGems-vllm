@@ -56,7 +56,7 @@ def test_perf_chunk_gated_delta_rule_fwd_intra_npu():
     native = workload.native()
     if native is None:
         pytest.skip(f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}")
-    from flaggems_vllm.runtime.backend._ascend.A5 import (
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import (
         chunk_gated_delta_rule_fwd_intra_npu_unfused,
     )
 

@@ -27,7 +27,9 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.A5 import chunk_scaled_dot_kkt_fwd_950dt
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import (
+        chunk_scaled_dot_kkt_fwd_950dt,
+    )
 
     return chunk_scaled_dot_kkt_fwd_950dt
 

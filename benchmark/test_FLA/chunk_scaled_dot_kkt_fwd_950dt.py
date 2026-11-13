@@ -70,7 +70,9 @@ def test_perf_chunk_scaled_dot_kkt_fwd_950dt():
     native = workload.native_kkt()
     if native is None:
         pytest.skip(f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}")
-    from flaggems_vllm.runtime.backend._ascend.A5 import chunk_scaled_dot_kkt_fwd_950dt
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import (
+        chunk_scaled_dot_kkt_fwd_950dt,
+    )
 
     bench = ChunkScaledDotKktFwd950dtBenchmark(
         op_name="chunk_scaled_dot_kkt_fwd_950dt",

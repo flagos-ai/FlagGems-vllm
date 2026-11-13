@@ -28,7 +28,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.A5 import solve_tril_950dt
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import solve_tril_950dt
 
     return solve_tril_950dt
 

@@ -27,7 +27,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.A5 import recompute_w_u_fwd_950dt
+    from flaggems_vllm.runtime.backend._ascend.a5.FLA import recompute_w_u_fwd_950dt
 
     return recompute_w_u_fwd_950dt
 
