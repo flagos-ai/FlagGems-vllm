@@ -66,7 +66,7 @@ jobs:
     steps:
       - id: checkout-attempt-1
         name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
         continue-on-error: true
@@ -79,7 +79,7 @@ jobs:
       - id: checkout-attempt-2
         name: retry checkout
         if: steps.checkout-attempt-1.outcome == 'failure'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
         continue-on-error: true
@@ -92,7 +92,7 @@ jobs:
       - id: checkout-attempt-3
         name: retry checkout again
         if: steps.checkout-attempt-2.outcome == 'failure'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
@@ -305,7 +305,7 @@ jobs:
       CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
     steps:
       - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
         continue-on-error: true
