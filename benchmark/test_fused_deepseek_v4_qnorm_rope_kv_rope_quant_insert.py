@@ -19,23 +19,8 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import base
-
-torch_device_fn = flaggems_vllm.runtime.torch_device_fn
-
-_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads", "thead"})
-
-
-def is_support_fp8e4nv():
-    if not hasattr(torch, "float8_e4m3fn"):
-        return False
-    if flaggems_vllm.vendor_name in _FP8E4NV_CAPABLE_VENDORS:
-        return True
-    major, minor = get_device_capability()
-    return major * 10 + minor >= 89
-
 
 VLLM_REF_AVAILABLE = False
 VLLM_0_22_0_AVAILABLE = False
@@ -345,10 +330,6 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(
-    not is_support_fp8e4nv(),
-    reason="Do not support fp8e4nv when capability < 89",
-)
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert():
     bench = FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark()
     bench.run()
