@@ -14,22 +14,32 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
-# The 8-partition path stores uint32 histograms and independent per-pass
+# The 8-partition path stores int32 histograms and independent per-pass
 # states in the supplied 16 KiB/row workspace. The 64-partition path fills that
-# workspace with uint16 histograms and allocates a small separate uint32 state.
+# workspace with uint16 histograms and allocates a small separate int32 state.
 # Separate pass states make every autotuned launch safe to repeat.
 _WORKSPACE_BYTES = 16384
+_IS_ASCEND = tl.constexpr(runtime.device.vendor_name == "ascend")
 
 
 @triton.jit
 def _ordered_key(values):
     bits = values.to(tl.uint32, bitcast=True)
-    magnitude = bits & 0x7FFFFFFF
+    magnitude = (bits & 0x7FFFFFFF).to(tl.int32)
     ordered = tl.where((bits & 0x80000000) != 0, bits ^ 0xFFFFFFFF, bits ^ 0x80000000)
     # Integer comparisons preserve subnormals even on hardware using FTZ.
     # Canonicalize both signs of zero and NaN to match torch.topk ordering.
     ordered = tl.where(magnitude == 0, 0x80000000, ordered)
     return tl.where(magnitude > 0x7F800000, 0xFFFFFFFF, ordered).to(tl.uint32)
+
+
+@triton.jit
+def _key_greater(left, right):
+    if _IS_ASCEND:
+        # Preserve unsigned key order using Ascend's signed comparison types.
+        left = (left ^ 0x80000000).to(tl.int32, bitcast=True)
+        right = (right ^ 0x80000000).to(tl.int32, bitcast=True)
+    return left > right
 
 
 @triton.jit
@@ -80,7 +90,7 @@ def _cooperative_topk_small(
             digit, remaining = _radix_digit(histogram, remaining)
             prefix = prefix | (digit << shift)
             candidates = candidates & (digits == digit)
-        greater = valid & (keys > prefix)
+        greater = valid & _key_greater(keys, prefix)
         equal = valid & (keys == prefix)
         tie_rank = tl.cumsum(equal.to(tl.int32))
         selected = greater | (equal & (tie_rank <= remaining))
@@ -93,7 +103,7 @@ def _histogram_pointer(Workspace, row, BITS: tl.constexpr):
     if BITS == 7:
         return Workspace.to(tl.pointer_type(tl.uint16)) + row * 8192
     else:
-        return Workspace.to(tl.pointer_type(tl.uint32)) + row * 4096
+        return Workspace.to(tl.pointer_type(tl.int32)) + row * 4096
 
 
 @triton.jit
@@ -101,7 +111,9 @@ def _state_pointer(State, row, PARTS: tl.constexpr, BITS: tl.constexpr):
     PASSES: tl.constexpr = triton.cdiv(32, BITS)
     STATE_STRIDE: tl.constexpr = 4096 if BITS == 8 else PASSES * (PARTS + 2) + PARTS
     STATE_OFFSET: tl.constexpr = PARTS * (1 << BITS) if BITS == 8 else 0
-    return State.to(tl.pointer_type(tl.uint32)) + row * STATE_STRIDE + STATE_OFFSET
+    # Store raw key bits through int32 pointers: Ascend A2/A3 do not support
+    # uint32 stores. Prefixes are explicitly bitcast on load/store below.
+    return State.to(tl.pointer_type(tl.int32)) + row * STATE_STRIDE + STATE_OFFSET
 
 
 @libentry()
@@ -138,7 +150,9 @@ def _cooperative_topk_histogram(
     if length > K:
         prefix = tl.full((), 0, tl.uint32)
         if PASS > 0:
-            prefix = tl.load(state + (PASS - 1) * STATE_SIZE)
+            prefix = tl.load(state + (PASS - 1) * STATE_SIZE).to(
+                tl.uint32, bitcast=True
+            )
         chunk: tl.constexpr = triton.cdiv(WIDTH, PARTS)
         end = tl.minimum((part + 1) * chunk, length)
         for start in range(part * chunk, end, BLOCK):
@@ -178,14 +192,14 @@ def _cooperative_topk_threshold(
     greater = tl.full((PARTS,), 0, tl.int32)
     if PASS > 0:
         previous = state_base + (PASS - 1) * STATE_SIZE
-        prefix = tl.load(previous)
+        prefix = tl.load(previous).to(tl.uint32, bitcast=True)
         remaining = tl.load(previous + 1).to(tl.int32)
         greater = tl.load(previous + 2 + parts).to(tl.int32)
     digit, remaining = _radix_digit(tl.sum(histogram, 0), remaining, BINS)
-    greater += tl.sum(tl.where(bins[None, :] > digit, histogram, 0), 1)
+    greater += tl.sum(tl.where(bins[None, :] > digit.to(tl.int32), histogram, 0), 1)
     prefix = prefix | (digit << ((PASSES - 1 - PASS) * BITS))
     state = state_base + PASS * STATE_SIZE
-    tl.store(state, prefix)
+    tl.store(state, prefix.to(tl.int32, bitcast=True))
     tl.store(state + 1, remaining)
     tl.store(state + 2 + parts, greater)
     if PASS == PASSES - 1:
@@ -228,7 +242,7 @@ def _cooperative_topk_scatter(
     else:
         state_base = _state_pointer(State, row, PARTS, BITS)
         state = state_base + (PASSES - 1) * STATE_SIZE
-        threshold = tl.load(state)
+        threshold = tl.load(state).to(tl.uint32, bitcast=True)
         remaining = tl.load(state + 1).to(tl.int32)
         parts = tl.arange(0, PARTS)
         greater_counts = tl.load(state + 2 + parts).to(tl.int32)
@@ -242,7 +256,7 @@ def _cooperative_topk_scatter(
             valid = offsets < end
             values = tl.load(Logits + row * STRIDE + offsets, valid, other=0)
             keys = _ordered_key(values)
-            greater = valid & (keys > threshold)
+            greater = valid & _key_greater(keys, threshold)
             equal = valid & (keys == threshold)
             greater_rank = tl.cumsum(greater.to(tl.int32))
             tie_rank = tie_offset + tl.cumsum(equal.to(tl.int32))
@@ -265,8 +279,28 @@ def _memory_interval(tensor):
     return start, start + span * tensor.element_size()
 
 
-def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
-    """Write unsorted top-k indices into ``output`` and return ``None``.
+def _cooperative_topk_impl(
+    logits,
+    lengths,
+    output,
+    workspace,
+    k,
+    max_seq_len,
+    small_kernel=None,
+    *,
+    small_max_width=8192,
+    small_max_rows=64,
+    wide_kernel=None,
+    wide_max_width=2147483647,
+):
+    """Implementation shared by the generic and vendor-specialized entrypoints.
+
+    Vendor backends can replace ``small_kernel`` or extend the single-CTA path
+    through ``small_max_width`` and ``small_max_rows``. Rows up to width 8192
+    always use the small kernel. Validation, workspace rules, and the wide-row
+    radix protocol are shared across backends. ``wide_kernel`` can replace the
+    wide-row launcher up to ``wide_max_width`` after the same validation and
+    device-context setup.
 
     ``logits`` is FP32 [rows, width] with contiguous columns; ``lengths``
     is contiguous INT32 with one entry per row (rank 1 or 2). Callers must
@@ -277,12 +311,17 @@ def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
     UINT8 with at least rows * 16384 bytes and four-byte alignment. Neither
     mutable buffer may overlap another argument. The 64-partition wide-row
     path additionally allocates 1576 bytes per row of internal state; callers
-    still provide the same 16384-byte-per-row workspace. Supports rows <= 64 and
-    k in {512, 1024, 2048}. ``max_seq_len`` is ignored, as in vLLM. NaNs
+    still provide the same 16384-byte-per-row workspace. Ascend uses the
+    eight-partition path with int32 scratch storage instead of packed uint16
+    histograms. Vendor launchers may allocate additional internal scratch.
+    Supports rows <= 64 and k in {512, 1024, 2048}.
+    ``max_seq_len`` is ignored, as in vLLM. NaNs
     outrank +inf; tie indices and output order are unspecified. Forward only.
     """
-    if logits.device.type != "cuda":
-        raise NotImplementedError("cooperative_topk requires a CUDA device")
+    if logits.device.type not in ("cuda", "musa", "npu"):
+        raise NotImplementedError(
+            "cooperative_topk requires a CUDA, MUSA or NPU device"
+        )
     if logits.dtype != torch.float32:
         raise NotImplementedError("cooperative_topk supports only float32 logits")
     if logits.layout != torch.strided:
@@ -338,10 +377,11 @@ def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
         return
 
     with runtime.torch_device_fn.device(logits.device):
-        # Larger register tiles spill heavily on SM120; partition those rows
-        # instead of keeping a full 16K-element row live through the scans.
-        if width <= 8192:
-            _cooperative_topk_small[(rows,)](
+        # Keep the default tile bound at 8192; vendor limits can extend the
+        # single-CTA path for batches where it beats the partitioned launches.
+        if width <= 8192 or (width <= small_max_width and rows <= small_max_rows):
+            kernel = small_kernel or _cooperative_topk_small
+            kernel[(rows,)](
                 logits,
                 lengths,
                 output,
@@ -351,10 +391,16 @@ def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
                 rows,
                 BLOCK=triton.next_power_of_2(max(width, 1)),
             )
+        elif wide_kernel is not None and width <= wide_max_width:
+            return wide_kernel(logits, lengths, output, workspace, k, max_seq_len)
         else:
             # More partitions expose parallelism for small batches of long rows.
             # Larger batches retain eight partitions to avoid excess CTA overhead.
-            use_many_parts = 65536 <= width <= 1048576 and rows <= 16
+            # Ascend A2/A3 cannot store packed uint16 histograms. Keep their
+            # scratch in the caller-provided int32 workspace for every width.
+            use_many_parts = (
+                logits.device.type != "npu" and 65536 <= width <= 1048576 and rows <= 16
+            )
             parts, bits = (64, 7) if use_many_parts else (8, 8)
             passes = triton.cdiv(32, bits)
             if bits == 7:
@@ -406,3 +452,13 @@ def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
                 parts,
                 bits,
             )
+
+
+def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
+    """Write unsorted top-k indices into ``output`` and return ``None``.
+
+    The public contract is documented on the shared implementation above;
+    this wrapper intentionally keeps the vLLM-compatible six-argument
+    signature used by dispatch and CUDA graph capture.
+    """
+    return _cooperative_topk_impl(logits, lengths, output, workspace, k, max_seq_len)

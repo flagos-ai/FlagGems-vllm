@@ -290,15 +290,16 @@ ops:
       - beta: '3.0'
   - id: cooperative_topk
     description: |
-      Select exact top-k indices from FP32 CUDA logits through vLLM's in-place
-      interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
-      and -1 padding for short rows.
+      Select exact top-k indices from FP32 logits through vLLM's in-place
+      interface, with MThreads fast paths. Supports up to 64 rows,
+      k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
     for:
       - _C.cooperative_topk
     labels:
       - fused
       - NoCPU
       - vLLM
+      - DSA
     kind:
       - NeuralNetwork
     stages:

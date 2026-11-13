@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
+    cooperative_topk,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -61,6 +64,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
 )
 
 __all__ = [
+    "cooperative_topk",
     "dequantize_and_gather_k_cache",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",
