@@ -36,8 +36,11 @@ NON_TEST_FILES = {
 }
 
 ENV_SMOKE_TRIGGER_FILES = {
+    ".github/actions/setup-flaggems/action.yml",
     ".github/backend-capabilities.json",
+    ".github/backends.json",
     ".github/configs/ci-backends.yaml",
+    ".github/workflows/backend-test.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
     "src/flaggems_vllm/backends.yaml",
@@ -45,7 +48,6 @@ ENV_SMOKE_TRIGGER_FILES = {
     "pytest.ini",
     "tests/conftest.py",
     "tools/check_backend_env.py",
-    "tools/check_ci_pins.py",
     "tools/prepare-flaggems-ci-env.sh",
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",

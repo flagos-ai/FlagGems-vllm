@@ -31,8 +31,8 @@ run_id="${GITHUB_RUN_ID:-local}"
 run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
 state_root="${RUNNER_TEMP}/flaggems-vllm-${run_id}-${run_attempt}-${BACKEND}"
 
-flaggems_dir="${workspace}/.ci/flaggems"
-flaggems_venv="${flaggems_dir}/.venv"
+# tools/setup.sh creates its virtual environment at <repo>/.venv.
+flaggems_venv="${workspace}/.venv"
 
 # Match FlagGems' own CI by retaining the runner's normal HOME and uv caches.
 # Some misconfigured self-hosted runners execute as an unprivileged account
@@ -83,7 +83,6 @@ fi
 home_dir="$(cd "${home_dir}" && pwd -P)"
 
 export HOME="${home_dir}"
-export FLAGGEMS_DIR="${flaggems_dir}"
 export FLAGGEMS_VENV="${flaggems_venv}"
 
 # Vendor runners often reach package mirrors through proxies. Keep retries
@@ -129,7 +128,6 @@ fi
 
 {
   printf 'HOME=%s\n' "${HOME}"
-  printf 'FLAGGEMS_DIR=%s\n' "${FLAGGEMS_DIR}"
   printf 'FLAGGEMS_VENV=%s\n' "${FLAGGEMS_VENV}"
   printf 'UV_HTTP_RETRIES=%s\n' "${UV_HTTP_RETRIES}"
   printf 'UV_HTTP_TIMEOUT=%s\n' "${UV_HTTP_TIMEOUT}"
