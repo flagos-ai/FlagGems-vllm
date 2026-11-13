@@ -247,6 +247,17 @@ moe_sum_general:
     num_warps: 8
     num_stages: 2
 
+triton_reshape_and_cache_flash:
+  - META: {TILE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 1024}
+    num_warps: 8
+    num_stages: 1
+
 expand_pools_and_append_tail:
   - META:
       BLOCK_COLS: 128
@@ -266,6 +277,42 @@ compute_global_topk_indices_and_lens:
       BLOCK: 128
       TPP: 2
     num_warps: 1
+    num_stages: 2
+
+ckfg_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BK: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BK: 32}
+    num_warps: 2
+    num_stages: 3
+
+ckfg_intra:
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+
+ckfg_inverse:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_recompute:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_output:
+  - META: {BK: 32, BV: 64}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_gate:
+  - META: {BD: 64}
+    num_warps: 4
     num_stages: 2
 
 ckfg_state_ascend:
@@ -293,6 +340,14 @@ gate_sigmoid_mul:
     num_stages: 1
 kda_kkt_inter:
   - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+pad_indexer_heads:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
     num_warps: 4
     num_stages: 1
 

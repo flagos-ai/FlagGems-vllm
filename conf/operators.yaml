@@ -135,9 +135,12 @@ ops:
       - beta: '5.3'
   - id: causal_conv1d_fn
     description: |
-      Causal depthwise conv1d over variable-length token sequences with
-      continuous batching support, updating the convolution state cache
-      during the forward pass (prefill path, Ascend port of the vLLM operator).
+      Causal depthwise conv1d prefill for vLLM continuous batching with
+      variable-length sequences. The Ascend A5 path reads a [channels, tokens]
+      input in either supported stride layout, [channels, width] weights,
+      optional bias and cached history; it returns same-shape activations and
+      updates the convolution state cache. It supports BF16/FP16 input and
+      matching state dtypes, with FP32 accumulation in the kernel.
     for:
       - causal_conv1d_fn
     labels:
@@ -146,11 +149,14 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: causal_conv1d_update
     description: |
-      Decode-stage causal conv1d with in-place convolution state update for
-      variable-length accepted tokens (Ascend port of the vLLM operator).
+      Causal depthwise conv1d decode for vLLM batched or variable-length
+      tokens, including speculative accepted-token counts and cache indices.
+      The Ascend A5 path returns an output with the input shape and updates
+      the convolution state in place. It supports BF16 input and matching
+      state dtypes, with FP32 accumulation in the kernel.
     for:
       - causal_conv1d_update
     labels:
@@ -159,7 +165,7 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: chunk_gated_delta_rule_fwd
     description: |
       The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear Attention (FLA).
@@ -175,7 +181,12 @@ ops:
       - beta: '5.3'
   - id: chunk_kda
     description: |
-      Inference-only implementation of chunk Kimi Delta Attention (KDA) with Flash Linear Attention (FLA).
+      Kimi Delta Attention (KDA) prefill for vLLM inference, with sequence-first
+      Q/K/V, gate and beta inputs, optional initial state and variable-length
+      sequence offsets. The Ascend A5 path uses chunk-major preparation,
+      recurrent state updates and output finalization. It returns attention
+      values and optionally an FP32 final state; FP16/BF16 inputs are supported
+      with FP32 accumulation in the kernels.
     for:
       - chunk_kda
     labels:
@@ -184,7 +195,7 @@ ops:
     kind:
       - Attention
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: chunk_kda_fwd_intra_token_parallel
     description: |
       Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
@@ -279,18 +290,20 @@ ops:
       - beta: '3.0'
   - id: cooperative_topk
     description: |
-      vLLM-compatible exact FP32 top-k selection with in-place INT32 indices,
-      variable row lengths, short-row padding, and MThreads fast paths.
+      Select exact top-k indices from FP32 logits through vLLM's in-place
+      interface, with MThreads fast paths. Supports up to 64 rows,
+      k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
     for:
       - _C.cooperative_topk
     labels:
       - fused
+      - NoCPU
       - vLLM
       - DSA
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '0.3'
+      - alpha: '5.4'
   - id: cp_gather_indexer_k_quant_cache
     description: This is a fused operator that gathers FP8 K cache values and scales.
     for:
@@ -384,6 +397,26 @@ ops:
     stages:
       - alpha: '4.2'
       - beta: '5.3'
+  - id: dsv41_o_proj
+    description: |
+      DeepSeek-V4.1 attention output projection (wo_a stage): inverse GPT-J
+      RoPE + per-128 FP8 quant + grouped block-scaled FP8 GEMM. Hopper recipe
+      (1, 128, 128); wo_b is an optional caller-supplied callback. Small batches
+      run in one kernel launch. A BF16 wo_a takes vLLM's non-quantizing path
+      (BF16 inverse RoPE + grouped BF16 GEMM, one Triton kernel). Hopper uses
+      tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
+      8.0 for BF16) use plain Triton kernels.
+    for:
+      - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: dswiglu
     description: |
       Swish-Gated Linear Unit, a variant of GLU with the Swish activation function.
@@ -491,6 +524,18 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: flash_mla_sparse_fwd_w8a8
+    description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and shared key/value.
+    for:
+      - flash_mla_sparse_fwd_w8a8
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: flash_mla_with_kvcache
     description: Dense and sparse Multi-head Latent Attention decoding with a paged
       KV cache.
@@ -602,6 +647,22 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: fused_indexer_k_norm
+    description: |
+      GLM5Next indexer FP32 LayerNorm with FP32 weight and bias, followed by
+      a cast to the input dtype. Supports two-dimensional FP16/BF16/FP32
+      inputs with nonnegative strides and widths from 1 through 4096.
+      Forward inference only; returns a fresh contiguous tensor.
+    for:
+      - vllm.models.glm5next.common.attention._fused_indexer_k_norm
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_indexer_q_rope_quant
     description: |
       Applies RoPE to sparse indexer Q, quantizes it to FP8 or MXFP4, and folds
@@ -620,7 +681,7 @@ ops:
   - id: fused_indexer_weight_scale
     description: |
       Scale floating-point indexer weights by FP32 query scales and a scalar.
-      Returns FP32 per-token, per-head weights on Ascend and MThreads.
+      Returns FP32 per-token, per-head weights.
     for:
       - fused_indexer_weight_scale
       - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
@@ -727,9 +788,12 @@ ops:
       - alpha: '5.4'
   - id: fused_recurrent_kda
     description: |
-      Independent Triton KDA decode with key-wise gate decay, optional QK L2
-      normalization, scalar/vector beta and FP32 value-major recurrent state.
-      Supports varlen, per-token state tables and strided inputs.
+      Kimi Delta Attention (KDA) decode for vLLM inference with key-wise gate
+      decay, optional QK L2 normalization, scalar/vector beta and an FP32
+      recurrent state. It returns output matching V's shape and dtype and an
+      updated FP32 state. The Ascend A5 path supports variable-length requests,
+      per-token state tables and FP16/BF16/FP32 inputs; it fuses the Kimi K3
+      bounded gate, beta sigmoid and speculative accepted-token selection.
     for:
       - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
     labels:
@@ -738,7 +802,7 @@ ops:
     kind:
       - Attention
     stages:
-      - alpha: '5.4'
+      - beta: '0.3'
   - id: gate_sigmoid_mul
     description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
     for:
@@ -755,8 +819,14 @@ ops:
     description: |
       Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
       per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
+      Supports decode, prefill and speculative state-slot updates.
+      MetaX uses a backend-specific core interface with precomputed FP32 gates
+      and immutable FP32 state, returning output and final state. Its opt-in mixed_precision=True chunk path
+      uses BF16/FP16 intermediates with FP32 accumulation and bounded workspace.
+      MetaX decode=True accepts raw gates and packed/separate QKV and updates
+      indexed FP32 state slots in place with fused normalization and gating.
       FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU and Hygon.
+      INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
     for:
       - gdn_w8a16
       - gdn_w8a16_int8
@@ -1083,6 +1153,21 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: megamoe_int8
+    description: |
+      Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
+      combining routing, two expert GEMMs, DUSHMEM communication, and Top-K
+      reduction in one persistent Triton/FlagTree kernel.
+    for:
+      - megamoe_int8
+    labels:
+      - fused
+      - vLLM
+      - MoE
+    kind:
+      - MoE
+    stages:
+      - alpha: '5.5'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).
@@ -1118,6 +1203,23 @@ ops:
       - fused
       - vLLM
       - DSA
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.3'
+  - id: mhc_shifted_post_pre
+    description: |
+      DSV4.1 shifted mHC boundary: applies the previous sublayer's post/comb
+      coefficients, then emits the next post/comb/pre coefficient set, the
+      collapsed (optionally RMSNorm'd) layer input and the stream mean.
+      Consumes the carried pre-mix instead of the freshly computed one, which is
+      what lets vLLM overlap coefficient generation with the sublayer.
+    for:
+      - vllm.models.deepseek_v41.nvidia.ops.mhc.mhc_shifted_post_pre
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
     kind:
       - NeuralNetwork
     stages:
@@ -1265,6 +1367,16 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: pad_indexer_heads
+    description: Append zero heads to GLM5Next FP8 queries and per-head weights with bit-preserving copies.
+    for:
+      - None
+    labels:
+      - vLLM
+    kind:
+      - DataMovement
+    stages:
+      - beta: '0.3'
   - id: paged_scatter_triton
     description: |
       Scatters token rows into paged caches by slot index in a single kernel,
@@ -1310,6 +1422,34 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: qsa_prepare
+    description: |
+      Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for the
+      indexer Q/K, the compressed-key pool, the state-ring commit, and the main
+      attention QK-norm/RoPE/gate with its paged K/V write, in one launch.
+    for:
+      - None
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - beta: '5.3'
+  - id: qsa_sparse_paged_attention
+    description: |
+      Computes sparse grouped-query attention over paged BF16 or FP8 KV caches
+      using packed token indices, with fused output gating.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.qsa.qsa_sparse_paged_attention
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: reglu
     description: |
       Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of the sigmoid function for gating.
@@ -1476,6 +1616,21 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: sparse_flash_attention
+    description: |
+      Ascend shared-KV MLA with the vLLM-Ascend SFA interface and tuple outputs.
+      FP16/BF16, BSND/TND and paged caches, block sparsity and right-down causal
+      masking; dimensions 512+64. value must alias key; forward inference only.
+    for:
+      - _C_ascend.npu_sparse_flash_attention
+    labels:
+      - fused
+      - vLLM
+      - Ascend
+    kind:
+      - DSA
+    stages:
+      - alpha: '0.1.0'
   - id: sparse_mla_fwd_interface
     description: |
       A generic interface for sparse MLA (Multi-head Latent Attention) for DeepSeek v3/v3.2.
@@ -1589,6 +1744,17 @@ ops:
       - MoE
     stages:
       - beta: '5.3'
+  - id: triton_ihc_post
+    description: iHC gated residual scatter with unfused FP32 multiply and addition.
+    for:
+      - triton_ihc_post
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.4'
   - id: triton_lighting_indexer_k_tiled_interface
     description: Part of FP8 MQA framework. It is currently not exposed as an operator
       for use.
@@ -1601,6 +1767,17 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.3'
+  - id: triton_reshape_and_cache_flash
+    description: In-place Flash 4D and head-major KV writes with ordinary or global E4M3 FP8 storage.
+    for:
+      - triton_reshape_and_cache_flash
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Attention
+    stages:
+      - alpha: '0.1'
   - id: unpack_seq_triton
     description: Unpack a packed sequence tensor back to its original variable-length
       form.

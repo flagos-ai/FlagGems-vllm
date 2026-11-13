@@ -112,10 +112,9 @@ def test_concat_and_cache_mla(
             convert_fp8(ref_kv_cache, ref_temp, scale.item(), kv_dtype=kv_cache_dtype)
         else:
             ref_kv_cache = utils.to_reference(ref_temp)
-        with flaggems_vllm.use_gems():
-            flaggems_vllm.concat_and_cache_mla(
-                kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-            )
+        flaggems_vllm.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+        )
 
         if kv_cache_dtype == "fp8":
             result_temp = torch.empty_like(kv_cache, dtype=torch.uint8)

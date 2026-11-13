@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from flaggems_vllm.runtime.backend.backend_utils import VendorDescriptor
+
+ARCH_MAP = {"a5": "a5"}
+
+
+def get_arch_key(torch_device_object, device=0):
+    """Identify Ascend 950 (A5) without classifying older 910 devices as A5."""
+    arch = os.environ.get("ARCH", "").lower()
+    if arch in {"a5", "ascend_a5", "950", "ascend_950"}:
+        return "a5"
+    try:
+        name = torch_device_object.get_device_name(device)
+    except Exception:
+        try:
+            name = torch_device_object.get_device_properties(device).name
+        except Exception:
+            return None
+    name = name.lower()
+    return "a5" if "ascend950" in name or "ascend 950" in name else None
 
 
 def get_triton_extra_name():

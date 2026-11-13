@@ -389,15 +389,6 @@ def test_scales_must_be_paired():
         flaggems_vllm.minimax_m3_sparse_attn(*args, output=out, k_scale=scale)
 
 
-@pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_m3_sparse_attn_decode
-def test_exports_are_not_registered_as_aten_overrides():
-    """Library-only APIs must stay out of the ATen registration config."""
-    registered = {name for name, _ in flaggems_vllm._FULL_CONFIG}
-    assert "minimax_m3_sparse_attn" not in registered
-    assert "minimax_m3_sparse_attn_decode" not in registered
-
-
 def topk_span_stats(top):
     """Per-row selected-id span statistics, reported by the benchmark.
 

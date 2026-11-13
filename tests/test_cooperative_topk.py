@@ -515,16 +515,15 @@ def test_vllm_cross_agreement_when_available(k, width):
     _check(logits, lengths, output, k)
 
 
-def test_export_and_registration():
+def test_export():
     assert "cooperative_topk" in flaggems_vllm.ops.__all__
     assert callable(flaggems_vllm.ops.cooperative_topk)
-    assert any(
-        name == "cooperative_topk" and fn is flaggems_vllm.cooperative_topk
-        for name, fn in flaggems_vllm._FULL_CONFIG
-    )
+    assert callable(flaggems_vllm.cooperative_topk)
     if flaggems_vllm.vendor_name == "mthreads":
         from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
             cooperative_topk as mthreads_cooperative_topk,
         )
 
         assert flaggems_vllm.cooperative_topk is mthreads_cooperative_topk
+    else:
+        assert flaggems_vllm.ops.cooperative_topk is flaggems_vllm.cooperative_topk

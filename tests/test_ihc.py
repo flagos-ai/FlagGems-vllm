@@ -25,10 +25,9 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.ops.ihc import ihc_post, ihc_post_ref, ihc_pre, ihc_pre_ref
 
-# vLLM's own iHC Triton kernels, used as a cross-check when vLLM is importable
+# vLLM's iHC pre kernel, used as a cross-check when vLLM is importable
 # (mirrors the HAS_VLLM pattern in test_mhc_ops.py).
 try:
-    from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_post as _vllm_ihc_post
     from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_pre as _vllm_ihc_pre
 
     HAS_VLLM = True
@@ -126,17 +125,20 @@ def test_ihc_pre_vs_vllm(n, h, hc):
 
 
 @pytest.mark.ihc_post
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not available")
 @pytest.mark.parametrize("n", _VLLM_TOKENS)
 @pytest.mark.parametrize("h", _HIDDEN)
 @pytest.mark.parametrize("hc", _HC_MULT)
-def test_ihc_post_vs_vllm(n, h, hc):
-    """FlagGems-vllm ihc_post must match vLLM's own iHC Triton kernel."""
+def test_ihc_post_model_shapes_vs_cpu_ref(n, h, hc):
+    """Keep the legacy wrapper's model-size BF16 coverage independent of vLLM."""
     dtype = torch.bfloat16
     torch.manual_seed(42)
     x = torch.randn((n, h), dtype=dtype, device=DEVICE)
     residual = torch.randn((n, hc, h), dtype=dtype, device=DEVICE)
     post = torch.randn((n, hc), dtype=torch.float32, device=DEVICE)
     out = ihc_post(x, residual, post)
-    out_v = _vllm_ihc_post(x, residual, post)
-    torch.testing.assert_close(out, out_v, rtol=0, atol=0)
+
+    # Limit CPU oracle intermediates at the largest model sizes.
+    for start in range(0, n, 32):
+        part = slice(start, start + 32)
+        expected = ihc_post_ref(x[part].cpu(), residual[part].cpu(), post[part].cpu())
+        torch.testing.assert_close(out[part].cpu(), expected, rtol=0, atol=0)

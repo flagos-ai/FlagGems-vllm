@@ -3,11 +3,13 @@
 
 """Standard kernel benchmark of the complete public grouped Gemma callable."""
 
+import gc
 import hashlib
 import json
 import logging
 import math
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,97 @@ class GroupedGemmaRmsnormBenchmark(base.Benchmark):
     def record_shapes(self, *args, **kwargs):
         # Base records dtype separately; retain every other binding in this key.
         return baseline.key_shape(self._binding)
+
+    def _compare_offline(self, metric, dtype, data):
+        # A tensor-shape match alone can conflate weight dtypes and bindings.
+        entry = data.get(self.op_name)
+        if not entry:
+            metric.base_miss_reason = f"operator '{self.op_name}' not found in baseline"
+            return
+        records = entry.get("shapes", {}).get(metric.shape_detail)
+        record = records.get(str(dtype)) if records else None
+        if record is None:
+            metric.base_miss_reason = (
+                f"no exact binding and dtype {dtype} in NVIDIA baseline"
+            )
+            return
+        config = record.get("config")
+        if config is not None and config != baseline.config(self._binding, dtype):
+            metric.base_miss_reason = "NVIDIA baseline configuration mismatch"
+            return
+        latency = record.get("latency_ms")
+        if (
+            type(latency) not in (int, float)
+            or not math.isfinite(latency)
+            or latency <= 0
+        ):
+            metric.base_miss_reason = (
+                record.get("reason") or "invalid NVIDIA baseline latency"
+            )
+            return
+        factor = consts.lookup_scaling_factor(
+            data, flaggems_vllm.vendor_name, record.get("bottle_neck_unit"), dtype
+        )
+        if type(factor) not in (int, float) or not math.isfinite(factor) or factor <= 0:
+            metric.base_miss_reason = "no valid NVIDIA baseline scaling factor"
+            return
+        metric.compared_speedup = latency / metric.latency / factor
+
+    def run(self):
+        cfg = conftest.Config
+        if cfg.query:
+            return super().run()
+
+        # Base.run aborts on a double baseline miss before publishing the row.
+        self.init_user_config()
+        for dtype in self.to_bench_dtypes:
+            metrics = []
+            native_skip_reason = None
+            for inputs in self.get_input_iter(dtype):
+                args, kwargs = self.unpack_to_args_kwargs(inputs)
+                metric = consts.BenchmarkMetrics(
+                    shape_detail=self.record_shapes(*args, **kwargs)
+                )
+                if (
+                    "latency_base" in self.to_bench_metrics
+                    and self.torch_op is not None
+                ):
+                    metric.latency_base = self.get_latency(
+                        self.torch_op, *args, **kwargs
+                    )
+                if "latency" in self.to_bench_metrics:
+                    metric.latency = self.get_latency(self.gems_op, *args, **kwargs)
+                    if cfg.base_data is not None:
+                        self._compare_offline(metric, dtype, cfg.base_data)
+                if (
+                    "speedup" in self.to_bench_metrics
+                    and metric.latency_base is not None
+                    and metric.latency is not None
+                ):
+                    metric.speedup = metric.latency_base / metric.latency
+                else:
+                    native_skip_reason = (
+                        native_skip_reason
+                        or self._native_error
+                        or "native speedup not requested"
+                    )
+                metrics.append(metric)
+                gc.collect()
+
+            result = consts.BenchmarkResult(
+                level=cfg.bench_level.value,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                mode=cfg.mode.value,
+                result=metrics,
+            )
+            print(result)
+            data = asdict(result)
+            # The weekly optest parser uses this field to exclude null ratios.
+            if native_skip_reason:
+                data["native_baseline_skip_reason"] = native_skip_reason
+            conftest.update_result(self.op_name, data)
+            conftest.emit_record_logger(json.dumps(data))
 
     def _record(self, role, latency_ms, status, reason=None):
         config = baseline.config(self._binding, self._dtype)
@@ -218,7 +311,7 @@ def test_grouped_gemma_rmsnorm():
         raise ValueError("grouped Gemma benchmark requires --mode kernel (no Graph)")
     bench = GroupedGemmaRmsnormBenchmark(
         op_name=baseline.OP_NAME,
-        torch_op=baseline.native(backend=flaggems_vllm.vendor_name),
+        torch_op=None,
         gems_op=flaggems_vllm.grouped_gemma_rmsnorm,
         dtypes=baseline.DTYPES,
     )
