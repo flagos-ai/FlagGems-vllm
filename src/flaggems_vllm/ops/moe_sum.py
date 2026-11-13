@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.runtime import device
 
 logger = logging.getLogger(__name__)
 
@@ -175,8 +178,11 @@ def _moe_sum_general_kernel(
     output_stride_hidden,
     BLOCK_SIZE: tl.constexpr,
     ELEM_SIZE: tl.constexpr,
+    USE_INT64_INDEX: tl.constexpr = True,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
+    token_idx = tl.program_id(0)
+    if USE_INT64_INDEX:
+        token_idx = token_idx.to(tl.int64)
     block_idx = tl.program_id(1)
     hidden_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     hidden_mask = hidden_offsets < hidden_size
@@ -247,12 +253,34 @@ def _min_vec_elems(dtype: torch.dtype, vec_bytes: int = 16) -> int:
     return max(1, vec_bytes // torch.tensor([], dtype=dtype).element_size())
 
 
+@functools.lru_cache(maxsize=1)
+def _sequential_moe_sum_impl():
+    # Only a callable is cached; no tensor or per-request state is retained.
+    from flaggems_vllm.runtime.backend._metax.fused.numerical_modes import (
+        sequential_moe_sum,
+    )
+
+    return sequential_moe_sum
+
+
 def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
+    *,
+    reduction: str = "native",
 ):
+    """Reduce expert outputs; sequential compatibility mode is MetaX-only."""
+    if reduction not in ("native", "sequential"):
+        raise ValueError("Unknown expert reduction order")
     logger.debug("GEMS MOE SUM")
     _check_moe_sum_inputs(input, output)
+    if reduction == "sequential":
+        if device.vendor_name != "metax":
+            raise NotImplementedError(
+                "Sequential numerical mode is supported on MetaX only"
+            )
+        return _sequential_moe_sum_impl()(input, output)
+
     num_tokens, topk, hidden_size = input.shape
 
     input_stride = input.stride()
