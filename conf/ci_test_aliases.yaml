@@ -22,6 +22,7 @@ hc_split_sinkhorn_forward: test_mhc_ops
 mhc_bwd: test_mhc_ops
 mhc_post: test_mhc_ops
 mhc_pre: test_mhc_ops
+mhc_pre_broadcast: test_mhc_pre_broadcast
 # Keep the legacy family marker mapped to its shared test file.
 ihc_post: test_ihc
 

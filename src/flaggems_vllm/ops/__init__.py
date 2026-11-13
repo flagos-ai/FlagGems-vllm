@@ -122,6 +122,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_bwd_ref,
     mhc_post,
     mhc_pre,
+    mhc_pre_broadcast,
     mhc_shifted_post_pre,
     sinkhorn_forward,
 )
@@ -353,6 +354,7 @@ __all__ = [
     "mhc_fused_post_pre_with_norm",
     "mhc_post",
     "mhc_pre",
+    "mhc_pre_broadcast",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
     "mhc_shifted_post_pre",
