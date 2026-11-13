@@ -19,8 +19,8 @@ Rules:
   1. __all__ entries must be sorted by casefold
   2. __all__ must not contain duplicates
 
-Note: Unlike FlagGems, FlagGems-vllm generates _FULL_CONFIG dynamically from
-ops.__all__ at runtime, so static AST checks on _FULL_CONFIG are not applicable.
+Note: Unlike FlagGems, FlagGems-vllm has no _FULL_CONFIG; ops are exported
+directly from ops.__all__.
 
 Exit codes:
   0 - all checks pass
