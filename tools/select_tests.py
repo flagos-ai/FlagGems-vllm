@@ -96,6 +96,27 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_mla.py",
         "tests/test_flash_mla_with_kvcache_w8a8.py",
     ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "tests/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
@@ -247,6 +268,25 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "benchmark/test_flash_mla.py",
         "benchmark/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": ["benchmark/test_megamoe.py"],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "benchmark/test_megamoe.py",
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
