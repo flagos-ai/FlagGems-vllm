@@ -45,14 +45,8 @@ def _cache_keys(kernel):
 
 
 @pytest.mark.flash_mla_with_kvcache
-@pytest.mark.parametrize(
-    "real_heads,physical_heads",
-    [(8, 16), (16, 16), (8, 8)],
-    ids=["h8", "h16", "native_h8"],
-)
-def test_public_split_decode_new_batches_reuse_reduce_kernel(
-    record_property, real_heads, physical_heads
-):
+@pytest.mark.parametrize("heads", [8, 16], ids=["h8", "h16"])
+def test_public_split_decode_new_batches_reuse_reduce_kernel(record_property, heads):
     from .test_sparse_mla_metax import _check_split_decode as check_public
 
     module = importlib.import_module(
@@ -63,12 +57,12 @@ def test_public_split_decode_new_batches_reuse_reduce_kernel(
         "_metax.ops.sparse_mla_decode"
     )
     with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
-        check_public(1, real_heads, physical_heads)
+        check_public(1, heads)
         warm_keys = _cache_keys(kernel)
         assert warm_keys, "The public split-decode path did not hit its reduce kernel"
         observed = [(1, len(warm_keys))]
         for batch in (3, 7, 17, 31, 63):
-            check_public(batch, real_heads, physical_heads)
+            check_public(batch, heads)
             assert _cache_keys(kernel) == warm_keys
             observed.append((batch, len(warm_keys)))
         record_property("native_cache_keys_by_batch", repr(observed))

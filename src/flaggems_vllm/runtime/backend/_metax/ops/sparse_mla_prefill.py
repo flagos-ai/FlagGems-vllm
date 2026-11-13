@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 
 # SPDX-License-Identifier: Apache-2.0
-"MetaX DeepSeek V4 sparse prefill kernels, replay and TP headpacking."
+"MetaX DeepSeek V4 sparse prefill for physical H8/H16 layouts."
 
 import importlib
 import logging
@@ -340,7 +340,7 @@ def triton_flash_mla_sparse_fwd_halfd_serial(
 
 
 @triton.jit
-def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
+def triton_flash_mla_sparse_fwd_h8(
     q,
     kv,
     indices,
@@ -372,7 +372,7 @@ def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
 ):
     # Physical H8 needs no padded Q/output. Virtual rows 8..15 carry the
     # second V half for the same eight heads; all external buffers remain H8.
-    tl.static_assert(HQ == 8 or HQ == 16)
+    tl.static_assert(HQ == 8)
     tl.static_assert(BH == 16)
     num_head_blocks: tl.constexpr = (HQ + BH - 1) // BH
     pid = tl.program_id(0)
@@ -478,10 +478,6 @@ def _flash_mla_sparse_halfd_serial_enabled() -> bool:
     return _tuning.DEFAULT_POLICY.prefill_half_d
 
 
-def _flash_mla_sparse_qkfold_blockdiag_enabled() -> bool:
-    return _tuning.DEFAULT_POLICY.prefill_blockdiag
-
-
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -494,13 +490,12 @@ def flash_mla_sparse_fwd(
     out: Optional[torch.Tensor] = None,
     max_logits_out: Optional[torch.Tensor] = None,
     lse_out: Optional[torch.Tensor] = None,
-    real_num_heads: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention prefill kernel
 
     Args:
-        q: [s_q, h_q, d_qk], bfloat16
+        q: [s_q, h_q, d_qk], bfloat16. H8/H16 are physical head counts.
         kv: [s_kv, h_kv, d_qk], bfloat16
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
         sm_scale: float
@@ -524,9 +519,7 @@ def flash_mla_sparse_fwd(
         - lse: [s_q, h_q], float, log-sum-exp of attention scores
     """
     logger.debug("GEMS_METAX FLASH_MLA_SPARSE_FWD")
-    # MetaX local-headpack extension: 2-D single-KV-head indices and explicit
-    # output buffers preserve the deployed staged/serial arithmetic. Keep the
-    # common 3-D indices path below unchanged.
+    # The 2-D single-KV-head extension requires caller-owned output buffers.
     if indices.ndim == 2:
         _validate_local_prefill(
             q,
@@ -538,7 +531,6 @@ def flash_mla_sparse_fwd(
             out,
             max_logits_out,
             lse_out,
-            real_num_heads,
         )
         return _sparse_prefill_local(
             q,
@@ -601,8 +593,6 @@ def flash_mla_sparse_fwd(
         for tensor in (kv, indices, attn_sink, topk_length):
             if tensor is not None and tensor.device != q.device:
                 raise ValueError("physical H8 inputs must share q.device")
-    if HQ == 8 and real_num_heads not in (None, 8):
-        raise ValueError("physical H8 requires real_num_heads=None or 8")
     if not (HQ in (8, 16, 64, 128)):
         raise ValueError("Unsupported h_q")
     if not (DQK == 576 or DQK == 512):
@@ -683,8 +673,8 @@ def flash_mla_sparse_fwd(
         and (attn_sink is None or attn_sink.is_contiguous())
         and (topk_length is None or topk_length.is_contiguous())
     ):
-        if _flash_mla_sparse_qkfold_blockdiag_enabled() and real_num_heads == 8:
-            triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag[triton_grid](
+        for _v_start, _write_stats in ((0, True), (256, False)):
+            triton_flash_mla_sparse_fwd_halfd_serial[triton_grid](
                 q,
                 kv,
                 indices,
@@ -713,45 +703,11 @@ def flash_mla_sparse_fwd(
                 topk_length is not None,
                 BK=16,
                 BH=16,
-                num_warps=4,
+                V_START=_v_start,
+                WRITE_STATS=_write_stats,
+                num_warps=2,
                 num_stages=1,
             )
-        else:
-            for _v_start, _write_stats in ((0, True), (256, False)):
-                triton_flash_mla_sparse_fwd_halfd_serial[triton_grid](
-                    q,
-                    kv,
-                    indices,
-                    attn_sink,
-                    topk_length,
-                    sm_scale,
-                    output,
-                    max_logits,
-                    lse,
-                    q.stride(1),
-                    q.stride(0),
-                    kv.stride(1),
-                    kv.stride(0),
-                    indices.stride(1),
-                    indices.stride(0),
-                    output.stride(1),
-                    output.stride(0),
-                    max_logits.stride(0),
-                    lse.stride(0),
-                    SQ,
-                    HQ,
-                    DQK,
-                    SKV,
-                    TOPK,
-                    attn_sink is not None,
-                    topk_length is not None,
-                    BK=16,
-                    BH=16,
-                    V_START=_v_start,
-                    WRITE_STATS=_write_stats,
-                    num_warps=2,
-                    num_stages=1,
-                )
         return (output, max_logits, lse)
     if _can_use_tle_flash_mla_sparse_fwd(q, kv, indices, d_v, topk_length):
         from triton.tools.tensor_descriptor import TensorDescriptor
@@ -844,7 +800,6 @@ def _validate_local_prefill(
     out,
     max_logits_out,
     lse_out,
-    real_num_heads,
 ):
     """Validate the explicit MetaX 2-D-index, caller-owned-output extension.
 
@@ -856,11 +811,7 @@ def _validate_local_prefill(
     if q.ndim != 3 or q.shape[1] not in (8, 16) or q.shape[2] not in (512, 576):
         raise ValueError("local prefill requires q shape [rows, 8 or 16, 512 or 576]")
     rows, heads, head_dim = q.shape
-    if (
-        rows <= 0
-        or d_v != 512
-        or real_num_heads not in ((None, 8) if heads == 8 else (None,))
-    ):
+    if rows <= 0 or d_v != 512:
         raise ValueError("local prefill requires nonempty rows, d_v=512 and full heads")
     if kv.ndim != 3 or kv.shape[0] <= 0 or kv.shape[1:] != (1, head_dim):
         raise ValueError("local prefill requires nonempty kv shape [keys, 1, head_dim]")
@@ -980,7 +931,7 @@ def _sparse_prefill_h8(q, kv, indices, scale, sink, lengths, out, maximum, lse):
     cannot lower an eight-row tl.dot; the existing folded tile avoids that
     compiler limitation while reading/writing only the eight real heads.
     """
-    triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag[(q.shape[0],)](
+    triton_flash_mla_sparse_fwd_h8[(q.shape[0],)](
         q,
         kv,
         indices,

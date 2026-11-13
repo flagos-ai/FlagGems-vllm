@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""DSV4 TP8 decode: padding-aware blockdiag and split-topk orchestration."""
+"""MetaX DSV4 sparse decode for physical H8 and full H16."""
 
 import importlib
 import logging
@@ -328,7 +328,7 @@ def _partial_model1_kernel_halfd(
 
 
 @triton.jit
-def _partial_model1_kernel_halfd_qkfold_blockdiag(
+def _partial_model1_h8_kernel(
     q,
     kv,
     indices,
@@ -366,7 +366,7 @@ def _partial_model1_kernel_halfd_qkfold_blockdiag(
 ):
     # The upper eight virtual rows compute V[256:512] of real heads 0..7.
     # They never address extra heads in Q, statistics or split workspace.
-    tl.static_assert(HQc == 8 or HQc == 16)
+    tl.static_assert(HQc == 8)
     tl.static_assert(BHc == 16)
     num_head_blocks: tl.constexpr = (HQc + BHc - 1) // BHc
     pid = tl.program_id(0)
@@ -713,13 +713,12 @@ def flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     *,
-    real_num_heads: Optional[int] = None,
     split_workspace: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     MODEL1 sparse decode with caller-owned output and optional split workspace.
-    Physical H8 is accepted directly (real_num_heads=None or 8). Its sink must
-    be contiguous, and split workspace uses H=8 instead of padded H=16.
+    Head count is inferred from the physical Q shape. H8 needs a contiguous
+    sink, and split workspace uses the same head count as Q.
     Dense and V32 paths delegate the existing upstream public operator.
 
     Returns:
@@ -766,8 +765,6 @@ def flash_mla_with_kvcache(
             raise ValueError("physical H8 requires nonempty batch and query sequence")
         if attn_sink is not None and not attn_sink.is_contiguous():
             raise ValueError("physical H8 requires contiguous attn_sink")
-        if real_num_heads not in (None, 8):
-            raise ValueError("physical H8 requires real_num_heads=None or 8")
         if q.stride(-1) != 1:
             raise ValueError("physical H8 requires q.stride(-1) == 1")
         for tensor in (
@@ -1045,7 +1042,6 @@ def flash_mla_with_kvcache(
         k_cache.shape[1],
         softmax_scale,
         is_fp8_kvcache,
-        real_num_heads=real_num_heads,
         split_workspace=split_workspace,
     )
 
@@ -1075,7 +1071,6 @@ def _try_sparse_decode_model1_split(
     topk,
     page_block_size,
     softmax_scale,
-    real_num_heads: Optional[int] = None,
     split_workspace: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """Launch graph-safe split-topk prototype for MODEL1 decode when explicitly enabled.
@@ -1125,21 +1120,8 @@ def _try_sparse_decode_model1_split(
     ps = part_sum[:batch_size]
     pa = part_acc[:batch_size]
     num_head_blocks = (num_heads_q + bh - 1) // bh
-    qkfold = (
-        (
-            num_heads_q == 8
-            or (_tuning.DEFAULT_POLICY.decode_qkfold and real_num_heads == 8)
-        )
-        and num_heads_q in (8, 16)
-        and bh == 16
-        and head_dim_k == 512
-        and head_dim_v == 512
-        and num_head_blocks == 1
-    )
-    if qkfold:
-        _partial_model1_kernel_halfd_qkfold_blockdiag[
-            (batch_size * seq_q * num_head_blocks * splits,)
-        ](
+    if num_heads_q == 8:
+        _partial_model1_h8_kernel[(batch_size * seq_q * num_head_blocks * splits,)](
             q,
             kv,
             indices,
@@ -1254,7 +1236,6 @@ def _sparse_decode_dispatch(
     page_block_size,
     softmax_scale,
     is_fp8_kvcache,
-    real_num_heads: Optional[int] = None,
     split_workspace: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """Launch sparse decode kernel."""
@@ -1281,7 +1262,6 @@ def _sparse_decode_dispatch(
         topk,
         page_block_size,
         softmax_scale,
-        real_num_heads=real_num_heads,
         split_workspace=split_workspace,
     ):
         return
@@ -1359,7 +1339,7 @@ def _sparse_decode_h8(
     ps = torch.empty_like(pm)
     pa = torch.empty((rows, 1, 8, 512), device=q.device, dtype=torch.float32)
     have_extra = extra is not None
-    _partial_model1_kernel_halfd_qkfold_blockdiag[(rows,)](
+    _partial_model1_h8_kernel[(rows,)](
         q,
         kv,
         ids,

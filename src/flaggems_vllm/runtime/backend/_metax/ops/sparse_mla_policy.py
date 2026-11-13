@@ -45,9 +45,7 @@ class KernelPolicy:
     decode_warps: int = 4
     decode_stages: int = 1
     decode_max_batch: int = 64
-    decode_qkfold: bool = True
     prefill_half_d: bool = True
-    prefill_blockdiag: bool = True
     prefill_staged: bool = True
 
 

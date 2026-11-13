@@ -114,14 +114,15 @@ class LocalPrefillContract(unittest.TestCase):
             max_logits_out=Tensor((17, 8), "fp32"),
             lse_out=Tensor((17, 8), "fp32"),
         )
-        for real_heads in (None, 8):
-            self.kw["real_num_heads"] = real_heads
+        self.invoke()
+        self.assertIs(self.calls[-1][0], self.q)
+        self.assertEqual(self.calls[-1][0].shape[1], 8)
+
+    def test_removed_padded_head_override_rejected(self):
+        self.kw["real_num_heads"] = 8
+        with self.assertRaisesRegex(TypeError, "real_num_heads"):
             self.invoke()
-            self.assertIs(self.calls[-1][0], self.q)
-            self.assertEqual(self.calls[-1][0].shape[1], 8)
-        self.calls.clear()
-        self.kw["real_num_heads"] = 16
-        self.assert_rejected()
+        self.assertEqual(self.calls, [])
 
     def test_missing_output_buffers(self):
         for name in ("out", "max_logits_out", "lse_out"):
@@ -186,9 +187,6 @@ class LocalPrefillContract(unittest.TestCase):
 
     def test_incompatible_semantic_arguments_rejected(self):
         self.kw["d_v"] = 256
-        self.assert_rejected()
-        self.kw["d_v"] = 512
-        self.kw["real_num_heads"] = 8
         self.assert_rejected()
 
     def test_legacy_public_local_name_is_not_defined(self):
