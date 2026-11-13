@@ -100,7 +100,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
-from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
+from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import (
+    paged_scatter_supports,
+    paged_scatter_triton,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -109,6 +112,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
+    quant_lightning_indexer,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -148,6 +154,7 @@ __all__ = [
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
+    "quant_lightning_indexer",
     "compute_slot_mapping_parallel",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
@@ -175,6 +182,7 @@ __all__ = [
     "npu_mhc_pre",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "paged_scatter_supports",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
     "persistent_topk",
