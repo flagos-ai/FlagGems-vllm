@@ -12,6 +12,106 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+mthreads_dense_fp8_mla_tle:
+- META:
+    BH: 16
+    CW: 4
+    PW: 4
+    SPLITS: 1
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 16
+    CW: 4
+    PW: 4
+    SPLITS: 2
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 16
+    CW: 4
+    PW: 4
+    SPLITS: 4
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+    CW: 4
+    PW: 8
+    SPLITS: 1
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+    CW: 4
+    PW: 8
+    SPLITS: 2
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+    CW: 4
+    PW: 8
+    SPLITS: 4
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 16
+    CW: 4
+    PW: 4
+    SPLITS: 8
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+    CW: 4
+    PW: 8
+    SPLITS: 8
+    llc_options: "-mtgpu-opt-level=1 -mtgpu-combine-instr-with-burst=0 -mtgpu-combine-fop-instr=1 -misched=mtgpu-max-ilp"
+    enable_backend_opt: false
+    enable_llc_opt: false
+  num_warps: 4
+  num_stages: 1
+
+mthreads_dense_fp8_mla:
+- META:
+    BH: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 16
+  num_warps: 8
+  num_stages: 1
+- META:
+    BH: 32
+  num_warps: 8
+  num_stages: 2
+
 w8a8_block_fp8_matmul_mthreads:
 - META:
     BLOCK_X: 16
