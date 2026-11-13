@@ -190,6 +190,11 @@ fused_recurrent_kda:
     num_warps: 1
     num_stages: 1
 
+hc_down_silu_wide_gemv:
+  - META: {BLOCK_N: 1, BLOCK_K: 1}
+    num_warps: 4
+    num_stages: 1
+
 hc_combine:
   - META: {BLOCK_D: 128, LOOP: false}
     num_warps: 4

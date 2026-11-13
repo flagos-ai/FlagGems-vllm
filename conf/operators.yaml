@@ -933,6 +933,17 @@ ops:
       - Pointwise
     stages:
       - beta: '0.3'
+  - id: hc_down_silu
+    description: BF16 HC down projection with FP32 accumulation and SiLU after BF16 rounding.
+    for:
+      - vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu.hc_down_silu
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '0.3'
   - id: hc_head_fused_kernel
     description: |
       The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
