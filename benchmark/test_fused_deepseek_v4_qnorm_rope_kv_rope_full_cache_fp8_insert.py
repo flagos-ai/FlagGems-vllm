@@ -116,7 +116,7 @@ def _resolve_gems_op():
     global _GEMS_OP_ERROR
     try:
         module = importlib.import_module(
-            f"flaggems_vllm.runtime.backend._{VENDOR}.ops.{OP_NAME}"
+            f"flaggems_vllm.runtime.backend._{VENDOR}.fused.{OP_NAME}"
         )
     except ModuleNotFoundError:
         try:
