@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from select_backends import backend_changed, read_changed_files
 
 REQUIRED_FIELDS = (
     "backend",
@@ -68,6 +69,14 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"platform {name!r}.container_volumes must be a list of strings"
             )
+        if not isinstance(entry.get("run_by_default", False), bool):
+            raise ValueError(f"platform {name!r}.run_by_default must be a boolean")
+        if not isinstance(entry.get("label", ""), str):
+            raise ValueError(f"platform {name!r}.label must be a string")
+        if not isinstance(entry.get("install_with_setup_sh", False), bool):
+            raise ValueError(
+                f"platform {name!r}.install_with_setup_sh must be a boolean"
+            )
         test_env = entry.get("test_env") or {}
         if not isinstance(test_env, dict) or not all(
             isinstance(key, str) and isinstance(value, str)
@@ -80,7 +89,27 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
 def select_platforms(
     platforms: dict[str, dict[str, Any]],
     only: set[str],
+    labels: set[str] | None = None,
+    all_enabled: bool = False,
+    changed_files: set[str] | None = None,
+    include_defaults: bool = False,
 ) -> list[dict[str, Any]]:
+    """Return the platforms to run.
+
+    `only` names platforms explicitly and overrides `enabled`. Otherwise an
+    enabled platform is selected when
+      - a changed file is under its backend directory
+        (`runtime/backend/_<vendor>/`), the same rule the bare-runner lane
+        uses;
+      - its `label` is in `labels` (a manual request);
+      - `all_enabled` is set; or
+      - `include_defaults` is set and the platform has `run_by_default: true`
+        (the caller sets it only when tests were selected).
+    NVIDIA platforms are never selected by path or by "all"; they run by label
+    or by default. With no request, nothing is selected.
+    """
+    labels = labels or set()
+    changed_files = changed_files or set()
     unknown = only - set(platforms)
     if unknown:
         raise ValueError(f"unknown platforms requested: {', '.join(sorted(unknown))}")
@@ -92,8 +121,16 @@ def select_platforms(
         if only:
             if name not in only:
                 continue
-        elif not entry.get("enabled", True):
-            continue
+        else:
+            if not entry.get("enabled", True):
+                continue
+            by_label = bool(entry.get("label")) and entry["label"] in labels
+            non_nvidia = not entry["backend"].startswith("nvidia")
+            by_all = all_enabled and non_nvidia
+            by_path = non_nvidia and backend_changed(entry["backend"], changed_files)
+            by_default = include_defaults and entry.get("run_by_default", False)
+            if not (by_label or by_all or by_path or by_default):
+                continue
 
         selected.append(
             {
@@ -113,9 +150,19 @@ def select_platforms(
                     entry.get("test_env") or {}, separators=(",", ":")
                 ),
                 "gpu_check_script": entry["gpu_check_script"],
+                "install_with_setup_sh": entry.get("install_with_setup_sh", False),
             }
         )
     return selected
+
+
+def parse_labels(value: str) -> set[str]:
+    labels = json.loads(value)
+    if labels is None:
+        return set()
+    if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+        raise ValueError("pull request labels must be a JSON array of strings")
+    return set(labels)
 
 
 def parse_only(value: str) -> set[str]:
@@ -134,6 +181,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="comma-separated platforms to select, overriding `enabled`",
     )
+    parser.add_argument("--changed-files", type=Path)
+    parser.add_argument("--labels-json", default="[]")
+    parser.add_argument("--all-enabled", action="store_true")
+    parser.add_argument(
+        "--include-defaults",
+        action="store_true",
+        help="also select platforms marked run_by_default",
+    )
     parser.add_argument("--format", choices=("github", "json", "list"), default="list")
     return parser.parse_args()
 
@@ -143,6 +198,10 @@ def main() -> int:
     selected = select_platforms(
         load_platforms(args.config),
         parse_only(args.only),
+        parse_labels(args.labels_json),
+        args.all_enabled,
+        read_changed_files(args.changed_files),
+        args.include_defaults,
     )
     matrix = {"include": selected}
 

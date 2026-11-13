@@ -36,8 +36,11 @@ NON_TEST_FILES = {
 }
 
 ENV_SMOKE_TRIGGER_FILES = {
+    ".github/actions/setup-flaggems/action.yml",
     ".github/backend-capabilities.json",
+    ".github/backends.json",
     ".github/configs/ci-backends.yaml",
+    ".github/workflows/backend-test.yaml",
     ".github/workflows/basic-ci.yml",
     "benchmark/conftest.py",
     "src/flaggems_vllm/backends.yaml",
@@ -45,7 +48,6 @@ ENV_SMOKE_TRIGGER_FILES = {
     "pytest.ini",
     "tests/conftest.py",
     "tools/check_backend_env.py",
-    "tools/check_ci_pins.py",
     "tools/prepare-flaggems-ci-env.sh",
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",
@@ -93,6 +95,27 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
         "tests/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "tests/test_megamoe.py",
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -245,6 +268,25 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "benchmark/test_flash_mla.py",
         "benchmark/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": ["benchmark/test_megamoe.py"],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "benchmark/test_megamoe.py",
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",

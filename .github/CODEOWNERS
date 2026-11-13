@@ -19,7 +19,6 @@
 /.github/configs/ci-backends.yaml @huangyiqun @0x45f @Vincent-Xiao
 /.github/MULTI_BACKEND_CI.md @huangyiqun @0x45f @Vincent-Xiao
 /tools/check_backend_env.py @huangyiqun @0x45f @Vincent-Xiao
-/tools/check_ci_pins.py @huangyiqun @0x45f @Vincent-Xiao
 /tools/prepare-flaggems-ci-env.sh @huangyiqun @0x45f @Vincent-Xiao
 /tools/run-multi-backend-tests.sh @huangyiqun @0x45f @Vincent-Xiao
 /tools/run_ci_targets.py @huangyiqun @0x45f @Vincent-Xiao

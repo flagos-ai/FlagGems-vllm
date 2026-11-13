@@ -1,0 +1,68 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Path-based PR labels, applied by .github/workflows/triage.yaml.
+#
+# Backend labels (vendor/*) are intentionally NOT assigned here: tools/
+# select_backends.py treats them as requests to run on self-hosted vendor
+# runners, so they must stay a maintainer decision.
+
+ci/cd:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'LICENSE'
+          - '*.md'
+          - 'docs/**'
+
+ops:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/flaggems_vllm/ops/**'
+          - 'conf/operators.yaml'
+
+backend:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/flaggems_vllm/runtime/backend/**'
+
+core:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pyproject.toml'
+          - 'src/flaggems_vllm/*.py'
+          - 'src/flaggems_vllm/runtime/*.py'
+          - 'src/flaggems_vllm/utils/**'
+          - 'src/flaggems_vllm/testing/**'
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tests/**'
+          - 'pytest.ini'
+          - '.pre-commit-config.yaml'
+
+benchmark:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'benchmark/**'
+
+tools:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tools/**'
