@@ -250,11 +250,22 @@ jobs:
       - id: select-ci-backends
         name: select container ci backends
         shell: bash
+        env:
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          ALL_ENABLED: >-
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true) ||
+                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/all-vendors')) }}
         run: |
           set -euo pipefail
-          python tools/select_ci_backends.py \
-            --config .github/configs/ci-backends.yaml \
-            --format github | tee -a "${GITHUB_OUTPUT}"
+          args=(
+            --config .github/configs/ci-backends.yaml
+            --labels-json "${PR_LABELS_JSON:-null}"
+            --format github
+          )
+          if [[ "${ALL_ENABLED}" == "true" ]]; then
+            args+=(--all-enabled)
+          fi
+          python tools/select_ci_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
   nvidia-tests:
     name: nvidia tests and benchmarks
@@ -362,13 +373,19 @@ jobs:
       test_script: tools/run-multi-backend-tests.sh
 
   # Container-based PR smoke tests for self-hosted vendor runners that ship a
-  # vendor-provided vLLM base image instead of going through tools/setup.sh. The runner/image pairings live in
+  # vendor-provided vLLM base image instead of going through tools/setup.sh.
+  # The runner/image pairings live in
   # `.github/configs/ci-backends.yaml` (schema mirrored from FlagOps'
   # resource_map.yaml) rather than in `.github/backends.json`, because those
   # vendor images do not fit that registry's "run tools/setup.sh on a bare
   # runner" contract. The H20 host deliberately stays out of this lane and
   # keeps running directly via `nvidia-tests`; the `nvidia` platform here is the
   # A100 runner with the NGC vLLM image.
+  #
+  # Scheduling is opt-in: a platform runs when its `vendor/*` label is on the
+  # pull request (or via `ci/all-vendors` / the `run_non_nvidia` dispatch,
+  # which never include NVIDIA). Labels need triage access, so a fork PR cannot
+  # pick its own runner.
   #
   # Bring-up status: observation period. Each platform is still proving out
   # its runner and image, so this job is intentionally excluded from
@@ -380,8 +397,9 @@ jobs:
     name: ${{ matrix.platform }} container smoke test
     needs: select-targets
     if: >-
-      needs.select-targets.outputs.should_run == 'true'
-      && needs.select-targets.outputs.has_container_backends == 'true'
+      needs.select-targets.outputs.has_container_backends == 'true'
+      && (needs.select-targets.outputs.should_run == 'true'
+          || github.event_name == 'pull_request')
       && (github.event_name != 'pull_request'
           || github.event.pull_request.user.login != 'dependabot[bot]')
     continue-on-error: true

@@ -68,6 +68,8 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"platform {name!r}.container_volumes must be a list of strings"
             )
+        if not isinstance(entry.get("label", ""), str):
+            raise ValueError(f"platform {name!r}.label must be a string")
         if not isinstance(entry.get("install_with_setup_sh", False), bool):
             raise ValueError(
                 f"platform {name!r}.install_with_setup_sh must be a boolean"
@@ -84,7 +86,17 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
 def select_platforms(
     platforms: dict[str, dict[str, Any]],
     only: set[str],
+    labels: set[str] | None = None,
+    all_enabled: bool = False,
 ) -> list[dict[str, Any]]:
+    """Return the platforms to run.
+
+    `only` names platforms explicitly and overrides `enabled`. Otherwise an
+    enabled platform is selected when its `label` is in `labels`, or when
+    `all_enabled` is set (NVIDIA platforms are excluded from "all", matching
+    the bare-runner lane). With no request, nothing is selected.
+    """
+    labels = labels or set()
     unknown = only - set(platforms)
     if unknown:
         raise ValueError(f"unknown platforms requested: {', '.join(sorted(unknown))}")
@@ -96,8 +108,13 @@ def select_platforms(
         if only:
             if name not in only:
                 continue
-        elif not entry.get("enabled", True):
-            continue
+        else:
+            if not entry.get("enabled", True):
+                continue
+            by_label = bool(entry.get("label")) and entry["label"] in labels
+            by_all = all_enabled and not entry["backend"].startswith("nvidia")
+            if not by_label and not by_all:
+                continue
 
         selected.append(
             {
@@ -123,6 +140,15 @@ def select_platforms(
     return selected
 
 
+def parse_labels(value: str) -> set[str]:
+    labels = json.loads(value)
+    if labels is None:
+        return set()
+    if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+        raise ValueError("pull request labels must be a JSON array of strings")
+    return set(labels)
+
+
 def parse_only(value: str) -> set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
 
@@ -139,6 +165,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="comma-separated platforms to select, overriding `enabled`",
     )
+    parser.add_argument("--labels-json", default="[]")
+    parser.add_argument("--all-enabled", action="store_true")
     parser.add_argument("--format", choices=("github", "json", "list"), default="list")
     return parser.parse_args()
 
@@ -148,6 +176,8 @@ def main() -> int:
     selected = select_platforms(
         load_platforms(args.config),
         parse_only(args.only),
+        parse_labels(args.labels_json),
+        args.all_enabled,
     )
     matrix = {"include": selected}
 

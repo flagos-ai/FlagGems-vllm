@@ -54,7 +54,7 @@ class SelectCiBackendsTest(unittest.TestCase):
         )
 
         selected = select_ci_backends.select_platforms(
-            select_ci_backends.load_platforms(path), set()
+            select_ci_backends.load_platforms(path), set(), all_enabled=True
         )
 
         self.assertEqual([entry["platform"] for entry in selected], ["ready"])
@@ -112,6 +112,83 @@ class SelectCiBackendsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_ci_backends.load_platforms(path)
 
+    def labelled_config(self) -> Path:
+        return self.write_config(
+            """
+            platforms:
+              hygon:
+                label: vendor/Hygon
+                backend: hygon
+                runner_labels: hygon-1
+                container_image: example.invalid/hygon:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+              metax:
+                label: vendor/MetaX
+                backend: metax-maca3810
+                runner_labels: metax-1
+                container_image: example.invalid/metax:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+              nvidia:
+                label: vendor/NVIDIA
+                backend: nvidia-cuda133
+                runner_labels: a100-1
+                container_image: example.invalid/nvidia:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+              pending:
+                enabled: false
+                label: vendor/Pending
+                backend: pending-backend
+                runner_labels: pending-1
+                container_image: example.invalid/pending:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+            """
+        )
+
+    def platforms_for(self, labels=(), all_enabled=False):
+        platforms = select_ci_backends.load_platforms(self.labelled_config())
+        selected = select_ci_backends.select_platforms(
+            platforms, set(), set(labels), all_enabled
+        )
+        return [entry["platform"] for entry in selected]
+
+    def test_nothing_is_selected_without_a_request(self):
+        self.assertEqual(self.platforms_for(), [])
+        self.assertEqual(self.platforms_for(["documentation", "size/Small"]), [])
+
+    def test_a_pr_label_selects_only_its_platform(self):
+        self.assertEqual(self.platforms_for(["vendor/Hygon"]), ["hygon"])
+        self.assertEqual(
+            self.platforms_for(["vendor/MetaX", "vendor/Hygon"]), ["hygon", "metax"]
+        )
+        self.assertEqual(self.platforms_for(["vendor/NVIDIA"]), ["nvidia"])
+
+    def test_all_enabled_excludes_nvidia_and_disabled_platforms(self):
+        self.assertEqual(self.platforms_for(all_enabled=True), ["hygon", "metax"])
+
+    def test_a_label_cannot_enable_a_disabled_platform(self):
+        self.assertEqual(self.platforms_for(["vendor/Pending"]), [])
+
+    def test_non_string_label_is_rejected(self):
+        path = self.write_config(
+            """
+            platforms:
+              broken:
+                label: 1
+                backend: broken-backend
+                runner_labels: broken-1
+                container_image: example.invalid/broken:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+            """
+        )
+
+        with self.assertRaises(ValueError):
+            select_ci_backends.load_platforms(path)
+
+    def test_label_json_requires_string_array(self):
+        self.assertEqual(select_ci_backends.parse_labels("null"), set())
+        with self.assertRaises(ValueError):
+            select_ci_backends.parse_labels('{"a": 1}')
+
     def test_missing_required_field_is_rejected(self):
         path = self.write_config(
             """
@@ -144,7 +221,7 @@ class SelectCiBackendsTest(unittest.TestCase):
         )
 
         entry = select_ci_backends.select_platforms(
-            select_ci_backends.load_platforms(path), set()
+            select_ci_backends.load_platforms(path), set(), all_enabled=True
         )[0]
 
         self.assertEqual(
@@ -175,7 +252,10 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
 
     def setUp(self):
         self.platforms = select_ci_backends.load_platforms(CONFIG_PATH)
-        self.selected = select_ci_backends.select_platforms(self.platforms, set())
+        # Name every platform so the checks below cover the whole config.
+        self.selected = select_ci_backends.select_platforms(
+            self.platforms, set(self.platforms)
+        )
 
     def test_config_loads_and_selects_the_enabled_platforms(self):
         self.assertEqual(
@@ -195,6 +275,12 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
             {"FLAGTREE_BACKEND": "mthreads"},
         )
         self.assertEqual(json.loads(by_platform["hygon"]["test_env"]), {})
+
+    def test_every_platform_has_a_vendor_label(self):
+        # Without a label a platform could only run through `ci/all-vendors`.
+        for name, entry in self.platforms.items():
+            with self.subTest(platform=name):
+                self.assertTrue(entry.get("label", "").startswith("vendor/"))
 
     def test_container_images_have_no_embedded_whitespace(self):
         for entry in self.selected:
