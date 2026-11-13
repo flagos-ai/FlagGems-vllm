@@ -65,6 +65,7 @@ _LIBRARY_ONLY_OPS = frozenset(
         "top_k_top_p",
         "triton_reshape_and_cache_flash",
         "triton_ihc_post",
+        "matmul_persistent",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
         "pad_indexer_heads",

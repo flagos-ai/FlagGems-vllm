@@ -1138,6 +1138,17 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: matmul_persistent
+    description: vLLM batch-invariant matmul with bounded H20 small-matrix optimization.
+    for:
+      - vllm.model_executor.determinism.batch_invariant.matmul_batch_invariant
+    labels:
+      - vLLM
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).
