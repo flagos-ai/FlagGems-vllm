@@ -23,8 +23,8 @@
 #     `*-flaggems-weekly` runners. Do not merge the two: a PR-level smoke
 #     test and a 4h weekly sweep have different runners, images and blast
 #     radius, and sharing one file would couple both lanes.
-#   - FlagGems' `.github/backends.json` — the registry behind the
-#     `non-nvidia-tests` job, whose contract is "run FlagGems setup.sh on a
+#   - `.github/backends.json` — the registry behind the
+#     `non-nvidia-tests` job, whose contract is "run tools/setup.sh on a
 #     bare runner". The vendor images below ship their own torch/vLLM, so
 #     they do not fit that contract.
 #
@@ -54,8 +54,7 @@ platforms:
     runner_labels: hygon-bw1000-1
     container_image: >-
       harbor.sourcefind.cn:5443/hcu/admin/base/vllm:0.21.0-ubuntu22.04-dtk2604-py3.10
-    # Device flags follow FlagGems' backends.json `hygon-dtk2604.container`,
-    # whose `runs_on_vllm` is this runner.
+    # Device flags follow the FlagOS `hygon-dtk2604` container profile.
     container_options: >-
       --device /dev/kfd
       --device /dev/mkfd
@@ -93,8 +92,7 @@ platforms:
     runner_labels: iluvatar-bi-v150-1
     container_image: >-
       harbor.baai.ac.cn/flagos-app/vllm0.20.2-iluvatar-corex4.5.0:2.2.0-0.2.2
-    # Device flags follow FlagGems' backends.json
-    # `iluvatar-corex450.container`, whose `runs_on_vllm` is this runner.
+    # Device flags follow the FlagOS `iluvatar-corex450` container profile.
     container_options: >-
       --device /dev/iluvatar0
       --device /dev/itrctl
@@ -110,11 +108,10 @@ platforms:
     runner_labels: metax-mxc550-1
     # The vendor's own cr.metax-tech.com image needs registry credentials. Use
     # the FlagOS app image, which ships vLLM (33 of this repository's tests
-    # import it) unlike the flagos-runtime images upstream backends.json uses.
+    # import it) unlike the flagos-runtime images.
     container_image: >-
       harbor.baai.ac.cn/flagos-app/vllm0.24.0-metax-maca3.8.1.3:2.2.0-0.3.0
-    # Device flags follow FlagGems' backends.json `metax-maca3810.container`,
-    # whose `runs_on_vllm` is this runner.
+    # Device flags follow the FlagOS `metax-maca3810` container profile.
     container_options: >-
       --device /dev/mxcd
       --device /dev/dri
@@ -130,8 +127,7 @@ platforms:
     runner_labels: mthreads-s5000-1
     # v0.32.0 is not pullable from this registry; stay on v0.28.0.
     container_image: registry.mthreads.com/mcconline/inference/vllm/vllm-openai:v0.28.0
-    # Device flags follow FlagGems' backends.json
-    # `mthreads-musa520.container`, whose `runs_on_vllm` is this runner.
+    # Device flags follow the FlagOS `mthreads-musa520` container profile.
     container_options: >-
       --device /dev/mtgpu.0
       --device /dev/mtgpu.1

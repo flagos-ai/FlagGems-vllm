@@ -79,7 +79,6 @@ jobs:
         shell: bash
         run: |
           python -m unittest discover -s tools -p 'test_ci_*.py'
-          python tools/check_ci_pins.py
 
       # Existing code still contains torch compute calls, so only files touched
       # by this change are checked; new violations are blocked without failing
@@ -220,18 +219,7 @@ jobs:
 
           python tools/select_tests.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
-      # Keep this ref aligned with the reusable workflow and setup action below.
-      # Reading FlagGems' registry avoids maintaining a second backend list here.
-      - name: check out FlagGems backend registry
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          repository: flagos-ai/FlagGems
-          ref: 42d396ff8270f7b051f478217929f75484e53ef4
-          sparse-checkout: .github/backends.json
-          sparse-checkout-cone-mode: false
-          path: .ci/flaggems-registry
-          persist-credentials: false
-
+      # The backend registry lives in this repository (.github/backends.json).
       - id: select-backends
         name: select non-NVIDIA backends
         shell: bash
@@ -245,7 +233,7 @@ jobs:
         run: |
           set -euo pipefail
           args=(
-            --registry .ci/flaggems-registry/.github/backends.json
+            --registry .github/backends.json
             --capabilities .github/backend-capabilities.json
             --labels-json "${PR_LABELS_JSON:-null}"
             --changed-files changed_files.bin
@@ -257,7 +245,7 @@ jobs:
           python tools/select_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
       # Separate from select-backends above: that step routes backends whose
-      # environment FlagGems' setup.sh builds on a bare runner, while this one
+      # environment tools/setup.sh builds on a bare runner, while this one
       # resolves backends that run inside a vendor-provided vLLM image.
       - id: select-ci-backends
         name: select container ci backends
@@ -267,6 +255,76 @@ jobs:
           python tools/select_ci_backends.py \
             --config .github/configs/ci-backends.yaml \
             --format github | tee -a "${GITHUB_OUTPUT}"
+
+  # Runs the selected tests inside the stock NGC vLLM image on an A100 runner,
+  # to check the code against the torch, Triton and vLLM builds that ship with
+  # that image. `tools/setup.sh --no-venv` keeps all of them and only adds
+  # flag-gems, this repository and the test dependencies.
+  #
+  # The runner is an ARC pod on a K8s node (`k8s-novolume` hook): do not add
+  # container volumes, and note that device access comes from the pod, so the
+  # `--gpus` option below only matters if the runner is switched to Docker.
+  #
+  # Like vendor-container-tests, this job is not part of multi-backend-summary
+  # yet. Add it to that job's needs: once the runner has been stable.
+  triton-test:
+    name: triton test (nvidia-a100-1, NGC vllm)
+    needs: select-targets
+    # Same trust model as nvidia-tests: no fork-controlled code on this
+    # runner unless a maintainer adds the `ci/nvidia` label.
+    if: >-
+      needs.select-targets.outputs.should_run == 'true'
+      && (github.event_name != 'pull_request'
+          || (github.event.pull_request.user.login != 'dependabot[bot]'
+              && (github.event.pull_request.head.repo.full_name == github.repository
+                  || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))))
+    runs-on: nvidia-a100-1
+    timeout-minutes: 60
+    container:
+      image: nvcr.io/nvidia/vllm:26.10-py3
+      options: >-
+        --gpus all
+        --shm-size=256g
+        --ulimit memlock=-1
+        --ulimit stack=67108864
+    env:
+      FLAGGEMS_VENDOR: nvidia
+      PYTHONPATH: ${{ github.workspace }}/src
+      CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
+    steps:
+      - name: check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: show gpu
+        shell: bash
+        run: nvidia-smi
+
+      - name: check gpu availability
+        shell: bash
+        run: bash tools/gpu_check_nvidia.sh
+
+      - name: install FlagGems-vllm into the NGC image
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -c "import torch, triton, vllm; print('torch', torch.__version__, 'triton', triton.__version__, 'vllm', vllm.__version__)"
+          bash tools/setup.sh --no-venv nvidia
+
+      - name: run portable backend preflight
+        shell: bash
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        run: python3 tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
+
+      - name: run selected tests and benchmarks
+        shell: bash
+        run: |
+          python3 tools/run_ci_targets.py \
+            --backend nvidia-cuda133 \
+            --capabilities .github/backend-capabilities.json
 
   nvidia-tests:
     name: nvidia tests and benchmarks
@@ -365,25 +423,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select-targets.outputs.non_nvidia_matrix) }}
-    uses: flagos-ai/FlagGems/.github/workflows/backend-test.yaml@42d396ff8270f7b051f478217929f75484e53ef4
+    uses: ./.github/workflows/backend-test.yaml
     with:
       backend: ${{ matrix.backend }}
       runner_label: ${{ matrix.runner_label }}
       gpu_check_script: ${{ matrix.gpu_check }}
       changed_files: ${{ needs.select-targets.outputs.targets }}
       test_script: tools/run-multi-backend-tests.sh
-    # FlagGems currently declares this unused secret as required. Pass only the
-    # caller's read-only token instead of exposing a long-lived runner SSH key.
-    secrets:
-      RUNNER_SSH_KEY: ${{ secrets.GITHUB_TOKEN }}
 
   # Container-based PR smoke tests for self-hosted vendor runners that ship a
-  # vendor-provided vLLM base image instead of going through FlagGems'
-  # setup.sh. The runner/image pairings live in
+  # vendor-provided vLLM base image instead of going through tools/setup.sh. The runner/image pairings live in
   # `.github/configs/ci-backends.yaml` (schema mirrored from FlagOps'
-  # resource_map.yaml) rather than in FlagGems' backend registry, because
-  # those vendor images do not fit the registry's "run FlagGems setup.sh on a
-  # bare runner" contract. NVIDIA deliberately stays out of this lane and
+  # resource_map.yaml) rather than in `.github/backends.json`, because those
+  # vendor images do not fit that registry's "run tools/setup.sh on a bare
+  # runner" contract. NVIDIA deliberately stays out of this lane and
   # keeps running directly on the H20 host.
   #
   # Bring-up status: observation period. Each platform is still proving out
