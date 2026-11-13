@@ -255,6 +255,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
+    "src/flaggems_vllm/ops/moe_align_block_size.py": [
+        "tests/test_moe_align_block_size.py",
+        "tests/test_moe_align_small_routes.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
@@ -385,6 +389,7 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/moe_align_block_size.py": [
         "benchmark/test_moe_align_block_size_triton.py",
+        "benchmark/test_moe_align_small_routes_perf.py",
     ],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
