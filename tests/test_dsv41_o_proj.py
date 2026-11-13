@@ -55,16 +55,31 @@ def nvidia_capability():
 CAPABILITY = nvidia_capability()
 HOPPER = CAPABILITY is not None and CAPABILITY[0] == 9
 FP8_GPU = CAPABILITY is not None and CAPABILITY >= (8, 9)
-# Hopper runs the tuned kernels, any other GPU with FP8 tensor cores the portable
-# path; both are tested here. Tests of the Hopper-only kernels say so.
+HYGON = flaggems_vllm.vendor_name == "hygon" and torch.cuda.is_available()
+# Hopper runs the tuned kernels, any other NVIDIA GPU with FP8 tensor cores the
+# portable path; both are tested here, and tests of the Hopper-only kernels say so.
+# Hygon DCU runs its own backend operator; those tests are named *_hygon_*.
 requires_hopper = pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper GPU")
 pytestmark = [
     pytest.mark.dsv41_o_proj,
     pytest.mark.skipif(
-        not FP8_GPU,
-        reason="requires an NVIDIA GPU with FP8 tensor cores (compute capability 8.9+)",
+        not (FP8_GPU or HYGON),
+        reason="requires an NVIDIA GPU with FP8 tensor cores (compute capability "
+        "8.9+) or a Hygon DCU",
     ),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _backend_gate(request):
+    # Tests named *_hygon_* cover the Hygon backend operator; the rest need an
+    # NVIDIA GPU with FP8 tensor cores.
+    if "_hygon_" in request.node.name:
+        if not HYGON:
+            pytest.skip("requires Hygon DCU")
+    elif not FP8_GPU:
+        pytest.skip("requires an NVIDIA GPU with FP8 tensor cores")
+
 
 try:
     from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
@@ -688,3 +703,330 @@ def test_dsv41_o_proj_vs_vllm(num_tokens, n_groups, hpg, rank):
     assert_relative_close(
         res, to_reference(ref), n_groups, rank, max_rel=MAX_VLLM_REL_ERR
     )
+
+
+# --------------------------------------------------------------------------
+# Against exact activations and the given weights, INT8 activation quant plus the
+# 128x128 INT8 requant of wo_a leave about 1.3% per (token, group) row on random data.
+HYGON_MAX_REL_ERR = 3e-2
+HYGON_TOKENS = (
+    [1, 7, 16, 17, 32, 96, 257]
+    if cfg.QUICK_MODE
+    else [1, 7, 16, 17, 32, 64, 96, 128, 257, 300, 1024, 2048]
+)
+HYGON_GROUP_CONFIGS = [*GROUP_CONFIGS, (1, 8, 1024)]
+
+
+def _hygon_module():
+    return importlib.import_module(
+        "flaggems_vllm.runtime.backend._hygon.ops.dsv41_o_proj"
+    )
+
+
+def _dequant_2d(w, ws, n_groups, rank):
+    k = w.shape[-1]
+    return ref_dequant_weight(
+        w.view(n_groups, rank, k), ws.view(n_groups, rank // QUANT_BLOCK, -1)
+    )
+
+
+def _hygon_ref(attn_out, pos, csc, w3_f32, n_groups, hpg, rank):
+    """Exact activations: inverse RoPE in fp32, then the einsum with fp32 weights."""
+    T = attn_out.shape[0]
+    x = ref_inverse_rope(attn_out[:, : n_groups * hpg], pos, csc, NOPE_DIM, ROPE_DIM)
+    x = x.reshape(T, n_groups, hpg * HEAD_DIM)
+    return torch.einsum("bhr,hdr->bhd", x, w3_f32).reshape(T, n_groups * rank)
+
+
+def _as_bf16_weight(w, ws, n_groups, rank):
+    """BF16 wo_a without scales, as vllm_hcu loads it."""
+    return _dequant_2d(w, ws, n_groups, rank).to(torch.bfloat16).view(w.shape)
+
+
+@pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("num_tokens", HYGON_TOKENS)
+@pytest.mark.parametrize("n_groups, hpg, rank", HYGON_GROUP_CONFIGS)
+def test_dsv41_o_proj_hygon_accuracy(num_tokens, n_groups, hpg, rank, weight_dtype):
+    attn_out, pos, csc, w, ws = make_inputs(
+        num_tokens, n_groups, hpg, rank, pad_heads=4
+    )
+    if weight_dtype == "bf16":
+        # Not quantized, as in vLLM: only the BF16 rounding of x and z remains.
+        w16 = _as_bf16_weight(w, ws, n_groups, rank)
+        res = call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)
+        ref = ref_dsv41_o_proj_bf16(attn_out, pos, csc, w16, n_groups, hpg, rank)
+        assert_relative_close(res, ref, n_groups, rank, max_rel=5e-3)
+        return
+    w3 = _dequant_2d(w, ws, n_groups, rank)
+    res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    ref = _hygon_ref(attn_out, pos, csc, w3, n_groups, hpg, rank)
+    assert_relative_close(res, ref, n_groups, rank, max_rel=HYGON_MAX_REL_ERR)
+
+
+@pytest.fixture
+def clean_call_plans():
+    """Launch recipes are cached per input signature. A test that patches the plan
+    tables must not leave recipes built from patched tables behind."""
+    module = _hygon_module()
+    module._call_plan.cache_clear()
+    yield module
+    module._call_plan.cache_clear()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 96, 300])
+@pytest.mark.parametrize("n_groups", [1, 8])
+def test_dsv41_o_proj_hygon_bf16_variants_agree(
+    num_tokens, n_groups, monkeypatch, clean_call_plans
+):
+    """Fused rope, rope tail buffer and split over heads give the same BF16 result."""
+    module = _hygon_module()
+    hpg, rank = 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(
+        num_tokens, n_groups, hpg, rank, pad_heads=4
+    )
+    w16 = _as_bf16_weight(w, ws, n_groups, rank)
+    ref = ref_dsv41_o_proj_bf16(attn_out, pos, csc, w16, n_groups, hpg, rank)
+    plans = [
+        (True, (1, 4, 2), (32, 128, 128, 4, 1, 1, 1)),
+        (False, (2, 8, 2), (32, 128, 128, 4, 1, 1, 1)),
+        (True, (1, 4, 2), (16, 64, 64, 4, 2, 8, 1)),
+        (False, (4, 2, 1), (64, 256, 64, 8, 1, 4, 2)),
+    ]
+    first = None
+    for plan in plans:
+        monkeypatch.setattr(module, "_bf16_plan", lambda *args, plan=plan: plan)
+        module._call_plan.cache_clear()
+        res = call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)
+        assert_relative_close(res, ref, n_groups, rank, max_rel=5e-3)
+        if first is None:
+            first = res
+        else:
+            assert_relative_close(res, first.float(), n_groups, rank, max_rel=1e-3)
+
+
+def test_dsv41_o_proj_hygon_bf16_strided_heads():
+    """Heads that are not 512 apart take the copy path and give the same result."""
+    n_groups, hpg, rank = 8, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(40, n_groups, hpg, rank)
+    w16 = _as_bf16_weight(w, ws, n_groups, rank)
+    wide = torch.zeros(
+        attn_out.shape[0],
+        attn_out.shape[1],
+        2 * HEAD_DIM,
+        dtype=attn_out.dtype,
+        device=attn_out.device,
+    )
+    wide[..., :HEAD_DIM] = attn_out
+    strided = wide[..., :HEAD_DIM]
+    assert strided.stride(1) != HEAD_DIM
+    res = call_gems(strided, pos, csc, w16, None, n_groups, hpg, rank)
+    ref = ref_dsv41_o_proj_bf16(attn_out, pos, csc, w16, n_groups, hpg, rank)
+    assert_relative_close(res, ref, n_groups, rank, max_rel=5e-3)
+    assert torch.equal(wide[..., :HEAD_DIM], attn_out)  # input left untouched
+
+
+def test_dsv41_o_proj_hygon_bf16_split_is_deterministic_and_replays():
+    module = _hygon_module()
+    hpg, rank = 8, 1024
+    for num_tokens, n_groups in ((1, 1), (32, 1), (32, 8)):
+        plan = module._bf16_plan(num_tokens, n_groups, hpg, rank)
+        assert plan[2][5] > 1, plan
+        attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+        w16 = _as_bf16_weight(w, ws, n_groups, rank)
+        ref = call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank)
+        for _ in range(50):
+            assert torch.equal(
+                call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank), ref
+            )
+        counters = module._tile_counters(
+            torch.cuda.current_stream(attn_out.device), attn_out.device
+        )
+        assert counters.sum().item() == 0
+        out = torch.empty_like(ref)
+        call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank, out=out)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call_gems(attn_out, pos, csc, w16, None, n_groups, hpg, rank, out=out)
+        for _ in range(10):
+            out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 33, 128])
+@pytest.mark.parametrize("n_groups", [1, 8])
+def test_dsv41_o_proj_hygon_paths_agree(
+    num_tokens, n_groups, monkeypatch, clean_call_plans
+):
+    """The fused and two-kernel paths quantize identically."""
+    module = _hygon_module()
+    hpg, rank = 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+    plans = {
+        "fused": ("fused", 16, 128, 2, 4),
+        "two": ("two", (1, 4, 1), (32, 128, 4)),
+    }
+    results = {}
+    for name, plan in plans.items():
+        monkeypatch.setattr(module, "_plan", lambda *args, plan=plan: plan)
+        module._call_plan.cache_clear()
+        results[name] = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    assert_relative_close(
+        results["fused"], results["two"].float(), n_groups, rank, max_rel=2e-3
+    )
+
+
+def test_dsv41_o_proj_hygon_split_k_is_deterministic():
+    """The last program of a tile sums the split parts in a fixed order."""
+    module = _hygon_module()
+    for num_tokens, n_groups in ((1, 1), (32, 1), (1, 8), (128, 1)):
+        plan = module._plan(num_tokens, n_groups, 8, 1024)
+        assert plan[0] == "fused" and plan[3] > 1, plan
+        attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, 8, 1024)
+        ref = call_gems(attn_out, pos, csc, w, ws, n_groups, 8, 1024)
+        for _ in range(100):
+            res = call_gems(attn_out, pos, csc, w, ws, n_groups, 8, 1024)
+            assert torch.equal(res, ref)
+        counters = module._tile_counters(
+            torch.cuda.current_stream(attn_out.device), attn_out.device
+        )
+        assert counters.sum().item() == 0  # every tile handed its counter back
+
+
+def test_dsv41_o_proj_hygon_cudagraph_replay():
+    n_groups, hpg, rank = 1, 8, 1024
+    for num_tokens in (32, 300):  # fused split-K, then two kernels
+        attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+        ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+        out = torch.empty_like(ref)
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, out=out)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, out=out)
+        for _ in range(20):
+            out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, ref)
+
+
+def test_dsv41_o_proj_hygon_new_token_count_does_not_recompile():
+    n_groups, hpg, rank = 8, 8, 1024
+
+    def first_call_ms(num_tokens):
+        attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
+        call_gems(attn_out[:1], pos[:1], csc, w, ws, n_groups, hpg, rank)  # weight
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) * 1000
+
+    first_call_ms(80)  # compile the quant and GEMM kernels once for T in (64, 128]
+    best = min(first_call_ms(t) for t in random.sample(range(65, 128), 3))
+    assert best < 100, f"new token count took {best:.1f} ms"
+
+
+def test_dsv41_o_proj_hygon_weight_cache_follows_updates():
+    n_groups, hpg, rank = 8, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(4, n_groups, hpg, rank)
+    first = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    cached = w._flaggems_dsv41_o_proj_int8[1]
+    call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    assert w._flaggems_dsv41_o_proj_int8[1] is cached
+    ws.mul_(2.0)  # in place: the cached INT8 copy must be rebuilt
+    second = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    assert w._flaggems_dsv41_o_proj_int8[1] is not cached
+    assert torch.equal(second, first * 2)
+
+
+def test_dsv41_o_proj_hygon_int32_positions_and_layouts():
+    n_groups, hpg, rank = 8, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(40, n_groups, hpg, rank, pad_heads=4)
+    ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    res = call_gems(attn_out, pos.to(torch.int32), csc, w, ws, n_groups, hpg, rank)
+    assert torch.equal(res, ref)
+    w3 = w.view(n_groups, rank, -1)
+    ws3 = ws.view(n_groups, rank // QUANT_BLOCK, -1)
+    out = torch.empty_like(ref)
+    res = call_gems(attn_out, pos, csc, w3, ws3, n_groups, hpg, rank, out=out)
+    assert res is out and torch.equal(out, ref)
+    seen = []
+
+    def wo_b(flat):
+        seen.append(flat.shape)
+        return flat[:, :128]
+
+    res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, wo_b_proj=wo_b)
+    assert seen == [(40, n_groups * rank)] and res.shape == (40, 128)
+    empty = call_gems(attn_out[:0], pos[:0], csc, w, ws, n_groups, hpg, rank)
+    assert empty.shape == (0, n_groups * rank)
+
+
+def test_dsv41_o_proj_hygon_rejects_unsupported():
+    n_groups, hpg, rank = 2, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(4, n_groups, hpg, rank)
+    w16 = _as_bf16_weight(w, ws, n_groups, rank)
+    with pytest.raises(ValueError):  # BF16 wo_a takes no scale
+        call_gems(attn_out, pos, csc, w16, ws, n_groups, hpg, rank)
+    with pytest.raises(NotImplementedError):  # FP8 wo_a needs its scale
+        call_gems(attn_out, pos, csc, w, None, n_groups, hpg, rank)
+    with pytest.raises(NotImplementedError):
+        call_gems(attn_out, pos, csc, w16.half(), None, n_groups, hpg, rank)
+    with pytest.raises(NotImplementedError):
+        call_gems(attn_out.half(), pos, csc, w, ws, n_groups, hpg, rank)
+    with pytest.raises(NotImplementedError):
+        call_gems(
+            attn_out, pos, csc, w, ws, n_groups, hpg, rank, nope_dim=480, rope_dim=32
+        )
+
+
+def test_dsv41_o_proj_hygon_call_cache_hits_and_values_follow_inputs():
+    """Checks and launch parameters are cached per input signature; values are not."""
+    module = _hygon_module()
+    n_groups, hpg, rank = 8, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(40, n_groups, hpg, rank)
+    first = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    hits = module._call_plan.cache_info().hits
+    other_pos = torch.roll(pos, 1)  # same signature, different values
+    second = call_gems(attn_out, other_pos, csc, w, ws, n_groups, hpg, rank)
+    assert module._call_plan.cache_info().hits == hits + 1
+    assert not torch.equal(first, second)
+    w3 = _dequant_2d(w, ws, n_groups, rank)
+    ref = _hygon_ref(attn_out, other_pos, csc, w3, n_groups, hpg, rank)
+    assert_relative_close(second, ref, n_groups, rank, max_rel=HYGON_MAX_REL_ERR)
+    attn_out.mul_(0.5)  # new values in the same buffer
+    third = call_gems(attn_out, other_pos, csc, w, ws, n_groups, hpg, rank)
+    assert module._call_plan.cache_info().hits == hits + 2
+    ref = _hygon_ref(attn_out, other_pos, csc, w3, n_groups, hpg, rank)
+    assert_relative_close(third, ref, n_groups, rank, max_rel=HYGON_MAX_REL_ERR)
+
+
+def test_dsv41_o_proj_hygon_alignment_and_bad_inputs_after_caching():
+    """Pointer alignment selects its own compiled kernel, and a cached good signature
+    never lets a bad call through."""
+    n_groups, hpg, rank = 8, 8, 1024
+    attn_out, pos, csc, w, ws = make_inputs(40, n_groups, hpg, rank)
+    ref = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
+    padded = torch.zeros(pos.numel() + 1, dtype=pos.dtype, device=pos.device)
+    padded[1:] = pos
+    assert padded[1:].data_ptr() % 16 != 0  # int64, one element in: 8 bytes off
+    assert torch.equal(
+        call_gems(attn_out, padded[1:], csc, w, ws, n_groups, hpg, rank), ref
+    )
+    assert torch.equal(call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank), ref)
+    with pytest.raises(ValueError):  # positions dtype
+        call_gems(attn_out, pos.to(torch.float32), csc, w, ws, n_groups, hpg, rank)
+    with pytest.raises(ValueError):  # positions length
+        call_gems(attn_out, pos[:-1], csc, w, ws, n_groups, hpg, rank)
+    with pytest.raises(ValueError):  # out has the wrong shape
+        bad = torch.empty(3, 3, dtype=torch.bfloat16, device=pos.device)
+        call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, out=bad)
+    with pytest.raises(ValueError):  # weight scale of the wrong shape
+        call_gems(attn_out, pos, csc, w, ws[:-1], n_groups, hpg, rank)
+    with pytest.raises(ValueError):  # non-contiguous weight
+        call_gems(attn_out, pos, csc, w.t().contiguous().t(), ws, n_groups, hpg, rank)
+    assert torch.equal(call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank), ref)
