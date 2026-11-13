@@ -735,6 +735,20 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: fused_q
+    description: |
+      Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
+      UE8M0 quantization, and index-weight scaling. Includes H20 scheduling.
+    for:
+      - vllm.models.deepseek_v32.common.kernels.fused_q
+    labels:
+      - fused
+      - vLLM
+      - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: fused_q_kv_rmsnorm
     description: |
       Applies RMSNorm to Q and KV tensors in a single fused kernel for DeepSeekV4 attention.
