@@ -263,8 +263,8 @@ jobs:
   # resource_map.yaml) rather than in `.github/backends.json`, because those
   # vendor images do not fit that registry's "run tools/setup.sh on a bare
   # runner" contract. The H20 host deliberately stays out of this lane and
-  # keeps running directly via `nvidia-tests`; the `nvidia` platform here is the
-  # A100 runner with the NGC vLLM image.
+  # keeps running via `nvidia-tests` (backend-test.yaml); the `nvidia` platform
+  # here is the A100 runner with the NGC vLLM image.
   #
   # Scheduling: a platform runs when the pull request changes its backend
   # directory (runtime/backend/_<vendor>/), or when a maintainer adds its

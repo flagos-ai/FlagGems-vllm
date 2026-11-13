@@ -101,9 +101,10 @@ the FlagGems repository (`tools/test_ci_helpers.py` enforces this for
 runtime package by `tools/setup.sh`.
 
 1. `.github/backends.json` supplies `backend`, `runner_label`, `label`,
-   `gpu_check`, and `enabled` for the `non-nvidia-tests` lane.
+   `gpu_check`, and `enabled` for the `non-nvidia-tests` lane. The H20
+   `nvidia-tests` job passes the same inputs by hand and is not in this file.
 2. `.github/workflows/backend-test.yaml` is the reusable job for one backend
-   on a bare self-hosted runner. It checks out this repository and runs the
+   (including H20) on a bare self-hosted runner. It checks out this repository and runs the
    local `setup-flaggems` action.
 3. `.github/actions/setup-flaggems/action.yml` runs `tools/setup.sh <backend>`
    to build the vendor environment in `$GITHUB_WORKSPACE/.venv` (torch stack,
@@ -215,10 +216,10 @@ For each non-NVIDIA group:
    ```
 
 Only jobs directly defined in that selected reusable workflow can then enter
-the group. The H20 job is currently defined directly in `basic-ci.yml`, so its
-group cannot use this restriction until the H20 job is migrated
-to the pinned reusable workflow. Prefer an ephemeral H20 runner in the
-meantime.
+the group. The H20 job (`nvidia-tests`) calls the same `backend-test.yaml`, so
+its runner group can use this restriction too. Prefer an ephemeral H20 runner
+regardless: the restriction does not stop a same-repository branch from editing
+the caller workflow.
 
 For non-NVIDIA runners, `Selected workflows` reduces accidental access but is
 not the fork security boundary in the currently pinned design: a fork can edit

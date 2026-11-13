@@ -200,7 +200,8 @@ Acceptance target for key shapes is `SpeedUp >= 0.9`.
 
 ## Code style & linting
 
-`pre-commit` runs on all commits and in CI (`rule-check-required` job in `rule-check.yaml`).
+`pre-commit` runs on all commits and in CI (`rule-check-required` job in
+`rule-check.yaml`; PRs lint only the changed files, pushes to `main` lint all).
 
 ```shell
 pip install pre-commit
@@ -281,7 +282,7 @@ Reading order for op work: `workflow.md` → `optimization.md` → `deep_opt.md`
 
 ## CI
 
-`.github/workflows/basic-ci.yml`:
+`.github/workflows/rule-check.yaml` and `.github/workflows/basic-ci.yml`:
 1. **rule-check-required** (`.github/workflows/rule-check.yaml`) — one job for
    style and rule checks, named to match FlagGems. pre-commit uses a cached hook
    environment; PRs lint only the changed files (`--from-ref/--to-ref`) and

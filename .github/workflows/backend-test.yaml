@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Reusable job for one non-NVIDIA backend on a bare self-hosted runner. The
+# Reusable job for one backend (non-NVIDIA lanes and the H20 nvidia-tests job)
+# on a bare self-hosted runner. The
 # vendor environment is built by this repository's tools/setup.sh from
 # src/flaggems_vllm/backends.yaml, so nothing is fetched from the FlagGems
 # repository.
