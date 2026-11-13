@@ -22,21 +22,8 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert as _generic_impl,
 )
-from flaggems_vllm.utils.device_info import get_device_capability
 
 from .conftest import QUICK_MODE
-
-_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads", "thead"})
-
-
-def is_support_fp8e4nv():
-    if not hasattr(torch, "float8_e4m3fn"):
-        return False
-    if flaggems_vllm.vendor_name in _FP8E4NV_CAPABLE_VENDORS:
-        return True
-    major, minor = get_device_capability()
-    return major * 10 + minor >= 89
-
 
 VLLM_REF_AVAILABLE = False
 VLLM_0_22_0_AVAILABLE = False
@@ -567,10 +554,6 @@ def _release_failed_case_memory():
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(
-    not is_support_fp8e4nv(),
-    reason="Do not support fp8e4nv when capability < 89",
-)
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
 @pytest.mark.parametrize("n_heads", [8, 64])
 def test_q_path_matches_reference(num_tokens: int, n_heads: int):
@@ -635,10 +618,6 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(
-    not is_support_fp8e4nv(),
-    reason="Do not support fp8e4nv when capability < 89",
-)
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_kv_path_matches_reference(num_tokens: int, block_size: int):
@@ -691,10 +670,6 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(
-    not is_support_fp8e4nv(),
-    reason="Do not support fp8e4nv when capability < 89",
-)
 @pytest.mark.parametrize("num_tokens", [4, 17])
 @pytest.mark.parametrize("pad", [1, 5])
 @pytest.mark.parametrize("block_size", [16, 64])
@@ -751,10 +726,6 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(
-    not is_support_fp8e4nv(),
-    reason="Do not support fp8e4nv when capability < 89",
-)
 @pytest.mark.parametrize(
     "num_tokens",
     (
@@ -821,7 +792,6 @@ _OVERRIDE_ACTIVE = (
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
 @pytest.mark.skipif(
     not _OVERRIDE_ACTIVE,
     reason="No backend override registered; the generic kernel is in use",
@@ -880,7 +850,6 @@ def test_backend_override_matches_reference(
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
 @pytest.mark.skipif(not VLLM_REF_AVAILABLE, reason="vLLM is not installed")
 @pytest.mark.parametrize(
     "num_tokens", [17, 512] if QUICK_MODE else [17, 512, 777, 4096]
@@ -949,7 +918,6 @@ def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
 
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
 @pytest.mark.parametrize("n_heads", [16, 64])
 @pytest.mark.parametrize("apply_q_norm", [False, True])
 @pytest.mark.parametrize("apply_q_rope", [False, True])
