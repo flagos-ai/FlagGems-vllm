@@ -53,7 +53,6 @@ Each operator file typically contains:
 runtime/
 ├── __init__.py             # Device detection, get_tuned_config(), replace_customized_ops()
 ├── common.py               # Vendor registry, VendorInfo, feature capabilities
-├── register.py             # Register class (PyTorch dispatch)
 ├── configloader.py         # Load tune_configs.yaml
 ├── flagtune.py             # FlagTune integration
 └── backend/

@@ -316,7 +316,6 @@ def test_export_signature_and_empty():
     )
     backend = "_" + flaggems_vllm.vendor_name
     assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
-    assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
     q = torch.empty((0, 4, 64), device=flaggems_vllm.device, dtype=torch.int8)
     cu = torch.zeros(2, device=flaggems_vllm.device, dtype=torch.int32)
     out, lse = op(q, q, q, 0, cu, 0, cu, return_softmax_lse=True)

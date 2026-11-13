@@ -287,7 +287,6 @@ class TestMetaXIndexerWeightScale:
     @pytest.mark.fused_indexer_weight_scale
     def test_fused_indexer_weight_scale_library_export(self):
         assert callable(flaggems_vllm.fused_indexer_weight_scale)
-        assert "fused_indexer_weight_scale" not in flaggems_vllm.FULL_CONFIG_BY_FUNC
 
     @pytest.mark.parametrize("offset", [1, 4])
     @pytest.mark.fused_indexer_weight_scale

@@ -327,7 +327,6 @@ def test_fp8_einsum_exports_and_configs():
     from flaggems_vllm import runtime
 
     assert flaggems_vllm.fp8_einsum is fp8_einsum
-    assert ("fp8_einsum", fp8_einsum) in flaggems_vllm._FULL_CONFIG
     for name in (
         "w8a8_block_fp8_bmm",
         "w8a8_block_fp8_bmm_general",
