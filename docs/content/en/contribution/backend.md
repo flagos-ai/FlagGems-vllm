@@ -39,6 +39,44 @@ backend/
 
 ## Adding a New Backend
 
+### Step 0: Add a Setup Profile
+
+Add an entry to `src/flaggems_vllm/backends.yaml` so `tools/setup.sh` can build the vendor
+environment. The registry records the Python version, vendor torch/accelerator
+packages, Triton/FlagTree builds, vLLM source, environment variables, vendor
+env scripts and backend-specific test dependencies:
+
+```yaml
+backends:
+  myvendor-myhw:
+    vendor: myvendor
+    python: "3.12"
+    deps:
+      - torch==2.10.0+myvendor
+      - myvendor-torch==1.2.3
+    triton: triton==3.6.0+myvendor
+    flagtree: flagtree==0.7.0+myvendor
+    # Omit vllm if the vendor image provides it; use --no-venv there.
+    vllm:
+      - vllm-myvendor==0.24.0
+    env:
+      MYVENDOR_HOME: /opt/myvendor
+      LD_LIBRARY_PATH: $MYVENDOR_HOME/lib:$LD_LIBRARY_PATH
+    env_source:
+      - /opt/myvendor/set_env.sh
+    # Optional backend-specific test packages (NVIDIA uses this for cupy).
+    test_deps:
+      - "some-vendor-test-helper>=1.0"
+```
+
+Add a short alias under `aliases:` if the vendor name alone should select this
+profile. Then verify with:
+
+```bash
+bash tools/setup.sh --list
+bash tools/setup.sh --dry-run myvendor
+```
+
 ### Step 1: Create Backend Directory
 
 ```bash

@@ -6,11 +6,15 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import device
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -147,7 +151,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     a stateful operation. Configuration experiments use externally restored
     state and no-Graph timing (see the accompanying benchmark).
     """
-    if device.vendor_name in ("nvidia", "hygon", "thead"):
+    logger.debug("GEMS FUSED_RECURRENT_GATED_DELTA_RULE_PACKED_DECODE")
+    if device.vendor_name in ("nvidia", "hygon", "thead", "metax"):
         return _packed_decode_gpu(
             mixed_qkv,
             a,

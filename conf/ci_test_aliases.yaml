@@ -22,6 +22,8 @@ hc_split_sinkhorn_forward: test_mhc_ops
 mhc_bwd: test_mhc_ops
 mhc_post: test_mhc_ops
 mhc_pre: test_mhc_ops
+# Keep the legacy family marker mapped to its shared test file.
+ihc_post: test_ihc
 
 # --- Inplace / _out variants sharing test with base ---
 beam_search_score_: test_beam_search_score
@@ -35,9 +37,10 @@ weight_norm_interface_backward: test_weight_norm_interface
 act_quant_triton: test_quant
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
 moe_align_block_size_triton: test_moe_align_block_size
+pad_indexer_heads: test_pad_indexer_heads
+triton_reshape_and_cache_flash: test_triton_reshape_and_cache_flash
 
 # Kanban operators that merge several weight precisions under one ID.
 flash_attn_varlen_func_w8a8: test_flash_attn_varlen_func_w8a8_fp8
 fused_marlin_moe_w4a16: test_fused_marlin_moe
 fused_marlin_moe_w8a16: test_fused_marlin_moe
-gdn_w8a16: test_gdn_w8a16_int8

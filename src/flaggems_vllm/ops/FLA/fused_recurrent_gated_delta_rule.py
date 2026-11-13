@@ -3,11 +3,14 @@
 # Retains the recurrent formulation from flash-linear-attention (MIT):
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 """Stride-aware recurrent GDN with vLLM's value-major state cache."""
+import logging
 import math
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -157,6 +160,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     cu_seqlens must be monotone, start at zero and end at T. Index-table width
     must cover each sequence. These device metadata are caller preconditions.
     """
+    logger.debug("GEMS FUSED_RECURRENT_GATED_DELTA_RULE_FWD")
     if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
         raise ValueError("q/k must have identical [B,T,H,K] shapes; v must be rank 4")
     B, T, H, K = q.shape
