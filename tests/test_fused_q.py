@@ -162,6 +162,7 @@ def assert_fp8(got: torch.Tensor, ref: torch.Tensor, msg: str):
 @pytest.mark.parametrize("cfg", MODEL_CONFIGS, ids=MODEL_IDS)
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 512, 4096])
 @pytest.mark.parametrize("index_interleave", [True, False])
+@pytest.mark.fused_q
 def test_fused_q(num_tokens: int, index_interleave: bool, cfg: ModelConfig, operator):
     K = operator
     torch.manual_seed(2)
