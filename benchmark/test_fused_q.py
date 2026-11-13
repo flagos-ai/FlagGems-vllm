@@ -5,10 +5,10 @@
 import inspect
 from pathlib import Path
 
-import flaggems_vllm as gems
 import pytest
 import torch
 
+import flaggems_vllm as gems
 from baseline import fused_q as workload
 from tests.test_fused_q import assert_benchmark_case
 
