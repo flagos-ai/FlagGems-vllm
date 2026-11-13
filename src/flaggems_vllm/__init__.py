@@ -22,6 +22,7 @@ from importlib.metadata import version as _metadata_version
 from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.ops import *  # noqa: F401,F403
+from flaggems_vllm.ops.flash_mla_with_kvcache import FlashMLASchedMeta
 
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name
@@ -44,5 +45,6 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
         globals()[_alias] = globals()[_target]
 
 __all__ = [
+    "FlashMLASchedMeta",
     "SUPPORTED_FP8_DTYPE",
 ]

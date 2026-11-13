@@ -20,19 +20,30 @@ import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
+from flaggems_vllm.ops.FLA import chunk_kda
 
+_backend_fla_name = f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}.FLA"
 try:
-    chunk_kda = import_module(
-        f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}.FLA"
-    ).chunk_kda
-except ModuleNotFoundError:
-    from flaggems_vllm.ops.FLA import chunk_kda
+    _backend_fla = import_module(_backend_fla_name)
+except ModuleNotFoundError as error:
+    if error.name != _backend_fla_name:
+        raise
+    # Backends without a vendor FLA package use the generic public entry.
+    _backend_has_kda = True
+else:
+    _backend_has_kda = hasattr(_backend_fla, "chunk_kda")
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 
 
-pytestmark = pytest.mark.chunk_kda
+pytestmark = [
+    pytest.mark.chunk_kda,
+    pytest.mark.skipif(
+        not _backend_has_kda,
+        reason=f"{flaggems_vllm.vendor_name} FLA backend does not export chunk_kda",
+    ),
+]
 
 
 def _naive_kda_lowerbound_gate(

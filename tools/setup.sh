@@ -739,13 +739,14 @@ PY
   ok
 
   if [ "${COMPILER}" = "flagtree" ]; then
-    printf "Checking FlagTree TLE support ..."
-    "${PYTHON_BIN}" - <<'PY' || die "FlagTree TLE support is unavailable"
+    # Older vendor FlagTree builds intentionally omit TLE. The compiler's
+    # integrity/import checks above are mandatory; TLE fast paths are selected
+    # by each operator's capability checks, not by a global version floor.
+    printf "Checking optional FlagTree TLE support ..."
+    "${PYTHON_BIN}" - <<'PY' || die "FlagTree capability check failed"
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-if not has_triton_tle(3, 6, 0):
-    raise SystemExit("FlagTree TLE support is unavailable")
-print(" has_triton_tle(3, 6, 0): True")
+print(" has_triton_tle():", has_triton_tle())
 PY
     ok
   fi

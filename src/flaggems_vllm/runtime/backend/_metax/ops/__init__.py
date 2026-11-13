@@ -59,8 +59,17 @@ if triton_version_utils.has_triton_tle():
 else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
+from flaggems_vllm.runtime.backend._metax.ops.sparse_mla_decode import (
+    flash_mla_with_kvcache,
+)
+from flaggems_vllm.runtime.backend._metax.ops.sparse_mla_prefill import (
+    flash_mla_sparse_fwd,
+)
+
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
+    "flash_mla_sparse_fwd",
+    "flash_mla_with_kvcache",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
