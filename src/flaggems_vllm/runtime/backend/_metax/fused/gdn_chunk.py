@@ -16,7 +16,6 @@ import logging
 
 import torch
 import triton
-import triton.backends.metax.compiler as backend
 import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
@@ -25,22 +24,19 @@ from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL, tensor_cache
 from flaggems_vllm.ops.FLA.wy_fast import recompute_w_u_fwd
 from flaggems_vllm.utils import libentry, libtuner
 
-_original_compile = backend.metax.translate_llvmir_to_mcfatbin
-
-
-# Disable backend LICM only for the GDN H-state kernel.
-def _compile_without_licm(src, mxcc, maca, options):
-    name = backend.maca_get_kernel_name(src)
-    if name == "chunk_gated_delta_rule_fwd_kernel_h_vmajor":
-        options += " -mllvm -metaxgpu-disable-licm=true"
-    return _original_compile(src, mxcc, maca, options)
-
-
-backend.metax.translate_llvmir_to_mcfatbin = _compile_without_licm
-
 logger = logging.getLogger(__name__)
 
 FLA_CHUNK_SIZE = 64
+
+
+def _supports_tle_load():
+    # Attribute presence is insufficient: FlagTree can expose primitives that
+    # the selected backend cannot lower. Use its actual capability registry.
+    try:
+        from triton.experimental.tle import get_supported_primitives
+    except ImportError:
+        return False
+    return "load" in get_supported_primitives("metax")
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +390,12 @@ def _skew_bucket_cached(chunk_offsets: torch.Tensor) -> int:
     N = chunk_offsets.numel() - 1
     if N <= 1:
         return 0
-    nt = chunk_offsets[1:] - chunk_offsets[:-1]
-    stats = torch.stack([nt.max(), nt.sum()])
-    max_nt, sum_nt = stats.tolist()  # One sync per chunk_offsets identity.
+    # This is identity-cached request metadata, not tensor numerical work.
+    # Copy once, then derive integer statistics on the host without launching
+    # subtraction/reduction/stack kernels in the production wrapper.
+    offsets = chunk_offsets.tolist()
+    counts = [end - start for start, end in zip(offsets, offsets[1:])]
+    max_nt, sum_nt = max(counts), sum(counts)
     if sum_nt <= 0:
         return 0
     avg_nt = sum_nt / N
@@ -1151,7 +1150,7 @@ def chunk_gated_delta_rule_fwd(
     chunk_offsets: torch.Tensor | None = None,
     **kwargs,
 ):
-    logger.debug("METAX GDN CHUNK FWD (V-major, fused cumsum+kkt+solve_tril)")
+    logger.debug("GEMS_METAX CHUNK_GATED_DELTA_RULE_FWD")
     # Ensure contiguity.
     if not q.is_contiguous():
         q = q.contiguous()
@@ -1185,6 +1184,7 @@ def chunk_gated_delta_rule_fwd(
         A=A,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        use_tle=_supports_tle_load(),
     )
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_vmajor(
