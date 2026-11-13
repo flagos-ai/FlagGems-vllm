@@ -1392,6 +1392,23 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: ple_conv
+    description: |
+      Upstream-compatible Qwen4Exp PLE dilated short convolution. Writes
+      SiLU(conv) into residual (optionally fused with outer residual) and
+      updates the persistent conv cache for decode, prefill, and speculative
+      decode modes, matching vLLM ops.ple.ple_conv.
+    for:
+      - vllm.models.qwen4_exp.common.ops.ple.ple_conv
+    labels:
+      - fused
+      - vLLM
+      - Qwen4Exp
+      - NoCPU
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '0.3'
   - id: qsa_sparse_paged_attention
     description: |
       Computes sparse grouped-query attention over paged BF16 or FP8 KV caches
