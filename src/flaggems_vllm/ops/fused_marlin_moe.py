@@ -3399,6 +3399,26 @@ def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
     return configs
 
 
+def _prune_w8a16_fp8_down_configs(configs, named_args, **kwargs):
+    """Drop the deeper pipelines of the FP8 down kernel where they cannot pay.
+
+    With at most 16 tokens and a K loop of at most four iterations
+    (DeepSeek-V4-Flash, I=256) the operator is slower with a deeper pipeline
+    than with one stage, although the kernel alone times faster: 0.83x at
+    T=2, 0.97x at T=4, 0.99x at T=8 and T=16 on H20. Longer loops (I >= 768)
+    gain 2-8% at the same token counts and keep every candidate.
+    """
+    args = {**named_args, **kwargs}
+    if args["T"] > 16:
+        return configs
+    return [
+        config
+        for config in configs
+        if config.num_stages == 1
+        or triton.cdiv(args["I"], config.kwargs["BLOCK_SIZE_K"]) > 4
+    ]
+
+
 # Share kernel bodies while tuning INT8 and FP8 independently. The tuning
 # library picks the stage count per shape; on FP8 decode shapes the deeper
 # pipelines pay off. INT8 down has no candidate above one stage: deeper stages
@@ -3422,6 +3442,7 @@ _fused_moe_kernel_w8a16_down_fp8 = _w8a16_tuned_kernel(
     "fused_marlin_moe_w8a16_fp8_down",
     key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
     hoist_dimension=True,
+    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_down_configs},
     reset_to_zero=["OUT"],
 )
 
