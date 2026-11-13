@@ -116,8 +116,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
     silu_and_mul_with_clamp_out,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
-    compute_slot_mapping_parallel,
+from flaggems_vllm.runtime.backend._ascend.ops.slot_mappings import (
+    compute_slot_mappings,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
@@ -148,7 +148,7 @@ __all__ = [
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
-    "compute_slot_mapping_parallel",
+    "compute_slot_mappings",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",

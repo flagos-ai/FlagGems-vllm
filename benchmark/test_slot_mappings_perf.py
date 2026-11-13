@@ -18,7 +18,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_slot_mapping import HAS_UPSTREAM, _upstream_slot_kernel
+from tests.test_slot_mappings import HAS_UPSTREAM, _upstream_slot_kernel
 
 from . import base
 
@@ -77,8 +77,8 @@ class SlotMappingBenchmark(base.Benchmark):
 
 def _gems(num, maxtok, qsl, nreq, pos, btab, bs):
     out = torch.full((maxtok,), -1, dtype=torch.int64, device=qsl.device)
-    flaggems_vllm.compute_slot_mapping_parallel(
-        num, maxtok, qsl, nreq, pos, btab, out, block_size=bs
+    flaggems_vllm.compute_slot_mappings(
+        nreq, num, maxtok, qsl, pos, btab, btab.stride(0), bs, out
     )
     return out
 
@@ -116,7 +116,7 @@ def _upstream(num, maxtok, qsl, nreq, pos, btab, bs):
     return out
 
 
-@pytest.mark.slot_mapping
+@pytest.mark.compute_slot_mappings
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
 def test_slot_mapping_perf():
     torch_op = _upstream if HAS_UPSTREAM else _torch_ref
