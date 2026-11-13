@@ -1685,3 +1685,81 @@ if __name__ == "__main__":
         _run_worker(_parse_worker_config())
     else:
         _main(sys.argv[1:])
+
+# ---- MUSA (MThreads) MegaMoE -------------------------------------------------
+_MTHREADS_TOKENS = (1, 64, 128, 256, 512, 2048, 16384)
+_MTHREADS_DEVICES = [
+    value
+    for value in os.environ.get("MEGAMOE_TEST_DEVICES", "").split(",")
+    if value.strip()
+]
+
+
+@dataclass(frozen=True)
+class _MThreadsConfig:
+    tokens: int
+    hidden: int = 2048
+    intermediate: int = 512
+    num_experts: int = 256
+    topk: int = 8
+    num_ranks: int = 1
+
+
+def _launch_mthreads(config: _MThreadsConfig) -> float:
+    """Time the operator across ranks and return the slowest-rank latency in ms."""
+    from flaggems_vllm.testing import megamoe_mthreads_baseline as mthreads
+
+    return mthreads.run_timing(
+        _MTHREADS_DEVICES[: config.num_ranks],
+        tokens=config.tokens,
+        iterations=int(os.environ.get("MEGAMOE_TEST_ITERATIONS", "20")),
+        warmup=int(os.environ.get("MEGAMOE_TEST_WARMUP", "5")),
+    )
+
+
+class MegaMoEMThreadsBenchmark(base.Benchmark):
+    DEFAULT_METRICS = ["latency"]
+    DEFAULT_DTYPES = [torch.float8_e4m3fn]
+    DEFAULT_SHAPE_DESC = "tokens, hidden, intermediate, num_experts, topk, num_ranks"
+
+    def __init__(self):
+        super().__init__(
+            op_name="megamoe_fp8",
+            torch_op=None,
+            gems_op=_launch_mthreads,
+            dtypes=self.DEFAULT_DTYPES,
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (value, 2048, 512, 256, 8, len(_MTHREADS_DEVICES) or 1)
+            for value in _MTHREADS_TOKENS
+        ]
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+
+    def get_input_iter(self, dtype):
+        yield from self.shapes
+
+    def get_latency(
+        self, op, tokens, hidden, intermediate, num_experts, topk, num_ranks
+    ):
+        return op(
+            _MThreadsConfig(
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                num_experts=num_experts,
+                topk=topk,
+                num_ranks=num_ranks,
+            )
+        )
+
+
+@pytest.mark.megamoe
+def test_megamoe_mthreads():
+    if Config.query:
+        MegaMoEMThreadsBenchmark().run()
+        return
+    if not _MTHREADS_DEVICES:
+        pytest.skip("Set MEGAMOE_TEST_DEVICES to an explicit MTS device list")
+    MegaMoEMThreadsBenchmark().run()

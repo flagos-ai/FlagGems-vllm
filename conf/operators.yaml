@@ -1437,6 +1437,20 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: megamoe_fp8
+  description: 'Fused multi-rank expert-parallel FP8 MegaMoE for MUSA accelerators,
+    combining routing, two FP8 expert GEMMs, NVSHMEM peer communication,
+    and Top-K reduction in one persistent Triton/FlagTree kernel.'
+  for:
+  - megamoe_fp8
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 
