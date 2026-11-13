@@ -106,6 +106,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "flaggems_vllm" = ["backends.yaml"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.runtime.backend._metax.ops" = ["flash_mla_with_kvcache_w8a8.cu"]
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
 "flaggems_vllm.utils" = ["configs/*.yaml"]
 

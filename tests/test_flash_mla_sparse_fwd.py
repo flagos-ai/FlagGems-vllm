@@ -114,6 +114,7 @@ class FlashmlaSparseTestKit:
         d_v: int,
         attn_sink: Optional[torch.Tensor],  # [h_q]
         topk_length: Optional[torch.Tensor],  # [s_q]
+        output_dtype: torch.dtype = torch.bfloat16,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -154,7 +155,7 @@ class FlashmlaSparseTestKit:
 
         lonely_q_mask = orig_lse == float("-inf")
         orig_lse[lonely_q_mask] = float("+inf")
-        return (out.to(torch.bfloat16), max_logits, orig_lse)
+        return (out.to(output_dtype), max_logits, orig_lse)
 
     @staticmethod
     def get_correctness_test_params():
@@ -290,7 +291,9 @@ class FlashmlaSparseTestKit:
         return res
 
     @staticmethod
-    def make_input_flashmla(param: Flashmla_Sparse_Test_Param):
+    def make_input_flashmla(
+        param: Flashmla_Sparse_Test_Param, *, seed: Optional[int] = None
+    ):
         """Create input data for sparse MLA operator by referring to the FlashMLA examples"""
         s_q = param.s_q
         s_kv = param.s_kv
@@ -305,8 +308,11 @@ class FlashmlaSparseTestKit:
         device = param.device
 
         global _flashmla_sparse_counter
-        FlashmlaSparseTestKit._init_seed(_flashmla_sparse_counter)
-        _flashmla_sparse_counter = _flashmla_sparse_counter + 1
+        if seed is None:
+            FlashmlaSparseTestKit._init_seed(_flashmla_sparse_counter)
+            _flashmla_sparse_counter = _flashmla_sparse_counter + 1
+        else:
+            FlashmlaSparseTestKit._init_seed(seed)
 
         q = (
             torch.randn((s_q, h_q, d_qk), dtype=dtype, device=device) / 10
