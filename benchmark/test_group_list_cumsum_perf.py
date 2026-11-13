@@ -59,7 +59,7 @@ class GroupListCumsumBenchmark(base.Benchmark):
         for i, n in enumerate(self.shapes):
             torch.manual_seed(1000 + i)
             x = torch.randint(0, 4096, (n,), dtype=torch.int64, device=self.device)
-            yield x
+            yield (x,)
 
 
 def _official(x):
