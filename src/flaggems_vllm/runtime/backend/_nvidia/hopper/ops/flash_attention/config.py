@@ -53,6 +53,7 @@ def get_compact_m_upper(
     return _ceil_div(total_q * pack_factor, block_m) + batch_size - 1
 
 
+DIRECT_GENERAL_BUCKET = 0
 DIRECT_DENSE_DECODE_BUCKET = 11
 DIRECT_PAGED_DECODE_BUCKET = 12
 DIRECT_PAGED_PREFILL_BUCKET = 25
@@ -237,6 +238,8 @@ def direct_launch_plan(
     max_seqlen_k: int,
     batch_size: int,
     effective_max_q: int,
+    effective_num_heads: int,
+    num_sms: int,
     is_paged: bool,
     paged_prefill: bool,
     pack_gqa: bool,
@@ -246,10 +249,19 @@ def direct_launch_plan(
     )
     medium_packed_q = is_paged and pack_gqa and effective_max_q > 64
     single_kv_tile = medium_packed_q and max_seqlen_k <= 128
+    # The decode buckets only admit BM16. Multi-row queries without a packed
+    # bucket of their own run faster with BM64 once those tiles fill a wave.
+    long_unpacked_q = (
+        effective_max_q >= 64
+        and (not is_paged or not pack_gqa)
+        and _ceil_div(effective_max_q, 64) * batch_size * effective_num_heads >= num_sms
+    )
     if paged_prefill:
         shape_bucket = DIRECT_PAGED_PREFILL_BUCKET
     elif medium_packed_q:
         shape_bucket = DIRECT_PAGED_PACKED_MEDIUM_BUCKET
+    elif long_unpacked_q:
+        shape_bucket = DIRECT_GENERAL_BUCKET
     elif is_paged:
         shape_bucket = DIRECT_PAGED_DECODE_BUCKET
     else:

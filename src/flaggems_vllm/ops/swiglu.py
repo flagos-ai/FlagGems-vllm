@@ -135,8 +135,8 @@ def swiglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch
         raise ValueError(
             f"The last dimension of must be even number, got {input_tensor.shape[-1]}"
         )
-    if not input_tensor.is_cuda:
-        raise ValueError("Only CUDA tensor is supported by SwiGLU")
+    if input_tensor.device.type == "cpu":
+        raise ValueError("SwiGLU requires an accelerator tensor, got a CPU tensor")
 
     shape = input_tensor.shape
     H = shape[-1] // 2
