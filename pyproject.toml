@@ -53,7 +53,7 @@ test = [
 # environment. `tools/setup.sh` installs the equivalent package from
 # src/flaggems_vllm/backends.yaml for NVIDIA profiles.
 test-nvidia = [
-    "cupy-cuda12x>=12.0.0,<14.0.0",  # Keep the existing NumPy version
+    "cupy-cuda12x>=12.0.0,<15.0.0",  # Keep the existing NumPy version
 ]
 # Native vLLM builds that carry the reference kernels used by the benchmark
 # baselines. Each extra targets exactly one backend image.
