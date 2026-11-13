@@ -18,6 +18,57 @@ import triton.language as tl
 
 
 @triton.jit
+def _check_fp8e4nv_cast_kernel(fp32_ptr, i8_ptr):
+    val = tl.load(fp32_ptr)
+    tl.store(i8_ptr, val.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+
+
+def _support_fp8e4nv_cast():
+    try:
+        import flaggems_vllm
+
+        x = torch.zeros([1], dtype=torch.float, device=flaggems_vllm.device)
+        y = x.new_empty([1])
+        _check_fp8e4nv_cast_kernel[(1,)](x, y)
+    except Exception:
+        return False
+    return True
+
+
+SUPPORT_FP8E4NV_CAST: tl.constexpr = tl.constexpr(_support_fp8e4nv_cast())
+
+
+@triton.jit
+def _f32_to_e4m3_bits(x):
+    """float32 -> OCP E4M3 (float8_e4m3fn) bit pattern, round-to-nearest-even.
+
+    **Requires |x| <= 448**: there is no saturation branch, so a larger input
+    silently yields a wrong byte. The caller guarantees it by construction; restore
+    saturation before using this anywhere else. Subnormals are handled.
+    """
+    b = x.to(tl.int32, bitcast=True)
+    sign = (b >> 24) & 0x80
+    mag = b & 0x7FFFFFFF
+    e = (mag >> 23) - 120
+
+    m_n = (mag >> 20) & 0x7
+    round_n = (mag >> 19) & 1
+    sticky_n = (mag & 0x7FFFF) != 0
+    m_n = m_n + tl.where((round_n == 1) & (sticky_n | ((m_n & 1) == 1)), 1, 0)
+    e_n = e + tl.where(m_n > 7, 1, 0)
+    m_n = tl.where(m_n > 7, 0, m_n)
+
+    # A subnormal is m * 2^-9 for m in 1..7, so its mantissa is |x| * 512 rounded
+    # to nearest even; adding and removing 2^23 forces that rounding without a
+    # per-lane shift, which this backend scalarises.
+    magic: tl.constexpr = 8388608.0  # 2^23
+    m_s = ((tl.abs(x) * 512.0 + magic) - magic).to(tl.int32)
+
+    v = tl.where(e >= 1, (e_n << 3) | m_n, m_s)
+    return (sign | v).to(tl.uint8)
+
+
+@triton.jit
 def _kv_fp8_quant(
     kv_quant_blk,  # [64], fp32
     out_data_ptrs,  # [64]
@@ -35,7 +86,10 @@ def _kv_fp8_quant(
     x_scaled = kv_quant_blk / scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
     # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
+    if SUPPORT_FP8E4NV_CAST:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+    else:
+        x_fp8 = _f32_to_e4m3_bits(x_clamped)
     x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
     # store quantized data
     tl.store(out_data_ptrs, x_uint8)
@@ -63,7 +117,10 @@ def _kv_fp8_quant_2d(
     x_scaled = kv_quant_blk / scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
     # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
+    if SUPPORT_FP8E4NV_CAST:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+    else:
+        x_fp8 = _f32_to_e4m3_bits(x_clamped)
     x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
     # store quantized data
     tl.store(out_data_ptrs, x_uint8)
@@ -92,7 +149,10 @@ def _kv_fp8_quant_3d(
     x_scaled = kv_quant_blk / scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
     # convert to fp8, then bitcast to uint8 for storage
-    x_fp8 = x_clamped.to(tl.float8e4nv)
+    if SUPPORT_FP8E4NV_CAST:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+    else:
+        x_fp8 = _f32_to_e4m3_bits(x_clamped)
     x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
     # store quantized data
     tl.store(out_data_ptrs, x_uint8, mask=ins_ok)
@@ -666,9 +726,13 @@ def _tiled_kernel(
             exponent = tl.ceil(tl.log2(block_max / FP8_MAX))
             scale = tl.exp2(exponent)
             x = tl.clamp(blk / scale[:, None], -FP8_MAX, FP8_MAX)
+            if SUPPORT_FP8E4NV_CAST:
+                x_fp8 = x.to(tl.float8e4nv)
+            else:
+                x_fp8 = _f32_to_e4m3_bits(x)
             tl.store(
                 k_cache + token_fp8[:, None] + b * QUANT_BLOCK + off_quant[None, :],
-                x.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+                x_fp8.to(tl.uint8, bitcast=True),
                 mask=ins_ok[:, None],
             )
             enc = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0)
