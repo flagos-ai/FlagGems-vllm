@@ -100,6 +100,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "benchmark/test_sparse_mla_metax.py",
         "tests/test_sparse_mla_specialization_metax.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
+        "tests/test_gdn_w8a16.py"
+    ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
         "tests/test_flash_mla_with_kvcache_w8a8.py",
@@ -246,6 +249,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/gdn_w8a16_int8.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "benchmark/test_flash_mla.py",
         "benchmark/test_flash_mla_with_kvcache_w8a8.py",

@@ -29,14 +29,12 @@ from tests.sparse_attn_sharedkv_utils import (
 )
 
 _IS_ASCEND = flaggems_vllm.vendor_name == "ascend" and hasattr(torch, "npu")
-pytestmark = [
-    pytest.mark.sparse_attn_sharedkv,
-    pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU"),
-]
+pytestmark = [pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU")]
 npu_only = pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU")
 
 
 @npu_only
+@pytest.mark.sparse_attn_sharedkv
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 @torch.inference_mode()
 def test_sparse_attn_sharedkv_accuracy(case):
@@ -58,6 +56,7 @@ def test_sparse_attn_sharedkv_accuracy(case):
     assert actual.shape == inputs["q"].shape and actual.dtype == torch.bfloat16
 
 
+@pytest.mark.sparse_attn_sharedkv
 def test_sparse_attn_sharedkv_rejects_cpu():
     module = __import__(
         "flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv",
@@ -68,6 +67,7 @@ def test_sparse_attn_sharedkv_rejects_cpu():
 
 
 @npu_only
+@pytest.mark.sparse_attn_sharedkv
 @torch.inference_mode()
 def test_sparse_attn_sharedkv_rejects_unsupported_layout():
     case = CASES[0]
@@ -82,6 +82,7 @@ def test_sparse_attn_sharedkv_rejects_unsupported_layout():
 
 
 @npu_only
+@pytest.mark.sparse_attn_sharedkv
 @torch.inference_mode()
 def test_sparse_attn_sharedkv_rejects_partial_host_lengths():
     case = CASES[0]
@@ -90,6 +91,7 @@ def test_sparse_attn_sharedkv_rejects_partial_host_lengths():
         flaggems_vllm.sparse_attn_sharedkv(**inputs, host_q_lens=(case.q_len,))
 
 
+@pytest.mark.sparse_attn_sharedkv
 def test_sparse_attn_sharedkv_case_labels():
     for case in CASES:
         label = shape_label(case)

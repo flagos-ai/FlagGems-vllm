@@ -23,13 +23,6 @@ on:
 
   workflow_call:
 
-  # Runs after sync-docs.yaml rebases gh-pages onto main.
-  workflow_run:
-    workflows:
-      - sync docs branch
-    types:
-      - completed
-
 permissions:
   contents: read
   pages: write

@@ -52,6 +52,29 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+
+fused_indexer_k_norm:
+  shapes:
+    - [1, 128, 0]
+    - [8, 128, 0]
+    - [128, 128, 0]
+    - [1024, 128, 0]
+    - [4096, 128, 0]
+    - [1, 128, 16]
+    - [8, 128, 16]
+    - [128, 128, 16]
+    - [1024, 128, 16]
+    - [4096, 128, 16]
+    - [128, 127, 0]
+    - [128, 129, 16]
+  shape_desc: "M, D, row_gap"
+
+chunk_kda_fwd_intra_token_parallel:
+  shapes:
+    - [1, 32, 128]
+    - [1, 32, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
+  shape_desc: "B, H, sequence_lengths... (packed when multiple)"
+
 fused_indexer_weight_scale:
   # Native GLM-5.3-Flash calls with dummy weights; top 10 by descending count.
   shapes:
@@ -610,6 +633,12 @@ chunk_gdn2:
     - [8, 1024, 8, 64, 64]
     - [8, 2048, 32, 256, 256]
 
+chunk_kda_scaled_dot_kkt_fwd:
+  shapes:
+    - [1, 65, 4, 128, 64]
+    - [1, 513, 4, 128, 64, 17, 0, 64, 432]
+  shape_desc: "B, T, H, K, BT, optional packed sequence lengths"
+
 chunk_gated_delta_rule_fwd:
   shapes:
     - [2, 16384, 16, 128, 128]
@@ -655,6 +684,19 @@ fused_allreduce_rms_norm:
     - [6, 6144]
     - [138, 6144]
   shape_desc: "M, H"
+
+mhc_shifted_post_pre:
+  # DSV4/DSV4.1 boundary shapes: decode-sized batches, a small chunk, and the
+  # full 4096-token prefill chunk at both hidden sizes.
+  shapes:
+    - [1, 1280]
+    - [16, 1280]
+    - [512, 1280]
+    - [512, 7168]
+    - [4096, 7168]
+    - [128, 5120]
+    - [2048, 5120]
+  shape_desc: "N, H"
 
 bmm_w8a8:
   shapes:
@@ -735,3 +777,9 @@ gate_sigmoid_mul:
     - [512, 12288, contiguous]
     - [4096, 12288, split_gate]
   shape_desc: "tokens, width, gate_layout"
+
+chunk_kda_with_fused_gate:
+  shapes:
+    - [1, 64, 8, 64, 64]
+    - [1, 512, 8, 128, 128, 129, 127, 256]
+  shape_desc: "B, T, H, K, V, optional packed sequence lengths"
