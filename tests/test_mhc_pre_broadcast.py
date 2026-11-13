@@ -1,12 +1,11 @@
 import pytest
 import torch
 
-from tests.test_mhc_ops import sinkhorn_normalize_ref
-
 from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
-    mhc_pre_broadcast,
     derive_fn_broadcast,
+    mhc_pre_broadcast,
 )
+from tests.test_mhc_ops import sinkhorn_normalize_ref
 
 
 def generate_mhc_pre_broadcast_data(n, hc_mult, hidden_size, device="cuda"):
@@ -49,7 +48,9 @@ def test_mhc_pre_broadcast_vs_ref(n, hidden_size):
     data_cpu = {k: (v.cpu() if hasattr(v, "cpu") else v) for k, v in data.items()}
     out_ref = mhc_pre_broadcast_ref(**data_cpu)
     names = ["residual_out", "post_mix", "comb_mix", "layer_input"]
-    assert torch.equal(out_triton[0].cpu(), out_ref[0]), "residual_out must be bit-exact"
+    assert torch.equal(
+        out_triton[0].cpu(), out_ref[0]
+    ), "residual_out must be bit-exact"
     for name, a, b in zip(names, out_triton, out_ref):
         a_cpu, b_cpu = a.cpu(), b
         diff = (a_cpu.float() - b_cpu.float()).abs()
@@ -69,8 +70,8 @@ def test_mhc_pre_broadcast_vs_ref(n, hidden_size):
 
 
 def mhc_pre_broadcast_ref(
-    residual: torch.Tensor,        # (T, H), bfloat16
-    fn_broadcast: torch.Tensor,    # (hc_mult3, H), float32
+    residual: torch.Tensor,  # (T, H), bfloat16
+    fn_broadcast: torch.Tensor,  # (hc_mult3, H), float32
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
     rms_eps: float,
@@ -90,9 +91,7 @@ def mhc_pre_broadcast_ref(
     residual_f32 = residual.float()
     sqrsum = hc_mult * residual_f32.square().sum(-1)  # 4 identical copies
     proj = (residual_f32 @ fn_broadcast.to(torch.bfloat16).float().T).bfloat16().float()
-    mixes = proj * (
-        sqrsum.unsqueeze(-1) / (hc_mult * hidden_size) + rms_eps
-    ).rsqrt()
+    mixes = proj * (sqrsum.unsqueeze(-1) / (hc_mult * hidden_size) + rms_eps).rsqrt()
 
     hc_scale_expanded = torch.cat(
         [
@@ -104,11 +103,15 @@ def mhc_pre_broadcast_ref(
     mixes = mixes * hc_scale_expanded + hc_base
 
     pre_mix = mixes[:, :hc_mult].sigmoid() + hc_pre_eps  # (T, hc_mult)
-    pre_sum = pre_mix.sum(-1, keepdim=True)              # (T, 1)
+    pre_sum = pre_mix.sum(-1, keepdim=True)  # (T, 1)
 
-    post_mix = (mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value).unsqueeze(-1)
+    post_mix = (
+        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
+    ).unsqueeze(-1)
     res_mix = mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult)
-    res_mix = sinkhorn_normalize_ref(res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps)
+    res_mix = sinkhorn_normalize_ref(
+        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+    )
 
     # Collapse, round to BF16 (matches kernel's output_shared boundary),
     # THEN compute sqrsum from the rounded value.
@@ -119,7 +122,8 @@ def mhc_pre_broadcast_ref(
     norm_inv = (sumsq / hidden_size + norm_eps).rsqrt()
     layer_input = (raw_rounded * norm_inv * norm_weight.float()).bfloat16()
 
-    residual_out = residual.unsqueeze(1).expand(num_tokens, hc_mult, hidden_size).contiguous()
+    residual_out = (
+        residual.unsqueeze(1).expand(num_tokens, hc_mult, hidden_size).contiguous()
+    )
 
     return residual_out, post_mix, res_mix, layer_input
-

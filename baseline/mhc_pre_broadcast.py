@@ -92,9 +92,7 @@ def build_inputs(binding, dtype, device):
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
 
     torch.manual_seed(42)
-    residual = torch.randn((n, hidden_size), dtype=torch.float, device=device).to(
-        dtype
-    )
+    residual = torch.randn((n, hidden_size), dtype=torch.float, device=device).to(dtype)
     fn = (
         torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float, device=device)
         * 1e-4
@@ -157,4 +155,3 @@ def config(binding, dtype):
             "hc_mult3": hc_mult3,
         },
     }
-

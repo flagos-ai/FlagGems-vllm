@@ -49,10 +49,7 @@ def native():
 
 
 def grid():
-    return [
-        {"shape": list(shape)}
-        for shape in TOPK_SOFTPLUS_SQRT_SHAPES
-    ]
+    return [{"shape": list(shape)} for shape in TOPK_SOFTPLUS_SQRT_SHAPES]
 
 
 def _unpack(binding):
@@ -64,18 +61,10 @@ def build_inputs(binding, dtype, device):
     num_tokens, num_experts, topk = _unpack(binding)
     torch.manual_seed(0)
 
-    gating_output = torch.randn(
-        (num_tokens, num_experts), dtype=dtype, device=device
-    )
-    correction_bias = torch.randn(
-        (num_experts,), dtype=torch.float32, device=device
-    )
-    topk_weights = torch.empty(
-        (num_tokens, topk), dtype=torch.float32, device=device
-    )
-    topk_indices = torch.empty(
-        (num_tokens, topk), dtype=torch.int32, device=device
-    )
+    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device=device)
+    correction_bias = torch.randn((num_experts,), dtype=torch.float32, device=device)
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
+    topk_indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
     token_expert_indices = torch.empty(
         (num_tokens, topk), dtype=torch.int32, device=device
     )
@@ -138,4 +127,3 @@ def config(binding, dtype):
             "topk": topk,
         },
     }
-

@@ -6,13 +6,13 @@ import warnings
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
     derive_fn_broadcast,
     mhc_pre_broadcast,
     mhc_pre_broadcast_ref,
 )
 
-import flaggems_vllm
 from . import base
 
 VENDOR = flaggems_vllm.vendor_name
@@ -26,7 +26,10 @@ VENDOR = flaggems_vllm.vendor_name
 # A vendor added here must expose the same positional signature as
 # mhc_pre_broadcast (see its docstring for argument order).
 _NATIVE_MHC_PRE_BROADCAST = {
-    "nvidia": ("vllm.model_executor.kernels.mhc.tilelang", "mhc_pre_broadcast_tilelang"),
+    "nvidia": (
+        "vllm.model_executor.kernels.mhc.tilelang",
+        "mhc_pre_broadcast_tilelang",
+    ),
 }
 
 
@@ -87,9 +90,12 @@ class MHCPreBroadcastBenchmark(base.Benchmark):
             residual = torch.randn(
                 (n, hidden_size), dtype=torch.float, device=device
             ).bfloat16()
-            fn = torch.randn(
-                (hc_mult3, hc_mult * hidden_size), dtype=torch.float, device=device
-            ) * 1e-4
+            fn = (
+                torch.randn(
+                    (hc_mult3, hc_mult * hidden_size), dtype=torch.float, device=device
+                )
+                * 1e-4
+            )
             fn_broadcast = derive_fn_broadcast(fn, hc_mult)
             hc_scale = torch.randn((3,), dtype=torch.float, device=device) * 0.1
             hc_base = torch.randn((hc_mult3,), dtype=torch.float, device=device) * 0.1
@@ -120,4 +126,3 @@ def test_mhc_pre_broadcast():
         dtypes=[torch.bfloat16],
     )
     bench.run()
-
