@@ -489,6 +489,24 @@ class NoFlagGemsSourceDependencyTest(unittest.TestCase):
                     f"{path} references the FlagGems repository",
                 )
 
+    def test_container_backends_are_not_in_the_bare_runner_registry(self):
+        import yaml
+
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        platforms = yaml.safe_load(
+            (repo_root / ".github/configs/ci-backends.yaml").read_text(encoding="utf-8")
+        )["platforms"]
+        # The H20 bare host (nvidia-cuda133) is recorded for reference only;
+        # select_backends never routes NVIDIA entries.
+        containerized = {
+            entry["backend"]
+            for entry in platforms.values()
+            if not entry["backend"].startswith("nvidia")
+        }
+        bare = {entry["backend"] for entry in registry}
+        self.assertEqual(containerized & bare, set())
+
     def test_backend_registry_is_local(self):
         repo_root = Path(__file__).resolve().parents[1]
         registry = select_backends.load_registry(repo_root / ".github/backends.json")

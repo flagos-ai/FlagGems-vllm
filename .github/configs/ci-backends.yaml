@@ -25,8 +25,9 @@
 #     radius, and sharing one file would couple both lanes.
 #   - `.github/backends.json` — the registry behind the
 #     `non-nvidia-tests` job, whose contract is "run tools/setup.sh on a
-#     bare runner". The vendor images below ship their own torch/vLLM, so
-#     they do not fit that contract.
+#     bare runner". A backend that has a container platform below is
+#     deprecated on the bare-runner lane and must not also be listed there
+#     (`tools/test_ci_helpers.py` enforces this).
 #
 # Schema: intentionally mirrors FlagOps' `flagos-user-tests/resource_map.yaml`
 # (`platforms.<name>` -> runner labels + container image + container options)

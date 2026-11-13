@@ -127,11 +127,18 @@ Three config sets now coexist, and they are deliberately not merged:
 
 | File | Drives | Runners / images |
 | --- | --- | --- |
-| `.github/backends.json` | `non-nvidia-tests` | bare runners, env built by `tools/setup.sh` |
+| `.github/backends.json` | `non-nvidia-tests` | bare runners, env built by `tools/setup.sh`; only backends without a container platform |
 | `.github/configs/ci-backends.yaml` | `vendor-container-tests` | specific runners, vendor and NGC vLLM images |
 | `.github/configs/backends/*.yaml` | `ops-test.yaml` (periodic full suite) | `*-flaggems-weekly` runners, internal harbor images |
 
-Keeping them apart is intentional: a per-PR smoke test and a multi-hour weekly
+A backend that has a platform in `ci-backends.yaml` (hygon, ascend-cann900,
+iluvatar, metax-maca3810, mthreads-musa520) is deprecated on the bare-runner
+lane and has been removed from `backends.json`; `tools/test_ci_helpers.py`
+fails if one reappears in both. Those backends are no longer path-routed
+(`auto_select`): the container lane runs for every selection that has test
+targets.
+
+Keeping the three apart is intentional: a per-PR smoke test and a multi-hour weekly
 sweep differ in runner, image, timeout and blast radius, so one shared file
 would couple two lanes that need to fail independently.
 

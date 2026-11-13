@@ -7,13 +7,6 @@
     "enabled": true
   },
   {
-    "backend": "ascend-cann900",
-    "runner_label": "cann9",
-    "label": "vendor/Ascend",
-    "gpu_check": "tools/gpu_check_ascend.sh",
-    "enabled": true
-  },
-  {
     "backend": "cambricon-neuware472",
     "runner_label": "cambricon",
     "label": "vendor/Cambricon",
@@ -28,20 +21,6 @@
     "enabled": true
   },
   {
-    "backend": "hygon",
-    "runner_label": "hygon",
-    "label": "vendor/Hygon",
-    "gpu_check": "tools/gpu_check_hygon.sh",
-    "enabled": true
-  },
-  {
-    "backend": "iluvatar",
-    "runner_label": "iluvatar",
-    "label": "vendor/Iluvatar",
-    "gpu_check": "tools/gpu_check_iluvatar.sh",
-    "enabled": true
-  },
-  {
     "backend": "kunlunxin",
     "runner_label": "kunlunxin",
     "label": "vendor/Kunlunxin",
@@ -53,20 +32,6 @@
     "runner_label": "maca372",
     "label": "vendor/MetaX",
     "gpu_check": "tools/gpu_check_metax.sh",
-    "enabled": true
-  },
-  {
-    "backend": "metax-maca3810",
-    "runner_label": "maca381",
-    "label": "vendor/MetaX",
-    "gpu_check": "tools/gpu_check_metax.sh",
-    "enabled": true
-  },
-  {
-    "backend": "mthreads-musa520",
-    "runner_label": "mthreads",
-    "label": "vendor/MooreThreads",
-    "gpu_check": "tools/gpu_check_mthreads.sh",
     "enabled": true
   },
   {
