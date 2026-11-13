@@ -1,0 +1,279 @@
+{
+  "op": "cooperative_topk",
+  "dtype": "float32",
+  "target_score": 0.95,
+  "report_date": "2026-11-13",
+  "baseline_device": "NVIDIA H20",
+  "scaling_reference": "H800",
+  "optest_commit": "e160a8ae56dcc3594e8b34d6408f04647d5b7e16",
+  "formula": "score = h20_us / (raw_us * factor)",
+  "note": "H20 latencies with H800-relative optest factors are the project convention, not measured H20 hardware calibration. Ascend and Iluvatar measurements from 2026-11-11 are preserved unchanged; extraction on 2026-11-13 is not a new device acceptance run.",
+  "platforms": {
+    "ascend": {
+      "device": "昇腾 910B4",
+      "measurement_date": "2026-11-11",
+      "measurement_kind": "formal_public_entry_three_seeds",
+      "source_files": [
+        {
+          "path": "cooperative-topk-ascend-20261111/measurements.json",
+          "sha256": "fcdc85ed8d0b42f19bedcd25558352eae7c3de5463eb6c6b51a910e32c4b2ec8"
+        }
+      ],
+      "cases": [
+        {
+          "rows": 1,
+          "width": 127,
+          "k": 512,
+          "h20_us": 5.408,
+          "resource": "mem",
+          "factor": 0.389412,
+          "raw_us": [
+            1.180000021122396,
+            1.180000021122396,
+            1.180000021122396
+          ],
+          "weighted_median_us": 0.4595061682253144,
+          "scores": [
+            11.769156485725867,
+            11.769156485725867,
+            11.769156485725867
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 4,
+          "width": 4097,
+          "k": 512,
+          "h20_us": 7.968,
+          "resource": "mem",
+          "factor": 0.389412,
+          "raw_us": [
+            18.479999154806137,
+            18.799999728798866,
+            18.559999763965607
+          ],
+          "weighted_median_us": 7.227486628085375,
+          "scores": [
+            1.1072305190610374,
+            1.0883840080635376,
+            1.1024579373190475
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 16,
+          "width": 16384,
+          "k": 1024,
+          "h20_us": 12.736,
+          "resource": "mem",
+          "factor": 0.389412,
+          "raw_us": [
+            31.599998474121094,
+            31.88999928534031,
+            31.640000641345978
+          ],
+          "weighted_median_us": 12.32099592974782,
+          "scores": [
+            1.0349912024928964,
+            1.0255792145639513,
+            1.0336826724575239
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 16,
+          "width": 16385,
+          "k": 1024,
+          "h20_us": 20.416,
+          "resource": "cuda",
+          "factor": 0.025008,
+          "raw_us": [
+            40.310001000761986,
+            39.91999849677086,
+            40.5299998819828
+          ],
+          "weighted_median_us": 1.0080725050270558,
+          "scores": [
+            20.252511499112906,
+            20.4503704794283,
+            20.142579846394174
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 4,
+          "width": 65539,
+          "k": 2048,
+          "h20_us": 16.96,
+          "resource": "mem",
+          "factor": 0.389412,
+          "raw_us": [
+            45.35000026226044,
+            45.21999880671501,
+            45.39000056684017
+          ],
+          "weighted_median_us": 17.65983430212736,
+          "scores": [
+            0.9603714117497095,
+            0.9631323512606841,
+            0.9595250766869222
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 1,
+          "width": 1048576,
+          "k": 1024,
+          "h20_us": 47.168,
+          "resource": "mem",
+          "factor": 0.389412,
+          "raw_us": [
+            120.80000340938568,
+            119.92999911308289,
+            119.22000348567963
+          ],
+          "weighted_median_us": 46.70218081462383,
+          "scores": [
+            1.0027003922291413,
+            1.0099742491089476,
+            1.0159889889151192
+          ],
+          "all_rounds_pass": true
+        }
+      ]
+    },
+    "iluvatar": {
+      "device": "天数 BI-V150",
+      "measurement_date": "2026-11-11",
+      "measurement_kind": "formal_public_entry_three_seeds",
+      "source_files": [
+        {
+          "path": "cooperative-topk-three-platforms-20261111/iluvatar-measurements.json",
+          "sha256": "e59fc98bb4d23e5ecc5d0af5b192b4955ba976fbadebf9b94d9efb1bec9a8b5c"
+        }
+      ],
+      "cases": [
+        {
+          "rows": 1,
+          "width": 127,
+          "k": 512,
+          "h20_us": 5.408,
+          "resource": "mem",
+          "factor": 0.356378,
+          "raw_us": [
+            3.307692240923643,
+            3.407692303881049,
+            3.326923120766878
+          ],
+          "weighted_median_us": 1.1856422079326585,
+          "scores": [
+            4.587760123210423,
+            4.453130508725566,
+            4.561241126384699
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 4,
+          "width": 4097,
+          "k": 512,
+          "h20_us": 7.968,
+          "resource": "mem",
+          "factor": 0.356378,
+          "raw_us": [
+            12.665384449064732,
+            12.665384449064732,
+            12.000000104308128
+          ],
+          "weighted_median_us": 4.513664379188791,
+          "scores": [
+            1.7653062635179873,
+            1.7653062635179873,
+            1.8631901919542837
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 16,
+          "width": 16384,
+          "k": 1024,
+          "h20_us": 12.736,
+          "resource": "mem",
+          "factor": 0.356378,
+          "raw_us": [
+            20.423077046871185,
+            19.307691603899002,
+            19.36538517475128
+          ],
+          "weighted_median_us": 6.901397237807512,
+          "scores": [
+            1.749850671119876,
+            1.8509377407697807,
+            1.8454234064703787
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 16,
+          "width": 16385,
+          "k": 1024,
+          "h20_us": 20.416,
+          "resource": "cuda",
+          "factor": 0.230792,
+          "raw_us": [
+            22.050000727176666,
+            21.019231528043747,
+            20.980769768357277
+          ],
+          "weighted_median_us": 4.851070482820273,
+          "scores": [
+            4.011818698548027,
+            4.208555631649105,
+            4.216270718231665
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 4,
+          "width": 65539,
+          "k": 2048,
+          "h20_us": 16.96,
+          "resource": "mem",
+          "factor": 0.356378,
+          "raw_us": [
+            43.15769299864769,
+            40.8557690680027,
+            40.86538404226303
+          ],
+          "weighted_median_us": 14.563523834213614,
+          "scores": [
+            1.1026983896266158,
+            1.164827383138897,
+            1.1645533178004916
+          ],
+          "all_rounds_pass": true
+        },
+        {
+          "rows": 1,
+          "width": 1048576,
+          "k": 1024,
+          "h20_us": 47.168,
+          "resource": "mem",
+          "factor": 0.356378,
+          "raw_us": [
+            122.48461693525314,
+            115.88461697101593,
+            115.5865378677845
+          ],
+          "weighted_median_us": 41.29872802689671,
+          "scores": [
+            1.0805752780611524,
+            1.142117499824227,
+            1.1450628372866392
+          ],
+          "all_rounds_pass": true
+        }
+      ]
+    }
+  }
+}

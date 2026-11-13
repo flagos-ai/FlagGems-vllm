@@ -1,0 +1,11 @@
+--- a/sort_ops/merge_pack_sort.cpp
++++ b/sort_ops/merge_pack_sort.cpp
+@@ -79,7 +79,7 @@
+   //   len>0 into consecutive lanes, record their original indices, and
+   //   scatter each lane's consumed count back to its original slot after
+   //   the merge.
+-  __ubuf__ float *xn[4];
++  __ubuf__ float *xn[4] = {src_ptr, src_ptr, src_ptr, src_ptr};
+   uint32_t lens[4] = {0, 0, 0, 0};
+   int orig_idx[4] = {0, 0, 0, 0}; // compacted lane w -> original slot
+   int active = 0;
