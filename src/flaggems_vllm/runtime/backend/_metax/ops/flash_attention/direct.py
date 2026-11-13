@@ -856,23 +856,17 @@ def flash_varlen_int8_fwd_kernel(
                             d[None, :] < HEAD_DIM,
                             0,
                         )
+                    # Preserve the FP32 softmax weights when opposite V rows cancel.
+                    # Each dot uses FP16 operands and accumulates into FP32.
+                    v_t = tl.trans(v.to(tl.float16))
+                    p_hi = probabilities.to(tl.float16)
+                    p_lo = (probabilities - p_hi.to(tl.float32)).to(tl.float16)
+                    pv_lo = tl.dot(v_t, tl.trans(p_lo), out_dtype=tl.float32)
+                    weighted_v = tl.trans(tl.dot(v_t, tl.trans(p_hi), pv_lo))
                     if vs2 == 0:
-                        acc = tl.trans(
-                            tl.dot(
-                                tl.trans(v.to(tl.float16)),
-                                tl.trans(probabilities.to(tl.float16)),
-                                tl.trans(acc * alpha[:, None]),
-                            )
-                        )
+                        acc = acc * alpha[:, None] + weighted_v
                     else:
-                        partial = tl.trans(
-                            tl.dot(
-                                tl.trans(v.to(tl.float16)),
-                                tl.trans(probabilities.to(tl.float16)),
-                                out_dtype=tl.float32,
-                            )
-                        )
-                        acc = acc * alpha[:, None] + partial * vs
+                        acc = acc * alpha[:, None] + weighted_v * vs
             if KV_SPLITS > 1:
                 result = acc
             else:
