@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -49,13 +52,13 @@ except ImportError:
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128
 
 from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name == "hygon":
+    if flaggems_vllm.vendor_name in ("hygon", "ascend"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -65,11 +68,12 @@ def is_supported_device():
 
 
 SUPPORTED_DEVICE = is_supported_device()
-HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
-    else HAS_VLLM_FUSED_MARLIN_MOE
-)
+if flaggems_vllm.vendor_name == "ascend":
+    HAS_REQUIRED_VLLM = importlib.util.find_spec("vllm_ascend") is not None
+elif flaggems_vllm.vendor_name == "hygon":
+    HAS_REQUIRED_VLLM = HAS_VLLM_FUSED_EXPERTS
+else:
+    HAS_REQUIRED_VLLM = HAS_VLLM_FUSED_MARLIN_MOE
 
 GROUP_SIZE = 128
 
@@ -310,19 +314,38 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+    DEFAULT_SHAPE_DESC = "M, E, K, N, topk"
+    DEFAULT_SHAPES = [
+        (tokens, experts, hidden, intermediate, topk)
+        for experts, hidden, intermediate, topk in (
+            (8, 4096, 14336, 2),  # Mixtral-8x7B
+            (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
+            (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
+            (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+        )
+        for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
+    ]
+
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (tokens, experts, hidden, intermediate, topk)
-            for experts, hidden, intermediate, topk in (
-                (8, 4096, 14336, 2),  # Mixtral-8x7B
-                (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
-                (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
-                (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+        if (
+            flaggems_vllm.vendor_name == "ascend"
+            and shape_file_path == self.DEFAULT_SHAPE_FILES
+        ):
+            shape_file_path = str(
+                Path(flaggems_vllm.__file__).parent
+                / "runtime/backend/_ascend/core_shapes.yaml"
             )
-            for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
-        ]
+        else:
+            pass
+        super().set_shapes(shape_file_path)
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "ascend":
+            from .ascend_marlin_moe import int8_input_iter
+
+            yield from int8_input_iter(self.shapes, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -485,6 +508,15 @@ def _vllm_baseline_int8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native INT8
     W8A16 fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "ascend":
+        from .ascend_marlin_moe import native_moe
+
+        baseline_hidden = (
+            w1_scale_marlin if w1_scale_marlin is not None else hidden_states
+        )
+        return native_moe(
+            baseline_hidden, w1_q_marlin, w2_q_marlin, topk_weights, topk_ids
+        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -524,12 +556,7 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
-    gems_op = (
-        flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name == "hygon"
-        else fused_marlin_moe
-    )
-    return gems_op(
+    return flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
         quant_type_id=QUANT_TYPE_UINT8B128,
@@ -548,7 +575,7 @@ def _gems_call_int8(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
+    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon or Ascend"
 )
 def test_fused_marlin_moe_w8a16_int8():
     """
@@ -560,8 +587,12 @@ def test_fused_marlin_moe_w8a16_int8():
     bench = FusedMarlinMoEW8A16INT8Benchmark(
         op_name="fused_marlin_moe_w8a16",
         torch_op=_vllm_baseline_int8,
-        dtypes=[torch.bfloat16],
+        dtypes=(
+            [torch.float16]
+            if flaggems_vllm.vendor_name == "ascend"
+            else [torch.bfloat16]
+        ),
     )
-    bench.base_variant = "int8"
+    bench.base_variant = "bf16" if flaggems_vllm.vendor_name == "ascend" else "int8"
     bench.set_gems(_gems_call_int8)
     bench.run()
