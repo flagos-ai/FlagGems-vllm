@@ -1607,3 +1607,29 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+fused_kimi_k3_mla_kv_concat:
+  - META: {BLOCK: 256, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1

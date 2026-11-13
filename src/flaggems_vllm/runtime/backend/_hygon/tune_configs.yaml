@@ -351,3 +351,35 @@ chunk_kda_fwd_intra_token_parallel:
       - 8
     stages:
       - 1
+
+fused_kimi_k3_mla_kv_concat:
+  - META: {BLOCK: 1, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 8, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
