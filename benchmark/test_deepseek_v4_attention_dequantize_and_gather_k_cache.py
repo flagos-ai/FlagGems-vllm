@@ -290,3 +290,56 @@ class DequantizeAndGatherKCacheBenchmark(base.Benchmark):
 )
 def test_dequantize_and_gather_k_cache_benchmark():
     DequantizeAndGatherKCacheBenchmark().run()
+
+
+class StridedPageGatherBenchmark(base.Benchmark):
+    """Isolate copy elimination; both sides use the same current math/tuner."""
+
+    def __init__(self):
+        def copy_baseline(out, cache, *args):
+            packed = cache.contiguous().view(cache.shape[0], -1)
+            return flaggems_vllm.dequantize_and_gather_k_cache(out, packed, *args)
+
+        super().__init__(
+            "dequantize_and_gather_k_cache",
+            copy_baseline,
+            [torch.bfloat16],
+            gems_op=flaggems_vllm.dequantize_and_gather_k_cache,
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (1, 129, 64),
+            (1, 4096, 64),
+            (1, 16384, 64),
+            (4, 4096, 64),
+            (1, 4096, 0),
+        ]
+
+    def get_input_iter(self, dtype):
+        for batch, length, padding in self.shapes:
+            block_size = 256
+            blocks = (length + block_size - 1) // block_size
+            page_bytes = block_size * 584
+            storage = torch.zeros(
+                (batch * blocks, page_bytes + padding),
+                dtype=torch.uint8,
+                device=flaggems_vllm.device,
+            )
+            cache = storage[:, :page_bytes].view(batch * blocks, block_size, 584)
+            out = torch.empty(
+                (batch, length, 512), dtype=dtype, device=flaggems_vllm.device
+            )
+            lens = torch.full(
+                (batch,), length, dtype=torch.int32, device=flaggems_vllm.device
+            )
+            table = torch.arange(
+                batch * blocks, dtype=torch.int32, device=flaggems_vllm.device
+            ).view(batch, blocks)
+            yield out, cache, lens, lens, table, block_size, 0, 64, 448, 8
+
+
+@pytest.mark.dequantize_and_gather_k_cache
+@pytest.mark.skipif(not _OP_RUNS, reason="requires an E4M3-casting backend")
+def test_strided_page_gather_benchmark():
+    StridedPageGatherBenchmark().run()
