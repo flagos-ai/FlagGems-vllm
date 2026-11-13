@@ -35,9 +35,7 @@ def _subject():
 def _reference():
     native = workload.native()
     if native is None:
-        pytest.skip(
-            f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}"
-        )
+        pytest.skip(f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}")
     return native
 
 
@@ -78,8 +76,9 @@ def test_stages_match_their_reference_counterparts(case):
         gf, wf = got.float(), want.float()
         return ((gf - wf).abs().max() / wf.abs().max().clamp(min=1e-6)).item()
 
-    kw = dict(k=k, g=g, beta=beta, cu_seqlens=cu, chunk_size=bt,
-              output_dtype=torch.float32)
+    kw = dict(
+        k=k, g=g, beta=beta, cu_seqlens=cu, chunk_size=bt, output_dtype=torch.float32
+    )
     a_ref = chunk_scaled_dot_kkt_fwd(**kw)
     a_mine = chunk_scaled_dot_kkt_fwd_950dt(**kw)
     assert rel(a_mine, a_ref) < tol, f"{case}/kkt: {rel(a_mine, a_ref):.3e}"

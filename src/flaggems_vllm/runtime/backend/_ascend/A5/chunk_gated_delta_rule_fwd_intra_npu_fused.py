@@ -82,6 +82,7 @@ def _grid_for(total, device_index):
     """
     return (min(total, _vector_core_count(device_index)),)
 
+
 # bishengir reports a UB overflow as a compilation error, not a typed one, so
 # the retry has to match on the message. Keep the tuple broad and the message
 # test narrow, so an unrelated compile failure is re-raised rather than

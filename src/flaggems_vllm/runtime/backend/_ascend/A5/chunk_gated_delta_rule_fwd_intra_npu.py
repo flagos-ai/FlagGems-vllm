@@ -350,7 +350,9 @@ def _solve_tril_32_kernel(
     m0 = (o < lim)[:, None]
     m1 = (16 + o < lim)[:, None]
 
-    a11 = tl.where(tri, tl.load(A + base + r + c, mask=m0, other=0.0).to(tl.float32), 0.0)
+    a11 = tl.where(
+        tri, tl.load(A + base + r + c, mask=m0, other=0.0).to(tl.float32), 0.0
+    )
     a22 = tl.where(
         tri,
         tl.load(A + base + 16 * st + r + 16 + c, mask=m1, other=0.0).to(tl.float32),
@@ -405,7 +407,9 @@ def _solve_tril_64_kernel(
     m2 = (32 + o < lim)[:, None]
     m3 = (48 + o < lim)[:, None]
 
-    a11 = tl.where(tri, tl.load(A + base + r + c, mask=m0, other=0.0).to(tl.float32), 0.0)
+    a11 = tl.where(
+        tri, tl.load(A + base + r + c, mask=m0, other=0.0).to(tl.float32), 0.0
+    )
     a22 = tl.where(
         tri,
         tl.load(A + base + 16 * st + r + 16 + c, mask=m1, other=0.0).to(tl.float32),

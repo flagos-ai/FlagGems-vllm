@@ -56,7 +56,9 @@ class SolveTril950dtBenchmark(Benchmark):
     def get_input_iter(self, cur_dtype):
         del cur_dtype
         for case in self.shapes:
-            args, kwargs = workload.build_inputs_solve_tril({"case": case}, None, gems.device)
+            args, kwargs = workload.build_inputs_solve_tril(
+                {"case": case}, None, gems.device
+            )
             if kwargs is None:
                 pytest.skip(
                     f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}"

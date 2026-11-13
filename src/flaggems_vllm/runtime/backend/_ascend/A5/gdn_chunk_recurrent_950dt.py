@@ -341,104 +341,6 @@ def _chunk_wy_kernel(
 
 
 @triton.jit
-def _chunk_state_kernel(
-    K,
-    W,
-    U,
-    GC,
-    GS,
-    State,
-    Final,
-    Cu,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    DK: tl.constexpr,
-    DV: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    NORMALIZE: tl.constexpr,
-    INITIAL: tl.constexpr,
-    STORE_FINAL: tl.constexpr,
-    VARLEN: tl.constexpr,
-    TOTAL: tl.constexpr,
-):
-    """Sequential chunk recurrence for the state, tiled by ``BV``.
-
-    One program owns one (sequence, v-head, v-tile) triple and walks its
-    chunks in order, so each state tile is written by a single core.
-    """
-    nv = tl.cdiv(DV, BV)
-    for pid in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
-        i_v = pid % nv
-        i_rest = pid // nv
-        i_hv = i_rest % HV
-        i_n = i_rest // HV
-        i_h = i_hv // (HV // H)
-        if VARLEN:
-            start = tl.load(Cu + i_n).to(tl.int64)
-            end = tl.load(Cu + i_n + 1).to(tl.int64)
-        else:
-            start = i_n * T
-            end = start + T
-        rk = tl.arange(0, DK)
-        rv = i_v * BV + tl.arange(0, BV)
-        vmask = rv < DV
-        rows = tl.arange(0, BT)
-
-        state = tl.zeros([BV, DK], dtype=tl.float32)
-        if INITIAL:
-            state += tl.load(
-                State + i_n * (HV * DV * DK) + i_hv * (DV * DK) + rv[:, None] * DK + rk[None, :],
-                mask=vmask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-
-        nt = tl.cdiv(end - start, BT)
-        for i_t in range(nt):
-            base = start + i_t * BT
-            offs = base + rows
-            mask = offs < end
-            k = tl.load(
-                K + offs[:, None] * (H * DK) + i_h * DK + rk[None, :],
-                mask=mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            if NORMALIZE:
-                norm = tl.sqrt(tl.sum(k * k, axis=1) + 1e-6)
-                k = k / norm[:, None]
-            w = tl.load(
-                W + offs[:, None] * (HV * DK) + i_hv * DK + rk[None, :],
-                mask=mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            u = tl.load(
-                U + offs[:, None] * (HV * DV) + i_hv * DV + rv[None, :],
-                mask=mask[:, None] & vmask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            gc = tl.load(GC + offs * HV + i_hv, mask=mask, other=0.0).to(tl.float32)
-            gs = tl.load(GS + (i_n * tl.cdiv(T, BT) + i_t) * HV + i_hv).to(tl.float32)
-
-            # v_new = u - w @ state^T, decayed to the chunk end.
-            # w already carries exp(gc) from the WY stage, so it is used as
-            # is; k is decayed from the token to the chunk end.
-            decay_k = tl.exp(gs - gc)
-            wd = tl.where(mask[:, None], w, 0.0)
-            delta = u - tl.dot(wd, tl.trans(state))
-            delta = tl.where(mask[:, None] & vmask[None, :], delta, 0.0)
-            kd = tl.where(mask[:, None], k * decay_k[:, None], 0.0)
-            state = state * tl.exp(gs) + tl.dot(tl.trans(delta), kd)
-
-        if STORE_FINAL:
-            tl.store(
-                Final + i_n * (HV * DV * DK) + i_hv * (DV * DK) + rv[None, :] * DK + rk[:, None],
-                state_t,
-                mask=vmask[None, :],
-            )
-
-
-@triton.jit
 def _chunk_output_kernel(
     Q,
     K,
@@ -502,7 +404,11 @@ def _chunk_output_kernel(
         state_t = tl.zeros([DK, BV], dtype=tl.float32)
         if INITIAL:
             state_t += tl.load(
-                State + i_n * (HV * DV * DK) + i_hv * (DV * DK) + rv[None, :] * DK + rk[:, None],
+                State
+                + i_n * (HV * DV * DK)
+                + i_hv * (DV * DK)
+                + rv[None, :] * DK
+                + rk[:, None],
                 mask=vmask[None, :],
                 other=0.0,
             ).to(tl.float32)
@@ -580,7 +486,11 @@ def _chunk_output_kernel(
         # s1024 (16%) for a value this loop already holds.
         if STORE_FINAL:
             tl.store(
-                Final + i_n * (HV * DV * DK) + i_hv * (DV * DK) + rv[None, :] * DK + rk[:, None],
+                Final
+                + i_n * (HV * DV * DK)
+                + i_hv * (DV * DK)
+                + rv[None, :] * DK
+                + rk[:, None],
                 state_t,
                 mask=vmask[None, :],
             )
@@ -767,7 +677,7 @@ def chunk_gdn_950dt(
     # existing recurrent GDN kernel in this backend). The probe picks the
     # largest *compilable* tile, not the fastest one.
     cores = _vector_core_count(dev)
-    bv = _resolve_bv(
+    _resolve_bv(
         "chunk_output",
         DV,
         (DK, DV, H, HV, use_qk_l2norm_in_kernel, q.dtype, varlen, n),
@@ -842,7 +752,11 @@ def _recurrent_gdn_950dt_kernel(
         state = tl.zeros([BV, DK], dtype=tl.float32)
         if valid:
             state += tl.load(
-                State + slot * (HV * DV * DK) + i_hv * (DV * DK) + rv[:, None] * DK + rk[None, :],
+                State
+                + slot * (HV * DV * DK)
+                + i_hv * (DV * DK)
+                + rv[:, None] * DK
+                + rk[None, :],
                 mask=vmask[:, None],
                 other=0.0,
             ).to(tl.float32)
@@ -854,9 +768,9 @@ def _recurrent_gdn_950dt_kernel(
                 q = q / tl.sqrt(tl.sum(q * q) + 1e-6)
                 k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
             q = q * scale
-            v = tl.load(
-                V + t * (HV * DV) + i_hv * DV + rv, mask=vmask, other=0.0
-            ).to(tl.float32)
+            v = tl.load(V + t * (HV * DV) + i_hv * DV + rv, mask=vmask, other=0.0).to(
+                tl.float32
+            )
             g = tl.load(G + t * HV + i_hv).to(tl.float32)
             beta = tl.load(Beta + t * HV + i_hv).to(tl.float32)
 
@@ -870,7 +784,11 @@ def _recurrent_gdn_950dt_kernel(
 
         if valid:
             tl.store(
-                State + slot * (HV * DV * DK) + i_hv * (DV * DK) + rv[:, None] * DK + rk[None, :],
+                State
+                + slot * (HV * DV * DK)
+                + i_hv * (DV * DK)
+                + rv[:, None] * DK
+                + rk[None, :],
                 state,
                 mask=vmask[:, None],
             )
@@ -1010,8 +928,6 @@ def fused_recurrent_gdn_950dt(
         cores=_vector_core_count(q.device.index),
     )
     return o, state
-
-
 
 
 __all__ = ["chunk_gdn_950dt", "fused_recurrent_gdn_950dt"]

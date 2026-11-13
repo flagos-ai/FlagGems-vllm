@@ -80,7 +80,9 @@ ALLOWED_TORCH_NAMESPACES = {
     "ixuca",
 }
 PRAGMA = "allow-torch-compute"
-VENDOR_SUBDIRS = ("ops", "fused", "FLA")
+# "A5" is the Ascend 950/arch35 arch dir; it holds production operators and so
+# must be guarded like the other vendor operator dirs.
+VENDOR_SUBDIRS = ("ops", "fused", "FLA", "A5")
 
 # Per-file exemptions for torch compute calls that dispatch to a vendor-native
 # kernel rather than falling back to CPU/CUDA.  Key: path suffix (posix);

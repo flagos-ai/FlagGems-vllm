@@ -54,9 +54,9 @@ def test_accuracy(case):
     w_got, u_got = _subject()(**kwargs)
     tol = workload.TOL[workload.case_dtype(case)]
     for name, got, want in (("w", w_got, w_ref), ("u", u_got, u_ref)):
-        assert got.shape == want.shape, (
-            f"{name}: {tuple(got.shape)} != {tuple(want.shape)}"
-        )
+        assert (
+            got.shape == want.shape
+        ), f"{name}: {tuple(got.shape)} != {tuple(want.shape)}"
         assert got.dtype == want.dtype, f"{name}: {got.dtype} != {want.dtype}"
         rel = workload.rel_error(got, want)
         assert rel < tol, f"{case}/{name}: relative error {rel:.3e} exceeds {tol:.1e}"

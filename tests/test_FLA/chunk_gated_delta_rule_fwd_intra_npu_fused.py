@@ -34,9 +34,7 @@ def _subject():
 def _reference():
     native = workload.native()
     if native is None:
-        pytest.skip(
-            f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}"
-        )
+        pytest.skip(f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}")
     return native
 
 
