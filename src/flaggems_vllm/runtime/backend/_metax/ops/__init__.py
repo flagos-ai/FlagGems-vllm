@@ -21,6 +21,12 @@ from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8 as flash_mla_with_kvcache_w8a8,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
 )
@@ -39,7 +45,6 @@ from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
 )
 from flaggems_vllm.runtime.backend._metax.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
-    SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
@@ -61,6 +66,8 @@ else:
 
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -79,7 +86,6 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
-    "SUPPORTED_FP8_DTYPE",
     "top_k_top_p",
     "w8a8_block_int8_bmm",
 ]
