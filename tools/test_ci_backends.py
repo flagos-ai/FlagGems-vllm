@@ -195,6 +195,53 @@ class SelectCiBackendsTest(unittest.TestCase):
         )
         self.assertEqual([e["platform"] for e in selected], ["hygon", "nvidia"])
 
+    def test_default_platforms_run_only_when_defaults_are_included(self):
+        path = self.write_config(
+            """
+            platforms:
+              a100:
+                backend: nvidia-cuda133
+                runner_labels: a100-1
+                container_image: example.invalid/a100:1
+                run_by_default: true
+                gpu_check_script: tools/gpu_check_nvidia.sh
+              hygon:
+                backend: hygon
+                runner_labels: hygon-1
+                container_image: example.invalid/hygon:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+            """
+        )
+        platforms = select_ci_backends.load_platforms(path)
+
+        def run(include_defaults, **kwargs):
+            selected = select_ci_backends.select_platforms(
+                platforms, set(), include_defaults=include_defaults, **kwargs
+            )
+            return [entry["platform"] for entry in selected]
+
+        self.assertEqual(run(False), [])
+        self.assertEqual(run(True), ["a100"])
+        # "all" still never picks NVIDIA; defaults add it back.
+        self.assertEqual(run(False, all_enabled=True), ["hygon"])
+        self.assertEqual(run(True, all_enabled=True), ["a100", "hygon"])
+
+    def test_non_boolean_run_by_default_is_rejected(self):
+        path = self.write_config(
+            """
+            platforms:
+              broken:
+                backend: broken-backend
+                runner_labels: broken-1
+                container_image: example.invalid/broken:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+                run_by_default: "yes"
+            """
+        )
+
+        with self.assertRaises(ValueError):
+            select_ci_backends.load_platforms(path)
+
     def test_a_label_cannot_enable_a_disabled_platform(self):
         self.assertEqual(self.platforms_for(["vendor/Pending"]), [])
 
@@ -322,6 +369,14 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
             directory = REPO_ROOT / "src/flaggems_vllm/runtime/backend" / f"_{vendor}"
             with self.subTest(platform=name):
                 self.assertTrue(directory.is_dir(), directory)
+
+    def test_only_the_a100_platform_runs_by_default(self):
+        defaults = [
+            name
+            for name, entry in self.platforms.items()
+            if entry.get("run_by_default")
+        ]
+        self.assertEqual(defaults, ["nvidia"])
 
     def test_container_images_have_no_embedded_whitespace(self):
         for entry in self.selected:

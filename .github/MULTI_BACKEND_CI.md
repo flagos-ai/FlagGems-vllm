@@ -125,8 +125,10 @@ runs that vendor's platform (`_hygon`, `_ascend`, `_iluvatar`, `_metax`,
 `vendor/*` label by hand (the `label` field in `ci-backends.yaml`:
 `vendor/Hygon`, `vendor/Ascend`, `vendor/Iluvatar`, `vendor/MetaX`,
 `vendor/MooreThreads`, `vendor/NVIDIA`). `ci/all-vendors` and the
-`run_non_nvidia` dispatch input select every platform except NVIDIA. NVIDIA is
-selected by its label only, so `_nvidia/` changes do not use the A100 runner. A label also runs the
+`run_non_nvidia` dispatch input select every platform except NVIDIA. A
+platform with `run_by_default: true` (the A100 `nvidia` platform) also runs
+whenever the change selects any test, without a label. NVIDIA is never chosen by
+path, so `_nvidia/` changes alone do not trigger it. A label also runs the
 platform on a docs-only change. No tests are selected then, so the job only
 installs the package and checks the accelerator, which validates the runner and
 image. Only users with triage access can add labels.
@@ -521,6 +523,7 @@ already ship flag-gems leave the flag unset and only get an editable install.
 
 The runner is an ARC pod on a K8s node (`k8s-novolume` hook), so the platform
 declares no container volumes and GPU access comes from the pod. It follows the
-rest of the container lane: selected by its `vendor/NVIDIA` label only, observation
+rest of the container lane: it runs by default whenever tests are selected
+(`run_by_default: true`; `vendor/NVIDIA` is only needed to force a run), observation
 period, not part of `multi-backend-summary`, and no `ci/nvidia` fork gate. This config stays
 separate from `.github/configs/backends/*.yaml`, which drives `ops-test.yaml`.

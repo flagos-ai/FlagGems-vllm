@@ -32,8 +32,11 @@
 # Scheduling (tools/select_ci_backends.py), same rule as the bare-runner lane:
 # a platform runs when the change touches `runtime/backend/_<vendor>/`, or when
 # its `label` is added to the pull request by hand, or when `ci/all-vendors` /
-# a `run_non_nvidia` dispatch asks for every platform. NVIDIA is selected by
-# its label only, never by path or by "all".
+# a `run_non_nvidia` dispatch asks for every platform. NVIDIA is never chosen
+# by path or by "all".
+#
+# `run_by_default: true` makes a platform run whenever the change selects any
+# test (like `nvidia-tests` on the H20 host), without a label or a path match.
 #
 # Schema: intentionally mirrors FlagOps' `flagos-user-tests/resource_map.yaml`
 # (`platforms.<name>` -> runner labels + container image + container options)
@@ -191,4 +194,5 @@ platforms:
     container_volumes: []
     # The NGC image ships torch, Triton and vLLM but not flag-gems.
     install_with_setup_sh: true
+    run_by_default: true
     gpu_check_script: tools/gpu_check_nvidia.sh

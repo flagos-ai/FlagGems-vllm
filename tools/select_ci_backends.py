@@ -69,6 +69,8 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"platform {name!r}.container_volumes must be a list of strings"
             )
+        if not isinstance(entry.get("run_by_default", False), bool):
+            raise ValueError(f"platform {name!r}.run_by_default must be a boolean")
         if not isinstance(entry.get("label", ""), str):
             raise ValueError(f"platform {name!r}.label must be a string")
         if not isinstance(entry.get("install_with_setup_sh", False), bool):
@@ -90,6 +92,7 @@ def select_platforms(
     labels: set[str] | None = None,
     all_enabled: bool = False,
     changed_files: set[str] | None = None,
+    include_defaults: bool = False,
 ) -> list[dict[str, Any]]:
     """Return the platforms to run.
 
@@ -98,10 +101,12 @@ def select_platforms(
       - a changed file is under its backend directory
         (`runtime/backend/_<vendor>/`), the same rule the bare-runner lane
         uses;
-      - its `label` is in `labels` (a manual request); or
-      - `all_enabled` is set.
-    NVIDIA platforms are only ever selected by label, never by path or by
-    "all", matching the bare-runner lane. With no request, nothing is selected.
+      - its `label` is in `labels` (a manual request);
+      - `all_enabled` is set; or
+      - `include_defaults` is set and the platform has `run_by_default: true`
+        (the caller sets it only when tests were selected).
+    NVIDIA platforms are never selected by path or by "all"; they run by label
+    or by default. With no request, nothing is selected.
     """
     labels = labels or set()
     changed_files = changed_files or set()
@@ -123,7 +128,8 @@ def select_platforms(
             non_nvidia = not entry["backend"].startswith("nvidia")
             by_all = all_enabled and non_nvidia
             by_path = non_nvidia and backend_changed(entry["backend"], changed_files)
-            if not (by_label or by_all or by_path):
+            by_default = include_defaults and entry.get("run_by_default", False)
+            if not (by_label or by_all or by_path or by_default):
                 continue
 
         selected.append(
@@ -178,6 +184,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--changed-files", type=Path)
     parser.add_argument("--labels-json", default="[]")
     parser.add_argument("--all-enabled", action="store_true")
+    parser.add_argument(
+        "--include-defaults",
+        action="store_true",
+        help="also select platforms marked run_by_default",
+    )
     parser.add_argument("--format", choices=("github", "json", "list"), default="list")
     return parser.parse_args()
 
@@ -190,6 +201,7 @@ def main() -> int:
         parse_labels(args.labels_json),
         args.all_enabled,
         read_changed_files(args.changed_files),
+        args.include_defaults,
     )
     matrix = {"include": selected}
 

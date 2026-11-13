@@ -252,6 +252,7 @@ jobs:
         shell: bash
         env:
           PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          SHOULD_RUN: ${{ steps.select.outputs.should_run }}
           ALL_ENABLED: >-
             ${{ (github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true) ||
                 (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/all-vendors')) }}
@@ -265,6 +266,11 @@ jobs:
           )
           if [[ "${ALL_ENABLED}" == "true" ]]; then
             args+=(--all-enabled)
+          fi
+          # Default platforms (the A100) only run when tests were selected, so
+          # a docs-only change does not occupy them.
+          if [[ "${SHOULD_RUN}" == "true" ]]; then
+            args+=(--include-defaults)
           fi
           python tools/select_ci_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
@@ -386,7 +392,9 @@ jobs:
   # Scheduling: a platform runs when the pull request changes its backend
   # directory (runtime/backend/_<vendor>/), or when a maintainer adds its
   # `vendor/*` label (or `ci/all-vendors` / the `run_non_nvidia` dispatch).
-  # NVIDIA is selected by its label only. Same rule as the bare-runner lane.
+  # Same rule as the bare-runner lane. The `nvidia` (A100) platform is marked
+  # `run_by_default` and runs whenever tests are selected; it is never chosen
+  # by path or by "all".
   #
   # Bring-up status: observation period. Each platform is still proving out
   # its runner and image, so this job is intentionally excluded from
