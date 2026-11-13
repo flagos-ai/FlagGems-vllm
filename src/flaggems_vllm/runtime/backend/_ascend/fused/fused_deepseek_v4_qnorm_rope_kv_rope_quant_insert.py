@@ -114,29 +114,112 @@ def _ue8m0_scale(raw_scale):
     return scale, stored
 
 
-def q_heads_per_program(num_heads: int) -> int:
+def q_heads_per_program(num_heads: int, is_q_interleaved: bool) -> int:
     """Heads of one token per program: the largest power of two, at most 32, that
     divides num_heads. Every tile is then full, so no mask is needed; this backend
     faults on an out-of-bounds address rather than honouring a mask.
     """
     h = 1
-    cap = min(Q_MAX_HEADS_PER_PROGRAM, num_heads)
+    cap = min(
+        (
+            Q_MAX_HEADS_PER_PROGRAM
+            if not is_q_interleaved
+            else Q_MAX_HEADS_PER_PROGRAM // 2
+        ),
+        num_heads,
+    )
     while h * 2 <= cap and num_heads % (h * 2) == 0:
         h *= 2
     return h
 
 
 @triton.jit
+def _kv_fp8_quant_2d(
+    kv_quant_blk,  # [2, 32], fp32
+    out_data_ptrs,  # [2, 32]
+    out_scale_ptrs,  # [2, 1]
+):
+    FP8_MAX: tl.constexpr = 448.0
+    block_max = tl.maximum(tl.max(tl.abs(kv_quant_blk), axis=-1, keep_dims=True), 1e-4)
+    # scale = 2^ceil(log2(block_max / FP8_MAX)), off the exponent bits
+    scale, scale_code = _ue8m0_scale(block_max / FP8_MAX)
+    # No clamp: scale is the smallest power of two with block_max / scale <=
+    # FP8_MAX, so |x| <= FP8_MAX holds by construction.
+    x_scaled = kv_quant_blk / scale
+    x_uint8 = _f32_to_e4m3_bits(x_scaled)
+    tl.store(out_data_ptrs, x_uint8)
+    tl.store(out_scale_ptrs, scale_code.to(tl.uint8))
+
+
+@triton.jit
+def _deepseek_v41_kv_quant(
+    qkv_blk_rope,  # [HALF_ROPE_DIM, 2], bf16
+    kv_base,
+    block_base,
+    pos_in_block,
+    cache_block_size,
+):
+    """
+    V4.1 (528 B/token, kv_mxfp8=true) -- RoPE is quantized as well, so the
+    whole row is MXFP8 (fp8 e4m3 with one UE8M0 scale per 32 dims)
+    [0,      bs*512):          token data, 512 fp8 each
+    [bs*512, bs*512 + bs*16):  UE8M0 scales, 16 per token
+    """
+    NOPE_DIM: tl.constexpr = 448
+    ROPE_DIM: tl.constexpr = 64
+    QUANT_BLOCK: tl.constexpr = 32
+    TOKEN_DATA_BYTES: tl.constexpr = 512
+    SCALE_BYTES_PER_TOKEN: tl.constexpr = 16
+    NOPE_QUANT_BLOCKS: tl.constexpr = NOPE_DIM // QUANT_BLOCK  # 14
+    ROPE_QUANT_BLOCKS: tl.constexpr = ROPE_DIM // QUANT_BLOCK  # 2
+
+    repeats = tl.arange(0, ROPE_QUANT_BLOCKS)
+    offset_quant = tl.arange(0, QUANT_BLOCK)
+    token_data_ptr = block_base + pos_in_block * TOKEN_DATA_BYTES
+    token_scale_ptr = (
+        block_base
+        + cache_block_size * TOKEN_DATA_BYTES
+        + pos_in_block * SCALE_BYTES_PER_TOKEN
+    )
+    # quant rope
+    _kv_fp8_quant_2d(
+        qkv_blk_rope.reshape(ROPE_QUANT_BLOCKS, QUANT_BLOCK).to(tl.float32),
+        token_data_ptr
+        + NOPE_DIM
+        + repeats[:, None] * QUANT_BLOCK
+        + offset_quant[None, :],
+        token_scale_ptr + NOPE_QUANT_BLOCKS + repeats[:, None],
+    )
+    # quant nope
+    for i in tl.static_range(NOPE_QUANT_BLOCKS // ROPE_QUANT_BLOCKS):
+        chunk_offs = i * ROPE_QUANT_BLOCKS + repeats
+        kv_quant_blk = tl.load(
+            kv_base + chunk_offs[:, None] * QUANT_BLOCK + offset_quant[None, :]
+        )
+        _kv_fp8_quant_2d(
+            kv_quant_blk.to(tl.float32),
+            token_data_ptr + chunk_offs[:, None] * QUANT_BLOCK + offset_quant[None, :],
+            token_scale_ptr + chunk_offs[:, None],
+        )
+
+
+@triton.jit
 def fused_qnorm_rope_kv_insert_kernel(
     q,
+    q_out,
     kv,
     k_cache,
     k_cache_bf16,
     slot_mapping,
     position_ids,
     cos_sin_cache,
+    q_head_padded: tl.constexpr,
     eps,
     cache_block_size: tl.constexpr,
+    apply_q_norm: tl.constexpr,
+    kv_mxfp8: tl.constexpr,
+    apply_q_rope: tl.constexpr,
+    is_q_interleaved: tl.constexpr,
     num_heads,
     kv_block_stride,
     pid_offset,
@@ -144,6 +227,7 @@ def fused_qnorm_rope_kv_insert_kernel(
     total_programs,
     tiles_per_token,
     H: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """Both halves of the operator in one launch, selected per program.
 
@@ -166,6 +250,10 @@ def fused_qnorm_rope_kv_insert_kernel(
     SCALE_BYTES_PER_TOKEN: tl.constexpr = NUM_QUANT_BLOCKS + 1  # 8 (7 real + 1 pad)
     TOKEN_DATA_BYTES: tl.constexpr = NOPE_DIM + 2 * ROPE_DIM  # 576
     FP8_MAX: tl.constexpr = 448.0
+    WARP_SIZE: tl.constexpr = 32
+    ELEMS_PER_LANE: tl.constexpr = 16
+    lane_offs = tl.arange(0, WARP_SIZE)
+    elem_offs = tl.arange(0, ELEMS_PER_LANE)
 
     # The last chunk is padded to a whole number of core groups; programs at or past
     # total_programs must do nothing, hence the `elif` guard below.
@@ -176,40 +264,192 @@ def fused_qnorm_rope_kv_insert_kernel(
         # device function or early return: each aborts ttir_to_linalg here.
         token_idx = pid // tiles_per_token
         head_base = (pid % tiles_per_token) * H
-        rows = token_idx * num_heads + head_base + tl.arange(0, H)
+        slot_idx = head_base + tl.arange(0, H)
+        rows = token_idx * num_heads + slot_idx
 
         col = tl.arange(0, HEAD_DIM)
-        blk = tl.load(q + rows[:, None] * HEAD_DIM + col[None, :]).to(tl.float32)
+        if not HAS_PADDING:
+            blk = tl.load(q + rows[:, None] * HEAD_DIM + col[None, :]).to(tl.float32)
+        else:
+            is_q_pad = slot_idx >= num_heads
+            blk = tl.load(
+                q + rows[:, None] * HEAD_DIM + col[None, :],
+                mask=(not is_q_pad)[:, None],
+                other=0,
+            ).to(tl.float32)
 
-        variance = tl.sum(blk * blk, axis=1) / HEAD_DIM
-        rsqrt = tl.rsqrt(variance + eps)
-        blk = blk * rsqrt[:, None]
-        tl.store(
-            q + rows[:, None] * HEAD_DIM + col[None, :],
-            blk.to(tl.bfloat16),
-            mask=col[None, :] < NOPE_DIM,
-        )
+        if apply_q_norm:
+            variance = tl.sum(blk * blk, axis=1) / HEAD_DIM
+            rsqrt = tl.rsqrt(variance + eps)
+            blk = blk * rsqrt[:, None]
+        if not is_q_interleaved:
+            if not HAS_PADDING:
+                tl.store(
+                    q_out + rows[:, None] * HEAD_DIM + col[None, :],
+                    blk.to(tl.bfloat16),
+                    mask=True if not apply_q_rope else (col[None, :] < NOPE_DIM),
+                )
+            else:
+                tl.store(
+                    q_out
+                    + (token_idx * q_head_padded + slot_idx[:, None]) * HEAD_DIM
+                    + col[None, :],
+                    blk.to(tl.bfloat16),
+                    mask=True if not apply_q_rope else (col[None, :] < NOPE_DIM),
+                )
+        else:
+            if not HAS_PADDING:
+                new_lane_offs = (
+                    slot_idx[:, None] * WARP_SIZE + lane_offs[None, :]
+                ) // num_heads
+                new_slot_offs = (
+                    slot_idx[:, None] * WARP_SIZE + lane_offs[None, :]
+                ) % num_heads
+            else:
+                new_lane_offs1 = (
+                    slot_idx[:, None] * WARP_SIZE + lane_offs[None, :]
+                ) // num_heads
+                new_slot_offs1 = (
+                    slot_idx[:, None] * WARP_SIZE + lane_offs[None, :]
+                ) % num_heads
+                new_lane_offs2 = (
+                    slot_idx[:, None] * WARP_SIZE
+                    + lane_offs[None, :]
+                    - WARP_SIZE * num_heads
+                ) // (q_head_padded - num_heads)
+                new_slot_offs2 = (
+                    slot_idx[:, None] * WARP_SIZE
+                    + lane_offs[None, :]
+                    - WARP_SIZE * num_heads
+                ) % (q_head_padded - num_heads) + num_heads
+                new_lane_offs = tl.where(
+                    not is_q_pad[:, None], new_lane_offs1, new_lane_offs2
+                )
+                new_slot_offs = tl.where(
+                    not is_q_pad[:, None], new_slot_offs1, new_slot_offs2
+                )
+            tl.store(
+                q_out
+                + token_idx * q_head_padded * HEAD_DIM
+                + (new_lane_offs * q_head_padded + new_slot_offs)[:, :, None]
+                * ELEMS_PER_LANE
+                + elem_offs[None, None, :],
+                blk.reshape(H, WARP_SIZE, ELEMS_PER_LANE).to(tl.bfloat16),
+                mask=(
+                    True
+                    if not apply_q_rope
+                    else (lane_offs[None, :, None] < (NOPE_DIM // ELEMS_PER_LANE))
+                ),
+            )
+        if apply_q_rope:
+            position_id = tl.load(position_ids + token_idx)  # scalar: one per token
+            half = tl.arange(0, HALF_ROPE_DIM)
+            cos_blk = tl.load(cos_sin_cache + position_id * ROPE_DIM + half)
+            sin_blk = tl.load(
+                cos_sin_cache + position_id * ROPE_DIM + HALF_ROPE_DIM + half
+            )
 
-        position_id = tl.load(position_ids + token_idx)  # scalar: one per token
-        half = tl.arange(0, HALF_ROPE_DIM)
-        cos_blk = tl.load(cos_sin_cache + position_id * ROPE_DIM + half)
-        sin_blk = tl.load(cos_sin_cache + position_id * ROPE_DIM + HALF_ROPE_DIM + half)
+            if not is_q_interleaved:
+                # [H, HALF_ROPE_DIM, 2]: the pair axis is broadcast into existence, as
+                # on the KV path, so no reshape is needed.
+                if not HAS_PADDING:
+                    pair_off = (
+                        rows[:, None, None] * HEAD_DIM
+                        + NOPE_DIM
+                        + half[None, :, None] * 2
+                        + tl.arange(0, 2)[None, None, :]
+                    )
+                    pair = tl.load(q + pair_off).to(tl.float32)
+                else:
+                    pair = tl.load(
+                        q
+                        + rows[:, None, None] * HEAD_DIM
+                        + NOPE_DIM
+                        + half[None, :, None] * 2
+                        + tl.arange(0, 2)[None, None, :],
+                        mask=(not is_q_pad)[:, None, None],
+                        other=0,
+                    ).to(tl.float32)
+                even_blk, odd_blk = tl.split(pair)
+                if apply_q_norm:
+                    even_blk = even_blk * rsqrt[:, None]
+                    odd_blk = odd_blk * rsqrt[:, None]
+                new_even_blk = even_blk * cos_blk[None, :] - odd_blk * sin_blk[None, :]
+                new_odd_blk = even_blk * sin_blk[None, :] + odd_blk * cos_blk[None, :]
+                pair = tl.join(new_even_blk, new_odd_blk).to(tl.bfloat16)
+                if not HAS_PADDING:
+                    tl.store(q_out + pair_off, pair)
+                else:
+                    tl.store(
+                        q_out
+                        + (token_idx * q_head_padded + slot_idx[:, None, None])
+                        * HEAD_DIM
+                        + NOPE_DIM
+                        + half[None, :, None] * 2
+                        + tl.arange(0, 2)[None, None, :],
+                        pair,
+                    )
+            else:
+                pair = tl.load(
+                    q
+                    + rows[:, None] * HEAD_DIM
+                    + NOPE_DIM
+                    + tl.arange(0, ROPE_DIM)[None, None, :],
+                    mask=True if not HAS_PADDING else (not is_q_pad)[:, None],
+                    other=0,
+                )
+                pair = pair.reshape(H, HALF_ROPE_DIM, 2)
+                even_blk, odd_blk = tl.split(pair.to(tl.float32))
+                if apply_q_norm:
+                    even_blk = even_blk * rsqrt[:, None]
+                    odd_blk = odd_blk * rsqrt[:, None]
+                new_even_blk = even_blk * cos_blk[None, :] - odd_blk * sin_blk[None, :]
+                new_odd_blk = even_blk * sin_blk[None, :] + odd_blk * cos_blk[None, :]
+                pair = tl.join(new_even_blk, new_odd_blk).to(tl.bfloat16)
 
-        # [H, HALF_ROPE_DIM, 2]: the pair axis is broadcast into existence, as
-        # on the KV path, so no reshape is needed.
-        pair_off = (
-            rows[:, None, None] * HEAD_DIM
-            + NOPE_DIM
-            + half[None, :, None] * 2
-            + tl.arange(0, 2)[None, None, :]
-        )
-        pair = tl.load(q + pair_off).to(tl.float32)
-        even_blk, odd_blk = tl.split(pair)
-        even_blk = even_blk * rsqrt[:, None]
-        odd_blk = odd_blk * rsqrt[:, None]
-        new_even_blk = even_blk * cos_blk[None, :] - odd_blk * sin_blk[None, :]
-        new_odd_blk = even_blk * sin_blk[None, :] + odd_blk * cos_blk[None, :]
-        tl.store(q + pair_off, tl.join(new_even_blk, new_odd_blk).to(tl.bfloat16))
+                rope_lane_offs = NOPE_DIM // ELEMS_PER_LANE + tl.arange(
+                    0, ROPE_DIM // ELEMS_PER_LANE
+                )
+                if not HAS_PADDING:
+                    new_rope_lane_offs = (
+                        slot_idx[:, None] * WARP_SIZE + rope_lane_offs[None, :]
+                    ) // num_heads
+                    new_rope_slot_offs = (
+                        slot_idx[:, None] * WARP_SIZE + rope_lane_offs[None, :]
+                    ) % num_heads
+                else:
+                    new_rope_lane_offs1 = (
+                        slot_idx[:, None] * WARP_SIZE + rope_lane_offs[None, :]
+                    ) // num_heads
+                    new_rope_slot_offs1 = (
+                        slot_idx[:, None] * WARP_SIZE + rope_lane_offs[None, :]
+                    ) % num_heads
+                    new_rope_lane_offs2 = (
+                        slot_idx[:, None] * WARP_SIZE
+                        + rope_lane_offs[None, :]
+                        - WARP_SIZE * num_heads
+                    ) // (q_head_padded - num_heads)
+                    new_rope_slot_offs2 = (
+                        slot_idx[:, None] * WARP_SIZE
+                        + rope_lane_offs[None, :]
+                        - WARP_SIZE * num_heads
+                    ) % (q_head_padded - num_heads) + num_heads
+                    new_rope_lane_offs = tl.where(
+                        not is_q_pad[:, None], new_rope_lane_offs1, new_rope_lane_offs2
+                    )
+                    new_rope_slot_offs = tl.where(
+                        not is_q_pad[:, None], new_rope_slot_offs1, new_rope_slot_offs2
+                    )
+                tl.store(
+                    q_out
+                    + token_idx * q_head_padded * HEAD_DIM
+                    + (new_rope_lane_offs * q_head_padded + new_rope_slot_offs)[
+                        :, :, None
+                    ]
+                    * ELEMS_PER_LANE
+                    + elem_offs[None, None, :],
+                    pair.reshape(H, ROPE_DIM // ELEMS_PER_LANE, ELEMS_PER_LANE),
+                )
     elif pid < total_programs:
         # ---- KV: GPT-J RoPE on the last 64, then UE8M0 FP8 quantisation of the
         # NoPE region and the paged-cache insert.
@@ -236,43 +476,54 @@ def fused_qnorm_rope_kv_insert_kernel(
             block_idx = kv_slot // cache_block_size
             pos_in_block = kv_slot % cache_block_size
             block_base = k_cache + block_idx * kv_block_stride
-            token_fp8_ptr = block_base + pos_in_block * TOKEN_DATA_BYTES
-            # Pointers cannot change element width here, so the RoPE region is reached
-            # through a bf16 view; every byte offset is even.
-            token_bf16_idx = (
-                block_idx * kv_block_stride + pos_in_block * TOKEN_DATA_BYTES + NOPE_DIM
-            ) // 2
-            token_scale_ptr = (
-                block_base
-                + cache_block_size * TOKEN_DATA_BYTES
-                + pos_in_block * SCALE_BYTES_PER_TOKEN
-            )
-            tl.store(
-                k_cache_bf16 + token_bf16_idx + offset_pair, qkv_blk_rope
-            )  # [HALF_ROPE_DIM, 2]
-            # Quantisation of the KV NoPE region: all seven groups as one [8, QUANT_BLOCK]
-            # tile. The eighth row is the token's RoPE segment, computed and discarded; both
-            # stores mask it off.
-            gidx = tl.arange(0, 8)
-            keep_group = gidx < NUM_QUANT_BLOCKS
-            kv_quant_blk = tl.load(
-                kv_base + gidx[:, None] * QUANT_BLOCK + offset_quant[None, :]
-            ).to(tl.float32)
-            block_max = tl.maximum(tl.max(tl.abs(kv_quant_blk), axis=1), 1e-4)
-            # scale = 2^ceil(log2(block_max / FP8_MAX)), off the exponent bits
-            scale, scale_code = _ue8m0_scale(block_max / FP8_MAX)
-            # No clamp: scale is the smallest power of two with block_max / scale <=
-            # FP8_MAX, so |x| <= FP8_MAX holds by construction.
-            x_scaled = kv_quant_blk / scale[:, None]
-            x_uint8 = _f32_to_e4m3_bits(x_scaled)
-            tl.store(
-                token_fp8_ptr + gidx[:, None] * QUANT_BLOCK + offset_quant[None, :],
-                x_uint8,
-                mask=keep_group[:, None],
-            )
-            # store scale: stored_value = exponent + 127 (bias)
-            tl.store(token_scale_ptr + gidx, scale_code.to(tl.uint8), mask=keep_group)
-            tl.store(token_scale_ptr + NUM_QUANT_BLOCKS, tl.zeros((), dtype=tl.uint8))
+            if not kv_mxfp8:
+                token_fp8_ptr = block_base + pos_in_block * TOKEN_DATA_BYTES
+                # Pointers cannot change element width here, so the RoPE region is reached
+                # through a bf16 view; every byte offset is even.
+                token_bf16_idx = (
+                    block_idx * kv_block_stride
+                    + pos_in_block * TOKEN_DATA_BYTES
+                    + NOPE_DIM
+                ) // 2
+                token_scale_ptr = (
+                    block_base
+                    + cache_block_size * TOKEN_DATA_BYTES
+                    + pos_in_block * SCALE_BYTES_PER_TOKEN
+                )
+                tl.store(
+                    k_cache_bf16 + token_bf16_idx + offset_pair, qkv_blk_rope
+                )  # [HALF_ROPE_DIM, 2]
+                # Quantisation of the KV NoPE region: all seven groups as one [8, QUANT_BLOCK]
+                # tile. The eighth row is the token's RoPE segment, computed and discarded; both
+                # stores mask it off.
+                gidx = tl.arange(0, 8)
+                keep_group = gidx < NUM_QUANT_BLOCKS
+                kv_quant_blk = tl.load(
+                    kv_base + gidx[:, None] * QUANT_BLOCK + offset_quant[None, :]
+                ).to(tl.float32)
+                block_max = tl.maximum(tl.max(tl.abs(kv_quant_blk), axis=1), 1e-4)
+                # scale = 2^ceil(log2(block_max / FP8_MAX)), off the exponent bits
+                scale, scale_code = _ue8m0_scale(block_max / FP8_MAX)
+                # No clamp: scale is the smallest power of two with block_max / scale <=
+                # FP8_MAX, so |x| <= FP8_MAX holds by construction.
+                x_scaled = kv_quant_blk / scale[:, None]
+                x_uint8 = _f32_to_e4m3_bits(x_scaled)
+                tl.store(
+                    token_fp8_ptr + gidx[:, None] * QUANT_BLOCK + offset_quant[None, :],
+                    x_uint8,
+                    mask=keep_group[:, None],
+                )
+                # store scale: stored_value = exponent + 127 (bias)
+                tl.store(
+                    token_scale_ptr + gidx, scale_code.to(tl.uint8), mask=keep_group
+                )
+                tl.store(
+                    token_scale_ptr + NUM_QUANT_BLOCKS, tl.zeros((), dtype=tl.uint8)
+                )
+            else:
+                _deepseek_v41_kv_quant(
+                    qkv_blk_rope, kv_base, block_base, pos_in_block, cache_block_size
+                )
 
 
 def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
@@ -282,8 +533,13 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     slot_mapping: torch.Tensor,
     position_ids: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    q_head_padded: int,
     eps: float,
     cache_block_size: int,
+    apply_q_norm: bool = True,
+    kv_mxfp8: bool = False,
+    apply_q_rope: bool = True,
+    is_q_interleaved: bool = False,
 ):
     """See the generic implementation for the layout contract."""
     assert q.is_contiguous() and kv.is_contiguous()
@@ -300,6 +556,12 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     assert position_ids.dtype == torch.int64
     assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64
     assert cos_sin_cache.dtype == torch.float32
+    assert q_head_padded in (0, 8, 16, 32, 64, 128)
+
+    if q_head_padded == 0:
+        q_out = q.new_empty([0])
+    else:
+        q_out = q.new_empty([num_tokens, q_head_padded, 512])
 
     assert k_cache.is_contiguous()
     k_cache_bf16 = k_cache.view(torch.bfloat16)
@@ -308,8 +570,8 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     # chunks within MAX_PROGRAMS_PER_LAUNCH, each program adding its chunk's offset,
     # and every launch is a whole number of core groups.
 
-    heads_per_program = q_heads_per_program(num_heads)
-    tiles_per_token = num_heads // heads_per_program
+    heads_per_program = q_heads_per_program(q_head_padded, is_q_interleaved)
+    tiles_per_token = q_head_padded // heads_per_program
     q_programs = num_tokens * tiles_per_token
     total_programs = q_programs + num_tokens_insert
     device_index = q.device.index
@@ -323,14 +585,20 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             grid = -(-grid // group) * group
         fused_qnorm_rope_kv_insert_kernel[(grid,)](
             q,
+            q_out,
             kv,
             k_cache,
             k_cache_bf16,
             slot_mapping,
             position_ids,
             cos_sin_cache,
+            q_head_padded,
             eps,
             cache_block_size,
+            apply_q_norm,
+            kv_mxfp8,
+            apply_q_rope,
+            is_q_interleaved,
             num_heads,
             k_cache.stride(0),
             pid_offset,
@@ -338,6 +606,8 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             total_programs,
             tiles_per_token,
             heads_per_program,
+            HAS_PADDING=q_head_padded > num_heads,
             num_warps=1,
             num_stages=1,
         )
+    return q_out
