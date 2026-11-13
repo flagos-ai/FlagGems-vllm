@@ -551,9 +551,16 @@ def _mhc_post_ascend(
         raise NotImplementedError(f"mhc_post only supports hc_mult=4, got hc_mult={N}")
     out = torch.empty_like(xf)
 
-    # AscendC picks dInner from the tiling table; we mirror with a fixed
+    # AscendC picks dInner from the tiling table; we mirror it with a fixed
     # BLOCK_D that keeps T * cdiv(D, BLOCK_D) under the 65535 coreDim cap.
-    BLOCK_D = min(1024, triton.next_power_of_2(D))
+    #
+    # 4096 is the largest d-chunk whose (4, BLOCK_D) fp32 compute tile still
+    # fits UB; raising it from 1024 to 4096 quarters the number of d-chunks per
+    # token, so each program issues fewer, longer DMAs.  Measured on a 910B4:
+    # 4096 tokens x 3584 hidden 566us -> 440us, 8192 x 3584 1115us -> 878us,
+    # with every smaller shape unchanged (they are launch-bound).  Whole-row
+    # chunks (BLOCK_D >= 8192 for hidden=7168) overflow UB, hence the cap.
+    BLOCK_D = min(4096, triton.next_power_of_2(D))
     while T * triton.cdiv(D, BLOCK_D) > 65535 and BLOCK_D < D:
         BLOCK_D *= 2
     BLOCK_D = min(BLOCK_D, triton.next_power_of_2(D))
