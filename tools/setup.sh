@@ -412,15 +412,19 @@ install_packages() {
       extra+=(--reinstall)
     fi
     local -a index_args=(--default-index "${MIRROR}")
+    # uv searches --index entries before --default-index, and by default only
+    # uses the first index that contains a package. The vendor index must
+    # therefore be the --index, or the mirror (which has a plain torch but no
+    # `+cu130` build) shadows it and resolution fails.
     if [ "${index_mode}" = "flagos" ]; then
       index_args=(
-        --default-index "${FLAGOS_PYPI}"
-        --index "${MIRROR}"
+        --index "${FLAGOS_PYPI}"
+        --default-index "${MIRROR}"
       )
     elif [ "${index_mode}" = "flag-gems" ]; then
       index_args=(
-        --default-index "${FLAG_GEMS_INDEX}"
-        --index "${MIRROR}"
+        --index "${FLAG_GEMS_INDEX}"
+        --default-index "${MIRROR}"
       )
     fi
     uv pip install --python "${PYTHON_BIN}" --no-config \
