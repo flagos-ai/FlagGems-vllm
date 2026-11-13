@@ -52,6 +52,7 @@ def _softplus(x):
 @triton.autotune(
     configs=[
         triton.Config({"BK": 32, "BV": 64}, num_warps=1, num_stages=1),
+        triton.Config({"BK": 32, "BV": 64}, num_warps=1, num_stages=1, maxnreg=128),
         triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=1),
     ],
     key=["H", "HV", "K", "V", "BT"],
@@ -95,8 +96,10 @@ def _thead_kda_fwd_intra_kernel(
     APPLY_BETA_SIGMOID: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    EVEN: tl.constexpr,
 ):
     i_tg, i_bh = tl.program_id(0), tl.program_id(1)
+
     i_b, i_hv = i_bh // HV, i_bh % HV
     i_h = i_hv // (HV // H)
 
@@ -140,23 +143,9 @@ def _thead_kda_fwd_intra_kernel(
     if USE_QK_L2NORM:
         b_q_ss = tl.zeros([BT], dtype=tl.float32)
         b_k_ss = tl.zeros([BT], dtype=tl.float32)
-        for i_k in range(tl.cdiv(K, BK)):
-            p_q = tl.make_block_ptr(
-                q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-            )
-            p_k = tl.make_block_ptr(
-                k, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-            )
-            b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-            b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-            b_q_ss += tl.sum(b_q * b_q, 1)
-            b_k_ss += tl.sum(b_k * b_k, 1)
-
-        b_q_rstd = 1.0 / tl.sqrt(b_q_ss + l2norm_eps)
-        b_k_rstd = 1.0 / tl.sqrt(b_k_ss + l2norm_eps)
 
     p_beta = tl.make_block_ptr(beta, (T,), (HV,), (i_t * BT,), (BT,), (0,))
-    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_beta = tl.load(p_beta, boundary_check=(0,) if not EVEN else ()).to(tl.float32)
     if APPLY_BETA_SIGMOID:
         b_beta = tl.sigmoid(b_beta)
 
@@ -178,21 +167,25 @@ def _thead_kda_fwd_intra_kernel(
             g, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
 
-        b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-        b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+        b_q = tl.load(p_q, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
+        b_k = tl.load(p_k, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
         if USE_QK_L2NORM:
-            b_q = b_q * b_q_rstd[:, None]
-            b_k = b_k * b_k_rstd[:, None]
-        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+            b_q_ss += tl.sum(b_q * b_q, 1)
+            b_k_ss += tl.sum(b_k * b_k, 1)
+        b_g = tl.load(p_g, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
         if USE_GATE_IN_KERNEL:
             if HAS_DT_BIAS:
                 p_dt = tl.make_block_ptr(
                     dt_bias + i_hv * K, (K,), (1,), (i_k * BK,), (BK,), (0,)
                 )
-                b_bias = tl.load(p_dt, boundary_check=(0,)).to(tl.float32)
+                b_bias = tl.load(p_dt, boundary_check=(0,) if not EVEN else ()).to(
+                    tl.float32
+                )
                 b_g = b_g + b_bias[None, :]
             if USE_LOWER_BOUND:
-                b_g = (lower_bound * g_scale) * tl.sigmoid(b_A * b_g)
+                b_g = (lower_bound * g_scale) / (
+                    1.0 + tl.exp2(-(b_A * b_g) * 1.4426950408889634)
+                )
             else:
                 b_g = -b_A * _softplus(b_g) * g_scale
         else:
@@ -210,6 +203,12 @@ def _thead_kda_fwd_intra_kernel(
         b_Aqk += tl.dot(b_q * b_gq, b_kgt)
         b_Akk += tl.dot(b_k * b_gq, b_kgt)
 
+    if USE_QK_L2NORM:
+        b_q_rstd = 1.0 / tl.sqrt(b_q_ss + l2norm_eps)
+        b_k_rstd = 1.0 / tl.sqrt(b_k_ss + l2norm_eps)
+        b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
+        b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
+
     # Causal mask
     m_Aqk = o_i[:, None] >= o_i[None, :]
     m_Akk = o_i[:, None] > o_i[None, :]
@@ -221,7 +220,9 @@ def _thead_kda_fwd_intra_kernel(
     p_Aqk = tl.make_block_ptr(
         Aqk, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
-    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(
+        p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ()
+    )
 
     b_L = b_Akk.to(tl.float16)
     b_Ai = m_I.to(tl.float16) - b_L
@@ -241,10 +242,12 @@ def _thead_kda_fwd_intra_kernel(
         p_u = tl.make_block_ptr(
             u, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
         )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_v = tl.load(p_v, boundary_check=(0, 1) if not EVEN else ())
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_Ai.to(b_vb.dtype), b_vb)
-        tl.store(p_u, b_u.to(u.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(
+            p_u, b_u.to(u.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ()
+        )
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(
@@ -253,17 +256,24 @@ def _thead_kda_fwd_intra_kernel(
         p_g = tl.make_block_ptr(
             g, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32) * b_k_rstd[:, None]
-        b_gk = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+        b_k = (
+            tl.load(p_k, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
+            * b_k_rstd[:, None]
+        )
+        b_gk = tl.load(p_g, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
         if USE_GATE_IN_KERNEL:
             if HAS_DT_BIAS:
                 p_dt = tl.make_block_ptr(
                     dt_bias + i_hv * K, (K,), (1,), (i_k * BK,), (BK,), (0,)
                 )
-                b_bias = tl.load(p_dt, boundary_check=(0,)).to(tl.float32)
+                b_bias = tl.load(p_dt, boundary_check=(0,) if not EVEN else ()).to(
+                    tl.float32
+                )
                 b_gk = b_gk + b_bias[None, :]
             if USE_LOWER_BOUND:
-                b_gk = (lower_bound * g_scale) * tl.sigmoid(b_A * b_gk)
+                b_gk = (lower_bound * g_scale) / (
+                    1.0 + tl.exp2(-(b_A * b_gk) * 1.4426950408889634)
+                )
             else:
                 b_gk = -b_A * _softplus(b_gk) * g_scale
         else:
@@ -278,9 +288,16 @@ def _thead_kda_fwd_intra_kernel(
             p_qg_out = tl.make_block_ptr(
                 qg, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
-            b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32) * b_q_rstd[:, None]
+            b_q = (
+                tl.load(p_q, boundary_check=(0, 1) if not EVEN else ()).to(tl.float32)
+                * b_q_rstd[:, None]
+            )
             b_qg_val = b_q * exp2(b_gk)
-            tl.store(p_qg_out, b_qg_val.to(qg.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                p_qg_out,
+                b_qg_val.to(qg.dtype.element_ty),
+                boundary_check=(0, 1) if not EVEN else (),
+            )
 
         if STORE_KG:
             # last cumsum row from the recomputed tile (same value as g_last)
@@ -289,13 +306,19 @@ def _thead_kda_fwd_intra_kernel(
             p_kg_out = tl.make_block_ptr(
                 kg, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
-            tl.store(p_kg_out, b_kg_val.to(kg.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                p_kg_out,
+                b_kg_val.to(kg.dtype.element_ty),
+                boundary_check=(0, 1) if not EVEN else (),
+            )
 
         p_w = tl.make_block_ptr(
             w, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
         b_w = tl.dot(b_Ai.to(b_kb.to(b_k.dtype).dtype), b_kb.to(b_k.dtype))
-        tl.store(p_w, b_w.to(w.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(
+            p_w, b_w.to(w.dtype.element_ty), boundary_check=(0, 1) if not EVEN else ()
+        )
 
 
 def _thead_kda_fwd_intra(
@@ -323,6 +346,8 @@ def _thead_kda_fwd_intra(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
+
+    even_t = (cu_seqlens is None) and ((T_len % BT) == 0)
     grid = (NT, B * HV)
 
     g_last = torch.empty(B * NT, HV, K, device=q.device, dtype=torch.float32)
@@ -360,6 +385,7 @@ def _thead_kda_fwd_intra(
         K=K,
         V=V,
         BT=BT,
+        EVEN=even_t,
     )
     return w, u, qg, kg, Aqk, g_last
 
@@ -373,8 +399,11 @@ def _thead_kda_fwd_intra(
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BV": 32}, num_warps=2, num_stages=3),
-        triton.Config({"BV": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BV": 8}, num_warps=1, num_stages=3),
+        triton.Config({"BV": 8}, num_warps=1, num_stages=2),
+        triton.Config({"BV": 16}, num_warps=1, num_stages=3),
+        triton.Config({"BV": 16}, num_warps=1, num_stages=2),
+        triton.Config({"BV": 16}, num_warps=1, num_stages=4),
     ],
     key=["HV", "K", "V", "BT", "IS_VARLEN"],
 )
@@ -432,76 +461,76 @@ def _thead_kda_fwd_h_o_kernel(
     o += (bos * HV + i_h).to(tl.int64) * V
 
     o_t0 = tl.arange(0, BT)
-    o_k1 = tl.arange(0, 64)
+    o_k1 = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
 
     if H_VFIRST:
-        b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
-        if K > 64:
-            b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
-        if K > 128:
-            b_h3 = tl.zeros([BV, 64], dtype=tl.float32)
-        if K > 192:
-            b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
+        b_h1 = tl.zeros([BV, K], dtype=tl.float32)
+        if K > 100000:
+            b_h2 = tl.zeros([BV, K], dtype=tl.float32)
+        if K > 100000:
+            b_h3 = tl.zeros([BV, K], dtype=tl.float32)
+        if K > 100000:
+            b_h4 = tl.zeros([BV, K], dtype=tl.float32)
     else:
-        b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 64:
-            b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 128:
-            b_h3 = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 192:
-            b_h4 = tl.zeros([64, BV], dtype=tl.float32)
+        b_h1 = tl.zeros([K, BV], dtype=tl.float32)
+        if K > 100000:
+            b_h2 = tl.zeros([K, BV], dtype=tl.float32)
+        if K > 100000:
+            b_h3 = tl.zeros([K, BV], dtype=tl.float32)
+        if K > 100000:
+            b_h4 = tl.zeros([K, BV], dtype=tl.float32)
 
     if USE_INITIAL_STATE:
         if STATE_V_FIRST:
             p_h0_1 = tl.make_block_ptr(
-                h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, K), (1, 0)
             )
         else:
             p_h0_1 = tl.make_block_ptr(
-                h0 + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                h0 + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0)
             )
         b_h0_1 = tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if STATE_V_FIRST == H_VFIRST:
             b_h1 += b_h0_1
         else:
             b_h1 += tl.trans(b_h0_1)
-        if K > 64:
+        if K > 100000:
             if STATE_V_FIRST:
                 p_h0_2 = tl.make_block_ptr(
-                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, K), (1, 0)
                 )
             else:
                 p_h0_2 = tl.make_block_ptr(
-                    h0 + i_nh * K * V, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                    h0 + i_nh * K * V, (K, V), (V, 1), (64, i_v * BV), (K, BV), (1, 0)
                 )
             b_h0_2 = tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
             if STATE_V_FIRST == H_VFIRST:
                 b_h2 += b_h0_2
             else:
                 b_h2 += tl.trans(b_h0_2)
-        if K > 128:
+        if K > 100000:
             if STATE_V_FIRST:
                 p_h0_3 = tl.make_block_ptr(
-                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, K), (1, 0)
                 )
             else:
                 p_h0_3 = tl.make_block_ptr(
-                    h0 + i_nh * K * V, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                    h0 + i_nh * K * V, (K, V), (V, 1), (128, i_v * BV), (K, BV), (1, 0)
                 )
             b_h0_3 = tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
             if STATE_V_FIRST == H_VFIRST:
                 b_h3 += b_h0_3
             else:
                 b_h3 += tl.trans(b_h0_3)
-        if K > 192:
+        if K > 100000:
             if STATE_V_FIRST:
                 p_h0_4 = tl.make_block_ptr(
-                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, K), (1, 0)
                 )
             else:
                 p_h0_4 = tl.make_block_ptr(
-                    h0 + i_nh * K * V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                    h0 + i_nh * K * V, (K, V), (V, 1), (192, i_v * BV), (K, BV), (1, 0)
                 )
             b_h0_4 = tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
             if STATE_V_FIRST == H_VFIRST:
@@ -513,17 +542,17 @@ def _thead_kda_fwd_h_o_kernel(
         b_gn_next1 = tl.load(
             gk + i_cb * (HV * K) + o_k1, mask=(o_k1 < K) & (NT > 0), other=0.0
         ).to(tl.float32)
-        if K > 64:
+        if K > 100000:
             o_k2 = 64 + o_k1
             b_gn_next2 = tl.load(
                 gk + i_cb * (HV * K) + o_k2, mask=(o_k2 < K) & (NT > 0), other=0.0
             ).to(tl.float32)
-        if K > 128:
+        if K > 100000:
             o_k3 = 128 + o_k1
             b_gn_next3 = tl.load(
                 gk + i_cb * (HV * K) + o_k3, mask=(o_k3 < K) & (NT > 0), other=0.0
             ).to(tl.float32)
-        if K > 192:
+        if K > 100000:
             o_k4 = 192 + o_k1
             b_gn_next4 = tl.load(
                 gk + i_cb * (HV * K) + o_k4, mask=(o_k4 < K) & (NT > 0), other=0.0
@@ -541,17 +570,17 @@ def _thead_kda_fwd_h_o_kernel(
             b_gn_next1 = tl.load(
                 gk + i_gn * (HV * K) + o_k1, mask=(o_k1 < K) & m_gn, other=0.0
             ).to(tl.float32)
-            if K > 64:
+            if K > 100000:
                 b_gk_last2 = b_gn_next2
                 b_gn_next2 = tl.load(
                     gk + i_gn * (HV * K) + o_k2, mask=(o_k2 < K) & m_gn, other=0.0
                 ).to(tl.float32)
-            if K > 128:
+            if K > 100000:
                 b_gk_last3 = b_gn_next3
                 b_gn_next3 = tl.load(
                     gk + i_gn * (HV * K) + o_k3, mask=(o_k3 < K) & m_gn, other=0.0
                 ).to(tl.float32)
-            if K > 192:
+            if K > 100000:
                 b_gk_last4 = b_gn_next4
                 b_gn_next4 = tl.load(
                     gk + i_gn * (HV * K) + o_k4, mask=(o_k4 < K) & m_gn, other=0.0
@@ -565,7 +594,7 @@ def _thead_kda_fwd_h_o_kernel(
             b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
         else:
             b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
-        if K > 64:
+        if K > 100000:
             b_w = tl.load(
                 w + o_t[:, None] * (HV * K) + (64 + o_k1)[None, :],
                 mask=m_t[:, None],
@@ -575,7 +604,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
             else:
                 b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
-        if K > 128:
+        if K > 100000:
             b_w = tl.load(
                 w + o_t[:, None] * (HV * K) + (128 + o_k1)[None, :],
                 mask=m_t[:, None],
@@ -585,7 +614,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
             else:
                 b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
-        if K > 192:
+        if K > 100000:
             b_w = tl.load(
                 w + o_t[:, None] * (HV * K) + (192 + o_k1)[None, :],
                 mask=m_t[:, None],
@@ -610,7 +639,7 @@ def _thead_kda_fwd_h_o_kernel(
             b_o = tl.dot(b_qg, tl.trans(b_h1).to(b_qg.dtype))
         else:
             b_o = tl.dot(b_qg, b_h1.to(b_qg.dtype))
-        if K > 64:
+        if K > 100000:
             b_qg = tl.load(
                 qg + o_t[:, None] * (HV * K) + (64 + o_k1)[None, :],
                 mask=m_t[:, None],
@@ -620,7 +649,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_o += tl.dot(b_qg, tl.trans(b_h2).to(b_qg.dtype))
             else:
                 b_o += tl.dot(b_qg, b_h2.to(b_qg.dtype))
-        if K > 128:
+        if K > 100000:
             b_qg = tl.load(
                 qg + o_t[:, None] * (HV * K) + (128 + o_k1)[None, :],
                 mask=m_t[:, None],
@@ -630,7 +659,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_o += tl.dot(b_qg, tl.trans(b_h3).to(b_qg.dtype))
             else:
                 b_o += tl.dot(b_qg, b_h3.to(b_qg.dtype))
-        if K > 192:
+        if K > 100000:
             b_qg = tl.load(
                 qg + o_t[:, None] * (HV * K) + (192 + o_k1)[None, :],
                 mask=m_t[:, None],
@@ -663,7 +692,7 @@ def _thead_kda_fwd_h_o_kernel(
             b_h1 *= exp2(b_gk_last1)[None, :]
         else:
             b_h1 *= exp2(b_gk_last1)[:, None]
-        if K > 64:
+        if K > 100000:
             if not GLAST_PREFETCH:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
@@ -673,7 +702,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_h2 *= exp2(b_gk_last2)[None, :]
             else:
                 b_h2 *= exp2(b_gk_last2)[:, None]
-        if K > 128:
+        if K > 100000:
             if not GLAST_PREFETCH:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
@@ -683,7 +712,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_h3 *= exp2(b_gk_last3)[None, :]
             else:
                 b_h3 *= exp2(b_gk_last3)[:, None]
-        if K > 192:
+        if K > 100000:
             if not GLAST_PREFETCH:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
@@ -703,7 +732,7 @@ def _thead_kda_fwd_h_o_kernel(
             b_h1 += tl.trans(tl.dot(b_kg, b_v))
         else:
             b_h1 += tl.dot(b_kg, b_v)
-        if K > 64:
+        if K > 100000:
             b_kg = tl.load(
                 kg + (64 + o_k1)[:, None] + o_t[None, :] * (HV * K),
                 mask=m_t[None, :],
@@ -713,7 +742,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_h2 += tl.trans(tl.dot(b_kg, b_v))
             else:
                 b_h2 += tl.dot(b_kg, b_v)
-        if K > 128:
+        if K > 100000:
             b_kg = tl.load(
                 kg + (128 + o_k1)[:, None] + o_t[None, :] * (HV * K),
                 mask=m_t[None, :],
@@ -723,7 +752,7 @@ def _thead_kda_fwd_h_o_kernel(
                 b_h3 += tl.trans(tl.dot(b_kg, b_v))
             else:
                 b_h3 += tl.dot(b_kg, b_v)
-        if K > 192:
+        if K > 100000:
             b_kg = tl.load(
                 kg + (192 + o_k1)[:, None] + o_t[None, :] * (HV * K),
                 mask=m_t[None, :],
@@ -737,11 +766,11 @@ def _thead_kda_fwd_h_o_kernel(
     if STORE_FINAL_STATE:
         if STATE_V_FIRST:
             p_ht = tl.make_block_ptr(
-                ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, K), (1, 0)
             )
         else:
             p_ht = tl.make_block_ptr(
-                ht + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                ht + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0)
             )
         if STATE_V_FIRST == H_VFIRST:
             tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
@@ -749,14 +778,14 @@ def _thead_kda_fwd_h_o_kernel(
             tl.store(
                 p_ht, tl.trans(b_h1).to(p_ht.dtype.element_ty), boundary_check=(0, 1)
             )
-        if K > 64:
+        if K > 100000:
             if STATE_V_FIRST:
                 p_ht = tl.make_block_ptr(
-                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, K), (1, 0)
                 )
             else:
                 p_ht = tl.make_block_ptr(
-                    ht + i_nh * K * V, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                    ht + i_nh * K * V, (K, V), (V, 1), (64, i_v * BV), (K, BV), (1, 0)
                 )
             if STATE_V_FIRST == H_VFIRST:
                 tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
@@ -766,14 +795,14 @@ def _thead_kda_fwd_h_o_kernel(
                     tl.trans(b_h2).to(p_ht.dtype.element_ty),
                     boundary_check=(0, 1),
                 )
-        if K > 128:
+        if K > 100000:
             if STATE_V_FIRST:
                 p_ht = tl.make_block_ptr(
-                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, K), (1, 0)
                 )
             else:
                 p_ht = tl.make_block_ptr(
-                    ht + i_nh * K * V, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                    ht + i_nh * K * V, (K, V), (V, 1), (128, i_v * BV), (K, BV), (1, 0)
                 )
             if STATE_V_FIRST == H_VFIRST:
                 tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
@@ -783,14 +812,14 @@ def _thead_kda_fwd_h_o_kernel(
                     tl.trans(b_h3).to(p_ht.dtype.element_ty),
                     boundary_check=(0, 1),
                 )
-        if K > 192:
+        if K > 100000:
             if STATE_V_FIRST:
                 p_ht = tl.make_block_ptr(
-                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, K), (1, 0)
                 )
             else:
                 p_ht = tl.make_block_ptr(
-                    ht + i_nh * K * V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                    ht + i_nh * K * V, (K, V), (V, 1), (192, i_v * BV), (K, BV), (1, 0)
                 )
             if STATE_V_FIRST == H_VFIRST:
                 tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))

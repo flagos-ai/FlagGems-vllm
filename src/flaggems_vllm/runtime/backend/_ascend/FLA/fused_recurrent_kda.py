@@ -4,6 +4,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 """Ascend KDA: affine aligned tiles and conservative irregular transfers."""
 
+import logging
+from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
@@ -18,15 +20,16 @@ from flaggems_vllm.ops.FLA.fused_recurrent_kda import (
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
+logger = logging.getLogger(__name__)
+
 
 @lru_cache(maxsize=None)
 def _vector_core_count(device_index):
     return NPUUtils().get_aivector_core_num()
 
 
-@libentry()
 @triton.jit
-def _ascend_recurrent_kda_kernel(
+def _recurrent_kda_body(
     Q,
     Kp,
     Vp,
@@ -38,37 +41,37 @@ def _ascend_recurrent_kda_kernel(
     Cu,
     Indices,
     scale,
+    POOL,
+    BLOCKS,
+    EXTRA,
+    NORMALIZE_INPUT,
     META: tl.constexpr,
 ):
     T: tl.constexpr = META[0]
     H: tl.constexpr = META[1]
     K: tl.constexpr = META[2]
     V: tl.constexpr = META[3]
-    POOL: tl.constexpr = META[4]
-    QS: tl.constexpr = META[5]
-    KS: tl.constexpr = META[6]
-    VS: tl.constexpr = META[7]
-    GS: tl.constexpr = META[8]
-    BS: tl.constexpr = META[9]
-    SS: tl.constexpr = META[10]
-    IX: tl.constexpr = META[11]
-    WIDTH: tl.constexpr = META[12]
-    VARLEN: tl.constexpr = META[13]
-    INDEXED: tl.constexpr = META[14]
-    TABLE: tl.constexpr = META[15]
-    INPLACE: tl.constexpr = META[16]
-    VECTOR_BETA: tl.constexpr = META[17]
-    NORMALIZE: tl.constexpr = META[18]
-    BK: tl.constexpr = META[19]
-    BV: tl.constexpr = META[20]
-    TOTAL: tl.constexpr = META[21]
-    FAST: tl.constexpr = META[22]
-    programs = tl.num_programs(0)
+    QS: tl.constexpr = META[4]
+    KS: tl.constexpr = META[5]
+    VS: tl.constexpr = META[6]
+    GS: tl.constexpr = META[7]
+    BS: tl.constexpr = META[8]
+    SS: tl.constexpr = META[9]
+    IX: tl.constexpr = META[10]
+    WIDTH: tl.constexpr = META[11]
+    VARLEN: tl.constexpr = META[12]
+    INDEXED: tl.constexpr = META[13]
+    TABLE: tl.constexpr = META[14]
+    INPLACE: tl.constexpr = META[15]
+    VECTOR_BETA: tl.constexpr = META[16]
+    NORMALIZE: tl.constexpr = META[17]
+    do_normalize = NORMALIZE_INPUT != 0 if NORMALIZE is None else NORMALIZE
+    BK: tl.constexpr = META[18]
+    BV: tl.constexpr = META[19]
+    FAST: tl.constexpr = META[20]
     core = tl.program_id(0)
-    blocks = TOTAL // programs
-    extra = TOTAL - blocks * programs
-    first = core * blocks + tl.minimum(core, extra)
-    last = first + blocks + (core.to(tl.float32) < extra).to(tl.int32)
+    first = core * BLOCKS + tl.minimum(core, EXTRA)
+    last = first + BLOCKS + (core.to(tl.float32) < EXTRA).to(tl.int32)
     for pid in range(first, last):
         nv = tl.cdiv(V, BV)
         iv = pid - (pid // nv) * nv
@@ -94,7 +97,10 @@ def _ascend_recurrent_kda_kernel(
             # Expose a unit-stride 1D transfer directly to the NPU compiler.
             # The decomposed V/K quotient-remainder expression may obscure DMA.
             state_offsets = h * SS[1] + iv * BV * K + linear
-            state_mask = linear.to(tl.float32) < (V - iv * BV) * K
+            if V % BV == 0:
+                state_mask = tl.full((BV * BK,), True, tl.int1)
+            else:
+                state_mask = linear.to(tl.float32) < (V - iv * BV) * K
         else:
             state_offsets = h * SS[1] + flat_v * SS[2] + flat_k * SS[3]
             state_mask = (flat_v < V) & (flat_k < K)
@@ -105,7 +111,10 @@ def _ascend_recurrent_kda_kernel(
         )
         if FAST:
             key_mask = rk.to(tl.float32) < K
-            value_mask = rv.to(tl.float32) < V
+            if V % BV == 0:
+                value_mask = tl.full((BV,), True, tl.int1)
+            else:
+                value_mask = rv.to(tl.float32) < V
         else:
             key_mask = rk < K
             value_mask = rv < V
@@ -116,7 +125,7 @@ def _ascend_recurrent_kda_kernel(
             k = tl.load(
                 Kp + batch * KS[0] + t * KS[1] + h * KS[2] + rk * KS[3], key_mask, 0
             ).to(tl.float32)
-            if NORMALIZE:
+            if do_normalize:
                 q /= tl.sqrt(tl.sum(q * q, 0) + 1.0e-6)
                 k /= tl.sqrt(tl.sum(k * k, 0) + 1.0e-6)
             q *= scale
@@ -164,6 +173,92 @@ def _ascend_recurrent_kda_kernel(
                 )
 
 
+@libentry()
+@triton.jit(do_not_specialize=["POOL", "BLOCKS", "EXTRA", "NORMALIZE_INPUT"])
+def _ascend_recurrent_kda_kernel(
+    Q,
+    Kp,
+    Vp,
+    G,
+    Beta,
+    State,
+    Out,
+    Final,
+    Cu,
+    Indices,
+    scale,
+    POOL,
+    BLOCKS,
+    EXTRA,
+    NORMALIZE_INPUT,
+    META: tl.constexpr,
+):
+    _recurrent_kda_body(
+        Q,
+        Kp,
+        Vp,
+        G,
+        Beta,
+        State,
+        Out,
+        Final,
+        Cu,
+        Indices,
+        scale,
+        POOL,
+        BLOCKS,
+        EXTRA,
+        NORMALIZE_INPUT,
+        META,
+    )
+
+
+@libentry()
+@triton.jit
+def _ascend_recurrent_kda_specialized(
+    Q,
+    Kp,
+    Vp,
+    G,
+    Beta,
+    State,
+    Out,
+    Final,
+    Cu,
+    Indices,
+    scale,
+    META: tl.constexpr,
+):
+    pool: tl.constexpr = META[21]
+    blocks: tl.constexpr = META[22]
+    extra: tl.constexpr = META[23]
+    _recurrent_kda_body(
+        Q,
+        Kp,
+        Vp,
+        G,
+        Beta,
+        State,
+        Out,
+        Final,
+        Cu,
+        Indices,
+        scale,
+        pool,
+        blocks,
+        extra,
+        1,
+        META,
+    )
+
+
+def _input_strides(tensor, varlen):
+    strides = tensor.stride()
+    # Packed inputs are always addressed in batch zero. Omit the stride that
+    # otherwise changes with the total number of packed tokens.
+    return (0, *strides[1:]) if varlen else strides
+
+
 def fused_recurrent_kda(
     q,
     k,
@@ -190,6 +285,7 @@ def fused_recurrent_kda(
     returns [T,H,V,K] token states and leaves initial_state unchanged. Without
     indices its initial state is token-major, matching vLLM's KDA convention.
     """
+    logger.debug("GEMS_ASCEND FUSED_RECURRENT_KDA")
     scale = (
         q.shape[-1] ** -0.5
         if scale is None and q.ndim == 4 and q.shape[-1] > 0
@@ -236,51 +332,79 @@ def fused_recurrent_kda(
         ix = (ssm_state_indices.stride(0), 0)
         if ssm_state_indices.ndim == 2:
             ix, width = ssm_state_indices.stride(), ssm_state_indices.shape[1]
-    bs = beta.stride() if beta.ndim == 4 else (*beta.stride(), 0)
-    with torch_device_fn.device(q.device):
+    varlen = cu_seqlens is not None
+    normalize = bool(use_qk_l2norm_in_kernel)
+    beta_strides = _input_strides(beta, varlen)
+    if beta.ndim == 3:
+        beta_strides = (*beta_strides, 0)
+    meta = (
+        0 if varlen else t,
+        h,
+        dk,
+        dv,
+        _input_strides(q, varlen),
+        _input_strides(k, varlen),
+        _input_strides(v, varlen),
+        _input_strides(g, varlen),
+        beta_strides,
+        ss,
+        ix,
+        width,
+        varlen,
+        ssm_state_indices is not None,
+        ssm_state_indices is not None and ssm_state_indices.ndim == 2,
+        inplace_final_state,
+        beta.ndim == 4,
+        normalize if fast else None,
+        triton.next_power_of_2(dk),
+        bv,
+        fast,
+    )
+    args = (
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        out,
+        final,
+        cu_seqlens,
+        ssm_state_indices,
+        scale,
+    )
+    pool = initial_state.shape[0]
+    device = q.device
+    device_context = (
+        nullcontext()
+        if torch_device_fn.current_device() == device.index
+        else torch_device_fn.device(device)
+    )
+    with device_context:
         total = n * h * triton.cdiv(dv, bv)
-        grid = (min(total, _vector_core_count(q.device.index)),)
-        _ascend_recurrent_kda_kernel[grid](
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state,
-            out,
-            final,
-            cu_seqlens,
-            ssm_state_indices,
-            scale,
-            (
-                t,
-                h,
-                dk,
-                dv,
-                initial_state.shape[0],
-                q.stride(),
-                k.stride(),
-                v.stride(),
-                g.stride(),
-                bs,
-                initial_state.stride(),
-                ix,
-                width,
-                cu_seqlens is not None,
-                ssm_state_indices is not None,
-                ssm_state_indices is not None and ssm_state_indices.ndim == 2,
-                inplace_final_state,
-                beta.ndim == 4,
-                use_qk_l2norm_in_kernel,
-                triton.next_power_of_2(dk),
-                bv,
-                total,
-                fast,
-            ),
-            num_warps=warps,
-            num_stages=stages,
-            enable_fp_fusion=False,
-        )
+        cores = min(total, _vector_core_count(device.index))
+        blocks, extra = divmod(total, cores)
+        grid = (cores,)
+        if fast and normalize:
+            _ascend_recurrent_kda_specialized[grid](
+                *args,
+                (*meta, pool, blocks, extra),
+                num_warps=warps,
+                num_stages=stages,
+                enable_fp_fusion=False,
+            )
+        else:
+            _ascend_recurrent_kda_kernel[grid](
+                *args,
+                pool,
+                blocks,
+                extra,
+                int(normalize),
+                meta,
+                num_warps=warps,
+                num_stages=stages,
+                enable_fp_fusion=False,
+            )
     return out, final
 
 

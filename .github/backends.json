@@ -1,0 +1,79 @@
+[
+  {
+    "backend": "ascend-cann850",
+    "runner_label": "cann850",
+    "label": "vendor/Ascend",
+    "gpu_check": "tools/gpu_check_ascend.sh",
+    "enabled": true
+  },
+  {
+    "backend": "cambricon-neuware472",
+    "runner_label": "cambricon",
+    "label": "vendor/Cambricon",
+    "gpu_check": "tools/gpu_check_cambricon.sh",
+    "enabled": true
+  },
+  {
+    "backend": "enflame-tops1106",
+    "runner_label": "enflame",
+    "label": "vendor/Enflame",
+    "gpu_check": "",
+    "enabled": true
+  },
+  {
+    "backend": "kunlunxin",
+    "runner_label": "kunlunxin",
+    "label": "vendor/Kunlunxin",
+    "gpu_check": "tools/gpu_check_kunlunxin.sh",
+    "enabled": true
+  },
+  {
+    "backend": "metax-maca3720",
+    "runner_label": "maca372",
+    "label": "vendor/MetaX",
+    "gpu_check": "tools/gpu_check_metax.sh",
+    "enabled": true
+  },
+  {
+    "backend": "nvidia-cuda128",
+    "runner_label": "h20-cu128",
+    "label": "vendor/NVIDIA",
+    "gpu_check": "tools/gpu_check_nvidia.sh",
+    "enabled": false
+  },
+  {
+    "backend": "nvidia-cuda133",
+    "runner_label": "h20",
+    "label": "vendor/NVIDIA",
+    "gpu_check": "tools/gpu_check_nvidia.sh",
+    "enabled": true
+  },
+  {
+    "backend": "spacemit",
+    "runner_label": "spacemit",
+    "label": "vendor/SpaceMit",
+    "gpu_check": "",
+    "enabled": true
+  },
+  {
+    "backend": "sunrise",
+    "runner_label": "sunrise",
+    "label": "vendor/Sunrise",
+    "gpu_check": "",
+    "enabled": true
+  },
+  {
+    "backend": "thead",
+    "runner_label": "thead",
+    "label": "vendor/THead",
+    "gpu_check": "tools/gpu_check_thead.sh",
+    "enabled": true
+  },
+  {
+    "backend": "tsingmicro",
+    "runner_label": "tsingmicro",
+    "label": "vendor/TsingMicro",
+    "gpu_check": "tools/gpu_check_tsingmicro.sh",
+    "enabled": true
+  }
+]

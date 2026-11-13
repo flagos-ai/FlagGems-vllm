@@ -12,6 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+cooperative_topk_small:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_histogram:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 4096
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_scatter:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 4096
+    num_warps: 8
+    num_stages: 1
+
 grouped_gemma_rmsnorm:
   - META: {}
     num_warps: 4
@@ -1170,6 +1206,64 @@ silu_and_mul_with_clamp_linear:
     num_warps: 8
     num_stages: 1
 
+sparse_fp8_repair:
+  - META: {BLOCK_H: 64, BLOCK_K: 64, REPAIR_GROUP: 8}
+    num_warps: 8
+    num_stages: 1
+
+sparse_fp8_short:
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 256}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 32, BLOCK_K: 128, VALUE_DIM: 256}
+    num_warps: 8
+    num_stages: 1
+
+
+
+sparse_fp8_warp_specialized:
+  - META: {PRODUCER_REGS: 48, PRODUCER_WARPS: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {PRODUCER_REGS: 56, PRODUCER_WARPS: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {PRODUCER_REGS: 32, PRODUCER_WARPS: 8}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_compact:
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 160}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 168}
+    num_warps: 4
+    num_stages: 1
+
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 224}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 232}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_tile:
+  - META: {BLOCK_K: 64, BLOCK_D: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, BLOCK_D: 256}
+    num_warps: 4
+    num_stages: 1
+
 # Pure output kernels; mutation/state kernels keep a single original launch.
 glm_data_copy:
   - META: {BLOCK: 256}
@@ -1199,6 +1293,78 @@ mhc_rms_norm:
   - META: {}
     num_warps: 4
   - META: {}
+    num_warps: 8
+
+triton_ihc_post:
+  - META: {BLOCK_D: 128, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 128, TOKEN_MAJOR: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, TOKEN_MAJOR: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, TOKEN_MAJOR: true}
+    num_warps: 4
+    num_stages: 1
+
+# Shifted mHC post->pre.  One token per program; only the warp count moves.
+mhc_shifted_project:
+  # num_stages stays at 1 on purpose.  This kernel fuses the row sum of squares
+  # into the K loop; under FlagTree 0.7 a loop-carried reduction sharing a
+  # pipelined loop with tl.dot miscompiles at num_stages >= 2 (tens of percent
+  # off, varying run to run).  A plain dot without the reduction is exact at
+  # every num_stages, so only this fused kernel needs the restriction.
+  - META: {BLOCK_M: 16, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_M: 128, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_M: 128, BLOCK_K: 128, BLOCK_N: 64}
+    num_warps: 8
+    num_stages: 1
+mhc_shifted_coeff:
+  - META: {}
+    num_warps: 2
+  - META: {}
+    num_warps: 4
+  - META: {}
+    num_warps: 8
+# Collapse + stream mean.  BLOCK_H lives in META (not passed as a launch-only
+# constexpr) so FlagTree aabs can rewrite it and still persist the winner.
+mhc_shifted_collapse:
+  - META: {BLOCK_H: 512}
+    num_warps: 4
+  - META: {BLOCK_H: 1024}
+    num_warps: 4
+  - META: {BLOCK_H: 1024}
+    num_warps: 8
+  - META: {BLOCK_H: 2048}
+    num_warps: 8
+# Two-pass row RMSNorm.
+mhc_shifted_norm:
+  - META: {BLOCK_D: 512}
+    num_warps: 4
+  - META: {BLOCK_D: 1024}
+    num_warps: 4
+  - META: {BLOCK_D: 2048}
     num_warps: 8
 
 kda_safe_gate_cumsum:
@@ -1238,6 +1404,17 @@ concat_mla_q:
     num_warps: 4
     num_stages: 1
   - META: {BLOCK: 1024}
+    num_warps: 8
+    num_stages: 1
+
+triton_reshape_and_cache_flash:
+  - META: {TILE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 1024}
     num_warps: 8
     num_stages: 1
 
@@ -1359,6 +1536,14 @@ kda_kkt_inter:
     num_warps: 1
     num_stages: 1
 
+pad_indexer_heads:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
 kda_kkt_diag:
   - META: {}
     num_warps: 4
@@ -1369,6 +1554,21 @@ fused_recurrent_kda:
   - META:
       BV: 8
     num_warps: 1
+    num_stages: 1
+
+# Read-only inputs and a fully overwritten private output need no tune reset.
+fused_indexer_k_norm:
+  - META: {BLOCK_M: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 1}
+    num_warps: 8
     num_stages: 1
 
 chunk_kda_fwd_intra_token_parallel:
