@@ -27,7 +27,11 @@ import torch
 import flaggems_vllm
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout
 from flaggems_vllm.ops.mhc.mhc_post import mhc_post_ref as generic_mhc_post_ref
-from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import _mhc_post_ascend
+
+try:
+    from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import _mhc_post_ascend
+except ImportError:  # pragma: no cover - needs the Ascend Triton extensions
+    _mhc_post_ascend = None
 
 try:
     import torch_npu  # noqa: F401
