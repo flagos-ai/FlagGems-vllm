@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.cooperative_topk import (
+    cooperative_topk,
+)
 from flaggems_vllm.runtime.backend._iluvatar.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -36,6 +39,7 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
 )
 
 __all__ = [
+    "cooperative_topk",
     "fused_add_rms_norm",
     "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
