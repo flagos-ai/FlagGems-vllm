@@ -140,10 +140,10 @@ def _record_launches(module, names):
         yield launches
 
 
-def _decode_case(batch, real_heads):
+def _decode_case(batch, real_heads, physical_heads=16):
     torch.manual_seed(104)
-    q = (torch.randn(batch, 1, 16, 512, device="cuda") * 0.1).bfloat16()
-    if real_heads == 8:
+    q = (torch.randn(batch, 1, physical_heads, 512, device="cuda") * 0.1).bfloat16()
+    if real_heads == 8 and physical_heads == 16:
         q[:, :, 8:].fill_(37)  # Padding must not be used by the folded path.
     cache, decoded = _model1_cache()
     extra_cache, extra_decoded = _model1_cache(pages=1)
@@ -159,10 +159,14 @@ def _decode_case(batch, real_heads):
     )
     lengths = torch.full((batch,), 256, device="cuda", dtype=torch.int32)
     extra_lengths = torch.full((batch,), 64, device="cuda", dtype=torch.int32)
-    sink = torch.randn(16, device="cuda") * 0.1
+    sink = torch.randn(physical_heads, device="cuda") * 0.1
     workspace = tuple(
         torch.empty(shape, device="cuda")
-        for shape in ((64, 4, 16), (64, 4, 16), (64, 4, 16, 512))
+        for shape in (
+            (64, 4, physical_heads),
+            (64, 4, physical_heads),
+            (64, 4, physical_heads, 512),
+        )
     )
     meta = ops.FlashMLASchedMeta()
     result = torch.empty_like(q)
@@ -188,8 +192,8 @@ def _decode_case(batch, real_heads):
     return kwargs, decoded, extra_decoded
 
 
-def _check_split_decode(batch, real_heads):
-    kwargs, decoded, extra_decoded = _decode_case(batch, real_heads)
+def _check_split_decode(batch, real_heads, physical_heads=16):
+    kwargs, decoded, extra_decoded = _decode_case(batch, real_heads, physical_heads)
     q, result, sink = (kwargs[name] for name in ("q", "out", "attn_sink"))
     # Non-tile-aligned lengths and masked IDs exercise each split's tail.
     kwargs["topk_length"] -= torch.arange(batch, device="cuda", dtype=torch.int32) % 7
@@ -251,7 +255,7 @@ def _check_split_decode(batch, real_heads):
     )
     with _record_launches(module, names) as launches:
         call()
-        if batch > 64:
+        if batch > 64 and physical_heads != 8:
             assert launches == ["_sparse_decode_model1_kernel"]
         elif real_heads == 8:
             assert launches == [
@@ -278,10 +282,21 @@ def test_h16_split_decode_reference_workspace_and_replay(batch):
     _check_split_decode(batch, real_heads=16)
 
 
-@pytest.mark.parametrize("bad_workspace", ["missing", "shape", "dtype", "layout"])
+@pytest.mark.parametrize("batch", [1, 3, 64, 65])
 @pytest.mark.flash_mla_with_kvcache
-def test_h16_split_decode_rejects_workspace_before_output_write(bad_workspace):
-    kwargs, _, _ = _decode_case(1, real_heads=16)
+def test_native_h8_decode_reference_and_changed_input_graph(batch):
+    _check_split_decode(batch, real_heads=8, physical_heads=8)
+
+
+@pytest.mark.parametrize("bad_workspace", ["missing", "shape", "dtype", "layout"])
+@pytest.mark.parametrize("physical_heads", [8, 16])
+@pytest.mark.flash_mla_with_kvcache
+def test_split_decode_rejects_workspace_before_output_write(
+    bad_workspace, physical_heads
+):
+    kwargs, _, _ = _decode_case(
+        1, real_heads=physical_heads, physical_heads=physical_heads
+    )
     kwargs["out"].fill_(17)
     workspace = list(kwargs["split_workspace"])
     if bad_workspace == "missing":
@@ -292,7 +307,9 @@ def test_h16_split_decode_rejects_workspace_before_output_write(bad_workspace):
         elif bad_workspace == "dtype":
             workspace[0] = workspace[0].bfloat16()
         else:
-            workspace[0] = torch.empty((64, 4, 32), device="cuda")[..., ::2]
+            workspace[0] = torch.empty((64, 4, physical_heads * 2), device="cuda")[
+                ..., ::2
+            ]
         kwargs["split_workspace"] = tuple(workspace)
     with pytest.raises(ValueError, match="workspace"):
         ops.flash_mla_with_kvcache(**kwargs)
@@ -310,13 +327,15 @@ def test_h16_split_decode_rejects_workspace_before_output_write(bad_workspace):
         (17, 512, True, True),
     ],
 )
+@pytest.mark.parametrize("physical_heads,index_dim", [(16, 3), (8, 3), (8, 2)])
 @pytest.mark.flash_mla_sparse_fwd
 def test_h8_prefill_reference_and_changed_input_graph(
-    rows, head_dim, sink_on, all_masked
+    rows, head_dim, sink_on, all_masked, physical_heads, index_dim
 ):
     torch.manual_seed(104)
-    q = (torch.randn(rows, 16, head_dim, device="cuda") * 0.1).bfloat16()
-    q[:, 8:].fill_(37)
+    q = (torch.randn(rows, physical_heads, head_dim, device="cuda") * 0.1).bfloat16()
+    if physical_heads == 16:
+        q[:, 8:].fill_(37)
     kv = (torch.randn(128, 1, head_dim, device="cuda") * 0.1).bfloat16()
     ids = torch.arange(64, device="cuda", dtype=torch.int32).repeat(rows, 1)
     ids[:, 5], ids[:, 17] = -1, 9999
@@ -324,9 +343,9 @@ def test_h8_prefill_reference_and_changed_input_graph(
     if all_masked:
         ids.fill_(-1)
         lengths.zero_()
-    sink = torch.linspace(-0.3, 0.9, 16, device="cuda") if sink_on else None
-    output = torch.empty(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
-    maximum = torch.empty(rows, 16, device="cuda")
+    sink = torch.linspace(-0.3, 0.9, physical_heads, device="cuda") if sink_on else None
+    output = torch.empty(rows, physical_heads, 512, device="cuda", dtype=torch.bfloat16)
+    maximum = torch.empty(rows, physical_heads, device="cuda")
     lse = torch.empty_like(maximum)
     scale = head_dim**-0.5
 
@@ -334,7 +353,7 @@ def test_h8_prefill_reference_and_changed_input_graph(
         result = ops.flash_mla_sparse_fwd(
             q,
             kv,
-            ids[:, None],
+            ids[:, None] if index_dim == 3 else ids,
             scale,
             attn_sink=sink,
             topk_length=lengths,
@@ -370,7 +389,7 @@ def test_h8_prefill_reference_and_changed_input_graph(
     name = "triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag"
     with _record_launches(module, (name,)) as launches:
         call()
-        assert launches == ([name] if rows > 1 else [])
+        assert launches == ([name] if rows > 1 or physical_heads == 8 else [])
         check()
         check_replays(call, update, check, outputs=(output, maximum, lse))
 
@@ -429,3 +448,159 @@ def test_sparse_prefill_all_masked_rows_and_empty_batch_rejection():
             lse_out=lse[:0],
         )
     assert bool((output == 17).all())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "multi_query",
+        "no_lengths_or_sink",
+        "empty_splits",
+        "invalid_ids",
+        "int8_cache",
+        "fp8_cache",
+    ],
+)
+@pytest.mark.flash_mla_with_kvcache
+def test_native_h8_decode_general_routes_and_guard_buffers(case):
+    kwargs, decoded, _ = _decode_case(3, 8, physical_heads=8)
+    kwargs.update(
+        real_num_heads=None,
+        extra_k_cache=None,
+        extra_indices_in_kvcache=None,
+        extra_topk_length=None,
+    )
+    if case == "multi_query":
+        kwargs["q"] = kwargs["q"].repeat(1, 2, 1, 1)
+        kwargs["indices"] = kwargs["indices"].repeat(1, 2, 1)
+    elif case == "no_lengths_or_sink":
+        kwargs.update(topk_length=None, attn_sink=None)
+    elif case == "empty_splits":
+        # Includes splits with no keys, and a completely empty attention row.
+        kwargs["topk_length"][:] = torch.tensor([0, 1, 3], device="cuda")
+        extra, _ = _model1_cache(pages=1)
+        kwargs.update(
+            extra_k_cache=extra,
+            extra_indices_in_kvcache=kwargs["indices"][..., :64].contiguous(),
+            extra_topk_length=torch.zeros(3, device="cuda", dtype=torch.int32),
+        )
+    elif case == "invalid_ids":
+        kwargs["indices"].fill_(-1)
+    if case in ("int8_cache", "fp8_cache"):
+        kwargs["k_cache"] = kwargs["k_cache"].view(
+            torch.int8 if case == "int8_cache" else torch.float8_e4m3fn
+        )
+    q = kwargs["q"]
+    # Prefix/suffix canaries catch writing virtual heads into physical H8 buffers.
+    guards = []
+
+    def guarded(shape, dtype):
+        size = 1
+        for n in shape:
+            size *= n
+        backing = torch.full((size + 64,), 17, device="cuda", dtype=dtype)
+        guards.append(backing)
+        return backing[32:-32].view(shape)
+
+    kwargs["out"] = guarded(q.shape, q.dtype)
+    kwargs["split_workspace"] = tuple(
+        guarded(x.shape, x.dtype) for x in kwargs["split_workspace"]
+    )
+    observed = []
+
+    def call():
+        result, lse = ops.flash_mla_with_kvcache(**kwargs)
+        observed[:] = [result, lse]
+
+    def check():
+        batch, sq = q.shape[:2]
+        lens = kwargs["topk_length"]
+        lens = [512] * batch if lens is None else lens.cpu().tolist()
+        for i in range(sq):
+            expected, expected_lse, _ = _cpu_sparse_attention(
+                q[:, i],
+                decoded,
+                kwargs["indices"][:, i],
+                lens,
+                512**-0.5,
+                kwargs["attn_sink"],
+            )
+            torch.testing.assert_close(
+                observed[0][:, i].cpu(), expected, atol=2e-3, rtol=2e-2
+            )
+            torch.testing.assert_close(
+                observed[1][:, :, i].cpu(), expected_lse, atol=2e-4, rtol=2e-4
+            )
+        for backing in guards:
+            assert bool((backing[:32] == 17).all())
+            assert bool((backing[-32:] == 17).all())
+
+    call()
+    check()
+    check_replays(call, lambda value: q.fill_(value), check, outputs=lambda: observed)
+
+
+@pytest.mark.parametrize("caller_outputs", [False, True])
+@pytest.mark.flash_mla_sparse_fwd
+def test_native_h8_prefill_optional_outputs_and_guard_buffers(caller_outputs):
+    q = torch.randn(3, 8, 576, device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn(128, 1, 576, device="cuda", dtype=torch.bfloat16) * 0.1
+    ids = torch.arange(64, device="cuda", dtype=torch.int32).repeat(3, 1)
+    # A fully masked chunk before valid chunks must not poison online softmax.
+    ids[:, :16] = -1
+    guards, kwargs = [], {}
+    if caller_outputs:
+        for name, shape, dtype in (
+            ("out", (3, 8, 512), torch.bfloat16),
+            ("max_logits_out", (3, 8), torch.float32),
+            ("lse_out", (3, 8), torch.float32),
+        ):
+            size = 1
+            for dim in shape:
+                size *= dim
+            backing = torch.full((size + 64,), 17, device="cuda", dtype=dtype)
+            guards.append(backing)
+            kwargs[name] = backing[32:-32].view(shape)
+    observed = []
+
+    def call():
+        observed[:] = ops.flash_mla_sparse_fwd(q, kv, ids[:, None], 576**-0.5, **kwargs)
+
+    def check():
+        expected, expected_lse, expected_max = _cpu_sparse_attention(
+            q, kv[:, 0], ids, [64] * 3, 576**-0.5, None
+        )
+        for actual, reference in zip(observed, (expected, expected_max, expected_lse)):
+            torch.testing.assert_close(actual.cpu(), reference, atol=2e-3, rtol=2e-2)
+        for backing in guards:
+            assert bool((backing[:32] == 17).all())
+            assert bool((backing[-32:] == 17).all())
+
+    call()
+    check()
+    check_replays(call, lambda value: q.fill_(value), check, outputs=lambda: observed)
+
+
+@pytest.mark.parametrize(
+    "bad_input", ["real_heads", "q_stride", "sink_stride", "empty_batch", "empty_query"]
+)
+@pytest.mark.flash_mla_with_kvcache
+def test_native_h8_decode_rejects_unsupported_inputs_before_state_write(bad_input):
+    kwargs, _, _ = _decode_case(1, 8, physical_heads=8)
+    kwargs["out"].fill_(17)
+    if bad_input == "real_heads":
+        kwargs["real_num_heads"] = 16
+    elif bad_input == "q_stride":
+        kwargs["q"] = torch.empty(1, 1, 8, 1024, device="cuda", dtype=torch.bfloat16)[
+            ..., ::2
+        ]
+    elif bad_input == "sink_stride":
+        kwargs["attn_sink"] = torch.empty(16, device="cuda")[::2]
+    elif bad_input == "empty_batch":
+        kwargs["q"] = kwargs["q"][:0]
+    else:
+        kwargs["q"] = kwargs["q"][:, :0]
+    with pytest.raises(ValueError, match="physical H8"):
+        ops.flash_mla_with_kvcache(**kwargs)
+    assert not kwargs["tile_scheduler_metadata"].have_initialized
+    assert bool((kwargs["out"] == 17).all())

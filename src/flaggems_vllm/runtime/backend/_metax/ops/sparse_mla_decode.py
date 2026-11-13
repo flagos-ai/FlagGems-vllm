@@ -358,7 +358,16 @@ def _partial_model1_kernel_halfd_qkfold_blockdiag(
     SPLITS: tl.constexpr,
     BKc: tl.constexpr,
     BHc: tl.constexpr,
+    TOPK: tl.constexpr = 0,
+    EXTRA_TOPK: tl.constexpr = 0,
+    HAVE_TOPK_LENGTH: tl.constexpr = True,
+    HAVE_EXTRA: tl.constexpr = True,
+    HAVE_EXTRA_TOPK_LENGTH: tl.constexpr = True,
 ):
+    # The upper eight virtual rows compute V[256:512] of real heads 0..7.
+    # They never address extra heads in Q, statistics or split workspace.
+    tl.static_assert(HQc == 8 or HQc == 16)
+    tl.static_assert(BHc == 16)
     num_head_blocks: tl.constexpr = (HQc + BHc - 1) // BHc
     pid = tl.program_id(0)
     i_split = pid % SPLITS
@@ -368,6 +377,8 @@ def _partial_model1_kernel_halfd_qkfold_blockdiag(
     i_sq = (rem // num_head_blocks).to(tl.int64)
     i_gbh = rem % num_head_blocks
     gbh_base = i_gbh * BHc
+    kv = kv.to(tl.pointer_type(tl.uint8))
+    extra_kv = extra_kv.to(tl.pointer_type(tl.uint8))
     NOPE: tl.constexpr = 448
     ROPE: tl.constexpr = 64
     BDP: tl.constexpr = 256
@@ -397,7 +408,7 @@ def _partial_model1_kernel_halfd_qkfold_blockdiag(
     sum_exp = tl.full([BHc], 0.0, dtype=tl.float32)
     acc = tl.zeros([BHc, BDP], dtype=tl.float32)
 
-    topk_len = tl.load(topk_length + i_b)
+    topk_len = tl.load(topk_length + i_b) if HAVE_TOPK_LENGTH else TOPK
     start = (topk_len * i_split) // SPLITS
     end = (topk_len * (i_split + 1)) // SPLITS
     seg_len = end - start
@@ -487,9 +498,10 @@ def _partial_model1_kernel_halfd_qkfold_blockdiag(
         qk *= sm_scale
         qk = tl.where(valid_ids[None, :], qk, float("-inf"))
         new_max = tl.maximum(max_log, tl.max(qk, axis=1))
-        exp_qk = tl.math.exp(qk - new_max[:, None])
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        exp_qk = tl.math.exp(qk - safe_max[:, None])
         sum_qk = tl.sum(exp_qk, axis=1)
-        alpha = tl.math.exp(max_log - new_max)
+        alpha = tl.math.exp(max_log - safe_max)
         sum_exp = sum_exp * alpha + sum_qk
         prob = exp_qk.to(tl.bfloat16)
         zero_prob = tl.zeros([BHc, BKc], dtype=tl.bfloat16)
@@ -502,117 +514,121 @@ def _partial_model1_kernel_halfd_qkfold_blockdiag(
         )
         max_log = new_max
 
-    extra_len = tl.load(extra_topk_length + i_b)
-    estart = (extra_len * i_split) // SPLITS
-    eend = (extra_len * (i_split + 1)) // SPLITS
-    eseg = eend - estart
-    ENK = tl.cdiv(eseg, BKc)
-    for ck in range(ENK):
-        t_offs = estart + BKc * ck + offs_t
-        t_msk = t_offs < eend
-        kv_ids = tl.load(et_base + t_offs, t_msk, other=-1)
-        block_ids = kv_ids // EXTRA_PAGE_SIZE
-        rel_ids = kv_ids - block_ids * EXTRA_PAGE_SIZE
-        valid_ids = t_msk & (kv_ids >= 0) & (block_ids < EXTRA_NUM_BLOCKS)
-        block_ids = tl.where(valid_ids, block_ids, 0)
-        rel_ids = tl.where(valid_ids, rel_ids, 0)
-        token_base = (
-            extra_kv
-            + block_ids.to(tl.int64) * stride_extra_kv_block
-            + rel_ids * TOKEN_DATA_BYTES
+    if HAVE_EXTRA:
+        extra_len = (
+            tl.load(extra_topk_length + i_b) if HAVE_EXTRA_TOPK_LENGTH else EXTRA_TOPK
         )
-        scale_base = (
-            extra_kv
-            + block_ids.to(tl.int64) * stride_extra_kv_block
-            + EXTRA_PAGE_SIZE * TOKEN_DATA_BYTES
-            + rel_ids * SCALE_BYTES
-        )
-        kv_fp8_0_u8 = tl.load(
-            token_base[None, :] + offs_d[:, None],
-            mask=valid_ids[None, :],
-            other=0,
-            cache_modifier=".cg",
-        )
-        kv_fp8_1_u8 = tl.load(
-            token_base[None, :] + (BDP + offs_d[:, None]),
-            mask=valid_ids[None, :] & (offs_d[:, None] < (NOPE - BDP)),
-            other=0,
-            cache_modifier=".cg",
-        )
-        scale0_u8 = tl.load(scale_base + 0, mask=valid_ids, other=127)
-        scale1_u8 = tl.load(scale_base + 1, mask=valid_ids, other=127)
-        scale2_u8 = tl.load(scale_base + 2, mask=valid_ids, other=127)
-        scale3_u8 = tl.load(scale_base + 3, mask=valid_ids, other=127)
-        scale4_u8 = tl.load(scale_base + 4, mask=valid_ids, other=127)
-        scale5_u8 = tl.load(scale_base + 5, mask=valid_ids, other=127)
-        scale6_u8 = tl.load(scale_base + 6, mask=valid_ids, other=127)
-        scale0 = (scale0_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale1 = (scale1_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale2 = (scale2_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale3 = (scale3_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale4 = (scale4_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale5 = (scale5_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale6 = (scale6_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        kv_fp8_0 = kv_fp8_0_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        scale_0 = tl.where(
-            offs_d[:, None] < 64,
-            scale0[None, :],
-            tl.where(
-                offs_d[:, None] < 128,
-                scale1[None, :],
-                tl.where(offs_d[:, None] < 192, scale2[None, :], scale3[None, :]),
-            ),
-        )
-        kv_blk0 = (kv_fp8_0 * scale_0).to(tl.bfloat16)
-        kv_fp8_1 = kv_fp8_1_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        scale_1 = tl.where(
-            offs_d[:, None] < 64,
-            scale4[None, :],
-            tl.where(offs_d[:, None] < 128, scale5[None, :], scale6[None, :]),
-        )
-        nope_tail = (kv_fp8_1 * scale_1).to(tl.bfloat16)
-        rope_ptr = (token_base + NOPE).to(tl.pointer_type(tl.bfloat16))
-        rope_blk = tl.load(
-            rope_ptr[None, :] + offs_rope[:, None],
-            mask=valid_ids[None, :],
-            other=0.0,
-            cache_modifier=".cg",
-        )
-        kv_blk1 = tl.where(
-            offs_d[:, None] < (NOPE - BDP),
-            nope_tail,
-            tl.load(
-                rope_ptr[None, :] + (offs_d[:, None] - (NOPE - BDP)),
-                mask=valid_ids[None, :] & (offs_d[:, None] >= (NOPE - BDP)),
+        estart = (extra_len * i_split) // SPLITS
+        eend = (extra_len * (i_split + 1)) // SPLITS
+        eseg = eend - estart
+        ENK = tl.cdiv(eseg, BKc)
+        for ck in range(ENK):
+            t_offs = estart + BKc * ck + offs_t
+            t_msk = t_offs < eend
+            kv_ids = tl.load(et_base + t_offs, t_msk, other=-1)
+            block_ids = kv_ids // EXTRA_PAGE_SIZE
+            rel_ids = kv_ids - block_ids * EXTRA_PAGE_SIZE
+            valid_ids = t_msk & (kv_ids >= 0) & (block_ids < EXTRA_NUM_BLOCKS)
+            block_ids = tl.where(valid_ids, block_ids, 0)
+            rel_ids = tl.where(valid_ids, rel_ids, 0)
+            token_base = (
+                extra_kv
+                + block_ids.to(tl.int64) * stride_extra_kv_block
+                + rel_ids * TOKEN_DATA_BYTES
+            )
+            scale_base = (
+                extra_kv
+                + block_ids.to(tl.int64) * stride_extra_kv_block
+                + EXTRA_PAGE_SIZE * TOKEN_DATA_BYTES
+                + rel_ids * SCALE_BYTES
+            )
+            kv_fp8_0_u8 = tl.load(
+                token_base[None, :] + offs_d[:, None],
+                mask=valid_ids[None, :],
+                other=0,
+                cache_modifier=".cg",
+            )
+            kv_fp8_1_u8 = tl.load(
+                token_base[None, :] + (BDP + offs_d[:, None]),
+                mask=valid_ids[None, :] & (offs_d[:, None] < (NOPE - BDP)),
+                other=0,
+                cache_modifier=".cg",
+            )
+            scale0_u8 = tl.load(scale_base + 0, mask=valid_ids, other=127)
+            scale1_u8 = tl.load(scale_base + 1, mask=valid_ids, other=127)
+            scale2_u8 = tl.load(scale_base + 2, mask=valid_ids, other=127)
+            scale3_u8 = tl.load(scale_base + 3, mask=valid_ids, other=127)
+            scale4_u8 = tl.load(scale_base + 4, mask=valid_ids, other=127)
+            scale5_u8 = tl.load(scale_base + 5, mask=valid_ids, other=127)
+            scale6_u8 = tl.load(scale_base + 6, mask=valid_ids, other=127)
+            scale0 = (scale0_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            scale1 = (scale1_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            scale2 = (scale2_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            scale3 = (scale3_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            scale4 = (scale4_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            scale5 = (scale5_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            scale6 = (scale6_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            kv_fp8_0 = kv_fp8_0_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            scale_0 = tl.where(
+                offs_d[:, None] < 64,
+                scale0[None, :],
+                tl.where(
+                    offs_d[:, None] < 128,
+                    scale1[None, :],
+                    tl.where(offs_d[:, None] < 192, scale2[None, :], scale3[None, :]),
+                ),
+            )
+            kv_blk0 = (kv_fp8_0 * scale_0).to(tl.bfloat16)
+            kv_fp8_1 = kv_fp8_1_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            scale_1 = tl.where(
+                offs_d[:, None] < 64,
+                scale4[None, :],
+                tl.where(offs_d[:, None] < 128, scale5[None, :], scale6[None, :]),
+            )
+            nope_tail = (kv_fp8_1 * scale_1).to(tl.bfloat16)
+            rope_ptr = (token_base + NOPE).to(tl.pointer_type(tl.bfloat16))
+            rope_blk = tl.load(
+                rope_ptr[None, :] + offs_rope[:, None],
+                mask=valid_ids[None, :],
                 other=0.0,
                 cache_modifier=".cg",
-            ),
-        )
-        qk = tl.dot(q_blk0, kv_blk0, out_dtype=tl.float32)
-        qk = tl.dot(q_blk1_nope, nope_tail, qk, out_dtype=tl.float32)
-        qk = tl.dot(q_rope, rope_blk, qk, out_dtype=tl.float32)
-        qk *= sm_scale
-        qk = tl.where(valid_ids[None, :], qk, float("-inf"))
-        new_max = tl.maximum(max_log, tl.max(qk, axis=1))
-        exp_qk = tl.math.exp(qk - new_max[:, None])
-        sum_qk = tl.sum(exp_qk, axis=1)
-        alpha = tl.math.exp(max_log - new_max)
-        sum_exp = sum_exp * alpha + sum_qk
-        prob = exp_qk.to(tl.bfloat16)
-        zero_prob = tl.zeros([BHc, BKc], dtype=tl.bfloat16)
-        prob_lo = tl.where(offs_h[:, None] < 8, prob, zero_prob)
-        prob_hi = tl.where(offs_h[:, None] >= 8, prob, zero_prob)
-        prob_pair = tl.reshape(tl.join(prob_lo, prob_hi), [BHc, BKc * 2])
-        kv_pair = tl.reshape(tl.join(kv_blk0, kv_blk1), [BDP, BKc * 2])
-        acc = tl.dot(
-            prob_pair, kv_pair.trans(), acc * alpha[:, None], out_dtype=tl.float32
-        )
-        max_log = new_max
+            )
+            kv_blk1 = tl.where(
+                offs_d[:, None] < (NOPE - BDP),
+                nope_tail,
+                tl.load(
+                    rope_ptr[None, :] + (offs_d[:, None] - (NOPE - BDP)),
+                    mask=valid_ids[None, :] & (offs_d[:, None] >= (NOPE - BDP)),
+                    other=0.0,
+                    cache_modifier=".cg",
+                ),
+            )
+            qk = tl.dot(q_blk0, kv_blk0, out_dtype=tl.float32)
+            qk = tl.dot(q_blk1_nope, nope_tail, qk, out_dtype=tl.float32)
+            qk = tl.dot(q_rope, rope_blk, qk, out_dtype=tl.float32)
+            qk *= sm_scale
+            qk = tl.where(valid_ids[None, :], qk, float("-inf"))
+            new_max = tl.maximum(max_log, tl.max(qk, axis=1))
+            safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+            exp_qk = tl.math.exp(qk - safe_max[:, None])
+            sum_qk = tl.sum(exp_qk, axis=1)
+            alpha = tl.math.exp(max_log - safe_max)
+            sum_exp = sum_exp * alpha + sum_qk
+            prob = exp_qk.to(tl.bfloat16)
+            zero_prob = tl.zeros([BHc, BKc], dtype=tl.bfloat16)
+            prob_lo = tl.where(offs_h[:, None] < 8, prob, zero_prob)
+            prob_hi = tl.where(offs_h[:, None] >= 8, prob, zero_prob)
+            prob_pair = tl.reshape(tl.join(prob_lo, prob_hi), [BHc, BKc * 2])
+            kv_pair = tl.reshape(tl.join(kv_blk0, kv_blk1), [BDP, BKc * 2])
+            acc = tl.dot(
+                prob_pair, kv_pair.trans(), acc * alpha[:, None], out_dtype=tl.float32
+            )
+            max_log = new_max
 
-    base = (i_b * SPLITS + i_split) * HQc + gbh_base
-    tl.store(part_max + base + offs_h, max_log)
-    tl.store(part_sum + base + offs_h, sum_exp)
-    acc_base = ((i_b * SPLITS + i_split) * HQc + gbh_base) * 512
+    base = ((i_b * SQ + i_sq) * SPLITS + i_split) * HQc + gbh_base
+    tl.store(part_max + base + offs_h, max_log, offs_h < HQc)
+    tl.store(part_sum + base + offs_h, sum_exp, offs_h < HQc)
+    acc_base = (((i_b * SQ + i_sq) * SPLITS + i_split) * HQc + gbh_base) * 512
     v_half = (offs_h >= 8).to(tl.int64) * BDP
     tl.store(
         part_acc + acc_base + real_h[:, None] * 512 + v_half[:, None] + offs_d[None, :],
@@ -638,38 +654,44 @@ def _reduce_split_kernel(
     SPLITS: tl.constexpr,
     HAVE_ATTN_SINK: tl.constexpr,
     D_BLOCK: tl.constexpr,
+    SQ: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     dblock = tl.program_id(1)
     h = pid % HQc
-    b = pid // HQc
+    row = pid // HQc
+    b = row // SQ
+    sq = row % SQ
     offs_d = tl.arange(0, D_BLOCK)
     d0 = dblock * D_BLOCK + offs_d
     m = tl.full((), float("-inf"), dtype=tl.float32)
     for s in range(SPLITS):
-        v = tl.load(part_max + (b * SPLITS + s) * HQc + h)
+        v = tl.load(part_max + (row * SPLITS + s) * HQc + h)
         m = tl.maximum(m, v)
     gsum = tl.full((), 0.0, dtype=tl.float32)
     acc = tl.zeros([D_BLOCK], dtype=tl.float32)
     for s in range(SPLITS):
-        pm = tl.load(part_max + (b * SPLITS + s) * HQc + h)
-        ps = tl.load(part_sum + (b * SPLITS + s) * HQc + h)
-        w = tl.math.exp(pm - m)
+        pm = tl.load(part_max + (row * SPLITS + s) * HQc + h)
+        ps = tl.load(part_sum + (row * SPLITS + s) * HQc + h)
+        w = tl.math.exp(pm - tl.where(m == -float("inf"), 0.0, m))
         gsum += ps * w
-        pa = tl.load(part_acc + (((b * SPLITS + s) * HQc + h) * 512) + d0)
+        pa = tl.load(part_acc + (((row * SPLITS + s) * HQc + h) * 512) + d0)
         acc += pa * w
     orig_lse = m + tl.math.log(gsum)
     if HAVE_ATTN_SINK:
         sink = tl.load(attn_sink + h)
-        factor = tl.math.exp(m) / (tl.math.exp(orig_lse) + tl.math.exp(sink))
+        factor = (1.0 / (1.0 + tl.math.exp(sink - orig_lse))) / gsum
     else:
         factor = 1.0 / gsum
-    vals = acc * factor
+    vals = tl.where(m != -float("inf"), acc * factor, 0.0)
     tl.store(
-        out + b * stride_ob + 0 * stride_osq + h * stride_oh + d0, vals.to(tl.bfloat16)
+        out + b * stride_ob + sq * stride_osq + h * stride_oh + d0, vals.to(tl.bfloat16)
     )
     if dblock == 0:
-        tl.store(lse + b * stride_lseb + h * stride_lseh + 0, orig_lse)
+        tl.store(
+            lse + b * stride_lseb + h * stride_lseh + sq,
+            tl.where(m != -float("inf"), orig_lse, float("inf")),
+        )
 
 
 def flash_mla_with_kvcache(
@@ -696,6 +718,8 @@ def flash_mla_with_kvcache(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     MODEL1 sparse decode with caller-owned output and optional split workspace.
+    Physical H8 is accepted directly (real_num_heads=None or 8). Its sink must
+    be contiguous, and split workspace uses H=8 instead of padded H=16.
     Dense and V32 paths delegate the existing upstream public operator.
 
     Returns:
@@ -736,6 +760,27 @@ def flash_mla_with_kvcache(
             extra_topk_length,
             out,
         )
+
+    if q.shape[2] == 8:
+        if q.shape[0] <= 0 or q.shape[1] <= 0:
+            raise ValueError("physical H8 requires nonempty batch and query sequence")
+        if attn_sink is not None and not attn_sink.is_contiguous():
+            raise ValueError("physical H8 requires contiguous attn_sink")
+        if real_num_heads not in (None, 8):
+            raise ValueError("physical H8 requires real_num_heads=None or 8")
+        if q.stride(-1) != 1:
+            raise ValueError("physical H8 requires q.stride(-1) == 1")
+        for tensor in (
+            k_cache,
+            indices,
+            attn_sink,
+            topk_length,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+        ):
+            if tensor is not None and tensor.device != q.device:
+                raise ValueError("physical H8 inputs must share q.device")
 
     topk = indices.shape[-1] if indices is not None else None
     extra_k_page_block_size = (
@@ -857,8 +902,8 @@ def flash_mla_with_kvcache(
         )
     if not (head_dim_v == 512):
         raise ValueError("Only head_size_v == 512 is supported")
-    if not (num_heads_q in (16, 64, 128)):
-        raise ValueError("Only h_q == 16, 64 or 128 is supported")
+    if not (num_heads_q in (8, 16, 64, 128)):
+        raise ValueError("Only h_q == 8, 16, 64 or 128 is supported")
     if not (head_dim_k in (512, 576)):
         raise ValueError(
             "Only head_size_k == 512 or 576 is supported for sparse decoding"
@@ -1042,7 +1087,7 @@ def _try_sparse_decode_model1_split(
         return False
     if head_dim_k != 512 or head_dim_v != 512:
         return False
-    if seq_q != 1 or num_heads_q != 16:
+    if seq_q != 1 or num_heads_q not in (8, 16):
         return False
     if topk_length is None or extra_topk_length is None:
         return False
@@ -1081,9 +1126,11 @@ def _try_sparse_decode_model1_split(
     pa = part_acc[:batch_size]
     num_head_blocks = (num_heads_q + bh - 1) // bh
     qkfold = (
-        _tuning.DEFAULT_POLICY.decode_qkfold
-        and real_num_heads == 8
-        and num_heads_q == 16
+        (
+            num_heads_q == 8
+            or (_tuning.DEFAULT_POLICY.decode_qkfold and real_num_heads == 8)
+        )
+        and num_heads_q in (8, 16)
         and bh == 16
         and head_dim_k == 512
         and head_dim_v == 512
@@ -1238,6 +1285,23 @@ def _sparse_decode_dispatch(
         split_workspace=split_workspace,
     ):
         return
+    if num_heads_q == 8:
+        # Native H8 remains valid outside split fast-path conditions (large B,
+        # SQ>1, absent sink/lengths/extra cache, or disabled split policy).
+        _sparse_decode_h8(
+            q,
+            kv,
+            indices,
+            out,
+            lse,
+            attn_sink,
+            topk_length,
+            extra_kv,
+            extra_indices,
+            extra_topk_length,
+            softmax_scale,
+        )
+        return
     _sparse_decode_model1_kernel[grid](
         q,
         kv,
@@ -1283,3 +1347,74 @@ def _sparse_decode_dispatch(
         extra_topk_length is not None,
     )
     return
+
+
+def _sparse_decode_h8(
+    q, kv, ids, out, lse, sink, lengths, extra, extra_ids, extra_lengths, scale
+):
+    """General H8 route; scratch has eight heads and never contains padded Q."""
+    batch, sq = q.shape[:2]
+    rows = batch * sq
+    pm = torch.empty((rows, 1, 8), device=q.device, dtype=torch.float32)
+    ps = torch.empty_like(pm)
+    pa = torch.empty((rows, 1, 8, 512), device=q.device, dtype=torch.float32)
+    have_extra = extra is not None
+    _partial_model1_kernel_halfd_qkfold_blockdiag[(rows,)](
+        q,
+        kv,
+        ids,
+        extra if have_extra else kv,
+        extra_ids if have_extra else ids,
+        lengths,
+        extra_lengths,
+        scale,
+        pm,
+        ps,
+        pa,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv.stride(0),
+        ids.stride(0),
+        ids.stride(1),
+        extra.stride(0) if have_extra else kv.stride(0),
+        extra_ids.stride(0) if have_extra else ids.stride(0),
+        extra_ids.stride(1) if have_extra else ids.stride(1),
+        sq,
+        8,
+        kv.shape[1],
+        extra.shape[1] if have_extra else 1,
+        kv.shape[0],
+        extra.shape[0] if have_extra else 0,
+        1,
+        16,
+        16,
+        TOPK=ids.shape[-1],
+        EXTRA_TOPK=extra_ids.shape[-1] if have_extra else 0,
+        HAVE_TOPK_LENGTH=lengths is not None,
+        HAVE_EXTRA=have_extra,
+        HAVE_EXTRA_TOPK_LENGTH=extra_lengths is not None,
+        num_warps=4,
+        num_stages=1,
+    )
+    _reduce_split_kernel[(rows * 8, 2)](
+        pm,
+        ps,
+        pa,
+        sink,
+        out,
+        lse,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        batch,
+        8,
+        1,
+        sink is not None,
+        256,
+        SQ=sq,
+        num_warps=4,
+        num_stages=1,
+    )

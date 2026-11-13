@@ -370,6 +370,10 @@ def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
     BK: tl.constexpr,
     BH: tl.constexpr,
 ):
+    # Physical H8 needs no padded Q/output. Virtual rows 8..15 carry the
+    # second V half for the same eight heads; all external buffers remain H8.
+    tl.static_assert(HQ == 8 or HQ == 16)
+    tl.static_assert(BH == 16)
     num_head_blocks: tl.constexpr = (HQ + BH - 1) // BH
     pid = tl.program_id(0)
     i_sq = pid // num_head_blocks
@@ -406,7 +410,11 @@ def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
     max_log = tl.full([BH], float("-inf"), dtype=tl.float32)
     sum_exp = tl.full([BH], 0.0, dtype=tl.float32)
     acc = tl.zeros([BH, BDP], dtype=tl.float32)
-    topk_len = tl.load(topk_length_ptr) if HAVE_TOPK_LENGTH else TOPK
+    topk_len = (
+        tl.minimum(tl.maximum(tl.load(topk_length_ptr), 0), TOPK)
+        if HAVE_TOPK_LENGTH
+        else TOPK
+    )
     NK = tl.cdiv(topk_len, BK)
     for ck in range(NK):
         t_idx = BK * ck + offs_t
@@ -427,9 +435,10 @@ def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
         qk *= sm_scale
         qk = tl.where(mask_ids[None, :], qk, float("-inf"))
         new_max = tl.maximum(max_log, tl.max(qk, axis=1))
-        exp_qk = tl.math.exp(qk - new_max[:, None])
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        exp_qk = tl.math.exp(qk - safe_max[:, None])
         sum_qk = tl.sum(exp_qk, axis=1)
-        alpha = tl.math.exp(max_log - new_max)
+        alpha = tl.math.exp(max_log - safe_max)
         sum_exp = sum_exp * alpha + sum_qk
 
         prob = exp_qk.to(tl.bfloat16)
@@ -448,16 +457,15 @@ def triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag(
 
     valid_mask = max_log != float("-inf")
     max_log = tl.where(valid_mask, max_log, float("-inf"))
-    tl.store(max_log_base + offs_h, max_log)
+    tl.store(max_log_base + offs_h, max_log, offs_h < HQ)
     orig_lse = max_log + tl.math.log(sum_exp)
     lse_out = tl.where(valid_mask, orig_lse, float("inf"))
-    tl.store(l_base + offs_h, lse_out)
+    tl.store(l_base + offs_h, lse_out, offs_h < HQ)
     if HAVE_ATTN_SINK:
         # High virtual rows carry V[256:512] for the same real head and must
         # use the same sink normalization as rows 0..7.
         sink = tl.load(attn_sink_ptr + real_h)
-        sum_exp_new_lse = tl.math.exp(orig_lse) + tl.math.exp(sink)
-        factor = tl.math.exp(max_log) / sum_exp_new_lse
+        factor = (1.0 / (1.0 + tl.math.exp(sink - orig_lse))) / sum_exp
     else:
         factor = 1.0 / sum_exp
     out_vals = tl.where(valid_mask[:, None], acc * factor[:, None], 0.0)
@@ -587,7 +595,15 @@ def flash_mla_sparse_fwd(
             raise ValueError("topk_length error shape")
     if not (HKV == 1):
         raise ValueError("h_kv is expected to be 1")
-    if not (HQ == 16 or HQ == 64 or HQ == 128):
+    if HQ == 8:
+        if SQ <= 0 or SKV <= 0 or TOPK <= 0:
+            raise ValueError("physical H8 requires nonempty q, kv and indices")
+        for tensor in (kv, indices, attn_sink, topk_length):
+            if tensor is not None and tensor.device != q.device:
+                raise ValueError("physical H8 inputs must share q.device")
+    if HQ == 8 and real_num_heads not in (None, 8):
+        raise ValueError("physical H8 requires real_num_heads=None or 8")
+    if not (HQ in (8, 16, 64, 128)):
         raise ValueError("Unsupported h_q")
     if not (DQK == 576 or DQK == 512):
         raise ValueError("Unsupported d_qk")
@@ -634,6 +650,22 @@ def flash_mla_sparse_fwd(
         if not (lse_out.shape == (SQ, HQ)):
             raise ValueError("lse_out error shape")
         lse = lse_out
+
+    if HQ == 8:
+        for tensor in (output, max_logits, lse):
+            if not tensor.is_contiguous():
+                raise ValueError("physical H8 requires contiguous output buffers")
+        return _sparse_prefill_h8(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            attn_sink,
+            topk_length,
+            output,
+            max_logits,
+            lse,
+        )
 
     def triton_grid(META):
         return (triton.cdiv(HQ, META["BH"]) * SQ,)
@@ -816,15 +848,19 @@ def _validate_local_prefill(
 ):
     """Validate the explicit MetaX 2-D-index, caller-owned-output extension.
 
-    This is the full physical 16-head local computation, not a padded-head
-    shortcut. Inputs and outputs must be non-overlapping buffers. Lifetimes and
+    Physical H8 and full H16 are supported without input padding.
+    Inputs and outputs must be non-overlapping buffers. Lifetimes and
     stream ordering remain the caller's responsibility, including graph replay.
     No tensor contents are read and no buffers are allocated or written here.
     """
-    if q.ndim != 3 or q.shape[1] != 16 or q.shape[2] not in (512, 576):
-        raise ValueError("local prefill requires q shape [rows, 16, 512 or 576]")
+    if q.ndim != 3 or q.shape[1] not in (8, 16) or q.shape[2] not in (512, 576):
+        raise ValueError("local prefill requires q shape [rows, 8 or 16, 512 or 576]")
     rows, heads, head_dim = q.shape
-    if rows <= 0 or d_v != 512 or real_num_heads is not None:
+    if (
+        rows <= 0
+        or d_v != 512
+        or real_num_heads not in ((None, 8) if heads == 8 else (None,))
+    ):
         raise ValueError("local prefill requires nonempty rows, d_v=512 and full heads")
     if kv.ndim != 3 or kv.shape[0] <= 0 or kv.shape[1:] != (1, head_dim):
         raise ValueError("local prefill requires nonempty kv shape [keys, 1, head_dim]")
@@ -862,6 +898,18 @@ def _sparse_prefill_local(
     logger.debug("GEMS_METAX SPARSE_PREFILL_LOCAL")
     (SQ, HQ, DQK) = q.shape
     (SKV, TOPK) = (kv.shape[0], indices.shape[-1])
+    if HQ == 8:
+        return _sparse_prefill_h8(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            attn_sink,
+            topk_length,
+            out,
+            max_logits,
+            lse,
+        )
     grid = (SQ,)
     if (
         _tuning.DEFAULT_POLICY.prefill_staged
@@ -923,3 +971,45 @@ def _sparse_prefill_local(
                 num_stages=1,
             )
     return (out, max_logits, lse)
+
+
+def _sparse_prefill_h8(q, kv, indices, scale, sink, lengths, out, maximum, lse):
+    """H8 physical layout with two useful V halves in the 16-row MMA tile.
+
+    No pad/copy kernel or H16 intermediate is needed. MetaX's current compiler
+    cannot lower an eight-row tl.dot; the existing folded tile avoids that
+    compiler limitation while reading/writing only the eight real heads.
+    """
+    triton_flash_mla_sparse_fwd_halfd_qkfold_blockdiag[(q.shape[0],)](
+        q,
+        kv,
+        indices,
+        sink,
+        lengths,
+        scale,
+        out,
+        maximum,
+        lse,
+        q.stride(1),
+        q.stride(0),
+        kv.stride(1),
+        kv.stride(0),
+        indices.stride(1),
+        indices.stride(0),
+        out.stride(1),
+        out.stride(0),
+        maximum.stride(0),
+        lse.stride(0),
+        q.shape[0],
+        8,
+        q.shape[2],
+        kv.shape[0],
+        indices.shape[-1],
+        sink is not None,
+        lengths is not None,
+        BK=16,
+        BH=16,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out, maximum, lse

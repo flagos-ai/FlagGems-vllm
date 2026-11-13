@@ -93,7 +93,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "benchmark/test_sparse_mla_metax.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/sparse_mla_prefill.py": [
-        "tests/test_sparse_mla_metax.py"
+        "tests/test_metax_mla_interface_cpu.py",
+        "tests/test_sparse_mla_metax.py",
+        "benchmark/test_sparse_mla_metax.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/sparse_mla_decode.py": [
         "tests/test_sparse_mla_metax.py",

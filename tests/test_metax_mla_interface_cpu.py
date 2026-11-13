@@ -106,6 +106,23 @@ class LocalPrefillContract(unittest.TestCase):
         self.invoke()
         self.assertEqual(len(self.calls), 1)
 
+    def test_native_h8_metadata_and_no_padding(self):
+        self.q = Tensor((17, 8, 512))
+        self.kw.update(
+            attn_sink=Tensor((8,), "fp32"),
+            out=Tensor((17, 8, 512)),
+            max_logits_out=Tensor((17, 8), "fp32"),
+            lse_out=Tensor((17, 8), "fp32"),
+        )
+        for real_heads in (None, 8):
+            self.kw["real_num_heads"] = real_heads
+            self.invoke()
+            self.assertIs(self.calls[-1][0], self.q)
+            self.assertEqual(self.calls[-1][0].shape[1], 8)
+        self.calls.clear()
+        self.kw["real_num_heads"] = 16
+        self.assert_rejected()
+
     def test_missing_output_buffers(self):
         for name in ("out", "max_logits_out", "lse_out"):
             with self.subTest(name=name):

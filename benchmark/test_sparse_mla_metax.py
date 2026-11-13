@@ -120,21 +120,26 @@ class SparseMLAMetaXBenchmark(base.Benchmark):
                 )
                 args = ()
             else:
-                q = (torch.randn(rows, 16, 512, device=self.device) * 0.1).bfloat16()
-                kv = (torch.randn(1024, 1, 512, device=self.device) * 0.1).bfloat16()
+                head_dim = getattr(self, "head_dim", 512)
+                q = (
+                    torch.randn(rows, 16, head_dim, device=self.device) * 0.1
+                ).bfloat16()
+                kv = (
+                    torch.randn(1024, 1, head_dim, device=self.device) * 0.1
+                ).bfloat16()
                 indices = torch.arange(
                     topk, device=self.device, dtype=torch.int32
                 ).repeat(rows, 1)
                 if self.real_heads == 8:
                     q[:, 8:] = 0
                     indices = indices[:, None]
-                args = (q, kv, indices, 512**-0.5)
+                args = (q, kv, indices, head_dim**-0.5)
                 kwargs = dict(
                     attn_sink=torch.randn(16, device=self.device) * 0.1,
                     topk_length=torch.full(
                         (rows,), topk, device=self.device, dtype=torch.int32
                     ),
-                    out=torch.empty_like(q),
+                    out=torch.empty(rows, 16, 512, device=self.device, dtype=dtype),
                     max_logits_out=torch.empty(rows, 16, device=self.device),
                     lse_out=torch.empty(rows, 16, device=self.device),
                     real_num_heads=8 if self.real_heads == 8 else None,
@@ -170,3 +175,120 @@ def test_sparse_prefill_optimized_vs_serial(real_heads):
     with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
         torch.manual_seed(104)
         SparseMLAMetaXBenchmark("prefill", real_heads).run()
+
+
+class NativeH8Benchmark(SparseMLAMetaXBenchmark):
+    """Compare physical H8 with the optimized padded-H8 route, not serial."""
+
+    def __init__(self, mode, include_padding, head_dim=512):
+        self.head_dim = head_dim
+        self.include_padding = include_padding
+        super().__init__(mode, 8)
+        self.torch_op = self.padded_call
+        self.gems_op = self.native_call
+
+    def set_shapes(self, shape_file_path=None):
+        super().set_shapes(shape_file_path)
+        if self.path == "prefill":
+            self.shapes.insert(0, (1, 64))
+
+    def record_shapes(self, *args, **kwargs):
+        bundle = args[0]
+        q = bundle["native_kwargs"].get("q")
+        if q is None:
+            q = bundle["native_args"][0]
+        return {
+            "real_heads": 8,
+            "physical_heads": 8,
+            "path": self.path,
+            "comparator": "optimized padded-H8 (physical H16)",
+            "includes_q_padding": self.include_padding,
+            "q_shape": list(q.shape),
+            "topk": (
+                bundle["padded_kwargs"]["indices"].shape[-1]
+                if self.path == "decode"
+                else bundle["padded_args"][2].shape[-1]
+            ),
+        }
+
+    def unpack_to_args_kwargs(self, input_tuple):
+        return [input_tuple[0]], {}
+
+    def padded_call(self, bundle):
+        args, kwargs = bundle["padded_args"], bundle["padded_kwargs"]
+        if self.include_padding:
+            q = kwargs["q"] if self.path == "decode" else args[0]
+            source = bundle["native_kwargs"].get("q")
+            if source is None:
+                source = bundle["native_args"][0]
+            # Explicitly time the two operations used to materialize H16 Q.
+            q[..., :8, :].copy_(source)
+            q[..., 8:, :].zero_()
+        return call_with_policy(True, self.path, *args, **kwargs)
+
+    def native_call(self, bundle):
+        return call_with_policy(
+            True, self.path, *bundle["native_args"], **bundle["native_kwargs"]
+        )
+
+    def get_input_iter(self, dtype):
+        for packed in super().get_input_iter(dtype):
+            args, kwargs = packed[:-1], packed[-1]
+            native_kwargs = kwargs.copy()
+            native_kwargs["real_num_heads"] = None
+            q = kwargs["q"] if self.path == "decode" else args[0]
+            native_q = q[..., :8, :].contiguous().clone()
+            native_kwargs["out"] = torch.empty(
+                (*native_q.shape[:-1], 512), device=self.device, dtype=dtype
+            )
+            native_kwargs["attn_sink"] = kwargs["attn_sink"][:8].clone()
+            if self.path == "decode":
+                native_args = ()
+                native_kwargs["q"] = native_q
+                native_kwargs["tile_scheduler_metadata"] = ops.FlashMLASchedMeta()
+                native_kwargs["split_workspace"] = tuple(
+                    torch.empty(shape, device=self.device)
+                    for shape in [(64, 4, 8), (64, 4, 8), (64, 4, 8, 512)]
+                )
+            else:
+                native_args = (native_q, *args[1:])
+                native_kwargs["max_logits_out"] = torch.empty(
+                    native_q.shape[:2], device=self.device
+                )
+                native_kwargs["lse_out"] = torch.empty(
+                    native_q.shape[:2], device=self.device
+                )
+            bundle = dict(
+                padded_args=args,
+                padded_kwargs=kwargs,
+                native_args=native_args,
+                native_kwargs=native_kwargs,
+            )
+            expected = [x.clone() for x in self.padded_call(bundle)]
+            actual = self.native_call(bundle)
+            for i, (value, reference) in enumerate(zip(actual, expected)):
+                if self.path == "decode" and i == 0:
+                    reference = reference[:, :, :8]
+                else:
+                    reference = reference[:, :8]
+                torch.testing.assert_close(value, reference, atol=2e-3, rtol=2e-2)
+            yield (bundle,)
+
+
+@pytest.mark.flash_mla_with_kvcache
+@pytest.mark.skipif(ops.vendor_name != "metax", reason="MetaX backend comparison")
+@pytest.mark.parametrize("include_padding", [False, True], ids=["kernel", "q_padding"])
+def test_native_h8_decode_vs_optimized_padded(include_padding):
+    with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+        torch.manual_seed(104)
+        NativeH8Benchmark("decode", include_padding).run()
+
+
+@pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(ops.vendor_name != "metax", reason="MetaX backend comparison")
+@pytest.mark.parametrize("include_padding", [False, True], ids=["kernel", "q_padding"])
+@pytest.mark.parametrize("head_dim", [512, 576])
+def test_native_h8_prefill_vs_optimized_padded(include_padding, head_dim):
+    with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+        torch.manual_seed(104)
+        NativeH8Benchmark("prefill", include_padding, head_dim).run()
