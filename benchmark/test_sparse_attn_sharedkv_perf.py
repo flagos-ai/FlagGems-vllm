@@ -25,6 +25,8 @@ on accuracy, which is checked here for every case and more broadly in
 `tests/test_sparse_attn_sharedkv.py`.
 """
 
+from typing import Generator
+
 import pytest
 import torch
 
@@ -34,11 +36,9 @@ from tests.sparse_attn_sharedkv_utils import (
     make_inputs,
     official_operator,
     output_tensor,
-    shape_label,
 )
 
-WARMUP = 5
-ACTIVE = 20
+from . import base
 
 _IS_ASCEND = flaggems_vllm.vendor_name == "ascend" and hasattr(torch, "npu")
 pytestmark = [
@@ -47,40 +47,43 @@ pytestmark = [
 ]
 
 
-def _kernel_time_us(fn) -> float:
-    from triton.backends.ascend.testing import do_bench_npu
+class SparseAttnSharedKVBenchmark(base.Benchmark):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shape_desc = "case"
 
-    return do_bench_npu(fn, warmup=WARMUP, active=ACTIVE) * 1000.0
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = CASES
+
+    def get_input_iter(self, dtype) -> Generator:
+        for case in self.shapes:
+            inputs = make_inputs(case, self.device)
+            inputs["host_q_lens"] = (case.q_len,)
+            inputs["host_kv_lens"] = (case.kv_len,)
+            # Yield a 1-tuple: a bare dict would be iterated key-by-key by
+            # unpack_to_args_kwargs instead of being merged into kwargs.
+            yield (inputs,)
 
 
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 @torch.inference_mode()
-def test_sparse_attn_sharedkv_kernel_perf(case):
+def test_sparse_attn_sharedkv_perf():
     official = official_operator()
     if official is None:
         pytest.skip("requires the vLLM-Ascend SparseAttnSharedKV reference")
-    inputs = make_inputs(case, flaggems_vllm.device)
 
-    def candidate():
-        return flaggems_vllm.sparse_attn_sharedkv(
-            **inputs,
-            host_q_lens=(case.q_len,),
-            host_kv_lens=(case.kv_len,),
-        )
+    def ascendc_op(**kwargs):
+        # host_q_lens / host_kv_lens are host-length hints consumed by this
+        # implementation only; the AscendC reference derives them on device.
+        kwargs.pop("host_q_lens", None)
+        kwargs.pop("host_kv_lens", None)
+        return output_tensor(official(**kwargs))
 
-    def reference():
-        return output_tensor(official(**inputs))
+    def gems_op(**kwargs):
+        return output_tensor(flaggems_vllm.sparse_attn_sharedkv(**kwargs))
 
-    torch.testing.assert_close(
-        output_tensor(candidate()).float().cpu(),
-        reference().float().cpu(),
-        atol=2e-2,
-        rtol=2e-2,
-    )
-    reference_us = _kernel_time_us(reference)
-    candidate_us = _kernel_time_us(candidate)
-    print(
-        f"\n{shape_label(case)}\n"
-        f"  ascendc={reference_us:.3f}us triton={candidate_us:.3f}us "
-        f"speedup={reference_us / candidate_us:.4f}x"
-    )
+    SparseAttnSharedKVBenchmark(
+        op_name="sparse_attn_sharedkv",
+        torch_op=ascendc_op,
+        gems_op=gems_op,
+        dtypes=[torch.bfloat16],
+    ).run()

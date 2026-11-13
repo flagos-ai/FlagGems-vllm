@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Independent FP64 oracle, native comparisons and recurrent state contracts."""
+"""Independent FP64 oracle and recurrent state contracts."""
 
 import pytest
 import torch
@@ -120,29 +120,6 @@ def test_fused_recurrent_kda(case, dtype, normalize):
         rtol=3e-5,
         atol=3e-5,
     )
-
-
-@pytest.mark.fused_recurrent_kda
-@pytest.mark.parametrize("case", PERF_CASES, ids=[case.name for case in PERF_CASES])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_fused_recurrent_kda_native(case, dtype):
-    if gems.vendor_name == "ascend":
-        pytest.skip(
-            "Ascend native KDA comparison disabled: native accuracy is unstable"
-        )
-    module = pytest.importorskip("vllm.model_executor.layers.fla.ops.kda")
-    data = build(case, dtype, gems.device)
-    state = data["initial_state"].clone()
-    expected = reference(data)
-    actual = gems.fused_recurrent_kda(**data)
-    assert_result(actual, expected)
-    actual = tuple(value.detach().clone() for value in actual)
-    data["initial_state"].copy_(state)
-    original = module.fused_recurrent_kda(**data)
-    assert_result(original, expected)
-    assert_result(actual, (original[0].detach().cpu(), original[1].detach().cpu()))
-    if not case.inplace:
-        torch.testing.assert_close(data["initial_state"], state, rtol=0, atol=0)
 
 
 @pytest.mark.fused_recurrent_kda

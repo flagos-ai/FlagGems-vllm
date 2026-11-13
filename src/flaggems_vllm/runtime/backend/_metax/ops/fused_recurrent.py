@@ -774,7 +774,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     the token loop all collapse into one launch. This is the shape Qwen3-Next /
     Qwen3.6 non-spec decode actually runs.
     """
-    logger.debug("GEMS FUSED RECURRENT GATED DELTA RULE PACKED DECODE")
+    logger.debug("GEMS_METAX FUSED_RECURRENT_GATED_DELTA_RULE_PACKED_DECODE")
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."

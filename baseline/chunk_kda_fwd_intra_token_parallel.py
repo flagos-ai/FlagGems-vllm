@@ -103,6 +103,8 @@ def build_inputs(binding, dtype, device):
         for length in lengths:
             boundaries.append(boundaries[-1] + length)
         cu = torch.tensor(boundaries, device=device, dtype=torch.int64)
+    # Both implementations default to eager execution. Older FLA builds do
+    # not expose a use_graph keyword.
     return (
         q.to(dtype).contiguous(),
         k.to(dtype).contiguous(),
@@ -111,7 +113,7 @@ def build_inputs(binding, dtype, device):
         aqk,
         akk,
         128**-0.5,
-    ), {"cu_seqlens": cu, "chunk_size": 64, "sub_chunk_size": 16, "use_graph": False}
+    ), {"cu_seqlens": cu, "chunk_size": 64, "sub_chunk_size": 16}
 
 
 def key_shape(binding):

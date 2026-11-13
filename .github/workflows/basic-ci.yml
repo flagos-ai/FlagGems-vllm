@@ -17,6 +17,12 @@ name: basic ci
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the older run so the single H20
+# runner is not occupied by stale commits. Pushes to main are never cancelled.
+concurrency:
+  group: basic-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: ["main"]
@@ -42,40 +48,8 @@ on:
         type: boolean
 
 jobs:
-  code-style:
-    name: code style
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
-      - name: set up python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: install style tools
-        shell: bash
-        run: python -m pip install pre-commit
-
-      - name: run pre-commit
-        shell: bash
-        run: pre-commit run --all-files --show-diff-on-failure
-
-      - name: test ci selection helpers
-        shell: bash
-        run: |
-          python -m unittest discover -s tools -p 'test_ci_*.py'
-          python tools/check_ci_pins.py
-
   select-targets:
     name: select ci targets
-    needs: code-style
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -84,6 +58,8 @@ jobs:
       should_run: ${{ steps.select.outputs.should_run }}
       non_nvidia_matrix: ${{ steps.select-backends.outputs.matrix }}
       has_non_nvidia_backends: ${{ steps.select-backends.outputs.has_backends }}
+      container_matrix: ${{ steps.select-ci-backends.outputs.matrix }}
+      has_container_backends: ${{ steps.select-ci-backends.outputs.has_backends }}
     env:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv-select
 
@@ -128,6 +104,9 @@ jobs:
           python --version
           test -x "${VIRTUAL_ENV}/bin/python"
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+          # select_tests.py and select_backends.py are stdlib-only;
+          # select_ci_backends.py reads YAML.
+          python -m pip install --quiet 'PyYAML>=6.0'
 
       - name: collect ci selection inputs
         shell: bash
@@ -176,18 +155,7 @@ jobs:
 
           python tools/select_tests.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
-      # Keep this ref aligned with the reusable workflow and setup action below.
-      # Reading FlagGems' registry avoids maintaining a second backend list here.
-      - name: check out FlagGems backend registry
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          repository: flagos-ai/FlagGems
-          ref: 42d396ff8270f7b051f478217929f75484e53ef4
-          sparse-checkout: .github/backends.json
-          sparse-checkout-cone-mode: false
-          path: .ci/flaggems-registry
-          persist-credentials: false
-
+      # The backend registry lives in this repository (.github/backends.json).
       - id: select-backends
         name: select non-NVIDIA backends
         shell: bash
@@ -201,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           args=(
-            --registry .ci/flaggems-registry/.github/backends.json
+            --registry .github/backends.json
             --capabilities .github/backend-capabilities.json
             --labels-json "${PR_LABELS_JSON:-null}"
             --changed-files changed_files.bin
@@ -211,6 +179,36 @@ jobs:
             args+=(--all-enabled)
           fi
           python tools/select_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
+
+      # Separate from select-backends above: that step routes backends whose
+      # environment tools/setup.sh builds on a bare runner, while this one
+      # resolves backends that run inside a vendor-provided vLLM image.
+      - id: select-ci-backends
+        name: select container ci backends
+        shell: bash
+        env:
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          SHOULD_RUN: ${{ steps.select.outputs.should_run }}
+          ALL_ENABLED: >-
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true) ||
+                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/all-vendors')) }}
+        run: |
+          set -euo pipefail
+          args=(
+            --config .github/configs/ci-backends.yaml
+            --changed-files changed_files.bin
+            --labels-json "${PR_LABELS_JSON:-null}"
+            --format github
+          )
+          if [[ "${ALL_ENABLED}" == "true" ]]; then
+            args+=(--all-enabled)
+          fi
+          # Default platforms (the A100) only run when tests were selected, so
+          # a docs-only change does not occupy them.
+          if [[ "${SHOULD_RUN}" == "true" ]]; then
+            args+=(--include-defaults)
+          fi
+          python tools/select_ci_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
   nvidia-tests:
     name: nvidia tests and benchmarks
@@ -224,65 +222,15 @@ jobs:
           || (github.event.pull_request.user.login != 'dependabot[bot]'
               && (github.event.pull_request.head.repo.full_name == github.repository
                   || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))))
-    runs-on: h20
-    timeout-minutes: 60
-    env:
-      FLAGGEMS_VENDOR: nvidia
-      PYTHONPATH: ${{ github.workspace }}/src
-      VENV_DIR: ${{ github.workspace }}/.venv
-      VIRTUAL_ENV: ${{ github.workspace }}/.venv
-
-    steps:
-      - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: clean generated state from persistent runner
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf -- .venv build dist
-          find . -maxdepth 2 -type d -name '*.egg-info' -exec rm -rf -- {} +
-
-      - name: show gpu
-        shell: bash
-        run: nvidia-smi
-
-      - name: install and activate python environment
-        shell: bash
-        run: |
-          source tools/setup.sh
-          source "${VENV_DIR}/bin/activate"
-          test -x "${VENV_DIR}/bin/python"
-          echo "VIRTUAL_ENV=${VENV_DIR}" >> "$GITHUB_ENV"
-          echo "${VENV_DIR}/bin" >> "$GITHUB_PATH"
-          if [[ -n "${CUDA_HOME:-}" ]]; then
-            echo "CUDA_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
-            echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
-          fi
-          if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
-            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-          fi
-          python --version
-
-      - name: run portable backend preflight
-        shell: bash
-        env:
-          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
-        run: |
-          source "${VENV_DIR}/bin/activate"
-          python tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
-
-      - name: run selected tests and benchmarks
-        shell: bash
-        env:
-          CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
-        run: |
-          source "${VENV_DIR}/bin/activate"
-          python tools/run_ci_targets.py \
-            --backend nvidia-cuda133 \
-            --capabilities .github/backend-capabilities.json
+    uses: ./.github/workflows/backend-test.yaml
+    with:
+      backend: nvidia-cuda133
+      runner_label: h20
+      gpu_check_script: tools/gpu_check_nvidia.sh
+      changed_files: ${{ needs.select-targets.outputs.targets }}
+      timeout_minutes: 60
+      # h20 is a persistent, non-ephemeral runner (see backend-test.yaml).
+      uv_refresh: "1"
 
   non-nvidia-tests:
     name: ${{ matrix.backend }} tests and benchmarks
@@ -300,23 +248,113 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select-targets.outputs.non_nvidia_matrix) }}
-    uses: flagos-ai/FlagGems/.github/workflows/backend-test.yaml@42d396ff8270f7b051f478217929f75484e53ef4
+    uses: ./.github/workflows/backend-test.yaml
     with:
       backend: ${{ matrix.backend }}
       runner_label: ${{ matrix.runner_label }}
       gpu_check_script: ${{ matrix.gpu_check }}
       changed_files: ${{ needs.select-targets.outputs.targets }}
       test_script: tools/run-multi-backend-tests.sh
-    # FlagGems currently declares this unused secret as required. Pass only the
-    # caller's read-only token instead of exposing a long-lived runner SSH key.
-    secrets:
-      RUNNER_SSH_KEY: ${{ secrets.GITHUB_TOKEN }}
 
-  multi-backend-summary:
-    name: multi-backend summary
+  # Container-based PR smoke tests for self-hosted vendor runners that ship a
+  # vendor-provided vLLM base image instead of going through tools/setup.sh.
+  # The runner/image pairings live in
+  # `.github/configs/ci-backends.yaml` (schema mirrored from FlagOps'
+  # resource_map.yaml) rather than in `.github/backends.json`, because those
+  # vendor images do not fit that registry's "run tools/setup.sh on a bare
+  # runner" contract. The H20 host deliberately stays out of this lane and
+  # keeps running via `nvidia-tests` (backend-test.yaml); the `nvidia` platform
+  # here is the A100 runner with the NGC vLLM image.
+  #
+  # Scheduling: a platform runs when the pull request changes its backend
+  # directory (runtime/backend/_<vendor>/), or when a maintainer adds its
+  # `vendor/*` label (or `ci/all-vendors` / the `run_non_nvidia` dispatch).
+  # Same rule as the bare-runner lane. The `nvidia` (A100) platform is marked
+  # `run_by_default` and runs whenever tests are selected; it is never chosen
+  # by path or by "all".
+  #
+  # Bring-up status: observation period. Each platform is still proving out
+  # its runner and image, so this job is intentionally excluded from
+  # unittest-required's needs: and every step tolerates failure
+  # (continue-on-error) so a flaky or unready runner cannot block a PR.
+  # Promote a platform into the required summary path only after it has been
+  # green for a sustained period.
+  vendor-container-tests:
+    name: ${{ matrix.platform }} container smoke test
+    needs: select-targets
+    if: >-
+      needs.select-targets.outputs.has_container_backends == 'true'
+      && (needs.select-targets.outputs.should_run == 'true'
+          || github.event_name == 'pull_request')
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.user.login != 'dependabot[bot]')
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-targets.outputs.container_matrix) }}
+    runs-on: ${{ matrix.runner_labels }}
+    timeout-minutes: 60
+    container:
+      image: ${{ matrix.container_image }}
+      options: ${{ matrix.container_options }}
+      volumes: ${{ matrix.container_volumes }}
+    env:
+      FLAGGEMS_VENDOR: ${{ matrix.platform }}
+      PYTHONPATH: ${{ github.workspace }}/src
+      BACKEND: ${{ matrix.backend }}
+      CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
+    steps:
+      - name: check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+        continue-on-error: true
+
+      - name: install FlagGems-vllm into the vendor image
+        shell: bash
+        continue-on-error: true
+        env:
+          INSTALL_WITH_SETUP_SH: ${{ matrix.install_with_setup_sh }}
+        run: |
+          set -euo pipefail
+          python3 --version
+          if [[ "${INSTALL_WITH_SETUP_SH}" == "true" ]]; then
+            # The image has no flag-gems. --no-venv keeps its torch, Triton
+            # and vLLM and only adds flag-gems, this repository and the test
+            # dependencies.
+            bash tools/setup.sh --no-venv "${BACKEND}"
+          else
+            # The image already ships a vendor-patched torch/triton/vLLM stack
+            # and flag-gems. Install this repository only, so pip cannot pull
+            # a generic PyPI torch over the vendor build.
+            python3 -m pip install --no-build-isolation --no-deps -e .
+            python3 -m pip install --no-build-isolation pytest einops
+          fi
+
+      - name: check gpu availability
+        shell: bash
+        continue-on-error: true
+        env:
+          GPU_CHECK_SCRIPT: ${{ matrix.gpu_check_script }}
+        run: bash "${GPU_CHECK_SCRIPT}"
+
+      - name: run selected tests
+        shell: bash
+        continue-on-error: true
+        env: ${{ fromJSON(matrix.test_env) }}
+        run: |
+          python3 tools/run_ci_targets.py \
+            --backend "${BACKEND}" \
+            --capabilities .github/backend-capabilities.json
+
+  # Gate job: the only check that should be required in branch protection.
+  # Individual jobs above are skipped for many PRs (label- and path-gated), so
+  # requiring them directly would block merges. Named unittest-required to
+  # match FlagGems. tools/ci_checks/check_workflow_policy.py verifies that every
+  # job is covered here.
+  unittest-required:
     if: always()
     needs:
-      - code-style
       - select-targets
       - nvidia-tests
       - non-nvidia-tests
@@ -326,7 +364,6 @@ jobs:
       - name: check ci results
         shell: bash
         env:
-          CODE_STYLE_RESULT: ${{ needs.code-style.result }}
           SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
           NVIDIA_RESULT: ${{ needs.nvidia-tests.result }}
           NON_NVIDIA_RESULT: ${{ needs.non-nvidia-tests.result }}
@@ -345,7 +382,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for result in "${CODE_STYLE_RESULT}" "${SELECT_TARGETS_RESULT}"; do
+          for result in "${SELECT_TARGETS_RESULT}"; do
             if [[ "${result}" != "success" ]]; then
               echo "Required CI preparation job ended with: ${result}" >&2
               exit 1

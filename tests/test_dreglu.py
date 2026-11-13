@@ -61,6 +61,5 @@ def test_dreglu(shape, dtype):
     grad_x2 = grad_output * torch.relu(x1)
     ref_out = torch.cat((grad_x1, grad_x2), dim=-1)
     ref_out = utils.to_reference(ref_out)
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.dreglu(grad_output, input_tensor, None)
+    res_out = flaggems_vllm.dreglu(grad_output, input_tensor, None)
     utils.gems_assert_close(res_out, ref_out, dtype)
