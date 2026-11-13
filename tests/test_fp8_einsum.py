@@ -155,6 +155,7 @@ def torch_fp8_block_einsum_reference(x_data, x_scale, y_data, y_scale, block_sha
     return torch.einsum("bhr,hdr->bhd", x_deq, y_deq)
 
 
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("config", FP8_EINSUM_CONFIGS)
 @pytest.mark.parametrize("block_shape", [[128, 128]])
 def test_accuracy_fp8_einsum(config, block_shape):
@@ -188,6 +189,7 @@ def test_accuracy_fp8_einsum(config, block_shape):
     torch.testing.assert_close(result, ref.to(result.dtype), rtol=rtol, atol=atol)
 
 
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("layout", ["contiguous", "vllm", "strided", "unaligned"])
 def test_fp8_einsum_out_and_layout(dtype, layout):
@@ -220,6 +222,7 @@ def test_fp8_einsum_out_and_layout(dtype, layout):
     assert torch.isnan(out_buf[..., d:]).all()
 
 
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_fp8_einsum_splitk_repeated(dtype):
     inputs = _make_fp8_einsum_inputs(3, 1, 4096, 128, [128, 128], "cuda")
@@ -230,6 +233,7 @@ def test_fp8_einsum_splitk_repeated(dtype):
         torch.testing.assert_close(out, ref.to(dtype), rtol=2e-1, atol=2.0)
 
 
+@pytest.mark.fp8_einsum
 def test_fp8_einsum_without_tle(monkeypatch):
     import importlib
 
@@ -243,6 +247,7 @@ def test_fp8_einsum_without_tle(monkeypatch):
     torch.testing.assert_close(result, ref.to(result.dtype), rtol=2e-2, atol=0.25)
 
 
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize(
     "shape", [(0, 2, 128, 128), (2, 0, 128, 128), (2, 2, 128, 0), (2, 2, 0, 128)]
 )
@@ -258,6 +263,7 @@ def test_fp8_einsum_empty(shape):
     torch.testing.assert_close(result, torch.zeros_like(result))
 
 
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize(
     "case",
     [
@@ -309,6 +315,7 @@ def test_fp8_einsum_invalid_inputs(case):
         fp8_einsum(equation, x, xs, y, ys, **kwargs)
 
 
+@pytest.mark.fp8_einsum
 def test_fp8_einsum_vllm_reference():
     deep_gemm = pytest.importorskip("vllm.utils.deep_gemm")
     if not deep_gemm.is_deep_gemm_supported():
@@ -323,6 +330,7 @@ def test_fp8_einsum_vllm_reference():
     torch.testing.assert_close(result, expected, rtol=2e-2, atol=1.0)
 
 
+@pytest.mark.fp8_einsum
 def test_fp8_einsum_exports_and_configs():
     from flaggems_vllm import runtime
 
@@ -337,6 +345,7 @@ def test_fp8_einsum_exports_and_configs():
         assert runtime.ops_get_configs(name)
 
 
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("config", [(3, 2, 256, 128), (3, 1, 4096, 128)])
 def test_fp8_einsum_cudagraph_replay(config):
     b, h, r, d = config
