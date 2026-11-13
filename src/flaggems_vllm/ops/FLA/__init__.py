@@ -63,7 +63,7 @@ if _runtime.device.vendor_name == "ascend":
     )
 
     if BackendArchEvent().arch == "a5":
-        from flaggems_vllm.runtime.backend._ascend.a5.ops import (  # noqa: F811
+        from flaggems_vllm.runtime.backend._ascend.a5.FLA import (  # noqa: F811
             chunk_kda,
             fused_recurrent_kda,
         )

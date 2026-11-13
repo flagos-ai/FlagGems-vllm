@@ -18,14 +18,8 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.causal_conv1d_fn import (
 from flaggems_vllm.runtime.backend._ascend.a5.ops.causal_conv1d_update import (
     causal_conv1d_update,
 )
-from flaggems_vllm.runtime.backend._ascend.a5.ops.chunk_kda import chunk_kda
-from flaggems_vllm.runtime.backend._ascend.a5.ops.fused_recurrent_kda import (
-    fused_recurrent_kda,
-)
 
 __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
-    "chunk_kda",
-    "fused_recurrent_kda",
 ]
