@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: basic ci
+name: unit-test
 
 permissions:
   contents: read
@@ -20,7 +20,7 @@ permissions:
 # A newer push to the same PR supersedes the older run so the single H20
 # runner is not occupied by stale commits. Pushes to main are never cancelled.
 concurrency:
-  group: basic-ci-${{ github.event.pull_request.number || github.ref }}
+  group: unit-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
@@ -48,25 +48,33 @@ on:
         type: boolean
 
 jobs:
-  select-targets:
-    name: select ci targets
+  preprocess:
+    name: preprocess
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}
       targets: ${{ steps.select.outputs.targets }}
       should_run: ${{ steps.select.outputs.should_run }}
+      pr_id: ${{ steps.get-pr-id.outputs.PR_ID }}
+      labels: ${{ steps.get-labels.outputs.labels }}
       non_nvidia_matrix: ${{ steps.select-backends.outputs.matrix }}
       has_non_nvidia_backends: ${{ steps.select-backends.outputs.has_backends }}
       container_matrix: ${{ steps.select-ci-backends.outputs.matrix }}
       has_container_backends: ${{ steps.select-ci-backends.outputs.has_backends }}
+    # actions: read lets wait-for-triage list workflow runs; the label lookup
+    # needs pull-requests: read. Fork PR tokens are read-only either way.
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
     env:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv-select
 
     steps:
       - id: checkout-attempt-1
         name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
         continue-on-error: true
@@ -79,7 +87,7 @@ jobs:
       - id: checkout-attempt-2
         name: retry checkout
         if: steps.checkout-attempt-1.outcome == 'failure'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
         continue-on-error: true
@@ -92,7 +100,7 @@ jobs:
       - id: checkout-attempt-3
         name: retry checkout again
         if: steps.checkout-attempt-2.outcome == 'failure'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
@@ -128,6 +136,62 @@ jobs:
             printf '  %q\n' "${path}"
           done < changed_files.bin
 
+      - id: get-pr-id
+        name: get pr id
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          PR_ID=""
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            PR_ID="${PR_NUMBER}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            # Squash-merge subjects end with "(#1234)".
+            PR_ID="$(git log -1 --pretty=format:'%s' | grep -oE '#[0-9]+' | tail -1 | tr -d '#' || true)"
+          fi
+          echo "PR_ID=${PR_ID}" >> "${GITHUB_OUTPUT}"
+          echo "PR_ID: ${PR_ID:-n/a}"
+
+      # The path labels are applied by triage.yaml (pull_request_target) in
+      # parallel with this run, so the labels in the event payload can be stale.
+      # Wait for the triage run on this commit, then read the labels from the API.
+      # If the wait fails, the run continues with whatever labels are present.
+      - id: wait-for-triage
+        name: wait for triage
+        if: github.event_name == 'pull_request'
+        uses: ArcticLampyrid/action-wait-for-workflow@ff297b23789206858260877c4b83026d90c6db8c  # v1.3.0
+        with:
+          workflow: .github/workflows/triage.yaml
+        continue-on-error: true
+
+      - id: get-labels
+        name: get pr labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          PAYLOAD_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('labels', '[]');
+              return;
+            }
+            let names;
+            try {
+              const { data } = await github.rest.issues.listLabelsOnIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+              });
+              names = data.map(label => label.name);
+            } catch (error) {
+              core.warning(`Label lookup failed, using the event payload: ${error.message}`);
+              names = JSON.parse(process.env.PAYLOAD_LABELS_JSON || '[]') || [];
+            }
+            console.log('Labels:', names);
+            core.setOutput('labels', JSON.stringify(names));
+
       - id: select
         name: select tests and benchmarks
         shell: bash
@@ -160,12 +224,12 @@ jobs:
         name: select non-NVIDIA backends
         shell: bash
         env:
-          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_LABELS_JSON: ${{ steps.get-labels.outputs.labels }}
           # During backend bring-up, a main push must not fan out to every
           # enabled accelerator. Use an explicit dispatch or PR label instead.
           ALL_ENABLED: >-
             ${{ (github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true) ||
-                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/all-vendors')) }}
+                (github.event_name == 'pull_request' && contains(fromJSON(steps.get-labels.outputs.labels), 'ci/all-vendors')) }}
         run: |
           set -euo pipefail
           args=(
@@ -187,11 +251,11 @@ jobs:
         name: select container ci backends
         shell: bash
         env:
-          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_LABELS_JSON: ${{ steps.get-labels.outputs.labels }}
           SHOULD_RUN: ${{ steps.select.outputs.should_run }}
           ALL_ENABLED: >-
             ${{ (github.event_name == 'workflow_dispatch' && inputs.run_non_nvidia == true) ||
-                (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/all-vendors')) }}
+                (github.event_name == 'pull_request' && contains(fromJSON(steps.get-labels.outputs.labels), 'ci/all-vendors')) }}
         run: |
           set -euo pipefail
           args=(
@@ -210,50 +274,52 @@ jobs:
           fi
           python tools/select_ci_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
-  nvidia-tests:
-    name: nvidia tests and benchmarks
-    needs: select-targets
+  python-op:
+    name: python-op (nvidia tests and benchmarks)
+    needs: preprocess
     # Default: never execute fork-controlled code on the persistent H20 runner.
     # Maintainers may opt in a fork PR with the write-gated `ci/nvidia` label
     # (same trust model as `ci/all-vendors`).
     if: >-
-      needs.select-targets.outputs.should_run == 'true'
+      needs.preprocess.outputs.should_run == 'true'
       && (github.event_name != 'pull_request'
           || (github.event.pull_request.user.login != 'dependabot[bot]'
               && (github.event.pull_request.head.repo.full_name == github.repository
-                  || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))))
+                  || contains(fromJSON(needs.preprocess.outputs.labels), 'ci/nvidia'))))
     uses: ./.github/workflows/backend-test.yaml
     with:
       backend: nvidia-cuda133
       runner_label: h20
       gpu_check_script: tools/gpu_check_nvidia.sh
-      changed_files: ${{ needs.select-targets.outputs.targets }}
+      changed_files: ${{ needs.preprocess.outputs.targets }}
+      pr_id: ${{ needs.preprocess.outputs.pr_id }}
       timeout_minutes: 60
       # h20 is a persistent, non-ephemeral runner (see backend-test.yaml).
       uv_refresh: "1"
 
-  non-nvidia-tests:
-    name: ${{ matrix.backend }} tests and benchmarks
-    needs: select-targets
+  backend-tests:
+    name: backend-tests (${{ matrix.backend }})
+    needs: preprocess
     # Non-NVIDIA CI intentionally accepts fork pull requests. The checked-out
     # setup and test code is therefore untrusted; these runner groups must be
     # dedicated to public CI and contain no secrets or persistent sensitive
     # state. NVIDIA/H20 keeps the stricter same-repository guard above.
     if: >-
-      needs.select-targets.outputs.has_non_nvidia_backends == 'true'
-      && (needs.select-targets.outputs.should_run == 'true'
+      needs.preprocess.outputs.has_non_nvidia_backends == 'true'
+      && (needs.preprocess.outputs.should_run == 'true'
           || github.event_name == 'pull_request')
       && (github.event_name != 'pull_request'
           || github.event.pull_request.user.login != 'dependabot[bot]')
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.select-targets.outputs.non_nvidia_matrix) }}
+      matrix: ${{ fromJSON(needs.preprocess.outputs.non_nvidia_matrix) }}
     uses: ./.github/workflows/backend-test.yaml
     with:
       backend: ${{ matrix.backend }}
       runner_label: ${{ matrix.runner_label }}
       gpu_check_script: ${{ matrix.gpu_check }}
-      changed_files: ${{ needs.select-targets.outputs.targets }}
+      changed_files: ${{ needs.preprocess.outputs.targets }}
+      pr_id: ${{ needs.preprocess.outputs.pr_id }}
       test_script: tools/run-multi-backend-tests.sh
 
   # Container-based PR smoke tests for self-hosted vendor runners that ship a
@@ -263,7 +329,7 @@ jobs:
   # resource_map.yaml) rather than in `.github/backends.json`, because those
   # vendor images do not fit that registry's "run tools/setup.sh on a bare
   # runner" contract. The H20 host deliberately stays out of this lane and
-  # keeps running via `nvidia-tests` (backend-test.yaml); the `nvidia` platform
+  # keeps running via `python-op` (backend-test.yaml); the `nvidia` platform
   # here is the A100 runner with the NGC vLLM image.
   #
   # Scheduling: a platform runs when the pull request changes its backend
@@ -281,17 +347,17 @@ jobs:
   # green for a sustained period.
   vendor-container-tests:
     name: ${{ matrix.platform }} container smoke test
-    needs: select-targets
+    needs: preprocess
     if: >-
-      needs.select-targets.outputs.has_container_backends == 'true'
-      && (needs.select-targets.outputs.should_run == 'true'
+      needs.preprocess.outputs.has_container_backends == 'true'
+      && (needs.preprocess.outputs.should_run == 'true'
           || github.event_name == 'pull_request')
       && (github.event_name != 'pull_request'
           || github.event.pull_request.user.login != 'dependabot[bot]')
     continue-on-error: true
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.select-targets.outputs.container_matrix) }}
+      matrix: ${{ fromJSON(needs.preprocess.outputs.container_matrix) }}
     runs-on: ${{ matrix.runner_labels }}
     timeout-minutes: 60
     container:
@@ -302,10 +368,10 @@ jobs:
       FLAGGEMS_VENDOR: ${{ matrix.platform }}
       PYTHONPATH: ${{ github.workspace }}/src
       BACKEND: ${{ matrix.backend }}
-      CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
+      CI_TARGETS_JSON: ${{ needs.preprocess.outputs.targets }}
     steps:
       - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
         continue-on-error: true
@@ -350,44 +416,45 @@ jobs:
   # Gate job: the only check that should be required in branch protection.
   # Individual jobs above are skipped for many PRs (label- and path-gated), so
   # requiring them directly would block merges. Named unittest-required to
-  # match FlagGems. tools/ci_checks/check_workflow_policy.py verifies that every
-  # job is covered here.
+  # match FlagGems. Unlike FlagGems, which accepts any success/skipped result,
+  # this gate derives which lanes were expected to run and fails when one was
+  # skipped by mistake (for example a broken `if:`) or ran unexpectedly.
+  # tools/ci_checks/check_workflow_policy.py verifies that every job is
+  # covered here.
   unittest-required:
     if: always()
     needs:
-      - select-targets
-      - nvidia-tests
-      - non-nvidia-tests
+      - preprocess
+      - python-op
+      - backend-tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: check ci results
         shell: bash
         env:
-          SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
-          NVIDIA_RESULT: ${{ needs.nvidia-tests.result }}
-          NON_NVIDIA_RESULT: ${{ needs.non-nvidia-tests.result }}
-          SHOULD_RUN: ${{ needs.select-targets.outputs.should_run }}
+          PREPROCESS_RESULT: ${{ needs.preprocess.result }}
+          NVIDIA_RESULT: ${{ needs.python-op.result }}
+          NON_NVIDIA_RESULT: ${{ needs.backend-tests.result }}
+          SHOULD_RUN: ${{ needs.preprocess.outputs.should_run }}
           HAS_NON_NVIDIA_BACKENDS: >-
-            ${{ needs.select-targets.outputs.has_non_nvidia_backends }}
+            ${{ needs.preprocess.outputs.has_non_nvidia_backends }}
           EVENT_NAME: ${{ github.event_name }}
           NVIDIA_RUN_ALLOWED: >-
             ${{ github.event_name != 'pull_request'
                 || (github.event.pull_request.user.login != 'dependabot[bot]'
                     && (github.event.pull_request.head.repo.full_name == github.repository
-                        || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))) }}
+                        || contains(fromJSON(needs.preprocess.outputs.labels), 'ci/nvidia'))) }}
           NON_NVIDIA_RUN_ALLOWED: >-
             ${{ github.event_name != 'pull_request'
                 || github.event.pull_request.user.login != 'dependabot[bot]' }}
         run: |
           set -euo pipefail
 
-          for result in "${SELECT_TARGETS_RESULT}"; do
-            if [[ "${result}" != "success" ]]; then
-              echo "Required CI preparation job ended with: ${result}" >&2
-              exit 1
-            fi
-          done
+          if [[ "${PREPROCESS_RESULT}" != "success" ]]; then
+            echo "preprocess ended with: ${PREPROCESS_RESULT}" >&2
+            exit 1
+          fi
 
           expect_nvidia=false
           expect_non_nvidia=false
@@ -400,7 +467,7 @@ jobs:
             fi
           fi
 
-          check_accelerator_result() {
+          check_lane_result() {
             local name="$1"
             local expected="$2"
             local result="$3"
@@ -414,6 +481,5 @@ jobs:
             fi
           }
 
-          check_accelerator_result nvidia "${expect_nvidia}" "${NVIDIA_RESULT}"
-          check_accelerator_result \
-            non-nvidia "${expect_non_nvidia}" "${NON_NVIDIA_RESULT}"
+          check_lane_result python-op "${expect_nvidia}" "${NVIDIA_RESULT}"
+          check_lane_result backend-tests "${expect_non_nvidia}" "${NON_NVIDIA_RESULT}"

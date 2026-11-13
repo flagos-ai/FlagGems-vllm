@@ -38,6 +38,8 @@ weight: 10
    - 附带功能测试与性能加速比测试数据；
    - 检查 CI 各项门禁（代码风格、`operators.yaml` 规范、单元测试、基准评测）。
 
+每个 Pull Request 会触发两个 workflow。`rule-check.yaml` 运行 pre-commit、CI 辅助脚本测试与算子规则检查，其中 `rule-check-required` 必须通过；`unittest.yaml` 按改动文件选择测试与基准（`tools/select_tests.py`），并在 H20 runner 以及被选中的厂商后端上运行，`unittest-required` 是唯一的汇总门禁。来自 fork 的 PR 默认不会在 H20 runner 上运行，除非维护者添加 `ci/nvidia` 标签。厂商后端按路径或维护者添加的 `vendor/*` 标签调度，详见[新增后端](backend.md)。
+
 ## 2. 设备隔离与可见性 {#device-visibility}
 
 在多人共享的加速卡节点上运行单元测试或性能测试时，建议指定特定设备运行。FlagGems-vllm 依赖各后端厂商的可见性环境变量来完成设备隔离，可见性变量必须在进程启动**之前**设置。

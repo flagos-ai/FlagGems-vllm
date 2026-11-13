@@ -14,7 +14,7 @@
 
 # Nightly full-range validation on the H20 runner: every functional test plus
 # every benchmark at core level, plus unit-test coverage. Pull requests only run the selected subset
-# (see basic-ci.yml), so this catches regressions that path-based selection
+# (see unittest.yaml), so this catches regressions that path-based selection
 # misses.
 
 name: daily
@@ -33,10 +33,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  nvidia-full:
-    name: nvidia full tests and benchmarks
+  prepare:
     # Scheduled runs only make sense on the upstream repository.
     if: github.repository == 'flagos-ai/FlagGems-vllm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      datetime: ${{ steps.get-date.outputs.CURRENT_DATE }}
+    steps:
+      - id: get-date
+        shell: bash
+        run: |
+          echo "CURRENT_DATE=$(date -u +'%Y%m%d')" >> "$GITHUB_OUTPUT"
+
+  python-op:
+    name: python-op (nvidia full tests and benchmarks)
+    needs: prepare
     runs-on: h20
     timeout-minutes: 360
     env:
@@ -46,7 +58,7 @@ jobs:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
       UV_REFRESH: "1"
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -139,7 +151,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: ut-coverage-${{ github.run_id }}
+          name: ut-coverage-${{ needs.prepare.outputs.datetime }}-${{ github.run_id }}
           path: coverage/
           if-no-files-found: ignore
           retention-days: 30

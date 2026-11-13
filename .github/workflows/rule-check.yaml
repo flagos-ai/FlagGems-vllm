@@ -42,7 +42,7 @@ jobs:
     # Hard cap so a wedged step cannot hold a shared GitHub-hosted runner.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # fetch-depth 0 required by derive_changed_operators.py (base...head
           # diff) and by the changed-file checks below.
@@ -85,7 +85,7 @@ jobs:
         run: python -m unittest discover -s tools -p 'test_ci_*.py'
 
       # Every ubuntu-latest job needs a timeout, and unittest-required must
-      # cover every job in basic-ci.yml (see the script docstring).
+      # cover every job in unittest.yaml (see the script docstring).
       - name: Check workflow policy
         run: |
           python tools/ci_checks/check_workflow_policy.py

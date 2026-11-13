@@ -19,7 +19,7 @@ Rules:
 
 1. Every job that runs on a GitHub-hosted ``ubuntu-latest`` runner declares
    ``timeout-minutes``, so a wedged step cannot hold a shared runner.
-2. ``basic-ci.yml`` has a gate job (``unittest-required``) with
+2. ``unittest.yaml`` has a gate job (``unittest-required``) with
    ``if: always()`` whose ``needs`` list covers every other job. Most jobs are
    skipped for many PRs, so branch protection must require the gate instead of
    the individual jobs. A job with job-level ``continue-on-error: true`` is in
@@ -34,7 +34,7 @@ from pathlib import Path
 
 import yaml
 
-GATE_WORKFLOW = "basic-ci.yml"
+GATE_WORKFLOW = "unittest.yaml"
 GATE_JOB = "unittest-required"
 HOSTED_RUNNER = "ubuntu-latest"
 
