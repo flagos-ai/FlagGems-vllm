@@ -248,3 +248,57 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert():
     bench = FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark()
     bench.run()
+
+
+class MetaXQNormPortableBenchmark(base.Benchmark):
+    """Both measured paths include identical input-state reset copies."""
+
+    def __init__(self):
+        import functools
+        import importlib
+
+        portable = importlib.import_module(
+            "flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+        ).fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+        public = flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+        assert public is not portable
+        super().__init__(
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+            functools.partial(self.reset_and_call, portable),
+            [torch.bfloat16],
+            gems_op=functools.partial(self.reset_and_call, public),
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (1, 64),
+            (17, 64),
+            (64, 64),
+            (513, 64),
+            (4096, 64),
+            (64, 128),
+            (17, 8),
+        ]
+
+    @staticmethod
+    def reset_and_call(op, q, kv, *args, q_initial, kv_initial):
+        q.copy_(q_initial)
+        kv.copy_(kv_initial)
+        return op(q, kv, *args)
+
+    def get_input_iter(self, dtype):
+        for tokens, heads in self.shapes:
+            param = TestParam(tokens, heads, tokens, 64, 4096, 1e-6)
+            for args in FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark.make_input(
+                param
+            ):
+                q, kv = args[:2]
+                yield (*args, {"q_initial": q.clone(), "kv_initial": kv.clone()})
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX portable comparison"
+)
+def test_metax_qnorm_vs_portable_with_state_reset():
+    MetaXQNormPortableBenchmark().run()

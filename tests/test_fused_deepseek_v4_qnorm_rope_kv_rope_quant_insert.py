@@ -422,7 +422,7 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
     reason="Do not support fp8e4nv when capability < 89",
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     torch.manual_seed(1)
     device = flaggems_vllm.device
@@ -472,7 +472,7 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
 )
 @pytest.mark.parametrize("num_tokens", [4, 17])
 @pytest.mark.parametrize("pad", [1, 5])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     """slot_mapping.size(0) < q.size(0): the kernel must skip padded
     tokens in the KV branch while still running Q-norm+RoPE on all rows."""
@@ -531,8 +531,8 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
         else [1, 4, 17, 64, 8192, 32768, 65536, 98304, 131072]
     ),
 )
-@pytest.mark.parametrize("n_heads", [64, 128])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("n_heads", [16, 64, 128])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
 
     torch.manual_seed(2)
@@ -588,8 +588,8 @@ _OVERRIDE_ACTIVE = (
     "num_tokens",
     [1, 17, 513] if QUICK_MODE else [1, 17, 64, 511, 512, 777, 1000, 4096],
 )
-@pytest.mark.parametrize("n_heads", [64, 128])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("n_heads", [16, 64, 128])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_backend_override_matches_reference(
     num_tokens: int, n_heads: int, block_size: int
 ):
@@ -632,8 +632,8 @@ def test_backend_override_matches_reference(
 @pytest.mark.parametrize(
     "num_tokens", [17, 512] if QUICK_MODE else [17, 512, 777, 4096]
 )
-@pytest.mark.parametrize("n_heads", [64, 128])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("n_heads", [16, 64, 128])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
     """Cross-check against vLLM's own kernel; skipped where vLLM is absent. The tests
     above compare against this file's torch reference instead.
@@ -679,3 +679,77 @@ def test_matches_vllm_reference(num_tokens: int, n_heads: int, block_size: int):
 
     _assert_close_by_token(q, q_ref, rtol=1e-2, atol=1e-2)
     k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+@pytest.mark.parametrize("num_tokens", [17, 513])
+def test_public_qnorm_cache_changed_input_graph(num_tokens):
+    device = flaggems_vllm.device
+    block = 256
+    blocks = (num_tokens + block - 1) // block + 1
+    q = torch.randn(num_tokens, 16, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    cache = torch.zeros(blocks, block * HEAD_BYTES, device=device, dtype=torch.uint8)
+    slots = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    trigs = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+
+    def call():
+        flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q, kv, cache, slots, positions, trigs, 1e-6, block
+        )
+
+    for _ in range(3):
+        call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for value in (0.125, -0.25):
+        q.fill_(value)
+        kv.fill_(value)
+        cache.zero_()
+        expected_q, expected_kv = q.clone(), kv.clone()
+        expected_cache = cache.clone()
+        ref_impl(
+            expected_q,
+            expected_kv,
+            expected_cache,
+            slots,
+            positions,
+            trigs,
+            1e-6,
+            block,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(q, expected_q, rtol=1e-2, atol=1e-2)
+        k_cache_compare(cache, expected_cache, block, rtol=1e-2, atol=1e-2)
+        # The unused extra page remains untouched; state is reset before each replay.
+        assert torch.equal(cache[-1], expected_cache[-1])
+
+
+@pytest.fixture(autouse=True)
+def restore_qnorm_rng_state():
+    cpu, gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
+    yield
+    torch.set_rng_state(cpu)
+    torch.cuda.set_rng_state(gpu)
+
+
+@pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+def test_metax_qnorm_mixed_device_rejected_before_mutation():
+    if flaggems_vllm.vendor_name != "metax":
+        pytest.skip("MetaX device guard")
+    q = torch.randn(17, 16, 512, device=flaggems_vllm.device, dtype=torch.bfloat16)
+    kv = torch.randn(17, 512, device=q.device, dtype=q.dtype)
+    cache = torch.full((2, 256 * 584), 93, dtype=torch.uint8)
+    slots = torch.arange(17, device=q.device, dtype=torch.int64)
+    trig = make_cos_sin_cache(4096, 64, torch.float32, q.device)
+    before_q, before_kv = q.clone(), kv.clone()
+    with pytest.raises(ValueError, match="share an accelerator"):
+        flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q, kv, cache, slots, slots, trig, 1e-6, 256
+        )
+    assert torch.equal(q, before_q) and torch.equal(kv, before_kv)
+    assert bool((cache == 93).all())
