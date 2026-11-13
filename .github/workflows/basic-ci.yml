@@ -311,7 +311,11 @@ jobs:
           set -euo pipefail
           python3 --version
           python3 -c "import torch, triton, vllm; print('torch', torch.__version__, 'triton', triton.__version__, 'vllm', vllm.__version__)"
-          bash tools/setup.sh --no-venv nvidia
+          # The image's stock Triton lacks vendor-only modules that some test
+          # files import at collection time (e.g. tests/test_mhc_post.py needs
+          # triton.language.extra.cann), so setup.sh's whole-suite collection
+          # smoke check cannot pass here. The preflight below checks the import.
+          bash tools/setup.sh --no-venv --skip-smoke nvidia
 
       - name: run portable backend preflight
         shell: bash
