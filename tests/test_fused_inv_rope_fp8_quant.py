@@ -302,16 +302,15 @@ def _run_case(
         tma_aligned_scales=tma_aligned_scales,
     )
 
-    with flaggems_vllm.use_gems():
-        out, scale_out = flaggems_vllm.fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            cos_sin_cache,
-            n_groups,
-            heads_per_group,
-            dtype=torch.float8_e4m3fn,
-            tma_aligned_scales=tma_aligned_scales,
-        )
+    out, scale_out = flaggems_vllm.fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups,
+        heads_per_group,
+        dtype=torch.float8_e4m3fn,
+        tma_aligned_scales=tma_aligned_scales,
+    )
 
     return {
         "o": o,
@@ -787,10 +786,6 @@ def test_musa_public_dispatch():
 
     assert flaggems_vllm.fused_inv_rope_fp8_quant is fused_inv_rope_fp8_quant
     assert flaggems_vllm.ops_inv_rope_fp8_quant is fused_inv_rope_fp8_quant
-    assert any(
-        name == "fused_inv_rope_fp8_quant" and function is fused_inv_rope_fp8_quant
-        for name, function in flaggems_vllm._FULL_CONFIG
-    )
     o, positions, cache = _edge_inputs()
     out, _ = flaggems_vllm.fused_inv_rope_fp8_quant(
         o, positions, cache, 1, o.shape[1], tma_aligned_scales=True

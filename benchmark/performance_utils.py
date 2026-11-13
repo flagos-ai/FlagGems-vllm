@@ -460,10 +460,9 @@ class Benchmark:
                                 self.gems_op, *args, **kwargs
                             )
                         else:
-                            with flaggems_vllm.use_gems():
-                                metric.latency = self.get_latency(
-                                    self.torch_op, *args, **kwargs
-                                )
+                            metric.latency = self.get_latency(
+                                self.torch_op, *args, **kwargs
+                            )
                     if "speedup" in self.to_bench_metrics:
                         metric.speedup = metric.latency_base / metric.latency
                     if Config.base_data is not None and metric.latency:

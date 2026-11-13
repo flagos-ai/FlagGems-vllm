@@ -52,12 +52,6 @@ def test_gdn_w8a16_registration():
 
     assert "gdn_w8a16" in ops.__all__
     assert flaggems_vllm.gdn_w8a16 is ops.gdn_w8a16
-    entries = [entry for entry in flaggems_vllm._FULL_CONFIG if entry[0] == "gdn_w8a16"]
-    assert entries == [("gdn_w8a16", flaggems_vllm.gdn_w8a16)]
-    assert flaggems_vllm.FULL_CONFIG_BY_FUNC["gdn_w8a16"] == entries
-    registered_names = {entry[0] for entry in flaggems_vllm._FULL_CONFIG}
-    assert "quantize_gdn_state_fp8" not in registered_names
-    assert "dequantize_gdn_state_fp8" not in registered_names
 
 
 def make_inputs(n, t, h, hv, dtype, packed=True):
@@ -1059,8 +1053,6 @@ def test_gdn_w8a16_backend_registration():
     )
 
     assert flaggems_vllm.gdn_w8a16 is metax_gdn
-    entries = [e for e in flaggems_vllm._FULL_CONFIG if e[0] == "gdn_w8a16"]
-    assert entries == [("gdn_w8a16", metax_gdn)]
 
 
 @requires_metax

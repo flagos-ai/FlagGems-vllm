@@ -53,7 +53,6 @@ ops/
 runtime/
 ├── __init__.py             # 设备检测、get_tuned_config()、replace_customized_ops()
 ├── common.py               # 厂商注册表、VendorInfo、硬件特性能力集
-├── register.py             # 调度注册器类 (PyTorch dispatch)
 ├── configloader.py         # 加载 tune_configs.yaml
 ├── flagtune.py             # FlagTune 自动调优集成
 └── backend/
