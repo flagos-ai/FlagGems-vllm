@@ -61,7 +61,6 @@ def test_dswiglu(shape: tuple[int, ...], dtype: torch.dtype):
     grad_x2 = grad_output_fp32 * silu_x1
     te_grad_input = utils.to_reference(torch.cat((grad_x1, grad_x2), dim=-1))
 
-    with flaggems_vllm.use_gems():
-        fg_grad_input = flaggems_vllm.dswiglu(grad_output, input_tensor, quantizer=None)
+    fg_grad_input = flaggems_vllm.dswiglu(grad_output, input_tensor, quantizer=None)
 
     utils.gems_assert_close(fg_grad_input, te_grad_input, dtype)

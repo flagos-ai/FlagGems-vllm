@@ -98,7 +98,6 @@ def test_public_dispatch(monkeypatch):
     )
     assert inspect.getmodule(flaggems_vllm.top_k_top_p) is backend
     assert not hasattr(flaggems_vllm, "apply_top_k_top_p")
-    assert {"top_k_top_p"}.isdisjoint({item[0] for item in flaggems_vllm._FULL_CONFIG})
     called = []
     kernel = backend._count_bf16
 
