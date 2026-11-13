@@ -15,6 +15,12 @@
 from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
     fused_recurrent_gated_delta_rule_fwd,
 )
+
+# The MetaX builder does not support TLE grid distributed_barrier.
+# Route the inplace helper directly to its existing non-TLE implementation.
+from flaggems_vllm.ops.moe_align_block_size import (
+    _moe_align_block_size_triton_4stage as moe_align_block_size_triton,
+)
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -69,6 +75,7 @@ __all__ = [
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "moe_align_block_size_triton",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
