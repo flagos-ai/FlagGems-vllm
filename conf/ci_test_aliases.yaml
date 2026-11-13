@@ -34,6 +34,7 @@ silu_and_mul_with_clamp_out: test_silu_and_mul_with_clamp
 weight_norm_interface_backward: test_weight_norm_interface
 
 # --- Alternative naming ---
+gather_sampler_output: test_batch_shard
 act_quant_triton: test_quant
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
 moe_align_block_size_triton: test_moe_align_block_size
