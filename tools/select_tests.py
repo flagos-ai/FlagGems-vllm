@@ -255,6 +255,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
+    "src/flaggems_vllm/ops/flash_mla_with_kvcache.py": [
+        "tests/test_flash_mla_with_kvcache.py",
+        "tests/test_flash_mla_backend.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
