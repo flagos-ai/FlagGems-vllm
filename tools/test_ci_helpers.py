@@ -548,8 +548,14 @@ class BackendTuneConfigTest(unittest.TestCase):
             {},
         )
 
-    def test_iluvatar_comment_only_tune_config_loads(self):
-        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), {})
+    def test_iluvatar_tune_config_loads(self):
+        import yaml
+
+        config_path = (
+            Path(self.backend_utils.__file__).parent / "_iluvatar/tune_configs.yaml"
+        )
+        expected = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), expected)
 
     def test_non_empty_tune_config_is_preserved(self):
         directory = self.write_config("mul:\n  BLOCK_SIZE: 128\n")
