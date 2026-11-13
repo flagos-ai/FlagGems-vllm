@@ -78,9 +78,9 @@ _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
 
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
 
-_MTHREADS_NO_INT8 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement INT8 W8A16",
+NO_INT8 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement INT8 W8A16",
 )
 
 
@@ -715,8 +715,8 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         pytest.param(
             "int8",
             marks=pytest.mark.skipif(
-                flaggems_vllm.vendor_name == "mthreads",
-                reason="MThreads backend does not implement INT8 W8A16",
+                flaggems_vllm.vendor_name in ("metax", "mthreads"),
+                reason="MetaX and MThreads backends do not implement INT8 W8A16",
             ),
         ),
         "fp8",
@@ -1566,9 +1566,7 @@ def test_fused_marlin_moe_w8a16_fp8_ppu(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize(
-    "precision", [pytest.param("int8", marks=_MTHREADS_NO_INT8), "fp8"]
-)
+@pytest.mark.parametrize("precision", [pytest.param("int8", marks=NO_INT8), "fp8"])
 @pytest.mark.parametrize(
     "num_tokens",
     [
@@ -1937,9 +1935,9 @@ def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
 # -----------------------------------------------------------------------------
 _DTYPES = [torch.bfloat16, torch.float16]
 
-_MTHREADS_NO_MXFP4 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement MXFP4 W4A16",
+NO_MXFP4 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement MXFP4 W4A16",
 )
 
 
@@ -1969,7 +1967,7 @@ def _cases(
 
 
 _W4A16_CASES = _cases("int4", FULL_CONFIGS, with_router_weight_on_input=True) + _cases(
-    "mxfp4", FULL_CONFIGS, marks=_MTHREADS_NO_MXFP4
+    "mxfp4", FULL_CONFIGS, marks=NO_MXFP4
 )
 _W4A16_CASES += _cases(
     "int4",
@@ -1983,7 +1981,7 @@ _W4A16_CASES += _cases(
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+    "int8", W8A16_CONFIGS, marks=NO_INT8
 )
 
 _W8A16_CASES += [
