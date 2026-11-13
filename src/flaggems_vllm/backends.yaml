@@ -63,9 +63,10 @@ pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
 # per-vendor indexes). Pin the release that this repository's tests target.
 flag_gems_version: "5.4.0"
 flag_gems_index: "https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
-# PyPI is the default fallback index. Set PIP_INDEX_URL (for example to
-# https://mirrors.aliyun.com/pypi/simple) on networks where PyPI is slow.
-mirror: "https://pypi.org/simple"
+# Fallback index for packages the vendor indexes do not carry. It defaults to
+# the Aliyun PyPI mirror because the CI runners reach pypi.org slowly. Set
+# PIP_INDEX_URL (for example to https://pypi.org/simple) to use another index.
+mirror: "https://mirrors.aliyun.com/pypi/simple/"
 
 # Test dependencies installed independently of the project metadata. They
 # mirror the `test` extra in pyproject.toml; NVIDIA profiles add cupy-cuda12x

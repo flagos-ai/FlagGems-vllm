@@ -853,7 +853,7 @@ main() {
   esac
 
   MIRROR="${PIP_INDEX_URL:-$(global_value mirror)}"
-  [ -n "${MIRROR}" ] || MIRROR="https://pypi.org/simple"
+  [ -n "${MIRROR}" ] || MIRROR="https://mirrors.aliyun.com/pypi/simple/"
   PYPI_BASE="$(global_value pypi_base)"
   [ -n "${PYPI_BASE}" ] || PYPI_BASE="https://pypi.org/simple"
   BACKEND_VENDOR="${BACKEND_VENDOR_FROM_KEY}"
