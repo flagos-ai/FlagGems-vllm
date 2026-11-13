@@ -28,7 +28,7 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
 from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn,
@@ -75,6 +75,14 @@ def _get_baseline_mhc_post_op():
     if VENDOR == "ascend":
         # npu_mhc_post(residual, h_res, h_out, h_post): mix first, (N, 4) post.
         return lambda x, r, p, m: native(r, m, x, p.squeeze(-1))
+    if VENDOR == "hygon":
+        # aiter mhc_post writes into an out tensor and returns None.
+        def _aiter_mhc_post(x, r, p, m):
+            out = torch.empty_like(r)
+            native(out, x, r, p.reshape(r.shape[0], r.shape[1]), m)
+            return out
+
+        return _aiter_mhc_post
     return native
 
 

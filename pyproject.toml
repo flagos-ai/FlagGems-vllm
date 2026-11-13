@@ -73,6 +73,12 @@ iluvatar = [
     "numpy<2",
 ]
 
+hygon = [
+    "aiter-dtk",
+    "vllm @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=00662bd456160fb9d610831cd7f04012e15a1feb57c3807b746f4e2c13ffd20d",
+]
+
+
 thead = [
     "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.23.0+v0.2.0.ppu2.2.0/vllm-0.23.0+cu130torch2.10.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
     "scikit-learn>=1.5",
@@ -93,6 +99,17 @@ exclude-dependencies = [
     # Transitive pins of the plugin wheels: letting them resolve downgrades the base image.
     "transformers", "tokenizers", "starlette", "xgrammar",
 ]
+
+[tool.uv.sources]
+aiter-dtk = { path = "tools/aiter_wrapper" }
+
+[[tool.uv.index]]
+name = "flagos-hygon"
+url = "https://resource.flagos.net/repository/flagos-pypi-hygon/simple"
+
+[[tool.uv.index]]
+name = "flagos-iluvatar"
+url = "https://resource.flagos.net/repository/flagos-pypi-iluvatar/simple"
 
 [project.urls]
 Homepage = "https://github.com/flagos-ai/FlagGems-vllm"
