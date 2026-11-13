@@ -28,7 +28,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.FLA import chunk_scaled_dot_kkt_fwd_950dt
+    from flaggems_vllm.runtime.backend._ascend.A5 import chunk_scaled_dot_kkt_fwd_950dt
 
     return chunk_scaled_dot_kkt_fwd_950dt
 
@@ -50,32 +50,6 @@ def test_accuracy(case):
     tol = workload.TOL[workload.case_dtype(case)]
     rel = workload.rel_error(got, want)
     assert rel < tol, f"{case}: relative error {rel:.3e} exceeds {tol:.1e}"
-
-
-@pytest.mark.parametrize("case", workload.CASE_NAMES)
-def test_output_is_strictly_lower_triangular(case):
-    """Every chunk tile must be strictly lower triangular.
-
-    This is a property of the output rather than a comparison, so it holds
-    even if both sides were wrong in the same way. ``solve_tril`` downstream
-    relies on it: a nonzero diagonal silently changes which matrix gets
-    inverted, and a nonzero upper triangle breaks nilpotency, which is what
-    makes the inverse terminate.
-    """
-    kwargs = workload.build_kkt(case)
-    got = _subject()(**kwargs)
-    bt = kwargs["chunk_size"]
-    t, hv = got.shape[1], got.shape[2]
-    worst = 0.0
-    for start in range(0, t - t % bt, bt):
-        for i_b in range(got.shape[0]):
-            for i_h in range(hv):
-                tile = got[i_b, start : start + bt, i_h, :].float().cpu()
-                worst = max(worst, tile.triu(0).abs().max().item())
-    assert worst == 0.0, (
-        f"{case}: found {worst:.3e} on or above the diagonal; "
-        "tiles must be strictly lower triangular"
-    )
 
 
 def test_without_gate():

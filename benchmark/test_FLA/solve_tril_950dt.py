@@ -69,7 +69,7 @@ def test_perf_solve_tril_950dt():
     native = workload.native_solve_tril()
     if native is None:
         pytest.skip(f"reference unavailable: {workload.NATIVE_UNAVAILABLE_REASON}")
-    from flaggems_vllm.runtime.backend._ascend.FLA import solve_tril_950dt
+    from flaggems_vllm.runtime.backend._ascend.A5 import solve_tril_950dt
 
     bench = SolveTril950dtBenchmark(
         op_name="solve_tril_950dt",

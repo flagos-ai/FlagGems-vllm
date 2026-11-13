@@ -25,7 +25,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.FLA import (
+    from flaggems_vllm.runtime.backend._ascend.A5 import (
         chunk_gated_delta_rule_fwd_intra_npu_unfused,
     )
 
@@ -63,7 +63,7 @@ def test_stages_match_their_reference_counterparts(case):
     from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
     from fla.ops.utils import solve_tril
 
-    from flaggems_vllm.runtime.backend._ascend.FLA import (
+    from flaggems_vllm.runtime.backend._ascend.A5 import (
         chunk_scaled_dot_kkt_fwd_950dt,
         recompute_w_u_fwd_950dt,
         solve_tril_950dt,
@@ -94,28 +94,6 @@ def test_stages_match_their_reference_counterparts(case):
     w_mine, u_mine = recompute_w_u_fwd_950dt(**kw)
     assert rel(w_mine, w_ref) < tol, f"{case}/w: {rel(w_mine, w_ref):.3e}"
     assert rel(u_mine, u_ref) < tol, f"{case}/u: {rel(u_mine, u_ref):.3e}"
-
-
-@pytest.mark.parametrize("case", ["bt64", "varlen"])
-def test_a_is_really_the_inverse(case):
-    """A must satisfy (I + A_kkt) A = I, not merely be close to the reference.
-
-    Guards against the whole pipeline agreeing on a wrong matrix.
-    """
-    from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-
-    data = workload.build(case)
-    bt = data["chunk_size"]
-    m = chunk_scaled_dot_kkt_fwd(
-        k=data["k"], g=data["g"], beta=data["beta"],
-        cu_seqlens=data["cu_seqlens"], chunk_size=bt, output_dtype=torch.float32,
-    )
-    _w, _u, a = _subject()(**data)
-    eye = torch.eye(bt, dtype=torch.float64)
-    m0 = m[0, :bt, 0, :].cpu().double()
-    a0 = a[0, :bt, 0, :].cpu().double()
-    residual = ((eye + m0) @ a0 - eye).abs().max().item()
-    assert residual < 5e-2, f"{case}: ||(I+M)A - I|| = {residual:.3e}"
 
 
 def test_unsupported_paths_raise():

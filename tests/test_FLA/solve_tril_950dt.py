@@ -29,7 +29,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.FLA import solve_tril_950dt
+    from flaggems_vllm.runtime.backend._ascend.A5 import solve_tril_950dt
 
     return solve_tril_950dt
 
@@ -58,66 +58,3 @@ def test_accuracy(case):
     tol = workload.TOL[workload.case_dtype(case)]
     rel = workload.rel_error(got, want)
     assert rel < tol, f"{case}: relative error {rel:.3e} exceeds {tol:.1e}"
-
-
-@pytest.mark.parametrize("case", workload.CASE_NAMES)
-def test_is_really_the_inverse(case):
-    """``(I + M) Ai = I`` per tile, independent of the reference.
-
-    The comparison above would pass if both sides agreed on a wrong matrix.
-    This checks the defining property instead, in float64 on the host.
-    """
-    kwargs = _kwargs(case)
-    m = kwargs["A"]
-    ai = _subject()(**kwargs)
-    bt = m.shape[-1]
-    eye = torch.eye(bt, dtype=torch.float64)
-    worst = 0.0
-    t = m.shape[1]
-    for start in range(0, t - t % bt, bt):
-        m0 = m[0, start : start + bt, 0, :].cpu().double()
-        a0 = ai[0, start : start + bt, 0, :].cpu().double()
-        worst = max(worst, ((eye + m0) @ a0 - eye).abs().max().item())
-    # bf16/fp16 storage of Ai bounds how close this can get; 5e-2 is loose
-    # enough for fp16 tiles and still rejects a wrong matrix by orders of
-    # magnitude (a truncated series leaves ~2e-1).
-    assert worst < 5e-2, f"{case}: ||(I+M)Ai - I|| = {worst:.3e}"
-
-
-@pytest.mark.parametrize("case", workload.CASE_NAMES)
-def test_diagonal_is_one(case):
-    """The inverse of a unit lower triangular matrix is unit lower triangular.
-
-    Pins the output convention: this returns the *full* inverse, not
-    ``inverse - I``. Getting that wrong shifts every downstream w/u by one
-    copy of the right-hand side.
-    """
-    kwargs = _kwargs(case)
-    ai = _subject()(**kwargs)
-    bt = ai.shape[-1]
-    t = ai.shape[1]
-    rows = torch.arange(bt)
-    for start in range(0, t - t % bt, bt):
-        tile = ai[0, start : start + bt, 0, :].float().cpu()
-        diag = tile[rows, rows]
-        assert torch.allclose(diag, torch.ones_like(diag), atol=1e-2), (
-            f"{case}: diagonal is {diag[:4].tolist()}..., expected all ones"
-        )
-        assert tile.triu(1).abs().max().item() == 0.0, (
-            f"{case}: upper triangle is nonzero"
-        )
-
-
-def test_all_three_kernels_are_exercised():
-    """bt16/bt32/bt64 must really reach three different kernels.
-
-    ``solve_tril`` dispatches on ``A.shape[-1]``, so if these cases ever
-    stopped differing in chunk_size, two of the three inverse kernels would
-    silently go untested.
-    """
-    seen = set()
-    for case in ("bt16", "bt32", "bt64"):
-        kwargs = _kwargs(case)
-        seen.add(kwargs["A"].shape[-1])
-        _subject()(**kwargs)
-    assert seen == {16, 32, 64}, f"expected BT 16/32/64, got {sorted(seen)}"

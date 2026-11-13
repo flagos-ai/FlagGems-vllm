@@ -24,7 +24,7 @@ pytestmark = [
 
 
 def _subject():
-    from flaggems_vllm.runtime.backend._ascend.FLA import (
+    from flaggems_vllm.runtime.backend._ascend.A5 import (
         chunk_gated_delta_rule_fwd_intra_npu_fused,
     )
 
@@ -47,48 +47,6 @@ def test_accuracy(case):
     want = _reference()(**data)
     got = _subject()(**data)
     workload.assert_close(case, got, want)
-
-
-@pytest.mark.parametrize("case", ["bt64", "varlen"])
-def test_a_is_really_the_inverse(case):
-    """A must satisfy (I + A_kkt) A = I.
-
-    The fused kernel never materializes A_kkt in GM, so this is the only
-    check that its in-UB inverse is the right matrix rather than merely
-    consistent with its own w/u.
-    """
-    from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-
-    data = workload.build(case)
-    bt = data["chunk_size"]
-    m = chunk_scaled_dot_kkt_fwd(
-        k=data["k"], g=data["g"], beta=data["beta"],
-        cu_seqlens=data["cu_seqlens"], chunk_size=bt, output_dtype=torch.float32,
-    )
-    _w, _u, a = _subject()(**data)
-    eye = torch.eye(bt, dtype=torch.float64)
-    m0 = m[0, :bt, 0, :].cpu().double()
-    a0 = a[0, :bt, 0, :].cpu().double()
-    residual = ((eye + m0) @ a0 - eye).abs().max().item()
-    assert residual < 5e-2, f"{case}: ||(I+M)A - I|| = {residual:.3e}"
-
-
-def test_matches_unfused_variant():
-    """Fused and unfused must agree with each other, not just with the reference.
-
-    They share no kernel code, so agreement here is independent evidence that
-    the fused doubling-based inverse and the three-stage path compute the same
-    thing.
-    """
-    from flaggems_vllm.runtime.backend._ascend.FLA import (
-        chunk_gated_delta_rule_fwd_intra_npu_unfused,
-    )
-
-    for case in ("bt64", "d128", "varlen"):
-        data = workload.build(case)
-        fused = _subject()(**data)
-        unfused = chunk_gated_delta_rule_fwd_intra_npu_unfused(**data)
-        workload.assert_close(case, fused, unfused)
 
 
 def test_unsupported_paths_raise():

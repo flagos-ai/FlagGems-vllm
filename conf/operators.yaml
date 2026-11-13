@@ -201,6 +201,9 @@ ops:
       flash-linear-attention's `chunk_gated_delta_rule_fwd_intra_npu` and
       returning the same (w, u, A) triple.
 
+      Both live under `runtime/backend/_ascend/A5/`, the A5-generation
+      (950 series, arch35) operator directory.
+
       Unfused, in `chunk_gated_delta_rule_fwd_intra_npu.py`: keeps the
       reference's three-operator structure so each can be substituted on
       its own -- `chunk_scaled_dot_kkt_fwd_950dt`
