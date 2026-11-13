@@ -525,5 +525,5 @@ The runner is an ARC pod on a K8s node (`k8s-novolume` hook), so the platform
 declares no container volumes and GPU access comes from the pod. It follows the
 rest of the container lane: it runs by default whenever tests are selected
 (`run_by_default: true`; `vendor/NVIDIA` is only needed to force a run), observation
-period, not part of `multi-backend-summary`, and no `ci/nvidia` fork gate. This config stays
+period, not part of `unittest-required`, and no `ci/nvidia` fork gate. This config stays
 separate from `.github/configs/backends/*.yaml`, which drives `ops-test.yaml`.

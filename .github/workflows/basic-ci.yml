@@ -48,72 +48,8 @@ on:
         type: boolean
 
 jobs:
-  code-style:
-    name: code style
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          fetch-depth: 0
-
-      - name: set up python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: install style tools
-        shell: bash
-        run: python -m pip install pre-commit
-
-      - name: run pre-commit
-        shell: bash
-        run: pre-commit run --all-files --show-diff-on-failure
-
-      - name: test ci selection helpers
-        shell: bash
-        run: |
-          python -m unittest discover -s tools -p 'test_ci_*.py'
-
-      # Existing code still contains torch compute calls, so only files touched
-      # by this change are checked; new violations are blocked without failing
-      # every PR on the legacy backlog.
-      - name: check no torch compute fallback in changed files
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_py.bin
-          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
-            git diff --name-only --diff-filter=d -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_py.bin
-          else
-            git diff-tree --no-commit-id --name-only --diff-filter=d -r -z "${GITHUB_SHA}" > changed_py.bin
-          fi
-          files=()
-          while IFS= read -r -d '' path; do
-            if [[ "${path}" == *.py ]]; then
-              files+=("${path}")
-            fi
-          done < changed_py.bin
-          rm -f changed_py.bin
-          if [[ "${#files[@]}" -eq 0 ]]; then
-            echo "No changed Python files."
-            exit 0
-          fi
-          python tools/ci_checks/check_no_torch_fallback.py "${files[@]}"
-
   select-targets:
     name: select ci targets
-    needs: code-style
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -286,74 +222,15 @@ jobs:
           || (github.event.pull_request.user.login != 'dependabot[bot]'
               && (github.event.pull_request.head.repo.full_name == github.repository
                   || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))))
-    runs-on: h20
-    timeout-minutes: 60
-    env:
-      FLAGGEMS_VENDOR: nvidia
-      PYTHONPATH: ${{ github.workspace }}/src
-      VENV_DIR: ${{ github.workspace }}/.venv
-      VIRTUAL_ENV: ${{ github.workspace }}/.venv
-      # h20 is a persistent, non-ephemeral runner: uv's global package cache
-      # survives across jobs. A stale/partially-evicted cache entry can make
-      # `uv pip install` report success without actually installing into the
-      # freshly recreated venv (see tools/setup.sh for details), so force
-      # cache revalidation here.
-      UV_REFRESH: "1"
-
-    steps:
-      - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: clean generated state from persistent runner
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf -- .venv build dist
-          find . -maxdepth 2 -type d -name '*.egg-info' -exec rm -rf -- {} +
-
-      - name: show gpu
-        shell: bash
-        run: nvidia-smi
-
-      - name: install and activate python environment
-        shell: bash
-        run: |
-          source tools/setup.sh
-          source "${VENV_DIR}/bin/activate"
-          test -x "${VENV_DIR}/bin/python"
-          echo "VIRTUAL_ENV=${VENV_DIR}" >> "$GITHUB_ENV"
-          echo "${VENV_DIR}/bin" >> "$GITHUB_PATH"
-          if [[ -n "${CUDA_HOME:-}" ]]; then
-            echo "CUDA_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
-            echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
-          fi
-          if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
-            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-          fi
-          if [[ -n "${USE_FLAGCX:-}" ]]; then
-            echo "USE_FLAGCX=${USE_FLAGCX}" >> "$GITHUB_ENV"
-          fi
-          python --version
-
-      - name: run portable backend preflight
-        shell: bash
-        env:
-          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
-        run: |
-          source "${VENV_DIR}/bin/activate"
-          python tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
-
-      - name: run selected tests and benchmarks
-        shell: bash
-        env:
-          CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
-        run: |
-          source "${VENV_DIR}/bin/activate"
-          python tools/run_ci_targets.py \
-            --backend nvidia-cuda133 \
-            --capabilities .github/backend-capabilities.json
+    uses: ./.github/workflows/backend-test.yaml
+    with:
+      backend: nvidia-cuda133
+      runner_label: h20
+      gpu_check_script: tools/gpu_check_nvidia.sh
+      changed_files: ${{ needs.select-targets.outputs.targets }}
+      timeout_minutes: 60
+      # h20 is a persistent, non-ephemeral runner (see backend-test.yaml).
+      uv_refresh: "1"
 
   non-nvidia-tests:
     name: ${{ matrix.backend }} tests and benchmarks
@@ -398,7 +275,7 @@ jobs:
   #
   # Bring-up status: observation period. Each platform is still proving out
   # its runner and image, so this job is intentionally excluded from
-  # multi-backend-summary's needs: and every step tolerates failure
+  # unittest-required's needs: and every step tolerates failure
   # (continue-on-error) so a flaky or unready runner cannot block a PR.
   # Promote a platform into the required summary path only after it has been
   # green for a sustained period.
@@ -470,11 +347,14 @@ jobs:
             --backend "${BACKEND}" \
             --capabilities .github/backend-capabilities.json
 
-  multi-backend-summary:
-    name: multi-backend summary
+  # Gate job: the only check that should be required in branch protection.
+  # Individual jobs above are skipped for many PRs (label- and path-gated), so
+  # requiring them directly would block merges. Named unittest-required to
+  # match FlagGems. tools/ci_checks/check_workflow_policy.py verifies that every
+  # job is covered here.
+  unittest-required:
     if: always()
     needs:
-      - code-style
       - select-targets
       - nvidia-tests
       - non-nvidia-tests
@@ -484,7 +364,6 @@ jobs:
       - name: check ci results
         shell: bash
         env:
-          CODE_STYLE_RESULT: ${{ needs.code-style.result }}
           SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
           NVIDIA_RESULT: ${{ needs.nvidia-tests.result }}
           NON_NVIDIA_RESULT: ${{ needs.non-nvidia-tests.result }}
@@ -503,7 +382,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for result in "${CODE_STYLE_RESULT}" "${SELECT_TARGETS_RESULT}"; do
+          for result in "${SELECT_TARGETS_RESULT}"; do
             if [[ "${result}" != "success" ]]; then
               echo "Required CI preparation job ended with: ${result}" >&2
               exit 1

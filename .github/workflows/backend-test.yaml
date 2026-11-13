@@ -45,6 +45,20 @@ on:
         required: false
         type: string
         default: 'tools/run-multi-backend-tests.sh'
+      timeout_minutes:
+        description: 'Job timeout in minutes'
+        required: false
+        type: number
+        default: 120
+      uv_refresh:
+        description: >-
+          Set to 1 on persistent runners whose uv cache survives across jobs, so
+          tools/setup.sh revalidates it (a stale entry can report success
+          without installing into the freshly recreated venv). Empty keeps the
+          setup.sh default.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -52,7 +66,9 @@ permissions:
 jobs:
   test:
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      UV_REFRESH: ${{ inputs.uv_refresh }}
     concurrency:
       group: >-
         backend-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
