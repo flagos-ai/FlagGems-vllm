@@ -68,9 +68,10 @@ def _varlen_inputs(batch, seqlen, dim, dtype, device):
         [0] + list(itertools.accumulate(seqlens)), dtype=torch.int32
     ).to(device)
 
-    # x: (1, dim, seqlen) sliced from a wider buffer, then squeezed to (dim, seqlen)
-    x = torch.randn(1, seqlen, 4096 + dim + 64, device=device, dtype=dtype)
-    x = x.transpose(1, 2)[:, 4096 : 4096 + dim, :]
+    # x follows the operator contract: channel-first [dim, seqlen], contiguous.
+    # The kernel consumes it directly (fused transpose) instead of copying to a
+    # token-major buffer first.
+    x = torch.randn(dim, seqlen, device=device, dtype=dtype)
     weight = torch.randn(dim, WIDTH, device=device, dtype=dtype)
     bias = torch.randn(dim, device=device, dtype=dtype)
     conv_states = torch.randn(
@@ -88,7 +89,7 @@ def _varlen_inputs(batch, seqlen, dim, dtype, device):
         0, 2, (padded_batch,), dtype=torch.bool, device=device
     )
     return (
-        x.squeeze(0),
+        x,
         weight,
         bias,
         conv_states,
