@@ -783,3 +783,14 @@ chunk_kda_with_fused_gate:
     - [1, 64, 8, 64, 64]
     - [1, 512, 8, 128, 128, 129, 127, 256]
   shape_desc: "B, T, H, K, V, optional packed sequence lengths"
+
+cast_sigmoid:
+  # Small / medium / large coverage; the native dtype set is FP16/BF16/FP32.
+  shapes:
+    - [1]             # smallest: single element
+    - [1, 256]        # single-token gating row (vLLM grouped topk)
+    - [128, 256]      # decode micro-batch
+    - [4096, 256]     # prefill batch
+    - [1048576]       # large flat (1M)
+    - [4096, 4096]    # large 2D (16M)
+  shape_desc: "small: [1], [1,256]; medium: [128,256], [4096,256]; large: [1048576], [4096,4096]"
