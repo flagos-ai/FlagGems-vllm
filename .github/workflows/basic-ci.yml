@@ -259,6 +259,7 @@ jobs:
           set -euo pipefail
           args=(
             --config .github/configs/ci-backends.yaml
+            --changed-files changed_files.bin
             --labels-json "${PR_LABELS_JSON:-null}"
             --format github
           )
@@ -382,10 +383,10 @@ jobs:
   # keeps running directly via `nvidia-tests`; the `nvidia` platform here is the
   # A100 runner with the NGC vLLM image.
   #
-  # Scheduling is opt-in: a platform runs when its `vendor/*` label is on the
-  # pull request (or via `ci/all-vendors` / the `run_non_nvidia` dispatch,
-  # which never include NVIDIA). Labels need triage access, so a fork PR cannot
-  # pick its own runner.
+  # Scheduling: a platform runs when the pull request changes its backend
+  # directory (runtime/backend/_<vendor>/), or when a maintainer adds its
+  # `vendor/*` label (or `ci/all-vendors` / the `run_non_nvidia` dispatch).
+  # NVIDIA is selected by its label only. Same rule as the bare-runner lane.
   #
   # Bring-up status: observation period. Each platform is still proving out
   # its runner and image, so this job is intentionally excluded from

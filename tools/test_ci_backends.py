@@ -165,6 +165,36 @@ class SelectCiBackendsTest(unittest.TestCase):
     def test_all_enabled_excludes_nvidia_and_disabled_platforms(self):
         self.assertEqual(self.platforms_for(all_enabled=True), ["hygon", "metax"])
 
+    def test_a_change_under_the_backend_directory_selects_the_platform(self):
+        platforms = select_ci_backends.load_platforms(self.labelled_config())
+        base = "src/flaggems_vllm/runtime/backend"
+
+        def run(*paths):
+            selected = select_ci_backends.select_platforms(
+                platforms, set(), set(), False, set(paths)
+            )
+            return [entry["platform"] for entry in selected]
+
+        self.assertEqual(run(f"{base}/_hygon/ops/x.py"), ["hygon"])
+        self.assertEqual(
+            run(f"{base}/_metax/ops/x.py", f"{base}/_hygon/y"), ["hygon", "metax"]
+        )
+        self.assertEqual(run("src/flaggems_vllm/ops/add.py", "README.md"), [])
+        # NVIDIA is label-only, and a disabled platform never runs.
+        self.assertEqual(run(f"{base}/_nvidia/ops/x.py"), [])
+        self.assertEqual(run(f"{base}/_pending/ops/x.py"), [])
+
+    def test_path_and_label_requests_are_combined(self):
+        platforms = select_ci_backends.load_platforms(self.labelled_config())
+        selected = select_ci_backends.select_platforms(
+            platforms,
+            set(),
+            {"vendor/NVIDIA"},
+            False,
+            {"src/flaggems_vllm/runtime/backend/_hygon/ops/x.py"},
+        )
+        self.assertEqual([e["platform"] for e in selected], ["hygon", "nvidia"])
+
     def test_a_label_cannot_enable_a_disabled_platform(self):
         self.assertEqual(self.platforms_for(["vendor/Pending"]), [])
 
@@ -281,6 +311,17 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
         for name, entry in self.platforms.items():
             with self.subTest(platform=name):
                 self.assertTrue(entry.get("label", "").startswith("vendor/"))
+
+    def test_each_platform_maps_to_an_existing_backend_directory(self):
+        # Path routing keys on the vendor prefix of `backend`; a typo would
+        # make the platform unreachable by path.
+        for name, entry in self.platforms.items():
+            if entry["backend"].startswith("nvidia"):
+                continue
+            vendor = entry["backend"].split("-", maxsplit=1)[0]
+            directory = REPO_ROOT / "src/flaggems_vllm/runtime/backend" / f"_{vendor}"
+            with self.subTest(platform=name):
+                self.assertTrue(directory.is_dir(), directory)
 
     def test_container_images_have_no_embedded_whitespace(self):
         for entry in self.selected:

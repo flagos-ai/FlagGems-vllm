@@ -118,11 +118,15 @@ to `.github/backends.json`, and a `tools/gpu_check_<vendor>.sh` health script.
 
 ## Container CI lane and FlagOps consolidation
 
-Container platforms are opt-in. Add a platform's `vendor/*` label (the `label`
-field in `ci-backends.yaml`: `vendor/Hygon`, `vendor/Ascend`, `vendor/Iluvatar`,
-`vendor/MetaX`, `vendor/MooreThreads`, `vendor/NVIDIA`) to a pull request to run
-that platform. `ci/all-vendors` and the `run_non_nvidia` dispatch input select
-every platform except NVIDIA, which needs its own label. A label also runs the
+Container platforms are chosen from the change itself, as on the bare-runner
+lane. A pull request that touches `src/flaggems_vllm/runtime/backend/_<vendor>/`
+runs that vendor's platform (`_hygon`, `_ascend`, `_iluvatar`, `_metax`,
+`_mthreads`). To run a platform without touching its directory, add its
+`vendor/*` label by hand (the `label` field in `ci-backends.yaml`:
+`vendor/Hygon`, `vendor/Ascend`, `vendor/Iluvatar`, `vendor/MetaX`,
+`vendor/MooreThreads`, `vendor/NVIDIA`). `ci/all-vendors` and the
+`run_non_nvidia` dispatch input select every platform except NVIDIA. NVIDIA is
+selected by its label only, so `_nvidia/` changes do not use the A100 runner. A label also runs the
 platform on a docs-only change. No tests are selected then, so the job only
 installs the package and checks the accelerator, which validates the runner and
 image. Only users with triage access can add labels.
@@ -144,7 +148,7 @@ A backend that has a platform in `ci-backends.yaml` (hygon, ascend-cann900,
 iluvatar, metax-maca3810, mthreads-musa520) is deprecated on the bare-runner
 lane and has been removed from `backends.json`; `tools/test_ci_helpers.py`
 fails if one reappears in both. Those backends are no longer path-routed
-(`auto_select`): the container lane is opt-in by PR label, see below.
+(`auto_select`); the container lane routes them by path or label, see below.
 
 Keeping the three apart is intentional: a per-PR smoke test and a multi-hour weekly
 sweep differ in runner, image, timeout and blast radius, so one shared file
@@ -517,6 +521,6 @@ already ship flag-gems leave the flag unset and only get an editable install.
 
 The runner is an ARC pod on a K8s node (`k8s-novolume` hook), so the platform
 declares no container volumes and GPU access comes from the pod. It follows the
-rest of the container lane: scheduled by its `vendor/NVIDIA` label, observation
+rest of the container lane: selected by its `vendor/NVIDIA` label only, observation
 period, not part of `multi-backend-summary`, and no `ci/nvidia` fork gate. This config stays
 separate from `.github/configs/backends/*.yaml`, which drives `ops-test.yaml`.

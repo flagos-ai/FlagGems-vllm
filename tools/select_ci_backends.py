@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from select_backends import backend_changed, read_changed_files
 
 REQUIRED_FIELDS = (
     "backend",
@@ -88,15 +89,22 @@ def select_platforms(
     only: set[str],
     labels: set[str] | None = None,
     all_enabled: bool = False,
+    changed_files: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return the platforms to run.
 
     `only` names platforms explicitly and overrides `enabled`. Otherwise an
-    enabled platform is selected when its `label` is in `labels`, or when
-    `all_enabled` is set (NVIDIA platforms are excluded from "all", matching
-    the bare-runner lane). With no request, nothing is selected.
+    enabled platform is selected when
+      - a changed file is under its backend directory
+        (`runtime/backend/_<vendor>/`), the same rule the bare-runner lane
+        uses;
+      - its `label` is in `labels` (a manual request); or
+      - `all_enabled` is set.
+    NVIDIA platforms are only ever selected by label, never by path or by
+    "all", matching the bare-runner lane. With no request, nothing is selected.
     """
     labels = labels or set()
+    changed_files = changed_files or set()
     unknown = only - set(platforms)
     if unknown:
         raise ValueError(f"unknown platforms requested: {', '.join(sorted(unknown))}")
@@ -112,8 +120,10 @@ def select_platforms(
             if not entry.get("enabled", True):
                 continue
             by_label = bool(entry.get("label")) and entry["label"] in labels
-            by_all = all_enabled and not entry["backend"].startswith("nvidia")
-            if not by_label and not by_all:
+            non_nvidia = not entry["backend"].startswith("nvidia")
+            by_all = all_enabled and non_nvidia
+            by_path = non_nvidia and backend_changed(entry["backend"], changed_files)
+            if not (by_label or by_all or by_path):
                 continue
 
         selected.append(
@@ -165,6 +175,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="comma-separated platforms to select, overriding `enabled`",
     )
+    parser.add_argument("--changed-files", type=Path)
     parser.add_argument("--labels-json", default="[]")
     parser.add_argument("--all-enabled", action="store_true")
     parser.add_argument("--format", choices=("github", "json", "list"), default="list")
@@ -178,6 +189,7 @@ def main() -> int:
         parse_only(args.only),
         parse_labels(args.labels_json),
         args.all_enabled,
+        read_changed_files(args.changed_files),
     )
     matrix = {"include": selected}
 
