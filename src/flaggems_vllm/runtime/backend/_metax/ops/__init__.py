@@ -59,6 +59,10 @@ if triton_version_utils.has_triton_tle():
 else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
+from flaggems_vllm.runtime.backend._metax.ops.moe_align_block_size import (
+    moe_align_block_size_no_tle,
+)
+
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "fused_experts_impl",
@@ -69,6 +73,7 @@ __all__ = [
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "moe_align_block_size_no_tle",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
