@@ -200,7 +200,8 @@ Acceptance target for key shapes is `SpeedUp >= 0.9`.
 
 ## Code style & linting
 
-`pre-commit` runs on all commits and in CI (`code-style` job, must pass first).
+`pre-commit` runs on all commits and in CI (`rule-check-required` job in
+`rule-check.yaml`; PRs lint only the changed files, pushes to `main` lint all).
 
 ```shell
 pip install pre-commit
@@ -281,13 +282,48 @@ Reading order for op work: `workflow.md` → `optimization.md` → `deep_opt.md`
 
 ## CI
 
-`.github/workflows/basic-ci.yml`:
-1. **code style** — `pre-commit run --all-files` (blocking).
+`.github/workflows/rule-check.yaml` and `.github/workflows/basic-ci.yml`:
+1. **rule-check-required** (`.github/workflows/rule-check.yaml`) — one job for
+   style and rule checks, named to match FlagGems. pre-commit uses a cached hook
+   environment; PRs lint only the changed files (`--from-ref/--to-ref`) and
+   pushes to `main` run `--all-files`. It also runs the CI helper tests, the
+   no-torch-fallback check, and on PRs the operator rule checks in
+   `tools/ci_checks/`.
 2. **select targets** — `tools/select_tests.py` maps changed files to the
    relevant `tests/`/`benchmark/` targets (edits to `pyproject.toml`,
    `pytest.ini`, `tools/setup.sh`, or the CI file trigger an env smoke set).
-3. **nvidia tests** — on an H20 runner: `pytest -q <selected> --quick` and
-   `pytest -q <benchmarks> --level core`.
+   Runs independently of `rule-check-required`.
+3. **nvidia tests** — H20 runs through the same reusable
+   `.github/workflows/backend-test.yaml` as the other backends (setup via
+   `tools/setup.sh`, GPU check, preflight), after select targets:
+   `pytest -q <selected> --quick` and `pytest -q <benchmarks> --level core`.
+   Fork PRs only reach H20 with the `ci/nvidia` label.
+4. **unittest-required** — gate job (named as in FlagGems) that fails when an
+   expected accelerator job failed or was skipped. Require this one in branch
+   protection, not the individual jobs. `tools/ci_checks/check_workflow_policy.py`
+   checks that it covers every job and that each `ubuntu-latest` job has a
+   `timeout-minutes`.
+
+### Keeping `ubuntu-latest` usage low
+
+GitHub-hosted `ubuntu-latest` runners are shared, so every PR-triggered job
+that lands on one competes with other PRs for a slot and pays its own checkout,
+Python setup and dependency install.
+
+- Before adding a new PR-triggered `ubuntu-latest` job or workflow, check
+  whether its steps can be appended to an existing one (for example the
+  `rule-check-required` job in `rule-check.yaml`). Merge them when they share a checkout
+  and toolchain and neither needs to gate the other.
+- Keep jobs separate when they need different permissions, a different
+  trigger (`pull_request_target`, `workflow_call`), or must start before or
+  after another job through `needs`.
+- A merged job keeps one check name. Before renaming or removing a job, check
+  the branch ruleset for required status checks that reference the old name.
+- In a merged job, use `continue-on-error: true` with a final step that reads
+  `steps.<id>.outcome`, so one failing check does not skip the rest.
+- Give every `ubuntu-latest` job `timeout-minutes`, cache tool environments
+  (pip, pre-commit), and restrict PR checks to changed files where the check
+  allows it.
 
 When you add an op, keep source↔test↔benchmark names aligned so
 `select_tests.py` picks them up (it infers `test_<stem>.py` from the source

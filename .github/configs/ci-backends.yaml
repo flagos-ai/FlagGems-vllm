@@ -44,10 +44,11 @@
 # read path, not the workflow. See `.github/MULTI_BACKEND_CI.md` for the
 # reuse plan.
 #
-# The H20 host is intentionally absent: the `nvidia-tests` job runs directly on
-# it via `tools/setup.sh` and must not be forced into a container. The
-# `nvidia` platform below is a different machine (A100) that runs the stock NGC
-# vLLM image, to test against the torch/Triton/vLLM builds shipped there.
+# The H20 host is intentionally absent: the `nvidia-tests` job runs on it
+# through `backend-test.yaml` (`tools/setup.sh`) and must not be forced into a
+# container. The `nvidia` platform below is a different machine (A100) that
+# runs the stock NGC vLLM image, to test against the torch/Triton/vLLM builds
+# shipped there.
 #
 # `install_with_setup_sh: true` runs `tools/setup.sh --no-venv <backend>` in the
 # image instead of only `pip install --no-deps -e .`. Use it for images that do
