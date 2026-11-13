@@ -13,1834 +13,2227 @@
 # limitations under the License.
 
 ops:
-  - id: act_quant_triton
-    description: This is a fused operator.
-    for:
-      - None
-    labels:
-      - fused
-    kind:
-      - Quantization
-    stages:
-      - beta: '5.3'
-  - id: add_rms_norm
-    description: |
-      Add two inputs element-wise and apply Root Mean Square Layer Normalization.
-    for:
-      - add_rms_norm
-    labels:
-      - aten
-      - KernelGen
-      - Normalization
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: apply_repetition_penalties
-    description: |
-      Modifies logit tensors in place to penalize tokens that have already appeared in the generated sequence.
-    for:
-      - _C.apply_repetition_penalties_
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '5.0'
-  - id: apply_rotary_pos_emb
-    description: |
-      A method to incorporate positional information into the Transformer architecture.
-      Rotary Positional Embedding (RoPE) applies position-dependent rotation to the query (Q)
-      and key (K) vectors before computing the attention score.
-    for:
-      - apply_rotary_pos_emb
-    labels:
-      - fused
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.0'
-  - id: beam_search_score
-    description: Computes beam search scores by adding cumulative log probabilities
-      with new token scores.
-    for:
-      - beam_search_score
-    labels:
-      - KernelGen
-      - fused
-    kind:
-      - Math
-    stages:
-      - alpha: '5.4'
-  - id: beam_search_score_
-    description: In-place version of beam search score computation.
-    for:
-      - beam_search_score_
-    labels:
-      - KernelGen
-      - fused
-    kind:
-      - Math
-    stages:
-      - alpha: '5.4'
-  - id: bf16_paged_mqa_logits
-    description: |
-      Compute multi-head weighted ReLU attention logits on paged BF16 KV cache.
-      Uses shape-specialized Triton kernels for H=32 and H=64 with
-      zero-constexpr dispatch for decode-phase inference.
-    for:
-      - bf16_paged_mqa_logits
-    labels:
-      - fused
-      - KernelGen
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: bincount
-    description: Count the frequency of each value in an array of non-negative integers.
-    for:
-      - bincount
-    labels:
-      - aten
-      - pointwise
-      - KernelGen
-    kind:
-      - Reduction
-    stages:
-      - stable: '5.0'
-  - id: bmm_w8a8
-    description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
-    for:
-      - bmm_w8a8_int8
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - BLAS
-    stages:
-      - alpha: '5.5'
-  - id: bucket_sort_topk
-    description: A wrapper of the TLE version and the Triton version bucket-sort topk
-      operation.
-    for:
-      - None
-    labels:
-      - fused
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: causal_conv1d_fn
-    description: |
-      Causal depthwise conv1d prefill for vLLM continuous batching with
-      variable-length sequences. The Ascend A5 path reads a [channels, tokens]
-      input in either supported stride layout, [channels, width] weights,
-      optional bias and cached history; it returns same-shape activations and
-      updates the convolution state cache. It supports BF16/FP16 input and
-      matching state dtypes, with FP32 accumulation in the kernel.
-    for:
-      - causal_conv1d_fn
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '0.3'
-  - id: causal_conv1d_update
-    description: |
-      Causal depthwise conv1d decode for vLLM batched or variable-length
-      tokens, including speculative accepted-token counts and cache indices.
-      The Ascend A5 path returns an output with the input shape and updates
-      the convolution state in place. It supports BF16 input and matching
-      state dtypes, with FP32 accumulation in the kernel.
-    for:
-      - causal_conv1d_update
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '0.3'
-  - id: chunk_gated_delta_rule_fwd
-    description: |
-      The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear Attention (FLA).
-    for:
-      - chunk_gated_delta_rule_fwd
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.0'
-      - beta: '5.3'
-  - id: chunk_kda
-    description: |
-      Kimi Delta Attention (KDA) prefill for vLLM inference, with sequence-first
-      Q/K/V, gate and beta inputs, optional initial state and variable-length
-      sequence offsets. The Ascend A5 path uses chunk-major preparation,
-      recurrent state updates and output finalization. It returns attention
-      values and optionally an FP32 final state; FP16/BF16 inputs are supported
-      with FP32 accumulation in the kernels.
-    for:
-      - chunk_kda
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - beta: '0.3'
-  - id: chunk_kda_fwd_intra_token_parallel
-    description: |
-      Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
-      Writes Aqk/Akk in place and preserves their unwritten regions.
-    for:
-      - chunk_kda_fwd_intra_token_parallel
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: chunk_kda_scaled_dot_kkt_fwd
-    description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
-    for:
-      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_scaled_dot_kkt_fwd
-    labels: [fused, FLA]
-    kind: [Attention]
-    stages:
-      - alpha: '5.4'
-  - id: chunk_kda_with_fused_gate
-    description: |
-      KDA prefill with fused softplus gate and 64-token chunks; V-first final state and aliased value output.
-    for:
-      - vllm.model_executor.layers.fla.ops.kda.chunk_kda_with_fused_gate
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - beta: '0.3'
-  - id: combine_topk_swa_indices
-    description: |
-      Combines compressed top-k sparse attention indices with sliding-window attention indices
-      for DeepSeekV4 attention.
-    for:
-      - vllm.v1.attention.ops.deepseek_v4_ops.combine_topk_swa_indices
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: compressor
-    description: |
-      Compressor operator of the Ascend sparse-attention indexer: projects the
-      input with the kv/gate weights, writes kv/score states into the state
-      cache, then applies APE, softmax-weighted reduction, RMSNorm and RoPE
-      over complete compression groups through dedicated prefill and decode
-      paths.
-    for:
-      - _C_ascend.compressor
-    labels:
-      - fused
-      - vLLM
-      - Attention
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: compute_global_topk_indices_and_lens
-    description: |
-      Converts local top-k sparse attention indices to global KV-cache indices and computes
-      valid top-k lengths for DeepSeekV4 attention.
-    for:
-      - vllm.v1.attention.ops.deepseek_v4_ops.compute_global_topk_indices_and_lens
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: concat_and_cache_mla
-    description: |
-      Writes the latent and RoPE value into KV cache for Multi-head Latent Attention forward case.
-    for:
-      - _C_cache_ops.concat_and_cache_mla
-    labels:
-      - fused
-      - MLA
-    kind:
-      - Attention
-    stages:
-      - beta: '3.0'
-  - id: cooperative_topk
-    description: |
-      Select exact top-k indices from FP32 CUDA logits through vLLM's in-place
-      interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
-      and -1 padding for short rows.
-    for:
-      - _C.cooperative_topk
-    labels:
-      - fused
-      - NoCPU
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: cp_gather_indexer_k_quant_cache
-    description: This is a fused operator that gathers FP8 K cache values and scales.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Quantization
-    stages:
-      - beta: '5.3'
-  - id: cross_entropy_loss
-    description: Computes the cross entropy loss between input logits and target.
-    for:
-      - CrossEntropyLoss
-    labels:
-      - fused
-      - Reduction
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.0'
-      - removed: '3.0'
-  - id: cutlass_scaled_mm
-    description: Scaled matrix multiplication with per-tensor or per-token quantization
-      scales.
-    for:
-      - cutlass_scaled_mm_sm_90
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - LinearAlg
-    stages:
-      - beta: '5.0'
-  - id: dequantize_and_gather_k_cache
-    description: |
-      Dequantizes FP8 K-cache entries and gathers them into a BF16 tensor for DeepSeekV4 attention.
-    for:
-      - vllm.v1.attention.ops.deepseek_v4_ops.dequantize_and_gather_k_cache
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: dgeglu
-    description: |
-      Gaussian Error Gated Linear Unit with GELU activation instead of sigmoid function.
-      This is for the backward case.
-    for:
-      - dgeglu
-    labels:
-      - fused
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '4.2'
-      - beta: '5.0'
-      - stable: '5.0'
-  - id: dispatch_fused_moe_kernel
-    description: |
-      Accelerates neural network training by combining token routing (dispatch/all-to-all communication),
-      expert computation (GEMM), and result aggregation into a single GPU kernel.
-    for:
-      - dispatch_fused_moe_kernel
-    labels:
-      - fused
-      - Activation
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '5.0'
-      - stable: '5.3'
-  - id: dreglu
-    description: |
-      Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of
-      the sigmoid function for gating. This is the backward case.
-    for:
-      - dreglu
-    labels:
-      - fused
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '4.2'
-      - beta: '5.3'
-  - id: dsv41_o_proj
-    description: |
-      DeepSeek-V4.1 attention output projection (wo_a stage): inverse GPT-J
-      RoPE + per-128 FP8 quant + grouped block-scaled FP8 GEMM. Hopper recipe
-      (1, 128, 128); wo_b is an optional caller-supplied callback. Small batches
-      run in one kernel launch. A BF16 wo_a takes vLLM's non-quantizing path
-      (BF16 inverse RoPE + grouped BF16 GEMM, one Triton kernel). Hopper uses
-      tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
-      8.0 for BF16) use plain Triton kernels.
-    for:
-      - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-      - Quantization
-    stages:
-      - alpha: '5.4'
-  - id: dswiglu
-    description: |
-      Swish-Gated Linear Unit, a variant of GLU with the Swish activation function.
-      This is for the backward case.
-    for:
-      - dswiglu
-    labels:
-      - fused
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.0'
-      - beta: '5.3'
-  - id: expand_pools_and_append_tail
-    description: Expand identity-mapped history pools and append an incomplete token tail.
-    for:
-      - vllm.models.glm5next.nvidia.ops.kpool_compress.expand_pools_and_append_tail
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Indexing
-    stages:
-      - beta: '0.3'
-  - id: flash_attention_forward
-    description: Forward pass of FlashAttention computing scaled dot-product attention.
-    for:
-      - _flash_attention_forward
-    labels:
-      - aten
-      - NoCPU
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '3.0'
-  - id: flash_attn_varlen_func
-    description: |
-      Compute attention for sequences of variable lengths within a single batch.
-      Eliminating the need for padding.
-    for:
-      - flash_attn_varlen_func
-    labels:
-      - aten
-      - Attention
-      - FlashAttention
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '3.1'
-    cpp: '4.0'
-  - id: flash_attn_varlen_func_w8a8
-    description: |
-      W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
-      FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
-      and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
-      Hygon DCU, PPU, MetaX, and Ascend).
-    for:
-      - flash_attn_varlen_func_w8a8
-      - flash_attn_varlen_func_w8a8_int8
-    labels:
-      - NoCPU
-      - fused
-      - Attention
-      - FlashAttention
-      - Quantization
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: flash_attn_varlen_opt_func
-    description: A variant of `flash_attn_varlen_func` that has `lse` as an optional
-      parameter.
-    for:
-      - flash_attn_varlen_func
-    labels:
-      - aten
-      - Attention
-      - FlashAttention
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: flash_mla
-    description: A variant of Multi-head Latent Attention (MLA).
-    for:
-      - triton_mla._forward_decode
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '3.0'
-  - id: flash_mla_sparse_fwd
-    description: Part of the FlashMLA.
-    for:
-      - vllm.v1.attention.backends.mla.flashmla_sparse
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.3'
-  - id: flash_mla_sparse_fwd_w8a8
-    description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and shared key/value.
-    for:
-      - flash_mla_sparse_fwd_w8a8
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: flash_mla_with_kvcache
-    description: Dense and sparse Multi-head Latent Attention decoding with a paged
-      KV cache.
-    for:
-      - vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: flash_mla_with_kvcache_w8a8
-    description: |
-      Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific implementations.
-    for:
-      - flash_mla_with_kvcache_w8a8
-    labels:
-      - fused
-      - Attention
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: fp8_einsum
-    description: |
-      Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
-      vLLM DeepGEMM fp8_einsum) and INT8 with per-token-group activation scales
-      (Hygon, MetaX, PPU).
-    for:
-      - vllm.utils.deep_gemm.fp8_einsum
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-      - Quantization
-    stages:
-      - alpha: '5.4'
-  - id: fp8_fp4_mqa_logits
-    description: |
-      Compute weighted MQA logits with FP8 quantized Q and K tensors.
-      Uses head-batched tiled dot products with K reuse for high throughput
-      on DeepSeek V4 sparse attention indexer workloads.
-    for:
-      - vllm.utils.deep_gemm.fp8_fp4_mqa_logits
-    labels:
-      - fused
-      - vLLM
-      - KernelGen
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.1'
-  - id: fp8_fp4_paged_mqa_logits
-    description: |
-      Compute paged multi-query attention logits from FP8 queries against
-      FP8/FP4 paged KV cache with per-token scaling. Used in DeepSeek-V4
-      decode-phase inference with adaptive tile sizing.
-    for:
-      - vllm.utils.deep_gemm.fp8_fp4_paged_mqa_logits
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-      - KernelGen
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: fused_add_rms_norm
-    description: Add two inputs element-wise and apply Root Mean Square Layer Normalization.
-    for:
-      - add_rms_norm
-    labels:
-      - fused
-      - Normalization
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.0'
-    cpp: '4.0'
-  - id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-    description: |
-      Horizontally-fused DeepseekV4-MLA.
-      per-head RMSNorm + GPT-J RoPE for Q, and GPT-J RoPE + UE8M0 FP8
-      quant + paged cache insert for KV, all in one kernel launch.
-    for:
-      - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: fused_experts_impl
-    description: An implementation of fused MoE.
-    for:
-      - vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl
-    labels:
-      - fused
-      - vLLM
-      - MoE
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: fused_indexer_k_norm
-    description: |
-      GLM5Next indexer FP32 LayerNorm with FP32 weight and bias, followed by
-      a cast to the input dtype. Supports two-dimensional FP16/BF16/FP32
-      inputs with nonnegative strides and widths from 1 through 4096.
-      Forward inference only; returns a fresh contiguous tensor.
-    for:
-      - vllm.models.glm5next.common.attention._fused_indexer_k_norm
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: fused_indexer_q_rope_quant
-    description: |
-      Applies RoPE to sparse indexer Q, quantizes it to FP8 or MXFP4, and folds
-      indexer weights for DeepSeekV4 attention.
-    for:
-      - vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q_rope_quant
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.4'
-  - id: fused_indexer_weight_scale
-    description: |
-      Scale floating-point indexer weights by FP32 query scales and a scalar.
-      Returns FP32 per-token, per-head weights.
-    for:
-      - fused_indexer_weight_scale
-      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Math
-    stages:
-      - alpha: '5.4'
-  - id: fused_inv_rope_fp8_quant
-    description: |
-      Apply inverse RoPE and group-wise quantization to attention output.
-      Precisions: FP8 and INT8 (Ascend NPU).
-    for:
-      - vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - Quantization
-    stages:
-      - beta: '5.4'
-  - id: fused_marlin_moe_w4a16
-    description: |
-      Fused mixture-of-experts computation with 4-bit weights and 16-bit
-      activations. Precisions: GPTQ INT4 (uint4b8) and MXFP4.
-    for:
-      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
-    labels:
-      - fused
-      - vLLM
-      - MoE
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: fused_marlin_moe_w8a16
-    description: |
-      Fused mixture-of-experts computation with 8-bit weights and 16-bit
-      activations. Precisions: FP8 (E4M3) and INT8 (uint8b128).
-    for:
-      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
-    labels:
-      - fused
-      - vLLM
-      - MoE
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: fused_moe
-    description: The generic interface for fused MoE.
-    for:
-      - vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl
-    labels:
-      - fused
-      - vLLM
-      - MoE
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: fused_q_kv_rmsnorm
-    description: |
-      Applies RMSNorm to Q and KV tensors in a single fused kernel for DeepSeekV4 attention.
-    for:
-      - vllm.v1.attention.ops.deepseek_v4_ops.fused_q_kv_rmsnorm
-    labels:
-      - fused
-      - Attention
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule
-    description: |
-      Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
-      variable-length sequences and speculative-decoding state tables.
-      Supports FP16/BF16/FP32; non-inplace mode returns per-token states.
-    for:
-      - fused_recurrent_gated_delta_rule_fwd
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.0'
-      - beta: '5.3'
-  - id: fused_recurrent_gated_delta_rule_packed_decode
-    description: vLLM 0.24.0 packed single-token gated delta rule decode.
-    for:
-      - fused_recurrent_gated_delta_rule_packed_decode
-    labels:
-      - fused
-    kind:
-      - FLA
-    stages:
-      - alpha: '5.4'
-  - id: fused_recurrent_kda
-    description: |
-      Kimi Delta Attention (KDA) decode for vLLM inference with key-wise gate
-      decay, optional QK L2 normalization, scalar/vector beta and an FP32
-      recurrent state. It returns output matching V's shape and dtype and an
-      updated FP32 state. The Ascend A5 path supports variable-length requests,
-      per-token state tables and FP16/BF16/FP32 inputs; it fuses the Kimi K3
-      bounded gate, beta sigmoid and speculative accepted-token selection.
-    for:
-      - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - beta: '0.3'
-  - id: gate_sigmoid_mul
-    description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
-    for:
-      - vllm.models.kimi_k3.nvidia.mla._gate_sigmoid_mul
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '0.3'
+- id: act_quant_triton
+  description: This is a fused operator.
+  for:
+  - None
+  labels:
+  - fused
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.3'
+- id: add_rms_norm
+  description: 'Add two inputs element-wise and apply Root Mean Square Layer Normalization.
 
-  - id: gdn_w8a16
-    description: |
-      Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8 state,
-      per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
-      Supports decode, prefill and speculative state-slot updates.
-      MetaX uses a backend-specific core interface with precomputed FP32 gates
-      and immutable FP32 state, returning output and final state. Its opt-in mixed_precision=True chunk path
-      uses BF16/FP16 intermediates with FP32 accumulation and bounded workspace.
-      MetaX decode=True accepts raw gates and packed/separate QKV and updates
-      indexed FP32 state slots in place with fused normalization and gating.
-      FP8 supports decode, prefill and speculative state-slot updates.
-      INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
-    for:
-      - gdn_w8a16
-      - gdn_w8a16_int8
-      - chunk_gated_delta_rule_w8a16_int8
-      - quantize_gdn_state_int8
-    labels:
-      - fused
-      - FLA
-      - Attention
-      - Quantization
-      - NoCPU
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: geglu
-    description: Gaussian Error Gated Linear Unit with GELU activation instead of
-      sigmoid function.
-    for:
-      - geglu
-    labels:
-      - fused
-      - Activation
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '4.2'
-      - beta: '5.3'
-  - id: gelu_and_mul
-    description: An activation function for GeGLU.
-    for:
-      - GeluAndMul
-    labels:
-      - fused
-      - pointwise
-      - Activation
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.0'
-  - id: gemma_rms_norm
-    description: |
-      RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
-      the learnable weight is offset by one: the output is
-      `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
-    for:
-      - vllm.model_executor.layers.layernorm.GemmaRMSNorm
-    labels:
-      - fused
-      - NoCPU
-      - Normalization
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: group_list_cumsum
-    description: |
-      Computes expert token-count offsets (cumsum) for expert-parallel MoE
-      routing. The aclnn cumsum dispatch has no AI_CORE path for integer
-      dtypes on Ascend, so this runs it as a single vector-core program.
-    for:
-      - None
-    labels:
-      - fused
-      - MoE
-      - Reduction
-    kind:
-      - Reduction
-    stages:
-      - alpha: '5.4'
-  - id: grouped_gemma_rmsnorm
-    description: Grouped Gemma RMS normalization with shared or per-group affine weights.
-    for:
-      - vllm.models.qwen4_exp.nvidia.ops.hc.grouped_gemma_rmsnorm
-    labels:
-      - fused
-      - vLLM
-      - Normalization
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '0.3'
-  - id: grouped_topk
-    description: |
-      A specialized routing mechanism used in Mixture-of-Experts (MoE) models (like DeepSeek-V3/R1)
-      to select top-k experts by first grouping them, rather than selecting globally.
-    for:
-      - _moe_C.grouped_topk
-    labels:
-      - fused
-      - NoCPU
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - stable: '5.0'
-  - id: hc_combine
-    description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
-    for:
-      - hc_combine
-    labels:
-      - fused
-    kind:
-      - Pointwise
-    stages:
-      - beta: '0.3'
-  - id: hc_head_fused_kernel
-    description: |
-      The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
-      This fused implementation computes RMS-normalized hidden states and applies
-      per-head weighted mixing to produce the output activations.
-    for:
-      - mhc_head_fused_kernel
-    labels:
-      - fused
-      - vLLM
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.2'
-      - stable: '5.3'
-  - id: hc_split_sinkhorn_forward
-    description: |
-      Computes a differentiable approximation of the Wasserstein distance (Optimal Transport)
-      between two probability distributions or point clouds.
-    for:
-      - None
-    labels:
-      - fused
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: indexer_epilogue
-    description: |
-      Fused post-topk epilogue for the GLM lightning indexer: expands the
-      selected pool ids to token ids, appends the causal tail and writes the
-      int32 output row directly, replacing a chain of ~10 small torch kernels
-      per call.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: indexer_gemm_score
-    description: |
-      GEMM-form scorer for the GLM lightning indexer: gathers each pool tile
-      once per request and multiplies it with a query block via tl.dot,
-      instead of re-reading the whole pool cache once per token row. Small
-      row counts (decode/draft steps) fall back to the matvec kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-      - DSA
-    kind:
-      - LinearAlg
-    stages:
-      - alpha: '5.4'
-  - id: indexer_k_quant_and_cache
-    description: This is a fused operator that quantizes K tensors and writes them
-      into the FP8 KV cache.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Quantization
-    stages:
-      - beta: '5.3'
-  - id: inplace_fused_experts
-    description: This operator writes output directly to `hidden_states`.
-    for:
-      - inplace_fused_experts
-    labels:
-      - fused
-      - Activation
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '5.0'
-      - stable: '5.3'
-  - id: instance_norm
-    description: |
-      Apply Instance Normalization independently for each channel in every data sample within a batch.
-    for:
-      - instance_norm
-    labels:
-      - fused
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.2'
-      - removed: '3.0'
-      - beta: '5.3'
-  - id: kda_conv_gather
-    description: |
-      Stages the rows used by a batch out of the block-strided Kimi Delta
-      Attention (KDA) short-convolution state cache into a contiguous buffer
-      for the AscendC conv operator, emitting local row indices with PAD
-      markers in a single kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: kda_conv_scatter
-    description: |
-      Restores the staged rows back into the block-strided KDA
-      short-convolution state cache after the AscendC conv operator in one
-      pass, skipping PAD entries inside the kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: kda_gate_cumsum
-    description: |
-      Fused Triton replacement for the AscendC kda_gate_cumsum operator:
-      computes the safe sigmoid gates of Kimi Delta Attention and their
-      in-chunk cumulative sums with one program per (chunk, head) tile
-      instead of one serial block per sequence.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: kda_state_gather
-    description: |
-      Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
-      layout expected by the AscendC chunk operator, zeroing slots without an
-      initial state, with the transpose folded into a single kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: kda_state_scatter
-    description: |
-      Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
-      chunk operator back into the paged [H, V, K] cache layout with the
-      transpose and dtype cast folded into a single kernel.
-    for:
-      - None
-    labels:
-      - fused
-      - FLA
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: kpool_state_compress
-    description: |
-      Fused fast path for the GLM5 Next A3 indexer pre-compress sequence:
-      writes each token's full-resolution k/gate_score row into the paged
-      compressor state cache and compresses completed pools with
-      softmax(gate_score + ape) weighting, all in one launch per sparse layer.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: kv_rmsnorm_rope_cache
-    description: |
-      Fused KV RMSNorm + RoPE + paged-KV cache writeback: splits a fused KV
-      projection, applies RMSNorm to the RMS half and rotary position
-      embedding to the RoPE half, and scatters both into the paged k/ckv
-      caches through the per-token slot index.
-    for:
-      - None
-    labels:
-      - fused
-      - TLE
-      - vLLM
-      - Normalization
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: lightning_indexer
-    description: |
-      TLE implementation of the Ascend paged-attention Lightning Indexer:
-      builds 512-key topk proposals for short-K, single-token long-K and
-      multi-token long-K varlen queries and merges them through a Stage2
-      merge tree, emitting the final topk indices.
-    for:
-      - None
-    labels:
-      - fused
-      - TLE
-      - DSA
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: megamoe_int8
-    description: |
-      Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
-      combining routing, two expert GEMMs, DUSHMEM communication, and Top-K
-      reduction in one persistent Triton/FlagTree kernel.
-    for:
-      - megamoe_int8
-    labels:
-      - fused
-      - vLLM
-      - MoE
-    kind:
-      - MoE
-    stages:
-      - alpha: '5.5'
-  - id: mhc_bwd
-    description: |
-      The backward case for MHC (Manifold-Constrained Hyper-Connections).
-      This is the Triton implmentation for Sinkhorn implicit CG differentiation.
-      It computes the gradient of the Sinkhorn normalization using implicit differentiation via the conjugate gradient method.
-    for:
-      - mhc_bwd
-    labels:
-      - fused
-      - vLLM
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: mhc_post
-    description: Triton implementation of mHC Post operator (optimized v3).
-    for:
-      - mhc_post
-    labels:
-      - fused
-      - vLLM
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: mhc_pre
-    description: Triton implementation of mHC Pre operator (optimized v2).
-    for:
-      - vllm.model_executor.layers.mhc.mhc_pre
-    labels:
-      - fused
-      - vLLM
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: mhc_shifted_post_pre
-    description: |
-      DSV4.1 shifted mHC boundary: applies the previous sublayer's post/comb
-      coefficients, then emits the next post/comb/pre coefficient set, the
-      collapsed (optionally RMSNorm'd) layer input and the stream mean.
-      Consumes the carried pre-mix instead of the freshly computed one, which is
-      what lets vLLM overlap coefficient generation with the sublayer.
-    for:
-      - vllm.models.deepseek_v41.nvidia.ops.mhc.mhc_shifted_post_pre
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: minimax_m3_sparse_attn
-    description: |
-      MiniMax M3 block-sparse GQA prefill attention over packed paged KV
-      (one 128-token page per sparse block). Dispatches to FlagAttention's
-      flag_attn.minimax_sparse_attention kernels.
-    for:
-      - vllm.models.minimax_m3.common.ops.sparse_attn
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: minimax_m3_sparse_attn_decode
-    description: |
-      MiniMax M3 block-sparse GQA decode attention; split-K over the selected
-      blocks with an LSE merge. Dispatches to FlagAttention's
-      flag_attn.minimax_sparse_attention kernels.
-    for:
-      - vllm.models.minimax_m3.common.ops.sparse_attn
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: moe_align_block_size_triton
-    description: |
-      Aligns the token distribution across experts to be compatible with block size
-      for matrix multiplication.
-    for:
-      - _moe_C.align_block_size
-    labels:
-      - fused
-      - Reduction
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '4.0'
-      - stable: '4.2'
-  - id: moe_sum
-    description: |
-      An implementation of Mixture of Experts (MoE) with sum-based aggregation
-      instead of the more common weighted average.
-    for:
-      - _moe_C.moe_sum
-    labels:
-      - fused
-      - Reduction
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - stable: '4.2'
-  - id: mrope
-    description: |
-      Applies multi-modal rotary positional embeddings to query and key tensors,
-      using temporal, height, and width sections.
-    for:
-      - mrope
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: mul
-    description: Multiplies `input` by `other`.
-    for:
-      - mul.Tensor
-    labels:
-      - aten
-      - pointwise
-    kind:
-      - Math
-    stages:
-      - stable: '1.0'
-  - id: mul_
-    description: The in-place version of `mul()`.
-    for:
-      - mul_.Tensor
-    labels:
-      - aten
-      - pointwise
-    kind:
-      - Math
-    stages:
-      - stable: '2.2'
-  - id: mv
-    description: Performs a matrix-vector product of the matrix `input` and the vector
-      `vec`.
-    for:
-      - mv
-    labels:
-      - aten
-    kind:
-      - BLAS
-    stages:
-      - stable: '2.0'
-  - id: outer
-    description: |
-      Computes outer product of self and the input vector.
-      If the self tensor is a vector of size `n` and the input tensor is a vector of size `m`,
-      the `out` tensor (if specified) must be a matrix of size `n * m`.
-    for:
-      - outer.Tensor
-    labels:
-      - fused
-    kind:
-      - BLAS
-    stages:
-      - stable: '2.0'
-  - id: outplace_fused_experts
-    description: This operator allocates and returns a new output tensor.
-    for:
-      - outplace_fused_experts
-    labels:
-      - fused
-      - Activation
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '5.0'
-      - stable: '5.3'
-  - id: pack_seq_triton
-    description: Pack variable-length token sequences into a padded batched tensor.
-    for:
-      - pack_seq_triton
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: pad_indexer_heads
-    description: Append zero heads to GLM5Next FP8 queries and per-head weights with bit-preserving copies.
-    for:
-      - None
-    labels:
-      - vLLM
-    kind:
-      - DataMovement
-    stages:
-      - beta: '0.3'
-  - id: paged_scatter_triton
-    description: |
-      Scatters token rows into paged caches by slot index in a single kernel,
-      skipping invalid slots inside the kernel. Replaces the torch
-      where/zeros_like/scatter_nd sentinel chains with a fixed-grid,
-      ACLGraph-capturable launch.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: per_token_group_quant_fp8
-    description: |
-      Function to perform per-token-group quantization on an input tensor `x`.
-      It converts the tensor values into signed float8 values and returns the
-      quantized tensor along with the scaling factor used for quantization.
-    for:
-      - _C.per_token_group_fp8_quant
-    labels:
-      - NoCPU
-      - vLLM
-    kind:
-      - Quantization
-    stages:
-      - alpha: '4.2'
-      - beta: '5.3'
-  - id: persistent_topk
-    description: |
-      vLLM-compatible persistent topk decode. Triton implementation supporting
-      three dispatch tiers (decode/medium/large) based on seq_len, with
-      cooperative multi-CTA kernels for large sequences.
-    for:
-      - _C.persistent_topk
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: qsa_prepare
-    description: |
-      Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for the
-      indexer Q/K, the compressed-key pool, the state-ring commit, and the main
-      attention QK-norm/RoPE/gate with its paged K/V write, in one launch.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - beta: '5.3'
-  - id: qsa_sparse_paged_attention
-    description: |
-      Computes sparse grouped-query attention over paged BF16 or FP8 KV caches
-      using packed token indices, with fused output gating.
-    for:
-      - vllm.models.qwen4_exp.nvidia.ops.qsa.qsa_sparse_paged_attention
-    labels:
-      - fused
-      - Attention
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.5'
-  - id: reglu
-    description: |
-      Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead of the sigmoid function for gating.
-    for:
-      - reglu
-    labels:
-      - fused
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '4.2'
-      - beta: '5.3'
-  - id: reshape_and_cache
-    description: Store the key/value token states into the pre-allcated kv_cache buffers
-      of paged attention.
-    for:
-      - reshape_and_cache
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - stable: '3.0'
-  - id: reshape_and_cache_flash
-    description: Store the key/value token states into the pre-allcated kv_cache buffers
-      of paged attention.
-    for:
-      - reshape_and_cache_flash
-    labels:
-      - fused
-    kind:
-      - Attention
-    stages:
-      - stable: '3.0'
-    cpp: '4.0'
-  - id: rwkv_ka_fusion
-    description: |
-      Merges, aligns, and enhances features from different data sources or spatial directions
-      using the efficient, linear-time RWKV framework.
-    for:
-      - rwkv_ka_fusion
-    labels:
-      - fused
-    kind:
-      - RWKV
-    stages:
-      - stable: '4.1'
-    cpp: '4.0'
-  - id: rwkv_mm_sparsity
-    description: Optimized, lossless sparse matrix multiplication in RWKV-7 models.
-    for:
-      - rwkv_mm_sparsity
-    labels:
-      - fused
-    kind:
-      - RWKV
-    stages:
-      - stable: '4.1'
-    cpp: '4.0'
-  - id: silu_and_mul
-    description: A custom operator in vLLM as activation function for SwiGLU.
-    for:
-      - silu_and_mul
-    labels:
-      - fused
-      - pointwise
-      - vLLM
-    kind:
-      - Activation
-    stages:
-      - stable: '2.0'
-  - id: silu_and_mul_out
-    description: A variant of `silu_and_mul` with an extra `out` argument.
-    for:
-      - silu_and_mul.out
-    labels:
-      - fused
-      - pointwise
-      - vLLM
-    kind:
-      - Activation
-    stages:
-      - stable: '2.0'
-  - id: silu_and_mul_with_clamp
-    description: A custom operator in vLLM as activation function for SwiGLU.
-    for:
-      - silu_and_mul_with_clamp
-    labels:
-      - fused
-      - pointwise
-      - vLLM
-    kind:
-      - Activation
-    stages:
-      - stable: '5.3'
-  - id: silu_and_mul_with_clamp_out
-    description: A variant of `silu_and_mul_with_clamp` with an extra `out` argument.
-    for:
-      - silu_and_mul_with_clamp.out
-    labels:
-      - fused
-      - pointwise
-      - vLLM
-    kind:
-      - Activation
-    stages:
-      - stable: '5.3'
-  - id: skip_layer_norm
-    description: |
-      An optimized operation used in Transformer models to improve performance
-      by combining residual connection (skip connection) addition and Layer Normalization
-      (LayerNorm) into a single kernel.
-    for:
-      - skip_layer_norm
-    labels:
-      - fused
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.0'
-  - id: slot_mapping_triton
-    description: |
-      Parallel slot-mapping computation for paged KV caches: parallelises over
-      (request, token block) instead of launching one program per request,
-      removing the serial token walk on prefill batches with few long requests.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: sparse_attn_sharedkv
-    description: |
-      DeepSeekV4 shared-KV sparse attention in three modes: SWA (sliding
-      window over the recent original KV), CFA (window plus the contiguous
-      compressed KV prefix) and SCFA (window plus the per-query selected
-      compressed KV), with graph-safe decode and chunked-prefill entry points.
-    for:
-      - None
-    labels:
-      - fused
-      - TLE
-      - vLLM
-      - DeepSeekV4
-      - Attention
-    kind:
-      - Attention
-    stages:
-      - alpha: '5.4'
-  - id: sparse_attn_triton
-    description: Sparse attention with attention-sink.
-    for:
-      - None
-    labels:
-      - fused
-      - NoCPU
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: sparse_flash_attention
-    description: |
-      Ascend shared-KV MLA with the vLLM-Ascend SFA interface and tuple outputs.
-      FP16/BF16, BSND/TND and paged caches, block sparsity and right-down causal
-      masking; dimensions 512+64. value must alias key; forward inference only.
-    for:
-      - _C_ascend.npu_sparse_flash_attention
-    labels:
-      - fused
-      - vLLM
-      - Ascend
-    kind:
-      - DSA
-    stages:
-      - alpha: '0.1.0'
-  - id: sparse_mla_fwd_interface
-    description: |
-      A generic interface for sparse MLA (Multi-head Latent Attention) for DeepSeek v3/v3.2.
-      It is currently not exposed as a standalone operator for use.
-    for:
-      - sparse_mla_fwd
-    labels:
-      - fused
-    kind:
-      - DSA
-    stages:
-      - beta: '5.0'
-      - stable: '5.3'
-  - id: stage_deepseek_v4_mega_moe_inputs
-    description: |
-      Stages DeepSeekV4 Mega-MoE inputs by quantizing hidden states to FP8
-      with UE8M0 scales and copying top-k indices and weights to output buffers.
-    for:
-      - stage_deepseek_v4_mega_moe_inputs
-    labels:
-      - fused
-      - DeepSeekV4
-      - MoE
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: swiglu
-    description: Swish-Gated Linear Unit, a variant of GLU with the Swish activation
-      function.
-    for:
-      - swiglu
-    labels:
-      - fused
-      - Transformer
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '5.0'
-  - id: top_k_per_row_decode
-    description: |
-      Triton top-K per row for DeepSeek V4 decode-phase token selection.
-      Radix-select based approach with three dispatch tiers for different vocab sizes.
-    for:
-      - None
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-      - KernelGen
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: top_k_per_row_prefill
-    description: |
-      Triton top-K per row for DeepSeek V4 sparse attention prefill phase.
-      Replaces vLLM persistent_topk CUDA kernel with in-place masking + adaptive topk selection.
-    for:
-      - None
-    labels:
-      - fused
-      - KernelGen
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: top_k_top_p
-    description: |
-      Per-row top-k / top-p filtering of [batch, vocab] sampling logits: masked
-      positions become -inf and kept positions keep their logit values.
-      Returns a new tensor and preserves the input. The shared argument order
-      is (logits, p=None, k=None). Ascend uses sorted top-L candidates; MetaX
-      uses single-row integer-key tile/merge sorting and batched counting/radix
-      sorting for contiguous FP32 with batch <= 64 and vocab <= 262144.
-      Ascend launch overrides remain
-      backend-specific.
-    for:
-      - torch_npu.npu_top_k_top_p
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
-  - id: topk_softmax
-    description: |
-      Selects the k most likely next-token candicates, sets all others to zero,
-      and renormalize the prbabilities of these top candidates.
-    for:
-      - _moe_C.topk_softmax
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - stable: '4.0'
-  - id: topk_softplus_sqrt
-    description: |
-      Fused softplus + sqrt + top-k selection and optional renormalization
-      for MoE gating in models like DeepSeek-V3/V4.
-    for:
-      - topk_softplus_sqrt
-    labels:
-      - fused
-      - KernelGen
-      - vLLM
-    kind:
-      - MoE
-    stages:
-      - beta: '5.3'
-  - id: triton_ihc_post
-    description: iHC gated residual scatter with unfused FP32 multiply and addition.
-    for:
-      - triton_ihc_post
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.4'
-  - id: triton_lighting_indexer_k_tiled_interface
-    description: Part of FP8 MQA framework. It is currently not exposed as an operator
-      for use.
-    for:
-      - None
-    labels:
-      - fused
-      - DSA
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.3'
-  - id: triton_reshape_and_cache_flash
-    description: In-place Flash 4D and head-major KV writes with ordinary or global E4M3 FP8 storage.
-    for:
-      - triton_reshape_and_cache_flash
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - Attention
-    stages:
-      - alpha: '0.1'
-  - id: unpack_seq_triton
-    description: Unpack a packed sequence tensor back to its original variable-length
-      form.
-    for:
-      - unpack_seq_triton
-    labels:
-      - fused
-      - vLLM
-      - DeepSeekV4
-    kind:
-      - NeuralNetwork
-    stages:
-      - beta: '5.3'
-  - id: w8a8_block_matmul
-    description: Matrix multiplication with block-wise scaled INT8 or FP8 activations and weights.
-    for:
-      - w8a8_block_matmul
-    labels:
-      - fused
-      - vLLM
-    kind:
-      - BLAS
-    stages:
-      - alpha: '5.5'
-    cpp: '5.5'
-  - id: weight_norm
-    description: |
-      Reparameterizes a module's weight tensor by decoupling its magnitude (g)
-      from its direction (v). It is a hook that compute the actual weight before
-      each forward pass.
-    for:
-      - weight_norm
-    labels:
-      - fused
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '3.0'
-  - id: weight_norm_interface
-    description: |
-      Apply weight normalization to neural network layers, decoupling the magnitued
-      of a weight tensor from its direction. It is used to stabilize training, particularly
-      for models with small batch sizes.
-    for:
-      - _weight_norm_interface
-    labels:
-      - aten
-      - fused
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '2.2'
-  - id: weight_norm_interface_backward
-    description: |
-      Computes the gradients for weight normalization during the backward pass.
-      It calculates the necessary derivatives for updating both the magnitude (g)
-      and direction (v)  parameters of a weight-normalized layer, based on gradients
-      received from the previous operation.
-    for:
-      - _weight_norm_interface_backward
-    labels:
-      - aten
-      - fused
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '3.0'
+    '
+  for:
+  - add_rms_norm
+  labels:
+  - aten
+  - KernelGen
+  - Normalization
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: apply_repetition_penalties
+  description: 'Modifies logit tensors in place to penalize tokens that have already
+    appeared in the generated sequence.
+
+    '
+  for:
+  - _C.apply_repetition_penalties_
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '5.0'
+- id: apply_rotary_pos_emb
+  description: 'A method to incorporate positional information into the Transformer
+    architecture.
+
+    Rotary Positional Embedding (RoPE) applies position-dependent rotation to the
+    query (Q)
+
+    and key (K) vectors before computing the attention score.
+
+    '
+  for:
+  - apply_rotary_pos_emb
+  labels:
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.0'
+- id: beam_search_score
+  description: Computes beam search scores by adding cumulative log probabilities
+    with new token scores.
+  for:
+  - beam_search_score
+  labels:
+  - KernelGen
+  - fused
+  kind:
+  - Math
+  stages:
+  - alpha: '5.4'
+- id: beam_search_score_
+  description: In-place version of beam search score computation.
+  for:
+  - beam_search_score_
+  labels:
+  - KernelGen
+  - fused
+  kind:
+  - Math
+  stages:
+  - alpha: '5.4'
+- id: bf16_paged_mqa_logits
+  description: 'Compute multi-head weighted ReLU attention logits on paged BF16 KV
+    cache.
+
+    Uses shape-specialized Triton kernels for H=32 and H=64 with
+
+    zero-constexpr dispatch for decode-phase inference.
+
+    '
+  for:
+  - bf16_paged_mqa_logits
+  labels:
+  - fused
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: bincount
+  description: Count the frequency of each value in an array of non-negative integers.
+  for:
+  - bincount
+  labels:
+  - aten
+  - pointwise
+  - KernelGen
+  kind:
+  - Reduction
+  stages:
+  - stable: '5.0'
+- id: bmm_w8a8
+  description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
+  for:
+  - bmm_w8a8_int8
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - BLAS
+  stages:
+  - alpha: '5.5'
+- id: bucket_sort_topk
+  description: A wrapper of the TLE version and the Triton version bucket-sort topk
+    operation.
+  for:
+  - None
+  labels:
+  - fused
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: causal_conv1d_fn
+  description: 'Causal depthwise conv1d prefill for vLLM continuous batching with
+
+    variable-length sequences. The Ascend A5 path reads a [channels, tokens]
+
+    input in either supported stride layout, [channels, width] weights,
+
+    optional bias and cached history; it returns same-shape activations and
+
+    updates the convolution state cache. It supports BF16/FP16 input and
+
+    matching state dtypes, with FP32 accumulation in the kernel.
+
+    '
+  for:
+  - causal_conv1d_fn
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
+- id: causal_conv1d_update
+  description: 'Causal depthwise conv1d decode for vLLM batched or variable-length
+
+    tokens, including speculative accepted-token counts and cache indices.
+
+    The Ascend A5 path returns an output with the input shape and updates
+
+    the convolution state in place. It supports BF16 input and matching
+
+    state dtypes, with FP32 accumulation in the kernel.
+
+    '
+  for:
+  - causal_conv1d_update
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
+- id: chunk_gated_delta_rule_fwd
+  description: 'The forward case for `ChunkGatedDeltaRuleFunction` with Flash Linear
+    Attention (FLA).
+
+    '
+  for:
+  - chunk_gated_delta_rule_fwd
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.0'
+  - beta: '5.3'
+- id: chunk_gated_delta_rule_fwd_intra_npu
+  description: 'The intra-chunk stage of the gated delta rule for Ascend 950DT
+
+    (A5 / arch35), triton-ascend only. Two interchangeable
+
+    implementations of the same math, both matching the signature of
+
+    flash-linear-attention''s `chunk_gated_delta_rule_fwd_intra_npu` and
+
+    returning the same (w, u, A) triple.
+
+
+    Both live under `runtime/backend/_ascend/a5/FLA/`, the A5-generation
+
+    (950 series, arch35) operator directory.
+
+
+    Unfused, in `chunk_gated_delta_rule_fwd_intra_npu.py`: keeps the
+
+    reference''s three-operator structure so each can be substituted on
+
+    its own -- `chunk_scaled_dot_kkt_fwd_950dt`
+
+    (A = tril(beta * K K^T * decay)), `solve_tril_950dt` ((I + A)^-1 by
+
+    doubling on 16x16 diagonal blocks plus block elimination) and
+
+    `recompute_w_u_fwd_950dt` (w = A @ beta*exp2(g)*k, u = A @ beta*v);
+
+    `chunk_gated_delta_rule_fwd_intra_npu_unfused` chains them in the
+
+    reference''s order.
+
+
+    Fused, in `chunk_gated_delta_rule_fwd_intra_npu_fused.py`: one kernel
+
+    that keeps the triangular inverse in UB, so it is faster end to end
+
+    but cannot be compared per operator.
+
+
+    Both support FP16/BF16/FP32, chunk_size 16/32/64, DK/DV <= 128, GVA
+
+    (HV % H == 0) and varlen via cu_seqlens. Gate convention matches the
+
+    reference: g is a raw per-chunk cumulative log decay consumed through
+
+    exp2, never pre-exponentiated. Forward only.
+
+    '
+  for:
+  - chunk_gated_delta_rule_fwd_intra_npu_fused
+  - chunk_gated_delta_rule_fwd_intra_npu_unfused
+  - chunk_scaled_dot_kkt_fwd_950dt
+  - solve_tril_950dt
+  - recompute_w_u_fwd_950dt
+  labels:
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: chunk_kda
+  description: 'Kimi Delta Attention (KDA) prefill for vLLM inference, with sequence-first
+
+    Q/K/V, gate and beta inputs, optional initial state and variable-length
+
+    sequence offsets. The Ascend A5 path uses chunk-major preparation,
+
+    recurrent state updates and output finalization. It returns attention
+
+    values and optionally an FP32 final state; FP16/BF16 inputs are supported
+
+    with FP32 accumulation in the kernels.
+
+    '
+  for:
+  - chunk_kda
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
+- id: chunk_kda_fwd_intra_token_parallel
+  description: 'Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
+
+    Writes Aqk/Akk in place and preserves their unwritten regions.
+
+    '
+  for:
+  - chunk_kda_fwd_intra_token_parallel
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: chunk_kda_scaled_dot_kkt_fwd
+  description: Causal KDA KKT and QKT matrices from cumulative log2 gates.
+  for:
+  - vllm.model_executor.layers.fla.ops.kda.chunk_kda_scaled_dot_kkt_fwd
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: chunk_kda_with_fused_gate
+  description: 'KDA prefill with fused softplus gate and 64-token chunks; V-first
+    final state and aliased value output.
+
+    '
+  for:
+  - vllm.model_executor.layers.fla.ops.kda.chunk_kda_with_fused_gate
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
+- id: combine_topk_swa_indices
+  description: 'Combines compressed top-k sparse attention indices with sliding-window
+    attention indices
+
+    for DeepSeekV4 attention.
+
+    '
+  for:
+  - vllm.v1.attention.ops.deepseek_v4_ops.combine_topk_swa_indices
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: compressor
+  description: 'Compressor operator of the Ascend sparse-attention indexer: projects
+    the
+
+    input with the kv/gate weights, writes kv/score states into the state
+
+    cache, then applies APE, softmax-weighted reduction, RMSNorm and RoPE
+
+    over complete compression groups through dedicated prefill and decode
+
+    paths.
+
+    '
+  for:
+  - _C_ascend.compressor
+  labels:
+  - fused
+  - vLLM
+  - Attention
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: compute_global_topk_indices_and_lens
+  description: 'Converts local top-k sparse attention indices to global KV-cache indices
+    and computes
+
+    valid top-k lengths for DeepSeekV4 attention.
+
+    '
+  for:
+  - vllm.v1.attention.ops.deepseek_v4_ops.compute_global_topk_indices_and_lens
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: concat_and_cache_mla
+  description: 'Writes the latent and RoPE value into KV cache for Multi-head Latent
+    Attention forward case.
+
+    '
+  for:
+  - _C_cache_ops.concat_and_cache_mla
+  labels:
+  - fused
+  - MLA
+  kind:
+  - Attention
+  stages:
+  - beta: '3.0'
+- id: cooperative_topk
+  description: 'Select exact top-k indices from FP32 CUDA logits through vLLM''s in-place
+
+    interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+
+    and -1 padding for short rows.
+
+    '
+  for:
+  - _C.cooperative_topk
+  labels:
+  - fused
+  - NoCPU
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: cp_gather_indexer_k_quant_cache
+  description: This is a fused operator that gathers FP8 K cache values and scales.
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.3'
+- id: cross_entropy_loss
+  description: Computes the cross entropy loss between input logits and target.
+  for:
+  - CrossEntropyLoss
+  labels:
+  - fused
+  - Reduction
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.0'
+  - removed: '3.0'
+- id: cutlass_scaled_mm
+  description: Scaled matrix multiplication with per-tensor or per-token quantization
+    scales.
+  for:
+  - cutlass_scaled_mm_sm_90
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - LinearAlg
+  stages:
+  - beta: '5.0'
+- id: dequantize_and_gather_k_cache
+  description: 'Dequantizes FP8 K-cache entries and gathers them into a BF16 tensor
+    for DeepSeekV4 attention.
+
+    '
+  for:
+  - vllm.v1.attention.ops.deepseek_v4_ops.dequantize_and_gather_k_cache
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: dgeglu
+  description: 'Gaussian Error Gated Linear Unit with GELU activation instead of sigmoid
+    function.
+
+    This is for the backward case.
+
+    '
+  for:
+  - dgeglu
+  labels:
+  - fused
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '4.2'
+  - beta: '5.0'
+  - stable: '5.0'
+- id: dispatch_fused_moe_kernel
+  description: 'Accelerates neural network training by combining token routing (dispatch/all-to-all
+    communication),
+
+    expert computation (GEMM), and result aggregation into a single GPU kernel.
+
+    '
+  for:
+  - dispatch_fused_moe_kernel
+  labels:
+  - fused
+  - Activation
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - beta: '5.0'
+  - stable: '5.3'
+- id: dreglu
+  description: 'Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead
+    of
+
+    the sigmoid function for gating. This is the backward case.
+
+    '
+  for:
+  - dreglu
+  labels:
+  - fused
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '4.2'
+  - beta: '5.3'
+- id: dsv41_o_proj
+  description: 'DeepSeek-V4.1 attention output projection (wo_a stage): inverse GPT-J
+
+    RoPE + per-128 FP8 quant + grouped block-scaled FP8 GEMM. Hopper recipe
+
+    (1, 128, 128); wo_b is an optional caller-supplied callback. Small batches
+
+    run in one kernel launch. A BF16 wo_a takes vLLM''s non-quantizing path
+
+    (BF16 inverse RoPE + grouped BF16 GEMM, one Triton kernel). Hopper uses
+
+    tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
+
+    8.0 for BF16) use plain Triton kernels.
+
+    '
+  for:
+  - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  - Quantization
+  stages:
+  - alpha: '5.4'
+- id: dswiglu
+  description: 'Swish-Gated Linear Unit, a variant of GLU with the Swish activation
+    function.
+
+    This is for the backward case.
+
+    '
+  for:
+  - dswiglu
+  labels:
+  - fused
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.0'
+  - beta: '5.3'
+- id: expand_pools_and_append_tail
+  description: Expand identity-mapped history pools and append an incomplete token
+    tail.
+  for:
+  - vllm.models.glm5next.nvidia.ops.kpool_compress.expand_pools_and_append_tail
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Indexing
+  stages:
+  - beta: '0.3'
+- id: flash_attention_forward
+  description: Forward pass of FlashAttention computing scaled dot-product attention.
+  for:
+  - _flash_attention_forward
+  labels:
+  - aten
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '3.0'
+- id: flash_attn_varlen_func
+  description: 'Compute attention for sequences of variable lengths within a single
+    batch.
+
+    Eliminating the need for padding.
+
+    '
+  for:
+  - flash_attn_varlen_func
+  labels:
+  - aten
+  - Attention
+  - FlashAttention
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '3.1'
+  cpp: '4.0'
+- id: flash_attn_varlen_func_w8a8
+  description: 'W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
+
+    FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
+
+    and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
+
+    Hygon DCU, PPU, MetaX, and Ascend).
+
+    '
+  for:
+  - flash_attn_varlen_func_w8a8
+  - flash_attn_varlen_func_w8a8_int8
+  labels:
+  - NoCPU
+  - fused
+  - Attention
+  - FlashAttention
+  - Quantization
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: flash_attn_varlen_opt_func
+  description: A variant of `flash_attn_varlen_func` that has `lse` as an optional
+    parameter.
+  for:
+  - flash_attn_varlen_func
+  labels:
+  - aten
+  - Attention
+  - FlashAttention
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: flash_mla
+  description: A variant of Multi-head Latent Attention (MLA).
+  for:
+  - triton_mla._forward_decode
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '3.0'
+- id: flash_mla_sparse_fwd
+  description: Part of the FlashMLA.
+  for:
+  - vllm.v1.attention.backends.mla.flashmla_sparse
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.3'
+- id: flash_mla_sparse_fwd_w8a8
+  description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and
+    shared key/value.
+  for:
+  - flash_mla_sparse_fwd_w8a8
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: flash_mla_with_kvcache
+  description: Dense and sparse Multi-head Latent Attention decoding with a paged
+    KV cache.
+  for:
+  - vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: flash_mla_with_kvcache_w8a8
+  description: 'Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific
+    implementations.
+
+    '
+  for:
+  - flash_mla_with_kvcache_w8a8
+  labels:
+  - fused
+  - Attention
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: fp8_einsum
+  description: 'Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
+
+    vLLM DeepGEMM fp8_einsum) and INT8 with per-token-group activation scales
+
+    (Hygon, MetaX, PPU).
+
+    '
+  for:
+  - vllm.utils.deep_gemm.fp8_einsum
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  - Quantization
+  stages:
+  - alpha: '5.4'
+- id: fp8_fp4_mqa_logits
+  description: 'Compute weighted MQA logits with FP8 quantized Q and K tensors.
+
+    Uses head-batched tiled dot products with K reuse for high throughput
+
+    on DeepSeek V4 sparse attention indexer workloads.
+
+    '
+  for:
+  - vllm.utils.deep_gemm.fp8_fp4_mqa_logits
+  labels:
+  - fused
+  - vLLM
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.1'
+- id: fp8_fp4_paged_mqa_logits
+  description: 'Compute paged multi-query attention logits from FP8 queries against
+
+    FP8/FP4 paged KV cache with per-token scaling. Used in DeepSeek-V4
+
+    decode-phase inference with adaptive tile sizing.
+
+    '
+  for:
+  - vllm.utils.deep_gemm.fp8_fp4_paged_mqa_logits
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: fused_add_rms_norm
+  description: Add two inputs element-wise and apply Root Mean Square Layer Normalization.
+  for:
+  - add_rms_norm
+  labels:
+  - fused
+  - Normalization
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.0'
+  cpp: '4.0'
+- id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+  description: 'Horizontally-fused DeepseekV4-MLA.
+
+    per-head RMSNorm + GPT-J RoPE for Q, and GPT-J RoPE + UE8M0 FP8
+
+    quant + paged cache insert for KV, all in one kernel launch.
+
+    '
+  for:
+  - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: fused_experts_impl
+  description: An implementation of fused MoE.
+  for:
+  - vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: fused_indexer_k_norm
+  description: 'GLM5Next indexer FP32 LayerNorm with FP32 weight and bias, followed
+    by
+
+    a cast to the input dtype. Supports two-dimensional FP16/BF16/FP32
+
+    inputs with nonnegative strides and widths from 1 through 4096.
+
+    Forward inference only; returns a fresh contiguous tensor.
+
+    '
+  for:
+  - vllm.models.glm5next.common.attention._fused_indexer_k_norm
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: fused_indexer_q_rope_quant
+  description: 'Applies RoPE to sparse indexer Q, quantizes it to FP8 or MXFP4, and
+    folds
+
+    indexer weights for DeepSeekV4 attention.
+
+    '
+  for:
+  - vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q_rope_quant
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+- id: fused_indexer_weight_scale
+  description: 'Scale floating-point indexer weights by FP32 query scales and a scalar.
+
+    Returns FP32 per-token, per-head weights.
+
+    '
+  for:
+  - fused_indexer_weight_scale
+  - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Math
+  stages:
+  - alpha: '5.4'
+- id: fused_inv_rope_fp8_quant
+  description: 'Apply inverse RoPE and group-wise quantization to attention output.
+
+    Precisions: FP8 and INT8 (Ascend NPU).
+
+    '
+  for:
+  - vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.4'
+- id: fused_marlin_moe_w4a16
+  description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
+
+    activations. Precisions: GPTQ INT4 (uint4b8) and MXFP4.
+
+    '
+  for:
+  - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: fused_marlin_moe_w8a16
+  description: 'Fused mixture-of-experts computation with 8-bit weights and 16-bit
+
+    activations. Precisions: FP8 (E4M3) and INT8 (uint8b128).
+
+    '
+  for:
+  - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: fused_moe
+  description: The generic interface for fused MoE.
+  for:
+  - vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: fused_q_kv_rmsnorm
+  description: 'Applies RMSNorm to Q and KV tensors in a single fused kernel for DeepSeekV4
+    attention.
+
+    '
+  for:
+  - vllm.v1.attention.ops.deepseek_v4_ops.fused_q_kv_rmsnorm
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: fused_recurrent_gated_delta_rule
+  description: 'Recurrent gated delta rule with [pool, HV, V, K] state, strided QKV,
+
+    variable-length sequences and speculative-decoding state tables.
+
+    Supports FP16/BF16/FP32; non-inplace mode returns per-token states.
+
+    '
+  for:
+  - fused_recurrent_gated_delta_rule_fwd
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.0'
+  - beta: '5.3'
+- id: fused_recurrent_gated_delta_rule_packed_decode
+  description: vLLM 0.24.0 packed single-token gated delta rule decode.
+  for:
+  - fused_recurrent_gated_delta_rule_packed_decode
+  labels:
+  - fused
+  kind:
+  - FLA
+  stages:
+  - alpha: '5.4'
+- id: fused_recurrent_kda
+  description: 'Kimi Delta Attention (KDA) decode for vLLM inference with key-wise
+    gate
+
+    decay, optional QK L2 normalization, scalar/vector beta and an FP32
+
+    recurrent state. It returns output matching V''s shape and dtype and an
+
+    updated FP32 state. The Ascend A5 path supports variable-length requests,
+
+    per-token state tables and FP16/BF16/FP32 inputs; it fuses the Kimi K3
+
+    bounded gate, beta sigmoid and speculative accepted-token selection.
+
+    '
+  for:
+  - vllm.model_executor.layers.fla.ops.kda.fused_recurrent_kda
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
+- id: gate_sigmoid_mul
+  description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
+  for:
+  - vllm.models.kimi_k3.nvidia.mla._gate_sigmoid_mul
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
+- id: gdn_950dt_triton_ascend
+  description: 'Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
+
+    Two forward entries sharing the packed TND layout of the aclnn ops:
+
+    `chunk_gdn_950dt` (prefill, BT=64, BV-tiled to fit the 950DT UB budget)
+
+    and `fused_recurrent_gdn_950dt` (decode, state resident in registers,
+
+    in-place pool update with slot indices). Supports FP16/BF16/FP32,
+
+    DK/DV <= 128, varlen via cu_seqlens, optional in-kernel q/k L2 norm.
+
+    Forward only: Triton GDN backward is reported to NaN on Ascend950.
+
+    Does not use triton.experimental.tle, which triton-ascend lacks.
+
+    '
+  for:
+  - chunk_gdn_950dt
+  - fused_recurrent_gdn_950dt
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: gdn_w8a16
+  description: 'Gated DeltaNet recurrence with dynamically quantized FP8 E4M3 or INT8
+    state,
+
+    per-value-channel FP32 scales, BF16/FP16 activations and FP32 accumulation.
+
+    Supports decode, prefill and speculative state-slot updates.
+
+    MetaX uses a backend-specific core interface with precomputed FP32 gates
+
+    and immutable FP32 state, returning output and final state. Its opt-in mixed_precision=True
+    chunk path
+
+    uses BF16/FP16 intermediates with FP32 accumulation and bounded workspace.
+
+    MetaX decode=True accepts raw gates and packed/separate QKV and updates
+
+    indexed FP32 state slots in place with fused normalization and gating.
+
+    FP8 supports decode, prefill and speculative state-slot updates.
+
+    INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
+
+    '
+  for:
+  - gdn_w8a16
+  - gdn_w8a16_int8
+  - chunk_gated_delta_rule_w8a16_int8
+  - quantize_gdn_state_int8
+  labels:
+  - fused
+  - FLA
+  - Attention
+  - Quantization
+  - NoCPU
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: geglu
+  description: Gaussian Error Gated Linear Unit with GELU activation instead of sigmoid
+    function.
+  for:
+  - geglu
+  labels:
+  - fused
+  - Activation
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '4.2'
+  - beta: '5.3'
+- id: gelu_and_mul
+  description: An activation function for GeGLU.
+  for:
+  - GeluAndMul
+  labels:
+  - fused
+  - pointwise
+  - Activation
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.0'
+- id: gemma_rms_norm
+  description: 'RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
+
+    the learnable weight is offset by one: the output is
+
+    `(1 + w) * x * rsqrt(mean(x^2) + eps)`, accumulated in float32.
+
+    '
+  for:
+  - vllm.model_executor.layers.layernorm.GemmaRMSNorm
+  labels:
+  - fused
+  - NoCPU
+  - Normalization
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: group_list_cumsum
+  description: 'Computes expert token-count offsets (cumsum) for expert-parallel MoE
+
+    routing. The aclnn cumsum dispatch has no AI_CORE path for integer
+
+    dtypes on Ascend, so this runs it as a single vector-core program.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - MoE
+  - Reduction
+  kind:
+  - Reduction
+  stages:
+  - alpha: '5.4'
+- id: grouped_gemma_rmsnorm
+  description: Grouped Gemma RMS normalization with shared or per-group affine weights.
+  for:
+  - vllm.models.qwen4_exp.nvidia.ops.hc.grouped_gemma_rmsnorm
+  labels:
+  - fused
+  - vLLM
+  - Normalization
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
+- id: grouped_topk
+  description: 'A specialized routing mechanism used in Mixture-of-Experts (MoE) models
+    (like DeepSeek-V3/R1)
+
+    to select top-k experts by first grouping them, rather than selecting globally.
+
+    '
+  for:
+  - _moe_C.grouped_topk
+  labels:
+  - fused
+  - NoCPU
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - stable: '5.0'
+- id: hc_combine
+  description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
+  for:
+  - hc_combine
+  labels:
+  - fused
+  kind:
+  - Pointwise
+  stages:
+  - beta: '0.3'
+- id: hc_head_fused_kernel
+  description: 'The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
+
+    This fused implementation computes RMS-normalized hidden states and applies
+
+    per-head weighted mixing to produce the output activations.
+
+    '
+  for:
+  - mhc_head_fused_kernel
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.2'
+  - stable: '5.3'
+- id: hc_split_sinkhorn_forward
+  description: 'Computes a differentiable approximation of the Wasserstein distance
+    (Optimal Transport)
+
+    between two probability distributions or point clouds.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: indexer_epilogue
+  description: 'Fused post-topk epilogue for the GLM lightning indexer: expands the
+
+    selected pool ids to token ids, appends the causal tail and writes the
+
+    int32 output row directly, replacing a chain of ~10 small torch kernels
+
+    per call.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: indexer_gemm_score
+  description: 'GEMM-form scorer for the GLM lightning indexer: gathers each pool
+    tile
+
+    once per request and multiplies it with a query block via tl.dot,
+
+    instead of re-reading the whole pool cache once per token row. Small
+
+    row counts (decode/draft steps) fall back to the matvec kernel.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - LinearAlg
+  stages:
+  - alpha: '5.4'
+- id: indexer_k_quant_and_cache
+  description: This is a fused operator that quantizes K tensors and writes them into
+    the FP8 KV cache.
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.3'
+- id: inplace_fused_experts
+  description: This operator writes output directly to `hidden_states`.
+  for:
+  - inplace_fused_experts
+  labels:
+  - fused
+  - Activation
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - beta: '5.0'
+  - stable: '5.3'
+- id: instance_norm
+  description: 'Apply Instance Normalization independently for each channel in every
+    data sample within a batch.
+
+    '
+  for:
+  - instance_norm
+  labels:
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.2'
+  - removed: '3.0'
+  - beta: '5.3'
+- id: kda_conv_gather
+  description: 'Stages the rows used by a batch out of the block-strided Kimi Delta
+
+    Attention (KDA) short-convolution state cache into a contiguous buffer
+
+    for the AscendC conv operator, emitting local row indices with PAD
+
+    markers in a single kernel.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: kda_conv_scatter
+  description: 'Restores the staged rows back into the block-strided KDA
+
+    short-convolution state cache after the AscendC conv operator in one
+
+    pass, skipping PAD entries inside the kernel.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: kda_gate_cumsum
+  description: 'Fused Triton replacement for the AscendC kda_gate_cumsum operator:
+
+    computes the safe sigmoid gates of Kimi Delta Attention and their
+
+    in-chunk cumulative sums with one program per (chunk, head) tile
+
+    instead of one serial block per sequence.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: kda_state_gather
+  description: 'Gathers KDA recurrent states from the paged cache into the [N, H,
+    K, V]
+
+    layout expected by the AscendC chunk operator, zeroing slots without an
+
+    initial state, with the transpose folded into a single kernel.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: kda_state_scatter
+  description: 'Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
+
+    chunk operator back into the paged [H, V, K] cache layout with the
+
+    transpose and dtype cast folded into a single kernel.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - FLA
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: kpool_state_compress
+  description: 'Fused fast path for the GLM5 Next A3 indexer pre-compress sequence:
+
+    writes each token''s full-resolution k/gate_score row into the paged
+
+    compressor state cache and compresses completed pools with
+
+    softmax(gate_score + ape) weighting, all in one launch per sparse layer.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: kv_rmsnorm_rope_cache
+  description: 'Fused KV RMSNorm + RoPE + paged-KV cache writeback: splits a fused
+    KV
+
+    projection, applies RMSNorm to the RMS half and rotary position
+
+    embedding to the RoPE half, and scatters both into the paged k/ckv
+
+    caches through the per-token slot index.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - TLE
+  - vLLM
+  - Normalization
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: lightning_indexer
+  description: 'TLE implementation of the Ascend paged-attention Lightning Indexer:
+
+    builds 512-key topk proposals for short-K, single-token long-K and
+
+    multi-token long-K varlen queries and merges them through a Stage2
+
+    merge tree, emitting the final topk indices.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - TLE
+  - DSA
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: megamoe_int8
+  description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
+
+    combining routing, two expert GEMMs, DUSHMEM communication, and Top-K
+
+    reduction in one persistent Triton/FlagTree kernel.
+
+    '
+  for:
+  - megamoe_int8
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
+- id: mhc_bwd
+  description: 'The backward case for MHC (Manifold-Constrained Hyper-Connections).
+
+    This is the Triton implmentation for Sinkhorn implicit CG differentiation.
+
+    It computes the gradient of the Sinkhorn normalization using implicit differentiation
+    via the conjugate gradient method.
+
+    '
+  for:
+  - mhc_bwd
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: mhc_post
+  description: Triton implementation of mHC Post operator (optimized v3).
+  for:
+  - mhc_post
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: mhc_pre
+  description: Triton implementation of mHC Pre operator (optimized v2).
+  for:
+  - vllm.model_executor.layers.mhc.mhc_pre
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: mhc_shifted_post_pre
+  description: 'DSV4.1 shifted mHC boundary: applies the previous sublayer''s post/comb
+
+    coefficients, then emits the next post/comb/pre coefficient set, the
+
+    collapsed (optionally RMSNorm''d) layer input and the stream mean.
+
+    Consumes the carried pre-mix instead of the freshly computed one, which is
+
+    what lets vLLM overlap coefficient generation with the sublayer.
+
+    '
+  for:
+  - vllm.models.deepseek_v41.nvidia.ops.mhc.mhc_shifted_post_pre
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: minimax_m3_sparse_attn
+  description: 'MiniMax M3 block-sparse GQA prefill attention over packed paged KV
+
+    (one 128-token page per sparse block). Dispatches to FlagAttention''s
+
+    flag_attn.minimax_sparse_attention kernels.
+
+    '
+  for:
+  - vllm.models.minimax_m3.common.ops.sparse_attn
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: minimax_m3_sparse_attn_decode
+  description: 'MiniMax M3 block-sparse GQA decode attention; split-K over the selected
+
+    blocks with an LSE merge. Dispatches to FlagAttention''s
+
+    flag_attn.minimax_sparse_attention kernels.
+
+    '
+  for:
+  - vllm.models.minimax_m3.common.ops.sparse_attn
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: moe_align_block_size_triton
+  description: 'Aligns the token distribution across experts to be compatible with
+    block size
+
+    for matrix multiplication.
+
+    '
+  for:
+  - _moe_C.align_block_size
+  labels:
+  - fused
+  - Reduction
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - beta: '4.0'
+  - stable: '4.2'
+- id: moe_sum
+  description: 'An implementation of Mixture of Experts (MoE) with sum-based aggregation
+
+    instead of the more common weighted average.
+
+    '
+  for:
+  - _moe_C.moe_sum
+  labels:
+  - fused
+  - Reduction
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - stable: '4.2'
+- id: mrope
+  description: 'Applies multi-modal rotary positional embeddings to query and key
+    tensors,
+
+    using temporal, height, and width sections.
+
+    '
+  for:
+  - mrope
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: mul
+  description: Multiplies `input` by `other`.
+  for:
+  - mul.Tensor
+  labels:
+  - aten
+  - pointwise
+  kind:
+  - Math
+  stages:
+  - stable: '1.0'
+- id: mul_
+  description: The in-place version of `mul()`.
+  for:
+  - mul_.Tensor
+  labels:
+  - aten
+  - pointwise
+  kind:
+  - Math
+  stages:
+  - stable: '2.2'
+- id: mv
+  description: Performs a matrix-vector product of the matrix `input` and the vector
+    `vec`.
+  for:
+  - mv
+  labels:
+  - aten
+  kind:
+  - BLAS
+  stages:
+  - stable: '2.0'
+- id: outer
+  description: 'Computes outer product of self and the input vector.
+
+    If the self tensor is a vector of size `n` and the input tensor is a vector of
+    size `m`,
+
+    the `out` tensor (if specified) must be a matrix of size `n * m`.
+
+    '
+  for:
+  - outer.Tensor
+  labels:
+  - fused
+  kind:
+  - BLAS
+  stages:
+  - stable: '2.0'
+- id: outplace_fused_experts
+  description: This operator allocates and returns a new output tensor.
+  for:
+  - outplace_fused_experts
+  labels:
+  - fused
+  - Activation
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - beta: '5.0'
+  - stable: '5.3'
+- id: pack_seq_triton
+  description: Pack variable-length token sequences into a padded batched tensor.
+  for:
+  - pack_seq_triton
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: pad_indexer_heads
+  description: Append zero heads to GLM5Next FP8 queries and per-head weights with
+    bit-preserving copies.
+  for:
+  - None
+  labels:
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '0.3'
+- id: paged_scatter_triton
+  description: 'Scatters token rows into paged caches by slot index in a single kernel,
+
+    skipping invalid slots inside the kernel. Replaces the torch
+
+    where/zeros_like/scatter_nd sentinel chains with a fixed-grid,
+
+    ACLGraph-capturable launch.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: per_token_group_quant_fp8
+  description: 'Function to perform per-token-group quantization on an input tensor
+    `x`.
+
+    It converts the tensor values into signed float8 values and returns the
+
+    quantized tensor along with the scaling factor used for quantization.
+
+    '
+  for:
+  - _C.per_token_group_fp8_quant
+  labels:
+  - NoCPU
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - alpha: '4.2'
+  - beta: '5.3'
+- id: persistent_topk
+  description: 'vLLM-compatible persistent topk decode. Triton implementation supporting
+
+    three dispatch tiers (decode/medium/large) based on seq_len, with
+
+    cooperative multi-CTA kernels for large sequences.
+
+    '
+  for:
+  - _C.persistent_topk
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: qsa_prepare
+  description: 'Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for
+    the
+
+    indexer Q/K, the compressed-key pool, the state-ring commit, and the main
+
+    attention QK-norm/RoPE/gate with its paged K/V write, in one launch.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - beta: '5.3'
+- id: qsa_sparse_paged_attention
+  description: 'Computes sparse grouped-query attention over paged BF16 or FP8 KV
+    caches
+
+    using packed token indices, with fused output gating.
+
+    '
+  for:
+  - vllm.models.qwen4_exp.nvidia.ops.qsa.qsa_sparse_paged_attention
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
+- id: reglu
+  description: 'Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead
+    of the sigmoid function for gating.
+
+    '
+  for:
+  - reglu
+  labels:
+  - fused
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '4.2'
+  - beta: '5.3'
+- id: reshape_and_cache
+  description: Store the key/value token states into the pre-allcated kv_cache buffers
+    of paged attention.
+  for:
+  - reshape_and_cache
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - stable: '3.0'
+- id: reshape_and_cache_flash
+  description: Store the key/value token states into the pre-allcated kv_cache buffers
+    of paged attention.
+  for:
+  - reshape_and_cache_flash
+  labels:
+  - fused
+  kind:
+  - Attention
+  stages:
+  - stable: '3.0'
+  cpp: '4.0'
+- id: rwkv_ka_fusion
+  description: 'Merges, aligns, and enhances features from different data sources
+    or spatial directions
+
+    using the efficient, linear-time RWKV framework.
+
+    '
+  for:
+  - rwkv_ka_fusion
+  labels:
+  - fused
+  kind:
+  - RWKV
+  stages:
+  - stable: '4.1'
+  cpp: '4.0'
+- id: rwkv_mm_sparsity
+  description: Optimized, lossless sparse matrix multiplication in RWKV-7 models.
+  for:
+  - rwkv_mm_sparsity
+  labels:
+  - fused
+  kind:
+  - RWKV
+  stages:
+  - stable: '4.1'
+  cpp: '4.0'
+- id: silu_and_mul
+  description: A custom operator in vLLM as activation function for SwiGLU.
+  for:
+  - silu_and_mul
+  labels:
+  - fused
+  - pointwise
+  - vLLM
+  kind:
+  - Activation
+  stages:
+  - stable: '2.0'
+- id: silu_and_mul_out
+  description: A variant of `silu_and_mul` with an extra `out` argument.
+  for:
+  - silu_and_mul.out
+  labels:
+  - fused
+  - pointwise
+  - vLLM
+  kind:
+  - Activation
+  stages:
+  - stable: '2.0'
+- id: silu_and_mul_with_clamp
+  description: A custom operator in vLLM as activation function for SwiGLU.
+  for:
+  - silu_and_mul_with_clamp
+  labels:
+  - fused
+  - pointwise
+  - vLLM
+  kind:
+  - Activation
+  stages:
+  - stable: '5.3'
+- id: silu_and_mul_with_clamp_out
+  description: A variant of `silu_and_mul_with_clamp` with an extra `out` argument.
+  for:
+  - silu_and_mul_with_clamp.out
+  labels:
+  - fused
+  - pointwise
+  - vLLM
+  kind:
+  - Activation
+  stages:
+  - stable: '5.3'
+- id: skip_layer_norm
+  description: 'An optimized operation used in Transformer models to improve performance
+
+    by combining residual connection (skip connection) addition and Layer Normalization
+
+    (LayerNorm) into a single kernel.
+
+    '
+  for:
+  - skip_layer_norm
+  labels:
+  - fused
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.0'
+- id: slot_mapping_triton
+  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
+    over
+
+    (request, token block) instead of launching one program per request,
+
+    removing the serial token walk on prefill batches with few long requests.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: sparse_attn_sharedkv
+  description: 'DeepSeekV4 shared-KV sparse attention in three modes: SWA (sliding
+
+    window over the recent original KV), CFA (window plus the contiguous
+
+    compressed KV prefix) and SCFA (window plus the per-query selected
+
+    compressed KV), with graph-safe decode and chunked-prefill entry points.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - TLE
+  - vLLM
+  - DeepSeekV4
+  - Attention
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
+- id: sparse_attn_triton
+  description: Sparse attention with attention-sink.
+  for:
+  - None
+  labels:
+  - fused
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: sparse_flash_attention
+  description: 'Ascend shared-KV MLA with the vLLM-Ascend SFA interface and tuple
+    outputs.
+
+    FP16/BF16, BSND/TND and paged caches, block sparsity and right-down causal
+
+    masking; dimensions 512+64. value must alias key; forward inference only.
+
+    '
+  for:
+  - _C_ascend.npu_sparse_flash_attention
+  labels:
+  - fused
+  - vLLM
+  - Ascend
+  kind:
+  - DSA
+  stages:
+  - alpha: 0.1.0
+- id: sparse_mla_fwd_interface
+  description: 'A generic interface for sparse MLA (Multi-head Latent Attention) for
+    DeepSeek v3/v3.2.
+
+    It is currently not exposed as a standalone operator for use.
+
+    '
+  for:
+  - sparse_mla_fwd
+  labels:
+  - fused
+  kind:
+  - DSA
+  stages:
+  - beta: '5.0'
+  - stable: '5.3'
+- id: stage_deepseek_v4_mega_moe_inputs
+  description: 'Stages DeepSeekV4 Mega-MoE inputs by quantizing hidden states to FP8
+
+    with UE8M0 scales and copying top-k indices and weights to output buffers.
+
+    '
+  for:
+  - stage_deepseek_v4_mega_moe_inputs
+  labels:
+  - fused
+  - DeepSeekV4
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: swiglu
+  description: Swish-Gated Linear Unit, a variant of GLU with the Swish activation
+    function.
+  for:
+  - swiglu
+  labels:
+  - fused
+  - Transformer
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '5.0'
+- id: top_k_per_row_decode
+  description: 'Triton top-K per row for DeepSeek V4 decode-phase token selection.
+
+    Radix-select based approach with three dispatch tiers for different vocab sizes.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: top_k_per_row_prefill
+  description: 'Triton top-K per row for DeepSeek V4 sparse attention prefill phase.
+
+    Replaces vLLM persistent_topk CUDA kernel with in-place masking + adaptive topk
+    selection.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: top_k_top_p
+  description: 'Per-row top-k / top-p filtering of [batch, vocab] sampling logits:
+    masked
+
+    positions become -inf and kept positions keep their logit values.
+
+    Returns a new tensor and preserves the input. The shared argument order
+
+    is (logits, p=None, k=None). Ascend uses sorted top-L candidates; MetaX
+
+    uses single-row integer-key tile/merge sorting and batched counting/radix
+
+    sorting for contiguous FP32 with batch <= 64 and vocab <= 262144.
+
+    Ascend launch overrides remain
+
+    backend-specific.
+
+    '
+  for:
+  - torch_npu.npu_top_k_top_p
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: topk_softmax
+  description: 'Selects the k most likely next-token candicates, sets all others to
+    zero,
+
+    and renormalize the prbabilities of these top candidates.
+
+    '
+  for:
+  - _moe_C.topk_softmax
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - stable: '4.0'
+- id: topk_softplus_sqrt
+  description: 'Fused softplus + sqrt + top-k selection and optional renormalization
+
+    for MoE gating in models like DeepSeek-V3/V4.
+
+    '
+  for:
+  - topk_softplus_sqrt
+  labels:
+  - fused
+  - KernelGen
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - beta: '5.3'
+- id: triton_ihc_post
+  description: iHC gated residual scatter with unfused FP32 multiply and addition.
+  for:
+  - triton_ihc_post
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+- id: triton_lighting_indexer_k_tiled_interface
+  description: Part of FP8 MQA framework. It is currently not exposed as an operator
+    for use.
+  for:
+  - None
+  labels:
+  - fused
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.3'
+- id: triton_reshape_and_cache_flash
+  description: In-place Flash 4D and head-major KV writes with ordinary or global
+    E4M3 FP8 storage.
+  for:
+  - triton_reshape_and_cache_flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '0.1'
+- id: unpack_seq_triton
+  description: Unpack a packed sequence tensor back to its original variable-length
+    form.
+  for:
+  - unpack_seq_triton
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: w8a8_block_matmul
+  description: Matrix multiplication with block-wise scaled INT8 or FP8 activations
+    and weights.
+  for:
+  - w8a8_block_matmul
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - BLAS
+  stages:
+  - alpha: '5.5'
+  cpp: '5.5'
+- id: weight_norm
+  description: 'Reparameterizes a module''s weight tensor by decoupling its magnitude
+    (g)
+
+    from its direction (v). It is a hook that compute the actual weight before
+
+    each forward pass.
+
+    '
+  for:
+  - weight_norm
+  labels:
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '3.0'
+- id: weight_norm_interface
+  description: 'Apply weight normalization to neural network layers, decoupling the
+    magnitued
+
+    of a weight tensor from its direction. It is used to stabilize training, particularly
+
+    for models with small batch sizes.
+
+    '
+  for:
+  - _weight_norm_interface
+  labels:
+  - aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '2.2'
+- id: weight_norm_interface_backward
+  description: 'Computes the gradients for weight normalization during the backward
+    pass.
+
+    It calculates the necessary derivatives for updating both the magnitude (g)
+
+    and direction (v)  parameters of a weight-normalized layer, based on gradients
+
+    received from the previous operation.
+
+    '
+  for:
+  - _weight_norm_interface_backward
+  labels:
+  - aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - stable: '3.0'
