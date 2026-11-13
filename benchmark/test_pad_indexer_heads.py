@@ -2,6 +2,7 @@
 # Copyright 2026 FlagOS Contributors
 """Standard reports with byte-qualified compiled native and no-Graph timing."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,13 @@ import flaggems_vllm as gems
 from baseline import pad_indexer_heads as workload
 from tests.test_pad_indexer_heads import assert_contract
 
-from . import base, consts
+from . import base
+from . import conftest as report
+from . import consts
+
+
+def _native_slot(*args, **kwargs):
+    raise RuntimeError("native slot must be handled by get_latency")
 
 
 class PadIndexerHeadsBenchmark(base.Benchmark):
@@ -39,34 +46,97 @@ class PadIndexerHeadsBenchmark(base.Benchmark):
             raise ValueError(
                 "pad_indexer_heads supports operator/kernel timing without Graph"
             )
+        self.native_op = None
+        self.native_reason = None
+        if "latency_base" not in self.to_bench_metrics:
+            self.native_reason = "native timing disabled by --metrics"
+            return
+        try:
+            native = workload.native()
+        except Exception as exc:
+            self.native_reason = f"native resolution: {exc!r}"
+            return
+        if native is self.gems_op:
+            self.native_reason = "native resolves to the Gems candidate"
+        elif callable(native):
+            self.native_op = native
+        else:
+            self.native_reason = workload.NATIVE_UNAVAILABLE_REASON or (
+                "installed native callable unavailable"
+            )
+
+    def run(self):
+        with pytest.MonkeyPatch.context() as patch:
+            if report.Config.user_desired_metrics == ["latency"]:
+                patch.setattr(report.Config, "base_data", None)
+            super().run()
 
     def get_input_iter(self, dtype):
+        misses = []
         for binding in self.shapes:
             self.binding = binding
             args, kwargs = workload.build_inputs(binding, dtype, gems.device)
             assert_contract(self.gems_op, *args, **kwargs)
             self.native_status = {
                 "status": "N/A",
-                "reason": workload.NATIVE_UNAVAILABLE_REASON,
+                "reason": self.native_reason,
                 "graph": False,
             }
             self.native_valid = False
-            if self.torch_op is not None:
+            self.native_inputs = None
+            if self.native_op is not None:
+                # Keep a broken native from mutating the candidate's inputs.
+                self.native_inputs = workload.build_inputs(binding, dtype, gems.device)
                 try:
                     # Compile and qualify outside the timed region. Failures
                     # remain attached to this configuration, not to the candidate.
-                    assert_contract(self.torch_op, *args, **kwargs)
+                    native_args, native_kwargs = self.native_inputs
+                    assert_contract(self.native_op, *native_args, **native_kwargs)
                 except Exception as exc:
-                    self.native_status.update(status="FAIL", reason=repr(exc))
+                    self.native_status.update(
+                        status="FAIL", reason=f"native qualification: {exc!r}"
+                    )
                 else:
                     self.native_valid = True
                     self.native_status.update(status="PASS", reason=None)
             yield (*args, kwargs)
+            if self.native_status["reason"]:
+                misses.append(
+                    {
+                        "shape": self.record_shapes(*args, **kwargs),
+                        "reason": self.native_status["reason"],
+                    }
+                )
+        if misses:
+            report.update_result(
+                self.op_name,
+                {
+                    "dtype": str(dtype),
+                    "native_baseline_skip_reason": "; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    "native_baseline_misses": misses,
+                },
+            )
 
     def get_latency(self, op, *args, **kwargs):
-        if op is self.torch_op and not self.native_valid:
+        if op is not self.torch_op:
+            latency = super().get_latency(op, *args, **kwargs)
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"invalid Gems latency: {latency!r}")
+            return latency
+        if not self.native_valid:
             return None
-        return super().get_latency(op, *args, **kwargs)
+        try:
+            native_args, native_kwargs = self.native_inputs
+            latency = super().get_latency(self.native_op, *native_args, **native_kwargs)
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"invalid native latency: {latency!r}")
+        except Exception as exc:
+            self.native_status.update(status="FAIL", reason=f"native timing: {exc!r}")
+            self.native_valid = False
+            return None
+        return latency
 
     def record_shapes(self, *args, **kwargs):
         # Per-configuration native validity cannot be represented by tensor shapes.
@@ -83,7 +153,7 @@ class PadIndexerHeadsBenchmark(base.Benchmark):
 def test_pad_indexer_heads():
     bench = PadIndexerHeadsBenchmark(
         op_name=workload.OP_NAME,
-        torch_op=workload.native(),
+        torch_op=_native_slot,
         gems_op=gems.pad_indexer_heads,
         dtypes=workload.DTYPES,
         is_inplace=workload.IS_INPLACE,
