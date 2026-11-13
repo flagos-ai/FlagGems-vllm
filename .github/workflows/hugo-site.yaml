@@ -40,6 +40,7 @@ jobs:
   build:
     name: build hugo site
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       DART_SASS_VERSION: 1.97.3
       GO_VERSION: "1.26.0"
@@ -131,6 +132,7 @@ jobs:
   deploy:
     name: deploy to github pages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: build
     environment:
       name: github-pages

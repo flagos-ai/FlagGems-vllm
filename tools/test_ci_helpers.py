@@ -828,7 +828,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
             "  non-nvidia-tests:", maxsplit=1
         )[0]
         non_nvidia_job = workflow.split("  non-nvidia-tests:", maxsplit=1)[1].split(
-            "  multi-backend-summary:", maxsplit=1
+            "  unittest-required:", maxsplit=1
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
@@ -847,14 +847,13 @@ class CiSummaryTest(unittest.TestCase):
         workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
             encoding="utf-8"
         )
-        summary = workflow.split("  multi-backend-summary:", maxsplit=1)[1]
+        summary = workflow.split("  unittest-required:", maxsplit=1)[1]
         cls.script = textwrap.dedent(
             summary.split("        run: |\n", maxsplit=1)[1]
         ).strip()
 
     def run_summary(self, **overrides):
         values = {
-            "CODE_STYLE_RESULT": "success",
             "SELECT_TARGETS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
@@ -914,7 +913,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def test_missing_or_unexpected_results_fail(self):
         cases = {
-            "preparation_failed": {"CODE_STYLE_RESULT": "failure"},
+            "preparation_failed": {"SELECT_TARGETS_RESULT": "failure"},
             "expected_nvidia_skipped": {
                 "SHOULD_RUN": "true",
                 "NVIDIA_RESULT": "skipped",
