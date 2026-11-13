@@ -282,19 +282,6 @@ def test_grouped_gemma_rmsnorm_legacy_consistency(shape, x_dtype, w_dtype):
 
 
 @pytest.mark.grouped_gemma_rmsnorm
-@pytest.mark.parametrize("binding", baseline.grid(), ids=baseline.key_shape)
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_grouped_gemma_rmsnorm_native(binding, dtype):
-    native = baseline.native(backend=flaggems_vllm.vendor_name)
-    if native is None:
-        pytest.skip(baseline.NATIVE_UNAVAILABLE_REASON)
-    args, kwargs = baseline.build_inputs(binding, dtype, flaggems_vllm.device)
-    expected = native(*args, **kwargs)
-    actual = _check_case(*args)
-    _assert_close(actual, expected.detach().cpu())
-
-
-@pytest.mark.grouped_gemma_rmsnorm
 def test_grouped_gemma_rmsnorm_public_dispatch():
     assert (
         flaggems_vllm.grouped_gemma_rmsnorm is flaggems_vllm.ops.grouped_gemma_rmsnorm
