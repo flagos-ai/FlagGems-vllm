@@ -153,6 +153,22 @@ class SelectCiBackendsTest(unittest.TestCase):
         )
         self.assertEqual(entry["container_options"], "--ipc=host --privileged")
 
+    def test_non_boolean_install_with_setup_sh_is_rejected(self):
+        path = self.write_config(
+            """
+            platforms:
+              broken:
+                backend: broken-backend
+                runner_labels: broken-1
+                container_image: example.invalid/broken:1
+                gpu_check_script: tools/gpu_check_nvidia.sh
+                install_with_setup_sh: "yes"
+            """
+        )
+
+        with self.assertRaises(ValueError):
+            select_ci_backends.load_platforms(path)
+
 
 class RepositoryCiBackendsConfigTest(unittest.TestCase):
     """Guard the checked-in config, not just the loader."""
@@ -164,7 +180,7 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
     def test_config_loads_and_selects_the_enabled_platforms(self):
         self.assertEqual(
             [entry["platform"] for entry in self.selected],
-            ["hygon", "ascend", "iluvatar", "metax", "mthreads"],
+            ["hygon", "ascend", "iluvatar", "metax", "mthreads", "nvidia"],
         )
 
     def test_test_env_round_trips_as_json(self):
@@ -207,6 +223,18 @@ class RepositoryCiBackendsConfigTest(unittest.TestCase):
         for name, entry in self.platforms.items():
             with self.subTest(platform=name):
                 self.assertIn(entry["backend"], capabilities["backends"])
+
+    def test_nvidia_platform_installs_through_setup_sh(self):
+        by_platform = {entry["platform"]: entry for entry in self.selected}
+        nvidia = by_platform["nvidia"]
+        self.assertEqual(nvidia["runner_labels"], "nvidia-a100-1")
+        self.assertEqual(nvidia["container_image"], "nvcr.io/nvidia/vllm:26.10-py3")
+        self.assertTrue(nvidia["install_with_setup_sh"])
+        # Vendor images already ship flag-gems; only the NGC image needs setup.sh.
+        for name, entry in by_platform.items():
+            if name != "nvidia":
+                with self.subTest(platform=name):
+                    self.assertFalse(entry["install_with_setup_sh"])
 
 
 if __name__ == "__main__":

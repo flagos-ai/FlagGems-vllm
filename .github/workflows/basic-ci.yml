@@ -256,76 +256,6 @@ jobs:
             --config .github/configs/ci-backends.yaml \
             --format github | tee -a "${GITHUB_OUTPUT}"
 
-  # Runs the selected tests inside the stock NGC vLLM image on an A100 runner,
-  # to check the code against the torch, Triton and vLLM builds that ship with
-  # that image. `tools/setup.sh --no-venv` keeps all of them and only adds
-  # flag-gems, this repository and the test dependencies.
-  #
-  # The runner is an ARC pod on a K8s node (`k8s-novolume` hook): do not add
-  # container volumes, and note that device access comes from the pod, so the
-  # `--gpus` option below only matters if the runner is switched to Docker.
-  #
-  # Like vendor-container-tests, this job is not part of multi-backend-summary
-  # yet. Add it to that job's needs: once the runner has been stable.
-  triton-test:
-    name: triton test (nvidia-a100-1, NGC vllm)
-    needs: select-targets
-    # Same trust model as nvidia-tests: no fork-controlled code on this
-    # runner unless a maintainer adds the `ci/nvidia` label.
-    if: >-
-      needs.select-targets.outputs.should_run == 'true'
-      && (github.event_name != 'pull_request'
-          || (github.event.pull_request.user.login != 'dependabot[bot]'
-              && (github.event.pull_request.head.repo.full_name == github.repository
-                  || contains(github.event.pull_request.labels.*.name, 'ci/nvidia'))))
-    runs-on: nvidia-a100-1
-    timeout-minutes: 60
-    container:
-      image: nvcr.io/nvidia/vllm:26.10-py3
-      options: >-
-        --gpus all
-        --shm-size=256g
-        --ulimit memlock=-1
-        --ulimit stack=67108864
-    env:
-      FLAGGEMS_VENDOR: nvidia
-      PYTHONPATH: ${{ github.workspace }}/src
-      CI_TARGETS_JSON: ${{ needs.select-targets.outputs.targets }}
-    steps:
-      - name: check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: show gpu
-        shell: bash
-        run: nvidia-smi
-
-      - name: check gpu availability
-        shell: bash
-        run: bash tools/gpu_check_nvidia.sh
-
-      - name: install FlagGems-vllm into the NGC image
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 --version
-          python3 -c "import torch, triton, vllm; print('torch', torch.__version__, 'triton', triton.__version__, 'vllm', vllm.__version__)"
-          bash tools/setup.sh --no-venv nvidia
-
-      - name: run portable backend preflight
-        shell: bash
-        env:
-          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
-        run: python3 tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
-
-      - name: run selected tests and benchmarks
-        shell: bash
-        run: |
-          python3 tools/run_ci_targets.py \
-            --backend nvidia-cuda133 \
-            --capabilities .github/backend-capabilities.json
-
   nvidia-tests:
     name: nvidia tests and benchmarks
     needs: select-targets
@@ -436,8 +366,9 @@ jobs:
   # `.github/configs/ci-backends.yaml` (schema mirrored from FlagOps'
   # resource_map.yaml) rather than in `.github/backends.json`, because those
   # vendor images do not fit that registry's "run tools/setup.sh on a bare
-  # runner" contract. NVIDIA deliberately stays out of this lane and
-  # keeps running directly on the H20 host.
+  # runner" contract. The H20 host deliberately stays out of this lane and
+  # keeps running directly via `nvidia-tests`; the `nvidia` platform here is the
+  # A100 runner with the NGC vLLM image.
   #
   # Bring-up status: observation period. Each platform is still proving out
   # its runner and image, so this job is intentionally excluded from
@@ -478,14 +409,23 @@ jobs:
       - name: install FlagGems-vllm into the vendor image
         shell: bash
         continue-on-error: true
+        env:
+          INSTALL_WITH_SETUP_SH: ${{ matrix.install_with_setup_sh }}
         run: |
           set -euo pipefail
-          # The image already ships a vendor-patched torch/triton/vLLM stack.
-          # Install this repository only, so pip cannot pull a generic
-          # PyPI torch over the vendor build.
-          python3 -m pip install --no-build-isolation --no-deps -e .
-          python3 -m pip install --no-build-isolation pytest einops
           python3 --version
+          if [[ "${INSTALL_WITH_SETUP_SH}" == "true" ]]; then
+            # The image has no flag-gems. --no-venv keeps its torch, Triton
+            # and vLLM and only adds flag-gems, this repository and the test
+            # dependencies.
+            bash tools/setup.sh --no-venv "${BACKEND}"
+          else
+            # The image already ships a vendor-patched torch/triton/vLLM stack
+            # and flag-gems. Install this repository only, so pip cannot pull
+            # a generic PyPI torch over the vendor build.
+            python3 -m pip install --no-build-isolation --no-deps -e .
+            python3 -m pip install --no-build-isolation pytest einops
+          fi
 
       - name: check gpu availability
         shell: bash

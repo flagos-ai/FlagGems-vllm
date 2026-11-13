@@ -84,18 +84,6 @@
     "enabled": true
   },
   {
-    "backend": "nvidia-a100-1",
-    "runner_label": "nvidia-a100-1",
-    "label": "vendor/NVIDIA",
-    "gpu_check": "tools/gpu_check_nvidia.sh",
-    "enabled": true,
-    "container": {
-      "image": "nvcr.io/nvidia/vllm:26.10-py3",
-      "options": "--gpus all --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
-      "volumes": []
-    }
-  },
-  {
     "backend": "spacemit",
     "runner_label": "spacemit",
     "label": "vendor/SpaceMit",

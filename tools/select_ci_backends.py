@@ -68,6 +68,10 @@ def load_platforms(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"platform {name!r}.container_volumes must be a list of strings"
             )
+        if not isinstance(entry.get("install_with_setup_sh", False), bool):
+            raise ValueError(
+                f"platform {name!r}.install_with_setup_sh must be a boolean"
+            )
         test_env = entry.get("test_env") or {}
         if not isinstance(test_env, dict) or not all(
             isinstance(key, str) and isinstance(value, str)
@@ -113,6 +117,7 @@ def select_platforms(
                     entry.get("test_env") or {}, separators=(",", ":")
                 ),
                 "gpu_check_script": entry["gpu_check_script"],
+                "install_with_setup_sh": entry.get("install_with_setup_sh", False),
             }
         )
     return selected

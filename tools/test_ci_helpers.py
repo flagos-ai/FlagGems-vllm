@@ -489,27 +489,6 @@ class NoFlagGemsSourceDependencyTest(unittest.TestCase):
                     f"{path} references the FlagGems repository",
                 )
 
-    def test_a100_entry_matches_the_triton_test_job(self):
-        import yaml
-
-        repo_root = Path(__file__).resolve().parents[1]
-        registry = select_backends.load_registry(repo_root / ".github/backends.json")
-        entry = next(e for e in registry if e["backend"] == "nvidia-a100-1")
-        workflow = yaml.safe_load(
-            (repo_root / ".github/workflows/basic-ci.yml").read_text(encoding="utf-8")
-        )
-        job = workflow["jobs"]["triton-test"]
-        self.assertEqual(entry["runner_label"], job["runs-on"])
-        self.assertEqual(entry["container"]["image"], job["container"]["image"])
-        self.assertEqual(
-            entry["container"]["options"].split(), job["container"]["options"].split()
-        )
-        # NVIDIA entries are never picked for the non-NVIDIA matrix.
-        selected = select_backends.select_backends(
-            registry, set(), True, auto_selected_backends=set()
-        )
-        self.assertNotIn("nvidia-a100-1", [e["backend"] for e in selected])
-
     def test_backend_registry_is_local(self):
         repo_root = Path(__file__).resolve().parents[1]
         registry = select_backends.load_registry(repo_root / ".github/backends.json")

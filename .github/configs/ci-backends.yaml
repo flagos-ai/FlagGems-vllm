@@ -34,8 +34,14 @@
 # read path, not the workflow. See `.github/MULTI_BACKEND_CI.md` for the
 # reuse plan.
 #
-# NVIDIA is intentionally absent: the `nvidia-tests` job runs directly on the
-# H20 host via `tools/setup.sh` and must not be forced into a container.
+# The H20 host is intentionally absent: the `nvidia-tests` job runs directly on
+# it via `tools/setup.sh` and must not be forced into a container. The
+# `nvidia` platform below is a different machine (A100) that runs the stock NGC
+# vLLM image, to test against the torch/Triton/vLLM builds shipped there.
+#
+# `install_with_setup_sh: true` runs `tools/setup.sh --no-venv <backend>` in the
+# image instead of only `pip install --no-deps -e .`. Use it for images that do
+# not already ship flag-gems (the vendor FlagOS images do).
 #
 # Keep `container_volumes` empty. These runners are ephemeral ARC pods driven
 # by the `k8s-novolume` container hook, which cannot bind-mount host paths: it
@@ -150,3 +156,20 @@ platforms:
     test_env:
       FLAGTREE_BACKEND: mthreads
     gpu_check_script: tools/gpu_check_mthreads.sh
+
+  nvidia:
+    description: "NVIDIA A100 on the NGC vLLM image"
+    backend: nvidia-cuda133
+    runner_labels: nvidia-a100-1
+    container_image: nvcr.io/nvidia/vllm:26.10-py3
+    # Device access comes from the K8s pod; `--gpus` only matters if the runner
+    # is switched to plain Docker.
+    container_options: >-
+      --gpus all
+      --shm-size=256g
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    container_volumes: []
+    # The NGC image ships torch, Triton and vLLM but not flag-gems.
+    install_with_setup_sh: true
+    gpu_check_script: tools/gpu_check_nvidia.sh

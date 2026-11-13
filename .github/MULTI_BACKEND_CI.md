@@ -128,7 +128,7 @@ Three config sets now coexist, and they are deliberately not merged:
 | File | Drives | Runners / images |
 | --- | --- | --- |
 | `.github/backends.json` | `non-nvidia-tests` | bare runners, env built by `tools/setup.sh` |
-| `.github/configs/ci-backends.yaml` | `vendor-container-tests` | specific runners, vendor vLLM images |
+| `.github/configs/ci-backends.yaml` | `vendor-container-tests` | specific runners, vendor and NGC vLLM images |
 | `.github/configs/backends/*.yaml` | `ops-test.yaml` (periodic full suite) | `*-flaggems-weekly` runners, internal harbor images |
 
 Keeping them apart is intentional: a per-PR smoke test and a multi-hour weekly
@@ -487,16 +487,21 @@ reserve every non-NVIDIA runner.
 - Repository Actions policy and fork approvals:
   https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository
 
-## Triton test lane
+## NVIDIA A100 / NGC vLLM image
 
-`triton-test` in `basic-ci.yml` runs the selected tests in the stock
-`nvcr.io/nvidia/vllm` image on the `nvidia-a100-1` runner, to check the code
-against the torch, Triton and vLLM builds that ship with that image. It runs
-`tools/setup.sh --no-venv nvidia`, which keeps the image's torch and Triton and
-adds only flag-gems, this repository and the test dependencies.
+The `nvidia` platform in `.github/configs/ci-backends.yaml` runs through the
+normal `vendor-container-tests` job on the `nvidia-a100-1` runner, inside
+`nvcr.io/nvidia/vllm`. It checks the code against the torch, Triton and vLLM
+builds that ship with that image.
 
-The runner is an ARC pod on a K8s node using the `k8s-novolume` hook, so the
-job declares no container volumes and GPU access comes from the pod. The job
-uses the same fork and `ci/nvidia` label gate as `nvidia-tests` and is not part
-of `multi-backend-summary` yet; add it to that job's `needs:` once the runner
-is stable.
+The NGC image does not ship flag-gems, so the platform sets
+`install_with_setup_sh: true`: the job runs `tools/setup.sh --no-venv
+nvidia-cuda133`, which keeps the image's torch, Triton and vLLM and adds only
+flag-gems, this repository and the test dependencies. Vendor images that
+already ship flag-gems leave the flag unset and only get an editable install.
+
+The runner is an ARC pod on a K8s node (`k8s-novolume` hook), so the platform
+declares no container volumes and GPU access comes from the pod. It follows the
+rest of the container lane: observation period, not part of
+`multi-backend-summary`, and no `ci/nvidia` fork gate. This config stays
+separate from `.github/configs/backends/*.yaml`, which drives `ops-test.yaml`.
