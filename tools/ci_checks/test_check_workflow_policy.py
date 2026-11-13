@@ -39,7 +39,7 @@ jobs:
 
 
 class WorkflowPolicyTest(unittest.TestCase):
-    def run_policy(self, text, name="basic-ci.yml"):
+    def run_policy(self, text, name="unittest.yaml"):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / name).write_text(textwrap.dedent(text), encoding="utf-8")
             return check_workflows(tmp)

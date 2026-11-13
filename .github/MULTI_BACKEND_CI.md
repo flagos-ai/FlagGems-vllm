@@ -6,6 +6,16 @@ benchmark merely because FlagGems can create its vendor environment.
 
 ## Scheduling and trust boundary
 
+- `unittest.yaml` starts with a `preprocess` job that decides everything else.
+  On a pull request it first waits for `triage.yaml` to finish on the same
+  commit (`wait-for-triage`), then reads the PR labels from the GitHub API.
+  Triage applies the path labels in a separate `pull_request_target` run, so
+  the labels in the event payload can be stale. If the wait or the lookup
+  fails, the job falls back to the payload labels.
+- The `python-op`, `backend-tests` and `vendor-container-tests` jobs decide in
+  their own `if:` whether to run, from the `preprocess` outputs (`should_run`,
+  the backend matrices and the fresh `labels`). The trust rules are written
+  there and checked by `CiWorkflowPolicyTest` in `tools/test_ci_helpers.py`.
 - Pull requests select a non-NVIDIA backend either through the exact `label`
   values in `.github/backends.json` or by changing a path
   under `src/flaggems_vllm/runtime/backend/_<vendor>/`. Automatic path
@@ -101,8 +111,8 @@ the FlagGems repository (`tools/test_ci_helpers.py` enforces this for
 runtime package by `tools/setup.sh`.
 
 1. `.github/backends.json` supplies `backend`, `runner_label`, `label`,
-   `gpu_check`, and `enabled` for the `non-nvidia-tests` lane. The H20
-   `nvidia-tests` job passes the same inputs by hand and is not in this file.
+   `gpu_check`, and `enabled` for the `backend-tests` lane. The H20
+   `python-op` job passes the same inputs by hand and is not in this file.
 2. `.github/workflows/backend-test.yaml` is the reusable job for one backend
    (including H20) on a bare self-hosted runner. It checks out this repository and runs the
    local `setup-flaggems` action.
@@ -134,7 +144,7 @@ platform on a docs-only change. No tests are selected then, so the job only
 installs the package and checks the accelerator, which validates the runner and
 image. Only users with triage access can add labels.
 
-`vendor-container-tests` in `basic-ci.yml` runs per-PR smoke tests inside
+`vendor-container-tests` in `unittest.yaml` runs per-PR smoke tests inside
 vendor-published vLLM images. Its runner/image data lives in
 `.github/configs/ci-backends.yaml` and is resolved by
 `tools/select_ci_backends.py`.
@@ -143,7 +153,7 @@ Three config sets now coexist, and they are deliberately not merged:
 
 | File | Drives | Runners / images |
 | --- | --- | --- |
-| `.github/backends.json` | `non-nvidia-tests` | bare runners, env built by `tools/setup.sh`; only backends without a container platform |
+| `.github/backends.json` | `backend-tests` | bare runners, env built by `tools/setup.sh`; only backends without a container platform |
 | `.github/configs/ci-backends.yaml` | `vendor-container-tests` | specific runners, vendor and NGC vLLM images |
 | `.github/configs/backends/*.yaml` | `ops-test.yaml` (periodic full suite) | `*-flaggems-weekly` runners, internal harbor images |
 
@@ -183,7 +193,7 @@ Two cautions learned from the current layout:
   version uses `github.ref` and keeps credentials. Swapping it is a security
   regression for fork pull requests. Reconcile by hardening the FlagOps action
   first.
-- Do not pull NVIDIA into the container lane. `nvidia-tests` runs on the H20
+- Do not pull NVIDIA into the container lane. `python-op` runs on the H20
   host through `tools/setup.sh` and benefits from the uv cache and FlagTree
   swap that script performs; containerizing it would buy nothing and lose that.
 
@@ -216,7 +226,7 @@ For each non-NVIDIA group:
    ```
 
 Only jobs directly defined in that selected reusable workflow can then enter
-the group. The H20 job (`nvidia-tests`) calls the same `backend-test.yaml`, so
+the group. The H20 job (`python-op`) calls the same `backend-test.yaml`, so
 its runner group can use this restriction too. Prefer an ephemeral H20 runner
 regardless: the restriction does not stop a same-repository branch from editing
 the caller workflow.
@@ -356,9 +366,10 @@ all actions created by GitHub, and allow the exact revisions used by the
 caller and called workflows, currently including:
 
 ```text
-actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
 actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+ArcticLampyrid/action-wait-for-workflow@ff297b23789206858260877c4b83026d90c6db8c
 flagos-ai/FlagGems-vllm/.github/workflows/backend-test.yaml@<ref>
 ```
 
@@ -380,13 +391,16 @@ CI makes disposable accelerator workers mandatory.
 ### Labels and branch rules
 
 Create the labels listed in the scheduling section under `Issues -> Labels`.
-Their spelling and case must match the pinned registry exactly.
+Their spelling and case must match the pinned registry exactly. The path
+labels in `.github/labeler.yml` are applied by `triage.yaml`; `preprocess`
+waits for that run, so do not rename `triage.yaml` without updating the
+`wait-for-triage` step.
 
 Under `Settings -> Rules -> Rulesets`, protect `main` with:
 
 - pull requests and approvals required;
 - code-owner review required;
-- the stable `multi-backend summary` status check required;
+- the `unittest-required` and `rule-check-required` status checks required;
 - branches required to be up to date if that matches the repository's merge
   policy; and
 - bypass permissions limited to the smallest maintainer set.
@@ -397,12 +411,19 @@ CODEOWNERS is read from the pull request's base branch, so the new CODEOWNERS
 file in the initial CI pull request cannot protect that same pull request.
 
 GitHub only offers a status check for selection as required after it has
-completed successfully in the repository recently. Run `multi-backend
-summary` successfully first, then add it to the ruleset. A successful summary
-means expected accelerator jobs succeeded or were deliberately skipped by the
-selection policy. For a non-Dependabot fork that selects a non-NVIDIA backend,
-the summary now requires that backend job to succeed; H20 is still expected to
-skip.
+completed successfully in the repository recently. Run `unittest-required`
+successfully first, then add it to the ruleset.
+
+`unittest-required` runs with `if: always()`. Unlike FlagGems, which accepts
+any `success` or `skipped` result, it works out from `preprocess` (the
+`should_run` and backend flags, the fresh labels, the event, the PR author and
+head repository) which lanes were expected to run. `python-op` and
+`backend-tests` must be `success` when expected and `skipped` otherwise, so a
+broken `if:` that skips a lane by mistake fails the gate instead of passing it.
+For a fork pull request that selects a non-NVIDIA backend, `backend-tests` must
+succeed while `python-op` is expected to skip unless a maintainer added
+`ci/nvidia`. `vendor-container-tests` is not part of the gate while it is in
+its observation period (`continue-on-error: true`).
 
 If the repository enables merge queue, add and validate a `merge_group`
 trigger before requiring this check for the queue. The current workflow does

@@ -424,7 +424,7 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
             "iluvatar",
         )
         approved = run_ci_targets.apply_policy(
-            # Normal pull requests pass --no-benchmarks in basic-ci.yml.
+            # Normal pull requests pass --no-benchmarks in unittest.yaml.
             {"tests": selected_tests, "benchmarks": []},
             policy,
         )
@@ -442,7 +442,7 @@ class BenchmarkWorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        cls.workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        cls.workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
 
@@ -791,7 +791,7 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 class CiWorkflowPolicyTest(unittest.TestCase):
     def test_backend_path_routing_uses_local_preflight_readiness(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         self.assertIn(
@@ -801,7 +801,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_all_backend_fanout_requires_an_explicit_request(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         all_enabled = workflow.split("ALL_ENABLED: >-", maxsplit=1)[1].split(
@@ -814,7 +814,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_forks_are_allowed_only_on_the_non_nvidia_lane(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         author_guard = "github.event.pull_request.user.login != 'dependabot[bot]'"
@@ -822,29 +822,42 @@ class CiWorkflowPolicyTest(unittest.TestCase):
             "github.event.pull_request.head.repo.full_name == github.repository"
         )
         nvidia_label_opt_in = (
-            "contains(github.event.pull_request.labels.*.name, 'ci/nvidia')"
+            "contains(fromJSON(needs.preprocess.outputs.labels), 'ci/nvidia')"
         )
-        nvidia_job = workflow.split("  nvidia-tests:", maxsplit=1)[1].split(
-            "  non-nvidia-tests:", maxsplit=1
+        nvidia_job = workflow.split("  python-op:", maxsplit=1)[1].split(
+            "  backend-tests:", maxsplit=1
         )[0]
-        non_nvidia_job = workflow.split("  non-nvidia-tests:", maxsplit=1)[1].split(
-            "  unittest-required:", maxsplit=1
+        non_nvidia_job = workflow.split("  backend-tests:", maxsplit=1)[1].split(
+            "  vendor-container-tests:", maxsplit=1
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
         self.assertIn(nvidia_label_opt_in, nvidia_job)
         self.assertNotIn(repository_guard, non_nvidia_job)
-        self.assertNotIn(nvidia_label_opt_in, non_nvidia_job)
+        self.assertNotIn("ci/nvidia", non_nvidia_job)
         self.assertIn(author_guard, nvidia_job)
         self.assertIn(author_guard, non_nvidia_job)
         self.assertNotIn("github.actor != 'dependabot[bot]'", workflow)
+
+    def test_labels_come_from_the_api_after_triage(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            workflow.index("id: wait-for-triage"), workflow.index("id: get-labels")
+        )
+        self.assertLess(
+            workflow.index("id: get-labels"), workflow.index("id: select-backends")
+        )
+        self.assertNotIn("github.event.pull_request.labels.*.name, '", workflow)
 
 
 class CiSummaryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         summary = workflow.split("  unittest-required:", maxsplit=1)[1]
@@ -854,7 +867,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def run_summary(self, **overrides):
         values = {
-            "SELECT_TARGETS_RESULT": "success",
+            "PREPROCESS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
             "SHOULD_RUN": "false",
@@ -872,7 +885,7 @@ class CiSummaryTest(unittest.TestCase):
             check=False,
         )
 
-    def test_expected_accelerator_results_succeed(self):
+    def test_expected_results_succeed(self):
         cases = {
             "trusted_nvidia_only": {
                 "SHOULD_RUN": "true",
@@ -913,7 +926,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def test_missing_or_unexpected_results_fail(self):
         cases = {
-            "preparation_failed": {"SELECT_TARGETS_RESULT": "failure"},
+            "preparation_failed": {"PREPROCESS_RESULT": "failure"},
             "expected_nvidia_skipped": {
                 "SHOULD_RUN": "true",
                 "NVIDIA_RESULT": "skipped",
@@ -925,6 +938,7 @@ class CiSummaryTest(unittest.TestCase):
                 "NON_NVIDIA_RESULT": "failure",
             },
             "unexpected_backend_run": {"NON_NVIDIA_RESULT": "success"},
+            "unexpected_nvidia_run": {"NVIDIA_RESULT": "success"},
         }
 
         for name, values in cases.items():
