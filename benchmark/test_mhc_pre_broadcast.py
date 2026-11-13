@@ -10,8 +10,8 @@ import flaggems_vllm
 from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
     derive_fn_broadcast,
     mhc_pre_broadcast,
-    mhc_pre_broadcast_ref,
 )
+from tests.test_mhc_pre_broadcast import mhc_pre_broadcast_ref
 
 from . import base
 
