@@ -744,3 +744,38 @@ def test_hygon_public_export_smoke():
 
 if __name__ == "__main__" and _IS_ACCURACY_WORKER:
     _run_accuracy_worker()
+
+# ---- MUSA (MThreads) MegaMoE -------------------------------------------------
+_MTHREADS_DEVICES = [
+    value
+    for value in os.environ.get("MEGAMOE_TEST_DEVICES", "").split(",")
+    if value.strip()
+]
+_MTHREADS_ENABLED = os.environ.get("MEGAMOE_MTHREADS_TEST") == "1"
+
+
+def _is_mthreads():
+    return getattr(flaggems_vllm, "vendor_name", "") == "mthreads"
+
+
+@pytest.mark.skipif(
+    not (_MTHREADS_ENABLED and _is_mthreads() and _MTHREADS_DEVICES),
+    reason=(
+        "Opt in with MEGAMOE_MTHREADS_TEST=1 and an explicit MEGAMOE_TEST_DEVICES "
+        "list on an MTS host"
+    ),
+)
+@pytest.mark.megamoe_fp8
+def test_megamoe_fp8_mthreads_accuracy():
+    """Validate the MUSA MegaMoE public API against the FP64 oracle."""
+    from flaggems_vllm.testing import megamoe_mthreads as mthreads
+
+    records = mthreads.run_accuracy(
+        _MTHREADS_DEVICES,
+        iterations=int(os.environ.get("MEGAMOE_TEST_ITERATIONS", "25")),
+        tokens=int(os.environ.get("MEGAMOE_TEST_TOKENS", "1")),
+    )
+    assert len(records) == len(_MTHREADS_DEVICES)
+    for record in records:
+        assert record["status"] == "PASS"
+        assert record["relative_l2"] <= 0.003

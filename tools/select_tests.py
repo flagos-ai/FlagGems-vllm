@@ -102,6 +102,27 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/testing/megamoe_hygon_host.hip": [
         "tests/test_megamoe.py",
     ],
+    "src/flaggems_vllm/testing/megamoe_mthreads.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_mthreads_baseline.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/megamoe/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/megamoe/api.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/megamoe/kernel.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/megamoe.py": [
+        "tests/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
         "tests/test_megamoe.py",
     ],
@@ -273,6 +294,27 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_megamoe.py",
     ],
     "src/flaggems_vllm/testing/megamoe_hygon_host.hip": ["benchmark/test_megamoe.py"],
+    "src/flaggems_vllm/testing/megamoe_mthreads.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_mthreads_baseline.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/megamoe/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/megamoe/api.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/mega/megamoe/kernel.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/megamoe.py": [
+        "benchmark/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
         "benchmark/test_megamoe.py",
     ],

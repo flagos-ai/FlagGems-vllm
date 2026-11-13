@@ -41,6 +41,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.megamoe import megamoe_fp8
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -71,6 +72,7 @@ __all__ = [
     "grouped_topk",
     "hc_combine",
     "inplace_fused_experts",
+    "megamoe_fp8",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
