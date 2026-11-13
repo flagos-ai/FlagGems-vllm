@@ -619,6 +619,22 @@ ops:
     stages:
       - stable: '2.0'
     cpp: '4.0'
+  - id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+    description: |
+      Horizontally-fused DeepseekV4-MLA full-cache path.
+      Optional weight-free RMSNorm + GPT-J RoPE for Q, GPT-J RoPE + per-tensor FP8
+      (e4m3) quant for both Q and KV, and paged cache insert for KV, all in one
+      kernel launch.
+    for:
+      - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+    labels:
+      - fused
+      - vLLM
+      - DeepSeekV4
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
     description: |
       Horizontally-fused DeepseekV4-MLA.
