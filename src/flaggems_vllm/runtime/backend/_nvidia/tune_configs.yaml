@@ -1607,3 +1607,17 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+draft_watermarking_mask:
+  - META:
+      BLOCK: 512
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 8192
+    num_warps: 4
+    num_stages: 1
