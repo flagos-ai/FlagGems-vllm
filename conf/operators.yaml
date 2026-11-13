@@ -1138,6 +1138,21 @@ ops:
       - Attention
     stages:
       - alpha: '5.4'
+  - id: megamhc
+    description: |
+      Single-kernel Hopper TLE implementation of the fused mHC post,
+      projection, pre-mix, Sinkhorn, and RMSNorm path for the exact
+      DeepSeek-V4-Flash Normal BF16 profile.
+    for:
+      - vllm.model_executor.kernels.mhc.mhc_fused_post_pre_tilelang
+    labels:
+      - fused
+      - TLE
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: mhc_bwd
     description: |
       The backward case for MHC (Manifold-Constrained Hyper-Connections).

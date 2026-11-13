@@ -450,6 +450,15 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if path.startswith("src/flaggems_vllm/ops/mhc/"):
         return ["tests/test_mhc_ops.py"] if "tests/test_mhc_ops.py" in tests else []
 
+    if path.startswith(
+        "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/megamhc/"
+    ):
+        return [
+            target
+            for target in ("tests/test_megamhc.py", "tests/test_megamhc_contract.py")
+            if target in tests
+        ]
+
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
         "/ops/" in path or "/fused/" in path or "/FLA/" in path
@@ -475,6 +484,15 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
     if path.startswith("src/flaggems_vllm/ops/mhc/"):
         return (
             ["benchmark/test_mhc.py"] if "benchmark/test_mhc.py" in benchmarks else []
+        )
+
+    if path.startswith(
+        "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/megamhc/"
+    ):
+        return (
+            ["benchmark/test_megamhc.py"]
+            if "benchmark/test_megamhc.py" in benchmarks
+            else []
         )
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
