@@ -23,6 +23,7 @@ import triton.language as tl
 import yaml
 
 from flaggems_vllm import runtime
+from flaggems_vllm.flagtune.inference.cost_model import tensor_dtypes
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
@@ -535,6 +536,23 @@ def _get_swap_ab_placeholder_configs(pre_hook=None):
     ]
 
 
+@triton.jit
+def _zero_splitk_output_kernel(C, M, N, stride_cm, stride_cn, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows = offsets // N
+    cols = offsets % N
+    tl.store(C + rows * stride_cm + cols * stride_cn, 0.0, offsets < M * N)
+
+
+def _reset_splitk_output(nargs):
+    """Include initialization in every timed and cached atomic split-K launch."""
+    c = nargs["C"]
+    m, n = nargs["M"], nargs["N"]
+    _zero_splitk_output_kernel[(triton.cdiv(m * n, 1024),)](
+        c, m, n, c.stride(0), c.stride(1), BLOCK=1024
+    )
+
+
 def _get_swap_ab_splitk_placeholder_configs(pre_hook=None):
     return [
         triton.Config(
@@ -597,6 +615,11 @@ def _get_fixed_matmul_meta(M: int, N: int, K: int, block_n: int, block_k: int):
     strategy=["align32", "align32", "align32", "align32", "align32"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_general",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_general",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -714,6 +737,11 @@ def w8a8_block_fp8_matmul_kernel_general(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_swap",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_swap_ab",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -861,15 +889,20 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
 
 @libentry()
 @libtuner(
-    configs=_get_swap_ab_splitk_placeholder_configs(pre_hook=None),
+    configs=_get_swap_ab_splitk_placeholder_configs(pre_hook=_reset_splitk_output),
     key=["M", "N", "K", "stride_am", "stride_bk"],
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_splitk_complete",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_swap_ab_splitk",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-    flagtune_pre_hook=None,
+    flagtune_pre_hook=_reset_splitk_output,
 )
 @triton.jit
 def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
@@ -1009,6 +1042,11 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_shortk",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_short_k256",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -1284,7 +1322,6 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
                 META["SPLIT_K"],
             )
             with torch_device_fn.device(a.device):
-                c.zero_()
                 w8a8_block_fp8_matmul_kernel_swap_ab_splitk[swap_splitk_grid](
                     a,
                     b,
@@ -1334,10 +1371,10 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             sm_count = torch.cuda.get_device_properties(dev_index).multi_processor_count
             split_k = min(total_k_iters, max(4, 2 * sm_count // max(grid_mn, 1)))
 
-            c.zero_()
             swap_splitk_grid = (grid_m, grid_n, split_k)
 
             with torch_device_fn.device(a.device):
+                _reset_splitk_output({"C": c, "M": M, "N": N})
                 w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn[swap_splitk_grid](
                     a,
                     b,
