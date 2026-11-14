@@ -31,7 +31,7 @@ import triton.language as tl
 
 import flaggems_vllm
 
-from .accuracy_utils import gems_assert_close
+from ..accuracy_utils import gems_assert_close
 
 
 @dataclass(frozen=True)

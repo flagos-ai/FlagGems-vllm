@@ -6,7 +6,7 @@ import torch
 
 import flaggems_vllm
 
-from .megapreattention_ppu_utils import run_tp2
+from .megapreattention_utils import run_tp2
 
 pytestmark = pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead" or torch.cuda.device_count() < 2,
@@ -24,6 +24,10 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 def test_megapreattention(tokens, model_dims, edge, sections):
+    from flaggems_vllm.runtime.backend._thead.ops import megapreattention
+
+    assert flaggems_vllm.megapreattention is megapreattention
+    assert flaggems_vllm.ops.__all__.count("megapreattention") == 1
     run_tp2(tokens, model_dims=model_dims, edge=edge, sections=sections)
 
 

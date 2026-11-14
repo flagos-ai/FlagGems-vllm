@@ -33,6 +33,7 @@ from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._thead.ops.megapreattention import megapreattention
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -57,6 +58,7 @@ __all__ = [
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "int8_einsum",
+    "megapreattention",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",

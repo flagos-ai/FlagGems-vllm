@@ -12,9 +12,9 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.megapreattention_ppu_utils import run_tp2, summarize_round
+from tests.thead.megapreattention_utils import run_tp2, summarize_round
 
-from .conftest import Config
+from ..conftest import Config
 
 pytestmark = pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead" or torch.cuda.device_count() < 2,
