@@ -24,6 +24,8 @@ LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
 # Signed INT8 stores 0..255 probability levels with a -128 zero point.
 PROB_QUANT_LEVELS = tl.constexpr(255)
+# The rounding residual is in [-0.5, 0.5] and fits in [-127, 127].
+PROB_RESIDUAL_SCALE = tl.constexpr(254)
 # Descales are indexed by logical sequence position in blocks of DESCALE_BLOCK.
 DESCALE_BLOCK = tl.constexpr(128)
 PACK_TILE = tl.constexpr(32)
@@ -214,7 +216,12 @@ def _flash_int8_fwd(
                 beta = tl.exp2(tile_max - safe_max)
                 denom = denom * alpha + tl.sum(p, 1) * beta
                 p_scale = beta * (1.0 / PROB_QUANT_LEVELS)
-                p_int8 = (tl.floor(p * PROB_QUANT_LEVELS + 0.5) - 128).to(tl.int8)
+                p_scaled = p * PROB_QUANT_LEVELS
+                p_rounded = tl.floor(p_scaled + 0.5)
+                p_int8 = (p_rounded - 128).to(tl.int8)
+                p_residual = tl.floor(
+                    (p_scaled - p_rounded) * PROB_RESIDUAL_SCALE + 0.5
+                ).to(tl.int8)
             v = tl.load(
                 V + v_row[:, None] + kv_head * hv + d[None, :], n[:, None] < nk, 0
             )
@@ -235,6 +242,8 @@ def _flash_int8_fwd(
                 partial = tl.dot(p_int8, v, -correction, out_dtype=tl.int32).to(
                     tl.float32
                 )
+                residual = tl.dot(p_residual, v, out_dtype=tl.int32).to(tl.float32)
+                partial += residual * (1.0 / PROB_RESIDUAL_SCALE)
                 acc = acc * alpha[:, None] + partial * (p_scale * vs)[:, None]
             maximum = new_max
         result = acc / tl.where(denom > 0, denom, 1)[:, None]
@@ -292,8 +301,8 @@ def flash_attn_varlen_func_w8a8_int8(
     (kv_heads for K/V), indexed by logical sequence position even for paged KV.
     Each real value is the INT8 value multiplied by its descale.
 
-    QK uses INT8 dot with INT32 accumulation. All paths quantize
-    probabilities to 256 levels and use INT8 PV with zero-point correction;
+    QK uses INT8 dot with INT32 accumulation. The INT8 PV path quantizes
+    both probabilities and their rounding residual, with zero-point correction;
     Hygon DCU sweeps found this faster than fp16 PV even for long paged
     queries, so the fp16-PV packing path is retained but disabled. Softmax
     and online accumulation use FP32.
