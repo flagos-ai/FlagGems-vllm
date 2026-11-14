@@ -1320,6 +1320,17 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: v2_apply_grammar_bitmask
+    description: Apply packed vLLM V2 structured-output masks to logits in place.
+    for:
+      - vllm.v1.worker.gpu.structured_outputs._apply_grammar_bitmask_kernel
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: weight_norm
     description: |
       Reparameterizes a module's weight tensor by decoupling its magnitude (g)

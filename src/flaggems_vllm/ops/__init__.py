@@ -146,6 +146,7 @@ from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
 from flaggems_vllm.ops.triton_scaled_mm import triton_scaled_mm
 from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 from flaggems_vllm.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.ops.v2_apply_grammar_bitmask import v2_apply_grammar_bitmask
 from flaggems_vllm.ops.weightnorm import (
     weight_norm_interface,
     weight_norm_interface_backward,
@@ -260,6 +261,7 @@ __all__ = [
     "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",
+    "v2_apply_grammar_bitmask",
     "weight_norm",
     "weight_norm_interface",
     "weight_norm_interface_backward",

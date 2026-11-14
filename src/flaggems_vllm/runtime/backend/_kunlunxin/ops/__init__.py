@@ -16,5 +16,11 @@
 from flaggems_vllm.runtime.backend._kunlunxin.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._kunlunxin.ops.v2_apply_grammar_bitmask import (
+    v2_apply_grammar_bitmask,
+)
 
-__all__ = ["scaled_int8_quant"]
+__all__ = [
+    "scaled_int8_quant",
+    "v2_apply_grammar_bitmask",
+]
