@@ -1455,6 +1455,19 @@ ops:
   - MoE
   stages:
   - alpha: '5.5'
+- id: megapreattention
+  description: >-
+    BF16 tensor-parallel AllGather and gated QKV projection with Gemma
+    RMSNorm, interleaved MRoPE, and in-place paged KV insertion on PPU.
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: mhc_bwd
   description: 'The backward case for MHC (Manifold-Constrained Hyper-Connections).
 

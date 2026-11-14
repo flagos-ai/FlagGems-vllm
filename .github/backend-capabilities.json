@@ -47,6 +47,11 @@
       "benchmarks_enabled": true,
       "allow_all_benchmarks": true
     },
+    "thead": {
+      "tests_allow": [
+        "tests/thead/test_megapreattention.py"
+      ]
+    },
     "tsingmicro": {
       "auto_select": true
     }
