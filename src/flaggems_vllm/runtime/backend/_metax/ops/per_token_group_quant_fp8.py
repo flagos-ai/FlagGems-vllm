@@ -19,8 +19,24 @@ import torch
 import triton
 import triton.language as tl
 
+# Retain the C550 software FP8 encoder: the validated MACA compiler's generic
+# conversion used a longer compare/select sequence. Instruction counts depend
+# on compiler versions; this existing optimization is independent of reorder.
+from flaggems_vllm.ops.per_token_group_quant_fp8 import (
+    _HAS_LOAD_REORDER,
+    _f32_to_fp8_e4m3fn,
+    _quant_groups,
+    _vendor_ngroups_per_program,
+    _vendor_reorder_launch_config,
+)
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.device_info import get_device_capability, get_sm_count
+
+try:
+    import triton.experimental.tle.language as tle
+except ImportError:
+    tle = tl
+
 
 if torch_device_fn.is_available() and get_device_capability() >= (8, 0):
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
@@ -29,74 +45,6 @@ else:
 
 
 logger = logging.getLogger(__name__)
-
-
-@triton.jit
-def _f32_to_fp8_e4m3fn(y):
-    """Bit-exact f32 -> e4m3fn conversion (RNE); `y` must be finite and
-    pre-clamped to [-448, 448] (guaranteed by the clamp in ``_quant_groups``).
-
-    MetaX C550 (maca backend) has no native fp8 conversion instruction, so the
-    TritonGPU -> LLVM lowering expands ``tt.fp_to_fp`` into a fully general
-    software sequence of ~30 LLVM ops per element, dominated by an 8-deep
-    icmp+select threshold ladder for subnormals plus NaN-detection and
-    saturation fixups the compiler cannot prove unnecessary (measured on the
-    generated LLIR: 185 icmp + 163 select vs 25 + 19 with this helper).  That
-    ALU chain cannot be hidden by this memory-bound kernel (num_warps=1), so
-    the generic conversion halves throughput on large shapes (C550: ~616 ->
-    ~1255 GB/s at 32768x7168); a pure load+convert+store microbenchmark shows
-    this helper matches the memcpy bandwidth floor while ``.to()`` runs ~27%
-    slower.
-
-    This branchless sequence needs only a few integer ops per element:
-      * normals (|y| >= 2^-6): rebias the exponent (127 -> 7) and RNE-round
-        the mantissa from 23 to 3 bits via ``t += 0x7FFFF + lsb_of_result``;
-      * subnormals: ``k = RNE(|y| / 2**-9)`` with the magic-number add
-        ``|y| * 512 + 2**23`` (an f32 add rounds to-nearest-even, leaving k
-        in the low mantissa bits) -- one FMA replaces the generic 8-level
-        icmp/select ladder.
-    """
-    b = y.to(tl.uint32, bitcast=True)
-    a = b & 0x7FFFFFFF
-    t = a - 0x3C000000
-    t += 0x0007FFFF + ((t >> 20) & 1)
-    r_norm = t >> 20
-    r_sub = (a.to(tl.float32, bitcast=True) * 512.0 + 8388608.0).to(
-        tl.uint32, bitcast=True
-    ) - 0x4B000000
-    r = tl.where(a >= 0x3C800000, r_norm, r_sub)
-    return (r | ((b >> 24) & 0x80)).to(tl.uint8)
-
-
-@triton.jit
-def _quant_groups(
-    y,
-    eps,
-    fp8_min: tl.constexpr,
-    fp8_max: tl.constexpr,
-    inv_fp8_max: tl.constexpr,
-    scale_ue8m0: tl.constexpr,
-    subnormal_scale: tl.constexpr,
-):
-    """Per-row (axis=1) abs-max scale + quantize, in f32."""
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax * inv_fp8_max
-
-    if scale_ue8m0:
-        e = tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10)))
-        y_s = tl.exp2(e)
-        # y_s is a power of two, so multiplying by 2^-e is a bit-exact
-        # division and avoids one f32 divide per element.
-        y_q = tl.clamp(y * tl.exp2(-e)[:, None], fp8_min, fp8_max)
-    elif subnormal_scale:
-        # `y_s` is subnormal when `fp8_max` is huge (e.g. fp32), and some
-        # backends flush subnormal fp32 divisors to zero; divide by the always
-        # normal `_absmax` instead and scale at the end.
-        y_q = tl.clamp((y / _absmax[:, None]) * fp8_max, fp8_min, fp8_max)
-    else:
-        # one reciprocal per group instead of one divide per element
-        y_q = tl.clamp(y * (1.0 / y_s)[:, None], fp8_min, fp8_max)
-    return y_q, y_s
 
 
 @triton.jit
@@ -116,44 +64,89 @@ def _per_token_group_quant_fp8_vec(
     BLOCK: tl.constexpr,
     GROUPS_PER_ROW: tl.constexpr,
     NGROUPS: tl.constexpr,
+    TOTAL_GROUPS: tl.constexpr = 0,
+    UNROLL: tl.constexpr = 1,
+    REORDER: tl.constexpr = False,
 ):
-    pid = tl.program_id(0)
-    programs_per_row = GROUPS_PER_ROW // NGROUPS
-    row = pid // programs_per_row
-    pg = pid % programs_per_row
+    if UNROLL == 1:
+        pid = tl.program_id(0)
+        programs_per_row = GROUPS_PER_ROW // NGROUPS
+        row = pid // programs_per_row
+        pg = pid % programs_per_row
 
-    start_gid = row * GROUPS_PER_ROW + pg * NGROUPS
+        start_gid = row * GROUPS_PER_ROW + pg * NGROUPS
 
-    gids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row.to(tl.int64) * y_row_stride
-        + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
-        + cols[None, :]
-    )
-    if BLOCK == GROUP_SIZE:
-        y = tl.load(y_ptr + offsets).to(tl.float32)
-    else:
-        y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
-            tl.float32
+        gids = tl.arange(0, NGROUPS)
+        cols = tl.arange(0, BLOCK)
+        offsets = (
+            row.to(tl.int64) * y_row_stride
+            + (pg.to(tl.int64) * NGROUPS + gids[:, None]) * GROUP_SIZE
+            + cols[None, :]
         )
+        if BLOCK == GROUP_SIZE:
+            y = tl.load(y_ptr + offsets).to(tl.float32)
+        else:
+            y = tl.load(y_ptr + offsets, mask=cols[None, :] < GROUP_SIZE, other=0.0).to(
+                tl.float32
+            )
 
-    y_q, y_s = _quant_groups(
-        y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
-    )
-    if fast_cvt:
-        y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
-    else:
-        y_q = y_q.to(y_q_ptr.dtype.element_ty)
+        y_q, y_s = _quant_groups(
+            y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
+        )
+        if fast_cvt:
+            y_q = _f32_to_fp8_e4m3fn(y_q).to(y_q_ptr.dtype.element_ty, bitcast=True)
+        else:
+            y_q = y_q.to(y_q_ptr.dtype.element_ty)
 
-    out_offsets = (
-        start_gid.to(tl.int64) * GROUP_SIZE + gids[:, None] * GROUP_SIZE + cols[None, :]
-    )
-    if BLOCK == GROUP_SIZE:
-        tl.store(y_q_ptr + out_offsets, y_q)
+        out_offsets = (
+            start_gid.to(tl.int64) * GROUP_SIZE
+            + gids[:, None] * GROUP_SIZE
+            + cols[None, :]
+        )
+        if BLOCK == GROUP_SIZE:
+            tl.store(y_q_ptr + out_offsets, y_q)
+        else:
+            tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
+        tl.store(y_s_ptr + start_gid + gids, y_s)
+
     else:
-        tl.store(y_q_ptr + out_offsets, y_q, mask=cols[None, :] < GROUP_SIZE)
-    tl.store(y_s_ptr + start_gid + gids, y_s)
+        # The same portable independent-group loop on every backend. Reuse
+        # the backend's existing quantization and FP8 conversion helpers.
+        pid = tl.program_id(0)
+        gids = tl.arange(0, NGROUPS)
+        cols = tl.arange(0, BLOCK)
+        q0 = tl.full((NGROUPS, BLOCK), 0, y_q_ptr.dtype.element_ty)
+        q1 = tl.full((NGROUPS, BLOCK), 0, y_q_ptr.dtype.element_ty)
+        s0 = tl.full((NGROUPS,), 0, tl.float32)
+        s1 = tl.full((NGROUPS,), 0, tl.float32)
+        for step in tle.range(0, UNROLL, loop_unroll_factor=UNROLL, reorder=REORDER):
+            group = pid * NGROUPS * UNROLL + step * NGROUPS + gids
+            # The host selects this branch only for contiguous 2-D input.
+            offset = group[:, None].to(tl.int64) * GROUP_SIZE + cols[None, :]
+            mask = (group[:, None] < TOTAL_GROUPS) & (cols[None, :] < GROUP_SIZE)
+            y = tl.load(y_ptr + offset, mask, other=0.0).to(tl.float32)
+            q, scale = _quant_groups(
+                y, eps, fp8_min, fp8_max, inv_fp8_max, scale_ue8m0, subnormal_scale
+            )
+            if fast_cvt:
+                q = _f32_to_fp8_e4m3fn(q).to(y_q_ptr.dtype.element_ty, bitcast=True)
+            else:
+                q = q.to(y_q_ptr.dtype.element_ty)
+            if step == 0:
+                q0, s0 = q, scale
+            else:
+                q1, s1 = q, scale
+        for step in tl.static_range(0, UNROLL):
+            group = pid * NGROUPS * UNROLL + step * NGROUPS + gids
+            q = q0 if step == 0 else q1
+            scale = s0 if step == 0 else s1
+            mask = (group[:, None] < TOTAL_GROUPS) & (cols[None, :] < GROUP_SIZE)
+            tl.store(
+                y_q_ptr + group[:, None].to(tl.int64) * GROUP_SIZE + cols[None, :],
+                q,
+                mask,
+            )
+            tl.store(y_s_ptr + group, scale, group < TOTAL_GROUPS)
 
 
 @triton.jit
@@ -218,18 +211,9 @@ def _per_token_group_quant_fp8_colmajor_vec(
 def _ngroups_per_program(
     total_groups: int, groups_per_row: int, group_size: int
 ) -> int:
-    # Fuse neighbouring groups into one ~1024-element tile per program; on the
-    # MetaX C550 a single wavefront per program with 16B vectorized accesses
-    # saturates memory bandwidth best.
-    cap = max(1, 1024 // group_size)
-    ngroups = 1
-    while ngroups < cap and groups_per_row % (ngroups * 2) == 0:
-        ngroups *= 2
-    # keep enough programs in flight when the input is small
-    cu_count = get_sm_count()
-    while ngroups > 1 and total_groups // ngroups < 4 * cu_count:
-        ngroups //= 2
-    return ngroups
+    return _vendor_ngroups_per_program(
+        total_groups, groups_per_row, group_size, get_sm_count()
+    )
 
 
 def per_token_group_quant_fp8(
@@ -281,6 +265,18 @@ def per_token_group_quant_fp8(
     ngroups = _ngroups_per_program(num_groups, groups_per_row, group_size)
     num_warps = min(max((ngroups * block) // 1024, 1), 4)
     grid = (num_groups // ngroups,)
+    unroll = 1
+    window_config = _vendor_reorder_launch_config(
+        x,
+        fp8_dtype,
+        column_major_scales,
+        group_size == 512,
+        num_groups,
+        block,
+        _HAS_LOAD_REORDER,
+    )
+    if window_config is not None:
+        ngroups, unroll, num_warps, grid = window_config
 
     if column_major_scales:
         _per_token_group_quant_fp8_colmajor_vec[grid](
@@ -320,6 +316,9 @@ def per_token_group_quant_fp8(
             BLOCK=block,
             GROUPS_PER_ROW=groups_per_row,
             NGROUPS=ngroups,
+            TOTAL_GROUPS=num_groups,
+            UNROLL=unroll,
+            REORDER=_HAS_LOAD_REORDER,
             num_warps=num_warps,
             num_stages=1,
         )
