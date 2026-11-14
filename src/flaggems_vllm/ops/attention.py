@@ -24,7 +24,12 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.config import use_c_extension
-from flaggems_vllm.ops.flash_api import mha_fwd, mha_varlan_fwd, mha_varlan_fwd_opt
+from flaggems_vllm.ops.flash_api import (
+    mha_fwd,
+    mha_varlan_fwd,
+    mha_varlan_fwd_opt,
+    validate_metax_fp32_varlen,
+)
 from flaggems_vllm.ops.flash_kernel import keep
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
@@ -1354,17 +1359,21 @@ def flash_attn_varlen_func(
     block_table=None,
     return_softmax_lse=False,
     out=None,
-    # Dummy FA3 arguments
+    # FA3 arguments
     scheduler_metadata=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
-    s_aux=None,
     num_splits: int = 0,
+    output_scale=None,
+    fa_version: int = 2,
+    s_aux=None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k=None,
-    fa_version: int = 2,
+    mask_mod=None,
+    aux_tensors=None,
+    dynamic_causal=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1418,6 +1427,15 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    # Match vLLM's public signature without silently accepting FA4 features.
+    if any(
+        value is not None
+        for value in (output_scale, mask_mod, aux_tensors, dynamic_causal)
+    ):
+        raise NotImplementedError(
+            "FlagGems-vllm does not support output_scale, mask_mod, aux_tensors "
+            "or dynamic_causal"
+        )
     if (
         type(fa_version) is int
         and fa_version == 3
@@ -1515,6 +1533,8 @@ def flash_attn_varlen_func(
     if is_metax:
         if fa_version != 2:
             raise NotImplementedError("MetaX varlen attention supports fa_version=2")
+        if q.dtype == torch.float32 and any(x.requires_grad for x in (q, k, v)):
+            raise NotImplementedError("MetaX fp32 attention is forward-only")
         if dropout_p != 0:
             raise NotImplementedError("MetaX varlen attention supports dropout_p=0")
         if return_attn_probs:
@@ -1553,10 +1573,23 @@ def flash_attn_varlen_func(
         max_seqlen_q, max_seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
         if max_seqlen_q < 0 or max_seqlen_k < 0:
             raise ValueError("maximum sequence lengths must be nonnegative")
-        assert q.device == k.device == v.device
-        assert cu_seqlens_q.device == q.device
-        if cu_seqlens_k is not None:
-            assert cu_seqlens_k.device == q.device
+        if q.dtype == torch.float32:
+            if q.device.type != runtime.device.name or any(
+                x.device != q.device for x in (k, v)
+            ):
+                raise ValueError("MetaX fp32 Q/K/V must be on the same device")
+            if any(
+                cu is not None and cu.device != q.device
+                for cu in (cu_seqlens_q, cu_seqlens_k)
+            ):
+                raise ValueError(
+                    "MetaX fp32 cumulative lengths must be on the Q device"
+                )
+        else:
+            assert q.device == k.device == v.device
+            assert cu_seqlens_q.device == q.device
+            if cu_seqlens_k is not None:
+                assert cu_seqlens_k.device == q.device
         if seqused_k is not None:
             assert seqused_k.device == q.device and seqused_k.dtype == torch.int32
         if block_table is not None:
@@ -1624,6 +1657,23 @@ def flash_attn_varlen_func(
         else:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])
+        if is_metax and q.dtype == torch.float32:
+            validate_metax_fp32_varlen(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k,
+                block_table,
+                alibi_slopes,
+                causal,
+                real_window_size[0],
+                real_window_size[1],
+                softcap,
+                num_splits,
+            )
         if is_metax:
             from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
                 ensure_last_dim_contiguous,
