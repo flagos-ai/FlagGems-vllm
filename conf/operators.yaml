@@ -1822,6 +1822,18 @@ ops:
   stages:
   - stable: '3.0'
   cpp: '4.0'
+- id: reshape_and_cache_flash_strided
+  description: Write unquantized keys and values into independently strided paged
+    cache views on Sunrise PTPU.
+  for:
+  - reshape_and_cache_flash_strided
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '0.3'
 - id: rwkv_ka_fusion
   description: 'Merges, aligns, and enhances features from different data sources
     or spatial directions
