@@ -19,6 +19,12 @@ import flaggems_vllm
 
 from . import base
 
+pytestmark = (
+    pytest.mark.fused_inv_rope_fp8_quant
+    if "fused_inv_rope_int8_quant" in vars(flaggems_vllm)
+    else pytest.mark.skip(reason="ascend int8 inverse-RoPE quant")
+)
+
 HEAD_DIM = 512
 NOPE_DIM = 448
 ROPE_DIM = 64
@@ -119,10 +125,6 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
             )
 
 
-@pytest.mark.fused_inv_rope_fp8_quant
-@pytest.mark.skipif(
-    flaggems_vllm.device != "npu", reason="ascend int8 inverse-RoPE quant"
-)
 def test_fused_inv_rope_int8_quant():
     bench = FusedInvRopeInt8QuantBenchmark(
         op_name="fused_inv_rope_fp8_quant",

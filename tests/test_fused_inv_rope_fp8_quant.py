@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.ops import fused_inv_rope_fp8_quant as generic_inv_rope_fp8_quant
 from flaggems_vllm.utils.device_info import get_device_capability
 
 from . import accuracy_utils as utils
@@ -32,6 +33,10 @@ HAS_FP8_QUANT = hasattr(torch, "float8_e4m3fn") and (
     flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
     or flaggems_vllm.vendor_name == "thead"
     or (flaggems_vllm.vendor_name == "mthreads" and get_device_capability() >= (3, 1))
+    or (
+        flaggems_vllm.vendor_name == "hygon"
+        and flaggems_vllm.fused_inv_rope_fp8_quant is not generic_inv_rope_fp8_quant
+    )
 )
 
 
