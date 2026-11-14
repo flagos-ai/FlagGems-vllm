@@ -137,6 +137,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.v2_apply_penalties import v2_apply_penalties
+from flaggems_vllm.runtime.backend._ascend.ops.v2_apply_temperature import v2_apply_temperature
 
 __all__ = [
     "add_rms_norm",
@@ -199,4 +201,6 @@ __all__ = [
     "top_k_top_p",
     "topk_softplus_sqrt",
     "unpack_seq_triton",
+    "v2_apply_penalties",
+    "v2_apply_temperature",
 ]
