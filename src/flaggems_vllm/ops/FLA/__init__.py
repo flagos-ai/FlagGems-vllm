@@ -13,6 +13,7 @@ from flaggems_vllm.ops.FLA.chunk_kda_scaled_dot_kkt_fwd import (
     chunk_kda_scaled_dot_kkt_fwd,
 )
 from flaggems_vllm.ops.FLA.chunk_kda_with_fused_gate import chunk_kda_with_fused_gate
+from flaggems_vllm.ops.FLA.fused_kda_gate import fused_kda_gate
 from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
     fused_recurrent_gated_delta_rule_fwd,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_fwd_intra_token_parallel",
     "chunk_kda_with_fused_gate",
+    "fused_kda_gate",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",

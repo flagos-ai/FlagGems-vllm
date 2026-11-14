@@ -49,6 +49,7 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_scaled_dot_kkt_fwd,
     chunk_kda_fwd_intra_token_parallel,
     chunk_kda_with_fused_gate,
+    fused_kda_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
@@ -317,6 +318,7 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
+    "fused_kda_gate",
     "fused_marlin_moe",
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
