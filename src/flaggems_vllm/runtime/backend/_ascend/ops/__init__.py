@@ -100,6 +100,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.v2_apply_penalties import (
+    v2_apply_penalties,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.v2_apply_temperature import (
+    v2_apply_temperature,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -140,6 +146,8 @@ __all__ = [
     "indexer_epilogue",
     "compute_slot_mapping_parallel",
     "unpack_seq_triton",
+    "v2_apply_penalties",
+    "v2_apply_temperature",
     "kpool_state_compress",
     "group_list_cumsum",
     "indexer_gemm_score",

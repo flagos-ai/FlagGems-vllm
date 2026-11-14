@@ -1320,6 +1320,40 @@ ops:
       - NeuralNetwork
     stages:
       - beta: '5.3'
+  - id: v2_apply_penalties
+    description: Apply vLLM V2 repetition, frequency and presence penalties to Ascend logits in place.
+    for:
+      - vllm.v1.worker.gpu.sample.penalties.apply_penalties
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: v2_apply_temperature
+    description: Scale vLLM V2 Ascend logits by per-request temperature in place.
+    for:
+      - vllm.v1.worker.gpu.sample.gumbel.apply_temperature
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: v2_gumbel_rng
+    description: Triton Murmur3 hash and uniform draws for vLLM V2 Gumbel sampling on Ascend.
+    for:
+      - vllm.v1.worker.gpu.sample.gumbel.murmur3_hash32
+      - vllm.v1.worker.gpu.sample.gumbel.murmur3_uniform32
+      - vllm.v1.worker.gpu.sample.gumbel.murmur3_uniform64
+    labels:
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: weight_norm
     description: |
       Reparameterizes a module's weight tensor by decoupling its magnitude (g)
