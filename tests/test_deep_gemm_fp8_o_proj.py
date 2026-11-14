@@ -47,13 +47,32 @@ def is_hopper_available():
     return sm_version_num >= 90 and sm_version_num < 100
 
 
-CUDA_AVAILABLE = is_hopper_available()
+def is_supported_backend():
+    """Hopper runs the FP8 einsum path; MetaX runs the INT8 block-scaled path."""
+    if flaggems_vllm.vendor_name == "metax":
+        return torch.cuda.is_available()
+    return is_hopper_available()
+
+
+CUDA_AVAILABLE = is_supported_backend()
 pytestmark = [
     pytest.mark.deep_gemm_fp8_o_proj,
     pytest.mark.skipif(
-        not CUDA_AVAILABLE, reason="requires NVIDIA Hopper GPU (fp8_einsum)"
+        not CUDA_AVAILABLE, reason="requires NVIDIA Hopper or MetaX (fp8 einsum)"
     ),
 ]
+
+# The MetaX path transports the FP8 grid values as INT8 (extra error <= half an
+# INT8 step, ~1.2% peak-relative measured); Hopper stays on exact FP8.
+COMPOSED_ATOL = 0.02 if flaggems_vllm.vendor_name == "metax" else 0.01
+
+
+class _QuantizedActivation:
+    """Attribute-only stand-in for vLLM >= 0.32 ``QuantizedActivation``."""
+
+    def __init__(self, data, scale):
+        self.data = data
+        self.scale = scale
 
 
 class _QuantWoA(torch.nn.Module):
@@ -209,6 +228,96 @@ def test_accuracy_deep_gemm_fp8_o_proj(config, seed):
     assert out.shape == (config[0], config[4])
     # FP8 block-wise quantization plus bf16 output rounding.
     atol = max(5e-2, ref.abs().max().item() * 5e-2)
+    utils.gems_assert_close(out, ref, torch.bfloat16, atol=atol)
+
+
+def _quantize_activation(inp):
+    """Inverse RoPE + per-128 FP8 quant, as vLLM 0.32's attention kernel emits."""
+    o = _inv_rope_reference(inp["o"], inp["positions"], inp["cos_sin_cache"])
+    num_tokens, n_groups = o.shape[0], inp["n_groups"]
+    grouped = o.reshape(num_tokens, n_groups, -1)
+    view = grouped.reshape(num_tokens, n_groups, -1, BLOCK)
+    amax = view.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-10)
+    scale = amax / float(torch.finfo(torch.float8_e4m3fn).max)
+    data = (view / scale).to(torch.float8_e4m3fn)
+    dequant = (data.float() * scale).reshape(num_tokens, n_groups, -1)
+    return (
+        data.reshape(num_tokens, n_groups, -1),
+        scale.squeeze(-1),
+        dequant,
+    )
+
+
+# Decode / small-batch / prefill points and both group counts, so the MetaX
+# dequantized-BF16 path is checked against every GEMM tile bucket.
+TORCH_COMPOSED_CONFIGS = (
+    (1, 8, 1, 1024, 7168),
+    (16, 64, 8, 1024, 7168),
+    (128, 64, 8, 1024, 7168),
+    (4096, 64, 8, 1024, 7168),
+    (16, 128, 16, 1024, 7168),
+)
+
+
+def _reference_torch_from_dequant(inp, dequant):
+    num_tokens = dequant.shape[0]
+    z = torch.einsum("tgr,gdr->tgd", dequant, inp["wa_dequant"])
+    return F.linear(z.reshape(num_tokens, -1), inp["wo_b"].weight.float())
+
+
+def _reference_torch(inp):
+    """Assemble the operator's exact math from torch ops.
+
+    Inverse RoPE, the per-128 FP8 quant/dequant of the activation, the
+    dequantized einsum over ``wo_a`` and the ``wo_b`` linear. MetaX has no vLLM
+    DeepGEMM to cross-check against, so this composition is the reference.
+    """
+    _, _, dequant = _quantize_activation(inp)
+    return _reference_torch_from_dequant(inp, dequant)
+
+
+@pytest.mark.parametrize("config", TORCH_COMPOSED_CONFIGS)
+def test_accuracy_deep_gemm_fp8_o_proj_torch_composed(config):
+    """Match a torch-composed reference across decode, small batch and prefill."""
+    device = flaggems_vllm.device
+    inp = _build_inputs(config, SEEDS[0], device)
+
+    out = _call_op(inp)
+    ref = utils.to_reference(_reference_torch(inp), upcast=True)
+    torch.cuda.synchronize()
+
+    assert out.shape == (config[0], config[4])
+    # Both sides quantize the activation identically, so only the GEMM rounding
+    # separates them (measured <= 0.6% bf16 / <= 1.2% INT8 of the peak).
+    atol = max(1e-2, ref.abs().max().item() * COMPOSED_ATOL)
+    utils.gems_assert_close(out, ref, torch.bfloat16, atol=atol)
+
+
+@pytest.mark.parametrize("config", TORCH_COMPOSED_CONFIGS)
+def test_accuracy_deep_gemm_fp8_o_proj_prequantized(config):
+    """A pre-quantized activation skips RoPE/quant and keeps the same math."""
+    device = flaggems_vllm.device
+    inp = _build_inputs(config, SEEDS[0], device)
+    data, scale, dequant = _quantize_activation(inp)
+
+    out = deep_gemm_fp8_o_proj(
+        _QuantizedActivation(data, scale),
+        inp["positions"],
+        inp["cos_sin_cache"],
+        inp["wo_a"],
+        inp["wo_b"],
+        n_groups=inp["n_groups"],
+        heads_per_group=inp["heads_per_group"],
+        nope_dim=NOPE_DIM,
+        rope_dim=ROPE_DIM,
+        o_lora_rank=inp["o_lora_rank"],
+    )
+
+    ref = utils.to_reference(_reference_torch_from_dequant(inp, dequant), upcast=True)
+    torch.cuda.synchronize()
+
+    assert out.shape == (config[0], config[4])
+    atol = max(1e-2, ref.abs().max().item() * COMPOSED_ATOL)
     utils.gems_assert_close(out, ref, torch.bfloat16, atol=atol)
 
 

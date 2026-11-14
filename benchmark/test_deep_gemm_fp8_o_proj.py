@@ -27,6 +27,7 @@ Shape = ``(tokens, n_groups, group_dim, o_lora_rank)`` with the model's
 """
 
 import glob
+import json
 import os
 import shutil
 
@@ -299,6 +300,58 @@ def test_perf_deep_gemm_fp8_o_proj_gems_vs_vllm():
     bench = DeepGemmFP8OProjBenchmark(
         op_name="deep_gemm_fp8_o_proj",
         torch_op=torch_op,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_o_proj_wrapper)
+    bench.run()
+
+
+# H100 native DeepGEMM records collected with ``baseline/deep_gemm_fp8_o_proj.py``
+# on an H100 80GB (vllm 0.24.0, do_bench, wo_b = identity).
+H100_BASELINE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "base_data",
+    "deep_gemm_fp8_o_proj_h100.json",
+)
+
+# Shapes produced by this benchmark: set_more_shapes() tokens plus the core
+# 4096-token point, for both group counts.
+_BASELINE_TOKENS = (1, 4, 16, 64, 128, 512, 2048, 4096, 8192)
+_BASELINE_GROUPS = (8, 16)
+
+
+@pytest.mark.deep_gemm_fp8_o_proj
+@pytest.mark.skipif(_is_metax() is False, reason="MetaX-only: H100-equivalent speedup")
+def test_perf_deep_gemm_fp8_o_proj_metax_vs_h100():
+    """Cross-chip speedup against the H100 DeepGEMM baseline.
+
+    MetaX has no native implementation to time in-process, so the reference is
+    the H100 record collected with the same inputs and timing method. The
+    harness prints ``vs Base = (base_ms / latency) / factor``, where ``factor``
+    is the C550/H100 peak ratio of the record's bottleneck resource from
+    ``_scaling_factors`` -- the 折算 the acceptance doc prescribes.
+    """
+    with open(H100_BASELINE) as handle:
+        data = json.load(handle)
+
+    # The baseline must cover every shape this benchmark emits, otherwise the
+    # harness reports a miss instead of a speedup for that point.
+    records = data["deep_gemm_fp8_o_proj"]["shapes"]
+    heads_per_group = 4096 // HEAD_DIM
+    missing = []
+    for tokens in _BASELINE_TOKENS:
+        for groups in _BASELINE_GROUPS:
+            key = str([tokens, groups * heads_per_group, HEAD_DIM])
+            if key not in records:
+                missing.append(key)
+    assert not missing, f"H100 baseline is missing shapes: {missing}"
+
+    if base.Config.base_data is None:
+        base.Config.base_data = data
+
+    bench = DeepGemmFP8OProjBenchmark(
+        op_name="deep_gemm_fp8_o_proj",
+        torch_op=None,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_o_proj_wrapper)
