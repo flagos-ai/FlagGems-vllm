@@ -30,8 +30,7 @@ import triton
 import triton.language as tl
 
 import flaggems_vllm
-
-from ..accuracy_utils import gems_assert_close
+from flaggems_vllm.testing import assert_close
 
 
 @dataclass(frozen=True)
@@ -184,11 +183,11 @@ BF16_ATOL = 0.01
 
 def check_outputs(actual, expected, inputs, expected_cache):
     for a, b in zip(actual.tensors()[:2], expected.tensors()[:2]):
-        gems_assert_close(a, b, torch.bfloat16, atol=BF16_ATOL)
+        assert_close(a, b, torch.bfloat16, atol=BF16_ATOL)
         assert torch.isfinite(a).all()
     torch.testing.assert_close(actual.value, expected.value, rtol=0, atol=0)
     torch.testing.assert_close(actual.gate, expected.gate, rtol=0, atol=0)
-    gems_assert_close(inputs.cache, expected_cache, torch.bfloat16, atol=BF16_ATOL)
+    assert_close(inputs.cache, expected_cache, torch.bfloat16, atol=BF16_ATOL)
     block_size = inputs.cache.shape[2]
     written = torch.zeros(
         (inputs.cache.shape[0], block_size),
