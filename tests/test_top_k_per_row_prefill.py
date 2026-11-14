@@ -475,3 +475,162 @@ def test_repeated_inputs_stable_selection(rows, vocab, k, score_kind, strided):
         else:
             torch.testing.assert_close(out, first, rtol=0, atol=0)
     torch.testing.assert_close(logits, inputs_before, rtol=0, atol=0)
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize("entry", ["public", "non_tle"])
+@pytest.mark.parametrize("vocab,k", [(128, 8), (2048, 32), (4099, 32)])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("score_kind", ["continuous", "quantized", "constant"])
+@torch.inference_mode()
+def test_prefill_stable_scan_eager_and_changed_input_graph(
+    monkeypatch, entry, vocab, k, strided, score_kind
+):
+    """Exercise scalar/vector tiles, padding and replay through both entry paths."""
+    module = import_module("flaggems_vllm.ops.top_k_per_row_prefill")
+    if entry == "non_tle":
+        # Exercise the baseline even when this machine has optional TLE support.
+        # The public-entry cases separately validate normal vendor dispatch.
+        monkeypatch.setattr(module, "HAS_TLE", False)
+        op = _generic_impl
+    else:
+        op = flaggems_vllm.top_k_per_row_prefill
+    rows = 4
+    torch.manual_seed(2026)
+    storage = torch.randn(rows, vocab * 2, device=device, dtype=torch.float32)
+    logits = storage[:, ::2] if strided else storage[:, :vocab]
+    out = torch.full((rows, k), -99, device=device, dtype=torch.int32)
+    starts = torch.tensor([0, 1, 3, 7], device=device, dtype=torch.int32)
+    ends = torch.tensor([0, 2, 40, vocab], device=device, dtype=torch.int32)
+
+    def run():
+        op(logits, starts, ends, out, rows, logits.stride(0), logits.stride(1), k)
+
+    # Compile/autotune before capture; retain all static inputs and output buffers.
+    for _ in range(3):
+        run()
+    device_fn = flaggems_vllm.runtime.torch_device_fn
+    device_fn.synchronize()
+    graph = device_fn.CUDAGraph()
+    with device_fn.graph(graph):
+        run()
+
+    for replay in (0, 1):
+        fresh = torch.randn_like(logits)
+        if score_kind == "quantized":
+            fresh = (fresh * 4).round() / 4
+        elif score_kind == "constant":
+            fresh.fill_(float(replay))
+        logits.copy_(fresh)
+        starts.copy_(torch.tensor([0, 2, 4, 8], device=device, dtype=torch.int32))
+        ends.copy_(
+            torch.tensor(
+                [0, 3, 41 + replay, vocab - replay], device=device, dtype=torch.int32
+            )
+        )
+        starts_before, ends_before = starts.clone(), ends.clone()
+        expected = torch.full_like(out, -1)
+        for row in range(rows):
+            start, end = int(starts[row]), int(ends[row])
+            count = min(k, end - start)
+            order = torch.argsort(logits[row, start:end], descending=True, stable=True)
+            expected[row, :count] = order[:count].to(torch.int32)
+        expected_set = torch.sort(expected, dim=1).values
+        for execute in (run, graph.replay):
+            out.fill_(-99)
+            execute()
+            device_fn.synchronize()
+            torch.testing.assert_close(
+                torch.sort(out, dim=1).values, expected_set, rtol=0, atol=0
+            )
+        torch.testing.assert_close(logits, fresh, rtol=0, atol=0)
+        torch.testing.assert_close(starts, starts_before, rtol=0, atol=0)
+        torch.testing.assert_close(ends, ends_before, rtol=0, atol=0)
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon radix routes")
+@pytest.mark.parametrize(
+    "vocab,k,route",
+    [
+        (128, 8, (4, False, False)),
+        (4099, 256, (4, False, False)),
+        (4099, 512, (2, True, False)),
+        (703, 512, (2, True, True)),
+    ],
+)
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("constant", [False, True])
+@torch.inference_mode()
+def test_hygon_prefill_radix_counters_graph(
+    monkeypatch, vocab, k, route, strided, constant
+):
+    backend = import_module(
+        "flaggems_vllm.runtime.backend._hygon.fused.top_k_per_row_prefill"
+    )
+    assert flaggems_vllm.top_k_per_row_prefill is backend.top_k_per_row_prefill
+    monkeypatch.setattr(backend._generic, "HAS_TLE", False)
+    launch = backend._launch_radix
+    routed = []
+
+    def checked_launch(*args):
+        routed.append(args[-1])
+        return launch(*args)
+
+    monkeypatch.setattr(backend, "_launch_radix", checked_launch)
+    rows = 4
+    torch.manual_seed(2027)
+    storage = torch.randn(rows, vocab * 2, device=device, dtype=torch.float32)
+    logits = storage[:, ::2] if strided else storage[:, :vocab]
+    starts = torch.tensor([0, 3, 5, 7], device=device, dtype=torch.int32)
+    ends = torch.tensor([0, 4, vocab - 1, vocab], device=device, dtype=torch.int32)
+    out = torch.full((rows, k), -99, device=device, dtype=torch.int32)
+
+    def run():
+        flaggems_vllm.top_k_per_row_prefill(
+            logits, starts, ends, out, rows, logits.stride(0), logits.stride(1), k
+        )
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    assert routed and all(actual == route for actual in routed)
+
+    for replay in (0, 1):
+        # Distinct scores test exact selection; constant rows force all radix
+        # rounds on long rows, including the final equal-bin counter.
+        fresh = torch.stack(
+            [torch.randperm(vocab, device=device).float() for _ in range(rows)]
+        )
+        if constant:
+            fresh.fill_(float(replay))
+        logits.copy_(fresh)
+        ends.copy_(
+            torch.tensor(
+                [0, 4 + replay, vocab - 1 - replay, vocab - replay],
+                device=device,
+                dtype=torch.int32,
+            )
+        )
+        starts_before, ends_before = starts.clone(), ends.clone()
+        for execute in (run, graph.replay):
+            out.fill_(-99)
+            execute()
+            torch.cuda.synchronize()
+            for row in range(rows):
+                start, end = int(starts[row]), int(ends[row])
+                count = min(k, end - start)
+                valid = out[row][out[row] >= 0].long()
+                assert valid.numel() == count
+                assert valid.unique().numel() == count
+                assert bool((valid < end - start).all())
+                assert int((out[row] == -1).sum()) == k - count
+                expected = torch.topk(fresh[row, start:end], count).values.sort().values
+                actual = fresh[row, start + valid].sort().values
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(logits, fresh, rtol=0, atol=0)
+            torch.testing.assert_close(starts, starts_before, rtol=0, atol=0)
+            torch.testing.assert_close(ends, ends_before, rtol=0, atol=0)
