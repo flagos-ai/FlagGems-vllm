@@ -97,6 +97,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.mega_mhc import (
+    create_mega_mhc_context,
+    mega_mhc,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
@@ -150,6 +154,7 @@ __all__ = [
     "compressor_prepared",
     "compute_slot_mapping_parallel",
     "cp_gather_indexer_k_quant_cache",
+    "create_mega_mhc_context",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
@@ -171,6 +176,7 @@ __all__ = [
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
+    "mega_mhc",
     "mhc_post",
     "npu_mhc_pre",
     "outplace_fused_experts",
