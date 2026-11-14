@@ -22,9 +22,17 @@ import flaggems_vllm
 from . import base
 
 try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts_impl as vllm_fused_experts_impl,
-    )
+    if flaggems_vllm.vendor_name == "ascend":
+        # vLLM's vanilla Triton fused_moe is CUDA-only; on Ascend use the
+        # vendor (vllm-ascend) implementation as the baseline instead.
+        import torch_npu
+        from vllm_ascend.ops.fused_moe.moe_mlp import (
+            unquant_apply_mlp as _ascend_unquant_apply_mlp,
+        )
+    else:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl as vllm_fused_experts_impl,
+        )
 
     HAS_VLLM_FUSED_MOE = True
 except ImportError:
@@ -43,9 +51,12 @@ def _supports_keyword(op, keyword):
 
 
 # vLLM versions differ: newer ones require ``inplace`` (no default), older ones
-# do not accept the keyword at all.
-VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
-    vllm_fused_experts_impl, "inplace"
+# do not accept the keyword at all. On Ascend the baseline is the vllm-ascend
+# reference (no ``vllm_fused_experts_impl`` symbol), so skip the probe there.
+VLLM_FUSED_MOE_SUPPORTS_INPLACE = (
+    HAS_VLLM_FUSED_MOE
+    and flaggems_vllm.vendor_name != "ascend"
+    and _supports_keyword(vllm_fused_experts_impl, "inplace")
 )
 
 
@@ -91,21 +102,18 @@ class FusedMoEBenchmark(base.Benchmark):
             yield from self._fused_moe_input_fn(config, cur_dtype)
 
     def _fused_moe_input_fn(self, config, dtype):
+        torch.manual_seed(42)
         num_tokens, num_experts, hidden_size, intermediate_size, topk = config
         device = flaggems_vllm.device
 
         hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-        w1 = torch.randn(
-            num_experts,
-            intermediate_size * 2,
-            hidden_size,
+        w1 = _randn_lowmem(
+            (num_experts, intermediate_size * 2, hidden_size),
             device=device,
             dtype=dtype,
         )
-        w2 = torch.randn(
-            num_experts,
-            hidden_size,
-            intermediate_size,
+        w2 = _randn_lowmem(
+            (num_experts, hidden_size, intermediate_size),
             device=device,
             dtype=dtype,
         )
@@ -120,8 +128,65 @@ class FusedMoEBenchmark(base.Benchmark):
         yield (hidden_states, w1, w2, topk_weights, topk_ids)
 
 
+def _randn_lowmem(shape, device, dtype):
+    """torch.randn without the full-size fp32 intermediate.
+
+    torch_npu generates low-precision randn by allocating an fp32 tensor of
+    the full shape and casting it, which OOMs on the huge DeepSeek-weight
+    shapes (e.g. (256, 4096, 7168) -> a 28 GiB fp32 temporary). Generate in
+    chunks along dim 0 instead, capping the fp32 temporary at ~2 GiB.
+    """
+    row = 1
+    for d in shape[1:]:
+        row *= d
+    rows_per_chunk = max(1, (2 * 1024**3 // 4) // row)
+    if rows_per_chunk >= shape[0]:
+        return torch.randn(shape, device=device, dtype=dtype)
+    parts = [
+        torch.randn(
+            (min(rows_per_chunk, shape[0] - i),) + tuple(shape[1:]),
+            device=device,
+            dtype=dtype,
+        )
+        for i in range(0, shape[0], rows_per_chunk)
+    ]
+    return torch.cat(parts)
+
+
 def _vllm_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids):
-    """Wrapper to call vllm fused_experts_impl."""
+    """Wrapper to call vllm fused_experts_impl (vendor vllm-ascend path on Ascend)."""
+    if flaggems_vllm.vendor_name == "ascend":
+        num_tokens, hidden_size = hidden_states.shape
+        topk = topk_ids.shape[1]
+        num_experts = w1.shape[0]
+        (expanded_x, expanded_row_idx, expert_token_cumsum_or_count, _) = (
+            torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids.int(),
+                scale=None,
+                offset=None,
+                active_num=num_tokens * topk,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                quant_mode=-1,
+                active_expert_range=[0, num_experts],
+                row_idx_type=0,
+            )
+        )
+        b = torch.empty_like(topk_weights.reshape(-1))
+        b[expanded_row_idx] = topk_weights.reshape(-1)
+        out_sorted = _ascend_unquant_apply_mlp(
+            expanded_x,
+            w1,
+            w2,
+            expert_token_cumsum_or_count,
+            activation="silu",
+            topk_scales=b.unsqueeze(-1).to(expanded_x.dtype),
+            need_trans=True,
+        )
+        out = out_sorted[expanded_row_idx]
+        return out.view(num_tokens, topk, hidden_size).sum(dim=1)
     kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(
         hidden_states.clone(),
