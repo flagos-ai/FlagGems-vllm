@@ -111,3 +111,82 @@ def test_topk_softmax(
     if renormalize:
         sums = gems_weights.sum(dim=-1)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+
+@pytest.mark.topk_softmax
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("expert_count", [5, 256, 257, 512])
+def test_topk_softmax_bias_and_padding(normalize, dtype, expert_count):
+    logits = torch.tensor(
+        [
+            [2, 1, 0, 1, 4],
+            [4, 3, 2, 1, 0],
+            [1, 3, 2, 3, 0],
+            [float("nan"), 1, 2, 3, 4],
+            [float("inf"), 1, 2, 3, 4],
+            [float("-inf")] * 5,
+        ],
+        device="cuda",
+        dtype=dtype,
+    )
+    bias = torch.tensor([0.0, 0.75, 0.0, 0.75, -0.5], device="cuda")
+    if expert_count > logits.shape[1]:
+        extra = torch.arange(expert_count - logits.shape[1], device="cuda")
+        extra_logits = (extra.remainder(13).float() / 5 - 2).to(dtype)
+        logits = torch.cat((logits, extra_logits.expand(logits.shape[0], -1)), dim=1)
+        bias = torch.cat((bias, (extra.remainder(7).float() - 3) * 0.03125))
+    padding = torch.tensor([False, True, False, False, False, False], device="cuda")
+    weights = torch.empty((6, 3), device="cuda")
+    indices = torch.empty((6, 3), device="cuda", dtype=torch.int64)
+    source = torch.empty_like(indices, dtype=torch.int32)
+
+    topk_softmax(weights, indices, source, logits, normalize, bias, padding)
+
+    probabilities = torch.softmax(logits.float(), dim=-1).nan_to_num()
+    ranking = torch.argsort(probabilities + bias, dim=-1, descending=True, stable=True)
+    expected_indices = ranking[:, :3]
+    expected_weights = probabilities.gather(1, expected_indices)
+    if normalize:
+        denominator = expected_weights.sum(dim=-1, keepdim=True)
+        expected_weights /= torch.where(denominator > 0, denominator, 1.0)
+    expected_source = (
+        torch.arange(3, device="cuda", dtype=torch.int32)[None, :] * 6
+        + torch.arange(6, device="cuda", dtype=torch.int32)[:, None]
+    )
+    torch.testing.assert_close(
+        weights, expected_weights.masked_fill(padding[:, None], 0)
+    )
+    torch.testing.assert_close(
+        indices, expected_indices.masked_fill(padding[:, None], -1)
+    )
+    torch.testing.assert_close(source, expected_source)
+
+
+@pytest.mark.topk_softmax
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or flaggems_vllm.vendor_name != "metax",
+    reason="MetaX CUDA runtime required",
+)
+def test_topk_softmax_metax_unpadded_without_bias():
+    logits = torch.arange(9 * 256, device="cuda", dtype=torch.float32).reshape(9, 256)
+    logits = logits.remainder(19) * 0.25
+    logits[0, 0] = float("nan")
+    weights = torch.empty((9, 8), device="cuda")
+    ids = torch.empty((9, 8), device="cuda", dtype=torch.int32)
+    source = torch.empty_like(ids)
+    topk_softmax(weights, ids, source, logits, True)
+
+    probabilities = torch.softmax(logits, dim=-1).nan_to_num()
+    expected_ids = probabilities.argsort(dim=1, descending=True, stable=True)[:, :8]
+    expected_weights = probabilities.gather(1, expected_ids)
+    denominator = expected_weights.sum(dim=1, keepdim=True)
+    expected_weights /= torch.where(denominator > 0, denominator, 1.0)
+    expected_source = (
+        torch.arange(8, device="cuda", dtype=torch.int32)[None, :] * 9
+        + torch.arange(9, device="cuda", dtype=torch.int32)[:, None]
+    )
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(source, expected_source)
