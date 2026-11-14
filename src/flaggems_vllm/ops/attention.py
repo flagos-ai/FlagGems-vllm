@@ -1454,6 +1454,7 @@ def flash_attn_varlen_func(
             cp_tot_seqused_k=cp_tot_seqused_k,
         )
 
+    specialized_attention = None
     if q.dtype == torch.int8 and runtime.device.vendor_name in (
         "hygon",
         "thead",
@@ -1478,6 +1479,12 @@ def flash_attn_varlen_func(
 
             specialized_attention = thead_attention.flash_attn_varlen_func_w8a8_int8
 
+    elif runtime.device.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.ops.flash_attention import (
+            launch_attention as specialized_attention,
+        )
+
+    if specialized_attention is not None:
         return specialized_attention(
             q,
             k,
