@@ -42,6 +42,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Third-party: aiter (https://github.com/ROCm/aiter), MIT License,
+# Copyright (c) Advanced Micro Devices, Inc. The pinned version is a
+# Hygon DTK build.
+hygon = [
+    "aiter==0.1.3+das.opt1.dtk2604.torch290.2605211823.gccde69",
+]
 test = [
     "pytest>=7.1.0",
     "scipy>=1.14,<1.18.0",  # Keep the existing NumPy version

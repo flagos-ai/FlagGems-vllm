@@ -135,7 +135,7 @@ _HYGON_ADDRESS_PATCH = None
 
 
 def _hygon_ensure_vllm_expert_offset_int64(weights):
-    """Process-local 64-bit addressing fix for the installed vLLM 0.6.2 kernel.
+    """Fix legacy int32 expert offsets, preserving already-int64 vLLM kernels.
 
     The Triton expert offset in vllm 0.6.2's fused_moe kernel is int32; on
     gfx936 its generated buffer load also has a 2 GiB resource range, so large
@@ -166,10 +166,14 @@ def _hygon_ensure_vllm_expert_offset_int64(weights):
     original = module.fused_moe_kernel.src
     before = "off_experts = tl.load(expert_ids_ptr + pid_m)"
     after = before + ".to(tl.int64)"
-    if original.count(before) != 1 or after in original:
+    if original.count(before) != 1:
         raise RuntimeError(
             "Unexpected vLLM source; review the address fix before benchmarking"
         )
+    if after in original:
+        info = dict(address_patch=False, already_int64=True)
+        print("HYGON_VLLM_ADDRESS", info, flush=True)
+        return info
     patched = original.replace(before, after, 1)
     patch_dir = tempfile.TemporaryDirectory(prefix="hygon-vllm-address-")
     path = Path(patch_dir.name) / "reference.py"
@@ -572,7 +576,18 @@ def _gems_call(
     )
 
 
+@pytest.fixture
+def hygon_native_moe_baseline(request):
+    if flaggems_vllm.vendor_name == "hygon" and not request.config.getoption("--query"):
+        from flaggems_vllm.runtime.backend._hygon.native_moe import (
+            register_native_moe_baseline,
+        )
+
+        register_native_moe_baseline()
+
+
 @pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.usefixtures("hygon_native_moe_baseline")
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
