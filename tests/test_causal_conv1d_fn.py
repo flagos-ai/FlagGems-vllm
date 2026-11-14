@@ -23,6 +23,8 @@ its vendor-port torch compute calls (dtype cast / contiguous / copy_) and is
 exercised as-is.
 """
 
+import glob
+import os
 import random
 
 import numpy as np
@@ -44,6 +46,73 @@ pytestmark = pytest.mark.skipif(
 
 device = "npu"
 PAD_SLOT_ID = -1
+
+
+def _ci_env_fingerprint():
+    """Environment fingerprint for CI logs (stdout is archived by run_tests.py
+    --dump-output into accuracy_stdout.log; compare against a local baseline)."""
+    import importlib.metadata as im
+
+    import torch_npu
+    import triton
+
+    parts = [
+        f"torch={torch.__version__}",
+        f"torch_npu={torch_npu.__version__}",
+        f"triton={triton.__version__}",
+    ]
+    try:
+        parts.append(f"flagtree={im.version('flagtree')}")
+    except im.PackageNotFoundError:
+        pass
+    parts.append(f"device={torch.npu.get_device_name(0)}")
+    parts.append(f"cann_dirs={sorted(glob.glob('/usr/local/Ascend/cann*'))}")
+    try:
+        with open("/usr/local/Ascend/driver/version.info") as f:
+            parts.append(f"driver={f.read().strip().splitlines()[0]}")
+    except OSError:
+        pass
+    return " ".join(parts)
+
+
+def _kernel_ir_fingerprint():
+    """One-line lowering fingerprint of the newest _causal_conv1d_fwd_kernel
+    dump (requires the dump enabled by the module fixture below)."""
+    import triton
+
+    pattern = os.path.join(
+        triton.knobs.cache.dump_dir, "*", "_causal_conv1d_fwd_kernel.ttadapter"
+    )
+    dumps = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not dumps:
+        return "no-dump"
+    with open(dumps[-1]) as f:
+        text = f.read()
+    ops = (
+        "scf.for",
+        "arith.select",
+        "memref.copy",
+        "memref.subview",
+        "tensor.extract_slice",
+        "linalg.fill",
+        "pointer_cast",
+    )
+    counts = " ".join(f"{op}={text.count(op)}" for op in ops)
+    return f"lines={len(text.splitlines())} {counts}"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ci_dump_ir():
+    """Print the env fingerprint once and enable IR dump for this module only
+    (runtime knob, lazy-read at compile time; restored on teardown)."""
+    import triton
+
+    print(f"\n[ci-diag] {_ci_env_fingerprint()}")
+    prev = triton.knobs.compilation.dump_ir
+    triton.knobs.compilation.dump_ir = True
+    yield
+    triton.knobs.compilation.dump_ir = prev
+
 
 if QUICK_MODE:
     BATCH = [4]
@@ -199,6 +268,16 @@ def test_causal_conv1d_varlen(
         activation=activation,
         pad_slot_id=PAD_SLOT_ID,
     )
+
+    # CI diagnosability: dump the branch-selecting inputs (NPU-RNG dependent)
+    # and the lowering fingerprint of the just-compiled kernel to stdout.
+    print(
+        f"[ci-diag] seqlens={seqlens[0]} "
+        f"has_initial_state={has_initial_states.tolist()} "
+        f"cache_indices={padded_state_indices.tolist()} "
+        f"query_start_loc={query_start_loc.tolist()}"
+    )
+    print(f"[ci-diag] ir-fingerprint: {_kernel_ir_fingerprint()}")
 
     # Reference: run the first batch_size sequences one by one (skip pad slots),
     # writing final conv states back into final_states_ref in place.
