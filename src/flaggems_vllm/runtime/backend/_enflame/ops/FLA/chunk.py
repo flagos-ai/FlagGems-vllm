@@ -1,0 +1,199 @@
+# This file contains code copied from the flash-linear-attention project.
+# The original source code was licensed under the MIT license and included
+# the following copyright notice:
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# ruff: noqa: E501
+
+import logging
+
+import torch
+
+from flaggems_vllm.runtime.backend._enflame.ops.FLA.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+)
+from flaggems_vllm.runtime.backend._enflame.ops.FLA.chunk_fused_tail_vblock import (
+    can_use_fused_tail_vblock,
+    chunk_gated_delta_rule_fused_tail_vblock,
+)
+from flaggems_vllm.runtime.backend._enflame.ops.FLA.chunk_o import chunk_fwd_o
+from flaggems_vllm.runtime.backend._enflame.ops.FLA.fused_cumsum_kkt_solve_tril import (
+    chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
+)
+from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL
+from flaggems_vllm.runtime.backend._enflame.ops.FLA.wy_fast import (
+    maybe_set_tle_recompute_allocator,
+    recompute_w_u_fwd,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _chunk_size_for_sequence(T: int, is_varlen: bool) -> int:
+    if is_varlen:
+        return 64
+    return min(64, max(16, 1 << (T - 1).bit_length()))
+
+
+def chunk_gated_delta_rule_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    logger.debug("GEMS CHUNK GATED DELTA RULE FWD")
+    # GCU: Triton reads int64 buffers with garbage values; normalize cu_seqlens
+    # to int32 once here so every downstream kernel gets 32-bit sequence
+    # offsets (sequence offsets are < 2^31 here).
+    if cu_seqlens is not None and cu_seqlens.dtype == torch.int64:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+    q_contiguous = q.is_contiguous()
+    k_contiguous = k.is_contiguous()
+    v_contiguous = v.is_contiguous()
+    g_contiguous = g.is_contiguous()
+    beta_contiguous = beta.is_contiguous()
+    initial_state_contiguous = initial_state is None or initial_state.is_contiguous()
+    cu_seqlens_contiguous = cu_seqlens is None or cu_seqlens.is_contiguous()
+    if not (
+        q_contiguous
+        and k_contiguous
+        and v_contiguous
+        and g_contiguous
+        and beta_contiguous
+        and initial_state_contiguous
+        and cu_seqlens_contiguous
+    ):
+        if not q_contiguous:
+            q = q.contiguous()
+        if not k_contiguous:
+            k = k.contiguous()
+        if not v_contiguous:
+            v = v.contiguous()
+        if not g_contiguous:
+            g = g.contiguous()
+        if not beta_contiguous:
+            beta = beta.contiguous()
+        if not initial_state_contiguous:
+            initial_state = initial_state.contiguous()
+        if not cu_seqlens_contiguous:
+            cu_seqlens = cu_seqlens.contiguous()
+
+    chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
+    maybe_set_tle_recompute_allocator(q.device, cu_seqlens)
+
+    if initial_state is None and output_final_state:
+        try:
+            from flaggems_vllm.ops.chunk_gated_delta_rule import (
+                _can_use_tle_chunk_gated_delta_rule,
+                _tle_chunk_gated_delta_rule_fwd,
+            )
+
+            if _can_use_tle_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                beta=beta,
+                g=g,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+            ):
+                g_tle, A_tle = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+                    g=g,
+                    k=k,
+                    beta=beta,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=chunk_size,
+                    output_dtype=k.dtype,
+                    use_g_in_kkt=False,
+                )
+                o, final_state = _tle_chunk_gated_delta_rule_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_cumsum=g_tle,
+                    beta=beta,
+                    a=A_tle,
+                    scale=float(scale),
+                )
+                g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+                    g=g,
+                    k=k,
+                    beta=beta,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=chunk_size,
+                    output_dtype=k.dtype,
+                )
+                return g, o, A, final_state, None, None, None
+        except ImportError:
+            pass
+
+    g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+        g=g,
+        k=k,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        output_dtype=k.dtype,
+    )
+    block_v = 128 if v.shape[-1] == 128 else 64
+    pipe_stages = 5 if v.shape[-1] >= 256 else (3 if v.shape[-1] == 128 else 2)
+    w, u = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        g_cumsum=g,
+        cu_seqlens=cu_seqlens,
+        block_v=block_v,
+        pipe_stages=pipe_stages,
+    )
+    if SUPPRESS_LEVEL < 3 and can_use_fused_tail_vblock(
+        q=q,
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+    ):
+        o, final_state = chunk_gated_delta_rule_fused_tail_vblock(
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            scale=scale,
+        )
+        return g, o, A, final_state, None, None, None
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+    )
+    o = chunk_fwd_o(
+        q=q,
+        k=k,
+        v=v_new,
+        h=h,
+        g=g,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
+    if SUPPRESS_LEVEL < 3:
+        return g, o, A, final_state, None, None, None
+    elif SUPPRESS_LEVEL >= 3:
+        return g, o, A, final_state, w, h, v_new
