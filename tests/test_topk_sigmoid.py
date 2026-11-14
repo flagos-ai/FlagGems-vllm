@@ -5,10 +5,7 @@ import torch
 
 import flaggems_vllm
 
-pytestmark = [
-    pytest.mark.topk_sigmoid,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def reference(logits, bias, k, renormalize):
@@ -27,6 +24,7 @@ def reference(logits, bias, k, renormalize):
     return weights, ids, source.int()
 
 
+@pytest.mark.topk_sigmoid
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(0, 32, 4), (1, 64, 8), (7, 128, 8), (64, 256, 4)])
 @pytest.mark.parametrize("renormalize", [False, True])
@@ -45,6 +43,7 @@ def test_topk_sigmoid(dtype, shape, renormalize, bias_on):
     assert torch.equal(ids, expected[1]) and torch.equal(source, expected[2])
 
 
+@pytest.mark.topk_sigmoid
 def test_topk_sigmoid_ties_nan_graph():
     logits = torch.zeros((3, 128), device="cuda")
     logits[1] = float("nan")
@@ -64,3 +63,49 @@ def test_topk_sigmoid_ties_nan_graph():
     expected = reference(logits, None, 8, True)
     assert torch.equal(ids, expected[1].int())
     torch.testing.assert_close(w, expected[0], atol=2e-7, rtol=2e-6)
+
+
+@pytest.mark.topk_sigmoid
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("apply_bias", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("expert_count", [5, 256, 257, 512])
+def test_topk_sigmoid_padded_scaled_rows(normalize, apply_bias, dtype, expert_count):
+    logits = torch.tensor(
+        [[1, 1, 0, -1, 2], [5, 4, 3, 2, 1], [float("nan"), 0, 0, -2, 2]],
+        device="cuda",
+        dtype=dtype,
+    )
+    bias = (
+        torch.tensor([0.0, 0.0, 0.25, 0.75, -0.25], device="cuda")
+        if apply_bias
+        else None
+    )
+    if expert_count > logits.shape[1]:
+        extra = torch.arange(expert_count - logits.shape[1], device="cuda")
+        extra_logits = (extra.remainder(13).float() / 5 - 2).to(dtype)
+        logits = torch.cat((logits, extra_logits.expand(logits.shape[0], -1)), dim=1)
+        if bias is not None:
+            bias = torch.cat((bias, (extra.remainder(7).float() - 3) * 0.03125))
+    padding = torch.tensor([False, True, False], device="cuda")
+    scale = 2.75
+    weights = torch.empty((3, 3), device="cuda")
+    indices = torch.empty((3, 3), device="cuda", dtype=torch.int64)
+    source = torch.empty_like(indices, dtype=torch.int32)
+
+    flaggems_vllm.topk_sigmoid(
+        weights,
+        indices,
+        source,
+        logits,
+        normalize,
+        bias,
+        routed_scaling_factor=scale,
+        is_padding=padding,
+    )
+    ref_weights, ref_indices, ref_source = reference(logits, bias, 3, normalize)
+    torch.testing.assert_close(
+        weights, (ref_weights * scale).masked_fill(padding[:, None], 0)
+    )
+    torch.testing.assert_close(indices, ref_indices.masked_fill(padding[:, None], -1))
+    torch.testing.assert_close(source, ref_source)

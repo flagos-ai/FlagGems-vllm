@@ -2089,13 +2089,21 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: topk_sigmoid
+  description: Selects MoE experts using sigmoid scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+  for:
+  - _moe_C.topk_sigmoid
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: topk_softmax
-  description: 'Selects the k most likely next-token candicates, sets all others to
-    zero,
-
-    and renormalize the prbabilities of these top candidates.
-
-    '
+  description: Selects MoE experts using softmax scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and marks padded experts.
   for:
   - _moe_C.topk_softmax
   labels:

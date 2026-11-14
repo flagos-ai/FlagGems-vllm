@@ -19,6 +19,7 @@ import flaggems_vllm
 import flaggems_vllm.ops as fused
 
 from . import base, utils
+from .test_topk_sigmoid import MetaXExtendedTopKBenchmark
 
 vendor_name = flaggems_vllm.vendor_name
 
@@ -98,3 +99,9 @@ def test_topk_softmax(monkeypatch):
     )
 
     bench.run()
+
+
+@pytest.mark.topk_softmax
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX workload")
+def test_perf_metax_padded_topk_softmax():
+    MetaXExtendedTopKBenchmark(sigmoid=False).run()

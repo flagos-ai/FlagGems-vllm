@@ -18,6 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.topk_sigmoid import _launch_topk_routing
+from flaggems_vllm.runtime import device
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,14 +84,76 @@ def topk_gating_softmax_kernel(
             tl.store(output_ptr + idx, val / norm, mask=valid_rows)
 
 
+@torch.library.custom_op(
+    "flaggems_vllm::topk_softmax_extended",
+    mutates_args=("topk_weights", "topk_indices", "token_expert_indices"),
+)
+def _topk_softmax_extended(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    e_score_correction_bias: torch.Tensor | None,
+    is_padding: torch.Tensor | None,
+) -> None:
+    _launch_topk_routing(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        renormalize,
+        e_score_correction_bias,
+        is_padding,
+        sigmoid=False,
+        scale=1.0,
+    )
+
+
+@_topk_softmax_extended.register_fake
+def _topk_softmax_extended_fake(
+    topk_weights,
+    topk_indices,
+    token_expert_indices,
+    gating_output,
+    renormalize,
+    e_score_correction_bias,
+    is_padding,
+):
+    return None
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
     renormalize: bool = False,
+    e_score_correction_bias: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
+    """Route with softmax scores, optionally using bias for expert selection.
+
+    Returned weights are unbiased. Padded rows have zero weights and expert
+    ID -1, with valid expanded token row indices.
+    """
     logger.debug("GEMS TOPK SOFTMAX")
+    # The legacy softmax kernel is not supported on MetaX (FlagGems issue #2857).
+    if (
+        device.vendor_name == "metax"
+        or e_score_correction_bias is not None
+        or is_padding is not None
+    ):
+        _topk_softmax_extended(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            e_score_correction_bias,
+            is_padding,
+        )
+        return
     num_tokens, num_experts = gating_output.shape
     topk = topk_weights.size(-1)
     assert topk <= 32
