@@ -1512,6 +1512,7 @@ def flash_attn_varlen_func(
         )
 
     is_metax = runtime.device.vendor_name == "metax"
+    is_ascend = runtime.device.vendor_name == "ascend"
     if is_metax:
         if fa_version != 2:
             raise NotImplementedError("MetaX varlen attention supports fa_version=2")
@@ -1564,12 +1565,64 @@ def flash_attn_varlen_func(
             assert block_table.stride(-1) == 1
         if out is not None:
             assert out.device == q.device
+    elif is_ascend:
+        if fa_version != 2:
+            raise NotImplementedError("Ascend varlen attention supports fa_version=2")
+        if dropout_p != 0:
+            raise NotImplementedError("Ascend varlen attention supports dropout_p=0")
+        if return_attn_probs:
+            raise NotImplementedError(
+                "Ascend varlen attention does not return attention probabilities"
+            )
+        if (
+            any(
+                x is not None
+                for x in (
+                    q_v,
+                    scheduler_metadata,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    s_aux,
+                    cp_tot_seqused_k,
+                )
+            )
+            or cp_world_size != 1
+            or cp_rank != 0
+        ):
+            raise NotImplementedError(
+                "Ascend varlen attention does not support FA3 or context-parallel extensions"
+            )
+        if isinstance(num_splits, bool) or not isinstance(num_splits, int):
+            raise TypeError(
+                f"num_splits must be an integer in [0, 1], got {num_splits!r}"
+            )
+        if not 0 <= num_splits <= 1:
+            raise ValueError(f"num_splits must be in [0, 1], got {num_splits}")
+        if not isinstance(max_seqlen_q, Integral) or not isinstance(
+            max_seqlen_k, Integral
+        ):
+            raise TypeError("max_seqlen_q and max_seqlen_k must be host integers")
+        max_seqlen_q, max_seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
+        if max_seqlen_q < 0 or max_seqlen_k < 0:
+            raise ValueError("maximum sequence lengths must be nonnegative")
+        assert q.device == k.device == v.device
+        assert cu_seqlens_q.device == q.device
+        if cu_seqlens_k is not None:
+            assert cu_seqlens_k.device == q.device
+        if seqused_k is not None:
+            assert seqused_k.device == q.device and seqused_k.dtype == torch.int32
+        if block_table is not None:
+            assert block_table.device == q.device and block_table.dtype == torch.int32
+            assert block_table.stride(-1) == 1
+        if out is not None:
+            assert out.device == q.device
     else:
         if fa_version != 2:
             raise RuntimeError("Only FA2 is implemented.")
         if num_splits > 0:
             raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
-    if use_c_extension and not is_metax:
+    if use_c_extension and not is_metax and not is_ascend:
         logger.debug("GEMS FLASH_ATTN_VARLEN_FUNC(C EXTENSION)")
         with torch_device_fn.device(q.device):
             out_cpp, softmax_lse = torch.ops.flaggems_vllm.flash_attn_varlen_func(
@@ -1626,6 +1679,12 @@ def flash_attn_varlen_func(
             real_window_size = (window_size[0], window_size[1])
         if is_metax:
             from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+                ensure_last_dim_contiguous,
+            )
+
+            q, k, v = [ensure_last_dim_contiguous(x) for x in (q, k, v)]
+        elif is_ascend:
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
                 ensure_last_dim_contiguous,
             )
 
