@@ -38,6 +38,9 @@ from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._metax.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._metax.ops.moe_align_block_size import (
+    moe_align_block_size_no_tle,
+)
 from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -69,6 +72,7 @@ __all__ = [
     "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
+    "moe_align_block_size_no_tle",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",

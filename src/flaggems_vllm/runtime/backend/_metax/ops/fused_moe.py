@@ -34,9 +34,11 @@ import triton
 import triton.language as tl
 import yaml
 
-from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.runtime.backend._metax.fused.moe_sum import moe_sum
+from flaggems_vllm.runtime.backend._metax.ops.moe_align_block_size import (
+    moe_align_block_size_no_tle,
+)
 from flaggems_vllm.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
