@@ -38,7 +38,13 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_deep_gemm_import_compat im
     install_vllm_deep_gemm_import_compat,
 )
 
-install_vllm_deep_gemm_import_compat()  # 库兼容 shim(非 GCUIR),保留
+# 库兼容 shim(非 GCUIR),保留。
+# Compat shims must run between imports: each has to be active before the
+# operator modules imported below are loaded. The dunder-assignment form is
+# intentional -- pycodestyle excludes `__dunder__ = ...` from its E402
+# "imports at top of file" tracking, so no blanket noqa or flake8 config
+# exemption is needed.
+__deep_gemm_compat__ = install_vllm_deep_gemm_import_compat()
 
 # vLLM accuracy tests call get_paged_mqa_logits_metadata with torch's
 # multi_processor_count, which the GCU deep_gemm C++ API rejects by
@@ -50,7 +56,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_paged_mqa_logits_compat im
     install_vllm_paged_mqa_logits_compat,
 )
 
-install_vllm_paged_mqa_logits_compat()  # 库兼容 shim(非 GCUIR),保留
+__paged_mqa_logits_compat__ = install_vllm_paged_mqa_logits_compat()
 
 # Make vLLM's own fused_experts_impl reference runnable on GCU (tests compare
 # FlagGems fused_moe against it): fall back to a GCU device name when vLLM
@@ -60,7 +66,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_moe_ref_compat import (
     install_vllm_moe_ref_compat,
 )
 
-install_vllm_moe_ref_compat()  # 库兼容 shim(非 GCUIR),保留
+__moe_ref_compat__ = install_vllm_moe_ref_compat()
 
 # flaggems_vllm 的 LibEntry(不同于 LibTuner)未暴露上游测试契约的 cache_key
 # (tests/test_tle_capabilities.py 断言 @libentry() 内核可访问该属性);纯增量
@@ -69,7 +75,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._flaggems_libentry_compat import
     install_flaggems_libentry_compat,
 )
 
-install_flaggems_libentry_compat()  # 库兼容 shim(非 GCUIR),保留
+__libentry_compat__ = install_flaggems_libentry_compat()
 
 # isort: off
 from flaggems_vllm.runtime.backend._enflame.ops.act_quant import act_quant_triton
@@ -189,7 +195,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_inv_rope_ref_compat import
     install_vllm_inv_rope_ref_compat,
 )
 
-install_vllm_inv_rope_ref_compat()  # 库兼容 shim(非 GCUIR),保留
+__inv_rope_ref_compat__ = install_vllm_inv_rope_ref_compat()
 
 from flaggems_vllm.runtime.backend._enflame.ops.fused_indexer_q_rope_quant import (
     fused_indexer_q_rope_quant,

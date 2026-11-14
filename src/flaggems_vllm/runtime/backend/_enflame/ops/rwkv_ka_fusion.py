@@ -46,7 +46,11 @@ def rwkv_ka_fusion_kernel(
     t_offs = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     h_offs = tl.arange(0, H_size)
     n_offs = tl.arange(0, N_size)
-    offs = (t_offs * C)[:, None, None] + (h_offs * N)[None, :, None] + n_offs[None, None, :]
+    offs = (
+        (t_offs * C)[:, None, None]
+        + (h_offs * N)[None, :, None]
+        + n_offs[None, None, :]
+    )
     c_offs = (h_offs * N)[:, None] + n_offs[None, :]
 
     if EVEN_T and EVEN_HN:

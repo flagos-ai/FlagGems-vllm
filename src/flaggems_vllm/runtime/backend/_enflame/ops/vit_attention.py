@@ -289,7 +289,6 @@ def _flash_attn(q, k, v, cu_q, cu_k, scale, uniform_q_len=0, uniform_k_len=0):
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     block_d = triton.next_power_of_2(head_dim)
     uniform = uniform_q_len > 0
-    num_seqs = total_q // uniform_q_len if uniform else cu_q.numel() - 1
     _vit_attn_flash_kernel[(triton.cdiv(total_q, BLOCK_M), num_heads)](
         q,
         k,

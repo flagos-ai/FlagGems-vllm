@@ -2418,10 +2418,7 @@ def _flash_mla_gcu(
             return out
         except Exception as exc:
             msg = str(exc)
-            if (
-                _GCU_TOOLCHAIN_ERROR_MARKER not in msg
-                and "out of resource" not in msg
-            ):
+            if _GCU_TOOLCHAIN_ERROR_MARKER not in msg and "out of resource" not in msg:
                 raise
             _GCU_TILED_KERNEL_BLOCKED = True
             logger.warning(

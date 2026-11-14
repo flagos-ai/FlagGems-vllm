@@ -24,13 +24,13 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.config import use_c_extension
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._enflame.ops.flash_api import (
     mha_fwd,
     mha_varlan_fwd,
     mha_varlan_fwd_opt,
 )
 from flaggems_vllm.runtime.backend._enflame.ops.flash_kernel import keep
-from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.shape_utils import broadcasted_stride
 
@@ -1718,8 +1718,6 @@ def flash_attn_varlen_func(
     return (out, softmax_lse) if return_softmax_lse else out
 
 
-
-
 def flash_attn_varlen_opt_func(
     q,
     k,
@@ -1903,6 +1901,7 @@ def flash_attn_varlen_opt_func(
 
     return (out, softmax_lse) if return_softmax_lse else out
 
+
 # ---------------------------------------------------------------------------
 # GCU wiring for the direct-import entrypoints and the aten flash op
 # ---------------------------------------------------------------------------
@@ -1934,9 +1933,11 @@ def _install():
             continue
         for name in _PATCHED_OPS:
             current = getattr(mod, name, None)
-            if current is not None and getattr(
-                current, "__module__", None
-            ) == "flaggems_vllm.ops.attention":
+            if (
+                current is not None
+                and getattr(current, "__module__", None)
+                == "flaggems_vllm.ops.attention"
+            ):
                 setattr(mod, name, globals()[name])
 
 

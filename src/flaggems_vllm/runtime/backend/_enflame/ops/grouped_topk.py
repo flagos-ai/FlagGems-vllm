@@ -51,7 +51,6 @@ import logging
 
 import torch
 import triton
-import triton.language as tl
 
 from flaggems_vllm.utils.code_cache import code_cache_dir
 from flaggems_vllm.utils.code_utils import write_atomic

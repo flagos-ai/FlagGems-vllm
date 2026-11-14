@@ -79,9 +79,7 @@ def _unpack_seq_triton_kernel(
                     nb = b + 1
                     go = 1
                     budget = r_end - r
-                    while (
-                        (nb < B) & (go == 1) & (valid_b + (nb - b) * Lmax <= budget)
-                    ):
+                    while (nb < B) & (go == 1) & (valid_b + (nb - b) * Lmax <= budget):
                         len_nb = tl.load(lengths_ptr + nb)
                         go = tl.where(len_nb == Lmax, 1, 0)
                         nb += go
@@ -103,9 +101,7 @@ def _unpack_seq_triton_kernel(
                         offs = j.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
                     else:
                         offs = j * BLOCK + tl.arange(0, BLOCK)
-                    tl.store(
-                        out_ptr + (dst + offs), tl.load(packed_ptr + (src + offs))
-                    )
+                    tl.store(out_ptr + (dst + offs), tl.load(packed_ptr + (src + offs)))
                 if WIDE:
                     base_full = n_blocks.to(tl.int64) * BLOCK
                 else:

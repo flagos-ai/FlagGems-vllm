@@ -325,9 +325,7 @@ def persistent_topk(
     if workspace.numel() >= scratch_bytes:
         thresholds = workspace[: num_rows * 4].view(torch.int32)
         eq_scratch = (
-            workspace[num_rows * 4 : scratch_bytes]
-            .view(torch.int32)
-            .view(num_rows, k)
+            workspace[num_rows * 4 : scratch_bytes].view(torch.int32).view(num_rows, k)
         )
     else:
         thresholds = torch.empty((num_rows,), device=device, dtype=torch.int32)

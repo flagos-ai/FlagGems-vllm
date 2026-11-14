@@ -108,7 +108,9 @@ def _patch_gcu_compiler_opt():
 
     def _shim(content, *args):
         if isinstance(content, str) and "operandSegmentSizes" in content:
-            content = "\n".join(_fix_gcu_dialect_line(l) for l in content.split("\n"))
+            content = "\n".join(
+                _fix_gcu_dialect_line(line) for line in content.split("\n")
+            )
         return _orig(content, *args)
 
     _shim._flaggems_dialect_shim = True

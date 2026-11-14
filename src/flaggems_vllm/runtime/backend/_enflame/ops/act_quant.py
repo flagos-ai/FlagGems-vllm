@@ -224,9 +224,7 @@ def act_quant_triton_flat_kernel(
         y = tl.clamp(y, -FP8_MAX, FP8_MAX)
         yflat = tl.reshape(y, (C,))
         tl.store(Y_ptr + base + offs, yflat.to(tl.float8e4nv), mask=m)
-        tl.store(
-            S_ptr + base // BS + group_offs, scale, mask=group_offs * BS < tail
-        )
+        tl.store(S_ptr + base // BS + group_offs, scale, mask=group_offs * BS < tail)
 
 
 def act_quant_triton(

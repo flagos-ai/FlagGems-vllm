@@ -183,9 +183,9 @@ def _fused_indexer_q_rope_quant_kernel(
 
     pos = tl.load(pos_ptr + tok_idx)
     half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
-    cos = tl.load(
-        index_q_cos_sin_ptr + pos * index_q_cos_sin_stride + half_offset
-    ).to(tl.float32)
+    cos = tl.load(index_q_cos_sin_ptr + pos * index_q_cos_sin_stride + half_offset).to(
+        tl.float32
+    )
     sin = tl.load(
         index_q_cos_sin_ptr
         + pos * index_q_cos_sin_stride
@@ -201,9 +201,7 @@ def _fused_indexer_q_rope_quant_kernel(
     # gathers; identical values by construction.
     if PAIR_WORD:
         rot_words = tl.load(
-            base_ptr.to(tl.pointer_type(tl.int32))
-            + INDEX_Q_NOPE_DIM // 2
-            + half_offset
+            base_ptr.to(tl.pointer_type(tl.int32)) + INDEX_Q_NOPE_DIM // 2 + half_offset
         )
         x_even = (rot_words & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
         x_odd = (rot_words >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
@@ -240,8 +238,14 @@ def _fused_indexer_q_rope_quant_kernel(
             tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
         )
     if PAIR_WORD:
-        re8 = tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-        ro8 = tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        re8 = (
+            tl.div_rn(r_even, index_q_scale)
+            .to(tl.float8e4nv)
+            .to(tl.uint8, bitcast=True)
+        )
+        ro8 = (
+            tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        )
         pair = re8.to(tl.uint16) | (ro8.to(tl.uint16) << 8)
         tl.store(
             fp8_base_ptr.to(tl.pointer_type(tl.uint16))
@@ -351,11 +355,11 @@ def _fused_indexer_q_rope_tile_kernel(
                         + INDEX_Q_NOPE_DIM // 2
                         + half_offset
                     )
-                    x_even = (rot_words & 0xFFFF).to(tl.uint16).to(
-                        tl.bfloat16, bitcast=True
+                    x_even = (
+                        (rot_words & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
                     )
-                    x_odd = (rot_words >> 16).to(tl.uint16).to(
-                        tl.bfloat16, bitcast=True
+                    x_odd = (
+                        (rot_words >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
                     )
                 else:
                     rot_base = base_ptr + INDEX_Q_NOPE_DIM
@@ -372,9 +376,7 @@ def _fused_indexer_q_rope_tile_kernel(
                     x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
                     amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
                 index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
-                index_q_scale = tl.math.exp2(
-                    tl.math.ceil(tl.math.log2(index_q_scale))
-                )
+                index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
                 fp8_base_ptr = (
                     index_q_fp8_ptr
@@ -387,11 +389,15 @@ def _fused_indexer_q_rope_tile_kernel(
                         tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
                     )
                 if PAIR_WORD:
-                    re8 = tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv).to(
-                        tl.uint8, bitcast=True
+                    re8 = (
+                        tl.div_rn(r_even, index_q_scale)
+                        .to(tl.float8e4nv)
+                        .to(tl.uint8, bitcast=True)
                     )
-                    ro8 = tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv).to(
-                        tl.uint8, bitcast=True
+                    ro8 = (
+                        tl.div_rn(r_odd, index_q_scale)
+                        .to(tl.float8e4nv)
+                        .to(tl.uint8, bitcast=True)
                     )
                     pair = re8.to(tl.uint16) | (ro8.to(tl.uint16) << 8)
                     tl.store(

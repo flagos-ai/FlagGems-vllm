@@ -155,9 +155,7 @@ def _dequantize_and_gather_k_cache_kernel(
                 r_a = tl.load(rp_a + roffs, mask=rmask, other=0.0)
                 r_b = tl.load(rp_b + roffs, mask=rmask, other=0.0)
 
-            out_a = (
-                out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
-            )
+            out_a = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
             xf_a = x_a.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             sc_a = tl.exp2(s_a.to(tl.float32) - 127.0)
             tl.store(out_a + qoffs, (xf_a * sc_a[:, None]).to(tl.bfloat16), mask=qmask)
@@ -167,11 +165,7 @@ def _dequantize_and_gather_k_cache_kernel(
                 tl.store(out_a + nope_dim + roffs, r_a, mask=rmask)
 
             if i_b < gather_len:
-                out_b = (
-                    out_ptr
-                    + req_idx * out_stride0
-                    + (offset + i_b) * out_stride1
-                )
+                out_b = out_ptr + req_idx * out_stride0 + (offset + i_b) * out_stride1
                 xf_b = x_b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
                 sc_b = tl.exp2(s_b.to(tl.float32) - 127.0)
                 tl.store(
@@ -269,9 +263,7 @@ def _dequantize_and_gather_k_cache_kernel(
                 r_c = tl.load(rp_c + roffs, mask=rmask, other=0.0)
                 r_d = tl.load(rp_d + roffs, mask=rmask, other=0.0)
 
-            out_a = (
-                out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
-            )
+            out_a = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
             xf_a = x_a.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             sc_a = tl.exp2(s_a.to(tl.float32) - 127.0)
             tl.store(out_a + qoffs, (xf_a * sc_a[:, None]).to(tl.bfloat16), mask=qmask)
@@ -346,20 +338,14 @@ def _dequantize_and_gather_k_cache_kernel(
             block_in_seq = pos // cache_block_size
             pos_in_block = pos - block_in_seq * cache_block_size
             physical_block = pb
-            cache_block = (
-                k_cache_ptr + physical_block.to(tl.int64) * cache_block_stride
-            )
+            cache_block = k_cache_ptr + physical_block.to(tl.int64) * cache_block_stride
             token_data = cache_block + pos_in_block * token_data_size
             scale_base = (
                 cache_block
                 + cache_block_size * token_data_size
                 + pos_in_block * scale_slots
             )
-            out_row = (
-                out_ptr
-                + req_idx * out_stride0
-                + (offset + local_i) * out_stride1
-            )
+            out_row = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
 
             if NOPE_OVERREAD:
                 x_u8 = tl.load(token_data + qoffs)

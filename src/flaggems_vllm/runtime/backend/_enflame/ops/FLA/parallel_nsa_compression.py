@@ -85,6 +85,7 @@ def _nsa_cmp_parallel_attn_bwd_preprocess(o, do):
     )
     return delta
 
+
 # ===========================================================================
 # GCU compiler-toolchain dialect compatibility shim
 # ===========================================================================
@@ -168,7 +169,9 @@ def _patch_gcu_compiler_opt():
 
     def _shim(content, *args):
         if isinstance(content, str) and "operandSegmentSizes" in content:
-            content = "\n".join(_fix_gcu_dialect_line(l) for l in content.split("\n"))
+            content = "\n".join(
+                _fix_gcu_dialect_line(line) for line in content.split("\n")
+            )
         return _orig(content, *args)
 
     _shim._flaggems_dialect_shim = True
@@ -404,7 +407,9 @@ def parallel_nsa_compression_fwd_tiled_kernel(
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
     # [R, BK] — each token's G query rows are contiguous in memory
-    q_ptrs = q + (bos + t)[:, None] * (HQ * K) + (i_h * G + g)[:, None] * K + o_k[None, :]
+    q_ptrs = (
+        q + (bos + t)[:, None] * (HQ * K) + (i_h * G + g)[:, None] * K + o_k[None, :]
+    )
     b_q = tl.load(q_ptrs, mask=row_valid[:, None], other=0.0)
     b_q = (b_q * scale).to(b_q.dtype)
 
@@ -419,9 +424,7 @@ def parallel_nsa_compression_fwd_tiled_kernel(
     # keeping the loop mask-only; empty tiles fully mask their rows.
     for i_c in range(0, tl.maximum(NC_max, 1), BC):
         o_c = i_c + tl.arange(0, BC)
-        p_k = tl.make_block_ptr(
-            k_base, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1)
-        )
+        p_k = tl.make_block_ptr(k_base, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1))
         p_v = tl.make_block_ptr(
             v_base, (TC, V), (H * V, 1), (i_c, i_v * BV), (BC, BV), (1, 0)
         )
@@ -447,10 +450,7 @@ def parallel_nsa_compression_fwd_tiled_kernel(
     b_lse = tl.where(NC_row == 0, 0.0, b_m + log(b_acc))
 
     o_ptrs = (
-        o
-        + (bos + t)[:, None] * (HQ * V)
-        + (i_h * G + g)[:, None] * V
-        + o_v[None, :]
+        o + (bos + t)[:, None] * (HQ * V) + (i_h * G + g)[:, None] * V + o_v[None, :]
     )
     tl.store(o_ptrs, b_o.to(o.dtype.element_ty), mask=row_valid[:, None])
     if i_v == 0:

@@ -279,9 +279,9 @@ def _convert_state_kernel(
             fp8_offsets = fp8_row * K * V + tile_offsets
             scale_offsets = fp8_row * V + o_v
             if QUANTIZE:
-                values = tl.load(
-                    state + state_offsets, mask=mask_state, other=0.0
-                ).to(tl.float32)
+                values = tl.load(state + state_offsets, mask=mask_state, other=0.0).to(
+                    tl.float32
+                )
                 _store_dynamic_fp8_state(
                     values,
                     state_fp8,
@@ -429,7 +429,9 @@ def _fused_recurrent_gated_delta_rule_w8a16_fp8_kernel(
                 + i_hv * stride_scale_h
                 + o_v * stride_scale_v
             )
-            safe_output_state_index = tl.where(output_state_valid, output_state_index, 0)
+            safe_output_state_index = tl.where(
+                output_state_valid, output_state_index, 0
+            )
             if USE_INT64_STATE_OFFSETS:
                 output_state_index_for_offset = safe_output_state_index.to(tl.int64)
             else:
@@ -689,9 +691,7 @@ def _fused_recurrent_gated_delta_rule_sequence_w8a16_fp8_kernel(
 
                     g_offset = i_b * stride_g_b + i_t * stride_g_t + i_hv * stride_g_h
                     beta_offset = (
-                        i_b * stride_beta_b
-                        + i_t * stride_beta_t
-                        + i_hv * stride_beta_h
+                        i_b * stride_beta_b + i_t * stride_beta_t + i_hv * stride_beta_h
                     )
                     state_acc, output = _gdn_step(
                         state_acc,

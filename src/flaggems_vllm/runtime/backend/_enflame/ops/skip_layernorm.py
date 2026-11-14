@@ -141,9 +141,7 @@ def _skip_layer_norm_row(
         b = tl.load(b_ptr + cols).to(tl.float32)
         x_hat = (x - mean) * rstd
         y = w * x_hat + b
-        tl.store(
-            out_ptr + cols * y_stride_c, y.to(out_ptr.dtype.element_ty)
-        )
+        tl.store(out_ptr + cols * y_stride_c, y.to(out_ptr.dtype.element_ty))
     else:
         mask = tl.arange(0, BLOCK_SIZE) < N
         cols = tl.arange(0, BLOCK_SIZE)
@@ -155,17 +153,15 @@ def _skip_layer_norm_row(
         _var = _var * _var
         var = tl.sum(_var, axis=0) / N
         rstd = 1 / tl.sqrt(var + eps)
-        w = tl.load(
-            w_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0
-        ).to(tl.float32)
-        b = tl.load(
-            b_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0
-        ).to(tl.float32)
+        w = tl.load(w_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0).to(
+            tl.float32
+        )
+        b = tl.load(b_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0).to(
+            tl.float32
+        )
         x_hat = (x - mean) * rstd
         y = w * x_hat + b
-        tl.store(
-            out_ptr + cols * y_stride_c, y.to(out_ptr.dtype.element_ty), mask=mask
-        )
+        tl.store(out_ptr + cols * y_stride_c, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @libentry()
@@ -192,11 +188,7 @@ def skip_layer_norm_kernel(
     # Legacy one-row-per-CTA path, used when the row width already fills the
     # row-batch tile budget (wide N).  Behavior is identical to the original
     # implementation, including the 3-D grid recombination for large M.
-    pid = (
-        ext.program_id(0)
-        + ext.program_id(1) * GRID_X
-        + ext.program_id(2) * GRID_XY
-    )
+    pid = ext.program_id(0) + ext.program_id(1) * GRID_X + ext.program_id(2) * GRID_XY
 
     if pid < M:
         _skip_layer_norm_row(
@@ -305,9 +297,7 @@ def skip_layer_norm_rows_kernel(
                 rstd = 1 / tl.sqrt(var + eps)
                 x_hat = (x - mean[:, None]) * rstd[:, None]
                 y = w[None, :] * x_hat + b[None, :]
-                tl.store(
-                    y_ptrs, y.to(Y.dtype.element_ty), mask=col_mask[None, :]
-                )
+                tl.store(y_ptrs, y.to(Y.dtype.element_ty), mask=col_mask[None, :])
         else:
             # Tail tile (partial rows / grid overshoot): normalize the leftover
             # rows one at a time with the 1-D form (correct at every BLOCK

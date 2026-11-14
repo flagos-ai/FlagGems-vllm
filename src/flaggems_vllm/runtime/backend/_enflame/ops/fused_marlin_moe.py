@@ -105,6 +105,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
 # GCU: the generic moe_sum mt kernel lowers to memref_ext.slice_pad_start ops the
 # current flagtree toolchain rejects; the enflame-local copy is 1D-affine only.
 from flaggems_vllm.runtime.backend._enflame.ops.moe_sum import moe_sum
+
 # GCU: the generic silu_and_mul_out kernel falls back to the NVIDIA-derived
 # CodeGenConfig max_grid_size=65536, one CTA above the GCU grid.x hardware limit
 # 65535; the enflame-local copy clamps it and takes the grid-stride-loop path.

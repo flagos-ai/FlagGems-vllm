@@ -131,9 +131,7 @@ def _indexer_k_quant_cache_tile_kernel(
     if pid == num_programs - 1:
         # Ragged tail: mask token rows past num_tokens (only this program).
         tmask = tv < num_tokens
-        slot = tl.load(
-            slot_words_ptr + tv * slot_word_stride, mask=tmask, other=-1
-        )
+        slot = tl.load(slot_words_ptr + tv * slot_word_stride, mask=tmask, other=-1)
         lmask = tl.reshape(
             tl.broadcast_to(tmask[:, None], (U, HEAD_DIM)), (U * HEAD_DIM,)
         )
@@ -231,9 +229,7 @@ def _indexer_k_quant_cache_ttok_kernel(
             if USE_UE8M0:
                 scale = tl.exp2(tl.ceil(tl.log2(scale)))
             fp8 = tl.reshape(
-                (a2.to(tl.float32) / scale[:, None]).to(
-                    kv_cache_ptr.type.element_ty
-                ),
+                (a2.to(tl.float32) / scale[:, None]).to(kv_cache_ptr.type.element_ty),
                 (HD_TILE,),
             )
             # Fold every scalar offset term into one i64 expression: i32
