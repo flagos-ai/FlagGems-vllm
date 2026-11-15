@@ -14,10 +14,13 @@
 
 import pytest
 import torch
+import yaml
 
 import flaggems_vllm
 
 from . import base
+from .conftest import Config
+from .consts import BenchLevel
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -111,11 +114,25 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
             (8192, 128, 8),
         ]
 
+    def set_shapes(self, shape_file_path):
+        with open(shape_file_path) as shape_file:
+            config = yaml.safe_load(shape_file) or {}
+        if any(key in config for key in (self.op_name, type(self).__name__)):
+            super().set_shapes(shape_file_path)
+            return
+
+        # Generic tensor shapes do not describe (tokens, heads, groups).
+        self.shapes = list(self.DEFAULT_SHAPES)
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+        if Config.bench_level == BenchLevel.COMPREHENSIVE and not Config.query:
+            self.shapes = list(dict.fromkeys(self.shapes + self.set_more_shapes()))
+
     def init_user_config(self):
         super().init_user_config()
         if any(len(shape) != 3 for shape in self.shapes):
             raise ValueError(
-                "fused_inv_rope_int8_quant shapes must have three dimensions"
+                f"Invalid fused_inv_rope_int8_quant shapes: {self.shapes}; "
+                "expected (num_tokens, num_heads, n_groups)"
             )
 
 
@@ -125,7 +142,7 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
 )
 def test_fused_inv_rope_int8_quant():
     bench = FusedInvRopeInt8QuantBenchmark(
-        op_name="fused_inv_rope_fp8_quant",
+        op_name="fused_inv_rope_int8_quant",
         input_fn=make_inputs,
         torch_op=unfused_inv_rope_int8_quant,
         dtypes=[torch.bfloat16],
