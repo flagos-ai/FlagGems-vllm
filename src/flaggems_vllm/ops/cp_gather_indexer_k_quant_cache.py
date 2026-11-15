@@ -151,7 +151,8 @@ def cp_gather_indexer_k_quant_cache(
     else:
         # Unused by the binary-search path; kept as a valid constexpr placeholder.
         batch_scan_size = 1
-    search_steps = batch_size.bit_length()
+    # The search includes the terminal cu_seqlen entry at batch_size.
+    search_steps = (batch_size + 1).bit_length()
 
     grid = (triton.cdiv(num_tokens, token_block), num_quant_blocks)
     _cp_gather_indexer_quant_cache_kernel[grid](

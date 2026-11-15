@@ -49,14 +49,15 @@ from flaggems_vllm.runtime.backend._mthreads.ops.persistent_topk import persiste
 from flaggems_vllm.runtime.backend._mthreads.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._mthreads.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._mthreads.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
-    w8a8_block_fp8_matmul,
+from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
+    w8a8_block_matmul,
 )
 
 __all__ = [
@@ -74,6 +75,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
+    "qsa_prepare",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
@@ -81,5 +83,5 @@ __all__ = [
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
-    "w8a8_block_fp8_matmul",
+    "w8a8_block_matmul",
 ]

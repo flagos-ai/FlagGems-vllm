@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import importlib
 import warnings
 
@@ -77,8 +78,202 @@ def _get_baseline_mhc_post_op():
     return native
 
 
+# Ascend: CANN ships aclnnMhcPreSinkhorn, which torch_npu does not bind (and
+# npu_mhc_pre has no kernel on 910B4).  Only argument marshalling happens
+# below, so the measured time is the vendor kernel's.
+
+_ASCEND_SYMS = None
+_ASCEND_CACHE = {}
+_ASCEND_REQUIRED = (
+    "aclnnMhcPreSinkhornGetWorkspaceSize",
+    "aclnnMhcPreSinkhorn",
+    "aclCreateTensor",
+)
+
+
+def _ascend_handles():
+    """Handles to resolve the CANN symbols from, without guessing any directory."""
+    yield ctypes.CDLL(None)
+    for name in ("libopapi_transformer.so", "libnnopbase.so", "libascendcl.so"):
+        try:
+            yield ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+
+
+def _ascend_load():
+    """Resolve the three CANN entry points, or raise ImportError."""
+    global _ASCEND_SYMS
+    if _ASCEND_SYMS is not None:
+        return _ASCEND_SYMS
+    syms = {}
+    for handle in _ascend_handles():
+        for name in _ASCEND_REQUIRED:
+            if name not in syms:
+                try:
+                    syms[name] = getattr(handle, name)
+                except AttributeError:
+                    pass
+        if len(syms) == len(_ASCEND_REQUIRED):
+            break
+    missing = sorted(set(_ASCEND_REQUIRED) - set(syms))
+    if missing:
+        raise ImportError(f"CANN symbols not found: {missing}")
+
+    vp, i64, u64, f64 = (
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_uint64,
+        ctypes.c_double,
+    )
+    syms["aclCreateTensor"].restype = vp
+    syms["aclCreateTensor"].argtypes = [
+        ctypes.POINTER(i64),
+        u64,
+        ctypes.c_int,
+        ctypes.POINTER(i64),
+        i64,
+        ctypes.c_int,
+        ctypes.POINTER(i64),
+        u64,
+        vp,
+    ]
+    # x, fn, hc_scale, hc_base, hc, numIters, eps, eps, outFlag, 8 outputs
+    syms["aclnnMhcPreSinkhornGetWorkspaceSize"].argtypes = (
+        [vp] * 4
+        + [i64, i64, f64, f64, i64]
+        + [vp] * 8
+        + [ctypes.POINTER(u64), ctypes.POINTER(vp)]
+    )
+    syms["aclnnMhcPreSinkhornGetWorkspaceSize"].restype = ctypes.c_int
+    syms["aclnnMhcPreSinkhorn"].argtypes = [vp, u64, vp, vp]
+    syms["aclnnMhcPreSinkhorn"].restype = ctypes.c_int
+    _ASCEND_SYMS = syms
+    return syms
+
+
+def _ascend_ptr(tensor):
+    create = _ascend_load()["aclCreateTensor"]
+    shape = list(tensor.shape)
+    dims = (ctypes.c_int64 * len(shape))(*shape)
+    strides = (ctypes.c_int64 * len(shape))(*tensor.stride())
+    dtype = 27 if tensor.dtype == torch.bfloat16 else 0  # ACL_BF16 / ACL_FLOAT
+    ptr = create(
+        dims,
+        len(shape),
+        dtype,
+        strides,
+        0,
+        2,
+        dims,
+        len(shape),
+        ctypes.c_void_p(tensor.data_ptr()),
+    )
+    return ctypes.c_void_p(ptr)
+
+
+def _ascend_state(residual, fn, hc_scale, hc_base, hc_pre_eps, rms_eps):
+    """Descriptors and scratch for one shape: everything except the executor."""
+    n, hc, h = residual.shape
+    dev = residual.device
+    # Always 20 iterations, two normalisations each: 40 rows.
+    f32, bf16, it = torch.float32, torch.bfloat16, 40
+    shapes = [
+        (bf16, (1, n, h)),
+        (f32, (1, n, hc)),
+        (f32, (1, n, hc * hc)),
+        (f32, (1, n, hc)),
+        (f32, (1, n, hc * hc + 2 * hc)),
+        (f32, (1, n, 1)),
+        (f32, (it, 1, n, hc)),
+        (f32, (it, 1, n, hc, hc)),
+    ]
+    tensors = [
+        residual.reshape(1, n, hc, h).contiguous(),
+        fn.contiguous(),
+        hc_scale.contiguous(),
+        hc_base.contiguous(),
+    ]
+    tensors += [torch.zeros(*shape, dtype=dt, device=dev) for dt, shape in shapes]
+    return {
+        "n": n,
+        "hc": hc,
+        "h": h,
+        "ptrs": [_ascend_ptr(t) for t in tensors],
+        "out": tensors[4:],
+        "eps": (hc_pre_eps, rms_eps),
+        "ws": None,
+        "stream": ctypes.c_void_p(torch.npu.current_stream().npu_stream),
+    }
+
+
+def _ascend_native_mhc_pre():
+    """Ascend native mhc_pre baseline.
+
+    Binds CANN's aclnnMhcPreSinkhorn through ctypes because torch_npu does not
+    expose it. The operator takes only numIters=20 (sinkhorn_repeat is ignored)
+    and has no hc_post_mult_value.
+    """
+    _ascend_load()
+
+    def npu_mhc_pre_ascend_native(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    ):
+        if hc_post_mult_value != 1.0:
+            # Not a vendor parameter; scaling here would time our own arithmetic.
+            raise ValueError("aclnnMhcPreSinkhorn has no hc_post_mult_value")
+        # Always 20 iterations; sinkhorn_repeat is accepted and ignored.
+        state = _ASCEND_CACHE.get(tuple(residual.shape))
+        if state is None:
+            state = _ascend_state(residual, fn, hc_scale, hc_base, hc_pre_eps, rms_eps)
+            _ASCEND_CACHE[tuple(residual.shape)] = state
+
+        syms = _ascend_load()
+        get_ws = syms["aclnnMhcPreSinkhornGetWorkspaceSize"]
+        run = syms["aclnnMhcPreSinkhorn"]
+        ws, ex = ctypes.c_uint64(0), ctypes.c_void_p(None)
+        rc = get_ws(
+            *state["ptrs"][:4],
+            state["hc"],
+            20,  # numIters: the operator's only accepted value
+            *state["eps"],
+            0,
+            *state["ptrs"][4:],
+            ctypes.byref(ws),
+            ctypes.byref(ex),
+        )
+        if rc:
+            raise RuntimeError(f"aclnnMhcPreSinkhornGetWorkspaceSize rc={rc}")
+        if state["ws"] is None or state["ws"].numel() < ws.value:
+            dev = residual.device
+            state["ws"] = torch.empty(max(ws.value, 1), dtype=torch.uint8, device=dev)
+        rc = run(ctypes.c_void_p(state["ws"].data_ptr()), ws.value, ex, state["stream"])
+        if rc:
+            raise RuntimeError(f"aclnnMhcPreSinkhorn rc={rc}")
+
+        n, hc, h = state["n"], state["hc"], state["h"]
+        layer_input, _, hres, *_ = state["out"]
+        return (
+            torch.zeros(n, hc, 1, dtype=torch.float32, device=residual.device),
+            hres.reshape(n, hc, hc),
+            layer_input.reshape(n, h),
+        )
+
+    return npu_mhc_pre_ascend_native
+
+
+# Every entry is a (module, attribute) pair; ascend is resolved by a special case
+# in _get_baseline_mhc_pre_op because torch_npu does not bind aclnnMhcPreSinkhorn.
 _NATIVE_MHC_PRE = {
-    "nvidia": ("vllm._custom_ops", "mhc_pre"),
+    "nvidia": ("vllm.model_executor.kernels.mhc", "mhc_pre_tilelang"),
     "hygon": ("aiter", "mhc_pre"),
     "thead": ("vllm.model_executor.layers.mhc", "mhc_pre"),
     "mthreads": ("mate", "mhc_pre"),
@@ -88,6 +283,18 @@ _NATIVE_MHC_PRE = {
 
 def _get_baseline_mhc_pre_op():
     """Vendor-native mhc_pre, or None when this vendor ships none."""
+    if VENDOR == "ascend":
+        try:
+            return _ascend_native_mhc_pre()
+        except (ImportError, OSError) as exc:
+            warnings.warn(
+                "mhc_pre benchmark: ascend declares a native baseline at "
+                f"aclnnMhcPreSinkhorn but it could not be loaded ({exc!r}); the "
+                "case runs without a baseline, so latency_base/speedup stay empty.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
     entry = _NATIVE_MHC_PRE.get(VENDOR)
     if entry is None:
         return None
@@ -121,13 +328,6 @@ def _get_baseline_mhc_pre_op():
 
 class MHCPostBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "N, H"
-
-    def init_user_config(self):
-        """Apply restrictions imposed by the selected baseline."""
-        super().init_user_config()
-
-        if self.torch_op is None:
-            pytest.skip(f"No vendor-native mhc_post kernel is available for {VENDOR}.")
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [

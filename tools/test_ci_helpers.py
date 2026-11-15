@@ -24,7 +24,6 @@ import textwrap
 import unittest
 from pathlib import Path
 
-import check_ci_pins
 import run_ci_targets
 import select_backends
 import select_tests
@@ -469,12 +468,52 @@ class BenchmarkWorkflowPolicyTest(unittest.TestCase):
         )
 
 
-class CiPinsTest(unittest.TestCase):
-    def test_three_flaggems_pins_are_identical(self):
+class NoFlagGemsSourceDependencyTest(unittest.TestCase):
+    """CI must not fetch or call anything from the FlagGems repository."""
+
+    def test_ci_files_do_not_reference_the_flaggems_repository(self):
+        import re
+
         repo_root = Path(__file__).resolve().parents[1]
-        pins = check_ci_pins.extract_pins(repo_root)
-        self.assertEqual(len(pins), 3)
-        self.assertEqual(len(set(pins)), 1)
+        # `flagos-ai/FlagGems` not followed by `-vllm`.
+        pattern = re.compile(r"flagos-ai/FlagGems(?!-vllm)", re.IGNORECASE)
+        paths = [
+            *(repo_root / ".github/workflows").glob("*.y*ml"),
+            *(repo_root / ".github/actions").rglob("*.y*ml"),
+        ]
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(path=path.name):
+                self.assertIsNone(
+                    pattern.search(path.read_text(encoding="utf-8")),
+                    f"{path} references the FlagGems repository",
+                )
+
+    def test_container_backends_are_not_in_the_bare_runner_registry(self):
+        import yaml
+
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        platforms = yaml.safe_load(
+            (repo_root / ".github/configs/ci-backends.yaml").read_text(encoding="utf-8")
+        )["platforms"]
+        # The H20 bare host (nvidia-cuda133) is recorded for reference only;
+        # select_backends never routes NVIDIA entries.
+        containerized = {
+            entry["backend"]
+            for entry in platforms.values()
+            if not entry["backend"].startswith("nvidia")
+        }
+        bare = {entry["backend"] for entry in registry}
+        self.assertEqual(containerized & bare, set())
+
+    def test_backend_registry_is_local(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        capabilities = select_backends.load_auto_selected_backends(
+            repo_root / ".github/backend-capabilities.json"
+        )
+        self.assertTrue(capabilities <= {entry["backend"] for entry in registry})
 
 
 class BackendTuneConfigTest(unittest.TestCase):
@@ -633,8 +672,7 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
 
         expected = {
             "HOME": inherited_home,
-            "FLAGGEMS_DIR": workspace / ".ci/flaggems",
-            "FLAGGEMS_VENV": workspace / ".ci/flaggems/.venv",
+            "FLAGGEMS_VENV": workspace / ".venv",
         }
         self.assertEqual(
             set(values),
@@ -722,12 +760,11 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 
     def test_uses_explicit_caller_checkout_and_vendor_venv_paths(self):
         self.assertIn("tools/prepare-flaggems-ci-env.sh", self.action)
-        self.assertIn('cd "${FLAGGEMS_DIR}"', self.action)
+        self.assertIn('bash tools/setup.sh "${BACKEND}"', self.action)
         self.assertIn('source "${FLAGGEMS_VENV}/bin/activate"', self.action)
-        self.assertIn('-e "${GITHUB_WORKSPACE}"', self.action)
-        self.assertIn('script="${FLAGGEMS_DIR}/${GPU_CHECK_SCRIPT}"', self.action)
-        self.assertIn('ln -s "${FLAGGEMS_VENV}" .venv', self.action)
-        self.assertNotIn("cd .ci/flaggems", self.action)
+        self.assertIn('script="${GITHUB_WORKSPACE:?}/${GPU_CHECK_SCRIPT}"', self.action)
+        self.assertNotIn("FLAGGEMS_DIR", self.action)
+        self.assertNotIn(".ci/flaggems", self.action)
 
     def test_backend_test_prefers_the_physical_vendor_venv(self):
         self.assertIn('VENV_PATH="${FLAGGEMS_VENV:-.venv}"', self.test_script)
@@ -791,7 +828,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
             "  non-nvidia-tests:", maxsplit=1
         )[0]
         non_nvidia_job = workflow.split("  non-nvidia-tests:", maxsplit=1)[1].split(
-            "  multi-backend-summary:", maxsplit=1
+            "  unittest-required:", maxsplit=1
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
@@ -810,14 +847,13 @@ class CiSummaryTest(unittest.TestCase):
         workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
             encoding="utf-8"
         )
-        summary = workflow.split("  multi-backend-summary:", maxsplit=1)[1]
+        summary = workflow.split("  unittest-required:", maxsplit=1)[1]
         cls.script = textwrap.dedent(
             summary.split("        run: |\n", maxsplit=1)[1]
         ).strip()
 
     def run_summary(self, **overrides):
         values = {
-            "CODE_STYLE_RESULT": "success",
             "SELECT_TARGETS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
@@ -877,7 +913,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def test_missing_or_unexpected_results_fail(self):
         cases = {
-            "preparation_failed": {"CODE_STYLE_RESULT": "failure"},
+            "preparation_failed": {"SELECT_TARGETS_RESULT": "failure"},
             "expected_nvidia_skipped": {
                 "SHOULD_RUN": "true",
                 "NVIDIA_RESULT": "skipped",

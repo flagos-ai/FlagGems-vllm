@@ -15,6 +15,9 @@
 name: rule-check
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -31,12 +34,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rule-check:
+  # Job name kept as rule-check-required, matching FlagGems, so the branch
+  # ruleset can require the same status check context in both repositories.
+  # This is the only ubuntu-latest job a PR needs for style and rule checks.
+  rule-check-required:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Hard cap so a wedged step cannot hold a shared GitHub-hosted runner.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          # fetch-depth 0 required by derive_changed_operators.py (base...head
+          # diff) and by the changed-file checks below.
           fetch-depth: 0
 
       - name: Set up Python
@@ -45,11 +54,78 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dependencies
-        run: pip install pyyaml
+      # pre-commit hook environments are cached by their config hash so they are
+      # only rebuilt when .pre-commit-config.yaml changes.
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: pre-commit-${{ runner.os }}-
 
+      - name: Install pre-commit and pyyaml
+        run: pip install pre-commit pyyaml
+
+      # On PRs lint only the files the PR touched; hooks with pass_filenames:
+      # false still run when a file matching their `files:` regex changed. The
+      # whole tree is linted on push to main, so anything that slips through
+      # is still caught there.
+      - name: Run pre-commit (code style, changed files)
+        if: github.event_name == 'pull_request'
+        run: |
+          pre-commit run --show-diff-on-failure --color=always \
+            --from-ref "${{ github.event.pull_request.base.sha }}" \
+            --to-ref "${{ github.event.pull_request.head.sha }}"
+
+      - name: Run pre-commit (code style, all files)
+        if: github.event_name != 'pull_request'
+        run: pre-commit run --all-files --show-diff-on-failure --color=always
+
+      - name: Test ci selection helpers
+        run: python -m unittest discover -s tools -p 'test_ci_*.py'
+
+      # Every ubuntu-latest job needs a timeout, and unittest-required must
+      # cover every job in basic-ci.yml (see the script docstring).
+      - name: Check workflow policy
+        run: |
+          python tools/ci_checks/check_workflow_policy.py
+          python -m unittest discover -s tools/ci_checks -p 'test_check_workflow_policy.py'
+
+      # Existing code still contains torch compute calls, so only files touched
+      # by this change are checked; new violations are blocked without failing
+      # every PR on the legacy backlog.
+      - name: check no torch compute fallback in changed files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only --diff-filter=d -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+          else
+            git diff-tree --no-commit-id --name-only --diff-filter=d -r -z "${GITHUB_SHA}" > changed_py.bin
+          fi
+          files=()
+          while IFS= read -r -d '' path; do
+            if [[ "${path}" == *.py ]]; then
+              files+=("${path}")
+            fi
+          done < changed_py.bin
+          rm -f changed_py.bin
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No changed Python files."
+            exit 0
+          fi
+          python tools/ci_checks/check_no_torch_fallback.py "${files[@]}"
+
+      # rule-check steps need a base SHA, so they only run on pull_request.
       - name: Derive changed operators
         id: derive
+        if: github.event_name == 'pull_request'
         run: |
           python3 tools/ci_checks/derive_changed_operators.py \
             --base "${{ github.event.pull_request.base.sha }}" \
@@ -57,7 +133,7 @@ jobs:
 
       - name: Check operators.yaml
         id: check-operators-yaml
-        if: steps.derive.outputs.has_changes == 'true'
+        if: github.event_name == 'pull_request' && steps.derive.outputs.has_changes == 'true'
         continue-on-error: true
         run: |
           python3 tools/ci_checks/check_operators_yaml.py \
@@ -65,12 +141,22 @@ jobs:
 
       - name: Check __init__.py exports
         id: check-init-exports
+        if: github.event_name == 'pull_request'
         continue-on-error: true
         run: python3 tools/ci_checks/check_init_exports.py
 
+      # Unlike check_operators_yaml.py above, which only validates operators
+      # already present in the registry, this check catches ops exported
+      # from __all__ but never registered at all (see the script docstring).
+      - name: Check exported ops are registered
+        id: check-exported-ops-registered
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: python3 tools/ci_checks/check_exported_ops_registered.py
+
       - name: Check operator test files and markers
         id: check-operator-markers
-        if: steps.derive.outputs.has_changes == 'true'
+        if: github.event_name == 'pull_request' && steps.derive.outputs.has_changes == 'true'
         continue-on-error: true
         run: |
           python3 tools/ci_checks/check_operator_markers.py \
@@ -78,7 +164,7 @@ jobs:
 
       - name: Check aten operator names
         id: check-aten-operators
-        if: steps.derive.outputs.has_changes == 'true'
+        if: github.event_name == 'pull_request' && steps.derive.outputs.has_changes == 'true'
         continue-on-error: true
         run: |
           python3 tools/ci_checks/check_aten_operators.py \
@@ -89,18 +175,18 @@ jobs:
       # need continue-on-error.
 
       - name: Check benchmark coverage
-        if: steps.derive.outputs.has_changes == 'true'
+        if: github.event_name == 'pull_request' && steps.derive.outputs.has_changes == 'true'
         run: |
           python3 tools/ci_checks/check_performance_reference.py \
             --operators '${{ steps.derive.outputs.changed_operators }}'
 
       - name: Verify required checks passed
-        if: always()
+        if: always() && github.event_name == 'pull_request'
         env:
           STEPS_JSON: ${{ toJSON(steps) }}
         run: |
           failed=0
-          for step_id in check-operators-yaml check-init-exports check-operator-markers check-aten-operators; do
+          for step_id in check-operators-yaml check-init-exports check-exported-ops-registered check-operator-markers check-aten-operators; do
             result=$(echo "$STEPS_JSON" | jq -r --arg id "$step_id" '.[$id].outcome // "skipped"')
             echo "$step_id: $result"
             if [ "$result" = "failure" ]; then

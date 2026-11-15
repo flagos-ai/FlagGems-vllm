@@ -7,7 +7,7 @@ benchmark merely because FlagGems can create its vendor environment.
 ## Scheduling and trust boundary
 
 - Pull requests select a non-NVIDIA backend either through the exact `label`
-  values in FlagGems' pinned `.github/backends.json` or by changing a path
+  values in `.github/backends.json` or by changing a path
   under `src/flaggems_vllm/runtime/backend/_<vendor>/`. Automatic path
   inference is limited to profiles with `auto_select: true` in the local
   capability policy, so a runner/profile must pass explicit bring-up before
@@ -95,32 +95,97 @@ in FlagGems before their hardware availability is considered fully verified.
 
 ## Reuse contract
 
-FlagGems remains the source of truth for backend profiles and runner routing:
+This repository is self-contained; CI does not check out or call anything from
+the FlagGems repository (`tools/test_ci_helpers.py` enforces this for
+`.github/workflows` and `.github/actions`). `flag-gems` is still installed as a
+runtime package by `tools/setup.sh`.
 
 1. `.github/backends.json` supplies `backend`, `runner_label`, `label`,
-   `gpu_check`, and `enabled`.
-2. `.github/workflows/backend-test.yaml` owns the shared self-hosted backend
-   job and bootstraps the caller repository.
-3. FlagGems-vllm's `.github/actions/setup-flaggems/action.yml` asks the pinned
-   FlagGems checkout to create the vendor environment, then installs only this
-   repository into that environment. The adapter keeps the caller checkout at
-   `$GITHUB_WORKSPACE`, the FlagGems checkout at
-   `$GITHUB_WORKSPACE/.ci/flaggems`, and the physical vendor environment at
-   `$GITHUB_WORKSPACE/.ci/flaggems/.venv`; a root `.venv` symlink exists only
-   for compatibility with the reusable workflow.
+   `gpu_check`, and `enabled` for the `non-nvidia-tests` lane. The H20
+   `nvidia-tests` job passes the same inputs by hand and is not in this file.
+2. `.github/workflows/backend-test.yaml` is the reusable job for one backend
+   (including H20) on a bare self-hosted runner. It checks out this repository and runs the
+   local `setup-flaggems` action.
+3. `.github/actions/setup-flaggems/action.yml` runs `tools/setup.sh <backend>`
+   to build the vendor environment in `$GITHUB_WORKSPACE/.venv` (torch stack,
+   vLLM, this repository editable, test dependencies), then exports it for the
+   following steps.
 4. `.github/backend-capabilities.json` records automatic-routing readiness and
    the FlagGems-vllm tests proven on each backend. It is not a second backend
    registry.
 
-Do not add a hand-maintained vendor matrix or copy vendor setup scripts into
-FlagGems-vllm. Add or change a backend in FlagGems first, then advance all
-three pinned FlagGems references together.
+To add a backend, add a profile to `src/flaggems_vllm/backends.yaml`, an entry
+to `.github/backends.json`, and a `tools/gpu_check_<vendor>.sh` health script.
 
-The current pin includes FlagGems' split of optional native extensions from
-the default pure-Python package and its compatible setuptools-scm constraint.
-Do not roll the pin back before those changes: even with C++ extensions
-disabled, the older scikit-build package path still configured a C++ compiler
-on every vendor host.
+## Container CI lane and FlagOps consolidation
+
+Container platforms are chosen from the change itself, as on the bare-runner
+lane. A pull request that touches `src/flaggems_vllm/runtime/backend/_<vendor>/`
+runs that vendor's platform (`_hygon`, `_ascend`, `_iluvatar`, `_metax`,
+`_mthreads`). To run a platform without touching its directory, add its
+`vendor/*` label by hand (the `label` field in `ci-backends.yaml`:
+`vendor/Hygon`, `vendor/Ascend`, `vendor/Iluvatar`, `vendor/MetaX`,
+`vendor/MooreThreads`, `vendor/NVIDIA`). `ci/all-vendors` and the
+`run_non_nvidia` dispatch input select every platform except NVIDIA. A
+platform with `run_by_default: true` (the A100 `nvidia` platform) also runs
+whenever the change selects any test, without a label. NVIDIA is never chosen by
+path, so `_nvidia/` changes alone do not trigger it. A label also runs the
+platform on a docs-only change. No tests are selected then, so the job only
+installs the package and checks the accelerator, which validates the runner and
+image. Only users with triage access can add labels.
+
+`vendor-container-tests` in `basic-ci.yml` runs per-PR smoke tests inside
+vendor-published vLLM images. Its runner/image data lives in
+`.github/configs/ci-backends.yaml` and is resolved by
+`tools/select_ci_backends.py`.
+
+Three config sets now coexist, and they are deliberately not merged:
+
+| File | Drives | Runners / images |
+| --- | --- | --- |
+| `.github/backends.json` | `non-nvidia-tests` | bare runners, env built by `tools/setup.sh`; only backends without a container platform |
+| `.github/configs/ci-backends.yaml` | `vendor-container-tests` | specific runners, vendor and NGC vLLM images |
+| `.github/configs/backends/*.yaml` | `ops-test.yaml` (periodic full suite) | `*-flaggems-weekly` runners, internal harbor images |
+
+A backend that has a platform in `ci-backends.yaml` (hygon, ascend-cann900,
+iluvatar, metax-maca3810, mthreads-musa520) is deprecated on the bare-runner
+lane and has been removed from `backends.json`; `tools/test_ci_helpers.py`
+fails if one reappears in both. Those backends are no longer path-routed
+(`auto_select`); the container lane routes them by path or label, see below.
+
+Keeping the three apart is intentional: a per-PR smoke test and a multi-hour weekly
+sweep differ in runner, image, timeout and blast radius, so one shared file
+would couple two lanes that need to fail independently.
+
+The duplication worth removing is between *repositories*, not between these
+lanes. `flagos-ai/FlagOps` is the designated home for org-wide CI assets; its
+`actions/setup-project/action.yml` is already described as "Generalized from
+FlagGems setup-flaggems for org-wide reuse", and `.github/workflows/ci-shared.yml`
+is a reserved placeholder. Consolidate in this order, highest certainty first:
+
+1. **GPU health checks.** `tools/gpu_check_*.sh` are near-identical copies of
+   FlagGems' versions. Move them to FlagOps and reference them from both
+   repositories. This is pure duplication with no caller-specific behavior.
+2. **Runner/image data.** `ci-backends.yaml` intentionally mirrors the
+   `platforms.<name>` schema of FlagOps'
+   `flagos-user-tests/resource_map.yaml`, so promoting it to FlagOps means
+   changing the read path in `select_ci_backends.py`, not rewriting the
+   workflow.
+3. **Job skeleton.** Fill `FlagOps/.github/workflows/ci-shared.yml` with the
+   "resolve targets -> start container -> install -> test -> summarize"
+   skeleton, leaving each caller to supply its backend config and test command.
+
+Two cautions learned from the current layout:
+
+- Do **not** replace `.github/actions/checkout-retry` with FlagOps'
+  same-named action. The local copy pins the immutable `github.sha`, sets
+  `persist-credentials: false`, and skips a completed checkout; the FlagOps
+  version uses `github.ref` and keeps credentials. Swapping it is a security
+  regression for fork pull requests. Reconcile by hardening the FlagOps action
+  first.
+- Do not pull NVIDIA into the container lane. `nvidia-tests` runs on the H20
+  host through `tools/setup.sh` and benefits from the uv cache and FlagTree
+  swap that script performs; containerizing it would buy nothing and lose that.
 
 GitHub documents that a called workflow can use only self-hosted runners made
 available in the caller repository's context. Sharing an organization alone
@@ -144,17 +209,17 @@ For each non-NVIDIA group:
 3. Explicitly allow public repositories; GitHub disables public-repository
    access to runner groups by default.
 4. Where workflow restrictions are available, choose `Selected workflows`
-   and allow the fixed revision:
+   and allow this repository's reusable workflow:
 
    ```text
-   flagos-ai/FlagGems/.github/workflows/backend-test.yaml@<FLAGGEMS_CI_SHA>
+   flagos-ai/FlagGems-vllm/.github/workflows/backend-test.yaml@<ref>
    ```
 
 Only jobs directly defined in that selected reusable workflow can then enter
-the group. The H20 job is currently defined directly in `basic-ci.yml`, so its
-group cannot use this FlagGems-only restriction until the H20 job is migrated
-to the pinned reusable workflow. Prefer an ephemeral H20 runner in the
-meantime.
+the group. The H20 job (`nvidia-tests`) calls the same `backend-test.yaml`, so
+its runner group can use this restriction too. Prefer an ephemeral H20 runner
+regardless: the restriction does not stop a same-repository branch from editing
+the caller workflow.
 
 For non-NVIDIA runners, `Selected workflows` reduces accidental access but is
 not the fork security boundary in the currently pinned design: a fork can edit
@@ -182,7 +247,7 @@ Prefer an ephemeral/JIT VM, container, or host image. If the runner is
 persistent, retain the workflow cleanup and verify the machine after cancelled
 jobs.
 
-To match FlagGems' own CI, the caller adapter preserves a writable inherited
+The caller adapter preserves a writable inherited
 `HOME` and its existing uv cache and managed Python. If `HOME` is unusable
 (for example, an unprivileged runner inherited `HOME=/root`), it tries the
 account database home and only then uses a job-local fallback under
@@ -294,7 +359,7 @@ caller and called workflows, currently including:
 actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-flagos-ai/FlagGems/.github/workflows/backend-test.yaml@<FLAGGEMS_CI_SHA>
+flagos-ai/FlagGems-vllm/.github/workflows/backend-test.yaml@<ref>
 ```
 
 If administrators instead enable all GitHub-authored actions for convenience,
@@ -398,52 +463,10 @@ If the backend already exists in the pinned FlagGems registry:
 5. After preflight succeeds, add only hardware-proven tests to that backend's
    `tests_allow`; enable benchmarks separately after correctness is stable.
 
-If the backend is not in FlagGems, first submit a FlagGems change that adds its
-`backend`, `runner_label`, `label`, `gpu_check`, and `enabled` fields, makes
-`./setup.sh <backend>` work, and provides a device health script. After it
-lands, advance the registry checkout, reusable workflow, and setup checkout to
-the same FlagGems commit and run `python tools/check_ci_pins.py`.
-
-## FlagGems reusable-workflow dependency
-
-The FlagGems revision is intentionally repeated in three syntax locations that
-cannot use an expression: the registry checkout, reusable workflow call, and
-setup checkout. `python tools/check_ci_pins.py` prevents those pins from
-drifting.
-
-The currently pinned FlagGems workflow still declares the unused
-`RUNNER_SSH_KEY` input and calls a caller-local checkout retry action after its
-bootstrap checkout. A failed bootstrap cannot load that local action. Until a
-FlagGems companion change is merged, the caller passes only its short-lived,
-read-only `GITHUB_TOKEN`; do not create a long-lived SSH private-key secret.
-
-The FlagGems companion change must:
-
-1. validate canonical backend/runner pairs inside the pinned called workflow,
-   detect fork pull requests from the caller context, keep NVIDIA blocked, and
-   force non-NVIDIA forks onto an immutable disposable-runner route;
-2. inline the checkout attempts in `backend-test.yaml` and leave `ref`
-   unspecified (or fix it to `github.sha`);
-3. add a 60-minute timeout to the called backend job;
-4. make `RUNNER_SSH_KEY` optional, then remove the unused interface after all
-   callers stop passing it; and
-5. pass `test_script`, `backend`, and `pr_id` through quoted environment
-   variables rather than interpolating workflow inputs into shell source.
-
-After that change lands, update all three FlagGems SHAs together, remove
-`.github/actions/checkout-retry`, stop passing `RUNNER_SSH_KEY`, and rerun the
-pin check.
-
-That companion hardening is not part of this FlagGems-vllm-only change. Until
-it is available and pinned, isolation of every matching vendor runner is the
-only boundary protecting infrastructure from fork-controlled code.
-
-Before changing the repository files, add the new FlagGems SHA alongside the
-old SHA in both the Actions allowlist and every non-NVIDIA runner group's
-`Selected workflows` policy. Then update the three code pins and validate a trusted
-backend run. Remove the old management-plane allowlist entries only after the
-new run succeeds; changing the code pin first can make the workflow ineligible
-for its runner group.
+If the backend is not in `.github/backends.json`, add its `backend`,
+`runner_label`, `label`, `gpu_check`, and `enabled` fields, make
+`bash tools/setup.sh <backend>` work, and provide a `tools/gpu_check_<vendor>.sh`
+device health script.
 
 ## Bring-up sequence
 
@@ -468,8 +491,8 @@ for its runner group.
 8. Use `ci/all-vendors` or `workflow_dispatch(run_non_nvidia=true)` only for an
    intentional full-matrix run, and enable benchmarks only after correctness
    is stable.
-9. After FlagGems gains immutable fork routing, advance all three pins and
-   tighten runner-group policy before considering any persistent trusted
+9. Add immutable fork routing to `backend-test.yaml` and tighten runner-group
+   policy before considering any persistent trusted
    vendor pool.
 
 A `main` push intentionally runs the normal NVIDIA selection but does not
@@ -485,3 +508,23 @@ reserve every non-NVIDIA runner.
   https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/configure-the-application
 - Repository Actions policy and fork approvals:
   https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository
+
+## NVIDIA A100 / NGC vLLM image
+
+The `nvidia` platform in `.github/configs/ci-backends.yaml` runs through the
+normal `vendor-container-tests` job on the `nvidia-a100-1` runner, inside
+`nvcr.io/nvidia/vllm`. It checks the code against the torch, Triton and vLLM
+builds that ship with that image.
+
+The NGC image does not ship flag-gems, so the platform sets
+`install_with_setup_sh: true`: the job runs `tools/setup.sh --no-venv
+nvidia-cuda133`, which keeps the image's torch, Triton and vLLM and adds only
+flag-gems, this repository and the test dependencies. Vendor images that
+already ship flag-gems leave the flag unset and only get an editable install.
+
+The runner is an ARC pod on a K8s node (`k8s-novolume` hook), so the platform
+declares no container volumes and GPU access comes from the pod. It follows the
+rest of the container lane: it runs by default whenever tests are selected
+(`run_by_default: true`; `vendor/NVIDIA` is only needed to force a run), observation
+period, not part of `unittest-required`, and no `ci/nvidia` fork gate. This config stays
+separate from `.github/configs/backends/*.yaml`, which drives `ops-test.yaml`.

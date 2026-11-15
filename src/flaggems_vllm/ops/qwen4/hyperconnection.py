@@ -10,11 +10,15 @@ fail closed when their accelerator/layout contract is not met.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.qwen4.hc_combine import _combine
+
+logger = logging.getLogger(__name__)
 
 HAS_TRITON = True
 
@@ -293,6 +297,7 @@ def qwen4_hc_inject_combine(
     residual: torch.Tensor,
     hc_count: int,
 ) -> torch.Tensor:
+    logger.debug("GEMS QWEN4_HC_INJECT_COMBINE")
     return _combine(residual, block_output, injection_logits, hc_count, legacy=True)
 
 
