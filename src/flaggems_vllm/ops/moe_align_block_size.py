@@ -24,15 +24,18 @@ from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
 
 if has_triton_tle(3, 6, 0):
     try:
+        import triton.experimental.tle as tle_api
         import triton.experimental.tle.language as tle
         import triton.experimental.tle.language.gpu as tleg
 
         HAS_TLE = True
     except ImportError:
+        tle_api = None
         tle = None
         tleg = None
         HAS_TLE = False
 else:
+    tle_api = None
     tle = None
     tleg = None
     HAS_TLE = False
@@ -42,6 +45,13 @@ logger = logging.getLogger(__name__)
 
 TLE_CLUSTER_SIZE = 8
 TLE_BIG_TOKEN_THRESHOLD_TOKENS = 4096
+TLE_COMMON_FEATURES = (
+    "device_mesh",
+    "distributed_barrier",
+    "gpu.alloc",
+    "gpu.local_ptr",
+)
+TLE_CLUSTER_FEATURES = (*TLE_COMMON_FEATURES, "remote", "shard_id")
 _TRITON_ALLOCATOR_INSTALLED = False
 TLE_ATOMIC_WARPS_CONFIGS = [
     triton.Config(kwargs={}, num_warps=4),
@@ -535,11 +545,13 @@ def _moe_align_block_size_triton_4stage(
     numel_sorted_token_ids = sorted_token_ids.numel()
     numel_expert_ids = expert_ids.numel()
     grid = (num_experts,)
-    tokens_per_thread = triton.next_power_of_2(ceil_div(numel, num_experts))
+    tokens_per_thread = triton.next_power_of_2(max(1, ceil_div(numel, num_experts)))
     block_size_sorted = triton.next_power_of_2(
-        ceil_div(numel_sorted_token_ids, num_experts)
+        max(1, ceil_div(numel_sorted_token_ids, num_experts))
     )
-    block_size_expert = triton.next_power_of_2(ceil_div(numel_expert_ids, num_experts))
+    block_size_expert = triton.next_power_of_2(
+        max(1, ceil_div(numel_expert_ids, num_experts))
+    )
 
     # The tensor needs to be padded before calculating IDs,
     # to prevent out-of-bounds address access.
@@ -606,7 +618,15 @@ def moe_align_block_size_triton(
     numel_expert_ids = expert_ids.numel()
     block_expert_tle = triton.next_power_of_2(num_experts)
 
-    if HAS_TLE and topk_ids.is_cuda and block_expert_tle <= 1024:
+    # Query the current compiler target at dispatch; older TLE versions fall back.
+    is_tle_supported = getattr(tle_api, "is_tle_supported", None)
+    if (
+        HAS_TLE
+        and topk_ids.is_cuda
+        and block_expert_tle <= 1024
+        and callable(is_tle_supported)
+        and is_tle_supported(TLE_COMMON_FEATURES)
+    ):
         block_tokens_taf, _ = _pick_tle_atomic_fused_launch_params(numel, num_experts)
         experts_per_shard = ceil_div(num_experts, TLE_CLUSTER_SIZE)
         num_tokens = topk_ids.shape[0] if topk_ids.ndim > 1 else numel
@@ -660,6 +680,7 @@ def moe_align_block_size_triton(
         if (
             num_tokens < TLE_BIG_TOKEN_THRESHOLD_TOKENS
             and _supports_tle_cluster_remote()
+            and is_tle_supported(TLE_CLUSTER_FEATURES)
         ):
             try:
                 moe_align_block_size_tle_cluster_fused[(1,)](

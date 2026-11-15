@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # FlagGems backends Configuration
-# This file defines environmentsettings for weekly testing
+# This file defines environmentsettings for operator testing
 name: H800
 vendor: Nvidia
 
@@ -55,5 +55,5 @@ test_env:
 # GPU availability check script for this backend
 gpu_check_script: tools/gpu_check_nvidia.sh
 
-# Output base directory for this backends
+# Output base directory; ops-test appends the GitHub repository name
 output_base_dir: /data/github-outputs

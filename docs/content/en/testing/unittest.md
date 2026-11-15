@@ -43,6 +43,7 @@ Test a specific operator:
 ```bash
 PYTHONPATH=src pytest -v tests/test_grouped_topk.py
 PYTHONPATH=src pytest -v tests/test_moe_align_block_size.py
+PYTHONPATH=src pytest -q tests/test_fused_inv_rope_fp8_quant.py --quick
 ```
 
 ### Verbose Output
@@ -260,6 +261,6 @@ def test_my_new_op(shape, dtype):
 
 ## Next Steps
 
-- [Coverage reporting](../coverage/)
-- [Benchmark guide](/FlagGems-vllm/performance/benchmark/)
-- [Contribution guide](/FlagGems-vllm/contribution/overview/)
+- [Coverage reporting](coverage.md)
+- [Benchmark guide](../performance/benchmark.md)
+- [Contribution guide](../contribution/overview.md)

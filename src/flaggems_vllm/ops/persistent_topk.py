@@ -2057,6 +2057,342 @@ def _per_row_cta_topk_selector(
         tl.store(out_row + pos, out_vals, mask=mask)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+
+K_SAMPLE = 4096
+K_CAPACITY = 8192
+K_MIN_SAMPLED_LENGTH_K512 = 32768
+K_MIN_SAMPLED_LENGTH_OTHER = 65536
+SAMPLED_SMEM_BYTES = 144 * 1024
+
+
+@triton.jit
+def _sampled_ordered(x):
+    return _per_row_cta_float_to_sortable(x).to(tl.uint32)
+
+
+@triton.jit
+def _sampled_coarse(key):
+    return (key >> 21).to(tl.int32)
+
+
+@triton.jit
+def _sampled_select_bin(histogram_ptr, remaining, K_BINS: tl.constexpr):
+    # suffix[b] counts the sample items whose bin is >= b, so the answer is the
+    # largest b that still keeps at least that many of them.
+    bins = tl.arange(0, K_BINS)
+    counts = tl.load(histogram_ptr + bins)
+    total = tl.sum(counts, axis=0)
+    remaining = tl.minimum(remaining, total)
+    suffix = total - tl.cumsum(counts, axis=0) + counts
+    return tl.max(tl.where(suffix >= remaining, bins, 0), axis=0)
+
+
+@triton.jit
+def _sampled_reserve(hit, count_ptr, TILE: tl.constexpr):
+    # One atomic per retained element. Triton has no warp ballot/popcount, and
+    # the cumsum-based alternatives measured 2.6x-6x slower than the atomics.
+    zeros = tl.zeros([TILE], dtype=tl.int32)
+    ones = tl.full([TILE], 1, tl.int32)
+    return tl.atomic_add(count_ptr + zeros, ones, mask=hit, sem="relaxed", scope="cta")
+
+
+@triton.jit
+def _sampled_threshold_emit(
+    candidates_ptr,
+    out_indices_ptr,
+    count_ptr,
+    radix_ptr,
+    count_out_ptr,
+    TOPK: tl.constexpr,
+    K_CAPACITY: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    lane = tl.arange(0, BLOCK_SIZE)
+    ones = tl.full([BLOCK_SIZE], 1, tl.int32)
+    digits = tl.arange(0, 256)
+
+    count = tl.minimum(tl.load(count_ptr), K_CAPACITY)
+    n_tiles = tl.cdiv(count, BLOCK_SIZE)
+
+    prefix = tl.zeros((), dtype=tl.uint32)
+    prefix_mask = tl.zeros((), dtype=tl.uint32)
+    remaining = tl.full((), TOPK, tl.int32)
+
+    # -- Stage 1: 4 rounds of radix select, one byte per round --
+    # Each round only counts candidates whose already-fixed high bytes match the
+    # current prefix; after 4 rounds the prefix is the exact K-th largest key.
+    for shift in tl.static_range(24, -1, -8):
+        tl.store(radix_ptr + digits, 0)
+        tl.debug_barrier()
+        for t in tl.range(0, n_tiles):
+            pos = t * BLOCK_SIZE + lane
+            valid = pos < count
+            packed = tl.load(candidates_ptr + pos, mask=valid, other=0)
+            key = _sampled_ordered(
+                (packed >> 32).to(tl.int32).to(tl.float32, bitcast=True)
+            )
+            match = valid & ((key & prefix_mask) == prefix)
+            digit = ((key >> shift) & 255).to(tl.int32)
+            tl.atomic_add(
+                radix_ptr + digit, ones, mask=match, sem="relaxed", scope="cta"
+            )
+        tl.debug_barrier()
+        counts = tl.load(radix_ptr + digits)
+        total = tl.sum(counts, axis=0)
+        suffix = total - tl.cumsum(counts, axis=0) + counts
+        bin = tl.max(tl.where(suffix >= remaining, digits, 0), axis=0)
+        above = tl.sum(tl.where(digits > bin, counts, 0), axis=0)
+        remaining = remaining - above
+        prefix = prefix | (bin.to(tl.uint32) << shift)
+        prefix_mask = prefix_mask | (tl.full((), 255, tl.uint32) << shift)
+        tl.debug_barrier()
+
+    cutoff = prefix
+
+    # -- Stage 2: emit above the cutoff, then fill the rest with ties --
+    # Writes past TOPK are masked off instead of counted, so the equal-key group
+    # may be truncated; the output is an unordered index set, order is free.
+    tl.store(count_out_ptr, 0)
+    tl.debug_barrier()
+
+    for t in tl.range(0, n_tiles):
+        pos = t * BLOCK_SIZE + lane
+        valid = pos < count
+        packed = tl.load(candidates_ptr + pos, mask=valid, other=0)
+        idx = (packed & 0xFFFFFFFF).to(tl.int32)
+        key = _sampled_ordered((packed >> 32).to(tl.int32).to(tl.float32, bitcast=True))
+        hit = valid & (key > cutoff)
+        offset = _sampled_reserve(hit, count_out_ptr, BLOCK_SIZE)
+        tl.store(out_indices_ptr + offset, idx, mask=hit & (offset < TOPK))
+    tl.debug_barrier()
+
+    for t in tl.range(0, n_tiles):
+        pos = t * BLOCK_SIZE + lane
+        valid = pos < count
+        packed = tl.load(candidates_ptr + pos, mask=valid, other=0)
+        idx = (packed & 0xFFFFFFFF).to(tl.int32)
+        key = _sampled_ordered((packed >> 32).to(tl.int32).to(tl.float32, bitcast=True))
+        hit = valid & (key == cutoff)
+        offset = _sampled_reserve(hit, count_out_ptr, BLOCK_SIZE)
+        tl.store(out_indices_ptr + offset, idx, mask=hit & (offset < TOPK))
+
+
+@triton.jit
+def _sampled_topk_kernel(
+    input_ptr,
+    output_ptr,
+    lengths_ptr,
+    next_n,
+    stride_xm,
+    stride_xn,
+    max_length,
+    TOPK: tl.constexpr,
+    TOPKP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    K_SAMPLE: tl.constexpr,
+    K_CAPACITY: tl.constexpr,
+    K_MIN_SAMPLED_LENGTH: tl.constexpr,
+    HISTOGRAM_SIZE: tl.constexpr,
+    HAS_TLE: tl.constexpr,
+):
+    K_BINS: tl.constexpr = 2048
+    TILE: tl.constexpr = BLOCK_SIZE * VEC_SIZE
+
+    pid = tl.program_id(0)
+    batch_id = pid // next_n
+    batch_offset = pid % next_n
+    seq_len = tl.load(lengths_ptr + batch_id)
+    length = seq_len - next_n + batch_offset + 1
+    length = tl.maximum(length, 0)
+    length = tl.minimum(length, max_length)
+
+    row = input_ptr + pid * stride_xm
+    dst = output_ptr + pid * TOPK
+
+    s_histogram = tle.gpu.alloc(
+        [HISTOGRAM_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_candidates = tle.gpu.alloc(
+        [K_CAPACITY],
+        dtype=tl.int64,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_out_indices = tle.gpu.alloc(
+        [TOPKP],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_radix_counts = tle.gpu.alloc(
+        [256],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_scalars = tle.gpu.alloc(
+        [8],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    histogram_ptr = tle.gpu.local_ptr(s_histogram, (0,))
+    candidates_ptr = tle.gpu.local_ptr(s_candidates, (0,))
+    out_indices_ptr = tle.gpu.local_ptr(s_out_indices, (0,))
+    radix_ptr = tle.gpu.local_ptr(s_radix_counts, (0,))
+    scalars_ptr = tle.gpu.local_ptr(s_scalars, (0,))
+    s_final_cnt_ptr = scalars_ptr + 0
+    s_threshold_bin_idx_ptr = scalars_ptr + 1
+    s_final_bin_size_ptr = scalars_ptr + 2
+    s_found_topk_values_ptr = scalars_ptr + 3
+    s_step_thresholds_ptr = scalars_ptr + 4
+    count_ptr = scalars_ptr + 5
+
+    lane = tl.arange(0, BLOCK_SIZE)
+    vec = tl.arange(0, VEC_SIZE)
+
+    # -- Stage 0: short rows skip sampling --
+    # Heterogeneous batches mix row lengths and the host cannot read them (that
+    # needs a D2H sync), so the split has to be decided per row here.
+    if length < K_MIN_SAMPLED_LENGTH:
+        _per_row_cta_topk_selector(
+            row,
+            dst,
+            0,
+            length,
+            stride_xn,
+            max_length,
+            histogram_ptr,
+            s_final_cnt_ptr,
+            s_threshold_bin_idx_ptr,
+            s_final_bin_size_ptr,
+            s_found_topk_values_ptr,
+            s_step_thresholds_ptr,
+            out_indices_ptr,
+            radix_ptr,
+            TOPK=TOPK,
+            BLOCK_SIZE=BLOCK_SIZE,
+            USE_RADIX_FINAL=True,
+            HAS_TLE=HAS_TLE,
+        )
+        return
+
+    # -- Stage 1: 2048-bin coarse histogram over a uniform sample --
+    # Sample whole warps evenly spread across the row: index = (i / 32) *
+    # stride + i % 32 keeps the 32 lanes of a warp on consecutive addresses.
+    bins = tl.arange(0, K_BINS)
+    tl.store(histogram_ptr + bins, 0)
+    tl.debug_barrier()
+
+    si = tl.arange(0, K_SAMPLE)
+    warp_stride = length // (K_SAMPLE // 32)
+    sample_offs = (si // 32) * warp_stride + (si % 32)
+    sampled = tl.load(row + sample_offs, mask=sample_offs < length, other=0.0)
+    tl.atomic_add(
+        histogram_ptr + _sampled_coarse(_sampled_ordered(sampled)),
+        1,
+        mask=sample_offs < length,
+        sem="relaxed",
+        scope="cta",
+    )
+    tl.debug_barrier()
+
+    # -- Stage 2: cutoff bin --
+    # vLLM targets kCapacity/2 survivors; 2 * TOPK measured faster here (fewer
+    # atomics in stage 3) at the cost of thinner headroom before the fallback.
+    remaining = tl.maximum((2 * TOPK * K_SAMPLE) // tl.maximum(length, 1), 1)
+    bin = _sampled_select_bin(histogram_ptr, remaining, K_BINS)
+
+    # -- Stage 3: compact survivors into smem --
+    # Index and value are packed into one int64 slot (uint2 in vLLM terms), so a
+    # survivor costs a single predicated store instead of two. Slots past
+    # K_CAPACITY are dropped but still counted, which is what lets the overflow
+    # check below fire instead of silently keeping a truncated set.
+    tl.store(count_ptr, 0)
+    tl.debug_barrier()
+    num_vec_tiles = length // TILE
+    for t in tl.range(0, num_vec_tiles):
+        base = t * TILE + lane * VEC_SIZE
+        offs = base[:, None] + vec[None, :]
+        x = tl.load(row + offs)
+        keep = (_sampled_coarse(_sampled_ordered(x)) >= bin).reshape(TILE)
+        offset = _sampled_reserve(keep, count_ptr, TILE)
+        in_capacity = keep & (offset < K_CAPACITY)
+        packed = (offs.reshape(TILE).to(tl.int64) & 0xFFFFFFFF) | (
+            x.reshape(TILE).to(tl.int32, bitcast=True).to(tl.int64) << 32
+        )
+        tl.store(candidates_ptr + offset, packed, mask=in_capacity)
+    tail = length - num_vec_tiles * TILE
+    if tail > 0:
+        base = num_vec_tiles * TILE + lane * VEC_SIZE
+        offs = base[:, None] + vec[None, :]
+        in_range = offs < length
+        x = tl.load(row + offs, mask=in_range, other=float("-inf"))
+        keep = (in_range & (_sampled_coarse(_sampled_ordered(x)) >= bin)).reshape(TILE)
+        offset = _sampled_reserve(keep, count_ptr, TILE)
+        in_capacity = keep & (offset < K_CAPACITY)
+        packed = (offs.reshape(TILE).to(tl.int64) & 0xFFFFFFFF) | (
+            x.reshape(TILE).to(tl.int32, bitcast=True).to(tl.int64) << 32
+        )
+        tl.store(candidates_ptr + offset, packed, mask=in_capacity)
+    tl.debug_barrier()
+
+    # -- Stage 4: exact select on the candidates, else on the whole row --
+    # The sample only prescreens: any count outside [TOPK, K_CAPACITY] falls
+    # back to the full-row selector, so a bad cutoff costs time, never accuracy.
+    count = tl.load(count_ptr)
+    if (count >= TOPK) & (count <= K_CAPACITY):
+        _sampled_threshold_emit(
+            candidates_ptr,
+            out_indices_ptr,
+            count_ptr,
+            radix_ptr,
+            s_found_topk_values_ptr,
+            TOPK=TOPK,
+            K_CAPACITY=K_CAPACITY,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        tl.debug_barrier()
+        # Copy out in BLOCK_SIZE chunks: TOPK can exceed BLOCK_SIZE (K=2048 vs
+        # 1024 lanes), and a single masked round would leave the upper half of
+        # the row unwritten.
+        for chunk in tl.static_range(0, (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE):
+            out_off = chunk * BLOCK_SIZE + lane
+            idx = tl.load(out_indices_ptr + out_off, mask=out_off < TOPK, other=-1)
+            tl.store(dst + out_off, idx, mask=out_off < TOPK)
+    else:
+        _per_row_cta_topk_selector(
+            row,
+            dst,
+            0,
+            length,
+            stride_xn,
+            max_length,
+            histogram_ptr,
+            s_final_cnt_ptr,
+            s_threshold_bin_idx_ptr,
+            s_final_bin_size_ptr,
+            s_found_topk_values_ptr,
+            s_step_thresholds_ptr,
+            out_indices_ptr,
+            radix_ptr,
+            TOPK=TOPK,
+            BLOCK_SIZE=BLOCK_SIZE,
+            USE_RADIX_FINAL=True,
+            HAS_TLE=HAS_TLE,
+        )
+
+
 @triton.jit
 def _per_row_cta_topk_wrapper(
     x_ptr,
@@ -2223,6 +2559,38 @@ def persistent_topk(
     ), f"persistent_topk supports k=512, k=1024, or k=2048, got k={k}"
     actual_max = max_seq_len if max_seq_len is not None else logits.shape[1]
     max_seq_len = min(logits.shape[1], actual_max)
+
+    device = logits.device
+    device_props = torch.cuda.get_device_properties(device.index)
+    max_smem_per_block = device_props.shared_memory_per_block_optin
+    sampled_min_len = (
+        K_MIN_SAMPLED_LENGTH_K512 if k == 512 else K_MIN_SAMPLED_LENGTH_OTHER
+    )
+    if (
+        num_rows > 32
+        and max_seq_len >= sampled_min_len
+        and max_smem_per_block >= SAMPLED_SMEM_BYTES
+    ):
+        _sampled_topk_kernel[(num_rows,)](
+            logits,
+            output,
+            seq_lens,
+            1,  # next_n
+            stride,  # stride_xm
+            1,  # stride_xn
+            max_seq_len,  # max_length
+            TOPK=k,
+            TOPKP=max(k, 2048),
+            BLOCK_SIZE=1024,
+            VEC_SIZE=(16 if stride % 16 == 0 else (4 if stride % 4 == 0 else 1)),
+            K_SAMPLE=K_SAMPLE,
+            K_CAPACITY=K_CAPACITY,
+            K_MIN_SAMPLED_LENGTH=sampled_min_len,
+            HISTOGRAM_SIZE=4096,
+            HAS_TLE=True,
+            num_warps=32,
+        )
+        return
 
     if num_rows > 32:
         _per_row_cta_topk_wrapper[(num_rows,)](

@@ -9,7 +9,7 @@ Add support for new hardware backends in FlagGems-vllm.
 
 ## Overview
 
-FlagGems-vllm supports 18+ hardware backends. Each backend has:
+FlagGems-vllm supports 17 hardware backends. Each backend has:
 - Device detection logic
 - Optional autotune configuration
 - Architecture-specific tuning (e.g., NVIDIA Ampere vs Hopper)
@@ -39,6 +39,44 @@ backend/
 
 ## Adding a New Backend
 
+### Step 0: Add a Setup Profile
+
+Add an entry to `src/flaggems_vllm/backends.yaml` so `tools/setup.sh` can build the vendor
+environment. The registry records the Python version, vendor torch/accelerator
+packages, Triton/FlagTree builds, vLLM source, environment variables, vendor
+env scripts and backend-specific test dependencies:
+
+```yaml
+backends:
+  myvendor-myhw:
+    vendor: myvendor
+    python: "3.12"
+    deps:
+      - torch==2.10.0+myvendor
+      - myvendor-torch==1.2.3
+    triton: triton==3.6.0+myvendor
+    flagtree: flagtree==0.7.0+myvendor
+    # Omit vllm if the vendor image provides it; use --no-venv there.
+    vllm:
+      - vllm-myvendor==0.24.0
+    env:
+      MYVENDOR_HOME: /opt/myvendor
+      LD_LIBRARY_PATH: $MYVENDOR_HOME/lib:$LD_LIBRARY_PATH
+    env_source:
+      - /opt/myvendor/set_env.sh
+    # Optional backend-specific test packages (NVIDIA uses this for cupy).
+    test_deps:
+      - "some-vendor-test-helper>=1.0"
+```
+
+Add a short alias under `aliases:` if the vendor name alone should select this
+profile. Then verify with:
+
+```bash
+bash tools/setup.sh --list
+bash tools/setup.sh --dry-run myvendor
+```
+
 ### Step 1: Create Backend Directory
 
 ```bash
@@ -46,23 +84,17 @@ mkdir src/flaggems_vllm/runtime/backend/_myvendor
 touch src/flaggems_vllm/runtime/backend/_myvendor/__init__.py
 ```
 
-### Step 2: Add Device Detection
+### Step 2: Register Vendor and Add Device Detection
 
-Edit `src/flaggems_vllm/runtime/device_finder.py`:
+1. Register vendor information in `src/flaggems_vllm/runtime/common.py`:
+   - Add `VendorInfo` (vendor name, device name, dispatch key, features like bf16/fp64 support)
+   - Add entry to `_VENDOR_TORCH_ATTR` or shell check scripts in `tools/`
+
+2. If needed, customize detection in `src/flaggems_vllm/runtime/backend/device_finder.py`:
 
 ```python
-def detect_vendor():
-    # Existing detection logic...
-
-    # Add your backend
-    try:
-        import myvendor_torch  # Vendor's PyTorch extension
-        if myvendor_torch.is_available():
-            return "myvendor"
-    except ImportError:
-        pass
-
-    return "nvidia"  # default
+# DeviceDetector detects vendor from environment variable DNN_VENDOR,
+# vendor check scripts, or PyTorch device modules.
 ```
 
 ### Step 3: Implement Backend Module
@@ -301,6 +333,6 @@ PR checklist:
 
 ## Next Steps
 
-- [Contribution overview](/FlagGems-vllm/contribution/overview/)
-- [Operator development protocol](/FlagGems-vllm/contribution/workflow/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Contribution overview](overview.md)
+- [Operator development protocol](workflow.md)
+- [Testing guide](../testing/unittest.md)

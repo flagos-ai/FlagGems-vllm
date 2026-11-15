@@ -328,3 +328,24 @@ def init_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def gems_log_prefix(fn):
+    """Derive the expected log prefix from the resolved function module.
+
+    The generic implementation logs with the ``"GEMS"`` prefix, while
+    vendor-specific overrides log with ``"GEMS_<VENDOR>"``.
+    """
+    module_parts = fn.__module__.split(".")
+    if f"_{flaggems_vllm.vendor_name}" in module_parts:
+        return f"GEMS_{flaggems_vllm.vendor_name.upper()}"
+    return "GEMS"
+
+
+def gems_log_logger(fn):
+    """Return the logger name used by an operator implementation.
+
+    Operator modules log with ``logging.getLogger(__name__)``, so the logger
+    name is just the resolved function's module.
+    """
+    return fn.__module__

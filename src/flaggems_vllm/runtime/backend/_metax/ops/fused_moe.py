@@ -23,6 +23,7 @@ the Hygon/PPU pattern established in PR #761.
 
 import functools
 import logging
+import math
 import os
 from enum import Enum
 from typing import Any, Optional
@@ -223,6 +224,107 @@ def _metax_pair_fused_moe_kernel(
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+def _is_qwen_tp2_moe_shape(
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: str | None,
+    gemm_stage: str,
+) -> bool:
+    if dtype not in _PLAIN_HALF_CONFIG_DTYPES:
+        return False
+    if E == 256 and topk == 8:
+        if gemm_stage == "gemm1":
+            return (N, K) == (512, 2048)
+        return (N, K) == (2048, 256)
+    return False
+
+
+def _qwen_tp2_config(
+    M: int,
+    gemm_stage: str,
+    enable_gemm_fast_path: bool = False,
+) -> dict[str, Any]:
+    """MC550 autotuned configs for Qwen3.6 MoE at TP2 (per-rank intermediate 256).
+
+    Separate from _is_qwen_moe_shape because the shared body's M-keyed overrides
+    (num_warps=4 at M=4096/8192/16384) are a large regression on these shapes.
+    """
+    is_gemm1 = gemm_stage == "gemm1"
+
+    if M <= 8:
+        block_m, block_n, block_k = (16, 64, 128) if is_gemm1 else (16, 64, 64)
+        group_m, num_warps, num_stages = (1, 4, 4) if is_gemm1 else (1, 4, 3)
+    elif M <= 384:
+        block_m, block_n, block_k = 16, 64, 64
+        group_m, num_warps, num_stages = 1, 4, 3
+    elif M <= 896:
+        # Ported from the vendor's own E=256,N=256 MXC550 table.
+        block_m, block_n, block_k = 32, 64, 64
+        group_m, num_warps, num_stages = (1, 8, 4) if is_gemm1 else (32, 4, 4)
+    elif M <= 1152:
+        block_m, block_n, block_k = (64, 64, 64) if is_gemm1 else (64, 64, 32)
+        group_m, num_warps, num_stages = (1, 8, 3) if is_gemm1 else (1, 4, 2)
+    elif M <= 1664:
+        block_m, block_n, block_k = (64, 128, 64) if is_gemm1 else (64, 128, 32)
+        group_m, num_warps, num_stages = 1, 8, 3
+    elif M <= 4096:
+        block_m, block_n, block_k = 128, 128, 64
+        group_m, num_warps, num_stages = (1, 8, 4) if is_gemm1 else (2, 4, 1)
+    elif M <= 8192:
+        block_m, block_n, block_k = 128, 128, 64
+        group_m, num_warps, num_stages = (1, 8, 4) if is_gemm1 else (8, 4, 1)
+    else:
+        block_m, block_n, block_k = 128, 128, 64
+        group_m, num_warps, num_stages = (1, 8, 4) if is_gemm1 else (4, 8, 1)
+
+    config = {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": group_m,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+    # MC550 FlagTree pipeline selections retained from real-shape tuning.
+    if M > 384 and M <= 896:
+        config["pipeline"] = "basic" if is_gemm1 else "cpasync"
+    if 1152 < M <= 1664 and not is_gemm1:
+        config["pipeline"] = "basic"
+        config["pipeline_load_num"] = 1
+    if 2048 < M <= 4096 and not is_gemm1:
+        config["pipeline"] = "basic"
+        config["pipeline_load_num"] = -1
+    if M > 8192:
+        config["pipeline"] = "basic"
+        config["pipeline_load_num"] = -1 if is_gemm1 else 1
+
+    if 8 < M <= 384 and not is_gemm1:
+        config["SWAP_AB"] = True
+
+    # Unfuse the activation at large M to buy BLOCK_SIZE_K=128: pairing the
+    # gate/up tiles caps BK at 64, which costs more than a standalone activation.
+    # BLOCK_SIZE_M must stay at the plain config's -- that also sets the M floor.
+    if is_gemm1 and enable_gemm_fast_path and M >= 2048:
+        config.update(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 4,
+                "pipeline": "cpasync",
+                "UNFUSE_SILU": True,
+            }
+        )
+        config.pop("pipeline_load_num", None)
+
+    return config
+
+
 def _is_qwen_moe_shape(
     E: int,
     N: int,
@@ -242,6 +344,62 @@ def _is_qwen_moe_shape(
     return False
 
 
+def _is_qwenvl_tp2_moe_shape(
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: str | None,
+    gemm_stage: str,
+    block_shape: list[int] | None = None,
+    use_int8_w8a8: bool = False,
+) -> bool:
+    return (
+        dtype in _PLAIN_HALF_CONFIG_DTYPES
+        and E == 128
+        and topk == 8
+        and (gemm_stage, N, K) in (("gemm1", 768, 2048), ("gemm2", 2048, 384))
+        and block_shape is None
+        and not use_int8_w8a8
+        and _get_device_name() == "MetaX_C550"
+        and not bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0")))
+    )
+
+
+def _qwenvl_tp2_config(M: int, gemm_stage: str) -> dict[str, Any]:
+    """Retained C550 TP2 configs for the matching Qwen-VL E128 geometry."""
+    # Both stages share one token alignment and must use the same block M.
+    if M <= 7:
+        block_m, block_n, block_k = 16, 128, 64
+        group_m, num_warps, num_stages = 1, 4, 1
+    elif M <= 64:
+        block_m, block_n, block_k = 16, 64, 128
+        group_m, num_warps = 1, 4
+        num_stages = 3 if gemm_stage == "gemm1" else 1
+    elif M <= 544:
+        block_m, block_n, block_k = 16, 128, 32
+        group_m, num_warps, num_stages = 4, 2, 3
+    else:
+        block_m, block_n, block_k = 128, 128, 64
+        group_m, num_warps, num_stages = 1, 4, 1
+        if gemm_stage == "gemm1":
+            if 4096 <= M <= 8192:
+                num_warps = 8
+            elif M >= 8193:
+                group_m = 8
+        elif M >= 4209:
+            group_m = 8
+    # Preserve nearest-M selection, including ties at 544 and 4208.
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": group_m,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -252,7 +410,23 @@ def get_default_config(
     block_shape: list[int] | None = None,
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
+    use_int8_w8a8: bool = False,
 ) -> dict[str, Any]:
+    if _is_qwenvl_tp2_moe_shape(
+        E,
+        N,
+        K,
+        topk,
+        dtype,
+        gemm_stage,
+        block_shape=block_shape,
+        use_int8_w8a8=use_int8_w8a8,
+    ):
+        return _qwenvl_tp2_config(M, gemm_stage)
+
+    if _is_qwen_tp2_moe_shape(E, N, K, topk, dtype, gemm_stage):
+        return _qwen_tp2_config(M, gemm_stage, enable_gemm_fast_path)
+
     if not _is_qwen_moe_shape(E, N, K, topk, dtype, gemm_stage):
         return _generic_get_default_config(
             M,
@@ -464,6 +638,8 @@ def _is_qwen_plain_half_shape(hidden_states, w1, w2, topk_ids) -> bool:
         ((512, 2048, 4096), (512, 4096, 1024), 10),
         ((256, 1024, 2048), (256, 2048, 512), 8),
         ((256, 256, 2048), (256, 2048, 128), 8),
+        # Qwen3.6 MoE at TP2 (local intermediate 256).
+        ((256, 512, 2048), (256, 2048, 256), 8),
     )
 
 
@@ -581,6 +757,12 @@ def dequant_mxfp6(
 # Activation quantization helpers
 
 
+@functools.lru_cache(maxsize=8)
+def _get_shared_memory_limit(device_index: int) -> int:
+    """Cache the actual per-block shared-memory limit for each MetaX device."""
+    return torch_device_fn.get_device_properties(device_index).shared_memory_per_block
+
+
 @functools.lru_cache(maxsize=1)
 def _get_device_name() -> str:
     """Return the normalised device name (spaces replaced by underscores).
@@ -664,6 +846,7 @@ def try_get_optimal_moe_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
     return_is_embedded: bool = False,
+    use_int8_w8a8: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], bool]:
     if gemm_stage not in ("gemm1", "gemm2"):
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
@@ -691,6 +874,7 @@ def try_get_optimal_moe_config(
             block_shape,
             gemm_stage=gemm_stage,
             enable_gemm_fast_path=enable_gemm_fast_path,
+            use_int8_w8a8=use_int8_w8a8,
         )
         is_embedded = False
     if return_is_embedded:
@@ -887,8 +1071,13 @@ def _generic_get_default_config(
             group_m = 2
             num_stages = 4
 
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+        smem_limit = _get_shared_memory_limit(torch_device_fn.current_device())
+        # Select the actual layout before estimating its shared-memory footprint.
+        # The paired layout needs over 64 KiB even with one stage.
+        pair_gate_up_dot = use_gemm1_fast_path and smem_limit > 64 * 1024
+        weight_tiles = 2 if pair_gate_up_dot else 1
+        smem_per_stage = (block_m * block_k + weight_tiles * block_k * block_n) * 2
+        while num_stages > 1 and smem_per_stage * num_stages > smem_limit:
             num_stages -= 1
 
         config = {
@@ -900,7 +1089,7 @@ def _generic_get_default_config(
             "num_stages": num_stages,
         }
         if use_gemm1_fast_path:
-            config["PAIR_GATE_UP_DOT"] = True
+            config["PAIR_GATE_UP_DOT"] = pair_gate_up_dot
     else:
         tokens_per_expert = M // max(E, 1)
 
@@ -939,8 +1128,10 @@ def _generic_get_default_config(
         num_warps = 4 if M <= 128 else 8
         num_stages = 3
 
-        smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-        while num_stages > 2 and smem_per_stage * num_stages > 200_000:
+        element_bytes = 4 if dtype == "float32" else 2
+        smem_per_stage = (block_m * block_k + block_k * block_n) * element_bytes
+        smem_limit = _get_shared_memory_limit(torch_device_fn.current_device())
+        while num_stages > 1 and smem_per_stage * num_stages > smem_limit:
             num_stages -= 1
 
         config = {
@@ -1240,6 +1431,31 @@ def _ensure_block_size_k_divisible(
         return group_size
 
     return size_k
+
+
+def _resize_workspace(x: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    """View the leading elements of a flat buffer as ``shape``, no copy."""
+    size = math.prod(shape)
+    if size > x.numel():
+        raise ValueError(
+            f"workspace with {x.numel()} elements is too small for {shape}"
+        )
+    return x.view(-1)[:size].view(*shape)
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two contiguous tensors occupy any of the same bytes.
+
+    Storage pointers alone are not enough: disjoint views of one allocation
+    report the same storage.
+    """
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+    a_begin = a.data_ptr()
+    b_begin = b.data_ptr()
+    a_end = a_begin + a.numel() * a.element_size()
+    b_end = b_begin + b.numel() * b.element_size()
+    return a_begin < b_end and b_begin < a_end
 
 
 @pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
@@ -2297,6 +2513,9 @@ def fused_experts_impl(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    workspace13: Optional[torch.Tensor] = None,
+    workspace2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     logger.debug("GEMS FUSED MOE")
     assert (
@@ -2342,7 +2561,18 @@ def fused_experts_impl(
         global_num_experts = E
     top_k_num = topk_ids.size(1)
 
-    CHUNK_SIZE: int = 32 * 1024
+    # vLLM's modular MoE aliases the output onto workspace13 (cache2 here) and
+    # documents "there is only one chunk", so don't chunk: a later chunk's
+    # activation would overwrite finished output rows with no error.
+    supplied_workspaces = (
+        out is not None or workspace13 is not None or workspace2 is not None
+    )
+    if supplied_workspaces and not (
+        out is not None and workspace13 is not None and workspace2 is not None
+    ):
+        raise ValueError("out, workspace13 and workspace2 must be provided together")
+
+    CHUNK_SIZE: int = max(num_tokens, 1) if supplied_workspaces else 32 * 1024
     M = min(num_tokens, CHUNK_SIZE)
 
     config_dtype = _get_config_dtype_str(
@@ -2370,25 +2600,39 @@ def fused_experts_impl(
         block_shape=block_shape,
         E=E,
         return_is_embedded=True,
+        # The config dtype key alone does not distinguish INT8 W8A8 from half.
+        use_int8_w8a8=use_int8_w8a8,
     )
 
     base_config, is_embedded_config = get_moe_config(M)
 
-    # cache1 and cache3 share memory (non-overlapping lifetime)
-    cache13 = torch.empty(
-        M * top_k_num * max(N, K),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
-    intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
-
-    # cache2 needs separate memory (concurrent with cache1)
     activation_out_dim = MoEActivation.adjust_N_for_activation(N, activation_enum)
-    intermediate_cache2 = torch.empty(
-        (M * top_k_num, activation_out_dim),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+
+    if supplied_workspaces:
+        for name, ws in (("workspace13", workspace13), ("workspace2", workspace2)):
+            if ws.dtype != hidden_states.dtype or ws.device != hidden_states.device:
+                raise ValueError(f"{name} must match hidden_states dtype and device")
+        # Same mapping vLLM's own TritonExperts.apply uses.
+        cache13 = workspace2
+        cache2_buffer = workspace13
+    else:
+        # cache1 and cache3 share memory (non-overlapping lifetime)
+        cache13 = torch.empty(
+            M * top_k_num * max(N, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        # cache2 needs separate memory (concurrent with cache1)
+        cache2_buffer = torch.empty(
+            M * top_k_num * activation_out_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+    intermediate_cache1 = _resize_workspace(cache13, (M, top_k_num, N))
+    intermediate_cache3 = _resize_workspace(cache13, (M, top_k_num, K))
+    intermediate_cache2 = _resize_workspace(
+        cache2_buffer, (M * top_k_num, activation_out_dim)
     )
 
     if hidden_states.dtype == torch.bfloat16:
@@ -2400,7 +2644,23 @@ def fused_experts_impl(
     else:
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+    if out is not None:
+        if out.shape != hidden_states.shape:
+            raise ValueError(
+                f"out shape {tuple(out.shape)} != hidden_states shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        if out.dtype != hidden_states.dtype or out.device != hidden_states.device:
+            raise ValueError("out must match hidden_states dtype and device")
+        out_hidden_states = out
+    else:
+        out_hidden_states = (
+            hidden_states if inplace else torch.empty_like(hidden_states)
+        )
+
+    # direct_sum accumulates GEMM2 into the output, unsafe if the caller aliased
+    # it onto bytes cache2 is still being read from.
+    out_overlaps_cache2 = _overlaps(out_hidden_states, intermediate_cache2)
 
     if ocp_mx_scheme is not None:
         # Dequantize OCP MX weights (TODO: skip on platforms with native MX)
@@ -2520,6 +2780,16 @@ def fused_experts_impl(
                 gemm_stage="gemm1",
                 enable_gemm_fast_path=True,
             )
+            # A tuned config may ask to give the fusion back to widen BK.
+            if gemm1_config.pop("UNFUSE_SILU", False):
+                do_fuse_silu = False
+            # Mismatched tile heights silently misread the token sort.
+            if gemm1_config["BLOCK_SIZE_M"] != base_config["BLOCK_SIZE_M"]:
+                raise ValueError(
+                    "gemm1 BLOCK_SIZE_M "
+                    f"{gemm1_config['BLOCK_SIZE_M']} must match the base config's "
+                    f"{base_config['BLOCK_SIZE_M']}: both read the same token sort"
+                )
 
         # 2. Dynamically determine the differing parameters based on the fusion flag
         if do_fuse_silu:
@@ -2597,6 +2867,8 @@ def fused_experts_impl(
             and tokens_in_chunk >= MOE_DIRECT_SUM_MIN_TOKENS
             and expert_map is None
             and not apply_router_weight_on_input
+            # GEMM2 would accumulate into the output while still reading cache2.
+            and not out_overlaps_cache2
         )
         if use_direct_sum:
             gemm2_output = out_hidden_states[begin_chunk_idx:end_chunk_idx].view(

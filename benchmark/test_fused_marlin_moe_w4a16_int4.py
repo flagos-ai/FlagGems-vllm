@@ -24,9 +24,6 @@ try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
         marlin_quantize,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
-    )
     from vllm.scalar_type import scalar_types
 
     VLLM_QUANT_TYPE = scalar_types.uint4b8
@@ -269,9 +266,15 @@ def _wna16_quantize_per_expert(w_fp):
     scales = torch.empty(
         E, out_dim, in_dim // GROUP_SIZE, device=w_fp.device, dtype=w_fp.dtype
     )
+    # Plain INT4 quantization does not require the optional Marlin module.
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        quantize_weights,
+    )
+    from vllm.scalar_type import scalar_types
+
     for e in range(E):
         _, q_e, sc_e, _ = quantize_weights(
-            w_fp[e].T, VLLM_QUANT_TYPE, GROUP_SIZE, False, False
+            w_fp[e].T, scalar_types.uint4b8, GROUP_SIZE, False, False
         )
         q_e = q_e.T.contiguous().to(torch.uint8)
         sc_e = sc_e.T
@@ -569,7 +572,7 @@ def _gems_call(
     )
 
 
-@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
@@ -583,9 +586,10 @@ def test_fused_marlin_moe_w4a16_int4():
     Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
     """
     bench = FusedMarlinMoEW4A16INT4Benchmark(
-        op_name="fused_marlin_moe_w4a16_int4",
+        op_name="fused_marlin_moe_w4a16",
         torch_op=_vllm_baseline,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "int4"
     bench.set_gems(_gems_call)
     bench.run()

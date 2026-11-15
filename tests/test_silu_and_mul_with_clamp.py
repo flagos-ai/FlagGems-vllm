@@ -101,8 +101,7 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit, vllm_silu_and_mul_with_cla
         vllm_out = utils.to_reference(vllm_op.forward_cuda(packed.detach()))
     # Use vLLM's differentiable reference for backward, not its fused kernel.
     ref_out = vllm_op.forward_native(torch.cat((ref_inp1, ref_inp2), dim=-1))
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.silu_and_mul_with_clamp(inp1, inp2, limit)
+    res_out = flaggems_vllm.silu_and_mul_with_clamp(inp1, inp2, limit)
 
     out_grad = torch.randn_like(res_out)
     ref_grad = utils.to_reference(out_grad, True)
@@ -138,8 +137,7 @@ def test_silu_and_mul_with_clamp_out(
         vllm_out = utils.to_reference(vllm_op.forward_cuda(packed))
 
     out = torch.empty_like(inp1)
-    with flaggems_vllm.use_gems():
-        ret = flaggems_vllm.silu_and_mul_with_clamp_out(inp1, inp2, out, limit)
+    ret = flaggems_vllm.silu_and_mul_with_clamp_out(inp1, inp2, out, limit)
 
     assert ret is out
     utils.gems_assert_close(out, vllm_out, dtype)

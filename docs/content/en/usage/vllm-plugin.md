@@ -20,8 +20,8 @@ vllm-plugin-fl (plugin layer)
     └─→ flaggems_vllm.<op>()      (vLLM-specific fused kernels)
 ```
 
-**FlagGems** provides general operator replacements registered into PyTorch dispatch.
-**FlagGems-vllm** provides vLLM-specific fused operators called explicitly by the plugin.
+**FlagGems** provides general operator replacements registered into PyTorch dispatch, and acts as a core prerequisite for FlagGems-vllm by providing underlying operator implementations.
+**FlagGems-vllm** depends on FlagGems and provides vLLM-specific fused operators called explicitly by the plugin.
 **vllm-plugin-fl** orchestrates both layers.
 
 ## Installation
@@ -29,9 +29,8 @@ vllm-plugin-fl (plugin layer)
 Install all three components in order:
 
 ```bash
-# 1. FlagGems (general operators)
-git clone https://github.com/flagos-ai/FlagGems.git
-cd FlagGems && pip install --no-build-isolation -e . && cd ..
+# 1. FlagGems (general operators, version 5.4.0)
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
 
 # 2. FlagGems-vllm (vLLM operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -121,7 +120,7 @@ vllm-plugin-fl leverages both FlagGems and FlagGems-vllm for performance:
 - **General ops** (matmul, layernorm, softmax): Handled by FlagGems
 - **vLLM-specific fusions**: Handled by FlagGems-vllm (grouped_topk, moe_align_block_size, flash_attention_forward, etc.)
 
-Expected speedups vary by model and hardware. See [performance benchmarks](/FlagGems-vllm/performance/) for details.
+Expected speedups vary by model and hardware. See [performance benchmarks](../performance/_index.md) for details.
 
 ## Troubleshooting
 
@@ -157,6 +156,6 @@ If performance is slower than expected:
 
 ## Next Steps
 
-- [Selective operator enablement](../selective/)
-- [Non-NVIDIA backend configuration](../non-nvidia/)
-- [Performance benchmarking](/FlagGems-vllm/performance/benchmark/)
+- [Basic usage patterns](basic.md)
+- [Non-NVIDIA backend configuration](non-nvidia.md)
+- [Performance benchmarking](../performance/benchmark.md)

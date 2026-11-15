@@ -14,6 +14,8 @@
 
 import functools
 import logging
+import math
+import numbers
 import os
 from enum import Enum
 from typing import Any, Optional
@@ -28,6 +30,7 @@ from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import pointwise_dynamic
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,92 @@ _HALF_GEMM_TILE_K = 64
 _HALF_GEMM2_TILE_N = 256
 _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 
+# Experimental, opt-in W8A8 path.  "quant_oai" fuses the OAI activation into
+# the second per-token quantizer, saving a round trip through the workspace.
+# The per-token quantizers themselves are always the Triton kernels and need
+# no opt-in; only this fusion is gated.
+_W8A8_QUANT_FUSION_MODE = os.environ.get("FLAG_GEMS_W8A8_QUANT_FUSION", "off").lower()
+
+
+_MOE_CONFIG_KEYS_ORDER = (
+    "BLOCK_SIZE_M",
+    "BLOCK_SIZE_N",
+    "BLOCK_SIZE_K",
+    "GROUP_SIZE_M",
+    "num_warps",
+    "num_stages",
+)
+# Optional seventh element of a tuned-config list.  These reach the kernel as
+# constexprs; anything else in that mapping is a typo rather than a new knob.
+_MOE_CONFIG_EXTRA_FLAGS = frozenset(("SWAP_AB", "INT32_DOWN"))
+_MOE_GEMM_STAGES = ("gemm1", "gemm2")
+
+
+def _parse_moe_config_list(value: list, where: str) -> dict[str, Any]:
+    """Expand one tuned-config list into a kernel config dict."""
+    if not len(_MOE_CONFIG_KEYS_ORDER) <= len(value) <= len(_MOE_CONFIG_KEYS_ORDER) + 1:
+        raise ValueError(
+            f"MoE config {where} needs {len(_MOE_CONFIG_KEYS_ORDER)} tile values "
+            f"and an optional flag mapping, got {len(value)} elements"
+        )
+    config = dict(zip(_MOE_CONFIG_KEYS_ORDER, value))
+    if len(value) == len(_MOE_CONFIG_KEYS_ORDER) + 1:
+        flags = value[-1]
+        if not isinstance(flags, dict):
+            raise ValueError(
+                f"MoE config {where} trailing element must be a flag mapping, "
+                f"got {type(flags).__name__}"
+            )
+        unknown = set(flags) - _MOE_CONFIG_EXTRA_FLAGS
+        if unknown:
+            raise ValueError(
+                f"MoE config {where} has unknown flags {sorted(unknown)}; "
+                f"supported: {sorted(_MOE_CONFIG_EXTRA_FLAGS)}"
+            )
+        config.update({name: bool(flag) for name, flag in flags.items()})
+    return config
+
+
+def _parse_moe_config_entry(value: Any, where: str) -> dict[str, dict[str, Any]]:
+    """Normalise one tuned entry into a per-GEMM-stage config mapping.
+
+    An entry is either a single config shared by both GEMMs or a mapping that
+    names each stage.  Returning the same shape for both keeps the lookup in
+    try_get_optimal_moe_config free of per-entry special cases.
+    """
+    if isinstance(value, list):
+        config = _parse_moe_config_list(value, where)
+        # One dict per stage rather than a shared object: callers pop keys
+        # out of the config they receive.
+        return {stage: dict(config) for stage in _MOE_GEMM_STAGES}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"MoE config {where} must be a list or mapping, got {type(value).__name__}"
+        )
+    if not set(value) & set(_MOE_GEMM_STAGES):
+        # A plain mapping of the kernel config keys, written out in full.
+        return {stage: dict(value) for stage in _MOE_GEMM_STAGES}
+    missing = set(_MOE_GEMM_STAGES) - set(value)
+    if missing:
+        raise ValueError(
+            f"MoE config {where} names some GEMM stages but is missing "
+            f"{sorted(missing)}"
+        )
+    parsed = {
+        stage: _parse_moe_config_list(value[stage], f"{where}[{stage}]")
+        for stage in _MOE_GEMM_STAGES
+    }
+    # Expert alignment runs once per layer with the GEMM1 block size and
+    # GEMM2 reuses the resulting sorted_token_ids, so the stages cannot
+    # disagree here even though every other tile value is independent.
+    block_m = {stage: config["BLOCK_SIZE_M"] for stage, config in parsed.items()}
+    if len(set(block_m.values())) != 1:
+        raise ValueError(
+            f"MoE config {where} must share BLOCK_SIZE_M across GEMM stages, "
+            f"got {block_m}"
+        )
+    return parsed
+
 
 @functools.lru_cache(maxsize=1)
 def get_embedded_moe_configs():
@@ -56,33 +145,22 @@ def get_embedded_moe_configs():
         # JSON keys are strings, values are dicts where keys are M and values are configs
         data = yaml.safe_load(f)
 
-        fallback = data.get("_FALLBACK", {})
+    fallback = data.get("_FALLBACK", {})
 
-        # We need to convert the innermost keys (which are stringified integers for M) back to integers.
-        # Ensure we map the lists back to config dicts.
-        keys_order = [
-            "BLOCK_SIZE_M",
-            "BLOCK_SIZE_N",
-            "BLOCK_SIZE_K",
-            "GROUP_SIZE_M",
-            "num_warps",
-            "num_stages",
-        ]
-        parsed_data = {}
-        for dev, configs in data.items():
-            if dev == "_FALLBACK":
-                continue
-            parsed_data[dev] = {}
-            for k, m_dict in configs.items():
-                parsed_dict = {}
-                for m, v in m_dict.items():
-                    if isinstance(v, list):
-                        parsed_dict[int(m)] = dict(zip(keys_order, v))
-                    else:
-                        parsed_dict[int(m)] = v
-                parsed_data[dev][k] = parsed_dict
+    # The innermost keys are stringified integers for M; convert them back and
+    # expand each entry into one kernel config per GEMM stage.
+    parsed_data = {}
+    for dev, configs in data.items():
+        if dev == "_FALLBACK":
+            continue
+        parsed_data[dev] = {}
+        for k, m_dict in configs.items():
+            parsed_dict = {}
+            for m, v in m_dict.items():
+                parsed_dict[int(m)] = _parse_moe_config_entry(v, f"{dev}[{k}][{m}]")
+            parsed_data[dev][k] = parsed_dict
 
-        return parsed_data, fallback
+    return parsed_data, fallback
 
 
 def dequant_mxfp4(
@@ -131,16 +209,19 @@ def dequant_mxfp6(
 # Activation quantization helpers
 
 
-@functools.lru_cache(maxsize=1)
-def _get_device_name() -> str:
+# Keyed by device index: a node can mix products, so a single cached answer
+# would leak one device's tuning table onto another.  Device identity itself
+# is immutable, which is what makes caching it safe at all.
+@functools.lru_cache(maxsize=None)
+def _get_device_name(device_index: int | None = None) -> str:
     """Return the normalised device name (spaces replaced by underscores).
 
     Matches the naming convention used by vLLM for its per-device config files.
     H800 falls back to H100_80GB_HBM3 (same SM 9.0 architecture).
     """
     try:
-        name = torch_device_fn.get_device_name().replace(" ", "_")
-    except AttributeError:
+        name = torch_device_fn.get_device_name(device_index).replace(" ", "_")
+    except (AttributeError, RuntimeError):
         name = device.name
     # Normalise the H200 product family to a single key, following vLLM.
     if "H200" in name.split("_"):
@@ -157,10 +238,10 @@ def _get_device_name() -> str:
     return name
 
 
-@functools.lru_cache(maxsize=1)
-def _is_h20() -> bool:
-    """Whether the current device is an NVIDIA H20 (gates the FP8 MoE swap_ab default)."""
-    return "H20" in _get_device_name().split("_")
+@functools.lru_cache(maxsize=None)
+def _is_h20(device_index: int | None = None) -> bool:
+    """Whether the device is an NVIDIA H20 (gates the FP8 MoE swap_ab default)."""
+    return "H20" in _get_device_name(device_index).split("_")
 
 
 def get_moe_configs(
@@ -169,14 +250,15 @@ def get_moe_configs(
     dtype: str | None,
     block_n: int | None = None,
     block_k: int | None = None,
+    device_index: int | None = None,
 ) -> dict[int, Any] | None:
     """
     Return optimized configurations for the fused MoE kernel.
 
     Looks up pre-tuned configs from the embedded table (ported from vLLM)
-    for the current GPU device. Returns None if no matching config is found.
+    for the given GPU device. Returns None if no matching config is found.
     """
-    device_name = _get_device_name()
+    device_name = _get_device_name(device_index)
     embedded_configs, _ = get_embedded_moe_configs()
     device_table = embedded_configs.get(device_name)
     if device_table is None:
@@ -214,17 +296,21 @@ def try_get_optimal_moe_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
     return_is_embedded: bool = False,
+    device_index: int | None = None,
 ) -> dict[str, Any] | tuple[dict[str, Any], bool]:
-    if gemm_stage not in ("gemm1", "gemm2"):
+    if gemm_stage not in _MOE_GEMM_STAGES:
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
     _, _, config_n = w2_shape
     if dtype == "int4_w4a16":
         config_n = config_n * 2
     block_n = block_shape[0] if block_shape else 0
     block_k = block_shape[1] if block_shape else 0
-    configs = get_moe_configs(E, config_n, dtype, block_n, block_k)
+    configs = get_moe_configs(
+        E, config_n, dtype, block_n, block_k, device_index=device_index
+    )
     if configs:
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))].copy()
+        entry = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        config = entry[gemm_stage].copy()
         is_embedded = True
     else:
         if gemm_stage == "gemm1":
@@ -241,6 +327,7 @@ def try_get_optimal_moe_config(
             block_shape,
             gemm_stage=gemm_stage,
             enable_gemm_fast_path=enable_gemm_fast_path,
+            device_index=device_index,
         )
         is_embedded = False
     if return_is_embedded:
@@ -332,6 +419,20 @@ def get_moe_wna16_block_config(
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
 
+def get_moe_pipeline_config(size_k: int, block_size_k: int) -> dict[str, Any]:
+    """Per-kernel FlagTree pipeline options of the fused MoE K loop.
+
+    Keeping the wgmma accumulator in flight across the K-loop iterations costs
+    a prologue and an epilogue wait. With one or two iterations there is nothing
+    to overlap, and the kernel loses ~16% on the small tiles (K=128 with
+    BLOCK_SIZE_K=64 measured 0.83x on H20), so the carry is switched off there.
+    """
+    iterations = size_k // max(block_size_k, 1)
+    if iterations <= 2:
+        return pipeline_options(pipeline_wgmma_carry=False)
+    return {}
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -342,6 +443,7 @@ def get_default_config(
     block_shape: list[int] | None = None,
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
+    device_index: int | None = None,
 ) -> dict[str, Any]:
     """Default Triton config for fused MoE kernel.
 
@@ -350,7 +452,7 @@ def get_default_config(
     expert sees very few tokens, so small BLOCK_SIZE_M (16) is critical.
     """
     is_fp8_blockwise = dtype == "fp8_w8a8" and block_shape is not None
-    if gemm_stage not in ("gemm1", "gemm2"):
+    if gemm_stage not in _MOE_GEMM_STAGES:
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
 
     if is_fp8_blockwise:
@@ -375,7 +477,7 @@ def get_default_config(
             # H20: swap_ab puts the larger N dim on the wgmma M-axis, a measured
             # win on H20 for small token tiles (block_m<=32) but a regression for
             # large tiles (e.g. 16k/32k-token prefill), so gate on both.
-            "SWAP_AB": _is_h20() and block_m <= 32,
+            "SWAP_AB": _is_h20(device_index) and block_m <= 32,
         }
     elif dtype in _PLAIN_HALF_CONFIG_DTYPES:
         # Routed rows per expert drives block_m.  Each token contributes topk
@@ -508,6 +610,7 @@ def _get_config_dtype_str(
     dtype: Optional[torch.dtype] = None,
     use_fp8_w8a8: bool = False,
     use_fp8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     ocp_mx_scheme: str | None = None,
@@ -517,6 +620,10 @@ def _get_config_dtype_str(
         return "fp8_w8a8"
     elif use_fp8_w8a16:
         return "fp8_w8a16"
+    elif use_int8_w8a8:
+        # Floating input activations are quantized inside fused_experts_impl.
+        # Do not select plain-half GEMM paths, which do not apply INT8 scales.
+        return "int8_w8a8"
     elif use_int8_w8a16:
         return "int8_w8a16"
     elif use_int4_w4a16:
@@ -543,6 +650,7 @@ class MoEActivation(Enum):
     GELU = "gelu"
     RELU2 = "relu2"
     SWIGLUOAI = "swigluoai"
+    SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
     SWIGLUSTEP = "swiglustep"
 
     # Non-gated: input [..., d] -> output [..., d]
@@ -577,10 +685,102 @@ class MoEActivation(Enum):
         return N if not activation.is_gated else N // 2
 
 
+def _validate_swigluoai_uninterleave_params(
+    gemm1_alpha: float | None,
+    gemm1_beta: float | None,
+    gemm1_clamp_limit: float | None,
+) -> tuple[float, float, float]:
+    """Validate the scalar gate parameters before launching an MoE kernel."""
+    params = {
+        "gemm1_alpha": gemm1_alpha,
+        "gemm1_beta": gemm1_beta,
+        "gemm1_clamp_limit": gemm1_clamp_limit,
+    }
+    validated = {}
+    for name, value in params.items():
+        if not isinstance(value, numbers.Real) or isinstance(value, bool):
+            raise ValueError(
+                f"swigluoai_uninterleave requires a finite scalar {name}, got {value!r}"
+            )
+        try:
+            converted = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"swigluoai_uninterleave requires a finite scalar {name}, got {value!r}"
+            ) from exc
+        # These scalars reach Triton as FP32.  A Python float is FP64, so a
+        # value such as 1e39 passes isfinite here yet overflows to infinity at
+        # that boundary, which would silently disable the clamp.
+        if (
+            not math.isfinite(converted)
+            or abs(converted) > torch.finfo(torch.float32).max
+        ):
+            raise ValueError(
+                f"swigluoai_uninterleave requires a finite FP32 scalar {name}, "
+                f"got {value!r}"
+            )
+        validated[name] = converted
+    if validated["gemm1_clamp_limit"] < 0:
+        raise ValueError("swigluoai_uninterleave requires gemm1_clamp_limit >= 0")
+    return (
+        validated["gemm1_alpha"],
+        validated["gemm1_beta"],
+        validated["gemm1_clamp_limit"],
+    )
+
+
+@triton.jit
+def _swigluoai_uninterleave_kernel(
+    input_ptr,
+    output_ptr,
+    n_inter,
+    stride_im,
+    stride_in,
+    stride_om,
+    stride_on,
+    alpha,
+    beta,
+    clamp_limit,
+    BLOCK_I: tl.constexpr,
+):
+    """Split gate/up layout; compute in FP32 and round on output store."""
+    # Promote before multiplying by a stride: a valid tensor stride can push
+    # the offset past int32 even when the logical activation is small.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1).to(tl.int64) * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask = cols < n_inter
+    gate = tl.load(
+        input_ptr + row * stride_im + cols * stride_in, mask=mask, other=0.0
+    ).to(tl.float32)
+    up = tl.load(
+        input_ptr + row * stride_im + (n_inter + cols) * stride_in,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    # Triton's min/max drop NaN by default, which would silently turn a NaN
+    # activation into the clamp bound.  Keep NaNs observable instead.
+    gate = tl.minimum(gate, clamp_limit, propagate_nan=tl.PropagateNan.ALL)
+    up = tl.minimum(
+        tl.maximum(up, -clamp_limit, propagate_nan=tl.PropagateNan.ALL),
+        clamp_limit,
+        propagate_nan=tl.PropagateNan.ALL,
+    )
+    activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
+    tl.store(
+        output_ptr + row * stride_om + cols * stride_on,
+        activated.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
     input: torch.Tensor,
+    *,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     """Apply MoE activation (pure PyTorch / FlagGems Triton)."""
     assert input.dim() == 2, "Input must be 2D"
@@ -600,6 +800,30 @@ def apply_moe_activation(
         N = output.size(-1)
         x, y = input[:, :N], input[:, N:]
         _silu_and_mul_kernel(x, y, out0=output)
+    elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+        alpha, beta, limit = _validate_swigluoai_uninterleave_params(
+            gemm1_alpha, gemm1_beta, gemm1_clamp_limit
+        )
+        assert input.dtype == output.dtype and input.device == output.device
+        assert input.size(0) == output.size(0)
+        if output.numel() == 0:
+            return output
+        block_i = 256
+        _swigluoai_uninterleave_kernel[
+            (output.size(0), triton.cdiv(output.size(1), block_i))
+        ](
+            input,
+            output,
+            output.size(1),
+            input.stride(0),
+            input.stride(1),
+            output.stride(0),
+            output.stride(1),
+            alpha,
+            beta,
+            limit,
+            BLOCK_I=block_i,
+        )
     elif activation == MoEActivation.GELU:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
@@ -731,19 +955,242 @@ def _int8_quantize(
         return A_q, scale
 
     elif per_act_token:
-        A_flat = A.reshape(-1, A.size(-1))
-        amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
-        scale = amax / int8_max
-        A_q = (A_flat.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
-        A_q = A_q.reshape(A.shape)
-        scale = scale.reshape(A.shape[:-1] + (1,))
-        return A_q, scale
+        # One Triton kernel, no eager reduce/divide/round chain.  That chain
+        # dispatched through abs/amax/clamp/div/round, so its arithmetic
+        # depended on whether FlagGems had overridden those operators.
+        A_q, scale = _int8_quantize_per_token_triton(A.reshape(-1, A.size(-1)))
+        return A_q.reshape(A.shape), scale.reshape(A.shape[:-1] + (1,))
 
     else:
         assert A_scale is not None, "int8 per-tensor requires A_scale"
         scale = A_scale.float().view(1, 1) if A_scale.numel() == 1 else A_scale.float()
         A_q = (A.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
         return A_q, A_scale
+
+
+# Widest row the single-pass quantizer keeps resident in registers; wider
+# rows take the two-pass kernel instead.
+_INT8_QUANT_MAX_SINGLE_PASS_K = 8192
+
+
+@triton.jit
+def _round_to_int8_even(x):
+    """Portable round-to-nearest-even for the bounded INT8 quotient."""
+    # Clamp before rounding so the endpoints and Inf are handled explicitly;
+    # for finite inputs this agrees with rounding first, half-way cases
+    # included.  A NaN quotient only arises from a NaN input row, where the
+    # scale is NaN too, so the quantized value is reported as zero.
+    x = tl.where(x == x, x, 0.0)
+    x = tl.minimum(tl.maximum(x, -128.0), 127.0)
+    floor_x = tl.floor(x)
+    fraction = x - floor_x
+    odd = (floor_x.to(tl.int32) & 1) != 0
+    rounded = floor_x + ((fraction > 0.5) | ((fraction == 0.5) & odd)).to(tl.float32)
+    return rounded.to(tl.int8)
+
+
+@triton.jit
+def _per_token_int8_values(x, valid, storage_dtype: tl.constexpr):
+    """Per-row dynamic INT8 scale and quantized values, computed in FP32."""
+    x = x.to(tl.float32)
+    amax = tl.max(tl.where(valid, tl.abs(x), 0.0), axis=0)
+    # tl.max ignores NaN, so recover propagation explicitly: this term is zero
+    # for finite rows and NaN when any valid lane holds NaN.
+    nan_term = tl.sum(tl.where(valid & (x != x), x, 0.0), axis=0)
+    # Form the literal in FP32 first. Triton's low-precision tl.full can
+    # underflow this BF16 clamp constant on the target compiler.
+    eps = tl.full((), 1e-10, tl.float32).to(storage_dtype).to(tl.float32)
+    amax = tl.maximum(amax, eps)
+    amax += nan_term
+    scale = amax * tl.full((), 1.0 / 127.0, tl.float32)
+    # Round-to-nearest division rather than Triton's default approximate
+    # reciprocal, which can land on the wrong side of an INT8 half-way point.
+    return _round_to_int8_even(tl.div_rn(x, scale)), scale
+
+
+@triton.jit
+def _int8_quantize_per_token_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    K: tl.constexpr,
+    stride_im: tl.constexpr,
+    stride_ik: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_K).to(tl.int64)
+    valid = cols < K
+    x = tl.load(input_ptr + row * stride_im + cols * stride_ik, valid, other=0)
+    q, scale = _per_token_int8_values(x, valid, input_ptr.dtype.element_ty)
+    tl.store(output_ptr + row * K + cols, q, valid)
+    tl.store(scale_ptr + row, scale)
+
+
+@triton.jit
+def _int8_quantize_per_token_wide_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    K,
+    stride_im,
+    stride_ik,
+    BLOCK_K: tl.constexpr,
+):
+    """Two-pass variant for rows too wide to hold in one block.
+
+    Reduces over K, then re-reads the row to divide.  Same arithmetic as the
+    single-pass kernel; it just cannot keep the row resident between passes.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    base = input_ptr + row * stride_im
+    storage_dtype: tl.constexpr = input_ptr.dtype.element_ty
+
+    amax = tl.zeros((), tl.float32)
+    nan_term = tl.zeros((), tl.float32)
+    for start in tl.range(0, K, BLOCK_K):
+        cols = start + tl.arange(0, BLOCK_K).to(tl.int64)
+        valid = cols < K
+        x = tl.load(base + cols * stride_ik, valid, other=0).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.where(valid, tl.abs(x), 0.0), axis=0))
+        nan_term += tl.sum(tl.where(valid & (x != x), x, 0.0), axis=0)
+
+    eps = tl.full((), 1e-10, tl.float32).to(storage_dtype).to(tl.float32)
+    amax = tl.maximum(amax, eps) + nan_term
+    scale = amax * tl.full((), 1.0 / 127.0, tl.float32)
+    tl.store(scale_ptr + row, scale)
+
+    for start in tl.range(0, K, BLOCK_K):
+        cols = start + tl.arange(0, BLOCK_K).to(tl.int64)
+        valid = cols < K
+        x = tl.load(base + cols * stride_ik, valid, other=0).to(tl.float32)
+        q = _round_to_int8_even(tl.div_rn(x, scale))
+        tl.store(output_ptr + row * K + cols, q, valid)
+
+
+def _int8_quantize_per_token_triton(
+    A: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stride-aware 2D dynamic INT8 quantizer; one program per input row."""
+    assert A.ndim == 2, f"per-token INT8 quant expects a 2D input, got {A.ndim}D"
+    assert A.dtype in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+    ), f"unsupported per-token INT8 quant input dtype {A.dtype}"
+    M, K = A.shape
+    assert K > 0, f"per-token INT8 quant needs a non-empty row, got K={K}"
+    A_q = torch.empty((M, K), device=A.device, dtype=torch.int8)
+    scale = torch.empty((M, 1), device=A.device, dtype=torch.float32)
+    if M:
+        if K <= _INT8_QUANT_MAX_SINGLE_PASS_K:
+            _int8_quantize_per_token_kernel[(M,)](
+                A,
+                A_q,
+                scale,
+                K,
+                A.stride(0),
+                A.stride(1),
+                BLOCK_K=triton.next_power_of_2(K),
+                num_warps=4 if K <= 2048 else 8,
+            )
+        else:
+            # Wider than one block: reduce and divide in two passes.
+            _int8_quantize_per_token_wide_kernel[(M,)](
+                A,
+                A_q,
+                scale,
+                K,
+                A.stride(0),
+                A.stride(1),
+                BLOCK_K=_INT8_QUANT_MAX_SINGLE_PASS_K,
+                num_warps=8,
+            )
+    return A_q, scale
+
+
+@triton.jit
+def _swigluoai_quantize_per_token_kernel(
+    input_ptr,
+    activation_ptr,
+    quant_ptr,
+    scale_ptr,
+    K: tl.constexpr,
+    stride_im: tl.constexpr,
+    stride_ik: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_ok: tl.constexpr,
+    # Runtime arguments, not constexprs: specialising on the scalar values
+    # would recompile the kernel once per distinct alpha/beta/clamp triple.
+    alpha,
+    beta,
+    clamp_limit,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_K).to(tl.int64)
+    valid = cols < K
+    gate = tl.load(input_ptr + row * stride_im + cols * stride_ik, valid, other=0).to(
+        tl.float32
+    )
+    up = tl.load(
+        input_ptr + row * stride_im + (K + cols) * stride_ik, valid, other=0
+    ).to(tl.float32)
+    gate = tl.minimum(gate, clamp_limit, propagate_nan=tl.PropagateNan.ALL)
+    up = tl.minimum(
+        tl.maximum(up, -clamp_limit, propagate_nan=tl.PropagateNan.ALL),
+        clamp_limit,
+        propagate_nan=tl.PropagateNan.ALL,
+    )
+    activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
+    # Retain the observable BF16/FP16 workspace rounding before quant2.
+    activated = activated.to(activation_ptr.dtype.element_ty)
+    tl.store(activation_ptr + row * stride_om + cols * stride_ok, activated, valid)
+    q, scale = _per_token_int8_values(activated, valid, activation_ptr.dtype.element_ty)
+    tl.store(quant_ptr + row * K + cols, q, valid)
+    tl.store(scale_ptr + row, scale)
+
+
+def _swigluoai_quantize_per_token_triton(
+    input: torch.Tensor,
+    activation_output: torch.Tensor,
+    alpha: float,
+    beta: float,
+    clamp_limit: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """OAI + quant2, retaining the rounded activation workspace for inspection."""
+    # Validate the scalars before touching tensor metadata so a bad alpha or
+    # clamp reports itself rather than surfacing as an attribute error.
+    alpha, beta, clamp_limit = _validate_swigluoai_uninterleave_params(
+        alpha, beta, clamp_limit
+    )
+    assert input.ndim == activation_output.ndim == 2
+    assert input.shape == (activation_output.size(0), activation_output.size(1) * 2)
+    assert input.dtype == activation_output.dtype
+    assert input.device == activation_output.device
+    assert input.dtype in (torch.bfloat16, torch.float16)
+    M, K = activation_output.shape
+    assert 0 < K <= 8192
+    q = torch.empty((M, K), device=input.device, dtype=torch.int8)
+    scale = torch.empty((M, 1), device=input.device, dtype=torch.float32)
+    if M:
+        _swigluoai_quantize_per_token_kernel[(M,)](
+            input,
+            activation_output,
+            q,
+            scale,
+            K,
+            input.stride(0),
+            input.stride(1),
+            activation_output.stride(0),
+            activation_output.stride(1),
+            alpha,
+            beta,
+            clamp_limit,
+            BLOCK_K=triton.next_power_of_2(K),
+            num_warps=4 if K <= 2048 else 8,
+        )
+    return q, scale
 
 
 def moe_kernel_quantize_input(
@@ -1059,6 +1506,7 @@ def fused_moe_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
+    INT32_DOWN: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -1403,10 +1851,21 @@ def fused_moe_kernel(
             bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn * stride_bbn
             bias = tl.load(bias_ptrs, mask=(offs_bn < N_out), other=0.0)
 
-        # Accumulate C block in fp32
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        if SWAP_AB:
-            accumulator_nm = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        # Non-blockwise W8A8 down GEMM with K<=1024 has an exact INT32 sum:
+        # 1024*128*128 = 2^24, so its final FP32 conversion is exact. Keep
+        # every blockwise or larger-K path on the original FP32 schedule.
+        if INT32_DOWN:
+            accumulator_i32 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+            if SWAP_AB:
+                accumulator_nm_i32 = tl.zeros(
+                    (BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.int32
+                )
+        else:
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            if SWAP_AB:
+                accumulator_nm = tl.zeros(
+                    (BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32
+                )
 
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             # Eliminate masking overhead when K is perfectly aligned with BLOCK_SIZE_K.
@@ -1449,7 +1908,19 @@ def fused_moe_kernel(
                             combined_scale = a_scale[:, None] * b_scale_val[None, :]
                         accumulator += tl.dot(a, b) * combined_scale
                 else:
-                    if use_fp8_w8a8:
+                    if INT32_DOWN:
+                        if SWAP_AB:
+                            accumulator_nm_i32 = tl.dot(
+                                tl.trans(b),
+                                tl.trans(a),
+                                acc=accumulator_nm_i32,
+                                out_dtype=tl.int32,
+                            )
+                        else:
+                            accumulator_i32 = tl.dot(
+                                a, b, acc=accumulator_i32, out_dtype=tl.int32
+                            )
+                    elif use_fp8_w8a8:
                         if SWAP_AB:
                             accumulator_nm = tl.dot(
                                 tl.trans(b), tl.trans(a), acc=accumulator_nm
@@ -1469,7 +1940,12 @@ def fused_moe_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
-        if SWAP_AB:
+        if INT32_DOWN:
+            if SWAP_AB:
+                accumulator = tl.trans(accumulator_nm_i32).to(tl.float32)
+            else:
+                accumulator = accumulator_i32.to(tl.float32)
+        elif SWAP_AB:
             accumulator = tl.trans(accumulator_nm)
 
         # Dequantization
@@ -1666,11 +2142,16 @@ def invoke_fused_moe_triton_kernel(
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+    config.update(get_moe_pipeline_config(B.size(2), BLOCK_SIZE_K))
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
 
     swap_AB = config.pop("SWAP_AB", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
+    # Whether a tuned config asks for the exact INT32 accumulator.  Defaults
+    # to on so untuned INT8 shapes keep their existing reduction, and is still
+    # subject to the eligibility guard below.
+    int32_down_requested = config.pop("INT32_DOWN", True)
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
@@ -1711,6 +2192,18 @@ def invoke_fused_moe_triton_kernel(
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
+        INT32_DOWN=(
+            int32_down_requested
+            and use_int8_w8a8
+            # Both operands must really be INT8 for an integer accumulator.
+            and A.dtype == torch.int8
+            and B.dtype == torch.int8
+            and block_shape is None
+            # K <= 1024 bounds the worst-case integer absolute sum by
+            # 1024 * 127 * 127 < 2**24, so the FP32 conversion is exact.
+            and B.size(2) <= 1024
+            and not FUSE_SILU
+        ),
         use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
@@ -1844,13 +2337,31 @@ def fused_experts_impl(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    *,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     logger.debug("GEMS FUSED MOE")
-    assert (
-        activation == "silu"
-    ), f"Only 'silu' activation is supported, got {activation}"
-
     activation_enum = MoEActivation.from_str(activation)
+    if activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+        gemm1_alpha, gemm1_beta, gemm1_clamp_limit = (
+            _validate_swigluoai_uninterleave_params(
+                gemm1_alpha, gemm1_beta, gemm1_clamp_limit
+            )
+        )
+    elif activation_enum == MoEActivation.SILU:
+        if any(
+            value is not None for value in (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
+        ):
+            raise ValueError(
+                "gemm1_alpha/beta/clamp_limit require swigluoai_uninterleave"
+            )
+    else:
+        raise ValueError(
+            f"Only 'silu' and 'swigluoai_uninterleave' activations are supported, "
+            f"got {activation!r}"
+        )
 
     # Check constraints
     if use_int4_w4a16:
@@ -1890,6 +2401,7 @@ def fused_experts_impl(
 
     config_dtype = _get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         ocp_mx_scheme=ocp_mx_scheme,
@@ -1913,6 +2425,11 @@ def fused_experts_impl(
         block_shape=block_shape,
         E=E,
         return_is_embedded=True,
+        # Select the tuning table for the device actually holding the
+        # activations, not whichever device happens to be current.
+        device_index=(
+            hidden_states.device.index if hidden_states.device.type != "cpu" else None
+        ),
     )
 
     base_config, is_embedded_config = get_moe_config(M)
@@ -1986,7 +2503,7 @@ def fused_experts_impl(
 
     # Check if we can safely fuse the activation with the first GEMM pass
     can_use_fused_silu = (
-        activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        activation_enum == MoEActivation.SILU
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
     )
@@ -2105,28 +2622,59 @@ def fused_experts_impl(
             FUSE_SILU=do_fuse_silu,  # Master switch for the kernel
         )
 
-        # 4. Apply activation separately if the fused path was not taken
-        if not do_fuse_silu:
+        # 4. Apply OAI and quant2 together only on the opt-in W8A8 path.
+        # The fused kernel still stores the rounded intermediate_cache2.
+        fused_oai_quant2 = (
+            _W8A8_QUANT_FUSION_MODE == "quant_oai"
+            and use_int8_w8a8
+            and per_channel_quant
+            and block_shape is None
+            and ocp_mx_scheme is None
+            and a2_scale is None
+            and activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+            and intermediate_cache2.dtype in (torch.bfloat16, torch.float16)
+            and intermediate_cache2.device.type in ("cuda", "musa", "xpu")
+            and 0 < activation_out_dim <= 8192
+        )
+        if fused_oai_quant2:
+            qintermediate_cache2, a2q_scale = _swigluoai_quantize_per_token_triton(
+                intermediate_cache1.view(-1, N),
+                intermediate_cache2,
+                gemm1_alpha,
+                gemm1_beta,
+                gemm1_clamp_limit,
+            )
+        elif not do_fuse_silu:
             apply_moe_activation(
-                activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+                activation_enum,
+                intermediate_cache2,
+                intermediate_cache1.view(-1, N),
+                gemm1_alpha=gemm1_alpha,
+                gemm1_beta=gemm1_beta,
+                gemm1_clamp_limit=gemm1_clamp_limit,
             )
 
         # 5. Quantize activated intermediate for GEMM2
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=a2_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-            ocp_mx_scheme=ocp_mx_scheme,
-        )
+        if not fused_oai_quant2:
+            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                A=intermediate_cache2,
+                A_scale=a2_scale,
+                quant_dtype=quant_dtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape,
+                ocp_mx_scheme=ocp_mx_scheme,
+            )
 
         if expert_map is not None:
             intermediate_cache3.zero_()
 
         # 6. Select GEMM2 config and output buffer/reduction path
         gemm2_config = base_config
-        if use_half_gemm_fast_paths:
+        if is_embedded_config:
+            # A tuned entry may give the two GEMMs different tiles; for a
+            # single shared entry this returns the same values as base_config.
+            gemm2_config, _ = get_moe_config(tokens_in_chunk, gemm_stage="gemm2")
+        elif use_half_gemm_fast_paths:
             gemm2_config, _ = get_moe_config(
                 tokens_in_chunk,
                 gemm_stage="gemm2",
@@ -2136,6 +2684,10 @@ def fused_experts_impl(
             not is_embedded_config
             and direct_sum_supported
             and tokens_in_chunk >= MOE_DIRECT_SUM_MIN_TOKENS
+            # Several experts would atomically accumulate into one output row
+            # in an unspecified order, and in the output dtype rather than
+            # FP32.  Keep the fixed-order moe_sum reduction for top-k > 1.
+            and top_k_num == 1
             and expert_map is None
             and not apply_router_weight_on_input
         )
@@ -2206,6 +2758,10 @@ def inplace_fused_experts(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    *,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> None:
     """
     In-place fused MoE: writes output directly into ``hidden_states``.
@@ -2235,6 +2791,9 @@ def inplace_fused_experts(
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -2259,6 +2818,10 @@ def outplace_fused_experts(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    *,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     """
     Out-of-place fused MoE: allocates and returns a new output tensor.
@@ -2287,4 +2850,7 @@ def outplace_fused_experts(
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )

@@ -331,3 +331,57 @@ def test_backend_override_matches_reference(batch_size, vocab_size, top_k):
     _torch_topk_ref(logits_ref, next_n, seq_lens, indices_ref, num_rows, s0, s1, k)
 
     assert check_topk_values_match(logits, indices, indices_ref, k)
+
+
+@pytest.mark.top_k_per_row_decode
+@pytest.mark.parametrize(
+    "rows,vocab,k", [(253, 703, 512), (4, 4096, 512), (1, 129280, 1024)]
+)
+@pytest.mark.parametrize("score_kind", ["continuous", "quantized", "constant"])
+@pytest.mark.parametrize("strided", [False, True])
+@torch.inference_mode()
+def test_repeated_inputs_stable_selection(rows, vocab, k, score_kind, strided):
+    torch.manual_seed(42)
+    width = vocab * 2 if strided else vocab
+    storage = torch.randn(rows, width, device=device, dtype=torch.float32)
+    logits = storage[:, ::2] if strided else storage
+    if score_kind == "quantized":
+        logits.copy_((logits * 16).round() / 16)
+    elif score_kind == "constant":
+        logits.zero_()
+    starts = torch.zeros(rows, device=device, dtype=torch.int32)
+    ends = (
+        640 + torch.arange(rows, device=device, dtype=torch.int32) // 4
+        if vocab == 703
+        else torch.full((rows,), vocab, device=device, dtype=torch.int32)
+    )
+    expected = torch.full((rows, k), -1, device=device, dtype=torch.int32)
+    for row in range(rows):
+        start, end = int(starts[row]), int(ends[row])
+        count = min(k, end - start)
+        # Stable sorting preserves the lower original index on an equal score.
+        order = torch.argsort(logits[row, start:end], descending=True, stable=True)
+        expected[row, :count] = order[:count].to(torch.int32)
+    expected_set = torch.sort(expected, dim=1).values
+    inputs_before = logits.clone()
+    first = None
+    for _ in range(8):
+        out = torch.full((rows, k), -17, device=device, dtype=torch.int32)
+        flaggems_vllm.top_k_per_row_decode(
+            logits,
+            1,
+            ends,
+            out,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            k,
+        )
+        torch.testing.assert_close(
+            torch.sort(out, dim=1).values, expected_set, rtol=0, atol=0
+        )
+        if first is None:
+            first = out.clone()
+        else:
+            torch.testing.assert_close(out, first, rtol=0, atol=0)
+    torch.testing.assert_close(logits, inputs_before, rtol=0, atol=0)

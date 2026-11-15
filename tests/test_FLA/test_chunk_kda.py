@@ -32,7 +32,7 @@ LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 
 
-pytest.mark.chunk_kda
+pytestmark = pytest.mark.chunk_kda
 
 
 def _naive_kda_lowerbound_gate(
