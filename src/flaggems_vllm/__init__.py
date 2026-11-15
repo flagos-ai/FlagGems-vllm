@@ -45,4 +45,5 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
+    "gumbel_sample",
 ]

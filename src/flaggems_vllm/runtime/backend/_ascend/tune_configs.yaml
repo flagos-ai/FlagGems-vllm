@@ -419,3 +419,17 @@ silu_and_mul_with_clamp_linear:
       UNMASKED: false
     num_warps: 4
     num_stages: 1
+
+gumbel_sample:
+  # Offline no-cache/no-bias FP32 tile; other paths retain the shared 1024 tile.
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
+
+gumbel_sample_streaming_row:
+  # Offline first structural candidate; one row per program, scalar carried max.
+  - META:
+      TILE_SIZE: 4096
+    num_warps: 4
+    num_stages: 1
