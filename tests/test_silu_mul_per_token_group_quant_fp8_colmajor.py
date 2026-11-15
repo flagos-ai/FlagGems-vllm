@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -19,6 +21,8 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 
 import flaggems_vllm
+
+VLLM_HAS_CLAMP = "clamp_limit" in inspect.signature(vllm_silu_mul_quant).parameters
 
 
 @pytest.mark.silu_mul_per_token_group_quant_fp8_colmajor
@@ -36,11 +40,14 @@ import flaggems_vllm
 def test_silu_mul_per_token_group_quant_fp8_colmajor(
     shape, dtype, use_ue8m0, clamp_limit
 ):
+    if clamp_limit is not None and not VLLM_HAS_CLAMP:
+        pytest.skip("installed vLLM baseline does not support clamp_limit")
     torch.manual_seed(1337)
     x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
-    ref_output, ref_scales = vllm_silu_mul_quant(
-        x, use_ue8m0=use_ue8m0, clamp_limit=clamp_limit
-    )
+    reference_kwargs = {"use_ue8m0": use_ue8m0}
+    if VLLM_HAS_CLAMP:
+        reference_kwargs["clamp_limit"] = clamp_limit
+    ref_output, ref_scales = vllm_silu_mul_quant(x, **reference_kwargs)
     output, scales = flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor(
         x, use_ue8m0=use_ue8m0, clamp_limit=clamp_limit
     )

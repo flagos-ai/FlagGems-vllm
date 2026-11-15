@@ -70,7 +70,7 @@ class SiluMulQuantFp8Benchmark(base.GenericBenchmark):
 def _inputs(shape, dtype, device, use_ue8m0=False):
     x = torch.randn(shape, dtype=dtype, device=device)
     before = x.clone()
-    expected = vllm_silu_mul_quant(x, use_ue8m0=use_ue8m0, clamp_limit=None)
+    expected = vllm_silu_mul_quant(x, use_ue8m0=use_ue8m0)
     actual = flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor(
         x, use_ue8m0=use_ue8m0, clamp_limit=None
     )
@@ -79,7 +79,7 @@ def _inputs(shape, dtype, device, use_ue8m0=False):
     torch.testing.assert_close(x, before, rtol=0, atol=0)
     assert actual[0].data_ptr() != x.data_ptr()
     del before, actual, expected
-    yield (x, {"use_ue8m0": use_ue8m0, "clamp_limit": None})
+    yield (x, {"use_ue8m0": use_ue8m0})
 
 
 @pytest.mark.silu_mul_per_token_group_quant_fp8_colmajor(
