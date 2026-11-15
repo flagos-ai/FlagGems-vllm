@@ -336,3 +336,24 @@ mhc_shifted_project_metax:
     bn: [32]
     w: [4, 8]
     s: [3]
+  # Large-M stage 2/3 tiles that still fit C550's 64 KB shared memory.
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [128]
+    bk: [64]
+    bn: [32]
+    w: [4, 8]
+    s: [2]
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [64, 128]
+    bk: [64]
+    bn: [32]
+    w: [4, 8]
+    s: [3]
