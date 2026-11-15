@@ -328,7 +328,7 @@ jobs:
             # and flag-gems. Install this repository only, so pip cannot pull
             # a generic PyPI torch over the vendor build.
             python3 -m pip install --no-build-isolation --no-deps -e .
-            python3 -m pip install --no-build-isolation pytest einops
+            python3 -m pip install --no-build-isolation pytest einops sqlalchemy
           fi
 
       - name: check gpu availability

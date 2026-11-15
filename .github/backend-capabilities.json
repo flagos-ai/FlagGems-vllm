@@ -24,6 +24,7 @@
     "metax-maca3810": {},
     "mthreads-musa520": {
       "tests_allow": [
+        "tests/test_gdn_w8a16.py",
         "tests/test_fused_inv_rope_fp8_quant.py",
         "tests/test_scaled_int8_quant.py",
         "tests/test_add_rms_norm.py",
