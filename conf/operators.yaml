@@ -289,6 +289,19 @@ ops:
   - Attention
   stages:
   - beta: '0.3'
+- id: chunk_kda_fwd_h
+  description: Ascend prepared KDA H stage with resident FP32 VK state and BF16 snapshots.
+  for:
+  - chunk_kda_fwd_h
+  labels:
+  - fused
+  - vLLM
+  - FLA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+
 - id: chunk_kda_fwd_intra_token_parallel
   description: 'Forward-only token-parallel diagonal sub-blocks for Kimi Delta Attention.
 

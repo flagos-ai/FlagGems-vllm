@@ -22,6 +22,7 @@ from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_s
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
+from flaggems_vllm.ops.chunk_kda_fwd_h import chunk_kda_fwd_h
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
@@ -273,6 +274,7 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "chunk_kda",
+    "chunk_kda_fwd_h",
     "chunk_kda_fwd_intra_token_parallel",
     "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_with_fused_gate",
