@@ -27,7 +27,7 @@ def chunk_kda_fwd_h(k, w, u, *, gk, initial_state, cu_seqlens, value_tile=128):
     cumulative gates. ``initial_state`` is FP32 ``[N,H,V,K]``. ``cu_seqlens``
     is a host list/tuple, not a device tensor. Snapshots are BF16
     ``[1,total_chunks,H,V,K]``; final state is FP32 and inputs are unmodified.
-    Ascend only, inference only; see docs/ascend_kda_fwd_h.md.
+    Ascend only, inference only. Uses fixed validated tiles without autotuning.
     """
     if runtime.device.vendor_name != "ascend":
         raise NotImplementedError("chunk_kda_fwd_h requires the Ascend CANN backend")
