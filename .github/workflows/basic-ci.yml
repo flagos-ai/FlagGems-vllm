@@ -318,8 +318,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 --version
-          # Container hooks do not share the checkout step's Git configuration.
-          git config --global --add safe.directory "$(pwd -P)"
           if [[ "${INSTALL_WITH_SETUP_SH}" == "true" ]]; then
             # The image has no flag-gems. --no-venv keeps its torch, Triton
             # and vLLM and only adds flag-gems, this repository and the test
@@ -330,7 +328,7 @@ jobs:
             # and flag-gems. Install this repository only, so pip cannot pull
             # a generic PyPI torch over the vendor build.
             python3 -m pip install --no-build-isolation --no-deps -e .
-            python3 -m pip install --no-build-isolation pytest einops sqlalchemy
+            python3 -m pip install --no-build-isolation pytest einops
           fi
 
       - name: check gpu availability
