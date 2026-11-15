@@ -96,7 +96,7 @@ def test_silu_mul_per_token_group_quant_fp8_colmajor(use_ue8m0):
         op_name="silu_mul_per_token_group_quant_fp8_colmajor",
         input_fn=partial(_inputs, use_ue8m0=use_ue8m0),
         torch_op=vllm_silu_mul_quant,
-        gems_op=flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor,
         dtypes=[torch.float16, torch.bfloat16],
     )
+    bench.set_gems(flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor)
     bench.run()
