@@ -40,6 +40,8 @@ def _launch_platform_fp8(input, output, scales, ue, eps, clamp_limit):
         ue,
         clamp_limit is not None,
         FP8_MAX=fp8_max,
+        NORMALIZE_UP_ZERO=runtime.device.vendor_name
+        in ("metax", "thead", "hygon", "mthreads"),
     )
 
 
@@ -120,6 +122,7 @@ def _silu_mul_quant_kernel(
     HAS_CLAMP: tl.constexpr,
     BLOCK_M: tl.constexpr,
     FP8_MAX: tl.constexpr = 448.0,
+    NORMALIZE_UP_ZERO: tl.constexpr = False,
 ):
     rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
     group = tl.program_id(1).to(tl.int64)
@@ -132,6 +135,9 @@ def _silu_mul_quant_kernel(
         up = tl.clamp(up.to(tl.float32), -clamp_limit, clamp_limit).to(
             X.dtype.element_ty
         )
+    if NORMALIZE_UP_ZERO:
+        # vLLM's default up + beta (beta=+0) canonicalizes input signed zero.
+        up = tl.where(up == 0.0, 0.0, up).to(X.dtype.element_ty)
     gate_f32 = gate.to(tl.float32)
     silu = (gate_f32 / (1.0 + tl.exp(-gate_f32))).to(X.dtype.element_ty)
     values = (silu * up).to(X.dtype.element_ty).to(tl.float32)
@@ -176,6 +182,8 @@ def _silu_mul_quant_tile(
     if HAS_CLAMP:
         gate = tl.minimum(gate.to(tl.float32), CLAMP).to(X.dtype.element_ty)
         up = tl.clamp(up.to(tl.float32), -CLAMP, CLAMP).to(X.dtype.element_ty)
+    if VENDOR != "nvidia":
+        up = tl.where(up == 0.0, 0.0, up).to(X.dtype.element_ty)
     gate = gate.to(tl.float32)
     # Preserve both input-precision rounding boundaries from vLLM 0.23.
     silu = (gate / (1.0 + tl.exp(-gate))).to(X.dtype.element_ty)

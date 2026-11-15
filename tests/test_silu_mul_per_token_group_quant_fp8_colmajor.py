@@ -44,6 +44,10 @@ def test_silu_mul_per_token_group_quant_fp8_colmajor(
         pytest.skip("installed vLLM baseline does not support clamp_limit")
     torch.manual_seed(1337)
     x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
+    # Exercise the sign of zero for positive and negative gates explicitly.
+    x[0, 0] = 1.0
+    x[0, 1] = -1.0
+    x[0, shape[1] // 2 : shape[1] // 2 + 2] = -0.0
     reference_kwargs = {"use_ue8m0": use_ue8m0}
     if VLLM_HAS_CLAMP:
         reference_kwargs["clamp_limit"] = clamp_limit

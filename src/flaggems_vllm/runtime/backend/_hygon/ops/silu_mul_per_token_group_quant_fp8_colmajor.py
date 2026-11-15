@@ -15,14 +15,17 @@
 """hygon SiLU/mul FP8 quantization with default/expand CUDA Graph tuning.
 
 Default schedules are searched for each input key; explicit FlagTune enables
-the larger expand space. The arithmetic keeps vLLM 0.23's input-precision activation/multiply boundaries.
+the larger expand space. Tuned launches are cached without retaining tensors;
+allocation alignment and HCU buffer-pointer specialization remain in the key.
 """
 
 from contextlib import nullcontext
+from threading import Lock
 
 import torch
 import triton
 import triton.language as tl
+from triton.backends.hcu.compiler import HIPBackend
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
@@ -33,10 +36,58 @@ from flaggems_vllm.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
     _validate_and_allocate,
 )
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils import libtuner
+from flaggems_vllm.utils.libentry import LibTuner
 
 
-@libentry()
+class _SiluConfigTuner(LibTuner.get("default")):
+    """Reuse tuned launches without retaining tensors or fixing tile sizes."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._launches = {}
+        self._key_positions = tuple(self.arg_names.index(name) for name in self.keys)
+        self._config_lock = Lock()
+
+    def run(self, *args, **kwargs):
+        if self.apply_flagtune():
+            self._launches.clear()
+        key = tuple(args[i] for i in self._key_positions) + tuple(
+            tensor.dtype for tensor in args[:3]
+        )
+        if getattr(self, "shared_config_pre_hook", None) is not None:
+            return super().run(*args, **kwargs)
+        # HCU's buffer operations specialize on the entire backing allocation,
+        # not just tensor.numel(). Preserve that distinction for sliced inputs.
+        key += (
+            args[0].device.index,
+            args[5],
+            type(args[6]),
+            tuple(
+                HIPBackend.get_tensor_specialization(t, align=True) for t in args[:3]
+            ),
+        )
+        cached = self._launches.get(key)
+        if cached is None:
+            with self._config_lock:
+                cached = self._launches.get(key)
+                if cached is None:
+                    result = super().run(*args, **kwargs)
+                    config = self.best_config
+                    if config.pre_hook is None:
+                        grid = kwargs["grid"]
+                        if callable(grid):
+                            grid = grid(
+                                {**dict(zip(self.arg_names, args)), **config.kwargs}
+                            )
+                        grid = (*grid, 1, 1)[:3]
+                        self._launches[key] = (result, config, result[grid])
+                    return result
+        kernel, config, launch = cached
+        launch(*args, config.kwargs["BR"], config.kwargs["BG"])
+        return kernel
+
+
 @libtuner(
     configs=runtime.get_tuned_config(
         "silu_mul_per_token_group_quant_fp8_tile_hygon_default"
@@ -47,6 +98,7 @@ from flaggems_vllm.utils import libentry, libtuner
     prune_configs_by={"early_config_prune": _prune_silu_tiles},
     use_cuda_graph=True,
     rep=30,
+    policy=_SiluConfigTuner,
 )
 @triton.jit(do_not_specialize=["CLAMP"])
 def _silu_mul_quant_autotuned(
