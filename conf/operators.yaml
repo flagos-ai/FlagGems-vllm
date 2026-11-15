@@ -1897,6 +1897,28 @@ ops:
   - Activation
   stages:
   - stable: '5.3'
+- id: silu_mul_per_token_group_quant_fp8_colmajor
+  description: 'Fused SiLU times up projection and per-token group-128 FP8
+
+    quantization with column-major FP32 scales. Aligns with vLLM 0.23;
+
+    supports contiguous FP16, BF16 and FP32 input on NVIDIA SM90+, MetaX
+
+    C550, T-Head PPU, MTT S5000 and Hygon gfx936. The default output dtype
+
+    and automatic UE8M0 selection follow the active vLLM platform.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - NoCPU
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - alpha: '5.4'
 - id: skip_layer_norm
   description: 'An optimized operation used in Transformer models to improve performance
 
