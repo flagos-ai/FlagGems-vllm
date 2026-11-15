@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TP2 test helpers adapted from MegaPreAttention PR #1007 (89b0a51)."""
+"""Distributed test helpers adapted from MegaPreAttention PR #1007 (89b0a51)."""
 
 import hashlib
 import json
@@ -30,6 +30,7 @@ import triton
 import triton.language as tl
 
 import flaggems_vllm
+from flaggems_vllm.ops.mrope import _axis_for_pair
 from flaggems_vllm.testing import assert_close
 
 
@@ -131,11 +132,16 @@ def load_fixture(path=None, model_dims=(2048, 16, 2), head_dim=256):
     }
 
 
-def independent_reference(inputs):
+def independent_reference(inputs, reference_group=None):
     """Oracle starts at original shards; never reads candidate scratch/results."""
     c, t = inputs.config, inputs.positions.shape[1]
-    hidden = inputs.hidden.new_empty((t, inputs.hidden.shape[1]))
-    dist.all_gather_into_tensor(hidden, inputs.hidden, group=inputs.group)
+    if reference_group is None:
+        hidden = inputs.hidden.new_empty((t, inputs.hidden.shape[1]))
+        dist.all_gather_into_tensor(hidden, inputs.hidden, group=inputs.group)
+    else:
+        shards = [None] * inputs.group.size()
+        dist.all_gather_object(shards, inputs.hidden.cpu(), group=reference_group)
+        hidden = torch.cat(shards).to(inputs.hidden.device)
     qkv = hidden @ inputs.weight.t()
     qgate, key, value = qkv.split((2 * c.q_size, c.kv_size, c.kv_size), dim=-1)
     query, gate = qgate.view(t, c.num_q_heads, 2 * c.head_dim).chunk(2, dim=-1)
@@ -202,19 +208,19 @@ def check_outputs(actual, expected, inputs, expected_cache):
     )
 
 
-def make_inputs(tokens, rank, model_dims, edge, fixture_path, sections):
+def make_inputs(tokens, rank, model_dims, edge, fixture_path, sections, *, tp):
     hidden_size, q_heads, kv_heads = model_dims
     c = Config(
-        q_heads // 2,
-        max(1, kv_heads // 2),
+        q_heads // tp,
+        max(1, kv_heads // tp),
         mrope_section=sections,
         global_kv_heads=kv_heads,
     )
     weights = load_fixture(fixture_path, model_dims)["weights"]
-    kv_rank = rank if kv_heads > 1 else 0
+    kv_rank = rank // max(1, tp // kv_heads)
     weight = torch.cat(
         (
-            weights["q_proj.weight"].chunk(2)[rank],
+            weights["q_proj.weight"].chunk(tp)[rank],
             weights["k_proj.weight"].narrow(0, kv_rank * c.kv_size, c.kv_size),
             weights["v_proj.weight"].narrow(0, kv_rank * c.kv_size, c.kv_size),
         )
@@ -222,7 +228,7 @@ def make_inputs(tokens, rank, model_dims, edge, fixture_path, sections):
     generator = torch.Generator(device="cuda").manual_seed(20261010 + rank + tokens)
     hidden = (
         torch.randn(
-            tokens // 2,
+            tokens // tp,
             hidden_size,
             device="cuda",
             dtype=torch.bfloat16,
@@ -235,6 +241,12 @@ def make_inputs(tokens, rank, model_dims, edge, fixture_path, sections):
     slots = base.clone()
     blocks = (tokens + 127) // 128 + 1
     if edge:
+        if rank == 0:
+            # Contiguous shards can still have an unaligned base address.
+            storage = hidden.new_empty((hidden.numel() + 1,))
+            shifted = storage[1:].view_as(hidden)
+            shifted.copy_(hidden)
+            hidden = shifted
         positions = torch.empty((3, tokens + 7), device="cuda", dtype=torch.int64)[
             :, :tokens
         ]
@@ -278,7 +290,7 @@ def make_inputs(tokens, rank, model_dims, edge, fixture_path, sections):
 def run_candidate(inputs, **overrides):
     c = inputs.config
     kwargs = dict(
-        num_heads=c.num_q_heads * 2,
+        num_heads=c.num_q_heads * inputs.group.size(),
         num_kv_heads=c.global_kv_heads,
         head_dim=c.head_dim,
         rotary_dim=c.rotary_dim,
@@ -303,72 +315,137 @@ def run_candidate(inputs, **overrides):
 
 
 @triton.jit
-def _store_kv(
-    key,
-    value,
-    cache,
+def _megapreattention_post(
+    projected,
+    positions,
+    q_norm,
+    k_norm,
+    rope,
+    kv_cache,
     slots,
-    K_WIDTH: tl.constexpr,
-    V_STRIDE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    query,
+    key,
+    tokens,
+    eps,
+    PROJ_STRIDE: tl.constexpr,
+    POS_AXIS_STRIDE: tl.constexpr,
+    POS_TOKEN_STRIDE: tl.constexpr,
+    ROPE_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    CACHE_BLOCK_STRIDE: tl.constexpr,
+    CACHE_HEAD_STRIDE: tl.constexpr,
+    CACHE_TOKEN_STRIDE: tl.constexpr,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+    CACHE_CAPACITY: tl.constexpr,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    SECTION_H: tl.constexpr,
+    SECTION_W: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
-    token = tl.program_id(0).to(tl.int64)
-    slot = tl.load(slots + token)
-    d = tl.arange(0, triton.next_power_of_2(K_WIDTH))
-    # Cache layout is [blocks, heads, block_size, 2 * head_dim].
-    target = (
-        (slot // BLOCK_SIZE) * BLOCK_SIZE * K_WIDTH * 2
-        + (d // 256) * BLOCK_SIZE * 512
-        + (slot % BLOCK_SIZE) * 512
-        + d % 256
+    token = (tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
+    head = tl.program_id(1)
+    d = tl.arange(0, 256)
+    valid = token < tokens
+    is_query = head < Q_HEADS
+    kv_head = head - Q_HEADS
+    column = tl.where(is_query, head * 512, Q_HEADS * 512 + kv_head * 256)
+    norm = q_norm if is_query else k_norm
+    src = projected + token[:, None] * PROJ_STRIDE + column
+
+    x = tl.load(src + d[None, :], valid[:, None], other=0).to(tl.float32)
+    rms = tl.rsqrt(tl.sum(x * x, 1) / 256.0 + eps)
+    w = tl.load(norm + d).to(tl.float32)
+    normalized = (x * rms[:, None] * (1.0 + w[None, :])).to(tl.bfloat16)
+
+    # NeoX pairs the two halves of the rotary prefix. Round both inputs to
+    # BF16 before rotation, matching the separate Gemma RMSNorm output.
+    partner_d = d ^ 32
+    partner_x = tl.load(
+        src + partner_d[None, :], valid[:, None] & (d[None, :] < 64), other=0
+    ).to(tl.float32)
+    partner_w = tl.load(norm + partner_d, d < 64, other=0).to(tl.float32)
+    partner = (partner_x * rms[:, None] * (1.0 + partner_w[None, :])).to(tl.bfloat16)
+    pair = d % 32
+    axis = _axis_for_pair(pair, None, 0, SECTION_H, SECTION_W, True, False, 256)
+    pos = tl.load(
+        positions + token[:, None] * POS_TOKEN_STRIDE + axis[None, :] * POS_AXIS_STRIDE,
+        valid[:, None] & (d[None, :] < 64),
+        other=0,
     )
-    valid = (d < K_WIDTH) & (slot >= 0)
-    k = tl.load(key + token * K_WIDTH + d, valid, other=0)
-    v = tl.load(value + token * V_STRIDE + d, valid, other=0)
-    tl.store(cache + target, k, valid)
-    tl.store(cache + target + 256, v, valid)
+    phase = rope + pos * ROPE_STRIDE + pair[None, :]
+    rotate = valid[:, None] & (d[None, :] < 64)
+    cos = tl.load(phase, rotate, other=1).to(tl.float32)
+    sin = tl.load(phase + 32, rotate, other=0).to(tl.float32)
+    signed_sin = tl.where(d[None, :] < 32, -sin, sin)
+    rotated = normalized.to(tl.float32) * cos + partner.to(tl.float32) * signed_sin
+    result = tl.where(d[None, :] < 64, rotated.to(tl.bfloat16), normalized)
+
+    if is_query:
+        offset = (token[:, None] * Q_HEADS + head) * 256 + d[None, :]
+        tl.store(query + offset, result, valid[:, None])
+    else:
+        offset = (token[:, None] * KV_HEADS + kv_head) * 256 + d[None, :]
+        tl.store(key + offset, result, valid[:, None])
+        slot = tl.load(slots + token * SLOT_STRIDE, valid, other=-1)
+        cache_valid = valid & (slot >= 0) & (slot < CACHE_CAPACITY)
+        cache_offset = (
+            (slot // CACHE_BLOCK_SIZE) * CACHE_BLOCK_STRIDE
+            + kv_head * CACHE_HEAD_STRIDE
+            + (slot % CACHE_BLOCK_SIZE) * CACHE_TOKEN_STRIDE
+        )
+        target = kv_cache + cache_offset[:, None] + d[None, :]
+        v = tl.load(src + KV_HEADS * 256 + d[None, :], cache_valid[:, None], other=0)
+        tl.store(target, result, cache_valid[:, None])
+        tl.store(target + 256, v, cache_valid[:, None])
 
 
-def run_unfused(inputs):
-    """Performance baseline for the contiguous benchmark layout."""
+def run_symmmem_post(inputs):
+    """Benchmark the original PR #1226 implementation."""
     from torch.distributed import _symmetric_memory as symm_mem
 
     c = inputs.config
     tokens = inputs.positions.shape[1]
     group_name = inputs.group.group_name
     symm_mem.enable_symm_mem_for_group(group_name)
-    _, (qkv,) = torch.ops.symm_mem.fused_all_gather_matmul(
+    _, (projected,) = torch.ops.symm_mem.fused_all_gather_matmul(
         inputs.hidden, [inputs.weight.t()], 0, group_name
     )
-    qgate, key, value = qkv.split((2 * c.q_size, c.kv_size, c.kv_size), dim=-1)
-    query, gate = qgate.view(tokens, c.num_q_heads, 2 * c.head_dim).chunk(2, dim=-1)
-    query = flaggems_vllm.gemma_rms_norm(
-        query.contiguous().view(-1, c.head_dim), inputs.q_norm, c.eps
-    ).view(tokens, c.q_size)
-    key = flaggems_vllm.gemma_rms_norm(
-        key.contiguous().view(-1, c.head_dim), inputs.k_norm, c.eps
-    ).view(tokens, c.kv_size)
-    flaggems_vllm.mrope(
-        query,
-        key,
-        inputs.rope,
+    query = inputs.hidden.new_empty((tokens, c.q_size))
+    key = inputs.hidden.new_empty((tokens, c.kv_size))
+    block_t = 4
+    _megapreattention_post[
+        (triton.cdiv(tokens, block_t), c.num_q_heads + c.num_kv_heads)
+    ](
+        projected,
         inputs.positions,
-        *c.mrope_section,
-        c.head_dim,
-        c.rotary_dim,
-        is_interleaved=True,
-    )
-    _store_kv[(tokens,)](
-        key,
-        value,
+        inputs.q_norm,
+        inputs.k_norm,
+        inputs.rope,
         inputs.cache,
         inputs.slots,
-        c.kv_size,
-        value.stride(0),
+        query,
+        key,
+        tokens,
+        c.eps,
+        projected.stride(0),
+        *inputs.positions.stride(),
+        inputs.rope.stride(0),
+        inputs.slots.stride(0),
+        *inputs.cache.stride()[:3],
         inputs.cache.shape[2],
+        inputs.cache.shape[0] * inputs.cache.shape[2],
+        c.num_q_heads,
+        c.num_kv_heads,
+        c.mrope_section[1],
+        c.mrope_section[2],
+        block_t,
         num_warps=4,
+        enable_fp_fusion=False,
     )
-    return Output(query, key, value, gate)
+    value = projected[:, -c.kv_size :]
+    gate = projected[:, : 2 * c.q_size].view(tokens, c.num_q_heads, 2 * c.head_dim)
+    return Output(query, key, value, gate[..., c.head_dim :])
 
 
 def _check(actual, expected, inputs, ref_cache):
@@ -387,6 +464,7 @@ def _worker(
     rank,
     directory,
     tokens,
+    tp,
     model_dims,
     edge,
     sections,
@@ -403,17 +481,21 @@ def _worker(
         "nccl",
         init_method=f"file://{directory}/rdzv",
         rank=rank,
-        world_size=2,
+        world_size=tp,
         device_id=device,
         timeout=timedelta(seconds=90),
     )
+    # PCCL 2.1 on this PPU can fault in the reference AllGather at TP3.
+    reference_group = dist.new_group(backend="gloo") if tp & (tp - 1) else None
     graphs = {}
     try:
-        inputs = make_inputs(tokens, rank, model_dims, edge, fixture_path, sections)
+        inputs = make_inputs(
+            tokens, rank, model_dims, edge, fixture_path, sections, tp=tp
+        )
         if not iterations:
             with pytest.raises(NotImplementedError, match="requires BF16"):
                 run_candidate(replace(inputs, hidden=inputs.hidden.float()))
-            with pytest.raises(NotImplementedError, match="requires TP2, D256 and R64"):
+            with pytest.raises(NotImplementedError, match="requires D256 and R64"):
                 run_candidate(inputs, rotary_dim=32)
             with pytest.raises(ValueError, match="invalid packed"):
                 run_candidate(replace(inputs, weight=inputs.weight[:-1]))
@@ -421,20 +503,22 @@ def _worker(
                 run_candidate(inputs, mrope_section=(0, 0, 0))
 
         reference = replace(inputs, cache=torch.full_like(inputs.cache, 0.375))
-        expected = independent_reference(reference)
+        expected = independent_reference(reference, reference_group)
         calls = {"candidate": (run_candidate, inputs)}
         if iterations:
             calls["baseline"] = (
-                run_unfused,
+                run_symmmem_post,
                 replace(inputs, cache=torch.full_like(inputs.cache, 0.375)),
             )
         if larger_tokens is not None:
-            larger = make_inputs(larger_tokens, rank, model_dims, edge, None, sections)
+            larger = make_inputs(
+                larger_tokens, rank, model_dims, edge, None, sections, tp=tp
+            )
             larger_reference = replace(
                 larger, cache=torch.full_like(larger.cache, 0.375)
             )
-            larger_expected = independent_reference(larger_reference)
-            # Reserve SymmMem's maximum workspace before any graph references it.
+            larger_expected = independent_reference(larger_reference, reference_group)
+            # Initialize the larger workspace before capture.
             run_candidate(larger)
             torch.cuda.synchronize()
         errors, outputs = {}, {}
@@ -443,7 +527,10 @@ def _worker(
             for _ in range(warmup):
                 call(args)
             torch.cuda.synchronize()
-            dist.barrier(device_ids=[rank])
+            if reference_group is None:
+                dist.barrier(device_ids=[rank])
+            else:
+                dist.barrier(group=reference_group)
             graph = graphs[name] = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 outputs[name] = call(args)
@@ -452,7 +539,7 @@ def _worker(
             _check(larger_actual, larger_expected, larger, larger_reference.cache)
         inputs.hidden.mul_(-0.75)
         reference.cache.fill_(0.375)
-        expected = independent_reference(reference)
+        expected = independent_reference(reference, reference_group)
         for name, (_, args) in calls.items():
             args.cache.fill_(0.375)
             graphs[name].replay()
@@ -461,6 +548,26 @@ def _worker(
                 outputs[name], expected, args, reference.cache
             ).items():
                 errors[name][tensor] = max(errors[name][tensor], error)
+
+        if not iterations:
+            # Replay without a rank barrier between launches. Each launch must
+            # protect the peer's remaining readers of the previous payload.
+            changed = inputs.hidden.clone()
+            for _ in range(4):
+                changed.mul_(-0.5)
+            reference.cache.fill_(0.375)
+            expected = independent_reference(
+                replace(reference, hidden=changed), reference_group
+            )
+            inputs.cache.fill_(0.375)
+            for _ in range(4):
+                inputs.hidden.mul_(-0.5)
+                graphs["candidate"].replay()
+            torch.cuda.synchronize()
+            for tensor, error in _check(
+                outputs["candidate"], expected, inputs, reference.cache
+            ).items():
+                errors["candidate"][tensor] = max(errors["candidate"][tensor], error)
 
         samples = {name: [] for name in calls}
         start = torch.cuda.Event(enable_timing=True)
@@ -488,12 +595,18 @@ def _worker(
         for graph in graphs.values():
             graph.reset()
         torch.cuda.synchronize()
+        from flaggems_vllm.runtime.backend._thead.ops.megapreattention import (
+            clear_megapreattention_cache,
+        )
+
+        clear_megapreattention_cache()
         dist.destroy_process_group()
 
 
-def run_tp2(
+def run_distributed(
     tokens,
     *,
+    tp=2,
     model_dims=(2048, 16, 2),
     edge=False,
     sections=(11, 11, 10),
@@ -508,6 +621,7 @@ def run_tp2(
             args=(
                 directory,
                 tokens,
+                tp,
                 model_dims,
                 edge,
                 sections,
@@ -516,7 +630,7 @@ def run_tp2(
                 iterations,
                 larger_tokens,
             ),
-            nprocs=2,
+            nprocs=tp,
             join=False,
         )
         deadline = time.monotonic() + 240
@@ -524,11 +638,11 @@ def run_tp2(
             while not context.join(timeout=1):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        "MegaPreAttention TP2 workers exceeded 240 seconds"
+                        f"MegaPreAttention TP{tp} workers exceeded 240 seconds"
                     )
             return [
                 json.loads((Path(directory) / f"rank{rank}.json").read_text())
-                for rank in range(2)
+                for rank in range(tp)
             ]
         finally:
             for process in context.processes:

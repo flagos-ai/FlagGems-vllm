@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Measure the complete BF16 TP2 PPU window with CUDA Graph replay."""
+"""Measure the complete BF16 PPU TP window with CUDA Graph replay."""
 
 import json
 import os
@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.thead.megapreattention_utils import run_tp2, summarize_round
+from tests.thead.megapreattention_utils import run_distributed, summarize_round
 
 from ..conftest import Config
 
@@ -24,7 +24,10 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.megapreattention
 @pytest.mark.parametrize("tokens", [4096, 8192, 16384, 32768])
-def test_megapreattention(tokens):
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_megapreattention(tokens, tp):
+    if torch.cuda.device_count() < tp:
+        pytest.skip(f"requires {tp} T-Head PPUs")
     warmup = (
         Config.warm_up if any(a.split("=")[0] == "--warmup" for a in sys.argv) else 20
     )
@@ -37,7 +40,13 @@ def test_megapreattention(tokens):
         )
     fixture_path = os.getenv("MEGAPREATTENTION_FIXTURE")
     ranks_by_round = [
-        run_tp2(tokens, fixture_path=fixture_path, warmup=warmup, iterations=iterations)
+        run_distributed(
+            tokens,
+            tp=tp,
+            fixture_path=fixture_path,
+            warmup=warmup,
+            iterations=iterations,
+        )
         for _ in range(5)
     ]
     names = ("baseline", "candidate")
@@ -51,14 +60,14 @@ def test_megapreattention(tokens):
     }
     result = {
         "global_tokens": tokens,
-        "tp": 2,
+        "tp": tp,
         "dtype": "bfloat16",
         "model_dims": [2048, 16, 2],
         "fixture": fixture_path or "seeded synthetic",
         "mode": "cudagraph",
         "warmup": warmup,
         "samples_per_rank_per_round": iterations,
-        "baseline": "SymmMem + separate FlagGems Gemma RMSNorm, MRoPE and KV store",
+        "baseline": "SymmMem projection + fused Triton postprocessing from PR #1226",
         "rank_max_mean_ms": latency,
         "speedup": latency["baseline"] / latency["candidate"],
         "rounds": rounds,
