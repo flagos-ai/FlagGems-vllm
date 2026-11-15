@@ -18,7 +18,6 @@ import sys
 import tempfile
 from functools import lru_cache, partial
 from pathlib import Path
-from statistics import median
 from types import SimpleNamespace
 
 import pytest
@@ -199,7 +198,7 @@ class MthreadsGdnW8A16Benchmark(GdnW8A16Benchmark):
     def get_latency(self, op, *args, **kwargs):
         if Config.mode != BenchMode.KERNEL:
             return super().get_latency(op, *args, **kwargs)
-        synchronize = flaggems_vllm.runtime.torch_device_fn.synchronize
+        synchronize = torch_device_fn.synchronize
         q, k, _, _, _, state, state_fp8, state_scale, _, _, _ = args
         buffers = (q, k, state, state_fp8, state_scale)
         saved = tuple(tensor.clone() for tensor in buffers)
@@ -283,29 +282,29 @@ class MthreadsGdnW8A16Benchmark(GdnW8A16Benchmark):
                 elapsed += end - begin
                 timings.append(elapsed / 1000.0)
         restore_state()
-        return median(timings)
+        return statistics.median(timings)
 
 
 @pytest.mark.gdn_w8a16
 def test_gdn_w8a16(tmp_path):
     if flaggems_vllm.vendor_name == "mthreads":
         bench = MthreadsGdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_mthreads_bf16)
-        bench.set_gems(_fp8)
-        bench.run()
     elif flaggems_vllm.vendor_name == "metax":
         run_perf_gdn_w8a16_metax(tmp_path)
+        return
     elif "gdn_w8a16_int8" in vars(flaggems_vllm):
         run_perf_gdn_w8a16_int8()
+        return
     elif (
         flaggems_vllm.vendor_name == "nvidia"
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability()[0] >= 9
     ):
         bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
-        bench.set_gems(_fp8)
-        bench.run()
     else:
         pytest.skip("GDN is unsupported on this backend")
+    bench.set_gems(_fp8)
+    bench.run()
 
 
 HYGON_INT8_STATE = (
