@@ -19,15 +19,11 @@ FlagTree 或 vLLM——这些依赖必须与目标加速卡匹配，由厂商镜
 
 ### 构建工具
 
-本包使用 `setuptools`。可编辑安装前请先安装构建后端和辅助工具：
+本包使用 `setuptools`，没有 C/CUDA 扩展。可编辑安装前请先安装构建后端：
 
 ```bash
 python -m pip install -U "setuptools>=64,<82" wheel packaging
 ```
-
-只有在构建可选的原生扩展或从源码构建厂商 wheel 时才需要
-`scikit-build-core`、`pybind11`、`cmake`、`ninja`；`tools/setup.sh` 会在虚拟环境中
-自动安装它们。
 
 ### FlagGems 依赖
 
@@ -338,12 +334,20 @@ export VLLM_PLUGINS=fl
 
 ### 未找到 CUDA
 
-如果未找到 CUDA，设置 `CUDA_HOME`：
+FlagGems-vllm 是纯 Python 包，`pip install` 本身不访问 CUDA。"未找到 CUDA"是
+Triton/PyTorch 运行时报错，而非安装问题。正确的排查方式：
 
 ```bash
+# 检查 PyTorch 是否能看到 GPU
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+
+# 若 CUDA 路径异常，设置后重新导入 Triton
 export CUDA_HOME=/usr/local/cuda
-python -m pip install --no-build-isolation -e .
+python -c "import triton"
 ```
+
+如果 PyTorch 或 Triton 未正确安装，请参考上文"PyTorch、Triton 与 vLLM"小节或
+使用 `bash tools/setup.sh nvidia` 重建环境。
 
 ### Triton 版本不匹配
 

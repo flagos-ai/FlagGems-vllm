@@ -53,7 +53,6 @@ def test_gemma_rms_norm(shape, dtype):
 
     ref_out = _torch_gemma_rms_norm(x, w, eps)
 
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
+    res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
 
     utils.gems_assert_close(res_out, ref_out, dtype)

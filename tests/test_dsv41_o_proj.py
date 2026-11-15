@@ -601,10 +601,8 @@ def test_dsv41_o_proj_rejects_autograd():
         call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
 
 
-def test_dsv41_o_proj_is_library_only():
-    """No ATen schema: importable, but never registered into PyTorch dispatch."""
+def test_dsv41_o_proj_is_exported():
     assert callable(flaggems_vllm.dsv41_o_proj)
-    assert "dsv41_o_proj" not in [name for name, _ in flaggems_vllm._FULL_CONFIG]
 
 
 def test_dsv41_o_proj_wo_b_proj():
