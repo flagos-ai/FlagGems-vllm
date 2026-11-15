@@ -169,7 +169,7 @@ def mhc_pre_norm_small(
     comb = torch.empty((b, 4, 4), device=x.device, dtype=torch.float32)
     out = torch.empty((b, 4096), device=x.device, dtype=torch.bfloat16)
     if b:
-        # Ascend-only fixed configuration; see the documented autotune exemption.
+        # Autotune exemption: Ascend-only, fixed validated tiles; no NVIDIA path.
         k, bk, bg, splits = 16384, 1024, 4, 16
         partial = torch.empty((b, 25, splits), device=x.device, dtype=torch.float32)
         pre = torch.empty_like(post)

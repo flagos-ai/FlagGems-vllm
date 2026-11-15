@@ -39,7 +39,7 @@ def mhc_pre_norm_small(
     Residual: BF16 [N,4,4096], fn: FP32 [24,16384], hc_scale/base: FP32
     [3]/[24], norm_weight: BF16 [4096]. Same-device contiguous Ascend tensors
     only. The projection remains FP32; weighted residual rounds to BF16
-    before RMSNorm. Inputs are read-only. See docs/ascend_mhc_pre_norm_small.md.
+    before RMSNorm. Inputs are read-only.
     """
     if runtime.device.vendor_name != "ascend":
         raise NotImplementedError("mhc_pre_norm_small requires Ascend")
