@@ -37,6 +37,24 @@ HAS_VLLM_BASELINE = SiluAndMulWithClamp is not None and hasattr(
 )
 
 SILU_AND_MUL_WITH_CLAMP_LIMITS = [3.0, 7.0]
+# Valid packed inputs: cover tiny/linear, decode/prefill, irregular and ND cases.
+SILU_AND_MUL_WITH_CLAMP_SHAPES = (
+    [(2,), (16, 1024), (2, 3, 100)]
+    if utils.QUICK_MODE
+    else [
+        (2,),
+        (1024,),
+        (1, 1024),
+        (16, 1024),
+        (496, 1024),
+        (513, 514),
+        (4096, 2048),
+        (2, 3, 100),
+        (2, 16, 1024),
+        (2, 3, 4, 128),
+        (2, 3, 4, 5, 64),
+    ]
+)
 
 
 @contextmanager
@@ -60,12 +78,10 @@ def vllm_silu_and_mul_with_clamp_cls():
 
 
 @pytest.mark.silu_and_mul_with_clamp
-@pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
+@pytest.mark.parametrize("shape", SILU_AND_MUL_WITH_CLAMP_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("limit", SILU_AND_MUL_WITH_CLAMP_LIMITS)
 def test_silu_and_mul_with_clamp(shape, dtype, limit, vllm_silu_and_mul_with_clamp_cls):
-    if not shape or shape[-1] <= 0 or shape[-1] % 2:
-        pytest.skip("vLLM requires a packed input with a positive even last dimension")
     packed = torch.randn(
         shape, dtype=dtype, device=flaggems_vllm.device, requires_grad=True
     )
@@ -103,18 +119,12 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit, vllm_silu_and_mul_with_cla
 
 
 @pytest.mark.silu_and_mul_with_clamp_out
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="Issue #636: silu_and_mul_with_clamp_out accuracy failure on mthreads",
-)
-@pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
+@pytest.mark.parametrize("shape", SILU_AND_MUL_WITH_CLAMP_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("limit", SILU_AND_MUL_WITH_CLAMP_LIMITS)
 def test_silu_and_mul_with_clamp_out(
     shape, dtype, limit, vllm_silu_and_mul_with_clamp_cls
 ):
-    if not shape or shape[-1] <= 0 or shape[-1] % 2:
-        pytest.skip("vLLM requires a packed input with a positive even last dimension")
     packed = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
     d = packed.shape[-1] // 2
     inp1 = packed[..., :d]

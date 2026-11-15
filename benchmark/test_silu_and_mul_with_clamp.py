@@ -14,6 +14,7 @@
 
 import importlib
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,44 @@ HAS_VLLM_BASELINE = SiluAndMulWithClamp is not None and hasattr(
     torch.ops._C, "silu_and_mul_with_clamp"
 )
 SWIGLU_LIMIT = 7.0
+
+# Each shape is the full packed input (..., 2D), not the gate/up shape.
+SILU_AND_MUL_WITH_CLAMP_CORE_SHAPES = [
+    # Representative model shapes: decode, prefill and the most frequent large inputs.
+    (1, 512),
+    (1, 1024),
+    (16, 512),
+    (16, 1024),
+    (496, 512),
+    (512, 1024),
+    (16384, 512),
+    (16384, 1024),
+    # Existing general coverage.
+    (64, 64),
+    (4096, 4096),
+    (64, 512, 512),
+    (1024, 1024, 1024),
+]
+
+
+class SiluAndMulWithClampBenchmark(base.GenericBenchmark):
+    DEFAULT_SHAPES = SILU_AND_MUL_WITH_CLAMP_CORE_SHAPES
+    DEFAULT_SHAPE_DESC = "packed (..., 2D)"
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+
+    def set_shapes(self, shape_file_path=None):
+        if (
+            shape_file_path
+            and Path(shape_file_path).resolve()
+            != Path(self.DEFAULT_SHAPE_FILES).resolve()
+        ):
+            return super().set_shapes(shape_file_path)
+        self.shapes = list(SILU_AND_MUL_WITH_CLAMP_CORE_SHAPES)
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+
+    def set_more_shapes(self):
+        # Custom shape files should not inherit unrelated generic shapes.
+        return []
 
 
 def packed_input_fn(shape, dtype, device):
@@ -82,7 +121,7 @@ def test_silu_and_mul_with_clamp(vllm_silu_and_mul_with_clamp):
     def vllm_op(packed):
         return vllm_silu_and_mul_with_clamp(packed)
 
-    bench = base.GenericBenchmark(
+    bench = SiluAndMulWithClampBenchmark(
         input_fn=packed_input_fn,
         op_name="silu_and_mul_with_clamp",
         gems_op=gems_op,
@@ -105,7 +144,7 @@ def test_silu_and_mul_with_clamp_out(vllm_silu_and_mul_with_clamp):
     def vllm_op(packed):
         return vllm_silu_and_mul_with_clamp(packed)
 
-    bench = base.GenericBenchmark(
+    bench = SiluAndMulWithClampBenchmark(
         input_fn=packed_input_fn,
         op_name="silu_and_mul_with_clamp_out",
         gems_op=gems_op,

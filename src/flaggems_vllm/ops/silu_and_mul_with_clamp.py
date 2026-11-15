@@ -600,9 +600,49 @@ def _layout(shape, tensors, allow_dense=False):
     return task_shape, strides, False
 
 
+def _packed_row_shape(x, y):
+    # Two separate tensors are also safe here: only the per-tensor layout
+    # matters because the kernel receives their own pointers.
+    shape = x.shape
+    if not shape or shape[-1] == 0:
+        return None
+    xs = x.stride()
+    ys = y.stride()
+    if xs[-1] != 1 or ys[-1] != 1:
+        return None
+    expected = 2 * shape[-1]
+    for size, sx, sy in zip(reversed(shape[:-1]), reversed(xs[:-1]), reversed(ys[:-1])):
+        if size > 1 and (sx != expected or sy != expected):
+            return None
+        expected *= size
+    return (x.numel() // shape[-1], shape[-1])
+
+
 def _forward(x, y, limit, out=None):
     if x.device != y.device:
         raise ValueError("x and y must be on the same device")
+    if (
+        runtime.device.vendor_name == "hygon"
+        and out is None
+        and not x.is_contiguous()
+        and x.shape == y.shape
+        and x.dtype == y.dtype
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        packed_shape = _packed_row_shape(x, y)
+        if packed_shape is not None:
+            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            d = packed_shape[1]
+            _launch_forward(
+                x,
+                y,
+                out,
+                limit,
+                packed_shape,
+                ((2 * d, 1), (2 * d, 1), (d, 1)),
+                False,
+            )
+            return out
     shape = x.shape if x.shape == y.shape else _broadcast_shape(x.shape, y.shape)
     if out is None:
         dtype = _result_dtype(x, y, limit)
