@@ -1498,6 +1498,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: mhc_pre_norm_small
+  description: Ascend small-row GLM5Next FP32-projection mHC Pre with BF16-premix RMSNorm.
+  for:
+  - mhc_pre_norm_small
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+
 - id: mhc_shifted_post_pre
   description: 'DSV4.1 shifted mHC boundary: applies the previous sublayer''s post/comb
 
