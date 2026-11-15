@@ -14,21 +14,19 @@
 
 """Fused FP8 latency (framework milliseconds); speedup = vLLM / Gems.
 
-The baseline is the unchanged installed-vLLM AST with only its platform dtype
-selected by vLLM. No FP32-output substitute or alternate quantizer is timed.
+The baseline is imported directly from the installed vLLM library.
 Use ``--mode cudagraph`` to measure captured device work through graph replay.
 """
 
-import ast
-import importlib.util
 from functools import partial
 from pathlib import Path
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 import yaml
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    silu_mul_per_token_group_quant_fp8_colmajor as vllm_silu_mul_quant,
+)
 
 import flaggems_vllm
 
@@ -36,47 +34,6 @@ from . import base
 
 if flaggems_vllm.vendor_name == "mthreads":
     import torchada  # noqa: F401
-
-
-def _installed_vllm_reference():
-    """Load unchanged installed function ASTs, isolating vLLM plugin setup.
-
-    Use the vLLM platform FP8 dtype, with scale mode passed explicitly.
-    """
-    spec = importlib.util.find_spec("vllm")
-    if spec is None:
-        pytest.skip("installed vLLM reference is unavailable")
-    path = Path(next(iter(spec.submodule_search_locations))) / (
-        "model_executor/layers/quantization/utils/fp8_utils.py"
-    )
-    source = path.read_text()
-    names = {
-        "_silu_mul_per_token_group_quant_fp8_colmajor",
-        "silu_mul_per_token_group_quant_fp8_colmajor",
-    }
-    functions = [
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name in names
-    ]
-    if len(functions) != 2:
-        pytest.skip("installed vLLM has no compatible Triton reference")
-    host = next(node for node in functions if not node.name.startswith("_"))
-    if "clamp_limit" not in {arg.arg for arg in host.args.args}:
-        pytest.skip("installed vLLM predates the v0.23 clamp/rounding contract")
-    from vllm.platforms import current_platform
-
-    namespace = {
-        "torch": torch,
-        "triton": triton,
-        "tl": tl,
-        "current_platform": current_platform,
-    }
-    exec(
-        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
-        namespace,
-    )
-    return namespace["silu_mul_per_token_group_quant_fp8_colmajor"]
 
 
 # Small, common, two narrow-group regressions, and bandwidth-heavy workloads.
@@ -113,8 +70,7 @@ class SiluMulQuantFp8Benchmark(base.GenericBenchmark):
 def _inputs(shape, dtype, device, use_ue8m0=False):
     x = torch.randn(shape, dtype=dtype, device=device)
     before = x.clone()
-    native = _installed_vllm_reference()
-    expected = native(x, use_ue8m0=use_ue8m0, clamp_limit=None)
+    expected = vllm_silu_mul_quant(x, use_ue8m0=use_ue8m0, clamp_limit=None)
     actual = flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor(
         x, use_ue8m0=use_ue8m0, clamp_limit=None
     )
@@ -139,7 +95,7 @@ def test_silu_mul_per_token_group_quant_fp8_colmajor(use_ue8m0):
     bench = SiluMulQuantFp8Benchmark(
         op_name="silu_mul_per_token_group_quant_fp8_colmajor",
         input_fn=partial(_inputs, use_ue8m0=use_ue8m0),
-        torch_op=_installed_vllm_reference(),
+        torch_op=vllm_silu_mul_quant,
         gems_op=flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor,
         dtypes=[torch.float16, torch.bfloat16],
     )

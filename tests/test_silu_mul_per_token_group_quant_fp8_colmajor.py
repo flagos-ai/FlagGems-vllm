@@ -14,29 +14,11 @@
 
 import pytest
 import torch
-from vllm.platforms import current_platform
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    silu_mul_per_token_group_quant_fp8_colmajor as vllm_silu_mul_quant,
+)
 
 import flaggems_vllm
-
-
-def native_silu_mul_per_token_group_quant_fp8_colmajor(
-    x, use_ue8m0, clamp_limit, eps=1e-10
-):
-    gate, up = x.chunk(2, dim=-1)
-    if clamp_limit is not None:
-        gate = gate.float().clamp(max=clamp_limit).to(x.dtype)
-        up = up.float().clamp(-clamp_limit, clamp_limit).to(x.dtype)
-    # Preserve vLLM's activation and multiplication rounding at input precision.
-    gate_f32 = gate.float()
-    activated = (gate_f32 / (1 + torch.exp(-gate_f32))).to(x.dtype)
-    values = (activated * up).float().reshape(x.shape[0], x.shape[1] // 256, 128)
-    fp8_dtype = current_platform.fp8_dtype()
-    fp8_max = 224.0 if current_platform.is_fp8_fnuz() else torch.finfo(fp8_dtype).max
-    scales = values.abs().amax(-1).clamp(min=eps) * (1.0 / fp8_max)
-    if use_ue8m0:
-        scales = torch.exp2(torch.ceil(torch.log2(scales)))
-    output = (values / scales[..., None]).clamp(-fp8_max, fp8_max).to(fp8_dtype)
-    return output.reshape(x.shape[0], x.shape[1] // 2), scales
 
 
 @pytest.mark.silu_mul_per_token_group_quant_fp8_colmajor
@@ -56,14 +38,11 @@ def test_silu_mul_per_token_group_quant_fp8_colmajor(
 ):
     torch.manual_seed(1337)
     x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
-    ref_output, ref_scales = native_silu_mul_per_token_group_quant_fp8_colmajor(
-        x.cpu(), use_ue8m0, clamp_limit
+    ref_output, ref_scales = vllm_silu_mul_quant(
+        x, use_ue8m0=use_ue8m0, clamp_limit=clamp_limit
     )
     output, scales = flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor(
         x, use_ue8m0=use_ue8m0, clamp_limit=clamp_limit
     )
-    torch.testing.assert_close(scales.cpu(), ref_scales, rtol=1e-5, atol=1e-8)
-    # CPU/GPU exp can straddle FP8 rounding boundaries; allow one FP8 step.
-    torch.testing.assert_close(
-        output.cpu().float(), ref_output.float(), rtol=0.125, atol=2**-9
-    )
+    torch.testing.assert_close(scales, ref_scales, rtol=1e-6, atol=0)
+    assert torch.equal(output.view(torch.uint8), ref_output.view(torch.uint8))
