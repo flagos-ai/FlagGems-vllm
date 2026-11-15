@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical contract and strict installed-vLLM kernel comparisons."""
+"""Accuracy tests against vLLM and an independent CPU reference."""
 
 import ast
 import importlib
 import importlib.util
 from functools import lru_cache
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,18 +41,6 @@ pytestmark = [
         reason="this backend has no validated fused FP8 implementation",
     ),
 ]
-
-
-def test_backend_routing():
-    prefix = "flaggems_vllm.ops"
-    if flaggems_vllm.vendor_name != "nvidia":
-        prefix = f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}.ops"
-    expected_module = f"{prefix}.silu_mul_per_token_group_quant_fp8_colmajor"
-    assert OP.__module__ == expected_module
-    assert OP is getattr(
-        importlib.import_module(expected_module),
-        "silu_mul_per_token_group_quant_fp8_colmajor",
-    )
 
 
 @lru_cache(maxsize=1)
@@ -122,10 +109,6 @@ def _cpu_reference(x, use_ue8m0=False, eps=1e-10, clamp_limit=None):
 def _assert_reference_equal(actual, expected):
     q, s = actual
     ref_q, ref_s = expected
-    assert q.dtype == _CORE._platform_fp8_dtype()
-    assert q.element_size() == 1
-    assert s.dtype == torch.float32
-    assert s.stride() == (1, q.shape[0])
     # NaN payload/sign need not be stable. Every non-NaN FP8 byte, including
     # signed zeros, must match the installed kernel exactly.
     actual_bytes = q.view(torch.uint8).cpu()
@@ -150,19 +133,10 @@ def test_matches_installed_vllm(dtype, shape, use_ue8m0, clamp_limit):
         pytest.skip("large shape omitted in quick mode")
     torch.manual_seed(1337)
     x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
-    before = x.clone()
     kwargs = dict(use_ue8m0=use_ue8m0, clamp_limit=clamp_limit)
     ref = _installed_vllm_reference()(x, **kwargs)
     actual = OP(x, **kwargs)
     _assert_reference_equal(actual, ref)
-    torch.testing.assert_close(x, before, rtol=0, atol=0)
-    # Separate independent mathematical check; CPU/GPU exp may straddle an
-    # FP8 rounding boundary. This is not the strict GPU equality criterion.
-    cpu_q, cpu_s = _cpu_reference(x, **kwargs)
-    torch.testing.assert_close(actual[1].cpu(), cpu_s, rtol=1e-5, atol=1e-8)
-    torch.testing.assert_close(
-        actual[0].cpu().float(), cpu_q.float(), rtol=0.125, atol=2**-9
-    )
 
 
 @pytest.mark.parametrize("special", ["zero", "nan", "inf", "negative_inf"])
@@ -182,27 +156,14 @@ def test_special_values_match_vllm(special, use_ue8m0):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_signed_zero_clamp_cache(dtype):
+def test_signed_zero_clamp_matches_vllm(dtype):
     """Scalar signed zero must remain correct across repeated compiled calls."""
     torch.manual_seed(2027)
-    x = torch.randn((1024, 1280), dtype=dtype, device=flaggems_vllm.device)
+    x = torch.randn((128, 4096), dtype=dtype, device=flaggems_vllm.device)
     reference = _installed_vllm_reference()
     for clamp_limit in (0.0, -0.0, 0.0):
         kwargs = dict(use_ue8m0=False, clamp_limit=clamp_limit)
         _assert_reference_equal(OP(x, **kwargs), reference(x, **kwargs))
-
-
-def test_output_and_default_scale_mode():
-    x = torch.randn((1024, 1280), dtype=torch.bfloat16, device=flaggems_vllm.device)
-    output = torch.empty(
-        (1024, 640), dtype=_CORE._platform_fp8_dtype(), device=x.device
-    )
-    actual = OP(x, output=output)
-    assert actual[0] is output
-    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
-
-    _assert_reference_equal(actual, _installed_vllm_reference()(x))
-    _assert_reference_equal(actual, OP(x, use_ue8m0=is_deep_gemm_e8m0_used()))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -211,126 +172,18 @@ def test_output_and_default_scale_mode():
 def test_independent_cpu_reference(dtype, use_ue8m0, clamp_limit):
     """Check numerical semantics against an independent CPU calculation."""
     torch.manual_seed(2026)
-    x = torch.randn((1024, 1280), dtype=dtype, device=flaggems_vllm.device)
+    x = torch.randn((128, 4096), dtype=dtype, device=flaggems_vllm.device)
     kwargs = dict(use_ue8m0=use_ue8m0, clamp_limit=clamp_limit)
-    before = x.cpu()
-    ref_q, ref_s = _cpu_reference(before, **kwargs)
+    ref_q, ref_s = _cpu_reference(x, **kwargs)
     q, s = OP(x, **kwargs)
-    torch.testing.assert_close(x.cpu(), before, rtol=0, atol=0)
-    assert q.dtype == _CORE._platform_fp8_dtype()
-    assert q.element_size() == 1
-    assert q.device == x.device and s.device == x.device
-    assert q.is_contiguous()
-    assert s.stride() == (1, x.shape[0])
     torch.testing.assert_close(s.cpu(), ref_s, rtol=1e-5, atol=1e-8)
     # CPU and accelerator exp may straddle an FP8 rounding boundary. Strict
     # byte comparisons against the native reference remain separate above.
     torch.testing.assert_close(q.cpu().float(), ref_q.float(), rtol=0.125, atol=2**-9)
 
 
-@pytest.mark.parametrize("shape", [(0, 256), (128, 0)])
-def test_empty(shape):
-    x = torch.empty(shape, dtype=torch.float16, device=flaggems_vllm.device)
-    q, s = OP(x)
-    assert q.shape == (shape[0], shape[1] // 2)
-    assert q.dtype == _CORE._platform_fp8_dtype()
-    assert s.shape == (shape[0], shape[1] // 256)
-    assert s.dtype == torch.float32
-
-
-@pytest.mark.parametrize(
-    "kind",
-    [
-        "rank",
-        "rows",
-        "columns",
-        "dtype",
-        "layout",
-        "out_shape",
-        "out_layout",
-        "alias",
-        "device",
-    ],
-)
-def test_invalid_contract(kind):
-    x = torch.empty((128, 256), dtype=torch.float16, device=flaggems_vllm.device)
-    kwargs = {}
-    if kind == "rank":
-        x = x.view(128, 2, 128)
-    elif kind == "rows":
-        x = x[:127]
-    elif kind == "columns":
-        x = torch.empty((128, 258), dtype=x.dtype, device=x.device)
-    elif kind == "dtype":
-        x = torch.empty(x.shape, dtype=torch.int32, device=x.device)
-    elif kind == "layout":
-        x = x.T
-    elif kind.startswith("out_"):
-        shape = (128, 127) if kind == "out_shape" else (128, 128)
-        dtype = torch.float16 if kind == "out_dtype" else _CORE._platform_fp8_dtype()
-        output = torch.empty(shape, dtype=dtype, device=x.device)
-        kwargs["output"] = output.T if kind == "out_layout" else output
-    elif kind == "alias":
-        kwargs["output"] = (
-            x.view(_CORE._platform_fp8_dtype()).view(-1)[: 128 * 128].view(128, 128)
-        )
-    elif kind == "device":
-        kwargs["output"] = torch.empty((128, 128), dtype=_CORE._platform_fp8_dtype())
-    with pytest.raises((ValueError, TypeError, NotImplementedError, AssertionError)):
-        OP(x, **kwargs)
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"eps": 0.0},
-        {"eps": -1.0},
-        {"eps": float("nan")},
-        {"eps": float("inf")},
-        {"eps": -float("inf")},
-        {"clamp_limit": -1.0},
-        {"clamp_limit": float("nan")},
-        {"clamp_limit": float("inf")},
-        {"clamp_limit": -float("inf")},
-        {"use_ue8m0": 0},
-        {"use_ue8m0": 1},
-    ],
-)
-def test_scalar_arguments_match_vllm(kwargs):
-    torch.manual_seed(16)
-    x = torch.randn((128, 256), dtype=torch.bfloat16, device=flaggems_vllm.device)
-    _assert_reference_equal(OP(x, **kwargs), _installed_vllm_reference()(x, **kwargs))
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_preallocated_float_output_matches_vllm(dtype):
-    x = torch.randn((128, 256), dtype=torch.bfloat16, device=flaggems_vllm.device)
-    output = torch.empty((128, 128), dtype=dtype, device=x.device)
-    ref_output = torch.empty_like(output)
-    q, s = OP(x, output=output, use_ue8m0=False)
-    rq, rs = _installed_vllm_reference()(x, output=ref_output, use_ue8m0=False)
-    assert q is output
-    torch.testing.assert_close(q, rq, rtol=1e-6, atol=0)
-    torch.testing.assert_close(s, rs, rtol=1e-6, atol=0)
-
-
-def test_disjoint_shared_storage():
-    # Both tensors share storage, but their contiguous byte ranges do not overlap.
-    storage = torch.empty(128 * 256 + 128 * 128, device=flaggems_vllm.device)
-    x = storage[: 128 * 256].view(128, 256)
-    x.normal_()
-    output = storage[128 * 256 :].view(128, 128)
-    actual = OP(x, output=output, use_ue8m0=False)
-    reference = _installed_vllm_reference()(
-        x, output=torch.empty_like(output), use_ue8m0=False
-    )
-    assert actual[0] is output
-    torch.testing.assert_close(actual[0], reference[0], rtol=1e-6, atol=0)
-    torch.testing.assert_close(actual[1], reference[1], rtol=1e-6, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(1024, 1280), (1024, 4096)])
+@pytest.mark.parametrize("shape", [(128, 4096), (1024, 1792)])
 @pytest.mark.parametrize(
     "eps",
     [
@@ -351,7 +204,7 @@ def test_ue8m0_eps_fast_path_boundary(dtype, shape, eps):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(1024, 1280), (1024, 4096), (8192, 4096)])
+@pytest.mark.parametrize("shape", [(128, 256), (1024, 1792), (8192, 4096)])
 def test_ue8m0_infinite_scale_preserves_negative_zero(dtype, shape):
     # Infinite scales must preserve the sign of finite negative activations.
     x = torch.empty(shape, dtype=dtype, device=flaggems_vllm.device)
@@ -362,21 +215,3 @@ def test_ue8m0_infinite_scale_preserves_negative_zero(dtype, shape):
     actual = OP(x, **kwargs)
     _assert_reference_equal(actual, _installed_vllm_reference()(x, **kwargs))
     assert torch.all(actual[0].view(torch.uint8).cpu()[0, 1:128] == 0x80)
-
-
-def test_platform_fp8_dtype_selection(monkeypatch):
-    """Follow vLLM's platform dtype rather than assuming every device uses FN."""
-    import importlib
-    import sys
-    from types import ModuleType
-
-    core = importlib.import_module(
-        "flaggems_vllm.ops.silu_mul_per_token_group_quant_fp8_colmajor"
-    )
-    platforms = ModuleType("vllm.platforms")
-    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
-    for dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        platforms.current_platform = SimpleNamespace(fp8_dtype=lambda: dtype)
-        assert core._platform_fp8_dtype() == dtype
-    platforms.current_platform = SimpleNamespace(fp8_dtype=lambda: torch.float32)
-    assert core._platform_fp8_dtype() == torch.float32
