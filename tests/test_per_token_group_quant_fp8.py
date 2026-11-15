@@ -16,7 +16,6 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
 
 from . import accuracy_utils as utils
 
@@ -138,42 +137,3 @@ def test_per_token_group_quant_fp8(
     ref_out_fp32 = _fp8_to_float32(ref_out)
 
     assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
-
-
-@pytest.mark.per_token_group_quant_fp8
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia" or not kernel_supports_fp8_e4m3(),
-    reason="NVIDIA native E4M3 metadata specialization",
-)
-@pytest.mark.parametrize(
-    "shape",
-    [(128, 256), (512, 4096), (1024, 1280), (1024, 1792), (8192, 4096)],
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("scale_ue8m0", [False, True])
-@pytest.mark.parametrize("column_major_scales", [False, True])
-def test_per_token_group_quant_fp8_layout_boundaries(
-    shape, dtype, scale_ue8m0, column_major_scales
-):
-    m, n = shape
-    pattern = torch.tensor(
-        [0.0, -0.0, 0.125, -0.125, 0.5, -0.5, 1.0, -1.0],
-        dtype=dtype,
-        device=flaggems_vllm.device,
-    )
-    x = pattern.repeat(m, n // pattern.numel())
-    x[:, :128] = 0.0
-    x[:, 1] = -0.0
-    values = x.float().reshape(m, n // 128, 128)
-    scales = values.abs().amax(dim=-1).clamp_min(1e-10) * (1.0 / 448.0)
-    if scale_ue8m0:
-        scales = torch.exp2(torch.ceil(torch.log2(scales.abs().clamp_min(1e-10))))
-    expected = (values / scales.unsqueeze(-1)).clamp(-448.0, 448.0)
-    expected = expected.reshape(m, n).to(torch.float8_e4m3fn)
-
-    q, actual_scales = flaggems_vllm.per_token_group_quant_fp8(
-        x, 128, column_major_scales=column_major_scales, scale_ue8m0=scale_ue8m0
-    )
-    assert actual_scales.stride() == ((1, m) if column_major_scales else (n // 128, 1))
-    assert torch.equal(q.view(torch.uint8), expected.view(torch.uint8))
-    assert torch.equal(actual_scales, scales)

@@ -19,8 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.device_info import kernel_supports_fp8_e4m3
 
 if kernel_supports_fp8_e4m3():
@@ -217,97 +215,6 @@ def _per_token_group_quant_fp8_colmajor_vec(
     tl.store(y_s_ptr + scale_offsets, y_s)
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("per_token_group_quant_fp8_rows"),
-    key=["M", "N", "DTYPE", "USE_UE8M0", "COLUMN_MAJOR"],
-)
-@triton.jit
-def _per_token_group_quant_fp8_rows(
-    X,
-    Q,
-    S,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    eps,
-    fp8_min,
-    fp8_max,
-    DTYPE: tl.constexpr,
-    USE_UE8M0: tl.constexpr,
-    COLUMN_MAJOR: tl.constexpr,
-    BROWS: tl.constexpr,
-):
-    # The host restricts this path to contiguous group-128 inputs with fewer
-    # than 2**31 elements. Every element and scale offset fits signed int32.
-    rows = tl.program_id(0) * BROWS + tl.arange(0, BROWS)
-    group = tl.program_id(1)
-    cols = group * 128 + tl.arange(0, 128)
-    values = tl.load(X + rows[:, None] * N + cols[None, :]).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(values), axis=1), eps)
-    scales = amax * (1.0 / fp8_max)
-    if USE_UE8M0:
-        scales = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scales), 1e-10))))
-    quantized = tl.clamp(values / scales[:, None], fp8_min, fp8_max)
-    tl.store(
-        Q + rows[:, None] * N + cols[None, :],
-        quantized.to(Q.dtype.element_ty),
-    )
-    if COLUMN_MAJOR:
-        tl.store(S + group * M + rows, scales)
-    else:
-        tl.store(S + rows * (N // 128) + group, scales)
-
-
-def _prune_quant_tiles(configs, named_args, **kwargs):
-    return [
-        config
-        for config in configs
-        if named_args["N"] % (128 * config.kwargs["BG"]) == 0
-    ]
-
-
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("per_token_group_quant_fp8_tile"),
-    key=["M", "N", "DTYPE", "COL", "UE"],
-    prune_configs_by={"early_config_prune": _prune_quant_tiles},
-    use_cuda_graph=True,
-)
-@triton.jit
-def _per_token_group_quant_fp8_tile(
-    X,
-    Q,
-    S,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    EPS,
-    MIN,
-    MAX,
-    COL: tl.constexpr,
-    UE: tl.constexpr,
-    BR: tl.constexpr,
-    BG: tl.constexpr,
-    DTYPE: tl.constexpr,
-):
-    rows = tl.program_id(0) * BR + tl.arange(0, BR)
-    groups = tl.program_id(1) * BG + tl.arange(0, BG)
-    cols = groups[:, None] * 128 + tl.arange(0, 128)[None, :]
-    offs = rows[:, None, None] * N + cols[None, :, :]
-    y = tl.load(X + offs).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(y), axis=2), EPS)
-    scale = amax * (1.0 / MAX)
-    if UE:
-        scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1e-10))))
-    quant = tl.clamp(y / scale[:, :, None], MIN, MAX).to(Q.dtype.element_ty)
-    tl.store(Q + offs, quant)
-    so = (
-        groups[None, :] * M + rows[:, None]
-        if COL
-        else rows[:, None] * (N // 128) + groups[None, :]
-    )
-    tl.store(S + so, scale)
-
-
 def _groups_per_program(x: torch.Tensor, group_size: int) -> int:
     groups_per_row = x.shape[-1] // group_size
     for groups in (8, 4, 2):
@@ -351,107 +258,21 @@ def per_token_group_quant_fp8(
     groups_per_program = _groups_per_program(x, group_size)
     grid = (num_groups // groups_per_program,)
 
-    native_vector_input = (
-        runtime.device.vendor_name == "nvidia"
-        and group_size == 128
-        and x.ndim == 2
-        and x.is_contiguous()
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and fp8_dtype == torch.float8_e4m3fn
-        and SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
-    )
-    # Narrow group counts lack column batching. Eight rows share one program
-    # and write adjacent column-major scales, reducing program count fourfold.
-    if (
-        native_vector_input
-        and groups_per_program == 2
-        and x.shape[0] >= 512
-        and x.shape[0] % 8 == 0
-        and x.numel() < 2**31
-        and isinstance(scale_ue8m0, bool)
-        and isinstance(column_major_scales, bool)
-        and torch.cuda.get_device_capability(x.device) == (9, 0)
-    ):
-        _per_token_group_quant_fp8_rows[
-            lambda meta: (x.shape[0] // meta["BROWS"], x.shape[1] // 128)
-        ](
-            x,
-            x_q,
-            x_s,
-            x.shape[0],
-            x.shape[1],
-            eps,
-            fp8_min,
-            fp8_max,
-            DTYPE=str(x.dtype),
-            USE_UE8M0=scale_ue8m0,
-            COLUMN_MAJOR=column_major_scales,
-        )
-        return x_q, x_s
-
-    if (
-        native_vector_input
-        and x.shape[0] >= 4096
-        and x.shape[0] % 8 == 0
-        and x.shape[1] >= 1024
-        and groups_per_program >= 4
-        and x.numel() < 2**31
-        and isinstance(scale_ue8m0, bool)
-        and isinstance(column_major_scales, bool)
-        and torch.cuda.get_device_capability(x.device) == (9, 0)
-    ):
-        _per_token_group_quant_fp8_tile[
-            lambda meta: (x.shape[0] // meta["BR"], x.shape[1] // (128 * meta["BG"]))
-        ](
-            x,
-            x_q,
-            x_s,
-            x.shape[0],
-            x.shape[1],
-            eps,
-            fp8_min,
-            fp8_max,
-            COL=column_major_scales,
-            UE=scale_ue8m0,
-            DTYPE=str(x.dtype),
-        )
-        return x_q, x_s
-
-    specialize_metadata = (
-        native_vector_input and x.shape[0] >= 128 and x.shape[1] >= 1024
-    )
-    # Two-group row-major programs regress with constexpr indexing once M
-    # exceeds 512, despite lower register usage. Retain their original kernel
-    # specialization, and keep the medium-row fast path for larger groups.
-    # The remaining column-batched paths keep their existing launch configs.
-    specialize_medium = (
-        specialize_metadata
-        and x.shape[0] <= 2048
-        and groups_per_program > 1
-        and (column_major_scales or groups_per_program >= 4 or x.shape[0] <= 512)
-    )
-    quant_scale_mode = (
-        tl.constexpr(scale_ue8m0)
-        if specialize_medium and isinstance(scale_ue8m0, bool)
-        else scale_ue8m0
-    )
-
     if column_major_scales:
         if groups_per_program > 1:
             kernel = _per_token_group_quant_fp8_colmajor_vec
-            metadata = (group_size, x.shape[1], x.stride(0), x_s.stride(1))
-            # Preserve the previous wide column-major specialization.
-            if specialize_metadata:
-                metadata = tuple(tl.constexpr(value) for value in metadata)
             kernel[grid](
                 x,
                 x_q,
                 x_s,
-                *metadata,
+                group_size,
+                x.shape[1],
+                x.stride(0),
+                x_s.stride(1),
                 eps,
                 fp8_min=fp8_min,
                 fp8_max=fp8_max,
-                scale_ue8m0=quant_scale_mode,
+                scale_ue8m0=scale_ue8m0,
                 BLOCK=block,
                 NGROUPS=groups_per_program,
                 num_warps=num_warps,
@@ -477,18 +298,17 @@ def per_token_group_quant_fp8(
             )
     elif groups_per_program > 1:
         kernel = _per_token_group_quant_fp8_vec
-        metadata = (group_size, x.shape[1], x.stride(0))
-        if specialize_medium:
-            metadata = tuple(tl.constexpr(value) for value in metadata)
         kernel[grid](
             x,
             x_q,
             x_s,
-            *metadata,
+            group_size,
+            x.shape[1],
+            x.stride(0),
             eps,
             fp8_min=fp8_min,
             fp8_max=fp8_max,
-            scale_ue8m0=quant_scale_mode,
+            scale_ue8m0=scale_ue8m0,
             BLOCK=block,
             NGROUPS=groups_per_program,
             num_warps=num_warps,

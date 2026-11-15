@@ -1608,11 +1608,6 @@ hc_combine:
     num_warps: 4
     num_stages: 1
 
-per_token_group_quant_fp8_rows:
-  - META: {BROWS: 8}
-    num_warps: 1
-    num_stages: 1
-
 silu_mul_per_token_group_quant_fp8_colmajor:
   - META: {BLOCK_M: 1}
     num_warps: 4
@@ -1628,18 +1623,6 @@ silu_mul_per_token_group_quant_fp8_colmajor:
     num_stages: 1
   - META: {BLOCK_M: 16}
     num_warps: 8
-    num_stages: 1
-
-# Large H20 group tiles, narrowed from a 74-config CUDA Graph search.
-per_token_group_quant_fp8_tile:
-  - META: {BR: 2, BG: 16}
-    num_warps: 2
-    num_stages: 1
-  - META: {BR: 8, BG: 2}
-    num_warps: 2
-    num_stages: 1
-  - META: {BR: 1, BG: 8}
-    num_warps: 1
     num_stages: 1
 
 # Default schedules; the larger expand space requires explicit FlagTune opt-in.
