@@ -1050,5 +1050,52 @@ def test_megamoe_worker_cli_preserves_test_config(monkeypatch):
     assert _parse_ppu_worker_config() == config
 
 
+def test_megamoe_fast_silu_preserves_bf16_domain():
+    """Compare the optimized BF16 map with the original FP32 div_rn formula."""
+    api = _require_ppu_device()
+    import triton
+    import triton.language as tl
+
+    kernel = importlib.import_module(
+        api.megamoe.__module__.rsplit(".", 1)[0] + ".kernel"
+    )
+
+    @triton.jit
+    def evaluate(reference, actual, fallback, BLOCK: tl.constexpr):
+        index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        gate = index.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+        up = tl.full((BLOCK,), 1.0, tl.float32)
+        expected = tl.div_rn(gate, 1.0 + tl.exp(-gate)).to(tl.bfloat16)
+        optimized = kernel.swiglu_bf16(gate, up, True)
+        original = kernel.swiglu_bf16(gate, up, False)
+        tl.store(reference + index, expected.to(tl.uint16, bitcast=True))
+        tl.store(actual + index, optimized.to(tl.uint16, bitcast=True))
+        tl.store(fallback + index, original.to(tl.uint16, bitcast=True))
+
+    reference = torch.empty(65536, device="cuda", dtype=torch.int16)
+    actual = torch.empty_like(reference)
+    fallback = torch.empty_like(reference)
+    evaluate[(256,)](reference, actual, fallback, 256)
+    reference = reference.cpu().to(torch.int32) & 65535
+    finite_input = (torch.arange(65536, dtype=torch.int32) & 0x7F80) != 0x7F80
+    for result in (actual, fallback):
+        result = result.cpu().to(torch.int32) & 65535
+        torch.testing.assert_close(
+            result[finite_input], reference[finite_input], rtol=0, atol=0
+        )
+        # NaN payload/sign are unspecified; preserve all output classifications.
+        for values in (reference, result):
+            is_special = (values & 0x7F80) == 0x7F80
+            classification = is_special.to(torch.int32) + (
+                is_special & ((values & 127) != 0)
+            ).to(torch.int32)
+            if values is reference:
+                expected_classification = classification
+            else:
+                torch.testing.assert_close(
+                    classification, expected_classification, rtol=0, atol=0
+                )
+
+
 if __name__ == "__main__" and _IS_ACCURACY_WORKER:
     _run_accuracy_worker()
