@@ -594,7 +594,8 @@ def mhc_shifted_post_pre(
 
     # (5) optional RMSNorm of the collapsed input.  The MetaX path loads the
     # row once when it fits in a single CTA instead of the generic two-pass
-    # kernel's two reads.
+    # kernel's two reads.  It only wins for wide rows: the H=1280 decode
+    # shapes regress because one CTA per row is launch bound there.
     if norm_weight is not None:
         if use_metax_fused and 4096 <= hidden_size <= 8192:
             layer_input = mhc_shifted_norm_metax(layer_input, norm_weight, norm_eps)
