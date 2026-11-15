@@ -515,18 +515,9 @@ class Benchmark:
                                 self.gems_op, *args, **kwargs
                             )
                         else:
-                            if self.op_name == "zero_":
-                                with flaggems_vllm.use_gems():
-                                    metric.latency = self.get_latency(
-                                        self.torch_op, *args, **kwargs
-                                    )
-                            else:
-                                # exclude flaggems' zero_ to avoid the overhead of zero_
-                                # in do_bench's clear_cache
-                                with flaggems_vllm.use_gems(exclude=["zero_"]):
-                                    metric.latency = self.get_latency(
-                                        self.torch_op, *args, **kwargs
-                                    )
+                            metric.latency = self.get_latency(
+                                self.torch_op, *args, **kwargs
+                            )
                     if (
                         "speedup" in self.to_bench_metrics
                         and metric.latency_base is not None
