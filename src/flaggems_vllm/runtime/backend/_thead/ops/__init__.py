@@ -42,6 +42,7 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -51,9 +52,8 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
-    "flash_mla_with_kvcache_fwd_w8a8_int8",
-    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "chunk_gated_delta_rule_w8a16_int8",
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
@@ -65,6 +65,8 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
+    "qsa_prepare",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
     "SUPPORTED_FP8_DTYPE",

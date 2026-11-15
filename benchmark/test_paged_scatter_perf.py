@@ -96,7 +96,7 @@ def _gems_scatter(cache, slots, values, bs):
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
 def test_paged_scatter_perf():
     PagedScatterBenchmark(
-        op_name="paged_scatter",
+        op_name="paged_scatter_triton",
         torch_op=_torch_scatter,
         gems_op=_gems_scatter,
         dtypes=[torch.bfloat16],
