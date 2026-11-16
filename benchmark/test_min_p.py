@@ -9,17 +9,18 @@ after warmup. Each provider starts from the same original logits.
 
 import pytest
 import torch
-from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
 
 try:
-    from flaggems_vllm import apply_min_p, runtime
+    from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
 except ImportError as exc:
     raise ImportError(
-        "Failed to import apply_min_p and runtime from flaggems_vllm. "
-        "Check that FlagGems-vllm and its dependencies are installed correctly."
+        "Failed to import apply_min_p from vLLM. "
+        "Check that the installed vLLM version provides this API "
+        "and its dependencies are installed correctly."
     ) from exc
 
 from benchmark import base
+from flaggems_vllm import apply_min_p, runtime
 
 pytestmark = [
     pytest.mark.apply_min_p,
