@@ -1633,3 +1633,17 @@ pad_trailing_draft_slots:
   - META: {BLOCK_ROWS: 32, BLOCK_SIZE: 16}
     num_warps: 4
     num_stages: 1
+
+draft_watermarking_mask:
+  - META:
+      BLOCK: 512
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 8192
+    num_warps: 4
+    num_stages: 1
