@@ -67,7 +67,6 @@ scaled_int8_quant
 scatter_decode_tokens
 scatter_state_rows
 sinkhorn_forward
-topk_sigmoid
 triton_scaled_mm
 triton_unified_attention
 vision_flash_attn_varlen
