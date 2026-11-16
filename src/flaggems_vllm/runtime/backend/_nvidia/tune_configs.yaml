@@ -849,6 +849,7 @@ fused_marlin_moe_w8a16_int8_gateup_silu_large:
     num_warps: 8
     num_stages: 1
 
+# FlagTree 0.7.0 also fails on Hopper for the three-stage FP8 down kernel.
 fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
     num_warps: 4
@@ -862,18 +863,6 @@ fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
-    num_warps: 8
-    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
@@ -913,6 +902,7 @@ fused_marlin_moe_w8a16_int8_unified:
     num_warps: 8
     num_stages: 3
 
+# FlagTree 0.7.0 also fails on Hopper for this three-stage FP8 decode path.
 fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
     num_warps: 4
@@ -923,15 +913,6 @@ fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
-    num_warps: 4
-    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_gateup:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
@@ -957,6 +938,8 @@ fused_marlin_moe_w8a16_int8_gateup:
     n: [64, 128]
     warps: [4, 8]
 
+# FlagTree 0.7.0 emits an illegal instruction on Hopper for short-M INT8
+# fused gate/up tiles when the pipeline uses three stages.
 fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
     num_warps: 4
@@ -991,39 +974,6 @@ fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
-  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 8
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
-    num_warps: 8
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
-    num_warps: 4
-    num_stages: 3
-  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
-    num_warps: 8
-    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
