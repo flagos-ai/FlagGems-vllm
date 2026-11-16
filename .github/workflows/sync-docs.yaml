@@ -36,6 +36,7 @@ permissions:
 jobs:
   rebase:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: check out gh-pages
         id: checkout-gh-pages

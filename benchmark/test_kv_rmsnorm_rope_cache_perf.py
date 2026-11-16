@@ -26,28 +26,28 @@ numbers.
 """
 
 import os
+from typing import Generator
 
 import pytest
 import torch
 
 try:
     import torch_npu  # noqa: F401
-
-    _NPU_AVAILABLE = torch.npu.is_available()
-except (ImportError, AttributeError):
-    _NPU_AVAILABLE = False
+except ImportError:
+    torch_npu = None
 
 import flaggems_vllm
+
+from . import base
 
 RMS_SIZE = 512
 ROPE_SIZE = 64
 PAGE_NUM = 493
 PAGE_SIZE = 128
-ATOL, RTOL = 1e-2, 1e-3
-WARMUP = 5
-ACTIVE = 20
 
-CASES = (("decode-fp16", 16384, 1, torch.float16),)
+# Same fp16 shapes as tests/test_kv_rmsnorm_rope_cache.py: decode-aligned,
+# decode-unaligned and prefill cover both kernel branches.
+CASES = ((16384, 1), (3, 1), (64, 256))
 
 _IS_ASCEND = flaggems_vllm.vendor_name == "ascend" and hasattr(torch, "npu")
 pytestmark = [
@@ -71,79 +71,49 @@ def _sequential_block_scheduling():
             os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved
 
 
-def _kernel_time_us(fn) -> float:
-    from triton.backends.ascend.testing import do_bench_npu
+class KvRmsnormRopeCacheBenchmark(base.Benchmark):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shape_desc = "batch,seq"
 
-    return do_bench_npu(fn, warmup=WARMUP, active=ACTIVE) * 1000.0
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = CASES
+
+    def get_input_iter(self, dtype) -> Generator:
+        for i, (batch_size, seq_len) in enumerate(self.shapes):
+            torch.manual_seed(i)
+            kv = torch.randn(
+                batch_size, 1, seq_len, RMS_SIZE + ROPE_SIZE, dtype=dtype
+            ).npu()
+            gamma = torch.ones(RMS_SIZE, dtype=dtype).npu()
+            cos = torch.randn(batch_size, 1, seq_len, ROPE_SIZE, dtype=dtype).npu()
+            sin = torch.randn(batch_size, 1, seq_len, ROPE_SIZE, dtype=dtype).npu()
+            k_cache = torch.zeros(PAGE_NUM, PAGE_SIZE, 1, ROPE_SIZE, dtype=dtype).npu()
+            ckv_cache = torch.zeros(PAGE_NUM, PAGE_SIZE, 1, RMS_SIZE, dtype=dtype).npu()
+            index = torch.arange(batch_size * seq_len, dtype=torch.int64).npu()
+            yield kv, gamma, cos, sin, index, k_cache, ckv_cache, {
+                "k_rope_scale": None,
+                "c_kv_scale": None,
+                "k_rope_offset": None,
+                "c_kv_offset": None,
+                "epsilon": 1e-5,
+                "cache_mode": "PA_BNSD",
+                "is_output_kv": True,
+            }
 
 
-def _make_inputs(batch_size, seq_len, dtype):
-    torch.manual_seed(0)
-    kv = torch.randn(batch_size, 1, seq_len, RMS_SIZE + ROPE_SIZE, dtype=dtype).npu()
-    gamma = torch.ones(RMS_SIZE, dtype=dtype).npu()
-    cos = torch.randn(batch_size, 1, seq_len, ROPE_SIZE, dtype=dtype).npu()
-    sin = torch.randn(batch_size, 1, seq_len, ROPE_SIZE, dtype=dtype).npu()
-    k_cache = torch.zeros(PAGE_NUM, PAGE_SIZE, 1, ROPE_SIZE, dtype=dtype).npu()
-    ckv_cache = torch.zeros(PAGE_NUM, PAGE_SIZE, 1, RMS_SIZE, dtype=dtype).npu()
-    index = torch.arange(batch_size * seq_len, dtype=torch.int64).npu()
-    return kv, gamma, cos, sin, k_cache, ckv_cache, index
-
-
-_KWARGS = dict(
-    k_rope_scale=None,
-    c_kv_scale=None,
-    k_rope_offset=None,
-    c_kv_offset=None,
-    epsilon=1e-5,
-    cache_mode="PA_BNSD",
-    is_output_kv=True,
-)
-
-
-@pytest.mark.parametrize(
-    "name, batch_size, seq_len, dtype",
-    CASES,
-    ids=lambda v: v if isinstance(v, str) else "",
-)
-@torch.inference_mode()
-def test_kv_rmsnorm_rope_cache_kernel_perf(name, batch_size, seq_len, dtype):
-    kv, gamma, cos, sin, k_cache, ckv_cache, index = _make_inputs(
-        batch_size, seq_len, dtype
+def torch_kv_rmsnorm_rope_cache(
+    kv, gamma, cos, sin, index, k_cache, ckv_cache, **kwargs
+):
+    return torch_npu.npu_kv_rmsnorm_rope_cache(
+        kv, gamma, cos, sin, index, k_cache, ckv_cache, **kwargs
     )
-    ref_k_cache = torch.zeros_like(k_cache)
-    ref_ckv_cache = torch.zeros_like(ckv_cache)
 
-    def candidate():
-        return flaggems_vllm.kv_rmsnorm_rope_cache(
-            kv, gamma, cos, sin, index, k_cache, ckv_cache, **_KWARGS
-        )
 
-    def reference():
-        return torch_npu.npu_kv_rmsnorm_rope_cache(
-            kv,
-            gamma,
-            cos,
-            sin,
-            index,
-            ref_k_cache,
-            ref_ckv_cache,
-            **_KWARGS,
-        )
-
-    k_cache_r, ckv_r, k_rope, c_kv = candidate()
-    k_cache_ref, v_cache_ref, k_rope_ref, c_kv_ref = reference()
-    for expected, actual in (
-        (k_rope_ref, k_rope),
-        (k_cache_ref, k_cache_r),
-        (v_cache_ref, ckv_r),
-        (c_kv_ref, c_kv),
-    ):
-        torch.testing.assert_close(expected, actual, atol=ATOL, rtol=RTOL)
-
-    reference_us = _kernel_time_us(reference)
-    candidate_us = _kernel_time_us(candidate)
-    print(
-        f"\nkv_rmsnorm_rope_cache[{name}] B={batch_size} S={seq_len} {str(dtype).split('.')[-1]}\n"
-        f"  ascendc={reference_us:.3f}us triton={candidate_us:.3f}us "
-        f"speedup={reference_us / candidate_us:.4f}x"
-    )
+def test_kv_rmsnorm_rope_cache_perf():
+    KvRmsnormRopeCacheBenchmark(
+        op_name="kv_rmsnorm_rope_cache",
+        torch_op=torch_kv_rmsnorm_rope_cache,
+        gems_op=flaggems_vllm.kv_rmsnorm_rope_cache,
+        dtypes=[torch.float16],
+    ).run()

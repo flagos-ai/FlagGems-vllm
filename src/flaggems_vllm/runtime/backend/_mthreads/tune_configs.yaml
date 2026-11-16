@@ -563,6 +563,17 @@ mthreads_marlin_moe_gemv:
     num_warps: 4
     num_stages: 1
 
+triton_reshape_and_cache_flash:
+  - META: {TILE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 1024}
+    num_warps: 8
+    num_stages: 1
+
 dequantize_and_gather_k_cache:
   - META:
       num_workers: 128
@@ -586,36 +597,12 @@ dequantize_and_gather_k_cache:
 ckfg_gate:
   - META:
       BD: 32
-    num_warps: 2
-    num_stages: 3
-  - META:
-      BD: 32
     num_warps: 4
     num_stages: 3
   - META:
       BD: 32
     num_warps: 8
     num_stages: 3
-  - META:
-      BD: 64
-    num_warps: 2
-    num_stages: 3
-  - META:
-      BD: 64
-    num_warps: 4
-    num_stages: 3
-  - META:
-      BD: 64
-    num_warps: 8
-    num_stages: 3
-  - META:
-      BD: 32
-    num_warps: 4
-    num_stages: 2
-  - META:
-      BD: 64
-    num_warps: 4
-    num_stages: 2
 kda_kkt_pairs:
   - META: {PAIRS: 16}
     num_warps: 4
@@ -636,6 +623,14 @@ gate_sigmoid_mul:
     num_stages: 1
 kda_kkt_inter:
   - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+pad_indexer_heads:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
     num_warps: 4
     num_stages: 1
 
@@ -667,6 +662,98 @@ chunk_kda_fwd_intra_token_parallel:
       - 8
     stages:
       - 1
+
+moe_sum_pair:
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_SIZE: 4096
+    num_warps: 8
+    num_stages: 2
+moe_sum_mt:
+  - META:
+      TOKENS: 8
+      BLOCK_H: 128
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TOKENS: 4
+      BLOCK_H: 256
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TOKENS: 8
+      BLOCK_H: 256
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 2
+      BLOCK_H: 256
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 2
+      BLOCK_H: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 1
+      BLOCK_H: 1024
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 1
+      BLOCK_H: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      TOKENS: 2
+      BLOCK_H: 1024
+    num_warps: 16
+    num_stages: 3
+moe_sum_general:
+  - META:
+      BLOCK_SIZE: 128
+    num_warps: 2
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 512
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 3
 
 hc_combine:
   - META: {BLOCK_D: 128, LOOP: false}
