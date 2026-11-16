@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from itertools import product
+from pathlib import Path
 from typing import NamedTuple
 
 import pytest
@@ -196,6 +197,7 @@ def run_dense_int8_mla(inputs):
 
 
 class DenseInt8MLABenchmark(base.Benchmark):
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
     DEFAULT_SHAPES = DENSE_INT8_SHAPES
     DEFAULT_SHAPE_DESC = "batch, queries, length, heads, varlen"
 
@@ -212,11 +214,12 @@ class DenseInt8MLABenchmark(base.Benchmark):
             configs = yaml.safe_load(shape_file)
         entry = configs.get(self.op_name, configs.get("flash_mla_with_kvcache_w8a8"))
         self.shapes = [tuple(shape) for shape in entry["shapes"]]
-        self.shape_desc = entry["shape_desc"]
+        self.shape_desc = entry.get("shape_desc", self.DEFAULT_SHAPE_DESC)
         if (
             Config.bench_level == consts.BenchLevel.COMPREHENSIVE
             and not Config.query
-            and shape_file_path == self.DEFAULT_SHAPE_FILES
+            and Path(shape_file_path).resolve()
+            == Path(self.DEFAULT_SHAPE_FILES).resolve()
         ):
             self.shapes = list(dict.fromkeys(self.shapes + DENSE_INT8_SHAPES))
 
