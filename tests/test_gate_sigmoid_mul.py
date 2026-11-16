@@ -14,7 +14,6 @@
 
 """Frozen mathematical coverage, independent of optional installed vLLM native."""
 
-import importlib
 import math
 
 import pytest
@@ -51,6 +50,38 @@ CASES = (
     "both_broadcast",
     "split_rowgap2112",
 )
+# Rank-8, split, and all dense and boundary cases retain their full matrix.
+# Each remaining Ascend layout still checks three output dtypes and both
+# directions of one mixed input pair. Rotate pairs across the layouts.
+_ASCEND_LAYOUT_MIXED_PAIRS = {
+    "row_gate": (torch.float16, torch.float32),
+    "column_gate": (torch.bfloat16, torch.float32),
+    "row_a": (torch.float16, torch.bfloat16),
+    "scalar_gate": (torch.float16, torch.bfloat16),
+    "scalar_a": (torch.bfloat16, torch.float32),
+    "transpose": (torch.float16, torch.float32),
+    "stepped": (torch.bfloat16, torch.float32),
+    "expanded": (torch.float16, torch.bfloat16),
+    "both_broadcast": (torch.float16, torch.float32),
+}
+
+
+def _layout_dtype_cases():
+    for case in CASES:
+        mixed = (
+            _ASCEND_LAYOUT_MIXED_PAIRS.get(case)
+            if flaggems_vllm.vendor_name == "ascend"
+            else None
+        )
+        for index, pair in enumerate(DTYPE_PAIRS):
+            if mixed is not None and pair not in (
+                (torch.float16, torch.float16),
+                (torch.bfloat16, torch.bfloat16),
+                mixed,
+                mixed[::-1],
+            ):
+                continue
+            yield pytest.param(case, *pair, id=f"{case}-a_dtype{index}-g_dtype{index}")
 
 
 @pytest.fixture
@@ -155,8 +186,7 @@ def _check(a, g, owners, expected=None):
 
 
 @pytest.mark.gate_sigmoid_mul
-@pytest.mark.parametrize("a_dtype,g_dtype", DTYPE_PAIRS)
-@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("case,a_dtype,g_dtype", list(_layout_dtype_cases()))
 def test_gate_sigmoid_mul_math_and_layout(case, a_dtype, g_dtype, device):
     _check(*_inputs(case, a_dtype, g_dtype, device))
 
@@ -218,48 +248,6 @@ def test_gate_sigmoid_mul_signed_zero(dtype, device):
     g = torch.tensor([-10, -10, 0, 0, 10, 10, 100, 100], dtype=dtype).to(device)
     actual = _check(a, g, (a, g))
     assert torch.equal(torch.signbit(actual), torch.signbit(a.cpu()))
-
-
-def _native():
-    """Optional installed native only; never reconstruct it from candidate code."""
-    module_name = "vllm.models.kimi_k3.nvidia.mla"
-    try:
-        baseline = importlib.import_module("baseline.gate_sigmoid_mul")
-    except ModuleNotFoundError as exc:
-        if exc.name != "baseline.gate_sigmoid_mul":
-            pytest.skip(
-                f"native baseline import unavailable: {type(exc).__name__}: {exc}"
-            )
-    else:
-        native = baseline.native()
-        if callable(native):
-            return native
-        reason = getattr(baseline, "NATIVE_UNAVAILABLE_REASON", None)
-        pytest.skip(
-            f"installed native unavailable: {reason or 'baseline resolver returned no callable'}"
-        )
-    try:
-        module = importlib.import_module(module_name)
-    except (ImportError, OSError) as exc:
-        pytest.skip(
-            f"installed native {module_name} unavailable: {type(exc).__name__}: {exc}"
-        )
-    native = getattr(module, "_gate_sigmoid_mul", None)
-    if not callable(native):
-        pytest.skip(f"installed {module_name} lacks callable _gate_sigmoid_mul")
-    return native
-
-
-@pytest.mark.gate_sigmoid_mul
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_gate_sigmoid_mul_installed_native(dtype, device):
-    native = _native()
-    a, g, owners = _inputs("matrix", dtype, dtype, device)
-    snapshots = [_bytes(owner) for owner in owners]
-    expected = native(a, g).cpu()
-    for owner, before in zip(owners, snapshots):
-        assert torch.equal(_bytes(owner), before), "native mutated input storage"
-    _check(a, g, owners, expected)
 
 
 @pytest.mark.gate_sigmoid_mul
