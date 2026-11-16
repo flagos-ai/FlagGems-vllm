@@ -1178,7 +1178,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     )
     if fast_path:
         native_splits = min(
-            4 if merged_heads == 32 and capacity <= 8192 else 8,
+            4 if merged_heads == 32 and capacity <= 12288 else 8,
             triton.next_power_of_2(block_table.shape[1]),
         )
         if merged_heads <= 32:

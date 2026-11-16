@@ -121,7 +121,6 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
   const int bound = causal ? max(length - sq + head / hq + 1, 0) : length;
   const long long qrow = (long long)batch * allheads + head;
   const float qs = input<float>(qsp)[qrow];
-#if HEADS == 32
   unsigned query[32];
   uint2_ query_rope[4];
 #pragma unroll
@@ -146,40 +145,8 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #define QROPE(k)                                                               \
   ((uint4_){query_rope[2 * (k)][0], query_rope[2 * (k)][1],                    \
             query_rope[2 * (k) + 1][0], query_rope[2 * (k) + 1][1]})
-#else
-  __shared__ unsigned char qbuffer[8192];
-  __shared__ unsigned char qrbuffer[2048];
-#pragma unroll
-  for (int c = 0; c < 2; ++c) {
-    const int i = t + c * 256, r = i >> 5, dim = ((i & 31) ^ (r & 7)) * 16;
-    void *dest = qbuffer + ((t & ~63) + c * 256) * 16;
-    void *src = (void *)input<unsigned char>(
-        qp + ((long long)batch * allheads + head_tile * 16 + r) * 512 + dim);
-    __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false, true,
-                                          1, 2, 40);
-  }
-  if (t < 128) {
-    const int r = t >> 3, dim = ((t & 7) ^ ((r & 3) * 2)) * 8;
-    void *dest = qrbuffer + (t & ~63) * 16;
-    void *src = (void *)input<unsigned char>(
-        qrp +
-        (((long long)batch * allheads + head_tile * 16 + r) * 64 + dim) * 2);
-    __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false, true,
-                                          1, 2, 40);
-  }
-  __builtin_mxc_arrive_gvmcnt(0);
-  sync();
-#define QNOPE(chunk, k)                                                        \
-  (*(const uint4_ *)(qbuffer + row * 512 +                                     \
-                     (((chunk) * 128 + (k) * 64 + group * 16) ^                \
-                      ((row & 7) * 16))))
-#define QROPE(k)                                                               \
-  (*(const uint4_ *)(qrbuffer + (row * 64 + ((group * 16 + (k) * 8) ^          \
-                                             ((row & 3) * 16))) *              \
-                                    2))
-#endif
-  // Two K planes overlap H16 copies with QK; H32 retains four planes for PV.
-  __shared__ unsigned char planes[HEADS == 32 ? 4 : 2][8192];
+  // Retain K in shared memory instead of keeping every V fragment live.
+  __shared__ unsigned char planes[4][8192];
   auto copy_wait = [&]() {
     __builtin_mxc_arrive_gvmcnt(0);
     __builtin_mxc_barrier_ex(2);
@@ -189,8 +156,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     for (int c = 0; c < 2; ++c) {
       const int i = t + c * 256, token = i >> 3;
       const int dim = ((i & 7) ^ ((token >> 1) & 7)) * 16;
-      void *dest = planes[HEADS == 32 ? chunk : (chunk & 1)] +
-                   ((t & ~63) + c * 256) * 16;
+      void *dest = planes[chunk] + ((t & ~63) + c * 256) * 16;
       void *src = (void *)input<unsigned char>(kp + (page * 64 + token) * 512 +
                                                chunk * 128 + dim);
       __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
@@ -229,22 +195,14 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #pragma unroll
     for (int n = 0; n < NR; ++n)
       content[n] = (int4_){0, 0, 0, 0};
-    unsigned retained[HEADS == 16 ? 4 : 1][4][QV];
-    if (HEADS == 32) {
+    unsigned retained[4][QV];
 #pragma unroll
-      for (int chunk = 0; chunk < 4; ++chunk)
-        load_plane(page, page_index, chunk);
-      copy_wait();
-    } else {
-      load_plane(page, page_index, 0);
-      load_plane(page, page_index, 1);
-      copy_wait();
-    }
+    for (int chunk = 0; chunk < 4; ++chunk)
+      load_plane(page, page_index, chunk);
+    copy_wait();
 #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
-      if (HEADS == 16 && chunk == 2)
-        copy_wait();
-      const auto tile = planes[HEADS == 32 ? chunk : (chunk & 1)];
+      const auto tile = planes[chunk];
 #pragma unroll
       for (int n = 0; n < NR; ++n) {
         const int token = wn * (64 / NW) + row * NR + n;
@@ -258,20 +216,14 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
             content[n] = mma(words[j], qwords[j], content[n]);
         }
       }
-      if (HEADS == 16 || chunk == 0) {
+      if (chunk == 0) {
 #pragma unroll
         for (int k = 0; k < 4; ++k)
           fragments(tile, group * 16 + k * 4, wn * (128 / NW) + row * QV,
-                    retained[HEADS == 16 ? chunk : 0][k]);
-      }
-      if (HEADS == 16) {
-        sync();
-        if (chunk < 2)
-          load_plane(page, page_index, chunk + 2);
+                    retained[k]);
       }
     }
-    if (HEADS == 32)
-      sync();
+    sync();
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
       const int i = t + c * 256, token = i >> 3,
@@ -409,10 +361,10 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       unsigned values[4][QV];
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
-        if (HEADS == 16 || chunk == 0) {
+        if (chunk == 0) {
 #pragma unroll
           for (int m = 0; m < QV; ++m)
-            values[k][m] = retained[HEADS == 16 ? chunk : 0][k][m];
+            values[k][m] = retained[k][m];
         } else
           fragments(planes[chunk], group * 16 + k * 4,
                     wn * (128 / NW) + row * QV, values[k]);
