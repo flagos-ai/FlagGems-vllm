@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PLE short-conv performance. Native baseline is vLLM ple_conv, or None."""
+"""PLE conv performance. Native baseline is vLLM ple_conv, or None."""
 
 import statistics
 
@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from baseline import ple_conv as workloads
-from flaggems_vllm import ple_short_conv_
+from flaggems_vllm import ple_conv
 
 from . import base
 
@@ -64,37 +64,6 @@ class PLEConvBenchmark(base.GenericBenchmark):
             torch.cuda.synchronize()
 
 
-def _gems_ple_conv(
-    inputs,
-    residual,
-    conv_state,
-    conv_weights,
-    state_indices,
-    outer_residual=None,
-    **kwargs,
-):
-    """Call FlagGems with the same tensors the vLLM baseline receives.
-
-    ``outer_residual`` stays in the argument list so fused and unfused
-    collection points keep distinct tensor signatures. FlagGems writes
-    SiLU(conv) into ``residual`` and does not add ``outer_residual``.
-    """
-    del outer_residual
-    mode = kwargs["mode"]
-    ple_short_conv_(
-        inputs,
-        residual,
-        conv_state,
-        conv_weights,
-        state_indices,
-        dilation=kwargs["dilation"],
-        query_start_loc=kwargs.get("query_start_loc"),
-        has_initial_state=kwargs.get("has_initial_states"),
-        accepted_tokens=kwargs.get("num_accepted_tokens"),
-        max_query_len=kwargs["spec_query_len"] if mode == "spec" else 1,
-    )
-
-
 def conv_inputs(shape, dtype, device):
     args, kwargs = workloads.build_inputs({"shape": list(shape)}, dtype, device)
     yield (*args, kwargs)
@@ -115,7 +84,7 @@ def test_ple_conv_perf():
         # Vendor-native callable. None means there is no on-machine baseline;
         # do not substitute a PyTorch conv1d.
         torch_op=native,
-        gems_op=_gems_ple_conv,
+        gems_op=ple_conv,
         dtypes=list(workloads.DTYPES),
         is_inplace=workloads.IS_INPLACE,
     ).run()

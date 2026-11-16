@@ -1,4 +1,5 @@
 MixLayout
+NULL_BLOCK_ID
 SUPPORTED_FP8_DTYPE
 attn_res
 chunk_gated_delta_rule

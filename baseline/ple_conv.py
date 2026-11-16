@@ -89,13 +89,14 @@ def build_inputs(binding, dtype, device):
     spec_query_len = _SPEC_QUERY_LEN if mode == "spec" else 1
     if mode == "prefill":
         nreq, tokens = 1, rows
-        state_indices = torch.zeros(1, dtype=torch.int32, device=device)
+        # Slot 0 is the null cache id, so the live request uses slot 1.
+        state_indices = torch.tensor([1], dtype=torch.int32, device=device)
         query_start_loc = torch.tensor([0, tokens], dtype=torch.int32, device=device)
         has_initial_states = torch.ones(1, dtype=torch.bool, device=device)
         num_accepted_tokens = None
     elif mode == "spec":
         nreq, tokens = rows, rows * spec_query_len
-        state_indices = torch.arange(nreq, dtype=torch.int32, device=device)
+        state_indices = torch.arange(1, nreq + 1, dtype=torch.int32, device=device)
         query_start_loc = (
             torch.arange(nreq + 1, device=device, dtype=torch.int32) * spec_query_len
         )
@@ -103,7 +104,7 @@ def build_inputs(binding, dtype, device):
         num_accepted_tokens = torch.ones(nreq, dtype=torch.int32, device=device)
     elif mode == "decode":
         nreq, tokens = rows, rows
-        state_indices = torch.arange(nreq, dtype=torch.int32, device=device)
+        state_indices = torch.arange(1, nreq + 1, dtype=torch.int32, device=device)
         query_start_loc = None
         has_initial_states = torch.ones(nreq, dtype=torch.bool, device=device)
         num_accepted_tokens = None
