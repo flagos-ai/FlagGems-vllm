@@ -69,7 +69,7 @@ def conv_inputs(shape, dtype, device):
     yield (*args, kwargs)
 
 
-@pytest.mark.ple_fusion
+@pytest.mark.ple_conv
 def test_ple_conv_perf():
     native = workloads.native()
     if native is None:

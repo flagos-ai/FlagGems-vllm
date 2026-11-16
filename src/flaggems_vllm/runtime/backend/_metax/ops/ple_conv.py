@@ -319,7 +319,15 @@ def ple_conv(
     """Update state and write activated convolution into residual.
     A non-None outer_residual enables both fused residual additions.
     """
-    BLOCK_C = 512
+    # Spec reads the cache as [slot, channel, window], so consecutive channels
+    # are strided by the window. A 128-wide tile keeps that gather saturated
+    # on this backend. Decode and prefill keep the 512-wide tile.
+    if mode == "spec":
+        BLOCK_C = 128
+        num_warps = 4
+    else:
+        BLOCK_C = 512
+        num_warps = 4 if mode == "prefill" else 8
     kernel_spec_query_len = spec_query_len if mode == "spec" else 1
     T, C = inputs.shape
     K = conv_weights.shape[1]
@@ -357,7 +365,6 @@ def ple_conv(
     else:
         raise ValueError(f"Unsupported short-conv mode: {mode}")
 
-    num_warps = 4 if mode == "prefill" else 8
     # C-series reports capability 8 and has no programmatic dependent launch.
     launch_pdl = False
     # Pure-prefill indices can be a strided block-table column view.
