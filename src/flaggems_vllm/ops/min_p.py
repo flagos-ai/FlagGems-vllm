@@ -63,22 +63,27 @@ def _min_p_kernel(
 
     offsets = tl.arange(0, BLOCK_SIZE)
     if USE_TLE:
+        # Keep a row dimension: TLE's reduction layout propagation requires
+        # a parent encoding of rank >= 2 when constructing a slice encoding.
         offsets = tle.gpu.set_layout(
-            offsets, tle.gpu.BlockEncoding([ELEMENTS], [32], [WARPS], [0])
+            offsets[None, :],
+            tle.gpu.BlockEncoding([1, ELEMENTS], [1, 32], [1, WARPS], [1, 0]),
         )
     row_ptr = logits_ptr + token_idx * logits_stride
     if SINGLE_TILE:
         # Keep the loaded row live for filtering below.
         logits = tl.load(row_ptr + offsets, offsets < vocab_size, other=-float("inf"))
-        max_val = tl.max(logits.to(tl.float32), 0)
+        max_val = tl.max(
+            logits.to(tl.float32), 1 if USE_TLE else 0, keep_dims=USE_TLE
+        )
     else:
         # Accumulate per-lane maxima and perform one cross-lane reduction.
-        maxima = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
+        maxima = tl.full(offsets.shape, -float("inf"), tl.float32)
         for i in range(0, vocab_size, BLOCK_SIZE):
             block = i + offsets
             logits = tl.load(row_ptr + block, block < vocab_size, other=-float("inf"))
             maxima = tl.maximum(maxima, logits.to(tl.float32))
-        max_val = tl.max(maxima, 0)
+        max_val = tl.max(maxima, 1 if USE_TLE else 0, keep_dims=USE_TLE)
 
     threshold = max_val + tl.log(min_p)
     if SINGLE_TILE:
