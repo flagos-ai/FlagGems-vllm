@@ -9,8 +9,14 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
+try:
+    from flaggems_vllm import runtime
+    from flaggems_vllm.utils import libentry, libtuner
+except ImportError as exc:
+    raise ImportError(
+        "Failed to import FlagGems-vllm runtime and kernel utilities. "
+        "Check that FlagGems-vllm and its dependencies are installed correctly."
+    ) from exc
 
 tle_api = None
 tle = None
