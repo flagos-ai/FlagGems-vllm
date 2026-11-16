@@ -145,6 +145,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: cast_sigmoid
+  description: 'Element-wise sigmoid with explicit output and compute dtype, used for
+    vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
+  for:
+  - None
+  labels:
+  - vLLM
+  - pointwise
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: causal_conv1d_fn
   description: 'Causal depthwise conv1d prefill for vLLM continuous batching with
 
@@ -507,6 +519,17 @@ ops:
   stages:
   - beta: '5.0'
   - stable: '5.3'
+- id: draft_watermarking_mask
+  description: Deduplicate committed and draft contexts before watermark sampling.
+  for:
+  - draft_watermarking_mask
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: dreglu
   description: 'Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead
     of
