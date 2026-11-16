@@ -231,3 +231,39 @@ chunk_kda_fwd_intra_token_parallel_short_dense:
   - META: {BH: 16}
     num_warps: 4
     num_stages: 1
+
+# Default schedules; the larger expand space requires explicit FlagTune opt-in.
+silu_mul_per_token_group_quant_fp8_tile_metax_default:
+  - META: {BR: 1, BG: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 1, BG: 2}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 1, BG: 4}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 1, BG: 8}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 1, BG: 16}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 2, BG: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 4, BG: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 4, BG: 2}
+    num_warps: 1
+    num_stages: 1
+  - META: {BR: 8, BG: 1}
+    num_warps: 2
+    num_stages: 1
+  - META: {BR: 8, BG: 2}
+    num_warps: 2
+    num_stages: 1
+  - META: {BR: 16, BG: 1}
+    num_warps: 4
+    num_stages: 1

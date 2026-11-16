@@ -190,6 +190,9 @@ from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
 from flaggems_vllm.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
+    silu_mul_per_token_group_quant_fp8_colmajor,
+)
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
 from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
@@ -421,6 +424,7 @@ __all__ = [
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
+    "silu_mul_per_token_group_quant_fp8_colmajor",
     "sinkhorn_forward",
     "skip_layer_norm",
     "sparse_attn_triton",
