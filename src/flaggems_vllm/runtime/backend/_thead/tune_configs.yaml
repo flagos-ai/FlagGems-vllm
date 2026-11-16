@@ -488,6 +488,38 @@ mhc_shifted_project_thead:
     bn: [32]
     w: [4, 8]
     s: [1, 2, 3]
+  # Deep-pipeline variants: BK=32 with more stages wins for medium-N wide-H
+  # shapes, and stages 4 is the plateau for the large prefill GEMM.
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [128]
+    bk: [32]
+    bn: [32]
+    w: [8]
+    s: [4, 6, 8]
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [64, 128]
+    bk: [128]
+    bn: [32]
+    w: [8]
+    s: [4]
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [64]
+    bk: [64]
+    bn: [32]
+    w: [8]
+    s: [4, 6]
 
 # Split-K + sum-of-squares reduction and Sinkhorn coefficients.  Tiny
 # per-token kernel; only the warp count moves.

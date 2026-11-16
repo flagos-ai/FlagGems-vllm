@@ -64,10 +64,11 @@ _FN_PACK_CACHE: dict = {}
 @triton.jit
 def _pack_fn_bf16_kernel(
     src_ptr,  # (mix_size, K) float32, contiguous
-    dst_ptr,  # (K, mix_size) bfloat16, contiguous
+    dst_ptr,  # (K, mix_stride) bfloat16, zero-padded columns
     numel,
     K,
     mix_size,
+    mix_stride,
     BLOCK: tl.constexpr,
 ):
     """One-time ``fn`` transpose-cast for the project kernel's B operand."""
@@ -76,11 +77,15 @@ def _pack_fn_bf16_kernel(
     n = offs // K
     k = offs % K
     value = tl.load(src_ptr + offs, mask=mask)
-    tl.store(dst_ptr + k * mix_size + n, value.to(tl.bfloat16), mask=mask)
+    tl.store(dst_ptr + k * mix_stride + n, value.to(tl.bfloat16), mask=mask)
 
 
 def _fn_bf16_packed(fn: torch.Tensor) -> torch.Tensor:
-    """``fn`` as a contiguous ``(hc*H, mix_size)`` bfloat16 tensor, cached.
+    """``fn`` as a zero-padded ``(hc*H, mix_stride)`` bfloat16 tensor, cached.
+
+    ``mix_stride`` is the next power of two above ``mix_size``.  The PPU B
+    loads then start on a 64-byte boundary for ``BLOCK_N=32`` instead of the
+    24-column (48-byte) stride, and the dot's N tile needs no column mask.
 
     ``_version`` is skipped for inference tensors: they do not track one and
     reading it raises.  Inference tensors cannot be edited in place either, so
@@ -96,10 +101,11 @@ def _fn_bf16_packed(fn: torch.Tensor) -> torch.Tensor:
             return cached
 
     mix_size, K = fn.shape
-    out = torch.empty(K, mix_size, dtype=torch.bfloat16, device=fn.device)
+    mix_stride = triton.next_power_of_2(mix_size)
+    out = torch.zeros(K, mix_stride, dtype=torch.bfloat16, device=fn.device)
     if fn.numel():
         _pack_fn_bf16_kernel[lambda meta: (triton.cdiv(fn.numel(), meta["BLOCK"]),)](
-            fn, out, fn.numel(), K, mix_size, BLOCK=1024
+            fn, out, fn.numel(), K, mix_size, mix_stride, BLOCK=1024
         )
     _FN_PACK_CACHE[key] = (
         weakref.ref(fn, lambda ref, key=key: _FN_PACK_CACHE.pop(key, None)),
@@ -405,12 +411,13 @@ def _mhc_shifted_post_collapse_norm_kernel(
 @triton.jit
 def _mhc_shifted_project_thead_kernel(
     a_ptr,  # (num_tokens, hc_hidden_size) bfloat16
-    bt_ptr,  # (hc_hidden_size, mix_size) bfloat16, contiguous
+    bt_ptr,  # (hc_hidden_size, mix_stride) bfloat16, zero-padded
     out_ptr,  # (split_k, num_tokens, mix_size) float32 partials
     num_tokens,
     hc_hidden_size,
     mix_size,
     a_stride_n,
+    bt_stride,
     split_k,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -440,11 +447,11 @@ def _mhc_shifted_project_thead_kernel(
             other=0.0,
         )
         b = tl.load(
-            bt_ptr + offs_k[:, None] * mix_size + offs_n[None, :],
-            mask=k_mask[:, None] & n_mask[None, :],
+            bt_ptr + offs_k[:, None] * bt_stride + offs_n[None, :],
+            mask=k_mask[:, None] & (offs_n[None, :] < bt_stride),
             other=0.0,
         )
-        acc += tl.dot(a, b)
+        acc = tl.dot(a, b, acc)
 
     # A separate fixed-order reduction combines the splits, so the result stays
     # bitwise deterministic even though the project stage is parallel over K.
@@ -683,6 +690,7 @@ def mhc_shifted_project_thead(a_flat, fn_packed, num_tokens, mix_size):
             a_flat.shape[1],
             mix_size,
             a_flat.stride(0),
+            fn_packed.stride(0),
             split_k,
         )
     finally:
@@ -862,9 +870,7 @@ def mhc_shifted_post_pre_thead(
     # (5) optional RMSNorm of the collapsed input.  The token-fused path has
     # already applied it; wider rows fall back to the generic two-pass kernel.
     if norm_weight is not None and not use_token_fused:
-        from flaggems_vllm.ops.mhc.mhc_shifted_post_pre import (
-            _mhc_shifted_norm_kernel,
-        )
+        from flaggems_vllm.ops.mhc.mhc_shifted_post_pre import _mhc_shifted_norm_kernel
 
         normed = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
