@@ -5,19 +5,20 @@
 
 import pytest
 import torch
-from vllm.v1.worker.gpu.sample.thinking_budget import (
-    apply_thinking_budget as vllm_reference,
-)
 
 try:
-    from flaggems_vllm import apply_thinking_budget, runtime
-    from flaggems_vllm import device as DEVICE
+    from vllm.v1.worker.gpu.sample.thinking_budget import (
+        apply_thinking_budget as vllm_reference,
+    )
 except ImportError as exc:
     raise ImportError(
-        "Failed to import apply_thinking_budget, runtime and device "
-        "from flaggems_vllm. "
-        "Check that FlagGems-vllm and its dependencies are installed correctly."
+        "Failed to import apply_thinking_budget from vLLM. "
+        "Check that the installed vLLM version provides this API "
+        "and its dependencies are installed correctly."
     ) from exc
+
+from flaggems_vllm import apply_thinking_budget, runtime
+from flaggems_vllm import device as DEVICE
 
 pytestmark = [
     pytest.mark.apply_thinking_budget,
