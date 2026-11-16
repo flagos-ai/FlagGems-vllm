@@ -911,7 +911,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             device=device,
         )
         self.cache_metadata = torch.empty(
-            (self.batch, self.capacity // 64, 2, merged, 4),
+            (self.batch, self.capacity // 64, merged, 4, 2),
             dtype=torch.float32,
             device=device,
         )

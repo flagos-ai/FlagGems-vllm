@@ -238,6 +238,11 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     copy_wait();
     float4_ rope[NR], scales[NR], probability[NR];
     float local_max = -INFINITY;
+    float4_ packed_scales[NR];
+#pragma unroll
+    for (int i = 0; i < NR; ++i)
+      packed_scales[i] = *input<float4_>(ksp +
+          (page * 64 + wn * (64 / NW) + group * (NR * 4) + i * 4) * 4);
 #pragma unroll
     for (int n = 0; n < NR; ++n) {
       rope[n] = (float4_){0, 0, 0, 0};
@@ -254,8 +259,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       }
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        scales[n][j] = input<float>(
-            ksp)[page * 64 + wn * (64 / NW) + group * (NR * 4) + j * NR + n];
+        scales[n][j] = packed_scales[(j * NR + n) / 4][(j * NR + n) % 4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int token_index =
@@ -641,12 +645,10 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
       *output<uint4_>(probability_ptr + dest * 2) = packed;
     }
     const long long offset =
-        (((long long)batch * (capacity / 64) * 2 + page_index * 2) * heads +
-         head) *
-            4 +
-        group;
-    output<float>(page_stats_ptr)[offset] = local_max;
-    output<float>(page_stats_ptr)[offset + heads * 4] = local_scale;
+        ((((long long)batch * (capacity / 64) + page_index) * heads + head) *
+             4 +
+         group) * 2;
+    *output<float2_>(page_stats_ptr + offset * 4) = (float2_){local_max, local_scale};
     const float raised = fmaxf(maximum, local_max),
                 safe_max = raised == -INFINITY ? 0.f : raised;
     const float alpha = exp2f(maximum - safe_max),
@@ -785,13 +787,11 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
             head * 64 + tokens;
         data.score[c] = *input<uint4_>(scores_ptr + offset * 2);
         const long long meta =
-            (((long long)batch * (capacity / 64) * 2 + page_index * 2) * heads +
-             head) *
-                4 +
-            tokens / 16;
-        const float local_max = input<float>(cache_metadata_ptr)[meta];
-        const float local_scale =
-            input<float>(cache_metadata_ptr)[meta + heads * 4];
+            ((((long long)batch * (capacity / 64) + page_index) * heads + head) *
+                 4 +
+             tokens / 16) * 2;
+        const float2_ local = *input<float2_>(cache_metadata_ptr + meta * 4);
+        const float local_max = local[0], local_scale = local[1];
         data.factor[c] =
             local_scale * exp2f(local_max - maximum[c]) * inverse[c];
       } else {
