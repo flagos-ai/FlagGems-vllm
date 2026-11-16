@@ -4,7 +4,6 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 """Ascend KDA: affine aligned tiles and conservative irregular transfers."""
 
-import logging
 from functools import lru_cache
 
 import torch
@@ -18,8 +17,6 @@ from flaggems_vllm.ops.FLA.fused_recurrent_kda import (
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-
-logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
@@ -348,7 +345,6 @@ def fused_recurrent_kda(
 
     Omitting all four keeps the pre-activated-gate contract unchanged.
     """
-    logger.debug("GEMS_ASCEND FUSED_RECURRENT_KDA")
     scale = (
         q.shape[-1] ** -0.5
         if scale is None and q.ndim == 4 and q.shape[-1] > 0

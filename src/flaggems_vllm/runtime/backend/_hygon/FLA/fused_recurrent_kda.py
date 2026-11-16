@@ -2,8 +2,6 @@
 # Copyright 2026 FlagOS Contributors
 """Hygon KDA launcher using Triton's current tensor specialization directly."""
 
-import logging
-
 import torch
 import triton
 
@@ -13,8 +11,6 @@ from flaggems_vllm.ops.FLA.fused_recurrent_kda import (
     _validate_recurrent_kda,
 )
 from flaggems_vllm.runtime import torch_device_fn
-
-logger = logging.getLogger(__name__)
 
 # LibEntry repeats HIP tensor-specialization queries on every call. Measured
 # dispatch overhead dominates small decode workloads on the Hygon BW stack.
@@ -50,7 +46,6 @@ def fused_recurrent_kda(
     returns [T,H,V,K] token states and leaves initial_state unchanged. Without
     indices its initial state is token-major, matching vLLM's KDA convention.
     """
-    logger.debug("GEMS_HYGON FUSED_RECURRENT_KDA")
     scale = (
         q.shape[-1] ** -0.5
         if scale is None and q.ndim == 4 and q.shape[-1] > 0
