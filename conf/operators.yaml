@@ -1025,6 +1025,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: gather_draft_sampled
+  description: Gather logits-aligned draft tokens and positions for speculative verification.
+  for:
+  - gather_draft_sampled
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gdn_950dt_triton_ascend
   description: 'Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
 
