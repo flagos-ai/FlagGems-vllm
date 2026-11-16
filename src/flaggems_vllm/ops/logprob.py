@@ -101,6 +101,7 @@ HAS_TLE = _TLE_CLUSTER_SUPPORTED
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
+ORIGINAL_RANK_BLOCK_SIZE = tl.constexpr(8192)
 _BATCH_CLUSTER_THRESHOLD = 59
 _SMALL_BATCH_CLUSTER_SIZE = 16
 _LARGE_BATCH_CLUSTER_SIZE = 8
@@ -220,7 +221,9 @@ def _topk_log_softmax_kernel(
 
         if COMPUTE_RANK:
             # Match the original rank kernel's padded -inf comparisons.
-            padded_tail = ((vocab_size + 8191) // 8192) * 8192 - vocab_size
+            padded_tail = (
+                vocab_size + ORIGINAL_RANK_BLOCK_SIZE - 1
+            ) // ORIGINAL_RANK_BLOCK_SIZE * ORIGINAL_RANK_BLOCK_SIZE - vocab_size
             merged_rank += tl.where(sampled_logit == float("-inf"), padded_tail, 0)
             tl.store(ranks_ptr + req_idx, merged_rank)
     tle.distributed_barrier(mesh)
@@ -289,7 +292,9 @@ def _logits_scores_and_ranks_kernel(
             remote_rank = tle.remote(partial_rank, peer, scope=mesh)
             merged_rank += tl.load(tle.gpu.local_ptr(remote_rank, (0,)))
         # Match the original rank kernel's padded -inf comparisons.
-        padded_tail = ((vocab_size + 8191) // 8192) * 8192 - vocab_size
+        padded_tail = (
+            vocab_size + ORIGINAL_RANK_BLOCK_SIZE - 1
+        ) // ORIGINAL_RANK_BLOCK_SIZE * ORIGINAL_RANK_BLOCK_SIZE - vocab_size
         merged_rank += tl.where(sampled_logit == float("-inf"), padded_tail, 0)
         tl.store(ranks_ptr + req_idx, merged_rank)
     tle.distributed_barrier(mesh)
@@ -365,7 +370,9 @@ def _triton_scores_and_ranks_kernel(
         tl.store(output_ptr + req_idx * num_scores + offsets, scores, mask=score_mask)
 
     if COMPUTE_RANK:
-        padded_tail = ((vocab_size + 8191) // 8192) * 8192 - vocab_size
+        padded_tail = (
+            vocab_size + ORIGINAL_RANK_BLOCK_SIZE - 1
+        ) // ORIGINAL_RANK_BLOCK_SIZE * ORIGINAL_RANK_BLOCK_SIZE - vocab_size
         rank += tl.where(sampled_logit == float("-inf"), padded_tail, 0)
         tl.store(ranks_ptr + req_idx, rank)
 
@@ -436,6 +443,35 @@ def compute_token_logprobs(
 
 
 @triton.jit
+def _pack_descending_sort_key(values, token_ids):
+    value_bits: tl.constexpr = 32
+    value_mask = tl.full((), (1 << value_bits) - 1, tl.uint32)
+    sign_bit = tl.full((), 1 << (value_bits - 1), tl.uint32)
+    bits = values.to(tl.uint32, bitcast=True)
+    flip = tl.where(bits & sign_bit != 0, value_mask, sign_bit)
+    value_key = bits ^ flip
+    token_key = value_mask - token_ids.to(tl.uint32)
+    return (value_key.to(tl.uint64) << value_bits) | token_key.to(tl.uint64)
+
+
+@triton.jit
+def _token_id_from_sort_key(key):
+    value_bits: tl.constexpr = 32
+    token_mask = tl.full((), (1 << value_bits) - 1, tl.uint64)
+    return (token_mask - (key & token_mask)).to(tl.int64)
+
+
+@triton.jit
+def _value_from_sort_key(key):
+    value_bits: tl.constexpr = 32
+    value_mask = tl.full((), (1 << value_bits) - 1, tl.uint32)
+    sign_bit = tl.full((), 1 << (value_bits - 1), tl.uint32)
+    value_key = (key >> value_bits).to(tl.uint32)
+    bits = value_key ^ tl.where(value_key & sign_bit != 0, sign_bit, value_mask)
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _topk_chunk_candidates_kernel(
     logits_ptr,
     logits_stride,
@@ -453,9 +489,7 @@ def _topk_chunk_candidates_kernel(
         mask=offsets < vocab_size,
         other=float("-inf"),
     ).to(tl.float32)
-    bits = values.to(tl.uint32, bitcast=True)
-    key = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
-    packed = (key.to(tl.uint64) << 32) | (0xFFFFFFFF - offsets.to(tl.uint64))
+    packed = _pack_descending_sort_key(values, offsets)
     packed = tl.where(offsets < vocab_size, packed, 0)
     if TOPK_PAD == 1:
         selected = tl.max(packed)
@@ -494,7 +528,7 @@ def _topk_merge_candidates_kernel(
     )
     if TOPK_PAD == 1:
         selected = tl.max(candidates)
-        token_id = 0xFFFFFFFF - (selected & 0xFFFFFFFF)
+        token_id = _token_id_from_sort_key(selected)
         tl.store(
             output_ptr + row * (num_topk + PACK_SAMPLED) + PACK_SAMPLED,
             token_id.to(tl.int64),
@@ -502,7 +536,7 @@ def _topk_merge_candidates_kernel(
     else:
         selected = tl.topk(candidates, TOPK_PAD)
         topk_positions = tl.arange(0, TOPK_PAD)
-        token_ids = 0xFFFFFFFF - (selected & 0xFFFFFFFF)
+        token_ids = _token_id_from_sort_key(selected)
         tl.store(
             output_ptr
             + row * (num_topk + PACK_SAMPLED)
@@ -561,9 +595,7 @@ def _sort_token_chunks_kernel(
             chunk_sum,
             mask=chunk < NUM_CHUNKS,
         )
-    bits = values.to(tl.uint32, bitcast=True)
-    key = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
-    packed = (key.to(tl.uint64) << 32) | (0xFFFFFFFF - offsets.to(tl.uint64))
+    packed = _pack_descending_sort_key(values, offsets)
     packed = tl.where(offsets < vocab_size, packed, 0)
     ordered = tl.sort(packed, descending=True)
     tl.store(
@@ -653,7 +685,7 @@ def _merge_sorted_token_runs_kernel(
         upper = tl.where(greater, upper, middle)
     result_position = pair_start + own_position + lower
     if FINAL:
-        token_id = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+        token_id = _token_id_from_sort_key(key)
         tl.store(
             output_ptr
             + row * (num_topk + PACK_SAMPLED)
@@ -663,13 +695,7 @@ def _merge_sorted_token_runs_kernel(
             mask=valid & (result_position < num_topk),
         )
         if FUSED_LOGITS or FUSED_LOGPROBS:
-            ordered_bits = (key >> 32).to(tl.uint32)
-            score_bits = tl.where(
-                (ordered_bits & 0x80000000) != 0,
-                ordered_bits ^ 0x80000000,
-                ~ordered_bits,
-            )
-            score = score_bits.to(tl.float32, bitcast=True)
+            score = _value_from_sort_key(key)
             if FUSED_LOGPROBS:
                 chunks = tl.arange(0, LSE_BLOCK)
                 maxima = tl.load(
@@ -713,11 +739,10 @@ def _merge_sorted_token_runs_kernel(
                     other=0,
                 )
                 rank = tl.sum(partial_ranks)
-                rank += tl.where(
-                    sampled_value == float("-inf"),
-                    (8192 - vocab_size % 8192) % 8192,
-                    0,
-                )
+                padded_tail = (
+                    ORIGINAL_RANK_BLOCK_SIZE - vocab_size % ORIGINAL_RANK_BLOCK_SIZE
+                ) % ORIGINAL_RANK_BLOCK_SIZE
+                rank += tl.where(sampled_value == float("-inf"), padded_tail, 0)
                 tl.store(ranks_ptr + row, rank.to(tl.int64))
     else:
         tl.store(
@@ -750,7 +775,7 @@ def _unpack_sorted_token_indices_kernel(
         mask=offsets < num_topk,
         other=0,
     )
-    ids = 0xFFFFFFFF - (keys & 0xFFFFFFFF)
+    ids = _token_id_from_sort_key(keys)
     tl.store(
         output_ptr + row * (num_topk + PACK_SAMPLED) + PACK_SAMPLED + offsets,
         ids.to(tl.int64),
@@ -821,12 +846,10 @@ def _sort_selected_topk_indices_kernel(
         mask=positions < num_topk,
         other=float("-inf"),
     ).to(tl.float32)
-    bits = values.to(tl.uint32, bitcast=True)
-    key = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
-    packed = (key.to(tl.uint64) << 32) | (0xFFFFFFFF - ids.to(tl.uint64))
+    packed = _pack_descending_sort_key(values, ids)
     packed = tl.where(positions < num_topk, packed, 0)
     ordered = tl.sort(packed, descending=True)
-    token_ids = 0xFFFFFFFF - (ordered & 0xFFFFFFFF)
+    token_ids = _token_id_from_sort_key(ordered)
     tl.store(
         output_ptr + row * (num_topk + PACK_SAMPLED) + PACK_SAMPLED + positions,
         token_ids.to(tl.int64),

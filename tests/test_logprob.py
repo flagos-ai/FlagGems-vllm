@@ -83,6 +83,35 @@ def _pytorch_reference(logits, sampled, k, custom_ids, mapping, logits_mode):
     return ids, scores, ranks
 
 
+def _assert_selected_token_ids(
+    actual, expected, logits, sampled, k, custom_ids, mapping
+):
+    batch_size, vocab_size = logits.shape
+    torch.testing.assert_close(actual[:, 0], sampled, rtol=0, atol=0)
+    for row in range(batch_size):
+        requested = custom_ids[mapping[row]] if custom_ids else ()
+        if requested or k == 0:
+            torch.testing.assert_close(actual[row], expected[row], rtol=0, atol=0)
+            continue
+        selected = actual[row, 1 : k + 1]
+        reference = expected[row, 1 : k + 1]
+        assert bool(((selected >= 0) & (selected < vocab_size)).all())
+        assert torch.unique(selected).numel() == k
+        selected_values = logits[row, selected]
+        reference_values = logits[row, reference]
+        torch.testing.assert_close(
+            selected_values, reference_values, rtol=0, atol=0, equal_nan=True
+        )
+        if actual.shape[1] > k + 1:
+            torch.testing.assert_close(
+                actual[row, k + 1 :], expected[row, k + 1 :], rtol=0, atol=0
+            )
+        if torch.unique(reference_values).numel() == k and bool(
+            (logits[row] == reference_values[-1]).sum() == 1
+        ):
+            torch.testing.assert_close(selected, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("scenario", "vocab_size", "k", "dtype", "logits_mode"),
     [
@@ -165,10 +194,16 @@ def test_topk_value_and_score_semantics(
 
 
 @pytest.mark.parametrize("logits_mode", [False, True])
+@pytest.mark.parametrize("negative_nan", [False, True])
 @pytest.mark.compute_topk_scores
-def test_full_vocab_batch64_values_and_ranks(candidate_logprob, device, logits_mode):
+def test_full_vocab_batch64_values_and_ranks(
+    candidate_logprob, device, logits_mode, negative_nan
+):
     """The large-batch full-vocabulary route preserves every selected value."""
+    torch.manual_seed(2026)
     logits = torch.randn((64, 32000), device=device)
+    if negative_nan:
+        logits[4, :3] = -float("nan")
     sampled = torch.arange(64, device=device, dtype=torch.int64)
     result = candidate_logprob.compute_topk_scores(
         logits, 32000, sampled, logits_mode=logits_mode
@@ -179,6 +214,7 @@ def test_full_vocab_batch64_values_and_ranks(candidate_logprob, device, logits_m
         torch.topk(logits, 32000, dim=1).values,
         rtol=0,
         atol=0,
+        equal_nan=True,
     )
     assert all(torch.unique(row).numel() == 32000 for row in selected)
     expected_rank = (logits >= logits.gather(1, sampled[:, None])).sum(dim=1)
@@ -186,7 +222,9 @@ def test_full_vocab_batch64_values_and_ranks(candidate_logprob, device, logits_m
     expected_scores = (
         logits if logits_mode else torch.log_softmax(logits, dim=-1)
     ).gather(1, result.logprob_token_ids)
-    torch.testing.assert_close(result.logprobs, expected_scores, rtol=2e-4, atol=2e-3)
+    torch.testing.assert_close(
+        result.logprobs, expected_scores, rtol=2e-4, atol=2e-3, equal_nan=True
+    )
 
 
 @pytest.mark.parametrize("logits_mode", [False, True])
@@ -291,7 +329,15 @@ def test_compute_topk_scores_matches_pytorch(
         logits, sampled, k, custom_ids, mapping, logits_mode
     )
 
-    torch.testing.assert_close(result.logprob_token_ids, expected_ids, rtol=0, atol=0)
+    _assert_selected_token_ids(
+        result.logprob_token_ids,
+        expected_ids,
+        logits,
+        sampled,
+        k,
+        custom_ids,
+        mapping,
+    )
     assert result.logprob_token_ids.dtype == sampled.dtype
     assert result.logprobs.dtype == torch.float32
     assert result.selected_token_ranks.dtype == torch.int64
@@ -338,7 +384,15 @@ def test_full_vocab_with_custom_ids(candidate_logprob, device):
     expected_ids, expected_scores, expected_ranks = _pytorch_reference(
         logits, sampled, vocab_size, CUSTOM_IDS, REQUEST_MAPPING, logits_mode
     )
-    torch.testing.assert_close(result.logprob_token_ids, expected_ids, rtol=0, atol=0)
+    _assert_selected_token_ids(
+        result.logprob_token_ids,
+        expected_ids,
+        logits,
+        sampled,
+        vocab_size,
+        CUSTOM_IDS,
+        REQUEST_MAPPING,
+    )
     torch.testing.assert_close(
         result.selected_token_ranks, expected_ranks, rtol=0, atol=0
     )
