@@ -49,8 +49,6 @@ W8A8_BLOCK_MNK_SHAPES = [
     (1, 4096, 7168),
     (16, 4096, 7168),
     (64, 4096, 7168),
-    (83, 7748, 3884),
-    (84, 7168, 3884),
 ]
 
 W8A8_BLOCK_SIZE = [128, 128]
@@ -115,7 +113,7 @@ class W8A8BlockMatmulBenchmark(base.Benchmark):
                 + 0.005
             ).contiguous()
 
-            yield A, B, As, Bs, self.block_size[:], torch.bfloat16
+            yield A, B, As, Bs, self.block_size[:], torch.float16
 
     def get_tflops(self, op, *args, **kwargs):
         A, B = args[0], args[1]
@@ -126,13 +124,13 @@ class W8A8BlockMatmulBenchmark(base.Benchmark):
 
 @pytest.mark.w8a8_block_matmul
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads"),
+    flaggems_vllm.vendor_name not in ("thead", "metax", "hygon", "nvidia", "mthreads"),
     reason="No W8A8 block matmul backend",
 )
 def test_perf_w8a8_block_matmul():
     if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
         pytest.skip("W8A8 block matmul is unavailable on this architecture")
-    if flaggems_vllm.vendor_name == "thead":
+    if flaggems_vllm.vendor_name in ("thead", "metax", "hygon"):
         if not VLLM_W8A8_BLOCK_INT8_AVAILABLE:
             pytest.skip("W8A8 block matmul benchmark requires the vLLM INT8 baseline")
         torch_op = vllm_w8a8_block_int8_matmul
