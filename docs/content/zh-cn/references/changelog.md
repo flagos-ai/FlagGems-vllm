@@ -7,6 +7,21 @@ weight: 30
 
 FlagGems-vllm 的版本历史与发布说明。
 
+## 未发布
+
+### 工具链
+
+- `tools/setup.sh` 改为由 `src/flaggems_vllm/backends.yaml` 注册表驱动，支持 21 个后端配置
+  （NVIDIA、昇腾、海光、沐曦、天数智芯、摩尔线程、寒武纪、燧原、昆仑芯、
+  平头哥、清微智能、壁仞、进迭时空、曦望以及 AMD ROCm），每个配置固定
+  Python、torch、Triton/FlagTree 和 vLLM 版本。
+- 新增 `--no-venv` 模式，用于已提供匹配 torch/triton/vLLM 栈的厂商镜像；
+  同时新增 `--list`、`--dry-run`、`--skip-vllm`、`--skip-compiler`、
+  `--skip-smoke`。
+- 将仅 CUDA 需要的 `cupy-cuda12x` 从 `[test]` 拆分到 `[test-nvidia]`，
+  避免非 NVIDIA 后端安装带 CUDA 的 wheel。
+- 运行时在选择后端时新增对 `DNN_VENDOR` 的支持。
+
 ## v0.1.0 (当前版本)
 
 FlagGems-vllm 作为独立 vLLM 算子库的首发版本。

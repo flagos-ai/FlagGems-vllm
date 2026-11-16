@@ -49,6 +49,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.persistent_topk import persiste
 from flaggems_vllm.runtime.backend._mthreads.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._mthreads.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._mthreads.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -62,10 +63,14 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
     w8a8_block_matmul as w8a8_block_fp8_matmul,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
+    draft_watermarking_mask,
+)
 
 __all__ = [
     "apply_trace_tokens",
     "dequantize_and_gather_k_cache",
+    "draft_watermarking_mask",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
@@ -79,6 +84,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
+    "qsa_prepare",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",

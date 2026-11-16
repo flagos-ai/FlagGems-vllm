@@ -51,11 +51,28 @@ vLLM
 ### 快速安装
 
 ```shell
-pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
-pip install --no-build-isolation -e .
+python -m pip install -U "setuptools>=64,<82" wheel packaging
+python -m pip install --no-deps "flag-gems==5.4.0" \
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+python -m pip install --no-build-isolation -e .
 ```
 
-完整安装流程（包含测试依赖安装、环境引导脚本 `tools/setup.sh` 以及与 FlagGems、vllm-plugin-fl 协同安装等），请参阅[安装指南](docs/content/zh-cn/getting-started/install.md)。
+### 多后端环境搭建
+
+`tools/setup.sh` 读取 `src/flaggems_vllm/backends.yaml` 中的后端注册表，创建
+`uv` 虚拟环境并安装匹配的 torch/vLLM/编译器栈：
+
+```shell
+bash tools/setup.sh --list          # 查看配置和别名
+bash tools/setup.sh nvidia          # 也可使用 ascend、metax、hygon 等
+source tools/setup.sh nvidia        # 一步完成创建和激活
+```
+
+在已经提供 torch/triton/vLLM 的厂商镜像中，使用
+`bash tools/setup.sh --no-venv <backend>` 只安装本仓库和测试依赖。
+
+完整安装流程（包含不创建虚拟环境的手动安装、测试依赖安装以及与 FlagGems、
+vllm-plugin-fl 协同安装等），请参阅[安装指南](docs/content/zh-cn/getting-started/install.md)。
 
 ### 使用示例
 
