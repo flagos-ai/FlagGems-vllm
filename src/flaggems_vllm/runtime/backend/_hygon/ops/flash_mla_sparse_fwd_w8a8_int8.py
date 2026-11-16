@@ -12,14 +12,29 @@ import triton.language as tl
 
 @triton.jit
 def sparse_int8_pv(
-    base, valid, high, low, correction, scale, acc, offset: tl.constexpr
+    base,
+    valid,
+    high,
+    low,
+    correction,
+    scale,
+    acc,
+    offset: tl.constexpr,
+    HeadMajor: tl.constexpr,
 ):
     value = tl.load(base + offset + tl.arange(0, 128)[None, :], valid[:, None], 0)
-    high_pv = tl.dot(tl.trans(value), high, out_dtype=tl.int32)
-    pv = tl.dot(tl.trans(value), low, high_pv * 128, out_dtype=tl.int32)
-    return acc * correction[None, :] + pv.to(tl.float32) * (
-        scale[None, :] * (1.0 / 128)
-    )
+    if HeadMajor:
+        high_pv = tl.dot(high, value, out_dtype=tl.int32)
+        pv = tl.dot(low, value, high_pv * 128, out_dtype=tl.int32)
+        return acc * correction[:, None] + pv.to(tl.float32) * (
+            scale[:, None] * (1.0 / 128)
+        )
+    else:
+        high_pv = tl.dot(tl.trans(value), high, out_dtype=tl.int32)
+        pv = tl.dot(tl.trans(value), low, high_pv * 128, out_dtype=tl.int32)
+        return acc * correction[None, :] + pv.to(tl.float32) * (
+            scale[None, :] * (1.0 / 128)
+        )
 
 
 @triton.jit
@@ -50,8 +65,10 @@ def sparse_int8_attention(
     BH: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    HeadMajor: tl.constexpr,
 ):
     head_tile, row, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    tl.static_assert(not HeadMajor or not Rope)
     heads = head_tile * BH + tl.arange(0, BH)
     lanes = tl.arange(0, BN)
     dims = tl.arange(0, BK)
@@ -65,10 +82,12 @@ def sparse_int8_attention(
     maximum = tl.full((BH,), -float("inf"), tl.float32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     # Bound the live QK register tile and reload V in channel panels.
-    acc0 = tl.full((128, BH), 0.0, tl.float32)
-    acc1 = tl.full((128, BH), 0.0, tl.float32)
-    acc2 = tl.full((128, BH), 0.0, tl.float32)
-    acc3 = tl.full((128, BH), 0.0, tl.float32)
+    AccShape: tl.constexpr = (BH, 128) if HeadMajor else (128, BH)
+    TokenAxis: tl.constexpr = 1 if HeadMajor else 0
+    acc0 = tl.full(AccShape, 0.0, tl.float32)
+    acc1 = tl.full(AccShape, 0.0, tl.float32)
+    acc2 = tl.full(AccShape, 0.0, tl.float32)
+    acc3 = tl.full(AccShape, 0.0, tl.float32)
     begin = split * SplitTiles * BN
     end = tl.minimum(begin + SplitTiles * BN, length)
     for start in range(begin, end, BN):
@@ -81,11 +100,14 @@ def sparse_int8_attention(
         else:
             kv_base = KV + token[:, None].to(tl.int64) * 512
         qs_ptr = Q + query_row[:, None] * 512
-        raw = tl.full((BN, BH), 0, tl.int32)
+        raw = tl.full((BH, BN) if HeadMajor else (BN, BH), 0, tl.int32)
         for ck in tl.range(0, 512, BK, loop_unroll_factor=1):
             q = tl.load(qs_ptr + ck + dims[None, :])
             k = tl.load(kv_base + ck + dims[None, :], valid[:, None], 0)
-            raw = tl.dot(k, tl.trans(q), raw, out_dtype=tl.int32)
+            if HeadMajor:
+                raw = tl.dot(q, tl.trans(k), raw, out_dtype=tl.int32)
+            else:
+                raw = tl.dot(k, tl.trans(q), raw, out_dtype=tl.int32)
         score = raw.to(tl.float32)
         if Rope:
             kr = tl.load(
@@ -95,34 +117,44 @@ def sparse_int8_attention(
             )
             score += tl.dot(kr, tl.trans(qr), out_dtype=tl.float32)
         ks = tl.load(KScale + token, valid, 0.0)
-        score *= ks[:, None] * query_scale[None, :]
-        score = tl.where(valid[:, None], score, -float("inf"))
+        if HeadMajor:
+            score *= ks[None, :] * query_scale[:, None]
+            score = tl.where(valid[None, :], score, -float("inf"))
+        else:
+            score *= ks[:, None] * query_scale[None, :]
+            score = tl.where(valid[:, None], score, -float("inf"))
 
-        next_maximum = tl.maximum(maximum, tl.max(score, 0))
+        next_maximum = tl.maximum(maximum, tl.max(score, TokenAxis))
         safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
         correction = tl.exp2(maximum - safe_maximum)
-        probability = tl.exp2(score - safe_maximum[None, :])
-        denominator = denominator * correction + tl.sum(probability, 0)
-
-        weight = probability * ks[:, None]
-        weight_scale = tl.maximum(tl.max(weight, 0) * (1.0 / 127), 1.0e-30)
-        scaled = weight * (1.0 / weight_scale[None, :])
+        if HeadMajor:
+            probability = tl.exp2(score - safe_maximum[:, None])
+            weight = probability * ks[None, :]
+        else:
+            probability = tl.exp2(score - safe_maximum[None, :])
+            weight = probability * ks[:, None]
+        denominator = denominator * correction + tl.sum(probability, TokenAxis)
+        weight_scale = tl.maximum(tl.max(weight, TokenAxis) * (1.0 / 127), 1.0e-30)
+        if HeadMajor:
+            scaled = weight * (1.0 / weight_scale[:, None])
+        else:
+            scaled = weight * (1.0 / weight_scale[None, :])
         # The FP32 ULP at 65536 is 1/128: split the rounded fixed point into signed bytes.
         quant = (scaled + 65536.0).to(tl.int32, bitcast=True) - 0x47800000
         high_raw = (quant + 64) >> 7
         high = high_raw.to(tl.int8)
         low = (quant - (high_raw << 7)).to(tl.int8)
         acc0 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc0, 0
+            kv_base, valid, high, low, correction, weight_scale, acc0, 0, HeadMajor
         )
         acc1 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc1, 128
+            kv_base, valid, high, low, correction, weight_scale, acc1, 128, HeadMajor
         )
         acc2 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc2, 256
+            kv_base, valid, high, low, correction, weight_scale, acc2, 256, HeadMajor
         )
         acc3 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc3, 384
+            kv_base, valid, high, low, correction, weight_scale, acc3, 384, HeadMajor
         )
         maximum = next_maximum
 
@@ -133,15 +165,23 @@ def sparse_int8_attention(
         if HasSink:
             sink = tl.load(Sink + heads)
             inv *= tl.where(denominator > 0, 1.0 / (1.0 + tl.exp(sink - logsum)), 0.0)
-        ptr = Output + query_row[None, :] * 512 + vd[:, None]
-        tl.store(ptr, acc0 * inv[None, :])
-        tl.store(ptr + 128, acc1 * inv[None, :])
-        tl.store(ptr + 256, acc2 * inv[None, :])
-        tl.store(ptr + 384, acc3 * inv[None, :])
+        if HeadMajor:
+            ptr = Output + query_row[:, None] * 512 + vd[None, :]
+            inv = inv[:, None]
+        else:
+            ptr = Output + query_row[None, :] * 512 + vd[:, None]
+            inv = inv[None, :]
+        tl.store(ptr, acc0 * inv)
+        tl.store(ptr + 128, acc1 * inv)
+        tl.store(ptr + 256, acc2 * inv)
+        tl.store(ptr + 384, acc3 * inv)
         tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum)
     else:
         partial_row = (row * Splits + split) * H + heads
-        ptr = Partial + partial_row[None, :] * 512 + vd[:, None]
+        if HeadMajor:
+            ptr = Partial + partial_row[:, None] * 512 + vd[None, :]
+        else:
+            ptr = Partial + partial_row[None, :] * 512 + vd[:, None]
         tl.store(ptr, acc0)
         tl.store(ptr + 128, acc1)
         tl.store(ptr + 256, acc2)
@@ -267,10 +307,13 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
         return lambda: (output, lse)
 
     bh = min(heads, 32)
+    # Large no-RoPE batches can use the head-major MMAC result through PV and
+    # write adjacent output channels directly. Keep the short/SQ-small tiles.
+    head_major = rows > 256 and heads == 64 and not rope
     if not rope and heads >= 32 and topk <= 1024 and rows <= 128:
         bn, bk, warps = 128, 64, 8
     else:
-        bn, bk, warps = 64, 128, 4
+        bn, bk, warps = 64, 256 if head_major else 128, 4
     tiles = triton.cdiv(topk, bn)
     # Target four CTAs per CU on the 80-CU HCU BW.
     occupancy = triton.cdiv(320, rows * (heads // bh))
@@ -316,6 +359,7 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
         bh,
         bn,
         bk,
+        head_major,
         num_warps=warps,
         num_stages=1,
     )
