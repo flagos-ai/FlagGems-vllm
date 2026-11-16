@@ -92,16 +92,22 @@ def _ensure_deep_gemm_env():
 NVCC_READY = _ensure_deep_gemm_env()
 
 
-try:
-    from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
-    from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
-        deep_gemm_fp8_o_proj as vllm_deep_gemm_fp8_o_proj,
-    )
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
+compute_fp8_einsum_recipe = None
+vllm_deep_gemm_fp8_o_proj = None
+HAS_VLLM = False
+if HOPPER_AVAILABLE:
+    try:
+        from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+            compute_fp8_einsum_recipe,
+        )
+        from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+            deep_gemm_fp8_o_proj as vllm_deep_gemm_fp8_o_proj,
+        )
+        from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    HAS_VLLM = is_deep_gemm_supported()
-except ImportError:
-    HAS_VLLM = False
+        HAS_VLLM = is_deep_gemm_supported()
+    except ImportError:
+        HAS_VLLM = False
 
 
 DEEP_GEMM_READY = HAS_VLLM and NVCC_READY
@@ -110,6 +116,11 @@ DEEP_GEMM_READY = HAS_VLLM and NVCC_READY
 def _is_metax():
     """MetaX has no vLLM DeepGEMM path, so the benchmark only reports latency."""
     return flaggems_vllm.vendor_name == "metax"
+
+
+def _is_int8_transport_vendor():
+    """MetaX and Hygon transport the FP8 values as INT8; both only report latency."""
+    return flaggems_vllm.vendor_name in ("metax", "hygon")
 
 
 def _identity(flat):
@@ -288,8 +299,8 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
 
 @pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.skipif(
-    not (HOPPER_AVAILABLE or _is_metax()),
-    reason="requires an NVIDIA Hopper or a MetaX GPU",
+    not (HOPPER_AVAILABLE or _is_int8_transport_vendor()),
+    reason="requires an NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon)",
 )
 def test_perf_deep_gemm_fp8_o_proj_gems_vs_vllm():
     # vLLM's op is only importable from a build that ships DeepSeek-V4, and its

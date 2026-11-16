@@ -47,9 +47,13 @@ def is_hopper_available():
     return sm_version_num >= 90 and sm_version_num < 100
 
 
+def is_int8_transport_vendor():
+    """MetaX and Hygon have no FP8 einsum; both transport FP8 values as INT8."""
+    return flaggems_vllm.vendor_name in ("metax", "hygon")
+
+
 def is_supported_backend():
-    """Hopper runs the FP8 einsum path; MetaX runs the INT8 block-scaled path."""
-    if flaggems_vllm.vendor_name == "metax":
+    if is_int8_transport_vendor():
         return torch.cuda.is_available()
     return is_hopper_available()
 
@@ -58,17 +62,18 @@ CUDA_AVAILABLE = is_supported_backend()
 pytestmark = [
     pytest.mark.deep_gemm_fp8_o_proj,
     pytest.mark.skipif(
-        not CUDA_AVAILABLE, reason="requires NVIDIA Hopper or MetaX (fp8 einsum)"
+        not CUDA_AVAILABLE,
+        reason="requires NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon)",
     ),
 ]
 
-# The MetaX path transports the FP8 grid values as INT8 (extra error <= half an
-# INT8 step, ~1.2% peak-relative measured); Hopper stays on exact FP8.
-COMPOSED_ATOL = 0.02 if flaggems_vllm.vendor_name == "metax" else 0.01
+# The INT8 transport adds at most half an INT8 step on top of the FP8 grid
+# (~1.2% peak-relative measured); Hopper stays on exact FP8.
+COMPOSED_ATOL = 0.02 if is_int8_transport_vendor() else 0.01
 
 
 class _QuantizedActivation:
-    """Attribute-only stand-in for vLLM >= 0.32 ``QuantizedActivation``."""
+    """Attribute-only stand-in for vLLM's ``QuantizedActivation``."""
 
     def __init__(self, data, scale):
         self.data = data
@@ -232,7 +237,7 @@ def test_accuracy_deep_gemm_fp8_o_proj(config, seed):
 
 
 def _quantize_activation(inp):
-    """Inverse RoPE + per-128 FP8 quant, as vLLM 0.32's attention kernel emits."""
+    """Inverse RoPE + per-128 FP8 quant, as vLLM's attention kernel emits."""
     o = _inv_rope_reference(inp["o"], inp["positions"], inp["cos_sin_cache"])
     num_tokens, n_groups = o.shape[0], inp["n_groups"]
     grouped = o.reshape(num_tokens, n_groups, -1)
@@ -248,8 +253,8 @@ def _quantize_activation(inp):
     )
 
 
-# Decode / small-batch / prefill points and both group counts, so the MetaX
-# dequantized-BF16 path is checked against every GEMM tile bucket.
+# Decode / small-batch / prefill points and both group counts, so the INT8
+# transport is checked against every GEMM bucket.
 TORCH_COMPOSED_CONFIGS = (
     (1, 8, 1, 1024, 7168),
     (16, 64, 8, 1024, 7168),
@@ -269,8 +274,9 @@ def _reference_torch(inp):
     """Assemble the operator's exact math from torch ops.
 
     Inverse RoPE, the per-128 FP8 quant/dequant of the activation, the
-    dequantized einsum over ``wo_a`` and the ``wo_b`` linear. MetaX has no vLLM
-    DeepGEMM to cross-check against, so this composition is the reference.
+    dequantized einsum over ``wo_a`` and the ``wo_b`` linear. The INT8 transport
+    vendors have no vLLM DeepGEMM to cross-check against, so this composition is
+    the reference.
     """
     _, _, dequant = _quantize_activation(inp)
     return _reference_torch_from_dequant(inp, dequant)
@@ -288,7 +294,7 @@ def test_accuracy_deep_gemm_fp8_o_proj_torch_composed(config):
 
     assert out.shape == (config[0], config[4])
     # Both sides quantize the activation identically, so only the GEMM rounding
-    # separates them (measured <= 0.6% bf16 / <= 1.2% INT8 of the peak).
+    # separates them (measured <= 1.2% of the peak for the INT8 transport).
     atol = max(1e-2, ref.abs().max().item() * COMPOSED_ATOL)
     utils.gems_assert_close(out, ref, torch.bfloat16, atol=atol)
 
@@ -333,6 +339,9 @@ def _vllm_native_op():
 
 
 @pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.skipif(
+    not is_hopper_available(), reason="vLLM's DeepGEMM path is NVIDIA Hopper only"
+)
 def test_deep_gemm_fp8_o_proj_matches_vllm_native(config):
     """Cross-check against vLLM's DeepGEMM implementation when it is runnable."""
     native_op, recipe_fn = _vllm_native_op()
@@ -357,7 +366,7 @@ def test_deep_gemm_fp8_o_proj_matches_vllm_native(config):
             einsum_recipe=recipe,
             tma_aligned_scales=tma_aligned,
         )
-    except (RuntimeError, NotImplementedError) as exc:
+    except (RuntimeError, NotImplementedError, TypeError) as exc:
         pytest.skip(f"vLLM native path unavailable: {exc}")
 
     out = _call_op(inp, recipe=recipe, tma_aligned_scales=tma_aligned)
