@@ -2900,9 +2900,7 @@ def _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=False):
     )
 
 
-
 # --- Dense grouped MoE path (inlined from fused_moe_dense.py) ---
-
 
 
 @triton.jit
@@ -3192,6 +3190,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         BLOCK=512,
     )
     return out
+
 
 def nopad_fused_moe(
     hidden_states: torch.Tensor,
