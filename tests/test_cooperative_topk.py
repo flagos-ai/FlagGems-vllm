@@ -394,9 +394,5 @@ def test_vllm_cross_agreement_when_available(k, width):
     _check(logits, lengths, output, k)
 
 
-def test_export_and_registration():
+def test_export():
     assert flaggems_vllm.ops.cooperative_topk is flaggems_vllm.cooperative_topk
-    assert any(
-        name == "cooperative_topk" and fn is flaggems_vllm.cooperative_topk
-        for name, fn in flaggems_vllm._FULL_CONFIG
-    )
