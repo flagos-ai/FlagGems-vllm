@@ -153,7 +153,7 @@ def _torch_reference(qbar, cache, cum_q, seq_lens, bt, positions):
 )
 def test_indexer_gemm_score_perf():
     IndexerGemmScoreBenchmark(
-        op_name="indexer_gemm_score_vs_matvec",
+        op_name="indexer_gemm_score",
         torch_op=_matvec,
         gems_op=flaggems_vllm.indexer_gemm_score,
         dtypes=[torch.float32],

@@ -24,6 +24,7 @@ from flaggems_vllm.runtime.backend._thead.fused.fused_deepseek_v4_qnorm_rope_kv_
 from flaggems_vllm.runtime.backend._thead.fused.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 from flaggems_vllm.runtime.backend._thead.fused.qsa_attention import (
     qsa_sparse_paged_attention,
@@ -34,6 +35,7 @@ __all__ = [
     "flash_mla_sparse_fwd",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_inv_rope_fp8_quant",
+    "fused_marlin_moe",
     "moe_sum",
     "qsa_sparse_paged_attention",
 ]
