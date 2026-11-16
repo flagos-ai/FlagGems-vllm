@@ -22,7 +22,6 @@ def _has_device():
 
 
 pytestmark = [
-    pytest.mark.apply_logit_bias,
     pytest.mark.skipif(
         not _has_device(), reason=f"requires an available {DEVICE} device"
     ),
@@ -47,6 +46,7 @@ def _i32(data):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("check_all_masked_rows", [False, True])
+@pytest.mark.apply_logit_bias
 def test_apply_logit_bias(dtype, check_all_masked_rows):
     logits = (
         torch.arange(51, device=DEVICE, dtype=torch.float32).reshape(3, 17) / 8
@@ -103,6 +103,7 @@ def test_apply_logit_bias(dtype, check_all_masked_rows):
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
+@pytest.mark.apply_logit_bias
 def test_restore_across_vocab_tiles():
     # Index 8192 is in the second tile of the 8192-column row scan.
     vocab_size = 8193
@@ -148,6 +149,7 @@ def test_restore_across_vocab_tiles():
         pytest.param(float("nan"), id="nan"),
     ],
 )
+@pytest.mark.apply_logit_bias
 def test_restore_only_finite_stop_logits(nonfinite):
     logits = torch.tensor([[2.0, nonfinite, NEG_INF]], device=DEVICE, dtype=torch.float32)
     zero = _i32([0])
@@ -172,6 +174,7 @@ def test_restore_only_finite_stop_logits(nonfinite):
 
 
 @pytest.mark.parametrize("check_all_masked_rows", [False, True])
+@pytest.mark.apply_logit_bias
 def test_no_stop_token_ids(check_all_masked_rows):
     logits = torch.tensor([[0.25, 1.5]], device=DEVICE, dtype=torch.float32)
     zero = _i32([0])
@@ -199,6 +202,7 @@ def test_no_stop_token_ids(check_all_masked_rows):
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
+@pytest.mark.apply_logit_bias
 def test_apply_logit_bias_empty():
     logits = torch.empty((0, 17), device=DEVICE, dtype=torch.float32)
     mapping = _i32([])

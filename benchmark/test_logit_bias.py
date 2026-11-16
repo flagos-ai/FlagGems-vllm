@@ -165,6 +165,7 @@ def _time_call(fn, original):
     return statistics.median(timings)
 
 
+@pytest.mark.apply_logit_bias
 @pytest.mark.parametrize(
     "batch,vocab,allowed_width,bias_width,scenario",
     [
