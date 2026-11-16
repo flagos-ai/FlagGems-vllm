@@ -17,14 +17,14 @@ from tests.thead.megapreattention_utils import run_distributed, summarize_round
 from ..conftest import Config
 
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead" or torch.cuda.device_count() < 2,
-    reason="requires two T-Head PPUs",
+    flaggems_vllm.vendor_name != "thead" or torch.cuda.device_count() == 0,
+    reason="requires a T-Head PPU",
 )
 
 
 @pytest.mark.megapreattention
 @pytest.mark.parametrize("tokens", [4096, 8192, 16384, 32768])
-@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_megapreattention(tokens, tp):
     if torch.cuda.device_count() < tp:
         pytest.skip(f"requires {tp} T-Head PPUs")

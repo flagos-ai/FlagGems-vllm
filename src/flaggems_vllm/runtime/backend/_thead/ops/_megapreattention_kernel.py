@@ -76,6 +76,9 @@ def _publish_tile(
     WORLD: tl.constexpr,
     COMM_TILES: tl.constexpr,
     COMM_JOBS: tl.constexpr,
+    LOCAL_TOKENS: tl.constexpr,
+    COMM_M: tl.constexpr,
+    HIDDEN: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
 ):
     if tile == 0:
@@ -89,12 +92,19 @@ def _publish_tile(
         _wait((entered + peer).to(tl.uint64), epoch)
 
     for tile_index in range(tile, COMM_TILES, COMM_JOBS):
-        row = (rank * COMM_TILES + tile_index).to(tl.int64)
+        row = rank.to(tl.int64) * COMM_TILES + tile_index
         source = (hidden + tile_index.to(tl.int64) * TILE_ELEMS).to(tl.uint64)
-        target = (gathered + row * TILE_ELEMS).to(tl.uint64)
-        size = tl.full((), TILE_ELEMS * 2, tl.uint64)
+        if LOCAL_TOKENS % COMM_M:
+            start = tile_index.to(tl.int64) * COMM_M
+            rows = tl.minimum(LOCAL_TOKENS - start, COMM_M)
+            target_row = rank.to(tl.int64) * LOCAL_TOKENS + start
+            target = (gathered + target_row * HIDDEN).to(tl.uint64)
+            size = rows.to(tl.uint64) * (HIDDEN * 2)
+        else:
+            target = (gathered + row * TILE_ELEMS).to(tl.uint64)
+            size = tl.full((), TILE_ELEMS * 2, tl.uint64)
         signal = (ready + row).to(tl.uint64)
-        if WORLD == 4 or WORLD == 8:
+        if WORLD == 4 or WORLD == 8 or WORLD == 16:
             _broadcast_tile(
                 target,
                 source,
@@ -116,15 +126,17 @@ def _project_head(
     source,
     weight,
     head_tile,
+    rows,
     HIDDEN: tl.constexpr,
     HEAD_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PIPE_STAGES: tl.constexpr,
+    HAS_ROW_TAIL: tl.constexpr,
 ):
     a_tile = tl.make_block_ptr(
         base=source,
-        shape=(BLOCK_M, HIDDEN),
+        shape=(rows, HIDDEN),
         strides=(HIDDEN, 1),
         offsets=(0, 0),
         block_shape=(BLOCK_M, BLOCK_K),
@@ -140,7 +152,12 @@ def _project_head(
     )
     acc = tl.zeros((BLOCK_M, 256), tl.float32)
     for _ in tl.range(0, HIDDEN // BLOCK_K, num_stages=PIPE_STAGES):
-        a = tle.load(a_tile, is_async=True)
+        if HAS_ROW_TAIL:
+            a = tle.load(
+                a_tile, boundary_check=(0,), padding_option="zero", is_async=True
+            )
+        else:
+            a = tle.load(a_tile, is_async=True)
         b = tle.load(b_tile, is_async=True)
         acc = tl.dot(a, b, acc)
         a_tile = tl.advance(a_tile, (0, BLOCK_K))
@@ -153,6 +170,7 @@ def _norm_rope(
     raw,
     cols,
     token,
+    row_valid,
     positions,
     norm,
     rope,
@@ -167,30 +185,68 @@ def _norm_rope(
     x = raw.to(tl.float32)
     scale = tl.rsqrt(tl.sum(x * x, 1) / 256.0 + eps)
     weight = tl.load(norm + cols).to(tl.float32)
-    normalized = (
-        (x * scale[:, None] * (1.0 + weight[None, :])).to(tl.bfloat16).to(tl.float32)
-    )
+    normalized = (x * scale[:, None] * (1.0 + weight[None, :])).to(tl.bfloat16)
 
-    frequency = tl.arange(0, 32)
-    axis = _axis_for_pair(frequency, None, 0, SECTION_H, SECTION_W, True, False, 256)
-    pos = tl.load(positions + token[:, None] * POS_TOKEN + axis[None, :] * POS_AXIS)
-    phase = rope + pos * ROPE_STRIDE + frequency[None, :]
-    cos = tl.load(phase).to(tl.float32)
-    sin = tl.load(phase + 32).to(tl.float32)
+    # Load a contiguous cos/sin row per axis and reuse it for matching positions.
+    position_ptr = positions + token * POS_TOKEN
+    zero = 0 if row_valid is not None else None
+    position_t = tl.load(position_ptr, row_valid, zero)
+    position_h = tl.load(position_ptr + POS_AXIS, row_valid, zero)
+    position_w = tl.load(position_ptr + 2 * POS_AXIS, row_valid, zero)
+    pair = tl.arange(0, 64)
+    axis = _axis_for_pair(pair % 32, None, 0, SECTION_H, SECTION_W, True, False, 256)
+    phase_t = rope + position_t[:, None] * ROPE_STRIDE + pair[None, :]
+    phase_valid = row_valid[:, None] if row_valid is not None else None
+    coefficients = tl.load(phase_t, phase_valid, zero)
+    if SECTION_H:
+        phase_h = rope + position_h[:, None] * ROPE_STRIDE + pair[None, :]
+        distinct_h = (position_h != position_t)[:, None]
+        select_h = distinct_h & (axis[None, :] == 1)
+        coefficients = tl.where(select_h, tl.load(phase_h, distinct_h, 0), coefficients)
+    if SECTION_W:
+        phase_w = rope + position_w[:, None] * ROPE_STRIDE + pair[None, :]
+        distinct_w = (position_w != position_t)[:, None]
+        select_w = distinct_w & (axis[None, :] == 2)
+        coefficients = tl.where(select_w, tl.load(phase_w, distinct_w, 0), coefficients)
+    cos, sin = tl.split(coefficients.reshape(BLOCK_M, 2, 32).permute(0, 2, 1))
+    cos = cos.to(tl.float32)
+    sin = sin.to(tl.float32)
     low128, high128 = tl.split(normalized.reshape(BLOCK_M, 2, 128).permute(0, 2, 1))
     low64, high64 = tl.split(low128.reshape(BLOCK_M, 2, 64).permute(0, 2, 1))
-    first, second = tl.split(low64.reshape(BLOCK_M, 2, 32).permute(0, 2, 1))
-    first_rotated = first * cos - second * sin
-    second_rotated = second * cos + first * sin
+    # Only the rotary prefix needs FP32 arithmetic after BF16 normalization.
+    prefix = low64.reshape(BLOCK_M, 2, 32).permute(0, 2, 1)
+    first, second = tl.split(prefix)
+    first = first.to(tl.float32)
+    second = second.to(tl.float32)
+    first_rotated = (first * cos - second * sin).to(tl.bfloat16)
+    second_rotated = (second * cos + first * sin).to(tl.bfloat16)
     low64 = tl.join(first_rotated, second_rotated).permute(0, 2, 1).reshape(BLOCK_M, 64)
     low128 = tl.join(low64, high64).permute(0, 2, 1).reshape(BLOCK_M, 128)
     return tl.join(low128, high128).permute(0, 2, 1).reshape(BLOCK_M, 256)
 
 
 @triton.jit
+def _cache_offset(
+    slot,
+    head,
+    CACHE_BLOCK: tl.constexpr,
+    CACHE_HEAD: tl.constexpr,
+    CACHE_TOKEN: tl.constexpr,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+):
+    slot = slot.to(tl.int64)
+    return (
+        (slot // CACHE_BLOCK_SIZE) * CACHE_BLOCK
+        + head.to(tl.int64) * CACHE_HEAD
+        + (slot % CACHE_BLOCK_SIZE) * CACHE_TOKEN
+    )
+
+
+@triton.jit
 def _store_head(
     acc,
     token,
+    row_valid,
     head_tile,
     query,
     key,
@@ -219,18 +275,20 @@ def _store_head(
     BLOCK_M: tl.constexpr,
 ):
     cols = tl.arange(0, 256)
+    output_valid = row_valid[:, None] if row_valid is not None else None
     # Preserve the BF16 rounding at the projection boundary.
     raw = acc.to(tl.bfloat16)
     if head_tile < 2 * Q_HEADS:
         head = head_tile // 2
         out_offset = (token[:, None] * Q_HEADS + head) * 256 + cols[None, :]
         if head_tile % 2:
-            tl.store(gate + out_offset, raw)
+            tl.store(gate + out_offset, raw, output_valid)
         else:
             result = _norm_rope(
                 raw,
                 cols,
                 token,
+                row_valid,
                 positions,
                 q_norm,
                 rope,
@@ -242,17 +300,16 @@ def _store_head(
                 SECTION_W,
                 BLOCK_M,
             )
-            tl.store(query + out_offset, result)
+            tl.store(query + out_offset, result, output_valid)
     else:
         is_key = head_tile < 2 * Q_HEADS + KV_HEADS
         head = (head_tile - 2 * Q_HEADS) % KV_HEADS
         out_offset = (token[:, None] * KV_HEADS + head) * 256 + cols[None, :]
-        slot = tl.load(slots + token * SLOT_STRIDE)
+        no_slot = -1 if row_valid is not None else None
+        slot = tl.load(slots + token * SLOT_STRIDE, row_valid, no_slot)
         valid = (slot >= 0) & (slot < CACHE_CAPACITY)
-        cache_offset = (
-            (slot // CACHE_BLOCK_SIZE) * CACHE_BLOCK
-            + head * CACHE_HEAD
-            + (slot % CACHE_BLOCK_SIZE) * CACHE_TOKEN
+        cache_offset = _cache_offset(
+            slot, head, CACHE_BLOCK, CACHE_HEAD, CACHE_TOKEN, CACHE_BLOCK_SIZE
         )
         target = cache + cache_offset[:, None] + cols[None, :]
         if is_key:
@@ -260,6 +317,7 @@ def _store_head(
                 raw,
                 cols,
                 token,
+                row_valid,
                 positions,
                 k_norm,
                 rope,
@@ -271,10 +329,10 @@ def _store_head(
                 SECTION_W,
                 BLOCK_M,
             )
-            tl.store(key + out_offset, result)
+            tl.store(key + out_offset, result, output_valid)
             tl.store(target, result, valid[:, None])
         else:
-            tl.store(value + out_offset, raw)
+            tl.store(value + out_offset, raw, output_valid)
             tl.store(target + 256, raw, valid[:, None])
 
 
@@ -310,7 +368,7 @@ def megapreattention_kernel(
     SECTION_H: tl.constexpr,
     SECTION_W: tl.constexpr,
     WORLD: tl.constexpr,
-    LOCAL_TILES: tl.constexpr,
+    LOCAL_TOKENS: tl.constexpr,
     HIDDEN: tl.constexpr,
     COMM_M: tl.constexpr,
     COMM_JOBS: tl.constexpr,
@@ -320,14 +378,15 @@ def megapreattention_kernel(
     PIPE_STAGES: tl.constexpr,
 ):
     TILE_ELEMS: tl.constexpr = BLOCK_M * HIDDEN
+    LOCAL_TILES: tl.constexpr = (LOCAL_TOKENS + BLOCK_M - 1) // BLOCK_M
     HEAD_TILES: tl.constexpr = 2 * (Q_HEADS + KV_HEADS)
     TILES_PER_MESSAGE: tl.constexpr = COMM_M // BLOCK_M
-    COMM_TILES: tl.constexpr = LOCAL_TILES // TILES_PER_MESSAGE
+    COMM_TILES: tl.constexpr = (LOCAL_TOKENS + COMM_M - 1) // COMM_M
     LOCAL_JOBS: tl.constexpr = LOCAL_TILES * HEAD_TILES
     TOTAL_JOBS: tl.constexpr = COMM_JOBS + WORLD * LOCAL_JOBS
 
     gathered = symmetric.to(tl.uint64).to(tl.pointer_type(tl.bfloat16))
-    ready = (gathered + WORLD * LOCAL_TILES * TILE_ELEMS).to(tl.pointer_type(tl.uint64))
+    ready = (gathered + WORLD * LOCAL_TOKENS * HIDDEN).to(tl.pointer_type(tl.uint64))
     entered = ready + WORLD * COMM_TILES
 
     # Each launch claims exactly TOTAL_JOBS tickets. The first scheduled
@@ -347,6 +406,9 @@ def megapreattention_kernel(
             WORLD,
             COMM_TILES,
             COMM_JOBS,
+            LOCAL_TOKENS,
+            COMM_M,
+            HIDDEN,
             COMM_M * HIDDEN,
         )
     else:
@@ -364,26 +426,48 @@ def megapreattention_kernel(
             within = local_job % (GROUP_M * HEAD_TILES)
             tile_in_rank = first_row + within % group_rows
             head_tile = within // group_rows
-        global_tile = (source_rank * LOCAL_TILES + tile_in_rank).to(tl.int64)
+        global_tile = source_rank.to(tl.int64) * LOCAL_TILES + tile_in_rank
+        if LOCAL_TOKENS % BLOCK_M:
+            local_start = tile_in_rank.to(tl.int64) * BLOCK_M
+            token_start = source_rank.to(tl.int64) * LOCAL_TOKENS + local_start
+            rows = tl.minimum(LOCAL_TOKENS - local_start, BLOCK_M).to(tl.int32)
+            row_valid = tl.arange(0, BLOCK_M) < rows
+        else:
+            token_start = global_tile * BLOCK_M
+            rows = BLOCK_M
+            row_valid = None
         if source_rank == rank:
             source = hidden + tile_in_rank.to(tl.int64) * TILE_ELEMS
         else:
-            _wait((ready + global_tile // TILES_PER_MESSAGE).to(tl.uint64), epoch)
-            source = gathered + global_tile * TILE_ELEMS
+            if LOCAL_TOKENS % COMM_M:
+                message = (
+                    source_rank.to(tl.int64) * COMM_TILES
+                    + tile_in_rank // TILES_PER_MESSAGE
+                )
+            else:
+                message = global_tile // TILES_PER_MESSAGE
+            _wait((ready + message).to(tl.uint64), epoch)
+            if LOCAL_TOKENS % BLOCK_M:
+                source = gathered + token_start * HIDDEN
+            else:
+                source = gathered + global_tile * TILE_ELEMS
         acc = _project_head(
             source,
             weight,
             head_tile,
+            rows,
             HIDDEN,
             HEAD_TILES,
             BLOCK_M,
             BLOCK_K,
             PIPE_STAGES,
+            LOCAL_TOKENS % BLOCK_M != 0,
         )
-        token = global_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+        token = token_start + tl.arange(0, BLOCK_M)
         _store_head(
             acc,
             token,
+            row_valid,
             head_tile,
             query,
             key,

@@ -35,7 +35,7 @@ def megapreattention(
     [2*(local_q_heads + local_kv_heads)*256, H]. Weights pack Q and gate
     per query head, followed by all K heads and then all V heads. Head counts
     in the API are global. H is a multiple of 64 and at least 256, each shard
-    has a positive multiple of 128 tokens, and head_dim/rotary_dim are 256/64.
+    has the same positive token count, and head_dim/rotary_dim are 256/64.
 
     Positions are int64 [3,T] indexing the BF16 cos/sin table [P,64].
     The BF16 cache has non-overlapping layout [blocks, local_kv_heads,
@@ -61,7 +61,7 @@ def megapreattention(
             "hidden must be a contiguous [local_tokens, hidden_size] tensor"
         )
     local_tokens, hidden_size = hidden.shape
-    if not local_tokens or local_tokens % 128 or hidden_size < 256 or hidden_size % 64:
+    if not local_tokens or hidden_size < 256 or hidden_size % 64:
         raise NotImplementedError("unsupported token shard or hidden size")
     if (
         num_heads <= 0
@@ -127,15 +127,24 @@ def megapreattention(
     from ._megapreattention_kernel import megapreattention_kernel
     from ._sailshmem import runtime_for
 
-    block_m, block_k, group_m, stages = 64, 64, 4, 3
+    block_m, block_k, stages = 64, 64, 3
+    # Keep CTAs using the same weight tile adjacent when there are fewer heads
+    # per rank to reuse a token tile's RoPE coefficients.
+    group_m = 1 if q_heads + kv_heads >= 4 else 4
     comm_m = 256 if local_tokens % 256 == 0 else 128
     if local_tokens >= 4096 and local_tokens % 512 == 0:
         comm_m = 512
-    local_tiles = local_tokens // block_m
-    comm_tiles = local_tokens // comm_m
-    # Keep most of the device available for projection as messages accumulate.
-    comm_jobs = min(comm_tiles, 4) if tp > 1 else 0
+    local_tiles = (local_tokens + block_m - 1) // block_m
+    comm_tiles = (local_tokens + comm_m - 1) // comm_m
+    # A single producer covers long TP2 shards with substantial local projection.
+    single_producer = tp == 2 and comm_m == 512 and q_heads >= 8
+    comm_jobs = min(comm_tiles, 1 if single_producer else 4) if tp > 1 else 0
     grid = (comm_jobs + tp * local_tiles * 2 * (q_heads + kv_heads),)
+    # AIU coordinates and the CTA ordinal use signed 32-bit indices.
+    if max(hidden_size, packed_width, grid[0]) > (1 << 31) - 1:
+        raise NotImplementedError(
+            "PPU MegaPreAttention projection dimensions or grid exceed int32"
+        )
     with torch_device_fn.device(device):
         runtime = runtime_for(group, device)
         workspace_bytes = (
@@ -175,7 +184,7 @@ def megapreattention(
             sections[1],
             sections[2],
             tp,
-            local_tiles,
+            local_tokens,
             hidden_size,
             comm_m,
             comm_jobs,
