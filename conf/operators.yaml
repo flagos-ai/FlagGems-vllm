@@ -145,6 +145,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: cast_sigmoid
+  description: 'Element-wise sigmoid with explicit output and compute dtype, used for
+    vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
+  for:
+  - None
+  labels:
+  - vLLM
+  - pointwise
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: causal_conv1d_fn
   description: 'Causal depthwise conv1d prefill for vLLM continuous batching with
 
@@ -403,11 +415,11 @@ ops:
   stages:
   - beta: '3.0'
 - id: cooperative_topk
-  description: 'Select exact top-k indices from FP32 CUDA logits through vLLM''s in-place
+  description: 'Select exact top-k indices from FP32 logits through vLLM''s in-place
 
-    interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+    interface, with Ascend and Iluvatar fast paths. Supports up to 64 rows,
 
-    and -1 padding for short rows.
+    k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
 
     '
   for:
@@ -507,6 +519,17 @@ ops:
   stages:
   - beta: '5.0'
   - stable: '5.3'
+- id: draft_watermarking_mask
+  description: Deduplicate committed and draft contexts before watermark sampling.
+  for:
+  - draft_watermarking_mask
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: dreglu
   description: 'Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead
     of
@@ -1002,6 +1025,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: gather_draft_sampled
+  description: Gather logits-aligned draft tokens and positions for speculative verification.
+  for:
+  - gather_draft_sampled
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gdn_950dt_triton_ascend
   description: 'Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
 
@@ -2100,13 +2134,21 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: topk_sigmoid
+  description: Selects MoE experts using sigmoid scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+  for:
+  - _moe_C.topk_sigmoid
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: topk_softmax
-  description: 'Selects the k most likely next-token candicates, sets all others to
-    zero,
-
-    and renormalize the prbabilities of these top candidates.
-
-    '
+  description: Selects MoE experts using softmax scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and marks padded experts.
   for:
   - _moe_C.topk_softmax
   labels:
