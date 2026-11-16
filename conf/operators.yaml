@@ -1718,3 +1718,64 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+
+  - id: apply_minimax_m3_rotary_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: fused_minimax_m3_qknorm_rope_kv_insert_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: insert_minimax_m3_kv_cache_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: insert_minimax_m3_index_cache_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: minimax_m3_index_score_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: minimax_m3_index_topk_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: minimax_m3_index_decode_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: prepare_minimax_m3_gemma_weight_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: attend_minimax_m3_sparse_ascend
+    description: Ascend-only MiniMax M3 operator; BF16 inference contract, no ATen fallback.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]
+  - id: minimax_m3_ascend
+    description: Ascend-only MiniMax M3 operator family and validation suite.
+    for: [vllm.models.minimax_m3]
+    labels: [fused, ascend]
+    kind: [ModelSpecific]
+    stages: [{experimental: M3_Ascend}]

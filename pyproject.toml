@@ -104,7 +104,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"flaggems_vllm" = ["backends.yaml"]
+"flaggems_vllm" = ["backends.yaml", "_minimax_m3_ascend/**/*"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
 "flaggems_vllm.utils" = ["configs/*.yaml"]

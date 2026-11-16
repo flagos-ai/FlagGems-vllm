@@ -1,0 +1,5 @@
+recursive-include csrc/minimax_m3_ascend *
+include tools/build_minimax_m3_ascend.sh
+recursive-exclude csrc/minimax_m3_ascend/build *
+recursive-exclude csrc/minimax_m3_ascend/build_out *
+recursive-exclude csrc/minimax_m3_ascend/output *

@@ -482,3 +482,21 @@ if _runtime.device.vendor_name == "ascend":
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
     __all__.append("flash_attn_varlen_func_w8a8")
+
+# Ascend M3 operators are imported without initializing their optional CANN payload.
+from flaggems_vllm.ops.minimax_m3_ascend import (
+    apply_minimax_m3_rotary_ascend,
+    attend_minimax_m3_sparse_ascend,
+    fused_minimax_m3_qknorm_rope_kv_insert_ascend,
+    insert_minimax_m3_index_cache_ascend,
+    insert_minimax_m3_kv_cache_ascend,
+    minimax_m3_index_decode_ascend,
+    minimax_m3_index_score_ascend,
+    minimax_m3_index_topk_ascend,
+    prepare_minimax_m3_gemma_weight_ascend,
+)
+from flaggems_vllm.ops.minimax_m3_ascend import __all__ as _minimax_m3_ascend_exports
+
+__all__.extend(_minimax_m3_ascend_exports)
+from flaggems_vllm.ops.minimax_m3_ascend_native import load_minimax_m3_ascend_native
+__all__.append('load_minimax_m3_ascend_native')

@@ -63,6 +63,16 @@ _LIBRARY_ONLY_OPS = frozenset(
         "top_k_top_p",
         "minimax_m3_sparse_attn",
         "minimax_m3_sparse_attn_decode",
+        "apply_minimax_m3_rotary_ascend",
+        "attend_minimax_m3_sparse_ascend",
+        "fused_minimax_m3_qknorm_rope_kv_insert_ascend",
+        "insert_minimax_m3_index_cache_ascend",
+        "insert_minimax_m3_kv_cache_ascend",
+        "minimax_m3_index_decode_ascend",
+        "minimax_m3_index_score_ascend",
+        "minimax_m3_index_topk_ascend",
+        "prepare_minimax_m3_gemma_weight_ascend",
+        "load_minimax_m3_ascend_native",
     }
 )
 
