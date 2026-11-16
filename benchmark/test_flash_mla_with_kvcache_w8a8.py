@@ -120,6 +120,10 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
     def record_shapes(self, *args, **kwargs):
         return self.input_shapes
 
+    def unpack_to_args_kwargs(self, input_tuple: tuple) -> tuple[tuple, dict]:
+        # Keep native scheduler objects that the generic argument filter drops.
+        return input_tuple[:-1], input_tuple[-1]
+
     @staticmethod
     def make_input(param: TestParam, dtype):
         torch.manual_seed(0)

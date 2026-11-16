@@ -870,7 +870,7 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
         super().__init__(tensors, splits, scale, causal)
         self.head_tile = self.queries * self.heads
         self.normalized_partials = True
-        if self.head_tile == 32 and 1 < self.batch <= 256:
+        if self.head_tile in (16, 32) and 1 < self.batch <= 256:
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=tensors[0].device
             )
@@ -1185,7 +1185,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
             workspace_bytes = (
                 output_bytes + rows * 4 + native_splits * rows * (512 + 2) * 4
             )
-            if merged_heads == 32 and 1 < batch <= 256:
+            if merged_heads in (16, 32) and 1 < batch <= 256:
                 workspace_bytes += 4 * batch
         else:
             score_splits = (
