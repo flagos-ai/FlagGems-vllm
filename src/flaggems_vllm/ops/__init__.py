@@ -17,6 +17,7 @@ from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
@@ -265,6 +266,7 @@ __all__ = [
     "add_rms_norm",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
+    "apply_trace_tokens",
     "attn_res",
     "beam_search_score",
     "beam_search_score_",
