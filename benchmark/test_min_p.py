@@ -6,17 +6,16 @@
 The dominant-token input and min_p=0.1 are adapted from
 tests/v1/logits_processors/test_correctness.py in vLLM at
 947dd62c0700851a79b0a8f32cb823e25a003b31.
+The shape matrix below is local coverage, not an upstream kernel case list.
 
 The standard kernel timer measures repeated calls on already-filtered logits
 after warmup. Each provider starts from the same original logits.
 """
 
-from pathlib import Path
-
 import pytest
 import torch
+from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
 
-from baseline.min_p import apply_min_p as vllm_reference
 from benchmark import base, consts
 from benchmark.conftest import Config
 from flaggems_vllm import apply_min_p, runtime
@@ -32,10 +31,9 @@ pytestmark = [
 
 
 class MinPBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
     DEFAULT_SHAPE_DESC = "tokens, vocab"
     DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
-    DEFAULT_SHAPES = [(50, 1024)]
+    DEFAULT_SHAPES = [(50, 1024), (1, 32000), (32, 128256), (128, 152065)]
 
     def __init__(self):
         super().__init__(
@@ -45,6 +43,9 @@ class MinPBenchmark(base.Benchmark):
             dtypes=[torch.float32],
             is_inplace=True,
         )
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = self.DEFAULT_SHAPES
 
     def init_user_config(self):
         if Config.mode != consts.BenchMode.KERNEL:

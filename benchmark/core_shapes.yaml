@@ -802,12 +802,3 @@ chunk_kda_with_fused_gate:
     - [1, 64, 8, 64, 64]
     - [1, 512, 8, 128, 128, 129, 127, 256]
   shape_desc: "B, T, H, K, V, optional packed sequence lengths"
-
-# Identical workloads for the vLLM and FlagGems public entry points.
-apply_min_p:
-  shape_desc: tokens, vocab
-  shapes:
-    - [50, 1024]
-    - [1, 32000]
-    - [32, 128256]
-    - [128, 152065]
