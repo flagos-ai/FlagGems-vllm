@@ -35,6 +35,8 @@ import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 
 from .accuracy_utils import gems_assert_close, to_reference
+from .mqa_utils import restore_rng_state  # noqa: F401 (pytest fixture)
+from .mqa_utils import check_replays, shared_mqa_reference
 
 
 def reference_fp4_mqa_logits(q_packed, q_scale, k_fp8, k_scale, weights, ks, ke):
@@ -226,3 +228,65 @@ def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
     gems_assert_close(
         res_out, ref_out, res_out.dtype, equal_nan=True, atol=atol, reduce_dim=1
     )
+
+
+@pytest.mark.fp8_fp4_mqa_logits
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX FP8 specialization"
+)
+@pytest.mark.usefixtures("restore_rng_state")
+@pytest.mark.parametrize("m,h,n", [(1, 1, 17), (17, 4, 65), (65, 64, 129), (2, 1, 5)])
+@pytest.mark.parametrize("clean", [False, True])
+@pytest.mark.parametrize("d", [128, 512])
+def test_shared_mqa_legacy_fp8_public_api_and_replay(m, h, n, clean, d):
+    generator = torch.Generator(device="cuda").manual_seed(104)
+    q = (torch.randn(m, h, d, device="cuda", generator=generator) * 0.1).to(
+        torch.float8_e4m3fn
+    )
+    k = (torch.randn(n, d, device="cuda", generator=generator) * 0.1).to(
+        torch.float8_e4m3fn
+    )
+    if (m, h, n) == (2, 1, 5):
+        # All 254 finite E4M3 encodings, including signed zero/subnormals/max.
+        raw = torch.arange(256, device="cuda", dtype=torch.int32)
+        raw[(raw & 127) == 127] = (
+            0  # omit the two NaN encodings from this finite-value case
+        )
+        q = (
+            raw.repeat((2 * d + 255) // 256)[: 2 * d]
+            .to(torch.uint8)
+            .view(torch.float8_e4m3fn)
+            .reshape(2, 1, d)
+        )
+        k = (
+            raw.repeat((n * d + 255) // 256)[: n * d]
+            .to(torch.uint8)
+            .view(torch.float8_e4m3fn)
+            .reshape(n, d)
+        )
+    scales = torch.linspace(0.125, 1.125, n, device="cuda")
+    weights = torch.randn(m, h, device="cuda", generator=generator) * 0.1
+    starts = torch.arange(m, device="cuda", dtype=torch.int32) % n
+    ends = torch.minimum(starts + max(1, n // 2), torch.full_like(starts, n))
+    result = []
+
+    def call():
+        result[:] = [
+            flaggems_vllm.fp8_fp4_mqa_logits(
+                (q, None), (k, scales), weights, starts, ends, clean_logits=clean
+            )
+        ]
+
+    def update(value):
+        weights.fill_(value)
+        scales.add_(0.125)
+
+    def check():
+        expected = shared_mqa_reference(
+            q, k, weights, starts, ends, scales=scales, clean=clean
+        )
+        torch.testing.assert_close(result[0].cpu(), expected, atol=2e-4, rtol=2e-4)
+
+    call()
+    check()
+    check_replays(call, update, check, outputs=lambda: (result[0],))

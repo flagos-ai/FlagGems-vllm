@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from tests.mqa_utils import pack_fp8_paged_cache
 
 from . import base
 
@@ -104,12 +105,7 @@ class MQAStoredCacheBenchmark(base.Benchmark):
                     torch.float8_e4m3fn
                 )
                 scales = torch.rand(pages, block, device=self.device) + 0.125
-                cache = torch.empty(
-                    pages, block, 1, 132, dtype=torch.uint8, device=self.device
-                )
-                flat = cache.view(pages, -1)
-                flat[:, : block * 128].copy_(values.view(torch.uint8).view(pages, -1))
-                flat[:, block * 128 :].view(torch.float32).copy_(scales)
+                cache, _ = pack_fp8_paged_cache(values, scales)
                 tables = torch.arange(
                     pages, device=self.device, dtype=torch.int32
                 ).repeat(rows, 1)
