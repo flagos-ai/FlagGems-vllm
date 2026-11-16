@@ -14,6 +14,7 @@
 
 # isort: off
 from flaggems_vllm.ops.batch_shard import gather_sampler_output
+from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -374,6 +375,7 @@ __all__ = [
     "pack_seq_triton",
     "pad_attention_heads",
     "pad_indexer_heads",
+    "pad_trailing_draft_slots",
     "paged_mqa_logits",
     "parallel_nsa",
     "parallel_nsa_compression",
