@@ -307,10 +307,15 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
         return lambda: (output, lse)
 
     bh = min(heads, 32)
-    # Large no-RoPE batches can use the head-major MMAC result through PV and
-    # write adjacent output channels directly. Keep the short/SQ-small tiles.
-    head_major = rows > 256 and heads == 64 and not rope
-    if not rope and heads >= 32 and topk <= 1024 and rows <= 128:
+    small_decode = rows <= 32 and heads == 64 and not rope and topk > 128
+    head_major = heads == 64 and not rope and (small_decode or rows > 256)
+    if small_decode:
+        bn, bk, warps = 64, 256 if topk <= 1024 else 128, 4
+    elif head_major and topk > 1024:
+        # Large batches have enough CTAs without splitting. The wider KV
+        # tile amortizes the softmax and PV rescaling over more tokens.
+        bn, bk, warps = 128, 128, 4
+    elif not rope and heads >= 32 and topk <= 1024 and rows <= 128:
         bn, bk, warps = 128, 64, 8
     else:
         bn, bk, warps = 64, 256 if head_major else 128, 4
@@ -318,6 +323,9 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     # Target four CTAs per CU on the 80-CU HCU BW.
     occupancy = triton.cdiv(320, rows * (heads // bh))
     num_splits = min(32, triton.next_power_of_2(occupancy))
+    if small_decode and topk <= 1024:
+        # Keep at least two KV tiles in most splits to amortize scratch and merge.
+        num_splits = min(num_splits, triton.cdiv(tiles, 2))
     split_tiles = max(1, triton.cdiv(tiles, num_splits))
     splits = max(1, triton.cdiv(tiles, split_tiles))
     partial_output = output
@@ -379,7 +387,7 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
                 attn_sink is not None,
                 triton.next_power_of_2(splits),
                 256,
-                num_warps=4,
+                num_warps=2 if small_decode else 4,
             )
         return output, lse
 

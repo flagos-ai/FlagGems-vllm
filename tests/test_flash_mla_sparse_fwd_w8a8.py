@@ -286,7 +286,15 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
         (62, 64, 512, 1521, 1, 512, 512, True, False, 4),
         (62, 128, 576, 98816, 1, 256, 512, False, True, 5),
         (547, 64, 512, 98816, 1, 8320, 512, False, False, 195),
-    ],
+    ]
+    + (
+        [
+            (16, 64, 512, 675, 1, 640, 512, True, True, 7),
+            (16, 64, 512, 8461, 1, 8320, 512, True, True, 8),
+        ]
+        if SPARSE_INT8_OP is not None
+        else []
+    ),
 )
 def test_flash_mla_sparse_flashmla(shape):
     inputs = make_sparse_inputs(shape)
