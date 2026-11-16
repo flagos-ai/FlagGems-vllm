@@ -274,13 +274,11 @@ def dense_mla_reference(query, cache, table, lengths, causal=False):
     return output, lse
 
 
-INT8_OP_NAME = "flash_mla_with_kvcache_fwd_w8a8_int8"
-INT8_VENDOR_MODULE = "flaggems_vllm.runtime.backend._thead.ops." + INT8_OP_NAME
-INT8_CUSTOMIZED_OPS = dict(flaggems_vllm.runtime.backend.get_customized_ops())
-INT8_SUPPORTED = INT8_OP_NAME in INT8_CUSTOMIZED_OPS
-PPU_INT8_SUPPORTED = (
-    INT8_SUPPORTED
-    and INT8_CUSTOMIZED_OPS[INT8_OP_NAME].__module__ == INT8_VENDOR_MODULE
+PPU_MLA_MODULE = "flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_w8a8"
+CUSTOMIZED_OPS = dict(flaggems_vllm.runtime.backend.get_customized_ops())
+PPU_MLA_SUPPORTED = (
+    "flash_mla_with_kvcache_w8a8" in CUSTOMIZED_OPS
+    and CUSTOMIZED_OPS["flash_mla_with_kvcache_w8a8"].__module__ == PPU_MLA_MODULE
 )
 INT8_CASES = (
     [(1, 64, 65), (3, 17, 129)]
@@ -298,55 +296,98 @@ INT8_CASES = (
 )
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(not PPU_MLA_SUPPORTED, reason="backend has no PPU MLA path")
+@pytest.mark.parametrize("cache_head_axis", [False, True])
+def test_dense_decode_ppu_backend_route(cache_head_axis):
+    vendor = importlib.import_module(PPU_MLA_MODULE)
+    assert (
+        flaggems_vllm.flash_mla_with_kvcache_w8a8 is vendor.flash_mla_with_kvcache_w8a8
+    )
+    assert "flash_mla_with_kvcache_fwd_w8a8_int8" not in vars(flaggems_vllm)
+    tensors = make_dense_int8_inputs(3, 17, 129, queries=2, ragged=True, strided=True)
+    expected, expected_lse = dense_int8_mla_reference(tensors, causal=True)
+    query, query_rope, cache, cache_rope, query_scale, cache_scale, table, lengths = (
+        tensors
+    )
+    if cache_head_axis:
+        cache = cache.unsqueeze(2)
+        cache_rope = cache_rope.unsqueeze(2)
+        cache_scale = cache_scale.unsqueeze(2)
+    else:
+        pass
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
+        q_nope=query,
+        q_rope=query_rope,
+        k_cache_lora=cache,
+        k_cache_rope=cache_rope,
+        q_scale=query_scale,
+        k_scale=cache_scale,
+        block_table=table,
+        cache_seqlens=lengths,
+        head_dim_v=512,
+        tile_scheduler_metadata=None,
+        num_splits=1,
+        softmax_scale=576**-0.5,
+        causal=True,
+        out=None,
+        lse=None,
+    )
+    gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
+    gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
+
+
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("batch,heads,length", INT8_CASES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("splits", [1, 4])
-def test_flash_mla_with_kvcache_fwd_w8a8_int8(batch, heads, length, dtype, splits):
+def test_flash_mla_with_kvcache_w8a8(batch, heads, length, dtype, splits):
     tensors = make_dense_int8_inputs(
         batch, heads, length, dtype, ragged=batch > 2, strided=True
     )
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
-        *tensors, num_splits=splits
-    )
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(*tensors, num_splits=splits)
     expected, expected_lse = dense_int8_mla_reference(tensors)
     gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_flash_mla_int8_large_head_tiles(dtype):
     tensors = make_dense_int8_inputs(128, 128, 257, dtype)
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
-        *tensors, num_splits=1
-    )
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(*tensors, num_splits=1)
     expected, expected_lse = dense_int8_mla_reference(tensors)
     gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 def test_flash_mla_int8_concentrated_probability():
     tensors = make_dense_int8_inputs(2, 64, 257, magnitude=2.0)
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
-        *tensors, num_splits=4
-    )
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(*tensors, num_splits=4)
     expected, expected_lse = dense_int8_mla_reference(tensors)
     gems_assert_close(output.float(), expected, torch.float32, atol=0.02)
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("batch,heads", [(0, 64), (2, 0)])
 @pytest.mark.parametrize("queries", [1, 2])
 def test_flash_mla_int8_empty_batch(batch, heads, queries):
     tensors = make_dense_int8_inputs(batch, heads, 64, queries=queries)
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(*tensors)
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(*tensors)
     assert output.shape == (batch, queries, heads, 512) and lse.shape == (
         batch,
         heads,
@@ -354,14 +395,16 @@ def test_flash_mla_int8_empty_batch(batch, heads, queries):
     )
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("queries", [1, 2])
 def test_flash_mla_int8_prepared_length_update(queries):
     tensors = make_dense_int8_inputs(2, 64, 257, queries=queries)
-    handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
-        *tensors, causal=True
-    )
+    handle, _ = importlib.import_module(
+        PPU_MLA_MODULE
+    ).prepare_flash_mla_with_kvcache_w8a8(*tensors, causal=True)
     tensors[-1].fill_(65)
     output, lse = handle()
     expected, expected_lse = dense_int8_mla_reference(tensors, True)
@@ -369,8 +412,10 @@ def test_flash_mla_int8_prepared_length_update(queries):
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 def test_flash_mla_int8_large_cache_address():
     tensors = make_dense_int8_inputs(1, 64, 64)
     q, qr, kv, kr, qs, ks, table, lengths = tensors
@@ -382,7 +427,7 @@ def test_flash_mla_int8_large_cache_address():
     rope_cache[-1].copy_(kr[0])
     scales[-1].copy_(ks[0])
     high_page = torch.full_like(table, pages - 1)
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
         q, qr, cache, rope_cache, qs, scales, high_page, lengths
     )
     expected, expected_lse = dense_int8_mla_reference(tensors)
@@ -390,13 +435,15 @@ def test_flash_mla_int8_large_cache_address():
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 def test_flash_mla_int8_prefill_is_unsupported():
     tensors = list(make_dense_int8_inputs(1, 64, 64))
     tensors[0] = tensors[0].expand(1, 3, 64, 512)
     with pytest.raises(NotImplementedError, match="requires Q"):
-        flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(*tensors)
+        flaggems_vllm.flash_mla_with_kvcache_w8a8(*tensors)
 
 
 @triton.jit
@@ -430,13 +477,13 @@ def probability_quantization_kernel(
     tl.store(Residual + offsets, residual, offsets < N)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
+@pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
-    not PPU_INT8_SUPPORTED, reason="backend has no matching INT8 MLA path"
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
 )
 @pytest.mark.parametrize("radix", [127, 256])
 def test_flash_mla_int8_probability_quantization(radix):
-    from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
+    from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_w8a8 import (
         quantize_mla_probabilities,
         quantize_mla_probabilities_packed,
     )
@@ -502,8 +549,10 @@ def test_flash_mla_int8_probability_quantization(radix):
         gems_assert_equal(residual, residual_reference)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("splits", [1, 4])
 @pytest.mark.parametrize("causal", [False, True])
@@ -511,7 +560,7 @@ def test_flash_mla_int8_two_queries(dtype, splits, causal):
     tensors = make_dense_int8_inputs(
         3, 17, 129, dtype, queries=2, ragged=True, strided=True
     )
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
         *tensors, causal=causal, num_splits=splits
     )
     expected, expected_lse = dense_int8_mla_reference(tensors, causal)
@@ -519,12 +568,14 @@ def test_flash_mla_int8_two_queries(dtype, splits, causal):
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("length", [0, 1, 2, 65])
 def test_flash_mla_int8_causal_query_boundaries(length):
     tensors = make_dense_int8_inputs(1, 16, length, queries=2)
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
         *tensors, causal=True, num_splits=4
     )
     expected, expected_lse = dense_int8_mla_reference(tensors, True)
@@ -532,8 +583,10 @@ def test_flash_mla_int8_causal_query_boundaries(length):
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
-@pytest.mark.skipif(not INT8_SUPPORTED, reason="backend has no matching INT8 MLA path")
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
+)
 @pytest.mark.parametrize("queries", [1, 2])
 def test_flash_mla_int8_nan_cache_tail(queries):
     tensors = make_dense_int8_inputs(2, 32, 65, queries=queries)
@@ -542,7 +595,7 @@ def test_flash_mla_int8_nan_cache_tail(queries):
         page = row * 2
         tensors[3][page, 1:].fill_(float("nan"))
         tensors[5][page, 1:].fill_(float("nan"))
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
         *tensors, causal=True, num_splits=4
     )
     expected, expected_lse = dense_int8_mla_reference(tensors, True)
@@ -550,9 +603,9 @@ def test_flash_mla_int8_nan_cache_tail(queries):
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
+@pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
-    not PPU_INT8_SUPPORTED, reason="backend has no matching INT8 MLA path"
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
 )
 @pytest.mark.parametrize(
     "batch,heads,queries,splits,varlen",
@@ -561,7 +614,7 @@ def test_flash_mla_int8_nan_cache_tail(queries):
 def test_flash_mla_int8_request_order(
     monkeypatch, batch, heads, queries, splits, varlen
 ):
-    vendor = importlib.import_module(INT8_VENDOR_MODULE)
+    vendor = importlib.import_module(PPU_MLA_MODULE)
     kernel = vendor.dense_int8_mla_kernel.jit_function
 
     class SortedKernel:
@@ -597,7 +650,7 @@ def test_flash_mla_int8_request_order(
             device=tensors[7].device,
         )
     )
-    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
         *tensors, num_splits=splits, causal=True
     )
     expected, expected_lse = dense_int8_mla_reference(tensors, causal=True)
@@ -605,9 +658,9 @@ def test_flash_mla_int8_request_order(
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
+@pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
-    not PPU_INT8_SUPPORTED, reason="backend has no matching INT8 MLA path"
+    not PPU_MLA_SUPPORTED, reason="backend has no matching INT8 MLA path"
 )
 @pytest.mark.parametrize("batch,varlen", [(65, False), (128, True)])
 def test_flash_mla_int8_auto_splits(batch, varlen):
@@ -616,11 +669,9 @@ def test_flash_mla_int8_auto_splits(batch, varlen):
     )
     expected, expected_lse = dense_int8_mla_reference(tensors, causal=True)
     for splits in [None, 1, 4]:
-        handle, (output, lse) = (
-            flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
-                *tensors, causal=True, num_splits=splits
-            )
-        )
+        handle, (output, lse) = importlib.import_module(
+            PPU_MLA_MODULE
+        ).prepare_flash_mla_with_kvcache_w8a8(*tensors, causal=True, num_splits=splits)
         gems_assert_close(output, expected, torch.bfloat16, atol=0.002)
         gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
         assert splits is None or handle.splits == splits

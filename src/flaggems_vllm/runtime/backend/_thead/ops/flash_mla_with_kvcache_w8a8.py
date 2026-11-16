@@ -868,11 +868,11 @@ class FlashMLAInt8PreparedHandle:
         return self.output, self.lse
 
 
-def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+def prepare_flash_mla_with_kvcache_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
-    k_lora: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     block_table: torch.Tensor,
@@ -889,20 +889,24 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     Unused cache slots may contain NaNs.
     Queries are the final one or two cache tokens; causal masks preserve their order.
     """
+    if k_cache_lora.ndim == 4 and k_cache_lora.shape[2] == 1:
+        k_cache_lora = k_cache_lora.squeeze(2)
+        k_cache_rope = k_cache_rope.squeeze(2)
+        k_scale = k_scale.squeeze(2)
     if q_nope.ndim != 4 or q_nope.shape[1] not in (1, 2) or q_nope.shape[-1] != 512:
         raise NotImplementedError("requires Q [batch, 1 or 2, heads, 512]")
     batch, queries, heads, _ = q_nope.shape
-    if k_lora.ndim != 3 or k_lora.shape[1:] != (64, 512) or head_dim_v != 512:
+    if k_cache_lora.ndim != 3 or k_cache_lora.shape[1:] != (64, 512) or head_dim_v != 512:
         raise NotImplementedError("requires KV [pages, 64, 512] and head_dim_v=512")
     expected_shapes = (
         (batch, queries, heads, 64),
-        (k_lora.shape[0], 64, 64),
+        (k_cache_lora.shape[0], 64, 64),
         (batch, queries, heads, 1),
-        (k_lora.shape[0], 64, 1),
+        (k_cache_lora.shape[0], 64, 1),
         (batch,),
     )
     for tensor, shape in zip(
-        (q_rope, k_rope, q_scale, k_scale, cache_seqlens), expected_shapes
+        (q_rope, k_cache_rope, q_scale, k_scale, cache_seqlens), expected_shapes
     ):
         if tensor.shape != shape:
             raise ValueError(f"expected shape {shape}, got {tuple(tensor.shape)}")
@@ -912,11 +916,11 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         or block_table.shape[1] == 0
     ):
         raise ValueError("block_table must have shape [batch, positive page capacity]")
-    if q_nope.dtype != torch.int8 or k_lora.dtype != torch.int8:
+    if q_nope.dtype != torch.int8 or k_cache_lora.dtype != torch.int8:
         raise TypeError("Q and KV content must be INT8")
     if (
         q_rope.dtype not in (torch.float16, torch.bfloat16)
-        or k_rope.dtype != q_rope.dtype
+        or k_cache_rope.dtype != q_rope.dtype
     ):
         raise TypeError("RoPE tensors must have the same FP16 or BF16 dtype")
     if q_scale.dtype != torch.float32 or k_scale.dtype != torch.float32:
@@ -926,8 +930,8 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     tensors = (
         q_nope,
         q_rope,
-        k_lora,
-        k_rope,
+        k_cache_lora,
+        k_cache_rope,
         q_scale,
         k_scale,
         block_table,
@@ -963,26 +967,34 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     return handle, handle()
 
 
-def flash_mla_with_kvcache_fwd_w8a8_int8(
+def flash_mla_with_kvcache_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
-    k_lora: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int = 512,
-    *,
+    tile_scheduler_metadata: None = None,
+    num_splits: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    num_splits: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, outputs = prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+    if tile_scheduler_metadata is not None:
+        raise NotImplementedError("PPU MLA uses its own split scheduling")
+    if out is not None or lse is not None:
+        raise NotImplementedError("PPU MLA outputs are allocated by its prepared handle")
+    if num_splits is not None and not isinstance(num_splits, int):
+        raise TypeError("PPU MLA num_splits must be an integer or None")
+    _, outputs = prepare_flash_mla_with_kvcache_w8a8(
         q_nope,
         q_rope,
-        k_lora,
-        k_rope,
+        k_cache_lora,
+        k_cache_rope,
         q_scale,
         k_scale,
         block_table,

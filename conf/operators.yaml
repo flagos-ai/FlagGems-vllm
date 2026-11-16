@@ -695,18 +695,6 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
-- id: flash_mla_with_kvcache_fwd_w8a8_int8
-  description: Dense one/two-token MLA decoding with per-token INT8 content and floating-point RoPE on PPU.
-  for:
-  - flash_mla_with_kvcache_fwd_w8a8_int8
-  labels:
-  - fused
-  - Attention
-  - vLLM
-  kind:
-  - NeuralNetwork
-  stages:
-  - alpha: '5.4'
 - id: flash_mla_with_kvcache_w8a8
   description: 'Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific
     implementations.

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import math
 import random
 from collections.abc import Callable
@@ -33,7 +34,8 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
 )
 from tests.accuracy_utils import gems_assert_close
 from tests.test_flash_mla_with_kvcache_w8a8 import (
-    INT8_SUPPORTED,
+    PPU_MLA_MODULE,
+    PPU_MLA_SUPPORTED,
     SUPPORTED,
     dense_int8_mla_reference,
     dense_mla_reference,
@@ -165,12 +167,6 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
         yield inputs, tuple(lengths)
 
 
-@pytest.mark.flash_mla_with_kvcache_w8a8
-@pytest.mark.skipif(not SUPPORTED, reason="FP8 MLA requires NVIDIA Hopper and TLE")
-def test_flash_mla_with_kvcache_w8a8():
-    FlashMLAWithKVCacheW8A8Benchmark().run()
-
-
 # The unchanged PR851 upstream matrix includes both draft lengths and ragged caches.
 DENSE_INT8_SHAPES = [
     (batch, queries, length, heads, varlen)
@@ -203,7 +199,7 @@ class DenseInt8MLABenchmark(base.Benchmark):
 
     def __init__(self):
         super().__init__(
-            "flash_mla_with_kvcache_fwd_w8a8_int8",
+            "flash_mla_with_kvcache_w8a8",
             run_native_bf16_mla,
             [torch.bfloat16],
         )
@@ -212,7 +208,7 @@ class DenseInt8MLABenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         with open(shape_file_path) as shape_file:
             configs = yaml.safe_load(shape_file)
-        entry = configs.get(self.op_name, configs.get("flash_mla_with_kvcache_w8a8"))
+        entry = configs[self.op_name]
         self.shapes = [tuple(shape) for shape in entry["shapes"]]
         self.shape_desc = entry.get("shape_desc", self.DEFAULT_SHAPE_DESC)
         if (
@@ -270,9 +266,9 @@ class DenseInt8MLABenchmark(base.Benchmark):
             cache = (
                 (torch.cat((kv.float(), kr.float()), -1) * ks).to(dtype).unsqueeze(2)
             )
-            handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
-                *tensors, causal=True
-            )
+            handle, _ = importlib.import_module(
+                PPU_MLA_MODULE
+            ).prepare_flash_mla_with_kvcache_w8a8(*tensors, causal=True)
             metadata, _ = get_mla_metadata()
             inputs = DenseInt8MLAInputs(
                 handle,
@@ -309,9 +305,13 @@ class DenseInt8MLABenchmark(base.Benchmark):
         return inputs.shape
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
+@pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
-    not INT8_SUPPORTED, reason="backend has no dense INT8 MLA implementation"
+    not (SUPPORTED or PPU_MLA_SUPPORTED),
+    reason="backend has no W8A8 MLA implementation",
 )
-def test_flash_mla_with_kvcache_fwd_w8a8_int8():
-    DenseInt8MLABenchmark().run()
+def test_flash_mla_with_kvcache_w8a8():
+    if PPU_MLA_SUPPORTED:
+        DenseInt8MLABenchmark().run()
+    else:
+        FlashMLAWithKVCacheW8A8Benchmark().run()

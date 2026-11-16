@@ -18,9 +18,8 @@ import flag_gems
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
-from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
-    flash_mla_with_kvcache_fwd_w8a8_int8,
-    prepare_flash_mla_with_kvcache_fwd_w8a8_int8,
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_w8a8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
@@ -53,7 +52,7 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_bloc
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
-    "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
@@ -65,7 +64,6 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
-    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "qsa_prepare",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
