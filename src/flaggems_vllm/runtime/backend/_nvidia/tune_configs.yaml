@@ -13,6 +13,9 @@
 # limitations under the License.
 
 min_p_single_tile:
+  - META: {WARPS: 2, ELEMENTS: 1}
+    num_warps: 2
+    num_stages: 1
   - META: {WARPS: 4, ELEMENTS: 1}
     num_warps: 4
     num_stages: 1
@@ -25,6 +28,9 @@ min_p_single_tile:
 
 min_p_streaming:
   - META: {BLOCK_SIZE: 1024, WARPS: 4, ELEMENTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 2048, WARPS: 4, ELEMENTS: 1}
     num_warps: 4
     num_stages: 1
   - META: {BLOCK_SIZE: 4096, WARPS: 4, ELEMENTS: 1}
