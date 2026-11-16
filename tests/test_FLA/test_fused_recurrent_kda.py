@@ -7,6 +7,7 @@ import torch
 
 import flaggems_vllm as gems
 from baseline.fused_recurrent_kda import PERF_CASES, Case, build
+from flaggems_vllm.ops import kda_bounded as bounded
 
 CASES = PERF_CASES + [
     Case("min_dims", [1, 2], 1, 1, 1, "table"),
@@ -95,6 +96,160 @@ def assert_result(result, expected):
         torch.testing.assert_close(
             got.detach().cpu(), ref, rtol=rtol, atol=atol, equal_nan=True
         )
+
+
+def assert_decode_entries(data, backing=None, defaults=False):
+    """Compare both import paths with an oracle from the same unmutated state."""
+    state = data["initial_state"]
+    before = state.clone()
+    saved_backing = backing.clone() if backing is not None else None
+    inputs = {
+        key: value.clone()
+        for key, value in data.items()
+        if isinstance(value, torch.Tensor) and key != "initial_state"
+    }
+    expected = reference(data)
+    kwargs = data.copy()
+    if defaults:
+        # Legacy callers omit these arguments; the oracle uses their defaults.
+        kwargs.pop("scale")
+        kwargs.pop("use_qk_l2norm_in_kernel")
+        if data["inplace_final_state"]:
+            kwargs.pop("inplace_final_state")
+    args = [kwargs.pop(key) for key in ("q", "k", "v", "g", "beta")]
+    for entry in (gems.fused_recurrent_kda, bounded.fused_recurrent_kda):
+        if backing is None:
+            state.copy_(before)
+        else:
+            backing.copy_(saved_backing)
+        result = entry(*args, **kwargs)
+        assert result[0].shape == data["v"].shape
+        assert result[0].dtype == data["v"].dtype
+        assert result[1].dtype == torch.float32
+        assert (result[1] is state) == data["inplace_final_state"]
+        assert_result(result, expected)
+        torch.testing.assert_close(
+            state.cpu(),
+            expected[1] if data["inplace_final_state"] else before.cpu(),
+            rtol=3e-5 if data["inplace_final_state"] else 0,
+            atol=3e-5 if data["inplace_final_state"] else 0,
+        )
+        for key, value in inputs.items():
+            torch.testing.assert_close(data[key], value, rtol=0, atol=0)
+        if data["ssm_state_indices"] is not None:
+            torch.testing.assert_close(state[0], before[0], rtol=0, atol=0)
+        if backing is not None:
+            wanted = saved_backing.cpu().clone()
+            if data["inplace_final_state"]:
+                wanted.as_strided(
+                    state.shape, state.stride(), state.storage_offset()
+                ).copy_(expected[1])
+            torch.testing.assert_close(backing.cpu(), wanted, rtol=3e-5, atol=3e-5)
+            padding = torch.ones(wanted.shape, dtype=torch.bool)
+            padding.as_strided(
+                state.shape, state.stride(), state.storage_offset()
+            ).fill_(False)
+            torch.testing.assert_close(
+                backing.cpu()[padding], saved_backing.cpu()[padding], rtol=0, atol=0
+            )
+
+
+# Compact replacements for bounded decode's native comparisons. Keep the full
+# canonical matrix below unchanged rather than parametrizing it by entry point.
+COMPAT_CASES = [
+    Case("legacy_slots", [1, 2], 2, 32, 32, "table"),
+    Case("legacy_one_token", [1, 1], 2, 128, 128),
+    Case("legacy_padded_cache", [1, 1], 2, 128, 128),
+    Case("legacy_slot_zero", [1, 2, 1], 2, 32, 32, "table"),
+]
+
+
+@pytest.mark.fused_recurrent_kda
+@pytest.mark.parametrize("case", COMPAT_CASES, ids=[case.name for case in COMPAT_CASES])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_fused_recurrent_kda_legacy_decode(case, dtype, inplace):
+    data = build(case._replace(inplace=inplace), dtype, gems.device)
+    if case.name == "legacy_slots":
+        data["initial_state"] = data["initial_state"][:5]
+        data["ssm_state_indices"] = torch.tensor(
+            [[3, 0], [1, 2]], dtype=torch.int32, device=gems.device
+        )
+    elif case.name == "legacy_slot_zero":
+        # Slot zero is padding, an invalid initial slot, and an invalid write.
+        data["ssm_state_indices"] = torch.tensor(
+            [[3, 0], [1, 0], [0, 0]], dtype=torch.int32, device=gems.device
+        )
+    else:
+        data["ssm_state_indices"] = torch.tensor(
+            [3, 1], dtype=torch.int32, device=gems.device
+        )
+    data["beta"] = data["beta"].float()
+    backing = None
+    if case.name == "legacy_padded_cache":
+        initial = data["initial_state"]
+        pool, heads, dv, dk = initial.shape
+        slot_stride = heads * dv * dk + 256
+        backing = torch.full(
+            (pool * slot_stride,), 1234.0, dtype=torch.float32, device=gems.device
+        )
+        state = backing.as_strided(initial.shape, (slot_stride, dv * dk, dk, 1))
+        state.copy_(initial)
+        data["initial_state"] = state
+        assert not state.is_contiguous()
+    assert_decode_entries(data, backing, defaults=True)
+
+
+@pytest.mark.fused_recurrent_kda
+def test_fused_recurrent_kda_legacy_model_head_dimension_128():
+    data = build(
+        Case("legacy_model", [1, 2], 2, 128, 128, "table"),
+        torch.bfloat16,
+        gems.device,
+    )
+    data["initial_state"] = data["initial_state"][:5]
+    data["ssm_state_indices"] = torch.tensor(
+        [[3, 0], [1, 2]], dtype=torch.int32, device=gems.device
+    )
+    data["beta"] = data["beta"].float()
+    assert_decode_entries(data, defaults=True)
+
+
+@pytest.mark.fused_recurrent_kda
+def test_fused_recurrent_kda_legacy_strided_vector_beta():
+    data = build(
+        Case(
+            "legacy_strided_vector_beta",
+            [2, 1],
+            2,
+            17,
+            23,
+            "strided_table",
+            False,
+            strided=True,
+            state_strided=True,
+            vector_beta=True,
+        ),
+        torch.float32,
+        gems.device,
+        normalize=False,
+    )
+    assert_decode_entries(data)
+
+
+@pytest.mark.fused_recurrent_kda
+def test_fused_recurrent_kda_legacy_independent_state_and_reset():
+    data = build(
+        Case("legacy_reset", [1, 2], 2, 32, 23, "table"),
+        torch.float32,
+        gems.device,
+    )
+    original = data["initial_state"].clone()
+    # Reuse pointers and metadata with changed live state, then replay the seed.
+    # Each request starts from its own slot, not the preceding request's state.
+    for offset in (0.0, 0.5, 0.0):
+        data["initial_state"].copy_(original + offset)
+        assert_decode_entries(data)
 
 
 @pytest.mark.fused_recurrent_kda

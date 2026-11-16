@@ -9,12 +9,10 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.data_movement import contiguous_copy, fill
-from flaggems_vllm.ops.kda64 import (
-    _prefill_core,
-    _recurrent_core,
-    prefill_kda64,
-    recurrent_kda_vk,
-)
+
+# Preserve the historical decode import path using the selected Gems entry.
+from flaggems_vllm.ops.FLA import fused_recurrent_kda
+from flaggems_vllm.ops.kda64 import _prefill_core, prefill_kda64
 from flaggems_vllm.utils import libentry, libtuner
 
 
@@ -316,64 +314,6 @@ def _validate_kda(
     if any(x is not None and x.device != q.device for x in tensors):
         raise ValueError("KDA inputs, metadata, and state must share device")
     return n
-
-
-def fused_recurrent_kda(
-    q,
-    k,
-    v,
-    g,
-    beta=None,
-    scale=None,
-    initial_state=None,
-    inplace_final_state=True,
-    use_qk_l2norm_in_kernel=True,
-    cu_seqlens=None,
-    ssm_state_indices=None,
-    **kwargs,
-):
-    """vLLM-compatible decode with live float32 [slots,H,V,K] state."""
-    if beta is None:
-        raise ValueError("KDA beta tensor is required")
-    if kwargs:
-        raise NotImplementedError(f"Unsupported KDA decode arguments: {tuple(kwargs)}")
-    n = _validate_kda(q, k, v, g, beta, initial_state, cu_seqlens, ssm_state_indices)
-    if initial_state is None:
-        raise ValueError("vLLM KDA decode requires an initial-state buffer")
-    if q.shape[1] == 0 or n == 0:
-        out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-        final = (
-            initial_state
-            if inplace_final_state
-            else torch.empty(
-                (q.shape[1], *initial_state.shape[1:]),
-                dtype=initial_state.dtype,
-                device=q.device,
-            )
-        )
-        return out, final
-    if inplace_final_state and ssm_state_indices is None:
-        raise ValueError("Inplace vLLM KDA decode requires an explicit state-slot map")
-    if not inplace_final_state and q.shape[0] != 1:
-        raise NotImplementedError(
-            "Non-inplace vLLM KDA state requires flattened batch one"
-        )
-    kernel = _recurrent_core()
-    q, k, v, g, beta = map(contiguous_copy, (q, k, v, g, beta))
-    return recurrent_kda_vk(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        q.shape[-1] ** -0.5 if scale is None else scale,
-        initial_state,
-        inplace_final_state,
-        use_qk_l2norm_in_kernel,
-        cu_seqlens,
-        ssm_state_indices,
-        kernel,
-    )
 
 
 def chunk_kda_with_safe_gate(
@@ -705,14 +645,12 @@ def _prefill_available():
 
 @lru_cache(maxsize=1)
 def _recurrent_available():
-    try:
-        _recurrent_core()
-        return True
-    except (ImportError, AttributeError, NotImplementedError, OSError):
-        return False
+    # Import availability only: numerical support is qualified by the caller.
+    # Decode no longer depends on an installed vLLM kernel or its private ABI.
+    return callable(fused_recurrent_kda)
 
 
-# Public capability hooks run only the cached ABI resolvers. They do not
-# submit a kernel, inspect real model state, or catch execution failures.
+# The prefill hook checks its native ABI; decode checks the selected Gems
+# entry. Neither submits a kernel or catches execution failures.
 chunk_kda_with_safe_gate._is_available = _prefill_available
 fused_recurrent_kda._is_available = _recurrent_available

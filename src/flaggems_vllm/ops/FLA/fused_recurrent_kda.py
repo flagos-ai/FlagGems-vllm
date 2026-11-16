@@ -4,6 +4,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 """KDA decode with key-wise decay and value-major recurrent state."""
 
+import logging
 import math
 from functools import lru_cache
 
@@ -14,6 +15,8 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -265,6 +268,7 @@ def fused_recurrent_kda(
     returns [T,H,V,K] token states and leaves initial_state unchanged. Without
     indices its initial state is token-major, matching vLLM's KDA convention.
     """
+    logger.debug("GEMS FUSED_RECURRENT_KDA")
     scale = (
         q.shape[-1] ** -0.5
         if scale is None and q.ndim == 4 and q.shape[-1] > 0

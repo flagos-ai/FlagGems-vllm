@@ -195,49 +195,6 @@ def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("inplace", [False, True])
-def test_decode_matches_vllm_vk_state_slots(dtype, inplace, dim=32):
-    from vllm.model_executor.layers.fla.ops import kda
-
-    torch.manual_seed(136)
-    q = torch.randn((1, 3, 2, dim), dtype=dtype, device="cuda")
-    k, v = torch.randn_like(q), torch.randn_like(q)
-    gate = -torch.rand_like(q, dtype=torch.float32)
-    beta = torch.rand((1, 3, 2), device="cuda")
-    initial = torch.randn((5, 2, dim, dim), dtype=torch.float32, device="cuda")
-    actual_state, reference_state = initial.clone(), initial.clone()
-    cu = torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda")
-    slots = torch.tensor([[3, 0], [1, 2]], dtype=torch.int32, device="cuda")
-    expected, expected_final = kda.fused_recurrent_kda(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        initial_state=reference_state,
-        cu_seqlens=cu,
-        ssm_state_indices=slots,
-        inplace_final_state=inplace,
-    )
-    actual, final = bounded.fused_recurrent_kda(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        initial_state=actual_state,
-        cu_seqlens=cu,
-        ssm_state_indices=slots,
-        inplace_final_state=inplace,
-    )
-    assert final.shape == expected_final.shape
-    assert (final is actual_state) == inplace
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(final, expected_final, rtol=0, atol=0)
-    torch.testing.assert_close(actual_state, reference_state, rtol=0, atol=0)
-
-
 def test_prefill_requires_metadata_before_core(monkeypatch):
     q = torch.empty((1, 1, 2, 32), device="cuda", dtype=torch.bfloat16)
     beta = torch.empty((1, 1, 2), device="cuda")
@@ -252,16 +209,11 @@ def test_prefill_requires_metadata_before_core(monkeypatch):
         bounded.chunk_kda_with_safe_gate(q, q, q, q, beta, a, None, cu_seqlens=cu)
 
 
-def test_decode_validates_vk_state_before_core(monkeypatch):
+def test_decode_validates_vk_state():
     q = torch.empty((1, 1, 2, 32), device="cuda", dtype=torch.bfloat16)
     v = torch.empty((1, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
     beta = torch.empty((1, 1, 2), device="cuda")
     wrong = torch.empty((1, 2, 32, 16), device="cuda")
-    monkeypatch.setattr(
-        bounded,
-        "_recurrent_core",
-        lambda: pytest.fail("core loaded before state validation"),
-    )
     with pytest.raises(ValueError, match="V,K"):
         bounded.fused_recurrent_kda(q, q, v, q, beta, initial_state=wrong)
 
@@ -284,10 +236,6 @@ def test_prefill_execution_error_propagates(monkeypatch):
 
 def test_prefill_model_head_dimension_128():
     test_prefill_matches_original_64_core(torch.bfloat16, 65, 128, 128)
-
-
-def test_decode_model_head_dimension_128():
-    test_decode_matches_vllm_vk_state_slots(torch.bfloat16, True, 128)
 
 
 def test_safe_gate_chunk_cumsum_resets_at_sequence_and_tiny_chunk():
@@ -335,26 +283,20 @@ def test_empty_prefill_returns_vk_state_without_native_core(monkeypatch):
     assert torch.count_nonzero(state) == 0
 
 
-def test_empty_decode_preserves_live_state_without_core(monkeypatch):
+def test_empty_decode_preserves_live_state():
     q = torch.empty((1, 0, 2, 32), device="cuda", dtype=torch.bfloat16)
     beta = torch.empty((1, 0, 2), device="cuda")
     initial = torch.randn((1, 2, 32, 32), device="cuda")
-    monkeypatch.setattr(
-        bounded, "_recurrent_core", lambda: pytest.fail("empty input loaded core")
-    )
     out, state = bounded.fused_recurrent_kda(q, q, q, q, beta, initial_state=initial)
     assert out.shape == q.shape and state is initial
 
 
-def test_multi_token_decode_rejects_1d_slots_before_core(monkeypatch):
+def test_multi_token_decode_rejects_1d_slots():
     q = torch.empty((1, 3, 2, 32), device="cuda", dtype=torch.bfloat16)
     beta = torch.empty((1, 3, 2), device="cuda")
     initial = torch.empty((5, 2, 32, 32), device="cuda")
     cu = torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda")
     slots = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
-    monkeypatch.setattr(
-        bounded, "_recurrent_core", lambda: pytest.fail("invalid slots loaded core")
-    )
     with pytest.raises(ValueError, match="Multi-token"):
         bounded.fused_recurrent_kda(
             q,
@@ -366,91 +308,6 @@ def test_multi_token_decode_rejects_1d_slots_before_core(monkeypatch):
             cu_seqlens=cu,
             ssm_state_indices=slots,
         )
-
-
-def test_model_decode_one_token_requests_preserve_1d_slots():
-    from vllm.model_executor.layers.fla.ops import kda
-
-    q = torch.randn((1, 2, 2, 128), device="cuda", dtype=torch.bfloat16)
-    k, v = torch.randn_like(q), torch.randn_like(q)
-    gate = -torch.rand_like(q, dtype=torch.float32)
-    beta = torch.rand((1, 2, 2), device="cuda")
-    initial = torch.randn((5, 2, 128, 128), device="cuda")
-    actual_state, expected_state = initial.clone(), initial.clone()
-    cu = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    slots = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
-    expected, expected_final = kda.fused_recurrent_kda(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        initial_state=expected_state,
-        cu_seqlens=cu,
-        ssm_state_indices=slots,
-    )
-    actual, actual_final = bounded.fused_recurrent_kda(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        initial_state=actual_state,
-        cu_seqlens=cu,
-        ssm_state_indices=slots,
-    )
-    assert actual_final is actual_state
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(actual_final, expected_final, rtol=0, atol=0)
-
-
-def test_decode_preserves_padded_mamba_cache_slot_stride():
-    from vllm.model_executor.layers.fla.ops import kda
-
-    torch.manual_seed(341)
-    h, dim, slots, padding = 2, 128, 5, 256
-    slot_stride = h * dim * dim + padding
-    raw_seed = torch.full((slots * slot_stride,), 1234.0, device="cuda")
-    state_shape, state_stride = (slots, h, dim, dim), (slot_stride, dim * dim, dim, 1)
-    seed = raw_seed.as_strided(state_shape, state_stride)
-    seed.copy_(torch.randn(state_shape, device="cuda"))
-    expected_raw, actual_raw = raw_seed.clone(), raw_seed.clone()
-    expected_state = expected_raw.as_strided(state_shape, state_stride)
-    actual_state = actual_raw.as_strided(state_shape, state_stride)
-    assert not actual_state.is_contiguous()
-    q = torch.randn((1, 2, h, dim), dtype=torch.bfloat16, device="cuda")
-    k, v = torch.randn_like(q), torch.randn_like(q)
-    g = -torch.rand_like(q, dtype=torch.float32)
-    beta = torch.rand((1, 2, h), device="cuda")
-    cu = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    indices = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
-    expected, _ = kda.fused_recurrent_kda(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=expected_state,
-        cu_seqlens=cu,
-        ssm_state_indices=indices,
-    )
-    actual, final = bounded.fused_recurrent_kda(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=actual_state,
-        cu_seqlens=cu,
-        ssm_state_indices=indices,
-    )
-    assert final is actual_state and final.stride(0) == slot_stride
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(actual_raw, expected_raw, rtol=0, atol=0)
-    untouched_padding = actual_raw.as_strided(
-        (slots, padding), (slot_stride, 1), storage_offset=h * dim * dim
-    )
-    assert torch.all(untouched_padding == 1234.0)
 
 
 def test_prefill_materializes_padded_initial_state_like_original():
@@ -501,7 +358,6 @@ def test_prefill_materializes_padded_initial_state_like_original():
     "name,resolver",
     [
         ("chunk_kda_with_safe_gate", "_prefill_core"),
-        ("fused_recurrent_kda", "_recurrent_core"),
     ],
 )
 def test_public_capability_hook_checks_core_before_execution(
