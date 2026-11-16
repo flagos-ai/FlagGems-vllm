@@ -1174,8 +1174,11 @@ def _require_ascend_streaming():
         pytest.skip("streaming row launch is specific to verified Ascend 3.5.1")
     module = importlib.import_module("flaggems_vllm.ops.gumbel_sample")
     assert module._COMPILED_FAST_LAUNCH
-    assert hasattr(module, "_sample_streaming_row")
-    return module
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._ascend.ops.gumbel_sample"
+    )
+    assert hasattr(backend, "_sample_streaming_row")
+    return backend
 
 
 @triton.jit
