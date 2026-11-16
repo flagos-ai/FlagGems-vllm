@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.flagtune.inference.cost_model import tensor_dtypes
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 
@@ -251,6 +252,10 @@ def _prune_matmul_configs(configs, named_args, **kwargs):
     warmup=5,
     rep=20,
     use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="ppu_general",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_matmul",
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
@@ -321,6 +326,10 @@ def _w8a8_block_int8_kernel_general(
     warmup=5,
     rep=20,
     use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="ppu_swap",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_swap",
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
@@ -391,6 +400,10 @@ def _w8a8_block_int8_kernel_swap(
     warmup=5,
     rep=20,
     use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="ppu_gemv",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_gemv",
 )
@@ -480,6 +493,10 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
     rep=20,
     use_cuda_graph=True,
     post_hook=_splitk_post_hook,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="ppu_splitk_complete",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_int8_splitk",
     prune_configs_by={"early_config_prune": _prune_splitk_configs},

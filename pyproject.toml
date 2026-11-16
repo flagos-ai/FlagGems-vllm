@@ -97,6 +97,11 @@ exclude-dependencies = [
 [project.urls]
 Homepage = "https://github.com/flagos-ai/FlagGems-vllm"
 
+[project.scripts]
+flaggems-vllm-flagtune-pretune = "flaggems_vllm.flagtune.offline.cli.pretune:main"
+flaggems-vllm-flagtune-train = "flaggems_vllm.flagtune.offline.cli.train:main"
+flaggems-vllm-flagtune-compare = "flaggems_vllm.flagtune.offline.cli.compare:main"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
@@ -106,6 +111,9 @@ where = ["src"]
 [tool.setuptools.package-data]
 "flaggems_vllm" = ["backends.yaml"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.flagtune.inference" = ["manifest.json"]
+"flaggems_vllm.flagtune.offline.contracts" = ["configs/*.yaml"]
+
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
 "flaggems_vllm.testing" = ["*.hip"]
 "flaggems_vllm.utils" = ["configs/*.yaml"]

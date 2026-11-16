@@ -30,6 +30,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.flagtune.inference.cost_model import tensor_dtypes
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
@@ -193,6 +194,12 @@ def _tle_consumer(
     prune_configs_by={"early_config_prune": _prune_tle_configs},
     warmup=5,
     rep=20,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="mthreads_tle",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
+    flagtune_pre_hook=_tle_descriptor_shapes,
 )
 @triton.jit
 def _block_fp8_matmul_tle(
@@ -380,6 +387,7 @@ def _block_fp8_matmul_kernel(
     BLOCK_M: tl.constexpr = 0,
     BLOCK_N: tl.constexpr = 0,
     GROUP_M: tl.constexpr = 0,
+    FINAL_C=None,
 ):
     # Keep native FP8 dot / Split-K on a matrix tile when AABS shrinks M.
     # An explicit tile expression is opaque to AABS, so retain its small-shape
@@ -489,7 +497,42 @@ _MATMUL_TUNING_KEY = [
 _FIXED_LAYOUT_TUNING_KEY = ["M", "N", "K", "stride_am", "stride_bk"]
 
 
+def _finish_split_candidate(args, exception):
+    """Include the final reduction in every successful split candidate trial."""
+    if exception is None:
+        splits = args.get("SPLIT_K", args.get("SPLITS", 1))
+        size = args["M"] * args["N"]
+        _finish_split_k[(triton.cdiv(size, 256),)](
+            args["C"], args["FINAL_C"], size, SPLIT_K=splits, BLOCK=256
+        )
+
+
 def _make_matmul_entry(config_name, expand_name, key=_MATMUL_TUNING_KEY):
+    variants = {
+        "w8a8_block_fp8_general": "mthreads_general",
+        "w8a8_block_fp8_swap_ab": "mthreads_swap",
+        "w8a8_block_fp8_short_k256": "mthreads_shortk",
+        "w8a8_block_fp8_swap_ab_splitk": "mthreads_splitk",
+        "w8a8_block_fp8_mthreads_narrow_splitk": "mthreads_narrow_splitk",
+    }
+    split_path = expand_name in (
+        "w8a8_block_fp8_swap_ab_splitk",
+        "w8a8_block_fp8_mthreads_narrow_splitk",
+    )
+    cost_options = {}
+    if expand_name in variants:
+        cost_options = {
+            "use_cuda_graph": True,
+            "policy": "flagtune",
+            "flagtune_op_id": "flaggems_vllm/w8a8_block_matmul",
+            "flagtune_variant": variants[expand_name]
+            + ("_fixed" if key == _FIXED_LAYOUT_TUNING_KEY else ""),
+            "flagtune_dtype_resolver": tensor_dtypes(
+                "A", "B", "As", "Bs", "FINAL_C" if split_path else "C"
+            ),
+        }
+        if split_path:
+            cost_options["post_hook"] = _finish_split_candidate
     return libentry()(
         libtuner(
             configs=runtime.get_tuned_config(config_name),
@@ -500,6 +543,7 @@ def _make_matmul_entry(config_name, expand_name, key=_MATMUL_TUNING_KEY):
             flagtune_op_name="w8a8_block_matmul",
             flagtune_expand_op_name=expand_name,
             flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+            **cost_options,
         )(_block_fp8_matmul_kernel)
     )
 
@@ -599,6 +643,12 @@ def _gemv_row(
     strategy="default",
     warmup=5,
     rep=20,
+    use_cuda_graph=True,
+    post_hook=_finish_split_candidate,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="mthreads_gemv_splitk",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "FINAL_C"),
 )
 @triton.jit
 def _block_fp8_gemv(
@@ -618,6 +668,7 @@ def _block_fp8_gemv(
     K_BOUND: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    FINAL_C=None,
 ):
     # Direct reductions avoid a padded 16-row matrix tile and FP16 workspace.
     # Keep the scale-group boundary even when AABS shrinks a candidate.
@@ -689,6 +740,23 @@ def _block_fp8_gemv(
         tl.store(out + 6 * N, acc6, nr < N)
     if M >= 8:
         tl.store(out + 7 * N, acc7, nr < N)
+
+
+# Unsplit GEMV uses the same body without the final-reduction benchmark hook.
+_block_fp8_gemv_unsplit = libentry()(
+    libtuner(
+        configs=_block_fp8_gemv.fn.configs,
+        key=_block_fp8_gemv.fn.keys,
+        strategy="default",
+        warmup=5,
+        rep=20,
+        use_cuda_graph=True,
+        policy="flagtune",
+        flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+        flagtune_variant="mthreads_gemv",
+        flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
+    )(_block_fp8_gemv.fn.fn)
+)
 
 
 @triton.jit
@@ -831,14 +899,16 @@ def w8a8_block_matmul(
         raise ValueError("invalid As shape")
     if Bs.shape != (triton.cdiv(n, group_n), triton.cdiv(k, group_k)):
         raise ValueError("invalid Bs shape")
+    c = torch.empty(A.shape[:-1] + (n,), dtype=output_dtype, device=A.device)
+    if m == 0 or n == 0:
+        return c
     # Bound the N dimension for very wide GEMV-like launches.  The MThreads
     # TLE path can otherwise generate an out-of-bounds access for N>65536.
     if n > 65536 or (m < 512 and n > 32768):
         chunk_n = 32768 if m <= 128 else 4096
-        chunks = []
         for start in range(0, n, chunk_n):
             end = min(start + chunk_n, n)
-            chunks.append(
+            c[..., start:end].copy_(
                 w8a8_block_matmul(
                     A,
                     B[start:end],
@@ -848,9 +918,6 @@ def w8a8_block_matmul(
                     output_dtype,
                 )
             )
-        return torch.cat(chunks, dim=-1)
-    c = torch.empty(A.shape[:-1] + (n,), dtype=output_dtype, device=A.device)
-    if m == 0 or n == 0:
         return c
     with torch_device_fn.device(A.device):
         if k == 0:
@@ -894,7 +961,8 @@ def w8a8_block_matmul(
                 if splits > 1
                 else c
             )
-            _block_fp8_gemv[lambda meta: (triton.cdiv(n, meta["BN"]), splits)](
+            gemv_entry = _block_fp8_gemv_unsplit if splits == 1 else _block_fp8_gemv
+            gemv_entry[lambda meta: (triton.cdiv(n, meta["BN"]), splits)](
                 a,
                 B,
                 a_s,
@@ -909,6 +977,7 @@ def w8a8_block_matmul(
                 Bs.stride(1),
                 SPLITS=splits,
                 K_BOUND=triton.next_power_of_2(k),
+                FINAL_C=c,
             )
             if splits > 1:
                 _finish_split_k[(triton.cdiv(m * n, 256),)](
@@ -1198,8 +1267,10 @@ def w8a8_block_matmul(
         )
         if not split_path:
             launch["SPLIT_K"] = 1
+        else:
+            launch["FINAL_C"] = c
 
-        entry[grid](
+        _, selected_meta = entry[grid](
             a,
             B,
             a_s,
@@ -1220,12 +1291,9 @@ def w8a8_block_matmul(
         )
 
         if split_path:
-            selected = getattr(entry.fn, "best_config", None)
-            selected_split_k = (
-                selected.kwargs.get("SPLIT_K", split_k)
-                if selected is not None
-                else split_k
-            )
+            # LibEntry can launch a cached shape without updating the tuner's
+            # best_config; use this launch's metadata for its scratch extent.
+            selected_split_k = selected_meta["SPLIT_K"]
             _finish_split_k[(triton.cdiv(m * n, 256),)](
                 partials,
                 c,
