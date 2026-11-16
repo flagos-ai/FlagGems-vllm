@@ -76,6 +76,10 @@ _EPS = 1e-10
 # the driver launch (~15 us), so cache it per (grid, pointer specialization,
 # constexpr) tuple. Any capture failure falls back to the normal dispatch path.
 _LEAN_LAUNCH = os.environ.get("FLAGGEMS_O_PROJ_LEAN_LAUNCH", "1") != "0"
+# Row-per-program quantization reads a whole group row contiguously instead of
+# one head at a time; it is the default because the strided variant stalls at
+# ~0.64 TB/s for 128/224-head models (see the H9 note in the design record).
+_QUANT_ROWS = os.environ.get("FLAGGEMS_O_PROJ_QUANT_ROWS", "1") != "0"
 _RUNNERS = {}
 _RUNNER_LIMIT = 512
 
@@ -312,19 +316,19 @@ def _inv_rope_quant_int8_kernel(
         mask=mask2d,
         other=0.0,
     ).to(tl.float32)
-    # ROPE_START is even, so (col ^ 1) stays inside the rope tile.
-    partner = tl.load(
-        input_base + row_off + last_base + ROPE_START + (hi_cols ^ 1)[None, :],
-        mask=mask2d,
-        other=0.0,
-    ).to(tl.float32)
-    cs_idx = hi_cols >> 1
-    cache_off = pos[:, None] * cache_stride_pos + cs_idx[None, :]
+    # The rope pairs are interleaved (even, odd): split them out of the tile
+    # instead of loading the partner element again (that re-read cost 1/8 of
+    # the row's bytes and showed up as ~10% of the pass at prefill sizes).
+    pairs = tl.reshape(hi, (BLOCK_T, HALF_ROPE, 2))
+    even, odd = tl.split(pairs)
+    half_cols = tl.arange(0, HALF_ROPE)
+    cache_off = pos[:, None] * cache_stride_pos + half_cols[None, :]
     cos_v = tl.load(cos_sin_cache_ptr + cache_off, mask=mask2d, other=1.0)
     sin_v = tl.load(cos_sin_cache_ptr + HALF_ROPE + cache_off, mask=mask2d, other=0.0)
-    x_add = hi * cos_v + partner * sin_v
-    x_sub = hi * cos_v - partner * sin_v
-    hi_rot = tl.where(((hi_cols & 1) == 0)[None, :], x_add, x_sub)
+    hi_rot = tl.reshape(
+        tl.join(even * cos_v + odd * sin_v, odd * cos_v - even * sin_v),
+        (BLOCK_T, ROPE_WIDTH),
+    )
 
     absmax_last = tl.maximum(
         tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)), eps
@@ -350,6 +354,177 @@ def _inv_rope_quant_int8_kernel(
         out_base + last_base + ROPE_START + hi_cols[None, :],
         q_hi,
         mask=mask2d,
+    )
+
+
+@triton.jit
+def _quant_to_int8(x, absmax, fp8_max: tl.constexpr, int8_max: tl.constexpr):
+    """Round ``x`` on the E4M3 grid, then rescale onto the INT8 grid."""
+    scaled = x * (fp8_max / absmax)[:, None]
+    q = _round_to_e4m3_grid(scaled) * (int8_max / fp8_max)
+    return tl.where(q >= 0, q + 0.5, q - 0.5).to(tl.int32).to(tl.int8)
+
+
+@triton.jit
+def _inv_rope_quant_int8_rows_kernel(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    out_ptr,
+    scale_ptr,
+    num_tokens,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    out_stride_group,
+    out_stride_token,
+    scale_stride_group,
+    scale_stride_token,
+    fp8_max: tl.constexpr,
+    int8_max: tl.constexpr,
+    eps: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEADS: tl.constexpr,
+    QUANT_GROUP_SIZE: tl.constexpr,
+    CHUNKS_PER_HEAD: tl.constexpr,
+    ROPE_START: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """One program covers a whole (group row, ``BLOCK_T`` tokens) tile.
+
+    The head-per-program layout below reads 1 KiB rows strided by the group
+    width, which tops out at ~0.7-0.9 TB/s; walking one group's contiguous
+    ``HEADS * HEAD_DIM`` row instead reaches the device streaming rate. Every
+    chunk is a compile-time constant, so the trailing rope chunk of each head is
+    still resolved statically.
+    """
+    pid_g = tl.program_id(0).to(tl.int64)
+    pid_t = tl.program_id(1).to(tl.int64)
+
+    rows = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    rows_valid = rows < num_tokens
+    mask2d = rows_valid[:, None]
+    row_off = rows[:, None] * o_stride_token
+    pos = tl.load(positions_ptr + rows, mask=rows_valid, other=0)
+    cos_idx = tl.arange(0, HALF_ROPE)
+    cache_off = pos[:, None] * cache_stride_pos + cos_idx[None, :]
+    cos_v = tl.load(cos_sin_cache_ptr + cache_off, mask=mask2d, other=1.0)
+    sin_v = tl.load(cos_sin_cache_ptr + HALF_ROPE + cache_off, mask=mask2d, other=0.0)
+
+    chunk_cols = tl.arange(0, QUANT_GROUP_SIZE)
+    lo_cols = tl.arange(0, ROPE_START)
+    hi_cols = tl.arange(0, QUANT_GROUP_SIZE - ROPE_START)
+    head0 = pid_g * HEADS
+    out_base = out_ptr + pid_g * out_stride_group + rows[:, None] * out_stride_token
+    scale_base = scale_ptr + pid_g * scale_stride_group + rows * scale_stride_token
+
+    for ci in tl.static_range(HEADS * CHUNKS_PER_HEAD):
+        head = ci // CHUNKS_PER_HEAD
+        sub = ci % CHUNKS_PER_HEAD
+        base = (head0 + head) * o_stride_head + sub * QUANT_GROUP_SIZE
+        if sub == CHUNKS_PER_HEAD - 1:
+            lo = tl.load(
+                o_ptr + base + row_off + lo_cols[None, :], mask=mask2d, other=0.0
+            ).to(tl.float32)
+            hi = tl.load(
+                o_ptr + base + row_off + ROPE_START + hi_cols[None, :],
+                mask=mask2d,
+                other=0.0,
+            ).to(tl.float32)
+            pairs = tl.reshape(hi, (BLOCK_T, HALF_ROPE, 2))
+            even, odd = tl.split(pairs)
+            hi_rot = tl.reshape(
+                tl.join(even * cos_v + odd * sin_v, odd * cos_v - even * sin_v),
+                (BLOCK_T, QUANT_GROUP_SIZE - ROPE_START),
+            )
+            absmax = tl.maximum(
+                tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)),
+                eps,
+            )
+            tl.store(
+                scale_base + ci,
+                tl.where(rows_valid, absmax * (1.0 / int8_max), 0.0),
+            )
+            tl.store(
+                out_base + ci * QUANT_GROUP_SIZE + lo_cols[None, :],
+                _quant_to_int8(lo, absmax, fp8_max, int8_max),
+                mask=mask2d,
+            )
+            tl.store(
+                out_base + ci * QUANT_GROUP_SIZE + ROPE_START + hi_cols[None, :],
+                _quant_to_int8(hi_rot, absmax, fp8_max, int8_max),
+                mask=mask2d,
+            )
+        else:
+            x = tl.load(
+                o_ptr + base + row_off + chunk_cols[None, :], mask=mask2d, other=0.0
+            ).to(tl.float32)
+            absmax = tl.maximum(tl.max(tl.abs(x), axis=1), eps)
+            tl.store(
+                scale_base + ci,
+                tl.where(rows_valid, absmax * (1.0 / int8_max), 0.0),
+            )
+            tl.store(
+                out_base + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
+                _quant_to_int8(x, absmax, fp8_max, int8_max),
+                mask=mask2d,
+            )
+
+
+def _launch_quant_rows(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    block_t: int,
+) -> None:
+    num_tokens = o.shape[0]
+    grid = (n_groups, triton.cdiv(max(num_tokens, 1), block_t))
+    args = (
+        o,
+        positions,
+        cos_sin_cache,
+        out,
+        scale,
+        num_tokens,
+        o.stride(0),
+        o.stride(1),
+        cos_sin_cache.stride(0),
+        out.stride(0),
+        out.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        _FP8_MAX,
+        _INT8_MAX,
+        _EPS,
+        head_dim,
+        heads_per_group,
+        _QUANT_BLOCK,
+        head_dim // _QUANT_BLOCK,
+        nope_dim % _QUANT_BLOCK,
+        rope_dim // 2,
+        block_t,
+    )
+    key_extra = (
+        tuple(_tensor_key(t) for t in (o, positions, cos_sin_cache, out, scale)),
+        args[6:23],
+        num_tokens == 1,
+        num_tokens % 16 == 0,
+    )
+    _launch(
+        "inv_rope_quant_int8_rows",
+        _inv_rope_quant_int8_rows_kernel,
+        grid,
+        args,
+        key_extra,
+        {"num_warps": 2, "num_stages": 1},
     )
 
 
@@ -435,6 +610,68 @@ def _quant_buffers(
         device=o.device,
     )
     return out, scale
+
+
+# ---------------------------------------------------------------------------
+# Group-major -> token-major output reorder
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _reorder_groups_kernel(
+    src_ptr,
+    dst_ptr,
+    num_tokens,
+    inner: tl.constexpr,
+    groups: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Copy ``[groups, tokens, inner]`` into contiguous ``[tokens, groups, inner]``.
+
+    One program per (token, group) moves ``inner`` contiguous elements, so both
+    sides issue full-width vector accesses; ``permute().reshape()`` in torch
+    gathers the same rows at roughly half the bandwidth.
+    """
+    token = tl.program_id(0)
+    group = tl.program_id(1)
+    cols = tl.arange(0, BLOCK)
+    src_base = (group * num_tokens + token) * inner
+    dst_base = (token * groups + group) * inner
+    for chunk in tl.static_range(inner // BLOCK):
+        offsets = chunk * BLOCK + cols
+        tl.store(dst_ptr + dst_base + offsets, tl.load(src_ptr + src_base + offsets))
+
+
+def _reorder_groups(
+    src: torch.Tensor, num_tokens: int, n_groups: int, inner: int
+) -> torch.Tensor:
+    dst = torch.empty(
+        (num_tokens, n_groups * inner), dtype=src.dtype, device=src.device
+    )
+    if dst.numel() == 0:
+        return dst
+    block = 1024
+    while block > 1 and inner % block:
+        block //= 2
+    grid = (num_tokens, n_groups)
+    args = (src, dst, num_tokens, inner, n_groups, block)
+    key_extra = (
+        _tensor_key(src),
+        _tensor_key(dst),
+        (num_tokens == 1, num_tokens % 16 == 0),
+        inner,
+        n_groups,
+        block,
+    )
+    _launch(
+        "reorder_groups",
+        _reorder_groups_kernel,
+        grid,
+        args,
+        key_extra,
+        {"num_warps": 4, "num_stages": 1},
+    )
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -786,18 +1023,38 @@ def deep_gemm_fp8_o_proj(
         else:
             act_i8, act_scale_i8 = _quant_buffers(o, n_groups, heads_per_group)
             block_t = 2 if num_tokens < 64 else 4
-            _launch_quant_int8(
-                o,
-                positions,
-                cos_sin_cache,
-                act_i8,
-                act_scale_i8,
-                n_groups,
-                heads_per_group,
-                nope_dim,
-                rope_dim,
-                block_t,
-            )
+            # 128/224-head models (g=16) run the row-wise pass 13-16% faster once
+            # there are enough tokens to fill the device; with 64 heads (g=8) the
+            # head-per-program layout already streams at ~0.9 TB/s and wins, and
+            # below 512 tokens the row tiles are too coarse to hide latency.
+            heads = n_groups * heads_per_group
+            if _QUANT_ROWS and heads >= 128 and num_tokens >= 512:
+                _launch_quant_rows(
+                    o,
+                    positions,
+                    cos_sin_cache,
+                    act_i8,
+                    act_scale_i8,
+                    n_groups,
+                    heads_per_group,
+                    head_dim,
+                    nope_dim,
+                    rope_dim,
+                    block_t,
+                )
+            else:
+                _launch_quant_int8(
+                    o,
+                    positions,
+                    cos_sin_cache,
+                    act_i8,
+                    act_scale_i8,
+                    n_groups,
+                    heads_per_group,
+                    nope_dim,
+                    rope_dim,
+                    block_t,
+                )
         weight_i8, weight_scale_i8 = _cached_weight(owner, weight, weight_scale)
         # The kernel stores tiles of one group at a time, so the caller's
         # ``[tokens, groups, o_lora_rank]`` order strides consecutive rows by
@@ -837,5 +1094,8 @@ def deep_gemm_fp8_o_proj(
             )
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
-    flat = out.permute(1, 0, 2) if dense else out
-    return wo_b(flat.reshape(num_tokens, n_groups * o_lora_rank))
+    if dense:
+        flat = _reorder_groups(out, num_tokens, n_groups, o_lora_rank)
+    else:
+        flat = out.reshape(num_tokens, n_groups * o_lora_rank)
+    return wo_b(flat)
