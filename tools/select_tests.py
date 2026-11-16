@@ -89,6 +89,24 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_metax/fused/numerical_modes.py": [
+        "tests/test_minimax_numerical_modes.py",
+        "tests/test_metax_numerical_dispatch.py",
+    ],
+    "src/flaggems_vllm/ops/fused_add_rms_norm.py": [
+        "tests/test_fused_add_rms_norm.py",
+        "tests/test_minimax_numerical_modes.py",
+    ],
+    "src/flaggems_vllm/ops/fused_minimax_m3_qknorm_rope_kv_insert.py": [
+        "tests/test_metax_numerical_dispatch.py",
+        "tests/test_fused_minimax_m3_qknorm_rope_kv_insert.py",
+        "tests/test_minimax_numerical_modes.py",
+    ],
+    "src/flaggems_vllm/ops/moe_sum.py": [
+        "tests/test_metax_numerical_dispatch.py",
+        "tests/test_moe_sum.py",
+        "tests/test_minimax_numerical_modes.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "tests/test_gdn_w8a16.py"
     ],
@@ -217,7 +235,11 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
-    "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
+    "src/flaggems_vllm/ops/fused_moe.py": [
+        "tests/test_metax_numerical_dispatch.py",
+        "tests/test_fused_experts_impl.py",
+        "tests/test_minimax_numerical_modes.py",
+    ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
