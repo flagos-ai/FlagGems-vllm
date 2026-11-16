@@ -151,7 +151,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     __builtin_mxc_arrive_gvmcnt(0);
     __builtin_mxc_barrier_ex(2);
   };
-  auto load_plane = [&](long long page, int page_index, int chunk) {
+  auto load_plane = [&](long long page, int chunk) {
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
       const int i = t + c * 256, token = i >> 3;
@@ -189,6 +189,13 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
   for (int a = 0; a < QV * 4; ++a)
     acc[a] = (float4_){0, 0, 0, 0};
   float maximum = -INFINITY, denominator = 0.f;
+  if (begin < end) {
+    const long long first_page = uniform(input<int>(tp)[batch * ts + begin]);
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk)
+      load_plane(first_page, chunk);
+    copy_wait();
+  }
   for (int page_index = begin; page_index < end; ++page_index) {
     const long long page = uniform(input<int>(tp)[batch * ts + page_index]);
     int4_ content[NR];
@@ -196,10 +203,6 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     for (int n = 0; n < NR; ++n)
       content[n] = (int4_){0, 0, 0, 0};
     unsigned retained[4][QV];
-#pragma unroll
-    for (int chunk = 0; chunk < 4; ++chunk)
-      load_plane(page, page_index, chunk);
-    copy_wait();
 #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
       const auto tile = planes[chunk];
@@ -320,7 +323,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
           stats[((HEADS == 16 ? 3 * NW : NW) + n) * HEADS + wm * 16 + row]);
     }
     const float pscale =
-        fmaxf(peak / (HEADS == 32 ? 32512.f : 16129.f), 1.e-30f);
+        fmaxf(peak / 32512.f, 1.e-30f);
     const float next_den = denominator * exp2f(maximum - safe) + page_sum;
     const float inverse_den = reciprocal(next_den > 0.f ? next_den : 1.f);
     const float old_weight = denominator * exp2f(maximum - safe) * inverse_den,
@@ -335,20 +338,12 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       for (int j = 0; j < 4; ++j) {
         const int index = word * 4 + j;
         const float p = probability[index % NR][index / NR];
-        integer[j] = HEADS == 32 ? __float_as_uint(p * inv + 8388736.f)
-                                 : (unsigned)(int)(p * inv + 0.5f);
+        integer[j] = __float_as_uint(p * inv + 8388736.f);
       }
       const unsigned p01 = perm(integer[1], integer[0], 0x05040100);
       const unsigned p23 = perm(integer[3], integer[2], 0x05040100);
-      unsigned high, low;
-      if (HEADS == 32) {
-        high = perm(p23, p01, 0x07050301);
-        low = perm(p23, p01, 0x06040200) ^ 0x80808080u;
-      } else {
-        high = perm((p23 + 0x00400040u) >> 7, (p01 + 0x00400040u) >> 7,
-                    0x06040200);
-        low = perm(p23, p01, 0x06040200) ^ ((high & 0x01010101u) << 7);
-      }
+      const unsigned high = perm(p23, p01, 0x07050301),
+                     low = perm(p23, p01, 0x06040200) ^ 0x80808080u;
       const int token = wn * (64 / NW) + group * (NR * 4) + word * 4;
       const int offset =
           (wm * 16 + row) * 64 + (token ^ ((((wm * 16 + row) >> 1) & 3) * 16));
@@ -360,6 +355,9 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                       ((group * 16) ^ ((((wm * 16 + row) >> 1) & 3) * 16));
     const uint4_ ph = *(const uint4_ *)(planes[0] + pbase),
                  pl = *(const uint4_ *)(planes[0] + HEADS * 64 + pbase);
+    const bool has_next = page_index + 1 < end;
+    const long long next_page = has_next
+        ? uniform(input<int>(tp)[batch * ts + page_index + 1]) : 0;
 #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
       unsigned values[4][QV];
@@ -373,13 +371,18 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
           fragments(planes[chunk], group * 16 + k * 4,
                     wn * (128 / NW) + row * QV, values[k]);
       }
+      if (has_next) {
+        // Every wave must finish reading this plane before the copy overwrites it.
+        sync();
+        load_plane(next_page, chunk);
+      }
 #pragma unroll
       for (int m = 0; m < QV; ++m) {
         int4_ high = {0, 0, 0, 0};
 #pragma unroll
         for (int k = 0; k < 4; ++k)
           high = mma(values[k][m], ph[k], high);
-        int4_ combined = high * (HEADS == 32 ? 256 : 128);
+        int4_ combined = high * 256;
 #pragma unroll
         for (int k = 0; k < 4; ++k)
           combined = mma(values[k][m], pl[k], combined);
@@ -393,7 +396,10 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     }
     maximum = next_max;
     denominator = next_den;
-    sync();
+    if (has_next)
+      copy_wait();
+    else
+      sync();
   }
   const long long outrow = ((long long)batch * allheads + head) * 512;
 #pragma unroll
@@ -768,8 +774,11 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
     const int worker = t + c * THREADS, h = worker >> 3,
               head = head_tile * 64 + h;
     const long long offset = ((long long)batch * heads + head) * 2;
-    maximum[c] = head < heads ? input<float>(metadata_ptr)[offset] : 0.f;
-    inverse[c] = head < heads ? input<float>(metadata_ptr)[offset + 1] : 0.f;
+    const float2_ normalization =
+        head < heads ? *input<float2_>(metadata_ptr + offset * 4)
+                     : (float2_){0.f, 0.f};
+    maximum[c] = normalization[0];
+    inverse[c] = normalization[1];
   }
   struct ProbabilityData {
     uint4_ score[PCOPIES];

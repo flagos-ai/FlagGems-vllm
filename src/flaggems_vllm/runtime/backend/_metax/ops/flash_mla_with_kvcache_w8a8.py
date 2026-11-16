@@ -387,6 +387,7 @@ def dense_int8_probability_merge(
     ADAPTIVE: tl.constexpr,
     QUANTIZED_CACHE: tl.constexpr,
     SORT_BATCHES: tl.constexpr = False,
+    BatchOrder=None,
 ):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
     if QUANTIZED_CACHE:
@@ -441,19 +442,21 @@ def dense_int8_probability_merge(
     if tl.program_id(0) == 0:
         if ADAPTIVE or SORT_BATCHES:
             batches = tl.arange(0, LENGTH_BLOCK)
+        if ADAPTIVE:
             lengths = tl.load(Lengths + batches * LS, batches < B, 0)
             maximum_length = tl.max(lengths, 0)
             minimum_length = tl.min(tl.where(batches < B, lengths, 2147483647), 0)
-        if ADAPTIVE:
             tl.store(SplitFlag, maximum_length != minimum_length)
         else:
             tl.store(SplitFlag, 0)
         if SORT_BATCHES:
-            if maximum_length != minimum_length:
-                keys = tl.where(batches < B, lengths * LENGTH_BLOCK + batches, -1)
-                ordered = tl.sort(keys, descending=True) % LENGTH_BLOCK
-            else:
-                ordered = batches
+            tl.static_assert(B == 1 or BatchOrder is not None)
+            # Reuse the ordering already computed before QK.
+            ordered = (
+                tl.load(BatchOrder + batches, batches < B, 0)
+                if BatchOrder is not None
+                else batches
+            )
             tl.store(SplitFlag + 1 + batches, ordered, batches < B)
 
 
@@ -750,9 +753,7 @@ def values_native_fragments(
     Metadata,
     PS,
     Output,
-    LSE,
     Partial,
-    PartialD,
     SplitFlag,
     KV_STRIDES: tl.constexpr,
     TS: tl.constexpr,
@@ -767,7 +768,6 @@ def values_native_fragments(
     QUANTIZED_CACHE: tl.constexpr = True,
     SORT_BATCHES: tl.constexpr = False,
     UNIFORM_SPLITS: tl.constexpr = 1,
-    STAGED: tl.constexpr = False,
 ):
     tl.static_assert(BH == 64 and QUANTIZED_CACHE)
     _values_device(
@@ -935,9 +935,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
         self.partial = torch.empty(
             (workspace_splits, rows, 512), dtype=torch.float32, device=device
         )
-        self.partial_denominator = torch.empty(
-            (workspace_splits, rows), dtype=torch.float32, device=device
-        )
         self.score_kernel = ScoresKernel(self)
         self.value_kernel = ValuesKernel(256 if merged <= 64 else 512, self)
 
@@ -988,6 +985,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.adaptive,
                 QUANTIZED_CACHE=True,
                 SORT_BATCHES=self.sort_batches,
+                BatchOrder=self.batch_order,
                 num_warps=4,
                 num_stages=1,
             )
@@ -1002,9 +1000,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.probability_metadata,
                 self.probability_scale,
                 self.output,
-                self.lse,
                 self.partial,
-                self.partial_denominator,
                 self.split_flag,
                 kv.stride(),
                 table.stride(0),
@@ -1019,7 +1015,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 UNIFORM_SPLITS=self.uniform_value_splits,
                 QUANTIZED_CACHE=True,
                 SORT_BATCHES=self.sort_batches,
-                STAGED=True,
             )
             if self.adaptive:
                 dense_int8_value_merge[(self.batch, triton.cdiv(merged, 4))](
@@ -1203,7 +1198,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
                 + 4 * batch
             )
             if merged_heads <= 64:
-                workspace_bytes += rows * 4 * (512 + 1) * 4
+                workspace_bytes += rows * 4 * 512 * 4
         free_bytes, _ = torch.cuda.mem_get_info(q_nope.device)
         free_bytes += torch.cuda.memory_reserved(
             q_nope.device
