@@ -440,3 +440,75 @@ cooperative_topk_thead_medium:
   - META: {}
     num_warps: 32
     num_stages: 1
+
+# Shifted mHC boundary (DSV4.1), PPU hc=4 path.  The generic spaces are the
+# NVIDIA ones; these replace them for the fused PPU kernels.
+#
+# H-tiled post + collapse + sum-of-squares kernel.  The token-fused kernel
+# below covers H <= 8192; this wider-row fallback tiles the hidden axis across
+# CTAs.  The sweep starts at 128 (the smallest tile the partials scratch is
+# sized for).
+mhc_shifted_post_collapse:
+  - META: {BLOCK_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 1024}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 2048}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 4096}
+    num_warps: 8
+    num_stages: 1
+
+# Pure split-K project GEMM: (N, hc*H) @ (hc*H, 24), BLOCK_N stays 32 so one
+# CTA covers all 24 mix columns.  Without the fused sum-of-squares reduction
+# the K loop can pipeline; the largest tile still fits the PPU's 256 KB smem.
+mhc_shifted_project_thead:
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [16, 32, 64, 128]
+    bk: [64, 128]
+    bn: [32]
+    w: [4, 8]
+    s: [1, 2, 3]
+
+# Split-K + sum-of-squares reduction and Sinkhorn coefficients.  Tiny
+# per-token kernel; only the warp count moves.
+mhc_shifted_coeff_thead:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# One CTA per token for H <= 8192: post + collapse + sum of squares + optional
+# RMSNorm.  BLOCK_H is next_power_of_2(H) and comes from the host, so only the
+# warp count is tuned.
+mhc_shifted_post_collapse_norm_thead:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1

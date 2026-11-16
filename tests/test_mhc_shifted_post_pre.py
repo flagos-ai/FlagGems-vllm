@@ -598,12 +598,13 @@ def test_shape_validation(field, shape):
 @pytest.mark.mhc_shifted_post_pre
 def test_production_path_has_no_torch_compute():
     """Static audit: host code may allocate, copy and read metadata, nothing else."""
-    path = Path(__file__).resolve().parents[1] / (
-        "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py"
-    )
-    source = path.read_text()
-    # The whole module is production; the torch reference lives in this test file.
-    production = source
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        root / "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py",
+        # Vendor path: same production contract as the generic module.
+        root / "src/flaggems_vllm/runtime/backend/_thead/ops/mhc_shifted_post_pre.py",
+    ]
+    # The whole modules are production; the torch reference lives in this test.
     allowed = {
         "torch.empty",
         "torch.zeros",
@@ -612,9 +613,10 @@ def test_production_path_has_no_torch_compute():
         "torch.float32",
         "torch.cuda",
     }
-    for match in re.finditer(r"torch\.[A-Za-z_][A-Za-z0-9_.]*", production):
-        call = match.group(0).rstrip(".")
-        assert any(call.startswith(prefix) for prefix in allowed), call
+    for path in paths:
+        for match in re.finditer(r"torch\.[A-Za-z_][A-Za-z0-9_.]*", path.read_text()):
+            call = match.group(0).rstrip(".")
+            assert any(call.startswith(prefix) for prefix in allowed), call
 
 
 # ---------------------------------------------------------------------------
