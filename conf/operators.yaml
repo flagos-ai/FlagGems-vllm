@@ -1036,6 +1036,18 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: gather_sampler_output
+  description: Pack and restore batch-sharded tokens, counts, and logprobs around
+    vLLM all-gather.
+  for:
+  - gather_sampler_output
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gdn_950dt_triton_ascend
   description: 'Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
 

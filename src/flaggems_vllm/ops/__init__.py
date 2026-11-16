@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.batch_shard import gather_sampler_output
 from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
@@ -336,6 +337,7 @@ __all__ = [
     "gate_sigmoid_mul",
     "gather_draft_sampled",
     "gather_rows",
+    "gather_sampler_output",
     "gather_state_rows",
     "gdn_w8a16",
     "geglu",
