@@ -204,13 +204,16 @@ def chunk_kda_with_fused_gate(
     if use_qk_l2norm_in_kernel:
         qn, kn = (torch.empty_like(q), torch.empty_like(k))
         rows = 32
+        # Short sequences reuse the K64 reduction for smaller keys. Keep the
+        # existing core and long-sequence tiles; padding is masked to zero.
+        key_tile = max(64 if t <= 256 else 1, triton.next_power_of_2(dk))
         for x, y in ((q, qn), (k, kn)):
             _ckfg_norm_ascend[(triton.cdiv(b * t * h, rows),)](
                 x,
                 y,
                 b * t * h,
                 dk,
-                triton.next_power_of_2(dk),
+                key_tile,
                 rows,
                 num_warps=4,
                 num_stages=2,
