@@ -7,6 +7,22 @@ weight: 30
 
 Version history and release notes for FlagGems-vllm.
 
+## Unreleased
+
+### Tooling
+
+- `tools/setup.sh` is now driven by the `src/flaggems_vllm/backends.yaml` registry and
+  supports 21 backend profiles (NVIDIA, Ascend, Hygon, MetaX, Iluvatar, Moore
+  Threads, Cambricon, Enflame, Kunlunxin, T-Head, TsingMicro, Biren, SpacemiT,
+  Sunrise and AMD ROCm) with per-profile Python, torch, Triton/FlagTree and
+  vLLM pins.
+- Added `--no-venv` installation for vendor images that already ship a matched
+  torch/triton/vLLM stack, plus `--list`, `--dry-run`, `--skip-vllm`,
+  `--skip-compiler` and `--skip-smoke`.
+- Split the CUDA-only `cupy-cuda12x` dependency out of `[test]` into
+  `[test-nvidia]`, so non-NVIDIA backends can install the base test set.
+- The runtime now accepts `DNN_VENDOR` in addition to `FLAGGEMS_VENDOR`.
+
 ## v0.1.0 (Current)
 
 Initial release of FlagGems-vllm as a standalone vLLM operator library.

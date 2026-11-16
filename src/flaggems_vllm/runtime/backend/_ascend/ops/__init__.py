@@ -56,6 +56,11 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gdn_w8a16_int8 import (
+    chunk_gated_delta_rule_w8a16_int8,
+    gdn_w8a16_int8,
+    quantize_gdn_state_int8,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
@@ -139,6 +144,7 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule_fwd",
+    "chunk_gated_delta_rule_w8a16_int8",
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
@@ -152,6 +158,7 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
     "group_list_cumsum",
     "grouped_topk",
@@ -173,6 +180,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
+    "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",

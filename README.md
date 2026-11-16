@@ -35,11 +35,32 @@ This means `FlagGems-vllm` builds on top of `FlagGems`: `FlagGems` provides the 
 ### Quick Installation
 
 ```shell
-pip install -U 'scikit-build-core>=0.11' pybind11 ninja cmake
-pip install --no-build-isolation -e .
+python -m pip install -U "setuptools>=64,<82" wheel packaging
+python -m pip install --no-deps "flag-gems==5.4.0" \
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+python -m pip install --no-build-isolation -e .
 ```
 
-For complete installation steps (including test dependencies, full environment bootstrapping via `tools/setup.sh`, and multi-repository setup with FlagGems and vllm-plugin-fl), please refer to the [Installation Guide](docs/content/en/getting-started/install.md).
+### Multi-Backend Setup
+
+`tools/setup.sh` reads the backend registry in
+`src/flaggems_vllm/backends.yaml`, creates a `uv` virtual environment and
+installs the matching torch/vLLM/compiler stack:
+
+```shell
+bash tools/setup.sh --list          # show profiles and aliases
+bash tools/setup.sh nvidia          # or ascend, metax, hygon, ...
+source tools/setup.sh nvidia        # create and activate in one step
+```
+
+Inside a vendor image that already provides torch/triton/vLLM, use
+`bash tools/setup.sh --no-venv <backend>` to add only this repository and its
+test dependencies.
+
+For complete installation steps (including manual installation without a
+virtual environment, test dependencies, and multi-repository setup with
+FlagGems and vllm-plugin-fl), please refer to the
+[Installation Guide](docs/content/en/getting-started/install.md).
 
 ### Quick Usage
 
