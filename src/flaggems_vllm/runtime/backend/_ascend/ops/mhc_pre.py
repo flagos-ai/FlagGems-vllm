@@ -349,7 +349,9 @@ def npu_mhc_pre(
     # projection: bf16 GEMM (ported generic path)
     x_flat = residual_flat.reshape(num_tokens, hc_hidden_size)
     fn_bf16 = _get_fn_bf16_cached(fn)
-    gemm_out = torch.mm(x_flat, fn_bf16.t()).float()
+    from flag_gems.runtime.backend._ascend.ops.mm import mm as _gems_mm
+
+    gemm_out = _gems_mm(x_flat, fn_bf16.t()).float()
 
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device

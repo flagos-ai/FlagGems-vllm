@@ -204,6 +204,17 @@ bmm:
     num_warps: 4
     num_stages: 3
 
+triton_reshape_and_cache_flash:
+  - META: {TILE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 1024}
+    num_warps: 8
+    num_stages: 1
+
 dequantize_and_gather_k_cache:
   - META:
       num_workers: 128
@@ -339,6 +350,14 @@ kda_kkt_inter:
     num_warps: 4
     num_stages: 1
 
+pad_indexer_heads:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
 kda_kkt_diag:
   - META: {}
     num_warps: 2
@@ -351,16 +370,13 @@ chunk_kda_fwd_intra_token_parallel:
         BH: head_tiles
       num_warps: warps
       num_stages: stages
+    # The core dense/packed winners both use one warp, with BH=2 and BH=4.
     head_tiles:
       - 1
       - 2
       - 4
-      - 8
     warps:
       - 1
-      - 2
-      - 4
-      - 8
     stages:
       - 1
 

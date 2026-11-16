@@ -71,8 +71,8 @@ DECODE_BATCH = ([512] * 16, [1] * 16, [8] * 16)
 # an OpenAI server, 16384 for offline throughput.
 #
 # A loaded server decodes with every slot busy, which is also when the scalar ring
-# commit and the main-attention tiling meet: 1024 tokens is exactly MAIN_TILE_T's
-# threshold, so DECODE_MAX is the only layout combining the two.
+# commit and the main-attention tiling meet: 1024 tokens is exactly the generic
+# kernel's MAIN_TILE_T threshold, so DECODE_MAX is the only layout combining them.
 DECODE_DEEP = ([512] * 512, [1] * 512, [8] * 512)
 DECODE_MAX = ([512] * 1024, [1] * 1024, [8] * 1024)
 # The ceilings the benchmark's last rows carry: 1010 + 14 = 1024 sequences, which
@@ -283,12 +283,24 @@ def _main_inputs(case: "QsaPrepareCase", fp8_cache: bool) -> dict:
         torch.randn(2, MAIN_HEAD_DIM, dtype=torch.bfloat16, device=case.device) * 0.2
     )
     qkv_width = 2 * (MAIN_QUERY_HEADS + MAIN_KV_HEADS) * MAIN_HEAD_DIM
-    qkv = torch.randn(
-        num_tokens,
-        qkv_width + (QUERY_HEADS + 1) * HEAD_DIM,
-        dtype=torch.bfloat16,
-        device=case.device,
-    )[:, :qkv_width]
+    row_width = qkv_width + (QUERY_HEADS + 1) * HEAD_DIM
+    offset = getattr(case, "main_qkv_offset", 0)
+    if offset:
+        # vLLM hands over a view into a wider fused projection, so the packed QKV
+        # buffer carries a non-zero storage_offset.  Reproduce that layout here.
+        base = torch.randn(
+            num_tokens * row_width + offset,
+            dtype=torch.bfloat16,
+            device=case.device,
+        )
+        qkv = base[offset:].view(num_tokens, row_width)[:, :qkv_width]
+    else:
+        qkv = torch.randn(
+            num_tokens,
+            row_width,
+            dtype=torch.bfloat16,
+            device=case.device,
+        )[:, :qkv_width]
     return dict(
         main_qkv=qkv,
         main_q_norm_weight=norm_weights[0],
@@ -316,9 +328,11 @@ class QsaPrepareCase:
         is_2d_positions: bool = True,
         cache_rope_positions: bool = True,
         indexer_dtype: torch.dtype = torch.bfloat16,
+        main_qkv_offset: int = 0,
         device: str = "cuda",
     ) -> None:
         self.device = device
+        self.main_qkv_offset = main_qkv_offset
         self.state_size = state_size
         self.mrope = mrope
         self.is_2d_positions = is_2d_positions
@@ -554,8 +568,8 @@ class QsaPrepareCase:
             self.main["main_kv_cache"].clone(),
         )
 
-    def run_kernel(self):
-        outputs = self.outputs()
+    def run_kernel(self, outputs=None):
+        outputs = self.outputs() if outputs is None else outputs
         main_q_out, main_gate_out = qsa_prepare(
             *self._launch_args(outputs),
             compress_ratio=COMPRESS_RATIO,
@@ -837,3 +851,64 @@ def test_qsa_prepare_matches_vllm(
     torch.cuda.synchronize()
     expected = (*outputs, main_q_out, main_gate_out, case.main["main_kv_cache"])
     _assert_matches(actual, expected)
+
+
+@pytest.mark.qsa_prepare
+def test_qwen_qsa_prepare_main_qkv_storage_offset() -> None:
+    """The gate output must follow the source view's own storage offset."""
+
+    case = QsaPrepareCase(
+        seq_lens=MIXED_BATCH[0],
+        query_lens=MIXED_BATCH[1],
+        history_lens=MIXED_BATCH[2],
+        main_qkv_offset=256,
+    )
+    qkv = case.main["main_qkv"]
+    assert qkv.storage_offset() == 256, qkv.storage_offset()
+    assert qkv.stride(-1) == 1
+    _assert_matches(case.run_kernel(), case.run_reference())
+
+
+@pytest.mark.qsa_prepare
+def test_qwen_qsa_prepare_compressed_cache_stride() -> None:
+    """A hit must not reuse stride scalars from a different compressed layout."""
+
+    case = QsaPrepareCase(
+        seq_lens=MIXED_BATCH[0],
+        query_lens=MIXED_BATCH[1],
+        history_lens=MIXED_BATCH[2],
+    )
+    page_elements = COMPRESSED_PAGE_SIZE * HEAD_DIM
+
+    def strided_cache(extra: int) -> torch.Tensor:
+        """Same shape as the case's cache, stride(0) differs by ``extra``."""
+
+        stride0 = page_elements + extra
+        storage = torch.zeros(
+            case.num_compressed_blocks * stride0,
+            dtype=case.base_compressed_cache.dtype,
+            device=case.device,
+        )
+        return torch.as_strided(
+            storage,
+            (case.num_compressed_blocks, COMPRESSED_PAGE_SIZE, 1, HEAD_DIM),
+            (stride0, HEAD_DIM, HEAD_DIM, 1),
+        )
+
+    # Two runs of the same shapes with different compressed strides.  The second
+    # must not reuse the first one's stride scalars.
+    for extra in (16, 32):
+        cache = strided_cache(extra)
+        assert cache.stride(0) == page_elements + extra
+        outputs = (
+            torch.empty(
+                case.num_tokens,
+                QUERY_HEADS,
+                HEAD_DIM,
+                dtype=case.indexer_dtype,
+                device=case.device,
+            ),
+            case.base_raw_cache.clone(),
+            cache,
+        )
+        _assert_matches(case.run_kernel(outputs), case.run_reference())

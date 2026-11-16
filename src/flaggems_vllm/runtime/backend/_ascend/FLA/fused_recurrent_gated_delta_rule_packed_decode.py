@@ -5,10 +5,13 @@
 # The upstream file includes MIT-licensed flash-linear-attention code:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-from triton.backends.ascend.driver import NPUUtils
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -149,31 +152,39 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     a stateful operation. Configuration experiments use externally restored
     state and no-Graph timing (see the accompanying benchmark).
     """
+    logger.debug("GEMS_ASCEND FUSED_RECURRENT_GATED_DELTA_RULE_PACKED_DECODE")
     float_types = (torch.float16, torch.bfloat16, torch.float32)
     tensors = (mixed_qkv, a, b, A_log, dt_bias, initial_state, out)
     if any(t.dtype not in float_types for t in tensors):
         raise NotImplementedError("Packed decode supports FP16, BF16 and FP32.")
     if ssm_state_indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("State indices must be int32 or int64.")
-    if mixed_qkv.ndim != 2:
+    mixed_shape = mixed_qkv.shape
+    if len(mixed_shape) != 2:
         raise ValueError(
-            f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
+            f"`mixed_qkv` must be a 2D tensor (got ndim={len(mixed_shape)})."
         )
-    if mixed_qkv.numel() and mixed_qkv.stride(-1) != 1:
+    stride_mixed_qkv_tok, mixed_feature_stride = mixed_qkv.stride()
+    if all(mixed_shape) and mixed_feature_stride != 1:
         raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
-    if a.ndim != 2 or b.ndim != 2:
+    a_shape, b_shape = a.shape, b.shape
+    if len(a_shape) != 2 or len(b_shape) != 2:
         raise ValueError(
-            f"`a` and `b` must be 2D tensors (got a.ndim={a.ndim}, b.ndim={b.ndim})."
+            f"`a` and `b` must be 2D tensors (got a.ndim={len(a_shape)}, b.ndim={len(b_shape)})."
         )
-    if a.numel() and (a.stride(-1) != 1 or b.stride(-1) != 1):
+    stride_a_tok, a_feature_stride = a.stride()
+    stride_b_tok, b_feature_stride = b.stride()
+    if all(a_shape) and (a_feature_stride != 1 or b_feature_stride != 1):
         raise ValueError("`a`/`b` must be contiguous in the last dim.")
-    if A_log.ndim != 1 or dt_bias.ndim != 1:
+    log_shape, bias_shape = A_log.shape, dt_bias.shape
+    if len(log_shape) != 1 or len(bias_shape) != 1:
         raise ValueError("`A_log`/`dt_bias` must be 1D tensors.")
     if A_log.stride(0) != 1 or dt_bias.stride(0) != 1:
         raise ValueError("`A_log`/`dt_bias` must be contiguous.")
-    if ssm_state_indices.ndim != 1:
+    indices_shape = ssm_state_indices.shape
+    if len(indices_shape) != 1:
         raise ValueError(
-            f"`ssm_state_indices` must be 1D for packed decode (got ndim={ssm_state_indices.ndim})."
+            f"`ssm_state_indices` must be 1D for packed decode (got ndim={len(indices_shape)})."
         )
     if not out.is_contiguous():
         raise ValueError("`out` must be contiguous.")
@@ -190,47 +201,44 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     ):
         raise ValueError("All inputs must be on the same device.")
 
-    B = mixed_qkv.shape[0]
-    if a.shape[0] != B or b.shape[0] != B:
+    B, qkv_dim = mixed_shape
+    if a_shape[0] != B or b_shape[0] != B:
         raise ValueError(
             "Mismatched batch sizes: "
-            f"mixed_qkv.shape[0]={B}, a.shape[0]={a.shape[0]}, b.shape[0]={b.shape[0]}."
+            f"mixed_qkv.shape[0]={B}, a.shape[0]={a_shape[0]}, b.shape[0]={b_shape[0]}."
         )
-    if ssm_state_indices.shape[0] != B:
+    if indices_shape[0] != B:
         raise ValueError(
-            f"`ssm_state_indices` must have shape [B] (got {tuple(ssm_state_indices.shape)}; expected ({B},))."
+            f"`ssm_state_indices` must have shape [B] (got {tuple(indices_shape)}; expected ({B},))."
         )
 
-    if initial_state.ndim != 4:
+    state_shape = initial_state.shape
+    if len(state_shape) != 4:
         raise ValueError(
-            f"`initial_state` must be a 4D tensor (got ndim={initial_state.ndim})."
+            f"`initial_state` must be a 4D tensor (got ndim={len(state_shape)})."
         )
-    if initial_state.stride(-1) != 1:
+    state_stride, head_stride, value_stride, key_stride = initial_state.stride()
+    if key_stride != 1:
         raise ValueError("`initial_state` must be contiguous in the last dim.")
-    HV, V, K = initial_state.shape[-3:]
+    _, HV, V, K = state_shape
     if min(HV, V, K) <= 0:
         raise ValueError("State head and feature dimensions must be positive.")
-    if (
-        initial_state.stride(1) != V * K
-        or initial_state.stride(2) != K
-        or initial_state.stride(0) < HV * V * K
-    ):
+    if head_stride != V * K or value_stride != K or state_stride < HV * V * K:
         raise ValueError("State must have dense HV/V/K dimensions and disjoint rows.")
-    if a.shape[1] != HV or b.shape[1] != HV:
+    if a_shape[1] != HV or b_shape[1] != HV:
         raise ValueError(
-            f"`a`/`b` must have shape [B, HV] with HV={HV} (got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)})."
+            f"`a`/`b` must have shape [B, HV] with HV={HV} (got a.shape={tuple(a_shape)}, b.shape={tuple(b_shape)})."
         )
-    if A_log.numel() != HV or dt_bias.numel() != HV:
+    if log_shape[0] != HV or bias_shape[0] != HV:
         raise ValueError(
             f"`A_log` and `dt_bias` must have {HV} elements "
-            f"(got A_log.numel()={A_log.numel()}, dt_bias.numel()={dt_bias.numel()})."
+            f"(got A_log.numel()={log_shape[0]}, dt_bias.numel()={bias_shape[0]})."
         )
     if out.shape != (B, 1, HV, V):
         raise ValueError(
             f"`out` must have shape {(B, 1, HV, V)} (got out.shape={tuple(out.shape)})."
         )
 
-    qkv_dim = mixed_qkv.shape[1]
     qk_dim = qkv_dim - HV * V
     if qk_dim <= 0 or qk_dim % 2 != 0:
         raise ValueError(
@@ -257,15 +265,13 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     num_stages = 1
     num_warps = 1
 
-    stride_mixed_qkv_tok = mixed_qkv.stride(0)
-    stride_a_tok = a.stride(0)
-    stride_b_tok = b.stride(0)
-    stride_init_state_token = initial_state.stride(0)
-    stride_final_state_token = initial_state.stride(0)
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (min(NV * B * HV, 32, NPUUtils().get_aivector_core_num()),)
+    # The active driver already owns the initialized NPUUtils instance.
+    # Constructing it here reloads its extension on every decode.
+    vector_cores = triton.runtime.driver.active.utils.get_aivector_core_num()
+    grid = (min(NV * B * HV, 32, vector_cores),)
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
@@ -280,8 +286,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,
-        stride_init_state_token=stride_init_state_token,
-        stride_final_state_token=stride_final_state_token,
+        stride_init_state_token=state_stride,
+        stride_final_state_token=state_stride,
         stride_indices_seq=stride_indices_seq,
         H=H,
         HV=HV,
