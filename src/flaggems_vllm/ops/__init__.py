@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -21,6 +22,7 @@ from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
+from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
@@ -42,6 +44,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_dequantize_and_gather_k_cache impor
 from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.ops.watermark import draft_watermarking_mask
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
@@ -88,6 +91,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
+from flaggems_vllm.ops.fused_indexer_k_norm import fused_indexer_k_norm
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
 from flaggems_vllm.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
@@ -121,6 +125,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_bwd_ref,
     mhc_post,
     mhc_pre,
+    mhc_shifted_post_pre,
     sinkhorn_forward,
 )
 from flaggems_vllm.ops.qwen4 import (
@@ -266,6 +271,7 @@ __all__ = [
     "bf16_paged_mqa_logits",
     "bincount",
     "bucket_sort_topk",
+    "cast_sigmoid",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule",
@@ -289,6 +295,7 @@ __all__ = [
     "dequantize_and_gather_k_cache",
     "dgeglu",
     "dispatch_fused_moe_kernel",
+    "draft_watermarking_mask",
     "dreglu",
     "dsv41_o_proj",
     "dswiglu",
@@ -311,6 +318,7 @@ __all__ = [
     "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
+    "fused_indexer_k_norm",
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
@@ -352,6 +360,7 @@ __all__ = [
     "mhc_pre",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
+    "mhc_shifted_post_pre",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
     "MixLayout",
@@ -368,6 +377,7 @@ __all__ = [
     "pack_seq_triton",
     "pad_attention_heads",
     "pad_indexer_heads",
+    "pad_trailing_draft_slots",
     "paged_mqa_logits",
     "parallel_nsa",
     "parallel_nsa_compression",
