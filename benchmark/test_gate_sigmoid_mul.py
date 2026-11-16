@@ -4,6 +4,7 @@
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -113,8 +114,52 @@ def _changed_inputs(args, snapshots, restore=False):
     return changed
 
 
+def _native_slot(*args, **kwargs):
+    raise RuntimeError("native slot must be handled by get_latency")
+
+
 class GateSigmoidMulBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "tokens, width, gate_layout"
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+
+    def init_user_config(self):
+        super().init_user_config()
+        if "latency_base" not in self.to_bench_metrics:
+            self.native_op = None
+            self.native_reason = "native timing disabled by --metrics"
+            return
+
+        try:
+            self.native_op = workloads.native()
+        except Exception as exc:
+            self.native_op = None
+            self.native_reason = f"native resolution: {type(exc).__name__}: {exc}"
+            return
+        self.native_reason = workloads.NATIVE_UNAVAILABLE_REASON
+        if self.native_op is self.gems_op:
+            self.native_op = None
+            self.native_reason = "resolved native aliases the candidate callable"
+
+    def run(self):
+        config = conftest.Config
+        with pytest.MonkeyPatch.context() as patch:
+            if config.user_desired_metrics == ["latency"]:
+                patch.setattr(config, "base_data", None)
+            elif not config.query and config.base_data is not None:
+                entry = config.base_data.get(self.op_name)
+                if entry:
+                    # The collector keys gate rows by layout as well as size.
+                    # Limit the framework's tensor-signature lookup to that row.
+                    variants = {
+                        key: {"shapes": {key: per_dtype}}
+                        for key, per_dtype in entry.get("shapes", {}).items()
+                    }
+                    patch.setattr(
+                        config,
+                        "base_data",
+                        {**config.base_data, self.op_name: {"variants": variants}},
+                    )
+            super().run()
 
     def set_more_shapes(self):
         # Standard set_shapes merges/deduplicates these with the six core triples.
@@ -124,70 +169,94 @@ class GateSigmoidMulBenchmark(base.Benchmark):
         ]
 
     def record_shapes(self, *args, **kwargs):
-        # Tensor.size alone loses the split-gate stride/offset distinction.
-        return workloads.key_shape(self._gate_binding)
+        return self.base_variant, super().record_shapes(*args, **kwargs)
 
     def get_input_iter(self, dtype):
-        native = workloads.native()
-        unavailable_reason = workloads.NATIVE_UNAVAILABLE_REASON
-        if native is self.gems_op:
-            native = None
-            unavailable_reason = "resolved native aliases the candidate callable"
         active_counts = {
             "bindings": len(self.shapes),
             "dtypes": len(self.to_bench_dtypes),
             "candidate_rows": len(self.shapes) * len(self.to_bench_dtypes),
         }
+        misses = []
         for tokens, width, layout in self.shapes:
             binding = {"tokens": tokens, "width": width, "layout": layout}
+            self.base_variant = workloads.key_shape(binding)
             self._gate_binding, self._gate_dtype = binding, dtype
             self._gate_counts = active_counts
-            self.torch_op = native
-            args, _ = workloads.build_inputs(binding, dtype, self.device)
+            args, kwargs = workloads.build_inputs(binding, dtype, self.device)
             snapshots = tuple(value.detach().cpu().clone() for value in args)
-            native_error = unavailable_reason
+            native = self.native_op
+            self._row_native_reason = self.native_reason
             if native is not None:
-                native_error = None
                 native_out = None
                 try:
-                    native_out = native(*args)
+                    native_out = native(*args, **kwargs)
                     _check_full_output(native_out, args, snapshots)
                 except Exception as exc:
-                    native_error = f"{type(exc).__name__}: {exc}"
+                    self._row_native_reason = (
+                        f"native qualification: {type(exc).__name__}: {exc}"
+                    )
                 finally:
                     del native_out
                 changed = _changed_inputs(args, snapshots, restore=True)
                 if changed:
                     mutation_error = f"native mutated positional inputs {changed}"
-                    native_error = (
-                        f"{native_error}; {mutation_error}"
-                        if native_error
+                    self._row_native_reason = (
+                        f"{self._row_native_reason}; {mutation_error}"
+                        if self._row_native_reason
                         else mutation_error
                     )
-            if native is None or native_error is not None:
-                self.torch_op = None
+            else:
+                self._row_native_reason = (
+                    self.native_reason or "exact native callable unavailable"
+                )
+            # Candidate failures remain hard failures, outside native exception scope.
+            candidate_out = self.gems_op(*args, **kwargs)
+            _check_full_output(candidate_out, args, snapshots)
+            changed = _changed_inputs(args, snapshots)
+            assert not changed, f"candidate mutated positional inputs {changed}"
+            self._gate_snapshots = snapshots
+            del candidate_out
+            yield (*args, kwargs)
+            if self._row_native_reason:
+                misses.append(
+                    {
+                        "shape": self.record_shapes(*args, **kwargs),
+                        "reason": self._row_native_reason,
+                    }
+                )
                 _record(
                     "native",
                     binding,
                     dtype,
                     None,
                     "N/A",
-                    reason=native_error or "exact native callable unavailable",
+                    reason=self._row_native_reason,
                     active_counts=active_counts,
                 )
-            # Candidate failures remain hard failures, outside native exception scope.
-            candidate_out = self.gems_op(*args)
-            _check_full_output(candidate_out, args, snapshots)
-            changed = _changed_inputs(args, snapshots)
-            assert not changed, f"candidate mutated positional inputs {changed}"
-            self._gate_snapshots = snapshots
-            del candidate_out
-            yield args
+
+        if misses:
+            conftest.update_result(
+                self.op_name,
+                {
+                    "dtype": str(dtype),
+                    "native_baseline_skip_reason": "; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    "native_baseline_misses": misses,
+                },
+            )
 
     def get_latency(self, op, *args, **kwargs):
-        candidate = op is self.gems_op
+        candidate = op is not self.torch_op
+        if not candidate:
+            if self._row_native_reason:
+                return None
+            op = self.native_op
         try:
             latency = super().get_latency(op, *args, **kwargs)
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"invalid latency: {latency!r}")
             changed = _changed_inputs(args, self._gate_snapshots, restore=not candidate)
             if changed:
                 raise AssertionError(
@@ -199,15 +268,8 @@ class GateSigmoidMulBenchmark(base.Benchmark):
             # Base.run fails the whole iterator on an exception; invalid native
             # rows must instead retain N/A while later candidate cases continue.
             _changed_inputs(args, self._gate_snapshots, restore=True)
-            self.torch_op = None
-            _record(
-                "native",
-                self._gate_binding,
-                self._gate_dtype,
-                None,
-                "N/A",
-                reason=f"native timing invalid: {type(exc).__name__}: {exc}",
-                active_counts=self._gate_counts,
+            self._row_native_reason = (
+                f"native timing invalid: {type(exc).__name__}: {exc}"
             )
             return None
         _record(
@@ -228,7 +290,7 @@ def test_gate_sigmoid_mul():
     bench = GateSigmoidMulBenchmark(
         op_name=workloads.OP_NAME,
         gems_op=flaggems_vllm.gate_sigmoid_mul,
-        torch_op=workloads.native(),
+        torch_op=_native_slot,
         dtypes=workloads.DTYPES,
     )
     bench.run()

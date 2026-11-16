@@ -119,14 +119,13 @@ def test_per_token_group_quant_fp8(
     ref_out, ref_scale = native_per_token_group_quant_fp8(
         ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
     )
-    with flaggems_vllm.use_gems():
-        out, scale = flaggems_vllm.per_token_group_quant_fp8(
-            x,
-            group_size,
-            dtype=output_dtype,
-            column_major_scales=column_major_scales,
-            scale_ue8m0=scale_ue8m0,
-        )
+    out, scale = flaggems_vllm.per_token_group_quant_fp8(
+        x,
+        group_size,
+        dtype=output_dtype,
+        column_major_scales=column_major_scales,
+        scale_ue8m0=scale_ue8m0,
+    )
 
     assert out.dtype == ref_out.dtype
     if column_major_scales:
