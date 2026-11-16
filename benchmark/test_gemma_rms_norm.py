@@ -70,8 +70,25 @@ try:
 
     HAS_BASELINE_OP = True
 except Exception as e:
-    print(e)
-    HAS_BASELINE_OP = False
+    # Fall back to vllm.model_executor.layers.layernorm.GemmaRMSNorm when
+    # the vendor-specific library (flashinfer, lightop, etc.) is absent.
+    try:
+        from vllm.model_executor.layers.layernorm import (
+            GemmaRMSNorm as _VllmGemmaRMSNorm,
+        )
+
+        def baseline_op(x, w, eps=1e-5):
+            N = x.shape[-1]
+            norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+            norm.weight = torch.nn.Parameter(w.float())
+            norm = norm.to(x.device)
+            with torch.inference_mode():
+                return norm(x)
+
+        HAS_BASELINE_OP = True
+    except ImportError:
+        print(e)
+        HAS_BASELINE_OP = False
 
 
 class GemmaRmsNormBenchmark(Benchmark):

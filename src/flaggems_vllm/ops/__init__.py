@@ -22,6 +22,7 @@ from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
+from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
@@ -43,6 +44,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_dequantize_and_gather_k_cache impor
 from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.ops.watermark import draft_watermarking_mask
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
@@ -179,6 +181,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
+from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
@@ -272,6 +275,7 @@ __all__ = [
     "bf16_paged_mqa_logits",
     "bincount",
     "bucket_sort_topk",
+    "cast_sigmoid",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule",
@@ -295,6 +299,7 @@ __all__ = [
     "dequantize_and_gather_k_cache",
     "dgeglu",
     "dispatch_fused_moe_kernel",
+    "draft_watermarking_mask",
     "dreglu",
     "dsv41_o_proj",
     "dswiglu",
@@ -329,6 +334,7 @@ __all__ = [
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gate_sigmoid_mul",
+    "gather_draft_sampled",
     "gather_rows",
     "gather_state_rows",
     "gdn_w8a16",
