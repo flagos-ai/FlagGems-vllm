@@ -30,6 +30,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     compressor_prepared,
     prepare_compressor_workspace,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -149,6 +150,7 @@ __all__ = [
     "compressor",
     "compressor_prepared",
     "compute_slot_mapping_parallel",
+    "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
