@@ -896,7 +896,11 @@ def prepare_flash_mla_with_kvcache_w8a8(
     if q_nope.ndim != 4 or q_nope.shape[1] not in (1, 2) or q_nope.shape[-1] != 512:
         raise NotImplementedError("requires Q [batch, 1 or 2, heads, 512]")
     batch, queries, heads, _ = q_nope.shape
-    if k_cache_lora.ndim != 3 or k_cache_lora.shape[1:] != (64, 512) or head_dim_v != 512:
+    if (
+        k_cache_lora.ndim != 3
+        or k_cache_lora.shape[1:] != (64, 512)
+        or head_dim_v != 512
+    ):
         raise NotImplementedError("requires KV [pages, 64, 512] and head_dim_v=512")
     expected_shapes = (
         (batch, queries, heads, 64),
@@ -987,7 +991,9 @@ def flash_mla_with_kvcache_w8a8(
     if tile_scheduler_metadata is not None:
         raise NotImplementedError("PPU MLA uses its own split scheduling")
     if out is not None or lse is not None:
-        raise NotImplementedError("PPU MLA outputs are allocated by its prepared handle")
+        raise NotImplementedError(
+            "PPU MLA outputs are allocated by its prepared handle"
+        )
     if num_splits is not None and not isinstance(num_splits, int):
         raise TypeError("PPU MLA num_splits must be an integer or None")
     _, outputs = prepare_flash_mla_with_kvcache_w8a8(
