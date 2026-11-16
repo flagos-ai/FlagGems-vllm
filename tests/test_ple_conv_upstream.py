@@ -259,7 +259,9 @@ def _short_conv_dilated_spec_pytorch(
     # Spec null slots still emit activations from the current chunk.
     conv_output.masked_fill_(~valid_packed.unsqueeze(-1), 0)
     output = x_spec.new_zeros(x_spec.shape)
-    output[valid_tokens] = conv_output[clamped_req_indices[valid_tokens], col_indices[valid_tokens]]
+    output[valid_tokens] = conv_output[
+        clamped_req_indices[valid_tokens], col_indices[valid_tokens]
+    ]
 
     if conv_state_len > 0 and cached_state is not None:
         # Keep candidate tokens; roll by one like causal_conv1d_update.
