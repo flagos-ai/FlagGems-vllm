@@ -194,9 +194,7 @@ def test_apply_logit_bias_latency(
     ).repeat(batch, 1)
     if scenario == "restore":
         allowed.fill_(vocab - 1)
-    bias_count = torch.full(
-        (batch,), bias_width, device=device, dtype=torch.int32
-    )
+    bias_count = torch.full((batch,), bias_width, device=device, dtype=torch.int32)
     bias_ids = torch.arange(bias_width, device=device, dtype=torch.int32)
     bias_ids = (bias_ids + 64).repeat(batch, 1)
     bias = torch.full((batch, bias_width), 0.1, device=device)
@@ -204,15 +202,20 @@ def test_apply_logit_bias_latency(
     stop_count = torch.full(
         (batch,), int(scenario != "bias_only"), device=device, dtype=torch.int32
     )
-    stop_ids = torch.full(
-        (batch, 1), vocab - 1, device=device, dtype=torch.int32
-    )
+    stop_ids = torch.full((batch, 1), vocab - 1, device=device, dtype=torch.int32)
     restore = torch.full(
         (batch,), int(scenario == "restore"), device=device, dtype=torch.int32
     )
     shared = (
-        mapping, pos, allowed_count, allowed, bias_count, bias_ids,
-        bias, min_lens, stop_count,
+        mapping,
+        pos,
+        allowed_count,
+        allowed,
+        bias_count,
+        bias_ids,
+        bias,
+        min_lens,
+        stop_count,
     )
     reference_ms = None
     try:
@@ -230,11 +233,16 @@ def test_apply_logit_bias_latency(
             original,
         )
     except Exception:
-        _record(
-            "FAILED", dtype, batch, vocab, allowed_width, bias_width, scenario
-        )
+        _record("FAILED", dtype, batch, vocab, allowed_width, bias_width, scenario)
         raise
     _record(
-        "PASSED", dtype, batch, vocab, allowed_width, bias_width, scenario,
-        reference_ms, implementation_ms,
+        "PASSED",
+        dtype,
+        batch,
+        vocab,
+        allowed_width,
+        bias_width,
+        scenario,
+        reference_ms,
+        implementation_ms,
     )

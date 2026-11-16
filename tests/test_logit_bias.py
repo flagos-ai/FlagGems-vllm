@@ -151,7 +151,9 @@ def test_restore_across_vocab_tiles():
 )
 @pytest.mark.apply_logit_bias
 def test_restore_only_finite_stop_logits(nonfinite):
-    logits = torch.tensor([[2.0, nonfinite, NEG_INF]], device=DEVICE, dtype=torch.float32)
+    logits = torch.tensor(
+        [[2.0, nonfinite, NEG_INF]], device=DEVICE, dtype=torch.float32
+    )
     zero = _i32([0])
     ids = _i32([[0, 1]])
     flaggems_vllm.apply_logit_bias(
@@ -169,7 +171,9 @@ def test_restore_only_finite_stop_logits(nonfinite):
         ids,
         check_all_masked_rows=True,
     )
-    expected = torch.tensor([[2.0, NEG_INF, NEG_INF]], device=DEVICE, dtype=torch.float32)
+    expected = torch.tensor(
+        [[2.0, NEG_INF, NEG_INF]], device=DEVICE, dtype=torch.float32
+    )
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
