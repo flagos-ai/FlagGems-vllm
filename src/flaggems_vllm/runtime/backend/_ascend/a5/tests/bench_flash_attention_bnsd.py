@@ -56,7 +56,6 @@ import os
 import time
 
 import torch
-
 import torch_npu  # noqa: F401  registers the npu device + npu_fusion_attention
 
 from flaggems_vllm.runtime.backend._ascend.a5.ops import flash_attention_fwd
@@ -78,7 +77,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # Filtered to DIM == 64 and symmetric Sq == Skv -> 240 compatible cases.
 _CLC_BATCHES = [1, 4, 8, 16, 32]
 _CLC_SEQLEN_PAIRS = [
-    (32, 8192),       # asymmetric: decode-like (skipped: Sq != Skv)
+    (32, 8192),  # asymmetric: decode-like (skipped: Sq != Skv)
     (256, 256),
     (1024, 1024),
     (2048, 2048),
@@ -87,16 +86,16 @@ _CLC_SEQLEN_PAIRS = [
     (16384, 16384),
 ]
 _CLC_HEAD_DIMS = [
-    (64, 64),         # standard
-    (96, 96),         # skipped: not in SUPPORTED_DIMS
-    (128, 128),       # supported since the D constraint was relaxed
-    (192, 128),       # skipped: Dq != Dkv
+    (64, 64),  # standard
+    (96, 96),  # skipped: not in SUPPORTED_DIMS
+    (128, 128),  # supported since the D constraint was relaxed
+    (192, 128),  # skipped: Dq != Dkv
 ]
 _CLC_HEAD_PAIRS = [
-    (16, 16),   # MHA
-    (16, 8),    # GQA 2:1
-    (16, 4),    # GQA 4:1
-    (16, 1),    # MQA
+    (16, 16),  # MHA
+    (16, 8),  # GQA 2:1
+    (16, 4),  # GQA 4:1
+    (16, 1),  # MQA
 ]
 _CLC_CAUSAL = [True, False]
 
@@ -109,7 +108,7 @@ _CLC_CAUSAL = [True, False]
 # relaxed, which silently reported every D=128 case as "DIM must be 64" and is
 # why there was no D=128 performance data at all.
 _KERNEL_DIMS = tuple(SUPPORTED_DIMS)
-_BLOCK = 128      # both BLOCK_M and BLOCK_N on 950DT
+_BLOCK = 128  # both BLOCK_M and BLOCK_N on 950DT
 _NUM_CORES = 32
 _CONFIG_LABEL = "M128/N128 (router auto-tunes dense M64/N256 at S>=4096)"
 
@@ -136,25 +135,37 @@ def _build_configs(filter_batch=None, filter_seqlen=None, filter_dim=None):
     for B in _CLC_BATCHES:
         if filter_batch and B not in filter_batch:
             continue
-        for (Sq, Skv) in _CLC_SEQLEN_PAIRS:
+        for Sq, Skv in _CLC_SEQLEN_PAIRS:
             if filter_seqlen and Sq not in filter_seqlen and Skv not in filter_seqlen:
                 continue
-            for (Dq, Dkv) in _CLC_HEAD_DIMS:
+            for Dq, Dkv in _CLC_HEAD_DIMS:
                 if filter_dim and Dq not in filter_dim:
                     continue
-                for (Hq, Hkv) in _CLC_HEAD_PAIRS:
+                for Hq, Hkv in _CLC_HEAD_PAIRS:
                     for causal in _CLC_CAUSAL:
                         reasons = _is_compatible(B, Sq, Skv, Dq, Dkv, Hq, Hkv)
-                        cfg = dict(B=B, Sq=Sq, Skv=Skv, Dq=Dq, Dkv=Dkv,
-                                   Hq=Hq, Hkv=Hkv, causal=causal)
-                        (skipped.append((cfg, reasons)) if reasons
-                         else compatible.append(cfg))
+                        cfg = dict(
+                            B=B,
+                            Sq=Sq,
+                            Skv=Skv,
+                            Dq=Dq,
+                            Dkv=Dkv,
+                            Hq=Hq,
+                            Hkv=Hkv,
+                            causal=causal,
+                        )
+                        (
+                            skipped.append((cfg, reasons))
+                            if reasons
+                            else compatible.append(cfg)
+                        )
     return compatible, skipped
 
 
 # ---------------------------------------------------------------------------
 # Device helpers
 # ---------------------------------------------------------------------------
+
 
 def _device():
     return "npu" if hasattr(torch, "npu") and torch.npu.is_available() else "cuda"
@@ -171,6 +182,7 @@ def _sync(device):
 # Metric helpers
 # ---------------------------------------------------------------------------
 
+
 def _tflops(B, Hq, Sq, Skv, D, latency_ms):
     """QK^T: B*Hq*Sq*Skv*D MADs, PV: same, each = 2 flops."""
     return 2 * 2.0 * B * Hq * Sq * Skv * D / (latency_ms * 1e-3) / 1e12
@@ -179,10 +191,12 @@ def _tflops(B, Hq, Sq, Skv, D, latency_ms):
 def _bandwidth_gbs(B, Hq, Hkv, Sq, Skv, D, latency_ms):
     """Read Q + K + V, write O. All fp16 = 2 bytes."""
     elem = 2
-    bytes_io = elem * (B * Hq * Sq * D +       # Q
-                       B * Hkv * Skv * D +      # K
-                       B * Hkv * Skv * D +      # V
-                       B * Hq * Sq * D)         # O
+    bytes_io = elem * (
+        B * Hq * Sq * D  # Q
+        + B * Hkv * Skv * D  # K
+        + B * Hkv * Skv * D  # V
+        + B * Hq * Sq * D
+    )  # O
     return bytes_io / (latency_ms * 1e-3) / 1e9
 
 
@@ -217,7 +231,8 @@ def _causal_mask_2048(device):
     key = str(device)
     if key not in _MASK_CACHE:
         _MASK_CACHE[key] = torch.triu(
-            torch.ones(2048, 2048, dtype=torch.bool, device=device), diagonal=1)
+            torch.ones(2048, 2048, dtype=torch.bool, device=device), diagonal=1
+        )
     return _MASK_CACHE[key]
 
 
@@ -227,10 +242,18 @@ def _ref_npu_fa(q, k, v, is_causal):
     scale = (1.0 / D) ** 0.5
     if not is_causal:
         return torch_npu.npu_fusion_attention(
-            q, k, v, head_num=Hq, input_layout="BNSD", scale=scale)[0]
+            q, k, v, head_num=Hq, input_layout="BNSD", scale=scale
+        )[0]
     return torch_npu.npu_fusion_attention(
-        q, k, v, head_num=Hq, input_layout="BNSD", scale=scale,
-        atten_mask=_causal_mask_2048(q.device), sparse_mode=2)[0]
+        q,
+        k,
+        v,
+        head_num=Hq,
+        input_layout="BNSD",
+        scale=scale,
+        atten_mask=_causal_mask_2048(q.device),
+        sparse_mode=2,
+    )[0]
 
 
 def _ref_fp32(q, k, v, is_causal):
@@ -258,7 +281,8 @@ def _ref_fp32(q, k, v, is_causal):
         scores = torch.matmul(qf[:, :, s0:s1], kf.transpose(-1, -2)) * scale
         if is_causal:
             scores = scores.masked_fill(
-                row_idx[None, :] > row_idx[s0:s1][:, None], float("-inf"))
+                row_idx[None, :] > row_idx[s0:s1][:, None], float("-inf")
+            )
         probs = torch.softmax(scores, dim=-1)
         out[:, :, s0:s1] = torch.matmul(probs, vf)
     return out.to(q.dtype)
@@ -272,12 +296,14 @@ def _ref_sdpa(q, k, v, is_causal):
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
     return torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, is_causal=is_causal)
+        q, k, v, is_causal=is_causal
+    )
 
 
 # ---------------------------------------------------------------------------
 # One shape
 # ---------------------------------------------------------------------------
+
 
 def run_one(cfg, warmup, rep, no_check, device):
     B, Sq, Skv = cfg["B"], cfg["Sq"], cfg["Skv"]
@@ -296,8 +322,7 @@ def run_one(cfg, warmup, rep, no_check, device):
         out = flash_attention_fwd(q, k, v, is_causal=causal)
         max_err = (out.float() - ref.float()).abs().max().item()
         try:
-            torch.testing.assert_close(ref.float(), out.float(),
-                                       rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(ref.float(), out.float(), rtol=2e-2, atol=2e-2)
             check = "PASS"
         except AssertionError:
             check = "FAIL"
@@ -317,16 +342,31 @@ def run_one(cfg, warmup, rep, no_check, device):
 
     speedup = npufa_med / fa_med if fa_med > 0 else float("inf")
     return dict(
-        B=B, Hq=Hq, Hkv=Hkv, Sq=Sq, Skv=Skv, D=D, causal=causal, cb=1,
+        B=B,
+        Hq=Hq,
+        Hkv=Hkv,
+        Sq=Sq,
+        Skv=Skv,
+        D=D,
+        causal=causal,
+        cb=1,
         config=_CONFIG_LABEL,
-        fa_ms=fa_med, fa_mean=fa_mean, fa_min=fa_min, fa_max=fa_max,
-        npufa_ms=npufa_med, speedup=speedup,
+        fa_ms=fa_med,
+        fa_mean=fa_mean,
+        fa_min=fa_min,
+        fa_max=fa_max,
+        npufa_ms=npufa_med,
+        speedup=speedup,
         tflops=_tflops(B, Hq, Sq, Skv, D, fa_med),
         bw_gbs=_bandwidth_gbs(B, Hq, Hkv, Sq, Skv, D, fa_med),
         sdpa_ms=sdpa_med,
-        sdpa_tflops=(_tflops(B, Hq, Sq, Skv, D, sdpa_med)
-                     if sdpa_med == sdpa_med else float("nan")),
-        max_err=max_err, check=check,
+        sdpa_tflops=(
+            _tflops(B, Hq, Sq, Skv, D, sdpa_med)
+            if sdpa_med == sdpa_med
+            else float("nan")
+        ),
+        max_err=max_err,
+        check=check,
     )
 
 
@@ -334,24 +374,42 @@ def run_one(cfg, warmup, rep, no_check, device):
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Benchmark the BNSD FA router vs npu_fusion_attention")
+        description="Benchmark the BNSD FA router vs npu_fusion_attention"
+    )
     # 30/60 rather than thin defaults: at S=256 the vendor column alone swings
     # ~1.5x between runs with few reps, which moves the speedup denominator.
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--rep", type=int, default=60)
     p.add_argument("--no-check", action="store_true")
-    p.add_argument("--csv", type=str, default="bench_fa_bnsd.csv",
-                   help="Written next to this script, not to cwd.")
-    p.add_argument("--filter-batch", type=str, default=None,
-                   help="Comma-separated batch sizes, e.g. '1,4'")
-    p.add_argument("--filter-seqlen", type=str, default=None,
-                   help="Comma-separated seqlens, e.g. '2048,4096'")
-    p.add_argument("--filter-dim", type=str, default=None,
-                   help=f"Comma-separated head dims from {tuple(SUPPORTED_DIMS)}, "
-                        "e.g. '128'. Default: all supported dims, which is "
-                        "240 cases per dim.")
+    p.add_argument(
+        "--csv",
+        type=str,
+        default="bench_fa_bnsd.csv",
+        help="Written next to this script, not to cwd.",
+    )
+    p.add_argument(
+        "--filter-batch",
+        type=str,
+        default=None,
+        help="Comma-separated batch sizes, e.g. '1,4'",
+    )
+    p.add_argument(
+        "--filter-seqlen",
+        type=str,
+        default=None,
+        help="Comma-separated seqlens, e.g. '2048,4096'",
+    )
+    p.add_argument(
+        "--filter-dim",
+        type=str,
+        default=None,
+        help=f"Comma-separated head dims from {tuple(SUPPORTED_DIMS)}, "
+        "e.g. '128'. Default: all supported dims, which is "
+        "240 cases per dim.",
+    )
     return p.parse_args()
 
 
@@ -359,34 +417,43 @@ def main():
     args = _parse_args()
     device = _device()
 
-    filter_batch = ([int(x) for x in args.filter_batch.split(",")]
-                    if args.filter_batch else None)
-    filter_seqlen = ([int(x) for x in args.filter_seqlen.split(",")]
-                     if args.filter_seqlen else None)
-    filter_dim = ([int(x) for x in args.filter_dim.split(",")]
-                  if args.filter_dim else None)
+    filter_batch = (
+        [int(x) for x in args.filter_batch.split(",")] if args.filter_batch else None
+    )
+    filter_seqlen = (
+        [int(x) for x in args.filter_seqlen.split(",")] if args.filter_seqlen else None
+    )
+    filter_dim = (
+        [int(x) for x in args.filter_dim.split(",")] if args.filter_dim else None
+    )
     compatible, skipped = _build_configs(filter_batch, filter_seqlen, filter_dim)
 
     print(f"Device : {device}")
     print(f"Warmup : {args.warmup}   Rep: {args.rep}")
-    print(f"Kernel : DIM={filter_dim or list(_KERNEL_DIMS)}  "
-          f"NUM_CORES={_NUM_CORES}  config={_CONFIG_LABEL}")
+    print(
+        f"Kernel : DIM={filter_dim or list(_KERNEL_DIMS)}  "
+        f"NUM_CORES={_NUM_CORES}  config={_CONFIG_LABEL}"
+    )
     print()
 
     if skipped:
         print(f"=== Skipped configs: {len(skipped)} (kernel incompatible) ===")
         for cfg, reasons in skipped[:10]:
-            print(f"  SKIP B={cfg['B']} Hq={cfg['Hq']} Hkv={cfg['Hkv']} "
-                  f"Sq={cfg['Sq']} Skv={cfg['Skv']} Dq={cfg['Dq']} Dkv={cfg['Dkv']}"
-                  f"  — {'; '.join(reasons)}")
+            print(
+                f"  SKIP B={cfg['B']} Hq={cfg['Hq']} Hkv={cfg['Hkv']} "
+                f"Sq={cfg['Sq']} Skv={cfg['Skv']} Dq={cfg['Dq']} Dkv={cfg['Dkv']}"
+                f"  — {'; '.join(reasons)}"
+            )
         if len(skipped) > 10:
             print(f"  ... and {len(skipped) - 10} more")
         print()
 
     print(f"=== Running {len(compatible)} compatible configs ===\n")
-    hdr = (f"{'#':>3} {'B':>3} {'Hq':>3} {'Hkv':>4} {'Sq':>6} {'Skv':>6} {'D':>3} "
-           f"{'csl':>4} {'FA(ms)':>9} {'npu_fa(ms)':>11} {'sdpa(ms)':>10} "
-           f"{'spd':>6} {'TFLOPS':>8} {'BW(GB/s)':>10} {'max_err':>9} {'status':>8}")
+    hdr = (
+        f"{'#':>3} {'B':>3} {'Hq':>3} {'Hkv':>4} {'Sq':>6} {'Skv':>6} {'D':>3} "
+        f"{'csl':>4} {'FA(ms)':>9} {'npu_fa(ms)':>11} {'sdpa(ms)':>10} "
+        f"{'spd':>6} {'TFLOPS':>8} {'BW(GB/s)':>10} {'max_err':>9} {'status':>8}"
+    )
     sep = "-" * len(hdr)
     print(hdr)
     print(sep)
@@ -396,25 +463,46 @@ def main():
         try:
             r = run_one(cfg, args.warmup, args.rep, args.no_check, device)
             direction = "↑" if r["speedup"] > 1 else "↓"
-            print(f"{i:>3} {r['B']:>3} {r['Hq']:>3} {r['Hkv']:>4} {r['Sq']:>6} "
-                  f"{r['Skv']:>6} {r['D']:>3} {'Y' if r['causal'] else 'N':>4} "
-                  f"{r['fa_ms']:>9.3f} {r['npufa_ms']:>11.3f} {r['sdpa_ms']:>10.3f} "
-                  f"{r['speedup']:>5.3f}{direction} {r['tflops']:>8.3f} "
-                  f"{r['bw_gbs']:>10.1f} {r['max_err']:>9.2e} {r['check']:>8}")
+            print(
+                f"{i:>3} {r['B']:>3} {r['Hq']:>3} {r['Hkv']:>4} {r['Sq']:>6} "
+                f"{r['Skv']:>6} {r['D']:>3} {'Y' if r['causal'] else 'N':>4} "
+                f"{r['fa_ms']:>9.3f} {r['npufa_ms']:>11.3f} {r['sdpa_ms']:>10.3f} "
+                f"{r['speedup']:>5.3f}{direction} {r['tflops']:>8.3f} "
+                f"{r['bw_gbs']:>10.1f} {r['max_err']:>9.2e} {r['check']:>8}"
+            )
             results.append(r)
         except Exception as exc:
-            print(f"{i:>3} {cfg['B']:>3} {cfg['Hq']:>3} {cfg['Hkv']:>4} {cfg['Sq']:>6} "
-                  f"{cfg['Skv']:>6} {cfg['Dq']:>3} {'Y' if cfg['causal'] else 'N':>4} "
-                  f"{'ERROR':>66}")
+            print(
+                f"{i:>3} {cfg['B']:>3} {cfg['Hq']:>3} {cfg['Hkv']:>4} {cfg['Sq']:>6} "
+                f"{cfg['Skv']:>6} {cfg['Dq']:>3} {'Y' if cfg['causal'] else 'N':>4} "
+                f"{'ERROR':>66}"
+            )
             print(f"    ERROR: {str(exc).splitlines()[0][:60]}")
-            results.append(dict(
-                B=cfg["B"], Hq=cfg["Hq"], Hkv=cfg["Hkv"], Sq=cfg["Sq"],
-                Skv=cfg["Skv"], D=cfg["Dq"], causal=cfg["causal"], cb=1,
-                config=_CONFIG_LABEL, fa_ms=float("nan"), fa_mean=float("nan"),
-                fa_min=float("nan"), fa_max=float("nan"), npufa_ms=float("nan"),
-                speedup=float("nan"), tflops=float("nan"), bw_gbs=float("nan"),
-                sdpa_ms=float("nan"), sdpa_tflops=float("nan"),
-                max_err=float("nan"), check="ERROR"))
+            results.append(
+                dict(
+                    B=cfg["B"],
+                    Hq=cfg["Hq"],
+                    Hkv=cfg["Hkv"],
+                    Sq=cfg["Sq"],
+                    Skv=cfg["Skv"],
+                    D=cfg["Dq"],
+                    causal=cfg["causal"],
+                    cb=1,
+                    config=_CONFIG_LABEL,
+                    fa_ms=float("nan"),
+                    fa_mean=float("nan"),
+                    fa_min=float("nan"),
+                    fa_max=float("nan"),
+                    npufa_ms=float("nan"),
+                    speedup=float("nan"),
+                    tflops=float("nan"),
+                    bw_gbs=float("nan"),
+                    sdpa_ms=float("nan"),
+                    sdpa_tflops=float("nan"),
+                    max_err=float("nan"),
+                    check="ERROR",
+                )
+            )
 
     print(sep)
 
@@ -424,26 +512,53 @@ def main():
         avg = sum(r["speedup"] for r in passed) / len(passed)
         best = max(passed, key=lambda r: r["speedup"])
         worst = min(passed, key=lambda r: r["speedup"])
-        print(f"\nSummary: {len(passed)} passed, {failed} failed, {len(skipped)} skipped")
+        print(
+            f"\nSummary: {len(passed)} passed, {failed} failed, {len(skipped)} skipped"
+        )
         print(f"  Average speedup: {avg:.3f}x")
-        print(f"  Best:  B={best['B']} Hq={best['Hq']} Hkv={best['Hkv']} "
-              f"Sq={best['Sq']} -> {best['speedup']:.3f}x "
-              f"({best['fa_ms']:.3f} vs {best['npufa_ms']:.3f} ms)")
-        print(f"  Worst: B={worst['B']} Hq={worst['Hq']} Hkv={worst['Hkv']} "
-              f"Sq={worst['Sq']} -> {worst['speedup']:.3f}x "
-              f"({worst['fa_ms']:.3f} vs {worst['npufa_ms']:.3f} ms)")
+        print(
+            f"  Best:  B={best['B']} Hq={best['Hq']} Hkv={best['Hkv']} "
+            f"Sq={best['Sq']} -> {best['speedup']:.3f}x "
+            f"({best['fa_ms']:.3f} vs {best['npufa_ms']:.3f} ms)"
+        )
+        print(
+            f"  Worst: B={worst['B']} Hq={worst['Hq']} Hkv={worst['Hkv']} "
+            f"Sq={worst['Sq']} -> {worst['speedup']:.3f}x "
+            f"({worst['fa_ms']:.3f} vs {worst['npufa_ms']:.3f} ms)"
+        )
         acc = [r for r in passed if r["check"] in ("PASS", "FAIL")]
         if acc:
             n_fail = sum(1 for r in acc if r["check"] == "FAIL")
-            print(f"  Accuracy: {len(acc) - n_fail}/{len(acc)} PASS, "
-                  f"max_err {max(r['max_err'] for r in acc):.2e}")
+            print(
+                f"  Accuracy: {len(acc) - n_fail}/{len(acc)} PASS, "
+                f"max_err {max(r['max_err'] for r in acc):.2e}"
+            )
 
     if args.csv and results:
         csv_path = os.path.join(_HERE, args.csv)
-        fields = ["B", "Hq", "Hkv", "Sq", "Skv", "D", "causal", "cb", "config",
-                  "fa_ms", "fa_mean", "fa_min", "fa_max",
-                  "sdpa_ms", "speedup", "tflops", "sdpa_tflops", "bw_gbs",
-                  "max_err", "check", "npufa_ms"]
+        fields = [
+            "B",
+            "Hq",
+            "Hkv",
+            "Sq",
+            "Skv",
+            "D",
+            "causal",
+            "cb",
+            "config",
+            "fa_ms",
+            "fa_mean",
+            "fa_min",
+            "fa_max",
+            "sdpa_ms",
+            "speedup",
+            "tflops",
+            "sdpa_tflops",
+            "bw_gbs",
+            "max_err",
+            "check",
+            "npufa_ms",
+        ]
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()

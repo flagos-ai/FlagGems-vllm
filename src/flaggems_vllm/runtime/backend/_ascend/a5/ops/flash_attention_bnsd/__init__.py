@@ -71,7 +71,8 @@ def flash_attention_fwd(q, k, v, is_causal=False, **kw):
             "flash_attention_fwd() has no `combine_batch`: it was a knob on "
             "the retired hand-written CV kernel. The router selects its own "
             "tile/pipeline configuration (fa_causal._pick / fa_dense._CONFIGS)."
-            " Drop the argument.")
+            " Drop the argument."
+        )
     if is_causal:
         kw.pop("autotune", None)
         return flash_attention_fwd_causal(q, k, v, **kw)

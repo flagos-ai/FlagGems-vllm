@@ -26,17 +26,43 @@ import torch
 import triton
 import triton.language as tl
 
-from .fa_naive import (_COMPILE_OPTS, _max_nan, build_tile_order,
-                      check_bnsd, validate_shape)
+from .fa_naive import (
+    _COMPILE_OPTS,
+    _max_nan,
+    build_tile_order,
+    check_bnsd,
+    validate_shape,
+)
 
 
 @triton.jit
-def _attn_fwd_dense_grp2(Q, K, V, Out, Tiles, ntiles, sm_scale,
-                          sQb, sQh, sQs, sKb, sKh, sKs, sOb, sOh, sOs,
-                          B, Hq, S,
-                          GQA: tl.constexpr, NUM_CORES: tl.constexpr,
-                          D: tl.constexpr, BLOCK_M: tl.constexpr,
-                          BLOCK_N: tl.constexpr, PRESCALED: tl.constexpr):
+def _attn_fwd_dense_grp2(
+    Q,
+    K,
+    V,
+    Out,
+    Tiles,
+    ntiles,
+    sm_scale,
+    sQb,
+    sQh,
+    sQs,
+    sKb,
+    sKh,
+    sKs,
+    sOb,
+    sOh,
+    sOs,
+    B,
+    Hq,
+    S,
+    GQA: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRESCALED: tl.constexpr,
+):
     """GROUP=2 grouped-accumulation kernel. Valid when BLOCK_M==64 and S%(2*BLOCK_N)==0.
 
     Processes two adjacent KV blocks per loop iteration. Within each group:
@@ -121,17 +147,40 @@ def _attn_fwd_dense_grp2(Q, K, V, Out, Tiles, ntiles, sm_scale,
             m_i = m_new
 
         acc = acc / l_i[:, None]
-        tl.store(o_base + offs_m[:, None] * sOs + offs_d[None, :],
-                 acc.to(Out.dtype.element_ty))
+        tl.store(
+            o_base + offs_m[:, None] * sOs + offs_d[None, :],
+            acc.to(Out.dtype.element_ty),
+        )
 
 
 @triton.jit
-def _attn_fwd_dense(Q, K, V, Out, Tiles, ntiles, sm_scale,
-                    sQb, sQh, sQs, sKb, sKh, sKs, sOb, sOh, sOs,
-                    B, Hq, S,
-                    GQA: tl.constexpr, NUM_CORES: tl.constexpr,
-                    D: tl.constexpr, BLOCK_M: tl.constexpr,
-                    BLOCK_N: tl.constexpr, PRESCALED: tl.constexpr):
+def _attn_fwd_dense(
+    Q,
+    K,
+    V,
+    Out,
+    Tiles,
+    ntiles,
+    sm_scale,
+    sQb,
+    sQh,
+    sQs,
+    sKb,
+    sKh,
+    sKs,
+    sOb,
+    sOh,
+    sOs,
+    B,
+    Hq,
+    S,
+    GQA: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRESCALED: tl.constexpr,
+):
     """No mask, no peel: every tile walks all S/BLOCK_N KV blocks."""
     nblk_m = S // BLOCK_M
     pid = tl.program_id(0)
@@ -178,8 +227,10 @@ def _attn_fwd_dense(Q, K, V, Out, Tiles, ntiles, sm_scale,
             m_i = m_ij
 
         acc = acc / l_i[:, None]
-        tl.store(o_base + offs_m[:, None] * sOs + offs_d[None, :],
-                 acc.to(Out.dtype.element_ty))
+        tl.store(
+            o_base + offs_m[:, None] * sOs + offs_d[None, :],
+            acc.to(Out.dtype.element_ty),
+        )
 
 
 # Base config list. (64, 256) wins only on large dense at D=64.
@@ -210,8 +261,9 @@ _CONFIGS_BASE = ((128, 128), (64, 256))
 _cache: dict = {}
 
 
-def flash_attention_fwd_dense(q, k, v, block_m=None, block_n=None,
-                              num_cores=32, autotune=True, **opts):
+def flash_attention_fwd_dense(
+    q, k, v, block_m=None, block_n=None, num_cores=32, autotune=True, **opts
+):
     check_bnsd(q, k, v)
     B, Hq, S, D = q.shape
     Hkv = k.shape[1]
@@ -227,10 +279,19 @@ def flash_attention_fwd_dense(q, k, v, block_m=None, block_n=None,
     if autotune and not explicit and S >= 4096 and len(_CONFIGS_BASE) > 1:
         key = (B, Hq, Hkv, S, D, str(q.device))
         if key not in _cache:
+
             def _probe(bm, bn):
                 return flash_attention_fwd_dense(
-                    q, k, v, block_m=bm, block_n=bn, num_cores=num_cores,
-                    autotune=False, **opts)
+                    q,
+                    k,
+                    v,
+                    block_m=bm,
+                    block_n=bn,
+                    num_cores=num_cores,
+                    autotune=False,
+                    **opts,
+                )
+
             _cache[key] = _tune(q, k, v, S, _probe, _CONFIGS_BASE)
         block_m, block_n = _cache[key]
 
@@ -250,18 +311,36 @@ def flash_attention_fwd_dense(q, k, v, block_m=None, block_n=None,
     # adjacent KV blocks per iteration so acc is only rescaled once per group
     # instead of once per block, halving the Cube/Vector sync count and letting
     # the two back-to-back PV matmuls run without a Vector barrier between them.
-    use_grp2 = (block_m == 64 and block_n == 128 and S % 256 == 0)
+    use_grp2 = block_m == 64 and block_n == 128 and S % 256 == 0
     kernel = _attn_fwd_dense_grp2 if use_grp2 else _attn_fwd_dense
 
     # `qs`, not `q`: see validate_shape.
     kernel[(num_cores,)](
-        qs, k, v, out, tiles, tiles.numel(), sm_scale,
-        qs.stride(0), qs.stride(1), qs.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        B, Hq, S,
-        GQA=Hq // Hkv, NUM_CORES=num_cores, D=D,
-        BLOCK_M=block_m, BLOCK_N=block_n, PRESCALED=prescale,
+        qs,
+        k,
+        v,
+        out,
+        tiles,
+        tiles.numel(),
+        sm_scale,
+        qs.stride(0),
+        qs.stride(1),
+        qs.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        B,
+        Hq,
+        S,
+        GQA=Hq // Hkv,
+        NUM_CORES=num_cores,
+        D=D,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        PRESCALED=prescale,
         **launch_opts,
     )
     return out
@@ -281,6 +360,7 @@ def _tune(q, k, v, S, launch, configs, warmup=3, rep=7):
     result cached per shape key, median of 7.
     """
     import time as _time
+
     best, best_ms = None, float("inf")
     for bm, bn in configs:
         if S % bm or S % bn:

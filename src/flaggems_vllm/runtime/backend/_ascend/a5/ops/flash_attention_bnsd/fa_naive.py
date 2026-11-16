@@ -92,13 +92,35 @@ def _max_nan(a, b):
 
 
 @triton.jit
-def _attn_fwd(Q, K, V, Out, Tiles, ntiles, sm_scale,
-              sQb, sQh, sQs, sKb, sKh, sKs, sOb, sOh, sOs,
-              B, Hq, S,
-              GQA: tl.constexpr, NUM_CORES: tl.constexpr,
-              D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-              PRESCALED: tl.constexpr, CAUSAL: tl.constexpr,
-              PEEL: tl.constexpr):
+def _attn_fwd(
+    Q,
+    K,
+    V,
+    Out,
+    Tiles,
+    ntiles,
+    sm_scale,
+    sQb,
+    sQh,
+    sQs,
+    sKb,
+    sKh,
+    sKs,
+    sOb,
+    sOh,
+    sOs,
+    B,
+    Hq,
+    S,
+    GQA: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRESCALED: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    PEEL: tl.constexpr,
+):
     nblk_m = S // BLOCK_M
     pid = tl.program_id(0)
 
@@ -159,8 +181,9 @@ def _attn_fwd(Q, K, V, Out, Tiles, ntiles, sm_scale,
                     # module's `flash_attention_fwd` is no longer reachable
                     # from the shipping router (it is a copy of the pre-split
                     # kernel), but the same mask bug lived here.
-                    qk = tl.where(offs_m0[:, None] >= offs_n[None, :],
-                                  qk, float("-inf"))
+                    qk = tl.where(
+                        offs_m0[:, None] >= offs_n[None, :], qk, float("-inf")
+                    )
             m_ij = _max_nan(m_i, tl.reduce(qk, 1, _max_nan))
             p = tl.exp(qk - m_ij[:, None])
             alpha = tl.exp(m_i - m_ij)
@@ -182,8 +205,7 @@ def _attn_fwd(Q, K, V, Out, Tiles, ntiles, sm_scale,
             qk = tl.dot(q, tl.trans(kb))
             if not PRESCALED:
                 qk = qk * sm_scale
-            qk = tl.where(offs_m0[:, None] >= offs_n[None, :],
-                          qk, float("-inf"))
+            qk = tl.where(offs_m0[:, None] >= offs_n[None, :], qk, float("-inf"))
             m_ij = _max_nan(m_i, tl.reduce(qk, 1, _max_nan))
             p = tl.exp(qk - m_ij[:, None])
             alpha = tl.exp(m_i - m_ij)
@@ -193,8 +215,10 @@ def _attn_fwd(Q, K, V, Out, Tiles, ntiles, sm_scale,
             acc = tl.dot(p.to(vb.dtype), vb, acc)
 
         acc = acc / l_i[:, None]
-        tl.store(o_base + offs_m[:, None] * sOs + offs_d[None, :],
-                 acc.to(Out.dtype.element_ty))
+        tl.store(
+            o_base + offs_m[:, None] * sOs + offs_d[None, :],
+            acc.to(Out.dtype.element_ty),
+        )
 
 
 _tile_cache = {}
@@ -213,10 +237,12 @@ def check_bnsd(q, k, v):
         if t.ndim != 4:
             raise ValueError(
                 f"{name} must be 4-D BNSD [B, H, S, D], got {t.ndim}-D shape "
-                f"{tuple(t.shape)}")
+                f"{tuple(t.shape)}"
+            )
         if t.dtype != torch.float16:
             raise ValueError(
-                f"{name} must be fp16 (the kernels are fp16-only), got {t.dtype}")
+                f"{name} must be fp16 (the kernels are fp16-only), got {t.dtype}"
+            )
         if t.device != q.device:
             raise ValueError(f"{name} is on {t.device} but q is on {q.device}")
         # One `sKs` is passed for both K and V, so both must be dense-contiguous.
@@ -226,7 +252,8 @@ def check_bnsd(q, k, v):
                 f"caller's strides, and a non-contiguous {name} is read at "
                 f"wrong offsets (silently wrong, not an error). Call "
                 f".contiguous() first. shape={tuple(t.shape)} "
-                f"strides={tuple(t.stride())}")
+                f"strides={tuple(t.stride())}"
+            )
     return True
 
 
@@ -236,19 +263,18 @@ def validate_shape(q, k, v, block_m, block_n, causal=False):
     which the entries call before unpacking `q.shape`.
     """
     B, Hq, S, D = q.shape
-    ks, vs = k.shape, v.shape          # .shape is a dispatch; index it once
+    ks, vs = k.shape, v.shape  # .shape is a dispatch; index it once
     Hk, Hv = ks[1], vs[1]
     if D not in SUPPORTED_DIMS:
         raise ValueError(f"D must be one of {SUPPORTED_DIMS}, got {D}")
     if ks[0] != B or vs[0] != B:
-        raise ValueError(
-            f"batch mismatch: q B={B}, k B={ks[0]}, v B={vs[0]}")
+        raise ValueError(f"batch mismatch: q B={B}, k B={ks[0]}, v B={vs[0]}")
     if ks[2] != S or vs[2] != S:
         raise ValueError(
-            f"asymmetric Sq/Skv is not supported: Sq={S}, Skv={ks[2]}/{vs[2]}")
+            f"asymmetric Sq/Skv is not supported: Sq={S}, Skv={ks[2]}/{vs[2]}"
+        )
     if ks[3] != D or vs[3] != D:
-        raise ValueError(
-            f"K/V head dim must be {D}, got {ks[3]}/{vs[3]}")
+        raise ValueError(f"K/V head dim must be {D}, got {ks[3]}/{vs[3]}")
     if Hk != Hv:
         raise ValueError(f"K and V must have the same head count: {Hk} vs {Hv}")
     if Hk <= 0 or Hq % Hk:
@@ -257,12 +283,13 @@ def validate_shape(q, k, v, block_m, block_n, causal=False):
         raise ValueError(f"empty input: B={B} S={S}")
     if S % block_m or S % block_n:
         raise ValueError(
-            f"S={S} must be divisible by block_m={block_m} and "
-            f"block_n={block_n}")
+            f"S={S} must be divisible by block_m={block_m} and " f"block_n={block_n}"
+        )
     if causal and block_m != block_n:
         raise ValueError(
             f"causal requires block_m == block_n (the diagonal block is one "
-            f"square KV block), got {block_m} vs {block_n}")
+            f"square KV block), got {block_m} vs {block_n}"
+        )
     return True
 
 
@@ -370,6 +397,7 @@ def _autotune_dense(q, k, v, S, launch, warmup=3, rep=7):
     separate 1.03x from a <1% spread on an idle device.
     """
     import time as _time
+
     best, best_ms = None, float("inf")
     for bm, bn in _AUTOTUNE_CONFIGS:
         if S % bm or S % bn:
@@ -388,14 +416,23 @@ def _autotune_dense(q, k, v, S, launch, warmup=3, rep=7):
             lat.sort()
             ms = lat[len(lat) // 2]
         except Exception:
-            continue          # a config that will not compile is not a candidate
+            continue  # a config that will not compile is not a candidate
         if ms < best_ms:
             best, best_ms = (bm, bn), ms
     return best or (128, 128)
 
 
-def flash_attention_fwd(q, k, v, is_causal=False, block_m=None, block_n=None,
-                        num_cores=32, autotune=True, **opts):
+def flash_attention_fwd(
+    q,
+    k,
+    v,
+    is_causal=False,
+    block_m=None,
+    block_n=None,
+    num_cores=32,
+    autotune=True,
+    **opts,
+):
     """q[B, Hq, S, D], k/v[B, Hkv, S, D], fp16, D in (64, 128), Hq % Hkv == 0.
 
     `block_m`/`block_n` default to None, meaning "choose". Pass them explicitly
@@ -415,14 +452,28 @@ def flash_attention_fwd(q, k, v, is_causal=False, block_m=None, block_n=None,
     # Causal is pinned by the peeled-diagonal constraint (block_m == block_n)
     # plus UB overflow at N=256, so there is nothing to choose; and at small S
     # every alternative measured worse, so tuning would only cost launches.
-    if (autotune and not explicit and not is_causal and S >= 4096
-            and len(_AUTOTUNE_CONFIGS) > 1):
+    if (
+        autotune
+        and not explicit
+        and not is_causal
+        and S >= 4096
+        and len(_AUTOTUNE_CONFIGS) > 1
+    ):
         key = (B, Hq, Hkv, S, D, str(q.device))
         if key not in _autotune_cache:
+
             def _probe(bm, bn):
-                return flash_attention_fwd(q, k, v, is_causal=False,
-                                           block_m=bm, block_n=bn,
-                                           num_cores=num_cores, **opts)
+                return flash_attention_fwd(
+                    q,
+                    k,
+                    v,
+                    is_causal=False,
+                    block_m=bm,
+                    block_n=bn,
+                    num_cores=num_cores,
+                    **opts,
+                )
+
             _autotune_cache[key] = _autotune_dense(q, k, v, S, _probe)
         block_m, block_n = _autotune_cache[key]
 
@@ -508,14 +559,33 @@ def flash_attention_fwd(q, k, v, is_causal=False, block_m=None, block_n=None,
     launch_opts = dict(_COMPILE_OPTS)
     launch_opts.update(opts)
     _attn_fwd[(num_cores,)](
-        qs, k, v, out, tiles, tiles.numel(), sm_scale,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        B, Hq, S,
-        GQA=Hq // Hkv, NUM_CORES=num_cores, D=D,
-        BLOCK_M=block_m, BLOCK_N=block_n,
-        PRESCALED=prescale, CAUSAL=is_causal, PEEL=peel,
+        qs,
+        k,
+        v,
+        out,
+        tiles,
+        tiles.numel(),
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        B,
+        Hq,
+        S,
+        GQA=Hq // Hkv,
+        NUM_CORES=num_cores,
+        D=D,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        PRESCALED=prescale,
+        CAUSAL=is_causal,
+        PEEL=peel,
         **launch_opts,
     )
     return out

@@ -34,18 +34,44 @@ import torch
 import triton
 import triton.language as tl
 
-from .fa_naive import (_COMPILE_OPTS, _max_nan, build_tile_order,
-                      check_bnsd, validate_shape)
+from .fa_naive import (
+    _COMPILE_OPTS,
+    _max_nan,
+    build_tile_order,
+    check_bnsd,
+    validate_shape,
+)
 
 
 @triton.jit
-def _attn_fwd_causal(Q, K, V, Out, Tiles, ntiles, sm_scale,
-                     sQb, sQh, sQs, sKb, sKh, sKs, sOb, sOh, sOs,
-                     B, Hq, S,
-                     GQA: tl.constexpr, NUM_CORES: tl.constexpr,
-                     D: tl.constexpr, BLOCK_M: tl.constexpr,
-                     BLOCK_N: tl.constexpr, PRESCALED: tl.constexpr,
-                     PEEL: tl.constexpr):
+def _attn_fwd_causal(
+    Q,
+    K,
+    V,
+    Out,
+    Tiles,
+    ntiles,
+    sm_scale,
+    sQb,
+    sQh,
+    sQs,
+    sKb,
+    sKh,
+    sKs,
+    sOb,
+    sOh,
+    sOs,
+    B,
+    Hq,
+    S,
+    GQA: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRESCALED: tl.constexpr,
+    PEEL: tl.constexpr,
+):
     """Causal only. One loop over KV blocks, no peeled diagonal.
 
     Every block including the diagonal one stays inside the pipelined loop;
@@ -122,8 +148,9 @@ def _attn_fwd_causal(Q, K, V, Out, Tiles, ntiles, sm_scale,
                 # interleaved over 12 shapes: 1.0026x net, and *faster* at
                 # S<=1024 because the select replaces the add.
                 rel = start_n - full
-                qk = tl.where(offs_m0[:, None] >= rel + offs_n[None, :],
-                              qk, float("-inf"))
+                qk = tl.where(
+                    offs_m0[:, None] >= rel + offs_n[None, :], qk, float("-inf")
+                )
             m_ij = _max_nan(m_i, tl.reduce(qk, 1, _max_nan))
             p = tl.exp(qk - m_ij[:, None])
             alpha = tl.exp(m_i - m_ij)
@@ -145,8 +172,7 @@ def _attn_fwd_causal(Q, K, V, Out, Tiles, ntiles, sm_scale,
             qk = tl.dot(q, tl.trans(kb))
             if not PRESCALED:
                 qk = qk * sm_scale
-            qk = tl.where(offs_m0[:, None] >= offs_n[None, :],
-                          qk, float("-inf"))
+            qk = tl.where(offs_m0[:, None] >= offs_n[None, :], qk, float("-inf"))
             m_ij = _max_nan(m_i, tl.reduce(qk, 1, _max_nan))
             p = tl.exp(qk - m_ij[:, None])
             alpha = tl.exp(m_i - m_ij)
@@ -156,8 +182,10 @@ def _attn_fwd_causal(Q, K, V, Out, Tiles, ntiles, sm_scale,
             acc = tl.dot(p.to(vb.dtype), vb, acc)
 
         acc = acc / l_i[:, None]
-        tl.store(o_base + offs_m[:, None] * sOs + offs_d[None, :],
-                 acc.to(Out.dtype.element_ty))
+        tl.store(
+            o_base + offs_m[:, None] * sOs + offs_d[None, :],
+            acc.to(Out.dtype.element_ty),
+        )
 
 
 # (block_m, block_n) candidates for causal, filled in by measurement below.
@@ -165,8 +193,9 @@ _CONFIGS = ((128, 128),)
 _cache: dict = {}
 
 
-def flash_attention_fwd_causal(q, k, v, block_m=None, block_n=None,
-                               num_cores=32, **opts):
+def flash_attention_fwd_causal(
+    q, k, v, block_m=None, block_n=None, num_cores=32, **opts
+):
     check_bnsd(q, k, v)
     B, Hq, S, D = q.shape
     Hkv = k.shape[1]
@@ -200,13 +229,32 @@ def flash_attention_fwd_causal(q, k, v, block_m=None, block_n=None,
     # `qs`, not `q`: qs is what the kernel reads, and an elementwise launch may
     # hand back different strides (see validate_shape).
     _attn_fwd_causal[(num_cores,)](
-        qs, k, v, out, tiles, tiles.numel(), sm_scale,
-        qs.stride(0), qs.stride(1), qs.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        B, Hq, S,
-        GQA=Hq // Hkv, NUM_CORES=num_cores, D=D,
-        BLOCK_M=block_m, BLOCK_N=block_n, PRESCALED=prescale, PEEL=peel,
+        qs,
+        k,
+        v,
+        out,
+        tiles,
+        tiles.numel(),
+        sm_scale,
+        qs.stride(0),
+        qs.stride(1),
+        qs.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        B,
+        Hq,
+        S,
+        GQA=Hq // Hkv,
+        NUM_CORES=num_cores,
+        D=D,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        PRESCALED=prescale,
+        PEEL=peel,
         **launch_opts,
     )
     return out

@@ -161,7 +161,8 @@ def _causal_mask_2048(dev):
     key = str(dev)
     if key not in _MASK_CACHE:
         _MASK_CACHE[key] = torch.triu(
-            torch.ones(2048, 2048, dtype=torch.bool, device=dev), diagonal=1)
+            torch.ones(2048, 2048, dtype=torch.bool, device=dev), diagonal=1
+        )
     return _MASK_CACHE[key]
 
 
@@ -172,10 +173,18 @@ def _vendor_fa(q, k, v, is_causal):
     scale = 1.0 / math.sqrt(Dh)
     if not is_causal:
         return torch_npu.npu_fusion_attention(
-            q, k, v, head_num=Hq, input_layout="BNSD", scale=scale)[0]
+            q, k, v, head_num=Hq, input_layout="BNSD", scale=scale
+        )[0]
     return torch_npu.npu_fusion_attention(
-        q, k, v, head_num=Hq, input_layout="BNSD", scale=scale,
-        atten_mask=_causal_mask_2048(q.device), sparse_mode=2)[0]
+        q,
+        k,
+        v,
+        head_num=Hq,
+        input_layout="BNSD",
+        scale=scale,
+        atten_mask=_causal_mask_2048(q.device),
+        sparse_mode=2,
+    )[0]
 
 
 @pytest.mark.parametrize("B", BATCHES)
@@ -232,11 +241,14 @@ def test_flash_attention_bnsd_tile_configs(dim):
     for bm, bn in ((128, 128), (64, 256), (64, 128)):
         if S % bm or S % bn:
             continue
-        out = flash_attention_fwd(q, k, v, is_causal=False,
-                                  block_m=bm, block_n=bn)
+        out = flash_attention_fwd(q, k, v, is_causal=False, block_m=bm, block_n=bn)
         torch.testing.assert_close(
-            out.float(), ref, atol=ATOL, rtol=RTOL,
-            msg=lambda m, bm=bm, bn=bn: f"D={dim} BLOCK_M={bm} BLOCK_N={bn}: {m}")
+            out.float(),
+            ref,
+            atol=ATOL,
+            rtol=RTOL,
+            msg=lambda m, bm=bm, bn=bn: f"D={dim} BLOCK_M={bm} BLOCK_N={bn}: {m}",
+        )
 
 
 def test_flash_attention_bnsd_rejects_unsupported_dim():
@@ -247,7 +259,9 @@ def test_flash_attention_bnsd_rejects_unsupported_dim():
         flash_attention_fwd(q, k, v, is_causal=False)
 
 
-@pytest.mark.skipif(not _HAS_NPU_FA, reason="torch_npu.npu_fusion_attention unavailable")
+@pytest.mark.skipif(
+    not _HAS_NPU_FA, reason="torch_npu.npu_fusion_attention unavailable"
+)
 @pytest.mark.parametrize("dim", SUPPORTED_DIMS)
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attention_bnsd_vs_vendor_dim(is_causal, dim):
@@ -267,7 +281,9 @@ def test_flash_attention_bnsd_vs_vendor_dim(is_causal, dim):
     torch.testing.assert_close(out, vendor, atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.skipif(not _HAS_NPU_FA, reason="torch_npu.npu_fusion_attention unavailable")
+@pytest.mark.skipif(
+    not _HAS_NPU_FA, reason="torch_npu.npu_fusion_attention unavailable"
+)
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("Hq,Hkv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("S", [512, 2048])
