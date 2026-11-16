@@ -5,16 +5,19 @@
 
 Source: benchmarks/kernels/benchmark_thinking_budget.py at
 947dd62c0700851a79b0a8f32cb823e25a003b31.
+
+Cold/incremental workloads use upstream's 10 warmup and 100 measured steps.
+The standard --warmup/--iter millisecond budgets apply to steady-state modes.
 """
 
 import statistics
-import time
-from pathlib import Path
 
 import pytest
 import torch
+from vllm.v1.worker.gpu.sample.thinking_budget import (
+    apply_thinking_budget as vllm_reference,
+)
 
-from baseline.thinking_budget import apply_thinking_budget as vllm_reference
 from benchmark import base, consts
 from benchmark.conftest import Config
 from flaggems_vllm import apply_thinking_budget, runtime
@@ -30,10 +33,24 @@ pytestmark = [
 
 
 class ThinkingBudgetBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
     DEFAULT_SHAPE_DESC = "mode, history_len, batch_size"
-    DEFAULT_SHAPES = [("cached", 128, 1)]
+    DEFAULT_SHAPES = [
+        (mode, history_len, batch_size)
+        for mode, batch_sizes in (
+            ("cached", (1,)),
+            ("incremental-decode", (1,)),
+            ("cold-prefill", (1,)),
+            ("cold-resume-worst-case", (1,)),
+            ("forced-end", (1,)),
+            ("batched-budgeted", (1, 8, 32)),
+            ("batched-mixed", (8, 32)),
+        )
+        for batch_size in batch_sizes
+        for history_len in (128, 16384, 32768)
+    ]
     DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    WARMUP_STEPS = 10
+    ITERATIONS = 100
 
     def __init__(self):
         super().__init__(
@@ -43,6 +60,9 @@ class ThinkingBudgetBenchmark(base.Benchmark):
             dtypes=[torch.float32],
             is_inplace=True,
         )
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = self.DEFAULT_SHAPES
 
     def init_user_config(self):
         if Config.mode != consts.BenchMode.KERNEL:
@@ -54,7 +74,11 @@ class ThinkingBudgetBenchmark(base.Benchmark):
     def get_input_iter(self, dtype):
         for self._case in self.shapes:
             mode, history_len, batch_size = self._case
-            extra_tokens = int(mode == "incremental-decode")
+            extra_tokens = (
+                self.WARMUP_STEPS + self.ITERATIONS
+                if mode == "incremental-decode"
+                else 0
+            )
             history = torch.full(
                 (batch_size, history_len + extra_tokens + 1),
                 10,
@@ -97,10 +121,7 @@ class ThinkingBudgetBenchmark(base.Benchmark):
             )
             if not mode.startswith("cold-"):
                 vllm_reference(*args)
-            if mode == "incremental-decode":
-                # Replay the same next-token step for both implementations.
-                args[5].fill_(history_len + 1)
-            self._original = [args[index].clone() for index in (0, 8, 9, 10)]
+            self._original = [args[index].clone() for index in (0, 5, 8, 9, 10)]
             yield args
 
     def record_shapes(self, *args, **kwargs):
@@ -108,31 +129,46 @@ class ThinkingBudgetBenchmark(base.Benchmark):
 
     def get_latency(self, op, *args, **kwargs):
         device_api = runtime.torch_device_fn
+        mode, history_len, _ = self._case
+        cold_scan = mode.startswith("cold-")
+        incremental = mode == "incremental-decode"
 
         def restore():
-            for index, original in zip((0, 8, 9, 10), self._original):
+            for index, original in zip((0, 5, 8, 9, 10), self._original):
                 args[index].copy_(original)
 
         with device_api.device(args[0].device):
+            # Finish compilation/tuning before replaying the workload.
             restore()
+            if incremental:
+                args[5].fill_(history_len + 1)
             op(*args, **kwargs)
             device_api.synchronize()
-            deadline = time.perf_counter() + Config.warm_up / 1000.0
-            while time.perf_counter() < deadline:
-                restore()
-                op(*args, **kwargs)
-                device_api.synchronize()
+            restore()
+            if not cold_scan and not incremental:
+                # These upstream cases reach a fixed state before measurement.
+                return super().get_latency(op, *args, **kwargs)
+
             start = device_api.Event(enable_timing=True)
             end = device_api.Event(enable_timing=True)
             samples = []
-            deadline = time.perf_counter() + Config.repetition / 1000.0
-            while not samples or time.perf_counter() < deadline:
-                restore()
+            for step in range(self.WARMUP_STEPS + self.ITERATIONS):
+                if cold_scan:
+                    args[8].fill_(-1)
+                    args[9].fill_(-1)
+                    args[10].zero_()
+                else:
+                    # Each provider replays the same growing history. The tail
+                    # is preallocated with token 10, so no history clone is needed.
+                    args[4][:, history_len + step].fill_(10)
+                    args[5].fill_(history_len + step + 1)
+                device_api.synchronize()
                 start.record()
                 op(*args, **kwargs)
                 end.record()
                 end.synchronize()
-                samples.append(start.elapsed_time(end))
+                if step >= self.WARMUP_STEPS:
+                    samples.append(start.elapsed_time(end))
             return statistics.median(samples)
 
 

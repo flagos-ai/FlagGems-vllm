@@ -62,12 +62,11 @@ def _load_effective_token(
 
 
 @triton.jit
-def _update_committed_marker_cache_kernel(
-    req_ids_ptr,
-    thinking_token_budget_ptr,
+def _update_committed_marker_cache(
+    req_state_idx,
     all_token_ids_ptr,
     all_token_ids_stride,
-    total_len_ptr,
+    total_len,
     cached_last_start_ptr,
     cached_last_end_ptr,
     cached_scan_pos_ptr,
@@ -81,12 +80,6 @@ def _update_committed_marker_cache_kernel(
     WARPS: tl.constexpr,
     ELEMENTS: tl.constexpr,
 ):
-    req_state_idx = tl.load(req_ids_ptr + tl.program_id(0))
-    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
-    if budget < 0:
-        return
-
-    total_len = tl.load(total_len_ptr + req_state_idx)
     scan_pos = tl.load(cached_scan_pos_ptr + req_state_idx)
     last_start = tl.load(cached_last_start_ptr + req_state_idx)
     last_end = tl.load(cached_last_end_ptr + req_state_idx)
@@ -98,13 +91,17 @@ def _update_committed_marker_cache_kernel(
 
     if scan_pos == 0 and last_start < 0 and last_end < 0:
         # Cold scan: walk backward in vectorized blocks, stopping at the first
-        # block with a marker; only the relative order of the two positions
-        # found matters below.
+        # block with a marker. Preserve both marker positions from that block.
         offsets = tl.arange(0, BLOCK)
         if USE_TLE:
+            # TLE reduction hints require a parent encoding of rank >= 2.
             offsets = tle.gpu.set_layout(
-                offsets, tle.gpu.BlockEncoding([ELEMENTS], [32], [WARPS], [0])
+                offsets[None, :],
+                tle.gpu.BlockEncoding([1, ELEMENTS], [1, 32], [1, WARPS], [1, 0]),
             )
+        # Zero means no match; bit 0 distinguishes end from start. Encode
+        # tile-local offsets so keys do not grow with the history length.
+        marker_keys = (offsets + 1) * 2
         block_hi = total_len
         while block_hi > 0 and last_start < 0 and last_end < 0:
             block_lo = block_hi - BLOCK
@@ -132,8 +129,32 @@ def _update_committed_marker_cache_kernel(
                 )
                 end_match = end_match & (actual == expected)
 
-            last_start = tl.max(tl.where(start_match, offs, -1), axis=0)
-            last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
+            # Empty blocks only need one reduction. On a hit, the key already
+            # gives one marker's last position; reduce only the other kind.
+            last_key = tl.max(
+                tl.where(
+                    end_match,
+                    marker_keys + 1,
+                    tl.where(start_match, marker_keys, 0),
+                ),
+                axis=1 if USE_TLE else 0,
+            )
+            if USE_TLE:
+                last_key = tl.reshape(last_key, ())
+            if last_key != 0:
+                is_end = (last_key & 1) != 0
+                last_pos = block_lo + (last_key >> 1) - 1
+                other_match = tl.where(is_end, start_match, end_match)
+                other_pos = tl.max(
+                    tl.where(other_match, offs, -1), axis=1 if USE_TLE else 0
+                )
+                if USE_TLE:
+                    other_pos = tl.reshape(other_pos, ())
+                last_start = tl.where(is_end, other_pos, last_pos)
+                last_end = tl.where(is_end, last_pos, other_pos)
+            else:
+                last_start = -1
+                last_end = -1
             block_hi = block_lo
     else:
         for i in tl.range(scan_pos, total_len):
@@ -165,6 +186,53 @@ def _update_committed_marker_cache_kernel(
     if new_scan_pos < 0:
         new_scan_pos = 0
     tl.store(cached_scan_pos_ptr + req_state_idx, new_scan_pos)
+    return last_start, last_end
+
+
+@triton.jit
+def _update_committed_marker_cache_kernel(
+    req_ids_ptr,
+    thinking_token_budget_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    total_len_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
+    cached_scan_pos_ptr,
+    reasoning_start_token_ids_ptr,
+    natural_reasoning_end_token_ids_ptr,
+    START_LEN: tl.constexpr,
+    NATURAL_END_LEN: tl.constexpr,
+    MAX_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_TLE: tl.constexpr,
+    WARPS: tl.constexpr,
+    ELEMENTS: tl.constexpr,
+):
+    req_state_idx = tl.load(req_ids_ptr + tl.program_id(0))
+    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
+    if budget < 0:
+        return
+
+    total_len = tl.load(total_len_ptr + req_state_idx)
+    _update_committed_marker_cache(
+        req_state_idx,
+        all_token_ids_ptr,
+        all_token_ids_stride,
+        total_len,
+        cached_last_start_ptr,
+        cached_last_end_ptr,
+        cached_scan_pos_ptr,
+        reasoning_start_token_ids_ptr,
+        natural_reasoning_end_token_ids_ptr,
+        START_LEN,
+        NATURAL_END_LEN,
+        MAX_LEN,
+        BLOCK,
+        USE_TLE,
+        WARPS,
+        ELEMENTS,
+    )
 
 
 @triton.jit
@@ -186,6 +254,11 @@ def _thinking_budget_kernel(
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
+    cached_scan_pos_ptr=None,
+    BLOCK: tl.constexpr = 1024,
+    USE_TLE: tl.constexpr = False,
+    WARPS: tl.constexpr = 4,
+    ELEMENTS: tl.constexpr = 1,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -198,8 +271,30 @@ def _thinking_budget_kernel(
     total_len = tl.load(total_len_ptr + req_state_idx)
     effective_len = total_len + local_pos
 
-    last_start = tl.load(cached_last_start_ptr + req_state_idx)
-    last_end = tl.load(cached_last_end_ptr + req_state_idx)
+    if cached_scan_pos_ptr is not None:
+        # The host only fuses when each request owns exactly one logits row.
+        # Reuse the updated positions directly, without a second launch/load.
+        last_start, last_end = _update_committed_marker_cache(
+            req_state_idx,
+            all_token_ids_ptr,
+            all_token_ids_stride,
+            total_len,
+            cached_last_start_ptr,
+            cached_last_end_ptr,
+            cached_scan_pos_ptr,
+            reasoning_start_token_ids_ptr,
+            natural_reasoning_end_token_ids_ptr,
+            START_LEN,
+            NATURAL_END_LEN,
+            START_LEN if START_LEN >= NATURAL_END_LEN else NATURAL_END_LEN,
+            BLOCK,
+            USE_TLE,
+            WARPS,
+            ELEMENTS,
+        )
+    else:
+        last_start = tl.load(cached_last_start_ptr + req_state_idx)
+        last_end = tl.load(cached_last_end_ptr + req_state_idx)
 
     start_lo = total_len - START_LEN + 1
     if start_lo < 0:
@@ -290,6 +385,7 @@ def _prune_cache_configs(configs, named_args, **kwargs):
 
 _cache_entry = _update_committed_marker_cache_kernel
 _thinking_entry = _thinking_budget_kernel
+_fused_entry = _thinking_budget_kernel
 if runtime.device.vendor_name == "nvidia":
     _cache_entry = libtuner(
         configs=runtime.get_tuned_config("thinking_budget_cache"),
@@ -312,8 +408,23 @@ if runtime.device.vendor_name == "nvidia":
         rep=30,
         use_cuda_graph=False,
     )(_thinking_entry)
+    _fused_entry = libtuner(
+        configs=runtime.get_tuned_config("thinking_budget_fused"),
+        key=["START_LEN", "NATURAL_END_LEN", "END_LEN", "USE_TLE"],
+        prune_configs_by={"early_config_prune": _prune_cache_configs},
+        restore_value=[
+            "logits_ptr",
+            "cached_last_start_ptr",
+            "cached_last_end_ptr",
+            "cached_scan_pos_ptr",
+        ],
+        warmup=5,
+        rep=30,
+        use_cuda_graph=False,
+    )(_fused_entry)
 _cache_entry = libentry()(_cache_entry)
 _thinking_entry = libentry()(_thinking_entry)
+_fused_entry = libentry()(_fused_entry)
 
 
 def apply_thinking_budget(
@@ -348,6 +459,37 @@ def apply_thinking_budget(
         cache_options.update(WARPS=4, ELEMENTS=1, num_warps=4, num_stages=1)
         thinking_options.update(num_warps=4, num_stages=1)
     with runtime.torch_device_fn.device(logits.device):
+        # vLLM's common no-draft path reuses idx_mapping directly. Identity
+        # plus matching row counts preserves the one-CTA-per-request contract.
+        if (
+            runtime.device.vendor_name == "nvidia"
+            and req_ids is expanded_idx_mapping
+            and req_ids.shape[0] == num_tokens
+        ):
+            if num_tokens:
+                _fused_entry[(num_tokens,)](
+                    logits,
+                    logits.stride(0),
+                    expanded_idx_mapping,
+                    thinking_token_budget,
+                    all_token_ids,
+                    all_token_ids.stride(0),
+                    total_len,
+                    input_ids,
+                    expanded_local_pos,
+                    cached_last_start,
+                    cached_last_end,
+                    reasoning_start_token_ids,
+                    natural_reasoning_end_token_ids,
+                    reasoning_end_token_ids,
+                    START_LEN=start_len,
+                    NATURAL_END_LEN=natural_end_len,
+                    END_LEN=end_len,
+                    cached_scan_pos_ptr=cached_scan_pos,
+                    BLOCK=1024,
+                    USE_TLE=_use_tle(logits.device),
+                )
+            return
         if req_ids.shape[0]:
             _cache_entry[(req_ids.shape[0],)](
                 req_ids,

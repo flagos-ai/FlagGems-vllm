@@ -23,6 +23,17 @@ thinking_budget_cache:
     num_warps: 8
     num_stages: 1
 
+thinking_budget_fused:
+  - META: {WARPS: 4, ELEMENTS: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {WARPS: 4, ELEMENTS: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {WARPS: 8, ELEMENTS: 1}
+    num_warps: 8
+    num_stages: 1
+
 thinking_budget:
   - META: {}
     num_warps: 1

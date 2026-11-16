@@ -9,8 +9,10 @@ Adapted from tests/v1/worker/test_gpu_thinking_budget.py at
 
 import pytest
 import torch
+from vllm.v1.worker.gpu.sample.thinking_budget import (
+    apply_thinking_budget as vllm_reference,
+)
 
-from baseline.thinking_budget import apply_thinking_budget as vllm_reference
 from flaggems_vllm import apply_thinking_budget, runtime
 from flaggems_vllm import device as DEVICE
 
@@ -46,10 +48,17 @@ def make_inputs(
     budgets[3] = budget
     lengths = torch.zeros(4, dtype=torch.int32, device=DEVICE)
     lengths[3] = len(tokens)
+    req_ids = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+    # Match model_runner's shared mapping for one sampled row per request.
+    mapping = (
+        req_ids
+        if rows == 1
+        else torch.full((rows,), 3, dtype=torch.int32, device=DEVICE)
+    )
     return [
         logits,
-        torch.tensor([3], dtype=torch.int32, device=DEVICE),
-        torch.full((rows,), 3, dtype=torch.int32, device=DEVICE),
+        req_ids,
+        mapping,
         budgets,
         history,
         lengths,
