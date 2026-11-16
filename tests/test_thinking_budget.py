@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Public-entry comparisons using vLLM's GPU thinking-budget cases.
-
-Adapted from tests/v1/worker/test_gpu_thinking_budget.py at
-947dd62c0700851a79b0a8f32cb823e25a003b31.
-"""
+"""Compare public thinking-budget entry points on identical inputs."""
 
 import pytest
 import torch

@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Thinking-budget filtering aligned with vLLM Model Runner V2.
-
-Source: vllm/v1/worker/gpu/sample/thinking_budget.py
-Commit: 947dd62c0700851a79b0a8f32cb823e25a003b31
-"""
+"""Thinking-budget filtering aligned with vLLM Model Runner V2."""
 
 from functools import lru_cache
 
@@ -398,7 +394,6 @@ if runtime.device.vendor_name == "nvidia":
         ],
         warmup=5,
         rep=30,
-        use_cuda_graph=False,
     )(_cache_entry)
     _thinking_entry = libtuner(
         configs=runtime.get_tuned_config("thinking_budget"),
@@ -406,7 +401,6 @@ if runtime.device.vendor_name == "nvidia":
         restore_value=["logits_ptr"],
         warmup=5,
         rep=30,
-        use_cuda_graph=False,
     )(_thinking_entry)
     _fused_entry = libtuner(
         configs=runtime.get_tuned_config("thinking_budget_fused"),
@@ -420,7 +414,6 @@ if runtime.device.vendor_name == "nvidia":
         ],
         warmup=5,
         rep=30,
-        use_cuda_graph=False,
     )(_fused_entry)
 _cache_entry = libentry()(_cache_entry)
 _thinking_entry = libentry()(_thinking_entry)

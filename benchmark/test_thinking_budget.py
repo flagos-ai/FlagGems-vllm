@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Public-entry workloads adapted from vLLM's thinking-budget benchmark.
+"""Compare public thinking-budget entry points on identical workloads.
 
-Source: benchmarks/kernels/benchmark_thinking_budget.py at
-947dd62c0700851a79b0a8f32cb823e25a003b31.
-
-Cold/incremental workloads use upstream's 10 warmup and 100 measured steps.
+Cold/incremental workloads use stepwise kernel event timing with 10 warmup
+and 100 measured steps. Other timing modes are not implemented for these cases.
 The standard --warmup/--iter millisecond budgets apply to steady-state modes.
 """
 
@@ -25,9 +23,8 @@ from flaggems_vllm import apply_thinking_budget, runtime
 pytestmark = [
     pytest.mark.apply_thinking_budget,
     pytest.mark.skipif(
-        runtime.device.vendor_name != "nvidia"
-        or not runtime.torch_device_fn.is_available(),
-        reason="NVIDIA event-timing benchmark",
+        not runtime.torch_device_fn.is_available(),
+        reason="requires the active accelerator",
     ),
 ]
 
@@ -63,13 +60,6 @@ class ThinkingBudgetBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = self.DEFAULT_SHAPES
-
-    def init_user_config(self):
-        if Config.mode != consts.BenchMode.KERNEL:
-            raise ValueError(
-                "apply_thinking_budget requires --mode kernel; CUDA Graph is disabled"
-            )
-        super().init_user_config()
 
     def get_input_iter(self, dtype):
         for self._case in self.shapes:
@@ -132,6 +122,10 @@ class ThinkingBudgetBenchmark(base.Benchmark):
         mode, history_len, _ = self._case
         cold_scan = mode.startswith("cold-")
         incremental = mode == "incremental-decode"
+        if (cold_scan or incremental) and Config.mode != consts.BenchMode.KERNEL:
+            raise NotImplementedError(
+                f"{mode} requires --mode kernel for stepwise event timing"
+            )
 
         def restore():
             for index, original in zip((0, 5, 8, 9, 10), self._original):
@@ -158,9 +152,7 @@ class ThinkingBudgetBenchmark(base.Benchmark):
                     args[9].fill_(-1)
                     args[10].zero_()
                 else:
-                    # Each provider replays the same growing history. The tail
-                    # is preallocated with token 10, so no history clone is needed.
-                    args[4][:, history_len + step].fill_(10)
+                    # The history tail is already filled with token 10.
                     args[5].fill_(history_len + step + 1)
                 device_api.synchronize()
                 start.record()
