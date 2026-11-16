@@ -41,7 +41,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     ".github/backends.json",
     ".github/configs/ci-backends.yaml",
     ".github/workflows/backend-test.yaml",
-    ".github/workflows/basic-ci.yml",
+    ".github/workflows/unittest.yaml",
     "benchmark/conftest.py",
     "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
