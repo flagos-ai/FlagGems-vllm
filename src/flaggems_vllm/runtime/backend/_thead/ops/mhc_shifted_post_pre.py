@@ -53,6 +53,18 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
+# TLE async loads need both the language surface and the PPU pass that lowers
+# them to AIU descriptors.  The regular load paths stay available when either
+# is missing.
+try:
+    import triton.experimental.tle.language as tle
+    from triton._C.libtriton import ppu as _ppu
+
+    _HAS_AIU = _ppu.passes.ttppugpuir.add_tle_promote_async_load_to_aiu is not None
+except Exception:  # noqa: BLE001 - optional compiler feature
+    tle = None
+    _HAS_AIU = False
+
 # Smallest BLOCK_H in the tuned space.  The per-token sum-of-squares scratch is
 # sized for it, so every tuned tile partition fits the same buffer.
 _MIN_BLOCK_H = 128
@@ -60,6 +72,13 @@ _MIN_BLOCK_H = 128
 # PPU-ZW810E has 64 SMs.  Split-K aims to fill them without shattering each
 # split below one useful K tile.
 _TARGET_CTAS = 64
+
+# AIU staging only breaks even once the K loop is long enough to amortize the
+# descriptor setup: at 4H <= 20480 (H <= 5120) the M tiles already keep the
+# machine busy and the stream-split kernel is as fast or faster, while at
+# 4H = 28672 (H = 7168) the AIU A load is 1.05-1.18x ahead.  Gate on K, not on
+# H, because K is the loop that pays for the staging.
+_AIU_MIN_K = 24576
 
 _FN_PACK_CACHE: dict = {}
 
@@ -672,6 +691,74 @@ def _mhc_shifted_project_thead_kernel(
 
 @libentry()
 @libtuner(
+    configs=runtime.get_tuned_config("mhc_shifted_project_thead_aiu"),
+    key=["num_tokens", "hc_hidden_size", "split_k"],
+)
+@triton.jit
+def _mhc_shifted_project_thead_aiu_kernel(
+    a_ptr,  # (num_tokens, hc_hidden_size) bfloat16, contiguous rows
+    bt_ptr,  # (hc_hidden_size, mix_stride) bfloat16, zero-padded
+    out_ptr,  # (split_k, num_tokens, mix_size) float32
+    num_tokens,
+    hc_hidden_size,
+    mix_size,
+    a_stride_n,
+    bt_stride,
+    split_k,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PIPE_STAGES: tl.constexpr,
+):
+    """Full-K project with an AIU async A load.
+
+    The AIU descriptor needs the whole logical row, so this variant only covers
+    the contiguous ``(N, hc*H)`` matrix.  The stream-split kernel's A is a
+    strided ``(N, H)`` sub-matrix and must keep regular loads.
+    """
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    m_mask = offs_m < num_tokens
+    n_mask = offs_n < mix_size
+
+    k_per_split = tl.cdiv(hc_hidden_size, split_k)
+    k_begin = pid_k * k_per_split
+    k_end = tl.minimum(k_begin + k_per_split, hc_hidden_size)
+
+    a_bp = tl.make_block_ptr(
+        base=a_ptr,
+        shape=(num_tokens, hc_hidden_size),
+        strides=(a_stride_n, 1),
+        offsets=(pid_m * BLOCK_M, k_begin),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in tl.range(k_begin, k_end, BLOCK_K, num_stages=PIPE_STAGES):
+        a = tle.load(a_bp, boundary_check=(0, 1), padding_option="zero", is_async=True)
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < k_end
+        b = tl.load(
+            bt_ptr + offs_k[:, None] * bt_stride + offs_n[None, :],
+            mask=k_mask[:, None] & (offs_n[None, :] < bt_stride),
+            other=0.0,
+        )
+        acc = tl.dot(a, b, acc)
+        a_bp = tl.advance(a_bp, (0, BLOCK_K))
+
+    tl.store(
+        out_ptr + (pid_k * num_tokens + offs_m[:, None]) * mix_size + offs_n[None, :],
+        acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+@libentry()
+@libtuner(
     configs=runtime.get_tuned_config("mhc_shifted_project_thead_stream"),
     key=["num_tokens", "hidden_size", "split_k"],
 )
@@ -745,7 +832,7 @@ def _mhc_shifted_project_thead_stream_kernel(
 @triton.jit
 def _mhc_shifted_reduce_coeff_thead_kernel(
     part_ptr,  # (split_k, num_tokens, MIX_SIZE) float32
-    ssq_part_ptr,  # (num_tokens, max_tiles) float32
+    ssq_part_ptr,  # (num_tokens, ssq_stride) float32
     scale_ptr,  # (3,) float32
     base_ptr,  # (MIX_SIZE,) float32
     pre_out_ptr,  # (num_tokens, HC) float32
@@ -762,59 +849,74 @@ def _mhc_shifted_reduce_coeff_thead_kernel(
     HC_PAD: tl.constexpr,
     SPLIT_BLOCK: tl.constexpr,
     SSQ_BLOCK: tl.constexpr,
+    TOKEN_TILE: tl.constexpr,
     PRE_EPS: tl.constexpr,
     SINK_EPS: tl.constexpr,
     POST_MULT: tl.constexpr,
     SINK_REPEAT: tl.constexpr,
 ):
-    """Reduce split-K and sum-of-squares partials, then build coefficients."""
-    n = tl.program_id(0)
+    """Reduce project partials and build the Sinkhorn coefficients.
+
+    ``TOKEN_TILE`` tokens share one program, so the serial Sinkhorn chain runs
+    as ``[T]``-vector math and the grid shrinks by the same factor.  The
+    per-token arithmetic and the fixed reduction order are unchanged.
+
+    hc=4 only (the thead dispatch): ``HC_PAD == HC``, and the stored comb block
+    is ``HC * HC`` contiguous values, so it is loaded flat and reshaped.
+    """
+    pid = tl.program_id(0)
+    offs_t = pid * TOKEN_TILE + tl.arange(0, TOKEN_TILE)
+    t_mask = offs_t < num_tokens
+
     idx = tl.arange(0, HC_PAD)
     valid = idx < HC
     comb_idx = idx[:, None] * HC + idx[None, :]
     comb_valid = valid[:, None] & valid[None, :]
+    cflat = tl.arange(0, HC * HC)
 
-    # Vectorised split-K reduction: one masked load per coefficient group.
+    # Vectorised split reduction: one masked load per coefficient group.
     si = tl.arange(0, SPLIT_BLOCK)
     s_valid = si < split_k
-    split_base = (si * num_tokens + n) * MIX_SIZE
+    split_base = (si[:, None] * num_tokens + offs_t[None, :]) * MIX_SIZE
     pre = tl.sum(
         tl.load(
-            part_ptr + split_base[:, None] + idx[None, :],
-            mask=s_valid[:, None] & valid[None, :],
+            part_ptr + split_base[:, :, None] + idx[None, None, :],
+            mask=s_valid[:, None, None] & t_mask[None, :, None] & valid[None, None, :],
             other=0.0,
         ),
         axis=0,
     )
     post = tl.sum(
         tl.load(
-            part_ptr + split_base[:, None] + (HC + idx)[None, :],
-            mask=s_valid[:, None] & valid[None, :],
+            part_ptr + split_base[:, :, None] + (HC + idx)[None, None, :],
+            mask=s_valid[:, None, None] & t_mask[None, :, None] & valid[None, None, :],
             other=0.0,
         ),
         axis=0,
     )
-    comb = tl.sum(
+    comb_flat = tl.sum(
         tl.load(
-            part_ptr + split_base[:, None, None] + (2 * HC + comb_idx)[None, :, :],
-            mask=s_valid[:, None, None] & comb_valid[None, :, :],
+            part_ptr + split_base[:, :, None] + (2 * HC + cflat)[None, None, :],
+            mask=s_valid[:, None, None] & t_mask[None, :, None],
             other=0.0,
         ),
         axis=0,
     )
+    comb = tl.reshape(comb_flat, (TOKEN_TILE, HC_PAD, HC_PAD))
 
     # Fixed-order tile reduction: bitwise deterministic across calls.  The
     # runtime bounds keep the varying tile counts out of the constexpr
     # signature (the persistent tuner cache treats those as config columns).
-    ssq = 0.0
+    ssq = tl.zeros((TOKEN_TILE,), dtype=tl.float32)
     for t0 in range(0, ssq_tiles, SSQ_BLOCK):
         ti = t0 + tl.arange(0, SSQ_BLOCK)
         ssq += tl.sum(
             tl.load(
-                ssq_part_ptr + n * ssq_stride + ti,
-                mask=ti < ssq_tiles,
+                ssq_part_ptr + offs_t[:, None] * ssq_stride + ti[None, :],
+                mask=t_mask[:, None] & (ti[None, :] < ssq_tiles),
                 other=0.0,
-            )
+            ),
+            axis=1,
         )
 
     scale_0 = tl.load(scale_ptr + 0)
@@ -822,36 +924,38 @@ def _mhc_shifted_reduce_coeff_thead_kernel(
     scale_2 = tl.load(scale_ptr + 2)
     rms_inv = tl.rsqrt(ssq / hc_hidden_size + RSUM_EPS)
 
-    pre_logits = pre * rms_inv * scale_0
-    pre_logits += tl.load(base_ptr + idx, mask=valid, other=0.0)
+    pre_logits = pre * rms_inv[:, None] * scale_0
+    pre_logits += tl.load(base_ptr + idx, mask=valid, other=0.0)[None, :]
     tl.store(
-        pre_out_ptr + n * HC + idx,
+        pre_out_ptr + offs_t[:, None] * HC + idx[None, :],
         tl.sigmoid(pre_logits) + PRE_EPS,
-        mask=valid,
+        mask=t_mask[:, None] & valid[None, :],
     )
 
-    post_logits = post * rms_inv * scale_1
-    post_logits += tl.load(base_ptr + HC + idx, mask=valid, other=0.0)
+    post_logits = post * rms_inv[:, None] * scale_1
+    post_logits += tl.load(base_ptr + HC + idx, mask=valid, other=0.0)[None, :]
     tl.store(
-        post_out_ptr + n * HC + idx,
+        post_out_ptr + offs_t[:, None] * HC + idx[None, :],
         tl.sigmoid(post_logits) * POST_MULT,
-        mask=valid,
+        mask=t_mask[:, None] & valid[None, :],
     )
 
-    comb = comb * rms_inv * scale_2
-    comb += tl.load(base_ptr + 2 * HC + comb_idx, mask=comb_valid, other=0.0)
-    comb = tl.where(comb_valid, comb, float("-inf"))
-    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
-    comb = comb / tl.sum(comb, axis=1)[:, None]
-    comb = tl.where(comb_valid, comb + SINK_EPS, 0.0)
-    comb = comb / (tl.sum(comb, axis=0)[None, :] + SINK_EPS)
+    comb = comb * rms_inv[:, None, None] * scale_2
+    comb += tl.load(base_ptr + 2 * HC + comb_idx, mask=comb_valid, other=0.0)[
+        None, :, :
+    ]
+    comb = tl.where(comb_valid[None, :, :], comb, float("-inf"))
+    comb = tl.exp(comb - tl.max(comb, axis=2)[:, :, None])
+    comb = comb / tl.sum(comb, axis=2)[:, :, None]
+    comb = tl.where(comb_valid[None, :, :], comb + SINK_EPS, 0.0)
+    comb = comb / (tl.sum(comb, axis=1)[:, None, :] + SINK_EPS)
     for _ in range(SINK_REPEAT - 1):
-        comb = comb / (tl.sum(comb, axis=1)[:, None] + SINK_EPS)
-        comb = comb / (tl.sum(comb, axis=0)[None, :] + SINK_EPS)
+        comb = comb / (tl.sum(comb, axis=2)[:, :, None] + SINK_EPS)
+        comb = comb / (tl.sum(comb, axis=1)[:, None, :] + SINK_EPS)
     tl.store(
-        comb_out_ptr + n * HC * HC + comb_idx,
+        comb_out_ptr + offs_t[:, None, None] * (HC * HC) + comb_idx[None, :, :],
         comb,
-        mask=comb_valid,
+        mask=t_mask[:, None, None] & comb_valid[None, :, :],
     )
 
 
@@ -952,6 +1056,37 @@ def mhc_shifted_project_thead(a_flat, fn_packed, num_tokens, mix_size):
     triton.knobs.autotuning.adjust_block_size = False
     try:
         _mhc_shifted_project_thead_kernel[
+            lambda meta: (
+                triton.cdiv(num_tokens, meta["BLOCK_M"]),
+                triton.cdiv(mix_size, meta["BLOCK_N"]),
+                split_k,
+            )
+        ](
+            a_flat,
+            fn_packed,
+            partials,
+            num_tokens,
+            a_flat.shape[1],
+            mix_size,
+            a_flat.stride(0),
+            fn_packed.stride(0),
+            split_k,
+        )
+    finally:
+        triton.knobs.autotuning.adjust_block_size = aabs
+    return partials, split_k
+
+
+def mhc_shifted_project_thead_aiu(a_flat, fn_packed, num_tokens, mix_size):
+    """Full-K project with AIU A loads; return ``(partials, split_k)``."""
+    split_k = _split_k_for(num_tokens, a_flat.shape[1])
+    partials = torch.empty(
+        split_k, num_tokens, mix_size, dtype=torch.float32, device=a_flat.device
+    )
+    aabs = triton.knobs.autotuning.adjust_block_size
+    triton.knobs.autotuning.adjust_block_size = False
+    try:
+        _mhc_shifted_project_thead_aiu_kernel[
             lambda meta: (
                 triton.cdiv(num_tokens, meta["BLOCK_M"]),
                 triton.cdiv(mix_size, meta["BLOCK_N"]),
@@ -1219,10 +1354,16 @@ def mhc_shifted_post_pre_thead(
         )
 
     # (2) projection.  Above 256 tokens the four-stream split shortens each
-    # CTA's K loop; smaller batches keep the full-K split-K kernel.
+    # CTA's K loop; smaller batches keep the full-K split-K kernel.  The AIU A
+    # load replaces the stream split only for long-K batches, where its
+    # staging is amortized (see _AIU_MIN_K).
     a_flat = residual_cur.view(num_tokens, hc * hidden_size)
     fn_packed = _fn_bf16_packed(fn)
-    if num_tokens >= 256:
+    if _HAS_AIU and 256 <= num_tokens < 1024 and hc * hidden_size >= _AIU_MIN_K:
+        project_partials, split_k = mhc_shifted_project_thead_aiu(
+            a_flat, fn_packed, num_tokens, mix_size
+        )
+    elif num_tokens >= 256:
         project_partials, split_k = mhc_shifted_project_thead_stream(
             a_flat, fn_packed, num_tokens, mix_size
         )
@@ -1240,7 +1381,9 @@ def mhc_shifted_post_pre_thead(
     aabs = triton.knobs.autotuning.adjust_block_size
     triton.knobs.autotuning.adjust_block_size = False
     try:
-        _mhc_shifted_reduce_coeff_thead_kernel[(num_tokens,)](
+        _mhc_shifted_reduce_coeff_thead_kernel[
+            lambda meta: (triton.cdiv(num_tokens, meta["TOKEN_TILE"]),)
+        ](
             project_partials,
             ssq_partials,
             hc_scale,

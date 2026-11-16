@@ -521,18 +521,17 @@ mhc_shifted_project_thead:
     w: [8]
     s: [4, 6]
 
-# Split-K + sum-of-squares reduction and Sinkhorn coefficients.  Tiny
-# per-token kernel; only the warp count moves.
+# Project-partial + sum-of-squares reduction and Sinkhorn coefficients.
+# TOKEN_TILE tokens share a program so the serial Sinkhorn runs as [T]-vector
+# math; T=1 keeps the old per-token shape.
 mhc_shifted_coeff_thead:
-  - META: {}
-    num_warps: 2
-    num_stages: 1
-  - META: {}
-    num_warps: 4
-    num_stages: 1
-  - META: {}
-    num_warps: 8
-    num_stages: 1
+  - gen: true
+    param_map:
+      META: {TOKEN_TILE: tt}
+      num_warps: w
+      num_stages: 1
+    tt: [1, 2, 4, 8]
+    w: [2, 4, 8]
 
 # One CTA per token for H <= 8192: post + collapse + sum of squares + optional
 # RMSNorm.  BLOCK_H is next_power_of_2(H) and comes from the host, so only the
@@ -573,3 +572,18 @@ mhc_shifted_post_collapse_norm_loop_thead:
     bh: [512, 1024, 2048]
     ps: [1, 2, 3]
     w: [4, 8]
+
+# Full-K project with an AIU async A load.  Only the contiguous (N, hc*H)
+# matrix is eligible: the stream-split A is a strided sub-matrix and keeps
+# regular loads.  PIPE_STAGES and num_stages must agree for the async copies.
+mhc_shifted_project_thead_aiu:
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn, PIPE_STAGES: ps}
+      num_warps: w
+      num_stages: ps
+    bm: [32, 64, 128]
+    bk: [64, 128]
+    bn: [32]
+    w: [4, 8]
+    ps: [3]
