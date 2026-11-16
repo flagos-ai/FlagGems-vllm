@@ -31,10 +31,18 @@ from tests.test_flash_mla_with_kvcache_w8a8 import quantize_dense_fp8
 
 from .accuracy_utils import gems_assert_close, gems_assert_equal, to_cpu, to_reference
 
+INT8_OP_NAME = "flash_mla_sparse_fwd_w8a8_int8"
+SPARSE_INT8_OP = dict(
+    flaggems_vllm.runtime.backend.get_customized_ops(flaggems_vllm.vendor_name)
+).get(INT8_OP_NAME)
+HAS_SPARSE_W8A8 = HAS_FP8_MLA or SPARSE_INT8_OP is not None
+
 
 @lru_cache(maxsize=1)
 def flashmla_reference() -> ModuleType:
-    """Load the explicitly selected, unmodified vLLM CUDA reference for tests only."""
+    """Load the native BF16 reference on the active backend."""
+    if SPARSE_INT8_OP is not None:
+        return importlib.import_module("flash_mla")
     reference_path = os.environ.get("FLAGGEMS_FLASHMLA_REFERENCE_PATH")
     if reference_path:
         # Initialize Torch shared libraries before loading the CUDA extension.
@@ -153,6 +161,99 @@ def quantize_sparse_fp8_fixture(
     )
 
 
+def quantize_sparse_int8_fixture(
+    q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None
+):
+    if value_dim != 512:
+        raise ValueError("INT8 sparse MLA requires value_dim=512")
+
+    def quantize(tensor):
+        tensor = tensor.float()
+        scale = (tensor[..., :512].abs().amax(-1, keepdim=True) / 127).clamp_min(1e-30)
+        nope = (tensor[..., :512] / scale).round().clamp(-127, 127).to(torch.int8)
+        rope = (tensor[..., 512:] / scale).to(q.dtype).contiguous()
+        return nope, rope, scale
+
+    q_nope, q_rope, q_scale = quantize(q)
+    k_nope, k_rope, k_scale = quantize(kv[:, 0])
+    pages = math.ceil(kv.shape[0] / 64)
+    pad = pages * 64 - kv.shape[0]
+    if pad:
+        k_nope = torch.nn.functional.pad(k_nope, (0, 0, 0, pad))
+        if k_rope.shape[-1]:
+            k_rope = torch.nn.functional.pad(k_rope, (0, 0, 0, pad))
+        else:
+            k_rope = torch.empty((pages * 64, 0), device=q.device, dtype=q.dtype)
+        k_scale = torch.nn.functional.pad(k_scale, (0, 0, 0, pad), value=1)
+    return (
+        q_nope[:, None],
+        q_rope[:, None],
+        k_nope.view(pages, 64, 512),
+        k_rope.view(pages, 64, q_rope.shape[-1]),
+        q_scale[:, None],
+        k_scale.view(pages, 64, 1),
+        torch.where(indices < kv.shape[0], indices, -1),
+        sm_scale,
+        attn_sink,
+        topk_length,
+    )
+
+
+def dequantize_sparse_int8_fixture(packed, skv, dtype):
+    q_nope, q_rope, kv_nope, kv_rope, q_scale, k_scale, indices, sm, sink, length = (
+        packed
+    )
+    q = torch.cat((q_nope.float(), q_rope.float()), -1) * q_scale
+    q = q.flatten(0, 1)
+    indices = indices.flatten(0, 1)[:, None]
+    k_nope = kv_nope.view(-1, 512)[:skv]
+    k_rope = kv_rope.view(kv_nope.shape[0] * 64, q_rope.shape[-1])[:skv]
+    k = torch.cat((k_nope.float(), k_rope.float()), -1) * k_scale.view(-1, 1)[:skv]
+    return q.to(dtype), k[:, None].to(dtype), indices, sm, 512, sink, length
+
+
+def assert_sparse_int8_close(output, lse, reference, reference_lse, *, lse_atol=2e-4):
+    gems_assert_close(output, reference, output.dtype, atol=2e-3)
+    gems_assert_equal(torch.isposinf(lse), torch.isposinf(reference_lse))
+    finite = torch.isfinite(reference_lse)
+    gems_assert_close(lse[finite], reference_lse[finite], torch.float32, atol=lse_atol)
+
+
+def assert_sparse_int8_reference(packed, skv, output, lse):
+    from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
+
+    q, kv, indices, sm, dv, sink, length = dequantize_sparse_int8_fixture(
+        packed, skv, torch.float32
+    )
+    output = output.flatten(0, 1)
+    lse = lse.transpose(1, 2).flatten(0, 1)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for begin in range(0, q.shape[0], 8):
+            part = slice(begin, begin + 8)
+            reference, _, reference_lse = (
+                FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+                    q[part].shape[0],
+                    kv.shape[0],
+                    q.shape[1],
+                    kv.shape[1],
+                    q.shape[2],
+                    indices.shape[2],
+                    q[part],
+                    kv,
+                    indices[part],
+                    sm,
+                    dv,
+                    sink,
+                    length[part] if length is not None else None,
+                )
+            )
+            assert_sparse_int8_close(output[part], lse[part], reference, reference_lse)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
 def assert_sparse_fixture_close(output, lse, reference, reference_lse):
     reference = to_reference(reference)
     reference_lse = to_reference(reference_lse)
@@ -174,7 +275,7 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
-@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+@pytest.mark.skipif(not HAS_SPARSE_W8A8, reason="Sparse W8A8 MLA is not registered")
 @pytest.mark.parametrize(
     "shape",
     [
@@ -190,8 +291,45 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
 def test_flash_mla_sparse_flashmla(shape):
     inputs = make_sparse_inputs(shape)
     inputs[2][0].fill_(-1)
+    if SPARSE_INT8_OP is not None:
+        inputs[2][1, 0, :2] = 1
+        packed = quantize_sparse_int8_fixture(*inputs)
+        packed[6][1, 0, 2] = packed[2].shape[0] * 64
+        output, lse = SPARSE_INT8_OP(*packed)
+        assert_sparse_int8_reference(packed, inputs[1].shape[0], output, lse)
+        return
     reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*inputs)
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
         *quantize_sparse_fp8_fixture(*inputs)
     )
     assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(SPARSE_INT8_OP is None, reason="Sparse INT8 MLA is not registered")
+@pytest.mark.parametrize("topk", [0, 65])
+def test_sparse_int8_multiquery_fp16(topk):
+    # SQ=2 also exercises the head-major LSE layout.
+    inputs = make_sparse_inputs((4, 16, 576, 71, 1, max(topk, 1), 512), torch.float16)
+    packed = quantize_sparse_int8_fixture(*inputs)
+    q, rope, k, kr, qs, ks, indices, sm, sink, length = packed
+    packed = (
+        q.view(2, 2, 16, 512),
+        rope.view(2, 2, 16, 64),
+        k,
+        kr,
+        qs.view(2, 2, 16, 1),
+        ks,
+        indices[..., :topk].view(2, 2, topk),
+        sm,
+        sink,
+        length,
+    )
+    output, lse = SPARSE_INT8_OP(*packed)
+    assert output.dtype == torch.float16 and output.shape == (2, 2, 16, 512)
+    assert lse.dtype == torch.float32 and lse.shape == (2, 16, 2)
+    if topk == 0:
+        gems_assert_equal(output, torch.zeros_like(output))
+        gems_assert_equal(torch.isposinf(lse), torch.ones_like(lse, dtype=torch.bool))
+    else:
+        assert_sparse_int8_reference(packed, inputs[1].shape[0], output, lse)
