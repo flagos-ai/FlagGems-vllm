@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Compare the public min-p entry points on identical inputs.
-
-The dominant-token input and min_p=0/0.1 cases are adapted from
-tests/v1/logits_processors/test_correctness.py in vLLM at
-947dd62c0700851a79b0a8f32cb823e25a003b31.
-The shape matrix below is local coverage, not an upstream kernel case list.
-"""
+"""Compare the public min-p entry points on identical inputs."""
 
 import pytest
 import torch

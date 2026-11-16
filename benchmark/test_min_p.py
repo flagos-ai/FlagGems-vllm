@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Compare public min-p entry points with identical inputs and no CUDA Graph.
+"""Compare public min-p entry points on identical inputs.
 
-The dominant-token input and min_p=0.1 are adapted from
-tests/v1/logits_processors/test_correctness.py in vLLM at
-947dd62c0700851a79b0a8f32cb823e25a003b31.
-The shape matrix below is local coverage, not an upstream kernel case list.
-
-The standard kernel timer measures repeated calls on already-filtered logits
+The standard timer measures repeated calls on already-filtered logits
 after warmup. Each provider starts from the same original logits.
 """
 
@@ -16,16 +11,14 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
 
-from benchmark import base, consts
-from benchmark.conftest import Config
+from benchmark import base
 from flaggems_vllm import apply_min_p, runtime
 
 pytestmark = [
     pytest.mark.apply_min_p,
     pytest.mark.skipif(
-        runtime.device.vendor_name != "nvidia"
-        or not runtime.torch_device_fn.is_available(),
-        reason="NVIDIA event-timing benchmark",
+        not runtime.torch_device_fn.is_available(),
+        reason="requires the active accelerator",
     ),
 ]
 
@@ -46,13 +39,6 @@ class MinPBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = self.DEFAULT_SHAPES
-
-    def init_user_config(self):
-        if Config.mode != consts.BenchMode.KERNEL:
-            raise ValueError(
-                "apply_min_p requires --mode kernel; CUDA Graph is disabled"
-            )
-        super().init_user_config()
 
     def get_input_iter(self, dtype):
         for rows, vocab in self.shapes:

@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""In-place min-p filtering aligned with vLLM's GPU sampler.
-
-Source: vllm/v1/worker/gpu/sample/min_p.py at
-947dd62c0700851a79b0a8f32cb823e25a003b31.
-"""
+"""In-place min-p filtering aligned with vLLM's GPU sampler."""
 
 from functools import lru_cache
 
@@ -114,7 +110,6 @@ def _make_entry(config_name):
             restore_value=["logits_ptr"],
             warmup=5,
             rep=30,
-            use_cuda_graph=False,
         )(entry)
     return libentry()(entry)
 
@@ -135,7 +130,6 @@ def apply_min_p(
     if logits.stride(1) != 1:
         raise ValueError("apply_min_p requires unit column stride for logits")
 
-    # Initial path boundary; the crossover still needs H100 measurements.
     single_tile = vocab_size <= 8192
     entry = _min_p_single_tile_entry if single_tile else _min_p_streaming_entry
     launch_args = {}
