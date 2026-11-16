@@ -415,11 +415,11 @@ ops:
   stages:
   - beta: '3.0'
 - id: cooperative_topk
-  description: 'Select exact top-k indices from FP32 CUDA logits through vLLM''s in-place
+  description: 'Select exact top-k indices from FP32 logits through vLLM''s in-place
 
-    interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+    interface, with Ascend and Iluvatar fast paths. Supports up to 64 rows,
 
-    and -1 padding for short rows.
+    k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
 
     '
   for:
@@ -1025,6 +1025,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: gather_draft_sampled
+  description: Gather logits-aligned draft tokens and positions for speculative verification.
+  for:
+  - gather_draft_sampled
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gather_sampler_output
   description: Pack and restore batch-sharded tokens, counts, and logprobs around
     vLLM all-gather.
@@ -2135,13 +2146,21 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: topk_sigmoid
+  description: Selects MoE experts using sigmoid scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+  for:
+  - _moe_C.topk_sigmoid
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: topk_softmax
-  description: 'Selects the k most likely next-token candicates, sets all others to
-    zero,
-
-    and renormalize the prbabilities of these top candidates.
-
-    '
+  description: Selects MoE experts using softmax scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and marks padded experts.
   for:
   - _moe_C.topk_softmax
   labels:
