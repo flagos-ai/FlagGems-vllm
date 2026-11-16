@@ -27,9 +27,9 @@ try:
     )
 
     _HAS_VLLM_FP8_REF = True
-    _VLLM_FP8_HAS_UE8M0 = "use_ue8m0" in inspect.signature(
-        _vllm_per_token_group_quant_fp8
-    ).parameters
+    _VLLM_FP8_HAS_UE8M0 = (
+        "use_ue8m0" in inspect.signature(_vllm_per_token_group_quant_fp8).parameters
+    )
 except (ImportError, TypeError):
     _HAS_VLLM_FP8_REF = False
     _VLLM_FP8_HAS_UE8M0 = False
