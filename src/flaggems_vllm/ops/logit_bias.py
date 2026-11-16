@@ -70,45 +70,46 @@ def _bias_kernel(
         tl.store(row_ptr + ids, values + bias, mask)
 
     stop_count = tl.load(num_stop_token_ids_ptr + request)
-    position = tl.load(pos_ptr + row)
-    min_len = tl.load(min_lens_ptr + request)
-    if stop_count > 0 and position + 1 < min_len:
-        mask = offsets < stop_count
-        stop_ids = tl.load(
-            stop_token_ids_ptr + request * stop_token_ids_stride + offsets,
-            mask=mask,
-            other=0,
-        )
-        if CHECK_ALL_MASKED_ROWS:
-            should_restore = tl.load(restore_when_all_masked_ptr + request)
-            if should_restore:
-                stop_values = tl.load(
-                    row_ptr + stop_ids, mask=mask, other=-float("inf")
-                )
-                tl.debug_barrier()
-                tl.store(row_ptr + stop_ids, -float("inf"), mask)
-                tl.debug_barrier()
-                row_max = tl.full((), -float("inf"), tl.float32)
-                for start in range(0, vocab_size, LOGITS_BLOCK_SIZE):
-                    columns = start + tl.arange(0, LOGITS_BLOCK_SIZE)
-                    values = tl.load(
-                        row_ptr + columns,
-                        columns < vocab_size,
-                        other=-float("inf"),
+    if stop_count > 0:
+        position = tl.load(pos_ptr + row)
+        min_len = tl.load(min_lens_ptr + request)
+        if position + 1 < min_len:
+            mask = offsets < stop_count
+            stop_ids = tl.load(
+                stop_token_ids_ptr + request * stop_token_ids_stride + offsets,
+                mask=mask,
+                other=0,
+            )
+            if CHECK_ALL_MASKED_ROWS:
+                should_restore = tl.load(restore_when_all_masked_ptr + request)
+                if should_restore:
+                    stop_values = tl.load(
+                        row_ptr + stop_ids, mask=mask, other=-float("inf")
                     )
-                    row_max = tl.maximum(row_max, tl.max(values, 0))
-                if row_max == -float("inf"):
-                    tl.store(
-                        row_ptr + stop_ids,
-                        stop_values,
-                        mask
-                        & (stop_values > -float("inf"))
-                        & (stop_values < float("inf")),
-                    )
+                    tl.debug_barrier()
+                    tl.store(row_ptr + stop_ids, -float("inf"), mask)
+                    tl.debug_barrier()
+                    row_max = tl.full((), -float("inf"), tl.float32)
+                    for start in range(0, vocab_size, LOGITS_BLOCK_SIZE):
+                        columns = start + tl.arange(0, LOGITS_BLOCK_SIZE)
+                        values = tl.load(
+                            row_ptr + columns,
+                            columns < vocab_size,
+                            other=-float("inf"),
+                        )
+                        row_max = tl.maximum(row_max, tl.max(values, 0))
+                    if row_max == -float("inf"):
+                        tl.store(
+                            row_ptr + stop_ids,
+                            stop_values,
+                            mask
+                            & (stop_values > -float("inf"))
+                            & (stop_values < float("inf")),
+                        )
+                else:
+                    tl.store(row_ptr + stop_ids, -float("inf"), mask)
             else:
                 tl.store(row_ptr + stop_ids, -float("inf"), mask)
-        else:
-            tl.store(row_ptr + stop_ids, -float("inf"), mask)
 
 
 def apply_logit_bias(

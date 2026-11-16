@@ -104,7 +104,7 @@ def test_apply_logit_bias(dtype, check_all_masked_rows):
 
 
 def test_restore_across_vocab_tiles():
-    # Index 8192 is in the second tile of the upstream 8192-wide row scan.
+    # Index 8192 is in the second tile of the 8192-column row scan.
     vocab_size = 8193
     storage = torch.full((3, vocab_size + 7), 11.0, device=DEVICE, dtype=torch.float32)
     logits = storage[:, :vocab_size]
@@ -171,8 +171,35 @@ def test_restore_only_finite_stop_logits(nonfinite):
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("check_all_masked_rows", [False, True])
+def test_no_stop_token_ids(check_all_masked_rows):
+    logits = torch.tensor([[0.25, 1.5]], device=DEVICE, dtype=torch.float32)
+    zero = _i32([0])
+    one = _i32([1])
+    ids = _i32([[1]])
+    bias = torch.tensor([[0.5]], device=DEVICE, dtype=torch.float32)
+
+    flaggems_vllm.apply_logit_bias(
+        logits,
+        zero,
+        zero,
+        zero,
+        ids,
+        one,
+        ids,
+        bias,
+        _i32([2]),
+        zero,
+        one,
+        ids,
+        check_all_masked_rows=check_all_masked_rows,
+    )
+
+    expected = torch.tensor([[0.25, 2.0]], device=DEVICE, dtype=torch.float32)
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
 def test_apply_logit_bias_empty():
-    # Zero rows are part of the FlagGems-vllm wrapper contract tested here.
     logits = torch.empty((0, 17), device=DEVICE, dtype=torch.float32)
     mapping = _i32([])
     counts = _i32([0])
