@@ -52,6 +52,7 @@ RECORD_LOG = False
 RECORD_JSON = False
 TO_CPU = False
 QUICK_MODE = False
+FIRST_PARAMETER_ONLY = False
 
 device = flaggems_vllm.device
 
@@ -73,6 +74,12 @@ def pytest_addoption(parser):
         "--quick",
         action="store_true",
         help="run tests on quick mode",
+    )
+
+    parser.addoption(
+        "--first-parameter-only",
+        action="store_true",
+        help="Run only the first parameter combination for each test function",
     )
 
     try:
@@ -112,15 +119,15 @@ def pytest_configure(config):
     global RUNTEST_INFO
     global TO_CPU
     global QUICK_MODE
+    global FIRST_PARAMETER_ONLY
 
-    REGISTERED_MARKS = {
-        marker.split(":")[0].strip() for marker in config.getini("markers")
-    }
+    REGISTERED_MARKS = {marker.split(":")[0].strip() for marker in config.getini("markers")}
 
     RECORD_LOG = config.getoption("--record") == "log"
     RECORD_JSON = config.getoption("--record") == "json"
     TO_CPU = config.getoption("--ref") == "cpu"
     QUICK_MODE = config.getoption("--quick") is True
+    FIRST_PARAMETER_ONLY = config.getoption("--first-parameter-only") is True
 
     if RECORD_JSON:
         report_file = config.getoption("--output")
@@ -129,16 +136,20 @@ def pytest_configure(config):
 
     if RECORD_LOG:
         RUNTEST_INFO = {}
-        cmd_args = [
-            arg.replace(".py", "").replace("=", "_").replace("/", "_")
-            for arg in config.invocation_params.args
-        ]
+        cmd_args = [arg.replace(".py", "").replace("=", "_").replace("/", "_") for arg in config.invocation_params.args]
         logging.basicConfig(
             filename="result_{}.log".format("_".join(cmd_args)).replace("_-", "-"),
             filemode="w",
             level=logging.INFO,
             format="[%(levelname)s] %(message)s",
         )
+
+    # Print info when first-parameter-only is enabled
+    if FIRST_PARAMETER_ONLY:
+        print(f"\n{'='*70}")
+        print("FIRST-PARAMETER-ONLY MODE ENABLED")
+        print("   Each test function will run with only its first parameter combination")
+        print(f"{'='*70}\n")
 
 
 def pytest_runtest_teardown(item, nextitem):
@@ -148,9 +159,7 @@ def pytest_runtest_teardown(item, nextitem):
     if hasattr(item, "callspec"):
         all_marks = list(item.iter_markers())
         op_marks = [
-            mark.name
-            for mark in all_marks
-            if mark.name not in BUILTIN_MARKS and mark.name not in REGISTERED_MARKS
+            mark.name for mark in all_marks if mark.name not in BUILTIN_MARKS and mark.name not in REGISTERED_MARKS
         ]
         if len(op_marks) > 0:
             params = str(item.callspec.params)
@@ -200,9 +209,7 @@ def get_reason(report):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_logreport(report):
-    result = TEST_RESULTS.setdefault(
-        report.nodeid, {"params": None, "result": None, "opname": None}
-    )
+    result = TEST_RESULTS.setdefault(report.nodeid, {"params": None, "result": None, "opname": None})
     if report.when == "setup":
         if report.outcome == "skipped":
             reason = get_reason(report)
@@ -234,8 +241,83 @@ def pytest_terminal_summary(terminalreporter):
         os.fsync(json_file.fileno())
 
 
+def _item_has_bfloat16_dtype(item):
+    """Check if a parameterized test item includes bfloat16 in its dtype parameter."""
+    if not hasattr(item, "callspec") or item.callspec is None:
+        return False
+
+    for param_name, param_value in item.callspec.params.items():
+        if "dtype" not in param_name.lower():
+            continue
+        # Match torch.bfloat16, string "bfloat16", numpy dtype, etc.
+        if "bfloat16" in str(param_value).lower():
+            return True
+    return False
+
+
 def pytest_collection_modifyitems(session, config, items):
+    """
+    Modify the collected test items before they are executed.
+
+    This hook handles:
+    1. --collect-marks: Collect all test marks and write to a YAML file
+    2. --first-parameter-only: Keep only one parameter combination per test function,
+       preferring the first one that uses bfloat16 dtype.
+    """
+
+    first_parameter_only = config.getoption("--first-parameter-only")
     collect_marks_file = config.getoption("--collect-marks")
+
+    if first_parameter_only:
+        # Group items by test function. For parameterized tests, drop the
+        # parameter part of the nodeid:
+        # "tests/test_add.py::test_add[dtype0-0.001-shape0]" -> "tests/test_add.py::test_add"
+        function_groups = {}
+
+        for item in items:
+            base_key = item.nodeid
+            if "[" in base_key:
+                base_key = base_key.split("[")[0]
+
+            if base_key not in function_groups:
+                function_groups[base_key] = []
+            function_groups[base_key].append(item)
+
+        # Keep only one item per group, preferring bfloat16
+        kept_items = []
+        bfloat16_count = 0
+        fallback_count = 0
+
+        for base_key, group_items in function_groups.items():
+            # Sort by nodeid to ensure deterministic selection
+            group_items.sort(key=lambda x: x.nodeid)
+
+            # Priority 1: first item that uses bfloat16 dtype
+            selected = None
+            for item in group_items:
+                if _item_has_bfloat16_dtype(item):
+                    selected = item
+                    bfloat16_count += 1
+                    break
+
+            # Priority 2: fallback to the very first item in the group
+            if selected is None:
+                selected = group_items[0]
+                fallback_count += 1
+
+            kept_items.append(selected)
+
+        original_count = len(items)
+        items[:] = kept_items
+
+        print(f"\n{'='*70}")
+        print("FIRST-PARAMETER-ONLY MODE ENABLED (bfloat16 preferred)")
+        print(f"   Original tests: {original_count}")
+        print(f"   Running tests:  {len(kept_items)} (one per test function)")
+        print(f"      bfloat16 preferred: {bfloat16_count}")
+        print(f"      fallback (no bfloat16): {fallback_count}")
+        print(f"{'='*70}\n")
+
     if collect_marks_file:
         report = []
         for item in items:
@@ -251,9 +333,7 @@ def pytest_collection_modifyitems(session, config, items):
 
             all_marks = list(item.iter_markers())
             op_marks = [
-                mark.name
-                for mark in all_marks
-                if mark.name not in BUILTIN_MARKS and mark.name not in REGISTERED_MARKS
+                mark.name for mark in all_marks if mark.name not in BUILTIN_MARKS and mark.name not in REGISTERED_MARKS
             ]
 
             data["marks"] = op_marks
@@ -264,3 +344,4 @@ def pytest_collection_modifyitems(session, config, items):
 
         # Skip all tests
         items.clear()
+        return
