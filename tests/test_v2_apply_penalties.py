@@ -135,7 +135,12 @@ def _sampling_device():
 @pytest.mark.v2_apply_penalties
 @pytest.mark.parametrize(
     "vocab_size,dtype",
-    [(1031, torch.bfloat16), (2057, torch.float16), (151939, torch.float32)],
+    [
+        (1031, torch.bfloat16),
+        (2057, torch.float16),
+        (151939, torch.float32),
+        (248320, torch.float16),
+    ],
 )
 def test_v2_apply_penalties(vocab_size, dtype):
     library, device = _sampling_device()

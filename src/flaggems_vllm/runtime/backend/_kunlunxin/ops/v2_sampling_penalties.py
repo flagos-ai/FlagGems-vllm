@@ -199,7 +199,12 @@ def _apply_penalties(
     offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = offset < vocab
     dst = logits + row * logits_stride + offset
-    original = tl.load(dst, valid, 0).to(tl.float32)
+    source = tl.load(dst, valid, 0)
+    original = source.to(tl.float32)
+    if logits.dtype.element_ty == tl.float16:
+        positive = source > tl.full((BLOCK,), 0.0, tl.float16)
+    else:
+        positive = original > 0.0
     dst_counts = tl.where(
         tl.load(positions + row) > 0,
         draft_counts + row * vocab + offset,
@@ -210,7 +215,7 @@ def _apply_penalties(
     repeated = ((packed >> (offset & 31)) & 1) != 0
     appeared = output_count > 0
     scale = tl.where(repeated | appeared, rep, 1.0)
-    value = original * tl.where(original > 0.0, 1.0 / scale, scale)
+    value = original * tl.where(positive, 1.0 / scale, scale)
     value -= freq * output_count
     value -= pres * appeared
     active = (rep != 1.0) | (freq != 0.0) | (pres != 0.0)
