@@ -13,6 +13,9 @@
 # limitations under the License.
 
 thinking_budget_cache:
+  - META: {WARPS: 2, ELEMENTS: 1}
+    num_warps: 2
+    num_stages: 1
   - META: {WARPS: 4, ELEMENTS: 1}
     num_warps: 4
     num_stages: 1
@@ -24,6 +27,9 @@ thinking_budget_cache:
     num_stages: 1
 
 thinking_budget_fused:
+  - META: {WARPS: 2, ELEMENTS: 1}
+    num_warps: 2
+    num_stages: 1
   - META: {WARPS: 4, ELEMENTS: 1}
     num_warps: 4
     num_stages: 1
@@ -37,6 +43,9 @@ thinking_budget_fused:
 thinking_budget:
   - META: {}
     num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
     num_stages: 1
   - META: {}
     num_warps: 4
