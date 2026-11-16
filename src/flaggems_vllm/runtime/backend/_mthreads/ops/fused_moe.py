@@ -2127,9 +2127,7 @@ def _fused_experts_impl(
     ):
         from .fused_moe_dense import dense_fused_moe
 
-        return dense_fused_moe(
-            hidden_states, w1, w2, topk_weights, topk_ids
-        )
+        return dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids)
 
     if _can_use_nopad_fp8_moe(
         hidden_states,
@@ -2887,8 +2885,10 @@ def _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=False):
     gate_up = None
     if need_gate_up:
         gate_up = data[
-            numel * n_inter + numel * H :
-            numel * n_inter + numel * H + 2 * numel * n_inter
+            numel * n_inter
+            + numel * H : numel * n_inter
+            + numel * H
+            + 2 * numel * n_inter
         ].view(numel, 2 * n_inter)
     return (
         counts,
@@ -2939,9 +2939,7 @@ def nopad_fused_moe(
         gate,
         cache3,
         gate_up,
-    ) = _get_buffers(
-        M, E, H, n_inter, topk, device, dtype, need_gate_up=split_shape
-    )
+    ) = _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=split_shape)
     out = torch.empty((M, H), device=device, dtype=dtype)
 
     ti_flat = topk_ids.reshape(-1)

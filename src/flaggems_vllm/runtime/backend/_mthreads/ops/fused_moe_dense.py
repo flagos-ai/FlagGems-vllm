@@ -138,12 +138,7 @@ def _grouped_gemm_kernel(
     offs_n = pn * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
     a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
-    b_ptrs = (
-        b_ptr
-        + expert * K * N
-        + offs_k[:, None] * N
-        + offs_n[None, :]
-    )
+    b_ptrs = b_ptr + expert * K * N + offs_k[:, None] * N + offs_n[None, :]
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BK)):
         a = tl.load(a_ptrs)
@@ -156,7 +151,9 @@ def _grouped_gemm_kernel(
 
 
 @triton.jit
-def _silu_mul_kernel(src_ptr, dst_ptr, total, n_inter: tl.constexpr, BLOCK: tl.constexpr):
+def _silu_mul_kernel(
+    src_ptr, dst_ptr, total, n_inter: tl.constexpr, BLOCK: tl.constexpr
+):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
@@ -216,8 +213,8 @@ def _transpose_weights(w):
 _CACHE = {}
 
 
-def _get_buffers(M, E, H, I, topk, device, dtype, max_tokens):
-    key = (M, E, H, I, topk, str(device), dtype)
+def _get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
+    key = (M, E, H, n_inter, topk, str(device), dtype)
     entry = _CACHE.get(key)
     if entry is not None:
         return entry
@@ -230,8 +227,8 @@ def _get_buffers(M, E, H, I, topk, device, dtype, max_tokens):
     inv_perm = torch.empty(M * topk, dtype=torch.int32, device=device)
     m_indices = torch.empty(max_tokens, dtype=torch.int32, device=device)
     hidden_perm = torch.empty(max_tokens, H, dtype=dtype, device=device)
-    gate_up = torch.empty(max_tokens, 2 * I, dtype=dtype, device=device)
-    act = torch.empty(max_tokens, I, dtype=dtype, device=device)
+    gate_up = torch.empty(max_tokens, 2 * n_inter, dtype=dtype, device=device)
+    act = torch.empty(max_tokens, n_inter, dtype=dtype, device=device)
     entry = (
         meta,
         row_token,
@@ -249,9 +246,11 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     """Run the dense grouped (padded-contiguous) BF16/fp16 path."""
     M, H = hidden_states.shape
     E, N, K = w1.shape
-    I = N // 2
-    if I < 256 or N % 128 or H % 64 or I % 64:
-        raise NotImplementedError("dense grouped MoE requires I>=256 and 64/128 alignment")
+    n_inter = N // 2
+    if n_inter < 256 or N % 128 or H % 64 or n_inter % 64:
+        raise NotImplementedError(
+            "dense grouped MoE requires n_inter>=256 and 64/128 alignment"
+        )
     topk = topk_ids.size(1)
     numel = M * topk
     device = hidden_states.device
@@ -266,7 +265,7 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         hidden_perm,
         gate_up,
         act,
-    ) = _get_buffers(M, E, H, I, topk, device, dtype, max_tokens)
+    ) = _get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens)
     counts = meta[:E]
     offsets = meta[E : 2 * E + 1]
     counters = meta[2 * E + 1 :]
@@ -278,9 +277,7 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     _padded_offsets_kernel[(1,)](counts, offsets, E=E, BM=BM)
     total = int(offsets[E].item())
 
-    _fill_m_indices_kernel[(E,)](
-        offsets, counts, m_indices, E=E, BM=BM, BLOCK=256
-    )
+    _fill_m_indices_kernel[(E,)](offsets, counts, m_indices, E=E, BM=BM, BLOCK=256)
     _fill_neg_kernel[(triton.cdiv(total, 1024),)](row_token, total, BLOCK=1024)
     _assign_padded_kernel[(triton.cdiv(numel, 1024),)](
         topk_ids.reshape(-1),
@@ -292,9 +289,7 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         topk=topk,
         BLOCK=1024,
     )
-    _compact_padded_kernel[
-        (triton.cdiv(total, 8), triton.cdiv(H, 256))
-    ](
+    _compact_padded_kernel[(triton.cdiv(total, 8), triton.cdiv(H, 256))](
         hidden_states,
         hidden_perm,
         row_token,
@@ -308,14 +303,14 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     w1t = _transpose_weights(w1)
     w2t = _transpose_weights(w2)
 
-    g1 = (total // BM) * triton.cdiv(2 * I, 128)
+    g1 = (total // BM) * triton.cdiv(2 * n_inter, 128)
     _grouped_gemm_kernel[(g1,)](
         hidden_perm,
         w1t,
         gate_up,
         m_indices,
         total,
-        2 * I,
+        2 * n_inter,
         H,
         BM=128,
         BN=128,
@@ -323,11 +318,11 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         num_warps=4,
         num_stages=2,
     )
-    _silu_mul_kernel[(triton.cdiv(total * I, 1024),)](
+    _silu_mul_kernel[(triton.cdiv(total * n_inter, 1024),)](
         gate_up,
         act,
-        total * I,
-        n_inter=I,
+        total * n_inter,
+        n_inter=n_inter,
         BLOCK=1024,
         num_warps=4,
     )
@@ -339,7 +334,7 @@ def dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         m_indices,
         total,
         H,
-        I,
+        n_inter,
         BM=128,
         BN=128,
         BK=64,
