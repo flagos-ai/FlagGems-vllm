@@ -15,9 +15,7 @@
 
 import pytest
 import torch
-from vllm.v1.worker.gpu.input_batch import (
-    get_num_sampled_and_rejected as vllm_op,
-)
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected as vllm_op
 
 import flaggems_vllm
 
@@ -86,9 +84,7 @@ def test_get_num_sampled_and_rejected_random():
 def test_get_num_sampled_and_rejected_thead_dispatch(caplog):
     from importlib import import_module
 
-    backend = import_module(
-        "flaggems_vllm.runtime.backend._thead.ops.input_batch"
-    )
+    backend = import_module("flaggems_vllm.runtime.backend._thead.ops.input_batch")
     entry = flaggems_vllm.get_num_sampled_and_rejected
     assert entry is backend.get_num_sampled_and_rejected
     with caplog.at_level("DEBUG", logger=entry.__module__):

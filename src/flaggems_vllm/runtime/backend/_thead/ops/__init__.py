@@ -29,11 +29,11 @@ from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
     quantize_gdn_state_int8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
-from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
-    get_num_sampled_and_rejected,
-)
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
+)
+from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
+    get_num_sampled_and_rejected,
 )
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (

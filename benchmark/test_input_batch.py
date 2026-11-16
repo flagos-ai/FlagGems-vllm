@@ -24,9 +24,7 @@ import flaggems_vllm
 from . import base
 
 try:
-    from vllm.v1.worker.gpu.input_batch import (
-        get_num_sampled_and_rejected as vllm_op,
-    )
+    from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected as vllm_op
 except Exception as exc:
     # A baseline is optional, including when its native extensions cannot load.
     vllm_op = None
