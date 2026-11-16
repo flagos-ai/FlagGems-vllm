@@ -557,7 +557,9 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
         __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                               true, 1, 2, 40);
       }
-      if (chunk == 1) {
+      __builtin_mxc_arrive_gvmcnt(0);
+      __builtin_mxc_barrier_ex(2);
+      if (chunk == 0) {
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
           const int i = t + c * 256, token = i >> 3,
@@ -570,8 +572,6 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
                                                 length, 40);
         }
       }
-      __builtin_mxc_arrive_gvmcnt(0);
-      __builtin_mxc_barrier_ex(2);
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
 #pragma unroll
