@@ -13,28 +13,32 @@ import torch
 import flaggems_vllm
 from baseline import fused_recurrent_gated_delta_rule_packed_decode as workload
 from benchmark import base, consts
-from benchmark.conftest import Config
+from benchmark.conftest import Config, update_result
 from flaggems_vllm.runtime import torch_device_fn
 
 OP = "fused_recurrent_gated_delta_rule_packed_decode"
+
+
+def _native_slot(*args, **kwargs):
+    # Routing token for Base.run, never a callable performance baseline.
+    raise RuntimeError("packed native slot must be handled by get_latency")
 
 
 class PackedDecodeBenchmark(base.Benchmark):
     DEFAULT_SHAPE_FILES = str(Path(__file__).resolve().parents[1] / "core_shapes.yaml")
     DEFAULT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
-    def __init__(self, entry, warmup=5, repetitions=25):
-        self.entry = entry
+    def __init__(self, warmup=5, repetitions=25):
+        self.entry = None
         self.warmup = warmup
         self.repetitions = repetitions
         self._latencies = None
+        self.native_op = None
         self.native_reason = None
         super().__init__(
             op_name=OP,
-            torch_op=None,
-            gems_op=getattr(
-                flaggems_vllm.ops if entry == "generic" else flaggems_vllm, OP
-            ),
+            torch_op=_native_slot,
+            gems_op=getattr(flaggems_vllm, OP),
             is_inplace=True,
         )
 
@@ -43,39 +47,83 @@ class PackedDecodeBenchmark(base.Benchmark):
             raise ValueError(
                 "Packed decode uses --mode kernel with no-Graph device events."
             )
+        super().init_user_config()
+        self.native_op = None
+        self.native_reason = "Native timing disabled by --metrics"
+        if "latency_base" not in self.to_bench_metrics:
+            self._native_import_reason = self.native_reason
+            return
         try:
             from vllm.model_executor.layers.fla.ops.fused_recurrent import (
                 fused_recurrent_gated_delta_rule_packed_decode as native,
             )
         except ImportError as exc:
-            self.torch_op = None
             self.native_reason = f"Native import unavailable: {exc}"
-            self.metrics = ["latency"]
         else:
-            self.torch_op = native
-            self.native_reason = None
-            self.metrics = self.DEFAULT_METRICS
+            if not callable(native):
+                self.native_reason = "Native entry is not callable"
+            elif native is getattr(flaggems_vllm.ops, OP) or native is getattr(
+                flaggems_vllm, OP
+            ):
+                self.native_reason = "Native entry resolves to the Gems candidate"
+            else:
+                self.native_op = native
+                self.native_reason = None
         self._native_import_reason = self.native_reason
-        super().init_user_config()
+
+    def run(self):
+        # Explicit latency-only mode must not resolve or compare either baseline.
+        # Restore Config even if a candidate/input/oracle raises.
+        with pytest.MonkeyPatch.context() as patch:
+            if Config.user_desired_metrics == ["latency"]:
+                patch.setattr(Config, "base_data", None)
+            super().run()
 
     def get_input_iter(self, dtype):
-        for shape in self.shapes:
-            self._shape = shape
-            self._dtype = dtype
-            self._latencies = None
-            self.native_reason = self._native_import_reason
-            self._native_result = dict(
-                accuracy="NOT_RUN", performance="N/A", reason=self.native_reason
+        # One framework result block per dtype, containing both public entries.
+        # Separate blocks with the same dtype overwrite each other downstream.
+        misses = []
+        for entry in ("generic", "top"):
+            self.entry = entry
+            self.gems_op = getattr(
+                flaggems_vllm.ops if entry == "generic" else flaggems_vllm, OP
             )
-            yield (
-                self.make_inputs(
+            for shape in self.shapes:
+                self._shape = shape
+                self._dtype = dtype
+                self._latencies = None
+                self.native_reason = self._native_import_reason
+                self._native_result = dict(
+                    accuracy="NOT_RUN", performance="N/A", reason=self.native_reason
+                )
+                data = self.make_inputs(
                     shape,
                     dtype,
                     torch.float32,
                     self.device,
                     strided=True,
                     invalid=False,
-                ),
+                )
+                yield (data,)
+                if self.native_reason:
+                    misses.append(
+                        {
+                            "shape": self.record_shapes(**data),
+                            "reason": self.native_reason,
+                        }
+                    )
+        if misses:
+            # The existing consumer uses this metadata to retain null scores
+            # rather than summing N/A as zero (or raising on None).
+            update_result(
+                self.op_name,
+                {
+                    "dtype": str(dtype),
+                    "native_baseline_skip_reason": "; ".join(
+                        dict.fromkeys(row["reason"] for row in misses)
+                    ),
+                    "native_baseline_misses": misses,
+                },
             )
 
     def record_shapes(self, *args, **kwargs):
@@ -97,12 +145,19 @@ class PackedDecodeBenchmark(base.Benchmark):
 
     def _measure_pair(self, data):
         state0 = data["initial_state"].clone()
+        data["out"].fill_(float("nan"))
+        out0 = data["out"].clone()
+
+        def restore():
+            data["initial_state"].copy_(state0)
+            data["out"].copy_(out0)
+
         expected = self.reference(data, True)
         functions = {"gems": self.gems_op}
-        if self.torch_op is not None:
-            functions["native"] = self.torch_op
+        if self.native_op is not None:
+            functions["native"] = self.native_op
         for name, fn in list(functions.items()):
-            data["initial_state"].copy_(state0)
+            restore()
             try:
                 fn(**data, use_qk_l2norm_in_kernel=True)
                 self.assert_result(data, expected, self._dtype)
@@ -119,7 +174,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         for name, fn in list(functions.items()):
             try:
                 for _ in range(self.warmup):
-                    data["initial_state"].copy_(state0)
+                    restore()
                     fn(**data, use_qk_l2norm_in_kernel=True)
             except Exception as exc:
                 if name == "gems":
@@ -131,7 +186,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         for i in range(self.repetitions):
             names = list(functions) if i % 2 == 0 else list(reversed(functions))
             for name in names:
-                data["initial_state"].copy_(state0)
+                restore()
                 torch_device_fn.synchronize()
                 try:
                     start = torch_device_fn.Event(enable_timing=True)
@@ -150,7 +205,7 @@ class PackedDecodeBenchmark(base.Benchmark):
         # Recheck each implementation separately; native must not invalidate a
         # correct Gems row if its state update becomes unstable after warmup.
         for name, fn in functions.items():
-            data["initial_state"].copy_(state0)
+            restore()
             try:
                 fn(**data, use_qk_l2norm_in_kernel=True)
                 self.assert_result(data, expected, self._dtype)
@@ -262,6 +317,5 @@ class PackedDecodeBenchmark(base.Benchmark):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
-@pytest.mark.parametrize("entry", ["generic", "top"])
-def test_packed_decode_performance(entry):
-    PackedDecodeBenchmark(entry).run()
+def test_packed_decode_performance():
+    PackedDecodeBenchmark().run()
