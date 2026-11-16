@@ -385,12 +385,6 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
           converted[j] = (float)combined[j];
         acc[chunk * QV + m] =
             acc[chunk * QV + m] * old_weight + converted * outscale;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          unsigned bits = __float_as_uint(acc[chunk * QV + m][j]);
-          asm volatile("" : "+r"(bits));
-          acc[chunk * QV + m][j] = __uint_as_float(bits);
-        }
       }
     }
     maximum = next_max;
