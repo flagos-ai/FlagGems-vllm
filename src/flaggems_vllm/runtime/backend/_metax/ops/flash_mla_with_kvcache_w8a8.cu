@@ -238,14 +238,15 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                                             true, page_index * 64 + token,
                                             length, 40);
     }
-    copy_wait();
-    float4_ rope[NR], scales[NR], probability[NR];
-    float local_max = -INFINITY;
+    // One wait covers both the RoPE copies and the scale reads.
     float4_ packed_scales[NR];
 #pragma unroll
     for (int i = 0; i < NR; ++i)
       packed_scales[i] = *input<float4_>(ksp +
           (page * 64 + wn * (64 / NW) + group * (NR * 4) + i * 4) * 4);
+    copy_wait();
+    float4_ rope[NR], scales[NR], probability[NR];
+    float local_max = -INFINITY;
 #pragma unroll
     for (int n = 0; n < NR; ++n) {
       rope[n] = (float4_){0, 0, 0, 0};
