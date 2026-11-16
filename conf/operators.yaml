@@ -36,6 +36,19 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: apply_logit_bias
+    description: |
+      Apply allowed-token filtering, per-token logit biases, and minimum-length
+      stop-token masking to vLLM sampling logits in place.
+    for:
+      - apply_logit_bias
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: apply_repetition_penalties
     description: |
       Modifies logit tensors in place to penalize tokens that have already appeared in the generated sequence.

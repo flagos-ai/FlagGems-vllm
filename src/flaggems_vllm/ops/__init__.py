@@ -15,6 +15,7 @@
 # isort: off
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
 from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
@@ -245,6 +246,7 @@ from flaggems_vllm.ops.vit_attention import (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_logit_bias",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "attn_res",
