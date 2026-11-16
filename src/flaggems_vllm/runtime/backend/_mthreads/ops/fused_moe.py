@@ -2125,7 +2125,9 @@ def _fused_experts_impl(
         and w2_bias is None
         and expert_map is None
     ):
-        from .fused_moe_dense import dense_fused_moe
+        from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe_dense import (
+            dense_fused_moe,
+        )
 
         return dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids)
 
