@@ -312,9 +312,9 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     if small_decode:
         bn, bk, warps = 64, 256 if topk <= 1024 else 128, 4
     elif head_major and topk > 1024:
-        # Large batches have enough CTAs without splitting. The wider KV
-        # tile amortizes the softmax and PV rescaling over more tokens.
-        bn, bk, warps = 128, 128, 4
+        # Large batches have enough CTAs without splitting. Wider KV tiles
+        # amortize online softmax, and wider QK panels halve the QK loop trips.
+        bn, bk, warps = 128, 256, 4
     elif not rope and heads >= 32 and topk <= 1024 and rows <= 128:
         bn, bk, warps = 128, 64, 8
     else:

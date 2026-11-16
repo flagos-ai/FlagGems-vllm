@@ -137,37 +137,15 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16):
     return q, kv, indices, 0.5, d_v, attn_sink, topk_length
 
 
-def quantize_sparse_fp8_fixture(
-    q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None
+def quantize_sparse_fixture(
+    q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None, *, int8=False
 ):
     if value_dim != 512:
-        raise ValueError("FP8 sparse MLA requires value_dim=512")
-    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(q, dequantize=False)
-    pages = math.ceil(kv.shape[0] / 64)
-    cache = torch.zeros((pages * 64, kv.shape[-1]), dtype=kv.dtype, device=kv.device)
-    cache[: kv.shape[0]].copy_(kv[:, 0])
-    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
-    return (
-        q_nope[:, None],
-        q_rope[:, None],
-        k_nope.view(pages, 64, 512),
-        k_rope.view(pages, 64, q_rope.shape[-1]),
-        q_scale[:, None],
-        k_scale.view(pages, 64, 1),
-        torch.where((indices >= 0) & (indices < kv.shape[0]), indices, -1),
-        sm_scale,
-        attn_sink,
-        topk_length,
-    )
-
-
-def quantize_sparse_int8_fixture(
-    q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None
-):
-    if value_dim != 512:
-        raise ValueError("INT8 sparse MLA requires value_dim=512")
+        raise ValueError("Sparse W8A8 MLA requires value_dim=512")
 
     def quantize(tensor):
+        if not int8:
+            return quantize_dense_fp8(tensor, dequantize=False)[:3]
         tensor = tensor.float()
         scale = (tensor[..., :512].abs().amax(-1, keepdim=True) / 127).clamp_min(1e-30)
         nope = (tensor[..., :512] / scale).round().clamp(-127, 127).to(torch.int8)
@@ -175,16 +153,13 @@ def quantize_sparse_int8_fixture(
         return nope, rope, scale
 
     q_nope, q_rope, q_scale = quantize(q)
-    k_nope, k_rope, k_scale = quantize(kv[:, 0])
-    pages = math.ceil(kv.shape[0] / 64)
-    pad = pages * 64 - kv.shape[0]
-    if pad:
-        k_nope = torch.nn.functional.pad(k_nope, (0, 0, 0, pad))
-        if k_rope.shape[-1]:
-            k_rope = torch.nn.functional.pad(k_rope, (0, 0, 0, pad))
-        else:
-            k_rope = torch.empty((pages * 64, 0), device=q.device, dtype=q.dtype)
-        k_scale = torch.nn.functional.pad(k_scale, (0, 0, 0, pad), value=1)
+    skv = kv.shape[0]
+    pages = math.ceil(skv / 64)
+    cache = torch.zeros((pages * 64, kv.shape[-1]), dtype=kv.dtype, device=kv.device)
+    cache[:skv].copy_(kv[:, 0])
+    k_nope, k_rope, k_scale = quantize(cache)
+    if int8 and pages * 64 != skv:
+        k_scale[skv:].fill_(1)
     return (
         q_nope[:, None],
         q_rope[:, None],
@@ -192,7 +167,7 @@ def quantize_sparse_int8_fixture(
         k_rope.view(pages, 64, q_rope.shape[-1]),
         q_scale[:, None],
         k_scale.view(pages, 64, 1),
-        torch.where(indices < kv.shape[0], indices, -1),
+        torch.where((indices >= 0) & (indices < skv), indices, -1),
         sm_scale,
         attn_sink,
         topk_length,
@@ -301,14 +276,14 @@ def test_flash_mla_sparse_flashmla(shape):
     inputs[2][0].fill_(-1)
     if SPARSE_INT8_OP is not None:
         inputs[2][1, 0, :2] = 1
-        packed = quantize_sparse_int8_fixture(*inputs)
+        packed = quantize_sparse_fixture(*inputs, int8=True)
         packed[6][1, 0, 2] = packed[2].shape[0] * 64
         output, lse = SPARSE_INT8_OP(*packed)
         assert_sparse_int8_reference(packed, inputs[1].shape[0], output, lse)
         return
     reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*inputs)
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
-        *quantize_sparse_fp8_fixture(*inputs)
+        *quantize_sparse_fixture(*inputs)
     )
     assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)
 
@@ -319,7 +294,7 @@ def test_flash_mla_sparse_flashmla(shape):
 def test_sparse_int8_multiquery_fp16(topk):
     # SQ=2 also exercises the head-major LSE layout.
     inputs = make_sparse_inputs((4, 16, 576, 71, 1, max(topk, 1), 512), torch.float16)
-    packed = quantize_sparse_int8_fixture(*inputs)
+    packed = quantize_sparse_fixture(*inputs, int8=True)
     q, rope, k, kr, qs, ks, indices, sm, sink, length = packed
     packed = (
         q.view(2, 2, 16, 512),
