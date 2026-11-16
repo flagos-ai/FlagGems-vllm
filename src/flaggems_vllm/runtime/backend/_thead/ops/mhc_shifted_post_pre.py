@@ -23,15 +23,18 @@ serialises the skinny projection for decode-sized ones (one CTA walks the whole
 This module changes the dataflow while keeping the post arithmetic verbatim:
 
 1. one fused kernel computes the post values, the collapse, the stream mean and
-   the per-tile sum of squares while the just-rounded bf16 post values are still
-   in registers;
-2. the project stage is a pure split-K GEMM over a packed contiguous ``fn``
-   weight, so it can pipeline at ``num_stages >= 2`` and fill the PPU's 64 SMs
-   even for a single token;
-3. one per-token kernel reduces the split-K partials, the sum-of-squares tiles
+   the row sum of squares while the just-rounded bf16 post values are still in
+   registers; narrow rows keep the whole row live, wide rows stream H in
+   pipelined tiles;
+2. the project stage is a pure GEMM over a packed contiguous ``fn`` weight, so
+   it can pipeline at ``num_stages >= 2``; above 256 tokens the four residual
+   streams run as separate K slabs, below that a split-K kernel fills the
+   PPU's SMs even for a single token;
+3. one per-token kernel reduces the project partials, the sum-of-squares tiles
    and computes the Sinkhorn coefficients;
 4. a one-pass RMSNorm replaces the generic two-pass kernel when the row fits a
-   single CTA.
+   single CTA; the wide-row token loop normalizes from the stored bf16
+   ``layer_input`` in a second pass.
 
 Every reduction runs in a fixed order, so repeated calls stay bitwise
 deterministic (the tests compare two calls with ``rtol=0, atol=0``).
@@ -405,6 +408,211 @@ def _mhc_shifted_post_collapse_norm_kernel(
 
 @libentry()
 @libtuner(
+    configs=runtime.get_tuned_config("mhc_shifted_post_collapse_norm_loop_thead"),
+    key=["H"],
+)
+@triton.jit
+def _mhc_shifted_post_collapse_norm_loop_kernel(
+    a_ptr,  # comb_res_mix : (N, 4, 4), float32 -- vLLM (j, i) orientation
+    b_ptr,  # residual     : (N, 4, H), bfloat16
+    c_ptr,  # post_layer_mix: (N, 4), float32
+    d_ptr,  # x            : (N, H), bfloat16
+    pre_ptr,  # pre_mix    : (N, 4), float32, or a dummy when USE_PRE is off
+    out_ptr,  # residual_cur: (N, 4, H), bfloat16
+    layer_ptr,  # layer_input: (N, H), bfloat16
+    aux_ptr,  # aux         : (N, H), bfloat16, or a dummy when WRITE_AUX is off
+    ssq_ptr,  # (N,) float32, row sum of squares of residual_cur
+    w_ptr,  # norm weight: (H,) bfloat16, or a dummy when HAS_W is off
+    norm_ptr,  # normed layer_input: (N, H), bfloat16, or a dummy
+    a_stride_n,
+    a_stride_j,
+    a_stride_i,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    PIPE_STAGES: tl.constexpr,
+    USE_PRE: tl.constexpr,
+    WRITE_AUX: tl.constexpr,
+    HAS_W: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Token-loop shape: one CTA per token, H streamed in pipelined tiles.
+
+    The flat kernel keeps the whole row live in registers.  This variant keeps
+    only ``BLOCK_H`` live and pipelines the next residual/x tile behind the
+    current post/collapse work.  The norm needs the full row's sum of squares,
+    so it runs a second pass over the stored bf16 ``layer_input`` (one extra
+    ``NH`` read) instead of holding the row in registers.
+    """
+    pid_n = tl.program_id(0)
+
+    a_base = pid_n * a_stride_n
+    c_base = pid_n * 4
+    b_base = pid_n * 4 * H
+    d_base = pid_n * H
+    out_base = pid_n * 4 * H
+
+    c0 = tl.load(c_ptr + c_base + 0).to(tl.float32)
+    c1 = tl.load(c_ptr + c_base + 1).to(tl.float32)
+    c2 = tl.load(c_ptr + c_base + 2).to(tl.float32)
+    c3 = tl.load(c_ptr + c_base + 3).to(tl.float32)
+
+    a00 = tl.load(a_ptr + a_base).to(tl.float32)
+    a01 = tl.load(a_ptr + a_base + 1 * a_stride_i).to(tl.float32)
+    a02 = tl.load(a_ptr + a_base + 2 * a_stride_i).to(tl.float32)
+    a03 = tl.load(a_ptr + a_base + 3 * a_stride_i).to(tl.float32)
+    a10 = tl.load(a_ptr + a_base + 1 * a_stride_j).to(tl.float32)
+    a11 = tl.load(a_ptr + a_base + 1 * a_stride_j + 1 * a_stride_i).to(tl.float32)
+    a12 = tl.load(a_ptr + a_base + 1 * a_stride_j + 2 * a_stride_i).to(tl.float32)
+    a13 = tl.load(a_ptr + a_base + 1 * a_stride_j + 3 * a_stride_i).to(tl.float32)
+    a20 = tl.load(a_ptr + a_base + 2 * a_stride_j).to(tl.float32)
+    a21 = tl.load(a_ptr + a_base + 2 * a_stride_j + 1 * a_stride_i).to(tl.float32)
+    a22 = tl.load(a_ptr + a_base + 2 * a_stride_j + 2 * a_stride_i).to(tl.float32)
+    a23 = tl.load(a_ptr + a_base + 2 * a_stride_j + 3 * a_stride_i).to(tl.float32)
+    a30 = tl.load(a_ptr + a_base + 3 * a_stride_j).to(tl.float32)
+    a31 = tl.load(a_ptr + a_base + 3 * a_stride_j + 1 * a_stride_i).to(tl.float32)
+    a32 = tl.load(a_ptr + a_base + 3 * a_stride_j + 2 * a_stride_i).to(tl.float32)
+    a33 = tl.load(a_ptr + a_base + 3 * a_stride_j + 3 * a_stride_i).to(tl.float32)
+
+    sq = 0.0
+    layer_sq = 0.0
+    for h0 in tl.range(0, H, BLOCK_H, num_stages=PIPE_STAGES):
+        h_off = h0 + tl.arange(0, BLOCK_H)
+        h_mask = h_off < H
+
+        d_vals = tl.load(
+            d_ptr + d_base + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b0 = tl.load(
+            b_ptr + b_base + 0 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b1 = tl.load(
+            b_ptr + b_base + 1 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b2 = tl.load(
+            b_ptr + b_base + 2 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        b3 = tl.load(
+            b_ptr + b_base + 3 * H + h_off,
+            mask=h_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+
+        acc0 = tl.fma(
+            a30, b3, tl.fma(a20, b2, tl.fma(a10, b1, tl.fma(a00, b0, c0 * d_vals)))
+        )
+        acc1 = tl.fma(
+            a31, b3, tl.fma(a21, b2, tl.fma(a11, b1, tl.fma(a01, b0, c1 * d_vals)))
+        )
+        acc2 = tl.fma(
+            a32, b3, tl.fma(a22, b2, tl.fma(a12, b1, tl.fma(a02, b0, c2 * d_vals)))
+        )
+        acc3 = tl.fma(
+            a33, b3, tl.fma(a23, b2, tl.fma(a13, b1, tl.fma(a03, b0, c3 * d_vals)))
+        )
+
+        v0 = acc0.to(tl.bfloat16)
+        v1 = acc1.to(tl.bfloat16)
+        v2 = acc2.to(tl.bfloat16)
+        v3 = acc3.to(tl.bfloat16)
+        tl.store(
+            out_ptr + out_base + 0 * H + h_off,
+            v0,
+            mask=h_mask,
+            eviction_policy="evict_first",
+        )
+        tl.store(
+            out_ptr + out_base + 1 * H + h_off,
+            v1,
+            mask=h_mask,
+            eviction_policy="evict_first",
+        )
+        tl.store(
+            out_ptr + out_base + 2 * H + h_off,
+            v2,
+            mask=h_mask,
+            eviction_policy="evict_first",
+        )
+        tl.store(
+            out_ptr + out_base + 3 * H + h_off,
+            v3,
+            mask=h_mask,
+            eviction_policy="evict_first",
+        )
+
+        f0 = v0.to(tl.float32)
+        f1 = v1.to(tl.float32)
+        f2 = v2.to(tl.float32)
+        f3 = v3.to(tl.float32)
+        if USE_PRE:
+            p0 = tl.load(pre_ptr + pid_n * 4 + 0)
+            p1 = tl.load(pre_ptr + pid_n * 4 + 1)
+            p2 = tl.load(pre_ptr + pid_n * 4 + 2)
+            p3 = tl.load(pre_ptr + pid_n * 4 + 3)
+            col = f0 * p0
+            col += f1 * p1
+            col += f2 * p2
+            col += f3 * p3
+        else:
+            col = f0
+        col_bf = col.to(tl.bfloat16)
+        # Keep layer_input in the default cache policy: the norm's second pass
+        # reads it back immediately.
+        tl.store(layer_ptr + pid_n * H + h_off, col_bf, mask=h_mask)
+        if WRITE_AUX:
+            total = f0 + f1
+            total += f2
+            total += f3
+            total = total / 4.0
+            tl.store(
+                aux_ptr + pid_n * H + h_off,
+                total.to(tl.bfloat16),
+                mask=h_mask,
+                eviction_policy="evict_first",
+            )
+
+        ssq = f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3
+        sq += tl.sum(ssq)
+        if HAS_W:
+            value = col_bf.to(tl.float32)
+            layer_sq += tl.sum(value * value)
+
+    tl.store(ssq_ptr + pid_n, sq)
+
+    if HAS_W:
+        # The first loop's layer_input stores must be visible to the second
+        # loop's loads across the CTA's threads.
+        tl.debug_barrier()
+        inv = tl.rsqrt(layer_sq / H + EPS)
+        for h0 in tl.range(0, H, BLOCK_H, num_stages=PIPE_STAGES):
+            h_off = h0 + tl.arange(0, BLOCK_H)
+            h_mask = h_off < H
+            value = tl.load(layer_ptr + pid_n * H + h_off, mask=h_mask, other=0.0).to(
+                tl.float32
+            )
+            weight = tl.load(w_ptr + h_off, mask=h_mask, other=0.0).to(tl.float32)
+            tl.store(
+                norm_ptr + pid_n * H + h_off,
+                (value * inv * weight).to(tl.bfloat16),
+                mask=h_mask,
+                eviction_policy="evict_first",
+            )
+
+
+@libentry()
+@libtuner(
     configs=runtime.get_tuned_config("mhc_shifted_project_thead"),
     key=["num_tokens", "hc_hidden_size", "split_k"],
 )
@@ -457,6 +665,73 @@ def _mhc_shifted_project_thead_kernel(
     # bitwise deterministic even though the project stage is parallel over K.
     tl.store(
         out_ptr + (pid_k * num_tokens + offs_m[:, None]) * mix_size + offs_n[None, :],
+        acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mhc_shifted_project_thead_stream"),
+    key=["num_tokens", "hidden_size", "split_k"],
+)
+@triton.jit
+def _mhc_shifted_project_thead_stream_kernel(
+    a_ptr,  # (num_tokens, 4 * hidden_size) bfloat16
+    bt_ptr,  # (4 * hidden_size, mix_stride) bfloat16, zero-padded
+    out_ptr,  # (N_STREAMS * split_k, num_tokens, mix_size) float32
+    num_tokens,
+    hidden_size,
+    mix_size,
+    a_stride_n,
+    bt_stride,
+    split_k,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    N_STREAMS: tl.constexpr,
+):
+    """Project each residual stream as an independent K slab.
+
+    The full-K kernel walks ``4 * H`` per CTA.  Splitting the four streams into
+    separate grid slices shortens that loop to ``H / split_k`` and keeps each
+    stream's weight tile in L2, which wins once the M grid has enough tiles.
+    The reduce kernel sums the stream partials in a fixed order.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    stream = pid_s // split_k
+    split = pid_s % split_k
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < num_tokens
+    n_mask = offs_n < mix_size
+
+    k_per_split = tl.cdiv(hidden_size, split_k)
+    k_begin = split * k_per_split
+    k_end = tl.minimum(k_begin + k_per_split, hidden_size)
+
+    stream_off = stream * hidden_size
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(k_begin, k_end, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < k_end
+        a = tl.load(
+            a_ptr + offs_m[:, None] * a_stride_n + stream_off + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            bt_ptr + (stream_off + offs_k)[:, None] * bt_stride + offs_n[None, :],
+            mask=k_mask[:, None] & (offs_n[None, :] < bt_stride),
+            other=0.0,
+        )
+        acc = tl.dot(a, b, acc)
+
+    tl.store(
+        out_ptr + (pid_s * num_tokens + offs_m[:, None]) * mix_size + offs_n[None, :],
         acc,
         mask=m_mask[:, None] & n_mask[None, :],
     )
@@ -698,6 +973,56 @@ def mhc_shifted_project_thead(a_flat, fn_packed, num_tokens, mix_size):
     return partials, split_k
 
 
+def _stream_split_for(num_tokens, hidden_size):
+    """Per-stream K splits for the four-stream project.
+
+    Medium batches with wide rows still leave the stream grid under-filled;
+    one K split per stream shortens each CTA's loop without adding a large
+    reduction.  Larger batches already expose enough M tiles.
+    """
+    return 4 if num_tokens < 512 and hidden_size >= 4096 else 1
+
+
+def mhc_shifted_project_thead_stream(a_flat, fn_packed, num_tokens, mix_size):
+    """Return ``(stream_partials, num_partial_planes)`` for ``a @ fn^T``.
+
+    Each of the four residual streams becomes its own grid slice, so the
+    reduce kernel sums ``4 * split_k`` fixed-order partials.
+    """
+    n_streams = 4
+    hidden_size = a_flat.shape[1] // n_streams
+    split_k = _stream_split_for(num_tokens, hidden_size)
+    num_partials = n_streams * split_k
+    partials = torch.empty(
+        num_partials, num_tokens, mix_size, dtype=torch.float32, device=a_flat.device
+    )
+    # See mhc_shifted_project_thead: keep aabs from rewriting the tuned tiles.
+    aabs = triton.knobs.autotuning.adjust_block_size
+    triton.knobs.autotuning.adjust_block_size = False
+    try:
+        _mhc_shifted_project_thead_stream_kernel[
+            lambda meta: (
+                triton.cdiv(num_tokens, meta["BLOCK_M"]),
+                triton.cdiv(mix_size, meta["BLOCK_N"]),
+                num_partials,
+            )
+        ](
+            a_flat,
+            fn_packed,
+            partials,
+            num_tokens,
+            hidden_size,
+            mix_size,
+            a_flat.stride(0),
+            fn_packed.stride(0),
+            split_k,
+            N_STREAMS=n_streams,
+        )
+    finally:
+        triton.knobs.autotuning.adjust_block_size = aabs
+    return partials, num_partials
+
+
 def mhc_shifted_post_collapse_norm(
     x,
     residual,
@@ -712,9 +1037,9 @@ def mhc_shifted_post_collapse_norm(
 ):
     """Token-fused post + collapse + sum of squares + optional RMSNorm.
 
-    Used for ``H <= 8192``: BLOCK_H covers the whole row, so one CTA per token
+    Used for ``H <= 2048``: BLOCK_H covers the whole row, so one CTA per token
     keeps the boundary at a single launch and writes a single sum-of-squares
-    value per token.
+    value per token.  Wider rows use the token-loop variant.
     """
     device = residual.device
     residual_cur = torch.empty_like(residual)
@@ -767,6 +1092,68 @@ def mhc_shifted_post_collapse_norm(
     return residual_cur, layer_out, aux, ssq, 1, 1
 
 
+def mhc_shifted_post_collapse_norm_loop(
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    pre_mix,
+    norm_weight,
+    norm_eps,
+    num_tokens,
+    hidden_size,
+    capture_aux,
+):
+    """Token-loop variant of the fused boundary; same outputs as the flat one."""
+    device = residual.device
+    residual_cur = torch.empty_like(residual)
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    aux = (
+        torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        if capture_aux
+        else residual_cur.new_empty(0, hidden_size)
+    )
+    ssq = torch.empty(num_tokens, 1, dtype=torch.float32, device=device)
+    normed = torch.empty_like(layer_input) if norm_weight is not None else layer_input
+
+    st = comb_res_mix.stride()
+    a_sn = st[0]
+    # vLLM orientation (MixLayout.TRANSPOSED): stored mix is [j, i].
+    a_sj, a_si = st[1], st[2]
+
+    aabs = triton.knobs.autotuning.adjust_block_size
+    triton.knobs.autotuning.adjust_block_size = False
+    try:
+        _mhc_shifted_post_collapse_norm_loop_kernel[(num_tokens,)](
+            comb_res_mix,
+            residual,
+            post_layer_mix,
+            x,
+            pre_mix if pre_mix is not None else post_layer_mix,
+            residual_cur,
+            layer_input,
+            aux if capture_aux else layer_input,
+            ssq,
+            norm_weight if norm_weight is not None else layer_input,
+            normed,
+            a_sn,
+            a_sj,
+            a_si,
+            H=hidden_size,
+            USE_PRE=pre_mix is not None,
+            WRITE_AUX=capture_aux,
+            HAS_W=norm_weight is not None,
+            EPS=norm_eps,
+        )
+    finally:
+        triton.knobs.autotuning.adjust_block_size = aabs
+
+    layer_out = normed if norm_weight is not None else layer_input
+    return residual_cur, layer_out, aux, ssq, 1, 1
+
+
 def mhc_shifted_post_pre_thead(
     x,
     residual,
@@ -794,11 +1181,17 @@ def mhc_shifted_post_pre_thead(
 
     # (1)+(4) post, collapse and the row sum of squares.  Narrow rows use the
     # one-CTA-per-token kernel that also applies the norm, which removes a
-    # launch from the decode-sized shapes.
+    # launch from the decode-sized shapes.  Wide rows stream the hidden axis in
+    # pipelined tiles: the flat whole-row tile spills at H >= 4096.
     use_token_fused = hidden_size <= 8192
     if use_token_fused:
+        token_kernel = (
+            mhc_shifted_post_collapse_norm_loop
+            if hidden_size >= 4096
+            else mhc_shifted_post_collapse_norm
+        )
         residual_cur, layer_input, aux, ssq_partials, ssq_stride, ssq_tiles = (
-            mhc_shifted_post_collapse_norm(
+            token_kernel(
                 x,
                 residual,
                 post_layer_mix,
@@ -825,11 +1218,18 @@ def mhc_shifted_post_pre_thead(
             )
         )
 
-    # (2) pure split-K projection.
+    # (2) projection.  Above 256 tokens the four-stream split shortens each
+    # CTA's K loop; smaller batches keep the full-K split-K kernel.
     a_flat = residual_cur.view(num_tokens, hc * hidden_size)
-    project_partials, split_k = mhc_shifted_project_thead(
-        a_flat, _fn_bf16_packed(fn), num_tokens, mix_size
-    )
+    fn_packed = _fn_bf16_packed(fn)
+    if num_tokens >= 256:
+        project_partials, split_k = mhc_shifted_project_thead_stream(
+            a_flat, fn_packed, num_tokens, mix_size
+        )
+    else:
+        project_partials, split_k = mhc_shifted_project_thead(
+            a_flat, fn_packed, num_tokens, mix_size
+        )
 
     # (3) split-K reduction + sum-of-squares reduction + coefficients.
     post_mix = torch.empty(num_tokens, hc, 1, dtype=torch.float32, device=device)

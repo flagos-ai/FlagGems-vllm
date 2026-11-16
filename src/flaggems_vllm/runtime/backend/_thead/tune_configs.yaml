@@ -544,3 +544,32 @@ mhc_shifted_post_collapse_norm_thead:
   - META: {}
     num_warps: 8
     num_stages: 1
+
+# Four-stream project GEMM: each residual stream is a separate K slab, so the
+# per-CTA loop is H (or H/split_k) instead of 4H and the four weight slabs stay
+# in L2.  Used for num_tokens >= 256; the full-K project kernel covers smaller
+# batches.  The stream sweep picked BM 32/64/128, BK 64/128, four warps.
+mhc_shifted_project_thead_stream:
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [32, 64, 128]
+    bk: [64, 128]
+    bn: [32]
+    w: [4]
+    s: [2, 3]
+
+# Token-loop fused post+collapse+ssq+norm.  The flat kernel keeps the whole
+# row in registers; this variant streams H in BLOCK_H tiles with an explicit
+# pipeline depth and pays one extra NH read for the norm's second pass.
+mhc_shifted_post_collapse_norm_loop_thead:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh, PIPE_STAGES: ps}
+      num_warps: w
+      num_stages: 1
+    bh: [512, 1024, 2048]
+    ps: [1, 2, 3]
+    w: [4, 8]
