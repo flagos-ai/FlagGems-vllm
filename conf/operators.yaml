@@ -1331,6 +1331,26 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: v2_apply_penalties
+    description: Apply vLLM V2 sampling penalties to logits in place.
+    for:
+      - vllm.v1.worker.gpu.sample.penalties.apply_penalties
+    labels:
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
+  - id: v2_penalty_bincount
+    description: Rebuild packed prompt bits and output counts for vLLM V2.
+    for:
+      - vllm.v1.worker.gpu.sample.penalties.bincount
+    labels:
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'
   - id: weight_norm
     description: |
       Reparameterizes a module's weight tensor by decoupling its magnitude (g)

@@ -19,8 +19,14 @@ from flaggems_vllm.runtime.backend._kunlunxin.ops.scaled_int8_quant import (
 from flaggems_vllm.runtime.backend._kunlunxin.ops.v2_apply_grammar_bitmask import (
     v2_apply_grammar_bitmask,
 )
+from flaggems_vllm.runtime.backend._kunlunxin.ops.v2_sampling_penalties import (
+    v2_apply_penalties,
+    v2_penalty_bincount,
+)
 
 __all__ = [
     "scaled_int8_quant",
     "v2_apply_grammar_bitmask",
+    "v2_apply_penalties",
+    "v2_penalty_bincount",
 ]
