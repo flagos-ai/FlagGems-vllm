@@ -38,11 +38,13 @@ fused_experts_impl = flaggems_vllm.ops_experts_impl
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
 
-if vendor_name in ("thead", "metax", "mthreads"):
+if vendor_name in ("thead", "metax", "mthreads", "hygon"):
     # These vendors' production MoE is not the stock fused_experts_impl.
     from benchmark.test_fused_moe import production_moe_op
 
     _vllm_moe_reference = production_moe_op(vendor_name)
+    if _vllm_moe_reference is None:
+        _vllm_moe_reference = vllm_fused_experts_impl
     _VLLM_REF_DTYPES = (
         [torch.bfloat16] if vendor_name == "thead" else [torch.bfloat16, torch.float16]
     )
