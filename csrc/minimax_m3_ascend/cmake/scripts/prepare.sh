@@ -165,7 +165,7 @@ function build() {
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
         -DVERSION=${VERSION} \
         -DENABLE_OOM=${ENABLE_OOM}
-        
+
     make ${JOB_NUM} prepare_build
 }
 

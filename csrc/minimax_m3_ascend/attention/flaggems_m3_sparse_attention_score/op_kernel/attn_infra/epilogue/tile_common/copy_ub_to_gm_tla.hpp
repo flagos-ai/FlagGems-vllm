@@ -107,4 +107,3 @@ struct CopyUb2GmTla<Arch::AtlasA5,
 }
 
 #endif // EPILOGUE_TILE_COPY_UB_TO_GM_TLA_HPP
-

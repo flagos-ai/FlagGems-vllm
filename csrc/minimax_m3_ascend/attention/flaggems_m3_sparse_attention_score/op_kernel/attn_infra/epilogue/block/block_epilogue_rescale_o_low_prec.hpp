@@ -287,7 +287,7 @@ public:
                     AscendC::Ln<half, false>(
                         lse16_ubuf_tensor,
                         glUbTensor,
-                        (uint64_t)0, 
+                        (uint64_t)0,
                         CeilDiv(totalRowNum, HALF_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -295,7 +295,7 @@ public:
                         lse16_ubuf_tensor,
                         lse16_ubuf_tensor,
                         gmUbTensor,
-                        (uint64_t)0, 
+                        (uint64_t)0,
                         CeilDiv(totalRowNum, HALF_VECTOR_SIZE),
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -303,7 +303,7 @@ public:
                         lse32_ubuf_tensor,
                         lse16_ubuf_tensor,
                         AscendC::RoundMode::CAST_NONE,
-                        (uint64_t)0, 
+                        (uint64_t)0,
                         CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 4));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -317,7 +317,7 @@ public:
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
-                    
+
                     if (qNThisSubBlock == 0U) {
                         AscendC::DataCopyPad(
                             gLse, tvUbTensor32,
@@ -379,12 +379,12 @@ public:
         uint32_t qSThisSubBlock = (qNBlockSize == 1U) ? inRowActualThisSubBlock : qSBlockSize;
         int64_t outOffsetSubBlock =
             layoutOutput.GetOffset(MatrixCoord(outRowOffsetThisSubBlock, outColOffsetThisSubBlock));
-        
+
         uint32_t outLseRowOffsetThisSubBlock = (qNBlockSize == 1U) ? inRowOffsetThisSubBlock : 0;
         uint32_t outLseColOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock;
         int64_t offsetLse = layoutLse.GetOffset(MatrixCoord(outLseRowOffsetThisSubBlock, outLseColOffsetThisSubBlock));
         auto gLseThisSubBlock = gLse[offsetLse];
-        
+
         if (inRowActualThisSubBlock > 0U) {
             uint32_t rowLoop = CeilDiv(inRowActualThisSubBlock, rowNumTile);
             uint32_t needRowLoop = (rowLoop > 1U) ? 1 : 0;

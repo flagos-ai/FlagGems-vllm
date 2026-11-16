@@ -67,7 +67,7 @@ struct CopyL0CToUBTla<
         AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(
             dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], intriParams);
     }
-    
+
     template <class TensorDst, class TensorSrc>
     __aicore__ inline void operator()(TensorDst const &dstTensor, TensorSrc const &srcTensor, bool subBlockId, uint8_t unitFlag = 0)
     {

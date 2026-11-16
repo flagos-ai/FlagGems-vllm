@@ -221,7 +221,7 @@ public:
             blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ);
 #endif
             for (uint32_t kvBlockIdx = 0; kvBlockIdx < kvSLoopNum + PRE_LAUNCH; kvBlockIdx++) {
-                
+
                 if (kvBlockIdx < kvSLoopNum) {
                     uint32_t kvSTileSizeAct = validTileSize[kvBlockIdx];
                     int32_t physicalBlockId = validPhysicalIds[kvBlockIdx];

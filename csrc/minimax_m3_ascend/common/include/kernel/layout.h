@@ -16,13 +16,13 @@
 #ifndef INCLUDE_LAYOUT_H
 #define INCLUDE_LAYOUT_H
 
-enum class DataFormatT { 
+enum class DataFormatT {
     ND = 0,
     NZ,
     ZN,
     ZZ,
     NN,
     VECTOR
-}; 
+};
 
 #endif // INCLUDE_LAYOUT_H

@@ -82,7 +82,7 @@
             return false;                                                                      \
         }                                                                                      \
         REGISTER_OP_BANK_KEY_PARSE_FUN(op, ParseFunc##op##bank_key, LoadFunc##op##bank_key)    \
-    } while (0)                                                                                 
+    } while (0)
 
 
 // v2

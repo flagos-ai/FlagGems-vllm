@@ -129,7 +129,7 @@ public:
         __ubuf__ ElementOTmp *glUb = ( __ubuf__ ElementOTmp *) glUbTensor32.GetPhyAddr();
         __ubuf__ ElementOTmp *dmUb =
             (__ubuf__ ElementOTmp *) dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
-        
+
         WaitCrossCoreSync<4, PIPE_V>(mm2ToReFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         if (isFirstKvSTile) {
@@ -206,7 +206,7 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
-    
+
     template <DRegSplitStages dRegSplitStages>
     __simd_vf__ inline void RescaleFunc(
         __ubuf__ ElementOTmp *goUb, __ubuf__ ElementOTmp *loUb, __ubuf__ ElementOTmp *dmUb,
@@ -214,7 +214,7 @@ public:
         uint32_t colTail, uint32_t vlElemNum)
     {
     }
-    
+
     template <>
     __simd_vf__ inline void RescaleFunc<DRegSplitStages::ONE>(
         __ubuf__ ElementOTmp *goUb, __ubuf__ ElementOTmp *loUb, __ubuf__ ElementOTmp *dmUb,

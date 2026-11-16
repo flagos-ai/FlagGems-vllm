@@ -52,7 +52,7 @@ function(cpack_empty_package)
   else()
     set(soc_version "${soc_version_temp}")
   endif()
-  
+
   if("${VERSION}" STREQUAL "")
       set(CPACK_PACKAGE_FILE_NAME "cann-${soc_version}-ops-transformer_linux-${ARCH}.run")
   else()

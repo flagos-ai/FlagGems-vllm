@@ -824,9 +824,9 @@ function(add_aicpu_cust_kernel_modules op_name aicpu_sources aicpu_jsons)
               -Wl,--no-whole-archive
       )
     if (NOT (UT_TEST_ALL OR OP_KERNEL_AICPU_UT))
-      set_property(TARGET ${target_name} PROPERTY 
+      set_property(TARGET ${target_name} PROPERTY
         CXX_COMPILER_LAUNCHER ${ASCEND_DIR}/toolkit/toolchain/hcc/bin/aarch64-target-linux-gnu-g++)
-    endif()    
+    endif()
     target_sources(${target_name} PRIVATE ${aicpu_sources})
     set_property(GLOBAL APPEND PROPERTY AICPU_JSON_FILES ${aicpu_jsons})
     if (NOT ${target_name} IN_LIST AICPU_CUST_OBJ_TARGETS)

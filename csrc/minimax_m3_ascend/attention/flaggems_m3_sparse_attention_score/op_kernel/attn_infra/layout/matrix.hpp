@@ -16,7 +16,7 @@
 #include "../../attn_infra/detail/alignment.hpp"
 #include "../../attn_infra/matrix_coord.hpp"
 
-namespace NpuArch::layout 
+namespace NpuArch::layout
 {
 
 /// Mapping function for row-major matrices

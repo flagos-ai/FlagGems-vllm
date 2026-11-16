@@ -18,10 +18,14 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        # Vendored patch contexts include significant whitespace.
+        exclude: ^csrc/minimax_m3_ascend/cmake/third_party/build/modules/patch/(protobuf-hide_absl_symbols|protobuf_25\.1_change_version)\.patch$
         name: trim trailing whitespace
         types: [text]
 
       - id: end-of-file-fixer
+        # Vendored patch contexts include significant whitespace.
+        exclude: ^csrc/minimax_m3_ascend/cmake/third_party/build/modules/patch/(protobuf-hide_absl_symbols|protobuf_25\.1_change_version)\.patch$
         name: fix end of files
         types: [text]
 

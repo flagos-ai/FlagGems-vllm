@@ -37,14 +37,14 @@ ge::graphStatus ExecuteOpLaunch(gert::OpExecuteLaunchContext *context) {
   auto params = reinterpret_cast<OpApiParams *>(context->GetOpApiParams());
   auto workspace_sizes = context->GetWorkspaceSizes();
   auto workspace_addrs = context->GetWorkspaceAddrs();
-  OP_CHECK_IF((workspace_sizes->GetSize() == 0) || (workspace_addrs->GetSize() == 0), 
+  OP_CHECK_IF((workspace_sizes->GetSize() == 0) || (workspace_addrs->GetSize() == 0),
     OP_LOGE("aclnnfallback", "no workspace addrs"), return ge::GRAPH_FAILED);
   auto workspace_size = workspace_sizes->GetData()[0];
   auto workspace_addr = workspace_addrs->GetData()[0]->GetAddr();
 
   auto acl_stream = context->GetStream();
   auto opApiFunc = params->op_api_func;
-  OP_CHECK_IF(opApiFunc == nullptr, 
+  OP_CHECK_IF(opApiFunc == nullptr,
     OP_LOGE("aclnnfallback", "opApiFunc nullptr"), return ge::GRAPH_FAILED);
   auto op_api_ret = opApiFunc(workspace_addr, workspace_size, params->executor, acl_stream);
   for (auto &av : params->converted_params) {

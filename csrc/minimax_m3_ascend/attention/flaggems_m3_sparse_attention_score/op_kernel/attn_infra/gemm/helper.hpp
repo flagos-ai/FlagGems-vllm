@@ -17,7 +17,7 @@
 #include "../../attn_infra/gemm/gemm_type.hpp"
 #include "../../tla/layout.hpp"
 
-namespace NpuArch::Gemm::helper 
+namespace NpuArch::Gemm::helper
 {
 
 template<class Element, class Layout>

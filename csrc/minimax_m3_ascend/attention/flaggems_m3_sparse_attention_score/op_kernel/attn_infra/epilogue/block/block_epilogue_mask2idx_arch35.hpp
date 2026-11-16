@@ -82,7 +82,7 @@ public:
         uint32_t curSubCoreRowOffset = subCoreIdx * avgRowPerSubCore;
         uint32_t actDealtRow = (subCoreIdx == preActiveSubCoreNum - 1) ?
             (totalRowNumBlockMask - curSubCoreRowOffset) : avgRowPerSubCore;
-        
+
         if (subCoreIdx < preActiveSubCoreNum) {
             uint32_t rowLoop = CeilDiv(actDealtRow, PRE_ROW_TILE);
             uint32_t colLoop = CeilDiv(yBlockNumAligned, PRE_COL_TILE);
@@ -188,7 +188,7 @@ private:
     AscendC::LocalTensor<int32_t> sparseCountUb[IO_STAGES];
     AscendC::LocalTensor<uint8_t> maskPatInBitUb8;
     AscendC::LocalTensor<uint32_t> maskPatInBitUb32;
-    
+
     AscendC::LocalTensor<int32_t> maskIdxUb;
     AscendC::LocalTensor<int32_t> sparseIdxUb[IO_STAGES];
     AscendC::LocalTensor<half> maskPatUb16;

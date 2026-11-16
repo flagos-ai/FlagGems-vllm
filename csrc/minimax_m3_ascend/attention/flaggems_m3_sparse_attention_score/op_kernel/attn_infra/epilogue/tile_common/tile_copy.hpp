@@ -20,7 +20,7 @@
 #include "../../../attn_infra/epilogue/tile_common/copy_ub_to_gm_tla.hpp"
 #include "../../../tla/tensor.hpp"
 
-namespace NpuArch::Epilogue::Tile 
+namespace NpuArch::Epilogue::Tile
 {
 
 template <
@@ -113,13 +113,13 @@ template <
     class ElementO_,
     class LayoutTagO_,
     class LayoutTagOTmp_
-> 
+>
 struct TileCopyRescaleO{
     using ElementO = ElementO_;
     using LayoutTagO = LayoutTagO_;
     using LayoutTagOTmp = LayoutTagOTmp_;
     using LayoutO = detail::TagToLayout_t<ElementO, LayoutTagO>;
-    
+
     using TensorUbO = tla::Tensor<AscendC::LocalTensor<ElementO>, LayoutO, tla::Coord<tla::_0, tla::_0>, AscendC::TPosition::VECCALC>;
     using TensorGmO = tla::Tensor<AscendC::GlobalTensor<ElementO>, LayoutO, tla::Coord<tla::_0, tla::_0>, AscendC::TPosition::GM>;
 

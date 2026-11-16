@@ -129,7 +129,7 @@ private:
     uint64_t l1Size_ = 0;
     uint64_t libapiSize_ = 0;
     uint32_t socVer_ = 0;
-    
+
     ge::DataType dataType_ = ge::DT_FLOAT16;
 
     FlagGemsM3SparseAttentionScoreTilingData *tilingData_ = nullptr;

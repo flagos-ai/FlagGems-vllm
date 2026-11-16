@@ -15,17 +15,17 @@
 
  #ifndef INCLUDE_COMMON_FUNC_H
  #define INCLUDE_COMMON_FUNC_H
- 
+
  #include <limits>
  #include <type_traits>
- 
+
  #ifdef __CCE_KT_TEST__
  #include "stub_def.h"
  #include "stub_fun.h"
  #else
  #include "kernel_macros.h"
  #endif
- 
+
  template <uint32_t ALIGN, typename T = uint32_t>
  inline __aicore__ T RoundUp(const T val)
  {
@@ -37,7 +37,7 @@
      }
      return (val + align - 1) / align * align;
  }
- 
+
  template <typename T>
  inline __aicore__ T RoundUp(const T val, const T align)
  {
@@ -47,7 +47,7 @@
      }
      return (val + align - 1) / align * align;
  }
- 
+
  template <uint32_t DIVISOR, typename T = uint32_t>
  inline __aicore__ T CeilDiv(const T dividend)
  {
@@ -59,10 +59,10 @@
      }
      return (dividend + divisor - 1) / divisor;
  }
- 
+
  template <typename T>
  constexpr T T_MAX = std::numeric_limits<T>::max();
- 
+
  template <typename T>
  inline __aicore__ T CeilDiv(const T dividend, const T divisor)
  {
@@ -72,46 +72,46 @@
      }
      return (dividend + divisor - 1) / divisor;
  }
- 
+
  template <typename T>
  __aicore__ inline T Min(const T lhs, const T rhs)
  {
      return lhs < rhs ? lhs : rhs;
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint32_t BlockSize()
  {
      return 32 / sizeof(Dtype);
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint32_t MatrixSize()
  {
      return 512 / sizeof(Dtype);
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint64_t BlockSizeRoundUp(uint64_t num)
  {
      return (num + BlockSize<Dtype>() - 1) / BlockSize<Dtype>() * BlockSize<Dtype>();
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint64_t NumBlocksRoundUp(uint64_t num)
  {
      return (num + BlockSize<Dtype>() - 1) / BlockSize<Dtype>();
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint64_t MatrixSizeRoundUp(uint64_t num)
  {
      return (num + MatrixSize<Dtype>() - 1) / MatrixSize<Dtype>() * MatrixSize<Dtype>();
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint64_t NumMatrixsRoundUp(uint64_t num)
  {
      return (num + MatrixSize<Dtype>() - 1) / MatrixSize<Dtype>();
  }
- 
+
  template <typename Dtype> __aicore__ __attribute__((always_inline)) inline uint64_t L0HalfSize()
  {
      return 32 * 1024 / sizeof(Dtype);
  }
- 
+
  #endif

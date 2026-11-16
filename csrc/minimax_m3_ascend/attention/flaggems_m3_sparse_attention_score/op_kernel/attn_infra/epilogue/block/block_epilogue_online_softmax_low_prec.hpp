@@ -185,7 +185,7 @@ public:
             dataBlockNumPerRow);
         AscendC::PipeBarrier<PIPE_V>();
     }
-    
+
     __aicore__ inline
     void RowsumSPECTILE1024(const AscendC::LocalTensor<half> &srcUb, const AscendC::LocalTensor<half> &rowsumUb,
                             const AscendC::LocalTensor<half> &tvUbTensor, uint32_t numRowsRound, uint32_t numElems,
@@ -449,7 +449,7 @@ public:
     }
 
     template<typename ElementMaskDst, typename ElementMaskSrc>
-    __aicore__ inline 
+    __aicore__ inline
     void UpCastMask(
         const AscendC::LocalTensor<ElementMaskDst> &maskUbTensorDst,
         const AscendC::LocalTensor<ElementMaskSrc> &maskUbTensorSrc,
@@ -723,7 +723,7 @@ public:
     __aicore__ inline
     void CopyPUbToGm(AscendC::GlobalTensor<ElementOutput> gOutput, uint32_t sUbOffset, uint32_t rowNumCurLoop,
         uint32_t columnNumRound, uint32_t columnNumPad)
-    {   
+    {
         AscendC::DataCopy(gOutput,
             lpUbTensor[sUbOffset],
             AscendC::DataCopyParams(
@@ -922,7 +922,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-            
+
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
             CopyMaskGmToUb(
                 gMaskThisSubBlock,

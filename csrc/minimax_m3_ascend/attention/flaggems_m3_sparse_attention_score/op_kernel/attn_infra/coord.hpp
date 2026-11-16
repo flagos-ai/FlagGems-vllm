@@ -253,7 +253,7 @@ private:
             return ArgmaxImpl<N + 1>(idx[N] > idx[i] ? N : i);
         }
     }
-    
+
     template <int N>
     HOST_DEVICE
     bool AnyImpl() const

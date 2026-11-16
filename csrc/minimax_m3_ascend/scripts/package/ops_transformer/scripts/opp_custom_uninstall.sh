@@ -15,7 +15,7 @@ OPP_COMMON="${curpath}""/opp_common.sh"
 common_func_path="${curpath}/common_func.inc"
 . "${OPP_COMMON}"
 . "${common_func_path}"
-# init arch 
+# init arch
 architecture=$(uname -m)
 architectureDir="${architecture}-linux"
 

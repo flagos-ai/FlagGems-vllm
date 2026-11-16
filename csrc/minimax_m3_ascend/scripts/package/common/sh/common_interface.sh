@@ -46,7 +46,7 @@ py_version_check(){
                     return 0
                 fi
             done
-            
+
             echo "[Common] [$cur_date] [WARNING]: $python_version is not in Python3.7.x, Python3.8.x, Python3.9.x, Python3.10.x, Python3.11.x, Python3.12.x"
             return 1
         else
@@ -58,4 +58,3 @@ py_version_check(){
         return 1
     fi
 }
-

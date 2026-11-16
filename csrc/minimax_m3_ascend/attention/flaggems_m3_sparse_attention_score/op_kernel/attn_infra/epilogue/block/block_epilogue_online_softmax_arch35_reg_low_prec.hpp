@@ -156,7 +156,7 @@ public:
             Arch::CrossCoreWaitFlag<MODE, PIPE>(crossCoreFlag);
         }
     }
-    
+
     template <class TensorP>
     __aicore__ inline
     void operator()(TensorP &l1PTensorTla, GemmCoord actualBlockShape,
@@ -275,7 +275,7 @@ private:
                       kvBaseTileRegSplitStages == KvBaseTileRegSplitStages::TWO,
                       "ComputeScaleAndMax only supports ONE Or TWO stages, please use the specialized versions.");
     }
-    
+
     template <>
     __simd_vf__ inline void ComputeScaleAndMax<KvBaseTileRegSplitStages::ONE>(
         __ubuf__ ElementInput *srcUb, __ubuf__ ElementInput *newMaxUb,

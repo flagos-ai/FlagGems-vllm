@@ -14,7 +14,7 @@
 #include "../../attn_infra/base_defs.hpp"
 #include "../../attn_infra/coord.hpp"
 
-namespace NpuArch::layout 
+namespace NpuArch::layout
 {
 
 struct VectorLayout {

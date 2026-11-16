@@ -163,7 +163,7 @@ public:
             tla::MakeCoord(0, 0), tla::MakeShape(rowNum, embed));
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
         copyGmToL1A(l1ATensorTlaTile, gATensorTlaTile);
-        
+
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
     }
@@ -195,13 +195,13 @@ public:
             Arch::CrossCoreWaitFlag<MODE, PIPE>(crossCoreFlagV1);
         }
     }
-    
+
     __aicore__ inline
     uint32_t GetCurLoopCounter(uint32_t outterLoopItr, uint32_t curLoopNum, uint32_t curLoopItr)
     {
         return outterLoopItr * curLoopNum + curLoopItr;
     }
-    
+
     template <class TensorB, class TensorL1B>
     __aicore__ inline
     void SparseKL1TileNLoad(TensorB &gBTensor, TensorL1B &l1BTensorTla,
@@ -339,7 +339,7 @@ public:
                             nL0Itr * L0_TILE_N), tla::MakeShape(l0TileKAct, l0TileNAct));
                         auto l0BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL0B>(l0TileKAct, l0TileNAct);
                         auto l0BTensorTla = tla::MakeTensor(l0BTensor[l0BBufId], l0BLayoutTla, Arch::PositionL0B{});
-                        
+
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                         copyL1ToL0B(l0BTensorTla, l1BTensorTlaTile);
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
@@ -488,7 +488,7 @@ public:
                             nL0Itr * L0_TILE_N), tla::MakeShape(l0TileKAct, l0TileNAct));
                         auto l0BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL0B>(l0TileKAct, l0TileNAct);
                         auto l0BTensorTla = tla::MakeTensor(l0BTensor[l0BBufId], l0BLayoutTla, Arch::PositionL0B{});
-                        
+
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                         copyL1ToL0B(l0BTensorTla, l1BTensorTlaTile);
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);

@@ -173,7 +173,7 @@ function(pack_built_in)
   else()
     set(soc_version "${soc_version_temp}")
   endif()
-  
+
   if(NOT ENABLE_OPS_KERNEL)
     set(CPACK_PACKAGE_FILE_NAME "CANN--${CPACK_PACKAGE_NAME}.run")
   else()
@@ -190,7 +190,7 @@ function(pack_built_in)
         set(CPACK_PACKAGE_FILE_NAME "cann-${soc_version}-ops-transformer_${VERSION}_linux-${ARCH}.run")
       endif()
     endif()
-    
+
   endif()
 
   set(CPACK_INSTALL_PREFIX "/")

@@ -438,7 +438,7 @@ check_pre_install() {
       exit 1
     fi
   fi
-  
+
   if [ "${IS_UPGRADE}" = "y" ]; then
     if [ ! -e "${INSTALL_INFO_FILE}" ]; then
       logandprint "[ERROR]: ERR_NO:${FILE_NOT_EXIST}; The directory:${TARGET_INSTALL_PATH} not install OpsTransformer, upgrade failed."

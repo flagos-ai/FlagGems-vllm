@@ -21,8 +21,8 @@
 /* Mode场景定义 */
 #define ELEMENTWISE_TPL_SCH_MODE_0 0
 #define ELEMENTWISE_TPL_SCH_MODE_1 1
-/* 继续定义其他Mode场景... */ 
- 
+/* 继续定义其他Mode场景... */
+
 /* 模板参数 */
 ASCENDC_TPL_ARGS_DECL(AddExample,
     ASCENDC_TPL_UINT_DECL(schMode, 1, ASCENDC_TPL_UI_LIST, ELEMENTWISE_TPL_SCH_MODE_0, ELEMENTWISE_TPL_SCH_MODE_1)

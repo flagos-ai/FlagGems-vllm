@@ -356,7 +356,7 @@ function(gen_ops_info_and_python)
           add_dependencies(ascendc_bin_${compute_unit}_${op_name} merge_ini_${compute_unit} ascendc_impl_gen)
         endif()
       endforeach()
-      
+
       # generate binary_info_config.json
       gen_binary_info_config_json(
         TARGET gen_bin_info_config_${compute_unit}

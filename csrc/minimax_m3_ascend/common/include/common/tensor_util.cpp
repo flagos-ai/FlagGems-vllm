@@ -63,8 +63,8 @@ const aclTensor* ResizeFrom1D(const aclTensor* cdim, const aclTensor* input, boo
 
   if ((inputDim == MAX_DIM_CNT) && !isSupportNcdhw) {
     return l0op::TransDataSpecial(cdimFormat, Format::FORMAT_NDC1HWC0, 0, executor);
-  } 
-  
+  }
+
   return cdimFormat;
 }
 

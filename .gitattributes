@@ -1,0 +1,2 @@
+# Vendored unified patch payload whitespace is part of the patch context.
+csrc/minimax_m3_ascend/cmake/third_party/build/modules/patch/*.patch -whitespace

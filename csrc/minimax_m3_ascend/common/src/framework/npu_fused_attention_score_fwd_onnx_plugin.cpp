@@ -53,7 +53,7 @@ static Status ParseParamsNpuFusedAttentionScoreFwd(const Message *op_src, ge::Op
       bmm_score_transpose_a = (attr.i() == 1);
     } else if (attr.name() == "bmm_score_transpose_b" && attr.type() == ge::onnx::AttributeProto::INT) {
       bmm_score_transpose_b = (attr.i() == 1);
-    } 
+    }
   }
 
   if (required_attr_num != REQUIRED_ATTR) {
@@ -73,7 +73,7 @@ static Status ParseParamsNpuFusedAttentionScoreFwd(const Message *op_src, ge::Op
 }
 
 namespace{
-static Status GetAttrFromOperator(const ge::Operator& op, float& scale, float& keep_prob, bool& query_transpose, 
+static Status GetAttrFromOperator(const ge::Operator& op, float& scale, float& keep_prob, bool& query_transpose,
   bool& key_transpose, bool& bmm_score_transpose_a, bool& bmm_score_transpose_b) {
   if (op.GetAttr("scale", scale) != SUCCESS) {
     OP_LOGE(GetOpName(op), "get scale from op failed");
@@ -114,7 +114,7 @@ static Status ParseOpToGraphNpuFusedAttentionScoreFwd(const ge::Operator& op, ge
   auto data1 = ge::op::Data((ori_name + "_data1").c_str()).set_attr_index(1);
   auto data2 = ge::op::Data((ori_name + "_data2").c_str()).set_attr_index(2);
   auto data3 = ge::op::Data((ori_name + "_data3").c_str()).set_attr_index(3);
-  
+
   float scale = 0;
   float keep_prob = 0;
   bool query_transpose = false;
@@ -141,7 +141,7 @@ static Status ParseOpToGraphNpuFusedAttentionScoreFwd(const ge::Operator& op, ge
   auto const_scale = ge::op::Const((ori_name + "_Const_scale").c_str()).set_attr_value(tensor_scale);
   auto cast_const_scale = ge::op::Cast((ori_name + "_Cast_const_scale").c_str()).set_input_x(const_scale)
                                                                       .set_attr_dst_type(ACL_FLOAT16);
-  
+
   auto AttentionScore = ge::op::AttentionScore((ori_name + "_AttentionScore").c_str()).set_input_query(data0)
                             .set_input_key(data1).set_input_value(data2).set_input_padding_mask(data3)
                             .set_input_scale(cast_const_scale).set_input_drop_mask(drop_mask)
@@ -161,7 +161,7 @@ static Status ParseOpToGraphNpuFusedAttentionScoreFwd(const ge::Operator& op, ge
 // register npu_fused_attention_score_fwd op info to GE
 REGISTER_CUSTOM_OP("PartitionedCall")
   .FrameworkType(ONNX)
-  .OriginOpType({ge::AscendString("npu::1::NPUFusedAttentionScoreFwd"), 
+  .OriginOpType({ge::AscendString("npu::1::NPUFusedAttentionScoreFwd"),
                  ge::AscendString("ai.onnx::11::NPUFusedAttentionScoreFwd"),
                  ge::AscendString("ai.onnx::12::NPUFusedAttentionScoreFwd"),
                  ge::AscendString("ai.onnx::13::NPUFusedAttentionScoreFwd"),

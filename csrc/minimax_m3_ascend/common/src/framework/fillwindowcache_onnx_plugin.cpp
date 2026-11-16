@@ -23,7 +23,7 @@ static Status parseParamsFillWindowCache(const Message* op_src, ge::Operator& op
     OP_LOGE(GetOpName(op_dest), "Dynamic fillwindowcache op_src to NodeProto failed.");
     return FAILED;
   }
-  
+
   int axis = 0;
   int cache_depth = 0;
   for (const auto &attr : node->attribute()) {

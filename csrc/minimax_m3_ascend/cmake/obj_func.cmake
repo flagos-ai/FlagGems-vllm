@@ -79,7 +79,7 @@ macro(add_modules_sources)
   endif()
 
   file(GLOB_RECURSE SUB_OPTILING_SRC ${SOURCE_DIR}/op_tiling/*.cpp)
-  file(GLOB OPTILING_SRCS 
+  file(GLOB OPTILING_SRCS
       ${SOURCE_DIR}/*fallback*.cpp
       ${SOURCE_DIR}/*_tiling*.cpp
       ${SOURCE_DIR}/op_tiling/arch35/*.cpp
@@ -277,7 +277,7 @@ macro(add_mc2_modules_sources)
   # 记录全局的COMPILED_OPS和COMPILED_OP_DIRS，其中COMPILED_OP_DIRS只记录到算子名，例如moe/moe_token_permute_with_routing_map_grad
   set(COMPILED_OPS ${COMPILED_OPS} ${OP_NAME} CACHE STRING "Compiled Ops" FORCE)
   set(COMPILED_OP_DIRS ${COMPILED_OP_DIRS} ${PARENT_DIR} CACHE STRING "Compiled Ops Dirs" FORCE)
-  
+
   file(GLOB OPINFER_SRCS ${SOURCE_DIR}/*_infershape*.cpp)
   if (OPINFER_SRCS)
     # proto
@@ -294,7 +294,7 @@ macro(add_mc2_modules_sources)
   if (OPTILING_SRCS)
     # tiling
     add_tiling_modules()
-    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE 
+    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
       ${OPTILING_SRCS}
       ${OPS_TRANSFORMER_DIR}/mc2/common/src/matmul_formulaic_tiling.cpp
       ${OPS_TRANSFORMER_DIR}/mc2/common/src/mc2_tiling_utils.cpp
@@ -587,7 +587,7 @@ function(add_tiling_modules)
       PRIVATE ${OP_TILING_INCLUDE}
       $<BUILD_INTERFACE:${ASCEND_CANN_PACKAGE_PATH}/include>
       $<BUILD_INTERFACE:${OPS_TRANSFORMER_DIR}/common/include>
-      
+
       $<$<BOOL:${BUILD_OPEN_PROJECT}>:$<BUILD_INTERFACE:${ASCEND_CANN_PACKAGE_PATH}/include/experiment>>
       $<$<BOOL:${BUILD_OPEN_PROJECT}>:$<BUILD_INTERFACE:${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/include/op_common/op_host>>
       $<$<BOOL:${BUILD_OPEN_PROJECT}>:$<BUILD_INTERFACE:${ASCEND_CANN_PACKAGE_PATH}/include/experiment/metadef/common/util>>
@@ -640,7 +640,7 @@ endfunction()
 function(add_graph_plugin_modules)
   if(NOT TARGET ${GRAPH_PLUGIN_NAME}_obj)
     add_library(${GRAPH_PLUGIN_NAME}_obj OBJECT)
-    target_include_directories(${GRAPH_PLUGIN_NAME}_obj PRIVATE 
+    target_include_directories(${GRAPH_PLUGIN_NAME}_obj PRIVATE
       ${OP_PROTO_INCLUDE}
     )
     target_compile_definitions(${GRAPH_PLUGIN_NAME}_obj PRIVATE OPS_UTILS_LOG_SUB_MOD_NAME="GRAPH_PLUGIN" LOG_CPP)
@@ -711,7 +711,7 @@ macro(add_graph_plugin_sources)
     endif()
   endif()
 
-  file(GLOB GRAPH_PLUGIN_SRCS 
+  file(GLOB GRAPH_PLUGIN_SRCS
       ${SOURCE_DIR}/*_graph_plugin*.cpp
   )
   if(GRAPH_PLUGIN_SRCS)
@@ -778,7 +778,7 @@ function(protobuf_generate_external comp c_var h_var)
 
     if (_add_target)
       add_custom_target(
-        ${comp} DEPENDS ${${c_var}} ${${h_var}}) 
+        ${comp} DEPENDS ${${c_var}} ${${h_var}})
     endif()
 
     set_source_files_properties(${${c_var}} ${${h_var}} PROPERTIES GENERATED TRUE)
@@ -791,7 +791,7 @@ function(add_onnx_plugin_modules)
   if (NOT TARGET ${ONNX_PLUGIN_NAME}_obj)
     set(ge_onnx_proto_srcs
       ${ASCEND_DIR}/include/proto/ge_onnx.proto)
-    
+
     protobuf_generate_external(onnx ge_onnx_proto_cc ge_onnx_proto_h ${ge_onnx_proto_srcs})
 
     add_library(${ONNX_PLUGIN_NAME}_obj OBJECT ${ge_onnx_proto_h})

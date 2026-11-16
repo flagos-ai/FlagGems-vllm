@@ -897,7 +897,7 @@ function(op_add_ut_subdirectory OP_UT_LIST OP_UT_DIR_LIST)
                     continue()
                 endif ()
             endif ()
-        endif ()        
+        endif ()
 
         list(APPEND _OP_UT_LIST ${OP_NAME})
         list(APPEND _OP_UT_DIR_LIST ${OP_DIR})

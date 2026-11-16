@@ -47,7 +47,7 @@ endif()
 get_filename_component(RUNTIME_INC_DIR ${RUNTIME_INC_DIR} REALPATH)
 
 if(runtime_FOUND)
-  if(NOT runtime_FIND_QUIETLY)	
+  if(NOT runtime_FIND_QUIETLY)
     message(STATUS "Found source npuruntime include dir: ${RUNTIME_INC_DIR}")
   endif()
   set(NPURUNTIME_INCLUDE_DIRS

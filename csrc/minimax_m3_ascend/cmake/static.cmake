@@ -73,7 +73,7 @@ foreach(compute_unit ${ASCEND_COMPUTE_UNIT})
     set(RESOURCE_PATH ${CMAKE_BINARY_DIR}/autogen/${compute_unit}/aclnnop_resource)
     file(GLOB RESOURCE_CPP ${RESOURCE_PATH}/*.cpp)
     set_source_files_properties(${RESOURCE_CPP} PROPERTIES GENERATED TRUE)
-    add_library(resource_${compute_unit}_static STATIC 
+    add_library(resource_${compute_unit}_static STATIC
                 $<$<TARGET_EXISTS:${OPHOST_NAME}_infer_obj>:$<TARGET_OBJECTS:${OPHOST_NAME}_infer_obj>>
                 $<$<TARGET_EXISTS:${OPHOST_NAME}_tiling_obj>:$<TARGET_OBJECTS:${OPHOST_NAME}_tiling_obj>>
                 $<$<TARGET_EXISTS:${COMMON_NAME}_obj>:$<TARGET_OBJECTS:${COMMON_NAME}_obj>>

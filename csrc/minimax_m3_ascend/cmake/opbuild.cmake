@@ -182,7 +182,7 @@ function(gen_aclnn_with_opdef)
   set(aclnn_master_header "${CMAKE_CURRENT_BINARY_DIR}/${aclnn_master_header_name}.h")
   gen_aclnn_master_header(${aclnn_master_header_name} "${aclnn_master_header}" "${opbuild_out_headers}")
 
-  set(mc2_op_aclnn_name 
+  set(mc2_op_aclnn_name
         "all_gather_matmul"
         "all_to_all_all_gather_batch_matmul"
         "allto_allv_grouped_mat_mul"

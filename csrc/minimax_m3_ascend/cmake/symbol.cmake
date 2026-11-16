@@ -84,8 +84,8 @@ function(gen_opgraph_symbol)
 endfunction()
 
 function(gen_opapi_symbol)
-  # opapi shared	
-  add_library(${OPAPI_NAME} SHARED	
+  # opapi shared
+  add_library(${OPAPI_NAME} SHARED
     $<$<TARGET_EXISTS:${OPHOST_NAME}_opapi_obj>:$<TARGET_OBJECTS:${OPHOST_NAME}_opapi_obj>>
     $<$<TARGET_EXISTS:opbuild_gen_aclnn_all>:$<TARGET_OBJECTS:opbuild_gen_aclnn_all>>
   )

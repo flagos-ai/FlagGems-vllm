@@ -15,9 +15,9 @@
 
 #ifndef INCLUDE_HARDWARE_H
 #define INCLUDE_HARDWARE_H
- 
+
 enum class ArchType { ASCEND_V220, ASCEND_V200, ASCEND_M200 };
- 
+
 template <ArchType ArchTag>
 struct HardwareInfo {
     static uint32_t const l2BW = 5;

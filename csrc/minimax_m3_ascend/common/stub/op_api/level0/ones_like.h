@@ -9,9 +9,9 @@
  */
 #ifndef PTA_NPU_OP_API_INC_LEVEL0_OP_ONES_LIKE_OP_H_
 #define PTA_NPU_OP_API_INC_LEVEL0_OP_ONES_LIKE_OP_H_
- 
+
 #include "opdev/op_executor.h"
- 
+
 namespace l0op {
 static const std::initializer_list<op::DataType> AICPU_DTYPE_SUPPORT_LIST = {
   op::DataType::DT_BOOL, op::DataType::DT_FLOAT, op::DataType::DT_FLOAT16, op::DataType::DT_INT8,

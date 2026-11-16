@@ -24,4 +24,3 @@ add_ops_compile_options(
 if (NOT BUILD_OPS_RTY_KERNEL)
     add_modules_sources(OPTYPE flaggems_m3_sparse_attention_score ACLNNTYPE aclnn_exclude)
 endif()
-

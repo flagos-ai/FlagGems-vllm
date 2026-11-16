@@ -194,9 +194,9 @@ add_cfg_version_comment() {
 
 # 处理移除子包版本配置行
 __process_unset_package_line() {
-    local line="$1" 
-    local package="$2" 
-    local target_type="$3" 
+    local line="$1"
+    local package="$2"
+    local target_type="$3"
     local filepath_new="$4"
     local cfg_items package_name attr_type
 
@@ -313,9 +313,9 @@ get_package_version_version_cfg() {
 
 # 处理单个配置文件
 __process_cfg_file() {
-    local filepath="$1" 
-    local package="$2" 
-    local running_version="$3" 
+    local filepath="$1"
+    local package="$2"
+    local running_version="$3"
     local filepath_new="$4"
     local cfg_items package_name attr_type line
     local is_set="false"
@@ -396,7 +396,7 @@ set_running_package_version() {
     fi
 
     __process_cfg_file "${filepath}" "${package}" "${running_version}" "${filepath_new}"
-    
+
     add_cfg_version_comment "${filepath_new}"
     mv -f "${filepath_new}" "${filepath}"
     if [ $? -ne 0 ]; then

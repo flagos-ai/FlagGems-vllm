@@ -140,7 +140,7 @@ find_library(DEVICE_REGISTER_EXIST device_register
 if (DEVICE_REGISTER_EXIST STREQUAL "DEVICE_REGISTER_EXIST-NOTFOUND")
     message(WARNING "device_register library not found!")
 else()
-    target_link_libraries(opmaster PRIVATE 
+    target_link_libraries(opmaster PRIVATE
     -Wl,--whole-archive
     device_register
     -Wl,--no-whole-archive

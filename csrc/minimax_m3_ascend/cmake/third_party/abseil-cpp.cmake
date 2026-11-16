@@ -51,7 +51,7 @@ else()
                       CONFIGURE_COMMAND ""
                       BUILD_COMMAND ""
                       INSTALL_COMMAND ""
-                      EXCLUDE_FROM_ALL TRUE 
+                      EXCLUDE_FROM_ALL TRUE
   )
 
   ExternalProject_Get_Property(abseil_build_transformer SOURCE_DIR)
