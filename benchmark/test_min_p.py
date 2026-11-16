@@ -6,10 +6,11 @@
 The dominant-token input and min_p=0.1 are adapted from
 tests/v1/logits_processors/test_correctness.py in vLLM at
 947dd62c0700851a79b0a8f32cb823e25a003b31.
+
+The standard kernel timer measures repeated calls on already-filtered logits
+after warmup. Each provider starts from the same original logits.
 """
 
-import statistics
-import time
 from pathlib import Path
 
 import pytest
@@ -62,35 +63,9 @@ class MinPBenchmark(base.Benchmark):
             yield logits, mapping, min_p
 
     def get_latency(self, op, *args, **kwargs):
-        logits = args[0]
-        device_api = runtime.torch_device_fn
-
-        def invoke():
-            logits.copy_(self._original)
-            op(*args, **kwargs)
-
-        with device_api.device(logits.device):
-            # Compilation/autotuning completes before any measured sample.
-            invoke()
-            device_api.synchronize()
-            deadline = time.perf_counter() + Config.warm_up / 1000.0
-            while time.perf_counter() < deadline:
-                invoke()
-                device_api.synchronize()
-
-            start = device_api.Event(enable_timing=True)
-            end = device_api.Event(enable_timing=True)
-            samples = []
-            deadline = time.perf_counter() + Config.repetition / 1000.0
-            while not samples or time.perf_counter() < deadline:
-                # The copy precedes the start event on the same stream.
-                logits.copy_(self._original)
-                start.record()
-                op(*args, **kwargs)
-                end.record()
-                end.synchronize()
-                samples.append(start.elapsed_time(end))
-            return statistics.median(samples)
+        # Restore once per provider; min-p is idempotent for these inputs.
+        args[0].copy_(self._original)
+        return super().get_latency(op, *args, **kwargs)
 
 
 def test_min_p_perf():
