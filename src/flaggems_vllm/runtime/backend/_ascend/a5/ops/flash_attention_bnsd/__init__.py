@@ -45,8 +45,12 @@ They share ``build_tile_order``, ``_max_nan`` and ``_COMPILE_OPTS`` from
 regressing the other.
 """
 
-from .fa_causal import flash_attention_fwd_causal
-from .fa_dense import flash_attention_fwd_dense
+from flaggems_vllm.runtime.backend._ascend.a5.ops.flash_attention_bnsd.fa_causal import (
+    flash_attention_fwd_causal,
+)
+from flaggems_vllm.runtime.backend._ascend.a5.ops.flash_attention_bnsd.fa_dense import (
+    flash_attention_fwd_dense,
+)
 
 __all__ = [
     "flash_attention_fwd",

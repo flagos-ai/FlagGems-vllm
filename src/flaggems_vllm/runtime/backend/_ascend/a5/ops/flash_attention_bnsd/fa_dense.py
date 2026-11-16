@@ -26,7 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .fa_naive import (
+from flaggems_vllm.runtime.backend._ascend.a5.ops.flash_attention_bnsd.fa_naive import (
     _COMPILE_OPTS,
     _max_nan,
     build_tile_order,
