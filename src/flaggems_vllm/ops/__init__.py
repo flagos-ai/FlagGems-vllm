@@ -88,6 +88,12 @@ from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
 from flaggems_vllm.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
 )
+from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
+    GemmReduceScatterConfig,
+    clear_fused_matmul_reduce_scatter_cache,
+    configure_fused_matmul_reduce_scatter,
+    fused_matmul_reduce_scatter,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -127,6 +133,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_bwd,
     mhc_post,
     mhc_pre,
+    mhc_pre_broadcast,
     mhc_shifted_post_pre,
 )
 from flaggems_vllm.ops.min_p import apply_min_p
@@ -287,11 +294,13 @@ __all__ = [
     "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_with_fused_gate",
     "chunk_kda_with_safe_gate",
+    "clear_fused_matmul_reduce_scatter_cache",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
+    "configure_fused_matmul_reduce_scatter",
     "contiguous_copy",
     "cooperative_topk",
     "copy_to",
@@ -329,6 +338,7 @@ __all__ = [
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
+    "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -344,6 +354,7 @@ __all__ = [
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "GemmReduceScatterConfig",
     "gems_rms_forward",
     "get_num_sampled_and_rejected",
     "grouped_gemma_rmsnorm",
@@ -367,6 +378,7 @@ __all__ = [
     "mhc_fused_post_pre_with_norm",
     "mhc_post",
     "mhc_pre",
+    "mhc_pre_broadcast",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
     "mhc_shifted_post_pre",
