@@ -60,11 +60,14 @@ from flaggems_vllm.testing.megamoe import (  # noqa: E402
     make_context,
     pool_tokens,
 )
+from flaggems_vllm.testing.megamoe_ppu import (  # noqa: E402
+    assert_relative_l2,
+    make_ppu_context,
+    reference_int8_moe,
+)
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle  # noqa: E402
 
 # isort: on
-
-from benchmark.test_megamoe import _make_ppu_context, _reference_int8_moe  # noqa: E402
 
 pytestmark = pytest.mark.megamoe
 HYGON_CANONICAL_DATA = Path(
@@ -903,8 +906,8 @@ def test_megamoe_int8_correctness(shape, ids_dtype, routing):
         ids.fill_(e - 1)
     elif routing == "dropped":
         ids.fill_(-1)
-    expected = _reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids)
-    context = _make_ppu_context(
+    expected = reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids)
+    context = make_ppu_context(
         api.MegaMoEConfig(t, h, i, e, k),
         torch.device("cuda", torch.cuda.current_device()),
     )
@@ -925,16 +928,14 @@ def test_megamoe_int8_correctness(shape, ids_dtype, routing):
     if routing == "dropped":
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     else:
-        from benchmark.test_megamoe import _assert_relative_l2
-
-        _assert_relative_l2(actual, expected)
+        assert_relative_l2(actual, expected)
 
 
 def test_megamoe_context_reuse_with_changing_routes():
     api = _require_ppu_device()
     t, h, i, e, k = 17, 256, 384, 5, 3
     device = torch.device("cuda", torch.cuda.current_device())
-    context = _make_ppu_context(api.MegaMoEConfig(t, h, i, e, k), device)
+    context = make_ppu_context(api.MegaMoEConfig(t, h, i, e, k), device)
     rng = torch.Generator().manual_seed(123)
     x = torch.randint(-8, 9, (t, h), dtype=torch.int8, generator=rng)
     scales = torch.rand(t, 1, generator=rng) * 0.02 + 0.01
@@ -958,7 +959,7 @@ def test_megamoe_context_reuse_with_changing_routes():
         elif routing == "dropped":
             ids.fill_(-1)
         router = torch.rand(t, k, generator=rng)
-        expected = _reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids)
+        expected = reference_int8_moe(x, scales, w1, s1, w2, s2, router, ids)
         # Poison both state and payload to expose missing reset/overwrite paths.
         for tensor in context.buffers.values():
             tensor.fill_(7)
@@ -969,9 +970,7 @@ def test_megamoe_context_reuse_with_changing_routes():
         if routing == "dropped":
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
         else:
-            from benchmark.test_megamoe import _assert_relative_l2
-
-            _assert_relative_l2(actual.cpu(), expected)
+            assert_relative_l2(actual.cpu(), expected)
         assert pointers == {
             name: tensor.data_ptr() for name, tensor in context.buffers.items()
         }
@@ -982,7 +981,7 @@ def test_megamoe_rejects_mismatched_context():
 
     api = _require_ppu_device()
     device = torch.device("cuda", torch.cuda.current_device())
-    context = _make_ppu_context(api.MegaMoEConfig(1, 128, 128, 4, 1), device)
+    context = make_ppu_context(api.MegaMoEConfig(1, 128, 128, 4, 1), device)
     inputs = (
         torch.empty((1, 128), device=device, dtype=torch.int8),
         torch.empty((1, 1), device=device, dtype=torch.float32),
