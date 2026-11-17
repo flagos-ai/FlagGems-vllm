@@ -37,6 +37,10 @@ def _flash_int8_pack_kv(
     V,
     KP,
     VP,
+    TABLE,
+    USED,
+    TABLE_STRIDE: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
     PAGE: tl.constexpr,
@@ -46,18 +50,27 @@ def _flash_int8_pack_kv(
     PV: tl.constexpr,
     SV: tl.constexpr,
     HV: tl.constexpr,
+    WIDE_PAGES: tl.constexpr,
 ):
     n = tl.program_id(0) * PACK_TILE + tl.arange(0, PACK_TILE)
     d = tl.arange(0, D)
     h = tl.program_id(1)
+    batch = n // TOKEN_STRIDE
+    token = n % TOKEN_STRIDE
+    used = tl.load(USED + batch, n < N, 0)
+    valid = (n < N) & (token < used)
+    page = tl.load(TABLE + batch * TABLE_STRIDE + token // PAGE, valid, 0)
+    if WIDE_PAGES:
+        page = page.to(tl.int64)
+    row = token % PAGE
     k = tl.load(
-        K + (n[:, None] // PAGE) * PK + (n[:, None] % PAGE) * SK + h * HK + d[None, :],
-        n[:, None] < N,
+        K + page[:, None] * PK + row[:, None] * SK + h * HK + d[None, :],
+        valid[:, None],
         0,
     )
     v = tl.load(
-        V + (n[:, None] // PAGE) * PV + (n[:, None] % PAGE) * SV + h * HV + d[None, :],
-        n[:, None] < N,
+        V + page[:, None] * PV + row[:, None] * SV + h * HV + d[None, :],
+        valid[:, None],
         0,
     )
     off = (h * N + n[:, None]) * D + d[None, :]
@@ -116,11 +129,13 @@ def _flash_int8_fwd(
     HAS_ALIBI: tl.constexpr,
     WRITE_LSE: tl.constexpr,
     HALF_PV: tl.constexpr,
+    PACKED_TOKENS: tl.constexpr,
     BATCH: tl.constexpr,
     COMPACT: tl.constexpr,
     FOLD: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    DK: tl.constexpr,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kv_head = head if FOLD else head // GROUP
@@ -150,11 +165,9 @@ def _flash_int8_fwd(
     h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
     d = tl.arange(0, D)
     if tile * query_tile < nq:
-        q = tl.load(
-            Q + (q_start + m[:, None]) * sq + h[:, None] * hq + d[None, :],
-            m[:, None] < nq,
-            0,
-        )
+        q_ptr = Q + (q_start + m[:, None]) * sq + h[:, None] * hq
+        if DK == D:
+            q = tl.load(q_ptr + d[None, :], m[:, None] < nq, 0)
         q_scale = tl.load(
             QS + batch * qs0 + h * qs1 + (m // DESCALE_BLOCK) * qs2, m < nq, 0
         )
@@ -174,7 +187,10 @@ def _flash_int8_fwd(
             end = tl.minimum(end, (tile + 1) * query_tile + nk - nq + RIGHT)
         for start in range(first, tl.cdiv(tl.maximum(end, 0), BN)):
             n = start * BN + tl.arange(0, BN)
-            if PAGED:
+            if PACKED_TOKENS:
+                k_row = (batch * PACKED_TOKENS + n) * sk
+                v_row = (batch * PACKED_TOKENS + n) * sv
+            elif PAGED:
                 page = tl.load(TABLE + batch * table_stride + n // PAGE, n < nk, 0)
                 if WIDE_PAGES:
                     page = page.to(tl.int64)
@@ -183,13 +199,23 @@ def _flash_int8_fwd(
             else:
                 k_row = (k_start + n) * sk
                 v_row = (k_start + n) * sv
-            k = tl.load(
-                K + k_row[None, :] + kv_head * hk + d[:, None], n[None, :] < nk, 0
-            )
             descale_block = start * BN // DESCALE_BLOCK
             ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
             vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
-            scores = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32)
+            k_ptr = K + k_row[None, :] + kv_head * hk
+            if DK == D:
+                k = tl.load(k_ptr + d[:, None], n[None, :] < nk, 0)
+                dot = tl.dot(q, k, out_dtype=tl.int32)
+            else:
+                # Keep one head slice live at a time and sum the integer QK
+                # products before scaling and softmax.
+                dot = tl.full((BM, BN), 0, tl.int32)
+                for d_start in range(0, D, DK):
+                    dk = d_start + tl.arange(0, DK)
+                    q_part = tl.load(q_ptr + dk[None, :], m[:, None] < nq, 0)
+                    k_part = tl.load(k_ptr + dk[:, None], n[None, :] < nk, 0)
+                    dot = tl.dot(q_part, k_part, dot, out_dtype=tl.int32)
+            scores = dot.to(tl.float32)
             scores = scores * (q_scale * ks * SCALE)[:, None]
             if CAP > 0:
                 scores = CAP * (2 / (1 + tl.exp(2 * (-scores / CAP))) - 1)
@@ -229,14 +255,17 @@ def _flash_int8_fwd(
                 V + v_row[:, None] + kv_head * hv + d[None, :], n[:, None] < nk, 0
             )
             if HALF_PV:
+                # A single FP16 probability can lose small differences
+                # between nearly equal scores. Accumulate its residual too.
+                v = v.to(tl.float16)
+                p_hi = p.to(tl.float16)
+                p_lo = ((p - p_hi.to(tl.float32)) * 4096.0).to(tl.float16)
+                partial = tl.dot(p_hi, v, out_dtype=tl.float32)
+                residual = tl.dot(p_lo, v, out_dtype=tl.float32)
+                partial += residual * (1.0 / 4096.0)
                 if vs2 == 0:
-                    acc = tl.dot(
-                        p.to(tl.float16), v.to(tl.float16), acc * alpha[:, None]
-                    )
+                    acc = acc * alpha[:, None] + partial
                 else:
-                    partial = tl.dot(
-                        p.to(tl.float16), v.to(tl.float16), out_dtype=tl.float32
-                    )
                     acc = acc * alpha[:, None] + partial * vs
             else:
                 correction = tl.dot(
@@ -304,11 +333,10 @@ def flash_attn_varlen_func_w8a8_int8(
     (kv_heads for K/V), indexed by logical sequence position even for paged KV.
     Each real value is the INT8 value multiplied by its descale.
 
-    QK uses INT8 dot with INT32 accumulation. The INT8 PV path quantizes
-    both probabilities and their rounding residual, with zero-point correction;
-    Hygon DCU sweeps found this faster than fp16 PV even for long paged
-    queries, so the fp16-PV packing path is retained but disabled. Softmax
-    and online accumulation use FP32.
+    QK uses INT8 dot with INT32 accumulation. Long paged GQA prefill uses
+    compensated FP16 PV, optionally packing live KV pages. The INT8 PV path quantizes
+    both probabilities and their rounding residual with zero-point correction.
+    Softmax and online accumulation use FP32.
     Output is BF16 by default, or uses the supplied FP16/BF16 out buffer.
     LSE is [heads, total_q], FP32. Fully masked rows return zero and LSE +inf,
     following FlashAttention's convention. Inputs and out must not overlap.
@@ -356,33 +384,56 @@ def flash_attn_varlen_func_w8a8_int8(
     group = heads // k.shape[-2]
     fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
     compact = paged and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
+    wide_prefill = dim == 256 and fold and max_seqlen_q >= 128
+    inline_half_pv = wide_prefill and group >= 8
+    mixed_half_pv = (
+        wide_prefill
+        and compact
+        and total >= 2048
+        and (
+            inline_half_pv
+            or batch * triton.cdiv(max_seqlen_k, k.shape[1]) <= k.shape[0]
+        )
+    )
+    half_pv = (
+        fold
+        and dim in (128, 256)
+        and ((not compact and max_seqlen_q >= 1024) or mixed_half_pv)
+        and max_seqlen_k > 0
+        and k.shape[0] > 0
+        and block_table.shape[1] > 0
+    )
     if fold:
         block_m = 32 if max_seqlen_q > 16 else 16
-        if max_seqlen_q >= 128:
-            # Hygon DCU MFMA needs wide MMA rows for INT8 dot throughput;
-            # compact grids already get parallelism from packed requests.
-            block_m = 128 if compact else 256
-    if dim == 256:
+        if half_pv:
+            block_m = 64
+        elif max_seqlen_q >= 128:
+            block_m = 128 if compact or (dim == 128 and max_seqlen_q >= 1024) else 256
+    if wide_prefill:
+        block_m = 64
+    elif dim == 256:
         # Limit the FP32 accumulator and Q/K/V tiles for the wider head.
         block_m = min(block_m, 32)
     query_tile = block_m // group if fold else block_m
     grid_heads = k.shape[-2] if fold else heads
-    num_warps = 8 if block_m >= 128 or (block_m == 64 and dim == 128) else 4
+    num_warps = (
+        8 if block_m >= 128 or (block_m == 64 and dim == 128 and not half_pv) else 4
+    )
     grid = (
         (triton.cdiv(total, query_tile) + batch - 1, 1, grid_heads)
         if compact
         else (triton.cdiv(max_seqlen_q, query_tile), batch, grid_heads)
     )
-    # Hygon sweeps found quantized-probability INT8 PV faster than fp16 PV
-    # for long paged queries too, so the packing path stays disabled.
-    half_pv = False
+    packed_tokens = 0
     with torch_device_fn.device(q.device):
-        if half_pv and k.shape[0] > 0:
-            # Preserve physical page indices while making each head contiguous.
-            # Packing and the INT8-to-FP16 V conversion are part of this call.
-            n = k.shape[0] * k.shape[1]
+        if half_pv and not inline_half_pv:
+            # The request's block table bounds the scratch space, independent
+            # of the size of the physical KV pool.
+            pages = min(block_table.shape[1], triton.cdiv(max_seqlen_k, k.shape[1]))
+            packed_tokens = pages * k.shape[1]
+            n = batch * packed_tokens
             kp = torch.empty_strided(
-                k.shape,
+                (batch * pages, k.shape[1], k.shape[2], dim),
                 (k.shape[1] * dim, dim, n * dim, 1),
                 dtype=torch.int8,
                 device=k.device,
@@ -395,11 +446,16 @@ def flash_attn_varlen_func_w8a8_int8(
                 v,
                 kp,
                 vp,
+                block_table,
+                seqused_k,
+                block_table.stride(0),
+                packed_tokens,
                 n,
                 dim,
                 k.shape[1],
                 *k.stride()[:3],
                 *v.stride()[:3],
+                WIDE_PAGES=wide_pages,
             )
             k, v = kp, vp
         _flash_int8_fwd[grid](
@@ -435,7 +491,7 @@ def flash_attn_varlen_func_w8a8_int8(
                 if alibi_slopes is not None and alibi_slopes.ndim == 2
                 else 0
             ),
-            total,
+            total if return_softmax_lse else 0,
             heads // k.shape[-2],
             dim,
             k.shape[1] if paged else 0,
@@ -449,12 +505,14 @@ def flash_attn_varlen_func_w8a8_int8(
             alibi_slopes is not None,
             return_softmax_lse,
             HALF_PV=half_pv,
-            BATCH=batch,
+            PACKED_TOKENS=packed_tokens,
+            BATCH=batch if compact else 0,
             COMPACT=compact,
             FOLD=fold,
             BM=block_m,
-            BN=128 if half_pv else 64,
+            BN=64,
+            DK=128 if wide_prefill else dim,
             num_warps=num_warps,
-            num_stages=3 if half_pv else 1,
+            num_stages=1,
         )
     return (out, lse) if return_softmax_lse else out

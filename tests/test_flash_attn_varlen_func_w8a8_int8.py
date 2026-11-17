@@ -700,6 +700,25 @@ def test_paged_large_query_tile(causal, broadcast_scales, query_len):
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon KV packing")
+@pytest.mark.parametrize("page_size,broadcast_scales", [(16, True), (64, False)])
+def test_hygon_long_prefill_packs_live_kv_pages(page_size, broadcast_scales):
+    _run_case(
+        [1089, 1024],
+        [2073, 127],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=True,
+        paged=True,
+        strided=True,
+        broadcast_scales=broadcast_scales,
+        extra_cache_pages=11,
+        page_size=page_size,
+    )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon head_dim=256")
 @pytest.mark.parametrize(
     "paged,qlens,klens",
