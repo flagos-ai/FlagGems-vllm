@@ -18,6 +18,7 @@ fused_recurrent_gated_delta_rule_fwd: test_FLA/test_fused_recurrent_gated_delta_
 
 # --- MHC operators (tested in test_mhc_ops.py) ---
 hc_head_fused_kernel: test_mhc_ops
+hc_split_sinkhorn: test_mhc_ops
 hc_split_sinkhorn_forward: test_mhc_ops
 mhc_bwd: test_mhc_ops
 mhc_post: test_mhc_ops
