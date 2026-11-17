@@ -136,6 +136,8 @@ def _flash_int8_fwd(
     BM: tl.constexpr,
     BN: tl.constexpr,
     DK: tl.constexpr,
+    ONE_QUERY: tl.constexpr,
+    ONE_KEY_BOUND: tl.constexpr,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kv_head = head if FOLD else head // GROUP
@@ -164,7 +166,19 @@ def _flash_int8_fwd(
     m = rows // GROUP if FOLD else rows
     h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
     d = tl.arange(0, D)
-    if tile * query_tile < nq:
+    if ONE_QUERY and nq > 0 and nk <= 1:
+        # With a single visible key, the normalized weight of V is exactly one.
+        page = tl.load(TABLE + batch * table_stride, nk == 1, 0)
+        if WIDE_PAGES:
+            page = page.to(tl.int64)
+        value = tl.load(V + page * pv + kv_head * hv + d, nk == 1, 0)
+        scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk == 1, 0)
+        tl.store(
+            O + (q_start + m[:, None]) * so + h[:, None] * ho + d[None, :],
+            (value.to(tl.float32) * scale)[None, :],
+            m[:, None] < nq,
+        )
+    if not ONE_KEY_BOUND and tile * query_tile < nq and (not ONE_QUERY or nk > 1):
         q_ptr = Q + (q_start + m[:, None]) * sq + h[:, None] * hq
         if DK == D:
             q = tl.load(q_ptr + d[None, :], m[:, None] < nq, 0)
@@ -403,6 +417,7 @@ def flash_attn_varlen_func_w8a8_int8(
         and k.shape[0] > 0
         and block_table.shape[1] > 0
     )
+    one_query = paged and dim == 256 and max_seqlen_q == 1 and not return_softmax_lse
     if fold:
         block_m = 32 if max_seqlen_q > 16 else 16
         if half_pv:
@@ -512,6 +527,8 @@ def flash_attn_varlen_func_w8a8_int8(
             BM=block_m,
             BN=64,
             DK=128 if wide_prefill else dim,
+            ONE_QUERY=one_query,
+            ONE_KEY_BOUND=one_query and max_seqlen_k <= 1,
             num_warps=num_warps,
             num_stages=1,
         )
