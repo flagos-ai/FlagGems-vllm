@@ -37,6 +37,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: apply_min_p
+  description: Filter logits in place using per-request minimum probability ratios.
+  for:
+  - apply_min_p
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: apply_repetition_penalties
   description: 'Modifies logit tensors in place to penalize tokens that have already
     appeared in the generated sequence.
@@ -69,6 +80,17 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
+- id: apply_thinking_budget
+  description: Update reasoning-marker caches and force the budgeted end token.
+  for:
+  - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: beam_search_score
   description: Computes beam search scores by adding cumulative log probabilities
     with new token scores.
@@ -562,6 +584,12 @@ ops:
 
     8.0 for BF16) use plain Triton kernels.
 
+    On Hygon BW1000, which has no FP8
+
+    compute, an FP8 wo_a runs in INT8 with the same per-128 activation scales,
+
+    and a BF16 wo_a is read in place without a full copy.
+
     '
   for:
   - vllm.models.deepseek_v41.nvidia.ops.o_proj.dsv41_o_proj
@@ -800,6 +828,26 @@ ops:
   stages:
   - stable: '2.0'
   cpp: '4.0'
+- id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+  description: 'Horizontally-fused DeepseekV4-MLA full-cache path.
+
+    Optional weight-free RMSNorm + GPT-J RoPE for Q, GPT-J RoPE + per-tensor FP8
+
+    (e4m3) quant for both Q and KV, and paged cache insert for KV, all in one
+
+    kernel launch.
+
+    '
+  for:
+  - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
   description: 'Horizontally-fused DeepseekV4-MLA.
 
@@ -932,6 +980,22 @@ ops:
   - MoE
   kind:
   - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: fused_matmul_reduce_scatter
+  description: |
+    Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+    Matches the symm_mem argument signature; currently inference-only, NVIDIA SM90+
+    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW nodes),
+    FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
+    Uses process-group-scoped communication resources and explicit configuration.
+  for:
+  - symm_mem.fused_matmul_reduce_scatter
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Distributed
   stages:
   - alpha: '5.4'
 - id: fused_moe
@@ -1097,11 +1161,16 @@ ops:
 
     FP8 supports decode, prefill and speculative state-slot updates.
 
+    MThreads exposes native decode/MTP and prefill with FP8 VK state, independent
+    indexed state pools, initialization flags and quantized rollback buffers.
+
     INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
 
     '
   for:
   - gdn_w8a16
+  - chunk_gated_delta_rule_w8a16_fp8
+  - gated_delta_rule_decode_w8a16_fp8
   - gdn_w8a16_int8
   - chunk_gated_delta_rule_w8a16_int8
   - quantize_gdn_state_int8
@@ -1580,6 +1649,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: mhc_pre_broadcast
+  description: Triton implementation of mHC Pre Broadcast operator (hc_mult=4).
+  for:
+  - vllm.model_executor.kernels.mhc.tilelang.mhc_pre_broadcast_tilelang
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
 - id: mhc_shifted_post_pre
   description: 'DSV4.1 shifted mHC boundary: applies the previous sublayer''s post/comb
 
@@ -1942,6 +2022,23 @@ ops:
   stages:
   - stable: '4.1'
   cpp: '4.0'
+- id: select_candidate_blocks_cooperative
+  description: |
+    DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM's
+    select_candidate_blocks_cooperative: per-block NaN-propagating max with
+    the newest block pinned, top-k over each row's valid block prefix (the
+    Triton persistent_topk / cooperative_topk in place of the CUDA
+    cooperative_topk), then -inf / out-of-range ids dropped to -1.
+  for:
+  - vllm.models.deepseek_v41.nvidia.specialized_decode.attention.candidate_topk.select_candidate_blocks_cooperative
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
 - id: silu_and_mul
   description: A custom operator in vLLM as activation function for SwiGLU.
   for:
