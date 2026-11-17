@@ -73,10 +73,10 @@ def find_test_file(op_id: str, aliases: dict[str, str]) -> Path | None:
     """
     # Check alias first
     if op_id in aliases:
-        alias_stem = aliases[op_id]
+        alias_stem = Path(aliases[op_id])
         # Ensure it has test_ prefix
-        if not alias_stem.startswith("test_"):
-            alias_stem = f"test_{alias_stem}"
+        if not alias_stem.name.startswith("test_"):
+            alias_stem = alias_stem.with_name(f"test_{alias_stem.name}")
         # Support subdirectory aliases like "test_FLA/test_chunk_kda"
         alias_path = TESTS_DIR / f"{alias_stem}.py"
         if alias_path.exists():
