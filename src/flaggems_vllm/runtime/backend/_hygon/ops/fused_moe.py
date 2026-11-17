@@ -192,15 +192,15 @@ def _apply_qwen_w16a16_tuning(
     if len(w1_shape) != 3 or len(w2_shape) != 3:
         return config
     E1, N1, K1 = w1_shape
-    E2, H, I = w2_shape
+    E2, H, intermediate = w2_shape
     if (
         E1 != 256
         or E2 != 256
         or H != 2048
         or K1 != 2048
         or top_k != 8
-        or I not in (128, 512)
-        or N1 != 2 * I
+        or intermediate not in (128, 512)
+        or N1 != 2 * intermediate
     ):
         return config
 
