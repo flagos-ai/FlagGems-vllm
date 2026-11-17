@@ -27,9 +27,20 @@ from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.flashmla_sparse import (
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.fused_moe import (
+    dispatch_fused_moe_kernel,
+    fused_experts_impl,
+    inplace_fused_experts,
+    invoke_fused_moe_triton_kernel,
+    outplace_fused_experts,
+)
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.mhc_pre import mhc_pre
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.moe_align_block_size import (
+    moe_align_block_size,
+    moe_align_block_size_triton,
+)
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.reshape_and_cache_flash import (
     reshape_and_cache_flash,
 )
@@ -47,6 +58,13 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "dispatch_fused_moe_kernel",
+    "fused_experts_impl",
+    "inplace_fused_experts",
+    "invoke_fused_moe_triton_kernel",
+    "outplace_fused_experts",
+    "moe_align_block_size",
+    "moe_align_block_size_triton",
     "mhc_post",
     "mhc_pre",
     "fused_add_rms_norm",
