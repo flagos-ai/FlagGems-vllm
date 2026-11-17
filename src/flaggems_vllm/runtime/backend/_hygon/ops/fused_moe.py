@@ -156,6 +156,50 @@ def dequant_mxfp6(
 # Activation quantization helpers
 
 
+def _apply_qwen_w16a16_tuning(
+    config: dict[str, Any],
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    top_k: int,
+    dtype: str | None,
+    M: int,
+    gemm_stage: str,
+) -> dict[str, Any]:
+    """Use the measured Qwen3.6-35B-A3B W16A16 tiling heuristic.
+
+    These are prefill chunks (M >= 1024) with E=256, H=2048 and
+    moe_intermediate_size 128 or 512. gemm1 and gemm2 share the same block M
+    because moe_align_block_size builds one sorted layout for both stages.
+    """
+    if dtype not in ("bf16", "fp16") or M < 1024:
+        return config
+    if len(w1_shape) != 3 or len(w2_shape) != 3:
+        return config
+    E1, N1, K1 = w1_shape
+    E2, H, I = w2_shape
+    if (
+        E1 != 256
+        or E2 != 256
+        or H != 2048
+        or K1 != 2048
+        or top_k != 8
+        or I not in (128, 512)
+        or N1 != 2 * I
+    ):
+        return config
+
+    tuned = dict(config)
+    tuned.update(
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=64,
+        GROUP_SIZE_M=1,
+        num_warps=8,
+        num_stages=2,
+    )
+    tuned.pop("PAIR_GATE_UP_DOT", None)
+    return tuned
+
+
 @functools.lru_cache(maxsize=1)
 def try_get_optimal_moe_config(
     w1_shape: tuple[int, ...],
@@ -185,6 +229,15 @@ def try_get_optimal_moe_config(
         block_shape,
         gemm_stage=gemm_stage,
         enable_gemm_fast_path=enable_gemm_fast_path,
+    )
+    config = _apply_qwen_w16a16_tuning(
+        config,
+        w1_shape,
+        w2_shape,
+        top_k,
+        dtype,
+        M,
+        gemm_stage,
     )
     if return_is_embedded:
         return config, False
