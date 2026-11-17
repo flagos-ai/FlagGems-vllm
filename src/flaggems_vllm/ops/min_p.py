@@ -69,9 +69,7 @@ def _min_p_kernel(
     if SINGLE_TILE:
         # Keep the loaded row live for filtering below.
         logits = tl.load(row_ptr + offsets, offsets < vocab_size, other=-float("inf"))
-        max_val = tl.max(
-            logits.to(tl.float32), 1 if USE_TLE else 0, keep_dims=USE_TLE
-        )
+        max_val = tl.max(logits.to(tl.float32), 1 if USE_TLE else 0, keep_dims=USE_TLE)
     else:
         # Accumulate per-lane maxima and perform one cross-lane reduction.
         maxima = tl.full(offsets.shape, -float("inf"), tl.float32)

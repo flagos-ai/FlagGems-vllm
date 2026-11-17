@@ -15,8 +15,9 @@ except ImportError as exc:
         "and its dependencies are installed correctly."
     ) from exc
 
-from flaggems_vllm import apply_min_p, runtime
+from flaggems_vllm import apply_min_p
 from flaggems_vllm import device as DEVICE
+from flaggems_vllm import runtime
 
 from . import conftest as cfg
 
@@ -31,9 +32,11 @@ pytestmark = [
 
 @pytest.mark.parametrize(
     "rows,vocab",
-    [(50, 1024)]
-    if cfg.QUICK_MODE
-    else [(50, 1024), (1, 32000), (32, 128256), (128, 152065)],
+    (
+        [(50, 1024)]
+        if cfg.QUICK_MODE
+        else [(50, 1024), (1, 32000), (32, 128256), (128, 152065)]
+    ),
 )
 @pytest.mark.parametrize("probability", [0.1, 0.0])
 def test_min_p(rows, vocab, probability):
