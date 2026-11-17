@@ -25,11 +25,15 @@ import pytest
 import torch
 
 import flaggems_vllm as gems
-from flaggems_vllm.ops.mhc.mhc_post import MixLayout, mhc_post, mhc_post_ref
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
-from flaggems_vllm.ops.mhc.mhc_shifted_post_pre import mhc_shifted_post_pre
 
 from .conftest import QUICK_MODE
+from .test_mhc_ops import mhc_post_ref
+
+# Package namespace, never module paths: see tests/test_mhc_ops.py.
+MixLayout = gems.MixLayout
+mhc_post = gems.mhc_post
+mhc_pre = gems.mhc_pre
+mhc_shifted_post_pre = gems.mhc_shifted_post_pre
 
 
 def _load_vllm_delayed_reference():

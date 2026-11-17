@@ -1245,6 +1245,21 @@ ops:
   stages:
   - beta: '5.2'
   - stable: '5.3'
+- id: hc_split_sinkhorn
+  description: 'Splits the mHC mix coefficients into the pre/post gates and the comb
+    matrix, then runs the Sinkhorn normalisation on the comb matrix.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: hc_split_sinkhorn_forward
   description: 'Computes a differentiable approximation of the Wasserstein distance
     (Optimal Transport)
