@@ -44,29 +44,30 @@ _CONFIGS = (
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-# SPEC contains (N, DIM, NUM_GROUPS, W_SHARED, ROW_GAPPED, EPS, BLOCK_SIZE,
-# stride_x). The compact signature reduces LibEntry's per-call parameter work.
+# SPEC contains (DIM, NUM_GROUPS, W_SHARED, ROW_GAPPED, EPS, BLOCK_SIZE,
+# stride_x). N still selects the tuning configuration, but only the launch grid
+# uses it: different row counts can reuse the same compiled kernel.
 # repr preserves all tuple fields in the SQL-backed tuner's scalar key column;
 # LibTuner still appends each pointer dtype independently to the tuning key.
 @libentry()
 @libtuner(
     configs=_CONFIGS,
-    key=["SPEC"],
-    strategy=[repr],
+    key=["N", "SPEC"],
+    strategy=[int, repr],
     # Explicit warmup/rep uses the non-Graph timer on Triton 3.2+; older
     # versions receive use_cuda_graph=False directly.
     warmup=5,
     rep=20,
     use_cuda_graph=False,
 )
-@triton.jit
-def _grouped_gemma_rmsnorm_kernel(X, W, Y, SPEC: tl.constexpr):
-    stride_x: tl.constexpr = SPEC[7]
-    DIM: tl.constexpr = SPEC[1]
-    NUM_GROUPS: tl.constexpr = SPEC[2]
-    W_SHARED: tl.constexpr = SPEC[3]
-    EPS: tl.constexpr = SPEC[5]
-    BLOCK_SIZE: tl.constexpr = SPEC[6]
+@triton.jit(do_not_specialize=["N"])
+def _grouped_gemma_rmsnorm_kernel(X, W, Y, N, SPEC: tl.constexpr):
+    stride_x: tl.constexpr = SPEC[6]
+    DIM: tl.constexpr = SPEC[0]
+    NUM_GROUPS: tl.constexpr = SPEC[1]
+    W_SHARED: tl.constexpr = SPEC[2]
+    EPS: tl.constexpr = SPEC[4]
+    BLOCK_SIZE: tl.constexpr = SPEC[5]
     GROUP_DIM: tl.constexpr = DIM // NUM_GROUPS
     pid = tl.program_id(0).to(tl.int64)
     row = pid // NUM_GROUPS
@@ -196,8 +197,8 @@ def grouped_gemma_rmsnorm(
             X=x,
             W=weight,
             Y=output,
+            N=n,
             SPEC=(
-                n,
                 dim,
                 num_groups,
                 weight_numel == group_dim,
@@ -215,8 +216,8 @@ def grouped_gemma_rmsnorm(
                 X=x,
                 W=weight,
                 Y=output,
+                N=n,
                 SPEC=(
-                    n,
                     dim,
                     num_groups,
                     weight_numel == group_dim,
