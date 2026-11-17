@@ -17,8 +17,9 @@ except ImportError as exc:
         "and its dependencies are installed correctly."
     ) from exc
 
-from flaggems_vllm import apply_thinking_budget, runtime
+from flaggems_vllm import apply_thinking_budget
 from flaggems_vllm import device as DEVICE
+from flaggems_vllm import runtime
 
 pytestmark = [
     pytest.mark.apply_thinking_budget,
@@ -99,9 +100,7 @@ def check(args):
             dict(tokens=[1, 90, 10, 11, 12], input_ids=[12], logits_kind="masked"),
             id="restore-masked-end",
         ),
-        pytest.param(
-            dict(tokens=[1, 90, 10, 11], input_ids=[11]), id="before-budget"
-        ),
+        pytest.param(dict(tokens=[1, 90, 10, 11], input_ids=[11]), id="before-budget"),
         pytest.param(
             dict(
                 tokens=[1, 90, 10, 11, 12],
