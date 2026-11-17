@@ -73,9 +73,8 @@ else:
 
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
-    "flash_mla_with_kvcache_sparse_w8a8_int8",
-    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
     "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
@@ -90,6 +89,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "qsa_prepare",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",

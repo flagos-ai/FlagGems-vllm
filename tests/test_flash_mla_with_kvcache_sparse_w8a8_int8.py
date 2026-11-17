@@ -16,7 +16,6 @@ OP_NAME = "flash_mla_with_kvcache_sparse_w8a8_int8"
 OVERRIDES = dict(flaggems_vllm.runtime.backend.get_customized_ops())
 SUPPORTED = OP_NAME in OVERRIDES
 pytestmark = [
-    pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8,
     pytest.mark.skipif(not SUPPORTED, reason="No registered sparse INT8 KVCache MLA"),
 ]
 
@@ -91,6 +90,7 @@ def assert_accuracy(actual, expected):
     gems_assert_close(lse[finite], ref_lse[finite], torch.float32, atol=2e-4)
 
 
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8
 @pytest.mark.parametrize("rope_dim", [0, 64])
 @pytest.mark.parametrize("queries", [1, 2])
 @pytest.mark.parametrize("heads", [16, 32, 64, 128])
@@ -124,6 +124,7 @@ def test_sparse_decode(queries, heads, dtype, rope_dim):
     )
 
 
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8
 @pytest.mark.parametrize("rope_dim", [0, 64])
 @pytest.mark.parametrize("topk", [0, 1, 64, 65, 512, 2048, 8320])
 def test_sparse_decode_lengths(topk, rope_dim):
@@ -142,6 +143,7 @@ def test_sparse_decode_lengths(topk, rope_dim):
         assert_accuracy(actual, reference(inputs))
 
 
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8
 @pytest.mark.parametrize("empty", ["batch", "heads", "cache"])
 def test_sparse_decode_empty(empty):
     inputs, _, _ = make_inputs(2, 1, 64, 65)
@@ -159,6 +161,7 @@ def test_sparse_decode_empty(empty):
     gems_assert_equal(lse, torch.full_like(lse, float("inf")))
 
 
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8
 @pytest.mark.parametrize(
     ("topk", "has_lengths"), [(65, True), (128, False), (192, False)]
 )
@@ -184,6 +187,7 @@ def test_sparse_decode_large_batch(topk, has_lengths):
     assert_accuracy(actual, reference(inputs, topk_length=lengths))
 
 
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8
 @pytest.mark.parametrize("batch, topk", [(8, 4096), (16, 640), (257, 4096)])
 def test_sparse_raw_selected_partitions(batch, topk):
     inputs, _, _ = make_inputs(
