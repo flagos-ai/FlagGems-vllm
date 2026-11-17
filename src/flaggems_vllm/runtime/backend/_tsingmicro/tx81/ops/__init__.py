@@ -28,6 +28,8 @@ from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.fused_add_rms_norm impor
     fused_add_rms_norm,
 )
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.mhc_post import mhc_post
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.mhc_pre import mhc_pre
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.reshape_and_cache_flash import (
     reshape_and_cache_flash,
 )
@@ -45,6 +47,8 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "mhc_post",
+    "mhc_pre",
     "fused_add_rms_norm",
     "grouped_topk",
     "reshape_and_cache_flash",
