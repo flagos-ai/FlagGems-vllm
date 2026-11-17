@@ -16,7 +16,13 @@
 # runtime/backend/_tsingmicro/tx81/fused/. Functions re-exported here override
 # the generic implementations through SpecOpRegistrar (matched by function
 # name), so every public entry must keep the generic-op signature.
-
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.fused_add_rms_norm import (
+    fused_add_rms_norm,
+)
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.grouped_topk import grouped_topk
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.reshape_and_cache_flash import (
+    reshape_and_cache_flash,
+)
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.silu_and_mul import (
     silu_and_mul,
     silu_and_mul_out,
@@ -27,6 +33,9 @@ from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.silu_and_mul_with_clamp 
 )
 
 __all__ = [
+    "fused_add_rms_norm",
+    "grouped_topk",
+    "reshape_and_cache_flash",
     "silu_and_mul",
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
