@@ -59,8 +59,13 @@ if triton_version_utils.has_triton_tle():
 else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
+from flaggems_vllm.runtime.backend._metax.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+)
+
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",

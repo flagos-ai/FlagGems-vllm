@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens", "num_tokens_insert"])
 def fused_qnorm_rope_kv_insert_kernel(
     q,
     kv,
@@ -27,10 +27,10 @@ def fused_qnorm_rope_kv_insert_kernel(
     cos_sin_cache,
     eps,
     cache_block_size: tl.constexpr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_heads: tl.constexpr,
     kv_block_stride,
-    num_tokens_insert: tl.constexpr,
+    num_tokens_insert,
 ):
     HEAD_DIM: tl.constexpr = 512
     NOPE_DIM: tl.constexpr = 448
