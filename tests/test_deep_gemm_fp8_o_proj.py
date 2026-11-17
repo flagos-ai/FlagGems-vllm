@@ -52,10 +52,38 @@ def is_int8_transport_vendor():
     return flaggems_vllm.vendor_name in ("metax", "hygon", "thead")
 
 
+def is_ascend_vendor():
+    """Ascend has no FP8 einsum either; it transports the values as FP16."""
+    return flaggems_vllm.vendor_name == "ascend"
+
+
+def _device_available():
+    if is_ascend_vendor():
+        return torch.npu.is_available()
+    return torch.cuda.is_available()
+
+
 def is_supported_backend():
-    if is_int8_transport_vendor():
-        return torch.cuda.is_available()
+    if is_int8_transport_vendor() or is_ascend_vendor():
+        return _device_available()
     return is_hopper_available()
+
+
+def _sync():
+    flaggems_vllm.runtime.torch_device_fn.synchronize()
+
+
+def _to_fp8(x):
+    """Cast to E4M3; Ascend cannot lower a device-side FP8 cast."""
+    if flaggems_vllm.vendor_name == "ascend":
+        return x.cpu().to(torch.float8_e4m3fn).to(x.device)
+    return x.to(torch.float8_e4m3fn)
+
+
+def _from_fp8(x):
+    if flaggems_vllm.vendor_name == "ascend":
+        return x.cpu().float().to(x.device)
+    return x.float()
 
 
 CUDA_AVAILABLE = is_supported_backend()
@@ -63,7 +91,10 @@ pytestmark = [
     pytest.mark.deep_gemm_fp8_o_proj,
     pytest.mark.skipif(
         not CUDA_AVAILABLE,
-        reason="requires NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon/PPU)",
+        reason=(
+            "requires NVIDIA Hopper or a non-FP8-einsum vendor "
+            "(MetaX/Hygon/PPU/Ascend)"
+        ),
     ),
 ]
 
@@ -138,14 +169,14 @@ def _quantize_block_weight(weight):
     g, d, r = weight.shape
     view = weight.float().reshape(g, d // BLOCK, BLOCK, r // BLOCK, BLOCK)
     scale = view.abs().amax(dim=(2, 4)).clamp(1e-4) / 448.0
-    quant = (view / scale.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
+    quant = _to_fp8(view / scale.unsqueeze(-1).unsqueeze(-3))
     return quant.reshape(g, d, r), scale
 
 
 def _dequant_block_weight(weight, scale):
     """Dequantize FP8 block-wise weights back to FP32."""
     g, d, r = weight.shape
-    view = weight.float().reshape(g, d // BLOCK, BLOCK, r // BLOCK, BLOCK)
+    view = _from_fp8(weight).reshape(g, d // BLOCK, BLOCK, r // BLOCK, BLOCK)
     return (view * scale.unsqueeze(-1).unsqueeze(-3)).reshape(g, d, r)
 
 
@@ -228,7 +259,7 @@ def test_accuracy_deep_gemm_fp8_o_proj(config, seed):
 
     out = _call_op(inp)
     ref = utils.to_reference(_reference(inp), upcast=True)
-    torch.cuda.synchronize()
+    _sync()
 
     assert out.shape == (config[0], config[4])
     # FP8 block-wise quantization plus bf16 output rounding.
@@ -244,12 +275,12 @@ def _quantize_activation(inp):
     view = grouped.reshape(num_tokens, n_groups, -1, BLOCK)
     amax = view.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-10)
     scale = amax / float(torch.finfo(torch.float8_e4m3fn).max)
-    data = (view / scale).to(torch.float8_e4m3fn)
-    dequant = (data.float() * scale).reshape(num_tokens, n_groups, -1)
+    data = _to_fp8(view / scale)
+    dequant = _from_fp8(data) * scale
     return (
         data.reshape(num_tokens, n_groups, -1),
         scale.squeeze(-1),
-        dequant,
+        dequant.reshape(num_tokens, n_groups, -1),
     )
 
 
@@ -290,7 +321,7 @@ def test_accuracy_deep_gemm_fp8_o_proj_torch_composed(config):
 
     out = _call_op(inp)
     ref = utils.to_reference(_reference_torch(inp), upcast=True)
-    torch.cuda.synchronize()
+    _sync()
 
     assert out.shape == (config[0], config[4])
     # Both sides quantize the activation identically, so only the GEMM rounding
@@ -320,7 +351,7 @@ def test_accuracy_deep_gemm_fp8_o_proj_prequantized(config):
     )
 
     ref = utils.to_reference(_reference_torch_from_dequant(inp, dequant), upcast=True)
-    torch.cuda.synchronize()
+    _sync()
 
     assert out.shape == (config[0], config[4])
     atol = max(1e-2, ref.abs().max().item() * COMPOSED_ATOL)
@@ -370,7 +401,7 @@ def test_deep_gemm_fp8_o_proj_matches_vllm_native(config):
         pytest.skip(f"vLLM native path unavailable: {exc}")
 
     out = _call_op(inp, recipe=recipe, tma_aligned_scales=tma_aligned)
-    torch.cuda.synchronize()
+    _sync()
 
     atol = max(5e-2, ref.abs().max().item() * 5e-2)
     utils.gems_assert_close(

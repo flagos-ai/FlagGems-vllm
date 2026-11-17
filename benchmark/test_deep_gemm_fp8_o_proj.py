@@ -114,8 +114,17 @@ DEEP_GEMM_READY = HAS_VLLM and NVCC_READY
 
 
 def _is_int8_transport_vendor():
-    """MetaX, Hygon and PPU transport the FP8 values as INT8; they only report latency."""
+    """MetaX, Hygon and PPU transport the FP8 values as INT8 (latency only)."""
     return flaggems_vllm.vendor_name in ("metax", "hygon", "thead")
+
+
+def _is_ascend():
+    """Ascend has no vLLM DeepGEMM path either; only latency is reported."""
+    return flaggems_vllm.vendor_name == "ascend"
+
+
+def _sync():
+    flaggems_vllm.runtime.torch_device_fn.synchronize()
 
 
 def _identity(flat):
@@ -158,9 +167,13 @@ def _per_block_cast_to_fp8(x, block_n=128, block_k=128):
     x_view = x.view(m // block_n, block_n, n // block_k, block_k)
     amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     scale = amax / FP8_MAX
-    return (x_view / scale).to(torch.float8_e4m3fn).view(m, n), scale.view(
-        m // block_n, n // block_k
-    )
+    payload = x_view / scale
+    if _is_ascend():
+        # Ascend cannot lower a device-side FP8 cast; build the payload on host.
+        payload = payload.cpu().to(torch.float8_e4m3fn).to(x.device)
+    else:
+        payload = payload.to(torch.float8_e4m3fn)
+    return payload.view(m, n), scale.view(m // block_n, n // block_k)
 
 
 def _make_inputs(shape, device, seed=0):
@@ -281,7 +294,7 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
             if DEEP_GEMM_READY and HOPPER_AVAILABLE:
                 _vllm_o_proj_wrapper(*args)
             _gems_o_proj_wrapper(*args)
-            torch.cuda.synchronize()
+            _sync()
             yield args
 
     def get_tflops(self, op, *args, **kwargs):
@@ -294,8 +307,9 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
 
 @pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.skipif(
-    not (HOPPER_AVAILABLE or _is_int8_transport_vendor()),
-    reason="requires an NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon/PPU)",
+    not (HOPPER_AVAILABLE or _is_int8_transport_vendor() or _is_ascend()),
+    reason="requires an NVIDIA Hopper or a non-FP8-einsum vendor "
+    "(MetaX/Hygon/PPU/Ascend)",
 )
 def test_perf_deep_gemm_fp8_o_proj_gems_vs_vllm():
     # vLLM's op is only importable from a build that ships DeepSeek-V4, and its
@@ -326,21 +340,8 @@ _BASELINE_TOKENS = (1, 4, 16, 64, 128, 512, 2048, 4096, 8192)
 _BASELINE_GROUPS = (8, 16)
 
 
-@pytest.mark.deep_gemm_fp8_o_proj
-@pytest.mark.skipif(
-    not _is_int8_transport_vendor(),
-    reason="INT8-transport vendors only: H100-equivalent speedup",
-)
-def test_perf_deep_gemm_fp8_o_proj_int8_vs_h100():
-    """Cross-chip speedup against the H100 DeepGEMM baseline.
-
-    MetaX, Hygon and PPU have no native vLLM implementation to time in-process,
-    so the reference is the H100 record collected with the same inputs and
-    timing method. The harness prints
-    ``vs Base = (base_ms / latency) / factor``, where ``factor`` is the
-    PPU/MetaX/Hygon-vs-H100 peak ratio of the record's bottleneck resource from
-    ``_scaling_factors`` -- the 折算 the acceptance doc prescribes.
-    """
+def _run_h100_baseline_comparison():
+    """Time the FlagGems op against the recorded H100 DeepGEMM baseline."""
     with open(H100_BASELINE) as handle:
         data = json.load(handle)
 
@@ -366,3 +367,35 @@ def test_perf_deep_gemm_fp8_o_proj_int8_vs_h100():
     )
     bench.set_gems(_gems_o_proj_wrapper)
     bench.run()
+
+
+@pytest.mark.deep_gemm_fp8_o_proj
+@pytest.mark.skipif(
+    not _is_int8_transport_vendor(),
+    reason="INT8-transport vendors only: H100-equivalent speedup",
+)
+def test_perf_deep_gemm_fp8_o_proj_int8_vs_h100():
+    """Cross-chip speedup against the H100 DeepGEMM baseline.
+
+    MetaX, Hygon and PPU have no native vLLM implementation to time in-process,
+    so the reference is the H100 record collected with the same inputs and
+    timing method. The harness prints
+    ``vs Base = (base_ms / latency) / factor``, where ``factor`` is the
+    PPU/MetaX/Hygon-vs-H100 peak ratio of the record's bottleneck resource from
+    ``_scaling_factors`` -- the 折算 the acceptance doc prescribes.
+    """
+    _run_h100_baseline_comparison()
+
+
+@pytest.mark.deep_gemm_fp8_o_proj
+@pytest.mark.skipif(
+    _is_ascend() is False, reason="Ascend-only: H100-equivalent speedup"
+)
+def test_perf_deep_gemm_fp8_o_proj_ascend_vs_h100():
+    """Cross-chip speedup of the Ascend FP16 transport against H100 DeepGEMM.
+
+    The reference is the same H100 record used for MetaX/Hygon; ``factor`` is
+    the Ascend910B4/H100 peak ratio of the record's bottleneck resource from
+    ``_scaling_factors`` (mem -> bandwidth, tensor -> bf16).
+    """
+    _run_h100_baseline_comparison()

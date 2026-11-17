@@ -494,7 +494,11 @@ ops:
     FP8 quantization, block-wise FP8 einsum over the o-LoRA weights, then wo_b.
     Precisions: FP8 (E4M3) with 128x128 block scales on Hopper; Hygon, MetaX
     and PPU transport the same block-quantized values as INT8 (INT8
-    tensor-core GEMM) because their Triton backends have no FP8 dot lowering.
+    tensor-core GEMM) because their Triton backends have no FP8 dot
+    lowering. Ascend keeps the block-quantized values but transports them
+    as FP16: it has neither an FP8 dot nor a device-side FP8 cast, and
+    folding the block scale into the GEMM K loop drops the throughput to
+    15 TFLOPS there.
 
     '
   for:
