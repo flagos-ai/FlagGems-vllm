@@ -38,6 +38,8 @@ In pull requests, contributors should describe what changed and why. Please also
    - Include test results (accuracy and performance SpeedUp);
    - Ensure all CI gates pass (code style, `operators.yaml` validation, unit tests, benchmarks).
 
+CI runs two workflows on every pull request. `rule-check.yaml` runs pre-commit, the CI helper tests and the operator rule checks, and its `rule-check-required` job must pass. `unittest.yaml` selects the tests and benchmarks for the files you changed (`tools/select_tests.py`) and runs them on the H20 runner and on any selected vendor backend; its `unittest-required` job is the single gate. Pull requests from forks do not run on the H20 runner unless a maintainer adds the `ci/nvidia` label. Backend runs are scheduled by path or by a maintainer-added `vendor/*` label, see [Adding a Backend](backend.md).
+
 ## 2. Device Isolation and Visibility {#device-visibility}
 
 On a node shared by multiple users or GPUs, you usually want a test or benchmark run to use only a subset of the available devices. FlagGems-vllm relies on each backend vendor's visibility environment variable to do the isolation. Visibility variables must be set **before** the process starts.
