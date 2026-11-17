@@ -10,6 +10,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.qwen4.qsa import _is_triton_device
 from flaggems_vllm.runtime import device as runtime_device
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 _QSA_SPLIT_ALLOWED = (1, 2, 4, 8, 16, 32)
 # MACA's MACAMmaEncodingAttr::composeSharedLayoutForOperand asserts when the MMA
@@ -40,6 +41,22 @@ def qsa_sparse_triton_launch_config(
         # No usable capability query: retain the conservative launch config.
         pass
     return 16, 4, 2
+
+
+def qsa_sparse_pipeline_launch(num_stages: int) -> dict:
+    """Launch options of the sparse-QSA kernels for the FlagTree pipeliner.
+
+    The token ids of the top-k loop are read in three layouts and only one copy
+    is prefetched; merging the two synchronous copies into the prefetched one
+    (``pipeline_merge_loads="any"``) removes two global reads per iteration
+    (measured on H20, B 1-256, top-k 256/2048). Only the measured
+    configuration (``num_stages == 3``) is changed.
+    """
+    if num_stages == 3:
+        options = pipeline_options(pipeline_merge_loads="any")
+        if options:
+            return dict(num_stages=2, **options)
+    return dict(num_stages=num_stages)
 
 
 def qsa_sparse_split_count(
@@ -596,7 +613,7 @@ def _qsa_sparse_paged_attention_split(
         BLOCK_N=block_n,
         BLOCK_D=block_d,
         num_warps=num_warps,
-        num_stages=num_stages,
+        **qsa_sparse_pipeline_launch(num_stages),
     )
     _qsa_sparse_paged_gqa_split_reduce_kernel[(q.shape[0], q.shape[1])](
         partial_output,
@@ -752,7 +769,7 @@ def _qsa_sparse_paged_attention(
         BLOCK_D=block_d,
         APPLY_GATE=gate is not None,
         num_warps=num_warps,
-        num_stages=num_stages,
+        **qsa_sparse_pipeline_launch(num_stages),
     )
     return out
 
