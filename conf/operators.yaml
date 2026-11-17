@@ -80,6 +80,17 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
+- id: apply_thinking_budget
+  description: Update reasoning-marker caches and force the budgeted end token.
+  for:
+  - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: beam_search_score
   description: Computes beam search scores by adding cumulative log probabilities
     with new token scores.

@@ -204,6 +204,7 @@ from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
 from flaggems_vllm.ops.swiglu import dswiglu, swiglu
+from flaggems_vllm.ops.thinking_budget import apply_thinking_budget
 from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode
 from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
@@ -268,6 +269,7 @@ __all__ = [
     "apply_min_p",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
+    "apply_thinking_budget",
     "attn_res",
     "beam_search_score",
     "beam_search_score_",
