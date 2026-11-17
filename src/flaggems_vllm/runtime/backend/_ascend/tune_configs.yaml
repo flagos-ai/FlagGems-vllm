@@ -247,6 +247,18 @@ moe_sum_general:
     num_warps: 8
     num_stages: 2
 
+triton_ihc_post:
+  # Keep all tile sizes; Ascend trials favor contiguous hidden-block order.
+  - META: {BLOCK_D: 128, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 1024, TOKEN_MAJOR: false}
+    num_warps: 4
+    num_stages: 1
+
 triton_reshape_and_cache_flash:
   - META: {TILE: 256}
     num_warps: 4
