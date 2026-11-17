@@ -144,6 +144,146 @@ def _rms_norm_loop_kernel(
         tl.store(out_ptr + pid * N + n_offsets, y)
 
 
+# FlagGems v5.4.0 uses different residual rounding on CUDA and Ascend.
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def _cuda_residual_kernel(x_ptr, residual_ptr, w_ptr, N, eps, BLOCK_SIZE: tl.constexpr):
+    if tl.constexpr(x_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
+        x_ptr.dtype.element_ty == tl.bfloat16
+    ):
+        cdtype = tl.float32
+    else:
+        cdtype = x_ptr.dtype.element_ty
+    row_start = ext.program_id(0) * N
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    offsets = row_start + cols
+    x = tl.load(x_ptr + offsets, mask, other=0.0).to(cdtype)
+    residual = tl.load(residual_ptr + offsets, mask, other=0.0).to(cdtype)
+    summed = x + residual
+    tl.store(residual_ptr + offsets, summed, mask)
+
+    var = tl.sum(summed * summed / N, axis=0)
+    rrms = 1 / tl.sqrt(var + eps)
+    weight = tl.load(w_ptr + cols, mask, other=0.0)
+    tl.store(x_ptr + offsets, (summed * rrms * weight).to(cdtype), mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def _cuda_residual_loop_kernel(
+    x_ptr, residual_ptr, w_ptr, N, eps, BLOCK_SIZE: tl.constexpr
+):
+    if tl.constexpr(x_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
+        x_ptr.dtype.element_ty == tl.bfloat16
+    ):
+        cdtype = tl.float32
+    else:
+        cdtype = x_ptr.dtype.element_ty
+    row_start = ext.program_id(0) * N
+    var_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    num_steps = tl.cdiv(N, BLOCK_SIZE)
+    lanes = tl.arange(0, BLOCK_SIZE)
+
+    for step in range(num_steps):
+        cols = step * BLOCK_SIZE + lanes
+        mask = cols < N
+        offsets = row_start + cols
+        x = tl.load(x_ptr + offsets, mask, other=0.0).to(cdtype)
+        residual = tl.load(residual_ptr + offsets, mask, other=0.0).to(cdtype)
+        summed = x + residual
+        tl.store(residual_ptr + offsets, summed, mask)
+        var_acc += summed * summed
+
+    rrms = 1 / tl.sqrt(tl.sum(var_acc) / N + eps)
+
+    for step in range(num_steps):
+        cols = step * BLOCK_SIZE + lanes
+        mask = cols < N
+        offsets = row_start + cols
+        # The original CUDA loop normalizes the rounded residual.
+        summed = tl.load(residual_ptr + offsets, mask, other=0.0).to(cdtype)
+        weight = tl.load(w_ptr + cols, mask, other=0.0)
+        tl.store(x_ptr + offsets, (summed * rrms * weight).to(cdtype), mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def _ascend_residual_kernel(
+    x_ptr, residual_ptr, w_ptr, N, eps, row_offset, BLOCK_SIZE: tl.constexpr
+):
+    row_start = (tl.program_id(0) + row_offset) * N
+    var_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    lanes = tl.arange(0, BLOCK_SIZE)
+
+    for start in range(0, N, BLOCK_SIZE):
+        cols = start + lanes
+        mask = cols < N
+        offsets = row_start + cols
+        x = tl.load(x_ptr + offsets, mask, other=0.0).to(tl.float32)
+        residual = tl.load(residual_ptr + offsets, mask, other=0.0).to(tl.float32)
+        summed = x + residual
+        var_acc += summed * summed / N
+
+    rrms = 1 / tl.sqrt(tl.sum(var_acc) + eps)
+
+    for start in range(0, N, BLOCK_SIZE):
+        cols = start + lanes
+        mask = cols < N
+        offsets = row_start + cols
+        x = tl.load(x_ptr + offsets, mask, other=0.0).to(tl.float32)
+        residual = tl.load(residual_ptr + offsets, mask, other=0.0).to(tl.float32)
+        summed = x + residual
+        weight = tl.load(w_ptr + cols, mask, other=0.0)
+        # The original Ascend kernel rounds the normalized value before scaling.
+        out = (summed * rrms).to(x_ptr.dtype.element_ty) * weight
+        tl.store(residual_ptr + offsets, summed, mask)
+        tl.store(x_ptr + offsets, out, mask)
+
+
+def _gems_rms_forward_residual(x, residual, weight, eps):
+    if runtime.device.vendor_name not in ("nvidia", "ascend"):
+        from flaggems_vllm import fused_add_rms_norm
+
+        return fused_add_rms_norm(x, residual, list(weight.shape), weight, eps)
+
+    x = x.contiguous()
+    residual = residual.contiguous()
+    weight = weight.contiguous()
+    if not x.numel():
+        return x, residual
+
+    n = weight.numel()
+    m = math.prod(x.shape[: x.ndim - weight.ndim])
+    with torch_device_fn.device(x.device):
+        if runtime.device.vendor_name == "ascend":
+            block_size = min(triton.next_power_of_2(n), 8192)
+            # Ascend limits the grid size. Launch each group of rows.
+            max_grid = 65535
+            for row_offset in range(0, m, max_grid):
+                grid = (min(m - row_offset, max_grid),)
+                # The 8192-element tile can exhaust unified buffer with multibuffering.
+                _ascend_residual_kernel[grid](
+                    x,
+                    residual,
+                    weight,
+                    n,
+                    eps,
+                    row_offset,
+                    BLOCK_SIZE=block_size,
+                    multibuffer=False,
+                )
+        elif n <= 4096:
+            _cuda_residual_kernel[(m,)](
+                x, residual, weight, n, eps, BLOCK_SIZE=triton.next_power_of_2(n)
+            )
+        else:
+            _cuda_residual_loop_kernel[(m,)](
+                x, residual, weight, n, eps, BLOCK_SIZE=1024
+            )
+    return x, residual
+
+
 def gems_rms_forward(
     x: torch.Tensor,
     residual: Optional[torch.Tensor],
@@ -156,11 +296,8 @@ def gems_rms_forward(
     buffers are updated in place and the pair of updated buffers is returned.
     The fused path applies its existing layout rules to noncontiguous inputs.
     """
-    normalized_shape = list(weight.shape)
     if residual is not None:
-        from flaggems_vllm import fused_add_rms_norm
-
-        return fused_add_rms_norm(x, residual, normalized_shape, weight, eps)
+        return _gems_rms_forward_residual(x, residual, weight, eps)
 
     x = x.contiguous()
     weight = weight.contiguous()
