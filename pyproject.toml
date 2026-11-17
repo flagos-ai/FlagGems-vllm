@@ -107,6 +107,7 @@ where = ["src"]
 "flaggems_vllm" = ["backends.yaml"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
+"flaggems_vllm.testing" = ["*.hip"]
 "flaggems_vllm.utils" = ["configs/*.yaml"]
 
 [tool.black]

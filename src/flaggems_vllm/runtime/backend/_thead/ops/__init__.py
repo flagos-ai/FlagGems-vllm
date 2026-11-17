@@ -32,12 +32,16 @@ from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_no
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
+from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
+    get_num_sampled_and_rejected,
+)
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -52,6 +56,7 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "get_num_sampled_and_rejected",
     "hc_combine",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
@@ -59,6 +64,7 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "qsa_prepare",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
     "SUPPORTED_FP8_DTYPE",

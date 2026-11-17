@@ -3,7 +3,7 @@
 
 """Explicit CUDA dispatch override for symm_mem.fused_matmul_reduce_scatter.
 
-Registration is process-wide, opt-in, and independent of ATen enable/use_gems.
+Registration is process-wide, opt-in, and independent of operator imports.
 It does not initialize distributed state or free collective workspaces. Callers
 must enable it in every participating worker before using the collective.
 """

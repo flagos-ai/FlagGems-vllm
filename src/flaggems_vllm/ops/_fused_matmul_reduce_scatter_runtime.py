@@ -151,7 +151,9 @@ class CollectiveContext:
             per_node_rows = m // local_size
             comm_elements = m * n + 2 * per_node_rows * n
             self.allocation = _FlagCXAllocation(self.library, comm_elements * 2, device)
-            comm_buf = torch.as_tensor(self.allocation, device=device).view(dtype)
+            comm_buf = torch.as_tensor(  # allow-torch-compute: zero-copy CUDA view
+                self.allocation, device=device
+            ).view(dtype)
             if comm_buf.data_ptr() != self.allocation.ptr.value:
                 raise RuntimeError(
                     "FlagCX communication buffer must be a zero-copy view"

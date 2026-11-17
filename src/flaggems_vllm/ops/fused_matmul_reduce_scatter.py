@@ -228,7 +228,9 @@ def fused_matmul_reduce_scatter(A, B, reduce_op, scatter_dim, group_name):
         if torch.cuda.is_current_stream_capturing():
             raise NotImplementedError("CUDA graph capture is not supported yet")
         tle = _load_tle()
-        from ._fused_matmul_reduce_scatter_runtime import CollectiveContext
+        from flaggems_vllm.ops._fused_matmul_reduce_scatter_runtime import (
+            CollectiveContext,
+        )
 
         key = (group, A.device, A.dtype, m, n, k, config)
         context = _CONTEXTS.get(key)

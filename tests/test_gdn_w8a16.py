@@ -10,6 +10,7 @@ import triton
 import flaggems_vllm
 from flaggems_vllm import gdn_w8a16, vendor_name
 from flaggems_vllm.ops.gdn_w8a16 import dequantize_gdn_state_fp8, quantize_gdn_state_fp8
+from flaggems_vllm.runtime import torch_device_fn
 from tests import conftest as cfg
 from tests.accuracy_utils import gems_assert_close, gems_assert_equal
 
@@ -51,12 +52,6 @@ def test_gdn_w8a16_registration():
 
     assert "gdn_w8a16" in ops.__all__
     assert flaggems_vllm.gdn_w8a16 is ops.gdn_w8a16
-    entries = [entry for entry in flaggems_vllm._FULL_CONFIG if entry[0] == "gdn_w8a16"]
-    assert entries == [("gdn_w8a16", flaggems_vllm.gdn_w8a16)]
-    assert flaggems_vllm.FULL_CONFIG_BY_FUNC["gdn_w8a16"] == entries
-    registered_names = {entry[0] for entry in flaggems_vllm._FULL_CONFIG}
-    assert "quantize_gdn_state_fp8" not in registered_names
-    assert "dequantize_gdn_state_fp8" not in registered_names
 
 
 def make_inputs(n, t, h, hv, dtype, packed=True):
@@ -632,7 +627,7 @@ def test_int8_state_gdn_prefill_independent_calls(
     sequences = 1 if boundaries is None else len(boundaries) - 1
     reference_boundaries = [0, tokens] if boundaries is None else boundaries
 
-    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    streams = [torch_device_fn.Stream(), torch_device_fn.Stream()]
     for alignment_offset in (0, 1, 0):
         calls = []
         for stream in streams:
@@ -671,8 +666,8 @@ def test_int8_state_gdn_prefill_independent_calls(
                 normalize,
                 0.125,
             )
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
+            stream.wait_stream(torch_device_fn.current_stream())
+            with torch_device_fn.stream(stream):
                 actual, updated = flaggems_vllm.chunk_gated_delta_rule_w8a16_int8(
                     *inputs,
                     scale=0.125,
@@ -1058,8 +1053,6 @@ def test_gdn_w8a16_backend_registration():
     )
 
     assert flaggems_vllm.gdn_w8a16 is metax_gdn
-    entries = [e for e in flaggems_vllm._FULL_CONFIG if e[0] == "gdn_w8a16"]
-    assert entries == [("gdn_w8a16", metax_gdn)]
 
 
 @requires_metax

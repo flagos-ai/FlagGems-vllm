@@ -70,7 +70,18 @@ def test_signature_and_export():
         "group_name",
     ]
     assert flaggems_vllm.fused_matmul_reduce_scatter is fused_matmul_reduce_scatter
-    assert "fused_matmul_reduce_scatter" in flaggems_vllm._LIBRARY_ONLY_OPS
+    assert flaggems_vllm.GemmReduceScatterConfig is GemmReduceScatterConfig
+    assert (
+        flaggems_vllm.configure_fused_matmul_reduce_scatter
+        is configure_fused_matmul_reduce_scatter
+    )
+    assert (
+        flaggems_vllm.clear_fused_matmul_reduce_scatter_cache
+        is clear_fused_matmul_reduce_scatter_cache
+    )
+    for name in ("disable_symm_mem", "enable_symm_mem", "use_symm_mem"):
+        assert name in flaggems_vllm.__all__
+        assert callable(getattr(flaggems_vllm, name))
 
 
 def test_hcu_default_and_device_routing(monkeypatch):
@@ -319,6 +330,7 @@ def test_exact_rank_and_shard_identity(gemm_rs_context, dtype, reduce_op):
 @pytest.mark.parametrize("reduce_op", ["sum", "avg"])
 @pytest.mark.parametrize("layout", ["contiguous", "transposed"])
 @pytest.mark.parametrize("rows_per_rank", [256, 384])
+@pytest.mark.fused_matmul_reduce_scatter
 def test_fused_matmul_reduce_scatter(
     gemm_rs_context, dtype, reduce_op, layout, rows_per_rank
 ):

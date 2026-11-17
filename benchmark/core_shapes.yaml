@@ -110,6 +110,25 @@ concat_mla_q:
     - [8192, 64, 512, 64]
   shape_desc: "tokens, heads, nope_width, rope_width"
 
+megapreattention:
+  shape_desc: "global tokens, TP, hidden, Q heads, KV heads, head_dim, rotary_dim"
+  shapes:
+    - [4096, 2, 2048, 16, 2, 256, 64]
+    - [8192, 2, 2048, 16, 2, 256, 64]
+    - [16384, 2, 2048, 16, 2, 256, 64]
+    - [32768, 2, 2048, 16, 2, 256, 64]
+    - [4096, 4, 2048, 16, 2, 256, 64]
+    - [8192, 4, 2048, 16, 2, 256, 64]
+    - [16384, 4, 2048, 16, 2, 256, 64]
+    - [32768, 4, 2048, 16, 2, 256, 64]
+    - [4096, 2, 5120, 24, 4, 256, 64]
+    - [8192, 2, 5120, 24, 4, 256, 64]
+    - [16384, 2, 5120, 24, 4, 256, 64]
+    - [32768, 2, 5120, 24, 4, 256, 64]
+    - [4096, 4, 5120, 24, 4, 256, 64]
+    - [8192, 4, 5120, 24, 4, 256, 64]
+    - [16384, 4, 5120, 24, 4, 256, 64]
+    - [32768, 4, 5120, 24, 4, 256, 64]
 dsv41_o_proj:
   shapes:
     - [1, 8, 8, 1024]
@@ -685,6 +704,19 @@ fused_allreduce_rms_norm:
     - [138, 6144]
   shape_desc: "M, H"
 
+mhc_shifted_post_pre:
+  # DSV4/DSV4.1 boundary shapes: decode-sized batches, a small chunk, and the
+  # full 4096-token prefill chunk at both hidden sizes.
+  shapes:
+    - [1, 1280]
+    - [16, 1280]
+    - [512, 1280]
+    - [512, 7168]
+    - [4096, 7168]
+    - [128, 5120]
+    - [2048, 5120]
+  shape_desc: "N, H"
+
 bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]
@@ -770,3 +802,14 @@ chunk_kda_with_fused_gate:
     - [1, 64, 8, 64, 64]
     - [1, 512, 8, 128, 128, 129, 127, 256]
   shape_desc: "B, T, H, K, V, optional packed sequence lengths"
+
+cast_sigmoid:
+  # Small / medium / large coverage; the native dtype set is FP16/BF16/FP32.
+  shapes:
+    - [1]             # smallest: single element
+    - [1, 256]        # single-token gating row (vLLM grouped topk)
+    - [128, 256]      # decode micro-batch
+    - [4096, 256]     # prefill batch
+    - [1048576]       # large flat (1M)
+    - [4096, 4096]    # large 2D (16M)
+  shape_desc: "small: [1], [1,256]; medium: [128,256], [4096,256]; large: [1048576], [4096,4096]"
