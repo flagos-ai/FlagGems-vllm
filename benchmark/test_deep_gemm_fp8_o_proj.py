@@ -113,14 +113,9 @@ if HOPPER_AVAILABLE:
 DEEP_GEMM_READY = HAS_VLLM and NVCC_READY
 
 
-def _is_metax():
-    """MetaX has no vLLM DeepGEMM path, so the benchmark only reports latency."""
-    return flaggems_vllm.vendor_name == "metax"
-
-
 def _is_int8_transport_vendor():
-    """MetaX and Hygon transport the FP8 values as INT8; both only report latency."""
-    return flaggems_vllm.vendor_name in ("metax", "hygon")
+    """MetaX, Hygon and PPU transport the FP8 values as INT8; they only report latency."""
+    return flaggems_vllm.vendor_name in ("metax", "hygon", "thead")
 
 
 def _identity(flat):
@@ -300,7 +295,7 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
 @pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.skipif(
     not (HOPPER_AVAILABLE or _is_int8_transport_vendor()),
-    reason="requires an NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon)",
+    reason="requires an NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon/PPU)",
 )
 def test_perf_deep_gemm_fp8_o_proj_gems_vs_vllm():
     # vLLM's op is only importable from a build that ships DeepSeek-V4, and its
@@ -332,14 +327,18 @@ _BASELINE_GROUPS = (8, 16)
 
 
 @pytest.mark.deep_gemm_fp8_o_proj
-@pytest.mark.skipif(_is_metax() is False, reason="MetaX-only: H100-equivalent speedup")
-def test_perf_deep_gemm_fp8_o_proj_metax_vs_h100():
+@pytest.mark.skipif(
+    not _is_int8_transport_vendor(),
+    reason="INT8-transport vendors only: H100-equivalent speedup",
+)
+def test_perf_deep_gemm_fp8_o_proj_int8_vs_h100():
     """Cross-chip speedup against the H100 DeepGEMM baseline.
 
-    MetaX has no native implementation to time in-process, so the reference is
-    the H100 record collected with the same inputs and timing method. The
-    harness prints ``vs Base = (base_ms / latency) / factor``, where ``factor``
-    is the C550/H100 peak ratio of the record's bottleneck resource from
+    MetaX, Hygon and PPU have no native vLLM implementation to time in-process,
+    so the reference is the H100 record collected with the same inputs and
+    timing method. The harness prints
+    ``vs Base = (base_ms / latency) / factor``, where ``factor`` is the
+    PPU/MetaX/Hygon-vs-H100 peak ratio of the record's bottleneck resource from
     ``_scaling_factors`` -- the 折算 the acceptance doc prescribes.
     """
     with open(H100_BASELINE) as handle:

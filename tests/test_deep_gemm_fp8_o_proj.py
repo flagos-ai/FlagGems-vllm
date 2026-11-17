@@ -48,8 +48,8 @@ def is_hopper_available():
 
 
 def is_int8_transport_vendor():
-    """MetaX and Hygon have no FP8 einsum; both transport FP8 values as INT8."""
-    return flaggems_vllm.vendor_name in ("metax", "hygon")
+    """MetaX, Hygon and PPU have no FP8 einsum; all transport FP8 values as INT8."""
+    return flaggems_vllm.vendor_name in ("metax", "hygon", "thead")
 
 
 def is_supported_backend():
@@ -63,7 +63,7 @@ pytestmark = [
     pytest.mark.deep_gemm_fp8_o_proj,
     pytest.mark.skipif(
         not CUDA_AVAILABLE,
-        reason="requires NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon)",
+        reason="requires NVIDIA Hopper or an INT8-transport vendor (MetaX/Hygon/PPU)",
     ),
 ]
 
