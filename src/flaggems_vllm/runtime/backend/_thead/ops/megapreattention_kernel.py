@@ -180,6 +180,8 @@ def _norm_rope(
     ROPE_STRIDE: tl.constexpr,
     SECTION_H: tl.constexpr,
     SECTION_W: tl.constexpr,
+    H_MASK: tl.constexpr,
+    W_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     x = raw.to(tl.float32)
@@ -194,19 +196,28 @@ def _norm_rope(
     position_h = tl.load(position_ptr + POS_AXIS, row_valid, zero)
     position_w = tl.load(position_ptr + 2 * POS_AXIS, row_valid, zero)
     pair = tl.arange(0, 64)
-    axis = _axis_for_pair(pair % 32, None, 0, SECTION_H, SECTION_W, True, False, 256)
+    if H_MASK is None:
+        axis = _axis_for_pair(
+            pair % 32, None, 0, SECTION_H, SECTION_W, True, False, 256
+        )
+        use_h = axis == 1
+        use_w = axis == 2
+    else:
+        shift = (pair % 32).to(tl.uint32)
+        use_h = ((tl.full((), H_MASK, tl.uint32) >> shift) & 1) != 0
+        use_w = ((tl.full((), W_MASK, tl.uint32) >> shift) & 1) != 0
     phase_t = rope + position_t[:, None] * ROPE_STRIDE + pair[None, :]
     phase_valid = row_valid[:, None] if row_valid is not None else None
     coefficients = tl.load(phase_t, phase_valid, zero)
     if SECTION_H:
         phase_h = rope + position_h[:, None] * ROPE_STRIDE + pair[None, :]
         distinct_h = (position_h != position_t)[:, None]
-        select_h = distinct_h & (axis[None, :] == 1)
+        select_h = distinct_h & use_h[None, :]
         coefficients = tl.where(select_h, tl.load(phase_h, distinct_h, 0), coefficients)
     if SECTION_W:
         phase_w = rope + position_w[:, None] * ROPE_STRIDE + pair[None, :]
         distinct_w = (position_w != position_t)[:, None]
-        select_w = distinct_w & (axis[None, :] == 2)
+        select_w = distinct_w & use_w[None, :]
         coefficients = tl.where(select_w, tl.load(phase_w, distinct_w, 0), coefficients)
     cos, sin = tl.split(coefficients.reshape(BLOCK_M, 2, 32).permute(0, 2, 1))
     cos = cos.to(tl.float32)
@@ -272,6 +283,8 @@ def _store_head(
     KV_HEADS: tl.constexpr,
     SECTION_H: tl.constexpr,
     SECTION_W: tl.constexpr,
+    H_MASK: tl.constexpr,
+    W_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     cols = tl.arange(0, 256)
@@ -298,6 +311,8 @@ def _store_head(
                 ROPE_STRIDE,
                 SECTION_H,
                 SECTION_W,
+                H_MASK,
+                W_MASK,
                 BLOCK_M,
             )
             tl.store(query + out_offset, result, output_valid)
@@ -327,6 +342,8 @@ def _store_head(
                 ROPE_STRIDE,
                 SECTION_H,
                 SECTION_W,
+                H_MASK,
+                W_MASK,
                 BLOCK_M,
             )
             tl.store(key + out_offset, result, output_valid)
@@ -367,6 +384,8 @@ def megapreattention_kernel(
     KV_HEADS: tl.constexpr,
     SECTION_H: tl.constexpr,
     SECTION_W: tl.constexpr,
+    H_MASK: tl.constexpr,
+    W_MASK: tl.constexpr,
     WORLD: tl.constexpr,
     LOCAL_TOKENS: tl.constexpr,
     HIDDEN: tl.constexpr,
@@ -493,5 +512,7 @@ def megapreattention_kernel(
             KV_HEADS,
             SECTION_H,
             SECTION_W,
+            H_MASK,
+            W_MASK,
             BLOCK_M,
         )

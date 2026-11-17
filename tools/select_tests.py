@@ -88,7 +88,7 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 
 THEAD_MEGAPREATTENTION_SOURCES = (
     "megapreattention.py",
-    "_megapreattention_kernel.py",
+    "megapreattention_kernel.py",
     "_sailshmem/__init__.py",
     "_sailshmem/bootstrap.cpp",
     "_sailshmem/p2p.cu",
@@ -100,7 +100,7 @@ THEAD_MEGAPREATTENTION_SOURCES = (
 EXPLICIT_SOURCE_TO_TESTS = {
     **{
         f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
-            "tests/thead/test_megapreattention.py"
+            "tests/test_megapreattention.py"
         ]
         for name in THEAD_MEGAPREATTENTION_SOURCES
     },
@@ -276,7 +276,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     **{
         f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
-            "benchmark/thead/test_megapreattention.py"
+            "benchmark/test_megapreattention.py"
         ]
         for name in THEAD_MEGAPREATTENTION_SOURCES
     },

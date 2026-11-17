@@ -4,11 +4,30 @@
 """PPU MegaPreAttention with native sailSHMEM and tile-level CTA scheduling."""
 
 import math
+from functools import lru_cache
 
 import torch
 
 from flaggems_vllm.runtime import device as runtime_device
 from flaggems_vllm.runtime import torch_device_fn
+
+
+@lru_cache(maxsize=64)
+def _interleaved_rope_masks(sections):
+    """Match vLLM MRotaryEmbeddingInterleaved with force_last=True."""
+    counts = (sections[0] - 1, *sections[1:])
+    remaining = list(counts)
+    masks = [0, 0, 0]
+    last = None
+    for pair in range(sum(counts)):
+        available = [axis for axis, count in enumerate(remaining) if count]
+        candidates = [axis for axis in available if axis != last] or available
+        axis = min(candidates, key=lambda i: (counts[i] - remaining[i]) / counts[i])
+        masks[axis] |= 1 << pair
+        remaining[axis] -= 1
+        last = axis
+    # The reserved last pair and all unmarked pairs use the time axis.
+    return tuple(masks[1:])
 
 
 def megapreattention(
@@ -28,6 +47,7 @@ def megapreattention(
     rotary_dim,
     mrope_section,
     eps=1e-6,
+    mrope_mode="qwen",
 ):
     """Run BF16 pre-attention on single-node PPU TP and update KV in place.
 
@@ -38,6 +58,9 @@ def megapreattention(
     has the same positive token count, and head_dim/rotary_dim are 256/64.
 
     Positions are int64 [3,T] indexing the BF16 cos/sin table [P,64].
+    mrope_mode="qwen" follows vLLM MRotaryEmbedding with interleaving enabled.
+    mrope_mode="interleaved" follows MRotaryEmbeddingInterleaved with a final
+    time-axis pair and requires a positive time section.
     The BF16 cache has non-overlapping layout [blocks, local_kv_heads,
     block_size, 512] with contiguous head elements and K followed by V.
     Int64 slots [T] must be unique and in bounds when nonnegative. Negative
@@ -79,6 +102,13 @@ def megapreattention(
         or eps < 0
     ):
         raise ValueError("invalid MRoPE sections or RMSNorm epsilon")
+
+    if mrope_mode == "qwen":
+        h_mask = w_mask = None
+    elif mrope_mode == "interleaved" and sections[0] > 0:
+        h_mask, w_mask = _interleaved_rope_masks(sections)
+    else:
+        raise ValueError("invalid MRoPE mode or missing time section")
 
     device = hidden.device
     if any(
@@ -124,8 +154,8 @@ def megapreattention(
     ):
         raise ValueError("invalid KV cache shape or last-axis stride")
 
-    from ._megapreattention_kernel import megapreattention_kernel
     from ._sailshmem import runtime_for
+    from .megapreattention_kernel import megapreattention_kernel
 
     block_m, block_k, stages = 64, 64, 3
     # Keep CTAs using the same weight tile adjacent when there are fewer heads
@@ -183,6 +213,8 @@ def megapreattention(
             kv_heads,
             sections[1],
             sections[2],
+            h_mask,
+            w_mask,
             tp,
             local_tokens,
             hidden_size,

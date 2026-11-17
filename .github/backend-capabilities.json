@@ -49,7 +49,7 @@
     },
     "thead": {
       "tests_allow": [
-        "tests/thead/test_megapreattention.py"
+        "tests/test_megapreattention.py"
       ]
     },
     "tsingmicro": {

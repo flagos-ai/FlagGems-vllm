@@ -12,10 +12,10 @@
 extern __constant__ nvshmemi_version_t nvshmemi_device_lib_version_d;
 
 __device__ static void set_peer_signal(uint64_t signal, uint64_t epoch, int peer) {
-    __threadfence_system();
-    auto *remote_signal = static_cast<volatile uint64_t *>(
-        nvshmem_ptr(reinterpret_cast<void *>(signal), peer));
-    *remote_signal = epoch;
+    // This module only links the SDK's direct P2P transport.
+    auto *remote_signal =
+        static_cast<uint64_t *>(nvshmem_ptr(reinterpret_cast<void *>(signal), peer));
+    __atomic_store_n(remote_signal, epoch, __ATOMIC_RELEASE);
 }
 
 __device__ static void put_bulk(void *dst, const void *src, size_t bytes) {
@@ -62,8 +62,11 @@ extern "C" __device__ int mega_put_signal(uint64_t dest, uint64_t source,
                                           uint64_t epoch, int peer) {
     auto *remote = nvshmem_ptr(reinterpret_cast<void *>(dest), peer);
     put_bulk(remote, reinterpret_cast<const void *>(source), bytes);
+    // SDK putmem_signal_block_bulk uses this same direct-P2P ordering:
+    // collective bulk stores, block barrier, system fence, then signal.
     __syncthreads();
     if (threadIdx.x == 0) {
+        __threadfence_system();
         set_peer_signal(ready, epoch, peer);
     }
     __syncthreads();
@@ -72,8 +75,12 @@ extern "C" __device__ int mega_put_signal(uint64_t dest, uint64_t source,
 
 extern "C" __device__ int mega_wait(uint64_t signal, uint64_t epoch) {
     if (threadIdx.x == 0) {
-        nvshmem_signal_wait_until(reinterpret_cast<uint64_t *>(signal),
-                                  NVSHMEM_CMP_GE, epoch);
+        auto *flag = reinterpret_cast<uint64_t *>(signal);
+        nvshmem_signal_wait_until(flag, NVSHMEM_CMP_GE, epoch);
+        // The sailSHMEM polling loop uses volatile loads. Acquire the ready
+        // epoch at system scope before releasing the CTA to load the tile.
+        while (__atomic_load_n(flag, __ATOMIC_ACQUIRE) < epoch) {
+        }
     }
     __syncthreads();
     return 0;
@@ -135,9 +142,7 @@ __device__ static int broadcast_tile(uint64_t dest, uint64_t source, uint64_t by
         __threadfence_system();
 #pragma unroll
         for (int i = 0; i < World - 1; ++i) {
-            auto *flag = static_cast<volatile uint64_t *>(
-                nvshmem_ptr(reinterpret_cast<void *>(ready), peers[i]));
-            *flag = epoch;
+            set_peer_signal(ready, epoch, peers[i]);
         }
     }
     __syncthreads();
