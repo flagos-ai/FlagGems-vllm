@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TX81 specialized vLLM operators. Populated as operators are migrated from
-# FlagGems runtime/backend/_tsingmicro/tx81/fused/. Functions re-exported here
-# override the generic implementations through SpecOpRegistrar.
+# tx81 specialized vLLM operators, migrated from FlagGems
+# runtime/backend/_tsingmicro/tx81/fused/. Functions re-exported here override
+# the generic implementations through SpecOpRegistrar (matched by function
+# name), so every public entry must keep the generic-op signature.
+
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.silu_and_mul import (
+    silu_and_mul,
+    silu_and_mul_out,
+)
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.silu_and_mul_with_clamp import (
+    silu_and_mul_with_clamp,
+    silu_and_mul_with_clamp_out,
+)
+
+__all__ = [
+    "silu_and_mul",
+    "silu_and_mul_out",
+    "silu_and_mul_with_clamp",
+    "silu_and_mul_with_clamp_out",
+]
