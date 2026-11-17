@@ -2,6 +2,8 @@
 # Copyright 2026 FlagOS Contributors
 """Installed Qwen4 native and the shared BF16 down-projection workload."""
 
+from contextlib import contextmanager
+
 import torch
 
 OP_NAME = "hc_down_silu"
@@ -12,6 +14,19 @@ NATIVE_API = "vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu.hc_down_sil
 NATIVE_UNAVAILABLE_REASON = None
 NATIVE_VERSION = None
 FIELDS = ("m", "k", "n", "rank", "hc", "layout")
+
+
+@contextmanager
+def _cpu_single_thread():
+    previous = torch.get_num_threads()
+    if previous == 1:
+        yield
+        return
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def native():
@@ -59,6 +74,7 @@ def key_shape(binding):
     return [binding[key] for key in FIELDS]
 
 
+@_cpu_single_thread()
 def build_inputs(binding, dtype, device):
     if dtype != torch.bfloat16:
         raise TypeError("hc_down_silu workload requires BF16")

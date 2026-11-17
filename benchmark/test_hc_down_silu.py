@@ -134,6 +134,7 @@ class HCDownSiluBenchmark(Benchmark):
             self.binding = dict(zip(workload.FIELDS, shape))
             self.base_variant = str(workload.key_shape(self.binding))
             args, kwargs = workload.build_inputs(self.binding, dtype, gems.device)
+            self.expected = reference(*args)
             yield (*args, kwargs)
             if self.detail["native_reason"]:
                 misses.append(
@@ -180,7 +181,7 @@ class HCDownSiluBenchmark(Benchmark):
         if is_native and self.native_op is None:
             return None
 
-        expected = reference(*args)
+        expected = self.expected
         unsupported = workload.unsupported_reason(self.binding, args[0].dtype)
         if is_native and unsupported:
             self.detail.update(native_status="NOT_RUN", native_reason=unsupported)

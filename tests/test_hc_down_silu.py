@@ -14,6 +14,7 @@ RTOL = 2 * torch.finfo(torch.bfloat16).eps
 ATOL = 2e-3
 
 
+@workload._cpu_single_thread()
 def reference(x, weight, rank, hc):
     a = x.detach().cpu().float()
     w = weight[: rank + hc].detach().cpu().float()
@@ -22,6 +23,7 @@ def reference(x, weight, rank, hc):
     return (z * torch.sigmoid(z)).to(torch.bfloat16), b[:, rank : rank + hc]
 
 
+@workload._cpu_single_thread()
 def assert_result(actual, expected, x, weight, rank, hc, *, exact=False):
     assert isinstance(actual, tuple) and len(actual) == 2
     m, n = x.shape[0], weight.shape[0]
@@ -46,14 +48,24 @@ def assert_result(actual, expected, x, weight, rank, hc, *, exact=False):
         assert actual[0].untyped_storage()._cdata != source.untyped_storage()._cdata
 
 
+@workload._cpu_single_thread()
+def snapshot_inputs(x, weight):
+    return x.cpu().clone(), weight.cpu().clone()
+
+
+@workload._cpu_single_thread()
+def assert_inputs_unchanged(args, before):
+    for inp, old in zip(args, before):
+        torch.testing.assert_close(inp.cpu(), old, rtol=0, atol=0, equal_nan=True)
+
+
 def check(args, *, exact=False):
     x, weight, rank, hc = args
-    before = (x.cpu().clone(), weight.cpu().clone())
+    before = snapshot_inputs(x, weight)
     expected = reference(*args)
     actual = gems.hc_down_silu(*args)
     assert_result(actual, expected, *args, exact=exact)
-    for inp, old in zip((x, weight), before):
-        torch.testing.assert_close(inp.cpu(), old, rtol=0, atol=0, equal_nan=True)
+    assert_inputs_unchanged((x, weight), before)
     return actual
 
 
