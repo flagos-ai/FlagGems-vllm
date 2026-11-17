@@ -161,8 +161,17 @@ def block_topk_metax(scores, lengths, out, k, workspace):
 
 
 @triton.jit
-def _coop_hist_kernel(scores_ptr, lengths_ptr, prefix_ptr, hist_ptr,
-                      stride_row, num_tiles, G, p: tl.constexpr, BLOCK: tl.constexpr):
+def _coop_hist_kernel(
+    scores_ptr,
+    lengths_ptr,
+    prefix_ptr,
+    hist_ptr,
+    stride_row,
+    num_tiles,
+    G,
+    p: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     row = tl.program_id(0)
     g = tl.program_id(1)
     length = tl.load(lengths_ptr + row)
@@ -219,9 +228,18 @@ def _coop_reduce_kernel(hist_ptr, prefix_ptr, krem_ptr, keff_ptr, k, p: tl.const
 
 
 @triton.jit
-def _coop_gather_gt_kernel(scores_ptr, lengths_ptr, prefix_ptr, out_ptr,
-                           posgt_ptr, stride_row, num_tiles, G, k,
-                           BLOCK: tl.constexpr):
+def _coop_gather_gt_kernel(
+    scores_ptr,
+    lengths_ptr,
+    prefix_ptr,
+    out_ptr,
+    posgt_ptr,
+    stride_row,
+    num_tiles,
+    G,
+    k,
+    BLOCK: tl.constexpr,
+):
     row = tl.program_id(0)
     g = tl.program_id(1)
     length = tl.load(lengths_ptr + row)
@@ -243,9 +261,20 @@ def _coop_gather_gt_kernel(scores_ptr, lengths_ptr, prefix_ptr, out_ptr,
 
 
 @triton.jit
-def _coop_gather_eq_kernel(scores_ptr, lengths_ptr, prefix_ptr, keff_ptr,
-                           posgt_ptr, out_ptr, poseq_ptr, stride_row, num_tiles,
-                           G, k, BLOCK: tl.constexpr):
+def _coop_gather_eq_kernel(
+    scores_ptr,
+    lengths_ptr,
+    prefix_ptr,
+    keff_ptr,
+    posgt_ptr,
+    out_ptr,
+    poseq_ptr,
+    stride_row,
+    num_tiles,
+    G,
+    k,
+    BLOCK: tl.constexpr,
+):
     row = tl.program_id(0)
     g = tl.program_id(1)
     length = tl.load(lengths_ptr + row)
@@ -287,12 +316,18 @@ def _block_topk_coop(scores, lengths, out, k, G, workspace):
     num_tiles = (nblocks + _BLOCK - 1) // _BLOCK
     w = workspace.view(dtype=torch.int32)
     o = 0
-    hist = w[o:o + rows * 256].view(rows, 256); o += rows * 256
-    prefix = w[o:o + rows]; o += rows
-    krem = w[o:o + rows]; o += rows
-    keff = w[o:o + rows]; o += rows
-    posgt = w[o:o + rows]; o += rows
-    poseq = w[o:o + rows]; o += rows
+    hist = w[o : o + rows * 256].view(rows, 256)
+    o += rows * 256
+    prefix = w[o : o + rows]
+    o += rows
+    krem = w[o : o + rows]
+    o += rows
+    keff = w[o : o + rows]
+    o += rows
+    posgt = w[o : o + rows]
+    o += rows
+    poseq = w[o : o + rows]
+    o += rows
     _coop_init_kernel[(rows,)](hist, prefix, posgt, poseq)
     sr = scores.stride(0)
     for p in range(4):
@@ -304,6 +339,17 @@ def _block_topk_coop(scores, lengths, out, k, G, workspace):
         scores, lengths, prefix, out, posgt, sr, num_tiles, G, k, BLOCK=_BLOCK
     )
     _coop_gather_eq_kernel[(rows, G)](
-        scores, lengths, prefix, keff, posgt, out, poseq, sr, num_tiles, G, k, BLOCK=_BLOCK
+        scores,
+        lengths,
+        prefix,
+        keff,
+        posgt,
+        out,
+        poseq,
+        sr,
+        num_tiles,
+        G,
+        k,
+        BLOCK=_BLOCK,
     )
     return out
