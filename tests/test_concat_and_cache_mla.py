@@ -113,13 +113,21 @@ def test_concat_and_cache_mla(
             num_blocks, block_size, entry_size, dtype, kv_cache_dtype, device
         )
 
-        if _HAS_VLLM_CONCAT_AND_CACHE_MLA and device.startswith("cuda") and kv_cache_dtype == "auto":
+        if (
+            _HAS_VLLM_CONCAT_AND_CACHE_MLA
+            and device.startswith("cuda")
+            and kv_cache_dtype == "auto"
+        ):
             ref_kv_cache = kv_cache.clone()
-            _vllm_concat_and_cache_mla(kv_c, k_pe, ref_kv_cache, slot_mapping, kv_cache_dtype, scale)
+            _vllm_concat_and_cache_mla(
+                kv_c, k_pe, ref_kv_cache, slot_mapping, kv_cache_dtype, scale
+            )
             flaggems_vllm.concat_and_cache_mla(
                 kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
             )
-            utils.gems_assert_close(kv_cache, utils.to_reference(ref_kv_cache), kv_cache.dtype)
+            utils.gems_assert_close(
+                kv_cache, utils.to_reference(ref_kv_cache), kv_cache.dtype
+            )
             return
 
         ref_temp = utils.to_reference(
