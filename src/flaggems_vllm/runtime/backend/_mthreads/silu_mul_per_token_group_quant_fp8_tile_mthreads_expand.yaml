@@ -1,0 +1,15 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+# 6 x 4 x 4 = 96 schedules before pruning.
+silu_mul_per_token_group_quant_fp8_tile_mthreads:
+  - gen: true
+    param_map:
+      META:
+        BR: br
+        BG: bg
+      num_warps: warps
+      num_stages: stages
+    br: [1, 2, 4, 8, 16, 32]
+    bg: [1, 2, 4, 8]
+    warps: [1, 2, 4, 8]
+    stages: [1]
