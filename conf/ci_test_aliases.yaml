@@ -38,6 +38,7 @@ weight_norm_interface_backward: test_weight_norm_interface
 gather_sampler_output: test_batch_shard
 draft_watermarking_mask: test_watermark
 act_quant_triton: test_quant
+apply_min_p: test_min_p
 apply_thinking_budget: test_thinking_budget
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
 megamoe_int8: test_megamoe

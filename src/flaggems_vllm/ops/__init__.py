@@ -128,6 +128,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     mhc_shifted_post_pre,
 )
+from flaggems_vllm.ops.min_p import apply_min_p
 from flaggems_vllm.ops.qwen4 import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -265,6 +266,7 @@ from flaggems_vllm.ops.vit_attention import (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_min_p",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "apply_thinking_budget",
