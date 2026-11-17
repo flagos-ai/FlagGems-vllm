@@ -94,4 +94,15 @@ jobs:
         shell: bash
         env:
           CHANGED_FILES: ${{ inputs.changed_files }}
-        run: bash "${{ inputs.test_script }}" "${{ inputs.backend }}" "${{ inputs.pr_id }}"
+          BACKEND: ${{ inputs.backend }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          TEST_SCRIPT: ${{ inputs.test_script }}
+          PR_ID: ${{ inputs.pr_id }}
+        run: |
+          if [[ "$BACKEND" == "nvidia-cuda133" && "$RUNNER_LABEL" == "h20" ]]; then
+            clang_dir="$(mktemp -d "${RUNNER_TEMP}/flaggems-clang-XXXXXX")"
+            trap 'rm -rf -- "$clang_dir"' EXIT
+            CLANG="$(bash tools/setup-tle-clang.sh "$clang_dir")"
+            export CLANG
+          fi
+          bash "$TEST_SCRIPT" "$BACKEND" "$PR_ID"
