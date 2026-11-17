@@ -103,6 +103,12 @@ reciprocal(float) __asm("llvm.mxc.rcp.f32");
 #define FMLA_PIPELINE_ROPE 0
 #endif
 namespace {
+#if defined(FMLA_SPARSE_RAW) && defined(FMLA_SCALE_TABLE) && HEADS == 32 && FMLA_NO_ROPE && FMLA_SPLITS == 1
+#define FMLA_EARLY_SCALE 1
+#else
+#define FMLA_EARLY_SCALE 0
+#endif
+
 constexpr int NW = 64 / HEADS, NR = 4 / NW, QV = 8 / NW;
 
 __device__ __forceinline__ int koff(int token, int dim) {
@@ -114,11 +120,17 @@ __device__ __forceinline__ int roff(int token, int dim) {
 
 } // namespace
 
+#if defined(FMLA_SPARSE_RAW) && defined(FMLA_SCALE_TABLE) && HEADS == 32 && FMLA_NO_ROPE && FMLA_SPLITS == 1 && FMLA_CAP > 128
+#define FMLA_PEEL_LAST_PAGE 1
+#else
+#define FMLA_PEEL_LAST_PAGE 0
+#endif
+
 extern "C" __device__ __attribute__((used, always_inline)) float
 mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                long long qsp, long long ksp, long long tp, long long lp,
                long long pp, long long sp, long long op, long long lsep,
-               long long ts, long long ls, long long orderp, int batches,
+               long long ts, long long ls, long long orderp, long long selectedp, int batches,
                int hq, int sq, int splits, int causal, int bf16,
                float scale_log2, int head_tile, int batch, int split) {
   qp = uniform(qp);
@@ -160,7 +172,14 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
             row = lane & 15, group = lane >> 4;
   const int wn = wave % NW, wm = wave / NW,
             head = head_tile * HEADS + wm * 16 + row;
-  const int allheads = hq * sq, length = uniform(input<int>(lp)[batch * ls]);
+#if defined(FMLA_SPARSE_RAW)
+  constexpr bool fixed_h16 = HEADS == 16 && FMLA_NO_ROPE;
+#else
+  constexpr bool fixed_h16 = false;
+#endif
+  const int allheads = hq * sq;
+  // The aligned raw path has no per-query length, so all capacity slots are visited.
+  const int length = fixed_h16 ? FMLA_CAP : uniform(input<int>(lp)[batch * ls]);
   const int pages = (length + 63) / 64, begin = pages * split / splits,
             end = pages * (split + 1) / splits;
   const int bound = causal ? max(length - sq + head / hq + 1, 0) : length;
@@ -229,15 +248,18 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     __builtin_mxc_arrive_gvmcnt(0);
     __builtin_mxc_barrier_ex(2);
   };
-  auto load_plane = [&](long long page, int page_index, int chunk) {
+  auto load_plane = [&](long long page, int chunk,
+                        const long long *token_offsets = nullptr) {
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
       const int i = t + c * 256, token = i >> 3;
       const int dim = ((i & 7) ^ ((token >> 1) & 7)) * 16;
       void *dest = planes[HEADS == 32 ? chunk : (chunk & 1)] +
                    ((t & ~63) + c * 256) * 16;
-      void *src = (void *)input<unsigned char>(kp + cache_token(tp, batch, page, token) * 512 +
-                                               chunk * 128 + dim);
+      const long long offset =
+          token_offsets ? token_offsets[c]
+                        : cache_token(tp, batch, page, token) * 512;
+      void *src = (void *)input<unsigned char>(kp + offset + chunk * 128 + dim);
       __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                             true, 1, 2, 40);
     }
@@ -258,10 +280,13 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
   auto fragments = [&](const unsigned char *base, int token, int col,
                        unsigned (&words)[QV]) {
     const int aligned = col & ~3;
-    const unsigned a = *(const unsigned *)(base + koff(token, aligned));
-    const unsigned b = *(const unsigned *)(base + koff(token + 1, aligned));
-    const unsigned c = *(const unsigned *)(base + koff(token + 2, aligned));
-    const unsigned d = *(const unsigned *)(base + koff(token + 3, aligned));
+    // PV loads four consecutive tokens starting at a multiple of four.
+    const int even = koff(token, aligned);
+    const int odd = (even ^ 16) + 256;
+    const unsigned a = *(const unsigned *)(base + even);
+    const unsigned b = *(const unsigned *)(base + even + 128);
+    const unsigned c = *(const unsigned *)(base + odd);
+    const unsigned d = *(const unsigned *)(base + odd + 128);
     if (QV == 2) {
       const unsigned selector = 0x05040100 + (col & 2) * 0x01010101;
       const unsigned u = perm(b, a, selector), v = perm(d, c, selector);
@@ -281,25 +306,87 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
   for (int a = 0; a < QV * 4; ++a)
     acc[a] = (float4_){0, 0, 0, 0};
   float maximum = -INFINITY, denominator = 0.f;
-  for (int page_index = begin; page_index < end; ++page_index) {
-    const long long page = cache_page(tp, batch, ts, page_index);
-    int4_ content[NR];
+#if FMLA_PEEL_LAST_PAGE && FMLA_CAP >= 4096 && FMLA_CAP <= 16384
+#define FMLA_DEFER_NORMALIZATION 1
+  // Scaling by a power of two bounds the running numerator by max |V|.
+  constexpr unsigned numerator_bound = 1u << (32 - __builtin_clz(FMLA_CAP - 1));
+#else
+#define FMLA_DEFER_NORMALIZATION 0
+#endif
+#if defined(FMLA_SPARSE_RAW)
+  constexpr bool prefetch_k = HEADS == 32 && FMLA_NO_ROPE;
+#else
+  constexpr bool prefetch_k = false;
+#endif
+  // Keep the lower register-pressure chain for long TopK.
+  constexpr bool independent_mma = (prefetch_k || fixed_h16) && FMLA_CAP <= 1024;
+  constexpr bool pair_stats = prefetch_k && FMLA_SPLITS == 1;
+  constexpr bool stats_outside_probability = pair_stats && true;
+  // Resolve the same two physical tokens once for all four channel planes.
+  auto token_offsets = [&](long long page, long long (&offsets)[2]) {
+    const int token = t >> 3;
+    offsets[0] = cache_token(tp, batch, page, token) * 512;
+    offsets[1] = cache_token(tp, batch, page, token + 32) * 512;
+  };
+  if (prefetch_k && begin < end) {
+    const long long first = cache_page(tp, batch, ts, begin);
+    long long first_offsets[2];
+    token_offsets(first, first_offsets);
 #pragma unroll
-    for (int n = 0; n < NR; ++n)
+    for (int chunk = 0; chunk < 4; ++chunk)
+      load_plane(first, chunk, first_offsets);
+    copy_wait();
+  }
+#if FMLA_PEEL_LAST_PAGE
+  auto step = [&](int page_index, auto next) {
+#else
+  for (int page_index = begin; page_index < end; ++page_index) {
+#endif
+#if FMLA_EARLY_SCALE
+    const auto *scale_base = input<float>(uniform(selectedp)) +
+        (long long)batch * FMLA_CAP + page_index * 64 + wn * 32 + group * 8;
+    const float4_ scale0 = *(const float4_ *)scale_base;
+    const float4_ scale1 = *(const float4_ *)(scale_base + 4);
+#endif
+    const long long page = cache_page(tp, batch, ts, page_index);
+#if FMLA_PEEL_LAST_PAGE
+    constexpr bool early_next = decltype(next)::value;
+    const long long next_page = early_next ? page_index + 1 : 0;
+    long long next_offsets[2];
+    if (early_next)
+      token_offsets(next_page, next_offsets);
+#endif
+    int4_ content[NR], content_second[NR];
+#pragma unroll
+    for (int n = 0; n < NR; ++n) {
       content[n] = (int4_){0, 0, 0, 0};
+      if (independent_mma)
+        content_second[n] = (int4_){0, 0, 0, 0};
+    }
     unsigned retained[HEADS == 16 ? 4 : 1][4][QV];
     if (HEADS == 32) {
+      if (!prefetch_k) {
 #pragma unroll
-      for (int chunk = 0; chunk < 4; ++chunk)
-        load_plane(page, page_index, chunk);
-      copy_wait();
-    } else {
-      load_plane(page, page_index, 0);
-      load_plane(page, page_index, 1);
+        for (int chunk = 0; chunk < 4; ++chunk)
+          load_plane(page, chunk);
+        copy_wait();
+      }
+    }
+    long long page_offsets[2];
+    if (HEADS == 16) {
+      if (fixed_h16)
+        token_offsets(page, page_offsets);
+      load_plane(page, 0, fixed_h16 ? page_offsets : nullptr);
+      load_plane(page, 1, fixed_h16 ? page_offsets : nullptr);
       copy_wait();
     }
 #pragma unroll
-    for (int chunk = 0; chunk < 4; ++chunk) {
+    for (int i = 0; i < 4; ++i) {
+#if FMLA_PEEL_LAST_PAGE
+      const int chunk = (i + 1) & 3;
+#else
+      const int chunk = i;
+#endif
       if (HEADS == 16 && chunk == 2)
         copy_wait();
       const auto tile = planes[HEADS == 32 ? chunk : (chunk & 1)];
@@ -312,8 +399,12 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
               *(const uint4_ *)(tile + koff(token, k * 64 + group * 16));
           const uint4_ qwords = QNOPE(chunk, k);
 #pragma unroll
-          for (int j = 0; j < 4; ++j)
-            content[n] = mma(words[j], qwords[j], content[n]);
+          for (int j = 0; j < 4; ++j) {
+            if ((independent_mma) && k == 1)
+              content_second[n] = mma(words[j], qwords[j], content_second[n]);
+            else
+              content[n] = mma(words[j], qwords[j], content[n]);
+          }
         }
       }
       if (HEADS == 16 || chunk == 0) {
@@ -331,7 +422,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
         sync();
 #endif
         if (chunk < 2)
-          load_plane(page, page_index, chunk + 2);
+          load_plane(page, chunk + 2, fixed_h16 ? page_offsets : nullptr);
         if (FMLA_PIPELINE_ROPE && chunk == 2)
           load_rope(page, page_index);
       } else if (FMLA_PIPELINE_ROPE && chunk == 0) {
@@ -347,6 +438,11 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     // The zero-width RoPE specialization issued no copy to wait for.
     if (!FMLA_NO_ROPE)
       copy_wait();
+    if (independent_mma) {
+#pragma unroll
+      for (int n = 0; n < NR; ++n)
+        content[n] += content_second[n];
+    }
     float4_ rope[NR], scales[NR], probability[NR];
     float local_max = -INFINITY;
 #pragma unroll
@@ -363,6 +459,30 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
         rope[n] = rope_mma((uint2_){words[2], words[3]},
                            (uint2_){qwords[2], qwords[3]}, rope[n], bf16);
       }
+#if defined(FMLA_SCALE_TABLE)
+      const auto *selected = input<float>(uniform(selectedp)) +
+          (long long)batch * FMLA_CAP + page_index * 64;
+      const int lane_token = wn * (64 / NW) + group * (NR * 4) + n;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+#if FMLA_EARLY_SCALE
+        const float weight = j < 2 ? scale0[n + 2 * j] : scale1[n + 2 * (j - 2)];
+#else
+        const float weight = selected[lane_token + j * NR];
+#endif
+        const bool valid = weight >= 0.f;  // Invalid physical IDs use a negative sentinel.
+#if FMLA_EARLY_SCALE
+        // The gather emits finite -1 for invalid entries and their masked
+        // probability is zero, so the scale does not need a separate mask.
+        scales[n][j] = weight;
+#else
+        scales[n][j] = valid ? weight : 0.f;
+#endif
+        probability[n][j] = valid ? (float)content[n][j] * qs * weight * scale_log2
+                                  : -INFINITY;
+        local_max = fmaxf(local_max, probability[n][j]);
+      }
+#else
 #pragma unroll
       for (int j = 0; j < 4; ++j)
         scales[n][j] = input<float>(
@@ -380,6 +500,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                                 : -INFINITY;
         local_max = fmaxf(local_max, probability[n][j]);
       }
+#endif
     }
     // K readers already synchronized; only RoPE readers still need this barrier.
     if (!FMLA_NO_ROPE && !FMLA_SEPARATE_ROPE_STATS)
@@ -389,7 +510,8 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     // H16 retains V in registers, so plane 1 can hold stats beside RoPE in plane 0.
     float *stats = FMLA_SEPARATE_ROPE_STATS
                        ? (float *)planes[1]
-                       : (float *)(planes[0] + (HEADS == 16 ? 4096 : 0));
+                       : (float *)(planes[0] + (HEADS == 16 || stats_outside_probability ? 4096 : 0));
+    auto *sum_peak = (float2_ *)(stats + (stats_outside_probability ? NW * HEADS : 0));
     if (group == 0)
       stats[wn * HEADS + wm * 16 + row] = local_max;
     sync();
@@ -414,32 +536,48 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     local_sum += __shfl_xor(local_sum, 32, 64);
     local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 16, 64));
     local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 32, 64));
-    if (HEADS == 32)
+    if (HEADS == 32 && !stats_outside_probability)
       sync();
     if (group == 0) {
-      stats[((HEADS == 16 ? 2 * NW : 0) + wn) * HEADS + wm * 16 + row] =
-          local_sum;
-      stats[((HEADS == 16 ? 3 * NW : NW) + wn) * HEADS + wm * 16 + row] =
-          local_peak;
+      if (pair_stats) {
+        sum_peak[wn * HEADS + wm * 16 + row] = (float2_){local_sum, local_peak};
+      } else {
+        stats[((HEADS == 16 ? 2 * NW : 0) + wn) * HEADS + wm * 16 + row] =
+            local_sum;
+        stats[((HEADS == 16 ? 3 * NW : NW) + wn) * HEADS + wm * 16 + row] =
+            local_peak;
+      }
     }
     sync();
     float page_sum = 0.f, peak = 0.f;
 #pragma unroll
     for (int n = 0; n < NW; ++n) {
-      page_sum +=
-          stats[((HEADS == 16 ? 2 * NW : 0) + n) * HEADS + wm * 16 + row];
-      peak = fmaxf(
-          peak,
-          stats[((HEADS == 16 ? 3 * NW : NW) + n) * HEADS + wm * 16 + row]);
+      if (pair_stats) {
+        const float2_ pair = sum_peak[n * HEADS + wm * 16 + row];
+        page_sum += pair[0];
+        peak = fmaxf(peak, pair[1]);
+      } else {
+        page_sum +=
+            stats[((HEADS == 16 ? 2 * NW : 0) + n) * HEADS + wm * 16 + row];
+        peak = fmaxf(
+            peak,
+            stats[((HEADS == 16 ? 3 * NW : NW) + n) * HEADS + wm * 16 + row]);
+      }
     }
     const float pscale =
         fmaxf(peak / (HEADS == 32 ? 32512.f : 16129.f), 1.e-30f);
+#if FMLA_DEFER_NORMALIZATION
+    const float old_weight = exp2f(maximum - safe);
+    const float next_den = denominator * old_weight + page_sum;
+    const float outscale = pscale * (1.f / numerator_bound);
+#else
     const float next_den = denominator * exp2f(maximum - safe) + page_sum;
     const float inverse_den = reciprocal(next_den > 0.f ? next_den : 1.f);
     const float old_weight = denominator * exp2f(maximum - safe) * inverse_den,
                 outscale = pscale * inverse_den;
+#endif
     const float inv = reciprocal(pscale);
-    if (HEADS == 32)
+    if (HEADS == 32 && !stats_outside_probability)
       sync();
 #pragma unroll
     for (int word = 0; word < NR; ++word) {
@@ -473,6 +611,17 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                       ((group * 16) ^ ((((wm * 16 + row) >> 1) & 3) * 16));
     const uint4_ ph = *(const uint4_ *)(planes[0] + pbase),
                  pl = *(const uint4_ *)(planes[0] + HEADS * 64 + pbase);
+#if FMLA_PEEL_LAST_PAGE
+    constexpr bool has_next = decltype(next)::value;
+#else
+    const bool has_next = prefetch_k && page_index + 1 < end;
+#endif
+#if !FMLA_PEEL_LAST_PAGE
+    const long long next_page = has_next ? cache_page(tp, batch, ts, page_index + 1) : 0;
+    long long next_offsets[2];
+    if (has_next)
+      token_offsets(next_page, next_offsets);
+#endif
 #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
       unsigned values[4][QV];
@@ -486,34 +635,78 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
           fragments(planes[chunk], group * 16 + k * 4,
                     wn * (128 / NW) + row * QV, values[k]);
       }
+      if (has_next) {
+        // Wait for all current PV reads before overwriting the shared K plane.
+        sync();
+        load_plane(next_page, chunk, next_offsets);
+      }
 #pragma unroll
       for (int m = 0; m < QV; ++m) {
-        int4_ high = {0, 0, 0, 0};
+        int4_ combined;
+        if (independent_mma) {
+          int4_ high = {}, low = {};
 #pragma unroll
-        for (int k = 0; k < 4; ++k)
-          high = mma(values[k][m], ph[k], high);
-        int4_ combined = high * (HEADS == 32 ? 256 : 128);
+          for (int k = 0; k < 4; ++k) {
+            high = mma(values[k][m], ph[k], high);
+            low = mma(values[k][m], pl[k], low);
+          }
+          combined = high * (HEADS == 32 ? 256 : 128) + low;
+        } else {
+          int4_ high = {0, 0, 0, 0};
 #pragma unroll
-        for (int k = 0; k < 4; ++k)
-          combined = mma(values[k][m], pl[k], combined);
+          for (int k = 0; k < 4; ++k)
+            high = mma(values[k][m], ph[k], high);
+          combined = high * (HEADS == 32 ? 256 : 128);
+#pragma unroll
+          for (int k = 0; k < 4; ++k)
+            combined = mma(values[k][m], pl[k], combined);
+        }
         float4_ converted;
 #pragma unroll
         for (int j = 0; j < 4; ++j)
           converted[j] = (float)combined[j];
         acc[chunk * QV + m] =
             acc[chunk * QV + m] * old_weight + converted * outscale;
+        if (!prefetch_k) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          unsigned bits = __float_as_uint(acc[chunk * QV + m][j]);
-          asm volatile("" : "+r"(bits));
-          acc[chunk * QV + m][j] = __uint_as_float(bits);
+          for (int j = 0; j < 4; ++j) {
+            unsigned bits = __float_as_uint(acc[chunk * QV + m][j]);
+            asm volatile("" : "+r"(bits));
+            acc[chunk * QV + m][j] = __uint_as_float(bits);
+          }
         }
       }
     }
     maximum = next_max;
     denominator = next_den;
-    sync();
+    if (has_next)
+      copy_wait();
+    else
+      sync();
+#if FMLA_PEEL_LAST_PAGE
+  };
+  struct More { enum { value = true }; };
+  struct Last { enum { value = false }; };
+  // Remove the next-page branch from each of the four PV copy sites.
+#if defined(FMLA_PAGE_UNROLL)
+#pragma unroll FMLA_PAGE_UNROLL
+#elif FMLA_CAP >= 4096 && FMLA_CAP <= 16384
+#pragma unroll 2
+#endif
+  for (int page_index = begin; page_index + 1 < end; ++page_index)
+    step(page_index, More{});
+  if (begin < end)
+    step(end - 1, Last{});
+#else
   }
+#endif
+#if FMLA_DEFER_NORMALIZATION
+  const float final_scale = numerator_bound * reciprocal(denominator > 0.f ? denominator : 1.f);
+#pragma unroll
+  for (int i = 0; i < QV * 4; ++i)
+    acc[i] *= final_scale;
+#endif
+#undef FMLA_DEFER_NORMALIZATION
   const long long outrow = ((long long)batch * allheads + head) * 512;
 #pragma unroll
   for (int chunk = 0; chunk < 4; ++chunk) {

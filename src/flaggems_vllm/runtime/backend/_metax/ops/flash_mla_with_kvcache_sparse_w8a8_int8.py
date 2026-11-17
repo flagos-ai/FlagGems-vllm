@@ -19,6 +19,25 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import
 from flaggems_vllm.utils import libentry
 
 MAX_SPARSE_SPLITS = 24
+LARGE_D512_ROWS = 256
+MAX_SPARSE_ROWS = 16384
+LENGTH_BLOCK = 256
+
+
+def _c550_small_route(rows, heads, capacity, rope, raw_indices):
+    if not raw_indices or heads != 64 or rope.shape[-1] != 0:
+        return None
+    if rows == 16 and 512 <= capacity <= 1024:
+        route = "prefetch_scales"
+    elif rows == 8 and 4096 <= capacity <= 16384:
+        route = "even_splits"
+    else:
+        return None
+    return (
+        route
+        if torch.cuda.get_device_properties(rope.device).name == "MetaX C550"
+        else None
+    )
 
 
 @libentry()
@@ -26,8 +45,25 @@ MAX_SPARSE_SPLITS = 24
 def initialize_sparse_lengths(
     Counts, ROWS: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr
 ):
-    offsets = tl.arange(0, BLOCK)
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     tl.store(Counts + offsets, K, offsets < ROWS)
+
+
+@libentry()
+@triton.jit
+def gather_sparse_scales(
+    Indices,
+    Scales,
+    Selected,
+    ELEMENTS: tl.constexpr,
+    TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ids = tl.load(Indices + offsets, offsets < ELEMENTS, -1)
+    valid = (ids >= 0) & (ids < TOKENS) & (offsets < ELEMENTS)
+    weights = tl.load(Scales + ids, valid, -1.0)
+    tl.store(Selected + offsets, weights, offsets < ELEMENTS)
 
 
 @libentry()
@@ -99,11 +135,11 @@ class SparseMLAInt8PreparedHandle:
             self.table = indices.view(rows, self.capacity // 64, 64)
             if rows > 0 and self.heads > 0:
                 with torch_device_fn.device(q.device):
-                    initialize_sparse_lengths[(1,)](
+                    initialize_sparse_lengths[(triton.cdiv(rows, LENGTH_BLOCK),)](
                         self.counts,
                         rows,
                         indices.shape[-1],
-                        triton.next_power_of_2(rows),
+                        LENGTH_BLOCK,
                         num_warps=4,
                     )
         else:
@@ -112,6 +148,7 @@ class SparseMLAInt8PreparedHandle:
             )
         self.needs_epilogue = sink is not None or out is not None
         self.native = None
+        self.selected_scales = None
         if rows > 0 and self.heads > 0:
             native_tensors = (
                 q.view(rows, 1, self.heads, 512),
@@ -131,8 +168,15 @@ class SparseMLAInt8PreparedHandle:
                     is_sparse=True,
                     uses_raw_indices=self.uses_raw_indices,
                 )
-            elif rows <= 32:
-                if self.heads == 64 and self.capacity >= 4096:
+            elif rows <= 32 or (rows > LARGE_D512_ROWS and qr.shape[-1] == 0):
+                route = _c550_small_route(
+                    rows, self.heads, self.capacity, qr, self.uses_raw_indices
+                )
+                prefetch_scales = route == "prefetch_scales"
+                if rows > LARGE_D512_ROWS:
+                    # Large batches already fill the device without split workspace.
+                    tile, splits = 32, 1
+                elif self.heads == 64 and self.capacity >= 4096:
                     tile = 32
                     # Fill two CTA slots per SM without excessive partial-buffer traffic.
                     resident_splits = max(
@@ -144,11 +188,14 @@ class SparseMLAInt8PreparedHandle:
                     splits = min(
                         MAX_SPARSE_SPLITS, self.capacity // 64, resident_splits
                     )
+                    if route == "even_splits" and splits > 1:
+                        splits -= splits % 2
                 elif self.heads == 64 and self.capacity <= 1024:
-                    tile = 16
+                    tile = 32 if prefetch_scales else 16
+                    # Use one CTA slot per SM with the wider prefetched tile.
                     resident_splits = max(
                         1,
-                        2
+                        (1 if prefetch_scales else 2)
                         * _get_num_sms(q.device)
                         // (rows * triton.cdiv(self.heads, tile)),
                     )
@@ -186,6 +233,21 @@ class SparseMLAInt8PreparedHandle:
                 self.native.head_tile = tile
                 self.native.normalized_partials = True
                 self.native.grid = (triton.cdiv(self.heads, tile), rows, splits)
+                if (
+                    self.uses_raw_indices
+                    and qr.shape[-1] == 0
+                    and (
+                        rows > LARGE_D512_ROWS
+                        or prefetch_scales
+                        or (rows <= 32 and self.heads == 64 and self.capacity >= 4096)
+                    )
+                ):
+                    self.selected_scales = torch.empty(
+                        (rows, self.capacity), dtype=torch.float32, device=q.device
+                    )
+                    self.native.kernel_arguments["SelectedScales"] = (
+                        self.selected_scales
+                    )
                 self.native.kernel = SmallKernel(tile, self.native)
             else:
                 self.native = NativeCachedHandle(
@@ -235,6 +297,19 @@ class SparseMLAInt8PreparedHandle:
                     self.lengths is not None,
                     triton.next_power_of_2(self.capacity),
                     num_warps=4,
+                )
+            if self.selected_scales is not None:
+                count = self.indices.numel()
+                # Prepared calls can receive updated indices and scale values.
+                block = 128 if self.batch * self.queries <= 32 else 512
+                gather_sparse_scales[(triton.cdiv(count, block),)](
+                    self.indices,
+                    self.native.tensors[5],
+                    self.selected_scales,
+                    count,
+                    self.tokens,
+                    block,
+                    num_warps=2 if block == 128 else 4,
                 )
             native_output, _ = self.native()
             if self.needs_epilogue:
@@ -361,11 +436,18 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
         )
     rows = batch * queries
     capacity = max(64, triton.cdiv(indices.shape[-1], 64) * 64)
-    # Native intermediate indexing is signed INT32; cap transient storage too.
-    workspace = rows * capacity * (3 * heads + 4) + rows * heads * 8192
+    uses_fused_large = rows > LARGE_D512_ROWS and heads >= 64 and q_rope.shape[-1] == 0
+    if uses_fused_large:
+        # Single-split fusion needs no intermediate score or split buffers.
+        workspace = rows * (capacity * 4 + heads * (512 * 2 + 4))
+    else:
+        workspace = rows * capacity * (3 * heads + 4) + rows * heads * 8192
     if (
-        rows >= 2**14
-        or rows * capacity * max(heads, 1) >= 2**30
+        rows > MAX_SPARSE_ROWS
+        or (
+            not uses_fused_large
+            and (rows == MAX_SPARSE_ROWS or rows * capacity * max(heads, 1) >= 2**30)
+        )
         or k_nope.shape[0] * 64 >= 2**31
         or workspace > 8 * 1024**3
     ):

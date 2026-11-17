@@ -53,10 +53,6 @@ class SparseMLAInt8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
             inputs, query, cache = make_inputs(
                 batch, queries, heads, topk, pages, dtype, rope_dim
             )
-            if rope_dim == 0:
-                # User-approved D512 baseline: zero-pad before timing; preserve D512 scale.
-                query = torch.nn.functional.pad(query, (0, 64))
-                cache = torch.nn.functional.pad(cache, (0, 64))
             device = query.device
             table = torch.arange(pages, dtype=torch.int32, device=device).repeat(
                 batch, 1
@@ -85,6 +81,10 @@ class SparseMLAInt8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
             assert_accuracy(actual, expected)
             assert_accuracy(run_native(*args), expected)
             yield (*args[:-1], {"handle": handle})
+
+    def unpack_to_args_kwargs(self, input_tuple):
+        # The native scheduler is opaque and must reach flash_mla unchanged.
+        return input_tuple[:-1], input_tuple[-1]
 
     def record_shapes(
         self, inputs, query, cache, table, lengths, metadata, splits, valid, handle

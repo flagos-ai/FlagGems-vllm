@@ -343,6 +343,8 @@ class FlashMLAInt8PreparedHandle:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
         query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
+        # The single-split kernel only needs the grid's batch coordinate.
+        batch_stride = self.batch if self.splits > 1 else 1
         with torch_device_fn.device(query.device):
             self._prepare_batch_order()
             self.kernel[self.grid](
@@ -359,7 +361,7 @@ class FlashMLAInt8PreparedHandle:
                 ks.stride(),
                 table.stride(0),
                 lengths.stride(0),
-                self.batch,
+                batch_stride,
                 self.heads,
                 self.splits,
                 self.scale,
@@ -382,7 +384,7 @@ class FlashMLAInt8PreparedHandle:
                     self.queries,
                     self.splits,
                     NORMALIZED=self.normalized_partials,
-                    num_warps=4,
+                    num_warps=2 if self.uses_raw_indices and rope.shape[-1] == 0 else 4,
                 )
         return self.output, self.lse
 
@@ -634,7 +636,7 @@ def _scale_spec(handle):
     )
 
 
-SMALL_SIGNATURE = (tl.int64,) * 15 + (tl.int32,) * 6 + (tl.float32,) + (tl.int32,) * 3
+SMALL_SIGNATURE = (tl.int64,) * 16 + (tl.int32,) * 6 + (tl.float32,) + (tl.int32,) * 3
 
 
 @extern
@@ -679,6 +681,8 @@ def small_native(
     CAUSAL: tl.constexpr,
     BH: tl.constexpr,
     BatchOrder=None,
+    SelectedScales=None,
+    REVERSE_SPLITS: tl.constexpr = False,
 ):
     _small_device(
         tl.cast(Q, tl.int64),
@@ -700,6 +704,11 @@ def small_native(
             if BatchOrder is None
             else tl.cast(BatchOrder, tl.int64)
         ),
+        (
+            tl.full((), 0, tl.int64)
+            if SelectedScales is None
+            else tl.cast(SelectedScales, tl.int64)
+        ),
         tl.cast(B, tl.int32),
         tl.cast(H, tl.int32),
         tl.cast(SQ, tl.int32),
@@ -709,7 +718,7 @@ def small_native(
         tl.cast(SCALE * 1.4426950408889634, tl.float32),
         tl.program_id(0),
         tl.program_id(1),
-        tl.program_id(2),
+        SPLITS - 1 - tl.program_id(2) if REVERSE_SPLITS else tl.program_id(2),
     )
 
 
@@ -866,9 +875,119 @@ def values_native_fragments(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _bsm_offset_kernel():
+    """Use BSM immediates for this specialization only on the validated toolchain."""
+    from triton.backends.metax.compiler import get_lld_version
+    from triton.compiler import CompiledKernel, compile
+    from triton.runtime.jit import JITFunction
+
+    compiler, version = _compiler()
+    if b"(d9102a1572)" not in version or get_lld_version() != 19:
+        return small_native
+
+    def compile_with_offsets(src, target=None, options=None, **kwargs):
+        standard = compile(src, target=target, options=options, **kwargs)
+        if (
+            "mcfatbin" not in standard.asm
+            or "llir" not in standard.asm
+            or target.backend != "maca"
+            or options.get("scenario") != "mla"
+            or options.get("pipeline") != "basic"
+            or options.get("num_stages") != 2
+            or options.get("debug")
+            or options.get("instrumentation_mode")
+            or os.environ.get("TRITON_COMPILER_OPT_PATH")
+        ):
+            return standard
+        maca_path = os.environ.get("MACA_PATH", "/opt/maca")
+        flags = (
+            "-metaxgpu-mma-sched=true",
+            "-map-use-pk-fma=1",
+            "-metaxgpu-split-regalloc=true",
+            "-metaxgpu-aggressive-fold=true",
+            "-metaxgpu-disable-licm=true",
+            "-metaxgpu-merge-copy-postra=false",
+            "--vectorize-slp=false",
+            "-metaxgpu-disable-bsm-offset=0",
+            f"-inputFuncBC={maca_path}/lib/maca_kernellib.bc",
+        )
+        key = hashlib.sha256(
+            standard.kernel + version + str(compiler).encode() + repr(flags).encode()
+        ).hexdigest()
+        entries = standard.metadata_group.copy()
+        binary = next(name for name in entries if name.endswith(".mcfatbin"))
+        cache = get_cache_manager(key)
+        path = cache.get_file(binary)
+        if path is None:
+            llvm_flags = [flag for item in flags for flag in ("-mllvm", item)]
+            with tempfile.TemporaryDirectory(prefix="flaggems-mla-bsm-") as work:
+                llir = Path(work) / "kernel.ll"
+                output = Path(work) / binary
+                llir.write_text(standard.asm["llir"])
+                subprocess.run(
+                    [
+                        str(compiler),
+                        "--fatbin",
+                        str(llir),
+                        *llvm_flags,
+                        "-maca-link",
+                        "-input-is-device",
+                        "--maca-path",
+                        maca_path,
+                        "-o",
+                        str(output),
+                    ],
+                    check=True,
+                )
+                path = cache.put(output.read_bytes(), binary)
+        entries[binary] = path
+        return CompiledKernel(src, entries, key)
+
+    class BsmOffsetKernel(JITFunction):
+        def create_binder(self):
+            binder = super().create_binder()
+            self.compile = compile_with_offsets
+            return binder
+
+    return BsmOffsetKernel(small_native.fn)
+
+
 class SmallKernel:
     def __init__(self, heads, handle):
-        spec = _scale_spec(handle) + (("B", handle.batch), ("SPLITS", handle.splits))
+        # Batch size only strides the split workspace when a merge is needed.
+        batch_stride = handle.batch if handle.splits > 1 else 1
+        spec = _scale_spec(handle) + (("B", batch_stride), ("SPLITS", handle.splits))
+        if "SelectedScales" in handle.kernel_arguments:
+            spec += (("SCALE_TABLE", 1),)
+        pages = handle.tensors[6].shape[1]
+        # With one remainder page, only the last partition is longer.
+        self.reverse_splits = (
+            handle.uses_raw_indices
+            and handle.tensors[1].shape[-1] == 0
+            and handle.batch <= 32
+            and pages <= 16
+            and 1 < handle.splits <= 6
+            and pages % handle.splits == 1
+        )
+        self.fn = (
+            _bsm_offset_kernel()
+            if heads == 32
+            and handle.is_sparse
+            and handle.uses_raw_indices
+            and handle.tensors[1].shape[-1] == 0
+            and torch.cuda.get_device_properties(handle.tensors[0].device).name
+            == "MetaX C550"
+            else small_native
+        )
+        if (
+            self.fn is not small_native
+            and "SelectedScales" in handle.kernel_arguments
+            and handle.splits == 1
+            and 3072 <= handle.batch <= 7168
+            and 4096 <= pages * 64 <= 16384
+        ):
+            spec += (("PAGE_UNROLL", 3),)
         self.bitcode = _library("small", heads, spec)
 
     def __getitem__(self, grid):
@@ -879,7 +998,7 @@ class SmallKernel:
                 scenario="mla",
                 extern_libs={"mla_int8_small": self.bitcode},
             )
-            return small_native[grid](*args, **kwargs)
+            return self.fn[grid](*args, REVERSE_SPLITS=self.reverse_splits, **kwargs)
 
         return launch
 

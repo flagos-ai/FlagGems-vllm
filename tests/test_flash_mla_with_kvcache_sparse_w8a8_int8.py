@@ -157,3 +157,50 @@ def test_sparse_decode_empty(empty):
     output, lse = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
     gems_assert_equal(output, torch.zeros_like(output))
     gems_assert_equal(lse, torch.full_like(lse, float("inf")))
+
+
+@pytest.mark.parametrize(
+    ("topk", "has_lengths"), [(65, True), (128, False), (192, False)]
+)
+def test_sparse_decode_large_batch(topk, has_lengths):
+    batch = 257
+    inputs, _, _ = make_inputs(batch, 1, 64, topk, rope_dim=0)
+    indices = inputs[-1]
+    indices[0].fill_(-1)
+    indices[1, :, ::3] = inputs[2].shape[0] * 64
+    indices[2, :, 1] = indices[2, :, 0]
+    if topk == 192:
+        # Exercise an empty final page and a query with only a valid final page.
+        indices[3, :, -64:].fill_(-1)
+        indices[4, :, :-64].fill_(-1)
+    lengths = (
+        torch.full((batch, 1), topk - 1, dtype=torch.int32, device=indices.device)
+        if has_lengths
+        else None
+    )
+    actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(
+        *inputs, topk_length=lengths
+    )
+    assert_accuracy(actual, reference(inputs, topk_length=lengths))
+
+
+@pytest.mark.parametrize("batch, topk", [(8, 4096), (16, 640), (257, 4096)])
+def test_sparse_raw_selected_partitions(batch, topk):
+    inputs, _, _ = make_inputs(
+        batch, 1, 64, topk, pages=max(32, topk // 32), rope_dim=0
+    )
+    indices = inputs[-1]
+    indices[0].fill_(-1)
+    indices[1, :, :-64].fill_(-1)
+    indices[2, :, 1] = indices[2, :, 0]
+    indices[2, :, -4] = inputs[2].shape[0] * 64
+    inputs[4][2].mul_(8)
+    actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(
+        *inputs, softmax_scale=0.5
+    )
+    first_rows = [
+        item[:4] if i in (0, 1, 4, 6) else item for i, item in enumerate(inputs)
+    ]
+    assert_accuracy(
+        (actual[0][:4], actual[1][:4]), reference(first_rows, softmax_scale=0.5)
+    )
