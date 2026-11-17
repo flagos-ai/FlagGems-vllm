@@ -25,7 +25,7 @@ the current routing IDs on every call; the same workspace can be reused.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from typing import Callable
 
 import torch
@@ -343,6 +343,13 @@ class MegaMoEContext:
     completes. Reusing this context overwrites its output; clone the result in
     the caller if it must survive the next invocation. Concurrent invocations
     require separate contexts and separate symmetric peer buffers.
+
+    To enable the tuned EP2/EP4 return paths, pass `all_ranks_true`, a
+    synchronous host callback that returns the logical AND of its argument
+    across this context's EP group. Construct matching contexts in the same
+    order on every rank, with the callback supplied on every rank or none.
+    Without the callback, use per-route returns. Keep the workspace and its
+    layout options fixed after construction.
     """
 
     config: MegaMoEConfig
@@ -356,6 +363,49 @@ class MegaMoEContext:
     barrier: Callable[[int], None] | None
     owners: tuple
     output: torch.Tensor
+    all_ranks_true: InitVar[Callable[[bool], bool] | None] = None
+    _ep2_partial_reduce: bool = field(init=False, default=False, repr=False)
+    _gather_input: bool = field(init=False, default=False, repr=False)
+
+    def __post_init__(self, all_ranks_true: Callable[[bool], bool] | None) -> None:
+        config = self.config
+        ep = config.num_ranks
+        if (
+            all_ranks_true is None
+            or not _is_tuned_shape(config)
+            or ep not in (2, 4)
+            or config.tokens not in (2048, 16384)
+        ):
+            return
+
+        tuned_device = (
+            self.device.type == "cuda"
+            and torch.cuda.get_device_properties(self.device).name == "PPU-ZW810E"
+        )
+        pool_tokens = self.options.get("POOL_TOKENS", 0)
+        if ep == 2:
+            block_m = self.options.get("BLOCK_M", 0)
+            l2_meta = self.buffers.get("l2_meta")
+            self._ep2_partial_reduce = all_ranks_true(
+                tuned_device
+                and self.options.get("AGGREGATE_COMPLETION", False)
+                and block_m > 0
+                and isinstance(l2_meta, torch.Tensor)
+                and l2_meta.numel()
+                >= (pool_tokens // block_m) * (config.hidden_size // 256) * 4
+            )
+            if not self._ep2_partial_reduce:
+                return
+
+        l1_tok = self.buffers.get("l1_tok")
+        source_ranks = ep if ep == 2 else ep - 1
+        self._gather_input = all_ranks_true(
+            tuned_device
+            and isinstance(l1_tok, torch.Tensor)
+            and l1_tok.data_ptr() % 16 == 0
+            and pool_tokens * (config.hidden_size - 4)
+            >= source_ranks * config.tokens * config.hidden_size
+        )
 
 
 def _buffer_sizes(config: MegaMoEConfig) -> dict[str, int]:
@@ -514,7 +564,8 @@ def megamoe(
     Partial-reduction paths cache a BF16 workspace on first use. Routing IDs
     and expert load may change between invocations.
 
-    All ranks must call this operator collectively with matching dimensions.
+    All ranks must call this operator collectively with matching dimensions
+    and numerical mode.
     The caller must keep the context and symmetric peer buffers alive until
     execution completes. Before reusing them, ensure the previous invocation
     completed on every rank. The stream barrier orders this invocation's input
@@ -610,37 +661,14 @@ def megamoe(
     a_block_ptr, async_a, async_b = _load_policy(config)
     if a_block_ptr or (_use_l1_pipeline(config) and config.tokens >= 2048):
         _check_full_tile_a_context(config, context, device)
-    partial_reduce = (
-        (not vendor_numerics or config.tokens == 16384)
-        and _is_tuned_shape(config)
-        and config.num_ranks == 2
-        and config.tokens in (2048, 16384)
-        and context.options.get("AGGREGATE_COMPLETION", False)
-        and context.buffers["l2_meta"].numel()
-        >= (context.options["POOL_TOKENS"] // context.options["BLOCK_M"])
-        * (config.hidden_size // 256)
-        * 4
-        and torch.cuda.get_device_properties(device).name == "PPU-ZW810E"
+    partial_reduce = context._ep2_partial_reduce and (
+        not vendor_numerics or config.tokens == 16384
     )
-    gather_input = (
-        partial_reduce
-        and context.buffers["l1_tok"].data_ptr() % 16 == 0
-        and context.options["POOL_TOKENS"] * (config.hidden_size - 4)
-        >= config.num_ranks * config.tokens * config.hidden_size
-    )
+    gather_input = partial_reduce and context._gather_input
     # Large EP4 shapes can cache each remote token once and start GEMM1
     # for locally routed blocks while the remote cache is being filled.
     ep4_cache_workers = 0
-    if (
-        vendor_numerics
-        and config.num_ranks == 4
-        and config.tokens in (2048, 16384)
-        and _is_tuned_shape(config)
-        and torch.cuda.get_device_properties(device).name == "PPU-ZW810E"
-        and context.buffers["l1_tok"].data_ptr() % 16 == 0
-        and context.options["POOL_TOKENS"] * (config.hidden_size - 4)
-        >= (config.num_ranks - 1) * config.tokens * config.hidden_size
-    ):
+    if vendor_numerics and config.num_ranks == 4 and context._gather_input:
         ep4_cache_workers = 16 if config.tokens == 16384 else 12
     ep4_rank_return = ep4_cache_workers != 0 and config.tokens == 16384
     partial_reduce = partial_reduce or ep4_rank_return

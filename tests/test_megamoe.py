@@ -841,6 +841,49 @@ def test_megamoe_peer_capacity_covers_routing_skew():
     }
 
 
+@pytest.mark.parametrize("ep", [2, 4])
+@pytest.mark.parametrize("layout", ["aligned", "mixed", "no_collective"])
+def test_megamoe_context_agrees_on_return_layout(ep, layout):
+    api = _require_ppu_device()
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_name(device) != "PPU-ZW810E":
+        pytest.skip("requires the tuned PPU return path")
+    pool_tokens = 1 << 20
+    block_m = 128 if ep == 2 else 64
+    storage = torch.empty(24, dtype=torch.int8, device=device)
+    meta = torch.empty((pool_tokens // block_m, 32), dtype=torch.int32, device=device)
+    for rank in range(ep):
+        offset = 8 if layout == "mixed" and rank == ep - 1 else 0
+        votes = []
+
+        def all_ranks_true(local):
+            votes.append(local)
+            # EP2 first checks the group-wide partial-reduction capacity.
+            return (ep == 2 and len(votes) == 1) or layout == "aligned"
+
+        context = api.MegaMoEContext(
+            config=api.MegaMoEConfig(16384, 2048, 512, 256, 8, ep, rank),
+            device=device,
+            buffers={"l1_tok": storage[offset : offset + 16], "l2_meta": meta},
+            peer_tables={},
+            options=dict(
+                POOL_TOKENS=pool_tokens, BLOCK_M=block_m, AGGREGATE_COMPLETION=True
+            ),
+            reset_table=meta,
+            reset_programs=0,
+            barrier=None,
+            owners=(),
+            output=meta,
+            all_ranks_true=None if layout == "no_collective" else all_ranks_true,
+        )
+        if layout == "no_collective":
+            assert not votes
+        else:
+            assert votes == ([True] if ep == 2 else []) + [offset == 0]
+        assert context._gather_input is (layout == "aligned")
+        assert context._ep2_partial_reduce is (ep == 2 and layout != "no_collective")
+
+
 @pytest.mark.parametrize("shape", [(1, 128, 128, 4, 1), (17, 256, 384, 5, 3)])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("routing", ["normal", "skew", "dropped"])

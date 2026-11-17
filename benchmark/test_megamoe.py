@@ -1921,6 +1921,9 @@ def _make_ppu_context(
     device,
     peer_tables=None,
     barrier=None,
+    *,
+    all_ranks_true=None,
+    l1_tok_offset=0,
 ):
     """Allocate the PPU context in the caller, outside timed invocations."""
     from flaggems_vllm.runtime.backend._thead.mega.megamoe.api import (
@@ -1987,7 +1990,17 @@ def _make_ppu_context(
         allocate("dispatch_block_arrived", max_blocks)
         allocate("dispatch_phase", 4)
         allocate("dispatch_cursor", 3)
-        allocate("l1_tok", (pool_tokens, config.hidden_size), torch.int8)
+        if l1_tok_offset:
+            storage = torch.empty(
+                pool_tokens * config.hidden_size + l1_tok_offset,
+                device=device,
+                dtype=torch.int8,
+            )
+            buffers["l1_tok"] = storage[l1_tok_offset:].view(
+                pool_tokens, config.hidden_size
+            )
+        else:
+            allocate("l1_tok", (pool_tokens, config.hidden_size), torch.int8)
         allocate("l1_sf", pool_tokens, torch.float32)
         allocate("l1_w", pool_tokens, torch.float32)
         allocate("l2_acts", (pool_tokens, config.intermediate_size), torch.int8)
@@ -2105,6 +2118,7 @@ def _make_ppu_context(
             barrier,
             tuple(references),
             output,
+            all_ranks_true=all_ranks_true,
         )
 
 
@@ -2365,7 +2379,7 @@ class PPUMegaMoEBenchmark(base.Benchmark):
         return op(
             _PPUBenchmarkConfig(
                 num_ranks=num_ranks,
-                ppu=vendor_name == "thead",
+                ppu=True,
                 tokens=tokens,
                 hidden=hidden,
                 intermediate=intermediate,
