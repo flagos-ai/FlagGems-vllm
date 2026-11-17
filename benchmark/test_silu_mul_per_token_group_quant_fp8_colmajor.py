@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused FP8 latency (framework milliseconds); speedup = vLLM / Gems.
+"""Fused FP8 latency (framework milliseconds); speedup = baseline / Gems.
 
-The baseline is imported directly from the installed vLLM library.
+Ascend uses a Torch composition with software E4M3FN encoding. Other backends
+use the fused baseline imported from the installed vLLM library.
 Use ``--mode cudagraph`` to measure captured device work through graph replay.
 """
 
@@ -24,11 +25,17 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    silu_mul_per_token_group_quant_fp8_colmajor as vllm_silu_mul_quant,
-)
 
 import flaggems_vllm
+
+if flaggems_vllm.vendor_name == "ascend":
+    from baseline.silu_mul_per_token_group_quant_fp8_colmajor import (
+        silu_mul_per_token_group_quant_fp8_colmajor as baseline_silu_mul_quant,
+    )
+else:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        silu_mul_per_token_group_quant_fp8_colmajor as baseline_silu_mul_quant,
+    )
 
 from . import base
 
@@ -70,7 +77,7 @@ class SiluMulQuantFp8Benchmark(base.GenericBenchmark):
 def _inputs(shape, dtype, device, use_ue8m0=False):
     x = torch.randn(shape, dtype=dtype, device=device)
     before = x.clone()
-    expected = vllm_silu_mul_quant(x, use_ue8m0=use_ue8m0)
+    expected = baseline_silu_mul_quant(x, use_ue8m0=use_ue8m0)
     actual = flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor(
         x, use_ue8m0=use_ue8m0, clamp_limit=None
     )
@@ -87,7 +94,8 @@ def _inputs(shape, dtype, device, use_ue8m0=False):
     shape_desc="M, packed_gate_up_N",
 )
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "metax", "thead", "mthreads", "hygon"),
+    flaggems_vllm.vendor_name
+    not in ("nvidia", "metax", "thead", "mthreads", "hygon", "ascend"),
     reason="this backend has no validated fused FP8 implementation",
 )
 @pytest.mark.parametrize("use_ue8m0", [False, True])
@@ -95,7 +103,7 @@ def test_silu_mul_per_token_group_quant_fp8_colmajor(use_ue8m0):
     bench = SiluMulQuantFp8Benchmark(
         op_name="silu_mul_per_token_group_quant_fp8_colmajor",
         input_fn=partial(_inputs, use_ue8m0=use_ue8m0),
-        torch_op=vllm_silu_mul_quant,
+        torch_op=baseline_silu_mul_quant,
         dtypes=[torch.float16, torch.bfloat16],
     )
     bench.set_gems(flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor)

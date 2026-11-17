@@ -16,18 +16,27 @@ import inspect
 
 import pytest
 import torch
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    silu_mul_per_token_group_quant_fp8_colmajor as vllm_silu_mul_quant,
-)
 
 import flaggems_vllm
 
-VLLM_HAS_CLAMP = "clamp_limit" in inspect.signature(vllm_silu_mul_quant).parameters
+if flaggems_vllm.vendor_name == "ascend":
+    from baseline.silu_mul_per_token_group_quant_fp8_colmajor import (
+        silu_mul_per_token_group_quant_fp8_colmajor as baseline_silu_mul_quant,
+    )
+else:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        silu_mul_per_token_group_quant_fp8_colmajor as baseline_silu_mul_quant,
+    )
+
+BASELINE_HAS_CLAMP = (
+    "clamp_limit" in inspect.signature(baseline_silu_mul_quant).parameters
+)
 
 
 @pytest.mark.silu_mul_per_token_group_quant_fp8_colmajor
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "metax", "thead", "mthreads", "hygon"),
+    flaggems_vllm.vendor_name
+    not in ("nvidia", "metax", "thead", "mthreads", "hygon", "ascend"),
     reason="this backend has no validated fused FP8 implementation",
 )
 @pytest.mark.parametrize(
@@ -40,8 +49,8 @@ VLLM_HAS_CLAMP = "clamp_limit" in inspect.signature(vllm_silu_mul_quant).paramet
 def test_silu_mul_per_token_group_quant_fp8_colmajor(
     shape, dtype, use_ue8m0, clamp_limit
 ):
-    if clamp_limit is not None and not VLLM_HAS_CLAMP:
-        pytest.skip("installed vLLM baseline does not support clamp_limit")
+    if clamp_limit is not None and not BASELINE_HAS_CLAMP:
+        pytest.skip("selected baseline does not support clamp_limit")
     torch.manual_seed(1337)
     x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
     # Exercise the sign of zero for positive and negative gates explicitly.
@@ -49,9 +58,9 @@ def test_silu_mul_per_token_group_quant_fp8_colmajor(
     x[0, 1] = -1.0
     x[0, shape[1] // 2 : shape[1] // 2 + 2] = -0.0
     reference_kwargs = {"use_ue8m0": use_ue8m0}
-    if VLLM_HAS_CLAMP:
+    if BASELINE_HAS_CLAMP:
         reference_kwargs["clamp_limit"] = clamp_limit
-    ref_output, ref_scales = vllm_silu_mul_quant(x, **reference_kwargs)
+    ref_output, ref_scales = baseline_silu_mul_quant(x, **reference_kwargs)
     output, scales = flaggems_vllm.silu_mul_per_token_group_quant_fp8_colmajor(
         x, use_ue8m0=use_ue8m0, clamp_limit=clamp_limit
     )

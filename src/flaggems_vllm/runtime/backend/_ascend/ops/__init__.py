@@ -117,6 +117,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
     silu_and_mul_with_clamp_out,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
+    silu_mul_per_token_group_quant_fp8_colmajor,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
     compute_slot_mapping_parallel,
 )
@@ -192,6 +195,7 @@ __all__ = [
     "scatter_kda_state",
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
+    "silu_mul_per_token_group_quant_fp8_colmajor",
     "sparse_attn_sharedkv",
     "sparse_flash_attention",
     "SUPPORTED_FP8_DTYPE",
