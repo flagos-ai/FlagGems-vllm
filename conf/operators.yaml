@@ -1141,11 +1141,16 @@ ops:
 
     FP8 supports decode, prefill and speculative state-slot updates.
 
+    MThreads exposes native decode/MTP and prefill with FP8 VK state, independent
+    indexed state pools, initialization flags and quantized rollback buffers.
+
     INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
 
     '
   for:
   - gdn_w8a16
+  - chunk_gated_delta_rule_w8a16_fp8
+  - gated_delta_rule_decode_w8a16_fp8
   - gdn_w8a16_int8
   - chunk_gated_delta_rule_w8a16_int8
   - quantize_gdn_state_int8
