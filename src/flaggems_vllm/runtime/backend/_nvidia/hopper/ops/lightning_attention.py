@@ -8,17 +8,25 @@ import triton.language as tl
 
 
 @triton.jit
-def _matmul(a, b):
-    # TF32 WGMMA requires a K-major B descriptor. Stage [N,K] and transpose
-    # the descriptor, so the logical product remains A[M,K] @ B[K,N].
-    rhs = tle.gpu.alloc(
-        (b.shape[1], b.shape[0]),
-        tl.float32,
-        scope=tle.gpu.smem,
-        init_value=tl.trans(b),
+def _stage_rhs(b):
+    # TF32 needs a K-major B descriptor. Store [N,K] and transpose its descriptor.
+    return tle.gpu.alloc(
+        (b.shape[1], b.shape[0]), tl.float32, scope=tle.gpu.smem, init_value=tl.trans(b)
     )
-    acc = tle.gpu.wgmma(a, rhs, trans_b=True, input_precision="tf32")
-    return tle.gpu.wgmma_wait(0, acc)
+
+
+@triton.jit
+def _issue_wgmma(a, rhs):
+    return tle.gpu.wgmma(a, rhs, trans_b=True, input_precision="tf32")
+
+
+@triton.jit
+def _matmul(a, b, WARP_MMA: tl.constexpr = False):
+    if WARP_MMA:
+        result = tl.dot(a, b, input_precision="tf32")
+    else:
+        result = tle.gpu.wgmma_wait(0, _issue_wgmma(a, _stage_rhs(b)))
+    return result
 
 
 @triton.jit
@@ -220,6 +228,7 @@ def _chunk_output(
     C: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    OVERLAP_Q: tl.constexpr,
 ):
     part, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     chunk, tile = part // ((E + BV - 1) // BV), part % ((E + BV - 1) // BV)
@@ -262,18 +271,37 @@ def _chunk_output(
         hist = History + bh * 2 * D * E + elem
         tl.store(hist, state, mask)
         weight = tl.exp(-slope * tl.maximum(T - 1 - row, 0))
-        final = _matmul(tl.trans(k), v * weight[:, None]) + tl.exp(-slope * T) * state
+        final = (
+            _matmul(tl.trans(k), v * weight[:, None], C < 64)
+            + tl.exp(-slope * T) * state
+        )
         tl.store(hist + D * E, final, mask)
     else:
         state = tl.load(
             Prefix + (bh * ((T + C - 1) // C) + chunk) * D * E + elem, mask, 0
         )
+    if OVERLAP_Q:
+        # Materialize both descriptors before issuing either product. Keep each
+        # RHS intact until its group has completed.
+        keys = _stage_rhs(tl.trans(k))
+        history_rhs = _stage_rhs(state)
+        score_acc = _issue_wgmma(q, keys)
+        cross_acc = _issue_wgmma(q, history_rhs)
     age = row[:, None] - row[None, :]
-    scores = _matmul(q, tl.trans(k))
-    causal = tl.where(age >= 0, tl.exp(-slope * tl.maximum(age, 0)) * scores, 0)
-    y = _matmul(causal, v)
-    if not SINGLE or HAS_INITIAL:
-        y += _matmul(q, state) * tl.exp(-slope * row)[:, None]
+    weight = tl.exp(-slope * tl.maximum(age, 0))
+    if OVERLAP_Q:
+        scores = tle.gpu.wgmma_wait(1, score_acc)
+    else:
+        scores = _matmul(q, tl.trans(k), C < 64)
+    causal = tl.where(age >= 0, weight * scores, 0)
+    if OVERLAP_Q:
+        # Drain the remaining group before staging V into shared memory.
+        carry = tle.gpu.wgmma_wait(0, cross_acc) * tl.exp(-slope * row)[:, None]
+    y = _matmul(causal, v, C < 64)
+    if OVERLAP_Q:
+        y += carry
+    elif not SINGLE or HAS_INITIAL:
+        y += _matmul(q, state, C < 64) * tl.exp(-slope * row)[:, None]
     tl.store(
         Output + (bh * T + t[:, None]) * E + e[None, :],
         y,
@@ -364,6 +392,7 @@ def _recurrent(
 _CACHE_LAYOUT = tle.gpu.BlockEncoding([1, 2], [4, 8], [4, 1], [1, 0])
 _SMALL_LAYOUT = tle.gpu.BlockEncoding([1, 2], [4, 8], [1, 1], [1, 0])
 _NARROW_LAYOUT = tle.gpu.BlockEncoding([1, 2], [4, 8], [2, 1], [1, 0])
+_TRANSPOSED_LAYOUT = tle.gpu.BlockEncoding([2, 1], [16, 2], [1, 1], [0, 1])
 _WIDE_LAYOUT = tle.gpu.BlockEncoding([1, 4], [4, 8], [4, 1], [1, 0])
 
 
@@ -396,7 +425,31 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
         initial.shape != (b, h, d, e) or initial.dtype != torch.float32
     ):
         raise ValueError("kv_history must have shape [B,H,D,E] and dtype float32")
-    value_tile = 16 if t <= 128 else (64 if e >= 128 else 32)
+    c = 64
+    warps = 4
+    if t <= 32:
+        c = 16 if t <= 16 else 32
+        warps = 2
+    elif 64 < t <= 128 and b * h >= 16:
+        c = 128
+    n = triton.cdiv(t, c)
+    if t <= 128:
+        value_tile = 32 if c == 128 else 16
+    elif t <= 256 and d == 64:
+        value_tile = 16
+    else:
+        value_tile = 64 if e >= 128 and b * h * n > 64 else 32
+    # Overlapping the two Q products helps short, single-tile prefixes with
+    # relatively few heads. Larger launches run faster with immediate waits.
+    overlap_q = (
+        c == 64
+        and n == 1
+        and d == 128
+        and e >= 32
+        and b * h <= 16
+        and initial is not None
+        and k.stride(3) == 1
+    )
     y = torch.empty((b, h, t, e), dtype=q.dtype, device=q.device)
     hist = torch.empty(
         (b, h, triton.cdiv(t, 256) + 1, d, e), dtype=torch.float32, device=q.device
@@ -406,11 +459,9 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
     sv = (q.stride(), k.stride(), v.stride())
     ss = slope.view(-1).stride(0)
     bk = max(64, triton.next_power_of_2(d))
-    c = 64
-    n = triton.cdiv(t, c)
     tiles = triton.cdiv(e, value_tile)
     with torch.cuda.device(q.device):
-        if t <= 4:
+        if t <= 1 or (t <= 4 and d == 64):
             _recurrent[(tiles, h, b)](
                 q,
                 k,
@@ -459,7 +510,8 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
                     num_warps=4,
                 )
                 if n >= 24:
-                    _scan_parallel[(triton.cdiv(d * e, 64), h, b)](
+                    width = 256 if n <= 128 and (d * e >= 16384 or b * h >= 16) else 64
+                    _scan_parallel[(triton.cdiv(d * e, width), h, b)](
                         prefix,
                         base,
                         slope,
@@ -473,7 +525,7 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
                         initial is not None,
                         c,
                         16,
-                        64,
+                        width,
                         num_warps=4,
                     )
                 else:
@@ -513,7 +565,8 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
                 c,
                 bk,
                 value_tile,
-                num_warps=4,
+                overlap_q,
+                num_warps=warps,
             )
     return y, hist
 
@@ -541,9 +594,14 @@ def lightning_attention_decode(q, k, v, kv_caches, slope_rate, slot_idx, BLOCK_S
         )
     if BLOCK_SIZE < 1 or BLOCK_SIZE & (BLOCK_SIZE - 1):
         raise ValueError("BLOCK_SIZE must be a positive power of two")
-    if d == 64:
+    if kv_caches.stride(2) == 1:
+        tile = min(BLOCK_SIZE, 8 if d == 64 else 4)
+        warps, layout = 1, _TRANSPOSED_LAYOUT
+    elif kv_caches.stride(3) != 1:
+        tile, warps, layout = min(BLOCK_SIZE, 16), 2, _NARROW_LAYOUT
+    elif d == 64:
         tile, warps, layout = min(BLOCK_SIZE, 32), 1, _SMALL_LAYOUT
-    elif b * h <= 64:
+    elif b * h <= 128:
         tile, warps, layout = min(BLOCK_SIZE, 16), 2, _NARROW_LAYOUT
     else:
         tile, warps, layout = min(2 * BLOCK_SIZE, 64), 4, _WIDE_LAYOUT

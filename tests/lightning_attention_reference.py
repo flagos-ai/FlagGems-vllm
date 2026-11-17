@@ -29,18 +29,20 @@ def prefix_reference(q, k, v, slope, initial=None, dtype=torch.float64):
     return y, torch.stack(snapshots, dim=2)
 
 
-def decode_reference(q, k, v, cache, slope, slots):
-    """Reference for a batch with unique live slots; padding returns zero."""
+def decode_reference(q, k, v, cache, slope, slots, dtype=torch.float32):
+    """Compute live rows in the requested precision and round the persistent cache each step."""
     active = slots >= 0
     idx = slots[active].long()
-    old = cache[idx]
-    state = torch.exp(-slope.reshape(1, -1, 1, 1)) * old
-    state = state + k[active, :, 0, :, None].float() * v[active, :, 0, None, :].float()
+    old = cache[idx].to(dtype)
+    state = torch.exp(-slope.to(dtype).reshape(1, -1, 1, 1)) * old
+    state = state + k[active, :, 0, :, None].to(dtype) * v[active, :, 0, None, :].to(
+        dtype
+    )
     result = torch.zeros(
         (q.shape[0], q.shape[1] * q.shape[-1]), device=q.device, dtype=q.dtype
     )
     result[active] = (
-        (q[active].float() @ state).reshape(-1, result.shape[-1]).to(q.dtype)
+        (q[active].to(dtype) @ state).reshape(-1, result.shape[-1]).to(q.dtype)
     )
-    cache[idx] = state
+    cache[idx] = state.to(cache.dtype)
     return result

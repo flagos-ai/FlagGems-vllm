@@ -9,6 +9,19 @@ import torch
 
 import flaggems_vllm
 from benchmark.conftest import update_result
+from tests.lightning_attention_cases import (
+    DECODE_CASES,
+    PREFIX_CASES,
+    PrefixCase,
+    case_id,
+    make_decode_inputs,
+    make_initial,
+    make_qkv,
+    make_slope,
+    make_state,
+    native_decode_reason,
+    native_prefix_reason,
+)
 from tests.lightning_attention_reference import prefix_reference
 
 pytestmark = pytest.mark.skipif(
@@ -16,34 +29,16 @@ pytestmark = pytest.mark.skipif(
     reason="requires Hopper with FlagTree TLE",
 )
 
-# Shape order is B,H,T,D. Sequence and decode retain their native return contracts.
-_SEQUENCE = [
-    (1, 8, 8, 64),
-    (1, 8, 64, 64),
-    (1, 8, 257, 64),
-    (2, 8, 320, 64),
-    (1, 16, 512, 128),
-    (1, 16, 1024, 128),
-    (1, 16, 2048, 128),
-    (1, 8, 4096, 128),
-    (1, 8, 8192, 128),
-]
-_DECODE = [
-    (1, 8, 1, 64),
-    (8, 8, 1, 64),
-    (32, 16, 1, 64),
-    (1, 8, 1, 128),
-    (8, 8, 1, 128),
-    (32, 16, 1, 128),
-    (64, 16, 1, 128),
-]
 
-
-def _measure(fns, resets, repeats):
+def _measure(fns, reset, repeats):
     graphs = {}
     for name, fn in fns.items():
+        if reset:
+            reset()
         for _ in range(5):
             fn()
+        if reset:
+            reset()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -51,15 +46,21 @@ def _measure(fns, resets, repeats):
                 fn()
         graphs[name] = graph
     for graph in graphs.values():
+        if reset:
+            reset()
         for _ in range(3):
             graph.replay()
     torch.cuda.synchronize()
     samples = {name: [] for name in fns}
     for round_idx in range(11):
-        order = list(fns) if round_idx % 2 == 0 else list(reversed(fns))
+        order = list(fns)
+        shift = round_idx % len(order)
+        order = order[shift:] + order[:shift]
+        if round_idx % 2:
+            order.reverse()
         for name in order:
-            if resets:
-                resets[name]()
+            if reset:
+                reset()
             begin = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             begin.record()
@@ -70,73 +71,108 @@ def _measure(fns, resets, repeats):
     return {name: statistics.median(times) for name, times in samples.items()}
 
 
-@pytest.mark.parametrize(
-    "phase,shape",
-    [("prefix", shape) for shape in _SEQUENCE]
-    + [("decode", shape) for shape in _DECODE],
-)
-def test_lightning_attention_cudagraph(phase, shape, request):
-    if request.config.getoption("--level") == "core" and shape not in (
-        _SEQUENCE[2],
-        _SEQUENCE[-2],
-        _DECODE[0],
-        _DECODE[-2],
-    ):
+def benchmark_case(case, native, candidates, include_torch=True):
+    """Measure the same tensors, layouts and state-update contract for every provider."""
+    torch.manual_seed(932)
+    device = flaggems_vllm.device
+    q, k, v = make_qkv(case, device)
+    fns = {}
+    if isinstance(case, PrefixCase):
+        reset = None
+        phase = "prefix"
+        initial = make_initial(case, device)
+        slope = make_slope(case, device)
+        native_reason = native_prefix_reason(case)
+        if include_torch:
+
+            def torch_prefix():
+                y, states = prefix_reference(q, k, v, slope, initial, torch.float32)
+                return y.to(q.dtype), states
+
+            fns["torch"] = torch_prefix
+        if native_reason is None:
+            fns["vllm"] = lambda: native.lightning_attention(
+                q, k, v, slope, kv_history=initial
+            )
+        for name, (prefix, _) in candidates.items():
+            fns[name] = lambda prefix=prefix: prefix(q, k, v, slope, kv_history=initial)
+        calls = 12 if case.t < 4096 else 6
+    else:
+        phase = "decode"
+        slope, slots, initial = make_decode_inputs(case, device)
+        native_reason = native_decode_reason((q, k, v), slope, slots)
+
+        # All graphs replay serially on the same physical cache address. A separate
+        # allocation per provider can change bandwidth on sparse slot patterns.
+        cache = make_state(case, initial.size(0), device)
+
+        def reset():
+            cache.copy_(initial)
+
+        if include_torch:
+            # Valid rows are fixed for benchmarking. Prepare indices outside capture.
+            rows = (slots >= 0).nonzero().flatten()
+            ids = slots.index_select(0, rows).long()
+
+            def torch_decode():
+                state = cache.index_select(0, ids)
+                ks = k.index_select(0, rows)[:, :, 0, :, None].float()
+                vs = v.index_select(0, rows)[:, :, 0, None, :].float()
+                state = torch.exp(-slope.reshape(1, -1, 1, 1)) * state + ks * vs
+                cache.index_copy_(0, ids, state)
+                product = q.index_select(0, rows).float() @ state
+                y = q.new_zeros((case.b, case.h * case.d))
+                y.index_copy_(
+                    0, rows, product.reshape(rows.numel(), case.h * case.d).to(q.dtype)
+                )
+                return y
+
+            fns["torch"] = torch_decode
+        if native_reason is None:
+            fns["vllm"] = lambda: native.linear_decode_forward_triton(
+                q, k, v, cache, slope, slots, case.block
+            )
+        for name, (_, decode) in candidates.items():
+            fns[name] = lambda decode=decode: decode(
+                q, k, v, cache, slope, slots, case.block
+            )
+        calls = 32
+    repeats = {
+        key: (1 if key == "torch" and getattr(case, "t", 1) >= 512 else calls)
+        for key in fns
+    }
+    times = _measure(fns, reset, repeats)
+    return dict(
+        id=case_id(case),
+        phase=phase,
+        group=case.group,
+        median_us=times,
+        native_unavailable=native_reason,
+    )
+
+
+_CORE = {
+    "p-history-b1h8t257d64e64",
+    "p-long-b1h8t4096d128e128",
+    "d-small-b1h8t1d64e64",
+    "d-throughput-b32h16t1d128e128",
+}
+
+
+@pytest.mark.parametrize("case", PREFIX_CASES + DECODE_CASES, ids=case_id)
+def test_lightning_attention_cudagraph(case, request):
+    if request.config.getoption("--level") == "core" and case_id(case) not in _CORE:
         pytest.skip("comprehensive shape")
     native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
-    torch.manual_seed(932)
-    b, h, t, d = shape
-    device = flaggems_vllm.device
-    q, k, v = [torch.randn(b, h, t, d, device=device) * 0.125 for _ in range(3)]
-    slopes = torch.linspace(0.002, 0.12, h, device=device)
-    initial = torch.randn(b, h, d, d, device=device) * 0.125
-    slots = torch.randperm(b, device=device)
-    resets = {}
-    if phase == "prefix":
-        fns = {
-            "torch": lambda: prefix_reference(q, k, v, slopes, initial, torch.float32),
-            "vllm": lambda: native.lightning_attention(
-                q, k, v, slopes, kv_history=initial
-            ),
-            "tle": lambda: flaggems_vllm.lightning_attention(
-                q, k, v, slopes, kv_history=initial
-            ),
-        }
-    else:
-        pools = {name: initial.clone() for name in ("torch", "vllm", "tle")}
-        resets = {
-            name: (lambda pool=pool: pool.copy_(initial))
-            for name, pool in pools.items()
-        }
-
-        def torch_decode():
-            state = pools["torch"].index_select(0, slots)
-            state = (
-                torch.exp(-slopes[None, :, None, None]) * state
-                + k[:, :, 0, :, None] * v[:, :, 0, None, :]
+    row = benchmark_case(
+        case,
+        native,
+        {
+            "tle": (
+                flaggems_vllm.lightning_attention,
+                flaggems_vllm.lightning_attention_decode,
             )
-            pools["torch"].index_copy_(0, slots, state)
-            return (q @ state).reshape(b, h * d)
-
-        fns = {
-            "torch": torch_decode,
-            "vllm": lambda: native.linear_decode_forward_triton(
-                q, k, v, pools["vllm"], slopes, slots
-            ),
-            "tle": lambda: flaggems_vllm.lightning_attention_decode(
-                q, k, v, pools["tle"], slopes, slots
-            ),
-        }
-    calls = 32 if phase == "decode" else 12
-    repeats = {"vllm": calls, "tle": calls, "torch": 1 if t >= 512 else calls}
-    median = _measure(fns, resets, repeats)
-    row = dict(
-        phase=phase,
-        shape=list(shape),
-        dtype="float32",
-        median_us=median,
-        vllm_over_tle=median["vllm"] / median["tle"],
-        torch_over_tle=median["torch"] / median["tle"],
+        },
     )
     print("LIGHTNING_BENCH " + json.dumps(row), flush=True)
-    update_result("lightning_attention_" + phase, row)
+    update_result("lightning_attention_" + row["phase"], row)

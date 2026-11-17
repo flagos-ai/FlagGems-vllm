@@ -1,10 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 
+import json
+
 import pytest
 import torch
 
 import flaggems_vllm
+from tests.lightning_attention_cases import (
+    DECODE_CASES,
+    PREFIX_CASES,
+    case_id,
+    make_decode_inputs,
+    make_initial,
+    make_qkv,
+    make_slope,
+    make_state,
+    native_prefix_reason,
+)
 from tests.lightning_attention_reference import decode_reference, prefix_reference
 
 pytestmark = pytest.mark.skipif(
@@ -14,107 +27,120 @@ pytestmark = pytest.mark.skipif(
 
 
 def assert_relative(actual, expected, limit):
-    expected = expected.double().cpu()
-    actual = actual.double().cpu()
-    if actual.numel() == 0:
-        assert actual.shape == expected.shape
-        return
-    error = torch.linalg.vector_norm(actual - expected)
-    scale = torch.linalg.vector_norm(expected).clamp_min(1.0e-12)
-    assert error / scale <= limit, f"relative L2 = {(error / scale).item():.6g}"
+    assert actual.shape == expected.shape
+    if not actual.numel():
+        return 0.0
+    expected = expected.double()
+    actual = actual.to(device=expected.device, dtype=torch.float64)
+    error = (
+        torch.linalg.vector_norm(actual - expected)
+        / torch.linalg.vector_norm(expected).clamp_min(1e-12)
+    ).item()
+    assert error <= limit, f"relative L2 = {error:.7g}, limit={limit}"
+    return error
 
 
-@pytest.mark.parametrize(
-    "b,h,t,d,e,has_initial,strided,dtype",
-    [
-        (1, 2, 0, 64, 64, True, False, torch.float32),
-        (2, 3, 1, 64, 64, True, False, torch.float32),
-        (2, 3, 4, 128, 128, False, True, torch.float32),
-        (1, 2, 63, 64, 64, False, True, torch.float32),
-        (1, 2, 64, 128, 64, True, False, torch.float32),
-        (1, 2, 65, 64, 64, True, False, torch.bfloat16),
-        (2, 3, 255, 64, 64, True, True, torch.float32),
-        (1, 2, 256, 128, 128, False, False, torch.float32),
-        (1, 2, 257, 64, 64, True, True, torch.float32),
-        (2, 2, 320, 64, 32, True, False, torch.float32),
-        (1, 2, 513, 128, 128, True, False, torch.bfloat16),
-        (1, 4, 2049, 128, 128, True, False, torch.float32),
-    ],
-)
-def test_lightning_prefix(b, h, t, d, e, has_initial, strided, dtype):
+def test_matrix_contains_distinct_cases():
+    for cases in (PREFIX_CASES, DECODE_CASES):
+        assert len(cases) == len({case_id(c) for c in cases}) == 80
+        assert (
+            len({tuple(v for k, v in vars(c).items() if k != "group") for c in cases})
+            == 80
+        )
+
+
+@pytest.mark.parametrize("case", PREFIX_CASES, ids=case_id)
+def test_lightning_prefix(case, record_property):
     torch.manual_seed(927)
     device = flaggems_vllm.device
-
-    def make(width):
-        x = torch.randn(
-            b, t, h, width * 2 if strided else width, dtype=dtype, device=device
-        )
-        return (
-            x[..., ::2].transpose(1, 2) if strided else x.transpose(1, 2).contiguous()
-        )
-
-    q, k, v = make(d), make(d), make(e)
-    slope = torch.linspace(0, 0.25, h, device=device)
-    s0 = torch.randn(b, h, d, e * 2, device=device)[..., ::2] if has_initial else None
-    original = s0.clone() if has_initial else None
-    y, states = flaggems_vllm.lightning_attention(q, k, v, slope, kv_history=s0)
-    expected = prefix_reference(
-        q.cpu(), k.cpu(), v.cpu(), slope.cpu(), s0.cpu() if has_initial else None
+    q, k, v = make_qkv(case, device)
+    slope = make_slope(case, device)
+    initial = make_initial(case, device)
+    old = None if initial is None else initial.cpu()
+    y, states = flaggems_vllm.lightning_attention(q, k, v, slope, kv_history=initial)
+    ref, ref_s = prefix_reference(q.cpu(), k.cpu(), v.cpu(), slope.cpu(), old)
+    assert y.dtype == case.dtype and states.dtype == torch.float32
+    limit = 0.007 if case.dtype == torch.bfloat16 else 0.0025
+    output_error = assert_relative(y, ref, limit)
+    snapshot_error = max(
+        assert_relative(x, z, 0.0025) for x, z in zip(states.unbind(2), ref_s.unbind(2))
     )
-    assert y.shape == expected[0].shape
-    assert states.shape == expected[1].shape
-    assert y.dtype == dtype and states.dtype == torch.float32
-    assert_relative(y, expected[0], 0.007 if dtype == torch.bfloat16 else 0.0025)
-    for block, expected_state in zip(states.unbind(2), expected[1].unbind(2)):
-        assert_relative(block, expected_state, 0.0025)
-    if has_initial:
-        torch.testing.assert_close(s0, original, rtol=0, atol=0)
-    if t:
+    # An isolated error at a hand-off can disappear in a whole-sequence norm.
+    boundaries = sorted(
+        {t for t in (0, 63, 64, 255, 256, 1471, 1472, case.t - 1) if 0 <= t < case.t}
+    )
+    if boundaries:
+        assert_relative(y[:, :, boundaries], ref[:, :, boundaries], limit)
+    if initial is not None:
+        torch.testing.assert_close(initial.cpu(), old, rtol=0, atol=0)
+    metrics = dict(output=output_error, max_snapshot=snapshot_error)
+    # With native BF16 unsupported, compare the same quantized values promoted to FP32.
+    reason = native_prefix_reason(case)
+    if reason in (None, "native prefix needs FP32 V with FP32 decay"):
         native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
-        # Bailing passes FP32. The native 0.24 kernel rejects BF16 V with FP32 decay.
-        native_qkv = (
-            (q.float(), k.float(), v.float()) if dtype == torch.bfloat16 else (q, k, v)
+
+        native_y, native_s = native.lightning_attention(
+            q.float(), k.float(), v.float(), slope, kv_history=initial
         )
-        baseline_y, baseline_s = native.lightning_attention(
-            *native_qkv, slope, kv_history=s0
+        metrics["native_output"] = assert_relative(
+            y, native_y, 0.012 if case.dtype == torch.bfloat16 else 0.0025
         )
-        assert_relative(y, baseline_y, 0.012 if dtype == torch.bfloat16 else 0.0025)
-        assert_relative(states, baseline_s, 0.003)
+        metrics["native_history"] = assert_relative(states, native_s, 0.003)
+    record_property("relative_l2", json.dumps(metrics))
 
 
-@pytest.mark.parametrize(
-    "b,d,dtype",
-    [(1, 64, torch.float32), (5, 128, torch.float32), (5, 64, torch.bfloat16)],
-)
-def test_lightning_decode(b, d, dtype):
+@pytest.mark.parametrize("case", DECODE_CASES, ids=case_id)
+def test_lightning_decode(case, record_property):
+    native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
+
     torch.manual_seed(928)
     device = flaggems_vllm.device
-    h = 4
-    q, k, v = [torch.randn(b, h, 1, d, dtype=dtype, device=device) for _ in range(3)]
-    s = torch.linspace(0.005, 0.25, h, device=device)
-    full = torch.randn(b + 3, h, d, d * 2, device=device)
-    original = full.clone()
-    pool = full[..., ::2]
-    slots = torch.tensor([2, -1, 0, 4, 1][:b], dtype=torch.int32, device=device)
-    expected_pool = pool.clone()
-    native_pool = pool.clone()
-    native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
+    q, k, v = make_qkv(case, device)
+    slope, slots, initial = make_decode_inputs(case, device)
+    pool = make_state(case, len(initial), device)
+    # Check padding bytes of pitched/interleaved views independently of logical values.
+    raw = pool.as_strided(
+        (pool.untyped_storage().nbytes() // pool.element_size(),), (1,), 0
+    )
+    raw.fill_(-17.5)
+    pool.copy_(initial)
+    guard = (raw == -17.5) if raw.numel() > pool.numel() else None
+    expected = initial.contiguous().clone()
+    baseline = initial.contiguous().clone()
+    native_qkv = tuple(x.contiguous() for x in (q, k, v))
+    live = slots >= 0
+    unused = torch.ones(len(pool), device=device, dtype=torch.bool)
+    unused[slots[live].long()] = False
+    metrics = dict(output=0.0, state=0.0, native_output=0.0, native_state=0.0)
     for _ in range(3):
-        y = flaggems_vllm.lightning_attention_decode(q, k, v, pool, s, slots)
-        expected = decode_reference(q, k, v, expected_pool, s, slots)
-        baseline = native.linear_decode_forward_triton(q, k, v, native_pool, s, slots)
-        assert y.shape == (b, h * d)
-        assert_relative(y, expected, 0.002 if dtype == torch.bfloat16 else 0.000002)
-        assert_relative(
-            y[slots >= 0],
-            baseline[slots >= 0],
-            0.008 if dtype == torch.bfloat16 else 0.000002,
+        y = flaggems_vllm.lightning_attention_decode(
+            q, k, v, pool, slope, slots, case.block
         )
-        assert_relative(pool, expected_pool, 2e-6)
-        assert_relative(pool, native_pool, 0.004 if dtype == torch.bfloat16 else 2e-6)
-    torch.testing.assert_close(full[..., 1::2], original[..., 1::2], rtol=0, atol=0)
-    unused = [n for n in range(pool.shape[0]) if n not in slots.tolist()]
-    torch.testing.assert_close(pool[unused], original[unused, ..., ::2], atol=0, rtol=0)
+        ref = decode_reference(q, k, v, expected, slope, slots, dtype=torch.float64)
+        native_y = native.linear_decode_forward_triton(
+            *native_qkv, baseline, slope.contiguous(), slots.contiguous(), case.block
+        )
+        assert y.shape == (case.b, case.h * case.d) and y.dtype == case.dtype
+        # Native padding rows have unspecified output. TLE zeros those rows.
+        assert torch.count_nonzero(y[~live]).item() == 0
+        measured = {
+            "output": assert_relative(
+                y, ref, 0.002 if case.dtype == torch.bfloat16 else 2e-6
+            ),
+            "state": assert_relative(pool, expected, 2e-6),
+            "native_output": assert_relative(
+                y[live], native_y[live], 0.008 if case.dtype == torch.bfloat16 else 2e-6
+            ),
+            "native_state": assert_relative(
+                pool, baseline, 0.004 if case.dtype == torch.bfloat16 else 2e-6
+            ),
+        }
+        for key, value in measured.items():
+            metrics[key] = max(metrics[key], value)
+    torch.testing.assert_close(pool[unused], initial[unused], atol=0, rtol=0)
+    if guard is not None:
+        assert torch.all(raw[guard] == -17.5).item()
+    record_property("relative_l2", json.dumps(metrics))
 
 
 def test_vllm_read_at_history_boundary():
@@ -225,3 +251,48 @@ def test_decode_rejects_mismatched_input_before_writing():
             torch.zeros(1, dtype=torch.int64, device=q.device),
         )
     torch.testing.assert_close(cache, original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "t,d,has_initial",
+    [
+        (7, 128, True),
+        (31, 64, False),
+        (62, 128, True),
+        (64, 64, True),
+        (67, 128, True),
+        (129, 128, True),
+        (257, 64, False),
+    ],
+)
+def test_prefix_graph_reads_current_operands(t, d, has_initial):
+    device = flaggems_vllm.device
+    shape = (1, 3, t, d)
+    torch.manual_seed(933)
+    q, k, v = [torch.randn(shape, device=device) for _ in range(3)]
+    initial = torch.randn(1, 3, d, d, device=device) if has_initial else None
+    slope = torch.rand(3, device=device)
+
+    def run():
+        return flaggems_vllm.lightning_attention(q, k, v, slope, kv_history=initial)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y, history = run()
+    for _ in range(6):
+        for x in (q, k, v):
+            x.normal_()
+        slope.uniform_(0.0, 0.25)
+        if initial is not None:
+            initial.normal_()
+        graph.replay()
+        expected, states = prefix_reference(
+            q.cpu(),
+            k.cpu(),
+            v.cpu(),
+            slope.cpu(),
+            initial.cpu() if has_initial else None,
+        )
+        assert_relative(y, expected, 0.0025)
+        assert_relative(history, states, 0.0025)
